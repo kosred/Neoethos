@@ -1,4 +1,5 @@
 import asyncio
+from collections import defaultdict
 import contextlib
 import concurrent.futures
 import gc
@@ -15,7 +16,6 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
-import torch.distributed as dist  # DDP Sync
 
 from ..core.config import Settings
 from ..data.loader import DataLoader
@@ -403,6 +403,24 @@ class TrainingService:
         min_genes = max(0, min_genes)
         if min_genes > max_genes:
             min_genes = max_genes
+        strict_symbol = str(os.environ.get("FOREX_BOT_PROP_SYMBOL_STRICT", "1") or "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        diversify_tf = str(os.environ.get("FOREX_BOT_PROP_DIVERSIFY_TIMEFRAMES", "1") or "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        try:
+            min_per_tf = int(os.environ.get("FOREX_BOT_PROP_MIN_PER_TF", "4") or 4)
+        except Exception:
+            min_per_tf = 4
+        min_per_tf = max(0, min_per_tf)
+        target_symbol = str(symbol or "").upper().strip()
 
         candidates = self._prop_gene_artifact_paths(symbol)
         if not candidates:
@@ -466,6 +484,10 @@ class TrainingService:
                 f"{float(gene.long_threshold):.6f}|{float(gene.short_threshold):.6f}"
             )
 
+        def _gene_tf(gene: TALibStrategyGene) -> str:
+            tf = str(getattr(gene, "source_timeframe", "") or "").strip().upper()
+            return tf or "UNK"
+
         def _top_up(base: list[TALibStrategyGene]) -> list[TALibStrategyGene]:
             if len(base) >= min_genes:
                 return base[:max_genes]
@@ -481,6 +503,53 @@ class TrainingService:
                     break
             return out[:max_genes]
 
+        def _diversify_by_timeframe(base: list[TALibStrategyGene]) -> list[TALibStrategyGene]:
+            if not diversify_tf or not base:
+                return base[:max_genes]
+
+            bucketed: dict[str, list[TALibStrategyGene]] = defaultdict(list)
+            for gene in base:
+                bucketed[_gene_tf(gene)].append(gene)
+            if len(bucketed) <= 1:
+                return base[:max_genes]
+
+            # Timeframe order: strongest first, then round-robin for diversity.
+            tf_order = sorted(
+                bucketed.keys(),
+                key=lambda tf: float(getattr(bucketed[tf][0], "fitness", 0.0) or 0.0),
+                reverse=True,
+            )
+            cursors = {tf: 0 for tf in tf_order}
+            out: list[TALibStrategyGene] = []
+
+            # Pass 1: guarantee a minimum contribution per timeframe when possible.
+            if min_per_tf > 0:
+                for tf in tf_order:
+                    bucket = bucketed[tf]
+                    take = min(min_per_tf, len(bucket))
+                    for i in range(take):
+                        out.append(bucket[i])
+                    cursors[tf] = take
+                    if len(out) >= max_genes:
+                        return out[:max_genes]
+
+            # Pass 2: round-robin fill remainder.
+            while len(out) < max_genes:
+                advanced = False
+                for tf in tf_order:
+                    cur = cursors[tf]
+                    bucket = bucketed[tf]
+                    if cur >= len(bucket):
+                        continue
+                    out.append(bucket[cur])
+                    cursors[tf] = cur + 1
+                    advanced = True
+                    if len(out) >= max_genes:
+                        break
+                if not advanced:
+                    break
+            return out[:max_genes]
+
         all_parsed: list[TALibStrategyGene] = []
         parsed_by_file: list[tuple[Path, int]] = []
         for path in candidates:
@@ -490,6 +559,10 @@ class TrainingService:
                 continue
             if not isinstance(payload, dict):
                 continue
+            payload_symbol = str(payload.get("symbol", "") or "").upper().strip()
+            if strict_symbol and payload_symbol and target_symbol and payload_symbol != target_symbol:
+                continue
+            payload_tf = str(payload.get("timeframe", payload.get("tf", "")) or "").upper().strip()
             raw_genes = payload.get("best_genes")
             if not isinstance(raw_genes, list) or not raw_genes:
                 continue
@@ -550,6 +623,8 @@ class TrainingService:
                     use_inducement=bool(raw.get("use_inducement", False)),
                     tp_pips=_to_float(raw, "tp_pips", 40.0),
                     sl_pips=_to_float(raw, "sl_pips", 20.0),
+                    source_symbol=payload_symbol,
+                    source_timeframe=payload_tf,
                 )
                 parsed.append(gene)
 
@@ -606,12 +681,15 @@ class TrainingService:
                 min_genes,
             )
 
+        chosen = _diversify_by_timeframe(chosen)
+        chosen_tfs = {str(getattr(g, "source_timeframe", "") or "UNK") for g in chosen}
+
         sources = ", ".join(f"{p.name}:{n}" for p, n in parsed_by_file[:6])
         if len(parsed_by_file) > 6:
             sources += ", ..."
         logger.info(
             "[STRATEGY DISCOVERY] %s: loaded %s genes from %s files (merged=%s, filtered=%s, selected=%s). "
-            "Filters: profit>%.3f, max_dd<=%.3f, trades>=%.0f, min_genes=%s. Sources: %s",
+            "Filters: profit>%.3f, max_dd<=%.3f, trades>=%.0f, min_genes=%s, strict_symbol=%s, diversify_tf=%s, tf_count=%s. Sources: %s",
             symbol,
             sum(n for _, n in parsed_by_file),
             len(parsed_by_file),
@@ -622,6 +700,9 @@ class TrainingService:
             keep_max_dd,
             keep_min_trades,
             min_genes,
+            strict_symbol,
+            diversify_tf,
+            len(chosen_tfs),
             sources or "none",
         )
         return chosen
@@ -1058,6 +1139,180 @@ class TrainingService:
             metadata=meta,
             labels=labels,
         )
+
+    @staticmethod
+    def _pair_corr_enabled() -> bool:
+        raw = str(os.environ.get("FOREX_BOT_PAIR_CORR_ENABLED", "1") or "1").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    def _inject_cross_pair_context(
+        self,
+        datasets: list[tuple[str, PreparedDataset]],
+    ) -> list[tuple[str, PreparedDataset]]:
+        """
+        Add cross-symbol correlation context for pooled multi-symbol training.
+        Features are lagged to avoid same-bar leakage.
+        """
+        if len(datasets) < 2 or not self._pair_corr_enabled():
+            return datasets
+
+        window = self._parse_int_env("FOREX_BOT_PAIR_CORR_WINDOW") or 240
+        window = max(16, int(window))
+        lag = self._parse_int_env("FOREX_BOT_PAIR_CORR_LAG") or 1
+        lag = max(1, int(lag))
+        max_peers = self._parse_int_env("FOREX_BOT_PAIR_CORR_MAX_PEERS")
+        if max_peers is None:
+            max_peers = min(4, len(datasets) - 1)
+        max_peers = max(1, min(int(max_peers), len(datasets) - 1))
+        min_overlap = self._parse_int_env("FOREX_BOT_PAIR_CORR_MIN_OVERLAP")
+        if min_overlap is None:
+            min_overlap = max(50, window)
+        min_overlap = max(20, int(min_overlap))
+        static_rows = self._parse_int_env("FOREX_BOT_PAIR_CORR_STATIC_ROWS") or 200_000
+        static_rows = max(5_000, int(static_rows))
+
+        returns_map: dict[str, pd.Series] = {}
+        for sym, ds in datasets:
+            try:
+                x = ds.X if isinstance(getattr(ds, "X", None), pd.DataFrame) else None
+                if x is None or x.empty:
+                    continue
+                idx = x.index
+                ret: pd.Series | None = None
+
+                meta = ds.metadata if isinstance(getattr(ds, "metadata", None), pd.DataFrame) else None
+                if isinstance(meta, pd.DataFrame) and "close" in meta.columns:
+                    close = pd.to_numeric(meta["close"], errors="coerce")
+                    if not close.index.equals(idx):
+                        close = close.reindex(idx).ffill()
+                    ret = close.pct_change()
+                elif "close" in x.columns:
+                    close = pd.to_numeric(x["close"], errors="coerce")
+                    ret = close.pct_change()
+                elif "returns" in x.columns:
+                    ret = pd.to_numeric(x["returns"], errors="coerce")
+
+                if ret is None:
+                    continue
+                ret = ret.replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(np.float32, copy=False)
+                returns_map[str(sym)] = ret
+            except Exception:
+                continue
+
+        if len(returns_map) < 2:
+            logger.info("[GLOBAL CORR] Skipping pair-correlation features (insufficient return series).")
+            return datasets
+
+        patched: list[tuple[str, PreparedDataset]] = []
+        for sym, ds in datasets:
+            sym_key = str(sym)
+            if sym_key not in returns_map:
+                patched.append((sym, ds))
+                continue
+
+            sym_ret = returns_map[sym_key]
+            peer_rank: list[tuple[str, float, float]] = []
+            for peer_sym, peer_ret in returns_map.items():
+                if peer_sym == sym_key:
+                    continue
+                aligned = pd.concat([sym_ret, peer_ret], axis=1, join="inner")
+                if len(aligned) > static_rows:
+                    aligned = aligned.iloc[-static_rows:]
+                aligned = aligned.replace([np.inf, -np.inf], np.nan).dropna()
+                if len(aligned) < min_overlap:
+                    continue
+                corr = float(aligned.iloc[:, 0].corr(aligned.iloc[:, 1]))
+                if not np.isfinite(corr):
+                    continue
+                peer_rank.append((peer_sym, abs(corr), corr))
+            peer_rank.sort(key=lambda item: item[1], reverse=True)
+            peers = [p for p, _abs, _corr in peer_rank[:max_peers]]
+            if not peers:
+                patched.append((sym, ds))
+                continue
+
+            try:
+                x = ds.X.copy()
+                idx = x.index
+                sym_hist = sym_ret.reindex(idx).ffill().fillna(0.0).shift(lag).fillna(0.0)
+                peer_hist = pd.DataFrame(
+                    {
+                        p: returns_map[p].reindex(idx).ffill().fillna(0.0).shift(lag).fillna(0.0)
+                        for p in peers
+                    },
+                    index=idx,
+                )
+
+                min_periods = max(20, window // 4)
+                corr_cols: dict[str, pd.Series] = {}
+                for p in peers:
+                    rc = sym_hist.rolling(window=window, min_periods=min_periods).corr(peer_hist[p])
+                    corr_cols[p] = rc.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                corr_df = pd.DataFrame(corr_cols, index=idx)
+
+                lead_peer = peers[0]
+                static_corrs = [c for _p, _abs, c in peer_rank[:max_peers]]
+
+                x["pair_peer_ret_mean"] = peer_hist.mean(axis=1)
+                x["pair_peer_ret_std"] = peer_hist.std(axis=1).fillna(0.0)
+                x["pair_peer_abs_mean"] = peer_hist.abs().mean(axis=1)
+                x["pair_corr_mean"] = corr_df.mean(axis=1)
+                x["pair_corr_abs_mean"] = corr_df.abs().mean(axis=1)
+                x["pair_corr_max"] = corr_df.max(axis=1)
+                x["pair_corr_min"] = corr_df.min(axis=1)
+                x["pair_lead_ret"] = peer_hist[lead_peer]
+                x["pair_lead_corr"] = corr_df[lead_peer]
+                x["pair_divergence"] = sym_hist - x["pair_peer_ret_mean"]
+                x["pair_relative_strength"] = sym_hist - x["pair_lead_ret"]
+                x["pair_static_corr_mean"] = float(np.mean(static_corrs)) if static_corrs else 0.0
+                x["pair_static_corr_abs_max"] = (
+                    float(max(abs(v) for v in static_corrs)) if static_corrs else 0.0
+                )
+
+                for col in (
+                    "pair_peer_ret_mean",
+                    "pair_peer_ret_std",
+                    "pair_peer_abs_mean",
+                    "pair_corr_mean",
+                    "pair_corr_abs_mean",
+                    "pair_corr_max",
+                    "pair_corr_min",
+                    "pair_lead_ret",
+                    "pair_lead_corr",
+                    "pair_divergence",
+                    "pair_relative_strength",
+                    "pair_static_corr_mean",
+                    "pair_static_corr_abs_max",
+                ):
+                    with contextlib.suppress(Exception):
+                        x[col] = pd.to_numeric(x[col], errors="coerce").fillna(0.0).astype(np.float32)
+
+                x = x.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                patched.append(
+                    (
+                        sym,
+                        PreparedDataset(
+                            X=x,
+                            y=ds.y,
+                            index=x.index,
+                            feature_names=list(x.columns),
+                            metadata=ds.metadata,
+                            labels=ds.labels if ds.labels is not None else ds.y,
+                        ),
+                    )
+                )
+                logger.info(
+                    "[GLOBAL CORR] %s: added pair-context features using peers=%s (window=%s, lag=%s).",
+                    sym,
+                    ",".join(peers),
+                    window,
+                    lag,
+                )
+            except Exception as exc:
+                logger.warning(f"[GLOBAL CORR] {sym}: failed to inject pair-context features: {exc}")
+                patched.append((sym, ds))
+
+        return patched
 
     async def train(self, optimize: bool = True, stop_event: asyncio.Event | None = None) -> None:
         """Run the full training pipeline for the single active symbol."""
@@ -1573,6 +1828,8 @@ class TrainingService:
                     pass
                 capped.append((sym, d))
             datasets = capped
+
+        datasets = self._inject_cross_pair_context(datasets)
 
         # Align feature spaces across symbols.
         cols, aligned = self._align_global_feature_space(datasets)

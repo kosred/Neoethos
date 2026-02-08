@@ -59,6 +59,8 @@ class TALibStrategyGene:
     win_rate: float = 0.0
     max_dd_pct: float = 0.0
     trades: float = 0.0
+    source_symbol: str = ""
+    source_timeframe: str = ""
     use_ob: bool = False
     use_fvg: bool = False
     use_liq_sweep: bool = False

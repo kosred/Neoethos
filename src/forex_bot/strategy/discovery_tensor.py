@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -437,14 +436,16 @@ class TensorDiscoveryEngine:
                     min_keep=keep_min_count,
                     cap=keep_cap,
                 )
+                symbol = str(df.attrs.get("symbol", "") or "")
 
                 payload = {
                     "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "symbol": symbol,
+                    "timeframe": str(df.attrs.get("timeframe", df.attrs.get("tf", "")) or ""),
                     "best_genes": [_gene_to_dict(g) for g in selected],
                 }
                 out_dir = Path("cache")
                 out_dir.mkdir(parents=True, exist_ok=True)
-                symbol = str(df.attrs.get("symbol", "") or "")
                 out_path = out_dir / "talib_knowledge.json"
                 if symbol:
                     safe = "".join(c for c in symbol if c.isalnum() or c in ("-", "_"))
@@ -579,6 +580,8 @@ class TensorDiscoveryEngine:
 
         payload = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            "symbol": symbol,
+            "timeframe": str(df.attrs.get("timeframe", df.attrs.get("tf", "")) or ""),
             "best_genes": [_gene_to_dict(g) for g in best],
         }
         out_dir = Path("cache")
