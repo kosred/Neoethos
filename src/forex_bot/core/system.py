@@ -19,6 +19,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _set_numexpr_threads(threads: int) -> None:
+    if int(threads or 0) <= 0:
+        return
+    try:
+        import numexpr as _numexpr
+
+        safe_threads = int(threads)
+        max_threads = getattr(getattr(_numexpr, "utils", None), "MAX_THREADS", None)
+        if max_threads is not None:
+            try:
+                safe_threads = min(safe_threads, max(1, int(max_threads)))
+            except Exception:
+                safe_threads = max(1, safe_threads)
+        safe_threads = max(1, safe_threads)
+        os.environ["NUMEXPR_NUM_THREADS"] = str(safe_threads)
+        _numexpr.set_num_threads(safe_threads)
+    except ImportError:
+        return
+    except Exception as exc:
+        logger.debug("NumExpr thread configuration skipped: %s", exc)
+
+
 def normalize_device_preference(value: Any | None) -> str:
     """
     Normalize user/device preference input to one of: "auto" | "cpu" | "gpu".
@@ -50,11 +72,7 @@ def thread_limits(blas_threads: int | None = None) -> None:
 
             limiter = _threadpool_limits(limits=blas_threads, user_api="blas")
 
-        # numexpr is separate
-        with contextlib.suppress(Exception):
-            import numexpr as _numexpr
-
-            _numexpr.set_num_threads(blas_threads)
+        _set_numexpr_threads(blas_threads)
 
     with limiter:
         yield
@@ -577,14 +595,7 @@ class AutoTuner:
         os.environ.setdefault("FOREX_BOT_RUST_THREADS", str(blas_threads))
         os.environ.setdefault("RAYON_NUM_THREADS", str(blas_threads))
 
-        try:
-            import numexpr as _numexpr
-
-            _numexpr.set_num_threads(int(os.environ.get("NUMEXPR_NUM_THREADS", str(blas_threads))))
-        except ImportError:
-            pass  # Optional
-        except Exception as e:
-            logger.warning(f"NumExpr configuration failed: {e}")
+        _set_numexpr_threads(int(os.environ.get("NUMEXPR_NUM_THREADS", str(blas_threads))))
 
         # Align PyTorch intra-op/inter-op threads with the chosen budget.
         try:

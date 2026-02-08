@@ -118,7 +118,13 @@ def _export_onnx_from_saved_models(models_dir: Path) -> bool:
         return False
 
 
-async def _run_global_training(base_settings: Settings, symbols: list[str], stop_event: asyncio.Event) -> None:
+async def _run_global_training(
+    base_settings: Settings,
+    symbols: list[str],
+    stop_event: asyncio.Event,
+    *,
+    optimize: bool = True,
+) -> None:
     """Train a single global model across all symbols."""
     logger = logging.getLogger(__name__)
     if not symbols:
@@ -132,7 +138,95 @@ async def _run_global_training(base_settings: Settings, symbols: list[str], stop
         logger.error("Failed to initialize ForexBot:", exc_info=True)
         raise
     logger.info(f"[TRAIN-GLOBAL] Training one model across symbols: {symbols}")
-    await bot.train_global(symbols=symbols, optimize=True, stop_event=stop_event)
+    await bot.train_global(symbols=symbols, optimize=optimize, stop_event=stop_event)
+
+
+def _apply_quick_e2e_env(args: argparse.Namespace) -> None:
+    """Apply fast-run environment caps before loading Settings()."""
+    if not bool(getattr(args, "quick_e2e", False)):
+        return
+
+    quick_rows = max(2_000, int(getattr(args, "quick_rows", 50_000) or 50_000))
+    quick_budget_seconds = max(10, int(getattr(args, "quick_budget_seconds", 30) or 30))
+
+    os.environ["FOREX_BOT_QUICK_E2E"] = "1"
+    os.environ["FOREX_BOT_GLOBAL_MAX_ROWS_PER_SYMBOL"] = str(quick_rows)
+    os.environ["FOREX_BOT_GLOBAL_MAX_ROWS"] = str(quick_rows)
+    os.environ["FOREX_BOT_DISCOVERY_EXPERTS"] = str(4)
+    os.environ["FOREX_BOT_DISCOVERY_ITERS"] = str(20)
+    os.environ["FOREX_BOT_DISCOVERY_SAMPLE"] = str(4)
+    os.environ["FOREX_BOT_DISCOVERY_POP"] = str(24)
+    os.environ["FOREX_BOT_DISCOVERY_GENS"] = str(1)
+    os.environ["FOREX_BOT_DISCOVERY_MAX_INDICATORS"] = str(6)
+    os.environ["FOREX_BOT_DISCOVERY_CANDIDATES"] = str(48)
+    os.environ["FOREX_BOT_DISCOVERY_PORTFOLIO"] = str(16)
+    os.environ["FOREX_BOT_DISCOVERY_FULL_TF_FEATURES"] = "0"
+    os.environ["FOREX_BOT_DISCOVERY_USE_TALIB_MIXER"] = "0"
+    os.environ["FOREX_BOT_PROP_SEARCH_ASYNC"] = "0"
+    os.environ["FOREX_BOT_DISCOVERY_ASYNC"] = "0"
+    os.environ["FOREX_BOT_HPO_STRICT_CONSTRAINTS"] = "0"
+    os.environ["FOREX_BOT_FEATURE_WORKERS"] = "4"
+    os.environ["FOREX_BOT_HPC_SHARDS_PER_SYMBOL"] = "2"
+    os.environ["FOREX_BOT_PARALLEL_MODELS"] = "0"
+    os.environ["FOREX_BOT_MODELS_OVERRIDE"] = "lightgbm,xgboost,catboost,mlp,transformer,genetic"
+    os.environ["NUMEXPR_MAX_THREADS"] = "16"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    # Keep consistency with model-side time budget checks.
+    os.environ["FOREX_BOT_QUICK_BUDGET_SECONDS"] = str(quick_budget_seconds)
+
+
+def _apply_quick_e2e_settings(settings: Settings, args: argparse.Namespace) -> None:
+    """Apply fast-run settings overrides after loading config."""
+    quick_rows = max(2_000, int(getattr(args, "quick_rows", 50_000) or 50_000))
+    quick_budget_seconds = max(10, int(getattr(args, "quick_budget_seconds", 30) or 30))
+
+    # Keep end-to-end path intact but reduce workload aggressively.
+    settings.models.hpo_backend = "none"
+    settings.models.hpo_trials = 1
+    settings.models.hpo_trials_by_model = {}
+    settings.models.prop_search_enabled = False
+    settings.models.enable_cpcv = False
+    settings.models.export_onnx = False
+    settings.models.global_max_rows_per_symbol = quick_rows
+    settings.models.global_max_rows = quick_rows
+    settings.system.discovery_max_rows = min(quick_rows, 5_000)
+    settings.news.enable_news = False
+    settings.news.news_backfill_enabled = False
+    settings.news.openai_news_enabled = False
+    settings.news.perplexity_enabled = False
+    settings.news.auto_rescore_enabled = False
+
+    # Tight per-model time budget so every expert still executes quickly.
+    for field_name in (
+        "transformer_train_seconds",
+        "nbeats_train_seconds",
+        "tide_train_seconds",
+        "tabnet_train_seconds",
+        "kan_train_seconds",
+        "mlp_train_seconds",
+        "rl_train_seconds",
+        "evo_train_seconds",
+    ):
+        setattr(settings.models, field_name, quick_budget_seconds)
+
+    # Deep models: one epoch cap in quick mode.
+    settings.models.max_epochs_by_model = {
+        "mlp": 1,
+        "transformer": 1,
+        "patchtst": 1,
+        "timesnet": 1,
+        "nbeats": 1,
+        "nbeatsx_nf": 1,
+        "tide": 1,
+        "tide_nf": 1,
+        "tabnet": 1,
+        "kan": 1,
+    }
+
+    # RL quick caps.
+    settings.models.rl_timesteps = min(int(settings.models.rl_timesteps), 2_000)
+    settings.models.rl_parallel_envs = 1
+    settings.models.rllib_num_workers = 0
 
 
 async def _run_offline_backtest(base_settings: Settings, symbols: list[str]) -> None:
@@ -447,6 +541,26 @@ def parse_args():
         choices=["auto", "cpu", "gpu"],
         help="Force feature-engineering device. Overrides FOREX_BOT_FEATURES_DEVICE.",
     )
+    parser.add_argument(
+        "--quick-e2e",
+        action="store_true",
+        help=(
+            "Fast end-to-end error-check mode: disables HPO/prop-search, caps rows/discovery, "
+            "and shrinks per-model training budgets."
+        ),
+    )
+    parser.add_argument(
+        "--quick-rows",
+        type=int,
+        default=50_000,
+        help="Per-symbol row cap used with --quick-e2e (default: 50000).",
+    )
+    parser.add_argument(
+        "--quick-budget-seconds",
+        type=int,
+        default=30,
+        help="Per-model training time budget used with --quick-e2e (default: 30).",
+    )
     return parser.parse_args()
 
 
@@ -482,6 +596,7 @@ async def main_async():
     ddp_rank = maybe_init_distributed()
 
     args = parse_args()
+    _apply_quick_e2e_env(args)
     setup_logging(verbose=args.verbose)
     logger = logging.getLogger(__name__)
 
@@ -512,6 +627,13 @@ async def main_async():
             return
 
     base_settings = Settings()
+    if bool(getattr(args, "quick_e2e", False)):
+        _apply_quick_e2e_settings(base_settings, args)
+        logger.info(
+            "[QUICK-E2E] Enabled: rows_per_symbol=%s budget_sec=%s hpo=off prop_search=off",
+            max(2_000, int(getattr(args, "quick_rows", 50_000) or 50_000)),
+            max(10, int(getattr(args, "quick_budget_seconds", 30) or 30)),
+        )
 
     # Runtime overrides (CLI wins over config.yaml)
     if getattr(args, "device", None):
@@ -604,7 +726,12 @@ async def main_async():
     if getattr(args, "train", False):
         logger.info("Training-only mode requested (--train).")
         try:
-            await _run_global_training(base_settings, symbols, stop_event)
+            await _run_global_training(
+                base_settings,
+                symbols,
+                stop_event,
+                optimize=not bool(getattr(args, "quick_e2e", False)),
+            )
         except asyncio.CancelledError:
             logger.info("Training cancelled by user.")
         return
@@ -612,7 +739,12 @@ async def main_async():
     if not getattr(args, "run", False) and not _global_models_exist():
         logger.info("No models found -> Training automatically before live trading...")
         try:
-            await _run_global_training(base_settings, symbols, stop_event)
+            await _run_global_training(
+                base_settings,
+                symbols,
+                stop_event,
+                optimize=not bool(getattr(args, "quick_e2e", False)),
+            )
         except asyncio.CancelledError:
             logger.info("Global training cancelled by user.")
             return

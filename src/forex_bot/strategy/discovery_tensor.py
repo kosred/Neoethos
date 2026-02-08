@@ -211,6 +211,7 @@ class TensorDiscoveryEngine:
         self.stream_mode = bool(stream_mode)
         self.auto_cap = bool(auto_cap)
         self.settings = settings
+        self._last_payload: dict[str, Any] | None = None
 
     def run_unsupervised_search(
         self,
@@ -230,17 +231,38 @@ class TensorDiscoveryEngine:
             df = df.tail(self.max_rows)
         if len(df) < 50:
             return
+        iter_budget = max(1, int(iterations or 1))
+
+        def _env_int(name: str, default: int) -> int:
+            raw = os.environ.get(name)
+            if raw is None or str(raw).strip() == "":
+                return int(default)
+            try:
+                return int(raw)
+            except Exception:
+                return int(default)
+
         if _RUST_DISCOVERY and _fb is not None:
             try:
                 ts = None
                 idx = df.index
                 if isinstance(idx, pd.DatetimeIndex):
-                    ts = (idx.view("int64") // 1_000_000).to_numpy(dtype=np.int64)
+                    idx_i64 = idx.view("int64")
+                    if hasattr(idx_i64, "to_numpy"):
+                        idx_i64 = idx_i64.to_numpy(dtype=np.int64, copy=False)
+                    else:
+                        idx_i64 = np.asarray(idx_i64, dtype=np.int64)
+                    ts = (np.asarray(idx_i64, dtype=np.int64) // 1_000_000).astype(np.int64, copy=False)
                 close = df["close"].to_numpy(dtype=np.float64)
                 high = df["high"].to_numpy(dtype=np.float64)
                 low = df["low"].to_numpy(dtype=np.float64)
                 open_ = df["open"].to_numpy(dtype=np.float64) if "open" in df.columns else close
                 volume = df["volume"].to_numpy(dtype=np.float64) if "volume" in df.columns else None
+
+                default_pop = max(8, min(100, iter_budget))
+                default_gens = max(1, min(5, (iter_budget + 19) // 20))
+                default_candidates = max(10, min(200, default_pop * 2))
+                default_portfolio = max(5, min(100, default_pop))
 
                 result = _fb.search_discovery_ohlcv(
                     open_,
@@ -249,11 +271,11 @@ class TensorDiscoveryEngine:
                     close,
                     ts,
                     volume,
-                    int(os.environ.get("FOREX_BOT_DISCOVERY_POP", "100") or 100),
-                    int(os.environ.get("FOREX_BOT_DISCOVERY_GENS", "5") or 5),
-                    int(os.environ.get("FOREX_BOT_DISCOVERY_MAX_INDICATORS", "12") or 12),
-                    int(os.environ.get("FOREX_BOT_DISCOVERY_CANDIDATES", "200") or 200),
-                    int(os.environ.get("FOREX_BOT_DISCOVERY_PORTFOLIO", "100") or 100),
+                    max(4, _env_int("FOREX_BOT_DISCOVERY_POP", default_pop)),
+                    max(1, _env_int("FOREX_BOT_DISCOVERY_GENS", default_gens)),
+                    max(2, _env_int("FOREX_BOT_DISCOVERY_MAX_INDICATORS", 12)),
+                    max(10, _env_int("FOREX_BOT_DISCOVERY_CANDIDATES", default_candidates)),
+                    max(5, _env_int("FOREX_BOT_DISCOVERY_PORTFOLIO", default_portfolio)),
                     float(os.environ.get("FOREX_BOT_DISCOVERY_CORR", "0.7") or 0.7),
                     float(os.environ.get("FOREX_BOT_DISCOVERY_MIN_TRADES", "1.0") or 1.0),
                     True,
@@ -284,6 +306,7 @@ class TensorDiscoveryEngine:
                     safe = "".join(c for c in symbol if c.isalnum() or c in ("-", "_"))
                     out_path = out_dir / f"talib_knowledge_{safe}.json"
                 out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                self._last_payload = payload
                 logger.info("Discovery (Rust): wrote %s", out_path)
                 return
             except Exception as exc:
@@ -294,7 +317,26 @@ class TensorDiscoveryEngine:
             return
 
         n = max(1, min(self.n_experts, int(os.environ.get("FOREX_BOT_DISCOVERY_SAMPLE", "64") or 64)))
-        genes = [mixer.generate_random_strategy(max_indicators=min(6, len(mixer.available_indicators))) for _ in range(n)]
+        max_indicators = 0
+        env_max = os.environ.get("FOREX_BOT_DISCOVERY_MAX_INDICATORS") or os.environ.get(
+            "FOREX_BOT_PROP_SEARCH_MAX_INDICATORS"
+        )
+        if env_max:
+            try:
+                max_indicators = int(env_max)
+            except Exception:
+                max_indicators = 0
+        if max_indicators <= 0:
+            try:
+                max_indicators = int(
+                    getattr(self.settings.models, "prop_search_max_indicators", 0) or 0
+                )
+            except Exception:
+                max_indicators = 0
+        if max_indicators <= 0:
+            max_indicators = len(mixer.available_indicators)
+        max_indicators = max(2, min(max_indicators, len(mixer.available_indicators)))
+        genes = [mixer.generate_random_strategy(max_indicators=max_indicators) for _ in range(n)]
         cache = mixer.bulk_calculate_indicators(df, genes)
 
         symbol = str(df.attrs.get("symbol", "") or "")
@@ -355,7 +397,26 @@ class TensorDiscoveryEngine:
             safe = "".join(c for c in symbol if c.isalnum() or c in ("-", "_"))
             out_path = out_dir / f"talib_knowledge_{safe}.json"
         out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self._last_payload = payload
         logger.info("Discovery: wrote %s", out_path)
+
+    def save_experts(self, path: str) -> None:
+        """
+        Backward-compatible artifact writer expected by TrainingService.
+        """
+        out_path = Path(path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self._last_payload or {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "best_genes": [],
+        }
+        try:
+            import torch
+
+            torch.save(payload, out_path)
+        except Exception:
+            out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        logger.info("Discovery: saved experts artifact %s", out_path)
 
 
 __all__ = ["TensorDiscoveryEngine"]

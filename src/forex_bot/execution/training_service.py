@@ -138,6 +138,37 @@ class TrainingService:
             return self._prop_search_async_enabled()
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
+    def _quick_e2e_enabled(self) -> bool:
+        raw = os.environ.get("FOREX_BOT_QUICK_E2E", "")
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _normalize_discovery_budget(
+        self,
+        *,
+        experts: int,
+        iterations: int,
+        has_gpu: bool,
+    ) -> tuple[int, int]:
+        quick = self._quick_e2e_enabled()
+        if has_gpu:
+            experts = int(experts)
+            iterations = int(iterations)
+        else:
+            # Keep discovery responsive on CPU-only nodes by default.
+            experts = min(int(experts), 40)
+            iterations = min(int(iterations), 250)
+
+        if quick:
+            # Fast E2E: preserve discovery path but shrink search budget heavily.
+            experts = min(int(experts), 4)
+            iterations = min(int(iterations), 20)
+            experts = max(2, int(experts))
+            iterations = max(5, int(iterations))
+        else:
+            experts = max(8, int(experts))
+            iterations = max(50, int(iterations))
+        return experts, iterations
+
     def _prop_search_workers_override(self) -> int | None:
         for key in ("FOREX_BOT_DISCOVERY_CPU_BUDGET", "FOREX_BOT_PROP_SEARCH_WORKERS"):
             raw = os.environ.get(key)
@@ -810,11 +841,11 @@ class TrainingService:
             discovery_mode = "gpu"
         else:
             discovery_mode = "cpu"
-            # Keep discovery responsive on CPU-only nodes by default.
-            discovery_experts = min(discovery_experts, 40)
-            discovery_iterations = min(discovery_iterations, 250)
-        discovery_experts = max(8, int(discovery_experts))
-        discovery_iterations = max(50, int(discovery_iterations))
+        discovery_experts, discovery_iterations = self._normalize_discovery_budget(
+            experts=discovery_experts,
+            iterations=discovery_iterations,
+            has_gpu=has_gpu,
+        )
         logger.info(
             "[STRATEGY DISCOVERY] mode=%s experts=%s iterations=%s",
             discovery_mode,
@@ -1917,12 +1948,11 @@ class TrainingService:
             ) > 0
             discovery_experts = self._parse_int_env("FOREX_BOT_DISCOVERY_EXPERTS") or 100
             discovery_iterations = self._parse_int_env("FOREX_BOT_DISCOVERY_ITERS") or 1000
-            if not has_gpu_local:
-                # Keep discovery responsive on CPU-only nodes by default.
-                discovery_experts = min(discovery_experts, 40)
-                discovery_iterations = min(discovery_iterations, 250)
-            discovery_experts = max(8, int(discovery_experts))
-            discovery_iterations = max(50, int(discovery_iterations))
+            discovery_experts, discovery_iterations = self._normalize_discovery_budget(
+                experts=discovery_experts,
+                iterations=discovery_iterations,
+                has_gpu=has_gpu_local,
+            )
 
             logger.info(
                 "[STRATEGY DISCOVERY] mode=%s experts=%s iterations=%s",

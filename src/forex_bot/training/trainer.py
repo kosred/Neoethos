@@ -1616,6 +1616,21 @@ class ModelTrainer:
                 ordered.append(norm)
                 seen.add(norm)
 
+        # Optional hard override for fast/diagnostic runs.
+        override_raw = os.environ.get("FOREX_BOT_MODELS_OVERRIDE", "")
+        if str(override_raw).strip():
+            override: list[str] = []
+            seen_override: set[str] = set()
+            for token in str(override_raw).split(","):
+                norm = ModelFactory._normalize_model_key(token.strip())
+                if norm and norm not in seen_override:
+                    override.append(norm)
+                    seen_override.add(norm)
+            if override:
+                override_set = set(override)
+                ordered = [m for m in ordered if m in override_set]
+                logger.info("Model override active (FOREX_BOT_MODELS_OVERRIDE): %s", ordered)
+
         # Filter out models that cannot run in the current environment.
         # This keeps the "train everything" philosophy while avoiding known no-op experts
         # (e.g., RLlib on Python 3.13 Windows where Ray wheels do not exist).
@@ -1736,10 +1751,18 @@ class ModelTrainer:
                 if len(filtered) >= 2:
                     selected = filtered
                     logger.info("MetaBlender: using Phase5 core models %s", sorted(filtered.keys()))
+            contributed = 0
             for name, m in selected.items():
-                p = self._pad_probs(m.predict_proba(X_m))
-                feats[f"{name}_buy"] = p[:, 1]
-                # ...
+                try:
+                    p = self._pad_probs(m.predict_proba(X_m))
+                    feats[f"{name}_buy"] = p[:, 1]
+                    contributed += 1
+                    # ...
+                except Exception as exc:
+                    logger.warning("MetaBlender: skipping model '%s': %s", name, exc)
+            if contributed < 2:
+                logger.warning("MetaBlender: insufficient valid base models (%s); skipping fit.", contributed)
+                return
             feats["label"] = np.asarray(y_m, dtype=int)
 
             if hasattr(feats.index, "is_monotonic_increasing") and not feats.index.is_monotonic_increasing:
