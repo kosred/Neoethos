@@ -67,6 +67,42 @@ def _gpu_only_mode() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _quick_e2e_mode() -> bool:
+    raw = str(os.environ.get("FOREX_BOT_QUICK_E2E", "")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _apply_quick_tree_caps(params: dict[str, Any], *, family: str) -> None:
+    """
+    Reduce heavy tree budgets during quick end-to-end validation runs.
+    """
+    if not _quick_e2e_mode():
+        return
+
+    try:
+        if family in {"lgbm", "xgb"}:
+            cap = int(os.environ.get("FOREX_BOT_QUICK_TREE_ESTIMATORS", "120") or 120)
+            current = int(params.get("n_estimators", cap) or cap)
+            params["n_estimators"] = max(16, min(current, cap))
+            if "max_depth" in params:
+                params["max_depth"] = max(2, min(int(params.get("max_depth", 6) or 6), 6))
+            if "num_parallel_tree" in params:
+                params["num_parallel_tree"] = max(1, min(int(params.get("num_parallel_tree", 2) or 2), 2))
+            if str(params.get("booster", "")).strip().lower() == "dart":
+                dart_cap = int(os.environ.get("FOREX_BOT_QUICK_XGB_DART_ESTIMATORS", "48") or 48)
+                params["n_estimators"] = max(16, min(int(params.get("n_estimators", dart_cap) or dart_cap), dart_cap))
+
+        if family == "cat":
+            cap = int(os.environ.get("FOREX_BOT_QUICK_CAT_ITERATIONS", "120") or 120)
+            current = int(params.get("iterations", cap) or cap)
+            params["iterations"] = max(16, min(current, cap))
+            if "depth" in params:
+                params["depth"] = max(2, min(int(params.get("depth", 6) or 6), 6))
+    except Exception:
+        # Never fail model init due to quick-cap parsing.
+        return
+
+
 def _torch_cuda_available() -> bool:
     try:
         import torch
@@ -204,6 +240,7 @@ class LightGBMExpert(ExpertModel):
             "path_smooth": 10,
             "linear_tree": True,
         }
+        _apply_quick_tree_caps(self.params, family="lgbm")
 
     def fit(self, x: pd.DataFrame, y: pd.Series) -> bool:
         if not LGBM_AVAILABLE:
@@ -401,6 +438,7 @@ class XGBoostExpert(ExpertModel):
             "eval_metric": "mlogloss",
             "tree_method": "hist",  # default; overridden to gpu_hist if GPU
         }
+        _apply_quick_tree_caps(self.params, family="xgb")
 
         cpu_threads = _cpu_threads_hint()
         if cpu_threads > 0 and int(self.params.get("n_jobs", -1) or -1) < 0:
@@ -541,6 +579,7 @@ class CatBoostExpert(ExpertModel):
             "verbose": False,
             "thread_count": -1,
         }
+        _apply_quick_tree_caps(self.params, family="cat")
 
         cpu_threads = _cpu_threads_hint()
         if cpu_threads > 0 and int(self.params.get("thread_count", -1) or -1) < 0:

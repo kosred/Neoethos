@@ -536,35 +536,40 @@ class RLExpertPPO(ExpertModel):
         if sb3_device == "auto" and not is_cuda:
             sb3_device = "cpu"
 
-        self.model = PPO("MlpPolicy", self.env, verbose=0, device=sb3_device, policy_kwargs=policy_kwargs)
+        try:
+            self.model = PPO("MlpPolicy", self.env, verbose=0, device=sb3_device, policy_kwargs=policy_kwargs)
 
-        callbacks = []
-        if _TimeLimitCallback is not None and self.max_time_sec > 0:
-            callbacks.append(_TimeLimitCallback(self.max_time_sec))
-        if (
-            eval_env is not None
-            and EvalCallback is not None
-            and StopTrainingOnNoModelImprovement is not None
-        ):
-            patience, _ = get_early_stop_params(5, 0.0)
-            eval_freq = self.eval_freq or max(1000, int(self.timesteps // 10))
-            stop_cb = StopTrainingOnNoModelImprovement(
-                max_no_improvement_evals=patience,
-                min_evals=3,
-                verbose=0,
-            )
-            eval_cb = EvalCallback(
-                eval_env,
-                eval_freq=eval_freq,
-                n_eval_episodes=1,
-                deterministic=True,
-                callback_after_eval=stop_cb,
-            )
-            callbacks.append(eval_cb)
+            callbacks = []
+            if _TimeLimitCallback is not None and self.max_time_sec > 0:
+                callbacks.append(_TimeLimitCallback(self.max_time_sec))
+            if (
+                eval_env is not None
+                and EvalCallback is not None
+                and StopTrainingOnNoModelImprovement is not None
+            ):
+                patience, _ = get_early_stop_params(5, 0.0)
+                eval_freq = self.eval_freq or max(1000, int(self.timesteps // 10))
+                stop_cb = StopTrainingOnNoModelImprovement(
+                    max_no_improvement_evals=patience,
+                    min_evals=3,
+                    verbose=0,
+                )
+                eval_cb = EvalCallback(
+                    eval_env,
+                    eval_freq=eval_freq,
+                    n_eval_episodes=1,
+                    deterministic=True,
+                    callback_after_eval=stop_cb,
+                )
+                callbacks.append(eval_cb)
 
-        callback = CallbackList(callbacks) if callbacks and CallbackList is not None else None
-        total_timesteps = max(1, int(self.timesteps))
-        self.model.learn(total_timesteps=total_timesteps, callback=callback)
+            callback = CallbackList(callbacks) if callbacks and CallbackList is not None else None
+            total_timesteps = max(1, int(self.timesteps))
+            self.model.learn(total_timesteps=total_timesteps, callback=callback)
+        except Exception as exc:
+            logger.warning("RLExpertPPO training skipped due to runtime error: %s", exc)
+            self.model = None
+            return
 
     def predict_proba(self, X: pd.DataFrame, **kwargs) -> np.ndarray:
         if self.model is None:
@@ -688,35 +693,48 @@ class RLExpertSAC(RLExpertPPO):
         if sb3_device == "auto" and not is_cuda:
             sb3_device = "cpu"
 
-        self.model = SAC("MlpPolicy", self.env, verbose=0, device=sb3_device, policy_kwargs=policy_kwargs)
-
-        callbacks = []
-        if _TimeLimitCallback is not None and self.max_time_sec > 0:
-            callbacks.append(_TimeLimitCallback(self.max_time_sec))
-        if (
-            eval_env is not None
-            and EvalCallback is not None
-            and StopTrainingOnNoModelImprovement is not None
-        ):
-            patience, _ = get_early_stop_params(5, 0.0)
-            eval_freq = self.eval_freq or max(1000, int(self.timesteps // 10))
-            stop_cb = StopTrainingOnNoModelImprovement(
-                max_no_improvement_evals=patience,
-                min_evals=3,
-                verbose=0,
+        if not isinstance(getattr(self.env, "action_space", None), spaces.Box):
+            logger.warning(
+                "RLExpertSAC requires continuous action space; got %s. Skipping.",
+                type(getattr(self.env, "action_space", None)).__name__,
             )
-            eval_cb = EvalCallback(
-                eval_env,
-                eval_freq=eval_freq,
-                n_eval_episodes=1,
-                deterministic=True,
-                callback_after_eval=stop_cb,
-            )
-            callbacks.append(eval_cb)
+            self.model = None
+            return
 
-        callback = CallbackList(callbacks) if callbacks and CallbackList is not None else None
-        total_timesteps = max(1, int(self.timesteps))
-        self.model.learn(total_timesteps=total_timesteps, callback=callback)
+        try:
+            self.model = SAC("MlpPolicy", self.env, verbose=0, device=sb3_device, policy_kwargs=policy_kwargs)
+
+            callbacks = []
+            if _TimeLimitCallback is not None and self.max_time_sec > 0:
+                callbacks.append(_TimeLimitCallback(self.max_time_sec))
+            if (
+                eval_env is not None
+                and EvalCallback is not None
+                and StopTrainingOnNoModelImprovement is not None
+            ):
+                patience, _ = get_early_stop_params(5, 0.0)
+                eval_freq = self.eval_freq or max(1000, int(self.timesteps // 10))
+                stop_cb = StopTrainingOnNoModelImprovement(
+                    max_no_improvement_evals=patience,
+                    min_evals=3,
+                    verbose=0,
+                )
+                eval_cb = EvalCallback(
+                    eval_env,
+                    eval_freq=eval_freq,
+                    n_eval_episodes=1,
+                    deterministic=True,
+                    callback_after_eval=stop_cb,
+                )
+                callbacks.append(eval_cb)
+
+            callback = CallbackList(callbacks) if callbacks and CallbackList is not None else None
+            total_timesteps = max(1, int(self.timesteps))
+            self.model.learn(total_timesteps=total_timesteps, callback=callback)
+        except Exception as exc:
+            logger.warning("RLExpertSAC training skipped due to runtime error: %s", exc)
+            self.model = None
+            return
 
     def save(self, path):
         if self.model:

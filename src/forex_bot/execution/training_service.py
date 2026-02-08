@@ -1970,13 +1970,10 @@ class TrainingService:
             discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
 
         if self._discovery_async_enabled():
-            if self._discovery_thread and self._discovery_thread.is_alive():
-                logger.info("[STRATEGY DISCOVERY] Async tensor discovery already running; skipping new launch.")
-            else:
-                logger.info("[STRATEGY DISCOVERY] Running tensor discovery in background thread.")
-                self._discovery_thread = self._start_background_thread("forex-tensor-discovery", _run_discovery)
-        else:
-            _run_discovery()
+            logger.info(
+                "[STRATEGY DISCOVERY] Async mode requested but running inline so discovery feeds models before training."
+            )
+        _run_discovery()
 
         # --- Final Global Training ---
         full_ds = await self._train_global_from_datasets(
@@ -2053,6 +2050,70 @@ class TrainingService:
                 self._start_prop_search_thread(symbols_to_run)
             else:
                 await self._run_prop_search_for_symbols(symbols_to_run, stop_event=stop_event)
+
+        # Ensure tensor strategy discovery runs before pooled model training.
+        if datasets:
+            try:
+                has_gpu_local = bool(getattr(self.settings.system, "enable_gpu", False)) and int(
+                    getattr(self.settings.system, "num_gpus", 0) or 0
+                ) > 0
+                if has_gpu_local:
+                    logger.info("Launching GPU-Native Expert Discovery (Sequential Global Path)...")
+                else:
+                    logger.info("Launching CPU-Native Expert Discovery (Sequential Global Path)...")
+
+                from ..strategy.discovery_tensor import TensorDiscoveryEngine
+
+                target_sym = "EURUSD" if "EURUSD" in [s for s, _ in datasets] else datasets[0][0]
+                target_ds = next(ds for sym, ds in datasets if sym == target_sym)
+
+                await self.data_loader.ensure_history(target_sym)
+                raw_frames = await self.data_loader.get_training_data(target_sym)
+                if isinstance(raw_frames, dict) and raw_frames:
+                    news_feats = self._build_news_features(analyzer, target_sym, raw_frames) if analyzer else None
+                    discovery_frames, timeframes = self._build_discovery_frames_for_tensor(
+                        raw_frames,
+                        news_feats,
+                        target_sym,
+                        base_dataset=target_ds,
+                    )
+
+                    discovery_experts = self._parse_int_env("FOREX_BOT_DISCOVERY_EXPERTS") or 100
+                    discovery_iterations = self._parse_int_env("FOREX_BOT_DISCOVERY_ITERS") or 1000
+                    discovery_experts, discovery_iterations = self._normalize_discovery_budget(
+                        experts=discovery_experts,
+                        iterations=discovery_iterations,
+                        has_gpu=has_gpu_local,
+                    )
+                    logger.info(
+                        "[STRATEGY DISCOVERY] mode=%s experts=%s iterations=%s",
+                        "gpu" if has_gpu_local else "cpu",
+                        discovery_experts,
+                        discovery_iterations,
+                    )
+
+                    discovery_tensor = TensorDiscoveryEngine(
+                        device="cuda" if has_gpu_local else "cpu",
+                        n_experts=discovery_experts,
+                        timeframes=timeframes,
+                        max_rows=int(getattr(self.settings.system, "discovery_max_rows", 0) or 0),
+                        stream_mode=bool(getattr(self.settings.system, "discovery_stream", False)),
+                        auto_cap=bool(getattr(self.settings.system, "discovery_auto_cap", True)),
+                        settings=self.settings,
+                    )
+                    discovery_tensor.run_unsupervised_search(
+                        discovery_frames,
+                        news_features=news_feats,
+                        iterations=discovery_iterations,
+                    )
+                    discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
+                else:
+                    logger.warning("[STRATEGY DISCOVERY] No raw frames available for sequential global path.")
+            except Exception as exc:
+                logger.warning(
+                    f"[STRATEGY DISCOVERY] Sequential global tensor discovery failed: {exc}",
+                    exc_info=True,
+                )
 
         await self._train_global_from_datasets(datasets, symbols, optimize, stop_event)
 

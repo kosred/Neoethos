@@ -168,7 +168,9 @@ def _apply_quick_e2e_env(args: argparse.Namespace) -> None:
     os.environ["FOREX_BOT_FEATURE_WORKERS"] = "4"
     os.environ["FOREX_BOT_HPC_SHARDS_PER_SYMBOL"] = "2"
     os.environ["FOREX_BOT_PARALLEL_MODELS"] = "0"
-    os.environ["FOREX_BOT_MODELS_OVERRIDE"] = "lightgbm,xgboost,catboost,mlp,transformer,genetic"
+    os.environ["FOREX_BOT_QUICK_TREE_ESTIMATORS"] = "120"
+    os.environ["FOREX_BOT_QUICK_XGB_DART_ESTIMATORS"] = "48"
+    os.environ["FOREX_BOT_QUICK_CAT_ITERATIONS"] = "120"
     os.environ["NUMEXPR_MAX_THREADS"] = "16"
     os.environ["NUMEXPR_NUM_THREADS"] = "1"
     # Keep consistency with model-side time budget checks.

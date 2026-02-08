@@ -77,6 +77,7 @@ class MetaBlender:
 
         self.feature_columns: pd.Index | None = None
         self.proba_classes: list[int] | None = None
+        self.constant_proba: np.ndarray | None = None
 
     def fit(self, frame: pd.DataFrame, val_ratio: float = 0.15) -> dict[str, float]:
         """
@@ -125,6 +126,7 @@ class MetaBlender:
         # Some estimators (notably XGBoost multi-class) require labels 0..K-1.
         to_model = {lab: i for i, lab in enumerate(unique)}
         y_model = np.array([to_model[int(v)] for v in labels_canon], dtype=int)
+        self.constant_proba = None
 
         if "symbol" in dataset:
             symbols = dataset.pop("symbol")
@@ -155,6 +157,35 @@ class MetaBlender:
         y_train = y_model[:train_end]
         X_val = features.iloc[train_end:].to_numpy()
         y_val = y_model[train_end:]
+
+        # Degenerate train split can happen on short/sparse runs; keep blender functional.
+        if len(np.unique(y_train)) < 2:
+            counts = {int(k): 0 for k in (-1, 0, 1)}
+            vals, cnts = np.unique(labels_canon, return_counts=True)
+            for v, c in zip(vals.tolist(), cnts.tolist()):
+                counts[int(v)] = int(c)
+            total = float(sum(counts.values()) + 3)  # Laplace smoothing
+            p_neutral = (counts[0] + 1) / total
+            p_buy = (counts[1] + 1) / total
+            p_sell = (counts[-1] + 1) / total
+            self.constant_proba = np.array([p_neutral, p_buy, p_sell], dtype=float)
+            self.proba_classes = [0, 1, -1]
+            logger.warning(
+                "MetaBlender: single-class train split; using constant fallback probs "
+                "(neutral=%.3f buy=%.3f sell=%.3f).",
+                p_neutral,
+                p_buy,
+                p_sell,
+            )
+            return {
+                "samples": int(len(y_model)),
+                "train_samples": int(len(y_train)),
+                "val_samples": int(len(y_val)),
+                "train_accuracy": 0.0,
+                "val_accuracy": 0.0,
+                "accuracy": 0.0,
+                "classes": list(self.proba_classes),
+            }
 
         self.model.fit(X_train, y_train)
         try:
@@ -189,6 +220,9 @@ class MetaBlender:
     def predict_proba(self, frame: pd.DataFrame) -> np.ndarray:
         if self.feature_columns is None:
             raise RuntimeError("MetaBlender has not been fitted")
+        if self.constant_proba is not None:
+            n = len(frame)
+            return np.tile(self.constant_proba.reshape(1, -1), (n, 1))
         
         # HPC Optimization: Direct NumPy Mapping
         # Instead of copying the whole dataframe, we map only the columns we need.
@@ -222,6 +256,7 @@ class MetaBlender:
             "model": self.model,
             "feature_columns": self.feature_columns,
             "proba_classes": self.proba_classes,
+            "constant_proba": self.constant_proba,
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(payload, path)
@@ -233,4 +268,5 @@ class MetaBlender:
         instance.model = payload["model"]
         instance.feature_columns = payload.get("feature_columns")
         instance.proba_classes = payload.get("proba_classes")
+        instance.constant_proba = payload.get("constant_proba")
         return instance
