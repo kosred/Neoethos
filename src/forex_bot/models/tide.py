@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from ..core.system import thread_limits
+from ..core.system import resolve_cpu_budget, thread_limits
 from .base import EarlyStopper, ExpertModel, dataframe_to_float32_numpy, get_early_stop_params
 from .device import select_device
 
@@ -140,8 +140,6 @@ class TiDEExpert(ExpertModel):
         self.input_dim = x_norm.shape[1]
         self.model = self._build_model()
 
-        import multiprocessing
-
         split = int(len(x_norm) * 0.85)
         # Use normalized data
         X_train_norm, X_val_norm = x_norm[:split], x_norm[split:]
@@ -191,7 +189,7 @@ class TiDEExpert(ExpertModel):
         except Exception:
             cpu_threads = 0
         if cpu_threads <= 0:
-            cpu_threads = max(1, multiprocessing.cpu_count() - 1)
+            cpu_threads = resolve_cpu_budget()
         with thread_limits(blas_threads=cpu_threads):
             for _epoch in range(self.max_epochs):
                 if time.time() - start > self.max_time_sec:

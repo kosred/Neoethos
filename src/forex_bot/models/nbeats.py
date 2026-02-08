@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from ..core.system import thread_limits
+from ..core.system import resolve_cpu_budget, thread_limits
 from .base import EarlyStopper, ExpertModel, dataframe_to_float32_numpy, get_early_stop_params
 from .device import select_device
 
@@ -157,7 +157,6 @@ class NBeatsExpert(ExpertModel):
         self.model.train()
 
         # Context manager helper
-        import multiprocessing
         from contextlib import nullcontext
 
         cpu_threads = 0
@@ -167,7 +166,7 @@ class NBeatsExpert(ExpertModel):
             except Exception:
                 cpu_threads = 0
             if cpu_threads <= 0:
-                cpu_threads = max(1, multiprocessing.cpu_count() - 1)
+                cpu_threads = resolve_cpu_budget()
         ctx = thread_limits(blas_threads=cpu_threads) if is_cpu else nullcontext()
 
         with ctx:

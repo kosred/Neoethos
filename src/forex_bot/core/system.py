@@ -545,17 +545,28 @@ class AutoTuner:
 
         # Fallbacks if no explicit override was set.
         if blas_threads is None:
-            multiproc_hint = (
-                hints.is_hpc
-                or hints.feature_workers > 1
-                or hints.n_jobs > 1
-                or int(os.environ.get("FOREX_BOT_FEATURE_WORKERS", "0") or 0) > 1
-                or int(os.environ.get("FOREX_BOT_PROP_SEARCH_WORKERS", "0") or 0) > 1
-                or int(os.environ.get("FOREX_BOT_CPU_WORKERS", "0") or 0) > 1
-                or int(os.environ.get("FOREX_BOT_GPU_WORKERS", "0") or 0) > 1
-            )
-            # Default to 1 thread per process when multiprocessing is expected.
-            blas_threads = 1 if multiproc_hint else max(1, cpu_budget)
+            process_hint = 1
+            for key in (
+                "WORLD_SIZE",
+                "FOREX_BOT_FEATURE_WORKERS",
+                "FOREX_BOT_PROP_SEARCH_WORKERS",
+                "FOREX_BOT_CPU_WORKERS",
+                "FOREX_BOT_GPU_WORKERS",
+            ):
+                workers = self._read_int_env(key, 0) or 0
+                if workers > 0:
+                    process_hint = max(process_hint, workers)
+            if local_rank is not None:
+                # DDP active but WORLD_SIZE may not be exported in all launchers.
+                process_hint = max(process_hint, 2)
+
+            # Split the thread budget across concurrent processes when explicitly known.
+            if process_hint > 1:
+                blas_threads = max(1, cpu_budget // process_hint)
+            else:
+                blas_threads = max(1, cpu_budget)
+
+        blas_threads = max(1, min(cpu_cores, int(blas_threads)))
 
         # HPC FIX: Strategic Thread Saturation
         # Ensure NumPy/SciPy/PyTorch can actually use the 252 cores
@@ -563,6 +574,8 @@ class AutoTuner:
         os.environ["MKL_NUM_THREADS"] = str(blas_threads)
         os.environ["OPENBLAS_NUM_THREADS"] = str(blas_threads)
         os.environ["NUMEXPR_NUM_THREADS"] = str(blas_threads)
+        os.environ.setdefault("FOREX_BOT_RUST_THREADS", str(blas_threads))
+        os.environ.setdefault("RAYON_NUM_THREADS", str(blas_threads))
 
         try:
             import numexpr as _numexpr

@@ -437,10 +437,20 @@ class TrainingService:
         if n_strategies <= 0:
             return frames
         try:
-            max_indicators = int(os.environ.get("FOREX_BOT_DISCOVERY_MIXER_MAX_INDICATORS", "20") or 20)
+            max_indicators = int(
+                os.environ.get("FOREX_BOT_DISCOVERY_MIXER_MAX_INDICATORS", "0") or 0
+            )
         except Exception:
-            max_indicators = 20
-        max_indicators = max(1, max_indicators)
+            max_indicators = 0
+        if max_indicators <= 0:
+            try:
+                max_indicators = int(
+                    getattr(self.settings.models, "prop_search_max_indicators", 0) or 0
+                )
+            except Exception:
+                max_indicators = 0
+        if max_indicators <= 0:
+            max_indicators = 0
 
         try:
             import torch
@@ -463,7 +473,9 @@ class TrainingService:
             logger.warning("Discovery: TA-Lib mixer has no available indicators; skipping.")
             return frames
 
-        max_indicators = min(max_indicators, max(1, len(mixer.available_indicators)))
+        if max_indicators <= 0:
+            max_indicators = len(mixer.available_indicators)
+        max_indicators = max(1, min(max_indicators, len(mixer.available_indicators)))
         genes = [mixer.generate_random_strategy(max_indicators=max_indicators) for _ in range(n_strategies)]
 
         def _apply(df: pd.DataFrame) -> pd.DataFrame:
@@ -710,7 +722,13 @@ class TrainingService:
         except Exception:
             pass
 
-        logger.info("Launching GPU-Native Expert Discovery...")
+        has_gpu = bool(getattr(self.settings.system, "enable_gpu", False)) and int(
+            getattr(self.settings.system, "num_gpus", 0) or 0
+        ) > 0
+        if has_gpu:
+            logger.info("Launching GPU-Native Expert Discovery...")
+        else:
+            logger.info("Launching CPU-Native Expert Discovery...")
         from ..strategy.discovery_tensor import TensorDiscoveryEngine
 
         discovery_frames, timeframes = self._build_discovery_frames_for_tensor(
@@ -786,9 +804,27 @@ class TrainingService:
 
         # New Unsupervised Tensor Engine (Million-Search)
         # We increase experts to 100 to create a diverse "Council of 100" for the deep models
+        discovery_experts = self._parse_int_env("FOREX_BOT_DISCOVERY_EXPERTS") or 100
+        discovery_iterations = self._parse_int_env("FOREX_BOT_DISCOVERY_ITERS") or 1000
+        if has_gpu:
+            discovery_mode = "gpu"
+        else:
+            discovery_mode = "cpu"
+            # Keep discovery responsive on CPU-only nodes by default.
+            discovery_experts = min(discovery_experts, 40)
+            discovery_iterations = min(discovery_iterations, 250)
+        discovery_experts = max(8, int(discovery_experts))
+        discovery_iterations = max(50, int(discovery_iterations))
+        logger.info(
+            "[STRATEGY DISCOVERY] mode=%s experts=%s iterations=%s",
+            discovery_mode,
+            discovery_experts,
+            discovery_iterations,
+        )
+
         discovery_tensor = TensorDiscoveryEngine(
-            device="cuda",
-            n_experts=100,
+            device="cuda" if has_gpu else "cpu",
+            n_experts=discovery_experts,
             timeframes=timeframes,
             max_rows=int(getattr(self.settings.system, "discovery_max_rows", 0) or 0),
             stream_mode=bool(getattr(self.settings.system, "discovery_stream", False)),
@@ -800,7 +836,7 @@ class TrainingService:
         discovery_tensor.run_unsupervised_search(
             discovery_frames,
             news_features=news_feats,
-            iterations=1000
+            iterations=discovery_iterations,
         )
         discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
 
@@ -864,8 +900,18 @@ class TrainingService:
         orig_symbol = self.settings.system.symbol
 
         is_hpc = getattr(self.autotune_hints, "is_hpc", False)
+        parallel_pref = str(os.environ.get("FOREX_BOT_PARALLEL_FEATURES", "auto")).strip().lower()
+        if parallel_pref in {"0", "false", "no", "off"}:
+            use_parallel = False
+        elif parallel_pref in {"1", "true", "yes", "on"}:
+            use_parallel = True
+        else:
+            workers = self._parse_int_env("FOREX_BOT_FEATURE_WORKERS") or 0
+            use_parallel = workers > 1
 
-        if is_hpc:
+        if is_hpc or use_parallel:
+            if not is_hpc and use_parallel:
+                logger.info("Parallel feature mode enabled (FOREX_BOT_FEATURE_WORKERS=%s).", os.environ.get("FOREX_BOT_FEATURE_WORKERS"))
             await self._train_global_hpc(symbols, optimize, stop_event)
         else:
             await self._train_global_sequential(symbols, optimize, stop_event)
@@ -1838,7 +1884,13 @@ class TrainingService:
             return
 
         # --- Launch Discovery (Uses internal 8-GPU ThreadPool) ---
-        logger.info("Launching GPU-Native Expert Discovery (Multi-GPU Pool)...")
+        has_gpu = bool(getattr(self.settings.system, "enable_gpu", False)) and int(
+            getattr(self.settings.system, "num_gpus", 0) or 0
+        ) > 0
+        if has_gpu:
+            logger.info("Launching GPU-Native Expert Discovery (Multi-GPU Pool)...")
+        else:
+            logger.info("Launching CPU-Native Expert Discovery (Multi-worker Pool)...")
         from ..strategy.discovery_tensor import TensorDiscoveryEngine
         
         target_sym = "EURUSD" if "EURUSD" in [s for s, _ in datasets] else datasets[0][0]
@@ -1860,12 +1912,31 @@ class TrainingService:
                 await self._run_prop_search_for_symbols(symbols, stop_event=stop_event)
 
         def _run_discovery() -> None:
+            has_gpu_local = bool(getattr(self.settings.system, "enable_gpu", False)) and int(
+                getattr(self.settings.system, "num_gpus", 0) or 0
+            ) > 0
+            discovery_experts = self._parse_int_env("FOREX_BOT_DISCOVERY_EXPERTS") or 100
+            discovery_iterations = self._parse_int_env("FOREX_BOT_DISCOVERY_ITERS") or 1000
+            if not has_gpu_local:
+                # Keep discovery responsive on CPU-only nodes by default.
+                discovery_experts = min(discovery_experts, 40)
+                discovery_iterations = min(discovery_iterations, 250)
+            discovery_experts = max(8, int(discovery_experts))
+            discovery_iterations = max(50, int(discovery_iterations))
+
+            logger.info(
+                "[STRATEGY DISCOVERY] mode=%s experts=%s iterations=%s",
+                "gpu" if has_gpu_local else "cpu",
+                discovery_experts,
+                discovery_iterations,
+            )
             discovery_tensor = TensorDiscoveryEngine(
-                n_experts=100,
+                device="cuda" if has_gpu_local else "cpu",
+                n_experts=discovery_experts,
                 timeframes=timeframes,
                 settings=self.settings,
             )
-            discovery_tensor.run_unsupervised_search(discovery_frames, iterations=1000)
+            discovery_tensor.run_unsupervised_search(discovery_frames, iterations=discovery_iterations)
             discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
 
         if self._discovery_async_enabled():

@@ -131,12 +131,125 @@ class RiskManager:
         self.symbol = settings.system.symbol or "GLOBAL"
         self.state_file = Path("cache") / f"risk_state_{self.symbol}.json"
 
+        session_tz = str(getattr(settings.system, "session_timezone", "UTC") or "UTC")
+        try:
+            self._session_tz = ZoneInfo(session_tz)
+        except Exception:
+            logger.warning("Invalid session timezone '%s'; falling back to UTC.", session_tz)
+            self._session_tz = ZoneInfo("UTC")
+
+        try:
+            self._session_start = self._parse_time(str(getattr(settings.system, "trading_session_start", "00:00")))
+        except Exception:
+            self._session_start = time(0, 0)
+        try:
+            self._session_end = self._parse_time(str(getattr(settings.system, "trading_session_end", "23:59")))
+        except Exception:
+            self._session_end = time(23, 59)
+
+        defaults = PropFirmRules()
+        daily_stop = float(
+            getattr(settings.risk, "daily_drawdown_limit", defaults.daily_dd_stop_trading_pct)
+            or defaults.daily_dd_stop_trading_pct
+        )
+        daily_stop = max(0.001, daily_stop)
+        daily_warn = min(defaults.daily_dd_warning_pct, daily_stop * 0.9)
+        daily_warn = max(0.001, min(daily_warn, daily_stop - 1e-4))
+        max_trades = int(getattr(settings.risk, "max_trades_per_day", defaults.max_trades_per_day) or 0)
+        max_trades = max(1, max_trades)
+
+        self.prop_rules = PropFirmRules(
+            max_daily_loss_pct=daily_stop,
+            max_total_loss_pct=float(
+                getattr(settings.risk, "total_drawdown_limit", defaults.max_total_loss_pct)
+                or defaults.max_total_loss_pct
+            ),
+            daily_dd_warning_pct=daily_warn,
+            daily_dd_stop_trading_pct=daily_stop,
+            max_trades_per_day=max_trades,
+        )
+        self._base_prop_max_trades = self.prop_rules.max_trades_per_day
+
+        self.risk_ledger = RiskLedger(max_events=int(getattr(settings.system, "risk_ledger_max_events", 1000) or 1000))
+        self.revenge_trading_detector = RevengeTradeDetector()
+        self.meta_controller = MetaController(
+            max_daily_dd=self.prop_rules.max_daily_loss_pct,
+            safety_buffer=max(0.0, self.prop_rules.daily_dd_warning_pct * 0.7),
+            base_risk_per_trade=float(getattr(settings.risk, "base_risk_per_trade", settings.risk.risk_per_trade)),
+            base_confidence=float(getattr(settings.risk, "min_confidence_threshold", 0.55) or 0.55),
+            settings=settings,
+            silent=True,
+        )
+
+        initial_balance = float(getattr(settings.risk, "initial_balance", 10000.0) or 10000.0)
+        now_date = datetime.now(self._session_tz).date()
+
+        self._last_session_date: date | None = None
+        self._kill_window_until: datetime | None = None
+        self._news_state: dict[str, Any] = {}
+        self._spread_state: dict[str, float] = {
+            "current_spread": 1.0,
+            "current_slippage": 1.0,
+            "spread_baseline": 1.0,
+            "slippage_baseline": 1.0,
+        }
+
+        self.day_start_equity = initial_balance
+        self.day_peak_equity = initial_balance
+        self.month_start_date = now_date.replace(day=1)
+        self.month_start_equity = initial_balance
+        self.total_peak_equity = initial_balance
+
+        self.daily_loss = 0.0
+        self.daily_profit = 0.0
+        self.session_trades = 0
+        self.consecutive_losses = 0
+        self.circuit_breaker_triggered = False
+
+        self.monthly_return_pct = 0.0
+        self.monthly_profit_target_pct = float(getattr(settings.risk, "monthly_profit_target_pct", 0.04) or 0.04)
+        self.monthly_target_hit = False
+        self.phase_trade_days: set[date] = set()
+
+        self.recovery_mode = False
+        self.recovery_conf_boost = 0.10
+        self.recovery_min_win_prob = max(
+            MIN_BREAKEVEN_PROBABILITY,
+            float(getattr(settings.risk, "high_quality_confidence", 0.65) or 0.65),
+        )
+        max_risk = float(getattr(settings.risk, "max_risk_per_trade", 0.03) or 0.03)
+        self.recovery_risk_cap = max(0.0, min(max_risk, max_risk * 0.5))
+        self.recovery_max_trades = max(1, self._base_prop_max_trades // 2)
+
+        self.reflection_mode = False
+        self.reflection_cooldown_until: datetime | None = None
+        self.rolling_outcomes: deque[int] = deque(maxlen=20)
+        self.last_risk_mult = 1.0
+
+        self.load_state()
+        self.initialize_session()
+
     def save_state(self) -> None:
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
             state = {
                 "date": self._last_session_date.isoformat() if self._last_session_date else None,
-                # ...
+                "month_start_date": self.month_start_date.isoformat() if self.month_start_date else None,
+                "month_start_equity": self.month_start_equity,
+                "day_start_equity": self.day_start_equity,
+                "day_peak_equity": self.day_peak_equity,
+                "daily_loss": self.daily_loss,
+                "daily_profit": self.daily_profit,
+                "session_trades": self.session_trades,
+                "consecutive_losses": self.consecutive_losses,
+                "total_peak_equity": self.total_peak_equity,
+                "circuit_breaker_triggered": self.circuit_breaker_triggered,
+                "recovery_mode": self.recovery_mode,
+                "monthly_target_hit": self.monthly_target_hit,
+                "reflection_mode": self.reflection_mode,
+                "reflection_cooldown_until": (
+                    self.reflection_cooldown_until.isoformat() if self.reflection_cooldown_until else None
+                ),
             }
 
             with open(self.state_file, 'w') as f:
@@ -177,9 +290,19 @@ class RiskManager:
                 self.session_trades = int(state.get("session_trades", 0))
                 self.consecutive_losses = int(state.get("consecutive_losses", 0))
                 self.total_peak_equity = float(state.get("total_peak_equity", self.day_start_equity))
+                self.day_peak_equity = float(state.get("day_peak_equity", max(self.total_peak_equity, self.day_start_equity)))
                 self.circuit_breaker_triggered = bool(state.get("circuit_breaker_triggered", False))
                 self.recovery_mode = bool(state.get("recovery_mode", False))
                 self.monthly_target_hit = bool(state.get("monthly_target_hit", False))
+                self.reflection_mode = bool(state.get("reflection_mode", False))
+                cooldown_raw = state.get("reflection_cooldown_until")
+                if cooldown_raw:
+                    try:
+                        self.reflection_cooldown_until = datetime.fromisoformat(str(cooldown_raw))
+                    except Exception:
+                        self.reflection_cooldown_until = None
+                else:
+                    self.reflection_cooldown_until = None
                 logger.info(f"Restored risk state for {self.symbol} ({saved_date})")
             else:
                 logger.info(f"Found stale risk state for {self.symbol} from {saved_date}, starting fresh for {now_date}")

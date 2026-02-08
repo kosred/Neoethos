@@ -18,6 +18,7 @@ import torch.distributed as dist
 import yaml
 
 from ..core.config import Settings
+from ..core.system import normalize_device_preference
 from ..domain.events import PreparedDataset
 from ..models.base import ExpertModel, detect_feature_drift
 from ..strategy.fast_backtest import (
@@ -274,9 +275,13 @@ class ModelTrainer:
     def _split_models_by_device(self, enabled_models: list[str]) -> tuple[list[str], list[str]]:
         gpu_preferred = {
             "transformer",
+            "patchtst",
+            "timesnet",
             "kan",
             "nbeats",
+            "nbeatsx_nf",
             "tide",
+            "tide_nf",
             "tabnet",
             "mlp",
             "rl_ppo",
@@ -285,6 +290,38 @@ class ModelTrainer:
             "rllib_sac",
             "evolution",
         }
+        tree_models = {
+            "lightgbm",
+            "xgboost",
+            "xgboost_rf",
+            "xgboost_dart",
+            "catboost",
+            "catboost_alt",
+        }
+
+        pref = normalize_device_preference(
+            getattr(self.settings.system, "enable_gpu_preference", "auto")
+        )
+        if pref == "cpu":
+            return [], list(enabled_models)
+
+        enable_gpu = bool(getattr(self.settings.system, "enable_gpu", False))
+        num_gpus = int(getattr(self.settings.system, "num_gpus", 0) or 0)
+        has_gpu = enable_gpu and num_gpus > 0
+
+        tree_pref = os.environ.get("FOREX_BOT_TREE_DEVICE")
+        if tree_pref is None or not str(tree_pref).strip():
+            tree_pref = str(
+                getattr(self.settings.models, "tree_device_preference", "")
+                or ""
+            ).strip()
+        if not tree_pref:
+            tree_pref = pref
+        tree_pref = normalize_device_preference(tree_pref)
+        tree_gpu = tree_pref == "gpu" or (tree_pref == "auto" and has_gpu)
+        if tree_gpu:
+            gpu_preferred = gpu_preferred | tree_models
+
         gpu_models = [m for m in enabled_models if m in gpu_preferred]
         cpu_models = [m for m in enabled_models if m not in gpu_preferred]
         return gpu_models, cpu_models
@@ -1157,26 +1194,14 @@ class ModelTrainer:
                         logger.warning(f"FSDP wrap failed for {name}: {e}")
 
                 # Boost Threads
-                import multiprocessing
-
-                from ..core.system import thread_limits
+                from ..core.system import resolve_cpu_budget, thread_limits
 
                 try:
                     cpu_threads = int(os.environ.get("FOREX_BOT_CPU_THREADS", "0") or 0)
                 except Exception:
                     cpu_threads = 0
                 if cpu_threads <= 0:
-                    try:
-                        cpu_threads = int(os.environ.get("FOREX_BOT_CPU_BUDGET", "0") or 0)
-                    except Exception:
-                        cpu_threads = 0
-                if cpu_threads <= 0:
-                    cpu_total = multiprocessing.cpu_count()
-                    try:
-                        reserve = int(os.environ.get("FOREX_BOT_CPU_RESERVE", "1") or 1)
-                    except Exception:
-                        reserve = 1
-                    cpu_threads = max(1, cpu_total - max(0, reserve))
+                    cpu_threads = resolve_cpu_budget()
                 with thread_limits(blas_threads=cpu_threads):
                     # Fit logic (simplified here, assume factory configured it well)
                     fit_kwargs = {}
@@ -1517,26 +1542,14 @@ class ModelTrainer:
 
                 model = self.models[name]
 
-                import multiprocessing
-
-                from ..core.system import thread_limits
+                from ..core.system import resolve_cpu_budget, thread_limits
 
                 try:
                     cpu_threads = int(os.environ.get("FOREX_BOT_CPU_THREADS", "0") or 0)
                 except Exception:
                     cpu_threads = 0
                 if cpu_threads <= 0:
-                    try:
-                        cpu_threads = int(os.environ.get("FOREX_BOT_CPU_BUDGET", "0") or 0)
-                    except Exception:
-                        cpu_threads = 0
-                if cpu_threads <= 0:
-                    cpu_total = multiprocessing.cpu_count()
-                    try:
-                        reserve = int(os.environ.get("FOREX_BOT_CPU_RESERVE", "1") or 1)
-                    except Exception:
-                        reserve = 1
-                    cpu_threads = max(1, cpu_total - max(0, reserve))
+                    cpu_threads = resolve_cpu_budget()
                 with thread_limits(blas_threads=cpu_threads):
                     fit_kwargs = {}
                     # Inspect signature...
@@ -1577,6 +1590,8 @@ class ModelTrainer:
         candidates.extend(
             [
                 "transformer",
+                "patchtst",
+                "timesnet",
                 "evolution",
                 "genetic",
                 "rl_ppo",
@@ -1584,7 +1599,9 @@ class ModelTrainer:
                 "rllib_ppo",
                 "rllib_sac",
                 "nbeats",
+                "nbeatsx_nf",
                 "tide",
+                "tide_nf",
                 "tabnet",
                 "kan",
             ]
@@ -1594,9 +1611,10 @@ class ModelTrainer:
         seen = set()
         ordered = []
         for m in candidates:
-            if m not in seen:
-                ordered.append(m)
-                seen.add(m)
+            norm = ModelFactory._normalize_model_key(m)
+            if norm not in seen:
+                ordered.append(norm)
+                seen.add(norm)
 
         # Filter out models that cannot run in the current environment.
         # This keeps the "train everything" philosophy while avoiding known no-op experts
@@ -1616,6 +1634,16 @@ class ModelTrainer:
             SB3_AVAILABLE = False  # type: ignore
 
         try:
+            from ..models.forecast_nf import NF_AVAILABLE as FORECAST_NF_AVAILABLE  # type: ignore
+        except Exception:
+            FORECAST_NF_AVAILABLE = False  # type: ignore
+
+        try:
+            from ..models.transformer_nf import NF_AVAILABLE as TRANSFORMER_NF_AVAILABLE  # type: ignore
+        except Exception:
+            TRANSFORMER_NF_AVAILABLE = False  # type: ignore
+
+        try:
             from ..models.registry import MODEL_REGISTRY
 
             registry = set(MODEL_REGISTRY.keys())
@@ -1627,6 +1655,12 @@ class ModelTrainer:
                 skipped.append(name)
                 continue
             if name in {"rl_ppo", "rl_sac"} and not bool(SB3_AVAILABLE):
+                skipped.append(name)
+                continue
+            if name in {"tide_nf", "nbeatsx_nf"} and not bool(FORECAST_NF_AVAILABLE):
+                skipped.append(name)
+                continue
+            if name in {"patchtst", "timesnet"} and not bool(TRANSFORMER_NF_AVAILABLE):
                 skipped.append(name)
                 continue
             if registry and name not in registry:
@@ -1651,7 +1685,15 @@ class ModelTrainer:
                 world_size = dist.get_world_size()
                 if world_size > 1:
                     deep_models = {
-                        "transformer", "kan", "nbeats", "tide", "tabnet",
+                        "transformer",
+                        "patchtst",
+                        "timesnet",
+                        "kan",
+                        "nbeats",
+                        "nbeatsx_nf",
+                        "tide",
+                        "tide_nf",
+                        "tabnet",
                         "rl_ppo", "rl_sac", "rllib_ppo", "rllib_sac",
                         "genetic", "evolution" # GA runs independent islands, so all ranks ok
                     }

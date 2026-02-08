@@ -5,6 +5,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+
 from ...domain.errors import APIBillingError
 
 logger = logging.getLogger(__name__)

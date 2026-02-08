@@ -6,7 +6,6 @@ import numpy as np
 import pandas as pd
 
 from ..models.base import validate_time_ordering
-from .evaluation import pad_probs
 
 try:
     from sklearn.ensemble import GradientBoostingClassifier
@@ -24,6 +23,41 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+def pad_probs(probs: np.ndarray, classes: list[int] | None = None) -> np.ndarray:
+    """
+    Normalize probability outputs to [neutral, buy, sell].
+    """
+    if probs is None or len(probs) == 0:
+        return np.zeros((0, 3), dtype=float)
+
+    arr = np.asarray(probs, dtype=float)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    n = arr.shape[0]
+    out = np.zeros((n, 3), dtype=float)
+
+    if classes is not None and len(classes) == arr.shape[1]:
+        for col, cls_val in enumerate(classes):
+            if cls_val == 0:
+                out[:, 0] = arr[:, col]
+            elif cls_val == 1:
+                out[:, 1] = arr[:, col]
+            elif cls_val in (-1, 2):
+                out[:, 2] = arr[:, col]
+        return out
+
+    if arr.shape[1] == 3:
+        return arr
+    if arr.shape[1] == 2:
+        out[:, 0] = arr[:, 0]
+        out[:, 1] = arr[:, 1]
+        return out
+
+    out[:, 0] = 1.0 - arr[:, 0]
+    out[:, 1] = arr[:, 0]
+    return out
 
 
 class MetaBlender:
@@ -174,8 +208,14 @@ class MetaBlender:
                 sym_name = col[4:]
                 X_np[:, i] = (frame["symbol"] == sym_name).astype(np.float32)
         
+        classes = self.proba_classes
+        if classes is None:
+            try:
+                classes = [int(c) for c in list(self.model.classes_)]
+            except Exception:
+                classes = None
         raw = self.model.predict_proba(X_np)
-        return pad_probs(raw, classes=self.proba_classes)
+        return pad_probs(raw, classes=classes)
 
     def save(self, path: Path) -> None:
         payload = {

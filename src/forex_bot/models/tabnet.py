@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from ..core.system import thread_limits
+from ..core.system import resolve_cpu_budget, thread_limits
 from .base import EarlyStopper, ExpertModel, dataframe_to_float32_numpy, get_early_stop_params
 from .device import select_device
 
@@ -146,8 +146,6 @@ class TabNetExpert(ExpertModel):
         self.input_dim = X.shape[1]
         self.model = self._build_model()
 
-        import multiprocessing
-
         # Align device to local rank if distributed
         if dist.is_available() and dist.is_initialized() and torch.cuda.is_available():
             try:
@@ -202,7 +200,7 @@ class TabNetExpert(ExpertModel):
         except Exception:
             cpu_threads = 0
         if cpu_threads <= 0:
-            cpu_threads = max(1, multiprocessing.cpu_count() - 1)
+            cpu_threads = resolve_cpu_budget()
         with thread_limits(blas_threads=cpu_threads):
             for _epoch in range(100):
                 if time.time() - start > self.max_time_sec:

@@ -11,6 +11,46 @@ import pandas as pd
 from ..core.config import Settings
 
 logger = logging.getLogger(__name__)
+_RUST_DATA_BACKEND_OK: bool | None = None
+_RUST_DATA_WARNED_UNAVAILABLE = False
+
+
+def _rust_data_backend_available(*, force_log: bool = False) -> bool:
+    global _RUST_DATA_BACKEND_OK, _RUST_DATA_WARNED_UNAVAILABLE
+    if _RUST_DATA_BACKEND_OK is None:
+        try:
+            import forex_bindings  # type: ignore
+
+            _RUST_DATA_BACKEND_OK = hasattr(forex_bindings, "load_symbol_frames")
+        except Exception:
+            _RUST_DATA_BACKEND_OK = False
+    if force_log and not _RUST_DATA_BACKEND_OK and not _RUST_DATA_WARNED_UNAVAILABLE:
+        logger.warning(
+            "Rust data backend requested but forex_bindings.load_symbol_frames is unavailable; using Python backend."
+        )
+        _RUST_DATA_WARNED_UNAVAILABLE = True
+    return bool(_RUST_DATA_BACKEND_OK)
+
+
+def _disable_rust_data_backend() -> None:
+    global _RUST_DATA_BACKEND_OK
+    _RUST_DATA_BACKEND_OK = False
+
+
+def _use_rust_data_backend() -> bool:
+    raw = os.environ.get("FOREX_BOT_RUST_DATA")
+    if raw is not None and str(raw).strip() != "":
+        mode = str(raw).strip().lower()
+        if mode in {"auto", "detect"}:
+            return _rust_data_backend_available()
+        enabled = mode in {"1", "true", "yes", "on", "rust"}
+        return enabled and _rust_data_backend_available(force_log=True)
+    mode = str(os.environ.get("FOREX_BOT_DATA_BACKEND", "auto")).strip().lower()
+    if mode in {"rust", "rs", "1", "true", "yes", "on"}:
+        return _rust_data_backend_available(force_log=True)
+    if mode in {"python", "py", "0", "false", "no", "off"}:
+        return False
+    return _rust_data_backend_available()
 
 
 def _timeframe_to_freq(tf: str) -> str | None:
@@ -331,6 +371,10 @@ class MT5Adapter:
             df = pd.DataFrame(rates)
             df = _normalize_columns(df)
             df = _ensure_datetime_index(df)
+            try:
+                df.attrs["source"] = "mt5"
+            except Exception:
+                pass
             frames[tf] = df
         return frames
 
@@ -377,6 +421,14 @@ class DataLoader:
 
     def _load_frames(self, symbol: str, *, tail: int | None = None, allow_resample: bool = True) -> dict[str, pd.DataFrame]:
         frames: dict[str, pd.DataFrame] = {}
+        if _use_rust_data_backend():
+            try:
+                rust_frames = self._load_frames_rust(symbol, tail=tail, allow_resample=allow_resample)
+                if rust_frames:
+                    return rust_frames
+            except Exception as exc:
+                _disable_rust_data_backend()
+                logger.warning("Rust data loader failed; falling back to Python: %s", exc)
         if not self.data_dir.exists():
             return frames
         for tf in self._timeframes():
@@ -390,6 +442,10 @@ class DataLoader:
             df = _normalize_columns(df)
             df = _ensure_datetime_index(df)
             df = _ensure_ohlcv(df)
+            try:
+                df.attrs["source"] = "disk"
+            except Exception:
+                pass
             if tail is not None and tail > 0:
                 df = df.tail(tail)
             frames[tf] = df
@@ -405,9 +461,81 @@ class DataLoader:
                         frames[tf] = resampled
         return frames
 
+    def _load_frames_rust(
+        self,
+        symbol: str,
+        *,
+        tail: int | None = None,
+        allow_resample: bool = True,
+    ) -> dict[str, pd.DataFrame]:
+        try:
+            import forex_bindings  # type: ignore
+        except Exception:
+            _disable_rust_data_backend()
+            return {}
+        if not hasattr(forex_bindings, "load_symbol_frames"):
+            _disable_rust_data_backend()
+            return {}
+
+        if not self.data_dir.exists():
+            return {}
+
+        base_tf = str(getattr(self.settings.system, "base_timeframe", "M1") or "M1")
+        tfs = self._timeframes()
+
+        payload = forex_bindings.load_symbol_frames(
+            root=str(self.data_dir),
+            symbol=symbol,
+            timeframes=tfs,
+            resample_missing=bool(allow_resample),
+            base_tf=base_tf,
+        )
+        if not isinstance(payload, dict):
+            return {}
+
+        frames: dict[str, pd.DataFrame] = {}
+        for tf, frame in payload.items():
+            if not isinstance(frame, dict):
+                continue
+            try:
+                data = {k: np.asarray(v) for k, v in frame.items()}
+                df = pd.DataFrame(data)
+            except Exception:
+                continue
+            df = _normalize_columns(df)
+            df = _ensure_datetime_index(df)
+            df = _ensure_ohlcv(df)
+            try:
+                df.attrs["source"] = "disk"
+            except Exception:
+                pass
+            if tail is not None and tail > 0:
+                df = df.tail(tail)
+            frames[str(tf)] = df
+        return frames
+
     async def ensure_history(self, symbol: str) -> bool:
         frames = self._load_frames(symbol)
         return bool(frames)
+
+    async def ensure_all_history(self, symbols: list[str]) -> bool:
+        if not self.data_dir.exists():
+            logger.warning(
+                "Data directory '%s' not found. Expected layout: "
+                "data/symbol=EURUSD/timeframe=M1/data.parquet (or data/EURUSD_M1.csv).",
+                self.data_dir,
+            )
+            return False
+        any_found = False
+        for sym in symbols:
+            try:
+                if await self.ensure_history(sym):
+                    any_found = True
+                else:
+                    logger.warning("No local history found for symbol %s.", sym)
+            except Exception as exc:
+                logger.warning("History check failed for %s: %s", sym, exc)
+        return any_found
 
     async def get_training_data(self, symbol: str) -> dict[str, pd.DataFrame]:
         return self._load_frames(symbol)

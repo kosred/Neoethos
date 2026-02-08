@@ -51,6 +51,8 @@ class MarketRegimeClassifier(ExpertModel):
         self.model = GaussianMixture(n_components=n_regimes, covariance_type='full', random_state=42)
         self.scaler = StandardScaler()
         self.is_fitted = False
+        # Backward compatibility for older callers/tests.
+        self.regime_map: dict[int, str] = {}
 
     def fit(self, df: pd.DataFrame, y=None, **kwargs) -> None:
         features = self._extract_features(df)
@@ -58,6 +60,12 @@ class MarketRegimeClassifier(ExpertModel):
 
         X = self.scaler.fit_transform(features)
         self.model.fit(X)
+        try:
+            labels = self.model.predict(X)
+            uniq = sorted({int(v) for v in labels.tolist()})
+            self.regime_map = {idx: f"Regime_{idx}" for idx in uniq}
+        except Exception:
+            self.regime_map = {idx: f"Regime_{idx}" for idx in range(self.n_regimes)}
         self.is_fitted = True
         logger.info(f"Unsupervised GMM fitted: {self.n_regimes} latent regimes discovered.")
 
@@ -84,7 +92,8 @@ class MarketRegimeClassifier(ExpertModel):
     def predict(self, df: pd.DataFrame) -> str:
         """Fallback for legacy components: returns the 'primary' regime ID."""
         dist = self.predict_regime_distribution(df)
-        return str(np.argmax(dist))
+        regime_idx = int(np.argmax(dist))
+        return self.regime_map.get(regime_idx, str(regime_idx))
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         """

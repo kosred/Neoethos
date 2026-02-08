@@ -10,6 +10,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+# Suppress noisy Ax SQL-storage compatibility warning before Ax imports.
+_ax_db_logger = logging.getLogger("ax.service.utils.with_db_settings_base")
+_ax_db_logger.setLevel(logging.ERROR)
+_ax_db_logger.disabled = True
+
 try:
     import ax  # type: ignore
     AX_AVAILABLE = True

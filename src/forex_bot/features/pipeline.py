@@ -12,6 +12,30 @@ from ..core.config import Settings
 from ..domain.events import PreparedDataset
 
 logger = logging.getLogger(__name__)
+_RUST_FEATURES_BACKEND_OK: bool | None = None
+_RUST_FEATURES_WARNED_UNAVAILABLE = False
+
+
+def _rust_features_backend_available(*, force_log: bool = False) -> bool:
+    global _RUST_FEATURES_BACKEND_OK, _RUST_FEATURES_WARNED_UNAVAILABLE
+    if _RUST_FEATURES_BACKEND_OK is None:
+        try:
+            import forex_bindings  # type: ignore
+
+            _RUST_FEATURES_BACKEND_OK = hasattr(forex_bindings, "load_symbol_features")
+        except Exception:
+            _RUST_FEATURES_BACKEND_OK = False
+    if force_log and not _RUST_FEATURES_BACKEND_OK and not _RUST_FEATURES_WARNED_UNAVAILABLE:
+        logger.warning(
+            "Rust features backend requested but forex_bindings.load_symbol_features is unavailable; using Python features."
+        )
+        _RUST_FEATURES_WARNED_UNAVAILABLE = True
+    return bool(_RUST_FEATURES_BACKEND_OK)
+
+
+def _disable_rust_features_backend() -> None:
+    global _RUST_FEATURES_BACKEND_OK
+    _RUST_FEATURES_BACKEND_OK = False
 
 
 def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
@@ -72,7 +96,7 @@ def _compute_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int 
         axis=1,
     ).max(axis=1)
     atr = tr.rolling(period, min_periods=period).mean()
-    return atr.fillna(method="bfill").fillna(0.0)
+    return atr.bfill().fillna(0.0)
 
 
 def _compute_adx_numba(high: Iterable[float], low: Iterable[float], close: Iterable[float], period: int = 14) -> np.ndarray:
@@ -139,6 +163,22 @@ class FeatureEngineer:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
+    @staticmethod
+    def _use_rust_backend() -> bool:
+        raw = os.environ.get("FOREX_BOT_RUST_FEATURES")
+        if raw is not None and str(raw).strip() != "":
+            mode = str(raw).strip().lower()
+            if mode in {"auto", "detect"}:
+                return _rust_features_backend_available()
+            enabled = mode in {"1", "true", "yes", "on", "rust"}
+            return enabled and _rust_features_backend_available(force_log=True)
+        mode = str(os.environ.get("FOREX_BOT_FEATURES_BACKEND", "auto")).strip().lower()
+        if mode in {"rust", "rs", "1", "true", "yes", "on"}:
+            return _rust_features_backend_available(force_log=True)
+        if mode in {"python", "py", "0", "false", "no", "off"}:
+            return False
+        return _rust_features_backend_available()
+
     def _label_config(self) -> _LabelConfig:
         horizon = 1
         for key in ("FOREX_BOT_LABEL_HORIZON", "FOREX_BOT_LABEL_HORIZON_BARS"):
@@ -201,7 +241,7 @@ class FeatureEngineer:
         window = 20
         vol_sum = volume.rolling(window, min_periods=1).sum().replace(0.0, np.nan)
         poc = (close * volume).rolling(window, min_periods=1).sum() / vol_sum
-        poc = poc.fillna(method="bfill").fillna(close)
+        poc = poc.bfill().fillna(close)
         out["dist_to_poc"] = (close - poc).fillna(0.0)
         std = close.rolling(window, min_periods=1).std().fillna(0.0)
         out["in_value_area"] = ((close >= (poc - std)) & (close <= (poc + std))).astype(float)
@@ -247,6 +287,162 @@ class FeatureEngineer:
         labels = np.where(up, 1, np.where(down, -1, 0)).astype(int)
         return pd.Series(labels, index=close.index)
 
+    def _prepare_rust_features(
+        self,
+        *,
+        news_features: pd.DataFrame | None = None,
+        symbol: str | None = None,
+    ) -> PreparedDataset | None:
+        if not symbol:
+            return None
+
+        root = str(getattr(self.settings.system, "data_dir", "data") or "data")
+        try:
+            import forex_bindings  # type: ignore
+        except Exception as exc:
+            _disable_rust_features_backend()
+            logger.warning("Rust bindings unavailable; falling back to Python features: %s", exc)
+            return None
+        if not hasattr(forex_bindings, "load_symbol_features"):
+            _disable_rust_features_backend()
+            return None
+
+        base_tf = str(getattr(self.settings.system, "base_timeframe", "M1") or "M1")
+        higher = list(getattr(self.settings.system, "higher_timeframes", []) or [])
+        required = list(getattr(self.settings.system, "required_timeframes", []) or [])
+        for tf in required:
+            if tf != base_tf and tf not in higher:
+                higher.append(tf)
+
+        include_raw = str(os.environ.get("FOREX_BOT_RUST_INCLUDE_RAW", "1") or "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        resample_missing = str(os.environ.get("FOREX_BOT_RUST_RESAMPLE", "1") or "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+        cache_dir = str(getattr(self.settings.system, "cache_dir", "cache") or "cache")
+        cache_enabled = bool(getattr(self.settings.system, "cache_enabled", False))
+        cache_override = os.environ.get("FOREX_BOT_RUST_FEATURE_CACHE")
+        if cache_override is not None and str(cache_override).strip() != "":
+            cache_enabled = str(cache_override).strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            cache_ttl = int(getattr(self.settings.system, "cache_max_age_minutes", 0) or 0)
+        except Exception:
+            cache_ttl = 0
+
+        try:
+            payload = forex_bindings.load_symbol_features(
+                root=root,
+                symbol=symbol,
+                base_tf=base_tf,
+                higher_tfs=higher or None,
+                include_raw=include_raw,
+                cache_dir=cache_dir,
+                cache_ttl_minutes=cache_ttl,
+                cache_enabled=cache_enabled,
+                resample_missing=resample_missing,
+            )
+        except Exception as exc:
+            _disable_rust_features_backend()
+            logger.warning("Rust feature load failed; falling back to Python: %s", exc)
+            return None
+
+        try:
+            feature_names = list(payload.get("feature_names") or [])
+            features = np.asarray(payload.get("features"), dtype=np.float32)
+        except Exception as exc:
+            logger.warning("Rust feature payload malformed; falling back: %s", exc)
+            return None
+
+        if features.ndim != 2 or not feature_names or features.shape[1] != len(feature_names):
+            logger.warning("Rust feature payload shape mismatch; falling back.")
+            return None
+
+        def _to_index(values: object) -> pd.Index:
+            if values is None:
+                return pd.RangeIndex(features.shape[0])
+            arr = np.asarray(values)
+            if arr.size == 0:
+                return pd.RangeIndex(0)
+            try:
+                return pd.to_datetime(arr.astype("int64", copy=False), utc=True)
+            except Exception:
+                return pd.to_datetime(arr, utc=True, errors="coerce")
+
+        idx = _to_index(payload.get("timestamps"))
+        X = pd.DataFrame(features, columns=feature_names, index=idx)
+
+        base_ts = payload.get("base_timestamps") or payload.get("timestamps")
+        base_idx = _to_index(base_ts)
+        base_df = pd.DataFrame(
+            {
+                "open": np.asarray(payload.get("open"), dtype=np.float64),
+                "high": np.asarray(payload.get("high"), dtype=np.float64),
+                "low": np.asarray(payload.get("low"), dtype=np.float64),
+                "close": np.asarray(payload.get("close"), dtype=np.float64),
+            },
+            index=base_idx,
+        )
+        if "volume" in payload:
+            base_df["volume"] = np.asarray(payload.get("volume"), dtype=np.float64)
+
+        base_df = base_df.reindex(X.index, method="ffill").fillna(0.0)
+        try:
+            if symbol:
+                base_df.attrs["symbol"] = symbol
+        except Exception:
+            pass
+
+        use_base_signal = str(os.environ.get("FOREX_BOT_BASE_SIGNAL", "1") or "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if use_base_signal and "base_signal" not in X.columns:
+            try:
+                tmp = self._compute_basic_features(base_df, use_gpu=False)
+                tmp = self._compute_base_signal(tmp)
+                sig = tmp.get("base_signal")
+                if sig is not None:
+                    X["base_signal"] = sig.reindex(X.index).fillna(0).astype(int)
+            except Exception:
+                X["base_signal"] = 0
+
+        if news_features is not None and not news_features.empty:
+            nf = _ensure_datetime_index(news_features)
+            nf = nf.reindex(X.index, method="ffill").fillna(0.0)
+            nf = nf.rename(columns={c: f"news_{c}" for c in nf.columns})
+            X = pd.concat([X, nf], axis=1)
+
+        X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+        label_cfg = self._label_config()
+        labels = self._compute_labels(base_df["close"].astype(float), label_cfg)
+        trim = int(label_cfg.horizon)
+        if trim > 0:
+            X = X.iloc[:-trim]
+            labels = labels.iloc[:-trim]
+            meta = base_df.iloc[:-trim]
+        else:
+            meta = base_df
+
+        return PreparedDataset(
+            X=X,
+            y=labels,
+            index=X.index,
+            feature_names=list(X.columns),
+            metadata=meta,
+            labels=labels,
+        )
+
     def prepare(
         self,
         frames: dict[str, pd.DataFrame],
@@ -254,6 +450,22 @@ class FeatureEngineer:
         news_features: pd.DataFrame | None = None,
         symbol: str | None = None,
     ) -> PreparedDataset:
+        if self._use_rust_backend():
+            live_source = False
+            try:
+                for df in (frames or {}).values():
+                    if getattr(df, "attrs", {}).get("source") == "mt5":
+                        live_source = True
+                        break
+            except Exception:
+                live_source = False
+            if live_source:
+                logger.info("Live MT5 frames detected; using Python feature pipeline.")
+            else:
+                rust_ds = self._prepare_rust_features(news_features=news_features, symbol=symbol)
+                if rust_ds is not None:
+                    return rust_ds
+
         if frames is None or len(frames) == 0:
             empty = pd.DataFrame()
             return PreparedDataset(X=empty, y=pd.Series(dtype=int), index=empty.index, feature_names=[], metadata=None, labels=None)

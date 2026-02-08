@@ -190,6 +190,7 @@ class OrderExecutor:
             return float(default)
 
     def _calculate_sl_pips(self, result, frames) -> float | None:
+        symbol = self.settings.system.symbol
         # Check recommended
         if result.recommended_sl is not None:
             try:
@@ -242,6 +243,7 @@ class OrderExecutor:
     def _calculate_prices(
         self, result, frames, sl_pips, info, tick_price: dict[str, float]
     ) -> tuple[float, float] | tuple[None, None]:
+        symbol = self.settings.system.symbol
         try:
             base_df = frames.get(self.settings.system.base_timeframe)
             if base_df is None:

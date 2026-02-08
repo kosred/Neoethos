@@ -35,6 +35,12 @@ class ModelFactory:
             "xgboostdart": "xgboost_dart",
             "catboostalt": "catboost_alt",
             "n_beats": "nbeats",
+            "nbeatsx": "nbeatsx_nf",
+            "nbeats_x": "nbeatsx_nf",
+            "nbeatsxnf": "nbeatsx_nf",
+            "tidenf": "tide_nf",
+            "patch_tst": "patchtst",
+            "times_net": "timesnet",
         }
         return aliases.get(key, key)
 
@@ -53,6 +59,8 @@ class ModelFactory:
 
     def create_model(self, model_name: str, best_params: dict, idx: int) -> ExpertModel:
         """Create and configure a model instance."""
+        requested_name = model_name
+        model_name = self._normalize_model_key(model_name)
         prefer_gpu = self.prefer_gpu and bool(self.available_gpus)
         model_cls = get_model_class(model_name, prefer_gpu=prefer_gpu)
 
@@ -69,16 +77,22 @@ class ModelFactory:
             "tabnet": "TabNet",
             "nbeats": "N-BEATS",
             "tide": "TiDE",
+            "tide_nf": "TiDE-NF",
+            "nbeatsx_nf": "NBEATSx-NF",
+            "patchtst": "PatchTST",
+            "timesnet": "TimesNet",
             "kan": "KAN",
             "transformer": "Transformer",
             "evolution": "Neuroevolution",
             "mlp": "MLP",
         }
-        opt_key = opt_key_map.get(model_name)
+        opt_key = opt_key_map.get(model_name) or opt_key_map.get(requested_name)
         if opt_key and opt_key in best_params:
             params = best_params[opt_key].copy()
         elif model_name in best_params:
             params = best_params[model_name].copy()
+        elif requested_name in best_params:
+            params = best_params[requested_name].copy()
 
         # 2. Batch size (config override if not fixed by HPO params)
         if "batch_size" not in params:
@@ -169,16 +183,20 @@ class ModelFactory:
         if hasattr(model, "max_time_sec"):
             budget_key = {
                 "transformer": "transformer_train_seconds",
-            "tabnet": "tabnet_train_seconds",
-            "nbeats": "nbeats_train_seconds",
-            "tide": "tide_train_seconds",
-            "kan": "kan_train_seconds",
-            "mlp": "mlp_train_seconds",
-            "evolution": "evo_train_seconds",
-            "rl_ppo": "rl_train_seconds",
-            "rl_sac": "rl_train_seconds",
-            "rllib_ppo": "rl_train_seconds",
-            "rllib_sac": "rl_train_seconds",
+                "patchtst": "transformer_train_seconds",
+                "timesnet": "transformer_train_seconds",
+                "tabnet": "tabnet_train_seconds",
+                "nbeats": "nbeats_train_seconds",
+                "nbeatsx_nf": "nbeats_train_seconds",
+                "tide": "tide_train_seconds",
+                "tide_nf": "tide_train_seconds",
+                "kan": "kan_train_seconds",
+                "mlp": "mlp_train_seconds",
+                "evolution": "evo_train_seconds",
+                "rl_ppo": "rl_train_seconds",
+                "rl_sac": "rl_train_seconds",
+                "rllib_ppo": "rl_train_seconds",
+                "rllib_sac": "rl_train_seconds",
             }.get(name)
             
             model.max_time_sec = HARD_CAP_SEC # Default to hard cap
@@ -191,7 +209,18 @@ class ModelFactory:
                     pass
 
         # Optional epoch caps for models that expose epoch-based training.
-        if name in {"transformer", "tabnet", "kan", "mlp", "nbeats", "tide"}:
+        if name in {
+            "transformer",
+            "patchtst",
+            "timesnet",
+            "tabnet",
+            "kan",
+            "mlp",
+            "nbeats",
+            "nbeatsx_nf",
+            "tide",
+            "tide_nf",
+        }:
             cap = self._epoch_cap_for(name)
             if cap > 0:
                 if hasattr(model, "max_epochs"):
