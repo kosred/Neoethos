@@ -53,6 +53,8 @@ def _gene_to_dict(gene: TALibStrategyGene) -> dict[str, Any]:
         "preferred_regime": gene.preferred_regime,
         "strategy_id": gene.strategy_id,
         "fitness": float(getattr(gene, "fitness", 0.0)),
+        "max_dd_pct": float(getattr(gene, "max_dd_pct", 0.0)),
+        "trades": float(getattr(gene, "trades", 0.0)),
         "use_ob": bool(getattr(gene, "use_ob", False)),
         "use_fvg": bool(getattr(gene, "use_fvg", False)),
         "use_liq_sweep": bool(getattr(gene, "use_liq_sweep", False)),
@@ -103,6 +105,17 @@ def _convert_rust_gene(gene: dict[str, Any], feature_names: list[str], available
     if not indicators:
         return None
 
+    try:
+        max_dd_pct = float(
+            gene.get("max_dd_pct", gene.get("max_dd", gene.get("drawdown", 0.0))) or 0.0
+        )
+    except Exception:
+        max_dd_pct = 0.0
+    try:
+        trades = float(gene.get("trades", gene.get("trade_count", 0.0)) or 0.0)
+    except Exception:
+        trades = 0.0
+
     return TALibStrategyGene(
         indicators=indicators,
         params=params,
@@ -115,6 +128,8 @@ def _convert_rust_gene(gene: dict[str, Any], feature_names: list[str], available
         fitness=float(gene.get("fitness", 0.0)),
         sharpe_ratio=float(gene.get("sharpe_ratio", 0.0)),
         win_rate=float(gene.get("win_rate", 0.0)),
+        max_dd_pct=max_dd_pct,
+        trades=trades,
         use_ob=bool(gene.get("use_ob", False)),
         use_fvg=bool(gene.get("use_fvg", False)),
         use_liq_sweep=bool(gene.get("use_liq_sweep", False)),
@@ -294,9 +309,56 @@ class TensorDiscoveryEngine:
                 if not best:
                     raise RuntimeError("Rust discovery produced no usable genes")
 
+                try:
+                    keep_max_dd = float(
+                        os.environ.get(
+                            "FOREX_BOT_DISCOVERY_KEEP_MAX_DD",
+                            getattr(self.settings.risk, "total_drawdown_limit", 0.07),
+                        )
+                        or 0.07
+                    )
+                except Exception:
+                    keep_max_dd = 0.07
+                keep_max_dd = float(min(1.0, max(0.0, keep_max_dd)))
+                try:
+                    keep_min_profit = float(
+                        os.environ.get("FOREX_BOT_DISCOVERY_KEEP_MIN_PROFIT", "0.0") or 0.0
+                    )
+                except Exception:
+                    keep_min_profit = 0.0
+                try:
+                    keep_min_trades = float(
+                        os.environ.get("FOREX_BOT_DISCOVERY_KEEP_MIN_TRADES", "1.0") or 1.0
+                    )
+                except Exception:
+                    keep_min_trades = 1.0
+                keep_min_trades = float(max(0.0, keep_min_trades))
+                try:
+                    keep_cap = int(os.environ.get("FOREX_BOT_DISCOVERY_PORTFOLIO", "50") or 50)
+                except Exception:
+                    keep_cap = 50
+                keep_cap = max(1, keep_cap)
+
+                filtered = [
+                    g
+                    for g in best
+                    if float(getattr(g, "fitness", 0.0) or 0.0) > keep_min_profit
+                    and float(getattr(g, "max_dd_pct", 0.0) or 0.0) <= keep_max_dd
+                    and float(getattr(g, "trades", 0.0) or 0.0) >= keep_min_trades
+                ]
+                selected = filtered if filtered else best
+                selected.sort(
+                    key=lambda g: (
+                        float(getattr(g, "fitness", 0.0) or 0.0),
+                        float(getattr(g, "sharpe_ratio", 0.0) or 0.0),
+                    ),
+                    reverse=True,
+                )
+                selected = selected[: max(1, min(keep_cap, len(selected)))]
+
                 payload = {
                     "generated_at": datetime.now(timezone.utc).isoformat(),
-                    "best_genes": [_gene_to_dict(g) for g in best],
+                    "best_genes": [_gene_to_dict(g) for g in selected],
                 }
                 out_dir = Path("cache")
                 out_dir.mkdir(parents=True, exist_ok=True)
@@ -307,7 +369,15 @@ class TensorDiscoveryEngine:
                     out_path = out_dir / f"talib_knowledge_{safe}.json"
                 out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
                 self._last_payload = payload
-                logger.info("Discovery (Rust): wrote %s", out_path)
+                logger.info(
+                    "Discovery (Rust): kept %s/%s genes (profit>%.3f, max_dd<=%.3f, trades>=%.0f). Wrote %s",
+                    len(selected),
+                    len(best),
+                    keep_min_profit,
+                    keep_max_dd,
+                    keep_min_trades,
+                    out_path,
+                )
                 return
             except Exception as exc:
                 logger.warning("Rust discovery failed, falling back to Python: %s", exc, exc_info=True)
@@ -347,6 +417,31 @@ class TensorDiscoveryEngine:
         open_ = df["open"].to_numpy(dtype=np.float64) if "open" in df.columns else close
         atr_vals = df["atr"].to_numpy(dtype=np.float64) if "atr" in df.columns else None
         month_idx, day_idx = _safe_indices(df.index, len(df))
+        try:
+            keep_max_dd = float(
+                os.environ.get(
+                    "FOREX_BOT_DISCOVERY_KEEP_MAX_DD",
+                    getattr(self.settings.risk, "total_drawdown_limit", 0.07),
+                )
+                or 0.07
+            )
+        except Exception:
+            keep_max_dd = 0.07
+        keep_max_dd = float(min(1.0, max(0.0, keep_max_dd)))
+        try:
+            keep_min_profit = float(os.environ.get("FOREX_BOT_DISCOVERY_KEEP_MIN_PROFIT", "0.0") or 0.0)
+        except Exception:
+            keep_min_profit = 0.0
+        try:
+            keep_min_trades = float(os.environ.get("FOREX_BOT_DISCOVERY_KEEP_MIN_TRADES", "1.0") or 1.0)
+        except Exception:
+            keep_min_trades = 1.0
+        keep_min_trades = float(max(0.0, keep_min_trades))
+        try:
+            keep_cap = int(os.environ.get("FOREX_BOT_DISCOVERY_PORTFOLIO", "50") or 50)
+        except Exception:
+            keep_cap = 50
+        keep_cap = max(1, keep_cap)
 
         scored: list[tuple[float, TALibStrategyGene]] = []
         for gene in genes:
@@ -376,7 +471,18 @@ class TensorDiscoveryEngine:
                     spread_pips=1.5,
                     commission_per_trade=7.0,
                 )
-                score = float(metrics[0]) if metrics is not None and len(metrics) > 0 else 0.0
+                if metrics is None or len(metrics) < 9:
+                    score = 0.0
+                    gene.sharpe_ratio = 0.0
+                    gene.max_dd_pct = 0.0
+                    gene.win_rate = 0.0
+                    gene.trades = 0.0
+                else:
+                    score = float(metrics[0])
+                    gene.sharpe_ratio = float(metrics[1])
+                    gene.max_dd_pct = float(metrics[3])
+                    gene.win_rate = float(metrics[4])
+                    gene.trades = float(metrics[8])
             except Exception as exc:
                 logger.debug("Discovery: gene eval failed: %s", exc)
                 score = 0.0
@@ -384,7 +490,16 @@ class TensorDiscoveryEngine:
             scored.append((score, gene))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        best = [g for _, g in scored[: max(1, min(50, len(scored)) )]]
+        merged = [g for _, g in scored]
+        filtered = [
+            g
+            for g in merged
+            if float(getattr(g, "fitness", 0.0) or 0.0) > keep_min_profit
+            and float(getattr(g, "max_dd_pct", 0.0) or 0.0) <= keep_max_dd
+            and float(getattr(g, "trades", 0.0) or 0.0) >= keep_min_trades
+        ]
+        selected = filtered if filtered else merged
+        best = selected[: max(1, min(keep_cap, len(selected)))]
 
         payload = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -398,7 +513,15 @@ class TensorDiscoveryEngine:
             out_path = out_dir / f"talib_knowledge_{safe}.json"
         out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         self._last_payload = payload
-        logger.info("Discovery: wrote %s", out_path)
+        logger.info(
+            "Discovery: kept %s/%s genes (profit>%.3f, max_dd<=%.3f, trades>=%.0f). Wrote %s",
+            len(best),
+            len(merged),
+            keep_min_profit,
+            keep_max_dd,
+            keep_min_trades,
+            out_path,
+        )
 
     def save_experts(self, path: str) -> None:
         """

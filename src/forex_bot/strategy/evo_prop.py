@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +53,8 @@ def _gene_to_dict(gene: TALibStrategyGene) -> dict[str, Any]:
         "preferred_regime": gene.preferred_regime,
         "strategy_id": gene.strategy_id,
         "fitness": float(getattr(gene, "fitness", 0.0)),
+        "max_dd_pct": float(getattr(gene, "max_dd_pct", 0.0)),
+        "trades": float(getattr(gene, "trades", 0.0)),
         "use_ob": bool(getattr(gene, "use_ob", False)),
         "use_fvg": bool(getattr(gene, "use_fvg", False)),
         "use_liq_sweep": bool(getattr(gene, "use_liq_sweep", False)),
@@ -102,6 +105,17 @@ def _convert_rust_gene(gene: dict[str, Any], feature_names: list[str], available
     if not indicators:
         return None
 
+    try:
+        max_dd_pct = float(
+            gene.get("max_dd_pct", gene.get("max_dd", gene.get("drawdown", 0.0))) or 0.0
+        )
+    except Exception:
+        max_dd_pct = 0.0
+    try:
+        trades = float(gene.get("trades", gene.get("trade_count", 0.0)) or 0.0)
+    except Exception:
+        trades = 0.0
+
     return TALibStrategyGene(
         indicators=indicators,
         params=params,
@@ -114,6 +128,8 @@ def _convert_rust_gene(gene: dict[str, Any], feature_names: list[str], available
         fitness=float(gene.get("fitness", 0.0)),
         sharpe_ratio=float(gene.get("sharpe_ratio", 0.0)),
         win_rate=float(gene.get("win_rate", 0.0)),
+        max_dd_pct=max_dd_pct,
+        trades=trades,
         use_ob=bool(gene.get("use_ob", False)),
         use_fvg=bool(gene.get("use_fvg", False)),
         use_liq_sweep=bool(gene.get("use_liq_sweep", False)),
@@ -228,10 +244,114 @@ def _evaluate_gene(
             spread_pips=1.5,
             commission_per_trade=7.0,
         )
-        return float(metrics[0]) if metrics is not None and len(metrics) > 0 else 0.0
+        if metrics is None or len(metrics) < 9:
+            gene.fitness = 0.0
+            return 0.0
+        gene.fitness = float(metrics[0])
+        gene.sharpe_ratio = float(metrics[1])
+        gene.max_dd_pct = float(metrics[3])
+        gene.win_rate = float(metrics[4])
+        gene.trades = float(metrics[8])
+        return float(gene.fitness)
     except Exception as exc:
         logger.debug("Prop search eval failed: %s", exc)
         return 0.0
+
+
+def _strategy_keep_limits(settings: Any) -> tuple[float, float, float, int]:
+    try:
+        max_dd = float(
+            os.environ.get(
+                "FOREX_BOT_PROP_KEEP_MAX_DD",
+                getattr(settings.risk, "total_drawdown_limit", 0.07),
+            )
+            or 0.07
+        )
+    except Exception:
+        max_dd = 0.07
+    max_dd = float(min(1.0, max(0.0, max_dd)))
+
+    try:
+        min_profit = float(os.environ.get("FOREX_BOT_PROP_KEEP_MIN_PROFIT", "0.0") or 0.0)
+    except Exception:
+        min_profit = 0.0
+
+    try:
+        min_trades = float(os.environ.get("FOREX_BOT_PROP_KEEP_MIN_TRADES", "1") or 1.0)
+    except Exception:
+        min_trades = 1.0
+    min_trades = float(max(0.0, min_trades))
+
+    try:
+        portfolio_cap = int(
+            os.environ.get(
+                "FOREX_BOT_PROP_KEEP_CAP",
+                getattr(settings.models, "prop_search_portfolio_size", 3000),
+            )
+            or 3000
+        )
+    except Exception:
+        portfolio_cap = 3000
+    if portfolio_cap < 0:
+        portfolio_cap = 0
+    return max_dd, min_profit, min_trades, portfolio_cap
+
+
+def _strategy_passes_filter(
+    gene: TALibStrategyGene,
+    *,
+    max_dd: float,
+    min_profit: float,
+    min_trades: float,
+) -> bool:
+    try:
+        profit = float(getattr(gene, "fitness", 0.0) or 0.0)
+    except Exception:
+        profit = 0.0
+    if profit <= min_profit:
+        return False
+
+    try:
+        dd = float(getattr(gene, "max_dd_pct", 0.0) or 0.0)
+    except Exception:
+        dd = 0.0
+    if dd > max_dd:
+        return False
+
+    try:
+        trades = float(getattr(gene, "trades", 0.0) or 0.0)
+    except Exception:
+        trades = 0.0
+    if trades < min_trades:
+        return False
+    return True
+
+
+def _dedupe_ranked(genes: list[TALibStrategyGene]) -> list[TALibStrategyGene]:
+    out: list[TALibStrategyGene] = []
+    seen: set[str] = set()
+    for gene in sorted(
+        genes,
+        key=lambda g: (
+            float(getattr(g, "fitness", 0.0) or 0.0),
+            float(getattr(g, "sharpe_ratio", 0.0) or 0.0),
+            float(getattr(g, "win_rate", 0.0) or 0.0),
+        ),
+        reverse=True,
+    ):
+        sid = str(getattr(gene, "strategy_id", "") or "").strip()
+        if sid:
+            key = f"id:{sid}"
+        else:
+            key = (
+                f"sig:{tuple(gene.indicators)}|{gene.combination_method}|"
+                f"{float(gene.long_threshold):.6f}|{float(gene.short_threshold):.6f}"
+            )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(gene)
+    return out
 
 
 def run_evo_search(
@@ -242,9 +362,16 @@ def run_evo_search(
     checkpoint: str,
     max_hours: float,
     actual_balance: float,
+    max_workers: int | None = None,
 ) -> None:
+    # API compatibility: callers may pass worker hints even though this search currently
+    # runs synchronously in-process.
+    _ = max_workers
     if df is None or df.empty:
         return
+    max_dd, min_profit, min_trades, portfolio_cap = _strategy_keep_limits(settings)
+    symbol = str(df.attrs.get("symbol", "") or "")
+    timeframe = str(df.attrs.get("timeframe", df.attrs.get("tf", "")) or "")
     if _RUST_SEARCH and _fb is not None:
         try:
             ts = None
@@ -257,6 +384,23 @@ def run_evo_search(
             open_ = df["open"].to_numpy(dtype=np.float64) if "open" in df.columns else close
             volume = df["volume"].to_numpy(dtype=np.float64) if "volume" in df.columns else None
 
+            max_indicators = 0
+            env_max = os.environ.get("FOREX_BOT_PROP_SEARCH_MAX_INDICATORS")
+            if env_max:
+                try:
+                    max_indicators = int(env_max)
+                except Exception:
+                    max_indicators = 0
+            if max_indicators <= 0:
+                try:
+                    max_indicators = int(
+                        getattr(settings.models, "prop_search_max_indicators", 0) or 0
+                    )
+                except Exception:
+                    max_indicators = 0
+            if max_indicators <= 0:
+                max_indicators = len(ALL_INDICATORS) or 12
+
             result = _fb.search_evolve_ohlcv(
                 open_,
                 high,
@@ -266,7 +410,7 @@ def run_evo_search(
                 volume,
                 int(population or 0),
                 int(generations or 0),
-                int(getattr(settings.models, "prop_search_max_indicators", 12) or 12),
+                int(max_indicators),
                 True,
             )
             feature_names = list(result.get("feature_names") or [])
@@ -282,9 +426,26 @@ def run_evo_search(
             if not best:
                 raise RuntimeError("Rust search produced no usable genes")
 
+            filtered = [
+                g
+                for g in best
+                if _strategy_passes_filter(
+                    g,
+                    max_dd=max_dd,
+                    min_profit=min_profit,
+                    min_trades=min_trades,
+                )
+            ]
+            selected = filtered if filtered else best
+            selected = _dedupe_ranked(selected)
+            if portfolio_cap > 0:
+                selected = selected[:portfolio_cap]
+
             payload = {
                 "generated_at": datetime.now(timezone.utc).isoformat(),
-                "best_genes": [_gene_to_dict(g) for g in best],
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "best_genes": [_gene_to_dict(g) for g in selected],
             }
             out_path = Path(checkpoint)
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -292,13 +453,22 @@ def run_evo_search(
 
             cache_dir = Path("cache")
             cache_dir.mkdir(parents=True, exist_ok=True)
-            symbol = str(df.attrs.get("symbol", "") or "")
             out = cache_dir / "talib_knowledge.json"
             if symbol:
                 safe = "".join(c for c in symbol if c.isalnum() or c in ("-", "_"))
                 out = cache_dir / f"talib_knowledge_{safe}.json"
             out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            logger.info("Prop search (Rust): wrote %s", out)
+            logger.info(
+                "Prop search (Rust): kept %s/%s genes for %s %s (profit>%.3f, max_dd<=%.3f, trades>=%.0f). Wrote %s",
+                len(selected),
+                len(best),
+                symbol or "?",
+                timeframe or "?",
+                min_profit,
+                max_dd,
+                min_trades,
+                out,
+            )
             return
         except Exception as exc:
             logger.warning("Rust prop search failed, falling back to Python: %s", exc, exc_info=True)
@@ -310,10 +480,27 @@ def run_evo_search(
 
     pop = max(2, int(population or 0))
     gens = max(1, int(generations or 0))
-    max_indicators = max(2, min(10, len(mixer.available_indicators)))
+    max_indicators = 0
+    env_max = os.environ.get("FOREX_BOT_PROP_SEARCH_MAX_INDICATORS")
+    if env_max:
+        try:
+            max_indicators = int(env_max)
+        except Exception:
+            max_indicators = 0
+    if max_indicators <= 0:
+        try:
+            max_indicators = int(
+                getattr(settings.models, "prop_search_max_indicators", 0) or 0
+            )
+        except Exception:
+            max_indicators = 0
+    if max_indicators <= 0:
+        max_indicators = len(mixer.available_indicators)
+    max_indicators = max(2, min(max_indicators, len(mixer.available_indicators)))
 
     genes = [mixer.generate_random_strategy(max_indicators=max_indicators) for _ in range(pop)]
     best: list[TALibStrategyGene] = []
+    accepted: list[TALibStrategyGene] = []
 
     start = time.time()
     for _ in range(gens):
@@ -324,6 +511,14 @@ def run_evo_search(
             gene.fitness = score
             scored.append((score, gene))
         scored.sort(key=lambda x: x[0], reverse=True)
+        for _score, gene in scored:
+            if _strategy_passes_filter(
+                gene,
+                max_dd=max_dd,
+                min_profit=min_profit,
+                min_trades=min_trades,
+            ):
+                accepted.append(gene)
         survivors = [g for _, g in scored[: max(1, pop // 2)]]
         best = survivors
         while len(survivors) < pop:
@@ -332,9 +527,15 @@ def run_evo_search(
         if max_hours > 0 and (time.time() - start) > max_hours * 3600.0:
             break
 
+    selected = _dedupe_ranked(accepted if accepted else best)
+    if portfolio_cap > 0:
+        selected = selected[:portfolio_cap]
+
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "best_genes": [_gene_to_dict(g) for g in best],
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "best_genes": [_gene_to_dict(g) for g in selected],
     }
     out_path = Path(checkpoint)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -342,13 +543,21 @@ def run_evo_search(
 
     cache_dir = Path("cache")
     cache_dir.mkdir(parents=True, exist_ok=True)
-    symbol = str(df.attrs.get("symbol", "") or "")
     out = cache_dir / "talib_knowledge.json"
     if symbol:
         safe = "".join(c for c in symbol if c.isalnum() or c in ("-", "_"))
         out = cache_dir / f"talib_knowledge_{safe}.json"
     out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    logger.info("Prop search: wrote %s", out)
+    logger.info(
+        "Prop search: kept %s genes for %s %s (profit>%.3f, max_dd<=%.3f, trades>=%.0f). Wrote %s",
+        len(selected),
+        symbol or "?",
+        timeframe or "?",
+        min_profit,
+        max_dd,
+        min_trades,
+        out,
+    )
 
 
 __all__ = ["run_evo_search"]

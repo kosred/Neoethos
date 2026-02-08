@@ -57,6 +57,8 @@ class TALibStrategyGene:
     fitness: float = 0.0
     sharpe_ratio: float = 0.0
     win_rate: float = 0.0
+    max_dd_pct: float = 0.0
+    trades: float = 0.0
     use_ob: bool = False
     use_fvg: bool = False
     use_liq_sweep: bool = False
@@ -79,6 +81,8 @@ class TALibStrategyMixer:
         inds = [i for i in self.available_indicators if i]
         if not inds:
             return TALibStrategyGene(indicators=[])
+        if max_indicators <= 0:
+            max_indicators = len(inds)
         k = max(1, min(max_indicators, len(inds)))
         selected = random.sample(inds, k=k)
         weights = {i: float(random.uniform(0.5, 1.5)) for i in selected}

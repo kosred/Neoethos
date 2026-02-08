@@ -341,6 +341,364 @@ class TrainingService:
         except Exception as exc:
             logger.warning(f"[STRATEGY DISCOVERY] Failed: {exc}", exc_info=True)
 
+    @staticmethod
+    def _safe_symbol_tag(symbol: str) -> str:
+        safe = "".join(c for c in str(symbol or "") if c.isalnum() or c in ("-", "_"))
+        return safe or "GLOBAL"
+
+    def _prop_gene_artifact_paths(self, symbol: str) -> list[Path]:
+        safe = self._safe_symbol_tag(symbol)
+        paths: list[Path] = []
+        cache_dir = Path(getattr(self.settings.system, "cache_dir", "cache") or "cache")
+        paths.append(cache_dir / f"talib_knowledge_{safe}.json")
+        paths.append(cache_dir / "talib_knowledge.json")
+
+        checkpoint = str(
+            getattr(
+                self.settings.models,
+                "prop_search_checkpoint",
+                "models/strategy_evo_checkpoint.json",
+            )
+            or "models/strategy_evo_checkpoint.json"
+        )
+        ckpt = Path(checkpoint)
+        paths.append(ckpt)
+        with contextlib.suppress(Exception):
+            for candidate in ckpt.parent.glob(f"{ckpt.stem}_{safe}_*{ckpt.suffix}"):
+                paths.append(candidate)
+
+        uniq: list[Path] = []
+        seen: set[str] = set()
+        for p in paths:
+            key = str(p.resolve()) if p.exists() else str(p)
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(p)
+
+        existing = [p for p in uniq if p.exists() and p.is_file()]
+        existing.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return existing
+
+    def _load_prop_best_genes(self, symbol: str, max_genes: int = 24):
+        try:
+            from ..features.talib_mixer import TALIB_AVAILABLE, TALibStrategyGene, TALibStrategyMixer
+        except Exception as exc:
+            logger.debug("Prop gene load unavailable: %s", exc)
+            return []
+        if not TALIB_AVAILABLE:
+            return []
+
+        try:
+            max_genes = int(
+                os.environ.get("FOREX_BOT_PROP_BASE_SIGNAL_GENES", str(max_genes)) or max_genes
+            )
+        except Exception:
+            max_genes = int(max_genes)
+        max_genes = max(1, max_genes)
+
+        candidates = self._prop_gene_artifact_paths(symbol)
+        if not candidates:
+            return []
+
+        mixer = TALibStrategyMixer(
+            device="cpu",
+            use_volume_features=bool(getattr(self.settings.system, "use_volume_features", False)),
+        )
+        available = {str(i).upper() for i in getattr(mixer, "available_indicators", [])}
+        if not available:
+            return []
+
+        def _to_float(source: dict[str, Any], key: str, default: float) -> float:
+            try:
+                return float(source.get(key, default) or default)
+            except Exception:
+                return float(default)
+
+        try:
+            keep_max_dd = float(
+                os.environ.get(
+                    "FOREX_BOT_PROP_KEEP_MAX_DD",
+                    getattr(self.settings.risk, "total_drawdown_limit", 0.07),
+                )
+                or 0.07
+            )
+        except Exception:
+            keep_max_dd = 0.07
+        keep_max_dd = float(min(1.0, max(0.0, keep_max_dd)))
+
+        try:
+            keep_min_profit = float(os.environ.get("FOREX_BOT_PROP_KEEP_MIN_PROFIT", "0.0") or 0.0)
+        except Exception:
+            keep_min_profit = 0.0
+
+        try:
+            keep_min_trades = float(os.environ.get("FOREX_BOT_PROP_KEEP_MIN_TRADES", "1.0") or 1.0)
+        except Exception:
+            keep_min_trades = 1.0
+        keep_min_trades = float(max(0.0, keep_min_trades))
+
+        def _passes(gene: TALibStrategyGene) -> bool:
+            profit = float(getattr(gene, "fitness", 0.0) or 0.0)
+            if profit <= keep_min_profit:
+                return False
+            dd = float(getattr(gene, "max_dd_pct", 0.0) or 0.0)
+            if dd > keep_max_dd:
+                return False
+            trades = float(getattr(gene, "trades", 0.0) or 0.0)
+            if trades < keep_min_trades:
+                return False
+            return True
+
+        all_parsed: list[TALibStrategyGene] = []
+        parsed_by_file: list[tuple[Path, int]] = []
+        for path in candidates:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            raw_genes = payload.get("best_genes")
+            if not isinstance(raw_genes, list) or not raw_genes:
+                continue
+
+            parsed: list[TALibStrategyGene] = []
+            for raw in raw_genes:
+                if not isinstance(raw, dict):
+                    continue
+                inds_raw = raw.get("indicators") or []
+                indicators = []
+                for ind in inds_raw:
+                    name = str(ind).strip().upper()
+                    if name and name in available and name not in indicators:
+                        indicators.append(name)
+                if not indicators:
+                    continue
+
+                params_raw = raw.get("params") if isinstance(raw.get("params"), dict) else {}
+                params = {}
+                for ind in indicators:
+                    val = params_raw.get(ind) or params_raw.get(ind.lower()) or params_raw.get(ind.upper()) or {}
+                    params[ind] = dict(val) if isinstance(val, dict) else {}
+
+                weights_raw = raw.get("weights") if isinstance(raw.get("weights"), dict) else {}
+                weights = {}
+                for ind in indicators:
+                    w = weights_raw.get(ind)
+                    if w is None:
+                        w = weights_raw.get(ind.lower(), 1.0)
+                    try:
+                        weights[ind] = float(w)
+                    except Exception:
+                        weights[ind] = 1.0
+
+                gene = TALibStrategyGene(
+                    indicators=indicators,
+                    params=params,
+                    combination_method=str(raw.get("combination_method", "weighted_vote") or "weighted_vote"),
+                    long_threshold=_to_float(raw, "long_threshold", 0.66),
+                    short_threshold=_to_float(raw, "short_threshold", -0.66),
+                    weights=weights,
+                    preferred_regime=str(raw.get("preferred_regime", "any") or "any"),
+                    strategy_id=str(raw.get("strategy_id", "") or ""),
+                    fitness=_to_float(raw, "fitness", 0.0),
+                    sharpe_ratio=_to_float(raw, "sharpe_ratio", 0.0),
+                    win_rate=_to_float(raw, "win_rate", 0.0),
+                    max_dd_pct=_to_float(
+                        raw,
+                        "max_dd_pct",
+                        _to_float(raw, "max_dd", _to_float(raw, "drawdown", 0.0)),
+                    ),
+                    trades=_to_float(raw, "trades", _to_float(raw, "trade_count", 0.0)),
+                    use_ob=bool(raw.get("use_ob", False)),
+                    use_fvg=bool(raw.get("use_fvg", False)),
+                    use_liq_sweep=bool(raw.get("use_liq_sweep", False)),
+                    mtf_confirmation=bool(raw.get("mtf_confirmation", False)),
+                    use_premium_discount=bool(raw.get("use_premium_discount", False)),
+                    use_inducement=bool(raw.get("use_inducement", False)),
+                    tp_pips=_to_float(raw, "tp_pips", 40.0),
+                    sl_pips=_to_float(raw, "sl_pips", 20.0),
+                )
+                parsed.append(gene)
+
+            if not parsed:
+                continue
+            parsed_by_file.append((path, len(parsed)))
+            all_parsed.extend(parsed)
+
+        if not all_parsed:
+            return []
+
+        dedup: dict[str, TALibStrategyGene] = {}
+        for gene in sorted(all_parsed, key=lambda g: float(getattr(g, "fitness", 0.0) or 0.0), reverse=True):
+            sid = str(getattr(gene, "strategy_id", "") or "").strip()
+            if sid:
+                key = f"id:{sid}"
+            else:
+                key = (
+                    f"sig:{tuple(gene.indicators)}|{gene.combination_method}|"
+                    f"{float(gene.long_threshold):.6f}|{float(gene.short_threshold):.6f}"
+                )
+            if key in dedup:
+                continue
+            dedup[key] = gene
+
+        merged = list(dedup.values())
+        merged.sort(
+            key=lambda g: (
+                float(getattr(g, "fitness", 0.0) or 0.0),
+                float(getattr(g, "sharpe_ratio", 0.0) or 0.0),
+                float(getattr(g, "win_rate", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        filtered = [g for g in merged if _passes(g)]
+
+        if filtered:
+            chosen = filtered[:max_genes]
+        else:
+            profitable = [g for g in merged if float(getattr(g, "fitness", 0.0) or 0.0) > 0.0]
+            chosen = (profitable if profitable else merged)[:max_genes]
+            logger.warning(
+                "[STRATEGY DISCOVERY] %s: strict strategy filter kept none; fallback to top-%s by fitness.",
+                symbol,
+                len(chosen),
+            )
+
+        sources = ", ".join(f"{p.name}:{n}" for p, n in parsed_by_file[:6])
+        if len(parsed_by_file) > 6:
+            sources += ", ..."
+        logger.info(
+            "[STRATEGY DISCOVERY] %s: loaded %s genes from %s files (merged=%s, filtered=%s, selected=%s). "
+            "Filters: profit>%.3f, max_dd<=%.3f, trades>=%.0f. Sources: %s",
+            symbol,
+            sum(n for _, n in parsed_by_file),
+            len(parsed_by_file),
+            len(merged),
+            len(filtered),
+            len(chosen),
+            keep_min_profit,
+            keep_max_dd,
+            keep_min_trades,
+            sources or "none",
+        )
+        return chosen
+
+        return []
+
+    def _apply_prop_discovered_base_signal(
+        self,
+        dataset: PreparedDataset,
+        *,
+        symbol: str,
+        source_df: pd.DataFrame | None = None,
+    ) -> PreparedDataset:
+        if dataset is None or not isinstance(getattr(dataset, "X", None), pd.DataFrame):
+            return dataset
+        if dataset.X.empty:
+            return dataset
+
+        genes = self._load_prop_best_genes(symbol=symbol, max_genes=24)
+        if not genes:
+            return dataset
+
+        try:
+            from ..features.talib_mixer import TALIB_AVAILABLE, TALibStrategyMixer
+        except Exception:
+            return dataset
+        if not TALIB_AVAILABLE:
+            return dataset
+
+        source = None
+        for candidate in (source_df, dataset.metadata, dataset.X):
+            if not isinstance(candidate, pd.DataFrame) or candidate.empty:
+                continue
+            cols = {str(c).lower() for c in candidate.columns}
+            if {"open", "high", "low", "close"}.issubset(cols):
+                source = candidate.copy()
+                break
+        if source is None:
+            logger.warning(
+                "[STRATEGY DISCOVERY] %s: cannot apply discovered base signal (missing OHLC source).",
+                symbol,
+            )
+            return dataset
+
+        if isinstance(source.index, pd.DatetimeIndex) and not source.index.is_monotonic_increasing:
+            source = source.sort_index(kind="mergesort")
+
+        try:
+            threshold = float(os.environ.get("FOREX_BOT_PROP_BASE_SIGNAL_THRESHOLD", "0.15") or 0.15)
+        except Exception:
+            threshold = 0.15
+        threshold = float(min(0.95, max(0.0, threshold)))
+        try:
+            min_coverage = float(os.environ.get("FOREX_BOT_PROP_BASE_SIGNAL_MIN_COVERAGE", "0.005") or 0.005)
+        except Exception:
+            min_coverage = 0.005
+        min_coverage = float(min(0.9, max(0.0, min_coverage)))
+
+        mixer = TALibStrategyMixer(
+            device="cpu",
+            use_volume_features=bool(getattr(self.settings.system, "use_volume_features", False)),
+        )
+        cache = mixer.bulk_calculate_indicators(source, genes)
+
+        score_sum = np.zeros(len(dataset.X), dtype=np.float64)
+        weight_sum = 0.0
+        for gene in genes:
+            try:
+                sig = mixer.compute_signals(source, gene, cache=cache)
+                aligned = sig.reindex(dataset.X.index).ffill().fillna(0.0).to_numpy(dtype=np.float64, copy=False)
+            except Exception as exc:
+                logger.debug("Prop signal compute failed for %s: %s", symbol, exc)
+                continue
+
+            w = float(getattr(gene, "fitness", 0.0) or 0.0)
+            if not np.isfinite(w) or w <= 0.0:
+                w = 1.0
+            score_sum += w * aligned
+            weight_sum += abs(w)
+
+        if weight_sum <= 0.0:
+            return dataset
+
+        score = score_sum / weight_sum
+        signal = np.where(score >= threshold, 1, np.where(score <= -threshold, -1, 0)).astype(np.int8)
+        coverage = float(np.count_nonzero(signal)) / float(max(1, len(signal)))
+        if coverage < min_coverage:
+            logger.warning(
+                "[STRATEGY DISCOVERY] %s: discovered base signal too sparse (coverage=%.3f < %.3f), keeping existing base_signal.",
+                symbol,
+                coverage,
+                min_coverage,
+            )
+            return dataset
+
+        x = dataset.X.copy()
+        if "base_signal" in x.columns and "base_signal_static" not in x.columns:
+            with contextlib.suppress(Exception):
+                x["base_signal_static"] = pd.to_numeric(x["base_signal"], errors="coerce").fillna(0).astype(np.int8)
+        x["base_signal"] = signal
+        x["prop_signal_score"] = score.astype(np.float32, copy=False)
+
+        logger.info(
+            "[STRATEGY DISCOVERY] %s: applied discovered base signal (%s genes, coverage=%.1f%%).",
+            symbol,
+            len(genes),
+            coverage * 100.0,
+        )
+
+        return PreparedDataset(
+            X=x,
+            y=dataset.y,
+            index=getattr(x, "index", dataset.index),
+            feature_names=list(x.columns),
+            metadata=dataset.metadata,
+            labels=dataset.labels if dataset.labels is not None else dataset.y,
+        )
+
     def _build_discovery_frames_for_tensor(
         self,
         frames: dict[str, pd.DataFrame],
@@ -753,6 +1111,23 @@ class TrainingService:
         except Exception:
             pass
 
+        if bool(getattr(self.settings.models, "prop_search_enabled", False)):
+            if self._prop_search_async_enabled():
+                logger.info(
+                    "[STRATEGY DISCOVERY] Async prop-search requested but running inline so discovered signals feed model training."
+                )
+            await self._run_prop_search_for_symbols([symbol], stop_event=stop_event)
+
+        base_tf = str(getattr(self.settings.system, "base_timeframe", "M1") or "M1")
+        signal_source = frames.get(base_tf)
+        if not isinstance(signal_source, pd.DataFrame):
+            signal_source = frames.get("M1")
+        dataset = self._apply_prop_discovered_base_signal(
+            dataset,
+            symbol=symbol,
+            source_df=signal_source if isinstance(signal_source, pd.DataFrame) else None,
+        )
+
         has_gpu = bool(getattr(self.settings.system, "enable_gpu", False)) and int(
             getattr(self.settings.system, "num_gpus", 0) or 0
         ) > 0
@@ -770,68 +1145,6 @@ class TrainingService:
         )
         if "M1" in discovery_frames:
             logger.debug(f"M1 Columns: {len(discovery_frames['M1'].columns)}")
-
-        prop_task = None
-        if bool(getattr(self.settings.models, "prop_search_enabled", False)):
-            try:
-                from ..strategy.evo_prop import run_evo_search
-
-                base_tf = str(getattr(self.settings.system, "base_timeframe", "M1") or "M1")
-                prop_df = frames.get(base_tf) or frames.get("M1")
-                if prop_df is not None and not prop_df.empty:
-                    max_rows = self._get_prop_max_rows(base_tf)
-                    if max_rows > 0 and len(prop_df) > max_rows:
-                        prop_df = prop_df.tail(max_rows)
-
-                    prop_settings = self.settings.model_copy()
-                    prop_device = str(
-                        getattr(self.settings.models, "prop_search_device", "cpu") or "cpu"
-                    )
-                    prop_settings.system.device = prop_device
-
-                    try:
-                        pop = int(getattr(self.settings.models, "prop_search_population", 64) or 64)
-                    except Exception:
-                        pop = 64
-                    try:
-                        gens = int(getattr(self.settings.models, "prop_search_generations", 50) or 50)
-                    except Exception:
-                        gens = 50
-                    try:
-                        max_hours = float(
-                            getattr(self.settings.models, "prop_search_max_hours", 1.0) or 1.0
-                        )
-                    except Exception:
-                        max_hours = 1.0
-                    checkpoint = str(
-                        getattr(
-                            self.settings.models,
-                            "prop_search_checkpoint",
-                            "models/strategy_evo_checkpoint.json",
-                        )
-                        or "models/strategy_evo_checkpoint.json"
-                    )
-                    try:
-                        actual_balance = float(
-                            getattr(self.settings.risk, "initial_balance", 100000.0) or 100000.0
-                        )
-                    except Exception:
-                        actual_balance = 100000.0
-
-                    loop = asyncio.get_running_loop()
-                    prop_task = loop.run_in_executor(
-                        None,
-                        run_evo_search,
-                        prop_df,
-                        prop_settings,
-                        pop,
-                        gens,
-                        checkpoint,
-                        max_hours,
-                        actual_balance,
-                    )
-            except Exception as exc:
-                logger.warning(f"Failed to start prop-aware search: {exc}")
 
         # New Unsupervised Tensor Engine (Million-Search)
         # We increase experts to 100 to create a diverse "Council of 100" for the deep models
@@ -871,32 +1184,14 @@ class TrainingService:
         )
         discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
 
-        exclude_models = ["genetic"] if prop_task is not None else None
         await asyncio.to_thread(
             self.trainer.train_all,
             dataset,
             optimize,
             stop_event,
             None,
-            exclude_models,
+            None,
         )
-
-        if prop_task is not None:
-            try:
-                await prop_task
-            except Exception as exc:
-                logger.warning(f"Prop-aware search failed: {exc}")
-
-            # Train genetic last so it consumes the merged prop-aware portfolio.
-            await asyncio.to_thread(
-                self.trainer.train_all,
-                dataset,
-                False,
-                stop_event,
-                ["genetic"],
-                None,
-            )
-
 
         logger.info("Training cycle complete.")
         self._maybe_stop_ray()
@@ -1937,10 +2232,23 @@ class TrainingService:
 
         if bool(getattr(self.settings.models, "prop_search_enabled", False)):
             if self._prop_search_async_enabled():
-                # Use a background thread so discovery starts even if the event loop is busy.
-                self._start_prop_search_thread(symbols)
-            else:
-                await self._run_prop_search_for_symbols(symbols, stop_event=stop_event)
+                logger.info(
+                    "[STRATEGY DISCOVERY] Async prop-search requested but running inline so discovered signals feed model training."
+                )
+            await self._run_prop_search_for_symbols(symbols, stop_event=stop_event)
+            patched_hpc: list[tuple[str, PreparedDataset]] = []
+            for sym, ds in datasets:
+                patched_hpc.append(
+                    (
+                        sym,
+                        self._apply_prop_discovered_base_signal(
+                            ds,
+                            symbol=sym,
+                            source_df=ds.metadata if isinstance(ds.metadata, pd.DataFrame) else None,
+                        ),
+                    )
+                )
+            datasets = patched_hpc
 
         def _run_discovery() -> None:
             has_gpu_local = bool(getattr(self.settings.system, "enable_gpu", False)) and int(
@@ -2043,13 +2351,27 @@ class TrainingService:
                 logger.error(f"Failed to prepare {sym}: {e}", exc_info=True)
                 continue
 
-        # === STRATEGY DISCOVERY (OPTIONAL ASYNC) ===
+        # Ensure prop-search runs first and discovered strategies feed model training.
         if datasets and bool(getattr(self.settings.models, "prop_search_enabled", False)):
             symbols_to_run = [sym for sym, _ in datasets]
             if self._prop_search_async_enabled():
-                self._start_prop_search_thread(symbols_to_run)
-            else:
-                await self._run_prop_search_for_symbols(symbols_to_run, stop_event=stop_event)
+                logger.info(
+                    "[STRATEGY DISCOVERY] Async prop-search requested but running inline so discovered signals feed model training."
+                )
+            await self._run_prop_search_for_symbols(symbols_to_run, stop_event=stop_event)
+            patched: list[tuple[str, PreparedDataset]] = []
+            for sym, ds in datasets:
+                patched.append(
+                    (
+                        sym,
+                        self._apply_prop_discovered_base_signal(
+                            ds,
+                            symbol=sym,
+                            source_df=ds.metadata if isinstance(ds.metadata, pd.DataFrame) else None,
+                        ),
+                    )
+                )
+            datasets = patched
 
         # Ensure tensor strategy discovery runs before pooled model training.
         if datasets:
