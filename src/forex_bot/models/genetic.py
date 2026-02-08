@@ -20,13 +20,32 @@ class GeneticStrategyExpert(ExpertModel):
 
     population_size: int = 50
     generations: int = 10
-    max_indicators: int = 5
+    # 0 = allow full indicator set (no hard cap)
+    max_indicators: int = 0
     best_gene: TALibStrategyGene | None = None
     mixer: TALibStrategyMixer | None = None
     portfolio: list[TALibStrategyGene] = field(default_factory=list)
 
     def __post_init__(self):
         self.mixer = TALibStrategyMixer()
+        if not self.mixer.available_indicators:
+            return
+        max_indicators = 0
+        env_max = os.environ.get("FOREX_BOT_PROP_SEARCH_MAX_INDICATORS") or os.environ.get(
+            "FOREX_BOT_DISCOVERY_MAX_INDICATORS"
+        )
+        if env_max:
+            try:
+                max_indicators = int(env_max)
+            except Exception:
+                max_indicators = 0
+        if max_indicators <= 0:
+            max_indicators = int(self.max_indicators or 0)
+        if max_indicators <= 0:
+            max_indicators = len(self.mixer.available_indicators)
+        self.max_indicators = max(
+            2, min(max_indicators, len(self.mixer.available_indicators))
+        )
 
     def _validate_gene(self, gene: TALibStrategyGene) -> TALibStrategyGene | None:
         """
@@ -203,15 +222,22 @@ class GeneticStrategyExpert(ExpertModel):
 
     def predict_proba(self, x: pd.DataFrame, metadata: pd.DataFrame | None = None) -> np.ndarray:
         n = len(x)
-        if not self.portfolio or metadata is None:
-            raise RuntimeError("Genetic model not initialized with portfolio or metadata")
+        neutral = np.full((n, 3), 1.0 / 3.0, dtype=float)
+        if not self.portfolio:
+            return neutral
+        source = metadata if metadata is not None else x
+        if source is None or not isinstance(source, pd.DataFrame):
+            return neutral
+        required = {"open", "high", "low", "close"}
+        if not required.issubset({str(c).lower() for c in source.columns}):
+            return neutral
 
         try:
             # Vote across portfolio
             total_vote = np.zeros(n, dtype=float)
 
             for gene in self.portfolio:
-                signals = self.mixer.compute_signals(metadata, gene)
+                signals = self.mixer.compute_signals(source, gene)
                 signals = signals.reindex(x.index).fillna(0).values
                 total_vote += signals
 
