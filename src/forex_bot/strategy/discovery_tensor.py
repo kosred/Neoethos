@@ -207,6 +207,106 @@ def _resolve_sl_tp(
     return float(sl_pips), float(tp_pips)
 
 
+def _gene_key(gene: TALibStrategyGene) -> str:
+    sid = str(getattr(gene, "strategy_id", "") or "").strip()
+    if sid:
+        return f"id:{sid}"
+    return (
+        f"sig:{tuple(gene.indicators)}|{gene.combination_method}|"
+        f"{float(gene.long_threshold):.6f}|{float(gene.short_threshold):.6f}"
+    )
+
+
+def _dedupe_ranked(genes: list[TALibStrategyGene]) -> list[TALibStrategyGene]:
+    out: list[TALibStrategyGene] = []
+    seen: set[str] = set()
+    for gene in sorted(
+        genes,
+        key=lambda g: (
+            float(getattr(g, "fitness", 0.0) or 0.0),
+            float(getattr(g, "sharpe_ratio", 0.0) or 0.0),
+            float(getattr(g, "win_rate", 0.0) or 0.0),
+        ),
+        reverse=True,
+    ):
+        key = _gene_key(gene)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(gene)
+    return out
+
+
+def _strategy_keep_limits(settings: Any | None, default_cap: int) -> tuple[float, float, float, int, int]:
+    try:
+        risk_dd = getattr(settings.risk, "total_drawdown_limit", 0.07) if settings is not None else 0.07
+        keep_max_dd = float(
+            os.environ.get(
+                "FOREX_BOT_DISCOVERY_KEEP_MAX_DD",
+                risk_dd,
+            )
+            or 0.07
+        )
+    except Exception:
+        keep_max_dd = 0.07
+    keep_max_dd = float(min(1.0, max(0.0, keep_max_dd)))
+
+    try:
+        keep_min_profit = float(os.environ.get("FOREX_BOT_DISCOVERY_KEEP_MIN_PROFIT", "0.0") or 0.0)
+    except Exception:
+        keep_min_profit = 0.0
+
+    try:
+        keep_min_trades = float(os.environ.get("FOREX_BOT_DISCOVERY_KEEP_MIN_TRADES", "1.0") or 1.0)
+    except Exception:
+        keep_min_trades = 1.0
+    keep_min_trades = float(max(0.0, keep_min_trades))
+
+    try:
+        keep_min_count = int(os.environ.get("FOREX_BOT_DISCOVERY_KEEP_MIN_COUNT", "100") or 100)
+    except Exception:
+        keep_min_count = 100
+    keep_min_count = max(0, keep_min_count)
+
+    fallback_cap = max(1, int(default_cap or 1))
+    try:
+        keep_cap = int(os.environ.get("FOREX_BOT_DISCOVERY_PORTFOLIO", str(fallback_cap)) or fallback_cap)
+    except Exception:
+        keep_cap = fallback_cap
+    keep_cap = max(1, keep_cap)
+    if keep_min_count > keep_cap:
+        keep_min_count = keep_cap
+
+    return keep_max_dd, keep_min_profit, keep_min_trades, keep_min_count, keep_cap
+
+
+def _select_ranked(
+    candidates: list[TALibStrategyGene],
+    *,
+    filtered: list[TALibStrategyGene],
+    min_keep: int,
+    cap: int,
+) -> tuple[list[TALibStrategyGene], int, int]:
+    ranked_all = _dedupe_ranked(candidates)
+    ranked_filtered = _dedupe_ranked(filtered) if filtered else []
+    selected = list(ranked_filtered)
+    if min_keep > 0 and len(selected) < min_keep:
+        seen = {_gene_key(g) for g in selected}
+        for gene in ranked_all:
+            key = _gene_key(gene)
+            if key in seen:
+                continue
+            selected.append(gene)
+            seen.add(key)
+            if len(selected) >= min_keep:
+                break
+    if not selected:
+        selected = ranked_all
+    if cap > 0:
+        selected = selected[:cap]
+    return selected, len(ranked_filtered), len(ranked_all)
+
+
 class TensorDiscoveryEngine:
     def __init__(
         self,
@@ -277,7 +377,17 @@ class TensorDiscoveryEngine:
                 default_pop = max(8, min(100, iter_budget))
                 default_gens = max(1, min(5, (iter_budget + 19) // 20))
                 default_candidates = max(10, min(200, default_pop * 2))
-                default_portfolio = max(5, min(100, default_pop))
+                default_portfolio = 3000
+                if self.settings is not None:
+                    try:
+                        default_portfolio = int(
+                            getattr(self.settings.models, "prop_search_portfolio_size", default_portfolio)
+                            or default_portfolio
+                        )
+                    except Exception:
+                        default_portfolio = 3000
+                default_portfolio = max(100, default_portfolio)
+                default_candidates = max(default_candidates, min(10_000, max(100, default_portfolio // 2)))
 
                 result = _fb.search_discovery_ohlcv(
                     open_,
@@ -309,35 +419,10 @@ class TensorDiscoveryEngine:
                 if not best:
                     raise RuntimeError("Rust discovery produced no usable genes")
 
-                try:
-                    keep_max_dd = float(
-                        os.environ.get(
-                            "FOREX_BOT_DISCOVERY_KEEP_MAX_DD",
-                            getattr(self.settings.risk, "total_drawdown_limit", 0.07),
-                        )
-                        or 0.07
-                    )
-                except Exception:
-                    keep_max_dd = 0.07
-                keep_max_dd = float(min(1.0, max(0.0, keep_max_dd)))
-                try:
-                    keep_min_profit = float(
-                        os.environ.get("FOREX_BOT_DISCOVERY_KEEP_MIN_PROFIT", "0.0") or 0.0
-                    )
-                except Exception:
-                    keep_min_profit = 0.0
-                try:
-                    keep_min_trades = float(
-                        os.environ.get("FOREX_BOT_DISCOVERY_KEEP_MIN_TRADES", "1.0") or 1.0
-                    )
-                except Exception:
-                    keep_min_trades = 1.0
-                keep_min_trades = float(max(0.0, keep_min_trades))
-                try:
-                    keep_cap = int(os.environ.get("FOREX_BOT_DISCOVERY_PORTFOLIO", "50") or 50)
-                except Exception:
-                    keep_cap = 50
-                keep_cap = max(1, keep_cap)
+                keep_max_dd, keep_min_profit, keep_min_trades, keep_min_count, keep_cap = _strategy_keep_limits(
+                    self.settings,
+                    default_cap=default_portfolio,
+                )
 
                 filtered = [
                     g
@@ -346,15 +431,12 @@ class TensorDiscoveryEngine:
                     and float(getattr(g, "max_dd_pct", 0.0) or 0.0) <= keep_max_dd
                     and float(getattr(g, "trades", 0.0) or 0.0) >= keep_min_trades
                 ]
-                selected = filtered if filtered else best
-                selected.sort(
-                    key=lambda g: (
-                        float(getattr(g, "fitness", 0.0) or 0.0),
-                        float(getattr(g, "sharpe_ratio", 0.0) or 0.0),
-                    ),
-                    reverse=True,
+                selected, strict_kept, ranked_total = _select_ranked(
+                    best,
+                    filtered=filtered,
+                    min_keep=keep_min_count,
+                    cap=keep_cap,
                 )
-                selected = selected[: max(1, min(keep_cap, len(selected)))]
 
                 payload = {
                     "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -370,9 +452,12 @@ class TensorDiscoveryEngine:
                 out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
                 self._last_payload = payload
                 logger.info(
-                    "Discovery (Rust): kept %s/%s genes (profit>%.3f, max_dd<=%.3f, trades>=%.0f). Wrote %s",
+                    "Discovery (Rust): kept %s/%s genes (strict=%s, min_keep=%s) "
+                    "(profit>%.3f, max_dd<=%.3f, trades>=%.0f). Wrote %s",
                     len(selected),
-                    len(best),
+                    ranked_total,
+                    strict_kept,
+                    keep_min_count,
                     keep_min_profit,
                     keep_max_dd,
                     keep_min_trades,
@@ -417,31 +502,18 @@ class TensorDiscoveryEngine:
         open_ = df["open"].to_numpy(dtype=np.float64) if "open" in df.columns else close
         atr_vals = df["atr"].to_numpy(dtype=np.float64) if "atr" in df.columns else None
         month_idx, day_idx = _safe_indices(df.index, len(df))
-        try:
-            keep_max_dd = float(
-                os.environ.get(
-                    "FOREX_BOT_DISCOVERY_KEEP_MAX_DD",
-                    getattr(self.settings.risk, "total_drawdown_limit", 0.07),
+        default_cap = 3000
+        if self.settings is not None:
+            try:
+                default_cap = int(
+                    getattr(self.settings.models, "prop_search_portfolio_size", default_cap) or default_cap
                 )
-                or 0.07
-            )
-        except Exception:
-            keep_max_dd = 0.07
-        keep_max_dd = float(min(1.0, max(0.0, keep_max_dd)))
-        try:
-            keep_min_profit = float(os.environ.get("FOREX_BOT_DISCOVERY_KEEP_MIN_PROFIT", "0.0") or 0.0)
-        except Exception:
-            keep_min_profit = 0.0
-        try:
-            keep_min_trades = float(os.environ.get("FOREX_BOT_DISCOVERY_KEEP_MIN_TRADES", "1.0") or 1.0)
-        except Exception:
-            keep_min_trades = 1.0
-        keep_min_trades = float(max(0.0, keep_min_trades))
-        try:
-            keep_cap = int(os.environ.get("FOREX_BOT_DISCOVERY_PORTFOLIO", "50") or 50)
-        except Exception:
-            keep_cap = 50
-        keep_cap = max(1, keep_cap)
+            except Exception:
+                default_cap = 3000
+        keep_max_dd, keep_min_profit, keep_min_trades, keep_min_count, keep_cap = _strategy_keep_limits(
+            self.settings,
+            default_cap=default_cap,
+        )
 
         scored: list[tuple[float, TALibStrategyGene]] = []
         for gene in genes:
@@ -498,8 +570,12 @@ class TensorDiscoveryEngine:
             and float(getattr(g, "max_dd_pct", 0.0) or 0.0) <= keep_max_dd
             and float(getattr(g, "trades", 0.0) or 0.0) >= keep_min_trades
         ]
-        selected = filtered if filtered else merged
-        best = selected[: max(1, min(keep_cap, len(selected)))]
+        best, strict_kept, ranked_total = _select_ranked(
+            merged,
+            filtered=filtered,
+            min_keep=keep_min_count,
+            cap=keep_cap,
+        )
 
         payload = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -514,9 +590,12 @@ class TensorDiscoveryEngine:
         out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         self._last_payload = payload
         logger.info(
-            "Discovery: kept %s/%s genes (profit>%.3f, max_dd<=%.3f, trades>=%.0f). Wrote %s",
+            "Discovery: kept %s/%s genes (strict=%s, min_keep=%s) "
+            "(profit>%.3f, max_dd<=%.3f, trades>=%.0f). Wrote %s",
             len(best),
-            len(merged),
+            ranked_total,
+            strict_kept,
+            keep_min_count,
             keep_min_profit,
             keep_max_dd,
             keep_min_trades,

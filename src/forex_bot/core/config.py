@@ -195,7 +195,9 @@ class ModelsConfig(BaseModel):
     prop_search_max_hours: float = 2.0
     prop_search_max_rows: int = 0
     prop_search_max_rows_by_tf: dict[str, int] = Field(default_factory=dict)
-    prop_search_portfolio_size: int = 3000
+    prop_search_portfolio_size: int = 5000
+    # 0 = allow full indicator set (no hard cap)
+    prop_search_max_indicators: int = 0
     prop_search_checkpoint: str = "models/strategy_evo_checkpoint.json"
     prop_search_device: str = "cpu"
     prop_search_train_years: int = 0

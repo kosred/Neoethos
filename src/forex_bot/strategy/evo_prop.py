@@ -258,7 +258,7 @@ def _evaluate_gene(
         return 0.0
 
 
-def _strategy_keep_limits(settings: Any) -> tuple[float, float, float, int]:
+def _strategy_keep_limits(settings: Any) -> tuple[float, float, float, int, int]:
     try:
         max_dd = float(
             os.environ.get(
@@ -283,6 +283,12 @@ def _strategy_keep_limits(settings: Any) -> tuple[float, float, float, int]:
     min_trades = float(max(0.0, min_trades))
 
     try:
+        min_keep = int(os.environ.get("FOREX_BOT_PROP_KEEP_MIN_COUNT", "100") or 100)
+    except Exception:
+        min_keep = 100
+    min_keep = max(0, min_keep)
+
+    try:
         portfolio_cap = int(
             os.environ.get(
                 "FOREX_BOT_PROP_KEEP_CAP",
@@ -294,7 +300,9 @@ def _strategy_keep_limits(settings: Any) -> tuple[float, float, float, int]:
         portfolio_cap = 3000
     if portfolio_cap < 0:
         portfolio_cap = 0
-    return max_dd, min_profit, min_trades, portfolio_cap
+    if portfolio_cap > 0 and min_keep > portfolio_cap:
+        min_keep = portfolio_cap
+    return max_dd, min_profit, min_trades, min_keep, portfolio_cap
 
 
 def _strategy_passes_filter(
@@ -339,19 +347,49 @@ def _dedupe_ranked(genes: list[TALibStrategyGene]) -> list[TALibStrategyGene]:
         ),
         reverse=True,
     ):
-        sid = str(getattr(gene, "strategy_id", "") or "").strip()
-        if sid:
-            key = f"id:{sid}"
-        else:
-            key = (
-                f"sig:{tuple(gene.indicators)}|{gene.combination_method}|"
-                f"{float(gene.long_threshold):.6f}|{float(gene.short_threshold):.6f}"
-            )
+        key = _gene_key(gene)
         if key in seen:
             continue
         seen.add(key)
         out.append(gene)
     return out
+
+
+def _gene_key(gene: TALibStrategyGene) -> str:
+    sid = str(getattr(gene, "strategy_id", "") or "").strip()
+    if sid:
+        return f"id:{sid}"
+    return (
+        f"sig:{tuple(gene.indicators)}|{gene.combination_method}|"
+        f"{float(gene.long_threshold):.6f}|{float(gene.short_threshold):.6f}"
+    )
+
+
+def _select_ranked(
+    candidates: list[TALibStrategyGene],
+    *,
+    filtered: list[TALibStrategyGene],
+    min_keep: int,
+    cap: int,
+) -> tuple[list[TALibStrategyGene], int, int]:
+    ranked_all = _dedupe_ranked(candidates)
+    ranked_filtered = _dedupe_ranked(filtered) if filtered else []
+    selected = list(ranked_filtered)
+    if min_keep > 0 and len(selected) < min_keep:
+        seen = {_gene_key(g) for g in selected}
+        for gene in ranked_all:
+            key = _gene_key(gene)
+            if key in seen:
+                continue
+            selected.append(gene)
+            seen.add(key)
+            if len(selected) >= min_keep:
+                break
+    if not selected:
+        selected = ranked_all
+    if cap > 0:
+        selected = selected[:cap]
+    return selected, len(ranked_filtered), len(ranked_all)
 
 
 def run_evo_search(
@@ -369,7 +407,7 @@ def run_evo_search(
     _ = max_workers
     if df is None or df.empty:
         return
-    max_dd, min_profit, min_trades, portfolio_cap = _strategy_keep_limits(settings)
+    max_dd, min_profit, min_trades, min_keep, portfolio_cap = _strategy_keep_limits(settings)
     symbol = str(df.attrs.get("symbol", "") or "")
     timeframe = str(df.attrs.get("timeframe", df.attrs.get("tf", "")) or "")
     if _RUST_SEARCH and _fb is not None:
@@ -436,10 +474,12 @@ def run_evo_search(
                     min_trades=min_trades,
                 )
             ]
-            selected = filtered if filtered else best
-            selected = _dedupe_ranked(selected)
-            if portfolio_cap > 0:
-                selected = selected[:portfolio_cap]
+            selected, strict_kept, ranked_total = _select_ranked(
+                best,
+                filtered=filtered,
+                min_keep=min_keep,
+                cap=portfolio_cap,
+            )
 
             payload = {
                 "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -459,9 +499,12 @@ def run_evo_search(
                 out = cache_dir / f"talib_knowledge_{safe}.json"
             out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             logger.info(
-                "Prop search (Rust): kept %s/%s genes for %s %s (profit>%.3f, max_dd<=%.3f, trades>=%.0f). Wrote %s",
+                "Prop search (Rust): kept %s/%s genes (strict=%s, min_keep=%s) for %s %s "
+                "(profit>%.3f, max_dd<=%.3f, trades>=%.0f). Wrote %s",
                 len(selected),
-                len(best),
+                ranked_total,
+                strict_kept,
+                min_keep,
                 symbol or "?",
                 timeframe or "?",
                 min_profit,
@@ -527,9 +570,12 @@ def run_evo_search(
         if max_hours > 0 and (time.time() - start) > max_hours * 3600.0:
             break
 
-    selected = _dedupe_ranked(accepted if accepted else best)
-    if portfolio_cap > 0:
-        selected = selected[:portfolio_cap]
+    selected, strict_kept, ranked_total = _select_ranked(
+        accepted + best,
+        filtered=accepted,
+        min_keep=min_keep,
+        cap=portfolio_cap,
+    )
 
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -549,8 +595,12 @@ def run_evo_search(
         out = cache_dir / f"talib_knowledge_{safe}.json"
     out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     logger.info(
-        "Prop search: kept %s genes for %s %s (profit>%.3f, max_dd<=%.3f, trades>=%.0f). Wrote %s",
+        "Prop search: kept %s/%s genes (strict=%s, min_keep=%s) for %s %s "
+        "(profit>%.3f, max_dd<=%.3f, trades>=%.0f). Wrote %s",
         len(selected),
+        ranked_total,
+        strict_kept,
+        min_keep,
         symbol or "?",
         timeframe or "?",
         min_profit,

@@ -380,7 +380,7 @@ class TrainingService:
         existing.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         return existing
 
-    def _load_prop_best_genes(self, symbol: str, max_genes: int = 24):
+    def _load_prop_best_genes(self, symbol: str, max_genes: int = 100):
         try:
             from ..features.talib_mixer import TALIB_AVAILABLE, TALibStrategyGene, TALibStrategyMixer
         except Exception as exc:
@@ -396,6 +396,13 @@ class TrainingService:
         except Exception:
             max_genes = int(max_genes)
         max_genes = max(1, max_genes)
+        try:
+            min_genes = int(os.environ.get("FOREX_BOT_PROP_BASE_SIGNAL_MIN_GENES", "100") or 100)
+        except Exception:
+            min_genes = 100
+        min_genes = max(0, min_genes)
+        if min_genes > max_genes:
+            min_genes = max_genes
 
         candidates = self._prop_gene_artifact_paths(symbol)
         if not candidates:
@@ -449,6 +456,30 @@ class TrainingService:
             if trades < keep_min_trades:
                 return False
             return True
+
+        def _gene_key(gene: TALibStrategyGene) -> str:
+            sid = str(getattr(gene, "strategy_id", "") or "").strip()
+            if sid:
+                return f"id:{sid}"
+            return (
+                f"sig:{tuple(gene.indicators)}|{gene.combination_method}|"
+                f"{float(gene.long_threshold):.6f}|{float(gene.short_threshold):.6f}"
+            )
+
+        def _top_up(base: list[TALibStrategyGene]) -> list[TALibStrategyGene]:
+            if len(base) >= min_genes:
+                return base[:max_genes]
+            seen = {_gene_key(g) for g in base}
+            out = list(base)
+            for gene in merged:
+                key = _gene_key(gene)
+                if key in seen:
+                    continue
+                out.append(gene)
+                seen.add(key)
+                if len(out) >= min_genes or len(out) >= max_genes:
+                    break
+            return out[:max_genes]
 
         all_parsed: list[TALibStrategyGene] = []
         parsed_by_file: list[tuple[Path, int]] = []
@@ -556,14 +587,23 @@ class TrainingService:
         filtered = [g for g in merged if _passes(g)]
 
         if filtered:
-            chosen = filtered[:max_genes]
+            chosen = _top_up(filtered[:max_genes])
+            if len(chosen) < min_genes:
+                logger.warning(
+                    "[STRATEGY DISCOVERY] %s: requested min_genes=%s but only %s strategies available after merge.",
+                    symbol,
+                    min_genes,
+                    len(chosen),
+                )
         else:
             profitable = [g for g in merged if float(getattr(g, "fitness", 0.0) or 0.0) > 0.0]
             chosen = (profitable if profitable else merged)[:max_genes]
+            chosen = _top_up(chosen)
             logger.warning(
-                "[STRATEGY DISCOVERY] %s: strict strategy filter kept none; fallback to top-%s by fitness.",
+                "[STRATEGY DISCOVERY] %s: strict strategy filter kept none; fallback to top-%s by fitness (min_genes=%s).",
                 symbol,
                 len(chosen),
+                min_genes,
             )
 
         sources = ", ".join(f"{p.name}:{n}" for p, n in parsed_by_file[:6])
@@ -571,7 +611,7 @@ class TrainingService:
             sources += ", ..."
         logger.info(
             "[STRATEGY DISCOVERY] %s: loaded %s genes from %s files (merged=%s, filtered=%s, selected=%s). "
-            "Filters: profit>%.3f, max_dd<=%.3f, trades>=%.0f. Sources: %s",
+            "Filters: profit>%.3f, max_dd<=%.3f, trades>=%.0f, min_genes=%s. Sources: %s",
             symbol,
             sum(n for _, n in parsed_by_file),
             len(parsed_by_file),
@@ -581,11 +621,10 @@ class TrainingService:
             keep_min_profit,
             keep_max_dd,
             keep_min_trades,
+            min_genes,
             sources or "none",
         )
         return chosen
-
-        return []
 
     def _apply_prop_discovered_base_signal(
         self,
@@ -599,7 +638,7 @@ class TrainingService:
         if dataset.X.empty:
             return dataset
 
-        genes = self._load_prop_best_genes(symbol=symbol, max_genes=24)
+        genes = self._load_prop_best_genes(symbol=symbol, max_genes=100)
         if not genes:
             return dataset
 
