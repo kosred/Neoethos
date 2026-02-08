@@ -1,6 +1,7 @@
 import json
 import logging
 import shutil
+import contextlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -115,10 +116,19 @@ class PersistenceService:
             return {}, None
 
         prefer_gpu = self._prefer_gpu()
+        try:
+            from .model_factory import ModelFactory
+
+            factory = ModelFactory(self.settings, self.models_dir) if self.settings is not None else None
+        except Exception:
+            factory = None
         
         import concurrent.futures
-        
-        def _load_single(name):
+
+        def _instantiate(name: str, idx: int):
+            if factory is not None:
+                with contextlib.suppress(Exception):
+                    return factory.create_model(name, {}, idx)
             candidates = []
             try:
                 candidates.append(get_model_class(name, prefer_gpu=prefer_gpu))
@@ -133,15 +143,26 @@ class PersistenceService:
                 
             for cls in unique_classes:
                 try:
-                    m = cls()
-                    m.load(str(self.models_dir))
-                    return name, m
+                    return cls()
                 except Exception: continue
-            return name, None
+            return None
+
+        def _load_single(item):
+            idx, name = item
+            model = _instantiate(name, idx)
+            if model is None:
+                return name, None
+            try:
+                model.load(str(self.models_dir))
+                return name, model
+            except Exception:
+                return name, None
 
         # HPC: Load all models in parallel threads
-        with concurrent.futures.ThreadPoolExecutor(max_workers=resolve_cpu_budget()) as executor:
-            results = list(executor.map(_load_single, active))
+        items: list[tuple[int, str]] = [(i, str(name)) for i, name in enumerate(list(active), start=1)]
+        max_workers = max(1, min(resolve_cpu_budget(), len(items) if items else 1))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = list(executor.map(_load_single, items))
             
         for name, model in results:
             if model:

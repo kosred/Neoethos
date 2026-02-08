@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import os
@@ -138,6 +139,101 @@ class ModelTrainer:
             logger.info(f"Distributed initialized: rank {self.rank}/{self.world_size - 1}")
         except Exception as exc:
             logger.warning(f"Failed to initialize distributed; falling back to single process: {exc}")
+
+    @staticmethod
+    def _strict_model_check_enabled() -> bool:
+        raw = str(os.environ.get("FOREX_BOT_STRICT_MODEL_CHECK", "1") or "1").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _roundtrip_check_enabled() -> bool:
+        raw = str(os.environ.get("FOREX_BOT_MODEL_ROUNDTRIP", "1") or "1").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _fit_accepts_metadata(model: ExpertModel) -> bool:
+        try:
+            sig = inspect.signature(model.fit)
+            if "metadata" in sig.parameters:
+                return True
+            return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _predict_kwargs(model: ExpertModel, metadata: pd.DataFrame | None) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {}
+        if metadata is None:
+            return kwargs
+        try:
+            sig = inspect.signature(model.predict_proba)
+            has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            if "metadata" in sig.parameters or has_kwargs:
+                kwargs["metadata"] = metadata
+        except Exception:
+            pass
+        return kwargs
+
+    def _smoke_predict(
+        self,
+        *,
+        model_name: str,
+        model: ExpertModel,
+        sample_x: pd.DataFrame,
+        sample_meta: pd.DataFrame | None = None,
+    ) -> tuple[bool, str]:
+        if sample_x is None or len(sample_x) == 0:
+            return False, "empty sample for smoke test"
+        try:
+            kwargs = self._predict_kwargs(model, sample_meta)
+            probs = self._pad_probs(model.predict_proba(sample_x, **kwargs))
+        except Exception as exc:
+            return False, f"inference exception: {exc}"
+        if probs.ndim != 2:
+            return False, f"invalid probability rank: {probs.ndim}"
+        if probs.shape[0] != len(sample_x):
+            return False, f"row mismatch: got {probs.shape[0]} expected {len(sample_x)}"
+        if probs.shape[1] < 2:
+            return False, f"invalid probability width: {probs.shape[1]}"
+        if not np.all(np.isfinite(probs)):
+            return False, "non-finite probabilities detected"
+        return True, f"{model_name} smoke check ok"
+
+    def _roundtrip_smoke_check(
+        self,
+        *,
+        model_name: str,
+        idx: int,
+        model: ExpertModel,
+        sample_x: pd.DataFrame,
+        sample_meta: pd.DataFrame | None = None,
+    ) -> tuple[bool, str]:
+        if not self._roundtrip_check_enabled():
+            return True, "roundtrip disabled"
+        stamp = f"{int(time.time() * 1_000_000)}_{os.getpid()}"
+        tmp_dir = self.models_dir / "_healthcheck" / f"{model_name}_{idx}_{stamp}"
+        try:
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            model.save(str(tmp_dir))
+            probe_factory = ModelFactory(self.settings, tmp_dir)
+            reloaded = probe_factory.create_model(model_name, {}, idx)
+            if not hasattr(reloaded, "load"):
+                return False, "reloaded model has no load()"
+            reloaded.load(str(tmp_dir))
+            ok, reason = self._smoke_predict(
+                model_name=model_name,
+                model=reloaded,
+                sample_x=sample_x,
+                sample_meta=sample_meta,
+            )
+            if not ok:
+                return False, f"roundtrip inference failed: {reason}"
+            return True, "roundtrip smoke check ok"
+        except Exception as exc:
+            return False, f"roundtrip exception: {exc}"
+        finally:
+            with contextlib.suppress(Exception):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
             self.distributed_enabled = False
             self.rank = 0
             self.world_size = 1
@@ -1206,44 +1302,44 @@ class ModelTrainer:
                     # Fit logic (simplified here, assume factory configured it well)
                     fit_kwargs = {}
                     if hasattr(model, "fit"):
-                        # Inspect if writer needed
-                        import inspect
-
-                        sig = inspect.signature(model.fit)
-                        has_kwargs = any(
-                            p.kind == inspect.Parameter.VAR_KEYWORD
-                            for p in sig.parameters.values()  # noqa: B023
-                        )
-                        if "tensorboard_writer" in sig.parameters:
-                            fit_kwargs["tensorboard_writer"] = writer
-                        if meta_fit_models is not None and ("metadata" in sig.parameters or has_kwargs):
+                        with contextlib.suppress(Exception):
+                            sig = inspect.signature(model.fit)
+                            if "tensorboard_writer" in sig.parameters:
+                                fit_kwargs["tensorboard_writer"] = writer
+                        if meta_fit_models is not None and self._fit_accepts_metadata(model):
                             fit_kwargs["metadata"] = meta_fit_models
 
                         model.fit(X_fit, y_fit, **fit_kwargs)
 
                 # Only persist models that can actually predict (prevents "active but unusable" artifacts).
-                try:
-                    import inspect
-
-                    pred_kwargs = {}
-                    try:
-                        psig = inspect.signature(model.predict_proba)
-                        has_kwargs = any(
-                            p.kind == inspect.Parameter.VAR_KEYWORD
-                            for p in psig.parameters.values()  # noqa: B023
-                        )
-                        if meta_fit_models is not None and ("metadata" in psig.parameters or has_kwargs):
-                            pred_kwargs["metadata"] = meta_fit_models
-                    except Exception:
-                        pass
-
-                    sample = X_fit.iloc[: min(256, len(X_fit))]
-                    if len(sample) == 0:
-                        raise RuntimeError("No samples available for post-fit check")
-                    _ = self._pad_probs(model.predict_proba(sample, **pred_kwargs))
-                except Exception as exc:
-                    logger.warning(f"{name} trained but is not usable for inference: {exc}")
+                sample = X_fit.iloc[: min(256, len(X_fit))]
+                sample_meta = None
+                if meta_fit_models is not None and isinstance(meta_fit_models, pd.DataFrame):
+                    with contextlib.suppress(Exception):
+                        sample_meta = meta_fit_models.reindex(sample.index)
+                ok, reason = self._smoke_predict(
+                    model_name=name,
+                    model=model,
+                    sample_x=sample,
+                    sample_meta=sample_meta,
+                )
+                if not ok:
+                    logger.warning(f"{name} trained but is not usable for inference: {reason}")
+                    self.run_summary.setdefault("model_health_failures", {})[name] = reason
                     continue
+
+                if self._strict_model_check_enabled():
+                    rt_ok, rt_reason = self._roundtrip_smoke_check(
+                        model_name=name,
+                        idx=idx,
+                        model=model,
+                        sample_x=sample,
+                        sample_meta=sample_meta,
+                    )
+                    if not rt_ok:
+                        logger.warning("%s failed save/load roundtrip check: %s", name, rt_reason)
+                        self.run_summary.setdefault("model_health_failures", {})[name] = rt_reason
+                        continue
 
                 self.models[name] = model
                 model.save(str(self.models_dir))
@@ -1554,10 +1650,7 @@ class ModelTrainer:
                     fit_kwargs = {}
                     # Inspect signature...
                     if hasattr(model, "fit"):
-                        import inspect
-
-                        sig = inspect.signature(model.fit)
-                        if "metadata" in sig.parameters:
+                        if self._fit_accepts_metadata(model):
                             fit_kwargs["metadata"] = dataset.metadata
                         t0 = time.perf_counter()
                         model.fit(X, y, **fit_kwargs)
@@ -1571,6 +1664,34 @@ class ModelTrainer:
                             "device": str(getattr(self.settings.system, "device", "cpu")),
                         }
                         self.persistence.save_incremental_stats(self.incremental_stats)
+
+                sample = X.iloc[: min(256, len(X))]
+                sample_meta = None
+                if dataset.metadata is not None and isinstance(dataset.metadata, pd.DataFrame):
+                    with contextlib.suppress(Exception):
+                        sample_meta = dataset.metadata.reindex(sample.index)
+                ok, reason = self._smoke_predict(
+                    model_name=name,
+                    model=model,
+                    sample_x=sample,
+                    sample_meta=sample_meta,
+                )
+                if not ok:
+                    logger.warning("Inc train %s failed inference smoke check: %s", name, reason)
+                    self.run_summary.setdefault("model_health_failures", {})[name] = reason
+                    continue
+                if self._strict_model_check_enabled():
+                    rt_ok, rt_reason = self._roundtrip_smoke_check(
+                        model_name=name,
+                        idx=idx,
+                        model=model,
+                        sample_x=sample,
+                        sample_meta=sample_meta,
+                    )
+                    if not rt_ok:
+                        logger.warning("Inc train %s failed roundtrip check: %s", name, rt_reason)
+                        self.run_summary.setdefault("model_health_failures", {})[name] = rt_reason
+                        continue
 
                 model.save(str(self.models_dir))
             except Exception as e:

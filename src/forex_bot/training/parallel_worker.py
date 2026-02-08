@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import inspect
 import json
 import logging
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -13,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 from ..core.config import Settings
-from ..core.system import AutoTuner, HardwareProbe, thread_limits
+from ..core.system import AutoTuner, HardwareProbe, resolve_cpu_budget, thread_limits
 from .model_factory import ModelFactory
 from .optimization import HyperparameterOptimizer
 
@@ -73,11 +76,122 @@ def _pad_probs(p: Any) -> np.ndarray:
     return arr[:, :3].astype(np.float32, copy=False)
 
 
+def _strict_model_check_enabled() -> bool:
+    raw = str(os.environ.get("FOREX_BOT_STRICT_MODEL_CHECK", "1") or "1").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _roundtrip_check_enabled() -> bool:
+    raw = str(os.environ.get("FOREX_BOT_MODEL_ROUNDTRIP", "1") or "1").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _fit_accepts_metadata(model: Any) -> bool:
+    try:
+        sig = inspect.signature(model.fit)
+        if "metadata" in sig.parameters:
+            return True
+        return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    except Exception:
+        return False
+
+
+def _predict_kwargs(model: Any, metadata: pd.DataFrame | None) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    if metadata is None:
+        return kwargs
+    try:
+        sig = inspect.signature(model.predict_proba)
+        has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        if "metadata" in sig.parameters or has_kwargs:
+            kwargs["metadata"] = metadata
+    except Exception:
+        pass
+    return kwargs
+
+
+def _smoke_predict(
+    model: Any,
+    sample_x: pd.DataFrame,
+    sample_meta: pd.DataFrame | None,
+) -> tuple[bool, str]:
+    if sample_x is None or len(sample_x) == 0:
+        return False, "empty sample"
+    try:
+        probs = _pad_probs(model.predict_proba(sample_x, **_predict_kwargs(model, sample_meta)))
+    except Exception as exc:
+        return False, f"inference exception: {exc}"
+    if probs.ndim != 2:
+        return False, f"invalid output rank: {probs.ndim}"
+    if probs.shape[0] != len(sample_x):
+        return False, f"row mismatch: got {probs.shape[0]} expected {len(sample_x)}"
+    if probs.shape[1] < 2:
+        return False, f"invalid output width: {probs.shape[1]}"
+    if not np.all(np.isfinite(probs)):
+        return False, "non-finite probabilities"
+    return True, "ok"
+
+
+def _roundtrip_smoke_check(
+    *,
+    settings: Settings,
+    model_name: str,
+    best_params: dict[str, Any],
+    idx: int,
+    model: Any,
+    sample_x: pd.DataFrame,
+    sample_meta: pd.DataFrame | None,
+    out_dir: Path,
+) -> tuple[bool, str]:
+    if not _roundtrip_check_enabled():
+        return True, "roundtrip disabled"
+    stamp = f"{int(time.time() * 1_000_000)}_{os.getpid()}"
+    tmp_dir = out_dir / "_healthcheck" / f"{model_name}_{idx}_{stamp}"
+    try:
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        model.save(str(tmp_dir))
+        probe_factory = ModelFactory(settings, tmp_dir)
+        probe = probe_factory.create_model(model_name, best_params, idx)
+        if not hasattr(probe, "load"):
+            return False, "reloaded model has no load()"
+        probe.load(str(tmp_dir))
+        ok, reason = _smoke_predict(probe, sample_x, sample_meta)
+        if not ok:
+            return False, f"roundtrip inference failed: {reason}"
+        return True, "ok"
+    except Exception as exc:
+        return False, f"roundtrip exception: {exc}"
+    finally:
+        with contextlib.suppress(Exception):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _apply_thread_env(threads: int) -> None:
+    if threads <= 0:
+        return
+    threads = max(1, int(threads))
+    os.environ["FOREX_BOT_CPU_BUDGET"] = str(threads)
+    os.environ["FOREX_BOT_CPU_THREADS"] = str(threads)
+    os.environ["FOREX_BOT_RUST_THREADS"] = str(threads)
+    os.environ["RAYON_NUM_THREADS"] = str(threads)
+    for key in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ[key] = str(threads)
+
+
 def _train_single_model_process(args: tuple[str, str, str, int, int, int, str | None]) -> tuple[str, float, bool]:
     """Train a single model in a separate process to avoid GIL contention."""
     dataset_dir, model_name, out_dir, idx, threads_per_model, cpu_threads, metadata_path = args
     t0 = time.perf_counter()
     try:
+        thread_budget = max(1, int(threads_per_model or 1))
+        if int(cpu_threads or 0) > 0:
+            thread_budget = min(thread_budget, int(cpu_threads))
+        _apply_thread_env(thread_budget)
         settings = Settings()
         try:
             profile = HardwareProbe().detect()
@@ -100,21 +214,34 @@ def _train_single_model_process(args: tuple[str, str, str, int, int, int, str | 
         factory = ModelFactory(settings, Path(out_dir))
 
         model = factory.create_model(model_name, best_params, idx)
-        with thread_limits(blas_threads=threads_per_model):
+        with thread_limits(blas_threads=thread_budget):
             fit_kwargs = {}
-            if metadata is not None:
-                try:
-                    import inspect
-
-                    sig = inspect.signature(model.fit)
-                    has_kwargs = any(
-                        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-                    )
-                    if "metadata" in sig.parameters or has_kwargs:
-                        fit_kwargs["metadata"] = metadata
-                except Exception:
-                    pass
+            if metadata is not None and _fit_accepts_metadata(model):
+                fit_kwargs["metadata"] = metadata
             model.fit(X, y, **fit_kwargs)
+
+        sample = X.iloc[: min(256, len(X))]
+        sample_meta = None
+        if metadata is not None and isinstance(metadata, pd.DataFrame):
+            with contextlib.suppress(Exception):
+                sample_meta = metadata.reindex(sample.index)
+
+        ok, reason = _smoke_predict(model, sample, sample_meta)
+        if not ok:
+            raise RuntimeError(f"inference smoke check failed: {reason}")
+        if _strict_model_check_enabled():
+            rt_ok, rt_reason = _roundtrip_smoke_check(
+                settings=settings,
+                model_name=model_name,
+                best_params=best_params,
+                idx=idx,
+                model=model,
+                sample_x=sample,
+                sample_meta=sample_meta,
+                out_dir=Path(out_dir),
+            )
+            if not rt_ok:
+                raise RuntimeError(f"roundtrip check failed: {rt_reason}")
         model.save(str(out_dir))
         duration = time.perf_counter() - t0
         return (model_name, duration, True)
@@ -158,10 +285,14 @@ def run_worker(argv: list[str] | None = None) -> int:
     if cpu_threads <= 0:
         env_threads = os.environ.get("FOREX_BOT_CPU_THREADS") or os.environ.get("FOREX_BOT_CPU_BUDGET")
         try:
-            cpu_threads = int(env_threads) if env_threads else cpu_total
+            cpu_threads = int(env_threads) if env_threads else 0
         except Exception:
-            cpu_threads = cpu_total
+            cpu_threads = 0
+        if cpu_threads <= 0:
+            cpu_threads = resolve_cpu_budget()
         cpu_threads = max(1, min(cpu_total, cpu_threads))
+
+    _apply_thread_env(cpu_threads)
 
     durations: dict[str, float] = {}
     trained: list[str] = []
@@ -176,8 +307,8 @@ def run_worker(argv: list[str] | None = None) -> int:
         except Exception:
             metadata = None
 
-    # Parallel Model Training Within Worker (Thread-Safe)
-    # NumPy/sklearn release GIL during heavy computation, so threads work well
+    # Parallel model training within worker.
+    # Default to process pools when running >1 model to avoid GIL contention.
     max_concurrent_models = int(args.max_concurrent_models or 0)
     if max_concurrent_models <= 0:
         # Auto: scale to available threads with a minimum threads-per-model target
@@ -200,19 +331,31 @@ def run_worker(argv: list[str] | None = None) -> int:
             model = factory.create_model(name, best_params, idx)
             with thread_limits(blas_threads=threads_per_model):
                 fit_kwargs = {}
-                if metadata is not None:
-                    try:
-                        import inspect
-
-                        sig = inspect.signature(model.fit)
-                        has_kwargs = any(
-                            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-                        )
-                        if "metadata" in sig.parameters or has_kwargs:
-                            fit_kwargs["metadata"] = metadata
-                    except Exception:
-                        pass
+                if metadata is not None and _fit_accepts_metadata(model):
+                    fit_kwargs["metadata"] = metadata
                 model.fit(X, y, **fit_kwargs)
+
+            sample = X.iloc[: min(256, len(X))]
+            sample_meta = None
+            if metadata is not None and isinstance(metadata, pd.DataFrame):
+                with contextlib.suppress(Exception):
+                    sample_meta = metadata.reindex(sample.index)
+            ok, reason = _smoke_predict(model, sample, sample_meta)
+            if not ok:
+                raise RuntimeError(f"inference smoke check failed: {reason}")
+            if _strict_model_check_enabled():
+                rt_ok, rt_reason = _roundtrip_smoke_check(
+                    settings=settings,
+                    model_name=name,
+                    best_params=best_params,
+                    idx=idx,
+                    model=model,
+                    sample_x=sample,
+                    sample_meta=sample_meta,
+                    out_dir=out_dir,
+                )
+                if not rt_ok:
+                    raise RuntimeError(f"roundtrip check failed: {rt_reason}")
             model.save(str(out_dir))
             duration = time.perf_counter() - t0
             logger.info(f"[WORKER] Successfully trained {name} in {duration:.1f}s")
@@ -222,12 +365,11 @@ def run_worker(argv: list[str] | None = None) -> int:
             return (name, 0.0, False)
 
     worker_mode_raw = os.environ.get("FOREX_BOT_PARALLEL_WORKER_MODE")
-    if worker_mode_raw is None:
-        backend = str(os.environ.get("FOREX_BOT_TREE_BACKEND", "auto")).strip().lower()
-        use_process_pool = backend in {"python", "py", "0", "false", "no", "off"}
-    else:
+    if worker_mode_raw:
         worker_mode = str(worker_mode_raw).strip().lower()
         use_process_pool = worker_mode in {"process", "mp", "multiprocess"}
+    else:
+        use_process_pool = max_concurrent_models > 1
 
     if use_process_pool:
         from concurrent.futures import ProcessPoolExecutor, as_completed
