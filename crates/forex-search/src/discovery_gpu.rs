@@ -205,13 +205,13 @@ pub fn run_gpu_discovery(
     }
 
     let dim = tf_count + n_features + 2;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let normal = Normal::new(0.0, 1.0).unwrap();
 
     let mut genomes: Vec<Vec<f32>> = (0..config.population)
         .map(|_| {
             (0..dim)
-                .map(|_| rng.gen_range(-1.0..1.0))
+                .map(|_| rng.random_range(-1.0..1.0))
                 .collect::<Vec<f32>>()
         })
         .collect();
@@ -253,11 +253,11 @@ pub fn run_gpu_discovery(
 
         let mut next = elites.clone();
         while next.len() < config.population {
-            let use_cross = rng.gen_bool(config.crossover_rate);
+            let use_cross = rng.random_bool(config.crossover_rate);
             let mut child = vec![0.0_f32; dim];
             if use_cross && elites.len() >= 2 {
-                let a = &elites[rng.gen_range(0..elites.len())];
-                let b = &elites[rng.gen_range(0..elites.len())];
+                let a = &elites[rng.random_range(0..elites.len())];
+                let b = &elites[rng.random_range(0..elites.len())];
                 for i in 0..dim {
                     let base = 0.5 * (a[i] + b[i]);
                     let noise = std[i] as f64 * normal.sample(&mut rng) * config.sigma;
@@ -325,6 +325,16 @@ fn evaluate_population_multi_gpu(
     device_ids: &[i64],
 ) -> Result<Vec<f32>> {
     let mut results = vec![0.0_f32; genomes.len()];
+
+    // Keep static cubes resident per GPU to avoid repeated host->device copies per chunk.
+    let mut per_device_cubes: Vec<(Device, Tensor, Tensor)> = Vec::with_capacity(device_ids.len());
+    for &device_id in device_ids {
+        let device = Device::Cuda(device_id);
+        let data_dev = data_cube.to_device(device).to_kind(Kind::Float);
+        let ohlc_dev = ohlc_cube.to_device(device).to_kind(Kind::Float);
+        per_device_cubes.push((device, data_dev, ohlc_dev));
+    }
+
     let mut offset = 0usize;
     while offset < genomes.len() {
         let end = (offset + config.chunk_size).min(genomes.len());
@@ -339,8 +349,8 @@ fn evaluate_population_multi_gpu(
         let mut per_device = Vec::new();
         let split = split_tensor(&chunk_tensor, device_ids.len());
         for (i, part) in split.into_iter().enumerate() {
-            let device = Device::Cuda(device_ids[i]);
-            let fit = evaluate_population_gpu(data_cube, ohlc_cube, &part, config, device)?;
+            let (device, data_dev, ohlc_dev) = &per_device_cubes[i];
+            let fit = evaluate_population_gpu(data_dev, ohlc_dev, &part, config, *device)?;
             per_device.push(fit);
         }
 
@@ -393,8 +403,16 @@ fn evaluate_population_gpu(
     let n_features = data_cube.size()[2];
     let pop = genomes.size()[0];
 
-    let data = data_cube.to_device(device).to_kind(Kind::Float);
-    let ohlc = ohlc_cube.to_device(device).to_kind(Kind::Float);
+    let data = if data_cube.device() == device {
+        data_cube.shallow_clone()
+    } else {
+        data_cube.to_device(device).to_kind(Kind::Float)
+    };
+    let ohlc = if ohlc_cube.device() == device {
+        ohlc_cube.shallow_clone()
+    } else {
+        ohlc_cube.to_device(device).to_kind(Kind::Float)
+    };
     let genomes = genomes.to_device(device).to_kind(Kind::Float);
 
     let tf_weights = genomes
@@ -496,13 +514,13 @@ fn build_segments(n_samples: usize, window: usize, segments: usize) -> Vec<(usiz
     if n_samples <= window + 2 {
         return vec![(0, n_samples)];
     }
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut out = Vec::new();
     let start_recent = n_samples.saturating_sub(window + 1);
     out.push((start_recent, window));
     let segs = segments.saturating_sub(1);
     for _ in 0..segs {
-        let start = rng.gen_range(0..(n_samples - window - 1));
+        let start = rng.random_range(0..(n_samples - window - 1));
         out.push((start, window));
     }
     out
@@ -544,7 +562,7 @@ fn map_feature_columns(
     let n_rows = aligned.nrows();
     let n_cols = base_names.len();
     let mut out = ndarray::Array2::<f32>::zeros((n_rows, n_cols));
-    let mut index_map = HashMap::new();
+    let mut index_map = HashMap::with_capacity(htf_names.len());
     for (idx, name) in htf_names.iter().enumerate() {
         index_map.insert(name.as_str(), idx);
     }
@@ -623,3 +641,4 @@ fn std_vector(elites: &[Vec<f32>], mean: &[f32]) -> Vec<f32> {
     }
     out
 }
+

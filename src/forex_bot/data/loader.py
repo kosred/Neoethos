@@ -13,6 +13,23 @@ from ..core.config import Settings
 logger = logging.getLogger(__name__)
 _RUST_DATA_BACKEND_OK: bool | None = None
 _RUST_DATA_WARNED_UNAVAILABLE = False
+_OHLCV_COLUMN_ALIASES = {
+    "timestamp",
+    "time",
+    "datetime",
+    "date",
+    "o",
+    "open",
+    "h",
+    "high",
+    "l",
+    "low",
+    "c",
+    "close",
+    "v",
+    "vol",
+    "volume",
+}
 
 
 def _rust_data_backend_available(*, force_log: bool = False) -> bool:
@@ -57,17 +74,109 @@ def _timeframe_to_freq(tf: str) -> str | None:
     tf = str(tf or "").upper()
     return {
         "M1": "1min",
+        "M2": "2min",
         "M3": "3min",
+        "M4": "4min",
         "M5": "5min",
+        "M6": "6min",
+        "M10": "10min",
+        "M12": "12min",
         "M15": "15min",
+        "M20": "20min",
         "M30": "30min",
         "H1": "1H",
         "H2": "2H",
+        "H3": "3H",
         "H4": "4H",
+        "H6": "6H",
+        "H8": "8H",
+        "H12": "12H",
         "D1": "1D",
         "W1": "1W",
         "MN1": "1M",
     }.get(tf)
+
+
+def _timeframe_to_minutes(tf: str) -> int | None:
+    tf = str(tf or "").upper()
+    return {
+        "M1": 1,
+        "M2": 2,
+        "M3": 3,
+        "M4": 4,
+        "M5": 5,
+        "M6": 6,
+        "M10": 10,
+        "M12": 12,
+        "M15": 15,
+        "M20": 20,
+        "M30": 30,
+        "H1": 60,
+        "H2": 120,
+        "H3": 180,
+        "H4": 240,
+        "H6": 360,
+        "H8": 480,
+        "H12": 720,
+        "D1": 1440,
+        "W1": 10080,
+        "MN1": 43200,
+    }.get(tf)
+
+
+def _ordered_timeframes(tfs: list[str]) -> list[str]:
+    uniq = [str(tf or "").upper() for tf in tfs if str(tf or "").strip()]
+    seen: set[str] = set()
+    out: list[str] = []
+    for tf in uniq:
+        if tf in seen:
+            continue
+        seen.add(tf)
+        out.append(tf)
+
+    def _key(tf: str) -> tuple[int, str]:
+        mins = _timeframe_to_minutes(tf)
+        if mins is None:
+            return (10**9, tf)
+        return (int(mins), tf)
+
+    return sorted(out, key=_key)
+
+
+def _resample_missing_from_available(frames: dict[str, pd.DataFrame], required_tfs: list[str]) -> dict[str, pd.DataFrame]:
+    if not frames:
+        return frames
+    required = _ordered_timeframes(required_tfs)
+    if not required:
+        return frames
+
+    available = {str(k).upper(): v for k, v in frames.items() if isinstance(v, pd.DataFrame) and not v.empty}
+    if not available:
+        return frames
+
+    # Prefer the finest available frame as source for upsampling to larger bars.
+    source_order = _ordered_timeframes(list(available.keys()))
+    if not source_order:
+        return frames
+    source_tf = source_order[0]
+    source_df = available.get(source_tf)
+    if source_df is None or source_df.empty:
+        return frames
+
+    for tf in required:
+        if tf in available:
+            continue
+        resampled = _resample_ohlcv(source_df, tf)
+        if resampled is None or resampled.empty:
+            continue
+        try:
+            resampled.attrs["source"] = str(source_df.attrs.get("source", "resampled"))
+        except Exception:
+            pass
+        frames[tf] = resampled
+        available[tf] = resampled
+
+    return frames
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -131,14 +240,30 @@ def _read_frame(path: Path) -> pd.DataFrame | None:
         import polars as pl
 
         if path.suffix.lower() == ".parquet":
-            df = pl.read_parquet(path).to_pandas()
+            cols: list[str] | None = None
+            try:
+                schema = pl.scan_parquet(path).collect_schema()
+                keep = [name for name in schema.names() if str(name).lower() in _OHLCV_COLUMN_ALIASES]
+                cols = keep or None
+            except Exception:
+                cols = None
+            df = pl.read_parquet(path, columns=cols).to_pandas()
         else:
             df = pl.read_csv(path).to_pandas()
         return df
     except Exception:
         try:
             if path.suffix.lower() == ".parquet":
-                return pd.read_parquet(path)
+                cols: list[str] | None = None
+                try:
+                    import pyarrow.parquet as pq
+
+                    names = [str(n) for n in pq.ParquetFile(path).schema.names]
+                    keep = [name for name in names if str(name).lower() in _OHLCV_COLUMN_ALIASES]
+                    cols = keep or None
+                except Exception:
+                    cols = None
+                return pd.read_parquet(path, columns=cols)
             return pd.read_csv(path)
         except Exception as exc:
             logger.warning("Failed to read data file %s: %s", path, exc)
@@ -349,15 +474,30 @@ class MT5Adapter:
             import MetaTrader5 as mt5  # type: ignore
         except Exception:
             return frames
-        tf_map = {
-            "M1": mt5.TIMEFRAME_M1,
-            "M5": mt5.TIMEFRAME_M5,
-            "M15": mt5.TIMEFRAME_M15,
-            "M30": mt5.TIMEFRAME_M30,
-            "H1": mt5.TIMEFRAME_H1,
-            "H4": mt5.TIMEFRAME_H4,
-            "D1": mt5.TIMEFRAME_D1,
+        tf_const_name = {
+            "M1": "TIMEFRAME_M1",
+            "M2": "TIMEFRAME_M2",
+            "M3": "TIMEFRAME_M3",
+            "M4": "TIMEFRAME_M4",
+            "M5": "TIMEFRAME_M5",
+            "M6": "TIMEFRAME_M6",
+            "M10": "TIMEFRAME_M10",
+            "M12": "TIMEFRAME_M12",
+            "M15": "TIMEFRAME_M15",
+            "M20": "TIMEFRAME_M20",
+            "M30": "TIMEFRAME_M30",
+            "H1": "TIMEFRAME_H1",
+            "H2": "TIMEFRAME_H2",
+            "H3": "TIMEFRAME_H3",
+            "H4": "TIMEFRAME_H4",
+            "H6": "TIMEFRAME_H6",
+            "H8": "TIMEFRAME_H8",
+            "H12": "TIMEFRAME_H12",
+            "D1": "TIMEFRAME_D1",
+            "W1": "TIMEFRAME_W1",
+            "MN1": "TIMEFRAME_MN1",
         }
+        tf_map = {tf: getattr(mt5, const, None) for tf, const in tf_const_name.items()}
         for tf in timeframes:
             mt5_tf = tf_map.get(tf)
             if mt5_tf is None:
@@ -376,6 +516,8 @@ class MT5Adapter:
             except Exception:
                 pass
             frames[tf] = df
+        # Fill unavailable MT5 timeframes via deterministic resampling from available data.
+        frames = _resample_missing_from_available(frames, [str(tf).upper() for tf in timeframes])
         return frames
 
 
@@ -400,13 +542,21 @@ class DataLoader:
     def _timeframes(self) -> list[str]:
         base_tf = str(getattr(self.settings.system, "base_timeframe", "M1") or "M1")
         tfs = [base_tf]
+        use_multires = bool(getattr(self.settings.system, "multi_resolution_enabled", True))
+        if use_multires:
+            for tf in list(getattr(self.settings.system, "multi_resolution_timeframes", []) or []):
+                tfu = str(tf or "").upper()
+                if tfu and tfu not in tfs:
+                    tfs.append(tfu)
         for tf in list(getattr(self.settings.system, "required_timeframes", []) or []):
-            if tf not in tfs:
-                tfs.append(tf)
+            tfu = str(tf or "").upper()
+            if tfu and tfu not in tfs:
+                tfs.append(tfu)
         for tf in list(getattr(self.settings.system, "higher_timeframes", []) or []):
-            if tf not in tfs:
-                tfs.append(tf)
-        return tfs
+            tfu = str(tf or "").upper()
+            if tfu and tfu not in tfs:
+                tfs.append(tfu)
+        return _ordered_timeframes(tfs)
 
     def _candidate_paths(self, symbol: str, tf: str) -> list[Path]:
         paths = []
@@ -450,15 +600,7 @@ class DataLoader:
                 df = df.tail(tail)
             frames[tf] = df
         if allow_resample:
-            base_tf = str(getattr(self.settings.system, "base_timeframe", "M1") or "M1")
-            base = frames.get(base_tf)
-            if base is not None and not base.empty:
-                for tf in self._timeframes():
-                    if tf in frames:
-                        continue
-                    resampled = _resample_ohlcv(base, tf)
-                    if resampled is not None and not resampled.empty:
-                        frames[tf] = resampled
+            frames = _resample_missing_from_available(frames, self._timeframes())
         return frames
 
     def _load_frames_rust(
@@ -545,6 +687,7 @@ class DataLoader:
         if self.mt5_adapter.is_connected():
             frames = await self.mt5_adapter.get_live_frames(symbol, timeframes=tfs, tail=500)
             if frames:
+                frames = _resample_missing_from_available(frames, tfs)
                 return frames
         return self._load_frames(symbol, tail=2000)
 

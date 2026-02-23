@@ -1,15 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
+use std::ptr;
 use std::sync::OnceLock;
 
 use anyhow::{bail, Context, Result};
 use ndarray::Array2;
 use polars::prelude::*;
-use talib::common::{ta_initialize, TimePeriodKwargs};
-use talib::momentum::{ta_adx, ta_cci, ta_macd, ta_rsi, MacdKwargs};
-use talib::overlap::{ta_bbands, ta_ema, ta_sma, BBANDSKwargs};
-use talib::volatility::{ta_atr, ta_natr, ATRKwargs, NATRKwargs};
-use talib_sys::{TA_MAType, TA_MAType_TA_MAType_SMA};
+use talib_sys::*;
 
 #[derive(Debug, Clone)]
 pub struct Ohlcv {
@@ -75,11 +73,180 @@ static TALIB_INIT: OnceLock<Result<(), anyhow::Error>> = OnceLock::new();
 
 fn ensure_talib_init() -> Result<()> {
     let init = TALIB_INIT.get_or_init(|| {
-        ta_initialize().map_err(|e| anyhow::anyhow!("TA-Lib init failed: {:?}", e))
+        let rc = unsafe { TA_Initialize() };
+        if rc == TA_RetCode::TA_SUCCESS {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("TA-Lib init failed: {:?}", rc))
+        }
     });
     match init {
         Ok(_) => Ok(()),
         Err(err) => Err(anyhow::anyhow!(err.to_string())),
+    }
+}
+
+const TA_IN_PRICE_VOLUME: i32 = 0x00000010;
+const TA_IN_PRICE_OPENINTEREST: i32 = 0x00000020;
+const TA_IN_PRICE_TIMESTAMP: i32 = 0x00000040;
+
+fn normalize_name(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut underscore = false;
+    for ch in input.chars() {
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            underscore = false;
+        } else if !underscore {
+            out.push('_');
+            underscore = true;
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+unsafe fn cstr_to_string(ptr: *const std::os::raw::c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    CStr::from_ptr(ptr).to_string_lossy().to_string()
+}
+
+unsafe fn string_table_to_vec(table: *const TA_StringTable) -> Vec<String> {
+    if table.is_null() {
+        return Vec::new();
+    }
+    let size = (*table).size as usize;
+    if size == 0 || (*table).string.is_null() {
+        return Vec::new();
+    }
+    let entries = std::slice::from_raw_parts((*table).string, size);
+    let mut out = Vec::with_capacity(size);
+    for &ptr in entries {
+        if ptr.is_null() {
+            continue;
+        }
+        out.push(cstr_to_string(ptr));
+    }
+    out
+}
+
+fn list_talib_functions() -> Result<Vec<String>> {
+    let mut group_table: *mut TA_StringTable = ptr::null_mut();
+    let ret = unsafe { TA_GroupTableAlloc(&mut group_table) };
+    if ret != TA_RetCode::TA_SUCCESS {
+        bail!("TA_GroupTableAlloc failed: {:?}", ret);
+    }
+    let groups = unsafe { string_table_to_vec(group_table) };
+    unsafe {
+        TA_GroupTableFree(group_table);
+    }
+
+    let mut names: HashSet<String> = HashSet::new();
+    for group in groups {
+        let c_group = CString::new(group.as_bytes())
+            .map_err(|_| anyhow::anyhow!("TA group name contains null byte"))?;
+        let mut func_table: *mut TA_StringTable = ptr::null_mut();
+        let ret = unsafe { TA_FuncTableAlloc(c_group.as_ptr(), &mut func_table) };
+        if ret != TA_RetCode::TA_SUCCESS {
+            continue;
+        }
+        for name in unsafe { string_table_to_vec(func_table) } {
+            if !name.is_empty() {
+                names.insert(name);
+            }
+        }
+        unsafe {
+            TA_FuncTableFree(func_table);
+        }
+    }
+
+    let mut list: Vec<String> = names.into_iter().collect();
+    list.sort();
+    Ok(list)
+}
+
+fn resolve_real_input(param_name: &str, idx: usize, ohlcv: &Ohlcv) -> *const f64 {
+    let lower = param_name.to_ascii_lowercase();
+    if lower.contains("open") {
+        return ohlcv.open.as_ptr();
+    }
+    if lower.contains("high") {
+        return ohlcv.high.as_ptr();
+    }
+    if lower.contains("low") {
+        return ohlcv.low.as_ptr();
+    }
+    if lower.contains("close") {
+        return ohlcv.close.as_ptr();
+    }
+    if lower.contains("volume") {
+        if let Some(volume) = &ohlcv.volume {
+            return volume.as_ptr();
+        }
+    }
+    match idx % 5 {
+        0 => ohlcv.close.as_ptr(),
+        1 => ohlcv.open.as_ptr(),
+        2 => ohlcv.high.as_ptr(),
+        3 => ohlcv.low.as_ptr(),
+        _ => ohlcv
+            .volume
+            .as_ref()
+            .map(|v| v.as_ptr())
+            .unwrap_or_else(|| ohlcv.close.as_ptr()),
+    }
+}
+
+fn build_integer_input(param_name: &str, idx: usize, ohlcv: &Ohlcv) -> Vec<TA_Integer> {
+    let lower = param_name.to_ascii_lowercase();
+    let source: &Vec<f64> = if lower.contains("volume") {
+        ohlcv.volume.as_ref().unwrap_or(&ohlcv.close)
+    } else if lower.contains("open") {
+        &ohlcv.open
+    } else if lower.contains("high") {
+        &ohlcv.high
+    } else if lower.contains("low") {
+        &ohlcv.low
+    } else if lower.contains("close") {
+        &ohlcv.close
+    } else {
+        match idx % 4 {
+            0 => &ohlcv.close,
+            1 => &ohlcv.open,
+            2 => &ohlcv.high,
+            _ => &ohlcv.low,
+        }
+    };
+
+    source.iter().map(|v| *v as TA_Integer).collect()
+}
+
+enum OutputBuffer {
+    Real(Vec<TA_Real>),
+    Int(Vec<TA_Integer>),
+}
+
+struct ParamHolderGuard(*mut TA_ParamHolder);
+
+impl Drop for ParamHolderGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                TA_ParamHolderFree(self.0);
+            }
+        }
+    }
+}
+
+fn unique_name(base: &str, counts: &mut HashMap<String, usize>) -> String {
+    if let Some(entry) = counts.get_mut(base) {
+        *entry += 1;
+        format!("{base}_{}", *entry)
+    } else {
+        counts.insert(base.to_string(), 1);
+        base.to_string()
     }
 }
 
@@ -90,77 +257,207 @@ fn compute_talib_indicators(ohlcv: &Ohlcv) -> Result<Vec<(String, Vec<f64>)>> {
     ensure_talib_init()?;
 
     let len = ohlcv.len();
-    let close_ptr = ohlcv.close.as_ptr();
-    let high_ptr = ohlcv.high.as_ptr();
-    let low_ptr = ohlcv.low.as_ptr();
-
+    let func_names = list_talib_functions()?;
     let mut out: Vec<(String, Vec<f64>)> = Vec::new();
+    let mut name_counts: HashMap<String, usize> = HashMap::new();
 
-    let period14 = TimePeriodKwargs { timeperiod: 14 };
-    let period20 = TimePeriodKwargs { timeperiod: 20 };
+    for func_name in func_names {
+        let c_name = CString::new(func_name.as_bytes())
+            .map_err(|_| anyhow::anyhow!("TA function name contains null byte"))?;
+        let mut handle_ptr: *const TA_FuncHandle = ptr::null();
+        let ret = unsafe { TA_GetFuncHandle(c_name.as_ptr(), &mut handle_ptr) };
+        if ret != TA_RetCode::TA_SUCCESS || handle_ptr.is_null() {
+            continue;
+        }
 
-    if let Ok(values) = ta_rsi(close_ptr, len, &period14) {
-        out.push(("rsi_14".to_string(), pad_vec(values, len)));
-    }
-    if let Ok(values) = ta_adx(high_ptr, low_ptr, close_ptr, len, &period14) {
-        out.push(("adx_14".to_string(), pad_vec(values, len)));
-    }
-    if let Ok(values) = ta_cci(high_ptr, low_ptr, close_ptr, len, &period20) {
-        out.push(("cci_20".to_string(), pad_vec(values, len)));
-    }
+        let mut info_ptr: *const TA_FuncInfo = ptr::null();
+        let ret = unsafe { TA_GetFuncInfo(handle_ptr, &mut info_ptr) };
+        if ret != TA_RetCode::TA_SUCCESS || info_ptr.is_null() {
+            continue;
+        }
+        let info = unsafe { &*info_ptr };
 
-    let macd_kwargs = MacdKwargs {
-        fastperiod: 12,
-        slowperiod: 26,
-        signalperiod: 9,
-    };
-    if let Ok((macd, signal, hist)) = ta_macd(close_ptr, len, &macd_kwargs) {
-        out.push(("macd".to_string(), pad_vec(macd, len)));
-        out.push(("macd_signal".to_string(), pad_vec(signal, len)));
-        out.push(("macd_hist".to_string(), pad_vec(hist, len)));
-    }
+        let mut params: *mut TA_ParamHolder = ptr::null_mut();
+        let ret = unsafe { TA_ParamHolderAlloc(handle_ptr, &mut params) };
+        if ret != TA_RetCode::TA_SUCCESS || params.is_null() {
+            continue;
+        }
+        let _guard = ParamHolderGuard(params);
 
-    let atr_kwargs = ATRKwargs { timeperiod: 14 };
-    if let Ok(values) = ta_atr(high_ptr, low_ptr, close_ptr, len, &atr_kwargs) {
-        out.push(("atr_14".to_string(), pad_vec(values, len)));
-    }
-    let natr_kwargs = NATRKwargs { timeperiod: 14 };
-    if let Ok(values) = ta_natr(high_ptr, low_ptr, close_ptr, len, &natr_kwargs) {
-        out.push(("natr_14".to_string(), pad_vec(values, len)));
-    }
+        let volume_ptr = ohlcv
+            .volume
+            .as_ref()
+            .map(|v| v.as_ptr())
+            .unwrap_or(ptr::null());
 
-    if let Ok(values) = ta_sma(close_ptr, len, &period20) {
-        out.push(("sma_20".to_string(), pad_vec(values, len)));
-    }
-    if let Ok(values) = ta_ema(close_ptr, len, &period20) {
-        out.push(("ema_20".to_string(), pad_vec(values, len)));
-    }
+        let mut int_inputs: Vec<Vec<TA_Integer>> = Vec::new();
+        let mut skip = false;
 
-    let bb_kwargs = BBANDSKwargs {
-        timeperiod: 20,
-        nbdevup: 2.0,
-        nbdevdn: 2.0,
-        matype: TA_MAType_TA_MAType_SMA as TA_MAType,
-    };
-    if let Ok((upper, middle, lower)) = ta_bbands(close_ptr, len, &bb_kwargs) {
-        let upper = pad_vec(upper, len);
-        let middle = pad_vec(middle, len);
-        let lower = pad_vec(lower, len);
-        out.push(("bb_upper".to_string(), upper.clone()));
-        out.push(("bb_middle".to_string(), middle.clone()));
-        out.push(("bb_lower".to_string(), lower.clone()));
-        let mut width = Vec::with_capacity(len);
-        for i in 0..len {
-            let mid = middle.get(i).copied().unwrap_or(f64::NAN);
-            let up = upper.get(i).copied().unwrap_or(f64::NAN);
-            let lo = lower.get(i).copied().unwrap_or(f64::NAN);
-            if !mid.is_finite() || mid.abs() <= f64::EPSILON {
-                width.push(f64::NAN);
-            } else {
-                width.push((up - lo) / mid.abs());
+        for input_idx in 0..info.nbInput {
+            let mut input_info_ptr: *const TA_InputParameterInfo = ptr::null();
+            let ret = unsafe { TA_GetInputParameterInfo(handle_ptr, input_idx, &mut input_info_ptr) };
+            if ret != TA_RetCode::TA_SUCCESS || input_info_ptr.is_null() {
+                skip = true;
+                break;
+            }
+            let input_info = unsafe { &*input_info_ptr };
+            match input_info.type_ {
+                x if x == TA_InputParameterType_TA_Input_Price => {
+                    let flags = input_info.flags;
+                    if (flags & TA_IN_PRICE_VOLUME) != 0 && volume_ptr.is_null() {
+                        skip = true;
+                        break;
+                    }
+                    if (flags & TA_IN_PRICE_OPENINTEREST) != 0 {
+                        skip = true;
+                        break;
+                    }
+                    if (flags & TA_IN_PRICE_TIMESTAMP) != 0 {
+                        skip = true;
+                        break;
+                    }
+                    let ret = unsafe {
+                        TA_SetInputParamPricePtr(
+                            params,
+                            input_idx,
+                            ohlcv.open.as_ptr(),
+                            ohlcv.high.as_ptr(),
+                            ohlcv.low.as_ptr(),
+                            ohlcv.close.as_ptr(),
+                            volume_ptr,
+                            ptr::null(),
+                        )
+                    };
+                    if ret != TA_RetCode::TA_SUCCESS {
+                        skip = true;
+                        break;
+                    }
+                }
+                x if x == TA_InputParameterType_TA_Input_Real => {
+                    let param_name = unsafe { cstr_to_string(input_info.paramName) };
+                    if param_name.to_ascii_lowercase().contains("volume") && volume_ptr.is_null() {
+                        skip = true;
+                        break;
+                    }
+                    let ptr_in = resolve_real_input(&param_name, input_idx as usize, ohlcv);
+                    let ret = unsafe { TA_SetInputParamRealPtr(params, input_idx, ptr_in) };
+                    if ret != TA_RetCode::TA_SUCCESS {
+                        skip = true;
+                        break;
+                    }
+                }
+                x if x == TA_InputParameterType_TA_Input_Integer => {
+                    let param_name = unsafe { cstr_to_string(input_info.paramName) };
+                    int_inputs.push(build_integer_input(&param_name, input_idx as usize, ohlcv));
+                    let ptr_in = int_inputs.last().unwrap().as_ptr();
+                    let ret = unsafe { TA_SetInputParamIntegerPtr(params, input_idx, ptr_in) };
+                    if ret != TA_RetCode::TA_SUCCESS {
+                        skip = true;
+                        break;
+                    }
+                }
+                _ => {
+                    skip = true;
+                    break;
+                }
             }
         }
-        out.push(("bb_width".to_string(), width));
+
+        if skip {
+            continue;
+        }
+
+        for opt_idx in 0..info.nbOptInput {
+            let mut opt_info_ptr: *const TA_OptInputParameterInfo = ptr::null();
+            let ret = unsafe { TA_GetOptInputParameterInfo(handle_ptr, opt_idx, &mut opt_info_ptr) };
+            if ret != TA_RetCode::TA_SUCCESS || opt_info_ptr.is_null() {
+                continue;
+            }
+            let opt_info = unsafe { &*opt_info_ptr };
+            match opt_info.type_ {
+                x if x == TA_OptInputParameterType_TA_OptInput_RealRange
+                    || x == TA_OptInputParameterType_TA_OptInput_RealList =>
+                {
+                    let _ = unsafe { TA_SetOptInputParamReal(params, opt_idx, opt_info.defaultValue) };
+                }
+                x if x == TA_OptInputParameterType_TA_OptInput_IntegerRange
+                    || x == TA_OptInputParameterType_TA_OptInput_IntegerList =>
+                {
+                    let _ = unsafe {
+                        TA_SetOptInputParamInteger(params, opt_idx, opt_info.defaultValue as TA_Integer)
+                    };
+                }
+                _ => {}
+            }
+        }
+
+        let func_lower = normalize_name(&func_name);
+        let mut outputs: Vec<(String, OutputBuffer)> = Vec::new();
+        for out_idx in 0..info.nbOutput {
+            let mut out_info_ptr: *const TA_OutputParameterInfo = ptr::null();
+            let ret = unsafe { TA_GetOutputParameterInfo(handle_ptr, out_idx, &mut out_info_ptr) };
+            if ret != TA_RetCode::TA_SUCCESS || out_info_ptr.is_null() {
+                continue;
+            }
+            let out_info = unsafe { &*out_info_ptr };
+            let param_name = unsafe { cstr_to_string(out_info.paramName) };
+            let param_norm = normalize_name(&param_name);
+            let base = if info.nbOutput <= 1 {
+                func_lower.clone()
+            } else if param_norm.is_empty() {
+                format!("{func_lower}_out{}", out_idx)
+            } else {
+                format!("{func_lower}_{param_norm}")
+            };
+            let name = unique_name(&normalize_name(&base), &mut name_counts);
+
+            match out_info.type_ {
+                x if x == TA_OutputParameterType_TA_Output_Integer => {
+                    let mut buf = vec![0 as TA_Integer; len];
+                    let ret = unsafe { TA_SetOutputParamIntegerPtr(params, out_idx, buf.as_mut_ptr()) };
+                    if ret == TA_RetCode::TA_SUCCESS {
+                        outputs.push((name, OutputBuffer::Int(buf)));
+                    }
+                }
+                _ => {
+                    let mut buf = vec![0.0 as TA_Real; len];
+                    let ret = unsafe { TA_SetOutputParamRealPtr(params, out_idx, buf.as_mut_ptr()) };
+                    if ret == TA_RetCode::TA_SUCCESS {
+                        outputs.push((name, OutputBuffer::Real(buf)));
+                    }
+                }
+            }
+        }
+
+        if outputs.is_empty() {
+            continue;
+        }
+
+        let mut out_beg: TA_Integer = 0;
+        let mut out_nb: TA_Integer = 0;
+        let ret = unsafe { TA_CallFunc(params, 0, (len as TA_Integer).saturating_sub(1), &mut out_beg, &mut out_nb) };
+        if ret != TA_RetCode::TA_SUCCESS || out_nb <= 0 || out_beg < 0 {
+            continue;
+        }
+
+        let out_beg = out_beg as usize;
+        let out_nb = out_nb as usize;
+
+        for (name, buf) in outputs {
+            let mut series = vec![f64::NAN; len];
+            for i in 0..out_nb {
+                let idx = out_beg + i;
+                if idx >= len {
+                    break;
+                }
+                let value = match &buf {
+                    OutputBuffer::Real(vals) => vals[i] as f64,
+                    OutputBuffer::Int(vals) => vals[i] as f64,
+                };
+                series[idx] = value;
+            }
+            out.push((name, series));
+        }
     }
 
     if out.is_empty() {
@@ -266,8 +563,9 @@ impl SymbolDataset {
     }
 }
 
-pub const MANDATORY_TFS: [&str; 11] = [
-    "M1", "M3", "M5", "M15", "M30", "H1", "H2", "H4", "D1", "W1", "MN1",
+pub const MANDATORY_TFS: [&str; 21] = [
+    "M1", "M2", "M3", "M4", "M5", "M6", "M10", "M12", "M15", "M20", "M30", "H1", "H2", "H3", "H4", "H6",
+    "H8", "H12", "D1", "W1", "MN1",
 ];
 
 fn series_to_f64(series: &Series) -> Result<Vec<f64>> {
@@ -325,24 +623,27 @@ fn feature_frame_to_df(frame: &FeatureFrame) -> Result<DataFrame> {
 
 fn df_to_feature_frame(df: &DataFrame) -> Result<FeatureFrame> {
     let timestamps = extract_timestamps(df)?.context("cached features missing timestamp column")?;
-    let mut names = Vec::new();
-    let mut columns: Vec<Vec<f32>> = Vec::new();
+    let n_rows = timestamps.len();
+    let n_cols = df
+        .get_columns()
+        .iter()
+        .filter(|col| !col.as_materialized_series().name().eq_ignore_ascii_case("timestamp"))
+        .count();
+    let mut names = Vec::with_capacity(n_cols);
+    let mut data = Array2::<f32>::zeros((n_rows, n_cols));
+    let mut col_idx = 0usize;
     for col in df.get_columns() {
         let series = col.as_materialized_series();
         if series.name().eq_ignore_ascii_case("timestamp") {
             continue;
         }
         names.push(series.name().to_string());
-        columns.push(series_to_f32(series, timestamps.len()));
-    }
-    let n_rows = timestamps.len();
-    let n_cols = columns.len();
-    let mut data = Array2::<f32>::zeros((n_rows, n_cols));
-    for (col_idx, vals) in columns.iter().enumerate() {
+        let vals = series_to_f32(series, n_rows);
         let len = vals.len().min(n_rows);
         for i in 0..len {
             data[(i, col_idx)] = vals[i];
         }
+        col_idx += 1;
     }
     Ok(FeatureFrame {
         timestamps,
@@ -438,21 +739,15 @@ pub fn compute_talib_features(ohlcv: &Ohlcv) -> Result<FeatureMatrix> {
     }
 
     let indicators = compute_talib_indicators(&sorted)?;
-    let mut names = Vec::with_capacity(indicators.len());
-    let mut columns: Vec<Vec<f32>> = Vec::with_capacity(indicators.len());
-
-    for (name, values) in indicators {
+    let n_cols = indicators.len();
+    let mut names = Vec::with_capacity(n_cols);
+    let mut out = Array2::<f32>::zeros((n_rows, n_cols));
+    for (col_idx, (name, values)) in indicators.into_iter().enumerate() {
         names.push(format!("ta_{name}"));
         let vals = pad_vec(values, n_rows);
-        columns.push(vals.iter().map(|v| *v as f32).collect());
-    }
-
-    let n_cols = columns.len();
-    let mut out = Array2::<f32>::zeros((n_rows, n_cols));
-    for (col_idx, vals) in columns.iter().enumerate() {
         let len = vals.len().min(n_rows);
         for i in 0..len {
-            out[(i, col_idx)] = vals[i];
+            out[(i, col_idx)] = vals[i] as f32;
         }
     }
 
@@ -472,37 +767,58 @@ pub fn compute_talib_feature_frame(ohlcv: &Ohlcv, include_raw: bool) -> Result<F
         .unwrap_or_else(|| (0..n_rows as i64).collect());
 
     let indicators = compute_talib_indicators(&sorted)?;
-    let mut names = Vec::new();
-    let mut columns: Vec<Vec<f32>> = Vec::new();
+    let raw_cols = if include_raw {
+        4 + usize::from(sorted.volume.is_some())
+    } else {
+        0
+    };
+    let n_cols = raw_cols + indicators.len();
+    let mut names = Vec::with_capacity(n_cols);
+    let mut out = Array2::<f32>::zeros((n_rows, n_cols));
+    let mut col_idx = 0usize;
 
     if include_raw {
         names.push("open".to_string());
-        columns.push(sorted.open.iter().map(|v| *v as f32).collect());
+        for i in 0..n_rows {
+            out[(i, col_idx)] = sorted.open[i] as f32;
+        }
+        col_idx += 1;
+
         names.push("high".to_string());
-        columns.push(sorted.high.iter().map(|v| *v as f32).collect());
+        for i in 0..n_rows {
+            out[(i, col_idx)] = sorted.high[i] as f32;
+        }
+        col_idx += 1;
+
         names.push("low".to_string());
-        columns.push(sorted.low.iter().map(|v| *v as f32).collect());
+        for i in 0..n_rows {
+            out[(i, col_idx)] = sorted.low[i] as f32;
+        }
+        col_idx += 1;
+
         names.push("close".to_string());
-        columns.push(sorted.close.iter().map(|v| *v as f32).collect());
+        for i in 0..n_rows {
+            out[(i, col_idx)] = sorted.close[i] as f32;
+        }
+        col_idx += 1;
+
         if let Some(volume) = &sorted.volume {
             names.push("volume".to_string());
-            columns.push(volume.iter().map(|v| *v as f32).collect());
+            for i in 0..n_rows {
+                out[(i, col_idx)] = volume[i] as f32;
+            }
+            col_idx += 1;
         }
     }
 
     for (name, values) in indicators {
         names.push(format!("ta_{name}"));
         let vals = pad_vec(values, n_rows);
-        columns.push(vals.iter().map(|v| *v as f32).collect());
-    }
-
-    let n_cols = columns.len();
-    let mut out = Array2::<f32>::zeros((n_rows, n_cols));
-    for (col_idx, vals) in columns.iter().enumerate() {
         let len = vals.len().min(n_rows);
         for i in 0..len {
-            out[(i, col_idx)] = vals[i];
+            out[(i, col_idx)] = vals[i] as f32;
         }
+        col_idx += 1;
     }
 
     Ok(FeatureFrame {
@@ -513,19 +829,7 @@ pub fn compute_talib_feature_frame(ohlcv: &Ohlcv, include_raw: bool) -> Result<F
 }
 
 fn select_htf_indices(names: &[String]) -> Vec<usize> {
-    let patterns = ["rsi", "macd", "atr", "bb", "bb_width"];
-    names
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, name)| {
-            let lower = name.to_ascii_lowercase();
-            if patterns.iter().any(|p| lower.contains(p)) {
-                Some(idx)
-            } else {
-                None
-            }
-        })
-        .collect()
+    (0..names.len()).collect()
 }
 
 fn select_columns(data: &Array2<f32>, indices: &[usize]) -> Array2<f32> {
@@ -603,13 +907,23 @@ pub fn ensure_timeframes(dataset: &SymbolDataset, required: &[&str]) -> Result<(
 fn timeframe_to_ms(tf: &str) -> Option<i64> {
     match tf.to_ascii_uppercase().as_str() {
         "M1" => Some(60_000),
+        "M2" => Some(120_000),
         "M3" => Some(180_000),
+        "M4" => Some(240_000),
         "M5" => Some(300_000),
+        "M6" => Some(360_000),
+        "M10" => Some(600_000),
+        "M12" => Some(720_000),
         "M15" => Some(900_000),
+        "M20" => Some(1_200_000),
         "M30" => Some(1_800_000),
         "H1" => Some(3_600_000),
         "H2" => Some(7_200_000),
+        "H3" => Some(10_800_000),
         "H4" => Some(14_400_000),
+        "H6" => Some(21_600_000),
+        "H8" => Some(28_800_000),
+        "H12" => Some(43_200_000),
         "D1" => Some(86_400_000),
         "W1" => Some(604_800_000),
         "MN1" => Some(2_592_000_000),

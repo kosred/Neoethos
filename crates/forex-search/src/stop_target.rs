@@ -414,8 +414,8 @@ pub fn estimate_hurst(close: &[f64], window: usize, max_lag: usize) -> Option<f6
         return None;
     }
     let max_lag = max_lag.min(series.len() / 2).max(2);
-    let mut lags = Vec::new();
-    let mut tau = Vec::new();
+    let mut lags = Vec::with_capacity(max_lag.saturating_sub(1));
+    let mut tau = Vec::with_capacity(max_lag.saturating_sub(1));
     for lag in 2..=max_lag {
         let mut diffs = Vec::with_capacity(series.len() - lag);
         for i in lag..series.len() {
@@ -520,7 +520,7 @@ fn compute_adx(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Optio
     let mut plus_sum: f64 = plus_dm[1..=period].iter().sum();
     let mut minus_sum: f64 = minus_dm[1..=period].iter().sum();
 
-    let mut dx = Vec::new();
+    let mut dx = Vec::with_capacity(n.saturating_sub(period + 1));
     for i in (period + 1)..n {
         tr_sum = tr_sum - (tr_sum / period as f64) + tr[i];
         plus_sum = plus_sum - (plus_sum / period as f64) + plus_dm[i];
@@ -544,7 +544,7 @@ fn compute_adx(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Optio
 }
 
 pub fn infer_regime(
-    open: &[f64],
+    _open: &[f64],
     high: &[f64],
     low: &[f64],
     close: &[f64],
