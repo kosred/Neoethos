@@ -1601,7 +1601,14 @@ fn batch_evaluate_strategies<'py>(
         .detach(|| {
             let mut metrics = Array2::<f64>::zeros((n_strats, 11));
             for row in 0..n_strats {
-                let sig_row: Vec<i8> = signals_mat.row(row).iter().copied().collect();
+                let row_view = signals_mat.row(row);
+                let sig_owned: Vec<i8>;
+                let sig_row: &[i8] = if let Some(s) = row_view.as_slice() {
+                    s
+                } else {
+                    sig_owned = row_view.iter().copied().collect();
+                    &sig_owned
+                };
                 let sl = if sl_vec.len() == 1 { sl_vec[0] } else { sl_vec[row] };
                 let tp = if tp_vec.len() == 1 { tp_vec[0] } else { tp_vec[row] };
                 let m = forex_search::fast_evaluate_strategy_core(
@@ -2164,6 +2171,200 @@ impl XGBoostDARTModel {
     }
 }
 
+#[cfg(feature = "catboost")]
+#[pyclass]
+struct CatBoostModel {
+    model: Arc<Mutex<CatBoostExpert>>,
+}
+
+#[cfg(feature = "catboost")]
+#[pymethods]
+impl CatBoostModel {
+    #[new]
+    #[pyo3(signature = (idx=1, params=None))]
+    fn new(idx: usize, params: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        let params = params_from_py(params)
+            .map_err(|msg| PyErr::new::<pyo3::exceptions::PyValueError, _>(msg))?;
+        Ok(Self {
+            model: Arc::new(Mutex::new(CatBoostExpert::new(idx, params))),
+        })
+    }
+
+    fn fit<'py>(
+        &self,
+        _py: Python<'py>,
+        features: PyReadonlyArray2<'py, f64>,
+        labels: PyReadonlyArray1<'py, i64>,
+    ) -> PyResult<()> {
+        let features_array = features.as_array().to_owned();
+        let labels_array = labels.as_array().to_owned();
+
+        let result: Result<(), String> = (|| {
+            let mut model = self
+                .model
+                .lock()
+                .map_err(|e| format!("Lock poisoned: {}", e))?;
+
+            let df = dataframe_from_ndarray(&features_array)?;
+            let labels_vec: Vec<i64> = labels_array.iter().copied().collect();
+            let labels_series = Series::new("label".into(), labels_vec);
+
+            model
+                .fit(&df, &labels_series)
+                .map_err(|e| format!("Training failed: {}", e))?;
+
+            Ok(())
+        })();
+
+        result.map_err(|msg| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg))
+    }
+
+    fn predict_proba<'py>(
+        &self,
+        py: Python<'py>,
+        features: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let features_array = features.as_array().to_owned();
+
+        let result: Result<Array2<f32>, String> = (|| {
+            let model = self
+                .model
+                .lock()
+                .map_err(|e| format!("Lock poisoned: {}", e))?;
+
+            let df = dataframe_from_ndarray(&features_array)?;
+            model
+                .predict_proba(&df)
+                .map_err(|e| format!("Prediction failed: {}", e))
+        })();
+
+        result
+            .map_err(|msg| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg))
+            .map(|arr: Array2<f32>| arr.into_pyarray(py))
+    }
+
+    fn save(&self, path: &str) -> PyResult<()> {
+        let model = self.model.lock().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Lock poisoned: {}", e))
+        })?;
+
+        model.save(Path::new(path)).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Save failed: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    fn load(&self, path: &str) -> PyResult<()> {
+        let mut model = self.model.lock().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Lock poisoned: {}", e))
+        })?;
+
+        model.load(Path::new(path)).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Load failed: {}", e))
+        })?;
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "catboost")]
+#[pyclass]
+struct CatBoostAltModel {
+    model: Arc<Mutex<CatBoostAltExpert>>,
+}
+
+#[cfg(feature = "catboost")]
+#[pymethods]
+impl CatBoostAltModel {
+    #[new]
+    #[pyo3(signature = (idx=1, params=None))]
+    fn new(idx: usize, params: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        let params = params_from_py(params)
+            .map_err(|msg| PyErr::new::<pyo3::exceptions::PyValueError, _>(msg))?;
+        Ok(Self {
+            model: Arc::new(Mutex::new(CatBoostAltExpert::new(idx, params))),
+        })
+    }
+
+    fn fit<'py>(
+        &self,
+        _py: Python<'py>,
+        features: PyReadonlyArray2<'py, f64>,
+        labels: PyReadonlyArray1<'py, i64>,
+    ) -> PyResult<()> {
+        let features_array = features.as_array().to_owned();
+        let labels_array = labels.as_array().to_owned();
+
+        let result: Result<(), String> = (|| {
+            let mut model = self
+                .model
+                .lock()
+                .map_err(|e| format!("Lock poisoned: {}", e))?;
+
+            let df = dataframe_from_ndarray(&features_array)?;
+            let labels_vec: Vec<i64> = labels_array.iter().copied().collect();
+            let labels_series = Series::new("label".into(), labels_vec);
+
+            model
+                .fit(&df, &labels_series)
+                .map_err(|e| format!("Training failed: {}", e))?;
+
+            Ok(())
+        })();
+
+        result.map_err(|msg| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg))
+    }
+
+    fn predict_proba<'py>(
+        &self,
+        py: Python<'py>,
+        features: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let features_array = features.as_array().to_owned();
+
+        let result: Result<Array2<f32>, String> = (|| {
+            let model = self
+                .model
+                .lock()
+                .map_err(|e| format!("Lock poisoned: {}", e))?;
+
+            let df = dataframe_from_ndarray(&features_array)?;
+            model
+                .predict_proba(&df)
+                .map_err(|e| format!("Prediction failed: {}", e))
+        })();
+
+        result
+            .map_err(|msg| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg))
+            .map(|arr: Array2<f32>| arr.into_pyarray(py))
+    }
+
+    fn save(&self, path: &str) -> PyResult<()> {
+        let model = self.model.lock().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Lock poisoned: {}", e))
+        })?;
+
+        model.save(Path::new(path)).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Save failed: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    fn load(&self, path: &str) -> PyResult<()> {
+        let mut model = self.model.lock().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Lock poisoned: {}", e))
+        })?;
+
+        model.load(Path::new(path)).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Load failed: {}", e))
+        })?;
+
+        Ok(())
+    }
+}
+
 #[pymodule]
 fn forex_bindings(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {       
     m.add_class::<ForexCore>()?;
@@ -2189,6 +2390,11 @@ fn forex_bindings(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<XGBoostModel>()?;
         m.add_class::<XGBoostRFModel>()?;
         m.add_class::<XGBoostDARTModel>()?;
+    }
+    #[cfg(feature = "catboost")]
+    {
+        m.add_class::<CatBoostModel>()?;
+        m.add_class::<CatBoostAltModel>()?;
     }
 
     Ok(())

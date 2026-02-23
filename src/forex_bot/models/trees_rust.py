@@ -169,8 +169,20 @@ class RustXGBoostDARTExpert(_RustTreeBase):
     _python_fallback_class_name = "XGBoostDARTExpert"
 
 
+class RustCatBoostExpert(_RustTreeBase):
+    _model_cls = getattr(_fb, "CatBoostModel", None)
+    _python_fallback_class_name = "CatBoostExpert"
+
+
+class RustCatBoostAltExpert(_RustTreeBase):
+    _model_cls = getattr(_fb, "CatBoostAltModel", None)
+    _python_fallback_class_name = "CatBoostAltExpert"
+
+
 # Aliases for drop-in compatibility
 LightGBMExpert = RustLightGBMExpert
 XGBoostExpert = RustXGBoostExpert
 XGBoostRFExpert = RustXGBoostRFExpert
 XGBoostDARTExpert = RustXGBoostDARTExpert
+CatBoostExpert = RustCatBoostExpert
+CatBoostAltExpert = RustCatBoostAltExpert

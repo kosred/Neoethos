@@ -31,6 +31,10 @@ _MODEL_ALIASES = {
     "tide_nf": "tide_nf",
     "patch_tst": "patchtst",
     "times_net": "timesnet",
+    "elastic_net": "elasticnet",
+    "bayesian_logit": "bayes_logit",
+    "passive_aggressive": "online_pa",
+    "hoeffding": "online_hoeffding",
 }
 
 
@@ -49,6 +53,11 @@ MODEL_MAPPING = {
     "catboost": ("trees", "CatBoostExpert"),
     "catboost_alt": ("trees", "CatBoostAltExpert"),
     "mlp": ("mlp", "MLPExpert"),
+    "elasticnet": ("linear", "ElasticNetExpert"),
+    "bayes_logit": ("linear", "BayesianLogitExpert"),
+    "online_pa": ("linear", "OnlinePassiveAggressiveExpert"),
+    "online_hoeffding": ("linear", "OnlineHoeffdingExpert"),
+    "vw": ("linear", "VowpalWabbitExpert"),
     "transformer": ("transformers", "TransformerExpertTorch"),
     "kan": ("kan_gpu", "KANExpert"),
     "nbeats": ("nbeats_gpu", "NBeatsExpert"),
@@ -72,6 +81,8 @@ _RUST_TREE_MAPPING = {
     "xgboost": "RustXGBoostExpert",
     "xgboost_rf": "RustXGBoostRFExpert",
     "xgboost_dart": "RustXGBoostDARTExpert",
+    "catboost": "RustCatBoostExpert",
+    "catboost_alt": "RustCatBoostAltExpert",
 }
 
 
@@ -208,6 +219,7 @@ _NEURAL_MODELS = {
     "patchtst",
     "timesnet",
 }
+_LINEAR_MODELS = {"elasticnet", "bayes_logit", "online_pa", "online_hoeffding", "vw"}
 _RL_MODELS = {"rl_ppo", "rl_sac", "rllib_ppo", "rllib_sac"}
 _EVOLUTION_MODELS = {"evolution", "genetic"}
 _UNSUPERVISED_MODELS = {"unsupervised"}
@@ -229,6 +241,10 @@ def get_model_info(name: str) -> Dict[str, Any] | None:
         category = "NeuralNetwork"
         requires_gpu = True
         description = "Neural network model (GPU recommended)"
+    elif canonical_name in _LINEAR_MODELS:
+        category = "LinearModel"
+        requires_gpu = False
+        description = "Linear/online baseline model"
     elif canonical_name in _RL_MODELS:
         category = "ReinforcementLearning"
         requires_gpu = True
