@@ -102,14 +102,14 @@ impl PortfolioOptimizer {
                 vols[i] = std.max(1e-6);
             }
 
-            let mut corr = vec![vec![0.0; n_assets]; n_assets];
+            // Avoid building a full NxN correlation matrix when we only need per-asset averages.
+            let mut corr_sums = vec![0.0_f64; n_assets];
             for i in 0..n_assets {
-                corr[i][i] = 1.0;
                 for j in (i + 1)..n_assets {
                     let c = cov(&rets[i], means[i], &rets[j], means[j]);
                     let v = c / (vols[i] * vols[j]).max(1e-9);
-                    corr[i][j] = v;
-                    corr[j][i] = v;
+                    corr_sums[i] += v;
+                    corr_sums[j] += v;
                 }
             }
 
@@ -124,13 +124,7 @@ impl PortfolioOptimizer {
 
             let mut avg_corr = vec![0.0; n_assets];
             for i in 0..n_assets {
-                let mut sum = 0.0;
-                for j in 0..n_assets {
-                    if i != j {
-                        sum += corr[i][j];
-                    }
-                }
-                avg_corr[i] = sum / (n_assets.saturating_sub(1).max(1) as f64);
+                avg_corr[i] = corr_sums[i] / (n_assets.saturating_sub(1).max(1) as f64);
             }
 
             let mut raw = vec![0.0; n_assets];
@@ -223,4 +217,62 @@ fn cov(a: &[f64], mean_a: f64, b: &[f64], mean_b: f64) -> f64 {
         sum += (a[i] - mean_a) * (b[i] - mean_b);
     }
     sum / (n as f64 - 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metrics(returns: Vec<f64>, sharpe: f64, win_rate: f64) -> SymbolMetrics {
+        SymbolMetrics {
+            returns,
+            sharpe,
+            win_rate,
+        }
+    }
+
+    #[test]
+    fn equal_weight_fallback_when_not_enough_corr_samples() {
+        let optimizer = PortfolioOptimizer::default();
+        let symbols = vec!["EURUSD".to_string(), "GBPUSD".to_string()];
+        let mut map = HashMap::new();
+        map.insert(
+            "EURUSD".to_string(),
+            metrics(vec![0.01; 20], 1.2, 0.55),
+        );
+        map.insert(
+            "GBPUSD".to_string(),
+            metrics(vec![0.02; 20], 1.0, 0.52),
+        );
+
+        let alloc = optimizer.get_optimal_allocation(&symbols, &map);
+        assert_eq!(alloc.len(), 2);
+        for symbol in symbols {
+            let w = alloc.get(&symbol).expect("missing allocation").weight;
+            assert!((w - 0.5).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn correlation_score_is_stable_for_identical_series() {
+        let optimizer = PortfolioOptimizer::new(30, 0.8, 0.25);
+        let symbols = vec!["EURUSD".to_string(), "GBPUSD".to_string()];
+        let rets: Vec<f64> = (0..64).map(|i| (i as f64 * 0.0001).sin()).collect();
+        let mut map = HashMap::new();
+        map.insert("EURUSD".to_string(), metrics(rets.clone(), 1.5, 0.56));
+        map.insert("GBPUSD".to_string(), metrics(rets, 1.3, 0.54));
+
+        let alloc = optimizer.get_optimal_allocation(&symbols, &map);
+        assert_eq!(alloc.len(), 2);
+        let eur_corr = alloc
+            .get("EURUSD")
+            .expect("missing EURUSD allocation")
+            .correlation_score;
+        let gbp_corr = alloc
+            .get("GBPUSD")
+            .expect("missing GBPUSD allocation")
+            .correlation_score;
+        assert!((eur_corr - 1.0).abs() < 1e-6);
+        assert!((gbp_corr - 1.0).abs() < 1e-6);
+    }
 }

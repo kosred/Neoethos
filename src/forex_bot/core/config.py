@@ -3,6 +3,36 @@ import yaml
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
+ALL_TIMEFRAMES: tuple[str, ...] = (
+    "M1",
+    "M2",
+    "M3",
+    "M4",
+    "M5",
+    "M6",
+    "M10",
+    "M12",
+    "M15",
+    "M20",
+    "M30",
+    "H1",
+    "H2",
+    "H3",
+    "H4",
+    "H6",
+    "H8",
+    "H12",
+    "D1",
+    "W1",
+    "MN1",
+)
+
+
+def _default_all_timeframes() -> list[str]:
+    # Return a fresh list for each settings instance.
+    return list(ALL_TIMEFRAMES)
+
+
 class YamlConfigSettingsSource(PydanticBaseSettingsSource):
     def get_field_value(self, field: object, field_name: str) -> tuple[object, str, bool]:
         return super().get_field_value(field, field_name)
@@ -24,79 +54,11 @@ class SystemConfig(BaseModel):
     mt5_eur_symbol: str = "EXY"
     base_timeframe: str = "M1"
     multi_resolution_enabled: bool = True
-    multi_resolution_timeframes: list[str] = Field(
-        default_factory=lambda: [
-            "M1",
-            "M2",
-            "M3",
-            "M4",
-            "M5",
-            "M6",
-            "M10",
-            "M12",
-            "M15",
-            "M20",
-            "M30",
-            "H1",
-            "H2",
-            "H3",
-            "H4",
-            "H6",
-            "H8",
-            "H12",
-            "D1",
-            "W1",
-            "MN1",
-        ]
-    )
+    multi_resolution_timeframes: list[str] = Field(default_factory=_default_all_timeframes)
     multi_resolution_prefix_base: bool = False
     use_volume_features: bool = True
-    higher_timeframes: list[str] = Field(default_factory=lambda: [
-        "M1",
-        "M2",
-        "M3",
-        "M4",
-        "M5",
-        "M6",
-        "M10",
-        "M12",
-        "M15",
-        "M20",
-        "M30",
-        "H1",
-        "H2",
-        "H3",
-        "H4",
-        "H6",
-        "H8",
-        "H12",
-        "D1",
-        "W1",
-        "MN1",
-    ])
-    required_timeframes: list[str] = Field(default_factory=lambda: [
-        "M1",
-        "M2",
-        "M3",
-        "M4",
-        "M5",
-        "M6",
-        "M10",
-        "M12",
-        "M15",
-        "M20",
-        "M30",
-        "H1",
-        "H2",
-        "H3",
-        "H4",
-        "H6",
-        "H8",
-        "H12",
-        "D1",
-        "W1",
-        "MN1",
-    ])
+    higher_timeframes: list[str] = Field(default_factory=_default_all_timeframes)
+    required_timeframes: list[str] = Field(default_factory=_default_all_timeframes)
     enable_level2: bool = False
     level2_depth_levels: int = 10
     history_years: int = 10
