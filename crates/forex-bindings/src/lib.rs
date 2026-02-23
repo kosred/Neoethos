@@ -188,6 +188,10 @@ fn vec_from_py_i64(arr: &PyReadonlyArray1<i64>) -> Vec<i64> {
     arr.as_array().iter().copied().collect()
 }
 
+fn vec_from_py_i8(arr: &PyReadonlyArray1<i8>) -> Vec<i8> {
+    arr.as_array().iter().copied().collect()
+}
+
 fn build_ohlcv(
     open: &PyReadonlyArray1<f64>,
     high: &PyReadonlyArray1<f64>,
@@ -1435,6 +1439,202 @@ fn infer_stop_target_pips_ohlcv(
 
 #[pyfunction]
 #[pyo3(signature = (
+    close_prices,
+    high_prices,
+    low_prices,
+    signals,
+    month_indices,
+    day_indices,
+    sl_pips,
+    tp_pips,
+    max_hold_bars=0,
+    trailing_enabled=false,
+    trailing_atr_multiplier=1.0,
+    trailing_be_trigger_r=1.0,
+    pip_value=0.0001,
+    spread_pips=1.5,
+    commission_per_trade=0.0,
+    pip_value_per_lot=10.0
+))]
+fn fast_evaluate_strategy(
+    py: Python,
+    close_prices: PyReadonlyArray1<f64>,
+    high_prices: PyReadonlyArray1<f64>,
+    low_prices: PyReadonlyArray1<f64>,
+    signals: PyReadonlyArray1<i8>,
+    month_indices: PyReadonlyArray1<i64>,
+    day_indices: PyReadonlyArray1<i64>,
+    sl_pips: f64,
+    tp_pips: f64,
+    max_hold_bars: usize,
+    trailing_enabled: bool,
+    trailing_atr_multiplier: f64,
+    trailing_be_trigger_r: f64,
+    pip_value: f64,
+    spread_pips: f64,
+    commission_per_trade: f64,
+    pip_value_per_lot: f64,
+) -> PyResult<Vec<f64>> {
+    let close_vec = vec_from_py_f64(&close_prices);
+    let high_vec = vec_from_py_f64(&high_prices);
+    let low_vec = vec_from_py_f64(&low_prices);
+    let sig_vec = vec_from_py_i8(&signals);
+    let month_vec = vec_from_py_i64(&month_indices);
+    let day_vec = vec_from_py_i64(&day_indices);
+
+    let n = close_vec.len();
+    if high_vec.len() != n || low_vec.len() != n || sig_vec.len() != n {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "close/high/low/signals arrays must have equal length",
+        ));
+    }
+    if month_vec.len() != n || day_vec.len() != n {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "month_indices/day_indices length must match close length",
+        ));
+    }
+
+    let out = py
+        .detach(|| {
+            Ok::<[f64; 11], String>(forex_search::fast_evaluate_strategy_core(
+                &close_vec,
+                &high_vec,
+                &low_vec,
+                &sig_vec,
+                &month_vec,
+                &day_vec,
+                sl_pips,
+                tp_pips,
+                max_hold_bars,
+                trailing_enabled,
+                trailing_atr_multiplier,
+                trailing_be_trigger_r,
+                pip_value,
+                spread_pips,
+                commission_per_trade,
+                pip_value_per_lot,
+            ))
+        })
+        .map_err(|msg| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg))?;
+
+    Ok(out.to_vec())
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    close_prices,
+    high_prices,
+    low_prices,
+    signals,
+    month_indices,
+    day_indices,
+    sl_pips,
+    tp_pips,
+    max_hold_bars=0,
+    trailing_enabled=false,
+    trailing_atr_multiplier=1.0,
+    trailing_be_trigger_r=1.0,
+    pip_value=0.0001,
+    spread_pips=1.5,
+    commission_per_trade=0.0,
+    pip_value_per_lot=10.0
+))]
+fn batch_evaluate_strategies<'py>(
+    py: Python<'py>,
+    close_prices: PyReadonlyArray1<'py, f64>,
+    high_prices: PyReadonlyArray1<'py, f64>,
+    low_prices: PyReadonlyArray1<'py, f64>,
+    signals: PyReadonlyArray2<'py, i8>,
+    month_indices: PyReadonlyArray1<'py, i64>,
+    day_indices: PyReadonlyArray1<'py, i64>,
+    sl_pips: PyReadonlyArray1<'py, f64>,
+    tp_pips: PyReadonlyArray1<'py, f64>,
+    max_hold_bars: usize,
+    trailing_enabled: bool,
+    trailing_atr_multiplier: f64,
+    trailing_be_trigger_r: f64,
+    pip_value: f64,
+    spread_pips: f64,
+    commission_per_trade: f64,
+    pip_value_per_lot: f64,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let close_vec = vec_from_py_f64(&close_prices);
+    let high_vec = vec_from_py_f64(&high_prices);
+    let low_vec = vec_from_py_f64(&low_prices);
+    let month_vec = vec_from_py_i64(&month_indices);
+    let day_vec = vec_from_py_i64(&day_indices);
+    let sl_vec = vec_from_py_f64(&sl_pips);
+    let tp_vec = vec_from_py_f64(&tp_pips);
+    let signals_mat = signals.as_array().to_owned();
+
+    let n = close_vec.len();
+    if high_vec.len() != n || low_vec.len() != n {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "close/high/low arrays must have equal length",
+        ));
+    }
+    if month_vec.len() != n || day_vec.len() != n {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "month_indices/day_indices length must match close length",
+        ));
+    }
+
+    let n_strats = signals_mat.nrows();
+    let n_bars = signals_mat.ncols();
+    if n_bars != n {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "signals.shape[1] must match close length",
+        ));
+    }
+    if !(sl_vec.len() == n_strats || sl_vec.len() == 1) {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "sl_pips length must be 1 or signals.shape[0]",
+        ));
+    }
+    if !(tp_vec.len() == n_strats || tp_vec.len() == 1) {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "tp_pips length must be 1 or signals.shape[0]",
+        ));
+    }
+
+    let out = py
+        .detach(|| {
+            let mut metrics = Array2::<f64>::zeros((n_strats, 11));
+            for row in 0..n_strats {
+                let sig_row: Vec<i8> = signals_mat.row(row).iter().copied().collect();
+                let sl = if sl_vec.len() == 1 { sl_vec[0] } else { sl_vec[row] };
+                let tp = if tp_vec.len() == 1 { tp_vec[0] } else { tp_vec[row] };
+                let m = forex_search::fast_evaluate_strategy_core(
+                    &close_vec,
+                    &high_vec,
+                    &low_vec,
+                    &sig_row,
+                    &month_vec,
+                    &day_vec,
+                    sl,
+                    tp,
+                    max_hold_bars,
+                    trailing_enabled,
+                    trailing_atr_multiplier,
+                    trailing_be_trigger_r,
+                    pip_value,
+                    spread_pips,
+                    commission_per_trade,
+                    pip_value_per_lot,
+                );
+                for col in 0..11 {
+                    metrics[(row, col)] = m[col];
+                }
+            }
+            Ok::<Array2<f64>, String>(metrics)
+        })
+        .map_err(|msg| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg))?;
+
+    Ok(out.into_pyarray(py))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
     close,
     high,
     low,
@@ -1975,6 +2175,8 @@ fn forex_bindings(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_symbol_frames, m)?)?;
     m.add_function(wrap_pyfunction!(load_symbol_features, m)?)?;
     m.add_function(wrap_pyfunction!(infer_stop_target_pips_ohlcv, m)?)?;
+    m.add_function(wrap_pyfunction!(fast_evaluate_strategy, m)?)?;
+    m.add_function(wrap_pyfunction!(batch_evaluate_strategies, m)?)?;
     m.add_function(wrap_pyfunction!(triple_barrier_labels, m)?)?;
     m.add_function(wrap_pyfunction!(compute_position_size_lots, m)?)?;
     m.add_function(wrap_pyfunction!(talib_bulk_signals_ohlcv, m)?)?;

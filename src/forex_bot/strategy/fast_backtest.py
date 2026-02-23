@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Iterable, Mapping, Tuple
 from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+_FOREX_BINDINGS_ERROR: Exception | None = None
+try:
+    import forex_bindings as _forex_bindings
+except Exception as exc:  # pragma: no cover - depends on native build
+    _forex_bindings = None
+    _FOREX_BINDINGS_ERROR = exc
 
 _FOREX_CORE_ERROR: Exception | None = None
 try:
@@ -15,8 +25,55 @@ except Exception as exc:  # pragma: no cover - depends on native build
     _FOREX_CORE_ERROR = exc
 
 
+def _bindings_backtest_available() -> bool:
+    return bool(
+        _forex_bindings is not None
+        and hasattr(_forex_bindings, "fast_evaluate_strategy")
+        and hasattr(_forex_bindings, "batch_evaluate_strategies")
+    )
+
+
+def _core_backtest_available() -> bool:
+    return bool(
+        _forex_core is not None
+        and hasattr(_forex_core, "fast_evaluate_strategy")
+        and hasattr(_forex_core, "batch_evaluate_strategies")
+    )
+
+
+def _backtest_backend_mode() -> str:
+    raw = str(os.environ.get("FOREX_BOT_BACKTEST_BACKEND", "auto") or "auto").strip().lower()
+    if raw in {"bindings", "binding", "forex_bindings", "rust_bindings"}:
+        return "bindings"
+    if raw in {"core", "forex_core", "legacy"}:
+        return "core"
+    if raw in {"python", "py"}:
+        return "python"
+    return "auto"
+
+
+def _select_backtest_backend() -> str | None:
+    mode = _backtest_backend_mode()
+    if mode == "bindings":
+        if _bindings_backtest_available():
+            return "bindings"
+        return None
+    if mode == "core":
+        if _core_backtest_available():
+            return "core"
+        return None
+    if mode == "python":
+        return None
+    if _bindings_backtest_available():
+        return "bindings"
+    if _core_backtest_available():
+        return "core"
+    return None
+
+
 def _require_rust() -> None:
-    if _forex_core is not None:
+    backend = _select_backtest_backend()
+    if backend is not None:
         return
     if str(os.environ.get("FOREX_BOT_ALLOW_PY_BACKTEST", "")).strip().lower() in {
         "1",
@@ -26,9 +83,9 @@ def _require_rust() -> None:
     }:
         return
     raise ImportError(
-        "forex_core Rust extension not available. Build the Rust core or set "
+        "No Rust backtest backend available (forex_bindings/forex_core). Build Rust extensions or set "
         "FOREX_BOT_ALLOW_PY_BACKTEST=1 to allow slow Python fallback."
-    ) from _FOREX_CORE_ERROR
+    ) from (_FOREX_BINDINGS_ERROR or _FOREX_CORE_ERROR)
 
 
 def _as_contig(arr: Iterable, dtype: np.dtype) -> np.ndarray:
@@ -311,11 +368,12 @@ def fast_evaluate_strategy(
     month_arr = _as_contig(month_indices, np.int64)
     day_arr = _as_contig(day_indices, np.int64)
 
-    if _forex_core is None:
+    backend = _select_backtest_backend()
+    if backend is None:
         # Optional fallback path (very slow); return zeros if explicitly allowed.
         return np.zeros(11, dtype=np.float64)
 
-    out = _forex_core.fast_evaluate_strategy(
+    args = (
         close_arr,
         high_arr,
         low_arr,
@@ -333,6 +391,21 @@ def fast_evaluate_strategy(
         float(commission_per_trade),
         float(pip_value_per_lot),
     )
+
+    mode = _backtest_backend_mode()
+    if backend == "bindings" and _forex_bindings is not None:
+        try:
+            out = _forex_bindings.fast_evaluate_strategy(*args)
+            return np.asarray(out, dtype=np.float64)
+        except Exception as exc:
+            if mode == "bindings" or not _core_backtest_available():
+                raise
+            logger.warning("forex_bindings backtest failed; falling back to forex_core: %s", exc)
+
+    if _forex_core is None:
+        return np.zeros(11, dtype=np.float64)
+
+    out = _forex_core.fast_evaluate_strategy(*args)
     return np.asarray(out, dtype=np.float64)
 
 
@@ -365,10 +438,11 @@ def batch_evaluate_strategies(
     sl_arr = _as_contig(sl_pips, np.float64)
     tp_arr = _as_contig(tp_pips, np.float64)
 
-    if _forex_core is None:
+    backend = _select_backtest_backend()
+    if backend is None:
         return np.zeros((0, 11), dtype=np.float64)
 
-    out = _forex_core.batch_evaluate_strategies(
+    args = (
         close_arr,
         high_arr,
         low_arr,
@@ -386,4 +460,19 @@ def batch_evaluate_strategies(
         float(commission_per_trade),
         float(pip_value_per_lot),
     )
+
+    mode = _backtest_backend_mode()
+    if backend == "bindings" and _forex_bindings is not None:
+        try:
+            out = _forex_bindings.batch_evaluate_strategies(*args)
+            return np.asarray(out, dtype=np.float64)
+        except Exception as exc:
+            if mode == "bindings" or not _core_backtest_available():
+                raise
+            logger.warning("forex_bindings batch backtest failed; falling back to forex_core: %s", exc)
+
+    if _forex_core is None:
+        return np.zeros((0, 11), dtype=np.float64)
+
+    out = _forex_core.batch_evaluate_strategies(*args)
     return np.asarray(out, dtype=np.float64)

@@ -30,6 +30,7 @@ _OHLCV_COLUMN_ALIASES = {
     "vol",
     "volume",
 }
+_FRAME_IO_WARNED_UNKNOWN = False
 
 
 def _rust_data_backend_available(*, force_log: bool = False) -> bool:
@@ -52,6 +53,39 @@ def _rust_data_backend_available(*, force_log: bool = False) -> bool:
 def _disable_rust_data_backend() -> None:
     global _RUST_DATA_BACKEND_OK
     _RUST_DATA_BACKEND_OK = False
+
+
+def _frame_io_backend() -> str:
+    """
+    Select the dataframe I/O backend for local history files.
+
+    Env (preferred): FOREX_BOT_FRAME_IO_BACKEND=auto|polars|pyarrow|pandas
+    Back-compat:     FOREX_BOT_DATA_IO_BACKEND=...
+    """
+    global _FRAME_IO_WARNED_UNKNOWN
+    raw = os.environ.get("FOREX_BOT_FRAME_IO_BACKEND")
+    if raw is None or str(raw).strip() == "":
+        raw = os.environ.get("FOREX_BOT_DATA_IO_BACKEND", "auto")
+    mode = str(raw).strip().lower()
+    aliases = {
+        "auto": "auto",
+        "detect": "auto",
+        "pl": "polars",
+        "polars": "polars",
+        "arrow": "pyarrow",
+        "pa": "pyarrow",
+        "pyarrow": "pyarrow",
+        "pd": "pandas",
+        "python": "pandas",
+        "pandas": "pandas",
+    }
+    resolved = aliases.get(mode)
+    if resolved is not None:
+        return resolved
+    if not _FRAME_IO_WARNED_UNKNOWN:
+        logger.warning("Unknown frame I/O backend '%s'; using auto.", mode)
+        _FRAME_IO_WARNED_UNKNOWN = True
+    return "auto"
 
 
 def _use_rust_data_backend() -> bool:
@@ -233,9 +267,20 @@ def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _read_frame(path: Path) -> pd.DataFrame | None:
-    if not path.exists():
-        return None
+def _parquet_ohlcv_columns(path: Path) -> list[str] | None:
+    cols: list[str] | None = None
+    try:
+        import pyarrow.parquet as pq
+
+        names = [str(n) for n in pq.ParquetFile(path).schema.names]
+        keep = [name for name in names if str(name).lower() in _OHLCV_COLUMN_ALIASES]
+        cols = keep or None
+    except Exception:
+        cols = None
+    return cols
+
+
+def _read_frame_polars(path: Path) -> pd.DataFrame | None:
     try:
         import polars as pl
 
@@ -247,27 +292,70 @@ def _read_frame(path: Path) -> pd.DataFrame | None:
                 cols = keep or None
             except Exception:
                 cols = None
-            df = pl.read_parquet(path, columns=cols).to_pandas()
+            frame = pl.read_parquet(path, columns=cols)
         else:
-            df = pl.read_csv(path).to_pandas()
-        return df
-    except Exception:
+            frame = pl.read_csv(path)
+        with_arrow = str(os.environ.get("FOREX_BOT_POLARS_ARROW_ARRAY", "1") or "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         try:
-            if path.suffix.lower() == ".parquet":
-                cols: list[str] | None = None
-                try:
-                    import pyarrow.parquet as pq
+            return frame.to_pandas(use_pyarrow_extension_array=with_arrow)
+        except Exception:
+            return frame.to_pandas()
+    except Exception:
+        return None
 
-                    names = [str(n) for n in pq.ParquetFile(path).schema.names]
-                    keep = [name for name in names if str(name).lower() in _OHLCV_COLUMN_ALIASES]
-                    cols = keep or None
-                except Exception:
-                    cols = None
-                return pd.read_parquet(path, columns=cols)
-            return pd.read_csv(path)
-        except Exception as exc:
-            logger.warning("Failed to read data file %s: %s", path, exc)
-            return None
+
+def _read_frame_pyarrow(path: Path) -> pd.DataFrame | None:
+    try:
+        if path.suffix.lower() == ".parquet":
+            import pyarrow.parquet as pq
+
+            cols = _parquet_ohlcv_columns(path)
+            table = pq.read_table(path, columns=cols, memory_map=True)
+        else:
+            import pyarrow.csv as pacsv
+
+            table = pacsv.read_csv(path)
+        try:
+            return table.to_pandas(types_mapper=pd.ArrowDtype)
+        except Exception:
+            return table.to_pandas()
+    except Exception:
+        return None
+
+
+def _read_frame_pandas(path: Path) -> pd.DataFrame | None:
+    try:
+        if path.suffix.lower() == ".parquet":
+            return pd.read_parquet(path, columns=_parquet_ohlcv_columns(path))
+        return pd.read_csv(path)
+    except Exception:
+        return None
+
+
+def _read_frame(path: Path) -> pd.DataFrame | None:
+    if not path.exists():
+        return None
+
+    mode = _frame_io_backend()
+    readers = {
+        "polars": (_read_frame_polars, _read_frame_pyarrow, _read_frame_pandas),
+        "pyarrow": (_read_frame_pyarrow, _read_frame_polars, _read_frame_pandas),
+        "pandas": (_read_frame_pandas, _read_frame_pyarrow, _read_frame_polars),
+        "auto": (_read_frame_polars, _read_frame_pyarrow, _read_frame_pandas),
+    }.get(mode, (_read_frame_polars, _read_frame_pyarrow, _read_frame_pandas))
+
+    for reader in readers:
+        df = reader(path)
+        if df is not None:
+            return df
+
+    logger.warning("Failed to read data file %s with all configured backends.", path)
+    return None
 
 
 def _resample_ohlcv(df: pd.DataFrame, tf: str) -> pd.DataFrame | None:
