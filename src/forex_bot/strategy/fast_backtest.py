@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
-from typing import Iterable, Tuple
+from typing import Iterable, Mapping, Tuple
+from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 
 _FOREX_CORE_ERROR: Exception | None = None
 try:
@@ -36,20 +38,152 @@ def _as_contig(arr: Iterable, dtype: np.dtype) -> np.ndarray:
     return out
 
 
-def infer_pip_metrics(symbol: str) -> Tuple[float, float]:
-    sym = (symbol or "").upper()
-    if sym.endswith("JPY") or sym.startswith("JPY"):
-        pip_size = 0.01
-        pip_value = 10.0
-    elif sym.startswith("XAU") or sym.startswith("XAG"):
-        pip_size = 0.01
-        pip_value = 10.0
-    elif "BTC" in sym or "ETH" in sym or "LTC" in sym:
-        pip_size = 1.0
-        pip_value = 1.0
+def _norm_symbol(symbol: str) -> str:
+    raw = "".join(ch for ch in str(symbol or "").upper() if ch.isalpha())
+    if len(raw) >= 6:
+        return raw[:6]
+    return raw
+
+
+def _split_symbol(symbol: str) -> tuple[str, str] | None:
+    sym = _norm_symbol(symbol)
+    if len(sym) == 6 and sym.isalpha():
+        return sym[:3], sym[3:]
+    return None
+
+
+def _symbol_kind(symbol: str, parts: tuple[str, str] | None) -> str:
+    if parts is not None:
+        base, quote = parts
+        if base in {"XAU", "XAG"}:
+            return "metal"
+        if base in {"BTC", "ETH", "LTC"}:
+            return "crypto"
+        if len(base) == 3 and len(quote) == 3:
+            return "fx"
+    sym = _norm_symbol(symbol)
+    if "BTC" in sym or "ETH" in sym or "LTC" in sym:
+        return "crypto"
+    if sym.startswith("XAU") or sym.startswith("XAG"):
+        return "metal"
+    return "other"
+
+
+def _pip_size(symbol: str, parts: tuple[str, str] | None) -> float:
+    kind = _symbol_kind(symbol, parts)
+    if kind == "metal":
+        return 0.01
+    if kind == "crypto":
+        return 1.0
+    if kind == "fx" and parts is not None and parts[1] == "JPY":
+        return 0.01
+    if kind == "fx":
+        return 0.0001
+    return 0.0001
+
+
+def _contract_size(symbol: str, parts: tuple[str, str] | None) -> float:
+    kind = _symbol_kind(symbol, parts)
+    if kind == "metal" and parts is not None:
+        base = parts[0]
+        if base == "XAU":
+            return 100.0
+        if base == "XAG":
+            return 5000.0
+    if kind == "crypto":
+        return 1.0
+    if kind == "fx":
+        return 100000.0
+    return 1.0
+
+
+def _norm_price_map(reference_prices: Mapping[str, float] | None) -> dict[str, float]:
+    out: dict[str, float] = {}
+    if not reference_prices:
+        return out
+    for key, value in reference_prices.items():
+        try:
+            price = float(value)
+        except Exception:
+            continue
+        if not np.isfinite(price) or price <= 0.0:
+            continue
+        pair = _norm_symbol(str(key))
+        if len(pair) == 6:
+            out[pair] = price
+    return out
+
+
+def _quote_to_account_rate(
+    *,
+    base: str,
+    quote: str,
+    account: str,
+    price: float | None,
+    reference_prices: Mapping[str, float] | None,
+) -> float | None:
+    acc = str(account or "USD").upper()
+    if quote == acc:
+        return 1.0
+
+    if price is not None:
+        px = float(price)
+        if np.isfinite(px) and px > 0.0 and base == acc:
+            return 1.0 / px
     else:
-        pip_size = 0.0001
-        pip_value = 10.0
+        px = np.nan
+
+    refs = _norm_price_map(reference_prices)
+
+    direct = refs.get(f"{quote}{acc}")
+    if direct is not None and direct > 0.0:
+        return float(direct)
+
+    inverse = refs.get(f"{acc}{quote}")
+    if inverse is not None and inverse > 0.0:
+        return 1.0 / float(inverse)
+
+    if np.isfinite(px) and px > 0.0:
+        base_to_acc = refs.get(f"{base}{acc}")
+        if base_to_acc is not None and base_to_acc > 0.0:
+            return float(base_to_acc) / px
+        acc_to_base = refs.get(f"{acc}{base}")
+        if acc_to_base is not None and acc_to_base > 0.0:
+            return 1.0 / (float(acc_to_base) * px)
+        # Last-resort approximation: treat account currency as base.
+        return 1.0 / px
+
+    return None
+
+
+def infer_pip_metrics(
+    symbol: str,
+    *,
+    price: float | None = None,
+    account_currency: str = "USD",
+    reference_prices: Mapping[str, float] | None = None,
+) -> Tuple[float, float]:
+    parts = _split_symbol(symbol)
+    pip_size = _pip_size(symbol, parts)
+    lot_size = _contract_size(symbol, parts)
+    pip_value_quote = pip_size * lot_size
+
+    pip_value = pip_value_quote
+    if parts is not None:
+        base, quote = parts
+        rate = _quote_to_account_rate(
+            base=base,
+            quote=quote,
+            account=account_currency,
+            price=price,
+            reference_prices=reference_prices,
+        )
+        if rate is not None and np.isfinite(rate) and rate > 0.0:
+            pip_value = pip_value_quote * rate
+
+    if not np.isfinite(pip_value) or pip_value <= 0.0:
+        pip_value = max(1e-6, float(pip_value_quote))
+
     return float(pip_size), float(pip_value)
 
 
@@ -66,9 +200,17 @@ def infer_sl_tp_pips_auto(
     min_dist: float,
     settings: object | None = None,
 ) -> Tuple[float, float] | None:
+    try:
+        from .stop_target import infer_stop_target_pips
+    except Exception:
+        infer_stop_target_pips = None  # type: ignore[assignment]
+
+    open_arr = _as_contig(open_prices, np.float64)
     close_arr = _as_contig(close_prices, np.float64)
     high_arr = _as_contig(high_prices, np.float64)
     low_arr = _as_contig(low_prices, np.float64)
+    if open_arr.size != close_arr.size:
+        open_arr = close_arr
     if atr_values is not None:
         atr_arr = _as_contig(atr_values, np.float64)
     else:
@@ -76,6 +218,39 @@ def infer_sl_tp_pips_auto(
 
     if close_arr.size < 2:
         return None
+
+    if infer_stop_target_pips is not None and pip_size > 0.0:
+        settings_obj = settings
+        if settings_obj is None or not hasattr(settings_obj, "risk"):
+            risk = SimpleNamespace(
+                atr_stop_multiplier=float(max(0.1, atr_mult)),
+                min_risk_reward=float(max(0.1, min_rr)),
+                meta_label_min_dist=float(max(0.0, min_dist)),
+                stop_target_mode=str(os.environ.get("FOREX_BOT_STOP_TARGET_MODE", "blend") or "blend"),
+            )
+            settings_obj = SimpleNamespace(risk=risk)
+        try:
+            df = {
+                "open": open_arr,
+                "high": high_arr,
+                "low": low_arr,
+                "close": close_arr,
+            }
+            if atr_arr is not None and atr_arr.size == close_arr.size:
+                df["atr"] = atr_arr
+            out = infer_stop_target_pips(
+                pd.DataFrame(df),
+                settings=settings_obj,
+                pip_size=float(pip_size),
+                signal=None,
+            )
+            if out is not None:
+                sl_pips, tp_pips, _rr = out
+                if np.isfinite(sl_pips) and np.isfinite(tp_pips) and sl_pips > 0.0 and tp_pips > 0.0:
+                    return float(sl_pips), float(tp_pips)
+        except Exception:
+            # Fallback to ATR-only path below.
+            pass
 
     if atr_arr is None or atr_arr.size == 0:
         prev_close = np.roll(close_arr, 1)

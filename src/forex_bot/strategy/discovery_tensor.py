@@ -16,6 +16,7 @@ from ..features.talib_mixer import (
     TALibStrategyMixer,
 )
 from .fast_backtest import (
+    batch_evaluate_strategies,
     fast_evaluate_strategy,
     infer_pip_metrics,
     infer_sl_tp_pips_auto,
@@ -30,6 +31,25 @@ try:
 except Exception:
     _fb = None  # type: ignore
     _RUST_DISCOVERY = False
+
+
+def _allow_python_discovery_fallback(settings: Any | None) -> bool:
+    override = os.environ.get("FOREX_BOT_DISCOVERY_ALLOW_PY_FALLBACK")
+    if override is not None and str(override).strip() != "":
+        return str(override).strip().lower() in {"1", "true", "yes", "on"}
+    rust_only = os.environ.get("FOREX_BOT_DISCOVERY_RUST_ONLY")
+    if rust_only is not None and str(rust_only).strip() != "":
+        if str(rust_only).strip().lower() in {"1", "true", "yes", "on"}:
+            return False
+    runtime_mode = str(os.environ.get("FOREX_BOT_RUNTIME_MODE", "") or "").strip().lower()
+    if runtime_mode in {"prod", "production", "live"}:
+        return False
+    try:
+        if settings is not None and bool(getattr(settings.system, "discovery_stream", False)):
+            return False
+    except Exception:
+        pass
+    return True
 
 
 def _safe_indices(idx: pd.Index, n: int) -> tuple[np.ndarray, np.ndarray]:
@@ -52,8 +72,15 @@ def _gene_to_dict(gene: TALibStrategyGene) -> dict[str, Any]:
         "preferred_regime": gene.preferred_regime,
         "strategy_id": gene.strategy_id,
         "fitness": float(getattr(gene, "fitness", 0.0)),
+        "sharpe_ratio": float(getattr(gene, "sharpe_ratio", 0.0)),
+        "win_rate": float(getattr(gene, "win_rate", 0.0)),
+        "net_profit": float(getattr(gene, "net_profit", 0.0)),
+        "profit_factor": float(getattr(gene, "profit_factor", 0.0)),
+        "expectancy": float(getattr(gene, "expectancy", 0.0)),
         "max_dd_pct": float(getattr(gene, "max_dd_pct", 0.0)),
+        "max_drawdown": float(getattr(gene, "max_dd_pct", 0.0)),
         "trades": float(getattr(gene, "trades", 0.0)),
+        "trades_count": float(getattr(gene, "trades", 0.0)),
         "use_ob": bool(getattr(gene, "use_ob", False)),
         "use_fvg": bool(getattr(gene, "use_fvg", False)),
         "use_liq_sweep": bool(getattr(gene, "use_liq_sweep", False)),
@@ -104,16 +131,23 @@ def _convert_rust_gene(gene: dict[str, Any], feature_names: list[str], available
     if not indicators:
         return None
 
-    try:
-        max_dd_pct = float(
-            gene.get("max_dd_pct", gene.get("max_dd", gene.get("drawdown", 0.0))) or 0.0
-        )
-    except Exception:
-        max_dd_pct = 0.0
-    try:
-        trades = float(gene.get("trades", gene.get("trade_count", 0.0)) or 0.0)
-    except Exception:
-        trades = 0.0
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    max_dd_pct = _to_float(
+        gene.get(
+            "max_dd_pct",
+            gene.get("max_drawdown", gene.get("max_dd", gene.get("drawdown", 0.0))),
+        ),
+        0.0,
+    )
+    trades = _to_float(gene.get("trades", gene.get("trades_count", gene.get("trade_count", 0.0))), 0.0)
+    net_profit = _to_float(gene.get("net_profit", 0.0), 0.0)
+    profit_factor = _to_float(gene.get("profit_factor", 0.0), 0.0)
+    expectancy = _to_float(gene.get("expectancy", 0.0), 0.0)
 
     return TALibStrategyGene(
         indicators=indicators,
@@ -125,10 +159,13 @@ def _convert_rust_gene(gene: dict[str, Any], feature_names: list[str], available
         preferred_regime=str(gene.get("preferred_regime", "any")),
         strategy_id=str(gene.get("strategy_id", "")),
         fitness=float(gene.get("fitness", 0.0)),
-        sharpe_ratio=float(gene.get("sharpe_ratio", 0.0)),
-        win_rate=float(gene.get("win_rate", 0.0)),
+        sharpe_ratio=_to_float(gene.get("sharpe_ratio", 0.0), 0.0),
+        win_rate=_to_float(gene.get("win_rate", 0.0), 0.0),
         max_dd_pct=max_dd_pct,
         trades=trades,
+        net_profit=net_profit,
+        profit_factor=profit_factor,
+        expectancy=expectancy,
         use_ob=bool(gene.get("use_ob", False)),
         use_fvg=bool(gene.get("use_fvg", False)),
         use_liq_sweep=bool(gene.get("use_liq_sweep", False)),
@@ -279,6 +316,19 @@ def _strategy_keep_limits(settings: Any | None, default_cap: int) -> tuple[float
     return keep_max_dd, keep_min_profit, keep_min_trades, keep_min_count, keep_cap
 
 
+def _profit_value(gene: TALibStrategyGene) -> float:
+    metric = str(os.environ.get("FOREX_BOT_DISCOVERY_KEEP_PROFIT_METRIC", "fitness") or "fitness").strip().lower()
+    if metric in {"net", "net_profit", "pnl"}:
+        try:
+            return float(getattr(gene, "net_profit", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+    try:
+        return float(getattr(gene, "fitness", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
 def _select_ranked(
     candidates: list[TALibStrategyGene],
     *,
@@ -304,6 +354,176 @@ def _select_ranked(
     if cap > 0:
         selected = selected[:cap]
     return selected, len(ranked_filtered), len(ranked_all)
+
+
+def _apply_eval_metrics(gene: TALibStrategyGene, metrics: np.ndarray | list[float] | tuple[float, ...] | None) -> float:
+    if metrics is None:
+        score = 0.0
+        gene.sharpe_ratio = 0.0
+        gene.max_dd_pct = 0.0
+        gene.win_rate = 0.0
+        gene.trades = 0.0
+        gene.net_profit = 0.0
+        gene.profit_factor = 0.0
+        gene.expectancy = 0.0
+        gene.fitness = score
+        return score
+    arr = np.asarray(metrics, dtype=np.float64).reshape(-1)
+    if arr.size < 9:
+        score = 0.0
+        gene.sharpe_ratio = 0.0
+        gene.max_dd_pct = 0.0
+        gene.win_rate = 0.0
+        gene.trades = 0.0
+        gene.net_profit = 0.0
+        gene.profit_factor = 0.0
+        gene.expectancy = 0.0
+        gene.fitness = score
+        return score
+    score = float(arr[0])
+    gene.sharpe_ratio = float(arr[1])
+    gene.max_dd_pct = float(arr[3])
+    gene.win_rate = float(arr[4])
+    gene.net_profit = float(arr[0])
+    gene.profit_factor = float(arr[5])
+    gene.expectancy = float(arr[6])
+    gene.trades = float(arr[8])
+    gene.fitness = score
+    return score
+
+
+def _score_genes_python_fallback(
+    *,
+    df: pd.DataFrame,
+    genes: list[TALibStrategyGene],
+    mixer: TALibStrategyMixer,
+    cache: dict[str, pd.Series],
+    settings: Any | None,
+    pip_size: float,
+    pip_val: float,
+    close: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    open_: np.ndarray,
+    atr_vals: np.ndarray | None,
+    month_idx: np.ndarray,
+    day_idx: np.ndarray,
+) -> list[tuple[float, TALibStrategyGene]]:
+    scored: list[tuple[float, TALibStrategyGene]] = []
+    batch_eval_enabled = str(os.environ.get("FOREX_BOT_DISCOVERY_BATCH_EVAL", "1") or "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    try:
+        batch_size = int(os.environ.get("FOREX_BOT_DISCOVERY_BATCH_SIZE", "32") or 32)
+    except Exception:
+        batch_size = 32
+    batch_size = max(1, min(batch_size, 512))
+
+    eval_genes: list[TALibStrategyGene] = []
+    eval_signals: list[np.ndarray] = []
+    sl_vals: list[float] = []
+    tp_vals: list[float] = []
+
+    for gene in genes:
+        try:
+            sig = mixer.compute_signals(df, gene, cache=cache).fillna(0.0).to_numpy(dtype=np.int8)
+            sl_pips, tp_pips = _resolve_sl_tp(
+                gene=gene,
+                settings=settings,
+                pip_size=pip_size,
+                open_prices=open_,
+                high_prices=high,
+                low_prices=low,
+                close_prices=close,
+                atr_values=atr_vals,
+            )
+            eval_genes.append(gene)
+            eval_signals.append(sig)
+            sl_vals.append(float(sl_pips))
+            tp_vals.append(float(tp_pips))
+        except Exception as exc:
+            logger.debug("Discovery: gene setup failed: %s", exc)
+            score = _apply_eval_metrics(gene, None)
+            scored.append((score, gene))
+
+    if not eval_genes:
+        return scored
+
+    # Prefer batched Rust backtest path when available; fall back safely on mismatch/errors.
+    if batch_eval_enabled:
+        batch_failed = False
+        for start in range(0, len(eval_genes), batch_size):
+            stop = min(start + batch_size, len(eval_genes))
+            chunk_genes = eval_genes[start:stop]
+            chunk_signals = eval_signals[start:stop]
+            if not chunk_genes:
+                continue
+            try:
+                sig_mat = np.ascontiguousarray(np.stack(chunk_signals, axis=0), dtype=np.int8)
+                rows = sig_mat.shape[0]
+                close_mat = np.ascontiguousarray(np.broadcast_to(close, (rows, close.size)), dtype=np.float64)
+                high_mat = np.ascontiguousarray(np.broadcast_to(high, (rows, high.size)), dtype=np.float64)
+                low_mat = np.ascontiguousarray(np.broadcast_to(low, (rows, low.size)), dtype=np.float64)
+                month_mat = np.ascontiguousarray(np.broadcast_to(month_idx, (rows, month_idx.size)), dtype=np.int64)
+                day_mat = np.ascontiguousarray(np.broadcast_to(day_idx, (rows, day_idx.size)), dtype=np.int64)
+                sl_arr = np.ascontiguousarray(np.asarray(sl_vals[start:stop], dtype=np.float64))
+                tp_arr = np.ascontiguousarray(np.asarray(tp_vals[start:stop], dtype=np.float64))
+                metrics_mat = batch_evaluate_strategies(
+                    close_mat,
+                    high_mat,
+                    low_mat,
+                    sig_mat,
+                    month_mat,
+                    day_mat,
+                    sl_arr,
+                    tp_arr,
+                    pip_value=pip_size,
+                    pip_value_per_lot=pip_val,
+                    spread_pips=1.5,
+                    commission_per_trade=7.0,
+                )
+                metrics_arr = np.asarray(metrics_mat, dtype=np.float64)
+                if metrics_arr.ndim != 2 or metrics_arr.shape[0] != rows or metrics_arr.shape[1] < 9:
+                    raise ValueError(f"unexpected batch metrics shape: {metrics_arr.shape}")
+                for i, gene in enumerate(chunk_genes):
+                    score = _apply_eval_metrics(gene, metrics_arr[i])
+                    scored.append((score, gene))
+            except Exception as exc:
+                logger.debug("Discovery batch evaluation failed; reverting to per-gene: %s", exc)
+                batch_failed = True
+                break
+        if not batch_failed and len(scored) >= len(genes):
+            return scored
+
+    # Per-gene fallback for any unevaluated genes or when batch mode fails.
+    already = {id(g) for _, g in scored}
+    for i, gene in enumerate(eval_genes):
+        if id(gene) in already:
+            continue
+        try:
+            metrics = fast_evaluate_strategy(
+                close_prices=close,
+                high_prices=high,
+                low_prices=low,
+                signals=eval_signals[i],
+                month_indices=month_idx,
+                day_indices=day_idx,
+                sl_pips=sl_vals[i],
+                tp_pips=tp_vals[i],
+                pip_value=pip_size,
+                pip_value_per_lot=pip_val,
+                spread_pips=1.5,
+                commission_per_trade=7.0,
+            )
+            score = _apply_eval_metrics(gene, metrics)
+        except Exception as exc:
+            logger.debug("Discovery: gene eval failed: %s", exc)
+            score = _apply_eval_metrics(gene, None)
+        scored.append((score, gene))
+    return scored
 
 
 class TensorDiscoveryEngine:
@@ -346,6 +566,7 @@ class TensorDiscoveryEngine:
         if len(df) < 50:
             return
         iter_budget = max(1, int(iterations or 1))
+        allow_python_fallback = _allow_python_discovery_fallback(self.settings)
 
         def _env_int(name: str, default: int) -> int:
             raw = os.environ.get(name)
@@ -388,22 +609,57 @@ class TensorDiscoveryEngine:
                 default_portfolio = max(100, default_portfolio)
                 default_candidates = max(default_candidates, min(10_000, max(100, default_portfolio // 2)))
 
-                result = _fb.search_discovery_ohlcv(
-                    open_,
-                    high,
-                    low,
-                    close,
-                    ts,
-                    volume,
-                    max(4, _env_int("FOREX_BOT_DISCOVERY_POP", default_pop)),
-                    max(1, _env_int("FOREX_BOT_DISCOVERY_GENS", default_gens)),
-                    max(2, _env_int("FOREX_BOT_DISCOVERY_MAX_INDICATORS", 12)),
-                    max(10, _env_int("FOREX_BOT_DISCOVERY_CANDIDATES", default_candidates)),
-                    max(5, _env_int("FOREX_BOT_DISCOVERY_PORTFOLIO", default_portfolio)),
-                    float(os.environ.get("FOREX_BOT_DISCOVERY_CORR", "0.7") or 0.7),
-                    float(os.environ.get("FOREX_BOT_DISCOVERY_MIN_TRADES", "1.0") or 1.0),
-                    True,
+                keep_max_dd, keep_min_profit, keep_min_trades, keep_min_count, keep_cap = _strategy_keep_limits(
+                    self.settings,
+                    default_cap=default_portfolio,
                 )
+                rust_pop = max(4, _env_int("FOREX_BOT_DISCOVERY_POP", default_pop))
+                rust_gens = max(1, _env_int("FOREX_BOT_DISCOVERY_GENS", default_gens))
+                rust_max_ind = max(2, _env_int("FOREX_BOT_DISCOVERY_MAX_INDICATORS", 12))
+                rust_candidates = max(10, _env_int("FOREX_BOT_DISCOVERY_CANDIDATES", default_candidates))
+                rust_portfolio = max(5, _env_int("FOREX_BOT_DISCOVERY_PORTFOLIO", default_portfolio))
+                rust_corr = float(os.environ.get("FOREX_BOT_DISCOVERY_CORR", "0.7") or 0.7)
+                rust_min_trades_day = float(os.environ.get("FOREX_BOT_DISCOVERY_MIN_TRADES", "1.0") or 1.0)
+                try:
+                    result = _fb.search_discovery_ohlcv(
+                        open_,
+                        high,
+                        low,
+                        close,
+                        ts,
+                        volume,
+                        rust_pop,
+                        rust_gens,
+                        rust_max_ind,
+                        rust_candidates,
+                        rust_portfolio,
+                        rust_corr,
+                        rust_min_trades_day,
+                        True,
+                        keep_max_dd,
+                        keep_min_profit,
+                        keep_min_trades,
+                        keep_min_count,
+                        keep_cap,
+                    )
+                except TypeError:
+                    # Backward compatibility for older bindings without Rust-side ranking arguments.
+                    result = _fb.search_discovery_ohlcv(
+                        open_,
+                        high,
+                        low,
+                        close,
+                        ts,
+                        volume,
+                        rust_pop,
+                        rust_gens,
+                        rust_max_ind,
+                        rust_candidates,
+                        rust_portfolio,
+                        rust_corr,
+                        rust_min_trades_day,
+                        True,
+                    )
 
                 feature_names = list(result.get("feature_names") or [])
                 portfolio = list(result.get("portfolio") or [])
@@ -418,24 +674,25 @@ class TensorDiscoveryEngine:
                 if not best:
                     raise RuntimeError("Rust discovery produced no usable genes")
 
-                keep_max_dd, keep_min_profit, keep_min_trades, keep_min_count, keep_cap = _strategy_keep_limits(
-                    self.settings,
-                    default_cap=default_portfolio,
-                )
-
-                filtered = [
-                    g
-                    for g in best
-                    if float(getattr(g, "fitness", 0.0) or 0.0) > keep_min_profit
-                    and float(getattr(g, "max_dd_pct", 0.0) or 0.0) <= keep_max_dd
-                    and float(getattr(g, "trades", 0.0) or 0.0) >= keep_min_trades
-                ]
-                selected, strict_kept, ranked_total = _select_ranked(
-                    best,
-                    filtered=filtered,
-                    min_keep=keep_min_count,
-                    cap=keep_cap,
-                )
+                rust_ranked = bool(result.get("rust_ranked", False))
+                if rust_ranked:
+                    selected = list(best)
+                    strict_kept = int(result.get("strict_kept", len(selected)) or len(selected))
+                    ranked_total = int(result.get("ranked_total", len(selected)) or len(selected))
+                else:
+                    filtered = [
+                        g
+                        for g in best
+                        if _profit_value(g) > keep_min_profit
+                        and float(getattr(g, "max_dd_pct", 0.0) or 0.0) <= keep_max_dd
+                        and float(getattr(g, "trades", 0.0) or 0.0) >= keep_min_trades
+                    ]
+                    selected, strict_kept, ranked_total = _select_ranked(
+                        best,
+                        filtered=filtered,
+                        min_keep=keep_min_count,
+                        cap=keep_cap,
+                    )
                 symbol = str(df.attrs.get("symbol", "") or "")
 
                 payload = {
@@ -466,7 +723,13 @@ class TensorDiscoveryEngine:
                 )
                 return
             except Exception as exc:
+                if not allow_python_fallback:
+                    logger.error("Rust discovery failed and Python fallback is disabled: %s", exc, exc_info=True)
+                    return
                 logger.warning("Rust discovery failed, falling back to Python: %s", exc, exc_info=True)
+        elif not allow_python_fallback:
+            logger.warning("Rust discovery backend unavailable and Python fallback is disabled; skipping discovery.")
+            return
         mixer = TALibStrategyMixer()
         if not mixer.available_indicators:
             logger.warning("Discovery: no TA-Lib indicators available.")        
@@ -516,58 +779,29 @@ class TensorDiscoveryEngine:
             default_cap=default_cap,
         )
 
-        scored: list[tuple[float, TALibStrategyGene]] = []
-        for gene in genes:
-            try:
-                sig = mixer.compute_signals(df, gene, cache=cache).fillna(0.0).to_numpy(dtype=np.int8)
-                sl_pips, tp_pips = _resolve_sl_tp(
-                    gene=gene,
-                    settings=self.settings,
-                    pip_size=pip_size,
-                    open_prices=open_,
-                    high_prices=high,
-                    low_prices=low,
-                    close_prices=close,
-                    atr_values=atr_vals,
-                )
-                metrics = fast_evaluate_strategy(
-                    close_prices=close,
-                    high_prices=high,
-                    low_prices=low,
-                    signals=sig,
-                    month_indices=month_idx,
-                    day_indices=day_idx,
-                    sl_pips=sl_pips,
-                    tp_pips=tp_pips,
-                    pip_value=pip_size,
-                    pip_value_per_lot=pip_val,
-                    spread_pips=1.5,
-                    commission_per_trade=7.0,
-                )
-                if metrics is None or len(metrics) < 9:
-                    score = 0.0
-                    gene.sharpe_ratio = 0.0
-                    gene.max_dd_pct = 0.0
-                    gene.win_rate = 0.0
-                    gene.trades = 0.0
-                else:
-                    score = float(metrics[0])
-                    gene.sharpe_ratio = float(metrics[1])
-                    gene.max_dd_pct = float(metrics[3])
-                    gene.win_rate = float(metrics[4])
-                    gene.trades = float(metrics[8])
-            except Exception as exc:
-                logger.debug("Discovery: gene eval failed: %s", exc)
-                score = 0.0
-            gene.fitness = score
-            scored.append((score, gene))
+        scored = _score_genes_python_fallback(
+            df=df,
+            genes=genes,
+            mixer=mixer,
+            cache=cache,
+            settings=self.settings,
+            pip_size=pip_size,
+            pip_val=pip_val,
+            close=close,
+            high=high,
+            low=low,
+            open_=open_,
+            atr_vals=atr_vals,
+            month_idx=month_idx,
+            day_idx=day_idx,
+        )
 
         scored.sort(key=lambda x: x[0], reverse=True)
         merged = [g for _, g in scored]
         filtered = [
             g
             for g in merged
-            if float(getattr(g, "fitness", 0.0) or 0.0) > keep_min_profit
+            if _profit_value(g) > keep_min_profit
             and float(getattr(g, "max_dd_pct", 0.0) or 0.0) <= keep_max_dd
             and float(getattr(g, "trades", 0.0) or 0.0) >= keep_min_trades
         ]

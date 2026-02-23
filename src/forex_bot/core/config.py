@@ -23,9 +23,80 @@ class SystemConfig(BaseModel):
     mt5_dxy_symbol: str = "USDX"
     mt5_eur_symbol: str = "EXY"
     base_timeframe: str = "M1"
+    multi_resolution_enabled: bool = True
+    multi_resolution_timeframes: list[str] = Field(
+        default_factory=lambda: [
+            "M1",
+            "M2",
+            "M3",
+            "M4",
+            "M5",
+            "M6",
+            "M10",
+            "M12",
+            "M15",
+            "M20",
+            "M30",
+            "H1",
+            "H2",
+            "H3",
+            "H4",
+            "H6",
+            "H8",
+            "H12",
+            "D1",
+            "W1",
+            "MN1",
+        ]
+    )
+    multi_resolution_prefix_base: bool = False
     use_volume_features: bool = True
-    higher_timeframes: list[str] = Field(default_factory=lambda: ["M1","M3","M5","M15","M30","H1","H2","H4","D1","W1","MN1"])
-    required_timeframes: list[str] = Field(default_factory=lambda: ["M1","M3","M5","M15","M30","H1","H2","H4","D1","W1","MN1"])
+    higher_timeframes: list[str] = Field(default_factory=lambda: [
+        "M1",
+        "M2",
+        "M3",
+        "M4",
+        "M5",
+        "M6",
+        "M10",
+        "M12",
+        "M15",
+        "M20",
+        "M30",
+        "H1",
+        "H2",
+        "H3",
+        "H4",
+        "H6",
+        "H8",
+        "H12",
+        "D1",
+        "W1",
+        "MN1",
+    ])
+    required_timeframes: list[str] = Field(default_factory=lambda: [
+        "M1",
+        "M2",
+        "M3",
+        "M4",
+        "M5",
+        "M6",
+        "M10",
+        "M12",
+        "M15",
+        "M20",
+        "M30",
+        "H1",
+        "H2",
+        "H3",
+        "H4",
+        "H6",
+        "H8",
+        "H12",
+        "D1",
+        "W1",
+        "MN1",
+    ])
     enable_level2: bool = False
     level2_depth_levels: int = 10
     history_years: int = 10
@@ -93,6 +164,7 @@ class RiskConfig(BaseModel):
     daily_drawdown_limit: float = 0.04
     total_drawdown_limit: float = 0.07
     min_risk_reward: float = 2.0
+    min_edge_cost_multiple: float = 3.0
     spread_guard_multiplier: float = 2.5
     slippage_guard_multiplier: float = 2.0
     challenge_mode: bool = False
@@ -103,10 +175,18 @@ class RiskConfig(BaseModel):
     daily_risk_budget: float = 0.040
     consistency_tracking: bool = True
     min_confidence_threshold: float = 0.55
+    dynamic_confidence_enabled: bool = True
+    dynamic_confidence_vol_sensitivity: float = 0.15
+    dynamic_confidence_min: float = 0.50
+    dynamic_confidence_max: float = 0.90
+    max_ensemble_disagreement: float = 0.20
     kill_zones_enabled: bool = True
     enhanced_features: bool = True
     uncertainty_quantification: bool = True
     max_trades_per_day: int = 8
+    max_trades_per_session: int = 3
+    correlation_filter_enabled: bool = True
+    max_correlated_positions: int = 1
     daily_profit_stop_pct: float = 0.0
     recovery_mode_enabled: bool = True
     feature_drift_threshold: float = 0.30
@@ -115,10 +195,33 @@ class RiskConfig(BaseModel):
     high_quality_rr: float = 2.0
     atr_period: int = 14
     atr_stop_multiplier: float = 1.5
+    chandelier_enabled: bool = True
+    chandelier_period: int = 22
+    chandelier_atr_multiplier: float = 3.0
     triple_barrier_max_bars: int = 35
     trailing_enabled: bool = True
     trailing_atr_multiplier: float = 1.0
     trailing_be_trigger_r: float = 1.0
+    time_stop_bars: int = 8
+    partial_take_profit_enabled: bool = True
+    partial_tp_r_levels: str = "1.0,2.0,3.0"
+    partial_tp_size_fracs: str = "0.5,0.25,0.25"
+    partial_tp_min_total_lot: float = 0.03
+    entry_patience_enabled: bool = True
+    entry_patience_bars: int = 3
+    entry_patience_pullback_atr: float = 0.20
+    volatility_targeting_enabled: bool = True
+    volatility_target: float = 0.0015
+    volatility_target_min_scale: float = 0.35
+    volatility_target_max_scale: float = 1.30
+    regime_transition_size_multiplier: float = 0.5
+    block_night_session: bool = True
+    night_block_start_utc: int = 0
+    night_block_end_utc: int = 6
+    night_min_volatility: float = 0.0008
+    session_london_confidence_threshold: float = 0.55
+    session_asia_confidence_threshold: float = 0.70
+    session_newyork_confidence_threshold: float = 0.58
     kelly_lambda: float = 1.0
     slippage_pips: float = 0.5
     commission_per_lot: float = 7.0
@@ -126,7 +229,9 @@ class RiskConfig(BaseModel):
     cost_penalty_r: float = 0.0
     gate_trade_prob: float = 0.55
     daily_hard_stop_pct: float = 0.04
+    conformal_enabled: bool = True
     conformal_alpha: float = 0.10
+    conformal_abstain_min_set_size: int = 3
     volatility_stop_sigma: float = 0.02
     volatility_lookback: int = 50
     meta_label_tp_pips: float | None = None
@@ -137,6 +242,10 @@ class RiskConfig(BaseModel):
     meta_label_fixed_sl: float = 0.0020
     meta_label_fixed_tp: float = 0.0040
     stop_target_mode: str = "blend"
+    structure_lookback_bars: int = 120
+    structure_swing_window: int = 2
+    structure_min_atr_mult: float = 0.8
+    structure_max_atr_mult: float = 4.0
     vol_estimator: str = "ensemble"
     vol_ensemble_weights: dict[str, float] = Field(default_factory=lambda: {"yang_zhang": 1.0,"garman_klass": 1.0,"rogers_satchell": 1.0,"parkinson": 1.0})
     vol_ensemble_weights_trend: dict[str, float] | None = None
@@ -144,7 +253,31 @@ class RiskConfig(BaseModel):
     vol_ensemble_weights_neutral: dict[str, float] | None = None
     vol_window: int = 50
     ewma_lambda: float = 0.94
-    ewma_lambda_by_timeframe: dict[str, float] = Field(default_factory=lambda: {"M1": 0.90,"M5": 0.92,"M15": 0.94,"M30": 0.95,"H1": 0.96,"H4": 0.97,"D1": 0.98,"W1": 0.985,"MN1": 0.99})
+    ewma_lambda_by_timeframe: dict[str, float] = Field(
+        default_factory=lambda: {
+            "M1": 0.90,
+            "M2": 0.905,
+            "M3": 0.91,
+            "M4": 0.915,
+            "M5": 0.92,
+            "M6": 0.925,
+            "M10": 0.935,
+            "M12": 0.938,
+            "M15": 0.94,
+            "M20": 0.945,
+            "M30": 0.95,
+            "H1": 0.96,
+            "H2": 0.965,
+            "H3": 0.968,
+            "H4": 0.97,
+            "H6": 0.974,
+            "H8": 0.977,
+            "H12": 0.98,
+            "D1": 0.985,
+            "W1": 0.99,
+            "MN1": 0.995,
+        }
+    )
     vol_horizon_bars: int = 5
     tail_window: int = 100
     tail_alpha: float = 0.975
@@ -172,13 +305,30 @@ class RiskConfig(BaseModel):
         return max(0.1, v)
 
 class ModelsConfig(BaseModel):
-    ml_models: list[str] = Field(default_factory=lambda: ["lightgbm","xgboost","xgboost_rf","xgboost_dart","catboost","catboost_alt","mlp"])
-    use_rl_agent: bool = True
-    use_sac_agent: bool = True
+    ml_models: list[str] = Field(
+        default_factory=lambda: [
+            "lightgbm",
+            "xgboost",
+            "xgboost_rf",
+            "xgboost_dart",
+            "catboost",
+            "catboost_alt",
+            "mlp",
+            "elasticnet",
+            "bayes_logit",
+            "online_pa",
+            "online_hoeffding",
+        ]
+    )
+    use_rl_agent: bool = False
+    use_sac_agent: bool = False
     use_rllib_agent: bool = False
+    train_all_registered_models: bool = False
+    ensure_linear_anchors: bool = True
+    online_learners_enabled: bool = True
     rllib_num_workers: int = 0
     auto_enable_rllib: bool = True
-    use_neuroevolution: bool = True
+    use_neuroevolution: bool = False
     rl_population_size: int = 5
     rl_timesteps: int = 10000000
     rl_eval_episodes: int = 15
@@ -200,6 +350,10 @@ class ModelsConfig(BaseModel):
     prop_search_max_indicators: int = 0
     prop_search_checkpoint: str = "models/strategy_evo_checkpoint.json"
     prop_search_device: str = "cpu"
+    evogp_enabled: bool = True
+    evogp_population: int = 4096
+    evogp_generations: int = 80
+    evogp_eval_candidates: int = 3000
     prop_search_train_years: int = 0
     prop_search_val_years: int = 0
     prop_search_val_candidates: int = 0
@@ -209,6 +363,13 @@ class ModelsConfig(BaseModel):
     prop_search_val_min_monthly_profit_pct: float = 0.0
     prop_search_val_log_trades: bool = False
     prop_search_val_trade_log_max: int = 20
+    prop_search_holdout_fraction: float = 0.20
+    prop_search_holdout_min_rows: int = 8000
+    prop_search_holdout_min_sharpe: float = 1.0
+    prop_search_holdout_min_win_rate: float = 0.50
+    prop_search_holdout_min_profit_factor: float = 1.20
+    prop_search_holdout_min_trades: int = 15
+    prop_search_holdout_required: bool = False
     prop_search_async: bool = False
     prop_search_async_wait: bool = False
     tree_device_preference: str = "auto"
@@ -287,6 +448,43 @@ class ModelsConfig(BaseModel):
     tabnet_hidden_dim: int = 64
     phase5_filter_meta_blender: bool = True
     phase5_core_models: list[str] = Field(default_factory=lambda: ["transformer", "nbeats", "tide", "tabnet", "kan"])
+    phase5_diversity_filter: bool = True
+    phase5_model_corr_max: float = 0.85
+    adversarial_validation_enabled: bool = True
+    adversarial_validation_max_rows: int = 200_000
+    adversarial_validation_alert_acc: float = 0.55
+    calibration_enabled: bool = True
+    calibration_method: str = "platt"
+    calibration_min_rows: int = 300
+    lightgbm_monotone_constraints_enabled: bool = True
+    lightgbm_monotone_constraints: dict[str, int] = Field(default_factory=dict)
+    regime_router_enabled: bool = True
+    regime_router_min_models: int = 2
+    regime_trend_models: list[str] = Field(
+        default_factory=lambda: ["transformer", "patchtst", "timesnet", "nbeats", "nbeatsx_nf", "tide", "tide_nf"]
+    )
+    regime_range_models: list[str] = Field(
+        default_factory=lambda: [
+            "tabnet",
+            "lightgbm",
+            "xgboost",
+            "xgboost_rf",
+            "xgboost_dart",
+            "catboost",
+            "catboost_alt",
+            "elasticnet",
+            "bayes_logit",
+            "online_pa",
+            "online_hoeffding",
+        ]
+    )
+    regime_neutral_models: list[str] = Field(default_factory=list)
+    l1_feature_selection_enabled: bool = True
+    l1_feature_selection_per_regime: bool = True
+    l1_feature_selection_min_features: int = 20
+    l1_feature_selection_max_features: int = 256
+    l1_feature_selection_sample_limit: int = 200_000
+    l1_feature_selection_c: float = 0.20
 
     @field_validator("train_batch_size", "inference_batch_size")
     @classmethod
@@ -295,9 +493,11 @@ class ModelsConfig(BaseModel):
 
 class NewsConfig(BaseModel):
     news_decay_minutes: int = 120
-    news_kill_window_min: int = 30
+    news_kill_window_min: int = 5
     news_confidence_threshold: float = 0.65
     news_lookahead_minutes: int = 60
+    news_pre_event_seconds: int = 300
+    news_post_event_seconds: int = 300
     news_trade_on_event: bool = False
     news_trade_confidence_threshold: float = 0.90
     enable_news: bool = True
