@@ -393,6 +393,116 @@ fn compute_position_size_lots(
 }
 
 #[pyfunction]
+#[pyo3(signature = (symbol, point=None, digits=None))]
+fn pip_size_from_symbol(symbol: &str, point: Option<f64>, digits: Option<i64>) -> PyResult<f64> {
+    let sym = symbol.to_ascii_uppercase();
+    let pip_size = if let (Some(pt), Some(dig)) = (point, digits) {
+        let ptv = if pt.is_finite() && pt > 0.0 { pt } else { 0.0001 };
+        let d = dig.max(0) as i32;
+        if sym.ends_with("JPY") || sym.starts_with("JPY") {
+            ptv * if d >= 3 { 10.0 } else { 1.0 }
+        } else if sym.starts_with("XAU") || sym.starts_with("XAG") {
+            0.01
+        } else if sym.contains("BTC") || sym.contains("ETH") || sym.contains("LTC") {
+            1.0
+        } else {
+            ptv * if d >= 4 { 10.0 } else { 1.0 }
+        }
+    } else if sym.ends_with("JPY") || sym.starts_with("JPY") {
+        0.01
+    } else if sym.starts_with("XAU") || sym.starts_with("XAG") {
+        0.01
+    } else if sym.contains("BTC") || sym.contains("ETH") || sym.contains("LTC") {
+        1.0
+    } else {
+        0.0001
+    };
+    Ok(pip_size.max(1e-9))
+}
+
+#[pyfunction]
+#[pyo3(signature = (entry_price, signal, sl_pips, rr, pip_size))]
+fn compute_order_prices(
+    entry_price: f64,
+    signal: i8,
+    sl_pips: f64,
+    rr: f64,
+    pip_size: f64,
+) -> PyResult<(f64, f64, f64)> {
+    if !entry_price.is_finite()
+        || !sl_pips.is_finite()
+        || !rr.is_finite()
+        || !pip_size.is_finite()
+        || entry_price <= 0.0
+        || sl_pips <= 0.0
+        || rr <= 0.0
+        || pip_size <= 0.0
+    {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "entry_price/sl_pips/rr/pip_size must be finite positive values",
+        ));
+    }
+
+    let sl_dist = sl_pips * pip_size;
+    if signal > 0 {
+        let sl = entry_price - sl_dist;
+        let tp = entry_price + (rr * sl_dist);
+        Ok((sl, tp, sl_dist))
+    } else if signal < 0 {
+        let sl = entry_price + sl_dist;
+        let tp = entry_price - (rr * sl_dist);
+        Ok((sl, tp, sl_dist))
+    } else {
+        Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "signal must be +1 or -1",
+        ))
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    sl_pips,
+    rr,
+    spread_pips,
+    slippage_pips,
+    commission_per_lot,
+    pip_value_per_lot,
+    min_edge_multiple
+))]
+fn evaluate_trade_edge(
+    sl_pips: f64,
+    rr: f64,
+    spread_pips: f64,
+    slippage_pips: f64,
+    commission_per_lot: f64,
+    pip_value_per_lot: f64,
+    min_edge_multiple: f64,
+) -> PyResult<(bool, f64, f64)> {
+    if !sl_pips.is_finite()
+        || !rr.is_finite()
+        || !spread_pips.is_finite()
+        || !slippage_pips.is_finite()
+        || !commission_per_lot.is_finite()
+        || !pip_value_per_lot.is_finite()
+        || !min_edge_multiple.is_finite()
+    {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "all inputs must be finite",
+        ));
+    }
+
+    let commission_pips = commission_per_lot / pip_value_per_lot.max(1e-9);
+    let total_cost_pips = (spread_pips.max(0.0) + slippage_pips.max(0.0) + commission_pips.max(0.0)).max(0.0);
+    let expected_profit_pips = (sl_pips.max(0.0) * rr.max(0.0)).max(0.0);
+    let passed = if min_edge_multiple <= 0.0 {
+        true
+    } else {
+        expected_profit_pips >= (min_edge_multiple * total_cost_pips)
+    };
+    Ok((passed, expected_profit_pips, total_cost_pips))
+}
+
+#[pyfunction]
 #[pyo3(signature = (
     open,
     high,
@@ -2380,6 +2490,9 @@ fn forex_bindings(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(batch_evaluate_strategies, m)?)?;
     m.add_function(wrap_pyfunction!(triple_barrier_labels, m)?)?;
     m.add_function(wrap_pyfunction!(compute_position_size_lots, m)?)?;
+    m.add_function(wrap_pyfunction!(pip_size_from_symbol, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_order_prices, m)?)?;
+    m.add_function(wrap_pyfunction!(evaluate_trade_edge, m)?)?;
     m.add_function(wrap_pyfunction!(talib_bulk_signals_ohlcv, m)?)?;
 
     // Add tree model classes if features enabled

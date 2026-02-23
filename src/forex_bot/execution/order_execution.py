@@ -13,6 +13,33 @@ from ..execution.risk import RiskManager
 from ..strategy.stop_target import infer_stop_target_pips
 
 logger = logging.getLogger(__name__)
+_RUST_ORDER_BACKEND_OK: bool | None = None
+_RUST_ORDER_WARNED_UNAVAILABLE = False
+
+
+def _rust_order_backend_available(*, force_log: bool = False) -> bool:
+    global _RUST_ORDER_BACKEND_OK, _RUST_ORDER_WARNED_UNAVAILABLE
+    if _RUST_ORDER_BACKEND_OK is None:
+        try:
+            import forex_bindings  # type: ignore
+
+            _RUST_ORDER_BACKEND_OK = all(
+                hasattr(forex_bindings, fn)
+                for fn in ("pip_size_from_symbol", "compute_order_prices", "evaluate_trade_edge")
+            )
+        except Exception:
+            _RUST_ORDER_BACKEND_OK = False
+    if force_log and not _RUST_ORDER_BACKEND_OK and not _RUST_ORDER_WARNED_UNAVAILABLE:
+        logger.warning(
+            "Rust order backend requested but required forex_bindings functions are unavailable; using Python order math."
+        )
+        _RUST_ORDER_WARNED_UNAVAILABLE = True
+    return bool(_RUST_ORDER_BACKEND_OK)
+
+
+def _disable_rust_order_backend() -> None:
+    global _RUST_ORDER_BACKEND_OK
+    _RUST_ORDER_BACKEND_OK = False
 
 
 class OrderExecutor:
@@ -420,10 +447,34 @@ class OrderExecutor:
             pass
         commission_per_lot = float(getattr(self.settings.risk, "commission_per_lot", 7.0) or 7.0)
         _pip_sz, pip_value_per_lot = self.risk_manager._compute_pip_metrics(symbol_info)
-        commission_pips = commission_per_lot / max(pip_value_per_lot, 1e-9)
-        total_cost_pips = max(0.0, spread_pips + slippage_pips + commission_pips)
-        expected_profit_pips = max(0.0, float(sl_pips) * max(0.0, float(rr)))
-        passed = expected_profit_pips >= (min_mult * total_cost_pips)
+        total_cost_pips = 0.0
+        expected_profit_pips = 0.0
+        if _rust_order_backend_available():
+            try:
+                import forex_bindings  # type: ignore
+
+                passed, expected_profit_pips, total_cost_pips = forex_bindings.evaluate_trade_edge(
+                    float(sl_pips),
+                    float(rr),
+                    float(spread_pips),
+                    float(slippage_pips),
+                    float(commission_per_lot),
+                    float(pip_value_per_lot),
+                    float(min_mult),
+                )
+                passed = bool(passed)
+            except Exception as exc:
+                _disable_rust_order_backend()
+                logger.debug("Rust evaluate_trade_edge failed; falling back to Python: %s", exc)
+                commission_pips = commission_per_lot / max(pip_value_per_lot, 1e-9)
+                total_cost_pips = max(0.0, spread_pips + slippage_pips + commission_pips)
+                expected_profit_pips = max(0.0, float(sl_pips) * max(0.0, float(rr)))
+                passed = expected_profit_pips >= (min_mult * total_cost_pips)
+        else:
+            commission_pips = commission_per_lot / max(pip_value_per_lot, 1e-9)
+            total_cost_pips = max(0.0, spread_pips + slippage_pips + commission_pips)
+            expected_profit_pips = max(0.0, float(sl_pips) * max(0.0, float(rr)))
+            passed = expected_profit_pips >= (min_mult * total_cost_pips)
         if not passed:
             logger.info(
                 "Cost/edge gate rejected trade: exp_pips=%.3f cost_pips=%.3f need>=%.3f",
@@ -648,10 +699,25 @@ class OrderExecutor:
             if rr is None:
                 return None
 
+            if _rust_order_backend_available():
+                try:
+                    import forex_bindings  # type: ignore
+
+                    sl, tp, sl_dist_rs = forex_bindings.compute_order_prices(
+                        float(entry_price),
+                        int(result.signal),
+                        float(sl_pips),
+                        float(rr),
+                        float(pip_size),
+                    )
+                    return float(sl), float(tp), entry_price, float(sl_dist_rs), float(rr)
+                except Exception as exc:
+                    _disable_rust_order_backend()
+                    logger.debug("Rust compute_order_prices failed; falling back to Python: %s", exc)
+
             if result.signal == 1:
                 return entry_price - sl_dist, entry_price + (rr * sl_dist), entry_price, sl_dist, float(rr)
-            else:
-                return entry_price + sl_dist, entry_price - (rr * sl_dist), entry_price, sl_dist, float(rr)
+            return entry_price + sl_dist, entry_price - (rr * sl_dist), entry_price, sl_dist, float(rr)
         except Exception as e:
             logger.error(f"Price calc failed: {e}")
             return None
@@ -682,6 +748,25 @@ class OrderExecutor:
 
     def _get_pip_size(self, symbol: str, info=None) -> float:
         sym = (symbol or "").upper()
+        if _rust_order_backend_available():
+            try:
+                import forex_bindings  # type: ignore
+
+                point = None
+                digits = None
+                if info:
+                    try:
+                        point = float(info.get("point", 0.0001) or 0.0001)
+                    except Exception:
+                        point = 0.0001
+                    try:
+                        digits = int(info.get("digits", 5) or 5)
+                    except Exception:
+                        digits = 5
+                return float(forex_bindings.pip_size_from_symbol(sym, point=point, digits=digits))
+            except Exception as exc:
+                _disable_rust_order_backend()
+                logger.debug("Rust pip_size_from_symbol failed; falling back to Python: %s", exc)
         if info:
             pt = float(info.get("point", 0.0001) or 0.0001)
             dig = int(info.get("digits", 5) or 5)

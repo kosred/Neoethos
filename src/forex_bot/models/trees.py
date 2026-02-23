@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -9,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from .base import ExpertModel, get_early_stop_params, time_series_train_val_split, validate_time_ordering
+from .label_utils import probs_to_three_class, remap_labels_sell_neutral_buy
 
 try:
     import lightgbm as lgb
@@ -150,29 +153,11 @@ def _reorder_to_neutral_buy_sell(probs: np.ndarray, classes: list[int] | None) -
     HPC PROTOCOL: Force output to [Neutral, Buy, Sell].
     Standard indices: 0=Neutral, 1=Buy, 2=Sell.
     """
-    arr = np.asarray(probs, dtype=float)
-    n = arr.shape[0]
-    out = np.zeros((n, 3), dtype=float)
-    
-    # If model is binary (Neutral vs Signal)
-    if arr.shape[1] == 2:
-        out[:, 0] = arr[:, 0] # Neutral
-        out[:, 1] = arr[:, 1] # Buy (Default assumption for 2-class)
-        return out
-        
-    # If model is multiclass
-    if classes is not None:
-        for col, cls_val in enumerate(classes):
-            # Map based on our contiguous mapping: 0=Sell, 1=Neutral, 2=Buy
-            # (Wait, let's match the remap_labels we just made: -1->0, 0->1, 1->2)
-            if cls_val == 0: out[:, 2] = arr[:, col] # Sell
-            elif cls_val == 1: out[:, 0] = arr[:, col] # Neutral
-            elif cls_val == 2: out[:, 1] = arr[:, col] # Buy
-    else:
-        # Fallback to direct mapping if classes missing
-        return arr # Assume [Neutral, Buy, Sell]
-        
-    return out
+    return probs_to_three_class(
+        probs,
+        classes,
+        class_to_output={0: 2, 1: 0, 2: 1},
+    )
 
 
 def _augment_time_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -182,6 +167,16 @@ def _augment_time_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     if "close" not in df.columns:
         return df
+    required = ("ret1", "ret1_lag1", "ret1_lag2", "ret1_lag5", "ret1_lag8", "vol14", "vol50", "mom5", "mom15")
+    if all(col in df.columns for col in required):
+        return df
+    try:
+        cached = df.attrs.get("_tree_augmented_cache")
+        if isinstance(cached, pd.DataFrame):
+            if all(col in cached.columns for col in required):
+                return cached
+    except Exception:
+        pass
     try:
         out = df.copy()
         close = pd.to_numeric(out["close"], errors="coerce")
@@ -195,6 +190,10 @@ def _augment_time_features(df: pd.DataFrame) -> pd.DataFrame:
         out["vol50"] = ret1.rolling(50).std().fillna(0.0)
         out["mom5"] = close.diff(5).fillna(0.0)
         out["mom15"] = close.diff(15).fillna(0.0)
+        try:
+            df.attrs["_tree_augmented_cache"] = out
+        except Exception:
+            pass
         return out
     except Exception:
         return df
@@ -206,16 +205,57 @@ def _remap_labels_to_contiguous(y: pd.Series | np.ndarray) -> tuple[np.ndarray, 
     Prevents 'Label Drift' where Buy/Sell columns are swapped depending on data.
     Order: -1 -> 0 (Sell), 0 -> 1 (Neutral), 1 -> 2 (Buy)
     """
-    y_arr = np.asarray(y, dtype=int)
     mapping = {-1: 0, 0: 1, 1: 2}
-    
-    # Fast vectorized mapping
-    remapped = np.zeros_like(y_arr)
-    remapped[y_arr == -1] = 0
-    remapped[y_arr == 0] = 1
-    remapped[y_arr == 1] = 2
-    
+    remapped = remap_labels_sell_neutral_buy(y)
     return remapped, mapping
+
+
+def _resolve_lgbm_monotone_constraints(params: dict[str, Any], feature_names: list[str]) -> list[int] | None:
+    def _to_constraint(v: Any) -> int:
+        try:
+            iv = int(v)
+        except Exception:
+            return 0
+        if iv > 0:
+            return 1
+        if iv < 0:
+            return -1
+        return 0
+
+    by_feature = params.pop("monotone_constraints_by_feature", None)
+    if isinstance(by_feature, dict):
+        vec = [_to_constraint(by_feature.get(str(col), 0)) for col in feature_names]
+        return vec if any(v != 0 for v in vec) else None
+
+    raw = params.get("monotone_constraints")
+    if raw is None:
+        return None
+
+    vals: list[Any] = []
+    if isinstance(raw, (list, tuple, np.ndarray)):
+        vals = list(raw)
+    elif isinstance(raw, str):
+        txt = raw.strip()
+        if txt:
+            with_brackets = txt if txt.startswith("[") else f"[{txt}]"
+            with contextlib.suppress(Exception):
+                parsed = json.loads(with_brackets)
+                if isinstance(parsed, list):
+                    vals = parsed
+            if not vals:
+                vals = [p.strip() for p in txt.replace("[", "").replace("]", "").split(",")]
+
+    if not vals:
+        params.pop("monotone_constraints", None)
+        return None
+
+    if len(vals) < len(feature_names):
+        vals = list(vals) + [0] * (len(feature_names) - len(vals))
+    elif len(vals) > len(feature_names):
+        vals = list(vals[: len(feature_names)])
+
+    vec = [_to_constraint(v) for v in vals]
+    return vec if any(v != 0 for v in vec) else None
 
 
 class LightGBMExpert(ExpertModel):
@@ -259,6 +299,11 @@ class LightGBMExpert(ExpertModel):
             x = x.replace([np.inf, -np.inf], np.nan)
 
             params = self.params.copy()
+            mono = _resolve_lgbm_monotone_constraints(params, list(x.columns))
+            if mono is not None:
+                params["monotone_constraints"] = mono
+            else:
+                params.pop("monotone_constraints", None)
 
             # Respect worker thread partitioning when set (prevents oversubscription on large CPUs).
             cpu_threads = _cpu_threads_hint()
@@ -333,17 +378,6 @@ class LightGBMExpert(ExpertModel):
                 if cnt > 0
             }
             params["class_weight"] = class_weight if class_weight else None
-
-            # Decide binary vs multiclass based on remapped labels
-            binary = len(uniq) <= 2
-            if binary:
-                params["objective"] = "binary"
-                params.pop("num_class", None)
-                eval_metric = "binary_logloss"
-            else:
-                params["objective"] = "multiclass"
-                params["num_class"] = params.get("num_class", len(uniq))
-                eval_metric = "multi_logloss"
 
             # Decide binary vs multiclass based on remapped labels
             binary = len(uniq) <= 2

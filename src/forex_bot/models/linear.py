@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .base import ExpertModel
+from .label_utils import margins_to_probs, probs_to_three_class, remap_labels_neutral_buy_sell
 
 logger = logging.getLogger(__name__)
 
@@ -42,11 +43,8 @@ except Exception:
 
 
 def _canon_y(y: pd.Series | np.ndarray) -> np.ndarray:
-    arr = np.asarray(y, dtype=int)
     # Canonical class order: 0=neutral, 1=buy, 2=sell.
-    arr = np.where(arr == -1, 2, arr).astype(int, copy=False)
-    arr = np.clip(arr, 0, 2)
-    return arr
+    return remap_labels_neutral_buy_sell(y)
 
 
 def _align_features(x: pd.DataFrame, cols: list[str] | None) -> pd.DataFrame:
@@ -57,48 +55,11 @@ def _align_features(x: pd.DataFrame, cols: list[str] | None) -> pd.DataFrame:
 
 
 def _pad_probs_with_classes(probs: np.ndarray, classes: np.ndarray | list[int] | None) -> np.ndarray:
-    arr = np.asarray(probs, dtype=float)
-    if arr.ndim == 1:
-        arr = arr.reshape(-1, 1)
-    n = arr.shape[0]
-    out = np.zeros((n, 3), dtype=float)
-    if classes is None:
-        if arr.shape[1] >= 3:
-            out[:, :3] = arr[:, :3]
-            return out
-        if arr.shape[1] == 2:
-            out[:, 0] = arr[:, 0]
-            out[:, 1] = arr[:, 1]
-            return out
-        out[:, 0] = 1.0 - arr[:, 0]
-        out[:, 1] = arr[:, 0]
-        return out
-
-    cls = [int(c) for c in list(classes)]
-    for i, c in enumerate(cls):
-        if 0 <= c <= 2 and i < arr.shape[1]:
-            out[:, c] = arr[:, i]
-    rs = out.sum(axis=1, keepdims=True)
-    rs = np.where(rs <= 0, 1.0, rs)
-    out = out / rs
-    return out
+    return probs_to_three_class(probs, classes)
 
 
 def _decision_to_probs(decision: np.ndarray) -> np.ndarray:
-    dec = np.asarray(decision, dtype=float)
-    if dec.ndim == 1:
-        # Binary margin -> map to classes [0,1], leave sell near-zero.
-        p1 = 1.0 / (1.0 + np.exp(-np.clip(dec, -30, 30)))
-        p0 = 1.0 - p1
-        raw = np.stack([p0, p1, np.zeros_like(p0)], axis=1)
-        rs = raw.sum(axis=1, keepdims=True)
-        rs = np.where(rs <= 0, 1.0, rs)
-        return raw / rs
-    dec = dec - np.max(dec, axis=1, keepdims=True)
-    ex = np.exp(np.clip(dec, -30, 30))
-    rs = ex.sum(axis=1, keepdims=True)
-    rs = np.where(rs <= 0, 1.0, rs)
-    return ex / rs
+    return margins_to_probs(decision)
 
 
 def _iter_feature_dict_rows(x_df: pd.DataFrame):

@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .base import ExpertModel
+from .label_utils import remap_labels_sell_neutral_buy
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +26,7 @@ def _python_fallback_enabled() -> bool:
 
 
 def _remap_labels_to_contiguous(y: pd.Series | np.ndarray) -> np.ndarray:
-    y_arr = np.asarray(y, dtype=np.int64)
-    remapped = np.zeros_like(y_arr)
-    remapped[y_arr == -1] = 0
-    remapped[y_arr == 0] = 1
-    remapped[y_arr == 1] = 2
-    return remapped
+    return remap_labels_sell_neutral_buy(y).astype(np.int64, copy=False)
 
 
 def _to_float64_contig(df: pd.DataFrame) -> np.ndarray:
