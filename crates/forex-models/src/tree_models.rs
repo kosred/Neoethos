@@ -8,14 +8,15 @@ use polars::prelude::*;
 use std::collections::HashMap;
 use std::env;
 use std::path::Path;
+use tracing::{info, warn};
 
-use crate::base::ExpertModel;
+use crate::base::{time_series_train_val_split, ExpertModel};
 
 #[cfg(feature = "lightgbm")]
 use lightgbm3::{Booster as LGBMBooster, Dataset as LGBMDataset};
 
 #[cfg(feature = "xgboost")]
-use xgboost_rust as xgb;
+use xgb as xgb;
 
 #[cfg(feature = "catboost")]
 use catboost_rust as catboost;
@@ -52,12 +53,28 @@ pub enum ParamValue {
 // ENVIRONMENT VARIABLE UTILITIES
 // ============================================================================ 
 
-/// Returns CPU thread hint from FOREX_BOT_CPU_THREADS environment variable
+/// Returns CPU thread hint from FOREX_BOT_CPU_THREADS environment variable     
 pub fn cpu_threads_hint() -> usize {
-    match env::var("FOREX_BOT_CPU_THREADS") {
-        Ok(val) => val.parse::<usize>().unwrap_or(0),
-        Err(_) => 0,
+    fn read_threads_env(keys: &[&str]) -> Option<usize> {
+        for key in keys {
+            if let Ok(val) = env::var(key) {
+                if let Ok(parsed) = val.trim().parse::<usize>() {
+                    if parsed > 0 {
+                        return Some(parsed);
+                    }
+                }
+            }
+        }
+        None
     }
+
+    read_threads_env(&[
+        "FOREX_BOT_RUST_THREADS",
+        "FOREX_BOT_CPU_THREADS",
+        "FOREX_BOT_CPU_BUDGET",
+        "RAYON_NUM_THREADS",
+    ])
+    .unwrap_or_else(|| num_cpus::get().saturating_sub(1).max(1))
 }
 
 /// Parse tree device preference from FOREX_BOT_TREE_DEVICE
@@ -410,6 +427,7 @@ pub struct LightGBMExpert {
     gpu_only_disabled: bool,
     #[cfg(feature = "lightgbm")]
     model: Option<LGBMBooster>,
+    #[cfg_attr(not(feature = "lightgbm"), allow(dead_code))]
     #[cfg(not(feature = "lightgbm"))]
     model: Option<()>, // Placeholder when feature not enabled
 }
@@ -468,6 +486,8 @@ impl ExpertModel for LightGBMExpert {
         #[cfg(feature = "lightgbm")]
         {
             use serde_json::json;
+            let x = _x;
+            let y = _y;
 
             // HPC CHECK: If GPU-only mode and no GPU, skip training
             if self.config.gpu_only && !torch_cuda_available() {
@@ -485,15 +505,16 @@ impl ExpertModel for LightGBMExpert {
 
             // STEP 2: Remap labels to contiguous {0, 1, 2}
             let (y_remapped, mapping) = remap_labels_to_contiguous(y)?;
+            let y_vec = y_remapped.to_vec();
             info!("Label mapping: {:?}", mapping);
 
             // STEP 3: Time-series train/val split with embargo
             let n_samples = x.height();
             let embargo_samples = (n_samples / 100).max(24);
 
-            let (x_train, x_val, y_train, y_val) = match base_split(
-                x.clone(),
-                Series::new("y", y_remapped.to_vec()),
+            let (x_train, _x_val, y_train, _y_val) = match time_series_train_val_split(
+                &x,
+                &Series::new("y".into(), y_vec.clone()),
                 0.15,
                 100,
                 embargo_samples,
@@ -505,19 +526,29 @@ impl ExpertModel for LightGBMExpert {
                     (
                         x.slice(0, split_idx),
                         x.slice(split_idx as i64, n_samples - split_idx),
-                        Series::new("y", y_remapped.slice(0, split_idx).to_vec()),
-                        Series::new("y", y_remapped.slice(split_idx, n_samples - split_idx).to_vec()),
+                        Series::new("y".into(), y_vec[..split_idx].to_vec()),
+                        Series::new("y".into(), y_vec[split_idx..].to_vec()),
                     )
                 }
             };
 
             // STEP 4: Convert DataFrame to Vec<Vec<f64>> for LightGBM
             let features_train = dataframe_to_vecs(&x_train)?;
-            let labels_train: Vec<f64> = y_train.f64()?.into_iter().map(|v| v.unwrap_or(1.0)).collect();
+            let labels_train: Vec<f32> = y_train
+                .i32()?
+                .into_iter()
+                .map(|v| v.unwrap_or(1) as f32)
+                .collect();
 
-            // STEP 5: Create LightGBM Dataset
-            let dataset = LGBMDataset::from_vec_of_vec(features_train, labels_train, true)
+            let train_with_params = |params_json: &serde_json::Value| -> Result<LGBMBooster> {
+                let dataset = LGBMDataset::from_vec_of_vec(
+                    features_train.clone(),
+                    labels_train.clone(),
+                    true,
+                )
                 .context("Failed to create LightGBM dataset")?;
+                LGBMBooster::train(dataset, params_json).context("LightGBM training failed")
+            };
 
             // STEP 6: Build parameters with HPC logic
             let mut params = json!({
@@ -555,14 +586,33 @@ impl ExpertModel for LightGBMExpert {
                 params["max_bin"] = json!(255);
             }
 
-            // CPU threads
-            if let Some(threads) = self.config.cpu_threads {
+            // CPU threads (explicit param > env > n_jobs fallback)
+            let explicit_threads = match self.config.params.get("num_threads") {
+                Some(ParamValue::Int(v)) if *v > 0 => Some(*v as usize),
+                Some(ParamValue::Float(v)) if *v > 0.0 => Some(*v as usize),
+                _ => None,
+            };
+            let n_jobs_threads = match self.config.params.get("n_jobs") {
+                Some(ParamValue::Int(v)) if *v != 0 => {
+                    if *v < 0 {
+                        Some(cpu_threads_hint())
+                    } else {
+                        Some(*v as usize)
+                    }
+                }
+                Some(ParamValue::Float(v)) if *v != 0.0 => Some(*v as usize),
+                _ => None,
+            };
+            let threads = explicit_threads
+                .or(self.config.cpu_threads)
+                .or(n_jobs_threads);
+            if let Some(threads) = threads {
                 params["num_threads"] = json!(threads);
             }
 
             // STEP 7: Train model
             info!("Training LightGBM model...");
-            let booster = match LGBMBooster::train(dataset, &params) {
+            let booster = match train_with_params(&params) {
                 Ok(b) => b,
                 Err(e) => {
                     if gpu_enabled && self.config.gpu_only {
@@ -573,9 +623,9 @@ impl ExpertModel for LightGBMExpert {
                         warn!("GPU training failed, falling back to CPU: {}", e);
                         params["device_type"] = json!("cpu");
                         params["max_bin"] = json!(255);
-                        LGBMBooster::train(dataset, &params)?
+                        train_with_params(&params)?
                     } else {
-                        return Err(e.into());
+                        return Err(e);
                     }
                 }
             };
@@ -607,14 +657,17 @@ impl ExpertModel for LightGBMExpert {
             };
             
             let features = dataframe_to_vecs(&x_aug)?;
-            let mut all_probs = Vec::with_capacity(x.height());
-
-            for feat in features {
-                let pred = model.predict(feat)?;
-                all_probs.push(pred);
-            }
-
-            let probs_array = Array2::from_shape_vec((x.height(), 3), all_probs.into_iter().flatten().map(|v| v as f32).collect())?;
+            let all_probs = model
+                .predict_from_vec_of_vec(features, true)
+                .context("LightGBM predict failed")?;
+            let probs_array = Array2::from_shape_vec(
+                (x.height(), 3),
+                all_probs
+                    .into_iter()
+                    .flatten()
+                    .map(|v| v as f32)
+                    .collect(),
+            )?;
             
             // Force output reordering to [Neutral, Buy, Sell]
             Ok(reorder_to_neutral_buy_sell(probs_array, Some(vec![0, 1, 2])))
@@ -628,6 +681,7 @@ impl ExpertModel for LightGBMExpert {
     fn save(&self, _path: &Path) -> Result<()> {
         #[cfg(feature = "lightgbm")]
         {
+            let path = _path;
             if let Some(model) = &self.model {
                 model.save_file(path.to_str().context("Invalid path")?)?;
             }
@@ -642,6 +696,7 @@ impl ExpertModel for LightGBMExpert {
     fn load(&mut self, _path: &Path) -> Result<()> {
         #[cfg(feature = "lightgbm")]
         {
+            let path = _path;
             let booster = LGBMBooster::from_file(path.to_str().context("Invalid path")?)?;
             self.model = Some(booster);
             Ok(())
@@ -653,8 +708,8 @@ impl ExpertModel for LightGBMExpert {
     }
 }
 
-/// Convert Polars DataFrame to Vec<Vec<f64>> for LightGBM
-#[cfg(feature = "lightgbm")]
+/// Convert Polars DataFrame to Vec<Vec<f64>> for tree models
+#[cfg(any(feature = "lightgbm", feature = "catboost"))]
 fn dataframe_to_vecs(df: &DataFrame) -> Result<Vec<Vec<f64>>> {
     let n_rows = df.height();
     let n_cols = df.width();
@@ -678,6 +733,139 @@ fn dataframe_to_vecs(df: &DataFrame) -> Result<Vec<Vec<f64>>> {
     Ok(result)
 }
 
+/// Convert Polars DataFrame to flat Vec<f32> (row-major) for XGBoost
+#[cfg(feature = "xgboost")]
+fn dataframe_to_f32_flat(df: &DataFrame) -> Result<Vec<f32>> {
+    let n_rows = df.height();
+    let n_cols = df.width();
+    let mut result = Vec::with_capacity(n_rows * n_cols);
+
+    for row_idx in 0..n_rows {
+        for col in df.get_columns() {
+            let value = match col.dtype() {
+                DataType::Float64 => col.f64()?.get(row_idx).unwrap_or(0.0) as f32,
+                DataType::Float32 => col.f32()?.get(row_idx).unwrap_or(0.0),
+                DataType::Int64 => col.i64()?.get(row_idx).unwrap_or(0) as f32,
+                DataType::Int32 => col.i32()?.get(row_idx).unwrap_or(0) as f32,
+                _ => 0.0,
+            };
+            result.push(value);
+        }
+    }
+
+    Ok(result)
+}
+
+#[cfg(feature = "xgboost")]
+fn param_value_to_string(value: &ParamValue) -> String {
+    match value {
+        ParamValue::Int(i) => i.to_string(),
+        ParamValue::Float(f) => f.to_string(),
+        ParamValue::String(s) => s.clone(),
+        ParamValue::Bool(b) => {
+            if *b { "1".to_string() } else { "0".to_string() }
+        }
+    }
+}
+
+#[cfg(feature = "xgboost")]
+fn extract_boost_rounds(params: &HashMap<String, ParamValue>, default_rounds: u32) -> u32 {
+    match params.get("n_estimators") {
+        Some(ParamValue::Int(i)) if *i > 0 => *i as u32,
+        Some(ParamValue::Float(f)) if *f > 0.0 => *f as u32,
+        _ => default_rounds,
+    }
+}
+
+#[cfg(feature = "xgboost")]
+fn build_xgb_param_pairs(
+    params: &HashMap<String, ParamValue>,
+    cpu_threads: Option<usize>,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut has_nthread = false;
+    for (k, v) in params {
+        if k == "n_estimators" {
+            continue;
+        }
+
+        let key = match k.as_str() {
+            "learning_rate" => "eta",
+            "n_jobs" => "nthread",
+            "random_state" => "seed",
+            _ => k.as_str(),
+        };
+        let mut value = param_value_to_string(v);
+        if key == "nthread" {
+            has_nthread = true;
+            if let ParamValue::Int(i) = v {
+                if *i < 0 {
+                    let threads = cpu_threads.unwrap_or_else(|| {
+                        num_cpus::get().saturating_sub(1).max(1)
+                    });
+                    value = threads.to_string();
+                }
+            }
+        }
+
+        out.push((key.to_string(), value));
+    }
+
+    if !has_nthread {
+        if let Some(threads) = cpu_threads {
+            out.push(("nthread".to_string(), threads.to_string()));
+        }
+    }
+    out
+}
+
+#[cfg(feature = "xgboost")]
+fn xgb_predict_probs(model: &xgb::Booster, x: &DataFrame) -> Result<Array2<f32>> {
+    let x_aug = if x.column("close").is_ok() {
+        augment_time_features(x.clone())?
+    } else {
+        x.clone()
+    };
+
+    let features = dataframe_to_f32_flat(&x_aug)?;
+    let dmatrix = xgb::DMatrix::from_dense(&features, x_aug.height())?;
+    let preds = model.predict(&dmatrix)?;
+    let probs_array = Array2::from_shape_vec((x_aug.height(), 3), preds)?;
+    Ok(reorder_to_neutral_buy_sell(probs_array, Some(vec![0, 1, 2])))
+}
+
+#[cfg(feature = "catboost")]
+fn catboost_predict_probs(model: &catboost::Model, x: &DataFrame) -> Result<Array2<f32>> {
+    // Augment time features if 'close' exists
+    let x = if x.column("close").is_ok() {
+        augment_time_features(x.clone())?
+    } else {
+        x.clone()
+    };
+
+    // Convert DataFrame to format CatBoost expects
+    let features = dataframe_to_vecs(&x)?;
+
+    // CatBoost expects float features in specific format
+    let float_features: Vec<Vec<f32>> = features
+        .iter()
+        .map(|row| row.iter().map(|&v| v as f32).collect())
+        .collect();
+
+    // Create ObjectsOrderFeatures
+    let features_obj = catboost::ObjectsOrderFeatures::new().with_float_features(float_features);
+
+    // Predict
+    let predictions = model.predict(features_obj)?;
+
+    // Convert to Array2<f32> and reorder to [Neutral, Buy, Sell]
+    let n_samples = predictions.len() / 3;
+    let probs_f32: Vec<f32> = predictions.iter().map(|v| *v as f32).collect();
+    let probs = Array2::from_shape_vec((n_samples, 3), probs_f32)?;
+
+    Ok(reorder_to_neutral_buy_sell(probs, Some(vec![0, 1, 2])))
+}
+
 // ============================================================================ 
 // XGBOOST IMPLEMENTATION
 // ============================================================================ 
@@ -689,6 +877,7 @@ pub struct XGBoostExpert {
     gpu_only_disabled: bool,
     #[cfg(feature = "xgboost")]
     model: Option<xgb::Booster>,
+    #[cfg_attr(not(feature = "xgboost"), allow(dead_code))]
     #[cfg(not(feature = "xgboost"))]
     model: Option<()>,
 }
@@ -740,6 +929,9 @@ impl ExpertModel for XGBoostExpert {
     fn fit(&mut self, _x: &DataFrame, _y: &Series) -> Result<()> {
         #[cfg(feature = "xgboost")]
         {
+            let x = _x;
+            let y = _y;
+
             // HPC CHECK: If GPU-only mode and no GPU, skip training
             if self.config.gpu_only && !torch_cuda_available() {
                 warn!("GPU-only mode enabled but no GPU available - skipping XGBoost training");
@@ -749,22 +941,23 @@ impl ExpertModel for XGBoostExpert {
 
             // STEP 1: Augment time features if 'close' column exists
             let x = if x.column("close").is_ok() {
-                augment_time_features(x.clone())? 
+                augment_time_features(x.clone())?
             } else {
                 x.clone()
             };
 
             // STEP 2: Remap labels to contiguous {0, 1, 2}
             let (y_remapped, mapping) = remap_labels_to_contiguous(y)?;
+            let y_vec = y_remapped.to_vec();
             info!("Label mapping: {:?}", mapping);
 
             // STEP 3: Time-series train/val split with embargo
             let n_samples = x.height();
             let embargo_samples = (n_samples / 100).max(24);
 
-            let (x_train, x_val, y_train, y_val) = match base_split(
-                x.clone(),
-                Series::new("y", y_remapped.to_vec()),
+            let (x_train, x_val, y_train, y_val) = match time_series_train_val_split(
+                &x,
+                &Series::new("y".into(), y_vec.clone()),
                 0.15,
                 100,
                 embargo_samples,
@@ -776,67 +969,104 @@ impl ExpertModel for XGBoostExpert {
                     (
                         x.slice(0, split_idx),
                         x.slice(split_idx as i64, n_samples - split_idx),
-                        Series::new("y", y_remapped.slice(0, split_idx).to_vec()),
-                        Series::new("y", y_remapped.slice(split_idx, n_samples - split_idx).to_vec()),
+                        Series::new("y".into(), y_vec[..split_idx].to_vec()),
+                        Series::new("y".into(), y_vec[split_idx..].to_vec()),
                     )
                 }
             };
 
-            // STEP 4: Convert to XGBoost format
-            let features_train = dataframe_to_vecs(&x_train)?;
-            let labels_train: Vec<f32> = y_train.f64()?.into_iter().map(|v| v.unwrap_or(1.0) as f32).collect();
+            let boost_rounds = extract_boost_rounds(&self.config.params, 800);
+            let base_params = build_xgb_param_pairs(&self.config.params, self.config.cpu_threads);
 
-            // STEP 5: Create DMatrix
-            let mut dtrain = xgb::DMatrix::from_dense(&features_train, x_train.height())?;
-            dtrain.set_labels(&labels_train)?;
-
-            // STEP 6: Build parameters with HPC logic
-            let mut params = vec![
-                ("objective", "multi:softprob"),
-                ("num_class", "3"),
-                ("eval_metric", "mlogloss"),
-            ];
-
-            // Add params from config
-            let mut param_strings = Vec::new();
-            for (k, v) in &self.config.params {
-                let val_str = match v {
-                    ParamValue::Int(i) => i.to_string(),
-                    ParamValue::Float(f) => f.to_string(),
-                    ParamValue::String(s) => s.clone(),
-                    ParamValue::Bool(b) => b.to_string(),
-                };
-                param_strings.push((k.clone(), val_str));
-            }
-            
-            for (k, v) in &param_strings {
-                params.push((k, v));
-            }
-
-            // GPU configuration
             let gpu_enabled = match self.config.device_pref {
                 DevicePreference::Gpu => torch_cuda_available(),
                 DevicePreference::Auto => torch_cuda_available(),
                 DevicePreference::Cpu => false,
             };
 
-            if gpu_enabled {
-                let gpu_id = (self.idx.saturating_sub(1)) % gpu_count();
-                params.push(("tree_method", "gpu_hist"));
-                params.push(("device", &format!("cuda:{}", gpu_id)));
-                info!("XGBoost using GPU {}", gpu_id);
-            } else {
-                params.push(("tree_method", "hist"));
-            }
+            let train_once = |use_gpu: bool| -> Result<xgb::Booster> {
+                let features_train = dataframe_to_f32_flat(&x_train)?;
+                let mut dtrain = xgb::DMatrix::from_dense(&features_train, x_train.height())?;
+                let labels_train: Vec<f32> = y_train
+                    .i32()?
+                    .into_iter()
+                    .map(|v| v.unwrap_or(1) as f32)
+                    .collect();
+                dtrain.set_labels(&labels_train)?;
 
-            // CPU threads
-            if let Some(threads) = self.config.cpu_threads {
-                params.push(("nthread", &threads.to_string()));
-            }
+                let mut eval_dmats: Vec<xgb::DMatrix> = Vec::new();
+                if x_val.height() > 0 {
+                    let features_val = dataframe_to_f32_flat(&x_val)?;
+                    let mut dval = xgb::DMatrix::from_dense(&features_val, x_val.height())?;
+                    let labels_val: Vec<f32> = y_val
+                        .i32()?
+                        .into_iter()
+                        .map(|v| v.unwrap_or(1) as f32)
+                        .collect();
+                    dval.set_labels(&labels_val)?;
+                    eval_dmats.push(dval);
+                }
 
-            // STEP 7: Train model
-            info!("Training XGBoost model...");
-            let booster = xgb::Booster::train(&dtrain, &params, 800, &[])?;
+                let mut cached_dmats: Vec<&xgb::DMatrix> = Vec::with_capacity(1 + eval_dmats.len());
+                cached_dmats.push(&dtrain);
+                for dmat in &eval_dmats {
+                    cached_dmats.push(dmat);
+                }
+
+                let mut booster_params_builder = xgb::parameters::BoosterParametersBuilder::default();
+                if let Some(threads) = self.config.cpu_threads {
+                    booster_params_builder.threads(Some(threads as u32));
+                }
+                if let Some(ParamValue::Int(v)) = self.config.params.get("verbosity") {
+                    booster_params_builder.verbose(*v > 0);
+                }
+                let booster_params = booster_params_builder
+                    .build()
+                    .context("Failed to build XGBoost parameters")?;
+                let mut booster = xgb::Booster::new_with_cached_dmats(&booster_params, &cached_dmats)?;
+
+                let mut params = base_params.clone();
+                if use_gpu {
+                    let gpu_id = (self.idx.saturating_sub(1)) % gpu_count();
+                    params.push(("tree_method".to_string(), "gpu_hist".to_string()));
+                    params.push(("predictor".to_string(), "gpu_predictor".to_string()));
+                    params.push(("device".to_string(), format!("cuda:{}", gpu_id)));
+                    info!("XGBoost using GPU {}", gpu_id);
+                } else if !params.iter().any(|(k, _)| k == "tree_method") {
+                    params.push(("tree_method".to_string(), "hist".to_string()));
+                }
+
+                if let Some(threads) = self.config.cpu_threads {
+                    params.push(("nthread".to_string(), threads.to_string()));
+                }
+
+                for (k, v) in params {
+                    booster.set_param(&k, &v)?;
+                }
+
+                info!("Training XGBoost model...");
+                for iter in 0..boost_rounds {
+                    booster.update(&dtrain, iter as i32)?;
+                }
+
+                Ok(booster)
+            };
+
+            let booster = match train_once(gpu_enabled) {
+                Ok(b) => b,
+                Err(e) => {
+                    if gpu_enabled && self.config.gpu_only {
+                        warn!("GPU training failed in GPU-only mode: {}", e);
+                        self.gpu_only_disabled = true;
+                        return Ok(());
+                    } else if gpu_enabled {
+                        warn!("GPU training failed, falling back to CPU: {}", e);
+                        train_once(false)?
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
 
             self.model = Some(booster);
             info!("XGBoost training complete");
@@ -856,20 +1086,7 @@ impl ExpertModel for XGBoostExpert {
         #[cfg(feature = "xgboost")]
         {
             let model = self.model.as_ref().context("XGBoost model not trained")?;
-            
-            let x_aug = if x.column("close").is_ok() {
-                augment_time_features(x.clone())? 
-            } else {
-                x.clone()
-            };
-            
-            let features = dataframe_to_vecs(&x_aug)?;
-            let dmatrix = xgb::DMatrix::from_dense(&features, x.height())?;
-            
-            let preds = model.predict(&dmatrix)?;
-            let probs_array = Array2::from_shape_vec((x.height(), 3), preds)?;
-            
-            Ok(reorder_to_neutral_buy_sell(probs_array, Some(vec![0, 1, 2])))
+            xgb_predict_probs(model, x)
         }
         #[cfg(not(feature = "xgboost"))]
         {
@@ -880,8 +1097,9 @@ impl ExpertModel for XGBoostExpert {
     fn save(&self, _path: &Path) -> Result<()> {
         #[cfg(feature = "xgboost")]
         {
+            let path = _path;
             if let Some(model) = &self.model {
-                model.save(path.to_str().context("Invalid path")?)?;
+                model.save(path)?;
             }
             Ok(())
         }
@@ -894,7 +1112,8 @@ impl ExpertModel for XGBoostExpert {
     fn load(&mut self, _path: &Path) -> Result<()> {
         #[cfg(feature = "xgboost")]
         {
-            let booster = xgb::Booster::load(path.to_str().context("Invalid path")?)?;
+            let path = _path;
+            let booster = xgb::Booster::load(path)?;
             self.model = Some(booster);
             Ok(())
         }
@@ -913,9 +1132,12 @@ impl ExpertModel for XGBoostExpert {
 pub struct XGBoostRFExpert {
     pub idx: usize,
     pub config: TreeModelConfig,
+    #[cfg_attr(not(feature = "xgboost"), allow(dead_code))]
     gpu_only_disabled: bool,
+    #[cfg_attr(not(feature = "xgboost"), allow(dead_code))]
     #[cfg(feature = "xgboost")]
     model: Option<xgb::Booster>,
+    #[cfg_attr(not(feature = "xgboost"), allow(dead_code))]
     #[cfg(not(feature = "xgboost"))]
     model: Option<()>,
 }
@@ -967,9 +1189,12 @@ impl XGBoostRFExpert {
 pub struct XGBoostDARTExpert {
     pub idx: usize,
     pub config: TreeModelConfig,
+    #[cfg_attr(not(feature = "xgboost"), allow(dead_code))]
     gpu_only_disabled: bool,
+    #[cfg_attr(not(feature = "xgboost"), allow(dead_code))]
     #[cfg(feature = "xgboost")]
     model: Option<xgb::Booster>,
+    #[cfg_attr(not(feature = "xgboost"), allow(dead_code))]
     #[cfg(not(feature = "xgboost"))]
     model: Option<()>,
 }
@@ -1026,6 +1251,8 @@ impl ExpertModel for XGBoostRFExpert {
     fn fit(&mut self, _x: &DataFrame, _y: &Series) -> Result<()> {
         #[cfg(feature = "xgboost")]
         {
+            let x = _x;
+            let y = _y;
             let mut base = XGBoostExpert {
                 idx: self.idx,
                 config: self.config.clone(),
@@ -1044,15 +1271,14 @@ impl ExpertModel for XGBoostRFExpert {
     }
 
     fn predict_proba(&self, _x: &DataFrame) -> Result<Array2<f32>> {
+        if self.gpu_only_disabled {
+            return Ok(Array2::zeros((_x.height(), 3)));
+        }
         #[cfg(feature = "xgboost")]
         {
-            let base = XGBoostExpert {
-                idx: self.idx,
-                config: self.config.clone(),
-                gpu_only_disabled: self.gpu_only_disabled,
-                model: self.model.clone(),
-            };
-            base.predict_proba(x)
+            let x = _x;
+            let model = self.model.as_ref().context("XGBoost model not trained")?;
+            xgb_predict_probs(model, x)
         }
         #[cfg(not(feature = "xgboost"))]
         {
@@ -1063,8 +1289,9 @@ impl ExpertModel for XGBoostRFExpert {
     fn save(&self, _path: &Path) -> Result<()> {
         #[cfg(feature = "xgboost")]
         {
+            let path = _path;
             if let Some(model) = &self.model {
-                model.save(path.to_str().context("Invalid path")?)?;
+                model.save(path)?;
             }
             Ok(())
         }
@@ -1077,7 +1304,8 @@ impl ExpertModel for XGBoostRFExpert {
     fn load(&mut self, _path: &Path) -> Result<()> {
         #[cfg(feature = "xgboost")]
         {
-            let booster = xgb::Booster::load(path.to_str().context("Invalid path")?)?;
+            let path = _path;
+            let booster = xgb::Booster::load(path)?;
             self.model = Some(booster);
             Ok(())
         }
@@ -1092,6 +1320,8 @@ impl ExpertModel for XGBoostDARTExpert {
     fn fit(&mut self, _x: &DataFrame, _y: &Series) -> Result<()> {
         #[cfg(feature = "xgboost")]
         {
+            let x = _x;
+            let y = _y;
             let mut base = XGBoostExpert {
                 idx: self.idx,
                 config: self.config.clone(),
@@ -1110,15 +1340,14 @@ impl ExpertModel for XGBoostDARTExpert {
     }
 
     fn predict_proba(&self, _x: &DataFrame) -> Result<Array2<f32>> {
+        if self.gpu_only_disabled {
+            return Ok(Array2::zeros((_x.height(), 3)));
+        }
         #[cfg(feature = "xgboost")]
         {
-            let base = XGBoostExpert {
-                idx: self.idx,
-                config: self.config.clone(),
-                gpu_only_disabled: self.gpu_only_disabled,
-                model: self.model.clone(),
-            };
-            base.predict_proba(x)
+            let x = _x;
+            let model = self.model.as_ref().context("XGBoost model not trained")?;
+            xgb_predict_probs(model, x)
         }
         #[cfg(not(feature = "xgboost"))]
         {
@@ -1129,8 +1358,9 @@ impl ExpertModel for XGBoostDARTExpert {
     fn save(&self, _path: &Path) -> Result<()> {
         #[cfg(feature = "xgboost")]
         {
+            let path = _path;
             if let Some(model) = &self.model {
-                model.save(path.to_str().context("Invalid path")?)?;
+                model.save(path)?;
             }
             Ok(())
         }
@@ -1143,7 +1373,8 @@ impl ExpertModel for XGBoostDARTExpert {
     fn load(&mut self, _path: &Path) -> Result<()> {
         #[cfg(feature = "xgboost")]
         {
-            let booster = xgb::Booster::load(path.to_str().context("Invalid path")?)?;
+            let path = _path;
+            let booster = xgb::Booster::load(path)?;
             self.model = Some(booster);
             Ok(())
         }
@@ -1164,8 +1395,10 @@ pub struct CatBoostExpert {
     pub idx: usize,
     pub config: TreeModelConfig,
     gpu_only_disabled: bool,
+    #[cfg_attr(not(feature = "catboost"), allow(dead_code))]
     #[cfg(feature = "catboost")]
     model: Option<catboost::Model>,
+    #[cfg_attr(not(feature = "catboost"), allow(dead_code))]
     #[cfg(not(feature = "catboost"))]
     model: Option<()>,
 }
@@ -1239,36 +1472,7 @@ impl ExpertModel for CatBoostExpert {
             let model = self.model.as_ref().context(
                 "Model not loaded. Train in Python and load .cbm file with load() method"
             )?;
-
-            // Augment time features if 'close' exists
-            let x = if x.column("close").is_ok() {
-                augment_time_features(x.clone())? 
-            } else {
-                x.clone()
-            };
-
-            // Convert DataFrame to format CatBoost expects
-            let features = dataframe_to_vecs(&x)?;
-
-            // CatBoost expects float features in specific format
-            let float_features: Vec<Vec<f32>> = features
-                .iter()
-                .map(|row| row.iter().map(|&v| v as f32).collect())
-                .collect();
-
-            // Create ObjectsOrderFeatures
-            let features_obj = catboost::ObjectsOrderFeatures::new()
-                .with_float_features(&float_features.iter().map(|v| v.as_slice()).collect::<Vec<_>>());
-
-            // Predict
-            let predictions = model.predict(features_obj)?;
-
-            // Convert to Array2<f32> and reorder to [Neutral, Buy, Sell]
-            let n_samples = predictions.len() / 3;
-            let probs = Array2::from_shape_vec((n_samples, 3), predictions)?;
-
-            // Reorder output
-            Ok(reorder_to_neutral_buy_sell(probs, Some(vec![0, 1, 2])))
+            catboost_predict_probs(model, x)
         }
         #[cfg(not(feature = "catboost"))]
         {
@@ -1290,22 +1494,20 @@ impl ExpertModel for CatBoostExpert {
     fn load(&mut self, _path: &Path) -> Result<()> {
         #[cfg(feature = "catboost")]
         {
+            let path = _path;
             let model = catboost::Model::load(path.to_str().unwrap())?;
 
             // Enable GPU if available and configured
-            #[cfg(feature = "gpu")]
-            {
-                let gpu_enabled = match self.config.device_pref {
-                    DevicePreference::Gpu => torch_cuda_available(),
-                    DevicePreference::Auto => torch_cuda_available(),
-                    DevicePreference::Cpu => false,
-                };
+            let gpu_enabled = match self.config.device_pref {
+                DevicePreference::Gpu => torch_cuda_available(),
+                DevicePreference::Auto => torch_cuda_available(),
+                DevicePreference::Cpu => false,
+            };
 
-                if gpu_enabled {
-                    let gpu_id = (self.idx.saturating_sub(1)) % gpu_count();
-                    model.enable_gpu_evaluation()?;
-                    info!("CatBoost using GPU {}", gpu_id);
-                }
+            if gpu_enabled {
+                let gpu_id = (self.idx.saturating_sub(1)) % gpu_count();
+                model.enable_gpu_evaluation()?;
+                info!("CatBoost using GPU {}", gpu_id);
             }
 
             self.model = Some(model);
@@ -1323,9 +1525,12 @@ impl ExpertModel for CatBoostExpert {
 pub struct CatBoostAltExpert {
     pub idx: usize,
     pub config: TreeModelConfig,
+    #[cfg_attr(not(feature = "catboost"), allow(dead_code))]
     gpu_only_disabled: bool,
+    #[cfg_attr(not(feature = "catboost"), allow(dead_code))]
     #[cfg(feature = "catboost")]
     model: Option<catboost::Model>,
+    #[cfg_attr(not(feature = "catboost"), allow(dead_code))]
     #[cfg(not(feature = "catboost"))]
     model: Option<()>,
 }
@@ -1426,7 +1631,7 @@ mod tests {
 
     #[test]
     fn test_remap_labels() {
-        let labels = Series::new("label", &[-1, 0, 1, -1, 0, 1]);
+        let labels = Series::new("label".into(), &[-1, 0, 1, -1, 0, 1]);
         let (remapped, mapping) = remap_labels_to_contiguous(&labels).unwrap();
 
         assert_eq!(remapped.as_slice().unwrap(), &[0, 1, 2, 0, 1, 2]);
@@ -1472,6 +1677,8 @@ impl ExpertModel for CatBoostAltExpert {
     fn fit(&mut self, _x: &DataFrame, _y: &Series) -> Result<()> {
         #[cfg(feature = "catboost")]
         {
+            let x = _x;
+            let y = _y;
             let mut base = CatBoostExpert {
                 idx: self.idx,
                 config: self.config.clone(),
@@ -1490,15 +1697,16 @@ impl ExpertModel for CatBoostAltExpert {
     }
 
     fn predict_proba(&self, _x: &DataFrame) -> Result<Array2<f32>> {
+        if self.gpu_only_disabled {
+            return Ok(Array2::zeros((_x.height(), 3)));
+        }
         #[cfg(feature = "catboost")]
         {
-            let base = CatBoostExpert {
-                idx: self.idx,
-                config: self.config.clone(),
-                gpu_only_disabled: self.gpu_only_disabled,
-                model: self.model.clone(),
-            };
-            base.predict_proba(x)
+            let x = _x;
+            let model = self.model.as_ref().context(
+                "Model not loaded. Train in Python and load .cbm file with load() method"
+            )?;
+            catboost_predict_probs(model, x)
         }
         #[cfg(not(feature = "catboost"))]
         {
@@ -1509,13 +1717,7 @@ impl ExpertModel for CatBoostAltExpert {
     fn save(&self, _path: &Path) -> Result<()> {
         #[cfg(feature = "catboost")]
         {
-            let base = CatBoostExpert {
-                idx: self.idx,
-                config: self.config.clone(),
-                gpu_only_disabled: self.gpu_only_disabled,
-                model: self.model.clone(),
-            };
-            base.save(path)
+            anyhow::bail!("CatBoost save not implemented. Model is already saved as .cbm file")
         }
         #[cfg(not(feature = "catboost"))]
         {
@@ -1526,7 +1728,21 @@ impl ExpertModel for CatBoostAltExpert {
     fn load(&mut self, _path: &Path) -> Result<()> {
         #[cfg(feature = "catboost")]
         {
+            let path = _path;
             let model = catboost::Model::load(path.to_str().context("Invalid path")?)?;
+
+            let gpu_enabled = match self.config.device_pref {
+                DevicePreference::Gpu => torch_cuda_available(),
+                DevicePreference::Auto => torch_cuda_available(),
+                DevicePreference::Cpu => false,
+            };
+
+            if gpu_enabled {
+                let gpu_id = (self.idx.saturating_sub(1)) % gpu_count();
+                model.enable_gpu_evaluation()?;
+                info!("CatBoost using GPU {}", gpu_id);
+            }
+
             self.model = Some(model);
             Ok(())
         }

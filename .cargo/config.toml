@@ -1,0 +1,5 @@
+[env]
+# Fix bindgen parsing against latest MSVC STL headers on Windows.
+# Without this, `lightgbm3-sys` can fail with:
+# "error STL1000: Unexpected compiler version..."
+BINDGEN_EXTRA_CLANG_ARGS = "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"

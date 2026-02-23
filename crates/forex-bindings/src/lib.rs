@@ -1890,7 +1890,7 @@ fn triple_barrier_labels(
 // ============================================================================
 
 #[cfg(feature = "lightgbm")]
-#[pyclass]
+#[pyclass(unsendable)]
 struct LightGBMModel {
     model: Mutex<LightGBMExpert>,
 }
@@ -1904,9 +1904,9 @@ impl LightGBMModel {
         let params = params_from_py(params).map_err(|msg| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(msg)
         })?;
-        Self {
+        Ok(Self {
             model: Mutex::new(LightGBMExpert::new(idx, params)),
-        }
+        })
     }
 
     fn fit<'py>(
