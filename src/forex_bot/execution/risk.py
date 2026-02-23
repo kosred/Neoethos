@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import sys
 from collections import deque
 from dataclasses import dataclass
@@ -24,6 +25,30 @@ logger = logging.getLogger(__name__)
 
 MIN_BREAKEVEN_PROBABILITY = 0.45
 RISK_STATE_FILE = Path("cache") / "risk_state.json"
+_RUST_RISK_BACKEND_OK: bool | None = None
+_RUST_RISK_WARNED_UNAVAILABLE = False
+
+
+def _rust_risk_backend_available(*, force_log: bool = False) -> bool:
+    global _RUST_RISK_BACKEND_OK, _RUST_RISK_WARNED_UNAVAILABLE
+    if _RUST_RISK_BACKEND_OK is None:
+        try:
+            import forex_bindings  # type: ignore
+
+            _RUST_RISK_BACKEND_OK = hasattr(forex_bindings, "compute_position_size_lots")
+        except Exception:
+            _RUST_RISK_BACKEND_OK = False
+    if force_log and not _RUST_RISK_BACKEND_OK and not _RUST_RISK_WARNED_UNAVAILABLE:
+        logger.warning(
+            "Rust risk backend requested but forex_bindings.compute_position_size_lots is unavailable; using Python risk sizing."
+        )
+        _RUST_RISK_WARNED_UNAVAILABLE = True
+    return bool(_RUST_RISK_BACKEND_OK)
+
+
+def _disable_rust_risk_backend() -> None:
+    global _RUST_RISK_BACKEND_OK
+    _RUST_RISK_BACKEND_OK = False
 
 
 class ChallengePhase(Enum):
@@ -47,6 +72,58 @@ class PropFirmRules:
     daily_dd_stop_trading_pct: float = 0.040  # 4.0% stop trading buffer
     daily_profit_lock_pct: float = 0.03  # lock profits if hit
     max_trades_per_day: int = 15
+
+
+@dataclass(slots=True)
+class ChallengeRiskPreset:
+    phase: str
+    risk_per_trade: float
+    max_risk_per_trade: float
+    min_confidence_threshold: float
+    max_trades_per_day: int
+    daily_drawdown_limit: float
+    total_drawdown_limit: float
+    daily_profit_lock_pct: float
+    monthly_profit_target_pct: float
+
+
+def resolve_challenge_risk_preset(phase: str) -> ChallengeRiskPreset:
+    raw = str(phase or "phase_1").strip().lower()
+    if raw in {"phase2", "phase_2", "verification", "verify"}:
+        return ChallengeRiskPreset(
+            phase="phase_2",
+            risk_per_trade=0.0030,
+            max_risk_per_trade=0.0050,
+            min_confidence_threshold=0.66,
+            max_trades_per_day=3,
+            daily_drawdown_limit=0.045,
+            total_drawdown_limit=0.10,
+            daily_profit_lock_pct=0.015,
+            monthly_profit_target_pct=0.025,
+        )
+    if raw in {"funded", "live"}:
+        return ChallengeRiskPreset(
+            phase="funded",
+            risk_per_trade=0.0040,
+            max_risk_per_trade=0.0070,
+            min_confidence_threshold=0.62,
+            max_trades_per_day=5,
+            daily_drawdown_limit=0.045,
+            total_drawdown_limit=0.10,
+            daily_profit_lock_pct=0.0,
+            monthly_profit_target_pct=0.05,
+        )
+    return ChallengeRiskPreset(
+        phase="phase_1",
+        risk_per_trade=0.0035,
+        max_risk_per_trade=0.0060,
+        min_confidence_threshold=0.64,
+        max_trades_per_day=4,
+        daily_drawdown_limit=0.045,
+        total_drawdown_limit=0.10,
+        daily_profit_lock_pct=0.020,
+        monthly_profit_target_pct=0.0375,
+    )
 
 
 class RevengeTradeDetector:
@@ -130,6 +207,14 @@ class RiskManager:
         self.settings = settings
         self.symbol = settings.system.symbol or "GLOBAL"
         self.state_file = Path("cache") / f"risk_state_{self.symbol}.json"
+        self.challenge_mode = bool(
+            getattr(settings.risk, "challenge_mode", False)
+            or str(os.environ.get("FOREX_BOT_CHALLENGE_MODE", "")).strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.challenge_phase = str(getattr(settings.risk, "challenge_phase", "phase_1") or "phase_1")
+        if self.challenge_mode:
+            self._apply_challenge_mode_preset()
 
         session_tz = str(getattr(settings.system, "session_timezone", "UTC") or "UTC")
         try:
@@ -203,6 +288,7 @@ class RiskManager:
         self.daily_loss = 0.0
         self.daily_profit = 0.0
         self.session_trades = 0
+        self.session_trade_counts: dict[str, int] = {}
         self.consecutive_losses = 0
         self.circuit_breaker_triggered = False
 
@@ -229,6 +315,114 @@ class RiskManager:
         self.load_state()
         self.initialize_session()
 
+    @staticmethod
+    def _session_bucket_utc(ts: datetime) -> str:
+        hour = int(ts.astimezone(ZoneInfo("UTC")).hour)
+        if 0 <= hour < 7:
+            return "asia"
+        if 7 <= hour < 13:
+            return "london"
+        if 13 <= hour < 21:
+            return "newyork"
+        return "offhours"
+
+    @staticmethod
+    def _in_hour_window(hour: int, start: int, end: int) -> bool:
+        s = int(start) % 24
+        e = int(end) % 24
+        if s == e:
+            return True
+        if s < e:
+            return s <= hour < e
+        return (hour >= s) or (hour < e)
+
+    def _apply_challenge_mode_preset(self) -> None:
+        preset = resolve_challenge_risk_preset(self.challenge_phase)
+        r = self.settings.risk
+
+        try:
+            current_risk = float(getattr(r, "risk_per_trade", preset.risk_per_trade) or preset.risk_per_trade)
+        except Exception:
+            current_risk = preset.risk_per_trade
+        r.risk_per_trade = max(0.0001, min(current_risk, preset.risk_per_trade))
+
+        try:
+            current_base_risk = float(getattr(r, "base_risk_per_trade", r.risk_per_trade) or r.risk_per_trade)
+        except Exception:
+            current_base_risk = r.risk_per_trade
+        r.base_risk_per_trade = max(0.0001, min(current_base_risk, preset.risk_per_trade))
+
+        try:
+            current_max_risk = float(
+                getattr(r, "max_risk_per_trade", preset.max_risk_per_trade) or preset.max_risk_per_trade
+            )
+        except Exception:
+            current_max_risk = preset.max_risk_per_trade
+        r.max_risk_per_trade = max(r.risk_per_trade, min(current_max_risk, preset.max_risk_per_trade))
+
+        try:
+            current_conf = float(
+                getattr(r, "min_confidence_threshold", preset.min_confidence_threshold) or preset.min_confidence_threshold
+            )
+        except Exception:
+            current_conf = preset.min_confidence_threshold
+        r.min_confidence_threshold = min(0.90, max(current_conf, preset.min_confidence_threshold))
+        r.high_quality_confidence = min(0.95, max(float(getattr(r, "high_quality_confidence", 0.65) or 0.65), r.min_confidence_threshold + 0.05))
+
+        try:
+            current_trades = int(getattr(r, "max_trades_per_day", preset.max_trades_per_day) or preset.max_trades_per_day)
+        except Exception:
+            current_trades = preset.max_trades_per_day
+        if current_trades <= 0:
+            current_trades = preset.max_trades_per_day
+        r.max_trades_per_day = max(1, min(current_trades, preset.max_trades_per_day))
+
+        try:
+            current_daily_dd = float(getattr(r, "daily_drawdown_limit", preset.daily_drawdown_limit) or preset.daily_drawdown_limit)
+        except Exception:
+            current_daily_dd = preset.daily_drawdown_limit
+        r.daily_drawdown_limit = max(0.001, min(current_daily_dd, preset.daily_drawdown_limit))
+
+        try:
+            current_total_dd = float(getattr(r, "total_drawdown_limit", preset.total_drawdown_limit) or preset.total_drawdown_limit)
+        except Exception:
+            current_total_dd = preset.total_drawdown_limit
+        r.total_drawdown_limit = max(0.01, min(current_total_dd, preset.total_drawdown_limit))
+
+        try:
+            current_monthly_target = float(
+                getattr(r, "monthly_profit_target_pct", preset.monthly_profit_target_pct) or preset.monthly_profit_target_pct
+            )
+        except Exception:
+            current_monthly_target = preset.monthly_profit_target_pct
+        r.monthly_profit_target_pct = max(current_monthly_target, preset.monthly_profit_target_pct)
+
+        try:
+            current_daily_stop = float(getattr(r, "daily_profit_stop_pct", 0.0) or 0.0)
+        except Exception:
+            current_daily_stop = 0.0
+        if preset.daily_profit_lock_pct > 0.0:
+            if current_daily_stop <= 0.0:
+                r.daily_profit_stop_pct = preset.daily_profit_lock_pct
+            else:
+                r.daily_profit_stop_pct = min(current_daily_stop, preset.daily_profit_lock_pct)
+
+        try:
+            current_hq_risk = float(getattr(r, "high_quality_risk_pct", r.max_risk_per_trade) or r.max_risk_per_trade)
+        except Exception:
+            current_hq_risk = r.max_risk_per_trade
+        r.high_quality_risk_pct = min(current_hq_risk, r.max_risk_per_trade)
+
+        logger.info(
+            "Challenge mode preset applied: phase=%s risk=%.3f%% max_risk=%.3f%% min_conf=%.2f max_trades=%d month_target=%.2f%%",
+            preset.phase,
+            100.0 * float(r.risk_per_trade),
+            100.0 * float(r.max_risk_per_trade),
+            float(r.min_confidence_threshold),
+            int(r.max_trades_per_day),
+            100.0 * float(r.monthly_profit_target_pct),
+        )
+
     def save_state(self) -> None:
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -241,6 +435,7 @@ class RiskManager:
                 "daily_loss": self.daily_loss,
                 "daily_profit": self.daily_profit,
                 "session_trades": self.session_trades,
+                "session_trade_counts": self.session_trade_counts,
                 "consecutive_losses": self.consecutive_losses,
                 "total_peak_equity": self.total_peak_equity,
                 "circuit_breaker_triggered": self.circuit_breaker_triggered,
@@ -288,6 +483,11 @@ class RiskManager:
                 self.daily_loss = float(state.get("daily_loss", 0.0))
                 self.daily_profit = float(state.get("daily_profit", 0.0))
                 self.session_trades = int(state.get("session_trades", 0))
+                raw_counts = state.get("session_trade_counts", {})
+                if isinstance(raw_counts, dict):
+                    self.session_trade_counts = {str(k): int(v) for k, v in raw_counts.items()}
+                else:
+                    self.session_trade_counts = {}
                 self.consecutive_losses = int(state.get("consecutive_losses", 0))
                 self.total_peak_equity = float(state.get("total_peak_equity", self.day_start_equity))
                 self.day_peak_equity = float(state.get("day_peak_equity", max(self.total_peak_equity, self.day_start_equity)))
@@ -325,6 +525,7 @@ class RiskManager:
             self.daily_loss = 0.0
             self.daily_profit = 0.0
             self.session_trades = 0
+            self.session_trade_counts = {}
             self.consecutive_losses = 0
             self._last_session_date = now_date
             self._kill_window_until = None
@@ -345,6 +546,7 @@ class RiskManager:
             self.daily_loss = 0.0
             self.daily_profit = 0.0
             self.session_trades = 0
+            self.session_trade_counts = {}
             self.consecutive_losses = 0
             self.day_start_equity = equity
             self.day_peak_equity = equity
@@ -443,7 +645,15 @@ class RiskManager:
             }
         )
 
-    def check_trade_allowed(self, equity: float, confidence: float, timestamp: datetime) -> tuple[bool, str]:
+    def check_trade_allowed(
+        self,
+        equity: float,
+        confidence: float,
+        timestamp: datetime,
+        *,
+        market_volatility: float | None = None,
+        ensemble_disagreement: float | None = None,
+    ) -> tuple[bool, str]:
         self._ensure_day(equity, timestamp)
         self._ensure_month(equity, timestamp)
         self._update_monthly_metrics(equity)
@@ -472,6 +682,17 @@ class RiskManager:
 
         if not self.is_trading_session():
             return False, "Outside trading session"
+
+        # UTC night block: avoid low-liquidity chop unless realized volatility is high enough.
+        if bool(getattr(self.settings.risk, "block_night_session", True)):
+            utc_hour = int(timestamp.astimezone(ZoneInfo("UTC")).hour)
+            start_h = int(getattr(self.settings.risk, "night_block_start_utc", 0) or 0)
+            end_h = int(getattr(self.settings.risk, "night_block_end_utc", 6) or 6)
+            if self._in_hour_window(utc_hour, start_h, end_h):
+                min_vol = float(getattr(self.settings.risk, "night_min_volatility", 0.0008) or 0.0008)
+                cur_vol = float(market_volatility or 0.0)
+                if cur_vol < min_vol:
+                    return False, f"Night session blocked (vol={cur_vol:.5f} < {min_vol:.5f})"
 
         if self._kill_window_until and timestamp < self._kill_window_until:
             return False, "News kill window active"
@@ -534,6 +755,12 @@ class RiskManager:
         if max_trades > 0 and self.session_trades >= max_trades:
             return False, "Max trades per day reached"
 
+        max_trades_session = int(getattr(self.settings.risk, "max_trades_per_session", 0) or 0)
+        if max_trades_session > 0:
+            bucket = self._session_bucket_utc(timestamp)
+            if int(self.session_trade_counts.get(bucket, 0)) >= max_trades_session:
+                return False, f"Max trades reached for session '{bucket}'"
+
         spread_baseline = self._spread_state.get("spread_baseline", 0.0) or 1e-6
         slippage_baseline = self._spread_state.get("slippage_baseline", 0.0) or 1e-6
         current_spread = self._spread_state.get("current_spread", spread_baseline)
@@ -552,12 +779,41 @@ class RiskManager:
             )
             return False, f"Slippage risk too high ({slippage_ratio:.1f}x baseline)"
 
-        # Confidence threshold check - higher requirement in recovery mode
-        min_conf = self.settings.risk.min_confidence_threshold
+        if ensemble_disagreement is not None:
+            max_disagree = float(getattr(self.settings.risk, "max_ensemble_disagreement", 0.20) or 0.20)
+            disagree = float(max(0.0, min(1.0, ensemble_disagreement)))
+            if max_disagree > 0 and disagree > max_disagree:
+                return False, f"Ensemble disagreement {disagree:.2f} exceeds {max_disagree:.2f}"
+
+        # Dynamic confidence threshold check (volatility/session/recovery aware).
+        min_conf = float(getattr(self.settings.risk, "min_confidence_threshold", 0.55) or 0.55)
+
+        if bool(getattr(self.settings.risk, "dynamic_confidence_enabled", True)):
+            vol = float(max(0.0, market_volatility or 0.0))
+            if vol > 0.0:
+                vol_ref = float(getattr(self.settings.risk, "volatility_target", 0.0015) or 0.0015)
+                norm_vol = min(1.0, vol / max(vol_ref, 1e-9))
+                vol_sens = float(getattr(self.settings.risk, "dynamic_confidence_vol_sensitivity", 0.15) or 0.15)
+                min_conf += vol_sens * (1.0 - norm_vol)
+
+        bucket = self._session_bucket_utc(timestamp)
+        if bucket == "asia":
+            min_conf = max(min_conf, float(getattr(self.settings.risk, "session_asia_confidence_threshold", min_conf) or min_conf))
+        elif bucket == "london":
+            min_conf = max(min_conf, float(getattr(self.settings.risk, "session_london_confidence_threshold", min_conf) or min_conf))
+        elif bucket == "newyork":
+            min_conf = max(min_conf, float(getattr(self.settings.risk, "session_newyork_confidence_threshold", min_conf) or min_conf))
+
         if self.recovery_mode:
             # In recovery mode, require HIGHER confidence (use min to take the more restrictive)
             min_conf = max(min_conf + self.recovery_conf_boost, self.recovery_min_win_prob)
             logger.debug(f"Recovery mode active: confidence threshold raised to {min_conf:.2f}")
+        min_conf = float(
+            min(
+                float(getattr(self.settings.risk, "dynamic_confidence_max", 0.90) or 0.90),
+                max(float(getattr(self.settings.risk, "dynamic_confidence_min", 0.50) or 0.50), min_conf),
+            )
+        )
         if confidence < min_conf:
             return False, f"Confidence {confidence:.2f} below threshold {min_conf:.2f}"
 
@@ -571,6 +827,7 @@ class RiskManager:
         uncertainty: float = 0.0,
         symbol_info: dict[str, Any] | None = None,
         market_regime: str = "Normal",
+        market_volatility: float | None = None,
     ) -> float:
         if stop_loss_pips <= 0:
             return 0.0
@@ -592,6 +849,21 @@ class RiskManager:
         if self.recovery_mode:
             risk_cap = min(risk_cap, self.recovery_risk_cap)
         risk_pct = min(risk_pct, risk_cap)
+
+        if bool(getattr(self.settings.risk, "volatility_targeting_enabled", True)):
+            cur_vol = float(max(0.0, market_volatility or 0.0))
+            tgt_vol = float(getattr(self.settings.risk, "volatility_target", 0.0015) or 0.0015)
+            if cur_vol > 0.0 and tgt_vol > 0.0:
+                vol_scale = tgt_vol / max(cur_vol, 1e-9)
+                min_scale = float(getattr(self.settings.risk, "volatility_target_min_scale", 0.35) or 0.35)
+                max_scale = float(getattr(self.settings.risk, "volatility_target_max_scale", 1.30) or 1.30)
+                vol_scale = float(min(max_scale, max(min_scale, vol_scale)))
+                risk_pct *= vol_scale
+
+        regime_txt = str(market_regime or "").strip().lower()
+        if any(tag in regime_txt for tag in ("transition", "uncertain", "shock", "volatile_switch")):
+            trans_mult = float(getattr(self.settings.risk, "regime_transition_size_multiplier", 0.5) or 0.5)
+            risk_pct *= max(0.0, min(1.0, trans_mult))
 
         news_cap = self._news_state.get("suggested_risk_cap")
         if news_cap is not None:
@@ -642,9 +914,55 @@ class RiskManager:
         except Exception as e:
             logger.warning(f"Saving risk state failed: {e}", exc_info=True)
 
-        risk_amount = equity * risk_pct
-        pip_size, pip_value = self._compute_pip_metrics(symbol_info)
+        if self.challenge_mode and self.month_start_equity > 0:
+            try:
+                now = datetime.now(self._session_tz)
+                day_ratio = min(1.0, max(1.0 / 31.0, float(now.day) / 31.0))
+                target_progress = float(self.monthly_profit_target_pct) * day_ratio
+                progress_gap = float(self.monthly_return_pct) - target_progress
+                if progress_gap < -0.01 and daily_dd_pct < max(0.005, self.prop_rules.daily_dd_warning_pct * 0.5):
+                    risk_pct *= 1.10
+                elif progress_gap > 0.01:
+                    risk_pct *= 0.85
+            except Exception:
+                pass
 
+        risk_floor = float(getattr(self.settings.risk, "min_risk_per_trade", 0.0) or 0.0)
+        risk_floor = max(0.0, min(risk_floor, self.settings.risk.max_risk_per_trade))
+        risk_pct = min(self.settings.risk.max_risk_per_trade, max(risk_floor, risk_pct))
+
+        pip_size, pip_value = self._compute_pip_metrics(symbol_info)
+        _ = pip_size
+
+        use_rust = str(os.environ.get("FOREX_BOT_RUST_RISK", "1") or "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+            "rust",
+        }
+        if use_rust and _rust_risk_backend_available(force_log=True):
+            try:
+                import forex_bindings  # type: ignore
+
+                lot_size_rs = float(
+                    forex_bindings.compute_position_size_lots(
+                        equity=float(equity),
+                        risk_pct=float(risk_pct),
+                        stop_loss_pips=float(stop_loss_pips),
+                        pip_value=float(pip_value),
+                        max_lot_size=float(self.prop_rules.max_lot_size),
+                        lot_step=0.01,
+                        min_lot=0.0,
+                    )
+                )
+                if np.isfinite(lot_size_rs):
+                    return max(0.0, min(float(lot_size_rs), self.prop_rules.max_lot_size))
+            except Exception as exc:
+                _disable_rust_risk_backend()
+                logger.debug("Rust risk sizing failed; falling back to Python: %s", exc)
+
+        risk_amount = equity * risk_pct
         lot_size = risk_amount / max(stop_loss_pips * pip_value, 1e-9)
 
         lot_size = int(lot_size * 100) / 100.0
@@ -700,6 +1018,8 @@ class RiskManager:
     def on_trade_opened(self, timestamp: datetime) -> None:
         """Increment trade counter on open."""
         self.session_trades += 1
+        bucket = self._session_bucket_utc(timestamp)
+        self.session_trade_counts[bucket] = int(self.session_trade_counts.get(bucket, 0)) + 1
 
     def on_trade_closed(self, pnl: float, timestamp: datetime) -> None:
         was_stopped = pnl < 0  # Simplified

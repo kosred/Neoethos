@@ -30,6 +30,14 @@ TALIB_INDICATORS: dict[str, list[str]] = {
     "volatility": ["ATR", "NATR"],
 }
 
+try:
+    import forex_bindings as _fb  # type: ignore
+
+    _RUST_TALIB_MIXER = hasattr(_fb, "talib_bulk_signals_ohlcv")
+except Exception:
+    _fb = None
+    _RUST_TALIB_MIXER = False
+
 
 def _normalize_indicator_name(name: str) -> str:
     return str(name or "").strip().upper()
@@ -69,6 +77,9 @@ class TALibStrategyGene:
     use_inducement: bool = False
     tp_pips: float = 40.0
     sl_pips: float = 20.0
+    net_profit: float = 0.0
+    profit_factor: float = 0.0
+    expectancy: float = 0.0
 
 
 class TALibStrategyMixer:
@@ -78,6 +89,108 @@ class TALibStrategyMixer:
         self.available_indicators = [_normalize_indicator_name(i) for i in ALL_INDICATORS]
         self.indicator_synergy_matrix: dict[tuple[str, str], float] = {}
         self.regime_performance: dict[str, dict[str, float]] = {}
+        self._rust_signal_cache: dict[tuple[Any, ...], pd.Series] = {}
+        self._rust_signal_index: pd.Index | None = None
+
+    @staticmethod
+    def _gene_key(gene: TALibStrategyGene) -> tuple[Any, ...]:
+        indicators = tuple(_normalize_indicator_name(i) for i in (gene.indicators or []))
+        weights = tuple(float((gene.weights or {}).get(ind, 1.0)) for ind in indicators)
+        return (
+            indicators,
+            weights,
+            float(gene.long_threshold),
+            float(gene.short_threshold),
+            str(gene.combination_method or "weighted_vote").lower(),
+        )
+
+    @staticmethod
+    def _has_custom_params(gene: TALibStrategyGene) -> bool:
+        params = gene.params or {}
+        if not params:
+            return False
+        for value in params.values():
+            if isinstance(value, dict) and len(value) == 0:
+                continue
+            if value:
+                return True
+        return False
+
+    def _try_rust_bulk_signal_cache(self, df: pd.DataFrame, population: list[TALibStrategyGene]) -> None:
+        self._rust_signal_cache = {}
+        self._rust_signal_index = None
+        if not _RUST_TALIB_MIXER or _fb is None:
+            return
+        if df is None or df.empty or not population:
+            return
+        required_cols = {"open", "high", "low", "close"}
+        if not required_cols.issubset(set(df.columns)):
+            return
+
+        eligible: list[tuple[tuple[Any, ...], TALibStrategyGene]] = []
+        indicator_sets: list[list[str]] = []
+        weight_sets: list[list[float]] = []
+        long_thresholds: list[float] = []
+        short_thresholds: list[float] = []
+        for gene in population:
+            if self._has_custom_params(gene):
+                continue
+            inds = [_normalize_indicator_name(i) for i in (gene.indicators or []) if _normalize_indicator_name(i)]
+            if not inds:
+                continue
+            key = self._gene_key(gene)
+            eligible.append((key, gene))
+            indicator_sets.append(inds)
+            weight_sets.append([float((gene.weights or {}).get(ind, 1.0)) for ind in inds])
+            long_thresholds.append(float(gene.long_threshold))
+            short_thresholds.append(float(gene.short_threshold))
+        if not eligible:
+            return
+
+        open_arr = np.asarray(df["open"], dtype=np.float64)
+        high_arr = np.asarray(df["high"], dtype=np.float64)
+        low_arr = np.asarray(df["low"], dtype=np.float64)
+        close_arr = np.asarray(df["close"], dtype=np.float64)
+        volume_arr = None
+        if self.use_volume_features and "volume" in df.columns:
+            volume_arr = np.asarray(df["volume"], dtype=np.float64)
+
+        try:
+            signals = np.asarray(
+                _fb.talib_bulk_signals_ohlcv(
+                    open_arr,
+                    high_arr,
+                    low_arr,
+                    close_arr,
+                    indicator_sets=indicator_sets,
+                    weight_sets=weight_sets,
+                    long_thresholds=long_thresholds,
+                    short_thresholds=short_thresholds,
+                    volume=volume_arr,
+                    include_raw=False,
+                ),
+                dtype=np.int8,
+            )
+        except Exception as exc:
+            logger.debug("Rust TALib bulk signals failed; fallback to Python mixer: %s", exc)
+            return
+
+        if signals.ndim != 2 or signals.shape[0] != len(df) or signals.shape[1] != len(eligible):
+            logger.debug(
+                "Rust TALib bulk signals shape mismatch (got=%s expected=(%s,%s)); fallback to Python mixer.",
+                signals.shape,
+                len(df),
+                len(eligible),
+            )
+            return
+
+        idx = df.index
+        for col_idx, (key, _gene) in enumerate(eligible):
+            self._rust_signal_cache[key] = pd.Series(
+                signals[:, col_idx].astype(np.float64, copy=False),
+                index=idx,
+            )
+        self._rust_signal_index = idx
 
     def generate_random_strategy(self, *, max_indicators: int = 5) -> TALibStrategyGene:
         inds = [i for i in self.available_indicators if i]
@@ -120,23 +233,35 @@ class TALibStrategyMixer:
 
     def bulk_calculate_indicators(self, df: pd.DataFrame, population: list[TALibStrategyGene]) -> dict[str, pd.Series]:
         cache: dict[str, pd.Series] = {}
+        self._rust_signal_cache = {}
+        self._rust_signal_index = None
         if df is None or df.empty:
             return cache
         if not population:
             return cache
+        self._try_rust_bulk_signal_cache(df, population)
+        # Build a first-seen parameter map once, avoiding O(indicators * population) scans.
+        params_by_indicator: dict[str, dict[str, Any]] = {}
+        for gene in population:
+            if self._gene_key(gene) in self._rust_signal_cache:
+                continue
+            if not gene.params:
+                continue
+            for key, value in gene.params.items():
+                norm = _normalize_indicator_name(key)
+                if norm and norm not in params_by_indicator:
+                    params_by_indicator[norm] = value
         needed: set[str] = set()
         for gene in population:
+            if self._gene_key(gene) in self._rust_signal_cache:
+                continue
             for ind in gene.indicators:
                 norm = _normalize_indicator_name(ind)
                 if norm:
                     needed.add(norm)
         for ind in needed:
             try:
-                params = None
-                for gene in population:
-                    if ind in gene.params:
-                        params = gene.params.get(ind)
-                        break
+                params = params_by_indicator.get(ind)
                 cache[ind] = self._compute_indicator(df, ind, params)
             except Exception as exc:
                 logger.debug("Indicator %s failed: %s", ind, exc)
@@ -155,6 +280,15 @@ class TALibStrategyMixer:
         indicators = [_normalize_indicator_name(i) for i in gene.indicators]
         if not indicators:
             return pd.Series(np.zeros(len(df), dtype=float), index=df.index)
+        rust_key = self._gene_key(gene)
+        if rust_key in self._rust_signal_cache:
+            cached = self._rust_signal_cache[rust_key]
+            try:
+                if self._rust_signal_index is not None and cached.index.equals(df.index):
+                    return cached
+                return cached.reindex(df.index).fillna(0.0)
+            except Exception:
+                pass
 
         votes = np.zeros(len(df), dtype=np.float64)
         weight_total = 0.0
@@ -167,7 +301,13 @@ class TALibStrategyMixer:
                 series = cache.get(ind)
             if series is None:
                 try:
-                    params = gene.params.get(ind) if gene.params else None
+                    params = None
+                    if gene.params:
+                        params = gene.params.get(ind)
+                        if params is None:
+                            params = gene.params.get(ind.lower())
+                        if params is None:
+                            params = gene.params.get(ind.upper())
                     series = self._compute_indicator(df, ind, params)
                 except Exception as exc:
                     logger.debug("Indicator %s compute failed: %s", ind, exc)

@@ -23,9 +23,7 @@ use pythonize::pythonize;
 use serde::Deserialize;
 #[cfg(any(feature = "lightgbm", feature = "xgboost", feature = "catboost"))]
 use polars::prelude::*;
-#[cfg(any(feature = "lightgbm", feature = "xgboost", feature = "catboost"))]
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(any(feature = "onnx", feature = "lightgbm", feature = "xgboost", feature = "catboost"))]
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -326,6 +324,250 @@ fn load_strategy_specs(path: &PathBuf) -> Result<Vec<StrategySpec>, String> {
     let genes: Vec<StrategySpec> = serde_json::from_value(genes_value)
         .map_err(|e| format!("Failed to parse strategy catalog genes: {}", e))?;
     Ok(genes)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    equity,
+    risk_pct,
+    stop_loss_pips,
+    pip_value,
+    max_lot_size=10.0,
+    lot_step=0.01,
+    min_lot=0.0
+))]
+fn compute_position_size_lots(
+    equity: f64,
+    risk_pct: f64,
+    stop_loss_pips: f64,
+    pip_value: f64,
+    max_lot_size: f64,
+    lot_step: f64,
+    min_lot: f64,
+) -> PyResult<f64> {
+    if !equity.is_finite()
+        || !risk_pct.is_finite()
+        || !stop_loss_pips.is_finite()
+        || !pip_value.is_finite()
+        || equity <= 0.0
+        || risk_pct <= 0.0
+        || stop_loss_pips <= 0.0
+        || pip_value <= 0.0
+    {
+        return Ok(0.0);
+    }
+
+    let risk_amount = equity * risk_pct.max(0.0);
+    let denom = (stop_loss_pips * pip_value).max(1e-9);
+    let mut lot_size = risk_amount / denom;
+    if !lot_size.is_finite() || lot_size <= 0.0 {
+        return Ok(0.0);
+    }
+
+    let step = if lot_step.is_finite() && lot_step > 0.0 {
+        lot_step
+    } else {
+        0.01
+    };
+    lot_size = (lot_size / step).floor() * step;
+
+    let cap = if max_lot_size.is_finite() && max_lot_size > 0.0 {
+        max_lot_size
+    } else {
+        lot_size
+    };
+    let floor = if min_lot.is_finite() {
+        min_lot.max(0.0)
+    } else {
+        0.0
+    };
+    lot_size = lot_size.max(floor).min(cap);
+    if !lot_size.is_finite() || lot_size < floor {
+        return Ok(0.0);
+    }
+    Ok(lot_size.max(0.0))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    open,
+    high,
+    low,
+    close,
+    indicator_sets,
+    weight_sets=None,
+    long_thresholds=None,
+    short_thresholds=None,
+    timestamps=None,
+    volume=None,
+    include_raw=false
+))]
+fn talib_bulk_signals_ohlcv(
+    py: Python,
+    open: PyReadonlyArray1<f64>,
+    high: PyReadonlyArray1<f64>,
+    low: PyReadonlyArray1<f64>,
+    close: PyReadonlyArray1<f64>,
+    indicator_sets: Vec<Vec<String>>,
+    weight_sets: Option<Vec<Vec<f64>>>,
+    long_thresholds: Option<Vec<f64>>,
+    short_thresholds: Option<Vec<f64>>,
+    timestamps: Option<PyReadonlyArray1<i64>>,
+    volume: Option<PyReadonlyArray1<f64>>,
+    include_raw: bool,
+) -> PyResult<Py<PyAny>> {
+    let ohlcv = build_ohlcv(
+        &open,
+        &high,
+        &low,
+        &close,
+        timestamps.as_ref(),
+        volume.as_ref(),
+    )
+    .map_err(|msg| PyErr::new::<pyo3::exceptions::PyValueError, _>(msg))?;
+
+    if let Some(ref wsets) = weight_sets {
+        if wsets.len() != indicator_sets.len() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "weight_sets length must match indicator_sets length",
+            ));
+        }
+    }
+    if let Some(ref longs) = long_thresholds {
+        if longs.len() != indicator_sets.len() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "long_thresholds length must match indicator_sets length",
+            ));
+        }
+    }
+    if let Some(ref shorts) = short_thresholds {
+        if shorts.len() != indicator_sets.len() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "short_thresholds length must match indicator_sets length",
+            ));
+        }
+    }
+
+    let signals = py
+        .detach(|| {
+            let frame = compute_talib_feature_frame(&ohlcv, include_raw)
+                .map_err(|e| format!("Feature computation failed: {}", e))?;
+            let n_rows = frame.data.nrows();
+            let n_genes = indicator_sets.len();
+            let mut out = Array2::<i8>::zeros((n_rows, n_genes));
+            if n_rows == 0 || n_genes == 0 {
+                return Ok::<Array2<i8>, String>(out);
+            }
+
+            let mut idx_map: HashMap<String, usize> = HashMap::with_capacity(frame.names.len() * 2);
+            for (idx, name) in frame.names.iter().enumerate() {
+                let key = normalize_indicator_name(name.strip_prefix("ta_").unwrap_or(name));
+                if !key.is_empty() {
+                    idx_map.entry(key).or_insert(idx);
+                }
+            }
+
+            for g in 0..n_genes {
+                let indicators = &indicator_sets[g];
+                if indicators.is_empty() {
+                    continue;
+                }
+                let weights = weight_sets.as_ref().and_then(|v| v.get(g));
+                let long_thr = long_thresholds
+                    .as_ref()
+                    .and_then(|v| v.get(g))
+                    .copied()
+                    .unwrap_or(0.66);
+                let short_thr = short_thresholds
+                    .as_ref()
+                    .and_then(|v| v.get(g))
+                    .copied()
+                    .unwrap_or(-0.66);
+
+                let mut votes = vec![0.0_f64; n_rows];
+                let mut weight_total = 0.0_f64;
+
+                for (k, indicator) in indicators.iter().enumerate() {
+                    let norm = normalize_indicator_name(indicator);
+                    if norm.is_empty() {
+                        continue;
+                    }
+                    let col_idx = idx_map
+                        .get(&norm)
+                        .copied()
+                        .or_else(|| map_indicator_index(indicator, &frame.names));
+                    let Some(col_idx) = col_idx else {
+                        continue;
+                    };
+
+                    let w = weights
+                        .and_then(|w| w.get(k))
+                        .copied()
+                        .unwrap_or(1.0);
+                    if !w.is_finite() || w.abs() <= 0.0 {
+                        continue;
+                    }
+
+                    let mut sum = 0.0_f64;
+                    let mut count = 0usize;
+                    for r in 0..n_rows {
+                        let v = frame.data[(r, col_idx)] as f64;
+                        if v.is_finite() {
+                            sum += v;
+                            count += 1;
+                        }
+                    }
+                    if count == 0 {
+                        continue;
+                    }
+                    let mean = sum / count as f64;
+                    let mut var_sum = 0.0_f64;
+                    for r in 0..n_rows {
+                        let v = frame.data[(r, col_idx)] as f64;
+                        if v.is_finite() {
+                            let d = v - mean;
+                            var_sum += d * d;
+                        }
+                    }
+                    let std = (var_sum / count.max(1) as f64).sqrt();
+
+                    for r in 0..n_rows {
+                        let v = frame.data[(r, col_idx)] as f64;
+                        let centered = if v.is_finite() {
+                            if std <= 1e-9 {
+                                v - mean
+                            } else {
+                                (v - mean) / std
+                            }
+                        } else {
+                            0.0
+                        };
+                        votes[r] += w * centered.tanh();
+                    }
+                    weight_total += w.abs();
+                }
+
+                let denom = if weight_total > 0.0 {
+                    weight_total
+                } else {
+                    1.0
+                };
+                for r in 0..n_rows {
+                    let combined = votes[r] / denom;
+                    out[(r, g)] = if combined > long_thr {
+                        1
+                    } else if combined < short_thr {
+                        -1
+                    } else {
+                        0
+                    };
+                }
+            }
+            Ok::<Array2<i8>, String>(out)
+        })
+        .map_err(|msg| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg))?;
+
+    Ok(signals.into_pyarray(py).into_any().into())
 }
 
 #[pyfunction]
@@ -1734,6 +1976,8 @@ fn forex_bindings(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_symbol_features, m)?)?;
     m.add_function(wrap_pyfunction!(infer_stop_target_pips_ohlcv, m)?)?;
     m.add_function(wrap_pyfunction!(triple_barrier_labels, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_position_size_lots, m)?)?;
+    m.add_function(wrap_pyfunction!(talib_bulk_signals_ohlcv, m)?)?;
 
     // Add tree model classes if features enabled
     #[cfg(feature = "lightgbm")]
