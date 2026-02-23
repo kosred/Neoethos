@@ -316,6 +316,68 @@ def _strategy_keep_limits(settings: Any | None, default_cap: int) -> tuple[float
     return keep_max_dd, keep_min_profit, keep_min_trades, keep_min_count, keep_cap
 
 
+def _strategy_quality_limits(settings: Any | None) -> tuple[float, float, float]:
+    try:
+        default_sharpe = float(
+            getattr(getattr(settings, "models", None), "prop_search_holdout_min_sharpe", 1.0) or 1.0
+        )
+    except Exception:
+        default_sharpe = 1.0
+    try:
+        default_pf = float(
+            getattr(getattr(settings, "models", None), "prop_search_holdout_min_profit_factor", 1.20) or 1.20
+        )
+    except Exception:
+        default_pf = 1.20
+
+    try:
+        min_sharpe = float(os.environ.get("FOREX_BOT_DISCOVERY_MIN_SHARPE", str(default_sharpe)) or default_sharpe)
+    except Exception:
+        min_sharpe = default_sharpe
+    try:
+        min_profit_factor = float(os.environ.get("FOREX_BOT_DISCOVERY_MIN_PROFIT_FACTOR", str(default_pf)) or default_pf)
+    except Exception:
+        min_profit_factor = default_pf
+    try:
+        min_win_rate = float(os.environ.get("FOREX_BOT_DISCOVERY_MIN_WIN_RATE", "0.0") or 0.0)
+    except Exception:
+        min_win_rate = 0.0
+
+    min_sharpe = float(max(-10.0, min(10.0, min_sharpe)))
+    min_profit_factor = float(max(0.0, min(10.0, min_profit_factor)))
+    min_win_rate = float(max(0.0, min(1.0, min_win_rate)))
+    return min_sharpe, min_profit_factor, min_win_rate
+
+
+def _passes_quality(
+    gene: TALibStrategyGene,
+    *,
+    min_sharpe: float,
+    min_profit_factor: float,
+    min_win_rate: float,
+) -> bool:
+    try:
+        sharpe = float(getattr(gene, "sharpe_ratio", 0.0) or 0.0)
+    except Exception:
+        sharpe = 0.0
+    try:
+        profit_factor = float(getattr(gene, "profit_factor", 0.0) or 0.0)
+    except Exception:
+        profit_factor = 0.0
+    try:
+        win_rate = float(getattr(gene, "win_rate", 0.0) or 0.0)
+    except Exception:
+        win_rate = 0.0
+    if win_rate > 1.0:
+        win_rate *= 0.01
+
+    return (
+        sharpe >= float(min_sharpe)
+        and profit_factor >= float(min_profit_factor)
+        and win_rate >= float(min_win_rate)
+    )
+
+
 def _profit_value(gene: TALibStrategyGene) -> float:
     metric = str(os.environ.get("FOREX_BOT_DISCOVERY_KEEP_PROFIT_METRIC", "fitness") or "fitness").strip().lower()
     if metric in {"net", "net_profit", "pnl"}:
@@ -613,6 +675,7 @@ class TensorDiscoveryEngine:
                     self.settings,
                     default_cap=default_portfolio,
                 )
+                min_sharpe, min_profit_factor, min_win_rate = _strategy_quality_limits(self.settings)
                 rust_pop = max(4, _env_int("FOREX_BOT_DISCOVERY_POP", default_pop))
                 rust_gens = max(1, _env_int("FOREX_BOT_DISCOVERY_GENS", default_gens))
                 rust_max_ind = max(2, _env_int("FOREX_BOT_DISCOVERY_MAX_INDICATORS", 12))
@@ -676,20 +739,44 @@ class TensorDiscoveryEngine:
 
                 rust_ranked = bool(result.get("rust_ranked", False))
                 if rust_ranked:
-                    selected = list(best)
-                    strict_kept = int(result.get("strict_kept", len(selected)) or len(selected))
-                    ranked_total = int(result.get("ranked_total", len(selected)) or len(selected))
+                    base_filtered = list(best)
+                    quality_filtered = [
+                        g
+                        for g in base_filtered
+                        if _passes_quality(
+                            g,
+                            min_sharpe=min_sharpe,
+                            min_profit_factor=min_profit_factor,
+                            min_win_rate=min_win_rate,
+                        )
+                    ]
+                    selected, strict_kept, ranked_total = _select_ranked(
+                        best,
+                        filtered=quality_filtered,
+                        min_keep=keep_min_count,
+                        cap=keep_cap,
+                    )
                 else:
-                    filtered = [
+                    base_filtered = [
                         g
                         for g in best
                         if _profit_value(g) > keep_min_profit
                         and float(getattr(g, "max_dd_pct", 0.0) or 0.0) <= keep_max_dd
                         and float(getattr(g, "trades", 0.0) or 0.0) >= keep_min_trades
                     ]
+                    quality_filtered = [
+                        g
+                        for g in base_filtered
+                        if _passes_quality(
+                            g,
+                            min_sharpe=min_sharpe,
+                            min_profit_factor=min_profit_factor,
+                            min_win_rate=min_win_rate,
+                        )
+                    ]
                     selected, strict_kept, ranked_total = _select_ranked(
                         best,
-                        filtered=filtered,
+                        filtered=quality_filtered,
                         min_keep=keep_min_count,
                         cap=keep_cap,
                     )
@@ -711,7 +798,7 @@ class TensorDiscoveryEngine:
                 self._last_payload = payload
                 logger.info(
                     "Discovery (Rust): kept %s/%s genes (strict=%s, min_keep=%s) "
-                    "(profit>%.3f, max_dd<=%.3f, trades>=%.0f). Wrote %s",
+                    "(profit>%.3f, max_dd<=%.3f, trades>=%.0f, sharpe>=%.2f, pf>=%.2f, win>=%.2f). Wrote %s",
                     len(selected),
                     ranked_total,
                     strict_kept,
@@ -719,6 +806,9 @@ class TensorDiscoveryEngine:
                     keep_min_profit,
                     keep_max_dd,
                     keep_min_trades,
+                    min_sharpe,
+                    min_profit_factor,
+                    min_win_rate,
                     out_path,
                 )
                 return
@@ -778,6 +868,7 @@ class TensorDiscoveryEngine:
             self.settings,
             default_cap=default_cap,
         )
+        min_sharpe, min_profit_factor, min_win_rate = _strategy_quality_limits(self.settings)
 
         scored = _score_genes_python_fallback(
             df=df,
@@ -798,12 +889,22 @@ class TensorDiscoveryEngine:
 
         scored.sort(key=lambda x: x[0], reverse=True)
         merged = [g for _, g in scored]
-        filtered = [
+        base_filtered = [
             g
             for g in merged
             if _profit_value(g) > keep_min_profit
             and float(getattr(g, "max_dd_pct", 0.0) or 0.0) <= keep_max_dd
             and float(getattr(g, "trades", 0.0) or 0.0) >= keep_min_trades
+        ]
+        filtered = [
+            g
+            for g in base_filtered
+            if _passes_quality(
+                g,
+                min_sharpe=min_sharpe,
+                min_profit_factor=min_profit_factor,
+                min_win_rate=min_win_rate,
+            )
         ]
         best, strict_kept, ranked_total = _select_ranked(
             merged,
@@ -828,7 +929,7 @@ class TensorDiscoveryEngine:
         self._last_payload = payload
         logger.info(
             "Discovery: kept %s/%s genes (strict=%s, min_keep=%s) "
-            "(profit>%.3f, max_dd<=%.3f, trades>=%.0f). Wrote %s",
+            "(profit>%.3f, max_dd<=%.3f, trades>=%.0f, sharpe>=%.2f, pf>=%.2f, win>=%.2f). Wrote %s",
             len(best),
             ranked_total,
             strict_kept,
@@ -836,6 +937,9 @@ class TensorDiscoveryEngine:
             keep_min_profit,
             keep_max_dd,
             keep_min_trades,
+            min_sharpe,
+            min_profit_factor,
+            min_win_rate,
             out_path,
         )
 
