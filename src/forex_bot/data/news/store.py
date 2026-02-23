@@ -113,6 +113,10 @@ class NewsDatabase:
         with self._get_lock():
             inserted = 0
             cur = self._conn.cursor()
+            insert_currency_sql = """
+                INSERT OR IGNORE INTO news_event_currency (event_id, currency)
+                VALUES (?, ?)
+                """
             for event in events:
                 try:
                     url = event.url.strip() if event.url else None
@@ -151,13 +155,11 @@ class NewsDatabase:
                             event_id = None
 
                     if event_id:
-                        for currency in {str(c).upper() for c in (event.currencies or []) if c}:
-                            cur.execute(
-                                """
-                                INSERT OR IGNORE INTO news_event_currency (event_id, currency)
-                                VALUES (?, ?)
-                                """,
-                                (event_id, currency),
+                        currencies = {str(c).upper() for c in (event.currencies or []) if c}
+                        if currencies:
+                            cur.executemany(
+                                insert_currency_sql,
+                                [(event_id, currency) for currency in currencies],
                             )
                 except sqlite3.Error:
                     continue

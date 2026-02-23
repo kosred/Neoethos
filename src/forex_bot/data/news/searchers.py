@@ -10,6 +10,7 @@ import requests
 from ...domain.errors import APIBillingError
 
 logger = logging.getLogger(__name__)
+_MD_LINK_RE = re.compile(r"\[(.*?)\]\((https?://.*?)\)")
 
 
 class PerplexitySearcher:
@@ -152,7 +153,7 @@ class PerplexitySearcher:
             if not line.strip():
                 continue
 
-            md_link = re.search(r"\[(.*?)\]\((https?://.*?)\)", line)
+            md_link = _MD_LINK_RE.search(line)
             if md_link:
                 title = md_link.group(1)
                 url = md_link.group(2)

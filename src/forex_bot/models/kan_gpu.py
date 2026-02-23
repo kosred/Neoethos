@@ -227,7 +227,14 @@ class KANExpert(ExpertModel):
                     break
 
         if is_cuda:
-            torch.cuda.empty_cache()
+            empty_cache = str(os.environ.get("FOREX_BOT_TORCH_EMPTY_CACHE", "0") or "0").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            if empty_cache:
+                torch.cuda.empty_cache()
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         if self.model is None:

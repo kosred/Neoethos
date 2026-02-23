@@ -104,13 +104,12 @@ impl PortfolioOptimizer {
 
             let mut corr = vec![vec![0.0; n_assets]; n_assets];
             for i in 0..n_assets {
-                for j in 0..n_assets {
-                    if i == j {
-                        corr[i][j] = 1.0;
-                    } else {
-                        let c = cov(&rets[i], means[i], &rets[j], means[j]);
-                        corr[i][j] = c / (vols[i] * vols[j]).max(1e-9);
-                    }
+                corr[i][i] = 1.0;
+                for j in (i + 1)..n_assets {
+                    let c = cov(&rets[i], means[i], &rets[j], means[j]);
+                    let v = c / (vols[i] * vols[j]).max(1e-9);
+                    corr[i][j] = v;
+                    corr[j][i] = v;
                 }
             }
 

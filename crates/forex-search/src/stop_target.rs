@@ -267,17 +267,23 @@ fn mean(values: &[f64]) -> f64 {
     values.iter().sum::<f64>() / values.len() as f64
 }
 
+fn cmp_f64(a: &f64, b: &f64) -> std::cmp::Ordering {
+    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+}
+
 fn median_ignore_nan(values: &[f64]) -> f64 {
     let mut vals: Vec<f64> = values.iter().cloned().filter(|v| v.is_finite()).collect();
     if vals.is_empty() {
         return f64::NAN;
     }
-    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = vals.len() / 2;
+    let (_, upper_ref, _) = vals.select_nth_unstable_by(mid, cmp_f64);
+    let upper = *upper_ref;
     if vals.len() % 2 == 0 {
-        (vals[mid - 1] + vals[mid]) / 2.0
+        let (_, lower_ref, _) = vals[..mid].select_nth_unstable_by(mid - 1, cmp_f64);
+        (*lower_ref + upper) / 2.0
     } else {
-        vals[mid]
+        upper
     }
 }
 
@@ -345,9 +351,9 @@ pub fn estimate_expected_shortfall(close: &[f64], window: usize, alpha: f64) -> 
     }
     let tail = &r[r.len() - window..];
     let mut sorted = tail.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let q_idx = ((1.0 - alpha).clamp(0.0, 1.0) * (sorted.len() as f64 - 1.0)).round() as usize;
-    let q = sorted[q_idx];
+    let (_, q_ref, _) = sorted.select_nth_unstable_by(q_idx, cmp_f64);
+    let q = *q_ref;
     let losses: Vec<f64> = tail.iter().cloned().filter(|v| *v <= q).collect();
     if losses.is_empty() {
         return None;
@@ -378,9 +384,9 @@ pub fn estimate_expected_shortfall_series(
     while i < r.len() {
         let win = &r[i + 1 - window..=i];
         let mut sorted = win.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let q_idx = ((1.0 - alpha).clamp(0.0, 1.0) * (sorted.len() as f64 - 1.0)).round() as usize;
-        let q = sorted[q_idx];
+        let (_, q_ref, _) = sorted.select_nth_unstable_by(q_idx, cmp_f64);
+        let q = *q_ref;
         let losses: Vec<f64> = win.iter().cloned().filter(|v| *v <= q).collect();
         if !losses.is_empty() {
             es[i] = losses.iter().map(|v| v.abs()).sum::<f64>() / losses.len() as f64;
