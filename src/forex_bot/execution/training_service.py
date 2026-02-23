@@ -612,9 +612,12 @@ class TrainingService:
                     max_dd_pct=_to_float(
                         raw,
                         "max_dd_pct",
-                        _to_float(raw, "max_dd", _to_float(raw, "drawdown", 0.0)),
+                        _to_float(raw, "max_drawdown", _to_float(raw, "max_dd", _to_float(raw, "drawdown", 0.0))),
                     ),
-                    trades=_to_float(raw, "trades", _to_float(raw, "trade_count", 0.0)),
+                    trades=_to_float(raw, "trades", _to_float(raw, "trades_count", _to_float(raw, "trade_count", 0.0))),
+                    net_profit=_to_float(raw, "net_profit", 0.0),
+                    profit_factor=_to_float(raw, "profit_factor", 0.0),
+                    expectancy=_to_float(raw, "expectancy", 0.0),
                     use_ob=bool(raw.get("use_ob", False)),
                     use_fvg=bool(raw.get("use_fvg", False)),
                     use_liq_sweep=bool(raw.get("use_liq_sweep", False)),
@@ -796,7 +799,8 @@ class TrainingService:
             )
             return dataset
 
-        x = dataset.X.copy()
+        # Use shallow copy (CoW on modern pandas) to avoid duplicating full feature matrix.
+        x = dataset.X.copy(deep=False)
         if "base_signal" in x.columns and "base_signal_static" not in x.columns:
             with contextlib.suppress(Exception):
                 x["base_signal_static"] = pd.to_numeric(x["base_signal"], errors="coerce").fillna(0).astype(np.int8)
@@ -846,7 +850,7 @@ class TrainingService:
         if not full_tf:
             discovery_frames = frames.copy()
             if base_tf in discovery_frames and base_dataset is not None:
-                rich_df = base_dataset.X.copy()
+                rich_df = base_dataset.X.copy(deep=False)
                 if "close" not in rich_df.columns:
                     orig = discovery_frames[base_tf].reindex(rich_df.index).ffill()
                     for col in ["open", "high", "low", "close"]:
@@ -878,13 +882,13 @@ class TrainingService:
                 continue
             try:
                 if base_dataset is not None and tf == base_tf:
-                    rich_df = base_dataset.X.copy()
+                    rich_df = base_dataset.X.copy(deep=False)
                 else:
                     tf_settings = self.settings.model_copy()
                     tf_settings.system.base_timeframe = tf
                     fe = FeatureEngineer(tf_settings)
                     ds_tf = fe.prepare(frames, news_features=news_feats, symbol=symbol)
-                    rich_df = ds_tf.X.copy()
+                    rich_df = ds_tf.X.copy(deep=False)
                 if "close" not in rich_df.columns:
                     orig = frames[tf].reindex(rich_df.index).ffill()
                     for col in ["open", "high", "low", "close"]:
@@ -990,7 +994,7 @@ class TrainingService:
         def _apply(df: pd.DataFrame) -> pd.DataFrame:
             if df is None or df.empty:
                 return df
-            local = df.copy()
+            local = df.copy(deep=False)
             cache = mixer.bulk_calculate_indicators(local, genes)
             for idx, gene in enumerate(genes):
                 col = f"tmx_sig_{idx}"
@@ -1026,7 +1030,7 @@ class TrainingService:
                 out[tf] = df
                 continue
             aligned = base_df[sig_cols].reindex(df.index).ffill().fillna(0.0)
-            local = df.copy()
+            local = df.copy(deep=False)
             for col in sig_cols:
                 if col not in local.columns:
                     local[col] = aligned[col].to_numpy(dtype=np.float32, copy=False)

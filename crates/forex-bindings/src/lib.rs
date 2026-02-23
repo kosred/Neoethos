@@ -397,7 +397,8 @@ fn load_symbol_frames(
     cache_dir=None,
     cache_ttl_minutes=0,
     cache_enabled=false,
-    resample_missing=true
+    resample_missing=true,
+    arrow_tensor=false
 ))]
 fn load_symbol_features(
     py: Python,
@@ -410,6 +411,7 @@ fn load_symbol_features(
     cache_ttl_minutes: u64,
     cache_enabled: bool,
     resample_missing: bool,
+    arrow_tensor: bool,
 ) -> PyResult<Py<PyAny>> {
     let result: Result<(forex_data::FeatureFrame, String, Ohlcv), String> = py.detach(|| {
         let higher = higher_tfs.clone().unwrap_or_default();
@@ -483,7 +485,17 @@ fn load_symbol_features(
     let dict = PyDict::new(py);
     dict.set_item("timestamps", frame.timestamps)?;
     dict.set_item("feature_names", frame.names)?;
-    dict.set_item("features", frame.data.into_pyarray(py))?;
+    let features_py = frame.data.into_pyarray(py);
+    dict.set_item("features", &features_py)?;
+    if arrow_tensor {
+        if let Ok(pyarrow) = py.import("pyarrow") {
+            if let Ok(tensor_cls) = pyarrow.getattr("Tensor") {
+                if let Ok(tensor) = tensor_cls.call_method1("from_numpy", (features_py.as_any(),)) {
+                    let _ = dict.set_item("features_arrow_tensor", tensor);
+                }
+            }
+        }
+    }
     dict.set_item("base_tf", base_final)?;
     dict.set_item("open", base.open)?;
     dict.set_item("high", base.high)?;
