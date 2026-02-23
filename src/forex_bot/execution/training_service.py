@@ -1031,9 +1031,9 @@ class TrainingService:
                 continue
             aligned = base_df[sig_cols].reindex(df.index).ffill().fillna(0.0)
             local = df.copy(deep=False)
-            for col in sig_cols:
-                if col not in local.columns:
-                    local[col] = aligned[col].to_numpy(dtype=np.float32, copy=False)
+            new_cols = [col for col in sig_cols if col not in local.columns]
+            if new_cols:
+                local[new_cols] = aligned[new_cols].to_numpy(dtype=np.float32, copy=False)
             out[tf] = local
         logger.info(f"Discovery: Injected {len(sig_cols)} TA-Lib mixer signals (base TF aligned).")
         return out

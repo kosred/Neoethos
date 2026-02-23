@@ -24,7 +24,7 @@ use serde::Deserialize;
 #[cfg(any(feature = "lightgbm", feature = "xgboost", feature = "catboost"))]
 use polars::prelude::*;
 use std::collections::{HashMap, HashSet};
-#[cfg(any(feature = "onnx", feature = "lightgbm", feature = "xgboost", feature = "catboost"))]
+#[cfg(feature = "onnx")]
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::fs;
@@ -1892,7 +1892,7 @@ fn triple_barrier_labels(
 #[cfg(feature = "lightgbm")]
 #[pyclass]
 struct LightGBMModel {
-    model: Arc<Mutex<LightGBMExpert>>,
+    model: Mutex<LightGBMExpert>,
 }
 
 #[cfg(feature = "lightgbm")]
@@ -1905,7 +1905,7 @@ impl LightGBMModel {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(msg)
         })?;
         Self {
-            model: Arc::new(Mutex::new(LightGBMExpert::new(idx, params))),
+            model: Mutex::new(LightGBMExpert::new(idx, params)),
         }
     }
 
@@ -1990,7 +1990,7 @@ impl LightGBMModel {
 #[cfg(feature = "xgboost")]
 #[pyclass(unsendable)]
 struct XGBoostModel {
-    model: Arc<Mutex<XGBoostExpert>>,
+    model: Mutex<XGBoostExpert>,
 }
 
 #[cfg(feature = "xgboost")]
@@ -2003,7 +2003,7 @@ impl XGBoostModel {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(msg)
         })?;
         Ok(Self {
-            model: Arc::new(Mutex::new(XGBoostExpert::new(idx, params))),
+            model: Mutex::new(XGBoostExpert::new(idx, params)),
         })
     }
 
@@ -2088,7 +2088,7 @@ impl XGBoostModel {
 #[cfg(feature = "xgboost")]
 #[pyclass(unsendable)]
 struct XGBoostRFModel {
-    model: Arc<Mutex<XGBoostRFExpert>>,
+    model: Mutex<XGBoostRFExpert>,
 }
 
 #[cfg(feature = "xgboost")]
@@ -2101,7 +2101,7 @@ impl XGBoostRFModel {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(msg)
         })?;
         Ok(Self {
-            model: Arc::new(Mutex::new(XGBoostRFExpert::new(idx, params))),
+            model: Mutex::new(XGBoostRFExpert::new(idx, params)),
         })
     }
 
@@ -2186,7 +2186,7 @@ impl XGBoostRFModel {
 #[cfg(feature = "xgboost")]
 #[pyclass(unsendable)]
 struct XGBoostDARTModel {
-    model: Arc<Mutex<XGBoostDARTExpert>>,
+    model: Mutex<XGBoostDARTExpert>,
 }
 
 #[cfg(feature = "xgboost")]
@@ -2199,7 +2199,7 @@ impl XGBoostDARTModel {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(msg)
         })?;
         Ok(Self {
-            model: Arc::new(Mutex::new(XGBoostDARTExpert::new(idx, params))),
+            model: Mutex::new(XGBoostDARTExpert::new(idx, params)),
         })
     }
 
@@ -2284,7 +2284,7 @@ impl XGBoostDARTModel {
 #[cfg(feature = "catboost")]
 #[pyclass]
 struct CatBoostModel {
-    model: Arc<Mutex<CatBoostExpert>>,
+    model: Mutex<CatBoostExpert>,
 }
 
 #[cfg(feature = "catboost")]
@@ -2296,7 +2296,7 @@ impl CatBoostModel {
         let params = params_from_py(params)
             .map_err(|msg| PyErr::new::<pyo3::exceptions::PyValueError, _>(msg))?;
         Ok(Self {
-            model: Arc::new(Mutex::new(CatBoostExpert::new(idx, params))),
+            model: Mutex::new(CatBoostExpert::new(idx, params)),
         })
     }
 
@@ -2381,7 +2381,7 @@ impl CatBoostModel {
 #[cfg(feature = "catboost")]
 #[pyclass]
 struct CatBoostAltModel {
-    model: Arc<Mutex<CatBoostAltExpert>>,
+    model: Mutex<CatBoostAltExpert>,
 }
 
 #[cfg(feature = "catboost")]
@@ -2393,7 +2393,7 @@ impl CatBoostAltModel {
         let params = params_from_py(params)
             .map_err(|msg| PyErr::new::<pyo3::exceptions::PyValueError, _>(msg))?;
         Ok(Self {
-            model: Arc::new(Mutex::new(CatBoostAltExpert::new(idx, params))),
+            model: Mutex::new(CatBoostAltExpert::new(idx, params)),
         })
     }
 
