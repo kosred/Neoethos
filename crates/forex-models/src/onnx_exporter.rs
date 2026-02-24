@@ -54,7 +54,7 @@ impl ONNXExporter {
             .context("Failed to create ONNX directory")?;
 
         // Initialize Python exporter
-        let py_exporter = Python::with_gil(|py| {
+        let py_exporter = Python::attach(|py| {
             let exporter_module = PyModule::import(py, "forex_bot.models.onnx_exporter")
                 .context("Failed to import forex_bot.models.onnx_exporter")?;
 
@@ -84,7 +84,7 @@ impl ONNXExporter {
         model: &Py<PyAny>,
         sample_input: &Array2<f32>,
     ) -> Result<PathBuf> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let exporter = self.py_exporter.as_ref()
                 .context("ONNX exporter not initialized")?
                 .bind(py);
@@ -115,7 +115,7 @@ impl ONNXExporter {
         name: &str,
         sample_input: &Array2<f32>,
     ) -> Result<PathBuf> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let exporter = self.py_exporter.as_ref()
                 .context("ONNX exporter not initialized")?
                 .bind(py);
@@ -154,7 +154,7 @@ impl ONNXExporter {
         name: &str,
         sample_input: &Array2<f32>,
     ) -> Result<PathBuf> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let exporter = self.py_exporter.as_ref()
                 .context("ONNX exporter not initialized")?
                 .bind(py);
@@ -190,7 +190,7 @@ impl ONNXExporter {
         name: &str,
         sample_input: &Array2<f32>,
     ) -> Result<PathBuf> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let exporter = self.py_exporter.as_ref()
                 .context("ONNX exporter not initialized")?
                 .bind(py);
@@ -258,7 +258,7 @@ impl ONNXExporter {
         model: &Py<PyAny>,
         sample_input: &Array2<f32>,
     ) -> Result<ExportMetadata> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let model_bound = model.bind(py);
             let model_type_str = model_bound.get_type().name()?.to_string();
 
@@ -291,7 +291,7 @@ impl ONNXExporter {
 
     /// Extract class labels from model
     fn extract_classes(model: &Bound<'_, PyAny>) -> Result<Option<Vec<i32>>> {
-        Python::with_gil(|_py| {
+        Python::attach(|_py| {
             // Try to get classes_ attribute
             if let Ok(classes_attr) = model.getattr("classes_") {
                 if let Ok(classes_list) = classes_attr.extract::<Vec<i32>>() {

@@ -19,6 +19,8 @@ models:
   prop_search_generations: 5
   prop_search_max_hours: 0.10
   prop_search_max_rows: 100000
+  # 0 = allow full indicator set (no hard cap)
+  prop_search_max_indicators: 0
   prop_search_max_rows_by_tf:
     M1: 100000
     M3: 100000

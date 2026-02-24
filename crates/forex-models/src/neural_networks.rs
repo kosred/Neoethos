@@ -43,7 +43,7 @@ impl MLPExpert {
         device: &str,
         batch_size: i64,
     ) -> Result<Self> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             // Import Python module (mlp.py)
             let mlp_module = PyModule::import(py, "forex_bot.models.mlp")
                 .context("Failed to import forex_bot.models.mlp")?;
@@ -74,7 +74,7 @@ impl MLPExpert {
     /// GIL WORKAROUND REMOVED: Rust handles data batching in parallel via Rayon
     /// Python only does model training (no DataLoader workers needed)
     pub fn fit(&mut self, x: &Array2<f32>, y: &[i32]) -> Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let expert = self.py_expert.as_ref()
                 .context("MLP expert not initialized")?
                 .bind(py);
@@ -102,7 +102,7 @@ impl MLPExpert {
 
     /// Predict probabilities - delegates to Python MLPExpert.predict_proba()
     pub fn predict_proba(&self, x: &Array2<f32>) -> Result<Array2<f32>> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let expert = self.py_expert.as_ref()
                 .context("MLP expert not initialized")?
                 .bind(py);
@@ -133,7 +133,7 @@ impl MLPExpert {
 
     /// Save model - delegates to Python MLPExpert.save()
     pub fn save(&self, path: &Path) -> Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let expert = self.py_expert.as_ref()
                 .context("MLP expert not initialized")?
                 .bind(py);
@@ -147,7 +147,7 @@ impl MLPExpert {
 
     /// Load model - delegates to Python MLPExpert.load()
     pub fn load(&mut self, path: &Path) -> Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let expert = self.py_expert.as_ref()
                 .context("MLP expert not initialized")?
                 .bind(py);
@@ -162,7 +162,7 @@ impl MLPExpert {
     /// Export model to ONNX format for ultra-fast inference
     /// Uses torch.onnx.export via PyO3
     pub fn export_to_onnx(&self, output_path: &Path, sample_input: &Array2<f32>) -> Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let torch = PyModule::import(py, "torch")?;
             let numpy = PyModule::import(py, "numpy")?;
 
@@ -226,7 +226,7 @@ pub struct NBeatsExpert {
 
 impl NBeatsExpert {
     pub fn new(hidden_dim: i64, n_layers: i64, n_blocks: i64, lr: f64, max_time_sec: u64, device: &str, batch_size: i64) -> Result<Self> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let deep_module = PyModule::import(py, "forex_bot.models.deep")?;
             let class = deep_module.getattr("NBeatsExpert")?;
 
@@ -263,7 +263,7 @@ impl NBeatsExpert {
 
     // Shared helper methods (DRY principle)
     fn call_python_fit(py_expert: &Option<Py<PyAny>>, x: &Array2<f32>, y: &[i32]) -> Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let expert = py_expert.as_ref().context("Expert not initialized")?.bind(py);
             let (x_df, y_series) = Self::arrays_to_pandas(py, x, y)?;
             expert.call_method1("fit", (x_df, y_series))?;
@@ -272,7 +272,7 @@ impl NBeatsExpert {
     }
 
     fn call_python_predict(py_expert: &Option<Py<PyAny>>, x: &Array2<f32>) -> Result<Array2<f32>> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let expert = py_expert.as_ref().context("Expert not initialized")?.bind(py);
             let x_df = Self::array_to_dataframe(py, x)?;
             let probs_np = expert.call_method1("predict_proba", (x_df,))?;
@@ -281,7 +281,7 @@ impl NBeatsExpert {
     }
 
     fn call_python_save(py_expert: &Option<Py<PyAny>>, path: &Path) -> Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let expert = py_expert.as_ref().context("Expert not initialized")?.bind(py);
             expert.call_method1("save", (path.to_string_lossy().as_ref(),))?;
             Ok(())
@@ -289,7 +289,7 @@ impl NBeatsExpert {
     }
 
     fn call_python_load(py_expert: &Option<Py<PyAny>>, path: &Path) -> Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let expert = py_expert.as_ref().context("Expert not initialized")?.bind(py);
             expert.call_method1("load", (path.to_string_lossy().as_ref(),))?;
             Ok(())
@@ -336,7 +336,7 @@ impl NBeatsExpert {
         sample_input: &Array2<f32>,
         model_name: &str,
     ) -> Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let torch = PyModule::import(py, "torch")?;
             let numpy = PyModule::import(py, "numpy")?;
 
@@ -401,7 +401,7 @@ pub struct TiDEExpert {
 
 impl TiDEExpert {
     pub fn new(hidden_dim: i64, lr: f64, batch_size: i64, max_time_sec: u64, device: &str) -> Result<Self> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let deep_module = PyModule::import(py, "forex_bot.models.deep")?;
             let class = deep_module.getattr("TiDEExpert")?;
 
@@ -447,7 +447,7 @@ pub struct TabNetExpert {
 
 impl TabNetExpert {
     pub fn new(hidden_dim: i64, n_steps: i64, lr: f64, batch_size: i64, max_time_sec: u64, device: &str) -> Result<Self> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let deep_module = PyModule::import(py, "forex_bot.models.deep")?;
             let class = deep_module.getattr("TabNetExpert")?;
 
@@ -494,7 +494,7 @@ pub struct KANExpert {
 
 impl KANExpert {
     pub fn new(hidden_dim: i64, lr: f64, batch_size: i64, max_time_sec: u64, device: &str) -> Result<Self> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let deep_module = PyModule::import(py, "forex_bot.models.deep")?;
             let class = deep_module.getattr("KANExpert")?;
 

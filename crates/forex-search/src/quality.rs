@@ -387,7 +387,7 @@ fn stddev_sample(values: &[f64], mean: f64) -> f64 {
 }
 
 fn score_strategy(analyzer: &StrategyQualityAnalyzer, metrics: &mut StrategyMetrics) {
-    let mut score = 0.0;
+    let mut score: f64 = 0.0;
     if metrics.sortino_ratio >= 3.0 {
         score += 30.0;
     } else if metrics.sortino_ratio >= 2.0 {

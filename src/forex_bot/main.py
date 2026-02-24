@@ -19,6 +19,31 @@ def maybe_init_distributed():
     return None
 
 
+def _detect_hpc_mode() -> bool:
+    """Detect if running on HPC hardware (Hyperstack N3 or similar)."""
+    # Check for explicit HPC mode
+    if os.environ.get("FOREX_BOT_HPC_MODE", "").lower() in ("1", "true", "yes", "on"):
+        return True
+    
+    # Auto-detect based on hardware
+    try:
+        import torch
+        gpu_count = torch.cuda.device_count()
+    except:
+        gpu_count = 0
+    
+    cpu_threads = os.cpu_count() or 1
+    
+    # Hyperstack N3: 8 GPUs, 504 threads
+    if gpu_count >= 8 and cpu_threads >= 500:
+        logger = logging.getLogger(__name__)
+        logger.info(f"HPC auto-detect: {gpu_count} GPUs, {cpu_threads} threads -> HPC mode enabled")
+        os.environ["FOREX_BOT_HPC_MODE"] = "1"
+        return True
+    
+    return False
+
+
 def _global_models_exist(models_dir: Path = Path("models")) -> bool:
     """
     Return True when at least one trained model is registered.
@@ -725,6 +750,30 @@ async def main_async():
     else:
         logger.info("Press Ctrl+C to shutdown gracefully")
 
+    # HPC Unified Mode: Auto-detect HPC hardware and run unified training+discovery
+    if _detect_hpc_mode() and not getattr(args, "quick_e2e", False):
+        logger.info("🚀 HPC Hardware Detected: Activating unified training+discovery mode")
+        try:
+            from forex_bot.hpc_coordinator import run_hpc_unified
+            
+            results = run_hpc_unified(base_settings, symbols)
+            
+            logger.info(
+                f"✅ HPC run complete: {results.get('total_strategies', 0)} strategies found, "
+                f"runtime: {results.get('runtime_seconds', 0)/3600:.1f}h"
+            )
+            
+            # If we found strategies, continue to live trading
+            if results.get("strategies") and not getattr(args, "train", False):
+                logger.info("Models trained, starting live trading...")
+            elif getattr(args, "train", False):
+                return  # Training-only mode
+                
+        except Exception as exc:
+            logger.error(f"HPC unified mode failed: {exc}", exc_info=True)
+            logger.info("Falling back to standard training mode...")
+            # Fall through to standard training
+    
     if getattr(args, "train", False):
         logger.info("Training-only mode requested (--train).")
         try:

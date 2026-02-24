@@ -31,7 +31,7 @@ impl GeneticStrategyExpert {
         generations: usize,
         max_indicators: usize,
     ) -> Result<Self> {
-        let py_expert = Python::with_gil(|py| {
+        let py_expert = Python::attach(|py| {
             // Import the Python module
             let genetic_module = PyModule::import(py, "forex_bot.models.genetic")
                 .context("Failed to import forex_bot.models.genetic")?;
@@ -67,7 +67,7 @@ impl GeneticStrategyExpert {
     /// 1. Try to load pre-discovered strategies from Discovery Engine JSON
     /// 2. Fall back to internal evolution if no cached strategies found
     pub fn fit(&mut self, x: &DataFrame, y: &Series, metadata: Option<&DataFrame>) -> Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let expert = self.py_expert.as_ref()
                 .context("Genetic expert not initialized")?
                 .bind(py);
@@ -109,8 +109,8 @@ impl GeneticStrategyExpert {
             expert.call_method("fit", (x_pd, y_pd), Some(&kwargs))?;
 
             info!(
-                "Genetic expert fitted ({} generations, population {})",
-                self.generations, self.population_size
+                "Genetic expert fitted ({} generations, population {}, max_indicators {})",
+                self.generations, self.population_size, self.max_indicators
             );
 
             Ok(())
@@ -123,7 +123,7 @@ impl GeneticStrategyExpert {
     /// Returns 3-class probabilities: [Neutral, Buy, Sell]
     /// Uses portfolio voting across multiple evolved strategies
     pub fn predict_proba(&self, x: &DataFrame, metadata: Option<&DataFrame>) -> Result<Array2<f32>> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let expert = self.py_expert.as_ref()
                 .context("Genetic expert not initialized")?
                 .bind(py);
@@ -180,7 +180,7 @@ impl GeneticStrategyExpert {
     /// Save the model
     /// Python lines 238-244
     pub fn save(&self, path: &Path) -> Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let expert = self.py_expert.as_ref()
                 .context("Genetic expert not initialized")?
                 .bind(py);
@@ -196,7 +196,7 @@ impl GeneticStrategyExpert {
     /// Load the model
     /// Python lines 246-256
     pub fn load(&mut self, path: &Path) -> Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let expert = self.py_expert.as_ref()
                 .context("Genetic expert not initialized")?
                 .bind(py);
@@ -211,7 +211,7 @@ impl GeneticStrategyExpert {
 
     /// Get the number of strategies in the portfolio
     pub fn portfolio_size(&self) -> Result<usize> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let expert = self.py_expert.as_ref()
                 .context("Genetic expert not initialized")?
                 .bind(py);
@@ -225,7 +225,7 @@ impl GeneticStrategyExpert {
 
     /// Get the best gene's fitness score
     pub fn best_fitness(&self) -> Result<f64> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let expert = self.py_expert.as_ref()
                 .context("Genetic expert not initialized")?
                 .bind(py);

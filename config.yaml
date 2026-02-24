@@ -3,6 +3,9 @@ system:
   symbols: [EURUSD]
   data_dir: data
   base_timeframe: M1  # 1-minute base for multi-timeframe analysis
+  multi_resolution_enabled: true
+  multi_resolution_timeframes: [M1, M3, M5, M15, M30, H1, H2, H4, D1, W1, MN1]
+  multi_resolution_prefix_base: false
   use_volume_features: true
   higher_timeframes: [M3, M5, M15, M30, H1, H2, H4, D1, W1, MN1]
   history_years: 10
@@ -75,7 +78,9 @@ risk:
   cost_penalty_r: 0.0
   gate_trade_prob: 0.55
   daily_hard_stop_pct: 0.04
+  conformal_enabled: true
   conformal_alpha: 0.10
+  conformal_abstain_min_set_size: 3
   volatility_stop_sigma: 0.02
   volatility_lookback: 50
   meta_label_tp_pips: null
@@ -122,7 +127,7 @@ risk:
   hurst_range: 0.45
 
 models:
-  ml_models: [lightgbm, xgboost, xgboost_rf, xgboost_dart, catboost, catboost_alt, mlp]
+  ml_models: [lightgbm, xgboost, xgboost_rf, xgboost_dart, catboost, catboost_alt, mlp, elasticnet, bayes_logit, online_pa, online_hoeffding]
   use_rl_agent: true
   use_sac_agent: true
   use_neuroevolution: true
@@ -141,7 +146,9 @@ models:
   prop_search_generations: 20  # Evolution iterations (budget-safe default)
   prop_search_max_hours: 2.0  # Budget-safe time cap
   prop_search_max_rows: 0  # 0 = USE FULL DATASET for strategy discovery (2.2M rows)
-  prop_search_portfolio_size: 3000  # Keep many strategies for downstream evaluation
+  prop_search_portfolio_size: 5000  # Keep many strategies for downstream evaluation
+  # 0 = allow full indicator set (no hard cap)
+  prop_search_max_indicators: 0
   prop_search_async: true
   prop_search_async_wait: false
   tree_device_preference: gpu
@@ -199,6 +206,20 @@ models:
   export_onnx: true  # Export ONNX for fast CPU inference (one-time at startup if missing)
   phase5_filter_meta_blender: true
   phase5_core_models: [transformer, nbeats, tide, tabnet, kan]
+  calibration_enabled: true
+  calibration_method: platt
+  calibration_min_rows: 300
+  regime_router_enabled: true
+  regime_router_min_models: 2
+  regime_trend_models: [transformer, patchtst, timesnet, nbeats, nbeatsx_nf, tide, tide_nf]
+  regime_range_models: [tabnet, lightgbm, xgboost, xgboost_rf, xgboost_dart, catboost, catboost_alt, elasticnet, bayes_logit, online_pa, online_hoeffding]
+  regime_neutral_models: []
+  l1_feature_selection_enabled: true
+  l1_feature_selection_per_regime: true
+  l1_feature_selection_min_features: 20
+  l1_feature_selection_max_features: 256
+  l1_feature_selection_sample_limit: 200000
+  l1_feature_selection_c: 0.20
   # Train using base-signal filter for meta-labeling (set false to use all rows)
   filter_to_base_signal: true
   # Global pooling caps (0 = no cap)

@@ -41,6 +41,10 @@ class ModelFactory:
             "tidenf": "tide_nf",
             "patch_tst": "patchtst",
             "times_net": "timesnet",
+            "elastic_net": "elasticnet",
+            "bayesian_logit": "bayes_logit",
+            "passive_aggressive": "online_pa",
+            "hoeffding": "online_hoeffding",
         }
         return aliases.get(key, key)
 
@@ -56,6 +60,43 @@ class ModelFactory:
             return max(0, int(overrides.get(key, 0) or 0))
         except Exception:
             return 0
+
+    def _inject_lightgbm_monotone_constraints(self, params: dict, model_cls: type) -> dict:
+        """
+        Attach optional monotonic constraints for Python LightGBM experts.
+        Rust tree bindings currently accept scalar params only; skip there.
+        """
+        out = dict(params or {})
+        if not bool(getattr(self.settings.models, "lightgbm_monotone_constraints_enabled", True)):
+            out.pop("monotone_constraints_by_feature", None)
+            return out
+        module_name = str(getattr(model_cls, "__module__", "") or "")
+        if module_name.endswith("trees_rust"):
+            out.pop("monotone_constraints_by_feature", None)
+            return out
+        raw = getattr(self.settings.models, "lightgbm_monotone_constraints", {}) or {}
+        if not isinstance(raw, dict):
+            return out
+        clean: dict[str, int] = {}
+        for k, v in raw.items():
+            key = str(k).strip()
+            if not key:
+                continue
+            try:
+                val = int(v)
+            except Exception:
+                continue
+            if val > 0:
+                clean[key] = 1
+            elif val < 0:
+                clean[key] = -1
+            else:
+                clean[key] = 0
+        if clean:
+            out["monotone_constraints_by_feature"] = clean
+        else:
+            out.pop("monotone_constraints_by_feature", None)
+        return out
 
     def create_model(self, model_name: str, best_params: dict, idx: int) -> ExpertModel:
         """Create and configure a model instance."""
@@ -85,6 +126,11 @@ class ModelFactory:
             "transformer": "Transformer",
             "evolution": "Neuroevolution",
             "mlp": "MLP",
+            "elasticnet": "ElasticNet",
+            "bayes_logit": "BayesLogit",
+            "online_pa": "OnlinePA",
+            "online_hoeffding": "OnlineHoeffding",
+            "vw": "VW",
         }
         opt_key = opt_key_map.get(model_name) or opt_key_map.get(requested_name)
         if opt_key and opt_key in best_params:
@@ -93,6 +139,8 @@ class ModelFactory:
             params = best_params[model_name].copy()
         elif requested_name in best_params:
             params = best_params[requested_name].copy()
+        if model_name == "lightgbm":
+            params = self._inject_lightgbm_monotone_constraints(params, model_cls)
 
         # 2. Batch size (config override if not fixed by HPO params)
         if "batch_size" not in params:

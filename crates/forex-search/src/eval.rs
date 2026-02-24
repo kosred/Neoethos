@@ -63,7 +63,6 @@ pub fn fast_evaluate_strategy_core(
     let mut returns = vec![0.0_f64; n];
     let mut trade_count: usize = 0;
     let mut wins: usize = 0;
-    let mut losses: usize = 0;
     let mut gross_profit = 0.0_f64;
     let mut gross_loss = 0.0_f64;
 
@@ -140,14 +139,12 @@ pub fn fast_evaluate_strategy_core(
                 day_low = current_floating_equity;
             }
 
-            let mut sl_price = 0.0_f64;
-            let mut tp_price = 0.0_f64;
             let mut pnl = 0.0_f64;
             let mut exit_signal = false;
 
             if in_position == 1 {
-                sl_price = entry_price - (sl_pips * pip_value);
-                tp_price = entry_price + (tp_pips * pip_value);
+                let mut sl_price = entry_price - (sl_pips * pip_value);
+                let tp_price = entry_price + (tp_pips * pip_value);
 
                 if trailing_enabled {
                     let mv = current_high - entry_price;
@@ -171,8 +168,8 @@ pub fn fast_evaluate_strategy_core(
                     exit_signal = true;
                 }
             } else {
-                sl_price = entry_price + (sl_pips * pip_value);
-                tp_price = entry_price - (tp_pips * pip_value);
+                let mut sl_price = entry_price + (sl_pips * pip_value);
+                let tp_price = entry_price - (tp_pips * pip_value);
 
                 if trailing_enabled {
                     let mv = entry_price - current_low;
@@ -209,7 +206,9 @@ pub fn fast_evaluate_strategy_core(
             }
 
             if !exit_signal {
-                let sig = signals[i];
+                // Enforce causal timing: signal at bar t can only affect decisions at bar t+1.
+                // The loop starts at i=1, so we consume signals[i-1] here.
+                let sig = signals[i - 1];
                 if in_position == 1 && sig == -1 {
                     pnl = (close_prices[i] - entry_price) / pip_value * cash_per_pip;
                     exit_signal = true;
@@ -220,6 +219,7 @@ pub fn fast_evaluate_strategy_core(
             }
 
             if exit_signal {
+                pnl -= commission_per_trade;
                 equity += pnl;
                 current_month_pnl += pnl;
 
@@ -227,7 +227,6 @@ pub fn fast_evaluate_strategy_core(
                     wins += 1;
                     gross_profit += pnl;
                 } else {
-                    losses += 1;
                     gross_loss += pnl.abs();
                 }
 
@@ -247,7 +246,8 @@ pub fn fast_evaluate_strategy_core(
         }
 
         if in_position == 0 {
-            let sig = signals[i];
+            // Enforce causal timing for entries as well.
+            let sig = signals[i - 1];
             if sig == 1 {
                 in_position = 1;
                 entry_price = close_prices[i] + (spread_pips * pip_value);
@@ -255,7 +255,7 @@ pub fn fast_evaluate_strategy_core(
                 trail_price = 0.0;
             } else if sig == -1 {
                 in_position = -1;
-                entry_price = close_prices[i];
+                entry_price = close_prices[i] - (spread_pips * pip_value);
                 entry_index = i as i64;
                 trail_price = 0.0;
             }
@@ -294,8 +294,9 @@ pub fn fast_evaluate_strategy_core(
     };
 
     let mut equity_curve = vec![0.0_f64; trade_count + 1];
-    let mut curr = 0.0_f64;
-    let mut peak = 0.0_f64;
+    let mut curr = 100000.0_f64;
+    let mut peak = 100000.0_f64;
+    equity_curve[0] = curr;
     let mut max_dd = 0.0_f64;
     for (k, ret) in trade_rets.iter().enumerate() {
         curr += ret;
@@ -303,7 +304,11 @@ pub fn fast_evaluate_strategy_core(
         if curr > peak {
             peak = curr;
         }
-        let dd = (peak - curr) / peak;
+        let dd = if peak > 0.0 {
+            (peak - curr) / peak
+        } else {
+            0.0
+        };
         if dd > max_dd {
             max_dd = dd;
         }
@@ -454,114 +459,119 @@ fn evaluate_population_impl(
 
     let results: Vec<[f64; 11]> = (0..n_genes)
         .into_par_iter()
-        .map(|g| {
-            let start = gene_offsets[g] as usize;
-            let end = gene_offsets[g + 1] as usize;
-            let mut combined = vec![0.0_f32; n_samples];
-            if end > start {
-                for idx in start..end {
-                    let ind_idx = gene_indices[idx] as usize;
-                    let weight = gene_weights[idx];
-                    if ind_idx >= indicators.shape()[0] {
-                        continue;
-                    }
-                    let row = indicators.row(ind_idx);
-                    for (i, v) in row.iter().enumerate() {
-                        combined[i] += weight * (*v);
+        .map_init(
+            || (vec![0.0_f32; n_samples], vec![0_i8; n_samples]),
+            |(combined, signals), g| {
+                let start = gene_offsets[g] as usize;
+                let end = gene_offsets[g + 1] as usize;
+
+                combined.fill(0.0);
+                signals.fill(0);
+
+                if end > start {
+                    for idx in start..end {
+                        let ind_idx = gene_indices[idx] as usize;
+                        let weight = gene_weights[idx];
+                        if ind_idx >= indicators.shape()[0] {
+                            continue;
+                        }
+                        let row = indicators.row(ind_idx);
+                        for (i, v) in row.iter().enumerate() {
+                            combined[i] += weight * (*v);
+                        }
                     }
                 }
-            }
 
-            let lt = long_thr[g];
-            let st = short_thr[g];
-            let mut signals = vec![0i8; n_samples];
-            for i in 0..n_samples {
-                let v = combined[i];
-                if v >= lt {
-                    signals[i] = 1;
-                } else if v <= st {
-                    signals[i] = -1;
-                }
-            }
-
-            let use_ob_g = use_ob_arr[g] != 0;
-            let use_fvg_g = use_fvg_arr[g] != 0;
-            let use_liq_g = use_liq_arr[g] != 0;
-            let use_mtf_g = use_mtf_arr[g] != 0;
-            let use_premium_g = use_premium_arr[g] != 0;
-            let use_inducement_g = use_inducement_arr[g] != 0;
-
-            let mut active_weight_sum = 0.0_f32;
-            if use_ob_g {
-                active_weight_sum += smc_weight_ob;
-            }
-            if use_fvg_g {
-                active_weight_sum += smc_weight_fvg;
-            }
-            if use_liq_g {
-                active_weight_sum += smc_weight_liq;
-            }
-            if use_mtf_g {
-                active_weight_sum += smc_weight_mtf;
-            }
-            if use_premium_g {
-                active_weight_sum += smc_weight_premium;
-            }
-            if use_inducement_g {
-                active_weight_sum += smc_weight_inducement;
-            }
-
-            if active_weight_sum > 0.0 {
-                let gate_threshold = smc_gate_threshold.min(active_weight_sum);
+                let lt = long_thr[g];
+                let st = short_thr[g];
                 for i in 0..n_samples {
-                    let dir = signals[i];
-                    if dir == 0 {
-                        continue;
-                    }
-                    let mut score = 0.0_f32;
-                    if use_ob_g && ob_arr[i] == dir {
-                        score += smc_weight_ob;
-                    }
-                    if use_fvg_g && fvg_arr[i] == dir {
-                        score += smc_weight_fvg;
-                    }
-                    if use_liq_g && liq_arr[i] == dir {
-                        score += smc_weight_liq;
-                    }
-                    if use_mtf_g && trend_arr[i] == dir {
-                        score += smc_weight_mtf;
-                    }
-                    if use_premium_g && premium_arr[i] == dir {
-                        score += smc_weight_premium;
-                    }
-                    if use_inducement_g && inducement_arr[i] == 1 {
-                        score += smc_weight_inducement;
-                    }
-                    if score < gate_threshold {
-                        signals[i] = 0;
+                    let v = combined[i];
+                    if v >= lt {
+                        signals[i] = 1;
+                    } else if v <= st {
+                        signals[i] = -1;
                     }
                 }
-            }
 
-            fast_evaluate_strategy_core(
-                close,
-                high,
-                low,
-                &signals,
-                month_indices,
-                day_indices,
-                sl_pips[g],
-                tp_pips[g],
-                max_hold_bars,
-                trailing_enabled,
-                trailing_atr_multiplier,
-                trailing_be_trigger_r,
-                pip_value,
-                spread_pips,
-                commission_per_trade,
-                pip_value_per_lot,
-            )
-        })
+                let use_ob_g = use_ob_arr[g] != 0;
+                let use_fvg_g = use_fvg_arr[g] != 0;
+                let use_liq_g = use_liq_arr[g] != 0;
+                let use_mtf_g = use_mtf_arr[g] != 0;
+                let use_premium_g = use_premium_arr[g] != 0;
+                let use_inducement_g = use_inducement_arr[g] != 0;
+
+                let mut active_weight_sum = 0.0_f32;
+                if use_ob_g {
+                    active_weight_sum += smc_weight_ob;
+                }
+                if use_fvg_g {
+                    active_weight_sum += smc_weight_fvg;
+                }
+                if use_liq_g {
+                    active_weight_sum += smc_weight_liq;
+                }
+                if use_mtf_g {
+                    active_weight_sum += smc_weight_mtf;
+                }
+                if use_premium_g {
+                    active_weight_sum += smc_weight_premium;
+                }
+                if use_inducement_g {
+                    active_weight_sum += smc_weight_inducement;
+                }
+
+                if active_weight_sum > 0.0 {
+                    let gate_threshold = smc_gate_threshold.min(active_weight_sum);
+                    for i in 0..n_samples {
+                        let dir = signals[i];
+                        if dir == 0 {
+                            continue;
+                        }
+                        let mut score = 0.0_f32;
+                        if use_ob_g && ob_arr[i] == dir {
+                            score += smc_weight_ob;
+                        }
+                        if use_fvg_g && fvg_arr[i] == dir {
+                            score += smc_weight_fvg;
+                        }
+                        if use_liq_g && liq_arr[i] == dir {
+                            score += smc_weight_liq;
+                        }
+                        if use_mtf_g && trend_arr[i] == dir {
+                            score += smc_weight_mtf;
+                        }
+                        if use_premium_g && premium_arr[i] == dir {
+                            score += smc_weight_premium;
+                        }
+                        if use_inducement_g && inducement_arr[i] == 1 {
+                            score += smc_weight_inducement;
+                        }
+                        if score < gate_threshold {
+                            signals[i] = 0;
+                        }
+                    }
+                }
+
+                fast_evaluate_strategy_core(
+                    close,
+                    high,
+                    low,
+                    signals,
+                    month_indices,
+                    day_indices,
+                    sl_pips[g],
+                    tp_pips[g],
+                    max_hold_bars,
+                    trailing_enabled,
+                    trailing_atr_multiplier,
+                    trailing_be_trigger_r,
+                    pip_value,
+                    spread_pips,
+                    commission_per_trade,
+                    pip_value_per_lot,
+                )
+            },
+        )
         .collect();
 
     Ok(results)

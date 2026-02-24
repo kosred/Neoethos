@@ -85,6 +85,8 @@ class ChallengeRiskPreset:
     total_drawdown_limit: float
     daily_profit_lock_pct: float
     monthly_profit_target_pct: float
+    challenge_target_return_pct: float
+    challenge_target_trading_days: int
 
 
 def resolve_challenge_risk_preset(phase: str) -> ChallengeRiskPreset:
@@ -92,37 +94,43 @@ def resolve_challenge_risk_preset(phase: str) -> ChallengeRiskPreset:
     if raw in {"phase2", "phase_2", "verification", "verify"}:
         return ChallengeRiskPreset(
             phase="phase_2",
-            risk_per_trade=0.0030,
-            max_risk_per_trade=0.0050,
-            min_confidence_threshold=0.66,
+            risk_per_trade=0.0025,
+            max_risk_per_trade=0.0040,
+            min_confidence_threshold=0.68,
             max_trades_per_day=3,
             daily_drawdown_limit=0.045,
             total_drawdown_limit=0.10,
-            daily_profit_lock_pct=0.015,
-            monthly_profit_target_pct=0.025,
+            daily_profit_lock_pct=0.012,
+            monthly_profit_target_pct=0.05,
+            challenge_target_return_pct=0.05,
+            challenge_target_trading_days=22,
         )
     if raw in {"funded", "live"}:
         return ChallengeRiskPreset(
             phase="funded",
-            risk_per_trade=0.0040,
-            max_risk_per_trade=0.0070,
-            min_confidence_threshold=0.62,
-            max_trades_per_day=5,
+            risk_per_trade=0.0030,
+            max_risk_per_trade=0.0050,
+            min_confidence_threshold=0.65,
+            max_trades_per_day=4,
             daily_drawdown_limit=0.045,
             total_drawdown_limit=0.10,
             daily_profit_lock_pct=0.0,
-            monthly_profit_target_pct=0.05,
+            monthly_profit_target_pct=0.06,
+            challenge_target_return_pct=0.06,
+            challenge_target_trading_days=22,
         )
     return ChallengeRiskPreset(
         phase="phase_1",
-        risk_per_trade=0.0035,
-        max_risk_per_trade=0.0060,
-        min_confidence_threshold=0.64,
-        max_trades_per_day=4,
+        risk_per_trade=0.0030,
+        max_risk_per_trade=0.0050,
+        min_confidence_threshold=0.66,
+        max_trades_per_day=3,
         daily_drawdown_limit=0.045,
         total_drawdown_limit=0.10,
-        daily_profit_lock_pct=0.020,
-        monthly_profit_target_pct=0.0375,
+        daily_profit_lock_pct=0.015,
+        monthly_profit_target_pct=0.10,
+        challenge_target_return_pct=0.10,
+        challenge_target_trading_days=22,
     )
 
 
@@ -296,6 +304,14 @@ class RiskManager:
         self.monthly_profit_target_pct = float(getattr(settings.risk, "monthly_profit_target_pct", 0.04) or 0.04)
         self.monthly_target_hit = False
         self.phase_trade_days: set[date] = set()
+        self.challenge_start_date: date | None = now_date if self.challenge_mode else None
+        self.challenge_start_equity = initial_balance if self.challenge_mode else 0.0
+        self.challenge_return_pct = 0.0
+        self.challenge_target_hit = False
+        self.challenge_target_return_pct = float(getattr(settings.risk, "challenge_target_return_pct", 0.10) or 0.10)
+        self.challenge_target_trading_days = int(getattr(settings.risk, "challenge_target_trading_days", 44) or 44)
+        self.challenge_target_return_pct = max(0.0, self.challenge_target_return_pct)
+        self.challenge_target_trading_days = max(1, self.challenge_target_trading_days)
 
         self.recovery_mode = False
         self.recovery_conf_boost = 0.10
@@ -335,6 +351,43 @@ class RiskManager:
         if s < e:
             return s <= hour < e
         return (hour >= s) or (hour < e)
+
+    @staticmethod
+    def _business_days_between(start: date, end: date) -> int:
+        if end < start:
+            start, end = end, start
+        span = (end - start).days + 1
+        weeks, rem = divmod(max(0, span), 7)
+        weekdays = weeks * 5
+        for i in range(rem):
+            if (start.weekday() + i) % 7 < 5:
+                weekdays += 1
+        return max(0, weekdays)
+
+    def _drawdown_state(self, equity: float) -> tuple[float, float, float, float]:
+        daily_dd_pct = (self.day_start_equity - equity) / self.day_start_equity if self.day_start_equity > 0 else 0.0
+        intraday_dd_pct = (self.day_peak_equity - equity) / self.day_peak_equity if self.day_peak_equity > 0 else 0.0
+        dd_used = max(0.0, max(daily_dd_pct, intraday_dd_pct))
+        dd_limit = max(float(self.prop_rules.daily_dd_stop_trading_pct), 1e-9)
+        return float(daily_dd_pct), float(intraday_dd_pct), float(dd_used), float(dd_limit)
+
+    def _challenge_progress_multiplier(self, equity: float, now: datetime, daily_dd_pct: float) -> float:
+        if not self.challenge_mode or self.challenge_start_equity <= 0:
+            return 1.0
+        start = self.challenge_start_date or now.date()
+        elapsed_days = max(1, self._business_days_between(start, now.date()))
+        target_days = max(1, int(getattr(self.settings.risk, "challenge_target_trading_days", self.challenge_target_trading_days) or self.challenge_target_trading_days))
+        progress = min(1.0, max(1.0 / float(target_days), float(elapsed_days) / float(target_days)))
+        target_return = float(getattr(self.settings.risk, "challenge_target_return_pct", self.challenge_target_return_pct) or self.challenge_target_return_pct) * progress
+        current_return = (equity - self.challenge_start_equity) / self.challenge_start_equity
+        tol = float(getattr(self.settings.risk, "challenge_progress_tolerance_pct", 0.01) or 0.01)
+        boost = float(getattr(self.settings.risk, "challenge_progress_boost_mult", 1.08) or 1.08)
+        reduce = float(getattr(self.settings.risk, "challenge_progress_reduce_mult", 0.85) or 0.85)
+        if current_return < (target_return - tol) and daily_dd_pct < max(0.005, self.prop_rules.daily_dd_warning_pct * 0.5):
+            return float(max(0.5, min(1.5, boost)))
+        if current_return > (target_return + tol):
+            return float(max(0.3, min(1.0, reduce)))
+        return 1.0
 
     def _apply_challenge_mode_preset(self) -> None:
         preset = resolve_challenge_risk_preset(self.challenge_phase)
@@ -398,6 +451,26 @@ class RiskManager:
         r.monthly_profit_target_pct = max(current_monthly_target, preset.monthly_profit_target_pct)
 
         try:
+            current_phase_target = float(
+                getattr(r, "challenge_target_return_pct", preset.challenge_target_return_pct) or preset.challenge_target_return_pct
+            )
+        except Exception:
+            current_phase_target = preset.challenge_target_return_pct
+        r.challenge_target_return_pct = max(0.0, max(current_phase_target, preset.challenge_target_return_pct))
+
+        try:
+            current_target_days = int(
+                getattr(r, "challenge_target_trading_days", preset.challenge_target_trading_days) or preset.challenge_target_trading_days
+            )
+        except Exception:
+            current_target_days = preset.challenge_target_trading_days
+        current_target_days = max(1, current_target_days)
+        if preset.phase in {"phase_1", "phase_2"}:
+            r.challenge_target_trading_days = min(current_target_days, preset.challenge_target_trading_days)
+        else:
+            r.challenge_target_trading_days = current_target_days
+
+        try:
             current_daily_stop = float(getattr(r, "daily_profit_stop_pct", 0.0) or 0.0)
         except Exception:
             current_daily_stop = 0.0
@@ -414,13 +487,15 @@ class RiskManager:
         r.high_quality_risk_pct = min(current_hq_risk, r.max_risk_per_trade)
 
         logger.info(
-            "Challenge mode preset applied: phase=%s risk=%.3f%% max_risk=%.3f%% min_conf=%.2f max_trades=%d month_target=%.2f%%",
+            "Challenge mode preset applied: phase=%s risk=%.3f%% max_risk=%.3f%% min_conf=%.2f max_trades=%d month_target=%.2f%% phase_target=%.2f%%/%sd",
             preset.phase,
             100.0 * float(r.risk_per_trade),
             100.0 * float(r.max_risk_per_trade),
             float(r.min_confidence_threshold),
             int(r.max_trades_per_day),
             100.0 * float(r.monthly_profit_target_pct),
+            100.0 * float(getattr(r, "challenge_target_return_pct", 0.0) or 0.0),
+            int(getattr(r, "challenge_target_trading_days", 0) or 0),
         )
 
     def save_state(self) -> None:
@@ -441,6 +516,10 @@ class RiskManager:
                 "circuit_breaker_triggered": self.circuit_breaker_triggered,
                 "recovery_mode": self.recovery_mode,
                 "monthly_target_hit": self.monthly_target_hit,
+                "challenge_start_date": self.challenge_start_date.isoformat() if self.challenge_start_date else None,
+                "challenge_start_equity": self.challenge_start_equity,
+                "challenge_return_pct": self.challenge_return_pct,
+                "challenge_target_hit": self.challenge_target_hit,
                 "reflection_mode": self.reflection_mode,
                 "reflection_cooldown_until": (
                     self.reflection_cooldown_until.isoformat() if self.reflection_cooldown_until else None
@@ -468,18 +547,42 @@ class RiskManager:
 
             saved_date = date.fromisoformat(saved_date_str)
             now_date = datetime.now(self._session_tz).date()
+            fallback_balance = float(getattr(self.settings.risk, "initial_balance", 0.0) or 0.0)
+
+            # Restore persistent fields even across day restarts.
+            month_saved = state.get("month_start_date")
+            if month_saved:
+                try:
+                    self.month_start_date = date.fromisoformat(month_saved)
+                except Exception:
+                    self.month_start_date = now_date.replace(day=1)
+            self.month_start_equity = float(state.get("month_start_equity", fallback_balance))
+            self.total_peak_equity = float(state.get("total_peak_equity", max(fallback_balance, self.month_start_equity)))
+            self.monthly_target_hit = bool(state.get("monthly_target_hit", False))
+            self.challenge_start_equity = float(state.get("challenge_start_equity", self.challenge_start_equity or fallback_balance))
+            self.challenge_return_pct = float(state.get("challenge_return_pct", self.challenge_return_pct))
+            self.challenge_target_hit = bool(state.get("challenge_target_hit", self.challenge_target_hit))
+            ch_start_raw = state.get("challenge_start_date")
+            if ch_start_raw:
+                try:
+                    self.challenge_start_date = date.fromisoformat(str(ch_start_raw))
+                except Exception:
+                    self.challenge_start_date = self.challenge_start_date or now_date
+
+            cooldown_raw = state.get("reflection_cooldown_until")
+            if cooldown_raw:
+                try:
+                    self.reflection_cooldown_until = datetime.fromisoformat(str(cooldown_raw))
+                except Exception:
+                    self.reflection_cooldown_until = None
+            else:
+                self.reflection_cooldown_until = None
+            self.reflection_mode = bool(state.get("reflection_mode", False))
 
             if saved_date == now_date:
                 self._last_session_date = saved_date
-                month_saved = state.get("month_start_date")
-                if month_saved:
-                    try:
-                        self.month_start_date = date.fromisoformat(month_saved)
-                    except Exception:
-                        self.month_start_date = now_date.replace(day=1)
-                fallback_balance = float(getattr(self.settings.risk, "initial_balance", 0.0) or 0.0)
-                self.month_start_equity = float(state.get("month_start_equity", fallback_balance))
                 self.day_start_equity = float(state.get("day_start_equity", fallback_balance))
+                self.day_peak_equity = float(state.get("day_peak_equity", max(self.total_peak_equity, self.day_start_equity)))
                 self.daily_loss = float(state.get("daily_loss", 0.0))
                 self.daily_profit = float(state.get("daily_profit", 0.0))
                 self.session_trades = int(state.get("session_trades", 0))
@@ -489,23 +592,22 @@ class RiskManager:
                 else:
                     self.session_trade_counts = {}
                 self.consecutive_losses = int(state.get("consecutive_losses", 0))
-                self.total_peak_equity = float(state.get("total_peak_equity", self.day_start_equity))
-                self.day_peak_equity = float(state.get("day_peak_equity", max(self.total_peak_equity, self.day_start_equity)))
                 self.circuit_breaker_triggered = bool(state.get("circuit_breaker_triggered", False))
                 self.recovery_mode = bool(state.get("recovery_mode", False))
-                self.monthly_target_hit = bool(state.get("monthly_target_hit", False))
-                self.reflection_mode = bool(state.get("reflection_mode", False))
-                cooldown_raw = state.get("reflection_cooldown_until")
-                if cooldown_raw:
-                    try:
-                        self.reflection_cooldown_until = datetime.fromisoformat(str(cooldown_raw))
-                    except Exception:
-                        self.reflection_cooldown_until = None
-                else:
-                    self.reflection_cooldown_until = None
                 logger.info(f"Restored risk state for {self.symbol} ({saved_date})")
             else:
-                logger.info(f"Found stale risk state for {self.symbol} from {saved_date}, starting fresh for {now_date}")
+                # Keep persistent state but force a fresh day reset from live equity on first check.
+                self._last_session_date = None
+                self.daily_loss = 0.0
+                self.daily_profit = 0.0
+                self.session_trades = 0
+                self.session_trade_counts = {}
+                self.consecutive_losses = 0
+                self.circuit_breaker_triggered = False
+                self.recovery_mode = False
+                logger.info(
+                    f"Restored persistent risk state for {self.symbol} from {saved_date}; daily counters reset for {now_date}"
+                )
         except Exception as e:
             logger.warning(f"Failed to load risk state for {self.symbol}: {e}")
 
@@ -527,7 +629,8 @@ class RiskManager:
             self.session_trades = 0
             self.session_trade_counts = {}
             self.consecutive_losses = 0
-            self._last_session_date = now_date
+            # Defer day start equity initialization until first live equity check.
+            self._last_session_date = None
             self._kill_window_until = None
             logger.info("Session initialized (fresh)", extra={"event_id": "risk_session_reset"})
         else:
@@ -535,13 +638,7 @@ class RiskManager:
 
     def _ensure_day(self, equity: float, now: datetime) -> None:
         """Reset daily counters if a new session day starts."""
-        # HPC FIX: Broker-aligned Day Rollover
-        # We must NOT reset if we just restarted midday.
         if self._last_session_date is None or now.date() != self._last_session_date:
-            # Check if we already have a saved start equity for TODAY
-            if self._last_session_date == now.date() and self.day_start_equity > 0:
-                return # Already initialized for today
-                
             self._last_session_date = now.date()
             self.daily_loss = 0.0
             self.daily_profit = 0.0
@@ -576,6 +673,24 @@ class RiskManager:
             self.risk_ledger.record(
                 "MONTH_TARGET_HIT",
                 f"Monthly return hit {self.monthly_return_pct:.2%} (target {self.monthly_profit_target_pct:.2%})",
+                severity="info",
+            )
+            self.save_state()
+
+    def _update_challenge_metrics(self, equity: float, now: datetime) -> None:
+        if not self.challenge_mode:
+            return
+        if self.challenge_start_equity <= 0:
+            self.challenge_start_equity = float(max(1.0, equity))
+        if self.challenge_start_date is None:
+            self.challenge_start_date = now.date()
+        self.challenge_return_pct = (equity - self.challenge_start_equity) / max(self.challenge_start_equity, 1e-9)
+        target = float(getattr(self.settings.risk, "challenge_target_return_pct", self.challenge_target_return_pct) or self.challenge_target_return_pct)
+        if not self.challenge_target_hit and target > 0.0 and self.challenge_return_pct >= target:
+            self.challenge_target_hit = True
+            self.risk_ledger.record(
+                "CHALLENGE_TARGET_HIT",
+                f"Phase return hit {self.challenge_return_pct:.2%} (target {target:.2%})",
                 severity="info",
             )
             self.save_state()
@@ -657,9 +772,13 @@ class RiskManager:
         self._ensure_day(equity, timestamp)
         self._ensure_month(equity, timestamp)
         self._update_monthly_metrics(equity)
+        self._update_challenge_metrics(equity, timestamp)
         self._update_recovery_state(equity)
 
-        if self.monthly_target_hit:
+        if self.challenge_mode and self.challenge_target_hit:
+            return False, "Challenge target reached"
+
+        if (not self.challenge_mode) and self.monthly_target_hit:
             return False, "Monthly profit target reached"
 
         if self.reflection_mode:
@@ -700,11 +819,7 @@ class RiskManager:
         if self.revenge_trading_detector.is_revenge_trading(timestamp):
             return False, "Revenge trading detected"
 
-        # Standard Daily Loss (from Day Start)
-        daily_dd_pct = (self.day_start_equity - equity) / self.day_start_equity if self.day_start_equity > 0 else 0.0
-
-        # Intraday Trailing Loss (from Day Peak) - Stricter rule used by some firms
-        intraday_dd_pct = (self.day_peak_equity - equity) / self.day_peak_equity if self.day_peak_equity > 0 else 0.0
+        daily_dd_pct, intraday_dd_pct, dd_used, dd_limit = self._drawdown_state(equity)
 
         if daily_dd_pct >= self.prop_rules.daily_dd_stop_trading_pct:
             self.circuit_breaker_triggered = True
@@ -724,6 +839,11 @@ class RiskManager:
                 severity="warning",
             )
             self.recovery_mode = True
+
+        pre_stop_frac = float(getattr(self.settings.risk, "drawdown_pre_stop_fraction", 0.90) or 0.90)
+        pre_stop_frac = max(0.0, min(1.0, pre_stop_frac))
+        if pre_stop_frac > 0.0 and dd_used >= (pre_stop_frac * dd_limit):
+            return False, f"Drawdown pre-stop brake active ({dd_used:.2%}/{dd_limit:.2%})"
 
         total_dd_pct = (self.total_peak_equity - equity) / self.total_peak_equity if self.total_peak_equity > 0 else 0.0
         if total_dd_pct >= self.settings.risk.total_drawdown_limit:
@@ -869,7 +989,7 @@ class RiskManager:
         if news_cap is not None:
             risk_pct = min(risk_pct, float(news_cap))
 
-        daily_dd_pct = (self.day_start_equity - equity) / self.day_start_equity if self.day_start_equity > 0 else 0.0
+        daily_dd_pct, _intraday_dd_pct, dd_used, dd_limit = self._drawdown_state(equity)
 
         if len(self.rolling_outcomes) > 0:
             real_win_rate = sum(self.rolling_outcomes) / len(self.rolling_outcomes)
@@ -897,13 +1017,28 @@ class RiskManager:
             market_regime=str(market_regime or "Normal"),
         )
 
-        risk_mult, required_conf, allow_trade = self.meta_controller.get_risk_parameters(meta_state)
+        risk_mult, _required_conf, allow_trade = self.meta_controller.get_risk_parameters(meta_state)
         self.last_risk_mult = risk_mult  # Store for logging
 
         if not allow_trade:
             return 0.0
 
         risk_pct *= risk_mult
+
+        # Drawdown circuit soft-brakes: progressively cut risk before hard stop.
+        dd_frac = dd_used / max(dd_limit, 1e-9)
+        soft1_frac = float(getattr(self.settings.risk, "drawdown_soft_brake_1_fraction", 0.50) or 0.50)
+        soft2_frac = float(getattr(self.settings.risk, "drawdown_soft_brake_2_fraction", 0.75) or 0.75)
+        soft1_mult = float(getattr(self.settings.risk, "drawdown_soft_brake_1_mult", 0.60) or 0.60)
+        soft2_mult = float(getattr(self.settings.risk, "drawdown_soft_brake_2_mult", 0.35) or 0.35)
+        soft1_frac = max(0.0, min(1.0, soft1_frac))
+        soft2_frac = max(soft1_frac, min(1.0, soft2_frac))
+        soft1_mult = max(0.0, min(1.0, soft1_mult))
+        soft2_mult = max(0.0, min(1.0, soft2_mult))
+        if dd_frac >= soft2_frac:
+            risk_pct *= soft2_mult
+        elif dd_frac >= soft1_frac:
+            risk_pct *= soft1_mult
 
         try:
             if self.total_peak_equity > 0:
@@ -912,20 +1047,11 @@ class RiskManager:
                     scale = max(0.3, 1.0 - dd_pct / max(self.settings.risk.total_drawdown_limit, 1e-6))
                     risk_pct *= scale
         except Exception as e:
-            logger.warning(f"Saving risk state failed: {e}", exc_info=True)
+            logger.warning(f"Risk drawdown scaling failed: {e}", exc_info=True)
 
-        if self.challenge_mode and self.month_start_equity > 0:
-            try:
-                now = datetime.now(self._session_tz)
-                day_ratio = min(1.0, max(1.0 / 31.0, float(now.day) / 31.0))
-                target_progress = float(self.monthly_profit_target_pct) * day_ratio
-                progress_gap = float(self.monthly_return_pct) - target_progress
-                if progress_gap < -0.01 and daily_dd_pct < max(0.005, self.prop_rules.daily_dd_warning_pct * 0.5):
-                    risk_pct *= 1.10
-                elif progress_gap > 0.01:
-                    risk_pct *= 0.85
-            except Exception:
-                pass
+        if self.challenge_mode:
+            now = datetime.now(self._session_tz)
+            risk_pct *= self._challenge_progress_multiplier(equity, now, daily_dd_pct)
 
         risk_floor = float(getattr(self.settings.risk, "min_risk_per_trade", 0.0) or 0.0)
         risk_floor = max(0.0, min(risk_floor, self.settings.risk.max_risk_per_trade))
@@ -1050,14 +1176,14 @@ class RiskManager:
             if dd_pct >= (0.5 * self.settings.risk.daily_drawdown_limit):
                 self.prop_rules.max_trades_per_day = max(3, int(self.prop_rules.max_trades_per_day / 2))
         except Exception as e:
-            logger.warning(f"Loading stale risk state failed: {e}", exc_info=True)
+            logger.warning(f"Trade-close drawdown update failed: {e}", exc_info=True)
 
         try:
-            inferred_equity = self.day_start_equity - self.daily_loss + max(pnl, 0)
+            inferred_equity = self.day_start_equity + self.daily_profit - self.daily_loss
             if inferred_equity > self.total_peak_equity:
                 self.total_peak_equity = inferred_equity
                 self.risk_ledger.record("EQUITY_PEAK", f"New equity peak (from PnL): {inferred_equity:.2f}")
         except Exception as e:
-            logger.warning(f"Deleting stale state file failed: {e}", exc_info=True)
+            logger.warning(f"Trade-close equity tracking failed: {e}", exc_info=True)
 
         self.save_state()

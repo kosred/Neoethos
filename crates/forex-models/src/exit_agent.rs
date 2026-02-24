@@ -18,8 +18,6 @@ use tracing::info;
 /// - Training: Regret analysis on historical exits
 pub struct ExitAgent {
     py_agent: Option<Py<PyAny>>,
-    device: String,
-    epsilon: f64,
 }
 
 impl ExitAgent {
@@ -28,7 +26,7 @@ impl ExitAgent {
     pub fn new(device: Option<String>) -> Result<Self> {
         let device_str = device.unwrap_or_else(|| "cpu".to_string());
 
-        let py_agent = Python::with_gil(|py| {
+        let py_agent = Python::attach(|py| {
             // Import the Python module
             let exit_module = PyModule::import(py, "forex_bot.models.exit_agent")
                 .context("Failed to import forex_bot.models.exit_agent")?;
@@ -56,8 +54,6 @@ impl ExitAgent {
 
         Ok(Self {
             py_agent: Some(py_agent),
-            device: device_str,
-            epsilon: 0.2,
         })
     }
 
@@ -67,7 +63,7 @@ impl ExitAgent {
     /// state: [pnl, duration, volatility, momentum, ...] (6-dim vector)
     /// Returns: 0 (Hold) or 1 (Close)
     pub fn get_action(&self, state: &[f64], eval_mode: bool) -> Result<i32> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let agent = self.py_agent.as_ref()
                 .context("Exit agent not initialized")?
                 .bind(py);
@@ -93,7 +89,7 @@ impl ExitAgent {
         current_price: f64,
         timestamp: i64,
     ) -> Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let agent = self.py_agent.as_ref()
                 .context("Exit agent not initialized")?
                 .bind(py);
@@ -121,7 +117,7 @@ impl ExitAgent {
         future_price_trace: &[f64],
         direction: i32,
     ) -> Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let agent = self.py_agent.as_ref()
                 .context("Exit agent not initialized")?
                 .bind(py);
@@ -138,7 +134,7 @@ impl ExitAgent {
     /// Train the agent on accumulated experience
     /// Python lines 130-150
     pub fn train_step(&mut self) -> Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let agent = self.py_agent.as_ref()
                 .context("Exit agent not initialized")?
                 .bind(py);
@@ -151,7 +147,7 @@ impl ExitAgent {
 
     /// Get current epsilon (exploration rate)
     pub fn get_epsilon(&self) -> Result<f64> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let agent = self.py_agent.as_ref()
                 .context("Exit agent not initialized")?
                 .bind(py);
@@ -164,7 +160,7 @@ impl ExitAgent {
 
     /// Set epsilon (exploration rate)
     pub fn set_epsilon(&mut self, epsilon: f64) -> Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let agent = self.py_agent.as_ref()
                 .context("Exit agent not initialized")?
                 .bind(py);
@@ -177,7 +173,7 @@ impl ExitAgent {
 
     /// Get memory size
     pub fn memory_size(&self) -> Result<usize> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let agent = self.py_agent.as_ref()
                 .context("Exit agent not initialized")?
                 .bind(py);
@@ -192,7 +188,7 @@ impl ExitAgent {
     /// Save the model
     /// Python lines 158-159
     pub fn save(&self, path: &Path) -> Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let agent = self.py_agent.as_ref()
                 .context("Exit agent not initialized")?
                 .bind(py);
@@ -208,7 +204,7 @@ impl ExitAgent {
     /// Load the model
     /// Python lines 161-169
     pub fn load(&mut self, path: &Path) -> Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let agent = self.py_agent.as_ref()
                 .context("Exit agent not initialized")?
                 .bind(py);

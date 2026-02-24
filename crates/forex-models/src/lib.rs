@@ -25,7 +25,7 @@ pub mod genetic;
 // Exit agent (RL-based trade exit decisions)
 pub mod exit_agent;
 
-// Parallel trainer - TRUE multi-core training (each thread gets independent GIL)
+// Parallel trainer - multi-core training (Python-backed work still obeys GIL)
 pub mod parallel_trainer;
 
 // Temporarily disabled modules (dependency issues - will re-enable after porting core files)

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import time
+from collections import defaultdict
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -137,7 +138,7 @@ def _copy_attrs(src: pd.DataFrame, dst: pd.DataFrame) -> pd.DataFrame:
     return dst
 
 
-def _holdout_cfg(settings: Any) -> tuple[float, int, float, float, float, int, bool]:
+def _holdout_cfg(settings: Any) -> tuple[float, int, float, float, float, int, bool, float, float]:
     def _get(name: str, fallback: Any) -> Any:
         env = os.environ.get(name)
         if env is not None and str(env).strip() != "":
@@ -150,19 +151,59 @@ def _holdout_cfg(settings: Any) -> tuple[float, int, float, float, float, int, b
     min_win = float(_get("FOREX_BOT_PROP_HOLDOUT_MIN_WIN_RATE", getattr(settings.models, "prop_search_holdout_min_win_rate", 0.50)) or 0.50)
     min_pf = float(_get("FOREX_BOT_PROP_HOLDOUT_MIN_PROFIT_FACTOR", getattr(settings.models, "prop_search_holdout_min_profit_factor", 1.20)) or 1.20)
     min_tr = int(_get("FOREX_BOT_PROP_HOLDOUT_MIN_TRADES", getattr(settings.models, "prop_search_holdout_min_trades", 15)) or 15)
+    years = float(_get("FOREX_BOT_PROP_HOLDOUT_YEARS", getattr(settings.models, "prop_search_holdout_years", 0.0)) or 0.0)
+    min_truth = float(
+        _get(
+            "FOREX_BOT_MIN_TRUTH_PROBABILITY",
+            _get(
+                "FOREX_BOT_PROP_MIN_TRUTH_PROBABILITY",
+                getattr(settings.models, "prop_search_holdout_min_truth_probability", 0.0),
+            ),
+        )
+        or 0.0
+    )
+    if min_truth > 1.0:
+        min_truth *= 0.01
+    min_truth = float(min(1.0, max(0.0, min_truth)))
     required = str(
         _get("FOREX_BOT_PROP_HOLDOUT_REQUIRED", getattr(settings.models, "prop_search_holdout_required", False))
     ).strip().lower() in {"1", "true", "yes", "on"}
-    return frac, max(0, min_rows), min_sharpe, min_win, min_pf, max(0, min_tr), required
+    return frac, max(0, min_rows), min_sharpe, min_win, min_pf, max(0, min_tr), required, max(0.0, years), min_truth
 
 
 def _split_discovery_holdout(df: pd.DataFrame, settings: Any) -> tuple[pd.DataFrame, pd.DataFrame | None]:
-    frac, min_rows, *_ = _holdout_cfg(settings)
-    if frac <= 0.0 or df is None or df.empty:
+    frac, min_rows, *_base, holdout_years, _min_truth = _holdout_cfg(settings)
+    if df is None or df.empty:
         return df, None
     n = len(df)
     if n < max(1000, min_rows):
         return df, None
+
+    # Preferred mode: strict calendar holdout (e.g., last 3 years as forward test).
+    if holdout_years > 0.0 and isinstance(df.index, pd.DatetimeIndex):
+        try:
+            idx = df.index
+            if idx.tz is None:
+                idx2 = idx.tz_localize("UTC")
+            else:
+                idx2 = idx.tz_convert("UTC")
+        except Exception:
+            idx2 = df.index
+        try:
+            split_ts = idx2.max() - pd.Timedelta(days=float(holdout_years) * 365.2425)
+            hold_mask = idx2 >= split_ts
+            hold_n = int(np.count_nonzero(hold_mask))
+            split = int(n - hold_n)
+            if split >= 500 and hold_n >= max(500, min_rows):
+                search_df = _copy_attrs(df, df.iloc[:split].copy())
+                holdout_df = _copy_attrs(df, df.iloc[split:].copy())
+                return search_df, holdout_df
+        except Exception:
+            pass
+
+    if frac <= 0.0:
+        return df, None
+
     split = int(round(n * (1.0 - min(0.8, max(0.05, frac)))))
     split = max(500, min(n - 500, split))
     if split <= 0 or split >= n:
@@ -170,6 +211,58 @@ def _split_discovery_holdout(df: pd.DataFrame, settings: Any) -> tuple[pd.DataFr
     search_df = _copy_attrs(df, df.iloc[:split].copy())
     holdout_df = _copy_attrs(df, df.iloc[split:].copy())
     return search_df, holdout_df
+
+
+def _clamp01(value: float) -> float:
+    return float(min(1.0, max(0.0, float(value))))
+
+
+def _ratio01(num: float, den: float) -> float:
+    if den <= 0.0:
+        return 1.0 if num > 0.0 else 0.0
+    return _clamp01(num / den)
+
+
+def _truth_probability(
+    *,
+    in_sample_net: float,
+    in_sample_sharpe: float,
+    in_sample_win: float,
+    in_sample_pf: float,
+    holdout_net: float,
+    holdout_sharpe: float,
+    holdout_win: float,
+    holdout_pf: float,
+    holdout_trades: float,
+    holdout_monthly_profit_pct: float,
+    min_sharpe: float,
+    min_win: float,
+    min_pf: float,
+    min_trades: float,
+) -> float:
+    quality = (
+        0.35 * _ratio01(max(0.0, holdout_sharpe), max(1e-9, min_sharpe))
+        + 0.25 * _ratio01(max(0.0, holdout_win), max(1e-9, min_win))
+        + 0.25 * _ratio01(max(0.0, holdout_pf), max(1e-9, min_pf))
+        + 0.15 * _ratio01(max(0.0, holdout_trades), max(1e-9, float(min_trades)))
+    )
+
+    stability = (
+        0.40 * _ratio01(max(0.0, holdout_net), max(1e-9, max(0.0, in_sample_net) * 0.35))
+        + 0.20 * _ratio01(max(0.0, holdout_sharpe), max(1e-9, max(0.0, in_sample_sharpe) * 0.60))
+        + 0.20 * _ratio01(max(0.0, holdout_pf), max(1e-9, max(0.0, in_sample_pf) * 0.60))
+        + 0.20 * _clamp01(1.0 - (abs(holdout_win - in_sample_win) / 0.25))
+    )
+
+    monthly_target = max(_env_float("FOREX_BOT_PROP_KEEP_MIN_MONTHLY_PROFIT_PCT", 0.0), 0.005)
+    monthly = _ratio01(max(0.0, holdout_monthly_profit_pct), monthly_target)
+
+    score = 0.50 * quality + 0.35 * stability + 0.15 * monthly
+    if holdout_net <= 0.0:
+        score *= 0.30
+    if holdout_trades < float(min_trades):
+        score *= 0.60
+    return _clamp01(score)
 
 
 def _apply_holdout_validation(
@@ -181,12 +274,18 @@ def _apply_holdout_validation(
     min_profit: float,
     min_trades: float,
     initial_balance: float,
+    search_history_months: float | None = None,
 ) -> list[TALibStrategyGene]:
-    if not selected or holdout_df is None or holdout_df.empty:
+    if not selected:
         return selected
 
-    frac, _min_rows, min_sharpe, min_win, min_pf, min_tr_holdout, required = _holdout_cfg(settings)
-    if frac <= 0.0:
+    frac, _min_rows, min_sharpe, min_win, min_pf, min_tr_holdout, required, holdout_years, min_truth = _holdout_cfg(settings)
+    if frac <= 0.0 and holdout_years <= 0.0:
+        return selected
+    if holdout_df is None or holdout_df.empty:
+        if required:
+            logger.warning("Holdout validation required but holdout split is unavailable; dropping selected strategies.")
+            return []
         return selected
 
     try:
@@ -198,45 +297,103 @@ def _apply_holdout_validation(
         cache = mixer.bulk_calculate_indicators(holdout_df, selected)
         _days, holdout_months = _history_span_days_months(holdout_df)
         passed: list[TALibStrategyGene] = []
+        search_months = float(search_history_months or 0.0)
+        init_bal = max(1e-9, float(initial_balance))
         for gene in selected:
+            in_sample_net = float(getattr(gene, "net_profit", 0.0) or 0.0)
+            in_sample_sharpe = float(getattr(gene, "sharpe_ratio", 0.0) or 0.0)
+            in_sample_win = float(getattr(gene, "win_rate", 0.0) or 0.0)
+            in_sample_pf = float(getattr(gene, "profit_factor", 0.0) or 0.0)
+            in_sample_trades = float(getattr(gene, "trades", 0.0) or 0.0)
+            in_sample_dd = float(getattr(gene, "max_dd_pct", 0.0) or 0.0)
+
             g_eval = replace(gene)
+            g_eval.in_sample_net_profit = in_sample_net
+            g_eval.in_sample_sharpe_ratio = in_sample_sharpe
+            g_eval.in_sample_win_rate = in_sample_win
+            g_eval.in_sample_profit_factor = in_sample_pf
+            g_eval.in_sample_trades = in_sample_trades
+            g_eval.in_sample_max_dd_pct = in_sample_dd
+            g_eval.in_sample_months = max(0.0, search_months)
             _evaluate_gene(holdout_df, g_eval, mixer, cache, settings)
-            if not _strategy_passes_filter(
+
+            holdout_net = float(getattr(g_eval, "net_profit", 0.0) or 0.0)
+            holdout_sharpe = float(getattr(g_eval, "sharpe_ratio", 0.0) or 0.0)
+            holdout_win = float(getattr(g_eval, "win_rate", 0.0) or 0.0)
+            holdout_pf = float(getattr(g_eval, "profit_factor", 0.0) or 0.0)
+            holdout_trades = float(getattr(g_eval, "trades", 0.0) or 0.0)
+            holdout_dd = float(getattr(g_eval, "max_dd_pct", 0.0) or 0.0)
+            holdout_tpm = (holdout_trades / holdout_months) if holdout_months > 0.0 else 0.0
+            holdout_monthly_pct = (holdout_net / (init_bal * holdout_months)) if holdout_months > 0.0 else 0.0
+
+            g_eval.holdout_net_profit = holdout_net
+            g_eval.holdout_sharpe_ratio = holdout_sharpe
+            g_eval.holdout_win_rate = holdout_win
+            g_eval.holdout_profit_factor = holdout_pf
+            g_eval.holdout_trades = holdout_trades
+            g_eval.holdout_max_dd_pct = holdout_dd
+            g_eval.holdout_months = holdout_months
+            g_eval.holdout_trades_per_month = holdout_tpm
+            g_eval.holdout_monthly_profit_pct = holdout_monthly_pct
+            g_eval.truth_probability = _truth_probability(
+                in_sample_net=in_sample_net,
+                in_sample_sharpe=in_sample_sharpe,
+                in_sample_win=in_sample_win,
+                in_sample_pf=in_sample_pf,
+                holdout_net=holdout_net,
+                holdout_sharpe=holdout_sharpe,
+                holdout_win=holdout_win,
+                holdout_pf=holdout_pf,
+                holdout_trades=holdout_trades,
+                holdout_monthly_profit_pct=holdout_monthly_pct,
+                min_sharpe=min_sharpe,
+                min_win=min_win,
+                min_pf=min_pf,
+                min_trades=max(min_trades, float(min_tr_holdout)),
+            )
+
+            passed_filters = _strategy_passes_filter(
                 g_eval,
                 max_dd=max_dd,
                 min_profit=min_profit,
                 min_trades=max(min_trades, float(min_tr_holdout)),
                 history_months=holdout_months,
                 initial_balance=initial_balance,
-            ):
-                continue
+            )
             if float(getattr(g_eval, "sharpe_ratio", 0.0) or 0.0) < float(min_sharpe):
-                continue
+                passed_filters = False
             if float(getattr(g_eval, "win_rate", 0.0) or 0.0) < float(min_win):
-                continue
+                passed_filters = False
             if float(getattr(g_eval, "profit_factor", 0.0) or 0.0) < float(min_pf):
-                continue
-            passed.append(g_eval)
+                passed_filters = False
+            if float(getattr(g_eval, "truth_probability", 0.0) or 0.0) < float(min_truth):
+                passed_filters = False
+
+            g_eval.forward_test_passed = bool(passed_filters)
+            if g_eval.forward_test_passed:
+                passed.append(g_eval)
 
         if not passed:
             logger.warning(
-                "Holdout validation kept 0/%s strategies (required=%s, min_sharpe=%.2f, min_win=%.2f, min_pf=%.2f).",
+                "Holdout validation kept 0/%s strategies (required=%s, min_sharpe=%.2f, min_win=%.2f, min_pf=%.2f, min_truth=%.2f).",
                 len(selected),
                 required,
                 min_sharpe,
                 min_win,
                 min_pf,
+                min_truth,
             )
             return [] if required else selected
 
         passed = _dedupe_ranked(passed)
         logger.info(
-            "Holdout validation kept %s/%s strategies (min_sharpe=%.2f, min_win=%.2f, min_pf=%.2f).",
+            "Holdout validation kept %s/%s strategies (min_sharpe=%.2f, min_win=%.2f, min_pf=%.2f, min_truth=%.2f).",
             len(passed),
             len(selected),
             min_sharpe,
             min_win,
             min_pf,
+            min_truth,
         )
         return passed
     except Exception as exc:
@@ -245,6 +402,27 @@ def _apply_holdout_validation(
 
 
 def _gene_to_dict(gene: TALibStrategyGene) -> dict[str, Any]:
+    in_trades = float(getattr(gene, "in_sample_trades", 0.0) or 0.0)
+    in_months = float(getattr(gene, "in_sample_months", 0.0) or 0.0)
+    hold_trades = float(getattr(gene, "holdout_trades", 0.0) or 0.0)
+    hold_months = float(getattr(gene, "holdout_months", 0.0) or 0.0)
+    in_net = float(getattr(gene, "in_sample_net_profit", 0.0) or 0.0)
+    hold_net = float(getattr(gene, "holdout_net_profit", 0.0) or 0.0)
+    bal = max(1e-9, _safe_float(os.environ.get("FOREX_BOT_PROP_INITIAL_BALANCE", 100000.0), 100000.0))
+
+    in_profit_per_trade = (in_net / in_trades) if in_trades > 0.0 else 0.0
+    hold_profit_per_trade = (hold_net / hold_trades) if hold_trades > 0.0 else 0.0
+    in_tpm = (in_trades / in_months) if in_months > 0.0 else 0.0
+    hold_tpm = float(getattr(gene, "holdout_trades_per_month", 0.0) or 0.0)
+    if hold_tpm <= 0.0 and hold_months > 0.0:
+        hold_tpm = hold_trades / hold_months
+    in_monthly_profit_pct = (in_net / (bal * in_months)) if in_months > 0.0 else 0.0
+    hold_monthly_profit_pct = float(getattr(gene, "holdout_monthly_profit_pct", 0.0) or 0.0)
+    if hold_monthly_profit_pct <= 0.0 and hold_months > 0.0:
+        hold_monthly_profit_pct = hold_net / (bal * hold_months)
+    in_journal = dict(getattr(gene, "in_sample_journal", {}) or {})
+    hold_journal = dict(getattr(gene, "holdout_journal", {}) or {})
+
     return {
         "indicators": list(gene.indicators),
         "params": gene.params,
@@ -272,6 +450,95 @@ def _gene_to_dict(gene: TALibStrategyGene) -> dict[str, Any]:
         "use_inducement": bool(getattr(gene, "use_inducement", False)),
         "tp_pips": float(getattr(gene, "tp_pips", 40.0)),
         "sl_pips": float(getattr(gene, "sl_pips", 20.0)),
+        "in_sample_net_profit": in_net,
+        "in_sample_sharpe_ratio": float(getattr(gene, "in_sample_sharpe_ratio", 0.0) or 0.0),
+        "in_sample_win_rate": float(getattr(gene, "in_sample_win_rate", 0.0) or 0.0),
+        "in_sample_profit_factor": float(getattr(gene, "in_sample_profit_factor", 0.0) or 0.0),
+        "in_sample_trades": in_trades,
+        "in_sample_max_dd_pct": float(getattr(gene, "in_sample_max_dd_pct", 0.0) or 0.0),
+        "in_sample_months": in_months,
+        "in_sample_trades_per_month": in_tpm,
+        "in_sample_profit_per_trade": in_profit_per_trade,
+        "in_sample_monthly_profit_pct": in_monthly_profit_pct,
+        "holdout_net_profit": hold_net,
+        "holdout_sharpe_ratio": float(getattr(gene, "holdout_sharpe_ratio", 0.0) or 0.0),
+        "holdout_win_rate": float(getattr(gene, "holdout_win_rate", 0.0) or 0.0),
+        "holdout_profit_factor": float(getattr(gene, "holdout_profit_factor", 0.0) or 0.0),
+        "holdout_trades": hold_trades,
+        "holdout_max_dd_pct": float(getattr(gene, "holdout_max_dd_pct", 0.0) or 0.0),
+        "holdout_months": hold_months,
+        "holdout_trades_per_month": hold_tpm,
+        "holdout_profit_per_trade": hold_profit_per_trade,
+        "holdout_monthly_profit_pct": hold_monthly_profit_pct,
+        "truth_probability": float(getattr(gene, "truth_probability", 0.0) or 0.0),
+        "forward_test_passed": bool(getattr(gene, "forward_test_passed", False)),
+        "in_sample_avg_holding_hours": float(in_journal.get("avg_holding_hours", 0.0) or 0.0),
+        "holdout_avg_holding_hours": float(hold_journal.get("avg_holding_hours", 0.0) or 0.0),
+        "in_sample_trades_per_day": float(in_journal.get("avg_trades_per_day", 0.0) or 0.0),
+        "holdout_trades_per_day": float(hold_journal.get("avg_trades_per_day", 0.0) or 0.0),
+        "in_sample_wins": float(in_journal.get("wins", 0.0) or 0.0),
+        "in_sample_losses": float(in_journal.get("losses", 0.0) or 0.0),
+        "holdout_wins": float(hold_journal.get("wins", 0.0) or 0.0),
+        "holdout_losses": float(hold_journal.get("losses", 0.0) or 0.0),
+        "in_sample_trade_dd_pct": float(in_journal.get("avg_trade_dd_pct", 0.0) or 0.0),
+        "holdout_trade_dd_pct": float(hold_journal.get("avg_trade_dd_pct", 0.0) or 0.0),
+        "in_sample_journal": in_journal,
+        "holdout_journal": hold_journal,
+    }
+
+
+def _journal_summary(genes: list[TALibStrategyGene]) -> dict[str, Any]:
+    if not genes:
+        return {"count": 0}
+    truth = np.asarray([float(getattr(g, "truth_probability", 0.0) or 0.0) for g in genes], dtype=np.float64)
+    hold_monthly = np.asarray(
+        [float(getattr(g, "holdout_monthly_profit_pct", 0.0) or 0.0) for g in genes],
+        dtype=np.float64,
+    )
+    hold_tpm = np.asarray(
+        [float(getattr(g, "holdout_trades_per_month", 0.0) or 0.0) for g in genes],
+        dtype=np.float64,
+    )
+    hold_net = np.asarray([float(getattr(g, "holdout_net_profit", 0.0) or 0.0) for g in genes], dtype=np.float64)
+    hold_trades = np.asarray([float(getattr(g, "holdout_trades", 0.0) or 0.0) for g in genes], dtype=np.float64)
+    ppt = np.divide(hold_net, np.maximum(hold_trades, 1e-9))
+    hold_journals = [dict(getattr(g, "holdout_journal", {}) or {}) for g in genes]
+    hold_journals = [j for j in hold_journals if bool(j.get("computed", False))]
+    avg_hold_hours = float(
+        np.mean(
+            np.asarray([float(j.get("avg_holding_hours", 0.0) or 0.0) for j in hold_journals], dtype=np.float64)
+        )
+    ) if hold_journals else 0.0
+    avg_trades_day = float(
+        np.mean(
+            np.asarray([float(j.get("avg_trades_per_day", 0.0) or 0.0) for j in hold_journals], dtype=np.float64)
+        )
+    ) if hold_journals else 0.0
+    avg_trade_dd_pct = float(
+        np.mean(
+            np.asarray([float(j.get("avg_trade_dd_pct", 0.0) or 0.0) for j in hold_journals], dtype=np.float64)
+        )
+    ) if hold_journals else 0.0
+    return {
+        "count": int(len(genes)),
+        "avg_truth_probability": float(np.mean(truth)),
+        "min_truth_probability": float(np.min(truth)),
+        "avg_holdout_monthly_profit_pct": float(np.mean(hold_monthly)),
+        "avg_holdout_trades_per_month": float(np.mean(hold_tpm)),
+        "avg_holdout_profit_per_trade": float(np.mean(ppt)),
+        "avg_holdout_sharpe_ratio": float(
+            np.mean(np.asarray([float(getattr(g, "holdout_sharpe_ratio", 0.0) or 0.0) for g in genes], dtype=np.float64))
+        ),
+        "avg_holdout_win_rate": float(
+            np.mean(np.asarray([float(getattr(g, "holdout_win_rate", 0.0) or 0.0) for g in genes], dtype=np.float64))
+        ),
+        "avg_holdout_profit_factor": float(
+            np.mean(np.asarray([float(getattr(g, "holdout_profit_factor", 0.0) or 0.0) for g in genes], dtype=np.float64))
+        ),
+        "journal_coverage": float(len(hold_journals)) / float(len(genes)) if genes else 0.0,
+        "avg_holdout_holding_hours": avg_hold_hours,
+        "avg_holdout_trades_per_day": avg_trades_day,
+        "avg_holdout_trade_dd_pct": avg_trade_dd_pct,
     }
 
 
@@ -574,6 +841,417 @@ def _resolve_sl_tp(
     sl_pips = float(getattr(gene, "sl_pips", 30.0) or 30.0)
     tp_pips = float(getattr(gene, "tp_pips", 60.0) or 60.0)
     return float(sl_pips), float(tp_pips)
+
+
+def _timeframe_hours(tf: str) -> float:
+    raw = str(tf or "").strip().upper()
+    if not raw:
+        return 1.0 / 60.0
+    try:
+        if raw.startswith("MN"):
+            n = max(1.0, float(raw[2:] or 1.0))
+            return n * 24.0 * 30.4375
+        unit = raw[0]
+        n = max(1.0, float(raw[1:] or 1.0))
+        if unit == "M":
+            return n / 60.0
+        if unit == "H":
+            return n
+        if unit == "D":
+            return n * 24.0
+        if unit == "W":
+            return n * 24.0 * 7.0
+    except Exception:
+        return 1.0 / 60.0
+    return 1.0 / 60.0
+
+
+def _index_ms_and_bar_hours(df: pd.DataFrame) -> tuple[np.ndarray | None, float]:
+    idx = df.index
+    if isinstance(idx, pd.DatetimeIndex) and len(idx) > 0:
+        try:
+            if idx.tz is None:
+                i2 = idx.tz_localize("UTC")
+            else:
+                i2 = idx.tz_convert("UTC")
+        except Exception:
+            i2 = idx
+        i64 = i2.view("int64")
+        if hasattr(i64, "to_numpy"):
+            i64 = i64.to_numpy(dtype=np.int64, copy=False)
+        else:
+            i64 = np.asarray(i64, dtype=np.int64)
+        raw = np.asarray(i64, dtype=np.int64)
+        abs_max = float(np.max(np.abs(raw))) if raw.size > 0 else 0.0
+        # Support pandas int64 datetime representations in ns/us/ms/s.
+        if abs_max > 1e16:
+            scale_to_ms = 1.0 / 1_000_000.0  # ns -> ms
+        elif abs_max > 1e13:
+            scale_to_ms = 1.0 / 1_000.0  # us -> ms
+        elif abs_max > 1e11:
+            scale_to_ms = 1.0  # ms -> ms
+        else:
+            scale_to_ms = 1_000.0  # s -> ms
+        ts_ms = np.asarray(np.round(raw.astype(np.float64) * scale_to_ms), dtype=np.int64)
+        if ts_ms.size >= 2:
+            delta = np.diff(ts_ms)
+            delta = delta[delta > 0]
+            if delta.size > 0:
+                bar_hours = float(np.median(delta) / 3_600_000.0)
+                return ts_ms, max(1e-9, bar_hours)
+        return ts_ms, _timeframe_hours(str(df.attrs.get("timeframe", df.attrs.get("tf", "M1"))))
+    return None, _timeframe_hours(str(df.attrs.get("timeframe", df.attrs.get("tf", "M1"))))
+
+
+def _trade_journal_from_signals(
+    *,
+    df: pd.DataFrame,
+    signals: np.ndarray,
+    sl_pips: float,
+    tp_pips: float,
+    pip_value: float,
+    pip_value_per_lot: float,
+    spread_pips: float,
+    commission_per_trade: float,
+    max_hold_bars: int = 0,
+    trailing_enabled: bool = False,
+    trailing_atr_multiplier: float = 1.0,
+    trailing_be_trigger_r: float = 1.0,
+) -> dict[str, Any]:
+    n = int(len(df))
+    if n <= 1:
+        return {"computed": False, "reason": "insufficient_rows"}
+
+    close = df["close"].to_numpy(dtype=np.float64, copy=False)
+    high = df["high"].to_numpy(dtype=np.float64, copy=False)
+    low = df["low"].to_numpy(dtype=np.float64, copy=False)
+    sig = np.asarray(signals, dtype=np.int8)
+    if sig.shape[0] != n:
+        return {"computed": False, "reason": "shape_mismatch"}
+
+    ts_ms, bar_hours = _index_ms_and_bar_hours(df)
+    pip_value = float(max(1e-12, abs(pip_value)))
+    cash_per_pip = float(pip_value_per_lot)
+    swap_long_per_day = _env_float("FOREX_BOT_PROP_SWAP_LONG_PER_DAY", 0.0)
+    swap_short_per_day = _env_float("FOREX_BOT_PROP_SWAP_SHORT_PER_DAY", 0.0)
+
+    in_position = 0
+    entry_price = 0.0
+    entry_i = -1
+    trail_price = 0.0
+    trade_adverse = 0.0
+
+    equity = 100000.0
+    peak_equity = equity
+
+    holds_hours: list[float] = []
+    trade_pnl: list[float] = []
+    trade_pnl_after_swap: list[float] = []
+    trade_dd_pct: list[float] = []
+    eq_dd_after_trade_pct: list[float] = []
+    swap_costs: list[float] = []
+
+    monthly: dict[str, dict[str, float]] = defaultdict(
+        lambda: {
+            "trades": 0.0,
+            "wins": 0.0,
+            "losses": 0.0,
+            "net_profit": 0.0,
+            "swap_total": 0.0,
+            "hold_hours_total": 0.0,
+            "trade_dd_pct_total": 0.0,
+        }
+    )
+    daily_counts: dict[str, int] = defaultdict(int)
+
+    for i in range(1, n):
+        if in_position != 0:
+            current_low = float(low[i])
+            current_high = float(high[i])
+            if in_position == 1:
+                adverse = max(0.0, (entry_price - current_low) / max(1e-12, entry_price))
+            else:
+                adverse = max(0.0, (current_high - entry_price) / max(1e-12, entry_price))
+            if adverse > trade_adverse:
+                trade_adverse = adverse
+
+            pnl = 0.0
+            exit_signal = False
+            if in_position == 1:
+                sl_price = entry_price - (float(sl_pips) * pip_value)
+                tp_price = entry_price + (float(tp_pips) * pip_value)
+                if trailing_enabled:
+                    mv = current_high - entry_price
+                    if mv >= (float(trailing_be_trigger_r) * float(sl_pips) * pip_value):
+                        trail_dist = float(trailing_atr_multiplier) * float(sl_pips) * pip_value
+                        candidate = current_high - trail_dist
+                        if trail_price == 0.0 or candidate > trail_price:
+                            trail_price = candidate
+                        if trail_price > sl_price:
+                            sl_price = trail_price
+                if current_low <= sl_price:
+                    pnl = (sl_price - entry_price) / pip_value * cash_per_pip
+                    exit_signal = True
+                elif current_high >= tp_price:
+                    pnl = (tp_price - entry_price) / pip_value * cash_per_pip
+                    exit_signal = True
+            else:
+                sl_price = entry_price + (float(sl_pips) * pip_value)
+                tp_price = entry_price - (float(tp_pips) * pip_value)
+                if trailing_enabled:
+                    mv = entry_price - current_low
+                    if mv >= (float(trailing_be_trigger_r) * float(sl_pips) * pip_value):
+                        trail_dist = float(trailing_atr_multiplier) * float(sl_pips) * pip_value
+                        candidate = current_low + trail_dist
+                        if trail_price == 0.0 or candidate < trail_price:
+                            trail_price = candidate
+                        if trail_price < sl_price:
+                            sl_price = trail_price
+                if current_high >= sl_price:
+                    pnl = (entry_price - sl_price) / pip_value * cash_per_pip
+                    exit_signal = True
+                elif current_low <= tp_price:
+                    pnl = (entry_price - tp_price) / pip_value * cash_per_pip
+                    exit_signal = True
+
+            if not exit_signal and max_hold_bars > 0 and entry_i >= 0 and (i - entry_i) >= int(max_hold_bars):
+                if in_position == 1:
+                    pnl = (close[i] - entry_price) / pip_value * cash_per_pip
+                else:
+                    pnl = (entry_price - close[i]) / pip_value * cash_per_pip
+                exit_signal = True
+
+            if not exit_signal:
+                s = int(sig[i - 1])
+                if in_position == 1 and s == -1:
+                    pnl = (close[i] - entry_price) / pip_value * cash_per_pip
+                    exit_signal = True
+                elif in_position == -1 and s == 1:
+                    pnl = (entry_price - close[i]) / pip_value * cash_per_pip
+                    exit_signal = True
+
+            if exit_signal:
+                hold_h = float(i - entry_i) * bar_hours if entry_i >= 0 else 0.0
+                if ts_ms is not None and entry_i >= 0 and i < ts_ms.size and entry_i < ts_ms.size:
+                    hold_h = max(0.0, float(ts_ms[i] - ts_ms[entry_i]) / 3_600_000.0)
+                swap_rate = swap_long_per_day if in_position == 1 else swap_short_per_day
+                swap_cost = max(0.0, hold_h / 24.0) * float(swap_rate)
+                pnl_net = float(pnl) - float(commission_per_trade) - float(swap_cost)
+
+                equity += pnl_net
+                peak_equity = max(peak_equity, equity)
+                eq_dd = (peak_equity - equity) / max(1e-9, peak_equity)
+
+                holds_hours.append(hold_h)
+                trade_pnl.append(float(pnl) - float(commission_per_trade))
+                trade_pnl_after_swap.append(pnl_net)
+                trade_dd_pct.append(float(trade_adverse))
+                eq_dd_after_trade_pct.append(float(eq_dd))
+                swap_costs.append(float(swap_cost))
+
+                if ts_ms is not None and i < ts_ms.size:
+                    dt = pd.Timestamp(int(ts_ms[i]), unit="ms", tz="UTC")
+                    month_key = dt.strftime("%Y-%m")
+                    day_key = dt.strftime("%Y-%m-%d")
+                else:
+                    month_key = f"m_{int(i // max(1, 30 * 24 / max(1e-9, bar_hours)))}"
+                    day_key = f"d_{int(i // max(1, 24 / max(1e-9, bar_hours)))}"
+                daily_counts[day_key] += 1
+                m = monthly[month_key]
+                m["trades"] += 1.0
+                if pnl_net > 0.0:
+                    m["wins"] += 1.0
+                else:
+                    m["losses"] += 1.0
+                m["net_profit"] += float(pnl_net)
+                m["swap_total"] += float(swap_cost)
+                m["hold_hours_total"] += float(hold_h)
+                m["trade_dd_pct_total"] += float(trade_adverse)
+
+                in_position = 0
+                entry_i = -1
+                trail_price = 0.0
+                trade_adverse = 0.0
+
+        if in_position == 0:
+            s = int(sig[i - 1])
+            if s == 1:
+                in_position = 1
+                entry_price = float(close[i]) + (float(spread_pips) * pip_value)
+                entry_i = i
+                trail_price = 0.0
+                trade_adverse = 0.0
+            elif s == -1:
+                in_position = -1
+                entry_price = float(close[i]) - (float(spread_pips) * pip_value)
+                entry_i = i
+                trail_price = 0.0
+                trade_adverse = 0.0
+
+    history_days, history_months = _history_span_days_months(df)
+    trades = int(len(trade_pnl_after_swap))
+    wins = int(sum(1 for p in trade_pnl_after_swap if p > 0.0))
+    losses = int(sum(1 for p in trade_pnl_after_swap if p <= 0.0))
+    net_after_swap = float(np.sum(np.asarray(trade_pnl_after_swap, dtype=np.float64))) if trades > 0 else 0.0
+    net_no_swap = float(np.sum(np.asarray(trade_pnl, dtype=np.float64))) if trades > 0 else 0.0
+    avg_hold = float(np.mean(holds_hours)) if holds_hours else 0.0
+    median_hold = float(np.median(holds_hours)) if holds_hours else 0.0
+    p90_hold = float(np.quantile(np.asarray(holds_hours, dtype=np.float64), 0.90)) if holds_hours else 0.0
+    max_hold = float(np.max(np.asarray(holds_hours, dtype=np.float64))) if holds_hours else 0.0
+    avg_dd_trade = float(np.mean(trade_dd_pct)) if trade_dd_pct else 0.0
+    max_dd_trade = float(np.max(np.asarray(trade_dd_pct, dtype=np.float64))) if trade_dd_pct else 0.0
+    avg_eq_dd_trade = float(np.mean(eq_dd_after_trade_pct)) if eq_dd_after_trade_pct else 0.0
+    max_eq_dd_trade = float(np.max(np.asarray(eq_dd_after_trade_pct, dtype=np.float64))) if eq_dd_after_trade_pct else 0.0
+
+    monthly_out: dict[str, dict[str, float]] = {}
+    for key in sorted(monthly.keys()):
+        m = monthly[key]
+        tr = float(m["trades"])
+        wins_m = float(m["wins"])
+        hold_total = float(m["hold_hours_total"])
+        dd_total = float(m["trade_dd_pct_total"])
+        net_m = float(m["net_profit"])
+        monthly_out[key] = {
+            "trades": tr,
+            "wins": wins_m,
+            "losses": float(m["losses"]),
+            "win_rate": (wins_m / tr) if tr > 0.0 else 0.0,
+            "net_profit": net_m,
+            "swap_total": float(m["swap_total"]),
+            "profit_per_trade": (net_m / tr) if tr > 0.0 else 0.0,
+            "avg_holding_hours": (hold_total / tr) if tr > 0.0 else 0.0,
+            "avg_trade_dd_pct": (dd_total / tr) if tr > 0.0 else 0.0,
+        }
+
+    active_days = len(daily_counts)
+    max_trades_day = max(daily_counts.values()) if daily_counts else 0
+    avg_trades_active_day = (trades / active_days) if active_days > 0 else 0.0
+    avg_trades_day = (trades / history_days) if history_days > 0.0 else 0.0
+    avg_trades_month = (trades / history_months) if history_months > 0.0 else 0.0
+
+    return {
+        "computed": True,
+        "history_days": float(history_days),
+        "history_months": float(history_months),
+        "trade_count": float(trades),
+        "wins": float(wins),
+        "losses": float(losses),
+        "win_rate": (float(wins) / float(trades)) if trades > 0 else 0.0,
+        "net_profit": net_after_swap,
+        "net_profit_no_swap": net_no_swap,
+        "swap_total": float(np.sum(np.asarray(swap_costs, dtype=np.float64))) if swap_costs else 0.0,
+        "avg_swap_per_trade": (float(np.mean(swap_costs)) if swap_costs else 0.0),
+        "profit_per_trade": (net_after_swap / float(trades)) if trades > 0 else 0.0,
+        "avg_holding_hours": avg_hold,
+        "median_holding_hours": median_hold,
+        "p90_holding_hours": p90_hold,
+        "max_holding_hours": max_hold,
+        "avg_trades_per_day": avg_trades_day,
+        "avg_trades_per_month": avg_trades_month,
+        "avg_trades_active_day": avg_trades_active_day,
+        "max_trades_single_day": float(max_trades_day),
+        "active_days": float(active_days),
+        "avg_trade_dd_pct": avg_dd_trade,
+        "max_trade_dd_pct": max_dd_trade,
+        "avg_equity_dd_after_trade_pct": avg_eq_dd_trade,
+        "max_equity_dd_after_trade_pct": max_eq_dd_trade,
+        "monthly": monthly_out,
+    }
+
+
+def _attach_trade_journals(
+    *,
+    selected: list[TALibStrategyGene],
+    search_df: pd.DataFrame,
+    holdout_df: pd.DataFrame | None,
+    settings: Any,
+) -> None:
+    if not selected:
+        return
+    top_k = int(max(0.0, _env_float("FOREX_BOT_PROP_JOURNAL_TOP_K", 10.0)))
+    if top_k <= 0:
+        return
+
+    targets = selected[: min(len(selected), top_k)]
+    try:
+        mixer = TALibStrategyMixer()
+        if not mixer.available_indicators:
+            return
+        search_cache = mixer.bulk_calculate_indicators(search_df, targets)
+        holdout_cache = mixer.bulk_calculate_indicators(holdout_df, targets) if holdout_df is not None and not holdout_df.empty else None
+    except Exception as exc:
+        logger.warning("Trade journal precompute failed: %s", exc)
+        return
+
+    spread = float(os.environ.get("FOREX_BOT_PROP_EVAL_SPREAD_PIPS", "1.5") or 1.5)
+    commission = float(os.environ.get("FOREX_BOT_PROP_EVAL_COMMISSION", "7.0") or 7.0)
+
+    for gene in targets:
+        try:
+            sig_search = mixer.compute_signals(search_df, gene, cache=search_cache).fillna(0.0).to_numpy(dtype=np.int8)
+            close = search_df["close"].to_numpy(dtype=np.float64)
+            high = search_df["high"].to_numpy(dtype=np.float64)
+            low = search_df["low"].to_numpy(dtype=np.float64)
+            open_ = search_df["open"].to_numpy(dtype=np.float64) if "open" in search_df.columns else close
+            atr_vals = search_df["atr"].to_numpy(dtype=np.float64) if "atr" in search_df.columns else None
+            pip_size, pip_val = _df_pip_metrics(search_df, close=close)
+            sl_pips, tp_pips = _resolve_sl_tp(
+                gene=gene,
+                settings=settings,
+                pip_size=pip_size,
+                open_prices=open_,
+                high_prices=high,
+                low_prices=low,
+                close_prices=close,
+                atr_values=atr_vals,
+            )
+            gene.in_sample_journal = _trade_journal_from_signals(
+                df=search_df,
+                signals=sig_search,
+                sl_pips=sl_pips,
+                tp_pips=tp_pips,
+                pip_value=pip_size,
+                pip_value_per_lot=pip_val,
+                spread_pips=spread,
+                commission_per_trade=commission,
+            )
+        except Exception as exc:
+            gene.in_sample_journal = {"computed": False, "reason": f"error:{exc}"}
+
+        if holdout_df is None or holdout_df.empty:
+            gene.holdout_journal = {"computed": False, "reason": "no_holdout"}
+            continue
+
+        try:
+            sig_hold = mixer.compute_signals(holdout_df, gene, cache=holdout_cache).fillna(0.0).to_numpy(dtype=np.int8)
+            close_h = holdout_df["close"].to_numpy(dtype=np.float64)
+            high_h = holdout_df["high"].to_numpy(dtype=np.float64)
+            low_h = holdout_df["low"].to_numpy(dtype=np.float64)
+            open_h = holdout_df["open"].to_numpy(dtype=np.float64) if "open" in holdout_df.columns else close_h
+            atr_h = holdout_df["atr"].to_numpy(dtype=np.float64) if "atr" in holdout_df.columns else None
+            pip_size_h, pip_val_h = _df_pip_metrics(holdout_df, close=close_h)
+            sl_h, tp_h = _resolve_sl_tp(
+                gene=gene,
+                settings=settings,
+                pip_size=pip_size_h,
+                open_prices=open_h,
+                high_prices=high_h,
+                low_prices=low_h,
+                close_prices=close_h,
+                atr_values=atr_h,
+            )
+            gene.holdout_journal = _trade_journal_from_signals(
+                df=holdout_df,
+                signals=sig_hold,
+                sl_pips=sl_h,
+                tp_pips=tp_h,
+                pip_value=pip_size_h,
+                pip_value_per_lot=pip_val_h,
+                spread_pips=spread,
+                commission_per_trade=commission,
+            )
+        except Exception as exc:
+            gene.holdout_journal = {"computed": False, "reason": f"error:{exc}"}
 
 
 def _evaluate_gene(
@@ -1007,6 +1685,7 @@ def run_evo_search(
     symbol = str(search_df.attrs.get("symbol", "") or "")
     timeframe = str(search_df.attrs.get("timeframe", search_df.attrs.get("tf", "")) or "")
     history_days, history_months = _history_span_days_months(search_df)
+    holdout_frac, _holdout_min_rows, holdout_min_sharpe, holdout_min_win, holdout_min_pf, holdout_min_trades, holdout_required, holdout_years, min_truth = _holdout_cfg(settings)
     if (_RUST_SEARCH or _RUST_GPU_SEARCH) and _fb is not None:
         try:
             ts = None
@@ -1302,7 +1981,15 @@ def run_evo_search(
                 min_profit=min_profit,
                 min_trades=min_trades,
                 initial_balance=actual_balance,
+                search_history_months=history_months,
             )
+            _attach_trade_journals(
+                selected=selected,
+                search_df=search_df,
+                holdout_df=holdout_df,
+                settings=settings,
+            )
+            journal = _journal_summary(selected)
 
             payload = {
                 "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1313,7 +2000,16 @@ def run_evo_search(
                 "holdout_rows": int(len(holdout_df)) if holdout_df is not None else 0,
                 "history_days": float(history_days),
                 "history_months": float(history_months),
+                "holdout_fraction": float(holdout_frac),
+                "holdout_years": float(holdout_years),
+                "holdout_required": bool(holdout_required),
+                "holdout_min_sharpe": float(holdout_min_sharpe),
+                "holdout_min_win_rate": float(holdout_min_win),
+                "holdout_min_profit_factor": float(holdout_min_pf),
+                "holdout_min_trades": int(holdout_min_trades),
+                "min_truth_probability": float(min_truth),
                 "initial_balance": float(actual_balance),
+                "journal_summary": journal,
                 "best_genes": [_gene_to_dict(g) for g in selected],
             }
             out_path = Path(checkpoint)
@@ -1329,7 +2025,7 @@ def run_evo_search(
             out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             logger.info(
                 "Prop search (%s): kept %s/%s genes (strict=%s, min_keep=%s) for %s %s "
-                "(profit>%.3f, max_dd<=%.3f, trades>=%.0f). Wrote %s",
+                "(profit>%.3f, max_dd<=%.3f, trades>=%.0f, holdout_years=%.2f, min_truth=%.2f). Wrote %s",
                 search_mode,
                 len(selected),
                 ranked_total,
@@ -1340,6 +2036,8 @@ def run_evo_search(
                 min_profit,
                 max_dd,
                 min_trades,
+                holdout_years,
+                min_truth,
                 out,
             )
             return
@@ -1433,7 +2131,15 @@ def run_evo_search(
         min_profit=min_profit,
         min_trades=min_trades,
         initial_balance=actual_balance,
+        search_history_months=history_months,
     )
+    _attach_trade_journals(
+        selected=selected,
+        search_df=search_df,
+        holdout_df=holdout_df,
+        settings=settings,
+    )
+    journal = _journal_summary(selected)
 
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1444,7 +2150,16 @@ def run_evo_search(
         "holdout_rows": int(len(holdout_df)) if holdout_df is not None else 0,
         "history_days": float(history_days),
         "history_months": float(history_months),
+        "holdout_fraction": float(holdout_frac),
+        "holdout_years": float(holdout_years),
+        "holdout_required": bool(holdout_required),
+        "holdout_min_sharpe": float(holdout_min_sharpe),
+        "holdout_min_win_rate": float(holdout_min_win),
+        "holdout_min_profit_factor": float(holdout_min_pf),
+        "holdout_min_trades": int(holdout_min_trades),
+        "min_truth_probability": float(min_truth),
         "initial_balance": float(actual_balance),
+        "journal_summary": journal,
         "best_genes": [_gene_to_dict(g) for g in selected],
     }
     out_path = Path(checkpoint)
@@ -1460,7 +2175,7 @@ def run_evo_search(
     out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     logger.info(
         "Prop search: kept %s/%s genes (strict=%s, min_keep=%s) for %s %s "
-        "(profit>%.3f, max_dd<=%.3f, trades>=%.0f). Wrote %s",
+        "(profit>%.3f, max_dd<=%.3f, trades>=%.0f, holdout_years=%.2f, min_truth=%.2f). Wrote %s",
         len(selected),
         ranked_total,
         strict_kept,
@@ -1470,6 +2185,8 @@ def run_evo_search(
         min_profit,
         max_dd,
         min_trades,
+        holdout_years,
+        min_truth,
         out,
     )
 

@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -62,6 +63,7 @@ class TradingEngine:
         self.last_prob = None
         self.last_close_price = None
         self.last_signal = None
+        self._feature_monitor_ready = False
 
         # Drift "neutral" band should be symbol-aware (pip size differs across FX/JPY/metals/crypto).
         try:
@@ -180,6 +182,22 @@ class TradingEngine:
                 # 5. News & Policy
                 news_policy = await self.news.get_news_policy(self.settings.system.symbol)
                 self.risk.update_news_state(news_policy)
+                if bool(news_policy.get("tier1_nearby")) and positions:
+                    # MT5 wrapper currently has no robust SL-modify path; safest fallback is flattening
+                    # non-profitable exposure into high-impact events.
+                    for pos in positions:
+                        if pos.symbol != self.settings.system.symbol:
+                            continue
+                        try:
+                            if float(getattr(pos, "profit", 0.0) or 0.0) <= 0.0:
+                                await self.executor.close_position(
+                                    pos.ticket,
+                                    pos.volume,
+                                    "News protection: flattening non-profitable position",
+                                )
+                                logger.info("News protection closed ticket=%s before high-impact event.", pos.ticket)
+                        except Exception as exc:
+                            logger.warning("News protection close failed for ticket=%s: %s", pos.ticket, exc)
 
                 # 6. Feature Engineering & Signal
                 base_df = frames.get(self.settings.system.base_timeframe)
@@ -192,9 +210,51 @@ class TradingEngine:
                     news_features=news_feats,
                     symbol=self.settings.system.symbol,
                 )
+                feature_drift_alert = False
+                if self.drift and isinstance(getattr(dataset, "X", None), pd.DataFrame) and len(dataset.X) > 0:
+                    if not self._feature_monitor_ready:
+                        with contextlib.suppress(Exception):
+                            baseline_rows = min(len(dataset.X), 2000)
+                            if baseline_rows > 0:
+                                self.drift.initialize_feature_monitor(
+                                    dataset.X.tail(baseline_rows), self.settings.system.symbol
+                                )
+                                self._feature_monitor_ready = True
+                    with contextlib.suppress(Exception):
+                        feature_drift_alert = bool(
+                            self.drift.check_feature_drift(
+                                dataset.X,
+                                threshold=float(getattr(self.settings.risk, "feature_drift_threshold", 0.30) or 0.30),
+                            )
+                        )
 
                 # 7. Signal
                 result = self.signal.generate_ensemble_signals(dataset)
+                if feature_drift_alert:
+                    logger.warning("Feature drift alert triggered; abstaining this cycle.")
+                    meta = dict(getattr(result, "meta_features", {}) or {})
+                    meta["feature_drift_alert"] = True
+                    result.meta_features = meta
+                    result.signal = 0
+                    result.confidence = 0.0
+                try:
+                    news_conf = float(news_policy.get("news_confidence", 0.0) or 0.0)
+                    news_sent = float(news_policy.get("news_surprise", 0.0) or 0.0)
+                    contrarian_thr = float(getattr(self.settings.news, "news_trade_confidence_threshold", 0.90) or 0.90)
+                    if (
+                        bool(getattr(self.settings.news, "news_trade_on_event", False))
+                        and int(getattr(result, "signal", 0) or 0) != 0
+                        and news_conf >= contrarian_thr
+                        and abs(news_sent) >= 0.90
+                    ):
+                        result.signal = int(-1 * int(result.signal))
+                        logger.info(
+                            "News contrarian override applied (conf=%.2f sent=%.2f).",
+                            news_conf,
+                            news_sent,
+                        )
+                except Exception:
+                    pass
 
                 # 8. Drift Check (Corrected Logic: Compare LAST prediction with CURRENT outcome)
                 if (
@@ -238,6 +298,13 @@ class TradingEngine:
                 # 9. Execution (With Thinking Brain)
                 # We need to manually invoke risk check to inject the regime
                 equity = self.mt5.get_real_equity()
+                live_tick = {}
+                live_symbol_info = {}
+                with contextlib.suppress(Exception):
+                    live_symbol_info = await self.mt5.connection.get_symbol_info(self.settings.system.symbol) or {}
+                    live_tick = await self.mt5.connection.get_symbol_price(self.settings.system.symbol) or {}
+                    if live_tick:
+                        self.executor.update_live_cost_state(live_tick, symbol_info=live_symbol_info)
 
                 # Override internal risk check to inject regime
                 meta_state = PropMetaState(
@@ -256,14 +323,56 @@ class TradingEngine:
 
                 # Get smart parameters
                 risk_mult, req_conf, allowed = self.risk.meta_controller.get_risk_parameters(meta_state)
+                meta_feats = getattr(result, "meta_features", {}) or {}
+                try:
+                    market_volatility = float(meta_feats.get("market_volatility", 0.0) or 0.0)
+                except Exception:
+                    market_volatility = 0.0
+                try:
+                    ensemble_disagreement = float(meta_feats.get("ensemble_disagreement", 0.0) or 0.0)
+                except Exception:
+                    ensemble_disagreement = 0.0
+                trade_allowed, trade_reason = self.risk.check_trade_allowed(
+                    equity,
+                    float(getattr(result, "confidence", 0.0) or 0.0),
+                    datetime.now(self.risk._session_tz),
+                    market_volatility=market_volatility,
+                    ensemble_disagreement=ensemble_disagreement,
+                )
 
                 # Inject back into risk manager for this tick
                 # We can't easily monkey-patch, but we can respect the outcome
-                if not allowed:
+                if result.signal == 0:
+                    pass
+                elif not trade_allowed:
+                    logger.info("Risk gate blocked trade: %s", trade_reason)
+                elif not allowed:
                     logger.info(f"Meta-Controller blocked trade (Regime: {regime})")
-                elif result.signal != 0 and result.confidence >= req_conf:
+                elif result.confidence >= req_conf:
+                    correlation_blocked = False
+                    if bool(getattr(self.settings.risk, "correlation_filter_enabled", True)):
+                        cur_sym = str(self.settings.system.symbol or "")
+                        cur_bias = self._usd_exposure_bias(cur_sym, int(result.signal))
+                        same_bias_open = 0
+                        if cur_bias != 0:
+                            for pos in positions:
+                                if str(pos.symbol).upper() == cur_sym.upper():
+                                    continue
+                                pos_sig = 1 if int(getattr(pos, "type", 0)) == 0 else -1
+                                pos_bias = self._usd_exposure_bias(str(pos.symbol), pos_sig)
+                                if pos_bias == cur_bias:
+                                    same_bias_open += 1
+                        max_corr = int(getattr(self.settings.risk, "max_correlated_positions", 1) or 1)
+                        if same_bias_open >= max_corr:
+                            logger.info(
+                                "Correlation filter blocked trade: %s open USD-correlated positions.",
+                                same_bias_open,
+                            )
+                            correlation_blocked = True
                     # Check repeat mistake guard
-                    if self.learner and self.learner.is_repeat_mistake(dataset.X):
+                    if correlation_blocked:
+                        logger.debug("Trade skipped due to cross-symbol correlation exposure.")
+                    elif self.learner and self.learner.is_repeat_mistake(dataset.X):
                         logger.warning("Similarity guard blocked trade (matches past loss pattern)")
                     else:
                         # Pass risk_mult implicitly by scaling size or handling inside executor?
@@ -281,7 +390,16 @@ class TradingEngine:
                             self.mt5.get_real_equity(),
                             frames,
                             advice_stance=self.news.last_advice.get("stance") if self.news.last_advice else None,
+                            tick_price=live_tick,
+                            symbol_info=live_symbol_info,
                         )
+                else:
+                    logger.debug(
+                        "Trade skipped by confidence gate: conf=%.3f required=%.3f regime=%s",
+                        float(result.confidence),
+                        float(req_conf),
+                        regime,
+                    )
 
                 # 10. Online Learning Update
                 # ... (Online learning logic)
@@ -304,6 +422,21 @@ class TradingEngine:
         if "Quiet" in regime_str:
             return "low"
         return "normal"
+
+    @staticmethod
+    def _usd_exposure_bias(symbol: str, signal: int) -> int:
+        sym = "".join(ch for ch in str(symbol or "").upper() if ch.isalpha())
+        if len(sym) < 6 or signal == 0:
+            return 0
+        base, quote = sym[:3], sym[3:6]
+        sgn = 1 if signal > 0 else -1
+        if quote == "USD":
+            # Buy EURUSD => short USD (-1); Sell EURUSD => long USD (+1)
+            return -sgn
+        if base == "USD":
+            # Buy USDJPY => long USD (+1); Sell USDJPY => short USD (-1)
+            return sgn
+        return 0
 
     async def _trigger_retraining(self) -> None:
         """Background retraining triggered by drift detection."""

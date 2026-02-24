@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import logging
+import os
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -106,6 +108,14 @@ class OnlineLearner:
             self.loss_archive.pop(0)
         self.loss_archive.append(vector)
 
+    @staticmethod
+    def _max_update_batch() -> int:
+        try:
+            val = int(os.environ.get("FOREX_BOT_ONLINE_MAX_BATCH", "512") or 512)
+        except Exception:
+            val = 512
+        return max(32, val)
+
     def is_repeat_mistake(self, current_features: pd.DataFrame, threshold: float = 0.95) -> bool:
         """
         HPC Optimized: GPU-accelerated similarity guard.
@@ -141,23 +151,39 @@ class OnlineLearner:
         if len(self.buffer) < self.min_samples_for_update:
             return False
 
-        logger.info(f"🔄 Online Learning: Updating models with {len(self.buffer)} recent trades...")
+        logger.info("Online Learning: updating models with %s recent trades...", len(self.buffer))
 
-        x_list, y_list, w_list = zip(*self.buffer, strict=False)
+        x_list, y_list, _w_list = zip(*self.buffer, strict=False)
+        max_batch = self._max_update_batch()
+        if len(x_list) > max_batch:
+            x_list = x_list[-max_batch:]
+            y_list = y_list[-max_batch:]
         try:
-            x_batch = pd.concat(x_list, axis=0)
+            x_batch = pd.concat(x_list, axis=0, copy=False)
             y_batch = pd.concat(y_list, axis=0)
-            x_batch = x_batch.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+            non_numeric = [c for c in x_batch.columns if not pd.api.types.is_numeric_dtype(x_batch[c])]
+            for col in non_numeric:
+                x_batch[col] = pd.to_numeric(x_batch[col], errors="coerce")
+            x_batch = x_batch.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            with np.errstate(all="ignore"):
+                x_batch = x_batch.astype(np.float32, copy=False)
+            y_batch = pd.to_numeric(y_batch, errors="coerce").fillna(0).astype(np.int8, copy=False)
         except Exception as e:
             logger.error(f"Online batch preparation failed: {e}")
+            return False
+
+        if int(pd.Series(y_batch).nunique(dropna=False)) < 2:
+            logger.info("Online learning skipped: update batch has <2 classes.")
             return False
 
         updated_count = 0
 
         for name, model in self.models.items():
+            backup_state = None
             try:
                 if isinstance(model, LightGBMExpert):
-                    if hasattr(model.model, "booster_"):
+                    if model.model is not None and hasattr(model.model, "booster_"):
+                        backup_state = copy.deepcopy(model.model)
                         model.model.fit(
                             x_batch,
                             y_batch,
@@ -167,10 +193,20 @@ class OnlineLearner:
                         updated_count += 1
 
                 elif hasattr(model, "model") and isinstance(model.model, torch.nn.Module):
+                    backup_state = {k: v.detach().cpu().clone() for k, v in model.model.state_dict().items()}
                     self._update_pytorch_model(model, x_batch, y_batch)
                     updated_count += 1
 
             except Exception as e:
+                if backup_state is not None:
+                    with np.errstate(all="ignore"):
+                        try:
+                            if isinstance(model, LightGBMExpert):
+                                model.model = backup_state
+                            elif hasattr(model, "model") and isinstance(model.model, torch.nn.Module):
+                                model.model.load_state_dict(backup_state, strict=True)
+                        except Exception:
+                            pass
                 logger.warning(f"Failed to update {name}: {e}")
 
         logger.info(f"Successfully updated {updated_count} models.")

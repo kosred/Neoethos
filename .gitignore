@@ -9,6 +9,9 @@
 /.ruff_cache/
 /catboost_info/
 /target/
+/rust_core/
+/vendor/talib-sys/dependencies/
+/vendor/ta-lib/
 /data/
 /tmp_upload/
 /venv/

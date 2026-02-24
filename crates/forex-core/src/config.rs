@@ -83,13 +83,15 @@ impl Default for SystemConfig {
             base_timeframe: "M1".to_string(),
             use_volume_features: true,
             higher_timeframes: vec![
-                "M1", "M3", "M5", "M15", "M30", "H1", "H2", "H4", "D1", "W1", "MN1",
+                "M1", "M2", "M3", "M4", "M5", "M6", "M10", "M12", "M15", "M20", "M30",
+                "H1", "H2", "H3", "H4", "H6", "H8", "H12", "D1", "W1", "MN1",
             ]
             .into_iter()
             .map(String::from)
             .collect(),
             required_timeframes: vec![
-                "M1", "M3", "M5", "M15", "M30", "H1", "H2", "H4", "D1", "W1", "MN1",
+                "M1", "M2", "M3", "M4", "M5", "M6", "M10", "M12", "M15", "M20", "M30",
+                "H1", "H2", "H3", "H4", "H6", "H8", "H12", "D1", "W1", "MN1",
             ]
             .into_iter()
             .map(String::from)
@@ -234,14 +236,26 @@ impl Default for RiskConfig {
         let mut ewma_lambda_by_timeframe = HashMap::new();
         for (tf, lambda) in [
             ("M1", 0.90),
+            ("M2", 0.905),
+            ("M3", 0.91),
+            ("M4", 0.915),
             ("M5", 0.92),
+            ("M6", 0.925),
+            ("M10", 0.935),
+            ("M12", 0.938),
             ("M15", 0.94),
+            ("M20", 0.945),
             ("M30", 0.95),
             ("H1", 0.96),
+            ("H2", 0.965),
+            ("H3", 0.968),
             ("H4", 0.97),
-            ("D1", 0.98),
-            ("W1", 0.985),
-            ("MN1", 0.99),
+            ("H6", 0.974),
+            ("H8", 0.977),
+            ("H12", 0.98),
+            ("D1", 0.985),
+            ("W1", 0.99),
+            ("MN1", 0.995),
         ] {
             ewma_lambda_by_timeframe.insert(tf.to_string(), lambda);
         }

@@ -208,11 +208,11 @@ pub enum DevicePreference {
 pub fn select_device(requested: DevicePreference) -> Vec<String> {
     match requested {
         DevicePreference::Cpu => vec!["cpu".to_string()],
-        DevicePreference::Gpu(idx) => {
+        DevicePreference::Gpu(_idx) => {
             #[cfg(feature = "tch")]
             {
-                if Cuda::is_available() && (idx as i64) < Cuda::device_count() {
-                    return vec![format!("cuda:{}", idx)];
+                if Cuda::is_available() && (_idx as i64) < Cuda::device_count() {
+                    return vec![format!("cuda:{}", _idx)];
                 }
             }
             vec!["cpu".to_string()]

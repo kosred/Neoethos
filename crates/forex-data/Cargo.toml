@@ -4,8 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1.0.99"
+anyhow = "1.0.100"
 polars = { version = "0.52.0", features = ["lazy", "parquet", "dtype-full", "temporal", "timezones"] }
-ndarray = { version = "0.16.1", features = ["rayon"] }
-talib = "0.1.2"
+ndarray = { version = "0.17.1", features = ["rayon"] }
 talib-sys = "0.1.0"

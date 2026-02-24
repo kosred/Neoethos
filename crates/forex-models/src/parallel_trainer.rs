@@ -1,15 +1,37 @@
-// Parallel Model Trainer - TRUE multi-core training
-// Each model trains on separate thread with independent GIL acquisition
-
-use anyhow::Result;
+// Parallel Model Trainer - multi-core training for Rust-native workloads
+// Note: Python-backed training still obeys the GIL unless it releases it or runs in separate processes.
+use anyhow::{Context, Result};
 use ndarray::Array2;
-use polars::prelude::*;
+use rayon::prelude::*;
+use std::env;
 use std::sync::Arc;
-use std::thread;
 use tracing::info;
 
-/// Train multiple models in parallel using independent threads
-/// Each thread acquires GIL independently - TRUE parallelism!
+fn read_threads_env(keys: &[&str]) -> Option<usize> {
+    for key in keys {
+        if let Ok(val) = env::var(key) {
+            if let Ok(parsed) = val.trim().parse::<usize>() {
+                if parsed > 0 {
+                    return Some(parsed);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn rust_threads_hint() -> usize {
+    read_threads_env(&[
+        "FOREX_BOT_RUST_THREADS",
+        "FOREX_BOT_CPU_THREADS",
+        "FOREX_BOT_CPU_BUDGET",
+        "RAYON_NUM_THREADS",
+    ])
+    .unwrap_or_else(|| num_cpus::get().saturating_sub(1).max(1))
+}
+
+/// Train multiple models in parallel using a bounded Rayon thread pool.
+/// Rust-native training will run in parallel; Python-backed training may still serialize under GIL.
 pub fn train_models_parallel<F>(
     model_configs: Vec<ModelConfig>,
     x: Arc<Array2<f32>>,
@@ -19,46 +41,63 @@ pub fn train_models_parallel<F>(
 where
     F: Fn(&str, &Array2<f32>, &[i32]) -> Result<()> + Send + Sync + Clone + 'static,
 {
-    info!("Starting parallel training for {} models", model_configs.len());
+    let threads = rust_threads_hint();
+    info!(
+        "Starting parallel training for {} models (threads={})",
+        model_configs.len(),
+        threads
+    );
 
-    // Spawn OS threads - each gets independent GIL!
-    let handles: Vec<_> = model_configs
-        .into_iter()
-        .map(|config| {
-            let x = Arc::clone(&x);
-            let y = Arc::clone(&y);
-            let train_fn = train_fn.clone();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .context("Failed to build Rayon thread pool")?;
 
-            thread::spawn(move || {
-                info!("Thread {:?}: Training {}", thread::current().id(), config.name);
+    let results: Vec<(String, Result<()>)> = pool.install(|| {
+        model_configs
+            .into_par_iter()
+            .map(|config| {
+                let x = Arc::clone(&x);
+                let y = Arc::clone(&y);
+                let train_fn = train_fn.clone();
 
-                // Each thread independently acquires GIL
-                // No blocking between threads!
+                info!(
+                    "Thread {:?}: Training {}",
+                    std::thread::current().id(),
+                    config.name
+                );
+
                 let result = train_fn(&config.name, &x, &y);
 
                 match &result {
-                    Ok(_) => info!("Thread {:?}: Completed {}", thread::current().id(), config.name),
-                    Err(e) => info!("Thread {:?}: Failed {} - {}", thread::current().id(), config.name, e),
+                    Ok(_) => info!(
+                        "Thread {:?}: Completed {}",
+                        std::thread::current().id(),
+                        config.name
+                    ),
+                    Err(e) => info!(
+                        "Thread {:?}: Failed {} - {}",
+                        std::thread::current().id(),
+                        config.name,
+                        e
+                    ),
                 }
 
                 (config.name, result)
             })
-        })
-        .collect();
+            .collect()
+    });
 
     // Collect results
     let mut successes = Vec::new();
     let mut failures = Vec::new();
 
-    for handle in handles {
-        match handle.join() {
-            Ok((name, Ok(_))) => successes.push(name),
-            Ok((name, Err(e))) => {
+    for (name, result) in results {
+        match result {
+            Ok(_) => successes.push(name),
+            Err(e) => {
                 info!("Model {} failed: {}", name, e);
                 failures.push(name);
-            }
-            Err(_) => {
-                info!("Thread panicked");
             }
         }
     }

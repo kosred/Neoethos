@@ -218,7 +218,7 @@ class ConceptDriftMonitor:
                 logger.warning(f"Drift monitoring failed: {e}", exc_info=True)
         logger.info(f"Adaptive Feature Monitor initialized for {symbol}. Tracking {len(self.feature_stats)} features.")
 
-    def check_feature_drift(self, current_features: pd.DataFrame) -> bool:
+    def check_feature_drift(self, current_features: pd.DataFrame, threshold: float | None = None) -> bool:
         """
         Check for drift using Z-score against ADAPTIVE statistics.
         Updates statistics online (EMA) to follow market regimes.
@@ -259,7 +259,8 @@ class ConceptDriftMonitor:
                 return False
 
             drift_ratio = drift_count / total_checked
-            return drift_ratio > 0.30
+            drift_threshold = float(threshold if threshold is not None else 0.30)
+            return drift_ratio > max(0.0, min(1.0, drift_threshold))
 
         except Exception as e:
             logger.warning(f"Adaptive drift check failed: {e}")

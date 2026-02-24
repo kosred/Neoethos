@@ -35,7 +35,7 @@ except ImportError:
 def _diagnose_positions_numba(
     pos_types, pos_prices_open, pos_sls, pos_durations,
     current_price, momentum, rsi, volatility,
-    stall_threshold, min_profit_bank, reversal_sens
+    stall_threshold, min_profit_bank, reversal_sens, zombie_minutes
 ):
     n = len(pos_types)
     results = np.zeros(n, dtype=np.int8) # 0=Hold, 1=Close
@@ -66,7 +66,7 @@ def _diagnose_positions_numba(
             if results[i] == 1: continue
             
         # 3. Zombie Check (Time-Aware)
-        if -0.2 < r_mult < 0 and p_dur > 240: # 4 hours of nothing
+        if -0.2 < r_mult < 0 and p_dur > zombie_minutes:
             results[i] = 1
             
     return results
@@ -86,6 +86,36 @@ class TradeDoctor:
         self.stall_threshold_minutes = doc_params.get("stall_threshold_minutes", 60.0)
         self.min_profit_to_bank = doc_params.get("min_profit_to_bank", 0.3)
         self.reversal_sensitivity = doc_params.get("reversal_sensitivity", 0.2)
+        try:
+            self.time_stop_bars = int(getattr(self.settings.risk, "time_stop_bars", 8) or 8)
+        except Exception:
+            self.time_stop_bars = 8
+        tf = str(getattr(self.settings.system, "base_timeframe", "M5") or "M5").upper()
+        tf_minutes = {
+            "M1": 1,
+            "M2": 2,
+            "M3": 3,
+            "M4": 4,
+            "M5": 5,
+            "M6": 6,
+            "M10": 10,
+            "M12": 12,
+            "M15": 15,
+            "M20": 20,
+            "M30": 30,
+            "H1": 60,
+            "H2": 120,
+            "H3": 180,
+            "H4": 240,
+            "H6": 360,
+            "H8": 480,
+            "H12": 720,
+            "D1": 1440,
+            "W1": 10080,
+            "MN1": 43200,
+        }.get(tf, 5)
+        self.time_stop_minutes = max(30.0, float(self.time_stop_bars) * float(tf_minutes))
+        self._scaled_tickets: dict[int, bool] = {}
 
         self.exit_agent = ExitAgent(settings)
         try:
@@ -95,7 +125,8 @@ class TradeDoctor:
 
         logger.info(
             f"TradeDoctor initialized with: Stall={self.stall_threshold_minutes:.1f}m, "
-            f"BankR={self.min_profit_to_bank:.2f}, RevSens={self.reversal_sensitivity:.2f}"
+            f"BankR={self.min_profit_to_bank:.2f}, RevSens={self.reversal_sensitivity:.2f}, "
+            f"TimeStop={self.time_stop_minutes:.1f}m"
         )
 
     def diagnose(self, positions: list[MT5Position], frames: dict[str, pd.DataFrame]) -> list[CloseInstruction]:
@@ -134,16 +165,57 @@ class TradeDoctor:
             current_price, momentum, rsi, vol,
             float(self.stall_threshold_minutes),
             float(self.min_profit_to_bank),
-            float(self.reversal_sensitivity)
+            float(self.reversal_sensitivity),
+            float(self.time_stop_minutes),
         )
 
         # Convert results back to instructions
+        close_all: set[int] = set()
         for i, res in enumerate(results):
             if res == 1:
                 p = target_positions[i]
+                close_all.add(int(p.ticket))
                 instructions.append(CloseInstruction(
                     p.ticket, p.symbol, 0.0, "TradeDoctor: Technical Exit (Numba)", 1.0
                 ))
+
+        # Partial take-profit: scale out 50% once at >=1R if position not already marked for full close.
+        for p in target_positions:
+            ticket = int(p.ticket)
+            if ticket in close_all:
+                continue
+            if self._scaled_tickets.get(ticket):
+                continue
+            try:
+                risk_dist = abs(float(p.price_open) - float(p.sl)) if float(p.sl) > 0 else max(float(vol) * 2.0, 1e-9)
+                if risk_dist <= 0:
+                    continue
+                current_dist = (
+                    float(current_price) - float(p.price_open) if int(p.type) == 0 else float(p.price_open) - float(current_price)
+                )
+                r_multiple = current_dist / risk_dist
+                if r_multiple < 1.0:
+                    continue
+                close_vol = round(max(0.01, float(p.volume) * 0.5), 2)
+                if close_vol >= float(p.volume):
+                    continue
+                instructions.append(
+                    CloseInstruction(
+                        p.ticket,
+                        p.symbol,
+                        close_vol,
+                        f"Scale-out 50% at {r_multiple:.2f}R",
+                        float(r_multiple),
+                    )
+                )
+                self._scaled_tickets[ticket] = True
+            except Exception:
+                continue
+
+        live_tickets = {int(p.ticket) for p in target_positions}
+        stale = [t for t in list(self._scaled_tickets.keys()) if t not in live_tickets]
+        for t in stale:
+            self._scaled_tickets.pop(t, None)
 
         return instructions
 
@@ -210,7 +282,13 @@ class TradeDoctor:
                     )
 
         if -0.5 < r_multiple < 0:  # Small loss
-            if duration_mins > 120:  # 2 hours doing nothing but bleeding
-                return CloseInstruction(pos.ticket, pos.symbol, 0.0, "Zombie trade (small loss) > 2h", r_multiple)
+            if duration_mins > self.time_stop_minutes:
+                return CloseInstruction(
+                    pos.ticket,
+                    pos.symbol,
+                    0.0,
+                    f"Zombie trade (small loss) > {int(self.time_stop_minutes)}m",
+                    r_multiple,
+                )
 
         return None

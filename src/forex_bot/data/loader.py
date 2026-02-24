@@ -118,16 +118,18 @@ def _timeframe_to_freq(tf: str) -> str | None:
         "M15": "15min",
         "M20": "20min",
         "M30": "30min",
-        "H1": "1H",
-        "H2": "2H",
-        "H3": "3H",
-        "H4": "4H",
-        "H6": "6H",
-        "H8": "8H",
-        "H12": "12H",
+        # Pandas >= 2.2/4 rejects legacy uppercase hour alias ("H").
+        "H1": "1h",
+        "H2": "2h",
+        "H3": "3h",
+        "H4": "4h",
+        "H6": "6h",
+        "H8": "8h",
+        "H12": "12h",
         "D1": "1D",
         "W1": "1W",
-        "MN1": "1M",
+        # "M" was removed; "ME" is the direct replacement for month-end bars.
+        "MN1": "1ME",
     }.get(tf)
 
 
@@ -259,11 +261,20 @@ def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
         idx = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
         out = out.set_index(idx)
     if not isinstance(out.index, pd.DatetimeIndex):
-        out.index = pd.to_datetime(out.index, utc=True, errors="coerce")
-    if out.index.tz is None:
-        out.index = out.index.tz_localize("UTC")
-    else:
-        out.index = out.index.tz_convert("UTC")
+        try:
+            idx = pd.to_datetime(out.index, utc=True, errors="coerce")
+            if not isinstance(idx, pd.DatetimeIndex):
+                idx = pd.DatetimeIndex(idx)
+            out.index = idx
+        except Exception:
+            # Keep original index as a last resort; caller can still proceed
+            # without a strict DatetimeIndex, but we must avoid crashing here.
+            return out
+    if isinstance(out.index, pd.DatetimeIndex):
+        if out.index.tz is None:
+            out.index = out.index.tz_localize("UTC")
+        else:
+            out.index = out.index.tz_convert("UTC")
     return out
 
 

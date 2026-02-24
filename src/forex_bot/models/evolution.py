@@ -300,6 +300,64 @@ def _loss_batch_gpu(
     return [float(l) for l in mean_loss.tolist()]
 
 
+def _evaluate_population_losses(
+    xc: list[np.ndarray] | list[Any],
+    *,
+    use_gpu: bool,
+    x_norm_np: np.ndarray,
+    yb: np.ndarray,
+    weight_decay: float,
+    d: int,
+    hidden: int,
+    row_idx_np: np.ndarray | None,
+    class_idx_np: np.ndarray | None,
+    x_norm_cp: Any | None = None,
+    yb_cp: Any | None = None,
+    row_idx_cp: Any | None = None,
+    class_idx_cp: Any | None = None,
+    gpu_id: int | None = None,
+    cpu_workers: int = 0,
+) -> list[float]:
+    thetas = [np.asarray(theta) for theta in xc]
+    if not thetas:
+        return []
+
+    if use_gpu and CUPY_AVAILABLE and x_norm_cp is not None and yb_cp is not None:
+        try:
+            return _loss_batch_gpu(
+                thetas,
+                x_norm_cp,
+                yb_cp,
+                weight_decay,
+                d,
+                hidden,
+                gpu_id,
+                row_idx=row_idx_cp,
+                class_idx=class_idx_cp,
+            )
+        except Exception as exc:
+            logger.warning("Batch GPU Evo evaluation failed; falling back to CPU path: %s", exc)
+
+    def _cpu_eval(theta_vec: np.ndarray) -> float:
+        return _loss_cpu(
+            theta_vec,
+            x_norm_np,
+            yb,
+            weight_decay,
+            d,
+            hidden,
+            row_idx=row_idx_np,
+            class_idx=class_idx_np,
+        )
+
+    workers = int(cpu_workers or 0)
+    if workers > 1 and len(thetas) > 2:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            return [float(v) for v in ex.map(_cpu_eval, thetas)]
+
+    return [float(_cpu_eval(theta_vec)) for theta_vec in thetas]
+
+
 def _run_island(
     args: tuple[
         int,
@@ -407,27 +465,29 @@ def _run_island(
         es = cma.CMAEvolutionStrategy(x0, sigma, opts)
         while not es.stop() and (time.time() - start) < time_budget:
             xc = es.ask()
-            
-            # Vectorized Population Evaluation
-            if use_gpu:
-                try:
-                    fitness_values = _loss_batch_gpu(
-                        xc,
-                        x_norm_cp,
-                        y_cp,
-                        weight_decay,
-                        d,
-                        hidden,
-                        gpu_id,
-                        row_idx=row_idx_cp,
-                        class_idx=class_idx_cp
-                    )
-                    es.tell(xc, fitness_values)
-                except Exception as e:
-                    logger.warning(f"Batch GPU Evo failed, falling back to sequential: {e}")
-                    es.tell(xc, [_loss_local(np.asarray(x)) for x in xc])
-            else:
-                es.tell(xc, [_loss_local(np.asarray(x)) for x in xc])
+            pop_cpu_workers = 0
+            try:
+                pop_cpu_workers = int(os.environ.get("FOREX_BOT_EVO_POP_THREADS", "0") or 0)
+            except Exception:
+                pop_cpu_workers = 0
+            fitness_values = _evaluate_population_losses(
+                xc,
+                use_gpu=use_gpu,
+                x_norm_np=x_norm_np,
+                yb=y_np,
+                weight_decay=weight_decay,
+                d=d,
+                hidden=hidden,
+                row_idx_np=row_idx_np,
+                class_idx_np=class_idx_np,
+                x_norm_cp=x_norm_cp,
+                yb_cp=y_cp,
+                row_idx_cp=row_idx_cp,
+                class_idx_cp=class_idx_cp,
+                gpu_id=gpu_id,
+                cpu_workers=pop_cpu_workers,
+            )
+            es.tell(xc, fitness_values)
 
     candidate = np.asarray(es.result.xbest, dtype=float)
     candidate_loss = _loss_local(candidate)
@@ -580,6 +640,11 @@ class EvoExpertCMA(ExpertModel):
         popsize = max(4, int(self.population))
         theta_dim = d_features * hidden + hidden + hidden * 3 + 3
         x0_cma = np.zeros(theta_dim, dtype=float)
+        try:
+            pop_eval_workers = int(os.environ.get("FOREX_BOT_EVO_POP_THREADS", "0") or 0)
+        except Exception:
+            pop_eval_workers = 0
+        pop_eval_workers = max(0, pop_eval_workers)
 
         def _available_ram_gb() -> float:
             try:
@@ -812,22 +877,19 @@ class EvoExpertCMA(ExpertModel):
                                 iters = 0
                                 while not es.stop() and (time.time() - island_start) < island_budget:
                                     xc = es.ask()
-                                    es.tell(
+                                    fitness_values = _evaluate_population_losses(
                                         xc,
-                                        [
-                                            _loss_cpu(
-                                                np.asarray(theta),
-                                                xb_norm_np,
-                                                yb,
-                                                self.weight_decay,
-                                                d_features,
-                                                hidden,
-                                                row_idx=row_idx,
-                                                class_idx=class_idx,
-                                            )
-                                            for theta in xc
-                                        ],
+                                        use_gpu=False,
+                                        x_norm_np=xb_norm_np,
+                                        yb=yb,
+                                        weight_decay=self.weight_decay,
+                                        d=d_features,
+                                        hidden=hidden,
+                                        row_idx_np=row_idx,
+                                        class_idx_np=class_idx,
+                                        cpu_workers=0,
                                     )
+                                    es.tell(xc, fitness_values)
                                     iters += 1
                                     now = time.time()
                                     if now - last_log >= 60.0:
@@ -950,22 +1012,19 @@ class EvoExpertCMA(ExpertModel):
                     iters = 0
                     while not es.stop() and (time.time() - island_start) < island_budget:
                         xc = es.ask()
-                        es.tell(
+                        fitness_values = _evaluate_population_losses(
                             xc,
-                            [
-                                _loss_cpu(
-                                    np.asarray(theta),
-                                    xb_norm_np,
-                                    yb,
-                                    self.weight_decay,
-                                    d_features,
-                                    hidden,
-                                    row_idx=row_idx,
-                                    class_idx=class_idx,
-                                )
-                                for theta in xc
-                            ],
+                            use_gpu=False,
+                            x_norm_np=xb_norm_np,
+                            yb=yb,
+                            weight_decay=self.weight_decay,
+                            d=d_features,
+                            hidden=hidden,
+                            row_idx_np=row_idx,
+                            class_idx_np=class_idx,
+                            cpu_workers=0,
                         )
+                        es.tell(xc, fitness_values)
                         iters += 1
                         now = time.time()
                         if now - last_log >= 60.0:
@@ -1032,34 +1091,24 @@ class EvoExpertCMA(ExpertModel):
                     iters = 0
                     while not es.stop() and (time.time() - island_start) < island_budget:
                         xc = es.ask()
-                        es.tell(
+                        fitness_values = _evaluate_population_losses(
                             xc,
-                            [
-                                _loss_cpu(
-                                    np.asarray(x),
-                                    xb_norm_np,
-                                    yb,
-                                    self.weight_decay,
-                                    d_features,
-                                    hidden,
-                                    row_idx=row_idx_np,
-                                    class_idx=class_idx_np,
-                                )
-                                if not use_gpu_island
-                                else _loss_gpu(
-                                    np.asarray(x),
-                                    xb_norm_cp,
-                                    yb_cp,
-                                    self.weight_decay,
-                                    d_features,
-                                    hidden,
-                                    _parse_gpu_id(active_device),
-                                    row_idx=row_idx_cp,
-                                    class_idx=class_idx_cp,
-                                )
-                                for x in xc
-                            ],
+                            use_gpu=use_gpu_island,
+                            x_norm_np=xb_norm_np,
+                            yb=yb,
+                            weight_decay=self.weight_decay,
+                            d=d_features,
+                            hidden=hidden,
+                            row_idx_np=row_idx_np,
+                            class_idx_np=class_idx_np,
+                            x_norm_cp=xb_norm_cp,
+                            yb_cp=yb_cp,
+                            row_idx_cp=row_idx_cp,
+                            class_idx_cp=class_idx_cp,
+                            gpu_id=_parse_gpu_id(active_device),
+                            cpu_workers=(0 if use_gpu_island else pop_eval_workers),
                         )
+                        es.tell(xc, fitness_values)
                         iters += 1
                         now = time.time()
                         if now - last_log >= 60.0:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,11 +37,47 @@ try:
     _RUST_TALIB_MIXER = hasattr(_fb, "talib_bulk_signals_ohlcv")
 except Exception:
     _fb = None
-    _RUST_TALIB_MIXER = False
+_RUST_TALIB_MIXER = False
 
 
 def _normalize_indicator_name(name: str) -> str:
     return str(name or "").strip().upper()
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return int(default)
+    try:
+        return int(raw)
+    except Exception:
+        return int(default)
+
+
+def _causal_tanh_zscore(values: np.ndarray, *, min_periods: int) -> np.ndarray:
+    """
+    Strictly causal normalization:
+    - stats are built from historical values only (shifted by one bar)
+    - no future values influence current signal
+    """
+    if values.size == 0:
+        return values.astype(np.float64, copy=False)
+    s = pd.Series(values, copy=False)
+    hist_mean = s.expanding(min_periods=max(2, int(min_periods))).mean().shift(1)
+    hist_std = s.expanding(min_periods=max(2, int(min_periods))).std(ddof=0).shift(1)
+    z = (s - hist_mean) / hist_std.replace(0.0, np.nan)
+    out = z.to_numpy(dtype=np.float64, copy=False)
+    if not out.flags.writeable:
+        out = out.copy()
+    out[~np.isfinite(out)] = 0.0
+    return np.tanh(out)
 
 
 def _parse_synergy_key(key: str) -> tuple[str, str] | None:
@@ -80,6 +117,27 @@ class TALibStrategyGene:
     net_profit: float = 0.0
     profit_factor: float = 0.0
     expectancy: float = 0.0
+    # Journal metrics (optional): in-sample and forward-holdout diagnostics.
+    in_sample_net_profit: float = 0.0
+    in_sample_sharpe_ratio: float = 0.0
+    in_sample_win_rate: float = 0.0
+    in_sample_profit_factor: float = 0.0
+    in_sample_trades: float = 0.0
+    in_sample_max_dd_pct: float = 0.0
+    in_sample_months: float = 0.0
+    holdout_net_profit: float = 0.0
+    holdout_sharpe_ratio: float = 0.0
+    holdout_win_rate: float = 0.0
+    holdout_profit_factor: float = 0.0
+    holdout_trades: float = 0.0
+    holdout_max_dd_pct: float = 0.0
+    holdout_months: float = 0.0
+    holdout_trades_per_month: float = 0.0
+    holdout_monthly_profit_pct: float = 0.0
+    truth_probability: float = 0.0
+    forward_test_passed: bool = False
+    in_sample_journal: dict[str, Any] = field(default_factory=dict)
+    holdout_journal: dict[str, Any] = field(default_factory=dict)
 
 
 class TALibStrategyMixer:
@@ -119,6 +177,10 @@ class TALibStrategyMixer:
     def _try_rust_bulk_signal_cache(self, df: pd.DataFrame, population: list[TALibStrategyGene]) -> None:
         self._rust_signal_cache = {}
         self._rust_signal_index = None
+        # Disabled by default: current Rust bulk mixer normalizes indicators using full-sample
+        # statistics, which introduces look-ahead leakage for backtests.
+        if not _env_bool("FOREX_BOT_TALIB_RUST_BULK_SIGNALS", False):
+            return
         if not _RUST_TALIB_MIXER or _fb is None:
             return
         if df is None or df.empty or not population:
@@ -292,6 +354,7 @@ class TALibStrategyMixer:
 
         votes = np.zeros(len(df), dtype=np.float64)
         weight_total = 0.0
+        causal_min_bars = max(2, _env_int("FOREX_BOT_TALIB_CAUSAL_MIN_BARS", 30))
 
         for ind in indicators:
             if not ind:
@@ -313,13 +376,7 @@ class TALibStrategyMixer:
                     logger.debug("Indicator %s compute failed: %s", ind, exc)
                     series = pd.Series(np.zeros(len(df), dtype=float), index=df.index)
             arr = np.asarray(series, dtype=np.float64)
-            mean = float(np.nanmean(arr)) if arr.size else 0.0
-            std = float(np.nanstd(arr)) if arr.size else 0.0
-            if std <= 1e-9:
-                norm = arr - mean
-            else:
-                norm = (arr - mean) / std
-            score = np.tanh(norm)
+            score = _causal_tanh_zscore(arr, min_periods=causal_min_bars)
             w = float(gene.weights.get(ind, 1.0)) if gene.weights else 1.0
             votes += w * score
             weight_total += abs(w)

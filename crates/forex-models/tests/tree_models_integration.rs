@@ -18,7 +18,7 @@ mod lightgbm_tests {
             let data: Vec<f64> = (0..n_samples)
                 .map(|j| (j as f64 * 0.1 + i as f64) % 10.0)
                 .collect();
-            features.push(Series::new(&format!("feature_{}", i), data));
+            features.push(Series::new(format!("feature_{}", i).into(), data));
         }
 
         let df = DataFrame::new(features).unwrap();
@@ -34,7 +34,7 @@ mod lightgbm_tests {
                 }
             })
             .collect();
-        let labels_series = Series::new("label", labels);
+        let labels_series = Series::new("label".into(), labels);
 
         (df, labels_series)
     }
@@ -116,7 +116,7 @@ mod lightgbm_tests {
         use forex_models::tree_models::remap_labels_to_contiguous;
 
         // Test with -1, 0, 1 labels
-        let labels = Series::new("label", &[-1i64, 0, 1, -1, 0, 1, 1, 0, -1]);
+        let labels = Series::new("label".into(), &[-1i64, 0, 1, -1, 0, 1, 1, 0, -1]);
         let (remapped, mapping) = remap_labels_to_contiguous(&labels).unwrap();
 
         // Check remapping: -1 -> 0, 0 -> 1, 1 -> 2
@@ -167,8 +167,8 @@ mod lightgbm_tests {
         let volume: Vec<f64> = vec![1000.0, 1100.0, 900.0, 1200.0, 1300.0, 1100.0, 1400.0, 1500.0];
 
         let df = DataFrame::new(vec![
-            Series::new("close", close_prices),
-            Series::new("volume", volume),
+            Series::new("close".into(), close_prices),
+            Series::new("volume".into(), volume),
         ]).unwrap();
 
         let augmented = augment_time_features(df);
@@ -231,12 +231,12 @@ mod xgboost_tests {
             let data: Vec<f64> = (0..n_samples)
                 .map(|j| (j as f64 * 0.1 + i as f64) % 10.0)
                 .collect();
-            features.push(Series::new(&format!("feature_{}", i), data));
+            features.push(Series::new(format!("feature_{}", i).into(), data));
         }
 
         let df = DataFrame::new(features).unwrap();
         let labels: Vec<i64> = (0..n_samples).map(|i| (i % 3 - 1) as i64).collect();
-        let labels_series = Series::new("label", labels);
+        let labels_series = Series::new("label".into(), labels);
 
         let train_df = df.slice(0, 400);
         let test_df = df.slice(400, 100);
@@ -264,9 +264,9 @@ mod catboost_tests {
     #[test]
     fn test_catboost_training_error() {
         // CatBoost should error on training (not supported in Rust)
-        let features = vec![Series::new("f1", vec![1.0, 2.0, 3.0])];
+        let features = vec![Series::new("f1".into(), vec![1.0, 2.0, 3.0])];
         let df = DataFrame::new(features).unwrap();
-        let labels = Series::new("label", vec![-1i64, 0, 1]);
+        let labels = Series::new("label".into(), vec![-1i64, 0, 1]);
 
         let mut model = CatBoostExpert::new(1, None);
         let result = model.fit(&df, &labels);

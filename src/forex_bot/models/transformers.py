@@ -208,7 +208,29 @@ class TransformerExpertTorch(ExpertModel):
             return
         prefixes = set()
         # Known timeframes ordered by duration (smallest to largest)
-        known_tfs = ["M1", "M3", "M5", "M15", "M30", "H1", "H2", "H4", "H12", "D1", "W1", "MN1"]
+        known_tfs = [
+            "M1",
+            "M2",
+            "M3",
+            "M4",
+            "M5",
+            "M6",
+            "M10",
+            "M12",
+            "M15",
+            "M20",
+            "M30",
+            "H1",
+            "H2",
+            "H3",
+            "H4",
+            "H6",
+            "H8",
+            "H12",
+            "D1",
+            "W1",
+            "MN1",
+        ]
 
         # Detect present timeframes
         for c in x.columns:

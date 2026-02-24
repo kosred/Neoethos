@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import joblib
 import numpy as np
 import pandas as pd
 import torch
@@ -41,6 +42,8 @@ except ImportError:
 
 # Services
 from .benchmark_service import BenchmarkService
+from .calibration import ProbabilityCalibrator
+from .conformal import ConformalClassifierGate
 from .evaluation_service import EvaluationService
 from .model_factory import ModelFactory
 from .persistence_service import PersistenceService
@@ -300,6 +303,367 @@ class ModelTrainer:
             return float(str(raw).strip())
         except Exception:
             return default
+
+    def _selected_features_path(self) -> Path:
+        return self.models_dir / "selected_features.json"
+
+    def _selected_features_by_regime_path(self) -> Path:
+        return self.models_dir / "selected_features_by_regime.json"
+
+    def _load_selected_features(self) -> list[str]:
+        path = self._selected_features_path()
+        if not path.exists():
+            return []
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, list):
+                return [str(c) for c in payload if str(c).strip()]
+        except Exception as exc:
+            logger.debug("Failed to load selected features: %s", exc)
+        return []
+
+    def _save_selected_features(self, cols: list[str]) -> None:
+        try:
+            self.models_dir.mkdir(parents=True, exist_ok=True)
+            self._selected_features_path().write_text(json.dumps(list(cols), indent=2), encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Failed to persist selected features: %s", exc)
+
+    def _save_selected_features_by_regime(self, mapping: dict[str, list[str]]) -> None:
+        try:
+            path = self._selected_features_by_regime_path()
+            self.models_dir.mkdir(parents=True, exist_ok=True)
+            if not mapping:
+                if path.exists():
+                    path.unlink()
+                return
+            payload = {
+                str(k): [str(c) for c in list(v or []) if str(c).strip()]
+                for k, v in mapping.items()
+                if str(k).strip()
+            }
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Failed to persist per-regime selected features: %s", exc)
+
+    @staticmethod
+    def _align_feature_frame(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+        if df is None:
+            return pd.DataFrame(columns=cols)
+        if not cols:
+            return df
+        return df.reindex(columns=cols, fill_value=0.0)
+
+    @staticmethod
+    def _canon_labels(y: pd.Series | np.ndarray) -> np.ndarray:
+        arr = np.asarray(y, dtype=int)
+        arr = np.where(arr == -1, 2, arr).astype(int, copy=False)
+        return np.clip(arr, 0, 2)
+
+    def _l1_regime_mask(self, X: pd.DataFrame) -> np.ndarray:
+        # 0=range, 1=neutral, 2=trend
+        n = int(len(X))
+        if n == 0:
+            return np.zeros(0, dtype=np.int8)
+        adx_col = None
+        if "adx" in X.columns:
+            adx_col = "adx"
+        else:
+            for c in X.columns:
+                if str(c).endswith("_adx"):
+                    adx_col = str(c)
+                    break
+        if adx_col is None:
+            return np.ones(n, dtype=np.int8)
+        adx = np.asarray(X[adx_col].replace([np.inf, -np.inf], np.nan).fillna(0.0), dtype=np.float32)
+        trend_thr = float(getattr(self.settings.risk, "regime_adx_trend", 25.0) or 25.0)
+        range_thr = float(getattr(self.settings.risk, "regime_adx_range", 20.0) or 20.0)
+        mask = np.ones(n, dtype=np.int8)
+        mask[adx >= trend_thr] = 2
+        mask[adx <= range_thr] = 0
+        return mask
+
+    def _apply_l1_feature_selection(
+        self,
+        X_fit: pd.DataFrame,
+        y_fit: pd.Series,
+        X_eval: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+        enabled = bool(getattr(self.settings.models, "l1_feature_selection_enabled", True))
+        if not enabled:
+            cols = list(getattr(X_fit, "columns", []))
+            self._save_selected_features(cols)
+            self._save_selected_features_by_regime({})
+            return X_fit, X_eval, cols
+        if len(X_fit) < 200:
+            cols = list(getattr(X_fit, "columns", []))
+            self._save_selected_features(cols)
+            self._save_selected_features_by_regime({})
+            return X_fit, X_eval, cols
+
+        try:
+            from sklearn.linear_model import LogisticRegression
+        except Exception:
+            cols = list(getattr(X_fit, "columns", []))
+            self._save_selected_features(cols)
+            self._save_selected_features_by_regime({})
+            logger.warning("L1 feature selection skipped: scikit-learn LogisticRegression unavailable.")
+            return X_fit, X_eval, cols
+
+        x_num = X_fit.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        if x_num.empty:
+            cols = list(getattr(X_fit, "columns", []))
+            self._save_selected_features(cols)
+            self._save_selected_features_by_regime({})
+            return X_fit, X_eval, cols
+
+        y_arr = self._canon_labels(y_fit)
+        per_regime = bool(getattr(self.settings.models, "l1_feature_selection_per_regime", True))
+        reg_mask = self._l1_regime_mask(X_fit) if per_regime else np.ones(len(X_fit), dtype=np.int8)
+
+        try:
+            sample_lim = int(getattr(self.settings.models, "l1_feature_selection_sample_limit", 200_000) or 200_000)
+        except Exception:
+            sample_lim = 200_000
+        sample_lim = max(500, sample_lim)
+
+        c_val = float(getattr(self.settings.models, "l1_feature_selection_c", 0.2) or 0.2)
+        c_val = max(1e-4, c_val)
+        score = np.zeros(x_num.shape[1], dtype=np.float64)
+        regime_scores: dict[int, np.ndarray] = {}
+
+        for rid in sorted(set(reg_mask.tolist())):
+            idx = np.where(reg_mask == int(rid))[0]
+            if idx.size < 150:
+                continue
+            x_r = x_num.iloc[idx]
+            y_r = y_arr[idx]
+            if len(np.unique(y_r)) < 2:
+                continue
+            if len(x_r) > sample_lim:
+                take = np.linspace(0, len(x_r) - 1, num=sample_lim, dtype=int)
+                x_r = x_r.iloc[take]
+                y_r = y_r[take]
+            try:
+                clf = LogisticRegression(
+                    penalty="l1",
+                    solver="saga",
+                    C=c_val,
+                    max_iter=400,
+                    n_jobs=1,
+                    multi_class="ovr",
+                    class_weight="balanced",
+                    random_state=42,
+                )
+                clf.fit(x_r.to_numpy(dtype=np.float32), y_r)
+                coef = np.abs(np.asarray(clf.coef_, dtype=np.float64))
+                if coef.ndim == 2:
+                    coef = coef.sum(axis=0)
+                score += coef
+                regime_scores[int(rid)] = np.asarray(coef, dtype=np.float64)
+            except Exception as exc:
+                logger.debug("L1 feature selection regime %s failed: %s", rid, exc)
+
+        cols = list(x_num.columns)
+        # Fallback ranking by variance if L1 couldn't fit.
+        if not np.any(np.isfinite(score)) or float(np.nanmax(score)) <= 0.0:
+            with contextlib.suppress(Exception):
+                score = np.asarray(x_num.var(axis=0, numeric_only=True).to_numpy(dtype=np.float64), dtype=np.float64)
+        score = np.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0)
+
+        must_keep = [
+            c
+            for c in ("open", "high", "low", "close", "volume", "base_signal", "rsi", "macd_hist", "adx", "atr14")
+            if c in X_fit.columns
+        ]
+
+        min_k = int(getattr(self.settings.models, "l1_feature_selection_min_features", 20) or 20)
+        max_k = int(getattr(self.settings.models, "l1_feature_selection_max_features", 256) or 256)
+        min_k = max(5, min_k)
+        max_k = max(min_k, max_k) if max_k > 0 else 0
+
+        def _ordered_from_score(score_vec: np.ndarray) -> list[str]:
+            local_ranked = [cols[i] for i in np.argsort(-np.asarray(score_vec, dtype=np.float64))]
+            selected: list[str] = []
+            seen: set[str] = set()
+            for c in must_keep:
+                if c not in seen:
+                    selected.append(c)
+                    seen.add(c)
+            for c in local_ranked:
+                if c in seen:
+                    continue
+                selected.append(c)
+                seen.add(c)
+                if max_k > 0 and len(selected) >= max_k:
+                    break
+            if len(selected) < min_k:
+                for c in X_fit.columns:
+                    c_str = str(c)
+                    if c_str in seen:
+                        continue
+                    selected.append(c_str)
+                    seen.add(c_str)
+                    if len(selected) >= min_k:
+                        break
+            ordered = [c for c in X_fit.columns if c in set(selected)]
+            return ordered if ordered else list(X_fit.columns)
+
+        ordered_selected = _ordered_from_score(score)
+
+        X_fit_sel = self._align_feature_frame(X_fit, ordered_selected)
+        X_eval_sel = self._align_feature_frame(X_eval, ordered_selected)
+        self._save_selected_features(ordered_selected)
+        regime_feature_sets: dict[str, list[str]] = {}
+        if per_regime:
+            rid_to_name = {0: "range", 1: "neutral", 2: "trend"}
+            for rid, name in rid_to_name.items():
+                r_score = regime_scores.get(rid)
+                if r_score is None:
+                    regime_feature_sets[name] = list(ordered_selected)
+                    continue
+                r_score = np.nan_to_num(np.asarray(r_score, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+                if r_score.size != len(cols) or float(np.nanmax(r_score)) <= 0.0:
+                    regime_feature_sets[name] = list(ordered_selected)
+                    continue
+                regime_feature_sets[name] = _ordered_from_score(r_score)
+        self._save_selected_features_by_regime(regime_feature_sets)
+        self.run_summary["feature_selection"] = {
+            "enabled": True,
+            "selected_count": int(len(ordered_selected)),
+            "total_count": int(X_fit.shape[1]),
+            "method": "l1_regime_ovr",
+            "per_regime": bool(per_regime),
+            "per_regime_counts": {k: int(len(v)) for k, v in regime_feature_sets.items()},
+        }
+        logger.info("L1 feature selection kept %s/%s columns.", len(ordered_selected), X_fit.shape[1])
+        return X_fit_sel, X_eval_sel, ordered_selected
+
+    def _predict_model_proba(
+        self,
+        *,
+        model: ExpertModel,
+        X: pd.DataFrame,
+        meta: pd.DataFrame | None = None,
+    ) -> np.ndarray | None:
+        try:
+            kwargs = self._predict_kwargs(model, meta)
+            p = self._pad_probs(model.predict_proba(X, **kwargs))
+            if p.shape[0] != len(X):
+                return None
+            return p
+        except Exception as exc:
+            logger.debug("Model prediction for calibration failed: %s", exc)
+            return None
+
+    def _fit_probability_calibrators(
+        self,
+        X_eval: pd.DataFrame,
+        y_eval: pd.Series,
+        meta_eval: pd.DataFrame | None,
+    ) -> dict[str, ProbabilityCalibrator]:
+        path = self.models_dir / "calibrators.joblib"
+        enabled = bool(getattr(self.settings.models, "calibration_enabled", True))
+        if not enabled or len(X_eval) < int(getattr(self.settings.models, "calibration_min_rows", 300) or 300):
+            with contextlib.suppress(Exception):
+                if path.exists():
+                    path.unlink()
+            return {}
+
+        method = str(getattr(self.settings.models, "calibration_method", "platt") or "platt")
+        y_arr = self._canon_labels(y_eval)
+        calibrators: dict[str, ProbabilityCalibrator] = {}
+        for name, model in self.models.items():
+            p = self._predict_model_proba(model=model, X=X_eval, meta=meta_eval)
+            if p is None:
+                continue
+            cal = ProbabilityCalibrator(method=method)
+            if cal.fit(p, y_arr):
+                calibrators[name] = cal
+
+        try:
+            if calibrators:
+                joblib.dump(calibrators, path)
+                logger.info("Saved %s probability calibrators (%s).", len(calibrators), method)
+            elif path.exists():
+                path.unlink()
+        except Exception as exc:
+            logger.warning("Failed to save calibrators: %s", exc)
+
+        self.run_summary["calibration"] = {
+            "enabled": bool(enabled),
+            "method": method,
+            "models_calibrated": int(len(calibrators)),
+        }
+        return calibrators
+
+    def _build_eval_ensemble_probs(
+        self,
+        X_eval: pd.DataFrame,
+        meta_eval: pd.DataFrame | None,
+        calibrators: dict[str, ProbabilityCalibrator],
+    ) -> np.ndarray | None:
+        if X_eval is None or len(X_eval) == 0 or not self.models:
+            return None
+        probs_by_model: dict[str, np.ndarray] = {}
+        feats = pd.DataFrame(index=X_eval.index)
+        for name, model in self.models.items():
+            p = self._predict_model_proba(model=model, X=X_eval, meta=meta_eval)
+            if p is None:
+                continue
+            cal = calibrators.get(name)
+            if cal is not None:
+                with contextlib.suppress(Exception):
+                    p = cal.predict_proba(p)
+            probs_by_model[name] = p
+            feats[f"{name}_buy"] = p[:, 1]
+
+        if not probs_by_model:
+            return None
+        if self.meta_blender is not None and not feats.empty:
+            try:
+                return self._pad_probs(self.meta_blender.predict_proba(feats))
+            except Exception as exc:
+                logger.debug("Meta-blender conformal source failed: %s", exc)
+        stacked = np.stack(list(probs_by_model.values()), axis=0)
+        return np.mean(stacked, axis=0)
+
+    def _fit_conformal_gate(
+        self,
+        X_eval: pd.DataFrame,
+        y_eval: pd.Series,
+        meta_eval: pd.DataFrame | None,
+        calibrators: dict[str, ProbabilityCalibrator],
+    ) -> dict[str, Any]:
+        path = self.models_dir / "conformal_gate.json"
+        enabled = bool(getattr(self.settings.risk, "conformal_enabled", True))
+        if not enabled:
+            with contextlib.suppress(Exception):
+                if path.exists():
+                    path.unlink()
+            return {"enabled": False}
+        probs = self._build_eval_ensemble_probs(X_eval, meta_eval, calibrators)
+        if probs is None or len(probs) < 64:
+            with contextlib.suppress(Exception):
+                if path.exists():
+                    path.unlink()
+            return {"enabled": True, "fitted": False}
+
+        gate = ConformalClassifierGate(alpha=float(getattr(self.settings.risk, "conformal_alpha", 0.10) or 0.10))
+        y_arr = self._canon_labels(y_eval)
+        fitted = gate.fit(probs, y_arr)
+        payload = {
+            "enabled": bool(enabled),
+            "fitted": bool(fitted),
+            "alpha": float(gate.alpha),
+            "qhat": float(gate.qhat),
+            "n_calib": int(gate.n_calib),
+        }
+        try:
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Failed to save conformal gate: %s", exc)
+        return payload
 
     def _resolve_cpu_budget(self) -> int:
         cpu_total = max(1, os.cpu_count() or 1)
@@ -945,12 +1309,37 @@ class ModelTrainer:
         has_base_signal = hasattr(X_raw, "columns") and "base_signal" in X_raw.columns
         if use_filter and has_base_signal:
             mask = X_raw["base_signal"] != 0
-            if mask.sum() < 100:
+            active_rows = int(mask.sum())
+            total_rows = int(len(X_raw))
+            coverage = float(active_rows) / float(max(1, total_rows))
+
+            try:
+                min_rows = int(os.environ.get("FOREX_BOT_BASE_SIGNAL_MIN_ROWS", "100") or 100)
+            except Exception:
+                min_rows = 100
+            min_rows = max(0, min_rows)
+
+            try:
+                min_cov = float(
+                    os.environ.get("FOREX_BOT_BASE_SIGNAL_MIN_COVERAGE", "0.0") or 0.0
+                )
+            except Exception:
+                min_cov = 0.0
+            min_cov = max(0.0, min(1.0, min_cov))
+
+            logger.info(
+                "Meta-Labeling: base_signal coverage=%.3f%% (%s/%s rows).",
+                coverage * 100.0,
+                active_rows,
+                total_rows,
+            )
+
+            if active_rows < min_rows or (min_cov > 0.0 and coverage < min_cov):
                 logger.warning("Insufficient base signals for meta-labeling. Training on all data (fallback).")
                 X = X_raw
                 y = y_raw
                 meta_subset = dataset.metadata
-            elif int(mask.sum()) == int(len(X_raw)):
+            elif active_rows == total_rows:
                 # Avoid an unnecessary full-frame copy when already pre-filtered upstream.
                 logger.info(f"Meta-Labeling: Using pre-filtered dataset ({len(X_raw)} active signal events).")
                 X = X_raw
@@ -958,7 +1347,7 @@ class ModelTrainer:
                 meta_subset = dataset.metadata
             else:
                 logger.info(
-                    f"Meta-Labeling: Filtering to {mask.sum()} active signal events (from {len(X_raw)} rows)."
+                    f"Meta-Labeling: Filtering to {active_rows} active signal events (from {total_rows} rows)."
                 )
                 X = X_raw.loc[mask].copy()
                 y = y_raw.loc[mask].copy()
@@ -1073,6 +1462,18 @@ class ModelTrainer:
             split_strategy = "positional" if eval_start < n else "positional_disabled"
             _finalize_summary()
 
+        selected_features: list[str] = []
+        try:
+            X_fit, X_eval, selected_features = self._apply_l1_feature_selection(X_fit, y_fit, X_eval)
+            if isinstance(X, pd.DataFrame):
+                X = self._align_feature_frame(X, selected_features)
+            self.run_summary["feature_columns"] = list(selected_features)
+        except Exception as exc:
+            logger.warning("L1 feature selection failed; continuing with original features: %s", exc)
+            selected_features = list(getattr(X_fit, "columns", []))
+            self._save_selected_features(selected_features)
+            self._save_selected_features_by_regime({})
+
         # Feature drift detection between train and eval sets
         if len(X_fit) > 0 and len(X_eval) > 0:
             try:
@@ -1090,6 +1491,52 @@ class ModelTrainer:
                     )
             except Exception as e:
                 logger.debug(f"Feature drift detection failed: {e}")
+
+        if len(X_fit) > 200 and len(X_eval) > 200 and bool(
+            getattr(self.settings.models, "adversarial_validation_enabled", True)
+        ):
+            try:
+                from sklearn.linear_model import LogisticRegression
+                from sklearn.model_selection import train_test_split
+
+                max_rows = int(getattr(self.settings.models, "adversarial_validation_max_rows", 200_000) or 200_000)
+                n_fit = min(len(X_fit), max(100, max_rows // 2))
+                n_eval = min(len(X_eval), max(100, max_rows // 2))
+                x_fit_adv = X_fit.sample(n=n_fit, random_state=42) if len(X_fit) > n_fit else X_fit
+                x_eval_adv = X_eval.sample(n=n_eval, random_state=42) if len(X_eval) > n_eval else X_eval
+                x_adv = pd.concat([x_fit_adv, x_eval_adv], axis=0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                y_adv = np.concatenate(
+                    [
+                        np.zeros(len(x_fit_adv), dtype=np.int8),
+                        np.ones(len(x_eval_adv), dtype=np.int8),
+                    ]
+                )
+                x_tr, x_te, y_tr, y_te = train_test_split(
+                    x_adv.to_numpy(dtype=np.float32),
+                    y_adv,
+                    test_size=0.30,
+                    random_state=42,
+                    stratify=y_adv,
+                )
+                clf = LogisticRegression(max_iter=300, n_jobs=1)
+                clf.fit(x_tr, y_tr)
+                adv_acc = float(clf.score(x_te, y_te))
+                adv_thr = float(getattr(self.settings.models, "adversarial_validation_alert_acc", 0.55) or 0.55)
+                self.run_summary["adversarial_validation"] = {
+                    "accuracy": adv_acc,
+                    "threshold": adv_thr,
+                    "rows_train": int(len(x_fit_adv)),
+                    "rows_eval": int(len(x_eval_adv)),
+                    "non_stationary": bool(adv_acc > adv_thr),
+                }
+                if adv_acc > adv_thr:
+                    logger.warning(
+                        "Adversarial validation flagged train/eval shift (acc=%.3f > %.3f).",
+                        adv_acc,
+                        adv_thr,
+                    )
+            except Exception as exc:
+                logger.debug(f"Adversarial validation skipped: {exc}")
 
         # Basic Cast
         try:
@@ -1476,8 +1923,11 @@ class ModelTrainer:
 
         # 7. Meta Blender
         self._prune_low_quality_models()
+        calibrators: dict[str, ProbabilityCalibrator] = {}
         if not stop_event or not stop_event.is_set():
             self._train_blender(X_eval, y_eval)
+            calibrators = self._fit_probability_calibrators(X_eval, y_eval, meta_eval_models)
+            self.run_summary["conformal_gate"] = self._fit_conformal_gate(X_eval, y_eval, meta_eval_models, calibrators)
 
         # 8. Evaluation (enforce walkforward/CPCV)
         if not stop_event or not stop_event.is_set():
@@ -1571,6 +2021,10 @@ class ModelTrainer:
             self.load_models()
 
         X, y = dataset.X, pd.Series(dataset.y)
+        if isinstance(X, pd.DataFrame):
+            selected = self._load_selected_features()
+            if selected:
+                X = self._align_feature_frame(X, selected)
 
         # Quick time estimate up front (works for CPU/GPU). Uses the same heuristic as full training.
         try:
@@ -1704,29 +2158,54 @@ class ModelTrainer:
 
     def _get_enabled_models(self) -> list[str]:
         """
-        Hard-enable every model type, ignoring feature flags.
-        This guarantees the full stack is always trained/included.
+        Resolve enabled model names with conservative defaults for prop-style robustness:
+        - honor explicit `ml_models`
+        - always keep linear anchors
+        - include online learners as add-ons (not replacements)
+        - avoid implicitly forcing every experimental model unless explicitly requested
         """
         candidates = list(self.settings.models.ml_models)
-        candidates.extend(
-            [
-                "transformer",
-                "patchtst",
-                "timesnet",
-                "evolution",
-                "genetic",
-                "rl_ppo",
-                "rl_sac",
-                "rllib_ppo",
-                "rllib_sac",
-                "nbeats",
-                "nbeatsx_nf",
-                "tide",
-                "tide_nf",
-                "tabnet",
-                "kan",
-            ]
-        )
+        force_all = bool(getattr(self.settings.models, "train_all_registered_models", False))
+        if force_all:
+            candidates.extend(
+                [
+                    "transformer",
+                    "patchtst",
+                    "timesnet",
+                    "evolution",
+                    "genetic",
+                    "rl_ppo",
+                    "rl_sac",
+                    "rllib_ppo",
+                    "rllib_sac",
+                    "nbeats",
+                    "nbeatsx_nf",
+                    "tide",
+                    "tide_nf",
+                    "tabnet",
+                    "kan",
+                    "elasticnet",
+                    "bayes_logit",
+                    "online_pa",
+                    "online_hoeffding",
+                    "vw",
+                ]
+            )
+        else:
+            if bool(getattr(self.settings.models, "ensure_linear_anchors", True)):
+                candidates.extend(["elasticnet", "bayes_logit"])
+            if bool(getattr(self.settings.models, "online_learners_enabled", True)):
+                candidates.extend(["online_pa", "online_hoeffding"])
+
+            # Include optional families only when their coarse feature flags are enabled.
+            if bool(getattr(self.settings.models, "use_neuroevolution", False)):
+                candidates.extend(["evolution", "genetic"])
+            if bool(getattr(self.settings.models, "use_rl_agent", False)):
+                candidates.append("rl_ppo")
+            if bool(getattr(self.settings.models, "use_sac_agent", False)):
+                candidates.append("rl_sac")
+            if bool(getattr(self.settings.models, "use_rllib_agent", False)):
+                candidates.extend(["rllib_ppo", "rllib_sac"])
 
         # Preserve order while deduplicating
         seen = set()
@@ -1753,11 +2232,10 @@ class ModelTrainer:
                 logger.info("Model override active (FOREX_BOT_MODELS_OVERRIDE): %s", ordered)
 
         # Filter out models that cannot run in the current environment.
-        # This keeps the "train everything" philosophy while avoiding known no-op experts
+        # This keeps the configured/robust model set while avoiding known no-op experts
         # (e.g., RLlib on Python 3.13 Windows where Ray wheels do not exist).
         filtered: list[str] = []
         skipped: list[str] = []
-        gpu_only = str(os.environ.get("FOREX_BOT_GPU_ONLY", "")).strip().lower() in {"1", "true", "yes", "on"}
 
         try:
             from ..models.rllib_agent import RAY_AVAILABLE  # type: ignore
@@ -1780,6 +2258,13 @@ class ModelTrainer:
             TRANSFORMER_NF_AVAILABLE = False  # type: ignore
 
         try:
+            from ..models.linear import SKLEARN_AVAILABLE as LINEAR_SKLEARN_AVAILABLE  # type: ignore
+            from ..models.linear import VW_AVAILABLE as LINEAR_VW_AVAILABLE  # type: ignore
+        except Exception:
+            LINEAR_SKLEARN_AVAILABLE = False  # type: ignore
+            LINEAR_VW_AVAILABLE = False  # type: ignore
+
+        try:
             from ..models.registry import MODEL_REGISTRY
 
             registry = set(MODEL_REGISTRY.keys())
@@ -1797,6 +2282,14 @@ class ModelTrainer:
                 skipped.append(name)
                 continue
             if name in {"patchtst", "timesnet"} and not bool(TRANSFORMER_NF_AVAILABLE):
+                skipped.append(name)
+                continue
+            if name in {"elasticnet", "bayes_logit", "online_pa", "online_hoeffding"} and not bool(
+                LINEAR_SKLEARN_AVAILABLE
+            ):
+                skipped.append(name)
+                continue
+            if name in {"vw"} and not bool(LINEAR_VW_AVAILABLE):
                 skipped.append(name)
                 continue
             if registry and name not in registry:
@@ -1864,6 +2357,8 @@ class ModelTrainer:
             if len(X_m) < 200 or len(y_m) < 200:
                 return
             feats = pd.DataFrame(index=X_m.index)
+            model_buy: dict[str, np.ndarray] = {}
+            model_acc: dict[str, float] = {}
             use_filter = bool(getattr(self.settings.models, "phase5_filter_meta_blender", False))
             core = set(getattr(self.settings.models, "phase5_core_models", []) or [])
             selected = self.models
@@ -1876,13 +2371,57 @@ class ModelTrainer:
             for name, m in selected.items():
                 try:
                     p = self._pad_probs(m.predict_proba(X_m))
+                    if p.shape[0] != len(X_m):
+                        continue
                     feats[f"{name}_buy"] = p[:, 1]
+                    model_buy[name] = np.asarray(p[:, 1], dtype=float)
+                    y_arr = np.asarray(y_m, dtype=int)
+                    pred_cls = np.argmax(p, axis=1)
+                    pred_lbl = np.where(pred_cls == 2, -1, pred_cls).astype(int)
+                    model_acc[name] = float((pred_lbl == y_arr).mean()) if len(y_arr) == len(pred_lbl) else 0.0
                     contributed += 1
                     # ...
                 except Exception as exc:
                     logger.warning("MetaBlender: skipping model '%s': %s", name, exc)
             if contributed < 2:
                 logger.warning("MetaBlender: insufficient valid base models (%s); skipping fit.", contributed)
+                return
+
+            if bool(getattr(self.settings.models, "phase5_diversity_filter", True)) and len(model_buy) >= 2:
+                corr_thr = float(getattr(self.settings.models, "phase5_model_corr_max", 0.85) or 0.85)
+                names = list(model_buy.keys())
+                drop: set[str] = set()
+                for i in range(len(names)):
+                    a = names[i]
+                    if a in drop:
+                        continue
+                    for j in range(i + 1, len(names)):
+                        b = names[j]
+                        if b in drop:
+                            continue
+                        try:
+                            corr = float(np.corrcoef(model_buy[a], model_buy[b])[0, 1])
+                        except Exception:
+                            corr = 0.0
+                        if not np.isfinite(corr):
+                            corr = 0.0
+                        if abs(corr) > corr_thr:
+                            a_acc = float(model_acc.get(a, 0.0))
+                            b_acc = float(model_acc.get(b, 0.0))
+                            weaker = a if a_acc < b_acc else b
+                            drop.add(weaker)
+                if drop:
+                    cols = [c for c in feats.columns if c.endswith("_buy") and c[:-4] in drop]
+                    if cols:
+                        feats = feats.drop(columns=cols, errors="ignore")
+                        logger.info(
+                            "MetaBlender diversity filter dropped %s highly correlated models: %s",
+                            len(drop),
+                            sorted(drop),
+                        )
+
+            if len([c for c in feats.columns if c.endswith("_buy")]) < 2:
+                logger.warning("MetaBlender: <2 diverse models remain after correlation filter; skipping fit.")
                 return
             feats["label"] = np.asarray(y_m, dtype=int)
 

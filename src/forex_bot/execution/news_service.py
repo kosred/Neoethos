@@ -32,8 +32,8 @@ class NewsService:
         self._last_news_fetch: datetime | None = None
         lookahead = int(getattr(self.settings.news, "news_lookahead_minutes", 60))
         self._news_fetch_min_seconds = max(900, int(lookahead * 60 / 2))
-        self._news_pre_event_seconds = 300
-        self._news_post_event_seconds = 120
+        self._news_pre_event_seconds = int(getattr(self.settings.news, "news_pre_event_seconds", 300) or 300)
+        self._news_post_event_seconds = int(getattr(self.settings.news, "news_post_event_seconds", 300) or 300)
 
         self.latest_events: list = []
         self.breaking_news: list = []
@@ -123,7 +123,12 @@ class NewsService:
                 })
 
         max_conf = max((e["conf"] for e in impactful_events), default=0.0)
-        max_sent = max((e["sent"] for e in impactful_events), default=0.0)
+        max_sent = 0.0
+        if impactful_events:
+            try:
+                max_sent = float(max((e["sent"] for e in impactful_events), key=lambda v: abs(float(v))))
+            except Exception:
+                max_sent = max((e["sent"] for e in impactful_events), default=0.0)
         
         # Risk cap reduces as confidence/surprise increases
         news_cap = self.settings.risk.max_risk_per_trade * max(0.2, 1.0 - max_conf)

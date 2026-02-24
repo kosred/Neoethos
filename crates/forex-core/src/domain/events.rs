@@ -1,5 +1,4 @@
 use chrono::{DateTime, Utc};
-use ndarray::Array1; // Minimal ndarray usage for now
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
