@@ -9,6 +9,7 @@
 /.ruff_cache/
 /catboost_info/
 /target/
+/.worktrees/
 /rust_core/
 /vendor/talib-sys/dependencies/
 /vendor/ta-lib/
