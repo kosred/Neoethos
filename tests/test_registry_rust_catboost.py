@@ -48,7 +48,6 @@ def test_get_model_class_prefers_rust_catboost_when_available(monkeypatch):
 
 def test_get_model_class_raises_when_rust_catboost_missing(monkeypatch):
     reg._CLASS_CACHE.clear()
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE", "0")
     monkeypatch.setenv("FOREX_BOT_TREE_BACKEND", "auto")
     monkeypatch.setattr(reg, "_use_rust_tree_models", lambda name=None: True)
 
@@ -70,7 +69,7 @@ def test_get_model_class_raises_when_rust_catboost_missing(monkeypatch):
         reg.get_model_class("catboost", prefer_gpu=False)
         assert False, "Expected Rust-only tree loading to raise when Rust class is missing."
     except ImportError as exc:
-        assert "Rust tree model is required" in str(exc)
+        assert "Rust runtime model is required" in str(exc)
     reg._CLASS_CACHE.clear()
 
 
@@ -94,6 +93,6 @@ def test_get_model_class_raises_in_rust_strict_mode(monkeypatch):
         reg.get_model_class("catboost", prefer_gpu=False)
         assert False, "Expected strict mode to raise when Rust binding class is missing."
     except ImportError as exc:
-        assert "Rust tree model is required" in str(exc)
+        assert "Rust runtime model is required" in str(exc)
     finally:
         reg._CLASS_CACHE.clear()

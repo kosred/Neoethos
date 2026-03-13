@@ -18,7 +18,6 @@ def test_transformer_aliases_route_to_native_expert() -> None:
 
 
 def test_alias_construction_works_in_strict_mode(monkeypatch) -> None:
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE_STRICT", "1")
     assert isinstance(fnf.TiDENFExpert(), TiDEExpert)
     assert isinstance(fnf.NBEATSxNFExpert(), NBeatsExpert)
     assert isinstance(tnf.PatchTSTExpert(), TransformerExpertTorch)

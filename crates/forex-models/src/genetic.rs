@@ -24,6 +24,86 @@ pub struct GeneticStrategyExpert {
 }
 
 impl GeneticStrategyExpert {
+    fn series_to_numpy(py: Python<'_>, series: &Series) -> Result<Py<PyAny>> {
+        let numpy = PyModule::import(py, "numpy")?;
+        let array = match series.dtype() {
+            DataType::Float32 => {
+                let values: Vec<f32> = series.f32()?.into_iter().map(|v| v.unwrap_or(0.0)).collect();
+                numpy.call_method1("array", (values,))?
+            }
+            DataType::Float64 => {
+                let values: Vec<f64> = series.f64()?.into_iter().map(|v| v.unwrap_or(0.0)).collect();
+                numpy.call_method1("array", (values,))?
+            }
+            DataType::Int8 => {
+                let values: Vec<i8> = series.i8()?.into_iter().map(|v| v.unwrap_or(0)).collect();
+                numpy.call_method1("array", (values,))?
+            }
+            DataType::Int16 => {
+                let values: Vec<i16> = series.i16()?.into_iter().map(|v| v.unwrap_or(0)).collect();
+                numpy.call_method1("array", (values,))?
+            }
+            DataType::Int32 => {
+                let values: Vec<i32> = series.i32()?.into_iter().map(|v| v.unwrap_or(0)).collect();
+                numpy.call_method1("array", (values,))?
+            }
+            DataType::Int64 => {
+                let values: Vec<i64> = series.i64()?.into_iter().map(|v| v.unwrap_or(0)).collect();
+                numpy.call_method1("array", (values,))?
+            }
+            DataType::UInt8 => {
+                let values: Vec<u8> = series.u8()?.into_iter().map(|v| v.unwrap_or(0)).collect();
+                numpy.call_method1("array", (values,))?
+            }
+            DataType::UInt16 => {
+                let values: Vec<u16> = series.u16()?.into_iter().map(|v| v.unwrap_or(0)).collect();
+                numpy.call_method1("array", (values,))?
+            }
+            DataType::UInt32 => {
+                let values: Vec<u32> = series.u32()?.into_iter().map(|v| v.unwrap_or(0)).collect();
+                numpy.call_method1("array", (values,))?
+            }
+            DataType::UInt64 => {
+                let values: Vec<u64> = series.u64()?.into_iter().map(|v| v.unwrap_or(0)).collect();
+                numpy.call_method1("array", (values,))?
+            }
+            DataType::Boolean => {
+                let values: Vec<bool> = series.bool()?.into_iter().map(|v| v.unwrap_or(false)).collect();
+                numpy.call_method1("array", (values,))?
+            }
+            _ => {
+                let casted = series.cast(&DataType::Float64)?;
+                let values: Vec<f64> = casted.f64()?.into_iter().map(|v| v.unwrap_or(0.0)).collect();
+                numpy.call_method1("array", (values,))?
+            }
+        };
+        Ok(array.unbind())
+    }
+
+    fn dataframe_to_bridge_frame(
+        py: Python<'_>,
+        genetic_module: &Bound<'_, PyModule>,
+        df: &DataFrame,
+        attrs: Option<Bound<'_, PyDict>>,
+    ) -> Result<Py<PyAny>> {
+        let frame_cls = genetic_module
+            .getattr("_BridgeFrame")
+            .context("_BridgeFrame helper not found in forex_bot.models.genetic")?;
+        let data = PyDict::new(py);
+        for col in df.get_columns() {
+            let series = col.as_materialized_series();
+            let array = Self::series_to_numpy(py, series)?;
+            data.set_item(col.name().as_str(), array.bind(py))?;
+        }
+        let numpy = PyModule::import(py, "numpy")?;
+        let index = numpy.call_method1("arange", (df.height(),))?;
+        let frame = match attrs {
+            Some(frame_attrs) => frame_cls.call1((data, index, frame_attrs))?,
+            None => frame_cls.call1((data, index))?,
+        };
+        Ok(frame.unbind())
+    }
+
     /// Create new Genetic Strategy Expert
     /// Python lines 15-30
     pub fn new(population_size: usize, generations: usize, max_indicators: usize) -> Result<Self> {
@@ -63,53 +143,40 @@ impl GeneticStrategyExpert {
     /// This will:
     /// 1. Try to load pre-discovered strategies from Discovery Engine JSON
     /// 2. Fall back to internal evolution if no cached strategies found
-    pub fn fit(&mut self, x: &DataFrame, y: &Series, metadata: Option<&DataFrame>) -> Result<()> {
+    pub fn fit(
+        &mut self,
+        x: &DataFrame,
+        y: &Series,
+        metadata: Option<&DataFrame>,
+        symbol: Option<&str>,
+    ) -> Result<()> {
         Python::attach(|py| {
+            let genetic_module = PyModule::import(py, "forex_bot.models.genetic")
+                .context("Failed to import forex_bot.models.genetic")?;
             let expert = self
                 .py_expert
                 .as_ref()
                 .context("Genetic expert not initialized")?
                 .bind(py);
+            let x_frame = Self::dataframe_to_bridge_frame(py, &genetic_module, x, None)?;
+            let y_np = Self::series_to_numpy(py, y)?;
 
-            // Convert DataFrames to pandas
-            let pd = PyModule::import(py, "pandas")?;
-
-            // Convert x to pandas DataFrame
-            let x_csv = {
-                let mut buf = Vec::new();
-                let mut x_clone = x.clone();
-                CsvWriter::new(&mut buf).finish(&mut x_clone)?;
-                String::from_utf8(buf)?
-            };
-            let x_str_io = PyModule::import(py, "io")?
-                .getattr("StringIO")?
-                .call1((x_csv,))?;
-            let x_pd = pd.call_method1("read_csv", (x_str_io,))?;
-
-            // Convert y to pandas Series
-            let y_values: Vec<f64> = y.f64()?.into_iter().map(|v| v.unwrap_or(0.0)).collect();
-            let y_pd = pd.call_method1("Series", (y_values,))?;
-
-            // Convert metadata if provided
-            let metadata_pd = if let Some(meta) = metadata {
-                let meta_csv = {
-                    let mut buf = Vec::new();
-                    let mut meta_clone = meta.clone();
-                    CsvWriter::new(&mut buf).finish(&mut meta_clone)?;
-                    String::from_utf8(buf)?
-                };
-                let meta_str_io = PyModule::import(py, "io")?
-                    .getattr("StringIO")?
-                    .call1((meta_csv,))?;
-                Some(pd.call_method1("read_csv", (meta_str_io,))?)
+            let metadata_frame = if let Some(meta) = metadata {
+                let attrs = PyDict::new(py);
+                if let Some(symbol) = symbol {
+                    if !symbol.trim().is_empty() {
+                        attrs.set_item("symbol", symbol)?;
+                    }
+                }
+                Some(Self::dataframe_to_bridge_frame(py, &genetic_module, meta, Some(attrs))?)
             } else {
                 None
             };
 
             // Call fit method
             let kwargs = PyDict::new(py);
-            kwargs.set_item("metadata", metadata_pd)?;
-            expert.call_method("fit", (x_pd, y_pd), Some(&kwargs))?;
+            kwargs.set_item("metadata", metadata_frame)?;
+            expert.call_method("fit", (x_frame, y_np), Some(&kwargs))?;
 
             info!(
                 "Genetic expert fitted ({} generations, population {}, max_indicators {})",
@@ -129,48 +196,33 @@ impl GeneticStrategyExpert {
         &self,
         x: &DataFrame,
         metadata: Option<&DataFrame>,
+        symbol: Option<&str>,
     ) -> Result<Array2<f32>> {
         Python::attach(|py| {
+            let genetic_module = PyModule::import(py, "forex_bot.models.genetic")
+                .context("Failed to import forex_bot.models.genetic")?;
             let expert = self
                 .py_expert
                 .as_ref()
                 .context("Genetic expert not initialized")?
                 .bind(py);
-
-            let pd = PyModule::import(py, "pandas")?;
-
-            // Convert x to pandas
-            let x_csv = {
-                let mut buf = Vec::new();
-                let mut x_clone = x.clone();
-                CsvWriter::new(&mut buf).finish(&mut x_clone)?;
-                String::from_utf8(buf)?
-            };
-            let x_str_io = PyModule::import(py, "io")?
-                .getattr("StringIO")?
-                .call1((x_csv,))?;
-            let x_pd = pd.call_method1("read_csv", (x_str_io,))?;
-
-            // Convert metadata if provided
-            let metadata_pd = if let Some(meta) = metadata {
-                let meta_csv = {
-                    let mut buf = Vec::new();
-                    let mut meta_clone = meta.clone();
-                    CsvWriter::new(&mut buf).finish(&mut meta_clone)?;
-                    String::from_utf8(buf)?
-                };
-                let meta_str_io = PyModule::import(py, "io")?
-                    .getattr("StringIO")?
-                    .call1((meta_csv,))?;
-                Some(pd.call_method1("read_csv", (meta_str_io,))?)
+            let x_frame = Self::dataframe_to_bridge_frame(py, &genetic_module, x, None)?;
+            let metadata_frame = if let Some(meta) = metadata {
+                let attrs = PyDict::new(py);
+                if let Some(symbol) = symbol {
+                    if !symbol.trim().is_empty() {
+                        attrs.set_item("symbol", symbol)?;
+                    }
+                }
+                Some(Self::dataframe_to_bridge_frame(py, &genetic_module, meta, Some(attrs))?)
             } else {
                 None
             };
 
             // Call predict_proba
             let kwargs = PyDict::new(py);
-            kwargs.set_item("metadata", metadata_pd)?;
-            let result = expert.call_method("predict_proba", (x_pd,), Some(&kwargs))?;
+            kwargs.set_item("metadata", metadata_frame)?;
+            let result = expert.call_method("predict_proba", (x_frame,), Some(&kwargs))?;
 
             // Convert numpy array to ndarray
             let _numpy = PyModule::import(py, "numpy")?;
@@ -295,3 +347,131 @@ impl GeneticStrategyExpert {
 // 2. Rust's performance and type safety
 // 3. Pre-discovered optimal strategies from external analysis
 //
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::types::PyDict;
+    use std::ffi::CString;
+
+    fn run_py(py: Python<'_>, code: &str, locals: &Bound<'_, PyDict>) -> PyResult<()> {
+        let code = CString::new(code).expect("python code should not contain embedded nulls");
+        py.run(code.as_c_str(), Some(locals), Some(locals))
+    }
+
+    #[test]
+    fn test_genetic_bridge_avoids_pandas_and_passes_frame_like_metadata() -> Result<()> {
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            run_py(
+                py,
+                r#"
+import sys, types, numpy as np
+_orig_pkg = sys.modules.get("forex_bot")
+_orig_models_pkg = sys.modules.get("forex_bot.models")
+_orig_genetic = sys.modules.get("forex_bot.models.genetic")
+_orig_pandas = sys.modules.get("pandas")
+
+class _PandasTrap(types.SimpleNamespace):
+    def __getattr__(self, name):
+        raise AssertionError("pandas bridge must not be used")
+
+sys.modules["pandas"] = _PandasTrap()
+
+class _BridgeFrame:
+    def __init__(self, data, index=None, attrs=None):
+        self._data = {str(k): np.asarray(v) for k, v in data.items()}
+        self.columns = list(self._data.keys())
+        n = len(next(iter(self._data.values()))) if self._data else 0
+        self.index = np.arange(n, dtype=np.int64) if index is None else np.asarray(index)
+        self.attrs = dict(attrs or {})
+    @property
+    def empty(self):
+        return len(self.index) <= 0
+    def __len__(self):
+        return int(len(self.index))
+    def __getitem__(self, key):
+        return self._data[str(key)]
+    def copy(self):
+        out = _BridgeFrame({k: np.asarray(v).copy() for k, v in self._data.items()}, np.asarray(self.index).copy(), dict(self.attrs))
+        return out
+
+class FakeGeneticStrategyExpert:
+    def __init__(self, population_size=0, generations=0, max_indicators=0):
+        self.population_size = population_size
+        self.generations = generations
+        self.max_indicators = max_indicators
+    def fit(self, x, y, metadata=None):
+        assert hasattr(x, "columns")
+        assert hasattr(x, "index")
+        assert isinstance(y, np.ndarray)
+        assert hasattr(metadata, "copy")
+        assert set(str(c).lower() for c in metadata.columns) >= {"open", "high", "low", "close"}
+    def predict_proba(self, x, metadata=None):
+        assert hasattr(x, "__getitem__")
+        assert hasattr(x, "columns")
+        assert metadata is None or hasattr(metadata, "__getitem__")
+        return np.tile(np.array([[1/3, 1/3, 1/3]], dtype=np.float32), (len(x), 1))
+
+fake_module = types.SimpleNamespace(
+    GeneticStrategyExpert=FakeGeneticStrategyExpert,
+    _BridgeFrame=_BridgeFrame,
+)
+pkg = sys.modules.get("forex_bot") or types.ModuleType("forex_bot")
+models_pkg = sys.modules.get("forex_bot.models") or types.ModuleType("forex_bot.models")
+setattr(pkg, "models", models_pkg)
+setattr(models_pkg, "genetic", fake_module)
+sys.modules["forex_bot"] = pkg
+sys.modules["forex_bot.models"] = models_pkg
+sys.modules["forex_bot.models.genetic"] = fake_module
+"#,
+                &locals,
+            )?;
+
+            let mut expert = GeneticStrategyExpert::new(8, 2, 3)?;
+            let x = DataFrame::new(vec![
+                Series::new("f1".into(), vec![1.0f64, 2.0, 3.0]).into(),
+                Series::new("f2".into(), vec![4.0f64, 5.0, 6.0]).into(),
+            ])?;
+            let y = Series::new("label".into(), vec![1.0f64, 0.0, -1.0]);
+            let meta = DataFrame::new(vec![
+                Series::new("open".into(), vec![1.0f64, 1.1, 1.2]).into(),
+                Series::new("high".into(), vec![1.2f64, 1.3, 1.4]).into(),
+                Series::new("low".into(), vec![0.9f64, 1.0, 1.1]).into(),
+                Series::new("close".into(), vec![1.1f64, 1.2, 1.3]).into(),
+            ])?;
+
+            let fit_result = expert.fit(&x, &y, Some(&meta), Some("EURUSD"));
+            let probs_result = expert.predict_proba(&x, Some(&meta), Some("EURUSD"));
+
+            let _ = run_py(
+                py,
+                r#"
+import sys
+if _orig_pkg is None:
+    sys.modules.pop("forex_bot", None)
+else:
+    sys.modules["forex_bot"] = _orig_pkg
+if _orig_models_pkg is None:
+    sys.modules.pop("forex_bot.models", None)
+else:
+    sys.modules["forex_bot.models"] = _orig_models_pkg
+if _orig_genetic is None:
+    sys.modules.pop("forex_bot.models.genetic", None)
+else:
+    sys.modules["forex_bot.models.genetic"] = _orig_genetic
+if _orig_pandas is None:
+    sys.modules.pop("pandas", None)
+else:
+    sys.modules["pandas"] = _orig_pandas
+"#,
+                &locals,
+            );
+
+            fit_result?;
+            let probs = probs_result?;
+            assert_eq!(probs.shape(), &[3, 3]);
+            Ok(())
+        })
+    }
+}

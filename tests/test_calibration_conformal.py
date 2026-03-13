@@ -32,6 +32,7 @@ def test_conformal_gate_fit_and_abstain_logic():
     y = np.argmax(probs, axis=1).astype(int)
 
     gate = ConformalClassifierGate(alpha=0.10)
+    assert type(gate).__module__.startswith("forex_bindings")
     assert gate.fit(probs, y)
     assert gate.fitted
     assert 0.0 <= gate.qhat <= 1.0
@@ -42,4 +43,3 @@ def test_conformal_gate_fit_and_abstain_logic():
     abstain, set_size = gate.should_abstain(np.array([1 / 3, 1 / 3, 1 / 3], dtype=float), min_set_size=3)
     assert abstain
     assert set_size == 3
-

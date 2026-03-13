@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from forex_bot.training.trainer import ModelTrainer
 
 
-def test_get_enabled_models_keeps_allowlisted_linear_in_pandas_free(monkeypatch):
+def test_get_enabled_models_keeps_allowlisted_linear_in_frame_native_runtime(monkeypatch):
     trainer = object.__new__(ModelTrainer)
     trainer.settings = SimpleNamespace(
         models=SimpleNamespace(
@@ -20,7 +20,6 @@ def test_get_enabled_models_keeps_allowlisted_linear_in_pandas_free(monkeypatch)
         )
     )
 
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE", "1")
     monkeypatch.setenv("FOREX_BOT_TREE_BACKEND", "rust_strict")
 
     # Rust trees available for xgboost; linear models do not require rust bindings.

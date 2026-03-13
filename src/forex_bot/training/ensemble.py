@@ -14,6 +14,8 @@ try:
 except Exception:
     _fb = None  # type: ignore
 
+from .probability_utils import pad_probs_neutral_buy_sell
+
 try:
     from sklearn.ensemble import GradientBoostingClassifier
     from sklearn.linear_model import LogisticRegression
@@ -156,38 +158,7 @@ def _frame_resolve_column(value: Any, name: str) -> str | None:
 
 
 def pad_probs(probs: np.ndarray, classes: list[int] | None = None) -> np.ndarray:
-    """
-    Normalize probability outputs to [neutral, buy, sell].
-    """
-    if probs is None or len(probs) == 0:
-        return np.zeros((0, 3), dtype=float)
-
-    arr = np.asarray(probs, dtype=float)
-    if arr.ndim == 1:
-        arr = arr.reshape(-1, 1)
-    n = arr.shape[0]
-    out = np.zeros((n, 3), dtype=float)
-
-    if classes is not None and len(classes) == arr.shape[1]:
-        for col, cls_val in enumerate(classes):
-            if cls_val == 0:
-                out[:, 0] = arr[:, col]
-            elif cls_val == 1:
-                out[:, 1] = arr[:, col]
-            elif cls_val in (-1, 2):
-                out[:, 2] = arr[:, col]
-        return out
-
-    if arr.shape[1] == 3:
-        return arr
-    if arr.shape[1] == 2:
-        out[:, 0] = arr[:, 0]
-        out[:, 1] = arr[:, 1]
-        return out
-
-    out[:, 0] = 1.0 - arr[:, 0]
-    out[:, 1] = arr[:, 0]
-    return out
+    return pad_probs_neutral_buy_sell(probs, classes=classes)
 
 
 class MetaBlender:

@@ -77,6 +77,7 @@ from ..strategy.fast_backtest import (
     infer_pip_metrics,
     infer_sl_tp_pips_auto,
 )
+from .probability_utils import pad_probs_neutral_buy_sell, threshold_signals_and_accuracy
 
 # Dynamic GPU/CPU model selection - use GPU versions when available for HPO
 _gpus = get_available_gpus()
@@ -178,6 +179,38 @@ def _rust_month_day_indices(index_like: Any, n_rows: int) -> tuple[np.ndarray, n
     if month_arr.size != int(n_rows) or day_arr.size != int(n_rows):
         return None
     return month_arr, day_arr
+
+
+def _rust_count_weekday_trading_days(index_like: Any) -> float | None:
+    if _fb is None or not hasattr(_fb, "count_weekday_trading_days"):
+        return None
+    try:
+        arr = np.asarray(index_like).reshape(-1)
+    except Exception:
+        return None
+    if arr.size <= 0:
+        return 0.0
+
+    try:
+        if np.issubdtype(arr.dtype, np.datetime64):
+            ns = arr.astype("datetime64[ns]").astype(np.int64, copy=False)
+        elif arr.dtype.kind in {"i", "u"}:
+            ns = arr.astype(np.int64, copy=False)
+        elif arr.dtype.kind == "f":
+            ns = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.int64, copy=False)
+        else:
+            return None
+    except Exception:
+        return None
+
+    try:
+        out = _fb.count_weekday_trading_days(np.asarray(ns, dtype=np.int64))
+    except Exception:
+        return None
+    try:
+        return float(out)
+    except Exception:
+        return None
 
 
 class HyperparameterOptimizer:
@@ -636,6 +669,9 @@ class HyperparameterOptimizer:
             idx_arr = np.asarray(idx).reshape(-1)
             if idx_arr.size <= 0:
                 return None
+            rust_days = _rust_count_weekday_trading_days(idx_arr)
+            if rust_days is not None:
+                return rust_days
             if np.issubdtype(idx_arr.dtype, np.datetime64):
                 days = idx_arr.astype("datetime64[D]")
             elif idx_arr.dtype.kind in {"i", "u"}:
@@ -681,27 +717,7 @@ class HyperparameterOptimizer:
 
     @staticmethod
     def _pad_probs(probs: np.ndarray) -> np.ndarray:
-        """
-        HPC UNIFIED PROTOCOL: Force output to [Neutral, Buy, Sell].
-        """
-        if probs is None or len(probs) == 0:
-            return np.zeros((0, 3), dtype=float)
-        arr = np.asarray(probs, dtype=float)
-        if arr.ndim == 1:
-            arr = arr.reshape(-1, 1)
-        n = arr.shape[0]
-
-        out = np.zeros((n, 3), dtype=float)
-        if arr.shape[1] == 3:
-            return arr
-        elif arr.shape[1] == 2:
-            out[:, 0] = arr[:, 0]
-            out[:, 1] = arr[:, 1]
-            return out
-
-        out[:, 0] = 1.0 - arr[:, 0]
-        out[:, 1] = arr[:, 0]
-        return out
+        return pad_probs_neutral_buy_sell(probs)
 
     def _objective_metrics(
         self,
@@ -730,12 +746,11 @@ class HyperparameterOptimizer:
             except Exception:
                 meta_val = None
 
-        p_buy = probs[:, 1]
-        p_sell = probs[:, 2]
-        trade_prob = np.maximum(p_buy, p_sell)
-        direction = np.where(p_buy >= p_sell, 1, -1).astype(np.int8, copy=False)
-        signals = np.where(trade_prob >= self.prop_conf_threshold, direction, 0).astype(np.int8, copy=False)
-        acc = float(np.mean(signals.astype(int) == y_true_arr)) if len(y_true_arr) else 0.0
+        signals, acc = threshold_signals_and_accuracy(
+            probs,
+            conf_threshold=self.prop_conf_threshold,
+            y_true=y_true_arr,
+        )
 
         meta_cols = self._meta_columns(meta_val)
         if meta_val is None or not {"close", "high", "low"}.issubset(meta_cols):
@@ -1496,4 +1511,5 @@ class HyperparameterOptimizer:
             except Exception as e:
                 logger.error(f"Failed to load best_params.json: {e}")
         return {}
+
 

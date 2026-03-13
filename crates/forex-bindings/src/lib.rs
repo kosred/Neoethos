@@ -16,7 +16,6 @@ use ndarray::{Array2, Ix1, Ix2};
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
 };
-#[cfg(any(feature = "lightgbm", feature = "xgboost", feature = "catboost"))]
 use polars::prelude::*;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
@@ -24,7 +23,6 @@ use pythonize::pythonize;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-#[cfg(any(feature = "lightgbm", feature = "xgboost", feature = "catboost"))]
 use std::path::Path;
 use std::path::PathBuf;
 #[cfg(feature = "onnx")]
@@ -41,12 +39,147 @@ use forex_models::tree_models::ParamValue;
 #[cfg(feature = "xgboost")]
 use forex_models::tree_models::{XGBoostDARTExpert, XGBoostExpert, XGBoostRFExpert};
 
+use forex_models::genetic::GeneticStrategyExpert;
+use forex_models::neural_networks::MLPExpert as RustMlpExpert;
 #[cfg(feature = "catboost")]
 use forex_models::tree_models::{CatBoostAltExpert, CatBoostExpert};
 
 #[pyclass]
 struct ForexCore {
     probe: Mutex<HardwareProbe>,
+}
+
+#[pyclass(name = "ConformalGate", module = "forex_bindings")]
+struct ConformalGate {
+    #[pyo3(get, set)]
+    alpha: f64,
+    #[pyo3(get, set)]
+    qhat: f64,
+    #[pyo3(get, set)]
+    fitted: bool,
+    #[pyo3(get, set)]
+    n_calib: usize,
+}
+
+#[pymethods]
+impl ConformalGate {
+    #[new]
+    #[pyo3(signature = (alpha=0.10))]
+    fn new(alpha: f64) -> Self {
+        Self {
+            alpha,
+            qhat: 1.0,
+            fitted: false,
+            n_calib: 0,
+        }
+    }
+
+    fn fit<'py>(
+        &mut self,
+        py: Python<'py>,
+        probs: &Bound<'py, PyAny>,
+        y_true: &Bound<'py, PyAny>,
+    ) -> PyResult<bool> {
+        let np = py.import("numpy")?;
+        let probs_array_any = np.getattr("asarray")?.call1((probs,))?;
+        let probs_array_f64 = probs_array_any.call_method1("astype", ("float64",))?;
+        let probs_array: PyReadonlyArray2<'py, f64> = probs_array_f64.extract()?;
+
+        let labels_array_any = np.getattr("asarray")?.call1((y_true,))?;
+        let labels_array_i64 = labels_array_any.call_method1("astype", ("int64",))?;
+        let labels_array: PyReadonlyArray1<'py, i64> = labels_array_i64.extract()?;
+
+        let p = probs_array.as_array();
+        if p.ndim() != 2 || p.shape()[1] < 3 {
+            return Ok(false);
+        }
+
+        let y_raw = labels_array.as_array();
+        let n = usize::min(y_raw.len(), p.shape()[0]);
+        if n < 64 {
+            return Ok(false);
+        }
+
+        let alpha = self.alpha.clamp(1e-6, 0.99);
+        let q_level = (((n + 1) as f64) * (1.0 - alpha)).ceil() / (n as f64);
+        let q_level = q_level.clamp(0.0, 1.0);
+
+        let mut scores = Vec::with_capacity(n);
+        for row in 0..n {
+            let y = match y_raw[row] {
+                -1 => 2usize,
+                value if value < 0 => 0usize,
+                value if value > 2 => 2usize,
+                value => value as usize,
+            };
+            let prob = p[[row, y]].clamp(1e-8, 1.0);
+            scores.push(1.0 - prob);
+        }
+        scores.sort_by(|a, b| a.total_cmp(b));
+        let idx = ((q_level * (n as f64)).ceil() as isize - 1).clamp(0, (n - 1) as isize) as usize;
+        self.qhat = scores[idx].clamp(0.0, 1.0);
+        self.fitted = true;
+        self.n_calib = n;
+        Ok(true)
+    }
+
+    fn prediction_set<'py>(
+        &self,
+        py: Python<'py>,
+        probs_row: &Bound<'py, PyAny>,
+    ) -> PyResult<Vec<usize>> {
+        let np = py.import("numpy")?;
+        let row_any = np.getattr("asarray")?.call1((probs_row,))?;
+        let row_f64 = row_any.call_method1("astype", ("float64",))?;
+        let row_array: PyReadonlyArray1<'py, f64> = row_f64.extract()?;
+        let row = row_array.as_array();
+        if row.len() < 3 {
+            return Ok(vec![0, 1, 2]);
+        }
+
+        let mut probs = [0.0_f64; 3];
+        for idx in 0..3 {
+            probs[idx] = row[idx].clamp(1e-8, 1.0);
+        }
+
+        let mut keep: Vec<usize> = probs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, prob)| {
+                if (1.0 - *prob) <= self.qhat {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if keep.is_empty() {
+            let best = probs
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
+            keep.push(best);
+        }
+        Ok(keep)
+    }
+
+    #[pyo3(signature = (probs_row, min_set_size=3))]
+    fn should_abstain<'py>(
+        &self,
+        py: Python<'py>,
+        probs_row: &Bound<'py, PyAny>,
+        min_set_size: usize,
+    ) -> PyResult<(bool, usize)> {
+        if !self.fitted {
+            return Ok((false, 1));
+        }
+        let keep = self.prediction_set(py, probs_row)?;
+        let size = keep.len();
+        Ok((size >= usize::max(1, min_set_size), size))
+    }
 }
 
 #[pymethods]
@@ -129,13 +262,38 @@ impl ModelEngine {
     }
 }
 
-#[cfg(any(feature = "lightgbm", feature = "xgboost", feature = "catboost"))]
 fn dataframe_from_ndarray(features: &Array2<f64>) -> Result<DataFrame, String> {
     let mut df_data: Vec<Column> = Vec::with_capacity(features.ncols());
     for col_idx in 0..features.ncols() {
         let col_data: Vec<f64> = features.column(col_idx).iter().copied().collect();
         let name = format!("feature_{col_idx}");
         df_data.push(Series::new(name.into(), col_data).into());
+    }
+    DataFrame::new(df_data).map_err(|e| format!("DataFrame creation failed: {}", e))
+}
+
+fn dataframe_from_named_ndarray(
+    features: &Array2<f64>,
+    column_names: Option<&[String]>,
+) -> Result<DataFrame, String> {
+    let names = if let Some(names) = column_names {
+        if names.len() == features.ncols() {
+            names.to_vec()
+        } else {
+            (0..features.ncols())
+                .map(|col_idx| format!("feature_{col_idx}"))
+                .collect()
+        }
+    } else {
+        (0..features.ncols())
+            .map(|col_idx| format!("feature_{col_idx}"))
+            .collect()
+    };
+
+    let mut df_data: Vec<Column> = Vec::with_capacity(features.ncols());
+    for (col_idx, name) in names.iter().enumerate() {
+        let col_data: Vec<f64> = features.column(col_idx).iter().copied().collect();
+        df_data.push(Series::new(name.as_str().into(), col_data).into());
     }
     DataFrame::new(df_data).map_err(|e| format!("DataFrame creation failed: {}", e))
 }
@@ -733,6 +891,25 @@ fn derive_time_index_arrays<'py>(
 }
 
 #[pyfunction]
+#[pyo3(signature = (index_ns))]
+fn count_weekday_trading_days(index_ns: PyReadonlyArray1<'_, i64>) -> PyResult<usize> {
+    const NS_PER_DAY: i64 = 86_400_000_000_000;
+
+    let ns_vec = vec_from_py_i64(&index_ns);
+    let mut uniq_days: HashSet<i64> = HashSet::with_capacity(ns_vec.len());
+
+    for ns in ns_vec {
+        let day_num = ns.div_euclid(NS_PER_DAY);
+        let weekday = (day_num + 3).rem_euclid(7);
+        if weekday < 5 {
+            uniq_days.insert(day_num);
+        }
+    }
+
+    Ok(uniq_days.len())
+}
+
+#[pyfunction]
 #[pyo3(signature = (src_idx_ns, src_vals, tgt_idx_ns, fill=0.0))]
 fn align_ffill_values_by_ns<'py>(
     py: Python<'py>,
@@ -922,7 +1099,7 @@ fn rank_scores_desc<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (base_idx_ns, event_idx_ns, event_sent, event_conf, lookback_ns))] 
+#[pyo3(signature = (base_idx_ns, event_idx_ns, event_sent, event_conf, lookback_ns))]
 fn aggregate_news_features<'py>(
     py: Python<'py>,
     base_idx_ns: PyReadonlyArray1<'py, i64>,
@@ -1103,8 +1280,16 @@ fn aggregate_news_activation<'py>(
             max_conf = max_conf.max(sorted_conf[j]);
             max_sent = max_sent.max(sorted_sent[j]);
         }
-        conf_max[i] = if max_conf.is_finite() { max_conf as f32 } else { 0.0 };
-        sent_max[i] = if max_sent.is_finite() { max_sent as f32 } else { 0.0 };
+        conf_max[i] = if max_conf.is_finite() {
+            max_conf as f32
+        } else {
+            0.0
+        };
+        sent_max[i] = if max_sent.is_finite() {
+            max_sent as f32
+        } else {
+            0.0
+        };
     }
 
     Ok((
@@ -1178,8 +1363,16 @@ fn extract_regime_features<'py>(
 
     let mut out = Array2::<f32>::zeros((n - 1, 3));
     for i in 0..(n - 1) {
-        out[(i, 0)] = if returns[i].is_finite() { returns[i] } else { 0.0 };
-        out[(i, 1)] = if volatility[i].is_finite() { volatility[i] } else { 0.0 };
+        out[(i, 0)] = if returns[i].is_finite() {
+            returns[i]
+        } else {
+            0.0
+        };
+        out[(i, 1)] = if volatility[i].is_finite() {
+            volatility[i]
+        } else {
+            0.0
+        };
         out[(i, 2)] = if adx[i].is_finite() { adx[i] } else { 0.0 };
     }
 
@@ -1195,13 +1388,7 @@ fn remap_labels_neutral_buy_sell<'py>(
     let input = vec_from_py_i64(&labels);
     let out: Vec<i64> = input
         .into_iter()
-        .map(|value| {
-            if value == -1 {
-                2
-            } else {
-                value.clamp(0, 2)
-            }
-        })
+        .map(|value| if value == -1 { 2 } else { value.clamp(0, 2) })
         .collect();
     Ok(out.into_pyarray(py))
 }
@@ -1226,6 +1413,93 @@ fn remap_labels_sell_neutral_buy<'py>(
 }
 
 #[pyfunction]
+#[pyo3(signature = (probs, classes=None))]
+fn pad_probs_neutral_buy_sell<'py>(
+    py: Python<'py>,
+    probs: PyReadonlyArrayDyn<'py, f64>,
+    classes: Option<Vec<i64>>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let view = probs.as_array();
+    let mut out = match view.ndim() {
+        1 => Array2::<f64>::zeros((view.len(), 3)),
+        2 => {
+            let rows = view.shape()[0];
+            Array2::<f64>::zeros((rows, 3))
+        }
+        _ => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "probs must be 1D or 2D",
+            ))
+        }
+    };
+
+    match view.ndim() {
+        1 => {
+            let arr = view.into_dimensionality::<Ix1>().map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>("probs must be 1D or 2D")
+            })?;
+            for r in 0..arr.len() {
+                let value = arr[r];
+                out[(r, 0)] = 1.0 - value;
+                out[(r, 1)] = value;
+            }
+        }
+        2 => {
+            let arr = view.into_dimensionality::<Ix2>().map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>("probs must be 1D or 2D")
+            })?;
+            let rows = arr.nrows();
+            let cols = arr.ncols();
+            if let Some(class_map) = classes.as_ref() {
+                if class_map.len() == cols {
+                    for (col, cls_val) in class_map.iter().copied().enumerate() {
+                        match cls_val {
+                            0 => {
+                                for r in 0..rows {
+                                    out[(r, 0)] = arr[(r, col)];
+                                }
+                            }
+                            1 => {
+                                for r in 0..rows {
+                                    out[(r, 1)] = arr[(r, col)];
+                                }
+                            }
+                            -1 | 2 => {
+                                for r in 0..rows {
+                                    out[(r, 2)] = arr[(r, col)];
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    return Ok(out.into_pyarray(py));
+                }
+            }
+            if cols == 3 {
+                for r in 0..rows {
+                    out[(r, 0)] = arr[(r, 0)];
+                    out[(r, 1)] = arr[(r, 1)];
+                    out[(r, 2)] = arr[(r, 2)];
+                }
+            } else if cols == 2 {
+                for r in 0..rows {
+                    out[(r, 0)] = arr[(r, 0)];
+                    out[(r, 1)] = arr[(r, 1)];
+                }
+            } else if cols >= 1 {
+                for r in 0..rows {
+                    let value = arr[(r, 0)];
+                    out[(r, 0)] = 1.0 - value;
+                    out[(r, 1)] = value;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(out.into_pyarray(py))
+}
+
+#[pyfunction]
 #[pyo3(signature = (decision))]
 fn margins_to_probs<'py>(
     py: Python<'py>,
@@ -1234,9 +1508,9 @@ fn margins_to_probs<'py>(
     let view = decision.as_array();
     match view.ndim() {
         1 => {
-            let arr = view
-                .into_dimensionality::<Ix1>()
-                .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>("decision must be 1D or 2D"))?;
+            let arr = view.into_dimensionality::<Ix1>().map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>("decision must be 1D or 2D")
+            })?;
             let n = arr.len();
             let mut out = Array2::<f64>::zeros((n, 3));
             for (i, value) in arr.iter().copied().enumerate() {
@@ -1253,9 +1527,9 @@ fn margins_to_probs<'py>(
             Ok(out.into_pyarray(py))
         }
         2 => {
-            let arr = view
-                .into_dimensionality::<Ix2>()
-                .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>("decision must be 1D or 2D"))?;
+            let arr = view.into_dimensionality::<Ix2>().map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>("decision must be 1D or 2D")
+            })?;
             let rows = arr.nrows();
             let cols = arr.ncols();
             let mut out = Array2::<f64>::zeros((rows, cols));
@@ -1335,14 +1609,65 @@ fn probs_to_signals<'py>(
 }
 
 #[pyfunction]
+#[pyo3(signature = (probs, conf_threshold, y_true=None))]
+fn threshold_signals_and_accuracy<'py>(
+    py: Python<'py>,
+    probs: PyReadonlyArray2<'py, f64>,
+    conf_threshold: f64,
+    y_true: Option<PyReadonlyArray1<'py, i64>>,
+) -> PyResult<(Bound<'py, PyArray1<i8>>, f64)> {
+    let arr = probs.as_array();
+    let rows = arr.nrows();
+    let cols = arr.ncols();
+    let mut out = vec![0_i8; rows];
+    if cols == 0 {
+        return Ok((out.into_pyarray(py), 0.0));
+    }
+
+    for r in 0..rows {
+        let buy = if cols > 1 { arr[(r, 1)] } else { 0.0 };
+        let sell = if cols > 2 { arr[(r, 2)] } else { 0.0 };
+        if !buy.is_finite() || !sell.is_finite() {
+            continue;
+        }
+        let trade_prob = if buy >= sell { buy } else { sell };
+        if trade_prob >= conf_threshold {
+            out[r] = if buy >= sell { 1 } else { -1 };
+        }
+    }
+
+    let accuracy = if let Some(labels) = y_true {
+        let label_vec = vec_from_py_i64(&labels);
+        let n = rows.min(label_vec.len());
+        if n == 0 {
+            0.0
+        } else {
+            let mut correct = 0usize;
+            for i in 0..n {
+                let expected = match label_vec[i] {
+                    1 => 1_i8,
+                    -1 | 2 => -1_i8,
+                    _ => 0_i8,
+                };
+                if out[i] == expected {
+                    correct += 1;
+                }
+            }
+            correct as f64 / n as f64
+        }
+    } else {
+        0.0
+    };
+
+    Ok((out.into_pyarray(py), accuracy))
+}
+
+#[pyfunction]
 #[pyo3(signature = (labels))]
 fn balanced_class_weights<'py>(
     py: Python<'py>,
     labels: PyReadonlyArray1<'py, i64>,
-) -> PyResult<(
-    Bound<'py, PyArray1<i64>>,
-    Bound<'py, PyArray1<f64>>,
-)> {
+) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>)> {
     let input = vec_from_py_i64(&labels);
     let n_samples = input.len();
     if n_samples == 0 {
@@ -1439,7 +1764,11 @@ fn quick_backtest_metrics<'py>(
         }
         if sig != 0 {
             let pnl = if sig == 1 {
-                if ret > 0.0 { 1.0 } else { -1.0 }
+                if ret > 0.0 {
+                    1.0
+                } else {
+                    -1.0
+                }
             } else if ret < 0.0 {
                 1.0
             } else {
@@ -5300,9 +5629,276 @@ impl CatBoostAltModel {
     }
 }
 
+#[pyclass(unsendable)]
+struct GeneticModel {
+    model: Mutex<GeneticStrategyExpert>,
+}
+
+#[pymethods]
+impl GeneticModel {
+    #[new]
+    #[pyo3(signature = (idx=1, population_size=50, generations=10, max_indicators=0))]
+    fn new(
+        idx: usize,
+        population_size: usize,
+        generations: usize,
+        max_indicators: usize,
+    ) -> PyResult<Self> {
+        let _ = idx;
+        let model = GeneticStrategyExpert::new(population_size, generations, max_indicators)
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "Genetic init failed: {}",
+                    e
+                ))
+            })?;
+        Ok(Self {
+            model: Mutex::new(model),
+        })
+    }
+
+    #[pyo3(signature = (
+        features,
+        labels,
+        feature_names=None,
+        metadata=None,
+        metadata_columns=None,
+        metadata_symbol=None,
+    ))]
+    fn fit<'py>(
+        &self,
+        _py: Python<'py>,
+        features: PyReadonlyArray2<'py, f64>,
+        labels: PyReadonlyArray1<'py, i32>,
+        feature_names: Option<Vec<String>>,
+        metadata: Option<PyReadonlyArray2<'py, f64>>,
+        metadata_columns: Option<Vec<String>>,
+        metadata_symbol: Option<String>,
+    ) -> PyResult<()> {
+        let features_array = features.as_array().to_owned();
+        let labels_vec: Vec<i32> = labels.as_array().iter().copied().collect();
+        let metadata_array = metadata.map(|arr| arr.as_array().to_owned());
+
+        let result: Result<(), String> = (|| {
+            let mut model = self
+                .model
+                .lock()
+                .map_err(|e| format!("Lock poisoned: {}", e))?;
+
+            let df = dataframe_from_named_ndarray(&features_array, feature_names.as_deref())?;
+            let labels_series = Series::new("label".into(), labels_vec);
+            let metadata_df = match metadata_array.as_ref() {
+                Some(arr) => Some(dataframe_from_named_ndarray(
+                    arr,
+                    metadata_columns.as_deref(),
+                )?),
+                None => None,
+            };
+
+            model
+                .fit(
+                    &df,
+                    &labels_series,
+                    metadata_df.as_ref(),
+                    metadata_symbol.as_deref(),
+                )
+                .map_err(|e| format!("Training failed: {}", e))?;
+
+            Ok(())
+        })();
+
+        result.map_err(|msg| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg))
+    }
+
+    #[pyo3(signature = (
+        features,
+        feature_names=None,
+        metadata=None,
+        metadata_columns=None,
+        metadata_symbol=None,
+    ))]
+    fn predict_proba<'py>(
+        &self,
+        py: Python<'py>,
+        features: PyReadonlyArray2<'py, f64>,
+        feature_names: Option<Vec<String>>,
+        metadata: Option<PyReadonlyArray2<'py, f64>>,
+        metadata_columns: Option<Vec<String>>,
+        metadata_symbol: Option<String>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let features_array = features.as_array().to_owned();
+        let metadata_array = metadata.map(|arr| arr.as_array().to_owned());
+
+        let result: Result<Array2<f32>, String> = (|| {
+            let model = self
+                .model
+                .lock()
+                .map_err(|e| format!("Lock poisoned: {}", e))?;
+
+            let df = dataframe_from_named_ndarray(&features_array, feature_names.as_deref())?;
+            let metadata_df = match metadata_array.as_ref() {
+                Some(arr) => Some(dataframe_from_named_ndarray(
+                    arr,
+                    metadata_columns.as_deref(),
+                )?),
+                None => None,
+            };
+
+            model
+                .predict_proba(&df, metadata_df.as_ref(), metadata_symbol.as_deref())
+                .map_err(|e| format!("Prediction failed: {}", e))
+        })();
+
+        result
+            .map_err(|msg| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg))
+            .map(|arr: Array2<f32>| arr.into_pyarray(py))
+    }
+
+    fn save(&self, path: &str) -> PyResult<()> {
+        let model = self.model.lock().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Lock poisoned: {}", e))
+        })?;
+
+        model.save(Path::new(path)).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Save failed: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    fn load(&self, path: &str) -> PyResult<()> {
+        let mut model = self.model.lock().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Lock poisoned: {}", e))
+        })?;
+
+        model.load(Path::new(path)).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Load failed: {}", e))
+        })?;
+
+        Ok(())
+    }
+}
+
+#[pyclass(unsendable)]
+struct MLPModel {
+    model: Mutex<RustMlpExpert>,
+}
+
+#[pymethods]
+impl MLPModel {
+    #[new]
+    #[pyo3(signature = (
+        idx=1,
+        hidden_dim=256,
+        n_layers=3,
+        dropout=0.1,
+        lr=1e-3,
+        max_time_sec=36000,
+        device="cpu",
+        batch_size=4096,
+    ))]
+    fn new(
+        idx: usize,
+        hidden_dim: i64,
+        n_layers: i64,
+        dropout: f64,
+        lr: f64,
+        max_time_sec: u64,
+        device: &str,
+        batch_size: i64,
+    ) -> PyResult<Self> {
+        let _ = idx;
+        let model = RustMlpExpert::new(
+            hidden_dim,
+            n_layers,
+            dropout,
+            lr,
+            max_time_sec,
+            device,
+            batch_size,
+        )
+        .map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("MLP init failed: {}", e))
+        })?;
+        Ok(Self {
+            model: Mutex::new(model),
+        })
+    }
+
+    fn fit<'py>(
+        &self,
+        _py: Python<'py>,
+        features: PyReadonlyArray2<'py, f32>,
+        labels: PyReadonlyArray1<'py, i32>,
+    ) -> PyResult<()> {
+        let features_array = features.as_array().to_owned();
+        let labels_vec: Vec<i32> = labels.as_array().iter().copied().collect();
+
+        let result: Result<(), String> = (|| {
+            let mut model = self
+                .model
+                .lock()
+                .map_err(|e| format!("Lock poisoned: {}", e))?;
+            model
+                .fit(&features_array, &labels_vec)
+                .map_err(|e| format!("Training failed: {}", e))?;
+            Ok(())
+        })();
+
+        result.map_err(|msg| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg))
+    }
+
+    fn predict_proba<'py>(
+        &self,
+        py: Python<'py>,
+        features: PyReadonlyArray2<'py, f32>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let features_array = features.as_array().to_owned();
+
+        let result: Result<Array2<f32>, String> = (|| {
+            let model = self
+                .model
+                .lock()
+                .map_err(|e| format!("Lock poisoned: {}", e))?;
+            model
+                .predict_proba(&features_array)
+                .map_err(|e| format!("Prediction failed: {}", e))
+        })();
+
+        result
+            .map_err(|msg| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg))
+            .map(|arr: Array2<f32>| arr.into_pyarray(py))
+    }
+
+    fn save(&self, path: &str) -> PyResult<()> {
+        let model = self.model.lock().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Lock poisoned: {}", e))
+        })?;
+
+        model.save(Path::new(path)).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Save failed: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    fn load(&self, path: &str) -> PyResult<()> {
+        let mut model = self.model.lock().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Lock poisoned: {}", e))
+        })?;
+
+        model.load(Path::new(path)).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Load failed: {}", e))
+        })?;
+
+        Ok(())
+    }
+}
+
 #[pymodule]
 fn forex_bindings(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ForexCore>()?;
+    m.add_class::<ConformalGate>()?;
     #[cfg(feature = "onnx")]
     m.add_class::<ModelEngine>()?;
     m.add_function(wrap_pyfunction!(search_evolve_ohlcv, m)?)?;
@@ -5322,6 +5918,7 @@ fn forex_bindings(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pip_size_from_symbol, m)?)?;
     m.add_function(wrap_pyfunction!(infer_pip_metrics, m)?)?;
     m.add_function(wrap_pyfunction!(derive_time_index_arrays, m)?)?;
+    m.add_function(wrap_pyfunction!(count_weekday_trading_days, m)?)?;
     m.add_function(wrap_pyfunction!(align_ffill_values_by_ns, m)?)?;
     m.add_function(wrap_pyfunction!(align_exact_values_by_ns, m)?)?;
     m.add_function(wrap_pyfunction!(align_feature_matrix, m)?)?;
@@ -5332,8 +5929,10 @@ fn forex_bindings(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_regime_features, m)?)?;
     m.add_function(wrap_pyfunction!(remap_labels_neutral_buy_sell, m)?)?;
     m.add_function(wrap_pyfunction!(remap_labels_sell_neutral_buy, m)?)?;
+    m.add_function(wrap_pyfunction!(pad_probs_neutral_buy_sell, m)?)?;
     m.add_function(wrap_pyfunction!(margins_to_probs, m)?)?;
     m.add_function(wrap_pyfunction!(probs_to_signals, m)?)?;
+    m.add_function(wrap_pyfunction!(threshold_signals_and_accuracy, m)?)?;
     m.add_function(wrap_pyfunction!(balanced_class_weights, m)?)?;
     m.add_function(wrap_pyfunction!(sample_weights_from_labels, m)?)?;
     m.add_function(wrap_pyfunction!(quick_backtest_metrics, m)?)?;
@@ -5357,6 +5956,8 @@ fn forex_bindings(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<CatBoostModel>()?;
         m.add_class::<CatBoostAltModel>()?;
     }
+    m.add_class::<MLPModel>()?;
+    m.add_class::<GeneticModel>()?;
 
     Ok(())
 }

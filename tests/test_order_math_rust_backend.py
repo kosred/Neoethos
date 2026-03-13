@@ -137,6 +137,15 @@ def test_column_values_preserves_timestamp_dtype():
     assert str(np.asarray(vals).dtype).startswith("datetime64")
 
 
+def test_latest_scalar_accepts_frame_like_without_pandas_methods():
+    ex = _make_executor()
+    frame = _ArrayFrame({"confidence": [0.15, 0.85]}, index=[10, 11])
+
+    out = ex._latest_scalar(frame, default=-1.0)
+
+    assert abs(out - 0.85) < 1e-12
+
+
 def test_edge_over_cost_uses_rust_binding(monkeypatch):
     ex = _make_executor()
     fake = types.SimpleNamespace(

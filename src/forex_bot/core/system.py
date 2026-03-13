@@ -120,6 +120,47 @@ def resolve_cpu_budget(reserve_default: int = 1) -> int:
 
 
 @dataclass(slots=True)
+class ParallelBudgetHints:
+    cpu_budget: int
+    gpu_workers: int
+    cpu_threads_per_gpu: int
+    parallel_models_mode: str = "auto"
+
+
+def derive_parallel_budget_hints(*, cpu_budget: int, gpu_count: int) -> ParallelBudgetHints:
+    usable_cpu = max(1, int(cpu_budget or 1))
+    gpus = max(0, int(gpu_count or 0))
+    if gpus <= 0:
+        return ParallelBudgetHints(
+            cpu_budget=usable_cpu,
+            gpu_workers=0,
+            cpu_threads_per_gpu=usable_cpu,
+            parallel_models_mode="auto",
+        )
+    return ParallelBudgetHints(
+        cpu_budget=usable_cpu,
+        gpu_workers=gpus,
+        cpu_threads_per_gpu=max(1, usable_cpu // gpus),
+        parallel_models_mode="auto",
+    )
+
+
+def derive_live_symbol_concurrency(
+    *,
+    symbol_count: int,
+    cpu_budget: int,
+    available_ram_gb: float,
+    per_symbol_gb: float = 4.0,
+) -> int:
+    symbols = max(1, int(symbol_count or 1))
+    usable_cpu = max(1, int(cpu_budget or 1))
+    usable_ram = max(0.5, float(available_ram_gb or 0.5))
+    ram_per_symbol = max(0.5, float(per_symbol_gb or 0.5))
+    ram_limited = max(1, int(usable_ram // ram_per_symbol))
+    return max(1, min(symbols, usable_cpu, ram_limited))
+
+
+@dataclass(slots=True)
 class HardwareProfile:
     """Summary of detected compute resources."""
 
@@ -518,10 +559,18 @@ class AutoTuner:
         """Set reasonable BLAS/OpenMP thread defaults based on hardware."""
         cpu_cores = max(1, self.profile.cpu_cores)
         cpu_budget = self._resolve_cpu_budget(cpu_cores)
+        parallel_hints = derive_parallel_budget_hints(
+            cpu_budget=cpu_budget,
+            gpu_count=int(getattr(hints, "num_gpus", 0) or 0),
+        )
 
         # Ensure the CPU budget is visible to downstream components.
         os.environ.setdefault("FOREX_BOT_CPU_BUDGET", str(cpu_budget))
         os.environ.setdefault("FOREX_BOT_CPU_THREADS", str(cpu_budget))
+        os.environ.setdefault("FOREX_BOT_PARALLEL_MODELS", parallel_hints.parallel_models_mode)
+        if parallel_hints.gpu_workers > 0:
+            os.environ.setdefault("FOREX_BOT_GPU_WORKERS", str(parallel_hints.gpu_workers))
+            os.environ.setdefault("FOREX_BOT_CPU_THREADS_PER_GPU", str(parallel_hints.cpu_threads_per_gpu))
 
         # Respect explicit BLAS thread overrides if present.
         explicit = (

@@ -14,7 +14,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
+_FEATURE_ROW_KIND = "feature_row_v1"
 
 
 class BoundedLRUFeatureStore:
@@ -77,6 +80,28 @@ class BoundedLRUFeatureStore:
         for ticket in to_remove:
             self.remove(ticket)
         return len(to_remove)
+
+
+class _FeatureRowFrame:
+    """Single-row frame rehydrated from persisted entry features."""
+
+    def __init__(self, columns: list[str], values: list[Any]) -> None:
+        self.columns = [str(col) for col in list(columns or [])]
+        self.index = np.asarray([0], dtype=np.int64)
+        self._data: dict[str, np.ndarray] = {}
+        for col, value in zip(self.columns, list(values or []), strict=False):
+            scalar = 0.0 if value is None else float(value)
+            self._data[str(col)] = np.asarray([scalar], dtype=np.float64)
+
+    @property
+    def empty(self) -> bool:
+        return int(len(self.columns)) <= 0
+
+    def __len__(self) -> int:
+        return 1 if self.columns else 0
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        return self._data[str(key)]
 
 
 @dataclass(slots=True)
@@ -179,6 +204,118 @@ class MT5StateManager:
         Some parts of the codebase refer to `mt5_state_manager.connection` for low-level broker calls.
         """
         return self.mt5
+
+    @staticmethod
+    def _frame_columns(value: Any) -> list[str]:
+        cols = getattr(value, "columns", None)
+        if cols is None:
+            return []
+        try:
+            return [str(col) for col in list(cols)]
+        except Exception:
+            return []
+
+    @staticmethod
+    def _as_json_feature_scalar(value: Any) -> float | int | bool | None:
+        if value is None:
+            return None
+        if isinstance(value, (bool, np.bool_)):
+            return bool(value)
+        if isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_)):
+            return int(value)
+        if isinstance(value, (float, np.floating)):
+            value_f = float(value)
+            return value_f if np.isfinite(value_f) else None
+        if isinstance(value, (np.datetime64, datetime)):
+            return None
+        try:
+            value_f = float(value)
+        except Exception:
+            return None
+        return value_f if np.isfinite(value_f) else None
+
+    @classmethod
+    def _validate_feature_row_payload(cls, payload: Any) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return None
+        if str(payload.get("kind", "") or "") != _FEATURE_ROW_KIND:
+            return None
+        raw_columns = payload.get("columns")
+        raw_values = payload.get("values")
+        if not isinstance(raw_columns, list) or not isinstance(raw_values, list):
+            return None
+        if len(raw_columns) != len(raw_values):
+            return None
+        if len(raw_columns) <= 0:
+            return None
+        columns: list[str] = []
+        values: list[float | int | bool | None] = []
+        for col, value in zip(raw_columns, raw_values, strict=False):
+            name = str(col or "").strip()
+            if not name:
+                return None
+            columns.append(name)
+            values.append(cls._as_json_feature_scalar(value))
+        return {
+            "kind": _FEATURE_ROW_KIND,
+            "columns": columns,
+            "values": values,
+        }
+
+    @classmethod
+    def build_feature_row_payload(
+        cls,
+        features: Any,
+        *,
+        feature_names: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        validated = cls._validate_feature_row_payload(features)
+        if validated is not None:
+            return validated
+        if features is None:
+            return None
+
+        cols = cls._frame_columns(features)
+        if cols:
+            values: list[float | int | bool | None] = []
+            for col in cols:
+                try:
+                    raw = features[col]  # type: ignore[index]
+                    if hasattr(raw, "to_numpy"):
+                        try:
+                            arr = raw.to_numpy(copy=False)
+                        except TypeError:
+                            arr = raw.to_numpy()
+                    else:
+                        arr = np.asarray(raw)
+                    vec = np.asarray(arr).reshape(-1)
+                    values.append(cls._as_json_feature_scalar(vec[-1] if vec.size > 0 else None))
+                except Exception:
+                    values.append(None)
+            return cls._validate_feature_row_payload({"kind": _FEATURE_ROW_KIND, "columns": cols, "values": values})
+
+        arr = np.asarray(features)
+        if arr.ndim == 0:
+            arr = arr.reshape(1, 1)
+        elif arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        elif arr.ndim > 2:
+            arr = arr.reshape(arr.shape[0], -1)
+        if arr.shape[0] <= 0 or arr.shape[1] <= 0:
+            return None
+        names = list(feature_names or [])
+        if len(names) != int(arr.shape[1]):
+            names = [f"feature_{idx}" for idx in range(int(arr.shape[1]))]
+        row = np.asarray(arr[-1]).reshape(-1)
+        values = [cls._as_json_feature_scalar(value) for value in row.tolist()]
+        return cls._validate_feature_row_payload({"kind": _FEATURE_ROW_KIND, "columns": names, "values": values})
+
+    @classmethod
+    def _rehydrate_feature_row(cls, payload: Any) -> _FeatureRowFrame | None:
+        validated = cls._validate_feature_row_payload(payload)
+        if validated is None:
+            return None
+        return _FeatureRowFrame(validated["columns"], validated["values"])
 
     async def sync_with_mt5(self, symbol: str | None = None) -> bool:
         """
@@ -443,13 +580,17 @@ class MT5StateManager:
             if payload is None:
                 continue
 
+            features = self._rehydrate_feature_row(payload.get("features"))
+            if features is None:
+                continue
+
             matched.append(
                 {
                     "profit": d.get("profit", 0.0),
                     "volume": d.get("volume", 0.0),
                     "symbol": d.get("symbol"),
                     "time": d.get("time"),
-                    "features": payload.get("features"),
+                    "features": features,
                     "signal": payload.get("signal", 0),
                 }
             )
@@ -494,10 +635,13 @@ class MT5StateManager:
                             try:
                                 bar_time = v.get("bar_time")
                                 bar_time_str = bar_time.isoformat() if isinstance(bar_time, datetime) else bar_time
+                                features = self._validate_feature_row_payload(v.get("features"))
+                                if features is None:
+                                    continue
                                 serializable[int(k)] = {
                                     "symbol": v.get("symbol"),
                                     "bar_time": bar_time_str,
-                                    "features": v.get("features"),
+                                    "features": features,
                                     "signal": v.get("signal"),
                                     "magic": v.get("magic"),
                                 }
@@ -533,10 +677,13 @@ class MT5StateManager:
                     bar_time = None
                     if v.get("bar_time"):
                         bar_time = datetime.fromisoformat(v["bar_time"])
+                    features = self._validate_feature_row_payload(v.get("features"))
+                    if features is None:
+                        continue
                     restored[int(k)] = {
                         "symbol": v.get("symbol"),
                         "bar_time": bar_time,
-                        "features": v.get("features"),
+                        "features": features,
                         "signal": v.get("signal"),
                         "magic": v.get("magic"),
                     }
@@ -559,12 +706,17 @@ class MT5StateManager:
         order_ticket: int | None = None,
         deal_ticket: int | None = None,
         magic: int | None = None,
+        feature_names: list[str] | None = None,
     ) -> None:
         """
         Store entry-time feature vector for online learning feedback.
-        Features should be a single-row DataFrame or Series.
+        Features are normalized to a single-row JSON-safe contract before persistence.
         """
         try:
+            normalized_features = self.build_feature_row_payload(features, feature_names=feature_names)
+            if normalized_features is None:
+                logger.debug("Skipping entry feature record for ticket=%s: no serializable feature row", ticket)
+                return
             key_ids = [ticket]
             if order_ticket:
                 key_ids.append(order_ticket)
@@ -575,7 +727,7 @@ class MT5StateManager:
             payload = {
                 "symbol": symbol,
                 "bar_time": bar_time,
-                "features": features,  # can be JSON
+                "features": normalized_features,
                 "signal": signal,
                 "magic": magic,
             }

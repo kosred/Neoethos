@@ -32,6 +32,15 @@ pub struct MLPExpert {
 }
 
 impl MLPExpert {
+    fn array2_to_numpy<'py>(py: Python<'py>, x: &Array2<f32>) -> PyResult<Bound<'py, PyAny>> {
+        let numpy = PyModule::import(py, "numpy")?;
+        let x_shape = (x.nrows(), x.ncols());
+        let x_flat: Vec<f32> = x.iter().copied().collect();
+        numpy
+            .call_method1("array", (x_flat,))?
+            .call_method1("reshape", (x_shape,))
+    }
+
     /// Create new MLP Expert by instantiating Python class
     /// Maps to: from forex_bot.models.mlp import MLPExpert
     pub fn new(
@@ -82,23 +91,12 @@ impl MLPExpert {
                 .context("MLP expert not initialized")?
                 .bind(py);
 
-            // Convert Rust Array2 to numpy array
             let numpy = PyModule::import(py, "numpy")?;
-            let x_shape = (x.nrows(), x.ncols());
-            let x_flat: Vec<f32> = x.iter().copied().collect();
-            let x_np = numpy
-                .call_method1("array", (x_flat,))?
-                .call_method1("reshape", (x_shape,))?;
-
+            let x_np = Self::array2_to_numpy(py, x)?;
             let y_np = numpy.call_method1("array", (y,))?;
 
-            // Convert to pandas DataFrame/Series
-            let pd = PyModule::import(py, "pandas")?;
-            let x_df = pd.call_method1("DataFrame", (x_np,))?;
-            let y_series = pd.call_method1("Series", (y_np,))?;
-
-            // Call Python: expert.fit(x_df, y_series)
-            expert.call_method1("fit", (x_df, y_series))?;
+            // Python MLPExpert already accepts array-like inputs; do not rebuild pandas objects.
+            expert.call_method1("fit", (x_np, y_np))?;
 
             Ok(())
         })
@@ -113,19 +111,7 @@ impl MLPExpert {
                 .context("MLP expert not initialized")?
                 .bind(py);
 
-            // Convert to DataFrame
-            let numpy = PyModule::import(py, "numpy")?;
-            let pd = PyModule::import(py, "pandas")?;
-
-            let x_shape = (x.nrows(), x.ncols());
-            let x_flat: Vec<f32> = x.iter().copied().collect();
-            let x_np = numpy
-                .call_method1("array", (x_flat,))?
-                .call_method1("reshape", (x_shape,))?;
-            let x_df = pd.call_method1("DataFrame", (x_np,))?;
-
-            // Call Python: probs = expert.predict_proba(x_df)
-            let probs_np = expert.call_method1("predict_proba", (x_df,))?;
+            let probs_np = expert.call_method1("predict_proba", (Self::array2_to_numpy(py, x)?,))?;
 
             // Convert numpy array back to Rust Array2
             let probs_list: Vec<Vec<f32>> = probs_np.call_method0("tolist")?.extract()?;
@@ -294,8 +280,10 @@ impl NBeatsExpert {
                 .as_ref()
                 .context("Expert not initialized")?
                 .bind(py);
-            let (x_df, y_series) = Self::arrays_to_pandas(py, x, y)?;
-            expert.call_method1("fit", (x_df, y_series))?;
+            let numpy = PyModule::import(py, "numpy")?;
+            let x_np = Self::array_to_numpy(py, x)?;
+            let y_np = numpy.call_method1("array", (y,))?;
+            expert.call_method1("fit", (x_np, y_np))?;
             Ok(())
         })
     }
@@ -306,8 +294,7 @@ impl NBeatsExpert {
                 .as_ref()
                 .context("Expert not initialized")?
                 .bind(py);
-            let x_df = Self::array_to_dataframe(py, x)?;
-            let probs_np = expert.call_method1("predict_proba", (x_df,))?;
+            let probs_np = expert.call_method1("predict_proba", (Self::array_to_numpy(py, x)?,))?;
             Self::numpy_to_array2(probs_np)
         })
     }
@@ -334,40 +321,17 @@ impl NBeatsExpert {
         })
     }
 
-    fn arrays_to_pandas<'py>(
-        py: Python<'py>,
-        x: &Array2<f32>,
-        y: &[i32],
-    ) -> Result<(Bound<'py, pyo3::PyAny>, Bound<'py, pyo3::PyAny>)> {
-        let numpy = PyModule::import(py, "numpy")?;
-        let pd = PyModule::import(py, "pandas")?;
-
-        let x_shape = (x.nrows(), x.ncols());
-        let x_flat: Vec<f32> = x.iter().copied().collect();
-        let x_np = numpy
-            .call_method1("array", (x_flat,))?
-            .call_method1("reshape", (x_shape,))?;
-        let y_np = numpy.call_method1("array", (y,))?;
-
-        let x_df = pd.call_method1("DataFrame", (x_np,))?;
-        let y_series = pd.call_method1("Series", (y_np,))?;
-
-        Ok((x_df, y_series))
-    }
-
-    fn array_to_dataframe<'py>(
+    fn array_to_numpy<'py>(
         py: Python<'py>,
         x: &Array2<f32>,
     ) -> Result<Bound<'py, pyo3::PyAny>> {
         let numpy = PyModule::import(py, "numpy")?;
-        let pd = PyModule::import(py, "pandas")?;
 
         let x_shape = (x.nrows(), x.ncols());
         let x_flat: Vec<f32> = x.iter().copied().collect();
-        let x_np = numpy
+        Ok(numpy
             .call_method1("array", (x_flat,))?
-            .call_method1("reshape", (x_shape,))?;
-        Ok(pd.call_method1("DataFrame", (x_np,))?)
+            .call_method1("reshape", (x_shape,))?)
     }
 
     fn numpy_to_array2(probs_np: Bound<'_, pyo3::PyAny>) -> Result<Array2<f32>> {

@@ -458,7 +458,6 @@ def test_triple_barrier_labels_python_fallback_opt_in_still_returns_neutral(monk
 
 
 def test_compute_labels_numpy_inputs_work_in_strict_pandas_free(monkeypatch) -> None:
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE_STRICT", "1")
     monkeypatch.setattr(plmod, "_RUST_LABELS_BACKEND_OK", False, raising=False)
 
     close = np.array([1.0, 2.0, 1.0, 3.0], dtype=np.float64)

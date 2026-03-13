@@ -40,36 +40,24 @@ def _write_symbol_parquet(
     pq.write_table(table, target / "data.parquet")
 
 
-def test_frame_io_backend_prefers_new_env(monkeypatch):
-    monkeypatch.setenv("FOREX_BOT_FRAME_IO_BACKEND", "pyarrow")
-    monkeypatch.setenv("FOREX_BOT_DATA_IO_BACKEND", "pandas")
-    assert loader._frame_io_backend() == "pyarrow"
+def test_build_frame_from_arrays_returns_rust_frame() -> None:
+    frame = loader._build_frame_from_arrays(
+        {
+            "open": np.array([1.0, 2.0], dtype=np.float64),
+            "high": np.array([1.1, 2.1], dtype=np.float64),
+            "low": np.array([0.9, 1.9], dtype=np.float64),
+            "close": np.array([1.05, 2.05], dtype=np.float64),
+        },
+        index=np.array(["2024-01-01T00:00:00", "2024-01-01T00:01:00"], dtype="datetime64[ns]"),
+    )
+
+    assert isinstance(frame, loader._RustFrame)
+    assert list(frame.columns) == ["open", "high", "low", "close"]
+    assert len(frame) == 2
 
 
-def test_frame_io_backend_supports_aliases(monkeypatch):
-    monkeypatch.setenv("FOREX_BOT_FRAME_IO_BACKEND", "pl")
-    assert loader._frame_io_backend() == "polars"
-    monkeypatch.setenv("FOREX_BOT_FRAME_IO_BACKEND", "python")
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE_STRICT", "0")
-    assert loader._frame_io_backend() == "pandas"
-
-
-def test_frame_io_backend_strict_pandas_free_blocks_pandas_alias(monkeypatch):
-    monkeypatch.setenv("FOREX_BOT_FRAME_IO_BACKEND", "python")
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE_STRICT", "1")
-    assert loader._frame_io_backend() == "auto"
-
-
-def test_frame_io_backend_unknown_falls_back_to_auto(monkeypatch):
-    monkeypatch.setenv("FOREX_BOT_FRAME_IO_BACKEND", "not-a-backend")
-    assert loader._frame_io_backend() == "auto"
-
-
-def test_strict_rust_data_mode_enabled_by_rust_only(monkeypatch):
-    monkeypatch.setenv("FOREX_BOT_RUST_ONLY", "1")
-    monkeypatch.delenv("FOREX_BOT_DATA_BACKEND", raising=False)
-    monkeypatch.delenv("FOREX_BOT_PANDAS_FREE", raising=False)
-    assert loader._strict_rust_data_mode_enabled() is True
+def test_dead_strict_rust_data_mode_helper_is_removed() -> None:
+    assert not hasattr(loader, "_strict_rust_data_mode_enabled")
 
 
 def test_load_frames_skips_python_path_when_rust_backend_disabled(monkeypatch):
@@ -113,7 +101,6 @@ def test_load_frames_returns_empty_when_rust_loader_returns_nothing(monkeypatch)
 
 
 def test_load_frames_rust_builds_strict_frame_without_pandas(monkeypatch, tmp_path):
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE_STRICT", "1")
 
     def _fake_load_symbol_frames(*, root, symbol, timeframes, resample_missing, base_tf):
         assert symbol == "EURUSD"
@@ -154,7 +141,6 @@ def test_load_frames_rust_builds_strict_frame_without_pandas(monkeypatch, tmp_pa
 
 
 def test_canonical_dataset_loader_consumer_receives_sorted_deduped_rust_frames(monkeypatch, tmp_path):
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE_STRICT", "1")
 
     ts = np.array(
         [
@@ -199,7 +185,6 @@ def test_canonical_dataset_loader_consumer_receives_sorted_deduped_rust_frames(m
 
 
 def test_load_frames_uses_rust_payload_when_enabled(monkeypatch, tmp_path):
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE_STRICT", "1")
     monkeypatch.setattr(loader, "_use_rust_data_backend", lambda: True)
 
     def _fake_load_symbol_frames(*, root, symbol, timeframes, resample_missing, base_tf):
@@ -234,7 +219,6 @@ def test_load_frames_uses_rust_payload_when_enabled(monkeypatch, tmp_path):
 
 
 def test_resample_missing_from_available_supports_rust_frame(monkeypatch):
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE_STRICT", "1")
     idx = np.array(
         [
             "2024-01-01T00:00:00",
@@ -269,7 +253,6 @@ def test_resample_missing_from_available_supports_rust_frame(monkeypatch):
 
 
 def test_resample_missing_from_available_supports_generic_frame_like(monkeypatch):
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE_STRICT", "1")
 
     class _GenericFrame:
         def __init__(self, data, index):
@@ -321,7 +304,6 @@ def test_resample_missing_from_available_supports_generic_frame_like(monkeypatch
 
 
 def test_mt5_adapter_get_live_frames_builds_rust_frame_without_pandas(monkeypatch):
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE_STRICT", "1")
 
     class _FakeMT5:
         TIMEFRAME_M1 = 1

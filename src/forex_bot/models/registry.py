@@ -85,6 +85,11 @@ _RUST_TREE_MAPPING = {
     "catboost_alt": "RustCatBoostAltExpert",
 }
 
+_RUST_PYO3_MAPPING = {
+    "mlp": ("neural_rust", "RustMLPExpert", "MLPModel"),
+    "genetic": ("genetic_rust", "RustGeneticExpert", "GeneticModel"),
+}
+
 _STRICT_RUNTIME_REDIRECTS = {
     # Legacy neuralforecast keys are routed to native experts.
     # In strict Rust/frame-native runtime, avoid legacy tabular conversion paths.
@@ -99,11 +104,11 @@ def _strict_rust_mode_enabled() -> bool:
     rust_only = str(os.environ.get("FOREX_BOT_RUST_ONLY", "") or "").strip().lower()
     if rust_only in {"1", "true", "yes", "on"}:
         return True
-    pandas_free = str(os.environ.get("FOREX_BOT_PANDAS_FREE", "1") or "1").strip().lower()
-    if pandas_free in {"1", "true", "yes", "on"}:
-        return True
     backend = str(os.environ.get("FOREX_BOT_TREE_BACKEND", "auto") or "auto").strip().lower()
-    return backend in {"rust_strict", "strict_rust", "rust-only", "rust_only"}
+    if backend in {"rust_strict", "strict_rust", "rust-only", "rust_only"}:
+        return True
+    runtime_profile = str(os.environ.get("FOREX_BOT_RUNTIME_PROFILE", "") or "").strip().lower()
+    return runtime_profile.startswith("rust")
 
 
 def _resolve_runtime_model_name(name: str) -> str:
@@ -138,7 +143,7 @@ def _use_rust_tree_models(model_name: str | None = None) -> bool:
 
         return any(hasattr(forex_bindings, cls_name) for cls_name in _RUST_TREE_MAPPING.values())
     except Exception:
-        return False
+        return bool(force_rust)
 
 def register_model(name: str, module_path: str, class_name: str) -> None:
     """Dynamically registers a new model type."""
@@ -172,6 +177,9 @@ def get_model_class(name: str, prefer_gpu: bool = False) -> Type['ExpertModel']:
             module_name = "trees_rust"
             class_name = _RUST_TREE_MAPPING[canonical_name]
             rust_requested = True
+        elif canonical_name in _RUST_PYO3_MAPPING and _strict_rust_mode_enabled():
+            module_name, class_name, binding_name = _RUST_PYO3_MAPPING[canonical_name]
+            rust_requested = True
 
         # Handle CPU fallback for GPU models if needed
         if not prefer_gpu and canonical_name in {"kan", "nbeats", "tabnet", "tide"}:
@@ -189,7 +197,7 @@ def get_model_class(name: str, prefer_gpu: bool = False) -> Type['ExpertModel']:
         except Exception as e:
             if rust_requested:
                 raise ImportError(
-                    f"Rust tree model is required for '{canonical_name}' but Rust bindings are unavailable."
+                    f"Rust runtime model is required for '{canonical_name}' but Rust bindings are unavailable."
                 ) from e
 
             # If GPU module import fails, try CPU implementation as fallback.

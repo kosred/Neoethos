@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 
 from forex_bot.training import optimization as opt_mod
@@ -64,3 +66,63 @@ def test_optimizer_meta_month_day_indices_uses_rust_binding_when_available(monke
 
     np.testing.assert_array_equal(month_idx, np.array([301, 302, 303], dtype=np.int64))
     np.testing.assert_array_equal(day_idx, np.array([401, 402, 403], dtype=np.int64))
+
+
+def test_optimizer_infer_meta_trading_days_uses_rust_binding_when_available(monkeypatch) -> None:
+    fake = type(
+        "_Fake",
+        (),
+        {
+            "count_weekday_trading_days": staticmethod(lambda index_ns: 7),
+        },
+    )()
+    monkeypatch.setattr(opt_mod, "_fb", fake, raising=False)
+
+    idx_ns = np.array(
+        [
+            1_704_067_200_000_000_000,
+            1_704_153_600_000_000_000,
+            1_704_240_000_000_000_000,
+        ],
+        dtype=np.int64,
+    )
+    opt = object.__new__(HyperparameterOptimizer)
+
+    days = HyperparameterOptimizer._infer_meta_trading_days(opt, {"index": idx_ns})
+
+    assert days == 7.0
+
+
+def test_optimizer_objective_metrics_uses_shared_threshold_helper(monkeypatch) -> None:
+    calls = {"count": 0}
+
+    def _fake_thresholded(probs, *, conf_threshold, y_true=None, classes=None):
+        calls["count"] += 1
+        return np.array([1, 0, -1], dtype=np.int8), 0.5
+
+    monkeypatch.setattr(opt_mod, "threshold_signals_and_accuracy", _fake_thresholded, raising=False)
+
+    opt = object.__new__(HyperparameterOptimizer)
+    opt.prop_conf_threshold = 0.66
+    opt.settings = SimpleNamespace(
+        risk=SimpleNamespace(),
+        system=SimpleNamespace(symbol="EURUSD"),
+    )
+
+    metrics = HyperparameterOptimizer._objective_metrics(
+        opt,
+        np.array([1, 0, -1], dtype=np.int64),
+        np.array(
+            [
+                [0.1, 0.8, 0.1],
+                [0.6, 0.3, 0.1],
+                [0.1, 0.2, 0.7],
+            ],
+            dtype=np.float64,
+        ),
+        None,
+    )
+
+    assert metrics["prop_score"] == 0.5
+    assert metrics["accuracy"] == 0.5
+    assert calls["count"] == 1

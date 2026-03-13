@@ -20,16 +20,21 @@ from ..core.config import Settings
 from ..core.system import AutoTuner, HardwareProbe, resolve_cpu_budget, thread_limits
 from .model_factory import ModelFactory
 from .optimization import HyperparameterOptimizer
+from .probability_utils import pad_probs_neutral_buy_sell
 
 logger = logging.getLogger(__name__)
 
-_PANDAS_FREE_MODEL_ALLOWLIST = {
+_FRAME_NATIVE_MODEL_ALLOWLIST = {
     "lightgbm",
     "xgboost",
     "xgboost_rf",
     "xgboost_dart",
     "catboost",
     "catboost_alt",
+    # PyTorch expert already consumes ndarray/memmap inputs directly.
+    "mlp",
+    # Rust genetic bridge now avoids dataframe reconstruction for fit/predict.
+    "genetic",
     # Numpy-native linear experts.
     "elasticnet",
     "bayes_logit",
@@ -45,19 +50,11 @@ _RUST_TREE_BINDING_CLASSES = {
     "xgboost_dart": "XGBoostDARTModel",
     "catboost": "CatBoostModel",
     "catboost_alt": "CatBoostAltModel",
+    "mlp": "MLPModel",
+    "genetic": "GeneticModel",
 }
 
-_PANDAS_FREE_RUST_TREE_REQUIRED = set(_RUST_TREE_BINDING_CLASSES.keys())
-
-
-def _pandas_free_enabled() -> bool:
-    raw = str(os.environ.get("FOREX_BOT_PANDAS_FREE", "1") or "1").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
-
-
-def _pandas_free_strict_enabled() -> bool:
-    raw = str(os.environ.get("FOREX_BOT_PANDAS_FREE_STRICT", "1") or "1").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+_FRAME_NATIVE_RUST_TREE_REQUIRED = set(_RUST_TREE_BINDING_CLASSES.keys())
 
 
 @lru_cache(maxsize=1)
@@ -80,7 +77,7 @@ def _load_metadata_artifact(path: Path) -> Any | None:
     return None
 
 
-def _is_pandas_dataframe(value: Any) -> bool:
+def _is_dataframe_like(value: Any) -> bool:
     return bool(
         hasattr(value, "columns")
         and hasattr(value, "index")
@@ -135,7 +132,7 @@ def _slice_rows(values: Any, n_rows: int) -> Any:
         return None
     if isinstance(values, np.ndarray):
         return values[:n]
-    if _is_pandas_dataframe(values):
+    if _is_dataframe_like(values):
         with contextlib.suppress(Exception):
             return values.take(np.arange(n, dtype=np.int64))
         with contextlib.suppress(Exception):
@@ -189,44 +186,33 @@ def _load_training_data(
     dataset_dir: Path,
     *,
     model_name: str | None,
-    pandas_free: bool,
-) -> tuple[Any, Any, bool]:
+) -> tuple[Any, Any]:
     """
-    Returns (X, y, uses_pandas_dataset).
+    Returns (X, y).
     """
-    # Always prefer frame-native path. pandas_free flag retained for API compat.
+    # Always prefer frame-native path.
     os.environ.setdefault("FOREX_BOT_TREE_BACKEND", "rust_strict")
     if model_name is None:
         X, y = _load_memmap_arrays(dataset_dir)
-        return X, y, False
+        return X, y
 
     name = str(model_name)
-    if name in _PANDAS_FREE_MODEL_ALLOWLIST:
-        if name in _PANDAS_FREE_RUST_TREE_REQUIRED:
+    if name in _FRAME_NATIVE_MODEL_ALLOWLIST:
+        if name in _FRAME_NATIVE_RUST_TREE_REQUIRED:
             if _rust_tree_model_available(name):
                 X, y = _load_memmap_arrays(dataset_dir)
-                return X, y, False
+                return X, y
             raise RuntimeError(
                 f"Rust tree binding is required for model '{name}', but binding is missing."
             )
         # Non-tree allowlisted models consume numpy arrays directly.
         X, y = _load_memmap_arrays(dataset_dir)
-        return X, y, False
+        return X, y
     raise RuntimeError(f"Rust tree workers do not support non-rust-tree model '{name}'.")
 
 
 def _pad_probs(p: Any) -> np.ndarray:
-    if p is None:
-        return np.zeros((0, 3), dtype=np.float32)
-    arr = np.asarray(p)
-    if arr.ndim != 2 or arr.shape[0] == 0:
-        return np.zeros((0, 3), dtype=np.float32)
-    if arr.shape[1] == 2:
-        out = np.zeros((len(arr), 3), dtype=np.float32)
-        out[:, 0] = arr[:, 0]
-        out[:, 1] = arr[:, 1]
-        return out
-    return arr[:, :3].astype(np.float32, copy=False)
+    return np.asarray(pad_probs_neutral_buy_sell(p), dtype=np.float32)
 
 
 def _strict_model_check_enabled() -> bool:
@@ -323,10 +309,15 @@ def _apply_thread_env(threads: int) -> None:
     if threads <= 0:
         return
     threads = max(1, int(threads))
+    try:
+        numexpr_max = max(int(os.environ.get("NUMEXPR_MAX_THREADS", "0") or 0), threads)
+    except Exception:
+        numexpr_max = threads
     os.environ["FOREX_BOT_CPU_BUDGET"] = str(threads)
     os.environ["FOREX_BOT_CPU_THREADS"] = str(threads)
     os.environ["FOREX_BOT_RUST_THREADS"] = str(threads)
     os.environ["RAYON_NUM_THREADS"] = str(threads)
+    os.environ["NUMEXPR_MAX_THREADS"] = str(max(1, numexpr_max))
     for key in (
         "OMP_NUM_THREADS",
         "MKL_NUM_THREADS",
@@ -352,11 +343,9 @@ def _train_single_model_process(args: tuple[str, str, str, int, int, int, str | 
         except Exception:
             pass
 
-        pandas_free = _pandas_free_enabled()
-        X, y, _uses_pandas_dataset = _load_training_data(
+        X, y = _load_training_data(
             Path(dataset_dir),
             model_name=model_name,
-            pandas_free=pandas_free,
         )
         metadata = None
         if metadata_path:
@@ -419,29 +408,27 @@ def run_worker(argv: list[str] | None = None) -> int:
     if not models:
         raise ValueError("No models provided for worker")
 
-    pandas_free = _pandas_free_enabled()
-    if pandas_free:
-        os.environ.setdefault("FOREX_BOT_TREE_BACKEND", "rust_strict")
-        kept: list[str] = []
-        for m in models:
-            if m not in _PANDAS_FREE_MODEL_ALLOWLIST:
-                continue
-            if m in _PANDAS_FREE_RUST_TREE_REQUIRED and not _rust_tree_model_available(m):
-                continue
-            kept.append(m)
-        dropped = [m for m in models if m not in _PANDAS_FREE_MODEL_ALLOWLIST]
-        dropped_missing = [
-            m
-            for m in models
-            if m in _PANDAS_FREE_RUST_TREE_REQUIRED and not _rust_tree_model_available(m)
-        ]
-        if dropped:
-            logger.info("[WORKER] Pandas-free mode: skipping unsupported model families: %s", dropped)
-        if dropped_missing:
-            logger.info("[WORKER] Pandas-free mode: skipping models without Rust bindings: %s", dropped_missing)
-        models = kept
-        if not models:
-            raise ValueError("Pandas-free mode has no compatible models to train.")
+    os.environ.setdefault("FOREX_BOT_TREE_BACKEND", "rust_strict")
+    kept: list[str] = []
+    for m in models:
+        if m not in _FRAME_NATIVE_MODEL_ALLOWLIST:
+            continue
+        if m in _FRAME_NATIVE_RUST_TREE_REQUIRED and not _rust_tree_model_available(m):
+            continue
+        kept.append(m)
+    dropped = [m for m in models if m not in _FRAME_NATIVE_MODEL_ALLOWLIST]
+    dropped_missing = [
+        m
+        for m in models
+        if m in _FRAME_NATIVE_RUST_TREE_REQUIRED and not _rust_tree_model_available(m)
+    ]
+    if dropped:
+        logger.info("[WORKER] Frame-native mode: skipping unsupported model families: %s", dropped)
+    if dropped_missing:
+        logger.info("[WORKER] Frame-native mode: skipping models without required Rust bindings: %s", dropped_missing)
+    models = kept
+    if not models:
+        raise ValueError("Frame-native mode has no compatible models to train.")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -453,10 +440,9 @@ def run_worker(argv: list[str] | None = None) -> int:
     except Exception:
         # Worker can still proceed with safe defaults if probing fails.
         pass
-    X, y, _uses_pandas_dataset = _load_training_data(
+    X, y = _load_training_data(
         Path(args.dataset_dir),
         model_name=None,
-        pandas_free=pandas_free,
     )
 
     optimizer = HyperparameterOptimizer(settings)

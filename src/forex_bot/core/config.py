@@ -49,14 +49,12 @@ _RUNTIME_PROFILE_ALIASES: dict[str, str] = {
 _RUNTIME_PROFILE_PRESETS: dict[str, dict[str, str]] = {
     # Safe defaults for 32GB-class machines.
     "rust_32gb": {
-        "FOREX_BOT_PANDAS_FREE": "1",
         "FOREX_BOT_RUST_ONLY": "1",
         "FOREX_BOT_TREE_BACKEND": "rust_strict",
         "FOREX_BOT_TREE_RUST_FALLBACK": "0",
         "FOREX_BOT_RUST_FEATURES": "1",
         "FOREX_BOT_FEATURES_BACKEND": "rust_strict",
         "FOREX_BOT_DATA_BACKEND": "rust_strict",
-        "FOREX_BOT_FRAME_IO_BACKEND": "polars",
         "FOREX_BOT_USE_ALL_TIMEFRAMES": "1",
         "FOREX_BOT_PARALLEL_FEATURES": "auto",
         "FOREX_BOT_FEATURE_WORKER_GB": "6",
@@ -92,14 +90,12 @@ _RUNTIME_PROFILE_PRESETS: dict[str, dict[str, str]] = {
     },
     # More aggressive profile for larger RAM/CPU machines.
     "rust_max": {
-        "FOREX_BOT_PANDAS_FREE": "1",
         "FOREX_BOT_RUST_ONLY": "1",
         "FOREX_BOT_TREE_BACKEND": "rust_strict",
         "FOREX_BOT_TREE_RUST_FALLBACK": "0",
         "FOREX_BOT_RUST_FEATURES": "1",
         "FOREX_BOT_FEATURES_BACKEND": "rust_strict",
         "FOREX_BOT_DATA_BACKEND": "rust_strict",
-        "FOREX_BOT_FRAME_IO_BACKEND": "polars",
         "FOREX_BOT_USE_ALL_FEATURES": "1",
         "FOREX_BOT_USE_ALL_TIMEFRAMES": "1",
         "FOREX_BOT_PARALLEL_FEATURES": "auto",
@@ -166,17 +162,32 @@ def apply_runtime_profile_defaults(profile: str | None = None) -> str:
 
     # CPU/thread defaults tuned per profile so Rust workers don't collapse to single-core.
     cpu_total = max(1, os.cpu_count() or 1)
-    if mode == "rust_32gb":
-        cpu_budget = max(1, min(cpu_total - 1, 8))
-    else:
-        cpu_budget = max(1, cpu_total - 1)
+    cpu_budget = max(1, cpu_total - 1)
     os.environ.setdefault("FOREX_BOT_DISCOVERY_CPU_BUDGET", str(cpu_budget))
     os.environ.setdefault("FOREX_BOT_PROP_SEARCH_WORKERS", str(cpu_budget))
     os.environ.setdefault("RAYON_NUM_THREADS", str(cpu_budget))
     os.environ.setdefault("OMP_NUM_THREADS", str(cpu_budget))
     os.environ.setdefault("OPENBLAS_NUM_THREADS", str(cpu_budget))
     os.environ.setdefault("MKL_NUM_THREADS", str(cpu_budget))
+    had_numexpr_num = "NUMEXPR_NUM_THREADS" in os.environ
+    explicit_numexpr_max = os.environ.get("NUMEXPR_MAX_THREADS")
     os.environ.setdefault("NUMEXPR_NUM_THREADS", str(cpu_budget))
+    try:
+        current_numexpr_num = int(os.environ.get("NUMEXPR_NUM_THREADS", str(cpu_budget)) or cpu_budget)
+        explicit_numexpr_max_int = int(explicit_numexpr_max or 0) if explicit_numexpr_max else 0
+        if explicit_numexpr_max_int > 0:
+            if not had_numexpr_num:
+                os.environ["NUMEXPR_NUM_THREADS"] = str(max(1, min(current_numexpr_num, explicit_numexpr_max_int)))
+            numexpr_max = explicit_numexpr_max_int
+        else:
+            numexpr_max = max(
+                0,
+                int(os.environ.get("NUMEXPR_MAX_THREADS", "0") or 0),
+                int(os.environ.get("NUMEXPR_NUM_THREADS", str(cpu_budget)) or cpu_budget),
+            )
+    except Exception:
+        numexpr_max = int(cpu_budget)
+    os.environ["NUMEXPR_MAX_THREADS"] = str(max(1, numexpr_max))
     os.environ.setdefault("FOREX_BOT_RUNTIME_PROFILE", mode)
     return mode
 

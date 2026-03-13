@@ -32,3 +32,17 @@ def test_trading_loop_frame_column_numpy_case_insensitive():
     frame = _ArrayFrame({"Close": [1.0, 1.1, 1.2]}, index=[0, 1, 2])
     close = tl._frame_column_numpy(frame, "close", dtype=np.float64)
     np.testing.assert_allclose(close, np.array([1.0, 1.1, 1.2], dtype=np.float64))
+
+
+def test_trading_loop_frame_tail_preserves_frame_like_rows():
+    frame = _ArrayFrame(
+        {"close": [1.0, 1.1, 1.2], "adx": [10.0, 20.0, 30.0]},
+        index=[100, 101, 102],
+    )
+
+    out = tl._frame_tail(frame, 2)
+
+    assert hasattr(out, "columns")
+    assert list(getattr(out, "columns", [])) == ["close", "adx"]
+    np.testing.assert_allclose(np.asarray(out["close"]), np.array([1.1, 1.2], dtype=np.float64))
+    np.testing.assert_array_equal(np.asarray(getattr(out, "index")), np.array([101, 102], dtype=np.int64))

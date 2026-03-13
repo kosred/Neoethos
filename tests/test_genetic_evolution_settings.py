@@ -42,7 +42,7 @@ def test_genetic_evolution_settings_default(monkeypatch):
 
     evo._evaluate_population(df, evo.population)
     assert evo.population[0].evaluated is True
-    assert evo.population[0].fitness == float("-inf")
+    assert evo.population[0].fitness > float("-inf")
 
 
 def test_genetic_evolution_settings_allow_python_fallback_env_is_ignored(monkeypatch):
@@ -75,5 +75,5 @@ def test_genetic_evolution_settings_allow_python_fallback_env_is_ignored(monkeyp
 
     evo._evaluate_population(df, evo.population)
     assert evo.population[0].evaluated is True
-    assert evo.population[0].fitness == float("-inf")
+    assert evo.population[0].fitness > float("-inf")
 

@@ -18,6 +18,46 @@ def _is_dataframe(obj: Any) -> bool:
     return bool(hasattr(obj, "columns") and hasattr(obj, "index") and hasattr(obj, "__getitem__"))
 
 
+class _BridgeFrame:
+    """Minimal frame used by Rust bridges to avoid dataframe reconstruction."""
+
+    def __init__(self, data: dict[str, Any], index: Any | None = None, attrs: dict[str, Any] | None = None) -> None:
+        self._data = {str(k): np.asarray(v).reshape(-1) for k, v in (data or {}).items()}
+        self.columns = list(self._data.keys())
+        n_rows = 0
+        if self.columns:
+            try:
+                n_rows = int(len(self._data[self.columns[0]]))
+            except Exception:
+                n_rows = 0
+        if index is None:
+            self.index = np.arange(n_rows, dtype=np.int64)
+        else:
+            idx = np.asarray(index).reshape(-1)
+            if idx.size != n_rows:
+                idx = np.arange(n_rows, dtype=np.int64)
+            self.index = idx
+        self.attrs = dict(attrs or {})
+
+    @property
+    def empty(self) -> bool:
+        return int(len(self.index)) <= 0
+
+    def __len__(self) -> int:
+        return int(len(self.index))
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        return self._data[str(key)]
+
+    def copy(self) -> "_BridgeFrame":
+        out = _BridgeFrame(
+            {k: np.asarray(v).copy() for k, v in self._data.items()},
+            np.asarray(self.index).copy(),
+            dict(self.attrs),
+        )
+        return out
+
+
 @dataclass(slots=True)
 class GeneticStrategyExpert(ExpertModel):
     """

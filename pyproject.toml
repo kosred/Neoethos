@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 dependencies = [
     # Core Scientific Computing (2026 targets)
     "numpy>=2.3.4,<3.0.0",
+    "polars>=1.34.0",
     "pyarrow>=21.0.0",
     "scipy>=1.16.2",
     "scikit-learn>=1.8.0",  # 1.8.2 not yet published for Py3.13; relax to available max
@@ -74,12 +75,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gpu = [
+    "cupy-cuda12x>=13.6.0",
+]
 dev = [
     "black>=25.9.0",
     "ruff>=0.15.3",
     "mypy>=1.18.2",
-    "memory-profiler>=0.61.0",
-    "pandas>=2.3.3"
+    "memory-profiler>=0.61.0"
 ]
 
 [tool.setuptools.packages.find]
@@ -109,3 +112,14 @@ disallow_untyped_defs = false
 ignore_missing_imports = true
 
 # Pytest configuration
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+minversion = "6.0"
+addopts = "-rsxX -l --tb=short --strict-markers"
+testpaths = ["tests"]
+markers = [
+    "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "gpu: marks tests that require GPU (deselect with '-m \"not gpu\"')",
+    "rust: marks tests that require Rust extensions (deselect with '-m \"not rust\"')",
+]

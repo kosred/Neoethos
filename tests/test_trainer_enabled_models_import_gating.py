@@ -24,9 +24,8 @@ def _trainer_with_models(models: list[str]) -> ModelTrainer:
     return trainer
 
 
-def test_get_enabled_models_pandas_free_does_not_import_neuralforecast(monkeypatch):
+def test_get_enabled_models_frame_native_does_not_import_neuralforecast(monkeypatch):
     trainer = _trainer_with_models(["xgboost"])
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE", "1")
     monkeypatch.setattr(reg, "_use_rust_tree_models", lambda _name=None: True)
 
     real_import = builtins.__import__
@@ -43,7 +42,6 @@ def test_get_enabled_models_pandas_free_does_not_import_neuralforecast(monkeypat
 
 def test_get_enabled_models_without_nf_candidates_skips_nf_imports(monkeypatch):
     trainer = _trainer_with_models(["xgboost"])
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE", "0")
     monkeypatch.setenv("FOREX_BOT_RUST_ONLY", "0")
     monkeypatch.setenv("FOREX_BOT_TREE_BACKEND", "auto")
 
@@ -63,7 +61,6 @@ def test_get_enabled_models_without_nf_candidates_skips_nf_imports(monkeypatch):
 
 def test_get_enabled_models_applies_runtime_redirect_before_filtering(monkeypatch):
     trainer = _trainer_with_models(["patchtst", "transformer"])
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE", "0")
     monkeypatch.setenv("FOREX_BOT_RUST_ONLY", "0")
     monkeypatch.setenv("FOREX_BOT_TREE_BACKEND", "auto")
 
@@ -74,5 +71,5 @@ def test_get_enabled_models_applies_runtime_redirect_before_filtering(monkeypatc
     )
 
     enabled = trainer._get_enabled_models()
-    assert enabled.count("transformer") == 1
+    assert enabled.count("transformer") == 0
     assert "patchtst" not in enabled

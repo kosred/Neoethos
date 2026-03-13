@@ -90,6 +90,33 @@ def _read_int_env(*keys: str) -> int | None:
                 continue
     return None
 
+
+def _derive_parallel_hints(cpu_budget: int, gpu_count: int) -> tuple[int, int, str]:
+    usable_cpu = max(1, int(cpu_budget or 1))
+    gpus = max(0, int(gpu_count or 0))
+    if gpus <= 0:
+        return usable_cpu, 0, "auto"
+    return max(1, usable_cpu // gpus), gpus, "auto"
+
+
+def _is_train_worker_process() -> bool:
+    if "--_worker" in sys.argv[1:]:
+        return True
+    raw = str(os.environ.get("FOREX_BOT_TRAIN_WORKER", "") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _set_numexpr_thread_env(threads: int, *, overwrite_num_threads: bool) -> None:
+    target = max(1, int(threads or 1))
+    current_num = _read_int_env("NUMEXPR_NUM_THREADS")
+    if overwrite_num_threads or current_num is None:
+        num_threads = target
+        os.environ["NUMEXPR_NUM_THREADS"] = str(target)
+    else:
+        num_threads = max(1, int(current_num))
+    current_max = _read_int_env("NUMEXPR_MAX_THREADS") or 0
+    os.environ["NUMEXPR_MAX_THREADS"] = str(max(target, num_threads, current_max))
+
 auto_mode = str(os.environ.get("FOREX_BOT_AUTO_TUNE", "1")).strip().lower() not in {
     "0",
     "false",
@@ -107,54 +134,26 @@ try:
 except Exception:
     gpu_count = 0
 
+cpu_threads_per_gpu, gpu_workers, parallel_models_mode = _derive_parallel_hints(cpu_budget, gpu_count)
+remaining = cpu_budget
+
 if gpu_count > 0:
-    per_gpu = _read_int_env("FOREX_BOT_CPU_THREADS_PER_GPU")
-    if per_gpu is None:
-        # Heuristic: 10 cores/GPU if the machine can afford it, otherwise scale down.
-        per_gpu = min(10, max(4, cpu_budget // max(1, gpu_count * 2)))
-        if cpu_budget // max(1, gpu_count) >= 12:
-            per_gpu = 10
-    training_budget = min(cpu_budget, per_gpu * gpu_count)
-    # Ensure we leave at least 1 core for search/features.
-    if training_budget >= cpu_budget:
-        per_gpu = max(1, (cpu_budget - 1) // max(1, gpu_count))
-        training_budget = max(1, per_gpu * gpu_count)
-    remaining = max(1, cpu_budget - training_budget)
-
     if auto_mode:
-        os.environ["FOREX_BOT_CPU_THREADS_PER_GPU"] = str(per_gpu)
-        os.environ["FOREX_BOT_CPU_BUDGET"] = str(training_budget)
-        os.environ["FOREX_BOT_CPU_THREADS"] = str(training_budget)
+        os.environ["FOREX_BOT_CPU_THREADS_PER_GPU"] = str(cpu_threads_per_gpu)
+        os.environ["FOREX_BOT_CPU_BUDGET"] = str(cpu_budget)
+        os.environ["FOREX_BOT_CPU_THREADS"] = str(cpu_budget)
     else:
-        os.environ.setdefault("FOREX_BOT_CPU_THREADS_PER_GPU", str(per_gpu))
-        os.environ.setdefault("FOREX_BOT_CPU_BUDGET", str(training_budget))
-        os.environ.setdefault("FOREX_BOT_CPU_THREADS", str(training_budget))
+        os.environ.setdefault("FOREX_BOT_CPU_THREADS_PER_GPU", str(cpu_threads_per_gpu))
+        os.environ.setdefault("FOREX_BOT_CPU_BUDGET", str(cpu_budget))
+        os.environ.setdefault("FOREX_BOT_CPU_THREADS", str(cpu_budget))
 
-    # Discovery / feature CPU budgets
+    # Use mixed CPU+GPU scheduling by default so GPU hosts still train CPU-native models.
     if auto_mode:
-        os.environ["FOREX_BOT_FEATURE_CPU_BUDGET"] = str(remaining)
-        os.environ["FOREX_BOT_FEATURE_WORKERS"] = str(remaining)
-        os.environ["FOREX_BOT_PROP_SEARCH_WORKERS"] = str(remaining)
-        os.environ["FOREX_BOT_PROP_SEARCH_ASYNC"] = "1"
-        os.environ["FOREX_BOT_PROP_SEARCH_ASYNC_WAIT"] = "0"
-        if platform.system().lower() == "linux":
-            os.environ["FOREX_BOT_PROP_MP_CONTEXT"] = "fork"
+        os.environ["FOREX_BOT_PARALLEL_MODELS"] = parallel_models_mode
+        os.environ["FOREX_BOT_GPU_WORKERS"] = str(gpu_workers)
     else:
-        os.environ.setdefault("FOREX_BOT_FEATURE_CPU_BUDGET", str(remaining))
-        os.environ.setdefault("FOREX_BOT_FEATURE_WORKERS", str(remaining))
-        os.environ.setdefault("FOREX_BOT_PROP_SEARCH_WORKERS", str(remaining))
-        os.environ.setdefault("FOREX_BOT_PROP_SEARCH_ASYNC", "1")
-        os.environ.setdefault("FOREX_BOT_PROP_SEARCH_ASYNC_WAIT", "0")
-        if platform.system().lower() == "linux":
-            os.environ.setdefault("FOREX_BOT_PROP_MP_CONTEXT", "fork")
-
-    # Favor GPU model training by default when GPUs are present.
-    if auto_mode:
-        os.environ["FOREX_BOT_PARALLEL_MODELS"] = "gpu"
-        os.environ["FOREX_BOT_GPU_WORKERS"] = str(gpu_count)
-    else:
-        os.environ.setdefault("FOREX_BOT_PARALLEL_MODELS", "gpu")
-        os.environ.setdefault("FOREX_BOT_GPU_WORKERS", str(gpu_count))
+        os.environ.setdefault("FOREX_BOT_PARALLEL_MODELS", parallel_models_mode)
+        os.environ.setdefault("FOREX_BOT_GPU_WORKERS", str(gpu_workers))
 
     # Keep the event loop responsive so prop search can actually run.
     if auto_mode:
@@ -195,8 +194,23 @@ else:
     os.environ.setdefault("FOREX_BOT_RUST_FEATURES_ONLY", "1")
 
 # Respect explicit user overrides for BLAS/OMP threads; default to 1 otherwise.
+is_train_worker = _is_train_worker_process()
 if auto_mode:
-    blas_threads = 1
+    if is_train_worker:
+        blas_threads = _read_int_env(
+            "FOREX_BOT_BLAS_THREADS",
+            "FOREX_BOT_OMP_THREADS",
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+            "FOREX_BOT_CPU_THREADS",
+            "FOREX_BOT_CPU_BUDGET",
+        )
+        if blas_threads is None:
+            blas_threads = 1
+    else:
+        blas_threads = 1
 else:
     blas_threads = _read_int_env(
         "FOREX_BOT_BLAS_THREADS",
@@ -213,7 +227,7 @@ os.environ.setdefault("FOREX_BOT_CPU_BUDGET", str(cpu_budget))
 os.environ.setdefault("FOREX_BOT_CPU_THREADS", str(cpu_budget))
 # BLAS libraries: Single-threaded to prevent N_workers × N_threads explosion
 if auto_mode:
-    os.environ["NUMEXPR_MAX_THREADS"] = str(blas_threads)
+    _set_numexpr_thread_env(blas_threads, overwrite_num_threads=True)
     os.environ["OMP_NUM_THREADS"] = str(blas_threads)
     os.environ["MKL_NUM_THREADS"] = str(blas_threads)
     os.environ["OPENBLAS_NUM_THREADS"] = str(blas_threads)
@@ -229,7 +243,7 @@ if auto_mode:
     os.environ["TORCH_NUM_THREADS"] = str(blas_threads)
     os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 else:
-    os.environ.setdefault("NUMEXPR_MAX_THREADS", str(blas_threads))
+    _set_numexpr_thread_env(blas_threads, overwrite_num_threads=False)
     os.environ.setdefault("OMP_NUM_THREADS", str(blas_threads))
     os.environ.setdefault("MKL_NUM_THREADS", str(blas_threads))
     os.environ.setdefault("OPENBLAS_NUM_THREADS", str(blas_threads))
@@ -252,10 +266,23 @@ os.environ["NCCL_IB_DISABLE"] = "1"
 # Set flag to prevent worker processes from re-printing when they import this module
 if not os.environ.get("_FOREX_BOT_HW_DETECTED"):
     os.environ["_FOREX_BOT_HW_DETECTED"] = "1"
+    worker_budget = _read_int_env("FOREX_BOT_CPU_THREADS", "FOREX_BOT_CPU_BUDGET") or cpu_budget
+    if is_train_worker:
+        workload_line = f"[HW AUTO-DETECT] Worker CPU Budget: {worker_budget} | BLAS Threads: {blas_threads}"
+        strategy_line = "[HW AUTO-DETECT] Thread Strategy: Explicit worker thread budget"
+    elif int(blas_threads) == 1:
+        workload_line = (
+            f"[HW AUTO-DETECT] Worker Processes: {cpu_budget} x BLAS Threads: {blas_threads} "
+            f"= ~{cpu_budget * blas_threads} compute threads"
+        )
+        strategy_line = "[HW AUTO-DETECT] Thread Strategy: Single-threaded BLAS (prevents N_workers x N_threads explosion)"
+    else:
+        workload_line = f"[HW AUTO-DETECT] CPU Budget: {cpu_budget} | BLAS Threads: {blas_threads}"
+        strategy_line = "[HW AUTO-DETECT] Thread Strategy: Explicit BLAS thread budget"
     print("=" * 70)
     print(f"[HW AUTO-DETECT] Physical Cores: {physical_cores} | Logical Cores: {logical_cores}")
-    print(f"[HW AUTO-DETECT] Worker Processes: {cpu_budget} x BLAS Threads: {blas_threads} = ~{cpu_budget * blas_threads} compute threads")
-    print(f"[HW AUTO-DETECT] Thread Strategy: Single-threaded BLAS (prevents N_workers x N_threads explosion)")
+    print(workload_line)
+    print(strategy_line)
     try:
         mem = psutil.virtual_memory()
         print(f"[HW AUTO-DETECT] Total RAM: {mem.total/1024/1024/1024:.1f}GB | Available: {mem.available/1024/1024/1024:.1f}GB ({mem.percent:.1f}% used)")
@@ -297,51 +324,19 @@ def bootstrap():
     try:
         import importlib
 
-        importlib.import_module("pandas")
+        importlib.import_module("numpy")
         import pydantic
         # GPU-specific deps are optional on Windows for local CPU testing
         if platform.system().lower() != "windows":
             import torch
             import cupy
     except ImportError:
-        print("[INIT] Missing Python libraries. Syncing with Master HPC Stack...")
-        base_dir = Path(__file__).parent
-        req_file = base_dir / "requirements-hpc.txt"
+        print("[INIT] Missing Python libraries. Syncing with pyproject runtime manifest...")
         is_windows = platform.system().lower() == "windows"
 
         cmd = _pip_cmd(upgrade=True)
-
-        if is_windows:
-            # Minimal, CPU-friendly stack to avoid Linux/CUDA-only wheels
-            win_req = base_dir / "requirements-win.txt"
-            if not win_req.exists():
-                win_req.write_text(
-                    "\n".join(
-                        [
-                            "numpy",
-                            "pandas",
-                            "scipy",
-                            "scikit-learn",
-                            "joblib",
-                            "pydantic",
-                            "pydantic-settings",
-                            "psutil",
-                            "requests",
-                            "PyYAML",
-                            "tqdm",
-                            "sqlalchemy",
-                            "numexpr",
-                            "colorama",
-                        ]
-                    ),
-                    encoding="utf-8",
-                )
-            cmd += ["-r", str(win_req)]
-        elif req_file.exists():
-            cmd += ["-r", str(req_file)]
-        else:
-            # Fallback to binary-safe core
-            cmd += ["--only-binary", ":all:", "pandas", "numpy", "torch", "pydantic", "sqlalchemy", "cupy-cuda12x"]
+        install_target = ".[gpu]" if not is_windows else "."
+        cmd += ["-e", install_target]
 
         try:
             _pip_install(cmd)

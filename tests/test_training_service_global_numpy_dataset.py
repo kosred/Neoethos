@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
+import joblib
 import numpy as np
 import pytest
 
@@ -103,7 +105,8 @@ def test_global_align_dataframe_inputs_forced_numpy_output() -> None:
         assert ds.index.dtype == np.int64
         assert ds.X.shape == (n, 3)
         assert ds.y.shape == (n,)
-        assert ds.metadata is None
+        assert ds.metadata is not None
+        assert len(ds.metadata) == n
 
 
 def test_global_train_from_numpy_datasets_runs_with_pair_context_and_pandas_block(
@@ -188,10 +191,10 @@ def test_global_train_from_numpy_datasets_runs_with_pair_context_and_pandas_bloc
     assert any(str(c).startswith("pair_") for c in features)
     saved = calls.get("saved_summary")
     assert isinstance(saved, dict)
-    assert saved.get("global_training", {}).get("pandas_free") is True
+    assert saved.get("global_training", {}).get("frame_native") is True
 
 
-def test_global_train_from_dataframe_datasets_uses_numpy_when_pandas_free(
+def test_global_train_from_dataframe_datasets_uses_numpy_when_frame_native(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
     monkeypatch.setenv("FOREX_BOT_PANDAS_FREE", "1")
@@ -246,13 +249,16 @@ def test_global_train_from_dataframe_datasets_uses_numpy_when_pandas_free(
     )
 
     assert calls.get("called") is True
-    assert calls.get("meta") is None
+    meta = calls.get("meta")
+    assert meta is not None
+    assert hasattr(meta, "columns")
+    assert len(meta) > 0
     saved = calls.get("saved_summary")
     assert isinstance(saved, dict)
-    assert saved.get("global_training", {}).get("pandas_free") is True
+    assert saved.get("global_training", {}).get("frame_native") is True
 
 
-def test_global_train_from_numpy_datasets_treats_rust_only_as_pandas_free(
+def test_global_train_from_numpy_datasets_treats_rust_only_as_frame_native(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
     monkeypatch.delenv("FOREX_BOT_PANDAS_FREE", raising=False)
@@ -307,7 +313,90 @@ def test_global_train_from_numpy_datasets_treats_rust_only_as_pandas_free(
     assert calls.get("called") is True
     saved = calls.get("saved_summary")
     assert isinstance(saved, dict)
-    assert saved.get("global_training", {}).get("pandas_free") is True
+    assert saved.get("global_training", {}).get("frame_native") is True
+
+
+def test_global_train_memmap_writes_frame_native_metadata_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE", "1")
+    monkeypatch.setenv("FOREX_BOT_GLOBAL_POOL_MEMMAP", "1")
+
+    n = 1400
+    idx = (np.arange(n, dtype=np.int64) + 1) * 60_000_000_000
+    x = np.column_stack(
+        [
+            np.linspace(1.0, 2.0, num=n, dtype=np.float32),
+            np.linspace(2.0, 3.0, num=n, dtype=np.float32),
+        ]
+    ).astype(np.float32)
+    y = np.random.default_rng(41).integers(0, 3, size=n, dtype=np.int8)
+    meta = _ArrayFrame(
+        {
+            "open": np.linspace(1.0, 1.2, num=n, dtype=np.float64),
+            "high": np.linspace(1.1, 1.3, num=n, dtype=np.float64),
+            "low": np.linspace(0.9, 1.1, num=n, dtype=np.float64),
+            "close": np.linspace(1.05, 1.25, num=n, dtype=np.float64),
+            "volume": np.linspace(10.0, 20.0, num=n, dtype=np.float64),
+        },
+        index=idx,
+        attrs={"symbol": "EURUSD"},
+    )
+
+    calls: dict[str, object] = {}
+
+    class _Persistence:
+        def save_run_summary(self, summary):
+            calls["saved_summary"] = dict(summary)
+
+    class _Trainer:
+        def __init__(self):
+            self.run_summary = {}
+            self.persistence = _Persistence()
+
+        def train_all(self, dataset, optimize, stop_event, models_override, exclude_models, memmap_dataset_dir=None):
+            calls["called"] = True
+            calls["memmap"] = Path(memmap_dataset_dir) if memmap_dataset_dir is not None else None
+            assert memmap_dataset_dir is not None
+            assert (Path(memmap_dataset_dir) / "metadata.pkl").exists()
+            loaded = joblib.load(Path(memmap_dataset_dir) / "metadata.pkl")
+            assert hasattr(loaded, "columns")
+            assert {"open", "high", "low", "close"}.issubset(set(getattr(loaded, "columns", [])))
+
+    svc = object.__new__(TrainingService)
+    svc.settings = SimpleNamespace(
+        models=SimpleNamespace(global_train_ratio=0.8, global_max_rows_per_symbol=0, global_max_rows=0),
+        risk=SimpleNamespace(meta_label_max_hold_bars=0, triple_barrier_max_bars=0),
+        system=SimpleNamespace(cache_dir=str(tmp_path), symbol="EURUSD"),
+    )
+    svc.trainer = _Trainer()
+
+    asyncio.run(
+        svc._train_global_from_datasets(
+            [
+                (
+                    "EURUSD",
+                    PreparedDataset(
+                        X=x,
+                        y=y,
+                        index=idx,
+                        feature_names=["f0", "f1"],
+                        metadata=meta,
+                        labels=y,
+                    ),
+                )
+            ],
+            symbols=["EURUSD"],
+            optimize=False,
+            stop_event=None,
+            exclude_models=None,
+        )
+    )
+
+    assert calls.get("called") is True
+    memmap_dir = calls.get("memmap")
+    assert isinstance(memmap_dir, Path)
+    assert (memmap_dir / "metadata.pkl").exists()
 
 
 def test_merge_symbol_shards_dataframe_outputs_dataframe_sorted_deduped() -> None:
@@ -435,15 +524,17 @@ def test_merge_symbol_shards_dataframe_forced_numpy_output() -> None:
     assert isinstance(ds.y, np.ndarray)
     assert isinstance(ds.index, np.ndarray)
     assert ds.index.dtype == np.int64
-    assert ds.metadata is None
+    assert ds.metadata is not None
+    assert len(ds.metadata) == len(ds.X)
     assert ds.X.shape == (4, 2)
     np.testing.assert_allclose(ds.X[:, 0], np.array([1.0, 2.0, 3.0, 40.0], dtype=np.float32))
     np.testing.assert_allclose(ds.X[:, 1], np.array([0.0, 0.0, 0.0, 400.0], dtype=np.float32))
 
 
-def test_global_train_post_eval_accepts_frame_like_metadata(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+def test_global_train_frame_native_skips_legacy_post_eval_but_records_summary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
     monkeypatch.setenv("FOREX_BOT_PANDAS_FREE", "0")
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE_STRICT", "0")
     monkeypatch.delenv("FOREX_BOT_RUST_ONLY", raising=False)
     monkeypatch.setenv("FOREX_BOT_GLOBAL_POOL_MEMMAP", "0")
     monkeypatch.setenv("FOREX_BOT_PAIR_CORR_ENABLED", "0")
@@ -534,10 +625,7 @@ def test_global_train_post_eval_accepts_frame_like_metadata(monkeypatch: pytest.
     assert isinstance(saved, dict)
     model_metrics = saved.get("model_metrics", {})
     assert isinstance(model_metrics, dict)
-    assert model_metrics
-    assert any(
-        isinstance(v, dict) and isinstance(v.get("per_symbol"), dict) and "EURUSD" in v.get("per_symbol", {})
-        for v in model_metrics.values()
-    )
-    assert calls.get("metadata_passed") is True
+    assert model_metrics == {}
+    assert saved.get("global_training", {}).get("frame_native") is True
+    assert calls.get("metadata_passed") is not True
 

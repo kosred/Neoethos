@@ -31,7 +31,6 @@ _OHLCV_COLUMN_ALIASES = {
     "tick_volume",
     "real_volume",
 }
-_FRAME_IO_WARNED_UNKNOWN = False
 
 
 class _RustFrame:
@@ -217,9 +216,7 @@ def _build_frame_from_arrays(
     data: dict[str, np.ndarray],
     *,
     index: np.ndarray,
-    allow_tabular_module: bool = False,
 ) -> Any:
-    _ = allow_tabular_module
     idx_np = _to_datetime64_ns(index)
     clean = {str(k): np.asarray(v).reshape(-1) for k, v in data.items()}
     return _RustFrame(clean, idx_np)
@@ -240,32 +237,6 @@ def _ensure_ohlcv_arrays(data: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     if "volume" not in out:
         out["volume"] = np.zeros(n, dtype=np.float64)
     return out
-
-
-def _strict_rust_data_mode_enabled() -> bool:
-    rust_only = str(os.environ.get("FOREX_BOT_RUST_ONLY", "") or "").strip().lower()
-    if rust_only in {"1", "true", "yes", "on"}:
-        return True
-    mode = str(os.environ.get("FOREX_BOT_DATA_BACKEND", "") or "").strip().lower()
-    if mode in {"rust_strict", "strict_rust", "rust_only", "rust-only"}:
-        return True
-    pandas_free = str(os.environ.get("FOREX_BOT_PANDAS_FREE", "1") or "1").strip().lower()
-    if pandas_free in {"1", "true", "yes", "on"}:
-        return True
-    runtime_profile = str(os.environ.get("FOREX_BOT_RUNTIME_PROFILE", "") or "").strip().lower()
-    if runtime_profile.startswith("rust"):
-        return True
-    return False
-
-
-def _strict_tabular_free_enabled() -> bool:
-    raw = str(os.environ.get("FOREX_BOT_PANDAS_FREE_STRICT", "1") or "1").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
-
-
-def _tabular_module(*, required: bool = True):
-    _ = required
-    return None
 
 
 def _is_dataframe(obj: Any) -> bool:
@@ -301,41 +272,6 @@ def _rust_data_backend_available(*, force_log: bool = False) -> bool:
 def _disable_rust_data_backend() -> None:
     global _RUST_DATA_BACKEND_OK
     _RUST_DATA_BACKEND_OK = False
-
-
-def _frame_io_backend() -> str:
-    """
-    Select the frame I/O backend for local history files.
-
-    Env (preferred): FOREX_BOT_FRAME_IO_BACKEND=auto|polars|pyarrow|python
-    Back-compat:     FOREX_BOT_DATA_IO_BACKEND=...
-    """
-    global _FRAME_IO_WARNED_UNKNOWN
-    raw = os.environ.get("FOREX_BOT_FRAME_IO_BACKEND")
-    if raw is None or str(raw).strip() == "":
-        raw = os.environ.get("FOREX_BOT_DATA_IO_BACKEND", "auto")
-    mode = str(raw).strip().lower()
-    aliases = {
-        "auto": "auto",
-        "detect": "auto",
-        "pl": "polars",
-        "polars": "polars",
-        "arrow": "pyarrow",
-        "pa": "pyarrow",
-        "pyarrow": "pyarrow",
-        "python": "python",
-        "legacy": "python",
-    }
-    resolved = aliases.get(mode)
-    if resolved is not None:
-        if _strict_tabular_free_enabled() and resolved == "python":
-            return "auto"
-        return resolved
-    if not _FRAME_IO_WARNED_UNKNOWN:
-        logger.warning("Unknown frame I/O backend '%s'; using auto.", mode)
-        _FRAME_IO_WARNED_UNKNOWN = True
-    return "auto"
-
 
 def _use_rust_data_backend() -> bool:
     raw = os.environ.get("FOREX_BOT_RUST_DATA")
@@ -552,27 +488,8 @@ def _resample_ohlcv(df: Any, tf: str) -> Any | None:
         return _resample_ohlcv_rust(df, tf)
     if df is None or df.empty:
         return None
-    if _strict_tabular_free_enabled():
-        rust_src = _to_rust_frame(df)
-        return _resample_ohlcv_rust(rust_src, tf) if rust_src is not None else None
-    if not _is_dataframe(df):
-        rust_src = _to_rust_frame(df)
-        return _resample_ohlcv_rust(rust_src, tf) if rust_src is not None else None
-    freq = _timeframe_to_freq(tf)
-    if freq is None:
-        return None
-    if not _is_datetime_index(df.index):
-        return None
-    agg = {
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-    }
-    if "volume" in df.columns:
-        agg["volume"] = "sum"
-    out = df.resample(freq).agg(agg).dropna()
-    return out
+    rust_src = _to_rust_frame(df)
+    return _resample_ohlcv_rust(rust_src, tf) if rust_src is not None else None
 
 
 def _resample_ohlcv_rust(df: _RustFrame, tf: str) -> _RustFrame | None:
@@ -886,7 +803,7 @@ class MT5Adapter:
                 idx_np = _to_datetime64_ns(ts_src if ts_src is not None else np.arange(n, dtype=np.int64))
                 for key, vals in list(data.items()):
                     data[key] = np.asarray(vals).reshape(-1)[:n]
-                df = _build_frame_from_arrays(data, index=idx_np, allow_tabular_module=not _strict_tabular_free_enabled())
+                df = _build_frame_from_arrays(data, index=idx_np)
             except Exception:
                 logger.debug("Skipping MT5 frame build for %s/%s because conversion failed.", symbol, tf)
                 continue
@@ -1026,7 +943,6 @@ class DataLoader:
                 df = _build_frame_from_arrays(
                     data,
                     index=idx_np,
-                    allow_tabular_module=not _strict_tabular_free_enabled(),
                 )
             except Exception:
                 continue

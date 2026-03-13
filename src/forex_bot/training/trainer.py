@@ -48,6 +48,7 @@ from .conformal import ConformalClassifierGate
 from .evaluation_service import EvaluationService
 from .model_factory import ModelFactory
 from .persistence_service import PersistenceService
+from .probability_utils import pad_probs_neutral_buy_sell
 
 logger = logging.getLogger(__name__)
 try:
@@ -55,13 +56,17 @@ try:
 except Exception:
     _fb = None  # type: ignore
 
-_PANDAS_FREE_MODEL_ALLOWLIST = {
+_FRAME_NATIVE_MODEL_ALLOWLIST = {
     "lightgbm",
     "xgboost",
     "xgboost_rf",
     "xgboost_dart",
     "catboost",
     "catboost_alt",
+    # PyTorch expert already consumes ndarray/memmap inputs directly.
+    "mlp",
+    # Rust genetic bridge now avoids dataframe reconstruction for fit/predict.
+    "genetic",
     # Numpy-native linear experts (no tabular-module dependency at fit/predict).
     "elasticnet",
     "bayes_logit",
@@ -70,13 +75,15 @@ _PANDAS_FREE_MODEL_ALLOWLIST = {
     "vw",
 }
 
-_PANDAS_FREE_RUST_TREE_REQUIRED = {
+_FRAME_NATIVE_RUST_TREE_REQUIRED = {
     "lightgbm",
     "xgboost",
     "xgboost_rf",
     "xgboost_dart",
     "catboost",
     "catboost_alt",
+    "mlp",
+    "genetic",
 }
 
 _RUST_TREE_BINDING_CLASSES = {
@@ -86,6 +93,16 @@ _RUST_TREE_BINDING_CLASSES = {
     "xgboost_dart": "XGBoostDARTModel",
     "catboost": "CatBoostModel",
     "catboost_alt": "CatBoostAltModel",
+    "mlp": "MLPModel",
+    "genetic": "GeneticModel",
+}
+
+_METADATA_REQUIRED_MODELS = {
+    "genetic",
+    "rl_ppo",
+    "rl_sac",
+    "rllib_ppo",
+    "rllib_sac",
 }
 
 
@@ -629,15 +646,6 @@ class ModelTrainer:
         return raw in {"1", "true", "yes", "on"}
 
     @staticmethod
-    def _pandas_free_enabled() -> bool:
-        raw_env = os.environ.get("FOREX_BOT_PANDAS_FREE")
-        if raw_env is not None and str(raw_env).strip() != "":
-            raw = str(raw_env).strip().lower()
-            return raw in {"1", "true", "yes", "on"}
-        # Keep frame-native default behavior unless explicitly disabled.
-        return True
-
-    @staticmethod
     def _rust_only_enabled() -> bool:
         raw = str(os.environ.get("FOREX_BOT_RUST_ONLY", "") or "").strip().lower()
         if raw in {"1", "true", "yes", "on"}:
@@ -647,11 +655,6 @@ class ModelTrainer:
             return True
         tree_backend = str(os.environ.get("FOREX_BOT_TREE_BACKEND", "") or "").strip().lower()
         return tree_backend in {"rust_strict", "strict_rust", "rust_only", "rust-only"}
-
-    @staticmethod
-    def _pandas_free_strict_enabled() -> bool:
-        raw = str(os.environ.get("FOREX_BOT_PANDAS_FREE_STRICT", "1") or "1").strip().lower()
-        return raw in {"1", "true", "yes", "on"}
 
     @staticmethod
     def _memmap_dataset_complete(dataset_dir: Path | str | None) -> bool:
@@ -1467,6 +1470,17 @@ class ModelTrainer:
 
         return max(1, min(models_count, cpu_budget, max_ram_workers))
 
+    @staticmethod
+    def _distribute_worker_threads(*, cpu_budget: int, total_concurrent: int) -> list[int]:
+        workers = max(1, int(total_concurrent or 1))
+        budget = max(1, int(cpu_budget or 1))
+        base = max(1, budget // workers)
+        remainder = max(0, budget - (base * workers))
+        threads = [base for _ in range(workers)]
+        for i in range(min(remainder, workers)):
+            threads[i] += 1
+        return threads
+
     def _resolve_gpu_worker_count(self, models_count: int) -> int:
         num_gpus = int(getattr(self.settings.system, "num_gpus", 0) or 0)
         if not bool(getattr(self.settings.system, "enable_gpu", False)):
@@ -1700,7 +1714,7 @@ class ModelTrainer:
         if coerced is None:
             return None
         X, y, names, idx = coerced
-        cache_root = Path(getattr(self.settings.system, "cache_dir", "cache")) / "pandas_free_pool"
+        cache_root = Path(getattr(self.settings.system, "cache_dir", "cache")) / "frame_native_pool"
         run_id = f"{int(time.time())}_{os.getpid()}"
         out_dir = cache_root / f"pool_{run_id}"
         try:
@@ -1711,6 +1725,11 @@ class ModelTrainer:
                 index_ns=idx,
                 out_dir=out_dir,
             )
+            metadata = getattr(dataset, "metadata", None)
+            if metadata is not None:
+                persisted = self._persist_metadata_artifact(metadata, out_dir / "metadata.pkl")
+                if persisted is None:
+                    raise RuntimeError(f"failed to persist metadata artifact for memmap dataset {out_dir}")
             return out_dir
         except Exception as exc:
             logger.warning("Failed to materialize numpy memmap dataset: %s", exc, exc_info=True)
@@ -1795,7 +1814,7 @@ class ModelTrainer:
             cpu_models = list(enabled_models)
 
         if meta_fit is None:
-            require_meta = {"genetic", "rl_ppo", "rl_sac", "rllib_ppo", "rllib_sac"}
+            require_meta = _METADATA_REQUIRED_MODELS
             dropped = [m for m in (gpu_models + cpu_models) if m in require_meta]
             if dropped:
                 logger.info(f"Parallel: skipping metadata-dependent models without metadata: {dropped}")
@@ -1851,9 +1870,9 @@ class ModelTrainer:
         if total_concurrent <= 0:
             raise RuntimeError("Parallel training requested but no workers were scheduled")
 
-        threads_per_worker = max(1, cpu_budget // max(1, total_concurrent))
-        for spec in gpu_specs + cpu_specs:
-            spec["threads"] = threads_per_worker
+        worker_threads = self._distribute_worker_threads(cpu_budget=cpu_budget, total_concurrent=total_concurrent)
+        for spec, threads in zip(gpu_specs + cpu_specs, worker_threads, strict=False):
+            spec["threads"] = max(1, int(threads))
 
         cache_root = Path(getattr(self.settings.system, "cache_dir", "cache")) / "parallel_training"
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1871,7 +1890,7 @@ class ModelTrainer:
             gpu_workers,
             cpu_workers,
             cpu_budget,
-            threads_per_worker,
+            worker_threads,
         )
 
         self._write_tuned_config(cfg_path)
@@ -1953,6 +1972,7 @@ class ModelTrainer:
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
             env["FOREX_BOT_TRAIN_WORKER"] = "1"
+            env["FOREX_BOT_AUTO_TUNE"] = "0"
             if cfg_exists:
                 env["CONFIG_FILE"] = str(cfg_path)
 
@@ -1961,12 +1981,17 @@ class ModelTrainer:
             else:
                 env["CUDA_VISIBLE_DEVICES"] = ""
 
-            worker_threads = int(spec.get("threads") or threads_per_worker)
-            worker_threads = max(1, worker_threads)
-            env["FOREX_BOT_CPU_BUDGET"] = str(worker_threads)
-            env["FOREX_BOT_CPU_THREADS"] = str(worker_threads)
+            worker_thread_budget = int(spec.get("threads") or 1)
+            worker_thread_budget = max(1, worker_thread_budget)
+            env["FOREX_BOT_CPU_BUDGET"] = str(worker_thread_budget)
+            env["FOREX_BOT_CPU_THREADS"] = str(worker_thread_budget)
+            try:
+                env_numexpr_max = max(int(env.get("NUMEXPR_MAX_THREADS", "0") or 0), worker_thread_budget)
+            except Exception:
+                env_numexpr_max = worker_thread_budget
+            env["NUMEXPR_MAX_THREADS"] = str(max(1, env_numexpr_max))
             for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
-                env[k] = str(worker_threads)
+                env[k] = str(worker_thread_budget)
 
             if spec.get("kind") == "gpu":
                 max_concurrent = 1
@@ -1987,7 +2012,7 @@ class ModelTrainer:
                 "--out-dir",
                 str(out_dir),
                 "--cpu-threads",
-                str(worker_threads),
+                str(worker_thread_budget),
                 "--max-concurrent-models",
                 str(max_concurrent),
             ]
@@ -2026,7 +2051,7 @@ class ModelTrainer:
                 label,
                 spec.get("kind"),
                 models,
-                worker_threads,
+                worker_thread_budget,
                 log_path,
             )
 
@@ -2115,18 +2140,12 @@ class ModelTrainer:
         except Exception:
             pass
 
-        if self._pandas_free_enabled():
-            self.models = {}
-            self.meta_blender = None
-        else:
-            try:
-                self.models, self.meta_blender = self.persistence.load_models()
-            except Exception as exc:
-                logger.warning(f"Failed to load merged models after parallel training: {exc}", exc_info=True)
+        self.models = {}
+        self.meta_blender = None
 
         return durations
 
-    def _train_all_pandas_free_memmap(
+    def _train_all_frame_native_memmap(
         self,
         *,
         optimize: bool,
@@ -2134,13 +2153,14 @@ class ModelTrainer:
         models_override: list[str] | None,
         exclude_models: list[str] | None,
         memmap_dataset_dir: Path | str | None,
+        meta_fit: Any | None,
     ) -> bool:
         if not self._memmap_dataset_complete(memmap_dataset_dir):
             return False
 
         dataset_dir = Path(memmap_dataset_dir)
         if optimize:
-            logger.info("Pandas-free mode: disabling HPO optimization for stable rust-tree training path.")
+            logger.info("Frame-native mode: disabling HPO optimization for stable rust-tree training path.")
 
         enabled_models = self._get_enabled_models()
         enabled_models = self._maybe_shard_models(enabled_models)
@@ -2157,8 +2177,8 @@ class ModelTrainer:
                 logger.warning("All models excluded; skipping training.")
                 return True
         if not enabled_models:
-            logger.warning("Pandas-free memmap: no compatible Rust-backed models selected; skipping training.")
-            self.run_summary["pandas_free_memmap"] = {
+            logger.warning("Frame-native memmap: no compatible Rust-backed models selected; skipping training.")
+            self.run_summary["frame_native_memmap"] = {
                 "enabled": True,
                 "dataset_dir": str(dataset_dir),
                 "models": [],
@@ -2182,16 +2202,31 @@ class ModelTrainer:
                 feature_columns = [str(c) for c in loaded]
 
         logger.info(
-            "Pandas-free memmap training path enabled: models=%s rows_source=%s",
+            "Frame-native memmap training path enabled: models=%s rows_source=%s",
             len(enabled_models),
             dataset_dir,
         )
+
+        effective_meta_fit = meta_fit
+        metadata_artifact = dataset_dir / "metadata.pkl"
+        if effective_meta_fit is None and metadata_artifact.exists():
+            with contextlib.suppress(Exception):
+                effective_meta_fit = joblib.load(metadata_artifact)
+            if effective_meta_fit is not None:
+                logger.info("Frame-native memmap: loaded metadata artifact from %s", metadata_artifact)
+        required_meta_models = [m for m in enabled_models if m in _METADATA_REQUIRED_MODELS]
+        if effective_meta_fit is None and required_meta_models:
+            names = ", ".join(required_meta_models)
+            raise RuntimeError(
+                "Frame-native memmap training requires PreparedDataset.metadata "
+                f"or {metadata_artifact} for metadata-dependent models: {names}"
+            )
 
         durations = self._train_models_parallel(
             enabled_models,
             np.empty((0, 0), dtype=np.float32),
             np.empty((0,), dtype=np.int8),
-            meta_fit=None,
+            meta_fit=effective_meta_fit,
             stop_event=stop_event,
             memmap_dataset_dir=dataset_dir,
         )
@@ -2209,7 +2244,7 @@ class ModelTrainer:
             "num_gpus": int(getattr(self.settings.system, "num_gpus", 1)),
             "device": str(getattr(self.settings.system, "device", "cpu")),
         }
-        self.run_summary["pandas_free_memmap"] = {
+        self.run_summary["frame_native_memmap"] = {
             "enabled": True,
             "dataset_dir": str(dataset_dir),
             "models": list(enabled_models),
@@ -2237,38 +2272,30 @@ class ModelTrainer:
         memmap_dataset_dir: Path | str | None = None,
     ) -> None:
         logger.info("Starting training cycle...")
-        pandas_free = self._pandas_free_enabled()
-        strict_pandas_free = self._pandas_free_strict_enabled()
-        if pandas_free and optimize:
-            logger.info("Pandas-free mode: disabling HPO optimization for stable rust-tree training path.")
+        if optimize:
+            logger.info("Frame-native mode: disabling HPO optimization for stable rust-tree training path.")
             optimize = False
-        pandas_free_memmap_dir: Path | str | None = memmap_dataset_dir
-        if pandas_free and not self._memmap_dataset_complete(pandas_free_memmap_dir):
-            pandas_free_memmap_dir = self._materialize_numpy_memmap_dataset(dataset)
-        if pandas_free and not self._memmap_dataset_complete(pandas_free_memmap_dir):
-            msg = (
-                "Pandas-free mode: memmap dataset is unavailable; "
-                "aborting instead of legacy tabular fallback."
+        frame_native_memmap_dir: Path | str | None = memmap_dataset_dir
+        if not self._memmap_dataset_complete(frame_native_memmap_dir):
+            frame_native_memmap_dir = self._materialize_numpy_memmap_dataset(dataset)
+        if not self._memmap_dataset_complete(frame_native_memmap_dir):
+            logger.error(
+                "Frame-native mode: memmap dataset is unavailable; aborting because the legacy tabular fallback path has been deleted."
             )
-            if strict_pandas_free:
-                logger.error("%s Set FOREX_BOT_PANDAS_FREE_STRICT=0 to allow fallback.", msg)
-                return
-            logger.error("%s (strict off) — legacy tabular fallback path removed; please regenerate memmap dataset.", msg)
             return
-        if pandas_free and self._train_all_pandas_free_memmap(
+        if self._train_all_frame_native_memmap(
             optimize=optimize,
             stop_event=stop_event,
             models_override=models_override,
             exclude_models=exclude_models,
-            memmap_dataset_dir=pandas_free_memmap_dir,
+            memmap_dataset_dir=frame_native_memmap_dir,
+            meta_fit=getattr(dataset, "metadata", None),
         ):
             return
-        if pandas_free and strict_pandas_free:
-            logger.error(
-                "Pandas-free strict mode: memmap training path did not complete; "
-                "aborting instead of using legacy tabular fallback."
-            )
-            return
+        logger.error(
+            "Frame-native mode: memmap training path did not complete; aborting because the legacy tabular fallback path has been deleted."
+        )
+        return
         # Enforce GPU-only mode when explicitly requested (or preference is GPU)
         try:
             gpu_only_env = str(os.environ.get("FOREX_BOT_GPU_ONLY", "")).strip().lower()
@@ -3272,7 +3299,6 @@ class ModelTrainer:
         # (e.g., RLlib on Python 3.13 Windows where Ray wheels do not exist).
         filtered: list[str] = []
         skipped: list[str] = []
-        pandas_free = self._pandas_free_enabled()
 
         needed = set(ordered)
 
@@ -3292,17 +3318,6 @@ class ModelTrainer:
 
         FORECAST_NF_AVAILABLE = False  # type: ignore
         TRANSFORMER_NF_AVAILABLE = False  # type: ignore
-        if not pandas_free:
-            if needed.intersection({"tide_nf", "nbeatsx_nf"}):
-                try:
-                    from ..models.forecast_nf import NF_AVAILABLE as FORECAST_NF_AVAILABLE  # type: ignore
-                except Exception:
-                    FORECAST_NF_AVAILABLE = False  # type: ignore
-            if needed.intersection({"patchtst", "timesnet"}):
-                try:
-                    from ..models.transformer_nf import NF_AVAILABLE as TRANSFORMER_NF_AVAILABLE  # type: ignore
-                except Exception:
-                    TRANSFORMER_NF_AVAILABLE = False  # type: ignore
 
         LINEAR_SKLEARN_AVAILABLE = False  # type: ignore
         LINEAR_VW_AVAILABLE = False  # type: ignore
@@ -3350,29 +3365,28 @@ class ModelTrainer:
         if skipped:
             logger.info(f"Skipping unavailable models: {skipped}")
 
-        if pandas_free:
-            os.environ.setdefault("FOREX_BOT_TREE_BACKEND", "rust_strict")
-            keep: list[str] = []
-            dropped: list[str] = []
-            dropped_missing: list[str] = []
-            for m in list(filtered):
-                if m not in _PANDAS_FREE_MODEL_ALLOWLIST:
-                    dropped.append(m)
-                    continue
-                if m in _PANDAS_FREE_RUST_TREE_REQUIRED and not _rust_tree_binding_available(m):
-                    dropped_missing.append(m)
-                    continue
-                keep.append(m)
-            if dropped:
-                logger.info("Pandas-free mode: skipping non-rust-tree models: %s", dropped)
-            if dropped_missing:
-                logger.info("Pandas-free mode: skipping tree models without Rust bindings: %s", dropped_missing)
-            if not keep and filtered:
-                logger.warning(
-                    "Pandas-free mode: no Rust-backed models remain after filtering; "
-                    "set FOREX_BOT_PANDAS_FREE=0 only if you intentionally want legacy python-frame fallback."
-                )
-            filtered = keep
+        os.environ.setdefault("FOREX_BOT_TREE_BACKEND", "rust_strict")
+        keep: list[str] = []
+        dropped: list[str] = []
+        dropped_missing: list[str] = []
+        for m in list(filtered):
+            if m not in _FRAME_NATIVE_MODEL_ALLOWLIST:
+                dropped.append(m)
+                continue
+            if m in _FRAME_NATIVE_RUST_TREE_REQUIRED and not _rust_tree_binding_available(m):
+                dropped_missing.append(m)
+                continue
+            keep.append(m)
+        if dropped:
+            logger.info("Frame-native runtime: skipping unsupported models: %s", dropped)
+        if dropped_missing:
+            logger.info("Frame-native runtime: skipping models without required Rust bindings: %s", dropped_missing)
+        if not keep and filtered:
+            logger.warning(
+                "Frame-native runtime: no Rust-backed models remain after filtering; "
+                "the legacy python-frame fallback path has been deleted."
+            )
+        filtered = keep
 
         return filtered
 
@@ -3526,26 +3540,5 @@ class ModelTrainer:
 
     @staticmethod
     def _pad_probs(p):
-        """
-        HPC UNIFIED PROTOCOL: Force output to [Neutral, Buy, Sell].
-        Standard indices: 0=Neutral, 1=Buy, 2=Sell.
-        """
-        if p is None:
-            return np.zeros((0, 3))
-        p = np.asarray(p)
-        if p.ndim == 1:
-            p = p.reshape(-1, 1)
-        n = p.shape[0]
-        
-        out = np.zeros((n, 3))
-        if p.shape[1] == 3:
-            return p # Assume standard protocol
-        elif p.shape[1] == 2:
-            # Model only knows Neutral vs Buy or similar
-            out[:, 0] = p[:, 0]
-            out[:, 1] = p[:, 1]
-        else:
-            out[:, 0] = 1.0 - p[:, 0]
-            out[:, 1] = p[:, 0]
-        return out
+        return pad_probs_neutral_buy_sell(p)
 

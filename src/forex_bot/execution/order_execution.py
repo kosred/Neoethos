@@ -59,6 +59,10 @@ def _is_dataframe_like(value: Any) -> bool:
     return bool(hasattr(value, "columns") and hasattr(value, "index"))
 
 
+def _is_frame_like(value: Any) -> bool:
+    return bool(hasattr(value, "columns") and hasattr(value, "__getitem__"))
+
+
 def _is_series_like(value: Any) -> bool:
     return bool(hasattr(value, "index") and hasattr(value, "to_numpy") and not hasattr(value, "columns"))
 
@@ -131,6 +135,7 @@ class OrderExecutor:
         signal_result: Any,
         equity: float,
         frames: dict[str, Any],
+        entry_features: Any = None,
         alloc_weight: Any = None,
         advice_stance: str | None = None,
         tick_price: dict[str, float] | None = None,
@@ -260,7 +265,17 @@ class OrderExecutor:
             last_result = result
             if result.get("success"):
                 any_success = True
-                self._handle_success(result, order_type, vol, sl, leg_tp, signal_result, count_trade=False)
+                self._handle_success(
+                    result,
+                    order_type,
+                    vol,
+                    sl,
+                    leg_tp,
+                    signal_result,
+                    entry_features=entry_features,
+                    bar_time=current_bar_time,
+                    count_trade=False,
+                )
                 self._record_fill_cost_state(
                     order_type=order_type,
                     expected_entry=entry_price,
@@ -362,6 +377,14 @@ class OrderExecutor:
             if _frame_empty(value):
                 return float(default)
             try:
+                if _is_frame_like(value):
+                    cols = _frame_columns(value)
+                    if len(cols) == 1:
+                        raw = value[cols[0]]
+                        arr = raw.to_numpy(copy=False) if hasattr(raw, "to_numpy") else np.asarray(raw)
+                        arr = np.asarray(arr).reshape(-1)
+                        if arr.size > 0:
+                            return float(arr[-1])
                 if hasattr(value, "take"):
                     tail = value.take([-1])
                     arr = np.asarray(tail)
@@ -846,7 +869,19 @@ class OrderExecutor:
             logger.error(f"Price calc failed: {e}")
             return None
 
-    def _handle_success(self, result, order_type, size, sl, tp, signal_result, *, count_trade: bool = True):
+    def _handle_success(
+        self,
+        result,
+        order_type,
+        size,
+        sl,
+        tp,
+        signal_result,
+        *,
+        entry_features: Any = None,
+        bar_time: datetime | None = None,
+        count_trade: bool = True,
+    ):
         logger.info(f"[ORDER SUCCESS] Ticket={result.get('ticket')}")
         if self.risk_manager and count_trade:
             self.risk_manager.on_trade_opened(datetime.now(UTC))
@@ -864,6 +899,24 @@ class OrderExecutor:
                 )
             except Exception as e:
                 logger.warning(f"Failed to log trade intent: {e}", exc_info=True)
+
+        if entry_features is not None and result.get("ticket"):
+            try:
+                entry_bar_time = bar_time or result.get("bar_time") or datetime.now(UTC)
+                if isinstance(entry_bar_time, str):
+                    entry_bar_time = datetime.fromisoformat(entry_bar_time)
+                self.mt5.record_entry_features(
+                    ticket=int(result["ticket"]),
+                    symbol=self.settings.system.symbol,
+                    bar_time=entry_bar_time,
+                    features=entry_features,
+                    signal=int(getattr(signal_result, "signal", 0) or 0),
+                    order_ticket=result.get("order_ticket"),
+                    deal_ticket=result.get("deal_ticket"),
+                    magic=result.get("magic"),
+                )
+            except Exception as exc:
+                logger.debug("Failed to record entry feature snapshot: %s", exc)
 
     def _handle_failure(self, result):
         logger.error(f"[ORDER FAIL] {result.get('reason')}")

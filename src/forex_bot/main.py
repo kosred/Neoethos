@@ -15,6 +15,7 @@ import numpy as np
 
 from forex_bot.core.config import Settings, apply_runtime_profile_defaults
 from forex_bot.core.logging import setup_logging
+from forex_bot.core.system import HardwareProbe, derive_live_symbol_concurrency, resolve_cpu_budget
 from forex_bot.data.loader import DataLoader
 from forex_bot.execution.bot import ForexBot
 
@@ -70,6 +71,34 @@ def _detect_hpc_mode() -> bool:
         return True
     
     return False
+
+
+def _resolve_live_symbol_concurrency(symbol_count: int) -> int:
+    try:
+        requested = int(os.environ.get("FOREX_BOT_MAX_CONCURRENT_SYMBOLS", "0") or 0)
+    except (TypeError, ValueError):
+        requested = 0
+    if requested > 0:
+        return max(1, min(int(symbol_count or 1), requested))
+
+    try:
+        per_symbol_gb = float(os.environ.get("FOREX_BOT_SYMBOL_WORKER_GB", "4.0") or 4.0)
+    except (TypeError, ValueError):
+        per_symbol_gb = 4.0
+    per_symbol_gb = max(0.5, per_symbol_gb)
+
+    try:
+        profile = HardwareProbe().detect()
+        available_ram_gb = float(getattr(profile, "available_ram_gb", 0.0) or 0.0)
+    except Exception:
+        available_ram_gb = 8.0
+
+    return derive_live_symbol_concurrency(
+        symbol_count=symbol_count,
+        cpu_budget=resolve_cpu_budget(),
+        available_ram_gb=available_ram_gb,
+        per_symbol_gb=per_symbol_gb,
+    )
 
 
 def _global_models_exist(models_dir: Path = Path("models")) -> bool:
@@ -651,11 +680,12 @@ async def run_bot_instance(settings: Settings, stop_event: asyncio.Event):
         logger.error(f"[ERROR] Bot instance for {settings.system.symbol} failed: {e}", exc_info=True)
 
 
-async def main_async():
+async def main_async(args: argparse.Namespace | None = None):
     # Initialize DDP if launched via torchrun (RANK/WORLD_SIZE env vars present)
     ddp_rank = maybe_init_distributed()
 
-    args = parse_args()
+    if args is None:
+        args = parse_args()
     if getattr(args, "runtime_profile", None):
         resolved = apply_runtime_profile_defaults(str(args.runtime_profile))
         if resolved:
@@ -847,16 +877,8 @@ async def main_async():
             logger.info("ONNX export requested and no manifest found; exporting ONNX models now...")
             await asyncio.to_thread(_export_onnx_from_saved_models, models_dir)
 
-    # CRITICAL FIX: Limit parallel symbol execution to avoid resource explosion
-    # Running all symbols in parallel multiplies all threading issues
-    # Cap at 2-4 concurrent symbols max to prevent system overload
-    try:
-        max_concurrent_symbols = int(os.environ.get("FOREX_BOT_MAX_CONCURRENT_SYMBOLS", "1"))
-    except (ValueError, TypeError):
-        max_concurrent_symbols = 1
-
-    if max_concurrent_symbols <= 0:
-        max_concurrent_symbols = min(2, len(symbols))  # Default to 2 max
+    # Auto-size live symbol concurrency from the current host unless explicitly overridden.
+    max_concurrent_symbols = _resolve_live_symbol_concurrency(len(symbols))
 
     logger.info(f"Running {len(symbols)} symbols with max {max_concurrent_symbols} concurrent instances...")
 
@@ -899,14 +921,24 @@ async def main_async():
     logger.info("All trading engines stopped.")
 
 
-def load_keys(keys_path: str = "keys.txt"):
+def _should_warn_on_missing_keys(args: argparse.Namespace) -> bool:
+    return not bool(
+        getattr(args, "train", False)
+        or getattr(args, "backtest", False)
+        or getattr(args, "export_onnx", False)
+        or getattr(args, "clean_only", False)
+    )
+
+
+def load_keys(keys_path: str = "keys.txt", *, warn_if_missing: bool = True):
     """Load secrets from a local keys file into environment variables."""
     path = Path(keys_path)
     if not path.exists():
-        print(
-            f"[WARN] Keys file {keys_path} not found. Ensure APIs/MT5 credentials are set via env vars.",
-            file=sys.stderr,
-        )
+        if warn_if_missing:
+            print(
+                f"[WARN] Keys file {keys_path} not found. Ensure APIs/MT5 credentials are set via env vars.",
+                file=sys.stderr,
+            )
         return
 
     try:
@@ -927,9 +959,10 @@ def main():
         if sys.platform == "win32":
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-        load_keys()
+        args = parse_args()
+        load_keys(warn_if_missing=_should_warn_on_missing_keys(args))
 
-        asyncio.run(main_async())
+        asyncio.run(main_async(args))
     except (KeyboardInterrupt, asyncio.CancelledError):
         logging.getLogger(__name__).info("Bot stopped by user.")
     except Exception as e:

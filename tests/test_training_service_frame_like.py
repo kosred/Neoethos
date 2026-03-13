@@ -84,7 +84,7 @@ def test_align_global_feature_space_accepts_frame_like() -> None:
         assert isinstance(ds.index, np.ndarray)
         assert ds.index.shape == (n,)
         if prefer_numpy:
-            assert ds.metadata is None
+            assert ds.metadata is not None
 
 
 def test_split_global_train_eval_accepts_frame_like(monkeypatch: pytest.MonkeyPatch) -> None:

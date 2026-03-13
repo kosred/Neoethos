@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -8,74 +9,43 @@ import pytest
 from forex_bot.training import parallel_worker as pw
 
 
-def test_pandas_free_strict_enabled_default_true(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("FOREX_BOT_PANDAS_FREE_STRICT", raising=False)
-    assert pw._pandas_free_strict_enabled() is True
-
-
-def test_load_training_data_pandas_free_uses_numpy_when_rust_available(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_training_data_frame_native_uses_numpy_when_rust_available(monkeypatch: pytest.MonkeyPatch) -> None:
     sentinel_x = np.zeros((8, 3), dtype=np.float32)
     sentinel_y = np.zeros(8, dtype=np.int8)
     monkeypatch.setattr(pw, "_load_memmap_arrays", lambda _p: (sentinel_x, sentinel_y))
-    monkeypatch.setattr(pw, "_load_memmap_dataset", lambda _p: (_ for _ in ()).throw(AssertionError("pandas path used")))
     monkeypatch.setattr(pw, "_rust_tree_model_available", lambda _name: True)
 
-    x, y, uses_pandas = pw._load_training_data(
+    x, y = pw._load_training_data(
         Path("."),
         model_name="xgboost",
-        pandas_free=True,
     )
 
-    assert uses_pandas is False
     assert x is sentinel_x
     assert y is sentinel_y
 
 
-def test_load_training_data_pandas_free_strict_raises_without_rust_binding(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("FOREX_BOT_PANDAS_FREE_STRICT", raising=False)
+def test_load_training_data_frame_native_requires_rust_binding(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(pw, "_rust_tree_model_available", lambda _name: False)
     monkeypatch.setattr(pw, "_load_memmap_arrays", lambda _p: (_ for _ in ()).throw(AssertionError("numpy path should not run")))
-    monkeypatch.setattr(pw, "_load_memmap_dataset", lambda _p: (_ for _ in ()).throw(AssertionError("pandas fallback should not run")))
 
     with pytest.raises(RuntimeError):
         pw._load_training_data(
             Path("."),
             model_name="xgboost",
-            pandas_free=True,
         )
 
 
-def test_load_training_data_non_strict_still_requires_rust_binding(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE_STRICT", "0")
-    monkeypatch.setattr(pw, "_rust_tree_model_available", lambda _name: False)
-    monkeypatch.setattr(pw, "_load_memmap_arrays", lambda _p: (_ for _ in ()).throw(AssertionError("numpy path should not run")))
-    monkeypatch.setattr(
-        pw,
-        "_load_memmap_dataset",
-        lambda _p: (_ for _ in ()).throw(AssertionError("pandas fallback should not run")),
-    )
-
-    with pytest.raises(RuntimeError):
-        pw._load_training_data(
-            Path("."),
-            model_name="xgboost",
-            pandas_free=True,
-        )
-
-
-def test_load_training_data_pandas_free_linear_model_uses_numpy_without_rust_binding(
+def test_load_training_data_frame_native_linear_model_uses_numpy_without_rust_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sentinel_x = np.zeros((5, 2), dtype=np.float32)
     sentinel_y = np.zeros(5, dtype=np.int8)
     monkeypatch.setattr(pw, "_rust_tree_model_available", lambda _name: False)
     monkeypatch.setattr(pw, "_load_memmap_arrays", lambda _p: (sentinel_x, sentinel_y))
-    x, y, uses_pandas = pw._load_training_data(
+    x, y = pw._load_training_data(
         Path("."),
         model_name="elasticnet",
-        pandas_free=True,
     )
-    assert uses_pandas is False
     assert x is sentinel_x
     assert y is sentinel_y
 
@@ -156,7 +126,6 @@ def test_train_single_model_process_loads_metadata_even_without_pandas_dataset(
         lambda *_args, **_kwargs: (
             np.zeros((8, 3), dtype=np.float32),
             np.zeros(8, dtype=np.int8),
-            False,
         ),
     )
     monkeypatch.setattr(pw, "_load_metadata_artifact", lambda _path: sentinel_meta)
@@ -181,3 +150,13 @@ def test_train_single_model_process_loads_metadata_even_without_pandas_dataset(
 
     assert result[2] is True
     assert captured["metadata"] is sentinel_meta
+
+
+def test_apply_thread_env_sets_numexpr_max_threads(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NUMEXPR_MAX_THREADS", "1")
+    monkeypatch.delenv("NUMEXPR_NUM_THREADS", raising=False)
+
+    pw._apply_thread_env(3)
+
+    assert os.environ.get("NUMEXPR_NUM_THREADS") == "3"
+    assert os.environ.get("NUMEXPR_MAX_THREADS") == "3"

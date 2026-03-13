@@ -16,8 +16,8 @@ sudo apt-get install -y nvidia-cuda-toolkit libcudnn9-dev libcudnn9-cuda-12
 echo "[*] Upgrading base environment..."
 "$PYTHON_BIN" -m pip install --upgrade pip setuptools wheel --user --break-system-packages
 
-echo "[*] Installing verified HPC requirements (CUDA 12.8)..."
-"$PYTHON_BIN" -m pip install -r requirements-hpc.txt --user --break-system-packages
+echo "[*] Installing unified pyproject GPU runtime manifest..."
+"$PYTHON_BIN" -m pip install -e ".[gpu]" --user --break-system-packages
 
 # --- GPU VERIFICATION (HPC MODE) ---
 echo "[*] Running multi-GPU integrity check..."

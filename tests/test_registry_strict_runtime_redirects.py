@@ -7,9 +7,9 @@ from forex_bot.models import registry as reg
 
 
 def test_resolve_runtime_model_name_redirects_neuralforecast_in_strict_mode(monkeypatch):
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE", "1")
-    monkeypatch.delenv("FOREX_BOT_RUST_ONLY", raising=False)
+    monkeypatch.setenv("FOREX_BOT_RUST_ONLY", "1")
     monkeypatch.delenv("FOREX_BOT_TREE_BACKEND", raising=False)
+    monkeypatch.delenv("FOREX_BOT_RUNTIME_PROFILE", raising=False)
     assert reg._resolve_runtime_model_name("patchtst") == "transformer"
     assert reg._resolve_runtime_model_name("timesnet") == "transformer"
     assert reg._resolve_runtime_model_name("tide_nf") == "tide"
@@ -17,16 +17,17 @@ def test_resolve_runtime_model_name_redirects_neuralforecast_in_strict_mode(monk
 
 
 def test_resolve_runtime_model_name_keeps_neuralforecast_when_not_strict(monkeypatch):
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE", "0")
     monkeypatch.setenv("FOREX_BOT_RUST_ONLY", "0")
     monkeypatch.setenv("FOREX_BOT_TREE_BACKEND", "auto")
+    monkeypatch.delenv("FOREX_BOT_RUNTIME_PROFILE", raising=False)
     assert reg._resolve_runtime_model_name("patchtst") == "patchtst"
     assert reg._resolve_runtime_model_name("tide_nf") == "tide_nf"
 
 
 def test_get_model_class_redirects_patchtst_to_transformer_in_strict_mode(monkeypatch):
     reg._CLASS_CACHE.clear()
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE", "1")
+    monkeypatch.setenv("FOREX_BOT_RUST_ONLY", "1")
+    monkeypatch.delenv("FOREX_BOT_RUNTIME_PROFILE", raising=False)
 
     class _Transformer:
         pass
@@ -46,9 +47,9 @@ def test_get_model_class_redirects_patchtst_to_transformer_in_strict_mode(monkey
 
 def test_get_model_class_uses_patchtst_module_when_not_strict(monkeypatch):
     reg._CLASS_CACHE.clear()
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE", "0")
     monkeypatch.setenv("FOREX_BOT_RUST_ONLY", "0")
     monkeypatch.setenv("FOREX_BOT_TREE_BACKEND", "auto")
+    monkeypatch.delenv("FOREX_BOT_RUNTIME_PROFILE", raising=False)
 
     class _Patch:
         pass
@@ -67,7 +68,8 @@ def test_get_model_class_uses_patchtst_module_when_not_strict(monkeypatch):
 
 
 def test_use_rust_tree_models_strict_mode_ignores_python_override(monkeypatch):
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE", "1")
+    monkeypatch.setenv("FOREX_BOT_RUST_ONLY", "1")
     monkeypatch.setenv("FOREX_BOT_TREE_BACKEND", "python")
+    monkeypatch.delenv("FOREX_BOT_RUNTIME_PROFILE", raising=False)
     monkeypatch.setitem(sys.modules, "forex_bindings", types.SimpleNamespace(RustCatBoostExpert=object()))
     assert reg._use_rust_tree_models("catboost")

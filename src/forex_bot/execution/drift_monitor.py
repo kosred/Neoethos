@@ -11,13 +11,47 @@ from scipy.stats import ks_2samp
 logger = logging.getLogger(__name__)
 
 
+def _column_to_numpy(values: Any) -> np.ndarray:
+    if hasattr(values, "to_numpy"):
+        try:
+            arr = values.to_numpy(copy=False)
+        except TypeError:
+            arr = values.to_numpy()
+    else:
+        arr = np.asarray(values)
+    return np.asarray(arr)
+
+
+def _frame_like_columns(frame: Any) -> list[str]:
+    cols = getattr(frame, "columns", None)
+    if cols is None:
+        return []
+    try:
+        return [str(c) for c in list(cols)]
+    except Exception:
+        return []
+
+
+def _frame_like_column_values(frame: Any, col: str) -> np.ndarray | None:
+    try:
+        values = frame[col]  # type: ignore[index]
+    except Exception:
+        return None
+    try:
+        arr = _column_to_numpy(values)
+        return np.asarray(arr, dtype=np.float64).reshape(-1)
+    except Exception:
+        return None
+
+
 def _frame_like_latest_scalar(frame: Any, col: str) -> float | None:
     try:
         if hasattr(frame, "take"):
             tail = frame.take([-1])
             if hasattr(tail, "__getitem__"):
                 values = tail[col]  # type: ignore[index]
-                arr = np.asarray(values, dtype=np.float64).reshape(-1)
+                arr = _column_to_numpy(values)
+                arr = np.asarray(arr, dtype=np.float64).reshape(-1)
                 if arr.size > 0:
                     return float(arr[-1])
     except Exception:
@@ -26,7 +60,8 @@ def _frame_like_latest_scalar(frame: Any, col: str) -> float | None:
         values = frame[col]
     except Exception:
         return None
-    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    arr = _column_to_numpy(values)
+    arr = np.asarray(arr, dtype=np.float64).reshape(-1)
     if arr.size <= 0:
         return None
     return float(arr[-1])
@@ -219,17 +254,21 @@ class ConceptDriftMonitor:
         self.feature_stats = {}
         self.alpha = 0.01  # Adaptation rate (approx 100-bar memory)
 
+        cols = _frame_like_columns(baseline_features)
         monitor_cols = [
             c
-            for c in baseline_features.columns
-            if "rsi" in c or "adx" in c or "atr" in c or "ema" in c or "return" in c
+            for c in cols
+            if "rsi" in c.lower() or "adx" in c.lower() or "atr" in c.lower() or "ema" in c.lower() or "return" in c.lower()
         ]
         if not monitor_cols:
-            monitor_cols = baseline_features.columns[:10].tolist()
+            monitor_cols = cols[:10]
 
         for col in monitor_cols:
             try:
-                series = baseline_features[col].dropna()
+                series = _frame_like_column_values(baseline_features, col)
+                if series is None:
+                    continue
+                series = series[np.isfinite(series)]
                 if len(series) > 10:
                     self.feature_stats[col] = {
                         "mean": float(series.mean()),

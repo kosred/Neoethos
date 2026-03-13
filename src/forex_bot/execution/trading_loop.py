@@ -29,6 +29,23 @@ from ..training.online_learner import OnlineLearner
 logger = logging.getLogger(__name__)
 
 
+class _FrameTailView:
+    def __init__(self, data: dict[str, np.ndarray], index: np.ndarray):
+        self._data = {str(k): np.asarray(v).reshape(-1) for k, v in data.items()}
+        self.columns = list(self._data.keys())
+        self.index = np.asarray(index).reshape(-1)
+
+    @property
+    def empty(self) -> bool:
+        return int(len(self.index)) <= 0
+
+    def __len__(self) -> int:
+        return int(len(self.index))
+
+    def __getitem__(self, key):
+        return self._data[str(key)]
+
+
 def _frame_empty(value: object) -> bool:
     if value is None:
         return True
@@ -74,8 +91,53 @@ def _frame_column_numpy(frame: object, name: str, *, dtype: Any = np.float64):
     return np.asarray(values, dtype=dtype).reshape(-1)
 
 
-def _is_dataframe_like(value: object) -> bool:
-    return bool(hasattr(value, "columns") and hasattr(value, "index") and hasattr(value, "iloc"))
+def _is_frame_like(value: object) -> bool:
+    return bool(hasattr(value, "columns") and hasattr(value, "index") and hasattr(value, "__getitem__"))
+
+
+def _frame_tail(value: object, n_rows: int) -> object:
+    if value is None:
+        return value
+    take = max(0, int(n_rows))
+    if take <= 0:
+        return value
+    if hasattr(value, "tail"):
+        with contextlib.suppress(Exception):
+            return value.tail(take)  # type: ignore[no-any-return]
+    if _is_frame_like(value):
+        try:
+            row_count = int(len(value))  # type: ignore[arg-type]
+        except Exception:
+            row_count = 0
+        if row_count <= 0:
+            return value
+        start = max(0, row_count - take)
+        data: dict[str, np.ndarray] = {}
+        cols = _frame_columns(value)
+        for col in cols:
+            raw = value[col]  # type: ignore[index]
+            arr = raw.to_numpy(copy=False) if hasattr(raw, "to_numpy") else np.asarray(raw)
+            vec = np.asarray(arr).reshape(-1)
+            data[str(col)] = vec[start:row_count]
+        idx_obj = getattr(value, "index", None)
+        idx_arr = np.asarray(idx_obj).reshape(-1) if idx_obj is not None else np.arange(row_count, dtype=np.int64)
+        if idx_arr.size < row_count:
+            idx_arr = np.arange(row_count, dtype=np.int64)
+        return _FrameTailView(data, idx_arr[start:row_count])
+    arr = np.asarray(value)
+    if arr.ndim == 0:
+        return arr.reshape(1)
+    return arr[-take:]
+
+
+def _entry_feature_snapshot(dataset: object) -> dict[str, Any] | None:
+    x = getattr(dataset, "X", None)
+    feature_names = getattr(dataset, "feature_names", None)
+    try:
+        names = [str(name) for name in list(feature_names)] if feature_names is not None else None
+    except Exception:
+        names = None
+    return MT5StateManager.build_feature_row_payload(x, feature_names=names)
 
 
 class TradingEngine:
@@ -265,19 +327,20 @@ class TradingEngine:
                     symbol=self.settings.system.symbol,
                 )
                 feature_drift_alert = False
-                if self.drift and _is_dataframe_like(getattr(dataset, "X", None)) and len(dataset.X) > 0:
+                dataset_x = getattr(dataset, "X", None)
+                if self.drift and dataset_x is not None and len(dataset_x) > 0:
                     if not self._feature_monitor_ready:
                         with contextlib.suppress(Exception):
-                            baseline_rows = min(len(dataset.X), 2000)
+                            baseline_rows = min(len(dataset_x), 2000)
                             if baseline_rows > 0:
                                 self.drift.initialize_feature_monitor(
-                                    dataset.X.tail(baseline_rows), self.settings.system.symbol
+                                    _frame_tail(dataset_x, baseline_rows), self.settings.system.symbol
                                 )
                                 self._feature_monitor_ready = True
                     with contextlib.suppress(Exception):
                         feature_drift_alert = bool(
                             self.drift.check_feature_drift(
-                                dataset.X,
+                                dataset_x,
                                 threshold=float(getattr(self.settings.risk, "feature_drift_threshold", 0.30) or 0.30),
                             )
                         )
@@ -352,6 +415,7 @@ class TradingEngine:
                 # 9. Execution (With Thinking Brain)
                 # We need to manually invoke risk check to inject the regime
                 equity = self.mt5.get_real_equity()
+                entry_features = _entry_feature_snapshot(dataset)
                 live_tick = {}
                 live_symbol_info = {}
                 with contextlib.suppress(Exception):
@@ -443,6 +507,7 @@ class TradingEngine:
                             result,
                             self.mt5.get_real_equity(),
                             frames,
+                            entry_features=entry_features,
                             advice_stance=self.news.last_advice.get("stance") if self.news.last_advice else None,
                             tick_price=live_tick,
                             symbol_info=live_symbol_info,

@@ -51,7 +51,7 @@ def ensure_dependencies() -> None:
         print("\n" + "!" * 60)
         print(f"[WARNING] Missing critical dependencies: {missing}")
         print("Please run the following command to set up your environment:")
-        print("  python3 -m pip install -r requirements-hpc.txt --user --break-system-packages")
+        print("  python3 -m pip install -e . --user --break-system-packages")
         print("!" * 60 + "\n")
     else:
         logger.info("✓ Environment dependencies verified.")

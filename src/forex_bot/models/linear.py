@@ -13,13 +13,12 @@ from .label_utils import margins_to_probs, probs_to_three_class, remap_labels_ne
 logger = logging.getLogger(__name__)
 
 try:
-    from sklearn.linear_model import LogisticRegression, PassiveAggressiveClassifier, SGDClassifier
+    from sklearn.linear_model import LogisticRegression, SGDClassifier
     from sklearn.tree import DecisionTreeClassifier
 
     SKLEARN_AVAILABLE = True
 except Exception:
     LogisticRegression = None  # type: ignore
-    PassiveAggressiveClassifier = None  # type: ignore
     SGDClassifier = None  # type: ignore
     DecisionTreeClassifier = None  # type: ignore
     SKLEARN_AVAILABLE = False
@@ -239,11 +238,16 @@ class OnlinePassiveAggressiveExpert(_LinearBase):
     model_name = "online_pa"
 
     def _build_model(self) -> Any:
-        if PassiveAggressiveClassifier is None:
+        if SGDClassifier is None:
             raise RuntimeError("scikit-learn missing")
-        return PassiveAggressiveClassifier(
-            C=float(self.params.get("C", 0.5) or 0.5),
+        # sklearn deprecated PassiveAggressiveClassifier in favor of SGDClassifier(pa1).
+        return SGDClassifier(
+            loss="hinge",
+            penalty=None,
+            learning_rate="pa1",
+            eta0=max(1e-6, float(self.params.get("C", 0.5) or 0.5)),
             max_iter=int(self.params.get("max_iter", 2000) or 2000),
+            tol=1e-3,
             class_weight="balanced",
             random_state=42,
         )

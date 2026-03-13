@@ -2,7 +2,7 @@
 set -eu
 
 # WSL2-safe defaults (override by exporting before running)
-: "${CONFIG_FILE:=config.wsl.yaml}"
+: "${CONFIG_FILE:=config.yaml}"
 : "${FOREX_BOT_FEATURE_WORKERS:=2}"
 : "${FOREX_BOT_MAX_CONCURRENT_SYMBOLS:=1}"
 : "${FOREX_BOT_MAX_CONCURRENT_TF_LOADS:=2}"

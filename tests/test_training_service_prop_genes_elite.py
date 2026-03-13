@@ -748,7 +748,6 @@ def test_inject_discovery_mixer_signals_py_fallback_disabled_skips_python_mixer(
 
 def test_prepared_dataset_to_frame_pandas_free_uses_fallback_frame(monkeypatch) -> None:
     svc = _make_service([])
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE_STRICT", "1")
 
     n = 12
     idx = np.datetime64("2025-01-01T00:00:00") + np.arange(n, dtype=np.int64) * np.timedelta64(1, "m")
@@ -787,7 +786,6 @@ def test_prepared_dataset_to_frame_pandas_free_uses_fallback_frame(monkeypatch) 
 
 def test_build_discovery_frames_non_dataframe_pandas_free(monkeypatch) -> None:
     svc = _make_service([])
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE_STRICT", "1")
     monkeypatch.setenv("FOREX_BOT_DISCOVERY_FULL_TF_FEATURES", "0")
     monkeypatch.setenv("FOREX_BOT_DISCOVERY_USE_TALIB_MIXER", "0")
 

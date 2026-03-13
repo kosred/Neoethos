@@ -25,6 +25,67 @@ def _tabular_module(*, required: bool = True):
     return None
 
 
+class _NumpyFrame:
+    """Minimal frame-like metadata container for frame-native pipelines."""
+
+    def __init__(
+        self,
+        data: dict[str, Any],
+        *,
+        index: Any | None = None,
+        attrs: dict[str, Any] | None = None,
+    ) -> None:
+        self._data = {str(k): np.asarray(v).reshape(-1) for k, v in data.items()}
+        n_rows = 0
+        if self._data:
+            try:
+                n_rows = int(next(iter(self._data.values())).shape[0])
+            except Exception:
+                n_rows = 0
+        if index is None:
+            self.index = np.arange(n_rows, dtype=np.int64)
+        else:
+            idx = np.asarray(index).reshape(-1)
+            if idx.size == n_rows:
+                self.index = idx
+            elif idx.size <= 0:
+                self.index = np.arange(n_rows, dtype=np.int64)
+            elif idx.size > n_rows:
+                self.index = idx[:n_rows]
+            else:
+                pad = np.full(n_rows - idx.size, idx[-1], dtype=idx.dtype)
+                self.index = np.concatenate([idx, pad])
+        self.columns = list(self._data.keys())
+        self.attrs = dict(attrs or {})
+
+    @property
+    def empty(self) -> bool:
+        return int(len(self.index)) <= 0
+
+    def __len__(self) -> int:
+        return int(self.index.shape[0])
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        return self._data[str(key)]
+
+    def copy(self, deep: bool = False) -> "_NumpyFrame":
+        _ = deep
+        return _NumpyFrame(
+            {k: np.asarray(v).copy() for k, v in self._data.items()},
+            index=np.asarray(self.index).copy(),
+            attrs=dict(self.attrs),
+        )
+
+    def to_numpy(self, dtype: Any | None = None, copy: bool = False) -> np.ndarray:
+        if not self.columns:
+            arr = np.zeros((len(self), 0), dtype=np.float32)
+        else:
+            arr = np.column_stack([np.asarray(self._data[col]).reshape(-1) for col in self.columns])
+        if dtype is not None:
+            arr = np.asarray(arr, dtype=dtype)
+        return np.array(arr, copy=True) if copy else np.asarray(arr)
+
+
 def _make_series(
     values: Any,
     *,
@@ -500,11 +561,6 @@ class FeatureEngineer:
         if mode in {"python", "py", "0", "false", "no", "off"}:
             return False
         return _rust_features_backend_available()
-
-    @staticmethod
-    def _pandas_free_enabled() -> bool:
-        raw = str(os.environ.get("FOREX_BOT_PANDAS_FREE", "1") or "1").strip().lower()
-        return raw in {"1", "true", "yes", "on"}
 
     @staticmethod
     def _rust_only_enabled() -> bool:
@@ -1703,9 +1759,13 @@ class FeatureEngineer:
             base_ts_values = payload.get("timestamps")
         base_ts = self._to_timestamp_ns(base_ts_values, base_rows)
 
+        open_arr = self._align_series_by_ts(ts, base_ts, payload.get("open"), default=0.0, dtype=np.float32)
         high_arr = self._align_series_by_ts(ts, base_ts, payload.get("high"), default=0.0, dtype=np.float32)
         low_arr = self._align_series_by_ts(ts, base_ts, payload.get("low"), default=0.0, dtype=np.float32)
         close_arr = self._align_series_by_ts(ts, base_ts, payload.get("close"), default=0.0, dtype=np.float32)
+        volume_arr = None
+        if volume_raw is not None:
+            volume_arr = self._align_series_by_ts(ts, base_ts, volume_raw, default=0.0, dtype=np.float32)
 
         cols = [str(c) for c in feature_names]
         col_pos = {name: i for i, name in enumerate(cols)}
@@ -1765,15 +1825,35 @@ class FeatureEngineer:
             X = X[:end]
             labels = labels[:end]
             ts = ts[:end]
+            open_arr = open_arr[:end]
+            high_arr = high_arr[:end]
+            low_arr = low_arr[:end]
+            close_arr = close_arr[:end]
+            if volume_arr is not None:
+                volume_arr = volume_arr[:end]
         elif trim > 0:
             return self._empty_numpy_dataset()
+
+        metadata_data: dict[str, Any] = {
+            "open": np.asarray(open_arr, dtype=np.float32),
+            "high": np.asarray(high_arr, dtype=np.float32),
+            "low": np.asarray(low_arr, dtype=np.float32),
+            "close": np.asarray(close_arr, dtype=np.float32),
+        }
+        if volume_arr is not None:
+            metadata_data["volume"] = np.asarray(volume_arr, dtype=np.float32)
+        metadata = _NumpyFrame(
+            metadata_data,
+            index=np.asarray(ts, dtype=np.int64),
+            attrs={"symbol": str(symbol)} if symbol else None,
+        )
 
         return PreparedDataset(
             X=np.asarray(X, dtype=np.float32),
             y=np.asarray(labels, dtype=np.int8),
             index=np.asarray(ts, dtype=np.int64),
             feature_names=list(cols),
-            metadata=None,
+            metadata=metadata,
             labels=np.asarray(labels, dtype=np.int8),
         )
 

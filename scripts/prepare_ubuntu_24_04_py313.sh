@@ -40,12 +40,11 @@ ${SUDO} update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.
 ${SUDO} update-alternatives --set python3 /usr/bin/python3.13
 
 # 3. Pip Optimization
-echo "[*] Upgrading pip and installing unified HPC requirements..."
+echo "[*] Upgrading pip and installing the unified pyproject runtime manifest..."
 python3 -m pip install --upgrade pip setuptools wheel --user --break-system-packages
 
 cd "${PROJECT_ROOT}"
-# Force binary-safe install for Python 3.13 stability
-python3 -m pip install -r requirements-hpc.txt --user --break-system-packages
+python3 -m pip install -e ".[gpu]" --user --break-system-packages
 
 # 4. Final Launch
 echo "[*] Setup Complete. Launching Forex AI in 252-core HPC mode..."

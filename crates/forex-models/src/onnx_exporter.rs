@@ -44,6 +44,16 @@ pub struct ONNXExporter {
 }
 
 impl ONNXExporter {
+    fn array2_to_numpy(py: Python<'_>, sample_input: &Array2<f32>) -> PyResult<Py<PyAny>> {
+        let numpy = PyModule::import(py, "numpy")?;
+        let shape = (sample_input.nrows(), sample_input.ncols());
+        let flat: Vec<f32> = sample_input.iter().copied().collect();
+        let np_array = numpy
+            .call_method1("array", (flat,))?
+            .call_method1("reshape", (shape,))?;
+        Ok(np_array.unbind())
+    }
+
     /// Create new ONNX exporter
     pub fn new(models_dir: impl AsRef<Path>) -> Result<Self> {
         let models_dir = models_dir.as_ref().to_path_buf();
@@ -91,19 +101,8 @@ impl ONNXExporter {
                 .context("ONNX exporter not initialized")?
                 .bind(py);
 
-            // Convert sample_input to pandas DataFrame
-            let numpy = PyModule::import(py, "numpy")?;
-            let pd = PyModule::import(py, "pandas")?;
-
-            let shape = (sample_input.nrows(), sample_input.ncols());
-            let flat: Vec<f32> = sample_input.iter().copied().collect();
-            let np_array = numpy
-                .call_method1("array", (flat,))?
-                .call_method1("reshape", (shape,))?;
-            let df = pd.call_method1("DataFrame", (np_array,))?;
-
-            // Call: exporter._export_pytorch_model(name, model, sample_input_df)
-            let result = exporter.call_method1("_export_pytorch_model", (name, model, df))?;
+            let np_array = Self::array2_to_numpy(py, sample_input)?;
+            let result = exporter.call_method1("_export_pytorch_model", (name, model, np_array))?;
 
             // Extract path from result
             let path_str: String = result.extract()?;
@@ -120,17 +119,7 @@ impl ONNXExporter {
                 .as_ref()
                 .context("ONNX exporter not initialized")?
                 .bind(py);
-
-            // Convert to DataFrame
-            let numpy = PyModule::import(py, "numpy")?;
-            let pd = PyModule::import(py, "pandas")?;
-
-            let shape = (sample_input.nrows(), sample_input.ncols());
-            let flat: Vec<f32> = sample_input.iter().copied().collect();
-            let np_array = numpy
-                .call_method1("array", (flat,))?
-                .call_method1("reshape", (shape,))?;
-            let df = pd.call_method1("DataFrame", (np_array,))?;
+            let np_array = Self::array2_to_numpy(py, sample_input)?;
 
             // Load the saved LightGBM model from disk
             let model_path = self.models_dir.join(format!("{}.joblib", name));
@@ -138,7 +127,7 @@ impl ONNXExporter {
             let model = joblib.call_method1("load", (model_path.to_string_lossy().as_ref(),))?;
 
             // Export via Python
-            let result = exporter.call_method1("_export_lightgbm_model", (name, model, df))?;
+            let result = exporter.call_method1("_export_lightgbm_model", (name, model, np_array))?;
 
             if result.is_none() {
                 return Err(anyhow::anyhow!("LightGBM ONNX export returned None"));
@@ -158,22 +147,13 @@ impl ONNXExporter {
                 .as_ref()
                 .context("ONNX exporter not initialized")?
                 .bind(py);
-
-            let numpy = PyModule::import(py, "numpy")?;
-            let pd = PyModule::import(py, "pandas")?;
-
-            let shape = (sample_input.nrows(), sample_input.ncols());
-            let flat: Vec<f32> = sample_input.iter().copied().collect();
-            let np_array = numpy
-                .call_method1("array", (flat,))?
-                .call_method1("reshape", (shape,))?;
-            let df = pd.call_method1("DataFrame", (np_array,))?;
+            let np_array = Self::array2_to_numpy(py, sample_input)?;
 
             let model_path = self.models_dir.join(format!("{}.joblib", name));
             let joblib = PyModule::import(py, "joblib")?;
             let model = joblib.call_method1("load", (model_path.to_string_lossy().as_ref(),))?;
 
-            let result = exporter.call_method1("_export_xgboost_model", (name, model, df))?;
+            let result = exporter.call_method1("_export_xgboost_model", (name, model, np_array))?;
 
             if result.is_none() {
                 return Err(anyhow::anyhow!("XGBoost ONNX export returned None"));
@@ -193,22 +173,13 @@ impl ONNXExporter {
                 .as_ref()
                 .context("ONNX exporter not initialized")?
                 .bind(py);
-
-            let numpy = PyModule::import(py, "numpy")?;
-            let pd = PyModule::import(py, "pandas")?;
-
-            let shape = (sample_input.nrows(), sample_input.ncols());
-            let flat: Vec<f32> = sample_input.iter().copied().collect();
-            let np_array = numpy
-                .call_method1("array", (flat,))?
-                .call_method1("reshape", (shape,))?;
-            let df = pd.call_method1("DataFrame", (np_array,))?;
+            let np_array = Self::array2_to_numpy(py, sample_input)?;
 
             let model_path = self.models_dir.join(format!("{}.joblib", name));
             let joblib = PyModule::import(py, "joblib")?;
             let model = joblib.call_method1("load", (model_path.to_string_lossy().as_ref(),))?;
 
-            let result = exporter.call_method1("_export_catboost_model", (name, model, df))?;
+            let result = exporter.call_method1("_export_catboost_model", (name, model, np_array))?;
 
             if result.is_none() {
                 return Err(anyhow::anyhow!("CatBoost ONNX export returned None"));
@@ -356,3 +327,79 @@ pub trait ONNXExportable {
 // 3. Load in production using ONNXInferenceEngine (lib.rs)
 // 4. Ultra-fast inference with ONNX Runtime
 //
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+    use pyo3::types::PyDict;
+    use std::ffi::CString;
+
+    fn run_py(py: Python<'_>, code: &str, locals: &Bound<'_, PyDict>) -> PyResult<()> {
+        let code = CString::new(code).expect("python code should not contain embedded nulls");
+        py.run(code.as_c_str(), Some(locals), Some(locals))
+    }
+
+    #[test]
+    fn test_export_pytorch_model_avoids_pandas_bridge() -> Result<()> {
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            run_py(
+                py,
+                r#"
+import sys, types, numpy as np
+_orig_pandas = sys.modules.get("pandas")
+
+class _PandasTrap(types.SimpleNamespace):
+    def DataFrame(self, *args, **kwargs):
+        raise AssertionError("pandas DataFrame bridge must not be used")
+
+sys.modules["pandas"] = _PandasTrap()
+
+class FakeExporter:
+    def _export_pytorch_model(self, name, model, sample_input):
+        assert isinstance(sample_input, np.ndarray)
+        return "ok.onnx"
+
+exporter = FakeExporter()
+model = object()
+"#,
+                &locals,
+            )?;
+
+            let exporter_obj = locals
+                .get_item("exporter")?
+                .expect("exporter should be defined")
+                .unbind();
+            let model_obj = locals
+                .get_item("model")?
+                .expect("model should be defined")
+                .unbind();
+
+            let exporter = ONNXExporter {
+                py_exporter: Some(exporter_obj),
+                models_dir: PathBuf::new(),
+                onnx_dir: PathBuf::new(),
+            };
+
+            let sample_input = array![[1.0f32, 2.0f32], [3.0f32, 4.0f32]];
+            let result = exporter.export_pytorch_model("mlp", &model_obj, &sample_input);
+
+            let _ = run_py(
+                py,
+                r#"
+import sys
+if _orig_pandas is None:
+    sys.modules.pop("pandas", None)
+else:
+    sys.modules["pandas"] = _orig_pandas
+"#,
+                &locals,
+            );
+
+            let path = result?;
+            assert_eq!(path, PathBuf::from("ok.onnx"));
+            Ok(())
+        })
+    }
+}

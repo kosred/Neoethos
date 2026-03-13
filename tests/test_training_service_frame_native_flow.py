@@ -23,9 +23,7 @@ def _dataset(rows: int = 128) -> PreparedDataset:
     )
 
 
-def test_train_pandas_free_bypasses_loader(monkeypatch) -> None:
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE", "1")
-
+def test_train_frame_native_bypasses_loader(monkeypatch) -> None:
     svc = object.__new__(TrainingService)
     svc.settings = SimpleNamespace(
         system=SimpleNamespace(symbol="EURUSD"),
@@ -57,8 +55,7 @@ def test_train_pandas_free_bypasses_loader(monkeypatch) -> None:
     assert calls["stop"] == 1
 
 
-def test_train_global_routes_to_pandas_free_path(monkeypatch) -> None:
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE", "1")
+def test_train_global_routes_to_frame_native_path(monkeypatch) -> None:
     svc = object.__new__(TrainingService)
     svc.settings = SimpleNamespace(system=SimpleNamespace(symbol="EURUSD"))
     calls: dict[str, object] = {"stop": 0}
@@ -68,7 +65,7 @@ def test_train_global_routes_to_pandas_free_path(monkeypatch) -> None:
         calls["optimize"] = bool(optimize)
         calls["called"] = True
 
-    svc._train_global_pandas_free = _pf
+    svc._train_global_frame_native = _pf
     svc._maybe_stop_ray = lambda: calls.__setitem__("stop", int(calls["stop"]) + 1)
 
     asyncio.run(svc.train_global(["EURUSD", "GBPUSD"], optimize=True, stop_event=None))
@@ -78,47 +75,7 @@ def test_train_global_routes_to_pandas_free_path(monkeypatch) -> None:
     assert calls["stop"] == 1
 
 
-def test_train_global_routes_to_pandas_free_path_when_rust_only(monkeypatch) -> None:
-    monkeypatch.delenv("FOREX_BOT_PANDAS_FREE", raising=False)
-    monkeypatch.setenv("FOREX_BOT_RUST_ONLY", "1")
-    svc = object.__new__(TrainingService)
-    svc.settings = SimpleNamespace(system=SimpleNamespace(symbol="EURUSD"))
-    calls: dict[str, object] = {"stop": 0}
-
-    async def _pf(symbols, optimize, stop_event):
-        calls["symbols"] = list(symbols)
-        calls["optimize"] = bool(optimize)
-        calls["called"] = True
-
-    svc._train_global_pandas_free = _pf
-    svc._maybe_stop_ray = lambda: calls.__setitem__("stop", int(calls["stop"]) + 1)
-
-    asyncio.run(svc.train_global(["EURUSD", "GBPUSD"], optimize=True, stop_event=None))
-    assert calls.get("called") is True
-    assert calls.get("symbols") == ["EURUSD", "GBPUSD"]
-    assert calls.get("optimize") is True
-    assert calls["stop"] == 1
-
-
-def test_pandas_free_is_default_when_env_unset(monkeypatch) -> None:
-    monkeypatch.delenv("FOREX_BOT_PANDAS_FREE", raising=False)
-    monkeypatch.delenv("FOREX_BOT_RUST_ONLY", raising=False)
-    monkeypatch.delenv("FOREX_BOT_RUNTIME_PROFILE", raising=False)
-    monkeypatch.delenv("FOREX_BOT_TREE_BACKEND", raising=False)
-    monkeypatch.delenv("FOREX_BOT_FEATURES_BACKEND", raising=False)
-    assert TrainingService._pandas_free_enabled() is True
-
-
-def test_pandas_free_can_be_explicitly_disabled(monkeypatch) -> None:
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE", "0")
-    monkeypatch.delenv("FOREX_BOT_RUST_ONLY", raising=False)
-    monkeypatch.delenv("FOREX_BOT_RUNTIME_PROFILE", raising=False)
-    monkeypatch.delenv("FOREX_BOT_TREE_BACKEND", raising=False)
-    monkeypatch.delenv("FOREX_BOT_FEATURES_BACKEND", raising=False)
-    assert TrainingService._pandas_free_enabled() is False
-
-
-def test_train_global_pandas_free_collects_non_empty_datasets() -> None:
+def test_train_global_frame_native_collects_non_empty_datasets() -> None:
     svc = object.__new__(TrainingService)
     svc.feature_engineer = SimpleNamespace(
         prepare=lambda _frames, news_features=None, symbol=None: _dataset(64) if symbol == "EURUSD" else _dataset(0)
@@ -135,7 +92,7 @@ def test_train_global_pandas_free_collects_non_empty_datasets() -> None:
 
     svc._train_global_from_datasets = _from_datasets
 
-    asyncio.run(svc._train_global_pandas_free(["EURUSD", "GBPUSD"], optimize=False, stop_event=None))
+    asyncio.run(svc._train_global_frame_native(["EURUSD", "GBPUSD"], optimize=False, stop_event=None))
 
     assert "datasets" in called
     datasets = called["datasets"]

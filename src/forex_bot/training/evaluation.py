@@ -19,6 +19,8 @@ try:
 except Exception:
     _fb = None  # type: ignore
 
+from .probability_utils import pad_probs_neutral_buy_sell
+
 
 def _as_1d(values: Any, *, dtype: np.dtype) -> np.ndarray:
     if values is None:
@@ -166,41 +168,7 @@ def _extract_symbol(frame: Any) -> str:
 
 
 def pad_probs(probs: np.ndarray, classes: list[int] | None = None) -> np.ndarray:
-    """
-    HPC UNIFIED PROTOCOL: Force output to [Neutral, Buy, Sell].
-    Standard indices: 0=Neutral, 1=Buy, 2=Sell.
-    """
-    if probs is None or len(probs) == 0:
-        return np.zeros((0, 3), dtype=float)
-
-    arr = np.asarray(probs, dtype=float)
-    if arr.ndim == 1:
-        arr = arr.reshape(-1, 1)
-    n = arr.shape[0]
-    out = np.zeros((n, 3), dtype=float)
-
-    # 1. Handle Model-Specific Mapping (If classes provided)
-    if classes is not None and len(classes) == arr.shape[1]:
-        for col, cls_val in enumerate(classes):
-            # Map from Project Labels {-1, 0, 1} to Unified Indices {0, 1, 2}
-            if cls_val == 0:
-                out[:, 0] = arr[:, col]  # Neutral -> 0
-            elif cls_val == 1:
-                out[:, 1] = arr[:, col]  # Buy -> 1
-            elif cls_val == -1 or cls_val == 2:
-                out[:, 2] = arr[:, col]  # Sell -> 2
-        return out
-
-    # 2. Automated Heuristics (If no class map)
-    if arr.shape[1] == 3:
-        return arr  # Assume [Neutral, Buy, Sell]
-    if arr.shape[1] == 2:
-        out[:, 0] = arr[:, 0]  # Neutral
-        out[:, 1] = arr[:, 1]  # Buy
-        return out
-    out[:, 0] = 1.0 - arr[:, 0]  # Neutral
-    out[:, 1] = arr[:, 0]  # Buy
-    return out
+    return pad_probs_neutral_buy_sell(probs, classes=classes)
 
 
 def _rust_probs_to_signals(probs: np.ndarray) -> np.ndarray | None:

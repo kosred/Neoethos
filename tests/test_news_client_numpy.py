@@ -12,7 +12,6 @@ def _analyzer_stub() -> client.SentimentAnalyzer:
 
 
 def test_build_features_strict_returns_frame_without_pandas(monkeypatch):
-    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE_STRICT", "1")
     analyzer = _analyzer_stub()
     events = [
         {

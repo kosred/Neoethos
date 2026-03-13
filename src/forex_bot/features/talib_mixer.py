@@ -125,19 +125,7 @@ def _frame_column_numpy(df: Any, name: str, *, dtype: Any = np.float64) -> np.nd
 
 
 def _strict_rust_mode_enabled() -> bool:
-    backend = str(os.environ.get("FOREX_BOT_TREE_BACKEND", "") or "").strip().lower()
-    if backend in {"rust_strict", "strict_rust", "rust_only", "rust-only"}:
-        return True
-    pandas_free = str(os.environ.get("FOREX_BOT_PANDAS_FREE", "1") or "1").strip().lower()
-    if pandas_free in {"1", "true", "yes", "on"}:
-        return True
-    runtime_profile = str(os.environ.get("FOREX_BOT_RUNTIME_PROFILE", "") or "").strip().lower()
-    if runtime_profile.startswith("rust"):
-        return True
-    discovery_rust = str(os.environ.get("FOREX_BOT_DISCOVERY_RUST_ONLY", "0") or "0").strip().lower()
-    if discovery_rust in {"1", "true", "yes", "on"}:
-        return True
-    return False
+    return True
 
 
 def _make_series(values: Any, index: Any):
@@ -288,6 +276,12 @@ def signal_to_numpy(
             m = min(src_ns.size, arr.size)
             src_ns = src_ns[:m]
             src_vals = np.asarray(arr[:m], dtype=np.float64)
+
+            valid_mask = np.isfinite(src_vals)
+            if not np.all(valid_mask):
+                src_ns = src_ns[valid_mask]
+                src_vals = src_vals[valid_mask]
+
             aligned = _rust_align_by_ns(
                 src_ns,
                 src_vals,

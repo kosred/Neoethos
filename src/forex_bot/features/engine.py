@@ -25,7 +25,11 @@ except Exception:
 
 
 def _is_dataframe_like(value: Any) -> bool:
-    return bool(hasattr(value, "columns") and hasattr(value, "index") and hasattr(value, "iloc"))
+    return bool(
+        hasattr(value, "columns")
+        and hasattr(value, "index")
+        and callable(getattr(value, "to_numpy", None))
+    )
 
 
 def _is_frame_like(value: Any) -> bool:
@@ -72,6 +76,20 @@ def _frame_extract_column(value: Any, name: str) -> np.ndarray | None:
 
 def _vector_scalar_at(values: np.ndarray | None, idx: int, *, default: float = 0.0) -> float:
     if values is None:
+        return float(default)
+    try:
+        arr = np.asarray(values).reshape(-1)
+        if arr.size <= 0:
+            return float(default)
+        pos = int(idx)
+        if pos < 0:
+            pos = int(arr.size + pos)
+        if pos < 0 or pos >= int(arr.size):
+            return float(default)
+        with np.errstate(all="ignore"):
+            out = float(arr[pos])
+        return out if np.isfinite(out) else float(default)
+    except Exception:
         return float(default)
 
 
@@ -129,20 +147,57 @@ def _align_feature_matrix(
     out = np.zeros((rows, width), dtype=np.float32)
     out[:, dst_idx] = src[:, src_idx]
     return out
-    try:
-        arr = np.asarray(values).reshape(-1)
-        if arr.size <= 0:
-            return float(default)
-        pos = int(idx)
-        if pos < 0:
-            pos = int(arr.size + pos)
-        if pos < 0 or pos >= int(arr.size):
-            return float(default)
-        with np.errstate(all="ignore"):
-            out = float(arr[pos])
-        return out if np.isfinite(out) else float(default)
-    except Exception:
-        return float(default)
+
+
+class _NumpyFrame:
+    def __init__(self, data: dict[str, Any], index: Any, attrs: dict[str, Any] | None = None) -> None:
+        self._data = {str(k): np.asarray(v).reshape(-1) for k, v in data.items()}
+        self.columns = list(self._data.keys())
+        self.index = np.asarray(index).reshape(-1)
+        self.attrs = dict(attrs or {})
+
+    def __len__(self) -> int:
+        return int(self.index.size)
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        return self._data[str(key)]
+
+    def to_numpy(self, dtype: Any | None = None, copy: bool = False) -> np.ndarray:
+        if not self.columns:
+            arr = np.zeros((len(self), 0), dtype=np.float32)
+        else:
+            arr = np.column_stack([np.asarray(self._data[str(col)]).reshape(-1) for col in self.columns])
+        if dtype is not None:
+            arr = np.asarray(arr, dtype=dtype)
+        elif copy:
+            arr = np.array(arr, copy=True)
+        return arr
+
+
+def _frame_from_matrix(matrix: Any, columns: list[str], index: Any, *, template: Any | None = None) -> Any:
+    arr = np.asarray(matrix, dtype=np.float32)
+    if arr.ndim == 0:
+        arr = arr.reshape(1, 1)
+    elif arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    elif arr.ndim > 2:
+        arr = arr.reshape(arr.shape[0], -1)
+    idx = np.asarray(index).reshape(-1) if index is not None else np.arange(int(arr.shape[0]), dtype=np.int64)
+    if idx.size != int(arr.shape[0]):
+        idx = np.arange(int(arr.shape[0]), dtype=np.int64)
+    data = {str(col): arr[:, i] if i < arr.shape[1] else np.zeros(arr.shape[0], dtype=np.float32) for i, col in enumerate(columns)}
+    attrs = getattr(template, "attrs", None)
+    attrs_dict = dict(attrs) if isinstance(attrs, dict) else None
+    if template is not None:
+        frame_cls = template.__class__
+        try:
+            return frame_cls(data, index=idx, columns=columns)
+        except Exception:
+            try:
+                return frame_cls(arr, index=idx, columns=columns)
+            except Exception:
+                pass
+    return _NumpyFrame(data, idx, attrs=attrs_dict)
 
 
 @dataclass(slots=True)
@@ -337,12 +392,7 @@ class SignalEngine:
                 names = self._resolve_feature_names(feature_names, X_arr.shape[1])
             src_cols, dst_cols = _column_index_mapping(names, cols)
             aligned = _align_feature_matrix(X_arr, src_cols, dst_cols, dst_width=len(cols))
-            try:
-                frame_cls = X.__class__
-                out = frame_cls(aligned, index=_frame_index(X), columns=cols)
-                return out, list(cols)
-            except Exception:
-                return aligned, list(cols)
+            return _frame_from_matrix(aligned, cols, _frame_index(X), template=X), list(cols)
 
         if _is_frame_like(X):
             frame_names = _frame_columns(X)
@@ -352,6 +402,8 @@ class SignalEngine:
         names = self._resolve_feature_names(feature_names, X_arr.shape[1])
         src_cols, dst_cols = _column_index_mapping(names, cols)
         aligned = _align_feature_matrix(X_arr, src_cols, dst_cols, dst_width=len(cols))
+        if _is_frame_like(X):
+            return _frame_from_matrix(aligned, cols, _frame_index(X), template=X), list(cols)
         return aligned, list(cols)
 
     def _predict_model_proba(self, name: str, model: Any, X: Any) -> np.ndarray | None:

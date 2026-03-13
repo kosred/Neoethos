@@ -50,6 +50,16 @@ def _array_ohlc_frame(rows: int = 12) -> _ArrayFrame:
     )
 
 
+def test_strict_rust_mode_ignores_pandas_toggle(monkeypatch):
+    monkeypatch.delenv("FOREX_BOT_RUNTIME_PROFILE", raising=False)
+    monkeypatch.delenv("FOREX_BOT_RUST_ONLY", raising=False)
+    monkeypatch.delenv("FOREX_BOT_TREE_BACKEND", raising=False)
+    monkeypatch.delenv("FOREX_BOT_DISCOVERY_RUST_ONLY", raising=False)
+    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE", "0")
+
+    assert tm._strict_rust_mode_enabled() is True
+
+
 def test_compute_signals_without_rust_cache_defaults_to_zero(monkeypatch):
     monkeypatch.delenv("FOREX_BOT_RUNTIME_PROFILE", raising=False)
     monkeypatch.setenv("FOREX_BOT_PANDAS_FREE", "0")

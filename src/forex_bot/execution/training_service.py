@@ -419,6 +419,33 @@ def _concat_dataframes(items: list[Any]) -> Any | None:
     return out
 
 
+def _compact_ohlcv_metadata_frame(
+    meta: Any,
+    *,
+    symbol: str | None = None,
+) -> Any | None:
+    if meta is None or not (_is_dataframe(meta) or _is_frame_like(meta)):
+        return None
+    data: dict[str, np.ndarray] = {}
+    for col in ("open", "high", "low", "close", "volume"):
+        arr = _frame_column_numpy_optional(meta, col, dtype=np.float64)
+        if arr is None:
+            continue
+        data[str(col)] = np.asarray(arr, dtype=np.float64).reshape(-1)
+    if "close" not in data:
+        return None
+    attrs = getattr(meta, "attrs", None)
+    out_attrs = dict(attrs) if isinstance(attrs, dict) else {}
+    sym = str(symbol or out_attrs.get("symbol", "") or "").strip()
+    if sym:
+        out_attrs["symbol"] = sym
+    return _NumpyFrame(
+        data,
+        index=_frame_index(meta),
+        attrs=out_attrs or None,
+    )
+
+
 class _NumpyFrame:
     """Minimal frame-like object for strict frame-native discovery flows."""
 
@@ -1086,15 +1113,6 @@ class TrainingService:
             return True
         features_backend = str(os.environ.get("FOREX_BOT_FEATURES_BACKEND", "") or "").strip().lower()
         return features_backend in {"rust_strict", "strict_rust", "rust_only", "rust-only"}
-
-    @classmethod
-    def _pandas_free_enabled(cls) -> bool:
-        raw_env = os.environ.get("FOREX_BOT_PANDAS_FREE")
-        if raw_env is not None and str(raw_env).strip() != "":
-            raw = str(raw_env).strip().lower()
-            return raw in {"1", "true", "yes", "on"}
-        # Keep frame-native default behavior unless explicitly disabled.
-        return True
 
     def _normalize_discovery_budget(
         self,
@@ -3166,189 +3184,12 @@ class TrainingService:
     async def train(self, optimize: bool = True, stop_event: asyncio.Event | None = None) -> None:
         """Run the full training pipeline for the single active symbol."""
         symbol = self.settings.system.symbol
-        pandas_free_mode = self._pandas_free_enabled()
         logger.info(f"Starting training for {symbol}...")
-        if pandas_free_mode:
-            logger.info("Pandas-free mode: loading dataset from Rust features backend.")
-            dataset = self.feature_engineer.prepare({}, news_features=None, symbol=symbol)
-            if getattr(dataset, "X", None) is None or len(dataset.X) <= 0:
-                logger.error("Pandas-free mode: no dataset rows available for %s.", symbol)
-                return
-            await asyncio.to_thread(
-                self.trainer.train_all,
-                dataset,
-                optimize,
-                stop_event,
-                None,
-                None,
-            )
-            logger.info("Training cycle complete.")
-            self._maybe_stop_ray()
+        logger.info("Frame-native mode: loading dataset from Rust features backend.")
+        dataset = self.feature_engineer.prepare({}, news_features=None, symbol=symbol)
+        if getattr(dataset, "X", None) is None or len(dataset.X) <= 0:
+            logger.error("Frame-native mode: no dataset rows available for %s.", symbol)
             return
-
-        logger.info("Ensuring historical data...")
-        has_data = await self.data_loader.ensure_history(symbol)
-        if not has_data:
-            logger.error(f"No data found for {symbol}. Cannot proceed with training.")
-            return
-
-        try:
-            frames = await self.data_loader.get_training_data(symbol)
-        except Exception as e:
-            logger.error(f"Failed to load training data frames: {e}")
-            return
-
-        analyzer = None
-        if self.settings.news.enable_news and not pandas_free_mode and not self._rust_only_enabled():
-            try:
-                analyzer = await get_sentiment_analyzer(self.settings)
-            except Exception as exc:
-                logger.warning(f"News analyzer unavailable: {exc}")
-
-        # News Backfill (Best Effort)
-        if analyzer is not None:
-            try:
-                base_tf = self.settings.system.base_timeframe
-                base_df = frames.get(base_tf)
-                if base_df is None:
-                    base_df = frames.get("M1")
-
-                if base_df is not None and hasattr(base_df, "empty") and not base_df.empty:
-                    _, start_ts, end_ts = self._base_index_and_bounds(base_df, coerce_datetime_index=False)
-                    if start_ts is not None and end_ts is not None:
-                        analyzer.ensure_news_history(symbol, start_ts, end_ts, use_live_llm=False)
-            except Exception as exc:
-                logger.debug(f"News backfill skipped: {exc}")
-
-        logger.info("Preparing feature set...")
-
-        # Prepare News Features
-        news_feats = None
-        if analyzer is not None:
-            try:
-                currencies = [symbol[:3], symbol[3:]] if len(symbol) == 6 else []
-                base_tf = self.settings.system.base_timeframe
-                base_df = frames.get(base_tf)
-                if base_df is None:
-                    base_df = frames.get("M1")
-
-                if base_df is not None and hasattr(base_df, "empty") and not base_df.empty:
-                    base_idx, start_ts, end_ts = self._base_index_and_bounds(base_df, coerce_datetime_index=True)
-                    if base_idx is None or start_ts is None or end_ts is None:
-                        raise RuntimeError("missing base timeframe timestamp bounds")
-
-                    events = analyzer.db.fetch_events(start_ts, end_ts, currencies=currencies)
-                    if events is not None and len(events) > 0:
-                        news_feats = analyzer.build_features(events, base_idx)
-                        if news_feats is not None and len(news_feats) > 0:
-                            logger.info(f"Generated news features for {symbol}: {news_feats.shape}")
-                        else:
-                            news_feats = None
-            except Exception as e:
-                logger.warning(f"Failed to build training news features: {e}")
-
-        dataset = self.feature_engineer.prepare(frames, news_features=news_feats, symbol=symbol)
-
-        if pandas_free_mode:
-            logger.info("Pandas-free mode: running direct memmap training path (prop/discovery skipped).")
-            await asyncio.to_thread(
-                self.trainer.train_all,
-                dataset,
-                optimize,
-                stop_event,
-                None,
-                None,
-            )
-            logger.info("Training cycle complete.")
-            self._maybe_stop_ray()
-            return
-
-        # Quick runtime estimate for visibility
-        try:
-            est_seconds = self.trainer.estimate_time_for_dataset(
-                dataset.X,
-                len(dataset.X),
-                context="full",
-                simulate_gpu=self.settings.system.device if self.settings.system.enable_gpu else None,
-            )
-            logger.info(
-                f"[ESTIMATE] ~{est_seconds / 3600:.2f} hours expected for training {symbol} ({len(dataset.X)} rows)."
-            )
-        except Exception:
-            pass
-
-        if bool(getattr(self.settings.models, "prop_search_enabled", False)):
-            if self._prop_search_async_enabled():
-                logger.info(
-                    "[STRATEGY DISCOVERY] Async prop-search requested but running inline so discovered signals feed model training."
-                )
-            await self._run_prop_search_for_symbols([symbol], stop_event=stop_event)
-
-        base_tf = str(getattr(self.settings.system, "base_timeframe", "M1") or "M1")
-        signal_source = frames.get(base_tf)
-        if _frame_empty(signal_source):
-            signal_source = frames.get("M1")
-        dataset = self._apply_prop_discovered_base_signal(
-            dataset,
-            symbol=symbol,
-            source_df=signal_source,
-        )
-
-        has_gpu = bool(getattr(self.settings.system, "enable_gpu", False)) and int(
-            getattr(self.settings.system, "num_gpus", 0) or 0
-        ) > 0
-        if has_gpu:
-            logger.info("Launching GPU-Native Expert Discovery...")
-        else:
-            logger.info("Launching CPU-Native Expert Discovery...")
-        from ..strategy.discovery_tensor import TensorDiscoveryEngine
-
-        discovery_frames, timeframes = self._build_discovery_frames_for_tensor(
-            frames,
-            news_feats,
-            symbol,
-            base_dataset=dataset,
-        )
-        if "M1" in discovery_frames:
-            logger.debug(f"M1 Columns: {len(discovery_frames['M1'].columns)}")
-
-        # New Unsupervised Tensor Engine (Million-Search)
-        # We increase experts to 100 to create a diverse "Council of 100" for the deep models
-        discovery_experts = self._parse_int_env("FOREX_BOT_DISCOVERY_EXPERTS") or 100
-        discovery_iterations = self._parse_int_env("FOREX_BOT_DISCOVERY_ITERS") or 1000
-        if has_gpu:
-            discovery_mode = "gpu"
-        else:
-            discovery_mode = "cpu"
-        discovery_experts, discovery_iterations = self._normalize_discovery_budget(
-            experts=discovery_experts,
-            iterations=discovery_iterations,
-            has_gpu=has_gpu,
-        )
-        logger.info(
-            "[STRATEGY DISCOVERY] mode=%s experts=%s iterations=%s",
-            discovery_mode,
-            discovery_experts,
-            discovery_iterations,
-        )
-
-        discovery_tensor = TensorDiscoveryEngine(
-            device="cuda" if has_gpu else "cpu",
-            n_experts=discovery_experts,
-            timeframes=timeframes,
-            max_rows=int(getattr(self.settings.system, "discovery_max_rows", 0) or 0),
-            stream_mode=bool(getattr(self.settings.system, "discovery_stream", False)),
-            auto_cap=bool(getattr(self.settings.system, "discovery_auto_cap", True)),
-            settings=self.settings,
-        )
-        
-        # We need to pass the enriched multi-timeframe frames to the engine
-        discovery_tensor.run_unsupervised_search(
-            discovery_frames,
-            news_features=news_feats,
-            iterations=discovery_iterations,
-        )
-        discovery_tensor.save_experts(self.settings.system.cache_dir + "/tensor_knowledge.pt")
 
         await asyncio.to_thread(
             self.trainer.train_all,
@@ -3387,46 +3228,12 @@ class TrainingService:
     async def train_global(
         self, symbols: list[str], optimize: bool = True, stop_event: asyncio.Event | None = None
     ) -> None:
-        """Train one global model across all provided symbols (Sequential or HPC)."""
+        """Train one global model across all provided symbols."""
         logger.info(f"Starting global training for symbols: {symbols}")
-        pandas_free_mode = self._pandas_free_enabled()
-        if pandas_free_mode:
-            await self._train_global_pandas_free(symbols, optimize, stop_event)
-            self._maybe_stop_ray()
-            return
-        orig_symbol = self.settings.system.symbol
-
-        is_hpc = getattr(self.autotune_hints, "is_hpc", False)
-        parallel_pref = str(os.environ.get("FOREX_BOT_PARALLEL_FEATURES", "auto")).strip().lower()
-        if parallel_pref in {"0", "false", "no", "off"}:
-            use_parallel = False
-        elif parallel_pref in {"1", "true", "yes", "on"}:
-            use_parallel = True
-        else:
-            workers = self._parse_int_env("FOREX_BOT_FEATURE_WORKERS") or 0
-            if workers > 1:
-                use_parallel = True
-            else:
-                auto_workers = self._auto_feature_workers(len(symbols))
-                use_parallel = auto_workers > 1
-                if use_parallel and workers <= 0:
-                    os.environ.setdefault("FOREX_BOT_FEATURE_WORKERS", str(auto_workers))
-                    logger.info(
-                        "Auto-enabled parallel feature workers: %s (set FOREX_BOT_PARALLEL_FEATURES=0 to disable).",
-                        auto_workers,
-                    )
-
-        if is_hpc or use_parallel:
-            if not is_hpc and use_parallel:
-                logger.info("Parallel feature mode enabled (FOREX_BOT_FEATURE_WORKERS=%s).", os.environ.get("FOREX_BOT_FEATURE_WORKERS"))
-            await self._train_global_hpc(symbols, optimize, stop_event)
-        else:
-            await self._train_global_sequential(symbols, optimize, stop_event)
-
-        self.settings.system.symbol = orig_symbol
+        await self._train_global_frame_native(symbols, optimize, stop_event)
         self._maybe_stop_ray()
 
-    async def _train_global_pandas_free(
+    async def _train_global_frame_native(
         self,
         symbols: list[str],
         optimize: bool,
@@ -3451,13 +3258,13 @@ class TrainingService:
                     symbol=sym,
                 )
             except Exception as exc:
-                logger.warning("Pandas-free global: failed to prepare %s: %s", sym, exc)
+                logger.warning("Frame-native global: failed to prepare %s: %s", sym, exc)
                 return sym, None
             return sym, ds
 
         if max_workers > 1 and len(symbols) > 1:
             logger.info(
-                "Pandas-free global: preparing %s symbols with up to %s workers.",
+                "Frame-native global: preparing %s symbols with up to %s workers.",
                 len(symbols),
                 max_workers,
             )
@@ -3479,11 +3286,11 @@ class TrainingService:
             if ds is None:
                 continue
             if getattr(ds, "X", None) is None or len(ds.X) <= 0:
-                logger.warning("Pandas-free global: empty dataset for %s; skipping.", sym)
+                logger.warning("Frame-native global: empty dataset for %s; skipping.", sym)
                 continue
             datasets.append((sym, ds))
         if not datasets:
-            logger.error("Pandas-free global: no datasets prepared.")
+            logger.error("Frame-native global: no datasets prepared.")
             return
         await self._train_global_from_datasets(
             datasets,
@@ -3749,9 +3556,7 @@ class TrainingService:
                     if y.shape[0] != rows:
                         raise ValueError(f"label length mismatch: {y.shape[0]} != {rows}")
                 meta = d.metadata
-                if prefer_numpy:
-                    meta = None
-                elif _is_dataframe(meta):
+                if _is_dataframe(meta):
                     if len(meta) != rows:
                         meta = _slice_rows_range(meta, 0, rows)
                 elif _is_frame_like(meta):
@@ -4104,8 +3909,6 @@ class TrainingService:
                 meta = getattr(ds, "metadata", None)
                 if not ((_is_dataframe(meta) or _is_frame_like(meta)) and len(meta) == rows):
                     meta = None
-                if prefer_numpy:
-                    meta = None
 
                 prepared.append(
                     (
@@ -4169,28 +3972,42 @@ class TrainingService:
             idx_out = idx_all
 
         meta_out = None
-        if use_dataframe and meta_frames:
+        if meta_frames:
             try:
                 meta_items: list[Any] = []
                 for meta, meta_idx in zip(meta_frames, meta_idx_chunks, strict=False):
                     m = meta.copy()
-                    m.index = np.asarray(meta_idx, dtype=np.int64).astype("datetime64[ns]")
+                    if use_dataframe:
+                        m.index = np.asarray(meta_idx, dtype=np.int64).astype("datetime64[ns]")
+                    else:
+                        m.index = np.asarray(meta_idx, dtype=np.int64)
                     meta_items.append(m)
                 meta_concat = _concat_dataframes(meta_items)
                 if meta_concat is None:
                     raise RuntimeError("frame concat unavailable")
                 meta_out = meta_concat
-                meta_out = meta_out.sort_index(kind="mergesort")
-                meta_out = meta_out[~meta_out.index.duplicated(keep="first")]
-                if len(meta_out) == len(idx_dt):
-                    with contextlib.suppress(Exception):
-                        meta_out.index = idx_dt
-                elif len(meta_out) > len(idx_dt):
-                    meta_out = _slice_rows_range(meta_out, 0, len(idx_dt))
-                    with contextlib.suppress(Exception):
-                        meta_out.index = idx_dt
+                if use_dataframe:
+                    meta_out = meta_out.sort_index(kind="mergesort")
+                    meta_out = meta_out[~meta_out.index.duplicated(keep="first")]
+                    if len(meta_out) == len(idx_dt):
+                        with contextlib.suppress(Exception):
+                            meta_out.index = idx_dt
+                    elif len(meta_out) > len(idx_dt):
+                        meta_out = _slice_rows_range(meta_out, 0, len(idx_dt))
+                        with contextlib.suppress(Exception):
+                            meta_out.index = idx_dt
+                    else:
+                        meta_out = None
                 else:
-                    meta_out = None
+                    if len(meta_out) == len(idx_all):
+                        with contextlib.suppress(Exception):
+                            meta_out.index = idx_all
+                    elif len(meta_out) > len(idx_all):
+                        meta_out = _slice_rows_range(meta_out, 0, len(idx_all))
+                        with contextlib.suppress(Exception):
+                            meta_out.index = idx_all
+                    else:
+                        meta_out = None
             except Exception:
                 meta_out = None
 
@@ -4215,7 +4032,7 @@ class TrainingService:
         if not datasets:
             logger.error("Global training: no datasets provided.")
             return None
-        pandas_free_mode = self._pandas_free_enabled()
+        frame_native_mode = True
 
         # Apply an additional cap here (covers HPC path and any callers that didn't cap during dataset creation).
         try:
@@ -4238,7 +4055,7 @@ class TrainingService:
         datasets = self._inject_cross_pair_context(datasets)
 
         # Align feature spaces across symbols.
-        cols, aligned = self._align_global_feature_space(datasets, prefer_numpy=pandas_free_mode)
+        cols, aligned = self._align_global_feature_space(datasets, prefer_numpy=frame_native_mode)
         if not aligned:
             logger.error("Global training: all datasets failed to align.")
             return None
@@ -4263,16 +4080,17 @@ class TrainingService:
 
         # Pool training data (streaming out-of-core to avoid RAM spikes).
         pooled_meta: list[Any] = []
-        if not pandas_free_mode:
-            for sym, d in train_parts:
-                X_part = d.X
-                if d.metadata is not None and _is_dataframe(d.metadata) and len(d.metadata) == len(X_part):
-                    try:
-                        m = d.metadata[["high", "low", "close"]].copy()
-                        m["symbol"] = sym
-                        pooled_meta.append(m)
-                    except Exception:
-                        pass
+        for sym, d in train_parts:
+            X_part = d.X
+            meta_part = getattr(d, "metadata", None)
+            if meta_part is None or len(meta_part) != len(X_part):
+                continue
+            compact_meta = _compact_ohlcv_metadata_frame(
+                meta_part,
+                symbol=sym if frame_native_mode else None,
+            )
+            if compact_meta is not None:
+                pooled_meta.append(compact_meta)
 
         total_rows = sum(len(d.X) for _, d in train_parts)
         n_features = len(cols)
@@ -4380,7 +4198,7 @@ class TrainingService:
                 if idx_mm is not None:
                     idx_mm.flush()
 
-                if pandas_free_mode:
+                if frame_native_mode:
                     X_train = np.load(x_path, mmap_mode="c")
                     y_train = np.load(y_path, mmap_mode="c")
                 else:
@@ -4431,7 +4249,7 @@ class TrainingService:
                     y_train_np[current_offset : current_offset + n] = y_arr[:n]
                 current_offset += n
 
-            if pandas_free_mode:
+            if frame_native_mode:
                 X_train = X_train_np
                 y_train = y_train_np
             else:
@@ -4442,19 +4260,35 @@ class TrainingService:
             gc.collect()
 
         meta_train: Any | None = None
-        if pooled_meta and not pandas_free_mode:
+        if pooled_meta:
             try:
                 meta_concat = _concat_dataframes(pooled_meta)
                 if meta_concat is None:
                     raise RuntimeError("frame concat unavailable")
                 meta_train = meta_concat
-                # Ensure 1:1 alignment with pooled training rows.
-                if len(meta_train) != len(X_train) or not meta_train.index.equals(X_train.index):
+                if len(meta_train) != len(X_train):
                     logger.warning(
-                        "Global training: pooled metadata index misaligned; disabling metadata for optimizer."
+                        "Global training: pooled metadata row count misaligned; disabling metadata."
                     )
                     meta_train = None
-                else:
+                elif not frame_native_mode and _is_dataframe(X_train):
+                    if not meta_train.index.equals(X_train.index):
+                        logger.warning(
+                            "Global training: pooled metadata index misaligned; disabling metadata for optimizer."
+                        )
+                        meta_train = None
+                    else:
+                        meta_train = meta_train.astype(
+                            {"high": np.float32, "low": np.float32, "close": np.float32},
+                            copy=False,
+                        )
+                        meta_train["symbol"] = meta_train["symbol"].astype("category")
+                elif meta_train is not None and _is_frame_like(meta_train):
+                    for col in ("open", "high", "low", "close"):
+                        arr = _frame_column_numpy_optional(meta_train, col, dtype=np.float32)
+                        if arr is not None:
+                            _frame_set_column(meta_train, col, arr, dtype=np.float32)
+                if meta_train is not None and (not frame_native_mode) and _is_dataframe(meta_train):
                     meta_train = meta_train.astype(
                         {"high": np.float32, "low": np.float32, "close": np.float32},
                         copy=False,
@@ -4463,14 +4297,30 @@ class TrainingService:
             except Exception:
                 meta_train = None
 
-        if pandas_free_mode:
+        if frame_native_mode and memmap_dir is not None and meta_train is not None:
+            meta_path = memmap_dir / "metadata.pkl"
+            persisted = None
+            persist_fn = getattr(self.trainer, "_persist_metadata_artifact", None)
+            if callable(persist_fn):
+                with contextlib.suppress(Exception):
+                    persisted = persist_fn(meta_train, meta_path)
+            if persisted is None:
+                try:
+                    joblib.dump(meta_train, meta_path)
+                    persisted = meta_path
+                except Exception as exc:
+                    logger.warning("Global training: failed to persist metadata artifact %s: %s", meta_path, exc)
+            if persisted is not None:
+                logger.info("Global training: persisted metadata artifact to %s", persisted)
+
+        if frame_native_mode:
             y_arr = np.asarray(y_train, dtype=np.int8).reshape(-1)
             full_ds = PreparedDataset(
                 X=np.asarray(X_train, dtype=np.float32),
                 y=y_arr,
                 index=np.arange(len(y_arr), dtype=np.int64),
                 feature_names=list(cols),
-                metadata=None,
+                metadata=meta_train,
                 labels=y_arr,
             )
         else:
@@ -4524,12 +4374,12 @@ class TrainingService:
         # Post-train: evaluate each trained model out-of-sample per symbol.
         if stop_event and stop_event.is_set():
             return full_ds
-        if pandas_free_mode:
+        if frame_native_mode:
             self.trainer.run_summary["global_training"] = {
                 "symbols": list(symbols),
                 "train_ratio": float(train_ratio),
                 "feature_columns": list(cols),
-                "pandas_free": True,
+                "frame_native": True,
                 **split_meta,
             }
             with contextlib.suppress(Exception):
@@ -5014,7 +4864,7 @@ class TrainingService:
                 
                 # Re-assemble using only valid parts
                 try:
-                    full_ds = self._merge_symbol_shards(sym, sym_parts, prefer_numpy=self._pandas_free_enabled())
+                    full_ds = self._merge_symbol_shards(sym, sym_parts, prefer_numpy=True)
                     if full_ds is None or getattr(full_ds, "X", None) is None or len(full_ds.X) <= 0:
                         raise RuntimeError("empty merged shard dataset")
                     datasets.append((sym, full_ds))
