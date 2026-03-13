@@ -4,8 +4,8 @@
 #[cfg(all(test, feature = "lightgbm"))]
 mod lightgbm_tests {
     use forex_models::tree_models::{LightGBMExpert, TreeModel};
-    use polars::prelude::*;
     use ndarray::Array2;
+    use polars::prelude::*;
 
     fn create_sample_data() -> (DataFrame, Series) {
         // Create synthetic classification data
@@ -57,11 +57,19 @@ mod lightgbm_tests {
         std::env::set_var("FOREX_BOT_TREE_DEVICE", "cpu");
 
         let result = model.fit(&train_df, &train_labels);
-        assert!(result.is_ok(), "Training should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Training should succeed: {:?}",
+            result.err()
+        );
 
         // Predict
         let predictions = model.predict_proba(&test_df);
-        assert!(predictions.is_ok(), "Prediction should succeed: {:?}", predictions.err());
+        assert!(
+            predictions.is_ok(),
+            "Prediction should succeed: {:?}",
+            predictions.err()
+        );
 
         let probs = predictions.unwrap();
         assert_eq!(probs.shape(), &[200, 3], "Output should be [n_samples, 3]");
@@ -69,19 +77,27 @@ mod lightgbm_tests {
         // Check probabilities sum to ~1
         for row in probs.outer_iter() {
             let sum: f32 = row.iter().sum();
-            assert!((sum - 1.0).abs() < 0.01, "Probabilities should sum to 1, got {}", sum);
+            assert!(
+                (sum - 1.0).abs() < 0.01,
+                "Probabilities should sum to 1, got {}",
+                sum
+            );
         }
 
         // Check probabilities are in [0, 1]
         for &prob in probs.iter() {
-            assert!(prob >= 0.0 && prob <= 1.0, "Probability should be in [0, 1], got {}", prob);
+            assert!(
+                prob >= 0.0 && prob <= 1.0,
+                "Probability should be in [0, 1], got {}",
+                prob
+            );
         }
     }
 
     #[test]
     fn test_lightgbm_save_load() {
-        use std::path::Path;
         use std::fs;
+        use std::path::Path;
 
         let (df, labels) = create_sample_data();
         let train_df = df.slice(0, 800);
@@ -105,7 +121,10 @@ mod lightgbm_tests {
         // Predict with loaded model
         let test_df = df.slice(800, 200);
         let predictions = loaded_model.predict_proba(&test_df);
-        assert!(predictions.is_ok(), "Prediction with loaded model should succeed");
+        assert!(
+            predictions.is_ok(),
+            "Prediction with loaded model should succeed"
+        );
 
         // Cleanup
         let _ = fs::remove_file(model_path);
@@ -132,10 +151,8 @@ mod lightgbm_tests {
         use ndarray::Array2;
 
         // Test binary classification (2 classes)
-        let probs_binary = Array2::from_shape_vec(
-            (3, 2),
-            vec![0.7, 0.3, 0.6, 0.4, 0.8, 0.2]
-        ).unwrap();
+        let probs_binary =
+            Array2::from_shape_vec((3, 2), vec![0.7, 0.3, 0.6, 0.4, 0.8, 0.2]).unwrap();
 
         let reordered = reorder_to_neutral_buy_sell(probs_binary, None);
         assert_eq!(reordered.shape(), &[3, 3]);
@@ -146,10 +163,8 @@ mod lightgbm_tests {
         assert_eq!(reordered[[0, 2]], 0.0); // Sell (zero for binary)
 
         // Test multiclass (3 classes) with known class order
-        let probs_multi = Array2::from_shape_vec(
-            (2, 3),
-            vec![0.1, 0.2, 0.7, 0.5, 0.3, 0.2]
-        ).unwrap();
+        let probs_multi =
+            Array2::from_shape_vec((2, 3), vec![0.1, 0.2, 0.7, 0.5, 0.3, 0.2]).unwrap();
 
         let reordered = reorder_to_neutral_buy_sell(probs_multi.clone(), Some(vec![0, 1, 2]));
         // With classes [0, 1, 2] (Neutral, Buy, Sell), output should match
@@ -164,27 +179,48 @@ mod lightgbm_tests {
 
         // Create DataFrame with 'close' column
         let close_prices: Vec<f64> = vec![100.0, 101.0, 99.0, 102.0, 103.0, 101.0, 104.0, 105.0];
-        let volume: Vec<f64> = vec![1000.0, 1100.0, 900.0, 1200.0, 1300.0, 1100.0, 1400.0, 1500.0];
+        let volume: Vec<f64> = vec![
+            1000.0, 1100.0, 900.0, 1200.0, 1300.0, 1100.0, 1400.0, 1500.0,
+        ];
 
         let df = DataFrame::new(vec![
             Series::new("close".into(), close_prices),
             Series::new("volume".into(), volume),
-        ]).unwrap();
+        ])
+        .unwrap();
 
         let augmented = augment_time_features(df);
-        assert!(augmented.is_ok(), "Augmentation should succeed: {:?}", augmented.err());
+        assert!(
+            augmented.is_ok(),
+            "Augmentation should succeed: {:?}",
+            augmented.err()
+        );
 
         let augmented_df = augmented.unwrap();
 
         // Check that new columns were added
-        assert!(augmented_df.column("ret1").is_ok(), "ret1 column should exist");
-        assert!(augmented_df.column("ret1_lag1").is_ok(), "ret1_lag1 column should exist");
-        assert!(augmented_df.column("vol14").is_ok() || augmented_df.height() < 14,
-                "vol14 should exist if enough data");
+        assert!(
+            augmented_df.column("ret1").is_ok(),
+            "ret1 column should exist"
+        );
+        assert!(
+            augmented_df.column("ret1_lag1").is_ok(),
+            "ret1_lag1 column should exist"
+        );
+        assert!(
+            augmented_df.column("vol14").is_ok() || augmented_df.height() < 14,
+            "vol14 should exist if enough data"
+        );
 
         // Original columns should still exist
-        assert!(augmented_df.column("close").is_ok(), "close column should exist");
-        assert!(augmented_df.column("volume").is_ok(), "volume column should exist");
+        assert!(
+            augmented_df.column("close").is_ok(),
+            "close column should exist"
+        );
+        assert!(
+            augmented_df.column("volume").is_ok(),
+            "volume column should exist"
+        );
     }
 
     #[test]
@@ -217,7 +253,7 @@ mod lightgbm_tests {
 
 #[cfg(all(test, feature = "xgboost"))]
 mod xgboost_tests {
-    use forex_models::tree_models::{XGBoostExpert, TreeModel};
+    use forex_models::tree_models::{TreeModel, XGBoostExpert};
     use polars::prelude::*;
 
     #[test]
@@ -246,10 +282,18 @@ mod xgboost_tests {
         std::env::set_var("FOREX_BOT_TREE_DEVICE", "cpu");
 
         let result = model.fit(&train_df, &train_labels);
-        assert!(result.is_ok(), "XGBoost training should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "XGBoost training should succeed: {:?}",
+            result.err()
+        );
 
         let predictions = model.predict_proba(&test_df);
-        assert!(predictions.is_ok(), "XGBoost prediction should succeed: {:?}", predictions.err());
+        assert!(
+            predictions.is_ok(),
+            "XGBoost prediction should succeed: {:?}",
+            predictions.err()
+        );
 
         let probs = predictions.unwrap();
         assert_eq!(probs.shape(), &[100, 3]);
@@ -274,6 +318,9 @@ mod catboost_tests {
         // Should fail with informative error
         assert!(result.is_err(), "CatBoost training should fail in Rust");
         let err_msg = result.err().unwrap().to_string();
-        assert!(err_msg.contains("not supported"), "Error should mention not supported");
+        assert!(
+            err_msg.contains("not supported"),
+            "Error should mention not supported"
+        );
     }
 }

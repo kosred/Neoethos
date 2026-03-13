@@ -122,8 +122,11 @@ pub trait ExpertModel {
     /// Keeps 'model.pt' (current) and 'model.pt.bak' (previous).
     ///
     /// Ported from Python _atomic_save method (lines 101-126)
-    fn atomic_save(&self, save_func: Box<dyn FnOnce(&Path) -> Result<()>>, target_path: &Path) -> Result<()>
-    {
+    fn atomic_save(
+        &self,
+        save_func: Box<dyn FnOnce(&Path) -> Result<()>>,
+        target_path: &Path,
+    ) -> Result<()> {
         let temp_path = target_path.with_extension("tmp");
         let backup_path = target_path.with_extension("bak");
 
@@ -134,11 +137,13 @@ pub trait ExpertModel {
         // Rotate: current -> backup, temp -> current
         if target_path.exists() {
             if backup_path.exists() {
-                std::fs::remove_file(&backup_path)
-                    .with_context(|| format!("Failed to delete old backup: {}", backup_path.display()))?;
+                std::fs::remove_file(&backup_path).with_context(|| {
+                    format!("Failed to delete old backup: {}", backup_path.display())
+                })?;
             }
-            std::fs::rename(target_path, &backup_path)
-                .with_context(|| format!("Failed to rotate to backup: {}", backup_path.display()))?;
+            std::fs::rename(target_path, &backup_path).with_context(|| {
+                format!("Failed to rotate to backup: {}", backup_path.display())
+            })?;
         }
 
         std::fs::rename(&temp_path, target_path)
@@ -164,10 +169,12 @@ pub fn dataframe_to_float32_array(df: &DataFrame) -> Result<Array2<f32>> {
     // Iterate through columns
     for col in df.get_columns() {
         // Try to convert to f64 series first
-        let series_f64 = col.cast(&DataType::Float64)
+        let series_f64 = col
+            .cast(&DataType::Float64)
             .with_context(|| format!("Failed to cast column {} to f64", col.name()))?;
 
-        let ca = series_f64.f64()
+        let ca = series_f64
+            .f64()
             .with_context(|| format!("Failed to get f64 chunked array for {}", col.name()))?;
 
         // Extract values
@@ -206,7 +213,10 @@ pub fn validate_time_ordering(df: &DataFrame, context: &str) -> Result<bool> {
     // For now, assume data is already sorted or skip this check
     // TODO: Implement proper datetime column check
 
-    warn!("{}: Rust port skips strict monotonic check - assume data is pre-sorted", context);
+    warn!(
+        "{}: Rust port skips strict monotonic check - assume data is pre-sorted",
+        context
+    );
     Ok(true)
 }
 
@@ -405,16 +415,25 @@ pub fn detect_feature_drift(
     }
 
     // Find common numeric columns
-    let train_cols: std::collections::HashSet<_> = train_df.get_column_names().iter().copied().collect();
-    let val_cols: std::collections::HashSet<_> = val_df.get_column_names().iter().copied().collect();
+    let train_cols: std::collections::HashSet<_> =
+        train_df.get_column_names().iter().copied().collect();
+    let val_cols: std::collections::HashSet<_> =
+        val_df.get_column_names().iter().copied().collect();
     let common_cols: Vec<_> = train_cols.intersection(&val_cols).copied().collect();
 
     let numeric_cols: Vec<String> = common_cols
         .iter()
         .filter(|&col_name| {
-            if let (Ok(train_col), Ok(val_col)) = (train_df.column(col_name), val_df.column(col_name)) {
-                matches!(train_col.dtype(), DataType::Float32 | DataType::Float64 | DataType::Int32 | DataType::Int64)
-                    && matches!(val_col.dtype(), DataType::Float32 | DataType::Float64 | DataType::Int32 | DataType::Int64)
+            if let (Ok(train_col), Ok(val_col)) =
+                (train_df.column(col_name), val_df.column(col_name))
+            {
+                matches!(
+                    train_col.dtype(),
+                    DataType::Float32 | DataType::Float64 | DataType::Int32 | DataType::Int64
+                ) && matches!(
+                    val_col.dtype(),
+                    DataType::Float32 | DataType::Float64 | DataType::Int32 | DataType::Int64
+                )
             } else {
                 false
             }
@@ -446,7 +465,8 @@ pub fn detect_feature_drift(
     // HPC: Use parallel processing for drift detection (lines 436-437)
     use rayon::prelude::*;
 
-    let results: Vec<_> = numeric_cols.par_iter()
+    let results: Vec<_> = numeric_cols
+        .par_iter()
         .filter_map(|col| {
             let train_col = train_df.column(col).ok()?;
             let val_col = val_df.column(col).ok()?;
@@ -481,15 +501,38 @@ pub fn detect_feature_drift(
 
     // Calculate overall drift severity (lines 448-460)
     let critical_threshold = 0.25;
-    let critical_count = drift_scores.values().filter(|&&s| s >= critical_threshold).count();
+    let critical_count = drift_scores
+        .values()
+        .filter(|&&s| s >= critical_threshold)
+        .count();
     let total_features = drift_scores.len();
 
     let (critical, summary) = if critical_count > total_features * 3 / 10 {
-        (true, format!("CRITICAL: {}/{} features have significant drift", critical_count, total_features))
+        (
+            true,
+            format!(
+                "CRITICAL: {}/{} features have significant drift",
+                critical_count, total_features
+            ),
+        )
     } else if drifted_features.len() > total_features * 2 / 10 {
-        (false, format!("WARNING: {}/{} features show drift", drifted_features.len(), total_features))
+        (
+            false,
+            format!(
+                "WARNING: {}/{} features show drift",
+                drifted_features.len(),
+                total_features
+            ),
+        )
     } else {
-        (false, format!("OK: {}/{} features with minor drift", drifted_features.len(), total_features))
+        (
+            false,
+            format!(
+                "OK: {}/{} features with minor drift",
+                drifted_features.len(),
+                total_features
+            ),
+        )
     };
 
     if !drifted_features.is_empty() {
@@ -497,7 +540,9 @@ pub fn detect_feature_drift(
         sorted_drifted.sort_by(|a, b| {
             let score_a = drift_scores.get(a).copied().unwrap_or(0.0);
             let score_b = drift_scores.get(b).copied().unwrap_or(0.0);
-            score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+            score_b
+                .partial_cmp(&score_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let top_5: Vec<_> = sorted_drifted.iter().take(5).map(|s| s.as_str()).collect();
@@ -569,11 +614,23 @@ pub fn compute_psi(expected: &[f64], actual: &[f64], n_bins: usize) -> f64 {
         if coarse_breaks.len() >= 2 && coarse_breaks.len() < breakpoints.len() {
             let expected_counts = histogram(expected, &coarse_breaks);
             let actual_counts = histogram(actual, &coarse_breaks);
-            return compute_psi_from_counts(&expected_counts, &actual_counts, expected.len(), actual.len(), eps);
+            return compute_psi_from_counts(
+                &expected_counts,
+                &actual_counts,
+                expected.len(),
+                actual.len(),
+                eps,
+            );
         }
     }
 
-    compute_psi_from_counts(&expected_counts, &actual_counts, expected.len(), actual.len(), eps)
+    compute_psi_from_counts(
+        &expected_counts,
+        &actual_counts,
+        expected.len(),
+        actual.len(),
+        eps,
+    )
 }
 
 fn compute_psi_from_counts(
@@ -583,14 +640,17 @@ fn compute_psi_from_counts(
     actual_len: usize,
     eps: f64,
 ) -> f64 {
-    let expected_pct: Vec<f64> = expected_counts.iter()
+    let expected_pct: Vec<f64> = expected_counts
+        .iter()
         .map(|&c| (c as f64 / (expected_len as f64 + eps)).clamp(eps, 1.0))
         .collect();
-    let actual_pct: Vec<f64> = actual_counts.iter()
+    let actual_pct: Vec<f64> = actual_counts
+        .iter()
         .map(|&c| (c as f64 / (actual_len as f64 + eps)).clamp(eps, 1.0))
         .collect();
 
-    let psi: f64 = expected_pct.iter()
+    let psi: f64 = expected_pct
+        .iter()
         .zip(actual_pct.iter())
         .map(|(&exp, &act)| {
             let diff = act - exp;
@@ -638,11 +698,19 @@ pub fn compute_stats_drift(train_vals: &[f64], val_vals: &[f64]) -> f64 {
     let val_mean = val_vals.iter().sum::<f64>() / val_vals.len() as f64;
 
     let train_std = {
-        let variance = train_vals.iter().map(|&x| (x - train_mean).powi(2)).sum::<f64>() / train_vals.len() as f64;
+        let variance = train_vals
+            .iter()
+            .map(|&x| (x - train_mean).powi(2))
+            .sum::<f64>()
+            / train_vals.len() as f64;
         variance.sqrt()
     };
     let val_std = {
-        let variance = val_vals.iter().map(|&x| (x - val_mean).powi(2)).sum::<f64>() / val_vals.len() as f64;
+        let variance = val_vals
+            .iter()
+            .map(|&x| (x - val_mean).powi(2))
+            .sum::<f64>()
+            / val_vals.len() as f64;
         variance.sqrt()
     };
 
@@ -685,11 +753,7 @@ impl RobustScaler {
 
         for j in 0..n_features {
             let col = data.column(j);
-            let valid_values: Vec<f32> = col
-                .iter()
-                .filter(|&&x| x.is_finite())
-                .copied()
-                .collect();
+            let valid_values: Vec<f32> = col.iter().filter(|&&x| x.is_finite()).copied().collect();
 
             if valid_values.is_empty() {
                 means[[0, j]] = 0.0;
@@ -706,7 +770,7 @@ impl RobustScaler {
                 .map(|&x| (x - mean).powi(2))
                 .sum::<f32>()
                 / count;
-            
+
             let std = variance.sqrt().max(1e-3);
 
             means[[0, j]] = mean;

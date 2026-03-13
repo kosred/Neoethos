@@ -9,6 +9,7 @@ use std::{io::Write, path::PathBuf};
 const TA_LIB_VER: &str = "0.4.0";
 // const TA_LIB_TGZ: &str = "ta-lib-0.4.0-src.tar.gz";
 
+#[allow(dead_code)]
 #[derive(Debug)]
 struct DerivesCallback;
 
@@ -173,7 +174,16 @@ fn main() {
         }
     }
 
-    println!("cargo:rustc-link-lib=static=ta_lib");
+    let mut lib_name = "ta_lib".to_string();
+    let ta_lib_path = PathBuf::from(&ta_library_path);
+    if !ta_lib_path.join(format!("{lib_name}.lib")).exists() {
+        if ta_lib_path.join("ta-lib.lib").exists() {
+            lib_name = "ta-lib".to_string();
+        } else if ta_lib_path.join("ta-lib-static.lib").exists() {
+            lib_name = "ta-lib-static".to_string();
+        }
+    }
+    println!("cargo:rustc-link-lib=static={lib_name}");
     println!("cargo:rustc-link-search=native={ta_library_path}");
     println!("cargo:rustc-link-search=native=../dependencies/lib");
     if skip_bindgen {

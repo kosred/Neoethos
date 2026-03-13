@@ -8,22 +8,25 @@ use polars::prelude::*;
 use std::collections::HashMap;
 use std::env;
 use std::path::Path;
+#[cfg(any(feature = "lightgbm", feature = "xgboost", feature = "catboost"))]
 use tracing::{info, warn};
 
-use crate::base::{time_series_train_val_split, ExpertModel};
+#[cfg(any(feature = "lightgbm", feature = "xgboost"))]
+use crate::base::time_series_train_val_split;
+use crate::base::ExpertModel;
 
 #[cfg(feature = "lightgbm")]
 use lightgbm3::{Booster as LGBMBooster, Dataset as LGBMDataset};
 
 #[cfg(feature = "xgboost")]
-use xgb as xgb;
+use xgb;
 
 #[cfg(feature = "catboost")]
 use catboost_rust as catboost;
 
-// ============================================================================ 
+// ============================================================================
 // TYPES AND ENUMS
-// ============================================================================ 
+// ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DevicePreference {
@@ -49,9 +52,9 @@ pub enum ParamValue {
     Bool(bool),
 }
 
-// ============================================================================ 
+// ============================================================================
 // ENVIRONMENT VARIABLE UTILITIES
-// ============================================================================ 
+// ============================================================================
 
 /// Returns CPU thread hint from FOREX_BOT_CPU_THREADS environment variable     
 pub fn cpu_threads_hint() -> usize {
@@ -112,7 +115,7 @@ pub fn torch_cuda_available() -> bool {
     {
         tch::Cuda::is_available() && tch::Cuda::device_count() > 0
     }
-#[cfg(not(feature = "tch"))]
+    #[cfg(not(feature = "tch"))]
     {
         // Fallback: check CUDA_VISIBLE_DEVICES for a non-empty device list
         match env::var("CUDA_VISIBLE_DEVICES") {
@@ -127,7 +130,7 @@ pub fn torch_cuda_available() -> bool {
 
 /// Get GPU count for distribution
 pub fn gpu_count() -> usize {
-#[cfg(feature = "tch")]
+    #[cfg(feature = "tch")]
     {
         if tch::Cuda::is_available() {
             tch::Cuda::device_count() as usize
@@ -144,10 +147,7 @@ pub fn gpu_count() -> usize {
                 if trimmed.is_empty() || trimmed == "-1" {
                     0
                 } else {
-                    trimmed
-                        .split(',')
-                        .filter(|v| !v.trim().is_empty())
-                        .count()
+                    trimmed.split(',').filter(|v| !v.trim().is_empty()).count()
                 }
             }
             Err(_) => 0,
@@ -171,9 +171,83 @@ pub fn get_early_stop_params(default_patience: usize, default_min_delta: f64) ->
     (patience, min_delta)
 }
 
-// ============================================================================ 
+fn quick_e2e_mode() -> bool {
+    match env::var("FOREX_BOT_QUICK_E2E") {
+        Ok(val) => {
+            let v = val.trim().to_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => false,
+    }
+}
+
+fn env_i32(name: &str, default: i32) -> i32 {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .unwrap_or(default)
+}
+
+fn param_int(params: &HashMap<String, ParamValue>, key: &str, default: i32) -> i32 {
+    match params.get(key) {
+        Some(ParamValue::Int(v)) => *v,
+        Some(ParamValue::Float(v)) => *v as i32,
+        _ => default,
+    }
+}
+
+fn param_string(params: &HashMap<String, ParamValue>, key: &str) -> String {
+    match params.get(key) {
+        Some(ParamValue::String(v)) => v.trim().to_lowercase(),
+        _ => String::new(),
+    }
+}
+
+fn apply_quick_tree_caps(params: &mut HashMap<String, ParamValue>, family: &str) {
+    if !quick_e2e_mode() {
+        return;
+    }
+
+    if matches!(family, "lgbm" | "xgb") {
+        let cap = env_i32("FOREX_BOT_QUICK_TREE_ESTIMATORS", 120).max(16);
+        let current = param_int(params, "n_estimators", cap);
+        params.insert("n_estimators".to_string(), ParamValue::Int(current.clamp(16, cap)));
+
+        if params.contains_key("max_depth") {
+            let depth = param_int(params, "max_depth", 6).clamp(2, 6);
+            params.insert("max_depth".to_string(), ParamValue::Int(depth));
+        }
+
+        if params.contains_key("num_parallel_tree") {
+            let trees = param_int(params, "num_parallel_tree", 2).clamp(1, 2);
+            params.insert("num_parallel_tree".to_string(), ParamValue::Int(trees));
+        }
+
+        if param_string(params, "booster") == "dart" {
+            let dart_cap = env_i32("FOREX_BOT_QUICK_XGB_DART_ESTIMATORS", 48).max(16);
+            let current = param_int(params, "n_estimators", dart_cap);
+            params.insert(
+                "n_estimators".to_string(),
+                ParamValue::Int(current.clamp(16, dart_cap)),
+            );
+        }
+    }
+
+    if family == "cat" {
+        let cap = env_i32("FOREX_BOT_QUICK_CAT_ITERATIONS", 120).max(16);
+        let current = param_int(params, "iterations", cap);
+        params.insert("iterations".to_string(), ParamValue::Int(current.clamp(16, cap)));
+
+        if params.contains_key("depth") {
+            let depth = param_int(params, "depth", 6).clamp(2, 6);
+            params.insert("depth".to_string(), ParamValue::Int(depth));
+        }
+    }
+}
+
+// ============================================================================
 // LABEL REMAPPING (HPC FIX - Prevents "Label Drift")
-// ============================================================================ 
+// ============================================================================
 
 /// HPC FIX: Hardcoded Deterministic Mapping
 /// Prevents 'Label Drift' where Buy/Sell columns are swapped depending on data.
@@ -204,18 +278,15 @@ pub fn remap_labels_to_contiguous(y: &Series) -> Result<(Array1<i32>, HashMap<i3
     Ok((Array1::from_vec(remapped), mapping))
 }
 
-// ============================================================================ 
+// ============================================================================
 // OUTPUT REORDERING (HPC PROTOCOL)
-// ============================================================================ 
+// ============================================================================
 
 /// HPC PROTOCOL: Force output to [Neutral, Buy, Sell].
 /// Standard indices: 0=Neutral, 1=Buy, 2=Sell.
 ///
 /// Handles both binary (2-class) and multiclass (3-class) cases.
-pub fn reorder_to_neutral_buy_sell(
-    probs: Array2<f32>,
-    classes: Option<Vec<i32>>,
-) -> Array2<f32> {
+pub fn reorder_to_neutral_buy_sell(probs: Array2<f32>, classes: Option<Vec<i32>>) -> Array2<f32> {
     let n_samples = probs.nrows();
     let n_classes = probs.ncols();
 
@@ -240,7 +311,7 @@ pub fn reorder_to_neutral_buy_sell(
                 0 => out.column_mut(2).assign(&probs.column(col_idx)), // Sell
                 1 => out.column_mut(0).assign(&probs.column(col_idx)), // Neutral
                 2 => out.column_mut(1).assign(&probs.column(col_idx)), // Buy
-                _ => {} 
+                _ => {}
             }
         }
     } else {
@@ -251,9 +322,9 @@ pub fn reorder_to_neutral_buy_sell(
     out
 }
 
-// ============================================================================ 
+// ============================================================================
 // TIME FEATURE AUGMENTATION
-// ============================================================================ 
+// ============================================================================
 
 /// Add lightweight lag/volatility features for tree models when raw close is available.
 /// If 'close' is absent, returns the input unchanged.
@@ -305,16 +376,40 @@ pub fn augment_time_features(df: DataFrame) -> Result<DataFrame> {
 
     // Add lagged returns (manual shift)
     let ret1_lag1: Vec<f64> = (0..ret1_f64.len())
-        .map(|i| if i < 1 { 0.0 } else { ret1_f64.get(i - 1).unwrap_or(0.0) })
+        .map(|i| {
+            if i < 1 {
+                0.0
+            } else {
+                ret1_f64.get(i - 1).unwrap_or(0.0)
+            }
+        })
         .collect();
     let ret1_lag2: Vec<f64> = (0..ret1_f64.len())
-        .map(|i| if i < 2 { 0.0 } else { ret1_f64.get(i - 2).unwrap_or(0.0) })
+        .map(|i| {
+            if i < 2 {
+                0.0
+            } else {
+                ret1_f64.get(i - 2).unwrap_or(0.0)
+            }
+        })
         .collect();
     let ret1_lag5: Vec<f64> = (0..ret1_f64.len())
-        .map(|i| if i < 5 { 0.0 } else { ret1_f64.get(i - 5).unwrap_or(0.0) })
+        .map(|i| {
+            if i < 5 {
+                0.0
+            } else {
+                ret1_f64.get(i - 5).unwrap_or(0.0)
+            }
+        })
         .collect();
     let ret1_lag8: Vec<f64> = (0..ret1_f64.len())
-        .map(|i| if i < 8 { 0.0 } else { ret1_f64.get(i - 8).unwrap_or(0.0) })
+        .map(|i| {
+            if i < 8 {
+                0.0
+            } else {
+                ret1_f64.get(i - 8).unwrap_or(0.0)
+            }
+        })
         .collect();
 
     df.with_column(Series::new("ret1_lag1".into(), ret1_lag1))?;
@@ -335,7 +430,8 @@ pub fn augment_time_features(df: DataFrame) -> Result<DataFrame> {
                     0.0
                 } else {
                     let mean = window.iter().sum::<f64>() / window.len() as f64;
-                    let variance = window.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / window.len() as f64;
+                    let variance = window.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+                        / window.len() as f64;
                     variance.sqrt()
                 }
             }
@@ -354,7 +450,8 @@ pub fn augment_time_features(df: DataFrame) -> Result<DataFrame> {
                     0.0
                 } else {
                     let mean = window.iter().sum::<f64>() / window.len() as f64;
-                    let variance = window.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / window.len() as f64;
+                    let variance = window.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+                        / window.len() as f64;
                     variance.sqrt()
                 }
             }
@@ -395,9 +492,9 @@ pub fn augment_time_features(df: DataFrame) -> Result<DataFrame> {
     Ok(df)
 }
 
-// ============================================================================ 
+// ============================================================================
 // INF/NAN HANDLING
-// ============================================================================ 
+// ============================================================================
 
 /// Replace inf/-inf with NaN in DataFrame
 pub fn replace_inf_with_nan(df: DataFrame) -> Result<DataFrame> {
@@ -416,9 +513,9 @@ pub fn replace_inf_with_nan(df: DataFrame) -> Result<DataFrame> {
     Ok(df)
 }
 
-// ============================================================================ 
+// ============================================================================
 // EXPERT MODEL IMPLEMENTATIONS
-// ============================================================================ 
+// ============================================================================
 
 /// LightGBM Expert Model
 pub struct LightGBMExpert {
@@ -462,7 +559,10 @@ impl LightGBMExpert {
         params.insert("n_estimators".to_string(), ParamValue::Int(800));
         params.insert("num_leaves".to_string(), ParamValue::Int(64));
         params.insert("learning_rate".to_string(), ParamValue::Float(0.03));
-        params.insert("objective".to_string(), ParamValue::String("multiclass".to_string()));
+        params.insert(
+            "objective".to_string(),
+            ParamValue::String("multiclass".to_string()),
+        );
         params.insert("num_class".to_string(), ParamValue::Int(3));
         params.insert("random_state".to_string(), ParamValue::Int(42));
         params.insert("n_jobs".to_string(), ParamValue::Int(-1));
@@ -472,14 +572,15 @@ impl LightGBMExpert {
         params.insert("bagging_fraction".to_string(), ParamValue::Float(0.8));
         params.insert("bagging_freq".to_string(), ParamValue::Int(1));
         params.insert("path_smooth".to_string(), ParamValue::Int(10));
-        params.insert("linear_tree".to_string(), ParamValue::Bool(true));
+        params.insert("linear_tree".to_string(), ParamValue::Bool(false));
+        apply_quick_tree_caps(&mut params, "lgbm");
         params
     }
 }
 
-// ============================================================================ 
+// ============================================================================
 // LIGHTGBM IMPLEMENTATION
-// ============================================================================ 
+// ============================================================================
 
 impl ExpertModel for LightGBMExpert {
     fn fit(&mut self, _x: &DataFrame, _y: &Series) -> Result<()> {
@@ -498,7 +599,7 @@ impl ExpertModel for LightGBMExpert {
 
             // STEP 1: Augment time features if 'close' column exists
             let x = if x.column("close").is_ok() {
-                augment_time_features(x.clone())? 
+                augment_time_features(x.clone())?
             } else {
                 x.clone()
             };
@@ -565,6 +666,11 @@ impl ExpertModel for LightGBMExpert {
                     ParamValue::String(s) => params[k] = json!(s),
                     ParamValue::Bool(b) => params[k] = json!(b),
                 }
+            }
+
+            if params["linear_tree"] == json!(true) {
+                warn!("Rust LightGBM backend does not support linear_tree reliably; forcing linear_tree=false");
+                params["linear_tree"] = json!(false);
             }
 
             // GPU configuration
@@ -648,29 +754,28 @@ impl ExpertModel for LightGBMExpert {
         #[cfg(feature = "lightgbm")]
         {
             let model = self.model.as_ref().context("LightGBM model not trained")?;
-            
+
             // Augment features
             let x_aug = if x.column("close").is_ok() {
-                augment_time_features(x.clone())? 
+                augment_time_features(x.clone())?
             } else {
                 x.clone()
             };
-            
+
             let features = dataframe_to_vecs(&x_aug)?;
             let all_probs = model
                 .predict_from_vec_of_vec(features, true)
                 .context("LightGBM predict failed")?;
             let probs_array = Array2::from_shape_vec(
                 (x.height(), 3),
-                all_probs
-                    .into_iter()
-                    .flatten()
-                    .map(|v| v as f32)
-                    .collect(),
+                all_probs.into_iter().flatten().map(|v| v as f32).collect(),
             )?;
-            
+
             // Force output reordering to [Neutral, Buy, Sell]
-            Ok(reorder_to_neutral_buy_sell(probs_array, Some(vec![0, 1, 2])))
+            Ok(reorder_to_neutral_buy_sell(
+                probs_array,
+                Some(vec![0, 1, 2]),
+            ))
         }
         #[cfg(not(feature = "lightgbm"))]
         {
@@ -763,7 +868,11 @@ fn param_value_to_string(value: &ParamValue) -> String {
         ParamValue::Float(f) => f.to_string(),
         ParamValue::String(s) => s.clone(),
         ParamValue::Bool(b) => {
-            if *b { "1".to_string() } else { "0".to_string() }
+            if *b {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            }
         }
     }
 }
@@ -800,9 +909,8 @@ fn build_xgb_param_pairs(
             has_nthread = true;
             if let ParamValue::Int(i) = v {
                 if *i < 0 {
-                    let threads = cpu_threads.unwrap_or_else(|| {
-                        num_cpus::get().saturating_sub(1).max(1)
-                    });
+                    let threads =
+                        cpu_threads.unwrap_or_else(|| num_cpus::get().saturating_sub(1).max(1));
                     value = threads.to_string();
                 }
             }
@@ -831,7 +939,10 @@ fn xgb_predict_probs(model: &xgb::Booster, x: &DataFrame) -> Result<Array2<f32>>
     let dmatrix = xgb::DMatrix::from_dense(&features, x_aug.height())?;
     let preds = model.predict(&dmatrix)?;
     let probs_array = Array2::from_shape_vec((x_aug.height(), 3), preds)?;
-    Ok(reorder_to_neutral_buy_sell(probs_array, Some(vec![0, 1, 2])))
+    Ok(reorder_to_neutral_buy_sell(
+        probs_array,
+        Some(vec![0, 1, 2]),
+    ))
 }
 
 #[cfg(feature = "catboost")]
@@ -866,9 +977,9 @@ fn catboost_predict_probs(model: &catboost::Model, x: &DataFrame) -> Result<Arra
     Ok(reorder_to_neutral_buy_sell(probs, Some(vec![0, 1, 2])))
 }
 
-// ============================================================================ 
+// ============================================================================
 // XGBOOST IMPLEMENTATION
-// ============================================================================ 
+// ============================================================================
 
 /// XGBoost Expert Model
 pub struct XGBoostExpert {
@@ -912,15 +1023,25 @@ impl XGBoostExpert {
         params.insert("n_estimators".to_string(), ParamValue::Int(800));
         params.insert("max_depth".to_string(), ParamValue::Int(8));
         params.insert("learning_rate".to_string(), ParamValue::Float(0.05));
-        params.insert("objective".to_string(), ParamValue::String("multi:softprob".to_string()));
+        params.insert(
+            "objective".to_string(),
+            ParamValue::String("multi:softprob".to_string()),
+        );
         params.insert("num_class".to_string(), ParamValue::Int(3));
         params.insert("random_state".to_string(), ParamValue::Int(42));
         params.insert("n_jobs".to_string(), ParamValue::Int(-1));
         params.insert("verbosity".to_string(), ParamValue::Int(0));
         params.insert("subsample".to_string(), ParamValue::Float(0.9));
         params.insert("colsample_bytree".to_string(), ParamValue::Float(0.9));
-        params.insert("eval_metric".to_string(), ParamValue::String("mlogloss".to_string()));
-        params.insert("tree_method".to_string(), ParamValue::String("hist".to_string()));
+        params.insert(
+            "eval_metric".to_string(),
+            ParamValue::String("mlogloss".to_string()),
+        );
+        params.insert(
+            "tree_method".to_string(),
+            ParamValue::String("hist".to_string()),
+        );
+        apply_quick_tree_caps(&mut params, "xgb");
         params
     }
 }
@@ -1013,7 +1134,8 @@ impl ExpertModel for XGBoostExpert {
                     cached_dmats.push(dmat);
                 }
 
-                let mut booster_params_builder = xgb::parameters::BoosterParametersBuilder::default();
+                let mut booster_params_builder =
+                    xgb::parameters::BoosterParametersBuilder::default();
                 if let Some(threads) = self.config.cpu_threads {
                     booster_params_builder.threads(Some(threads as u32));
                 }
@@ -1023,7 +1145,8 @@ impl ExpertModel for XGBoostExpert {
                 let booster_params = booster_params_builder
                     .build()
                     .context("Failed to build XGBoost parameters")?;
-                let mut booster = xgb::Booster::new_with_cached_dmats(&booster_params, &cached_dmats)?;
+                let mut booster =
+                    xgb::Booster::new_with_cached_dmats(&booster_params, &cached_dmats)?;
 
                 let mut params = base_params.clone();
                 if use_gpu {
@@ -1124,9 +1247,9 @@ impl ExpertModel for XGBoostExpert {
     }
 }
 
-// ============================================================================ 
+// ============================================================================
 // XGBOOST VARIANT MODELS
-// ============================================================================ 
+// ============================================================================
 
 /// XGBoost Random Forest Expert (num_parallel_tree=8)
 pub struct XGBoostRFExpert {
@@ -1177,10 +1300,14 @@ impl XGBoostRFExpert {
         params.insert("colsample_bynode".to_string(), ParamValue::Float(0.8)); // NEW
         params.insert("colsample_bytree".to_string(), ParamValue::Float(0.8)); // not 0.9
         params.insert("num_parallel_tree".to_string(), ParamValue::Int(8)); // NEW - RF mode
-        params.insert("objective".to_string(), ParamValue::String("multi:softprob".to_string()));
+        params.insert(
+            "objective".to_string(),
+            ParamValue::String("multi:softprob".to_string()),
+        );
         params.insert("num_class".to_string(), ParamValue::Int(3));
         params.insert("random_state".to_string(), ParamValue::Int(42));
         params.insert("verbosity".to_string(), ParamValue::Int(0));
+        apply_quick_tree_caps(&mut params, "xgb");
         params
     }
 }
@@ -1228,24 +1355,37 @@ impl XGBoostDARTExpert {
         let mut params = HashMap::new();
         // DART variant
         params.insert("n_estimators".to_string(), ParamValue::Int(600)); // not 800
-        params.insert("booster".to_string(), ParamValue::String("dart".to_string())); // NEW
+        params.insert(
+            "booster".to_string(),
+            ParamValue::String("dart".to_string()),
+        ); // NEW
         params.insert("rate_drop".to_string(), ParamValue::Float(0.10)); // NEW
         params.insert("skip_drop".to_string(), ParamValue::Float(0.50)); // NEW
-        params.insert("sample_type".to_string(), ParamValue::String("uniform".to_string())); // NEW
-        params.insert("normalize_type".to_string(), ParamValue::String("tree".to_string())); // NEW
+        params.insert(
+            "sample_type".to_string(),
+            ParamValue::String("uniform".to_string()),
+        ); // NEW
+        params.insert(
+            "normalize_type".to_string(),
+            ParamValue::String("tree".to_string()),
+        ); // NEW
         params.insert("max_depth".to_string(), ParamValue::Int(8));
         params.insert("learning_rate".to_string(), ParamValue::Float(0.05));
-        params.insert("objective".to_string(), ParamValue::String("multi:softprob".to_string()));
+        params.insert(
+            "objective".to_string(),
+            ParamValue::String("multi:softprob".to_string()),
+        );
         params.insert("num_class".to_string(), ParamValue::Int(3));
         params.insert("random_state".to_string(), ParamValue::Int(42));
         params.insert("verbosity".to_string(), ParamValue::Int(0));
+        apply_quick_tree_caps(&mut params, "xgb");
         params
     }
 }
 
-// ============================================================================ 
+// ============================================================================
 // XGBOOST VARIANT IMPLEMENTATIONS
-// ============================================================================ 
+// ============================================================================
 
 impl ExpertModel for XGBoostRFExpert {
     fn fit(&mut self, _x: &DataFrame, _y: &Series) -> Result<()> {
@@ -1385,9 +1525,9 @@ impl ExpertModel for XGBoostDARTExpert {
     }
 }
 
-// ============================================================================ 
+// ============================================================================
 // CATBOOST IMPLEMENTATION (INFERENCE ONLY - HYBRID APPROACH)
-// ============================================================================ 
+// ============================================================================
 
 /// CatBoost Expert Model
 /// NOTE: Training must be done in Python, this loads pre-trained .cbm models
@@ -1435,7 +1575,10 @@ impl CatBoostExpert {
         params.insert("iterations".to_string(), ParamValue::Int(800));
         params.insert("depth".to_string(), ParamValue::Int(8));
         params.insert("learning_rate".to_string(), ParamValue::Float(0.05));
-        params.insert("loss_function".to_string(), ParamValue::String("MultiClass".to_string()));
+        params.insert(
+            "loss_function".to_string(),
+            ParamValue::String("MultiClass".to_string()),
+        );
         params.insert("random_seed".to_string(), ParamValue::Int(42));
         params.insert("verbose".to_string(), ParamValue::Bool(false));
         params.insert("thread_count".to_string(), ParamValue::Int(-1));
@@ -1470,7 +1613,7 @@ impl ExpertModel for CatBoostExpert {
         #[cfg(feature = "catboost")]
         {
             let model = self.model.as_ref().context(
-                "Model not loaded. Train in Python and load .cbm file with load() method"
+                "Model not loaded. Train in Python and load .cbm file with load() method",
             )?;
             catboost_predict_probs(model, x)
         }
@@ -1569,7 +1712,10 @@ impl CatBoostAltExpert {
         params.insert("random_seed".to_string(), ParamValue::Int(7)); // not 42
         params.insert("l2_leaf_reg".to_string(), ParamValue::Float(6.0)); // NEW
         params.insert("random_strength".to_string(), ParamValue::Float(1.5)); // NEW
-        params.insert("loss_function".to_string(), ParamValue::String("MultiClass".to_string()));
+        params.insert(
+            "loss_function".to_string(),
+            ParamValue::String("MultiClass".to_string()),
+        );
         params.insert("verbose".to_string(), ParamValue::Bool(false));
         params.insert("thread_count".to_string(), ParamValue::Int(-1));
         params
@@ -1579,9 +1725,9 @@ impl CatBoostAltExpert {
 // NOTE: CatBoostAltExpert uses same TreeModel impl as CatBoostExpert
 // It differs only in default parameters (for Python training reference)
 
-// ============================================================================ 
+// ============================================================================
 // PYTHON TRAINING SCRIPT GENERATOR (HELPER FOR CATBOOST)
-// ============================================================================ 
+// ============================================================================
 
 /// Generates Python training script for CatBoost models
 pub fn generate_catboost_training_script(
@@ -1593,7 +1739,6 @@ pub fn generate_catboost_training_script(
     script.push_str("# Auto-generated CatBoost training script\n");
     script.push_str("# Train model in Python, then load .cbm file in Rust\n\n");
     script.push_str("from catboost import CatBoostClassifier\n");
-    script.push_str("import pandas as pd\n");
     script.push_str("import numpy as np\n\n");
 
     script.push_str("# Load your data\n");
@@ -1620,7 +1765,10 @@ pub fn generate_catboost_training_script(
         "model.save_model('{}')\n",
         output_path.to_str().unwrap()
     ));
-    script.push_str(&format!("print('Model saved to {}')\n", output_path.to_str().unwrap()));
+    script.push_str(&format!(
+        "print('Model saved to {}')\n",
+        output_path.to_str().unwrap()
+    ));
 
     Ok(script)
 }
@@ -1704,7 +1852,7 @@ impl ExpertModel for CatBoostAltExpert {
         {
             let x = _x;
             let model = self.model.as_ref().context(
-                "Model not loaded. Train in Python and load .cbm file with load() method"
+                "Model not loaded. Train in Python and load .cbm file with load() method",
             )?;
             catboost_predict_probs(model, x)
         }

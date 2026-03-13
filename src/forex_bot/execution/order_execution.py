@@ -4,7 +4,6 @@ from datetime import UTC, datetime
 from typing import Any
 
 import numpy as np
-import pandas as pd
 
 from ..core.config import Settings
 from ..core.storage import RiskLedger, StrategyLedger
@@ -15,6 +14,53 @@ from ..strategy.stop_target import infer_stop_target_pips
 logger = logging.getLogger(__name__)
 _RUST_ORDER_BACKEND_OK: bool | None = None
 _RUST_ORDER_WARNED_UNAVAILABLE = False
+
+
+def _frame_empty(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        return bool(value.empty)
+    except Exception:
+        pass
+    try:
+        return int(len(value)) <= 0
+    except Exception:
+        return True
+
+
+def _frame_columns(value: Any) -> list[str]:
+    cols = getattr(value, "columns", None)
+    if cols is None:
+        return []
+    try:
+        return [str(c) for c in list(cols)]
+    except Exception:
+        return []
+
+
+def _frame_resolve_column(value: Any, name: str) -> str | None:
+    target = str(name).strip().lower()
+    for col in _frame_columns(value):
+        if str(col).strip().lower() == target:
+            return col
+    return None
+
+
+def _frame_has_column(value: Any, name: str) -> bool:
+    return _frame_resolve_column(value, name) is not None
+
+
+def _frame_index(value: Any) -> Any:
+    return getattr(value, "index", None)
+
+
+def _is_dataframe_like(value: Any) -> bool:
+    return bool(hasattr(value, "columns") and hasattr(value, "index"))
+
+
+def _is_series_like(value: Any) -> bool:
+    return bool(hasattr(value, "index") and hasattr(value, "to_numpy") and not hasattr(value, "columns"))
 
 
 def _rust_order_backend_available(*, force_log: bool = False) -> bool:
@@ -31,7 +77,7 @@ def _rust_order_backend_available(*, force_log: bool = False) -> bool:
             _RUST_ORDER_BACKEND_OK = False
     if force_log and not _RUST_ORDER_BACKEND_OK and not _RUST_ORDER_WARNED_UNAVAILABLE:
         logger.warning(
-            "Rust order backend requested but required forex_bindings functions are unavailable; using Python order math."
+            "Rust order backend requested but required forex_bindings functions are unavailable."
         )
         _RUST_ORDER_WARNED_UNAVAILABLE = True
     return bool(_RUST_ORDER_BACKEND_OK)
@@ -156,14 +202,20 @@ class OrderExecutor:
         base_df = frames.get(self.settings.system.base_timeframe)
         if base_df is None:
             base_df = frames.get("M1")
-        if base_df is None or getattr(base_df, "empty", True):
+        if _frame_empty(base_df):
             current_bar_time = datetime.now(UTC)
         else:
             try:
-                if "timestamp" in getattr(base_df, "columns", []):
-                    current_bar_time = base_df["timestamp"].iloc[-1]
+                if _frame_has_column(base_df, "timestamp"):
+                    ts_arr = self._column_values(base_df, "timestamp")
+                    if ts_arr is not None and ts_arr.size > 0:
+                        current_bar_time = ts_arr[-1]
+                    else:
+                        idx = _frame_index(base_df)
+                        current_bar_time = idx[-1] if idx is not None and len(idx) > 0 else datetime.now(UTC)
                 else:
-                    current_bar_time = base_df.index[-1]
+                    idx = _frame_index(base_df)
+                    current_bar_time = idx[-1] if idx is not None and len(idx) > 0 else datetime.now(UTC)
                 # Normalize to python datetime where possible
                 if hasattr(current_bar_time, "to_pydatetime"):
                     current_bar_time = current_bar_time.to_pydatetime()
@@ -226,31 +278,63 @@ class OrderExecutor:
     def _entry_patience_block(self, signal: int, base_df: Any) -> bool:
         if not bool(getattr(self.settings.risk, "entry_patience_enabled", True)):
             return False
-        if base_df is None or getattr(base_df, "empty", True):
+        if _frame_empty(base_df):
             return False
         try:
             bars = int(getattr(self.settings.risk, "entry_patience_bars", 3) or 3)
             bars = max(1, bars)
-            close = pd.Series(base_df["close"]).astype(float)
-            if len(close) <= bars:
+            close = self._column_array(base_df, "close")
+            if close is None or close.size <= bars:
                 return False
             atr_val = 0.0
-            if "atr" in base_df.columns:
-                atr_val = float(pd.Series(base_df["atr"]).astype(float).iloc[-1])
-            elif "atr14" in base_df.columns:
-                atr_val = float(pd.Series(base_df["atr14"]).astype(float).iloc[-1])
+            atr = self._column_array(base_df, "atr")
+            if atr is None:
+                atr = self._column_array(base_df, "atr14")
+            if atr is not None and atr.size > 0:
+                atr_last = float(atr[-1])
+                if np.isfinite(atr_last):
+                    atr_val = atr_last
             pullback_atr = float(getattr(self.settings.risk, "entry_patience_pullback_atr", 0.20) or 0.20)
             pullback = max(0.0, pullback_atr * max(0.0, atr_val))
-            recent = close.iloc[-(bars + 1) :]
-            last = float(recent.iloc[-1])
-            prior = recent.iloc[:-1]
+            recent = close[-(bars + 1) :]
+            last = float(recent[-1])
+            prior = recent[:-1]
             if signal > 0:
-                return bool(last >= (float(prior.max()) - pullback))
+                return bool(last >= (float(np.nanmax(prior)) - pullback))
             if signal < 0:
-                return bool(last <= (float(prior.min()) + pullback))
+                return bool(last <= (float(np.nanmin(prior)) + pullback))
             return False
         except Exception:
             return False
+
+    @staticmethod
+    def _column_values(frame: Any, name: str) -> np.ndarray | None:
+        col = _frame_resolve_column(frame, name)
+        if col is None:
+            return None
+        try:
+            values = frame[col]
+        except Exception:
+            return None
+        try:
+            if hasattr(values, "to_numpy"):
+                arr = values.to_numpy(copy=False)
+            else:
+                arr = np.asarray(values)
+            arr = np.asarray(arr).reshape(-1)
+            return arr
+        except Exception:
+            return None
+
+    @staticmethod
+    def _column_array(frame: Any, name: str) -> np.ndarray | None:
+        arr = OrderExecutor._column_values(frame, name)
+        if arr is None:
+            return None
+        try:
+            return np.asarray(arr, dtype=float).reshape(-1)
+        except Exception:
+            return None
 
     @staticmethod
     def _latest_scalar(value: Any, *, default: float = 0.0) -> float:
@@ -262,19 +346,31 @@ class OrderExecutor:
         if value is None:
             return float(default)
 
-        # Pandas objects: take last element.
-        if isinstance(value, pd.Series):
+        # Series-like objects: take last element.
+        if _is_series_like(value):
             if len(value) == 0:
                 return float(default)
             try:
-                return float(value.iloc[-1])
+                arr = value.to_numpy(copy=False) if hasattr(value, "to_numpy") else np.asarray(value)
+                arr = np.asarray(arr).reshape(-1)
+                if arr.size <= 0:
+                    return float(default)
+                return float(arr[-1])
             except Exception:
                 return float(default)
-        if isinstance(value, pd.DataFrame):
-            if value.empty:
+        if _is_dataframe_like(value):
+            if _frame_empty(value):
                 return float(default)
             try:
-                return float(value.iloc[-1, -1])
+                if hasattr(value, "take"):
+                    tail = value.take([-1])
+                    arr = np.asarray(tail)
+                    if arr.size > 0:
+                        return float(arr.reshape(-1)[-1])
+                arr = np.asarray(value)
+                if arr.size <= 0:
+                    return float(default)
+                return float(arr.reshape(-1)[-1])
             except Exception:
                 return float(default)
 
@@ -425,6 +521,9 @@ class OrderExecutor:
         if min_mult <= 0:
             return True
         pip_size = self._get_pip_size(self.settings.system.symbol, symbol_info)
+        if pip_size <= 0:
+            logger.error("Rust pip-size backend unavailable; blocking cost/edge evaluation.")
+            return False
         bid = float(tick.get("bid", 0.0) or 0.0)
         ask = float(tick.get("ask", 0.0) or 0.0)
         spread_pips_live = ((ask - bid) / pip_size) if (ask > 0 and bid > 0 and pip_size > 0) else 0.0
@@ -447,34 +546,27 @@ class OrderExecutor:
             pass
         commission_per_lot = float(getattr(self.settings.risk, "commission_per_lot", 7.0) or 7.0)
         _pip_sz, pip_value_per_lot = self.risk_manager._compute_pip_metrics(symbol_info)
-        total_cost_pips = 0.0
-        expected_profit_pips = 0.0
-        if _rust_order_backend_available():
-            try:
-                import forex_bindings  # type: ignore
+        backend_ok = _rust_order_backend_available(force_log=True)
+        if not backend_ok:
+            logger.error("Rust order backend unavailable; blocking cost/edge gate.")
+            return False
+        try:
+            import forex_bindings  # type: ignore
 
-                passed, expected_profit_pips, total_cost_pips = forex_bindings.evaluate_trade_edge(
-                    float(sl_pips),
-                    float(rr),
-                    float(spread_pips),
-                    float(slippage_pips),
-                    float(commission_per_lot),
-                    float(pip_value_per_lot),
-                    float(min_mult),
-                )
-                passed = bool(passed)
-            except Exception as exc:
-                _disable_rust_order_backend()
-                logger.debug("Rust evaluate_trade_edge failed; falling back to Python: %s", exc)
-                commission_pips = commission_per_lot / max(pip_value_per_lot, 1e-9)
-                total_cost_pips = max(0.0, spread_pips + slippage_pips + commission_pips)
-                expected_profit_pips = max(0.0, float(sl_pips) * max(0.0, float(rr)))
-                passed = expected_profit_pips >= (min_mult * total_cost_pips)
-        else:
-            commission_pips = commission_per_lot / max(pip_value_per_lot, 1e-9)
-            total_cost_pips = max(0.0, spread_pips + slippage_pips + commission_pips)
-            expected_profit_pips = max(0.0, float(sl_pips) * max(0.0, float(rr)))
-            passed = expected_profit_pips >= (min_mult * total_cost_pips)
+            passed, expected_profit_pips, total_cost_pips = forex_bindings.evaluate_trade_edge(
+                float(sl_pips),
+                float(rr),
+                float(spread_pips),
+                float(slippage_pips),
+                float(commission_per_lot),
+                float(pip_value_per_lot),
+                float(min_mult),
+            )
+            passed = bool(passed)
+        except Exception as exc:
+            _disable_rust_order_backend()
+            logger.error("Rust evaluate_trade_edge failed; blocking trade: %s", exc)
+            return False
         if not passed:
             logger.info(
                 "Cost/edge gate rejected trade: exp_pips=%.3f cost_pips=%.3f need>=%.3f",
@@ -535,7 +627,7 @@ class OrderExecutor:
         # Check recommended
         if result.recommended_sl is not None:
             try:
-                val = float(result.recommended_sl.iloc[-1])
+                val = self._latest_scalar(result.recommended_sl, default=0.0)
                 if val > 0 and np.isfinite(val):
                     self._last_rr = None
                     return val
@@ -552,7 +644,7 @@ class OrderExecutor:
         base_df = frames.get(self.settings.system.base_timeframe)
         if base_df is None:
             base_df = frames.get("M1")
-        if base_df is None or base_df.empty:
+        if _frame_empty(base_df):
             logger.debug("Missing base timeframe data for SL calculation")
             return None
 
@@ -575,32 +667,47 @@ class OrderExecutor:
 
         def _chandelier_candidate() -> float | None:
             try:
-                if not {"high", "low", "close"}.issubset(base_df.columns):
+                high = self._column_array(base_df, "high")
+                low = self._column_array(base_df, "low")
+                close = self._column_array(base_df, "close")
+                if high is None or low is None or close is None:
                     return None
+                n = int(min(high.size, low.size, close.size))
+                if n <= 1:
+                    return None
+                high = high[-n:]
+                low = low[-n:]
+                close = close[-n:]
                 period = int(getattr(self.settings.risk, "chandelier_period", 22) or 22)
                 period = max(5, period)
-                high = base_df["high"].astype(float)
-                low = base_df["low"].astype(float)
-                close = base_df["close"].astype(float)
-                atr = base_df["atr"].astype(float) if "atr" in base_df.columns else None
-                if atr is None or atr.empty:
-                    tr1 = (high - low).abs()
-                    tr2 = (high - close.shift(1)).abs()
-                    tr3 = (low - close.shift(1)).abs()
-                    atr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14, min_periods=2).mean()
-                atr_last = float(atr.iloc[-1]) if len(atr) > 0 else 0.0
+                atr = self._column_array(base_df, "atr")
+                if atr is None or atr.size <= 0:
+                    atr = self._column_array(base_df, "atr14")
+                if atr is None or atr.size <= 0:
+                    prev_close = np.roll(close, 1)
+                    prev_close[0] = close[0]
+                    tr = np.maximum(
+                        high - low,
+                        np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)),
+                    )
+                    span = min(14, tr.size)
+                    if span < 2:
+                        return None
+                    atr_last = float(np.nanmean(tr[-span:]))
+                else:
+                    atr_last = float(atr[-1])
                 if not np.isfinite(atr_last) or atr_last <= 0:
                     return None
                 mult = float(getattr(self.settings.risk, "chandelier_atr_multiplier", 3.0) or 3.0)
                 pip_size = self._get_pip_size(symbol)
-                close_px = float(close.iloc[-1])
+                close_px = float(close[-1])
                 signal = int(getattr(result, "signal", 0) or 0)
                 if signal == 1:
-                    hh = float(high.tail(period).max())
+                    hh = float(np.nanmax(high[-period:]))
                     stop_px = hh - (mult * atr_last)
                     dist = max(0.0, close_px - stop_px)
                 elif signal == -1:
-                    ll = float(low.tail(period).min())
+                    ll = float(np.nanmin(low[-period:]))
                     stop_px = ll + (mult * atr_last)
                     dist = max(0.0, stop_px - close_px)
                 else:
@@ -613,7 +720,12 @@ class OrderExecutor:
 
         def _atr_candidate() -> float | None:
             try:
-                atr = base_df["atr"].iloc[-1] if "atr" in base_df.columns else None
+                atr = None
+                atr_col = self._column_array(base_df, "atr")
+                if atr_col is None:
+                    atr_col = self._column_array(base_df, "atr14")
+                if atr_col is not None and atr_col.size > 0:
+                    atr = float(atr_col[-1])
                 pip_size = self._get_pip_size(symbol)
                 if atr and atr > 0:
                     atr_mult = float(getattr(self.settings.risk, "atr_stop_multiplier", 1.5))
@@ -668,9 +780,12 @@ class OrderExecutor:
             base_df = frames.get(self.settings.system.base_timeframe)
             if base_df is None:
                 base_df = frames.get("M1")
-            if base_df is None or base_df.empty:
+            if _frame_empty(base_df):
                 raise RuntimeError("Missing base timeframe data for price calc")
-            close_price = float(base_df["close"].iloc[-1])
+            close_arr = self._column_array(base_df, "close")
+            if close_arr is None or close_arr.size <= 0:
+                raise RuntimeError("Missing close prices for price calc")
+            close_price = float(close_arr[-1])
             bid = float(tick_price.get("bid", 0.0) or 0.0)
             ask = float(tick_price.get("ask", 0.0) or 0.0)
             # Use live bid/ask when available; otherwise fall back to last close
@@ -680,12 +795,14 @@ class OrderExecutor:
                 entry_price = bid if bid > 0 else close_price
 
             pip_size = self._get_pip_size(symbol, info)
-            sl_dist = sl_pips * pip_size
+            if pip_size <= 0:
+                logger.error("Rust pip-size backend unavailable; cannot calculate prices.")
+                return None
 
             rr = None
             if result.recommended_rr is not None:
                 try:
-                    val = float(result.recommended_rr.iloc[-1])
+                    val = self._latest_scalar(result.recommended_rr, default=0.0)
                     if val > 0 and np.isfinite(val):
                         rr = val
                 except Exception as e:
@@ -698,26 +815,33 @@ class OrderExecutor:
                     rr = rr_cfg
             if rr is None:
                 return None
+            # Enforce a hard floor so live execution never degrades below baseline RR.
+            rr_floor = max(1.5, float(getattr(self.settings.risk, "min_risk_reward", 1.5) or 1.5))
+            if not np.isfinite(rr):
+                rr = rr_floor
+            rr = max(rr_floor, float(rr))
 
-            if _rust_order_backend_available():
-                try:
-                    import forex_bindings  # type: ignore
+            backend_ok = _rust_order_backend_available(force_log=True)
+            if not backend_ok:
+                logger.error("Rust order backend unavailable; price calculation is blocked.")
+                return None
 
-                    sl, tp, sl_dist_rs = forex_bindings.compute_order_prices(
-                        float(entry_price),
-                        int(result.signal),
-                        float(sl_pips),
-                        float(rr),
-                        float(pip_size),
-                    )
-                    return float(sl), float(tp), entry_price, float(sl_dist_rs), float(rr)
-                except Exception as exc:
-                    _disable_rust_order_backend()
-                    logger.debug("Rust compute_order_prices failed; falling back to Python: %s", exc)
+            try:
+                import forex_bindings  # type: ignore
 
-            if result.signal == 1:
-                return entry_price - sl_dist, entry_price + (rr * sl_dist), entry_price, sl_dist, float(rr)
-            return entry_price + sl_dist, entry_price - (rr * sl_dist), entry_price, sl_dist, float(rr)
+                sl, tp, sl_dist_rs = forex_bindings.compute_order_prices(
+                    float(entry_price),
+                    int(result.signal),
+                    float(sl_pips),
+                    float(rr),
+                    float(pip_size),
+                )
+                return float(sl), float(tp), entry_price, float(sl_dist_rs), float(rr)
+            except Exception as exc:
+                _disable_rust_order_backend()
+                logger.error("Rust compute_order_prices failed; price calculation is blocked: %s", exc)
+                return None
+
         except Exception as e:
             logger.error(f"Price calc failed: {e}")
             return None
@@ -748,44 +872,27 @@ class OrderExecutor:
 
     def _get_pip_size(self, symbol: str, info=None) -> float:
         sym = (symbol or "").upper()
-        if _rust_order_backend_available():
-            try:
-                import forex_bindings  # type: ignore
+        backend_ok = _rust_order_backend_available(force_log=True)
+        if not backend_ok:
+            logger.error("Rust pip-size backend unavailable for %s.", sym)
+            return 0.0
+        try:
+            import forex_bindings  # type: ignore
 
-                point = None
-                digits = None
-                if info:
-                    try:
-                        point = float(info.get("point", 0.0001) or 0.0001)
-                    except Exception:
-                        point = 0.0001
-                    try:
-                        digits = int(info.get("digits", 5) or 5)
-                    except Exception:
-                        digits = 5
-                return float(forex_bindings.pip_size_from_symbol(sym, point=point, digits=digits))
-            except Exception as exc:
-                _disable_rust_order_backend()
-                logger.debug("Rust pip_size_from_symbol failed; falling back to Python: %s", exc)
-        if info:
-            pt = float(info.get("point", 0.0001) or 0.0001)
-            dig = int(info.get("digits", 5) or 5)
-            if sym.endswith("JPY") or sym.startswith("JPY"):
-                pip_size = pt * (10 if dig >= 3 else 1)
-            elif sym.startswith("XAU") or sym.startswith("XAG"):
-                pip_size = 0.01
-            elif "BTC" in sym or "ETH" in sym or "LTC" in sym:
-                pip_size = 1.0
-            else:
-                # Standard FX logic: 4+ digits = 10 points per pip, else 1
-                pip_size = pt * (10 if dig >= 4 else 1)
-        else:
-            if sym.endswith("JPY") or sym.startswith("JPY"):
-                pip_size = 0.01
-            elif sym.startswith("XAU") or sym.startswith("XAG"):
-                pip_size = 0.01
-            elif "BTC" in sym or "ETH" in sym or "LTC" in sym:
-                pip_size = 1.0
-            else:
-                pip_size = 0.0001
-        return pip_size
+            point = None
+            digits = None
+            if info:
+                try:
+                    point = float(info.get("point", 0.0001) or 0.0001)
+                except Exception:
+                    point = 0.0001
+                try:
+                    digits = int(info.get("digits", 5) or 5)
+                except Exception:
+                    digits = 5
+            return float(forex_bindings.pip_size_from_symbol(sym, point=point, digits=digits))
+        except Exception as exc:
+            _disable_rust_order_backend()
+            logger.error("Rust pip_size_from_symbol failed for %s: %s", sym, exc)
+            return 0.0
+

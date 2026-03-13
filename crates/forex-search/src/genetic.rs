@@ -1,3 +1,4 @@
+use crate::stop_target::{infer_stop_target_pips, StopTargetSettings};
 use anyhow::{bail, Result};
 use chrono::{Datelike, TimeZone, Utc};
 use forex_data::{FeatureFrame, Ohlcv};
@@ -9,7 +10,6 @@ use std::collections::{HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use crate::stop_target::{infer_stop_target_pips, StopTargetSettings};
 
 fn env_f32(name: &str, default: f32) -> f32 {
     std::env::var(name)
@@ -35,7 +35,12 @@ fn env_usize(name: &str, default: usize) -> usize {
 fn env_bool(name: &str, default: bool) -> bool {
     std::env::var(name)
         .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(default)
 }
 
@@ -72,14 +77,25 @@ fn gene_signature_hash(gene: &Gene) -> u64 {
     for w in &gene.weights {
         h = fnv1a_update(h, &quantize_f32(*w, 10_000.0).to_le_bytes());
     }
-    h = fnv1a_update(h, &quantize_f32(gene.long_threshold, 1_000_000.0).to_le_bytes());
-    h = fnv1a_update(h, &quantize_f32(gene.short_threshold, 1_000_000.0).to_le_bytes());
+    h = fnv1a_update(
+        h,
+        &quantize_f32(gene.long_threshold, 1_000_000.0).to_le_bytes(),
+    );
+    h = fnv1a_update(
+        h,
+        &quantize_f32(gene.short_threshold, 1_000_000.0).to_le_bytes(),
+    );
     h = fnv1a_update(h, &[gene.use_ob as u8]);
     h = fnv1a_update(h, &[gene.use_fvg as u8]);
     h = fnv1a_update(h, &[gene.use_liq_sweep as u8]);
     h = fnv1a_update(h, &[gene.mtf_confirmation as u8]);
     h = fnv1a_update(h, &[gene.use_premium_discount as u8]);
     h = fnv1a_update(h, &[gene.use_inducement as u8]);
+    h = fnv1a_update(h, &[gene.use_bos as u8]);
+    h = fnv1a_update(h, &[gene.use_choch as u8]);
+    h = fnv1a_update(h, &[gene.use_eqh as u8]);
+    h = fnv1a_update(h, &[gene.use_eql as u8]);
+    h = fnv1a_update(h, &[gene.use_displacement as u8]);
     h = fnv1a_update(h, &quantize_f64(gene.tp_pips, 100.0).to_le_bytes());
     h = fnv1a_update(h, &quantize_f64(gene.sl_pips, 100.0).to_le_bytes());
     h
@@ -270,13 +286,23 @@ pub struct Gene {
     pub mtf_confirmation: bool,
     pub use_premium_discount: bool,
     pub use_inducement: bool,
+    #[serde(default)]
+    pub use_bos: bool,
+    #[serde(default)]
+    pub use_choch: bool,
+    #[serde(default)]
+    pub use_eqh: bool,
+    #[serde(default)]
+    pub use_eql: bool,
+    #[serde(default)]
+    pub use_displacement: bool,
     pub tp_pips: f64,
     pub sl_pips: f64,
     pub slice_pass_rate: f64,
 }
 
 impl Gene {
-    fn normalize(&mut self, n_indicators: usize, min_indicators: usize) {       
+    fn normalize(&mut self, n_indicators: usize, min_indicators: usize) {
         if self.indices.is_empty() {
             self.indices.push(0);
         }
@@ -330,6 +356,11 @@ pub struct EvaluationConfig {
     pub smc_weight_mtf: f32,
     pub smc_weight_premium: f32,
     pub smc_weight_inducement: f32,
+    pub smc_weight_bos: f32,
+    pub smc_weight_choch: f32,
+    pub smc_weight_eqh: f32,
+    pub smc_weight_eql: f32,
+    pub smc_weight_displacement: f32,
 }
 
 impl Default for EvaluationConfig {
@@ -350,6 +381,11 @@ impl Default for EvaluationConfig {
             smc_weight_mtf: env_f32("FOREX_BOT_PROP_SMC_W_MTF", 1.0),
             smc_weight_premium: env_f32("FOREX_BOT_PROP_SMC_W_PREMIUM", 1.0),
             smc_weight_inducement: env_f32("FOREX_BOT_PROP_SMC_W_INDUCEMENT", 1.0),
+            smc_weight_bos: env_f32("FOREX_BOT_PROP_SMC_W_BOS", 1.0),
+            smc_weight_choch: env_f32("FOREX_BOT_PROP_SMC_W_CHOCH", 1.0),
+            smc_weight_eqh: env_f32("FOREX_BOT_PROP_SMC_W_EQH", 1.0),
+            smc_weight_eql: env_f32("FOREX_BOT_PROP_SMC_W_EQL", 1.0),
+            smc_weight_displacement: env_f32("FOREX_BOT_PROP_SMC_W_DISPLACEMENT", 1.0),
         }
     }
 }
@@ -364,6 +400,11 @@ struct SmcSearchConfig {
     p_premium: f64,
     p_inducement: f64,
     p_mtf: f64,
+    p_bos: f64,
+    p_choch: f64,
+    p_eqh: f64,
+    p_eql: f64,
+    p_displacement: f64,
 }
 
 impl SmcSearchConfig {
@@ -378,6 +419,11 @@ impl SmcSearchConfig {
             p_premium: clamp01(env_f64("FOREX_BOT_PROP_SMC_P_PREMIUM", default_p)),
             p_inducement: clamp01(env_f64("FOREX_BOT_PROP_SMC_P_INDUCEMENT", default_p)),
             p_mtf: clamp01(env_f64("FOREX_BOT_PROP_SMC_P_MTF", 0.85)),
+            p_bos: clamp01(env_f64("FOREX_BOT_PROP_SMC_P_BOS", default_p)),
+            p_choch: clamp01(env_f64("FOREX_BOT_PROP_SMC_P_CHOCH", default_p)),
+            p_eqh: clamp01(env_f64("FOREX_BOT_PROP_SMC_P_EQH", default_p)),
+            p_eql: clamp01(env_f64("FOREX_BOT_PROP_SMC_P_EQL", default_p)),
+            p_displacement: clamp01(env_f64("FOREX_BOT_PROP_SMC_P_DISPLACEMENT", default_p)),
         };
         if !env_bool("FOREX_BOT_PROP_SMC_FORCE_ENABLED", true) {
             cfg.force_ratio = 0.0;
@@ -404,6 +450,21 @@ fn smc_structural_flag_count(gene: &Gene) -> usize {
     if gene.use_inducement {
         n += 1;
     }
+    if gene.use_bos {
+        n += 1;
+    }
+    if gene.use_choch {
+        n += 1;
+    }
+    if gene.use_eqh {
+        n += 1;
+    }
+    if gene.use_eql {
+        n += 1;
+    }
+    if gene.use_displacement {
+        n += 1;
+    }
     n
 }
 
@@ -414,20 +475,30 @@ fn randomize_smc_flags(gene: &mut Gene, cfg: &SmcSearchConfig, rng: &mut impl Rn
     gene.use_premium_discount = rng.random_bool(cfg.p_premium);
     gene.use_inducement = rng.random_bool(cfg.p_inducement);
     gene.mtf_confirmation = rng.random_bool(cfg.p_mtf);
+    gene.use_bos = rng.random_bool(cfg.p_bos);
+    gene.use_choch = rng.random_bool(cfg.p_choch);
+    gene.use_eqh = rng.random_bool(cfg.p_eqh);
+    gene.use_eql = rng.random_bool(cfg.p_eql);
+    gene.use_displacement = rng.random_bool(cfg.p_displacement);
 }
 
 fn enforce_min_structural_smc_flags(gene: &mut Gene, cfg: &SmcSearchConfig, rng: &mut impl Rng) {
-    let need = cfg.min_flags.min(5);
+    let need = cfg.min_flags.min(10);
     if need == 0 {
         return;
     }
     while smc_structural_flag_count(gene) < need {
-        match rng.random_range(0..5) {
+        match rng.random_range(0..10) {
             0 => gene.use_ob = true,
             1 => gene.use_fvg = true,
             2 => gene.use_liq_sweep = true,
             3 => gene.use_premium_discount = true,
-            _ => gene.use_inducement = true,
+            4 => gene.use_inducement = true,
+            5 => gene.use_bos = true,
+            6 => gene.use_choch = true,
+            7 => gene.use_eqh = true,
+            8 => gene.use_eql = true,
+            _ => gene.use_displacement = true,
         }
     }
     if !gene.mtf_confirmation && rng.random_bool(cfg.p_mtf.max(0.5)) {
@@ -443,7 +514,10 @@ fn enforce_population_smc_ratio(genes: &mut [Gene], cfg: &SmcSearchConfig) {
     if target == 0 {
         return;
     }
-    let mut active = genes.iter().filter(|g| smc_structural_flag_count(g) > 0).count();
+    let mut active = genes
+        .iter()
+        .filter(|g| smc_structural_flag_count(g) > 0)
+        .count();
     if active >= target {
         return;
     }
@@ -509,6 +583,11 @@ struct SmcColumns {
     trend: Option<usize>,
     premium: Option<usize>,
     inducement: Option<usize>,
+    bos: Option<usize>,
+    choch: Option<usize>,
+    eqh: Option<usize>,
+    eql: Option<usize>,
+    displacement: Option<usize>,
 }
 
 fn normalize_feature_name(name: &str) -> String {
@@ -518,10 +597,14 @@ fn normalize_feature_name(name: &str) -> String {
 }
 
 fn find_feature_column(names: &[String], aliases: &[&str]) -> Option<usize> {
-    let normalized_aliases: Vec<String> = aliases.iter().map(|a| normalize_feature_name(a)).collect();
+    let normalized_aliases: Vec<String> =
+        aliases.iter().map(|a| normalize_feature_name(a)).collect();
     for (idx, raw) in names.iter().enumerate() {
         let norm = normalize_feature_name(raw);
-        if normalized_aliases.iter().any(|a| norm == *a || norm.contains(a)) {
+        if normalized_aliases
+            .iter()
+            .any(|a| norm == *a || norm.contains(a))
+        {
             return Some(idx);
         }
     }
@@ -554,10 +637,32 @@ fn detect_smc_columns(names: &[String]) -> SmcColumns {
         trend: find_feature_column(names, &["smc_trend", "trend", "market_trend"]),
         premium: find_feature_column(names, &["smc_premium", "premium_discount", "premium"]),
         inducement: find_feature_column(names, &["smc_inducement", "inducement"]),
+        bos: find_feature_column(names, &["smc_bos", "bos", "break_of_structure"]),
+        choch: find_feature_column(names, &["smc_choch", "choch", "change_of_character"]),
+        eqh: find_feature_column(names, &["smc_eqh", "eqh", "equal_highs"]),
+        eql: find_feature_column(names, &["smc_eql", "eql", "equal_lows"]),
+        displacement: find_feature_column(
+            names,
+            &["smc_displacement", "displacement", "impulse_displacement"],
+        ),
     }
 }
 
-fn derive_smc_arrays(ohlcv: &Ohlcv) -> (Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>) {
+fn derive_smc_arrays(
+    ohlcv: &Ohlcv,
+) -> (
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+) {
     let n = ohlcv.close.len();
     let mut ob = vec![0_i8; n];
     let mut fvg = vec![0_i8; n];
@@ -565,19 +670,50 @@ fn derive_smc_arrays(ohlcv: &Ohlcv) -> (Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<
     let mut trend = vec![0_i8; n];
     let mut premium = vec![0_i8; n];
     let mut inducement = vec![0_i8; n];
+    let mut bos = vec![0_i8; n];
+    let mut choch = vec![0_i8; n];
+    let mut eqh = vec![0_i8; n];
+    let mut eql = vec![0_i8; n];
+    let mut displacement = vec![0_i8; n];
     if n == 0 {
-        return (ob, fvg, liq, trend, premium, inducement);
+        return (
+            ob,
+            fvg,
+            liq,
+            trend,
+            premium,
+            inducement,
+            bos,
+            choch,
+            eqh,
+            eql,
+            displacement,
+        );
     }
 
     let lookback = 12usize;
+    let eq_lookback = 20usize;
+    let displacement_lookback = 20usize;
     for i in 0..n {
         // Trend proxy: 12-bar momentum sign.
         if i >= lookback {
             let d = ohlcv.close[i] - ohlcv.close[i - lookback];
-            trend[i] = if d > 0.0 { 1 } else if d < 0.0 { -1 } else { 0 };
+            trend[i] = if d > 0.0 {
+                1
+            } else if d < 0.0 {
+                -1
+            } else {
+                0
+            };
         } else if i > 0 {
             let d = ohlcv.close[i] - ohlcv.close[i - 1];
-            trend[i] = if d > 0.0 { 1 } else if d < 0.0 { -1 } else { 0 };
+            trend[i] = if d > 0.0 {
+                1
+            } else if d < 0.0 {
+                -1
+            } else {
+                0
+            };
         }
 
         // Premium/discount proxy inside current candle range:
@@ -587,11 +723,19 @@ fn derive_smc_arrays(ohlcv: &Ohlcv) -> (Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<
 
         if i >= 1 {
             // Order-block style proxy via engulfing behavior.
-            let bull =
-                ohlcv.close[i] > ohlcv.open[i] && ohlcv.close[i - 1] < ohlcv.open[i - 1] && ohlcv.close[i] >= ohlcv.high[i - 1];
-            let bear =
-                ohlcv.close[i] < ohlcv.open[i] && ohlcv.close[i - 1] > ohlcv.open[i - 1] && ohlcv.close[i] <= ohlcv.low[i - 1];
-            ob[i] = if bull { 1 } else if bear { -1 } else { 0 };
+            let bull = ohlcv.close[i] > ohlcv.open[i]
+                && ohlcv.close[i - 1] < ohlcv.open[i - 1]
+                && ohlcv.close[i] >= ohlcv.high[i - 1];
+            let bear = ohlcv.close[i] < ohlcv.open[i]
+                && ohlcv.close[i - 1] > ohlcv.open[i - 1]
+                && ohlcv.close[i] <= ohlcv.low[i - 1];
+            ob[i] = if bull {
+                1
+            } else if bear {
+                -1
+            } else {
+                0
+            };
 
             // Inducement proxy: wick imbalance relative to body.
             let body = (ohlcv.close[i] - ohlcv.open[i]).abs();
@@ -625,15 +769,112 @@ fn derive_smc_arrays(ohlcv: &Ohlcv) -> (Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<
                 liq[i] = -1;
             }
         }
+
+        if i >= lookback {
+            let prev_low = ohlcv.low[(i - lookback)..i]
+                .iter()
+                .fold(f64::INFINITY, |a, b| a.min(*b));
+            let prev_high = ohlcv.high[(i - lookback)..i]
+                .iter()
+                .fold(f64::NEG_INFINITY, |a, b| a.max(*b));
+            if ohlcv.close[i] > prev_high {
+                bos[i] = 1;
+            } else if ohlcv.close[i] < prev_low {
+                bos[i] = -1;
+            }
+        }
+
+        if i >= 1 && trend[i] != 0 && trend[i - 1] != 0 && trend[i] != trend[i - 1] {
+            choch[i] = trend[i];
+        }
+
+        if i >= eq_lookback {
+            let lb = i - eq_lookback;
+            let mut range_sum = 0.0;
+            for j in lb..=i {
+                range_sum += (ohlcv.high[j] - ohlcv.low[j]).abs();
+            }
+            let avg_range = range_sum / ((eq_lookback as f64) + 1.0);
+            let tol = (avg_range * 0.1).max(1e-9);
+            for j in lb..i {
+                if (ohlcv.high[i] - ohlcv.high[j]).abs() <= tol {
+                    eqh[i] = -1;
+                    break;
+                }
+            }
+            for j in lb..i {
+                if (ohlcv.low[i] - ohlcv.low[j]).abs() <= tol {
+                    eql[i] = 1;
+                    break;
+                }
+            }
+        }
+
+        if i >= displacement_lookback {
+            let body = (ohlcv.close[i] - ohlcv.open[i]).abs();
+            let mut avg_body = 0.0;
+            for j in (i - displacement_lookback)..i {
+                avg_body += (ohlcv.close[j] - ohlcv.open[j]).abs();
+            }
+            avg_body /= displacement_lookback as f64;
+            if avg_body > 1e-12 && body >= (1.8 * avg_body) {
+                displacement[i] = if ohlcv.close[i] > ohlcv.open[i] {
+                    1
+                } else if ohlcv.close[i] < ohlcv.open[i] {
+                    -1
+                } else {
+                    0
+                };
+            }
+        }
     }
 
-    (ob, fvg, liq, trend, premium, inducement)
+    (
+        ob,
+        fvg,
+        liq,
+        trend,
+        premium,
+        inducement,
+        bos,
+        choch,
+        eqh,
+        eql,
+        displacement,
+    )
 }
 
-fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> (Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>) {
+fn build_smc_arrays(
+    frame: &FeatureFrame,
+    ohlcv: &Ohlcv,
+) -> (
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+) {
     let n = frame.data.nrows();
     let cols = detect_smc_columns(&frame.names);
-    let (mut ob, mut fvg, mut liq, mut trend, mut premium, mut inducement) = derive_smc_arrays(ohlcv);
+    let (
+        mut ob,
+        mut fvg,
+        mut liq,
+        mut trend,
+        mut premium,
+        mut inducement,
+        mut bos,
+        mut choch,
+        mut eqh,
+        mut eql,
+        mut displacement,
+    ) = derive_smc_arrays(ohlcv);
 
     let apply_dir_col = |target: &mut Vec<i8>, col_opt: Option<usize>| {
         if let Some(col) = col_opt {
@@ -653,6 +894,71 @@ fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> (Vec<i8>, Vec<i8>, V
             }
         }
     };
+    let apply_eqh_col = |target: &mut Vec<i8>, col_opt: Option<usize>| {
+        if let Some(col) = col_opt {
+            if col < frame.data.ncols() {
+                for i in 0..n {
+                    let v = frame.data[(i, col)];
+                    let q = quantize_dir(v);
+                    if q != 0 {
+                        target[i] = q;
+                    } else if quantize_binary(v) != 0 {
+                        target[i] = -1;
+                    } else {
+                        target[i] = 0;
+                    }
+                }
+            }
+        }
+    };
+    let apply_eql_col = |target: &mut Vec<i8>, col_opt: Option<usize>| {
+        if let Some(col) = col_opt {
+            if col < frame.data.ncols() {
+                for i in 0..n {
+                    let v = frame.data[(i, col)];
+                    let q = quantize_dir(v);
+                    if q != 0 {
+                        target[i] = q;
+                    } else if quantize_binary(v) != 0 {
+                        target[i] = 1;
+                    } else {
+                        target[i] = 0;
+                    }
+                }
+            }
+        }
+    };
+    let apply_dir_fill_zeros = |target: &mut Vec<i8>, col_opt: Option<usize>| {
+        if let Some(col) = col_opt {
+            if col < frame.data.ncols() {
+                for i in 0..n {
+                    if target[i] == 0 {
+                        target[i] = quantize_dir(frame.data[(i, col)]);
+                    }
+                }
+            }
+        }
+    };
+    let apply_eq_levels = |target: &mut Vec<i8>, eqh_col: Option<usize>, eql_col: Option<usize>| {
+        if let Some(col) = eqh_col {
+            if col < frame.data.ncols() {
+                for i in 0..n {
+                    if quantize_binary(frame.data[(i, col)]) != 0 {
+                        target[i] = -1;
+                    }
+                }
+            }
+        }
+        if let Some(col) = eql_col {
+            if col < frame.data.ncols() {
+                for i in 0..n {
+                    if quantize_binary(frame.data[(i, col)]) != 0 {
+                        target[i] = 1;
+                    }
+                }
+            }
+        }
+    };
 
     apply_dir_col(&mut ob, cols.ob);
     apply_dir_col(&mut fvg, cols.fvg);
@@ -660,8 +966,45 @@ fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> (Vec<i8>, Vec<i8>, V
     apply_dir_col(&mut trend, cols.trend);
     apply_dir_col(&mut premium, cols.premium);
     apply_binary_col(&mut inducement, cols.inducement);
+    apply_dir_col(&mut bos, cols.bos);
+    apply_dir_col(&mut choch, cols.choch);
+    apply_eqh_col(&mut eqh, cols.eqh);
+    apply_eql_col(&mut eql, cols.eql);
+    apply_dir_col(&mut displacement, cols.displacement);
+    apply_dir_fill_zeros(&mut ob, cols.bos);
+    apply_dir_fill_zeros(&mut ob, cols.choch);
+    apply_eq_levels(&mut liq, cols.eqh, cols.eql);
+    apply_dir_fill_zeros(&mut trend, cols.bos);
+    apply_dir_fill_zeros(&mut trend, cols.choch);
+    apply_dir_fill_zeros(&mut trend, cols.displacement);
+    if let Some(col) = cols.displacement {
+        if col < frame.data.ncols() {
+            for i in 0..n {
+                if quantize_dir(frame.data[(i, col)]) != 0 {
+                    inducement[i] = 1;
+                }
+            }
+        }
+    }
+    for i in 0..n {
+        if displacement[i] != 0 {
+            inducement[i] = 1;
+        }
+    }
 
-    (ob, fvg, liq, trend, premium, inducement)
+    (
+        ob,
+        fvg,
+        liq,
+        trend,
+        premium,
+        inducement,
+        bos,
+        choch,
+        eqh,
+        eql,
+        displacement,
+    )
 }
 
 fn new_random_gene(
@@ -708,6 +1051,11 @@ fn new_random_gene(
         mtf_confirmation: true,
         use_premium_discount: false,
         use_inducement: false,
+        use_bos: false,
+        use_choch: false,
+        use_eqh: false,
+        use_eql: false,
+        use_displacement: false,
         tp_pips,
         sl_pips,
         slice_pass_rate: 0.0,
@@ -771,14 +1119,60 @@ pub fn evaluate_genes(
     let (offsets, indices, weights, long_thr, short_thr) = build_gene_arrays(genes);
     let (sl_pips, tp_pips) = resolve_stop_target_arrays(genes, ohlcv, config);
     let (months, days) = month_day_indices(&features.timestamps);
-    let (ob_arr, fvg_arr, liq_arr, trend_arr, premium_arr, inducement_arr) =
-        build_smc_arrays(features, ohlcv);
+    let (
+        ob_arr,
+        fvg_arr,
+        liq_arr,
+        trend_arr,
+        premium_arr,
+        inducement_arr,
+        bos_arr,
+        choch_arr,
+        eqh_arr,
+        eql_arr,
+        displacement_arr,
+    ) = build_smc_arrays(features, ohlcv);
     let use_ob: Vec<i8> = genes.iter().map(|g| if g.use_ob { 1 } else { 0 }).collect();
-    let use_fvg: Vec<i8> = genes.iter().map(|g| if g.use_fvg { 1 } else { 0 }).collect();
-    let use_liq: Vec<i8> = genes.iter().map(|g| if g.use_liq_sweep { 1 } else { 0 }).collect();
-    let use_mtf: Vec<i8> = genes.iter().map(|g| if g.mtf_confirmation { 1 } else { 0 }).collect();
-    let use_premium: Vec<i8> = genes.iter().map(|g| if g.use_premium_discount { 1 } else { 0 }).collect();
-    let use_inducement: Vec<i8> = genes.iter().map(|g| if g.use_inducement { 1 } else { 0 }).collect();
+    let use_fvg: Vec<i8> = genes
+        .iter()
+        .map(|g| if g.use_fvg { 1 } else { 0 })
+        .collect();
+    let use_liq: Vec<i8> = genes
+        .iter()
+        .map(|g| if g.use_liq_sweep { 1 } else { 0 })
+        .collect();
+    let use_mtf: Vec<i8> = genes
+        .iter()
+        .map(|g| if g.mtf_confirmation { 1 } else { 0 })
+        .collect();
+    let use_premium: Vec<i8> = genes
+        .iter()
+        .map(|g| if g.use_premium_discount { 1 } else { 0 })
+        .collect();
+    let use_inducement: Vec<i8> = genes
+        .iter()
+        .map(|g| if g.use_inducement { 1 } else { 0 })
+        .collect();
+    let use_bos: Vec<i8> = genes
+        .iter()
+        .map(|g| if g.use_bos { 1 } else { 0 })
+        .collect();
+    let use_choch: Vec<i8> = genes
+        .iter()
+        .map(|g| if g.use_choch { 1 } else { 0 })
+        .collect();
+    let use_eqh: Vec<i8> = genes
+        .iter()
+        .map(|g| if g.use_eqh { 1 } else { 0 })
+        .collect();
+    let use_eql: Vec<i8> = genes
+        .iter()
+        .map(|g| if g.use_eql { 1 } else { 0 })
+        .collect();
+    let use_displacement: Vec<i8> = genes
+        .iter()
+        .map(|g| if g.use_displacement { 1 } else { 0 })
+        .collect();
 
     let metrics = crate::eval::evaluate_population_core(
         &ohlcv.close,
@@ -800,12 +1194,22 @@ pub fn evaluate_genes(
         &trend_arr,
         &premium_arr,
         &inducement_arr,
+        &bos_arr,
+        &choch_arr,
+        &eqh_arr,
+        &eql_arr,
+        &displacement_arr,
         &use_ob,
         &use_fvg,
         &use_liq,
         &use_mtf,
         &use_premium,
         &use_inducement,
+        &use_bos,
+        &use_choch,
+        &use_eqh,
+        &use_eql,
+        &use_displacement,
         config.smc_gate_threshold,
         config.smc_weight_ob,
         config.smc_weight_fvg,
@@ -813,6 +1217,11 @@ pub fn evaluate_genes(
         config.smc_weight_mtf,
         config.smc_weight_premium,
         config.smc_weight_inducement,
+        config.smc_weight_bos,
+        config.smc_weight_choch,
+        config.smc_weight_eqh,
+        config.smc_weight_eql,
+        config.smc_weight_displacement,
         config.max_hold_bars,
         config.trailing_enabled,
         config.trailing_atr_multiplier,
@@ -844,6 +1253,7 @@ fn resolve_stop_target_arrays(
         &ohlcv.close,
         &StopTargetSettings::default(),
         pip_size,
+        0,
     );
     let (default_sl, default_tp) = default
         .map(|(sl, tp, _rr)| (sl, tp))
@@ -907,16 +1317,81 @@ fn crossover(a: &Gene, b: &Gene, generation: usize) -> Gene {
         indices.push(*a.indices.first().unwrap_or(&0));
         weights.push(*a.weights.first().unwrap_or(&1.0));
     }
-    let long_threshold = if rng.random_bool(0.5) { a.long_threshold } else { b.long_threshold };
-    let short_threshold = if rng.random_bool(0.5) { a.short_threshold } else { b.short_threshold };
-    let use_ob = if rng.random_bool(0.5) { a.use_ob } else { b.use_ob };
-    let use_fvg = if rng.random_bool(0.5) { a.use_fvg } else { b.use_fvg };
-    let use_liq_sweep = if rng.random_bool(0.5) { a.use_liq_sweep } else { b.use_liq_sweep };
-    let mtf_confirmation = if rng.random_bool(0.5) { a.mtf_confirmation } else { b.mtf_confirmation };
-    let use_premium_discount = if rng.random_bool(0.5) { a.use_premium_discount } else { b.use_premium_discount };
-    let use_inducement = if rng.random_bool(0.5) { a.use_inducement } else { b.use_inducement };
-    let tp_pips = if rng.random_bool(0.5) { a.tp_pips } else { b.tp_pips };
-    let sl_pips = if rng.random_bool(0.5) { a.sl_pips } else { b.sl_pips };
+    let long_threshold = if rng.random_bool(0.5) {
+        a.long_threshold
+    } else {
+        b.long_threshold
+    };
+    let short_threshold = if rng.random_bool(0.5) {
+        a.short_threshold
+    } else {
+        b.short_threshold
+    };
+    let use_ob = if rng.random_bool(0.5) {
+        a.use_ob
+    } else {
+        b.use_ob
+    };
+    let use_fvg = if rng.random_bool(0.5) {
+        a.use_fvg
+    } else {
+        b.use_fvg
+    };
+    let use_liq_sweep = if rng.random_bool(0.5) {
+        a.use_liq_sweep
+    } else {
+        b.use_liq_sweep
+    };
+    let mtf_confirmation = if rng.random_bool(0.5) {
+        a.mtf_confirmation
+    } else {
+        b.mtf_confirmation
+    };
+    let use_premium_discount = if rng.random_bool(0.5) {
+        a.use_premium_discount
+    } else {
+        b.use_premium_discount
+    };
+    let use_inducement = if rng.random_bool(0.5) {
+        a.use_inducement
+    } else {
+        b.use_inducement
+    };
+    let use_bos = if rng.random_bool(0.5) {
+        a.use_bos
+    } else {
+        b.use_bos
+    };
+    let use_choch = if rng.random_bool(0.5) {
+        a.use_choch
+    } else {
+        b.use_choch
+    };
+    let use_eqh = if rng.random_bool(0.5) {
+        a.use_eqh
+    } else {
+        b.use_eqh
+    };
+    let use_eql = if rng.random_bool(0.5) {
+        a.use_eql
+    } else {
+        b.use_eql
+    };
+    let use_displacement = if rng.random_bool(0.5) {
+        a.use_displacement
+    } else {
+        b.use_displacement
+    };
+    let tp_pips = if rng.random_bool(0.5) {
+        a.tp_pips
+    } else {
+        b.tp_pips
+    };
+    let sl_pips = if rng.random_bool(0.5) {
+        a.sl_pips
+    } else {
+        b.sl_pips
+    };
     let strategy_id = format!("gene_{}_{}", rng.random_range(0..1_000_000u64), generation);
     Gene {
         indices,
@@ -938,6 +1413,11 @@ fn crossover(a: &Gene, b: &Gene, generation: usize) -> Gene {
         mtf_confirmation,
         use_premium_discount,
         use_inducement,
+        use_bos,
+        use_choch,
+        use_eqh,
+        use_eql,
+        use_displacement,
         tp_pips,
         sl_pips,
         slice_pass_rate: 0.0,
@@ -970,8 +1450,10 @@ fn mutate(
             }
         }
         1 => {
-            mutated.long_threshold = (mutated.long_threshold * rng.random_range(0.7..1.3)).clamp(0.08, 0.8);
-            mutated.short_threshold = (mutated.short_threshold * rng.random_range(0.7..1.3)).clamp(-0.8, -0.08);
+            mutated.long_threshold =
+                (mutated.long_threshold * rng.random_range(0.7..1.3)).clamp(0.08, 0.8);
+            mutated.short_threshold =
+                (mutated.short_threshold * rng.random_range(0.7..1.3)).clamp(-0.8, -0.08);
         }
         2 => {
             mutated.tp_pips = (mutated.tp_pips * rng.random_range(0.8..1.2)).clamp(10.0, 100.0);
@@ -1073,7 +1555,11 @@ pub fn evolve_search(
     let archive_cap = std::env::var("FOREX_BOT_PROP_ARCHIVE_CAP")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or_else(|| population.saturating_mul(generations.max(1)).max(population))
+        .unwrap_or_else(|| {
+            population
+                .saturating_mul(generations.max(1))
+                .max(population)
+        })
         .max(population.max(1));
     let base_immigrant_ratio = std::env::var("FOREX_BOT_PROP_RANDOM_IMMIGRANTS")
         .ok()
@@ -1118,10 +1604,7 @@ pub fn evolve_search(
             .map(|(g, m)| (g.fitness, g, m))
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let top_score = scored
-            .first()
-            .map(|x| x.0)
-            .unwrap_or(f64::NEG_INFINITY);
+        let top_score = scored.first().map(|x| x.0).unwrap_or(f64::NEG_INFINITY);
         if top_score.is_finite() && top_score > best_score_seen + 1e-12 {
             best_score_seen = top_score;
             stagnant_gens = 0;
@@ -1154,7 +1637,10 @@ pub fn evolve_search(
                 continue;
             }
             let sid = if gene.strategy_id.is_empty() {
-                format!("{:?}|{:?}|{:.3}|{:.3}", gene.indices, gene.weights, gene.long_threshold, gene.short_threshold)
+                format!(
+                    "{:?}|{:?}|{:.3}|{:.3}",
+                    gene.indices, gene.weights, gene.long_threshold, gene.short_threshold
+                )
             } else {
                 gene.strategy_id.clone()
             };
@@ -1166,8 +1652,16 @@ pub fn evolve_search(
 
         let elite_count = (population.max(2) as f32 * 0.2) as usize;
         let elite_count = elite_count.max(2).min(scored.len());
-        let elites: Vec<Gene> = scored.iter().take(elite_count).map(|(_, g, _)| g.clone()).collect();
-        best_metrics = scored.iter().take(elite_count).map(|(_, _, m)| *m).collect();
+        let elites: Vec<Gene> = scored
+            .iter()
+            .take(elite_count)
+            .map(|(_, g, _)| g.clone())
+            .collect();
+        best_metrics = scored
+            .iter()
+            .take(elite_count)
+            .map(|(_, _, m)| *m)
+            .collect();
 
         if gen + 1 == generations {
             seen_memory.flush();
@@ -1243,4 +1737,3 @@ pub fn evolve_search(
         metrics: best_metrics,
     })
 }
-

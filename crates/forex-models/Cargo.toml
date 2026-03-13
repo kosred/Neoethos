@@ -48,7 +48,8 @@ lightgbm = ["dep:lightgbm3"]
 lightgbm-gpu = ["lightgbm", "lightgbm3/gpu", "lightgbm3/cuda"]
 xgboost = ["dep:xgb"]
 catboost = ["dep:catboost-rust"]
-tree-models = ["lightgbm", "xgboost", "catboost"]
+tree-models-core = ["lightgbm", "xgboost"]
+tree-models = ["tree-models-core", "catboost"]
 
 # Burn backends - DISABLED temporarily
 # burn-ndarray-backend = ["burn", "burn-ndarray"]

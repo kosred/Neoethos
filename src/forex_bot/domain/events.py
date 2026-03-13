@@ -1,10 +1,11 @@
+from __future__ import annotations
+
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Union
 
 import numpy as np
-import pandas as pd
 
 
 @dataclass(slots=True)
@@ -18,25 +19,25 @@ class SignalResult:
     # HPC FIX: Use NumPy for zero-copy prob storage
     probs: np.ndarray | None = None  # [neutral, buy, sell] for the latest bar
 
-    trade_probability: pd.Series | None = None
-    stacking_confidence: pd.Series | None = None
-    regimes: pd.Series | None = None
-    uncertainty: pd.Series | None = None
-    recommended_rr: pd.Series | None = None
-    recommended_sl: pd.Series | None = None
-    win_probability: pd.Series | None = None
-    signals: pd.Series | None = None  # Full series for backtest
+    trade_probability: Any | None = None
+    stacking_confidence: Any | None = None
+    regimes: Any | None = None
+    uncertainty: Any | None = None
+    recommended_rr: Any | None = None
+    recommended_sl: Any | None = None
+    win_probability: Any | None = None
+    signals: Any | None = None  # Full series for backtest
 
 
 @dataclass(slots=True)
 class PreparedDataset:
     # HPC FIX: Strict typing for sharded data
-    X: Union[pd.DataFrame, np.ndarray]
-    y: Union[pd.Series, np.ndarray]
+    X: Union[Any, np.ndarray]
+    y: Union[Any, np.ndarray]
     index: Any  # DatetimeIndex
     feature_names: list[str]
-    metadata: pd.DataFrame | None = None  # OHLCV for backtesting
-    labels: pd.Series | None = None  # For training convenience
+    metadata: Any | None = None  # OHLCV for backtesting
+    labels: Any | None = None  # For training convenience
 
 
 @dataclass(slots=True)
@@ -80,3 +81,4 @@ class RiskEvent:
             "severity": self.severity,
             "context": self.context,
         }
+

@@ -5,7 +5,9 @@ import contextlib
 import inspect
 import json
 import logging
+from functools import lru_cache
 import os
+import pickle
 import shutil
 import time
 from pathlib import Path
@@ -13,7 +15,6 @@ from typing import Any
 import multiprocessing
 
 import numpy as np
-import pandas as pd
 
 from ..core.config import Settings
 from ..core.system import AutoTuner, HardwareProbe, resolve_cpu_budget, thread_limits
@@ -22,44 +23,196 @@ from .optimization import HyperparameterOptimizer
 
 logger = logging.getLogger(__name__)
 
+_PANDAS_FREE_MODEL_ALLOWLIST = {
+    "lightgbm",
+    "xgboost",
+    "xgboost_rf",
+    "xgboost_dart",
+    "catboost",
+    "catboost_alt",
+    # Numpy-native linear experts.
+    "elasticnet",
+    "bayes_logit",
+    "online_pa",
+    "online_hoeffding",
+    "vw",
+}
 
-def _load_memmap_dataset(dataset_dir: Path) -> tuple[pd.DataFrame, pd.Series]:
-    meta_path = dataset_dir / "meta.json"
+_RUST_TREE_BINDING_CLASSES = {
+    "lightgbm": "LightGBMModel",
+    "xgboost": "XGBoostModel",
+    "xgboost_rf": "XGBoostRFModel",
+    "xgboost_dart": "XGBoostDARTModel",
+    "catboost": "CatBoostModel",
+    "catboost_alt": "CatBoostAltModel",
+}
+
+_PANDAS_FREE_RUST_TREE_REQUIRED = set(_RUST_TREE_BINDING_CLASSES.keys())
+
+
+def _pandas_free_enabled() -> bool:
+    raw = str(os.environ.get("FOREX_BOT_PANDAS_FREE", "1") or "1").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _pandas_free_strict_enabled() -> bool:
+    raw = str(os.environ.get("FOREX_BOT_PANDAS_FREE_STRICT", "1") or "1").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+@lru_cache(maxsize=1)
+def _joblib_module():
+    import joblib  # type: ignore
+
+    return joblib
+
+
+def _load_metadata_artifact(path: Path) -> Any | None:
+    if not path.exists():
+        return None
+    # Prefer joblib because this project writes most artifacts with it.
+    with contextlib.suppress(Exception):
+        return _joblib_module().load(path)
+    # Fallback to stdlib pickle for plain pickle payloads.
+    with contextlib.suppress(Exception):
+        with path.open("rb") as fh:
+            return pickle.load(fh)
+    return None
+
+
+def _is_pandas_dataframe(value: Any) -> bool:
+    return bool(
+        hasattr(value, "columns")
+        and hasattr(value, "index")
+        and callable(getattr(value, "to_numpy", None))
+    )
+
+
+class _NumpyFrame:
+    """Minimal frame container used when slicing generic frame-like metadata."""
+
+    def __init__(self, data: dict[str, Any], index: Any, attrs: dict[str, Any] | None = None) -> None:
+        self._data = {str(k): np.asarray(v).reshape(-1) for k, v in data.items()}
+        self.index = np.asarray(index).reshape(-1)
+        self.columns = list(self._data.keys())
+        self.attrs = dict(attrs or {})
+
+    @property
+    def empty(self) -> bool:
+        return int(len(self.index)) <= 0
+
+    def __len__(self) -> int:
+        return int(len(self.index))
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        return self._data[str(key)]
+
+
+def _slice_frame_head(values: Any, n_rows: int) -> Any:
+    n = max(0, int(n_rows))
+    cols = list(getattr(values, "columns", []) or [])
+    if not cols:
+        return np.asarray(values)[:n]
+    out_data: dict[str, np.ndarray] = {}
+    for col in cols:
+        with contextlib.suppress(Exception):
+            raw = values[col]  # type: ignore[index]
+            vec = raw.to_numpy(copy=False) if hasattr(raw, "to_numpy") else np.asarray(raw)
+            out_data[str(col)] = np.asarray(vec).reshape(-1)[:n]
+    idx_obj = getattr(values, "index", None)
+    if idx_obj is None:
+        out_idx = np.arange(n, dtype=np.int64)
+    else:
+        idx_arr = np.asarray(idx_obj).reshape(-1)
+        out_idx = idx_arr[:n] if idx_arr.size >= n else np.arange(n, dtype=np.int64)
+    attrs = getattr(values, "attrs", None)
+    return _NumpyFrame(out_data, out_idx, attrs=(dict(attrs) if isinstance(attrs, dict) else None))
+
+
+def _slice_rows(values: Any, n_rows: int) -> Any:
+    n = max(0, int(n_rows))
+    if values is None:
+        return None
+    if isinstance(values, np.ndarray):
+        return values[:n]
+    if _is_pandas_dataframe(values):
+        with contextlib.suppress(Exception):
+            return values.take(np.arange(n, dtype=np.int64))
+        with contextlib.suppress(Exception):
+            base_idx = np.asarray(getattr(values, "index")).reshape(-1)
+            return values.loc[base_idx[:n]]
+    if hasattr(values, "columns") and hasattr(values, "__getitem__"):
+        with contextlib.suppress(Exception):
+            return _slice_frame_head(values, n)
+    arr = np.asarray(values)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    return arr[:n]
+
+
+def _rust_tree_model_available(model_name: str) -> bool:
+    cls_name = _RUST_TREE_BINDING_CLASSES.get(str(model_name))
+    if not cls_name:
+        return False
+    try:
+        import forex_bindings  # type: ignore
+
+        return hasattr(forex_bindings, cls_name)
+    except Exception:
+        return False
+
+
+def _load_memmap_arrays(dataset_dir: Path) -> tuple[np.ndarray, np.ndarray]:
     cols_path = dataset_dir / "columns.json"
     x_path = dataset_dir / "X.npy"
     y_path = dataset_dir / "y.npy"
-    idx_path = dataset_dir / "index.npy"
+    if not cols_path.exists() or not x_path.exists() or not y_path.exists():
+        raise FileNotFoundError(f"Dataset cache is incomplete: {dataset_dir}")
+    X_mm = np.load(x_path, mmap_mode="c")
+    y_mm = np.load(y_path, mmap_mode="c")
+    return np.asarray(X_mm), np.asarray(y_mm)
 
+
+def _load_memmap_dataset(dataset_dir: Path) -> tuple[Any, Any]:
+    cols_path = dataset_dir / "columns.json"
+    x_path = dataset_dir / "X.npy"
+    y_path = dataset_dir / "y.npy"
     if not cols_path.exists() or not x_path.exists() or not y_path.exists():
         raise FileNotFoundError(f"Dataset cache is incomplete: {dataset_dir}")
 
-    meta: dict[str, Any] = {}
-    try:
-        if meta_path.exists():
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except Exception:
-        meta = {}
+    X_mm, y_mm = _load_memmap_arrays(dataset_dir)
+    # Return numpy arrays only (frame-native mode).
+    return np.asarray(X_mm), np.asarray(y_mm)
 
-    cols = json.loads(cols_path.read_text(encoding="utf-8"))
-    # Copy-on-write keeps the backing file read-only but marks the array writeable, which
-    # avoids unnecessary copies in some downstream pipelines that require writeable inputs.
-    X_mm = np.load(x_path, mmap_mode="c")
-    y_mm = np.load(y_path, mmap_mode="c")
 
-    index = None
-    if idx_path.exists():
-        try:
-            idx_ns = np.load(idx_path, mmap_mode="r")
-            if str(meta.get("index_kind", "")).startswith("datetime"):
-                index = pd.to_datetime(idx_ns.astype(np.int64), utc=True)
-            else:
-                index = pd.Index(idx_ns)
-        except Exception:
-            index = None
+def _load_training_data(
+    dataset_dir: Path,
+    *,
+    model_name: str | None,
+    pandas_free: bool,
+) -> tuple[Any, Any, bool]:
+    """
+    Returns (X, y, uses_pandas_dataset).
+    """
+    # Always prefer frame-native path. pandas_free flag retained for API compat.
+    os.environ.setdefault("FOREX_BOT_TREE_BACKEND", "rust_strict")
+    if model_name is None:
+        X, y = _load_memmap_arrays(dataset_dir)
+        return X, y, False
 
-    X = pd.DataFrame(X_mm, columns=list(cols), index=index)
-    y = pd.Series(y_mm, index=X.index, dtype=np.int8)
-    return X, y
+    name = str(model_name)
+    if name in _PANDAS_FREE_MODEL_ALLOWLIST:
+        if name in _PANDAS_FREE_RUST_TREE_REQUIRED:
+            if _rust_tree_model_available(name):
+                X, y = _load_memmap_arrays(dataset_dir)
+                return X, y, False
+            raise RuntimeError(
+                f"Rust tree binding is required for model '{name}', but binding is missing."
+            )
+        # Non-tree allowlisted models consume numpy arrays directly.
+        X, y = _load_memmap_arrays(dataset_dir)
+        return X, y, False
+    raise RuntimeError(f"Rust tree workers do not support non-rust-tree model '{name}'.")
 
 
 def _pad_probs(p: Any) -> np.ndarray:
@@ -96,7 +249,7 @@ def _fit_accepts_metadata(model: Any) -> bool:
         return False
 
 
-def _predict_kwargs(model: Any, metadata: pd.DataFrame | None) -> dict[str, Any]:
+def _predict_kwargs(model: Any, metadata: Any | None) -> dict[str, Any]:
     kwargs: dict[str, Any] = {}
     if metadata is None:
         return kwargs
@@ -112,8 +265,8 @@ def _predict_kwargs(model: Any, metadata: pd.DataFrame | None) -> dict[str, Any]
 
 def _smoke_predict(
     model: Any,
-    sample_x: pd.DataFrame,
-    sample_meta: pd.DataFrame | None,
+    sample_x: Any,
+    sample_meta: Any | None,
 ) -> tuple[bool, str]:
     if sample_x is None or len(sample_x) == 0:
         return False, "empty sample"
@@ -139,8 +292,8 @@ def _roundtrip_smoke_check(
     best_params: dict[str, Any],
     idx: int,
     model: Any,
-    sample_x: pd.DataFrame,
-    sample_meta: pd.DataFrame | None,
+    sample_x: Any,
+    sample_meta: Any | None,
     out_dir: Path,
 ) -> tuple[bool, str]:
     if not _roundtrip_check_enabled():
@@ -199,13 +352,17 @@ def _train_single_model_process(args: tuple[str, str, str, int, int, int, str | 
         except Exception:
             pass
 
-        X, y = _load_memmap_dataset(Path(dataset_dir))
+        pandas_free = _pandas_free_enabled()
+        X, y, _uses_pandas_dataset = _load_training_data(
+            Path(dataset_dir),
+            model_name=model_name,
+            pandas_free=pandas_free,
+        )
         metadata = None
         if metadata_path:
             try:
                 meta_path = Path(metadata_path)
-                if meta_path.exists():
-                    metadata = pd.read_pickle(meta_path)
+                metadata = _load_metadata_artifact(meta_path)
             except Exception:
                 metadata = None
 
@@ -220,11 +377,9 @@ def _train_single_model_process(args: tuple[str, str, str, int, int, int, str | 
                 fit_kwargs["metadata"] = metadata
             model.fit(X, y, **fit_kwargs)
 
-        sample = X.iloc[: min(256, len(X))]
-        sample_meta = None
-        if metadata is not None and isinstance(metadata, pd.DataFrame):
-            with contextlib.suppress(Exception):
-                sample_meta = metadata.reindex(sample.index)
+        sample_n = min(256, len(X))
+        sample = _slice_rows(X, sample_n)
+        sample_meta = _slice_rows(metadata, sample_n) if metadata is not None else None
 
         ok, reason = _smoke_predict(model, sample, sample_meta)
         if not ok:
@@ -264,6 +419,30 @@ def run_worker(argv: list[str] | None = None) -> int:
     if not models:
         raise ValueError("No models provided for worker")
 
+    pandas_free = _pandas_free_enabled()
+    if pandas_free:
+        os.environ.setdefault("FOREX_BOT_TREE_BACKEND", "rust_strict")
+        kept: list[str] = []
+        for m in models:
+            if m not in _PANDAS_FREE_MODEL_ALLOWLIST:
+                continue
+            if m in _PANDAS_FREE_RUST_TREE_REQUIRED and not _rust_tree_model_available(m):
+                continue
+            kept.append(m)
+        dropped = [m for m in models if m not in _PANDAS_FREE_MODEL_ALLOWLIST]
+        dropped_missing = [
+            m
+            for m in models
+            if m in _PANDAS_FREE_RUST_TREE_REQUIRED and not _rust_tree_model_available(m)
+        ]
+        if dropped:
+            logger.info("[WORKER] Pandas-free mode: skipping unsupported model families: %s", dropped)
+        if dropped_missing:
+            logger.info("[WORKER] Pandas-free mode: skipping models without Rust bindings: %s", dropped_missing)
+        models = kept
+        if not models:
+            raise ValueError("Pandas-free mode has no compatible models to train.")
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -274,7 +453,11 @@ def run_worker(argv: list[str] | None = None) -> int:
     except Exception:
         # Worker can still proceed with safe defaults if probing fails.
         pass
-    X, y = _load_memmap_dataset(Path(args.dataset_dir))
+    X, y, _uses_pandas_dataset = _load_training_data(
+        Path(args.dataset_dir),
+        model_name=None,
+        pandas_free=pandas_free,
+    )
 
     optimizer = HyperparameterOptimizer(settings)
     best_params = optimizer.load_params()
@@ -302,8 +485,7 @@ def run_worker(argv: list[str] | None = None) -> int:
     if args.metadata_path:
         try:
             meta_path = Path(str(args.metadata_path))
-            if meta_path.exists():
-                metadata = pd.read_pickle(meta_path)
+            metadata = _load_metadata_artifact(meta_path)
         except Exception:
             metadata = None
 
@@ -335,11 +517,9 @@ def run_worker(argv: list[str] | None = None) -> int:
                     fit_kwargs["metadata"] = metadata
                 model.fit(X, y, **fit_kwargs)
 
-            sample = X.iloc[: min(256, len(X))]
-            sample_meta = None
-            if metadata is not None and isinstance(metadata, pd.DataFrame):
-                with contextlib.suppress(Exception):
-                    sample_meta = metadata.reindex(sample.index)
+            sample_n = min(256, len(X))
+            sample = _slice_rows(X, sample_n)
+            sample_meta = _slice_rows(metadata, sample_n) if metadata is not None else None
             ok, reason = _smoke_predict(model, sample, sample_meta)
             if not ok:
                 raise RuntimeError(f"inference smoke check failed: {reason}")
@@ -412,14 +592,14 @@ def run_worker(argv: list[str] | None = None) -> int:
                     executor.submit(train_single_model, idx, name): name
                     for idx, name in enumerate(models, start=1)
                 }
-            for future in as_completed(future_to_model):
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as e:
-                    model_name = future_to_model[future]
-                    logger.error(f"[WORKER] Exception training {model_name}: {e}")
-                    results.append((model_name, 0.0, False))
+                for future in as_completed(future_to_model):
+                    try:
+                        result = future.result()
+                        results.append(result)
+                    except Exception as e:
+                        model_name = future_to_model[future]
+                        logger.error(f"[WORKER] Exception training {model_name}: {e}")
+                        results.append((model_name, 0.0, False))
     else:
         # Sequential training (fallback for low-resource systems)
         logger.info("[WORKER] Sequential training mode (limited CPU resources)")
@@ -449,3 +629,4 @@ def run_worker(argv: list[str] | None = None) -> int:
 
     # Ensure artifacts exist for at least one model; otherwise signal failure.
     return 0 if trained else 2
+

@@ -1,5 +1,5 @@
 //! SIMD-optimized CPU validation for HPC mode (AVX2/FMA).
-//! 
+//!
 //! This module provides AVX2-optimized backtesting for CPU validation
 //! of strategies that pass initial GPU screening.
 
@@ -11,7 +11,7 @@ pub fn has_avx2() -> bool {
 }
 
 /// SIMD-optimized backtest using AVX2/FMA
-/// 
+///
 /// Computes equity curve from signals and returns.
 /// Returns final profit factor approximation.
 #[target_feature(enable = "avx2")]
@@ -52,7 +52,10 @@ pub unsafe fn backtest_simd(signals: &[i8], returns: &[f64]) -> f64 {
         let is_profit = _mm256_cmp_pd(pnl, zero, _CMP_GT_OQ);
 
         let profit = _mm256_and_pd(pnl, is_profit);
-        let loss = _mm256_and_pd(_mm256_sub_pd(zero, pnl), _mm256_cmp_pd(pnl, zero, _CMP_LT_OQ));
+        let loss = _mm256_and_pd(
+            _mm256_sub_pd(zero, pnl),
+            _mm256_cmp_pd(pnl, zero, _CMP_LT_OQ),
+        );
 
         sum_profit = _mm256_add_pd(sum_profit, profit);
         sum_loss = _mm256_add_pd(sum_loss, loss);
@@ -99,15 +102,11 @@ unsafe fn hsum256_pd(v: __m256d) -> f64 {
 }
 
 /// SIMD-optimized signal computation
-/// 
+///
 /// Computes weighted sum of features for multiple genes simultaneously
 #[target_feature(enable = "avx2")]
 #[target_feature(enable = "fma")]
-pub unsafe fn compute_signals_simd(
-    features: &[f32],
-    weights: &[f32],
-    threshold: f32,
-) -> i8 {
+pub unsafe fn compute_signals_simd(features: &[f32], weights: &[f32], threshold: f32) -> i8 {
     let n = features.len().min(weights.len());
     let chunks = n / 8;
     let remainder = n % 8;
@@ -148,18 +147,18 @@ unsafe fn hsum256_ps(v: __m256) -> f32 {
     let sum1 = _mm256_hadd_ps(v, v);
     // Sum again: [a+b+c+d, e+f+g+h, ...]
     let sum2 = _mm256_hadd_ps(sum1, sum1);
-    
+
     // Extract low and high 128-bit halves
     let low = _mm256_castps256_ps128(sum2);
     let high = _mm256_extractf128_ps(sum2, 1);
-    
+
     // Add halves
     let sum128 = _mm_add_ss(low, high);
     _mm_cvtss_f32(sum128)
 }
 
 /// Batch evaluation of multiple strategies using SIMD
-/// 
+///
 /// This is much faster for CPU validation of candidates
 pub fn batch_evaluate_simd(
     features: &[Vec<f32>],
@@ -192,16 +191,12 @@ pub fn batch_evaluate_simd(
         // Pre-extract features for this gene
         let gene_features: Vec<Vec<f32>> = features
             .iter()
-            .map(|sample| {
-                indices.iter().map(|&i| sample[i]).collect()
-            })
+            .map(|sample| indices.iter().map(|&i| sample[i]).collect())
             .collect();
 
         // Compute signals
         for (sample_idx, sample_features) in gene_features.iter().enumerate() {
-            let signal = unsafe {
-                compute_signals_simd(sample_features, weights, long_th)
-            };
+            let signal = unsafe { compute_signals_simd(sample_features, weights, long_th) };
             signals[sample_idx * n_genes + gene_idx] = signal;
         }
     }
@@ -333,10 +328,10 @@ mod tests {
     #[test]
     fn test_sharpe_ratio() {
         let returns = vec![0.01, -0.005, 0.02, -0.01, 0.015, -0.008, 0.012];
-        
+
         let simd_result = compute_sharpe_ratio(&returns);
         let scalar_result = compute_sharpe_scalar(&returns);
-        
+
         assert!((simd_result - scalar_result).abs() < 1e-10);
     }
 

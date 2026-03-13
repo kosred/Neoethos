@@ -67,11 +67,19 @@ pub fn run_discovery_cycle(
     )?;
 
     let mut candidates = search.genes;
-    candidates.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.sort_by(|a, b| {
+        b.fitness
+            .partial_cmp(&a.fitness)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let max_candidates = config.candidate_count.max(10).min(candidates.len());
     candidates.truncate(max_candidates);
 
-    let min_trades = min_trades_required(&features.timestamps, config.min_trades_per_day, features.data.nrows());
+    let min_trades = min_trades_required(
+        &features.timestamps,
+        config.min_trades_per_day,
+        features.data.nrows(),
+    );
     let mut filtered = Vec::new();
     let mut signals_map = Vec::new();
     for gene in &candidates {
@@ -103,7 +111,10 @@ pub fn run_discovery_cycle(
         }
     }
 
-    Ok(DiscoveryResult { portfolio, candidates })
+    Ok(DiscoveryResult {
+        portfolio,
+        candidates,
+    })
 }
 
 fn min_trades_required(timestamps: &[i64], min_trades_per_day: f64, n_rows: usize) -> usize {

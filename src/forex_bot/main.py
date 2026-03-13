@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import asyncio
 import logging
@@ -9,7 +11,9 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from forex_bot.core.config import Settings
+import numpy as np
+
+from forex_bot.core.config import Settings, apply_runtime_profile_defaults
 from forex_bot.core.logging import setup_logging
 from forex_bot.data.loader import DataLoader
 from forex_bot.execution.bot import ForexBot
@@ -17,6 +21,30 @@ from forex_bot.execution.bot import ForexBot
 # No DDP support here; we use internal ThreadPools for 8-GPU scaling.
 def maybe_init_distributed():
     return None
+
+
+def _index_to_datetime64_ns(index: Any) -> np.ndarray:
+    arr = np.asarray(index).reshape(-1)
+    if arr.size <= 0:
+        return np.zeros(0, dtype="datetime64[ns]")
+    if np.issubdtype(arr.dtype, np.datetime64):
+        return arr.astype("datetime64[ns]", copy=False)
+    if arr.dtype.kind in {"i", "u"}:
+        vals = arr.astype(np.int64, copy=False)
+        vmax = int(np.max(np.abs(vals))) if vals.size > 0 else 0
+        # Heuristic unit detection.
+        if vmax > 10**14:  # nanoseconds
+            return vals.astype("datetime64[ns]")
+        if vmax > 10**11:  # milliseconds
+            return vals.astype("datetime64[ms]").astype("datetime64[ns]")
+        return vals.astype("datetime64[s]").astype("datetime64[ns]")
+    if arr.dtype.kind == "f":
+        vals = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.int64, copy=False)
+        return vals.astype("datetime64[s]").astype("datetime64[ns]")
+    try:
+        return arr.astype("datetime64[ns]")
+    except Exception:
+        return np.arange(arr.size, dtype=np.int64).astype("datetime64[s]").astype("datetime64[ns]")
 
 
 def _detect_hpc_mode() -> bool:
@@ -95,9 +123,6 @@ def _export_onnx_from_saved_models(models_dir: Path) -> bool:
     try:
         import json
 
-        import numpy as np
-        import pandas as pd
-
         from forex_bot.training.persistence_service import PersistenceService
 
         models_dir = Path(models_dir)
@@ -122,7 +147,7 @@ def _export_onnx_from_saved_models(models_dir: Path) -> bool:
             logger.error("Cannot export ONNX: `feature_columns` missing/empty in run_summary.json")
             return False
 
-        sample = pd.DataFrame(np.zeros((1, len(cols)), dtype=np.float32), columns=[str(c) for c in cols])
+        sample = np.zeros((1, len(cols)), dtype=np.float32)
 
         logs_dir = Path(os.environ.get("FOREX_BOT_LOGS_DIR", "logs"))
         ps = PersistenceService(models_dir=models_dir, logs_dir=logs_dir)
@@ -267,9 +292,6 @@ async def _run_offline_backtest(base_settings: Settings, symbols: list[str]) -> 
     import json
     import time
 
-    import numpy as np
-    import pandas as pd
-
     from forex_bot.features.engine import SignalEngine
     from forex_bot.features.pipeline import FeatureEngineer
     from forex_bot.strategy.fast_backtest import (
@@ -328,14 +350,17 @@ async def _run_offline_backtest(base_settings: Settings, symbols: list[str]) -> 
         try:
             if {"close", "high", "low"}.issubset(set(df.columns)):
                 idx = df.index
-                if not isinstance(idx, pd.DatetimeIndex):
-                    idx = pd.to_datetime(idx, utc=True, errors="coerce")
-                month_idx = (idx.year.astype(np.int32) * 12 + idx.month.astype(np.int32)).to_numpy(dtype=np.int64)
-                day_idx = (
-                    idx.year.astype(np.int32) * 10000
-                    + idx.month.astype(np.int32) * 100
-                    + idx.day.astype(np.int32)
-                ).to_numpy(dtype=np.int64)
+                if hasattr(idx, "year") and hasattr(idx, "month") and hasattr(idx, "day"):
+                    month_idx = (idx.year.astype(np.int32) * 12 + idx.month.astype(np.int32)).to_numpy(dtype=np.int64)
+                    day_idx = (
+                        idx.year.astype(np.int32) * 10000
+                        + idx.month.astype(np.int32) * 100
+                        + idx.day.astype(np.int32)
+                    ).to_numpy(dtype=np.int64)
+                else:
+                    idx_ns = _index_to_datetime64_ns(idx)
+                    month_idx = idx_ns.astype("datetime64[M]").astype(np.int64, copy=False)
+                    day_idx = idx_ns.astype("datetime64[D]").astype(np.int64, copy=False)
 
                 pip_size, pip_value_per_lot = infer_pip_metrics(sym)
                 sl_cfg = getattr(base_settings.risk, "meta_label_sl_pips", None)
@@ -588,6 +613,14 @@ def parse_args():
         default=30,
         help="Per-model training time budget used with --quick-e2e (default: 30).",
     )
+    parser.add_argument(
+        "--runtime-profile",
+        choices=["rust_32gb", "rust_max", "rust", "rust32", "rust_safe", "rust_fast"],
+        help=(
+            "Apply grouped runtime defaults (Rust-first presets) before loading Settings. "
+            "Equivalent to setting FOREX_BOT_RUNTIME_PROFILE."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -623,6 +656,10 @@ async def main_async():
     ddp_rank = maybe_init_distributed()
 
     args = parse_args()
+    if getattr(args, "runtime_profile", None):
+        resolved = apply_runtime_profile_defaults(str(args.runtime_profile))
+        if resolved:
+            os.environ.setdefault("FOREX_BOT_RUNTIME_PROFILE", resolved)
     _apply_quick_e2e_env(args)
     setup_logging(verbose=args.verbose)
     logger = logging.getLogger(__name__)
@@ -743,7 +780,7 @@ async def main_async():
 
     stop_event = asyncio.Event()
     _install_signal_handlers(asyncio.get_running_loop(), stop_event)
-    listener = asyncio.create_task(_listen_for_escape(stop_event))
+    _listener = asyncio.create_task(_listen_for_escape(stop_event))
 
     if sys.platform == "win32":
         logger.info("Press ESC twice (within 2 seconds) to shutdown gracefully | Ctrl+C may not work in some terminals")
@@ -902,3 +939,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

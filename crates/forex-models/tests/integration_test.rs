@@ -51,7 +51,10 @@ fn test_hardware_detection() {
 
     let hw = HardwareInfo::detect();
     println!("Hardware detected:");
-    println!("  CPU cores: {} (logical: {})", hw.cpu_cores, hw.logical_cores);
+    println!(
+        "  CPU cores: {} (logical: {})",
+        hw.cpu_cores, hw.logical_cores
+    );
     println!("  RAM: {:.2} GB", hw.ram_gb);
     println!("  GPUs: {}", hw.gpu_count);
 

@@ -83,15 +83,15 @@ impl Default for SystemConfig {
             base_timeframe: "M1".to_string(),
             use_volume_features: true,
             higher_timeframes: vec![
-                "M1", "M2", "M3", "M4", "M5", "M6", "M10", "M12", "M15", "M20", "M30",
-                "H1", "H2", "H3", "H4", "H6", "H8", "H12", "D1", "W1", "MN1",
+                "M1", "M2", "M3", "M4", "M5", "M6", "M10", "M12", "M15", "M20", "M30", "H1", "H2",
+                "H3", "H4", "H6", "H8", "H12", "D1", "W1", "MN1",
             ]
             .into_iter()
             .map(String::from)
             .collect(),
             required_timeframes: vec![
-                "M1", "M2", "M3", "M4", "M5", "M6", "M10", "M12", "M15", "M20", "M30",
-                "H1", "H2", "H3", "H4", "H6", "H8", "H12", "D1", "W1", "MN1",
+                "M1", "M2", "M3", "M4", "M5", "M6", "M10", "M12", "M15", "M20", "M30", "H1", "H2",
+                "H3", "H4", "H6", "H8", "H12", "D1", "W1", "MN1",
             ]
             .into_iter()
             .map(String::from)

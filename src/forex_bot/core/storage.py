@@ -224,6 +224,11 @@ class StrategyLedger:
                         "mtf_confirmation": gene.mtf_confirmation,
                         "use_premium_discount": getattr(gene, "use_premium_discount", False),
                         "use_inducement": getattr(gene, "use_inducement", False),
+                        "use_bos": getattr(gene, "use_bos", False),
+                        "use_choch": getattr(gene, "use_choch", False),
+                        "use_eqh": getattr(gene, "use_eqh", False),
+                        "use_eql": getattr(gene, "use_eql", False),
+                        "use_displacement": getattr(gene, "use_displacement", False),
                     }
                 )
                 metrics_json = json.dumps(
@@ -289,6 +294,11 @@ class StrategyLedger:
                             mtf_confirmation=smc.get("mtf_confirmation", False),
                             use_premium_discount=smc.get("use_premium_discount", False),
                             use_inducement=smc.get("use_inducement", False),
+                            use_bos=smc.get("use_bos", False),
+                            use_choch=smc.get("use_choch", False),
+                            use_eqh=smc.get("use_eqh", False),
+                            use_eql=smc.get("use_eql", False),
+                            use_displacement=smc.get("use_displacement", False),
                         )
                         genes.append(gene)
                     except Exception:

@@ -8,12 +8,15 @@ import numpy as np
 import time
 from threading import Thread
 
-# Import Rust bindings (after building with: maturin develop --features tree-models)
+# Import Rust bindings (build core set without CatBoost: maturin develop --features tree-models-core)
 try:
     from forex_bindings import LightGBMModel
     RUST_AVAILABLE = True
 except ImportError:
-    print("Rust bindings not available. Build with: cd crates/forex-bindings && maturin develop --features tree-models")
+    print(
+        "Rust bindings not available. Build with: cd crates/forex-bindings && "
+        "maturin develop --features tree-models-core"
+    )
     RUST_AVAILABLE = False
 
 # For comparison

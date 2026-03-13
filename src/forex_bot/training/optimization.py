@@ -1,41 +1,45 @@
+from __future__ import annotations
+
 import asyncio
+import importlib
+import importlib.util
 import inspect
 import json
 import logging
 import os
-import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pandas as pd
 
-# Suppress noisy Ax SQL-storage compatibility warning before Ax imports.
-_ax_db_logger = logging.getLogger("ax.service.utils.with_db_settings_base")
-_ax_db_logger.setLevel(logging.ERROR)
-_ax_db_logger.disabled = True
+AX_AVAILABLE = importlib.util.find_spec("ax") is not None
+AxClient = None  # type: ignore[assignment]
+ObjectiveProperties = None  # type: ignore[assignment]
+AX_CLIENT_AVAILABLE = False
 
-try:
-    import ax  # type: ignore
-    AX_AVAILABLE = True
-except ImportError:
-    AX_AVAILABLE = False
 
-try:
-    from ax.service.ax_client import AxClient  # type: ignore
-    from ax.service.utils.instantiation import ObjectiveProperties  # type: ignore
-    AX_CLIENT_AVAILABLE = True
-except Exception:
-    AxClient = None
-    ObjectiveProperties = None
-    AX_CLIENT_AVAILABLE = False
+def _try_import_ax_client() -> bool:
+    global AxClient, ObjectiveProperties, AX_CLIENT_AVAILABLE
+    if AX_CLIENT_AVAILABLE:
+        return True
+    if not AX_AVAILABLE:
+        return False
+    try:
+        from ax.service.ax_client import AxClient as _AxClient  # type: ignore
+        from ax.service.utils.instantiation import ObjectiveProperties as _ObjectiveProperties  # type: ignore
+
+        AxClient = _AxClient
+        ObjectiveProperties = _ObjectiveProperties
+        AX_CLIENT_AVAILABLE = True
+        return True
+    except Exception:
+        return False
 
 try:
     import ray
     from ray import tune
     from ray.tune.schedulers import ASHAScheduler
     from ray.tune.search import ConcurrencyLimiter
-    from ray.tune.search.ax import AxSearch
 
     RAY_AVAILABLE = True
 except Exception:
@@ -43,8 +47,17 @@ except Exception:
     tune = None  # type: ignore
     ASHAScheduler = None  # type: ignore
     ConcurrencyLimiter = None  # type: ignore
-    AxSearch = None  # type: ignore
     RAY_AVAILABLE = False
+
+
+def _try_import_ax_search():
+    if not RAY_AVAILABLE:
+        return None
+    try:
+        mod = importlib.import_module("ray.tune.search.ax")
+        return getattr(mod, "AxSearch", None)
+    except Exception:
+        return None
 
 
 
@@ -79,6 +92,94 @@ else:
     from ..models.tide import TiDEExpert
 
 logger = logging.getLogger(__name__)
+try:
+    import forex_bindings as _fb  # type: ignore
+except Exception:
+    _fb = None  # type: ignore
+
+
+def _is_dataframe_like(values: Any) -> bool:
+    return bool(
+        hasattr(values, "columns")
+        and hasattr(values, "index")
+        and callable(getattr(values, "to_numpy", None))
+    )
+
+
+def _frame_columns(values: Any) -> list[str]:
+    cols = getattr(values, "columns", None)
+    if cols is None:
+        return []
+    try:
+        return [str(c) for c in list(cols)]
+    except Exception:
+        return []
+
+
+def _slice_frame_rows(values: Any, rows: np.ndarray) -> Any:
+    rows_arr = np.asarray(rows, dtype=np.int64).reshape(-1)
+    cols = _frame_columns(values)
+    if not cols:
+        return np.asarray(values)[rows_arr]
+    out: dict[str, np.ndarray] = {}
+    max_i = int(np.max(rows_arr)) if rows_arr.size > 0 else -1
+    for col in cols:
+        try:
+            vec = np.asarray(values[col]).reshape(-1)  # type: ignore[index]
+            if vec.size > max_i >= 0:
+                out[str(col)] = vec[rows_arr]
+            else:
+                out[str(col)] = vec
+        except Exception:
+            continue
+    idx = getattr(values, "index", None)
+    if idx is None:
+        out_idx = rows_arr.copy()
+    else:
+        idx_arr = np.asarray(idx).reshape(-1)
+        out_idx = idx_arr[rows_arr] if idx_arr.size > max_i >= 0 else rows_arr.copy()
+    attrs = getattr(values, "attrs", None)
+    try:
+        from .trainer import _NumpyFrame  # Local import to avoid module cycle at import time.
+
+        return _NumpyFrame(out, out_idx, attrs=(dict(attrs) if isinstance(attrs, dict) else None))
+    except Exception:
+        return {"index": out_idx, **out}
+
+
+def _rust_month_day_indices(index_like: Any, n_rows: int) -> tuple[np.ndarray, np.ndarray] | None:
+    if n_rows <= 0 or _fb is None or not hasattr(_fb, "derive_time_index_arrays"):
+        return None
+    try:
+        arr = np.asarray(index_like).reshape(-1)
+    except Exception:
+        return None
+    if arr.size != int(n_rows):
+        return None
+
+    try:
+        if np.issubdtype(arr.dtype, np.datetime64):
+            ns = arr.astype("datetime64[ns]").astype(np.int64, copy=False)
+        elif arr.dtype.kind in {"i", "u"}:
+            ns = arr.astype(np.int64, copy=False)
+        elif arr.dtype.kind == "f":
+            ns = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.int64, copy=False)
+        else:
+            return None
+    except Exception:
+        return None
+
+    try:
+        _unix_ms, month_idx, day_idx = _fb.derive_time_index_arrays(np.asarray(ns, dtype=np.int64))
+    except Exception:
+        return None
+    month_arr = np.asarray(month_idx, dtype=np.int64).reshape(-1)
+    day_arr = np.asarray(day_idx, dtype=np.int64).reshape(-1)
+    if month_arr.size != int(n_rows) or day_arr.size != int(n_rows):
+        return None
+    return month_arr, day_arr
+
+
 class HyperparameterOptimizer:
     """
     Auto-tunes model hyperparameters using Ray Tune + Ax/BoTorch (default).
@@ -96,10 +197,10 @@ class HyperparameterOptimizer:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.ray_dir = Path(cache_dir) / "ray_tune"
         self.ray_dir.mkdir(parents=True, exist_ok=True)
-        # FIX: Allow Ax standalone without Ray (Windows Python 3.13 compatibility)
-        self.available = AX_CLIENT_AVAILABLE or (RAY_AVAILABLE and AX_AVAILABLE)
-        self.use_ray = RAY_AVAILABLE and AX_AVAILABLE
-        self.meta_df: pd.DataFrame | None = None
+        # Only check package presence at startup; defer Ax import until optimization actually runs.
+        self.available = bool(AX_AVAILABLE)
+        self.use_ray = bool(RAY_AVAILABLE and AX_AVAILABLE)
+        self.meta_df: Any | None = None
         self.ray_max_concurrency = max(
             1, int(getattr(self.settings.models, "ray_tune_max_concurrency", 1) or 1)
         )
@@ -128,10 +229,8 @@ class HyperparameterOptimizer:
         elif self.hpo_backend != "none":
             if self.use_ray:
                 logger.info("HPO backend: Ray Tune + Ax (distributed Bayesian optimization)")
-            elif AX_CLIENT_AVAILABLE:
-                logger.info("HPO backend: Ax/BoTorch via AxClient (standalone, no Ray)")
             else:
-                logger.info("HPO backend: AxSearch (AxClient unavailable).")
+                logger.info("HPO backend: Ax standalone (lazy AxClient import).")
 
     def _should_stop(self) -> bool:
         try:
@@ -187,7 +286,179 @@ class HyperparameterOptimizer:
     def _ray_trials_for_model(self, name: str) -> int:
         return self._trials_for_model(name, apply_heuristics=True)
 
-    def _ax_search_space(self, name: str, y_train: pd.Series) -> list[dict[str, Any]]:
+    @staticmethod
+    def _nunique_labels(y: Any) -> int:
+        try:
+            arr = y.to_numpy() if hasattr(y, "to_numpy") else np.asarray(y)
+        except Exception:
+            arr = np.asarray(y)
+        arr = np.asarray(arr).reshape(-1)
+        if arr.size <= 0:
+            return 0
+        if arr.dtype.kind in {"f"}:
+            arr = arr[np.isfinite(arr)]
+        return int(np.unique(arr).size) if arr.size > 0 else 0
+
+    @staticmethod
+    def _slice_rows(values: Any, rows: np.ndarray) -> Any:
+        if _is_dataframe_like(values):
+            idx = np.asarray(rows, dtype=np.int64).reshape(-1)
+            try:
+                return values.take(idx)
+            except Exception:
+                try:
+                    base_idx = np.asarray(getattr(values, "index")).reshape(-1)
+                    return values.loc[base_idx[idx]]
+                except Exception:
+                    pass
+        if hasattr(values, "columns") and hasattr(values, "__getitem__"):
+            try:
+                return _slice_frame_rows(values, np.asarray(rows, dtype=np.int64))
+            except Exception:
+                pass
+        arr = np.asarray(values)
+        return arr[rows]
+
+    @staticmethod
+    def _meta_columns(meta: Any) -> set[str]:
+        if meta is None:
+            return set()
+        cols = getattr(meta, "columns", None)
+        if cols is not None:
+            try:
+                return {str(c) for c in cols}
+            except Exception:
+                return set()
+        if isinstance(meta, dict):
+            return {str(k) for k in meta.keys()}
+        return set()
+
+    @staticmethod
+    def _meta_len(meta: Any) -> int:
+        if meta is None:
+            return 0
+        if isinstance(meta, dict):
+            lengths: list[int] = []
+            for value in meta.values():
+                try:
+                    arr = np.asarray(value)
+                    if arr.ndim > 0:
+                        lengths.append(int(arr.shape[0]))
+                except Exception:
+                    continue
+            return int(max(lengths)) if lengths else 0
+        try:
+            return int(len(meta))
+        except Exception:
+            return 0
+
+    def _meta_slice(self, meta: Any, rows: np.ndarray) -> Any:
+        if meta is None:
+            return None
+        if isinstance(meta, dict):
+            out: dict[str, Any] = {}
+            max_i = int(np.max(rows)) if rows.size > 0 else -1
+            for key, value in meta.items():
+                try:
+                    arr = np.asarray(value)
+                    if arr.ndim <= 0:
+                        out[str(key)] = value
+                    elif arr.shape[0] > max_i >= 0:
+                        out[str(key)] = arr[rows]
+                    else:
+                        out[str(key)] = arr
+                except Exception:
+                    out[str(key)] = value
+            return out
+        try:
+            return self._slice_rows(meta, rows)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _meta_column(meta: Any, name: str, *, dtype: np.dtype = np.float64) -> np.ndarray | None:
+        if meta is None:
+            return None
+        col = None
+        try:
+            col = meta[name]
+        except Exception:
+            if isinstance(meta, dict):
+                col = meta.get(name)
+            elif hasattr(meta, "columns") and hasattr(meta, "__getitem__"):
+                target = str(name).strip().lower()
+                for col_name in _frame_columns(meta):
+                    if str(col_name).strip().lower() == target:
+                        try:
+                            col = meta[col_name]
+                            break
+                        except Exception:
+                            col = None
+        if col is None:
+            return None
+        try:
+            if hasattr(col, "to_numpy"):
+                arr = col.to_numpy(dtype=dtype, copy=False)
+            else:
+                arr = np.asarray(col, dtype=dtype)
+        except Exception:
+            arr = np.asarray(col)
+            arr = arr.astype(dtype, copy=False)
+        return np.asarray(arr, dtype=dtype).reshape(-1)
+
+    @staticmethod
+    def _meta_index(meta: Any) -> np.ndarray | None:
+        if meta is None:
+            return None
+        idx = getattr(meta, "index", None)
+        if idx is None and isinstance(meta, dict):
+            idx = meta.get("index")
+        if idx is None:
+            return None
+        arr = np.asarray(idx).reshape(-1)
+        return arr if arr.size > 0 else None
+
+    def _meta_month_day_indices(self, meta: Any, n_rows: int) -> tuple[np.ndarray, np.ndarray]:
+        month_idx = np.zeros(n_rows, dtype=np.int64)
+        day_idx = np.zeros(n_rows, dtype=np.int64)
+        if n_rows <= 0:
+            return month_idx, day_idx
+
+        idx = self._meta_index(meta)
+        if idx is None or idx.size != n_rows:
+            ts_raw = None
+            for key in ("timestamp", "time", "datetime", "date"):
+                col = self._meta_column(meta, key, dtype=np.float64)
+                if col is not None and col.size == n_rows:
+                    ts_raw = col
+                    break
+            if ts_raw is None:
+                return month_idx, day_idx
+            idx = np.asarray(ts_raw).reshape(-1)
+
+        rust = _rust_month_day_indices(idx, n_rows)
+        if rust is not None:
+            return rust
+
+        try:
+            arr = np.asarray(idx).reshape(-1)
+            if np.issubdtype(arr.dtype, np.datetime64):
+                dt = arr.astype("datetime64[ns]")
+            elif arr.dtype.kind in {"i", "u"}:
+                dt = arr.astype(np.int64, copy=False).astype("datetime64[ns]")
+            elif arr.dtype.kind == "f":
+                ints = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.int64, copy=False)
+                dt = ints.astype("datetime64[ns]")
+            else:
+                return month_idx, day_idx
+            month_idx = dt.astype("datetime64[M]").astype(np.int64, copy=False)
+            day_idx = dt.astype("datetime64[D]").astype(np.int64, copy=False)
+        except Exception:
+            month_idx = np.zeros(n_rows, dtype=np.int64)
+            day_idx = np.zeros(n_rows, dtype=np.int64)
+        return month_idx, day_idx
+
+    def _ax_search_space(self, name: str, y_train: Any) -> list[dict[str, Any]]:
         if name == "LightGBM":
             return [
                 {"name": "n_estimators", "type": "range", "bounds": [100, 1000], "value_type": "int"},
@@ -286,7 +557,7 @@ class HyperparameterOptimizer:
             return self.device_pool[0]
         return "cpu"
 
-    def _ray_create_model(self, name: str, params: dict[str, Any], device: str, y_train: pd.Series):
+    def _ray_create_model(self, name: str, params: dict[str, Any], device: str, y_train: Any):
         params = params.copy()
         if name == "TabNet":
             hidden = params.pop("hidden_dim", None)
@@ -294,8 +565,9 @@ class HyperparameterOptimizer:
                 params.setdefault("n_d", int(hidden))
                 params.setdefault("n_a", int(hidden))
         if name == "LightGBM":
-            params["objective"] = "binary" if y_train.nunique() == 2 else "multiclass"
-            params["num_class"] = int(y_train.nunique())
+            n_classes = max(2, self._nunique_labels(y_train))
+            params["objective"] = "binary" if n_classes == 2 else "multiclass"
+            params["num_class"] = int(n_classes)
             params["n_jobs"] = int(self._hpo_cpu_threads) if self._hpo_cpu_threads > 0 else -1
             if isinstance(device, str) and device.startswith("cuda:"):
                 try:
@@ -348,37 +620,46 @@ class HyperparameterOptimizer:
         except Exception:
             return params
 
-    def _infer_meta_trading_days(self, meta: pd.DataFrame | None) -> float | None:
+    def _infer_meta_trading_days(self, meta: Any | None) -> float | None:
         if meta is None:
             return None
         try:
-            ts: pd.DatetimeIndex | None
-            idx = getattr(meta, "index", None)
-            if isinstance(idx, pd.DatetimeIndex):
-                ts = idx
-            else:
-                ts = None
+            idx = self._meta_index(meta)
+            if idx is None:
                 for col in ("timestamp", "time", "datetime", "date"):
-                    if col in meta.columns:
-                        ts = pd.to_datetime(meta[col], utc=True, errors="coerce")
+                    raw = self._meta_column(meta, col, dtype=np.float64)
+                    if raw is not None and raw.size > 0:
+                        idx = np.asarray(raw).reshape(-1)
                         break
-            if ts is None:
+            if idx is None:
                 return None
-            ts = pd.DatetimeIndex(ts)
-            if ts.tz is not None:
-                ts = ts.tz_convert("UTC")
-            ts = ts[~ts.isna()]
-            if len(ts) == 0:
+            idx_arr = np.asarray(idx).reshape(-1)
+            if idx_arr.size <= 0:
                 return None
-            mask = ts.weekday < 5
+            if np.issubdtype(idx_arr.dtype, np.datetime64):
+                days = idx_arr.astype("datetime64[D]")
+            elif idx_arr.dtype.kind in {"i", "u"}:
+                days = idx_arr.astype(np.int64, copy=False).astype("datetime64[ns]").astype("datetime64[D]")
+            elif idx_arr.dtype.kind == "f":
+                ints = np.nan_to_num(idx_arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.int64, copy=False)
+                days = ints.astype("datetime64[ns]").astype("datetime64[D]")
+            else:
+                return None
+            valid = ~np.isnat(days)
+            if not np.any(valid):
+                return None
+            day_nums = days[valid].astype(np.int64, copy=False)
+            # 1970-01-01 is Thursday => weekday=(day_num+3)%7 with Monday=0.
+            weekdays = (day_nums + 3) % 7
+            mask = weekdays < 5
             if not np.any(mask):
                 return None
-            days = pd.unique(ts[mask].normalize())
-            return float(len(days))
+            uniq_days = np.unique(day_nums[mask])
+            return float(len(uniq_days))
         except Exception:
             return None
 
-    def _prop_required_trades(self, meta_val: pd.DataFrame | None) -> float:
+    def _prop_required_trades(self, meta_val: Any | None) -> float:
         base = float(self.prop_min_trades)
         if base <= 0:
             return 0.0
@@ -426,7 +707,7 @@ class HyperparameterOptimizer:
         self,
         y_true: np.ndarray,
         y_pred_proba: np.ndarray,
-        meta_val: pd.DataFrame | None,
+        meta_val: Any | None,
     ) -> dict[str, float]:
         y_true_arr = np.asarray(y_true, dtype=int)
         y_true_arr = np.where(y_true_arr == 2, -1, y_true_arr).astype(int, copy=False)
@@ -443,9 +724,9 @@ class HyperparameterOptimizer:
             }
         y_true_arr = y_true_arr[:n]
         probs = probs[:n]
-        if meta_val is not None and len(meta_val) != n:
+        if meta_val is not None and self._meta_len(meta_val) != n:
             try:
-                meta_val = meta_val.iloc[:n]
+                meta_val = self._meta_slice(meta_val, np.arange(n, dtype=np.int64))
             except Exception:
                 meta_val = None
 
@@ -456,7 +737,8 @@ class HyperparameterOptimizer:
         signals = np.where(trade_prob >= self.prop_conf_threshold, direction, 0).astype(np.int8, copy=False)
         acc = float(np.mean(signals.astype(int) == y_true_arr)) if len(y_true_arr) else 0.0
 
-        if meta_val is None or not {"close", "high", "low"}.issubset(set(meta_val.columns)):
+        meta_cols = self._meta_columns(meta_val)
+        if meta_val is None or not {"close", "high", "low"}.issubset(meta_cols):
             return {
                 "prop_score": float(acc),
                 "drawdown": 0.0,
@@ -477,38 +759,36 @@ class HyperparameterOptimizer:
         dd_limit = float(getattr(self.settings.risk, "total_drawdown_limit", 0.08))
         daily_dd_limit = float(getattr(self.settings.risk, "daily_drawdown_limit", 0.04) or 0.04)
 
-        close_all = meta_val["close"].to_numpy()
-        high_all = meta_val["high"].to_numpy()
-        low_all = meta_val["low"].to_numpy()
-        atr_all = meta_val["atr"].to_numpy() if "atr" in meta_val.columns else None
+        close_all = self._meta_column(meta_val, "close", dtype=np.float64)
+        high_all = self._meta_column(meta_val, "high", dtype=np.float64)
+        low_all = self._meta_column(meta_val, "low", dtype=np.float64)
+        if close_all is None or high_all is None or low_all is None:
+            return {
+                "prop_score": float(acc),
+                "drawdown": 0.0,
+                "daily_dd": 0.0,
+                "accuracy": float(acc),
+                "trades": 0.0,
+            }
+        n_meta = int(min(close_all.size, high_all.size, low_all.size, len(signals)))
+        if n_meta <= 0:
+            return {
+                "prop_score": float(acc),
+                "drawdown": 0.0,
+                "daily_dd": 0.0,
+                "accuracy": float(acc),
+                "trades": 0.0,
+            }
+        close_all = close_all[:n_meta]
+        high_all = high_all[:n_meta]
+        low_all = low_all[:n_meta]
+        signals = signals[:n_meta]
+        y_true_arr = y_true_arr[:n_meta]
+        atr_all = self._meta_column(meta_val, "atr", dtype=np.float64)
+        if atr_all is not None:
+            atr_all = atr_all[:n_meta]
 
-        month_indices_all = np.zeros(len(meta_val), dtype=np.int64)
-        day_indices_all = np.zeros(len(meta_val), dtype=np.int64)
-        try:
-            ts: pd.DatetimeIndex | None
-            idx = getattr(meta_val, "index", None)
-            if isinstance(idx, pd.DatetimeIndex):
-                ts = idx
-            else:
-                ts = None
-                for col in ("timestamp", "time", "datetime", "date"):
-                    if col in meta_val.columns:
-                        ts = pd.DatetimeIndex(pd.to_datetime(meta_val[col], utc=True, errors="coerce"))
-                        break
-            if ts is not None and len(ts) == len(meta_val):
-                if ts.tz is not None:
-                    ts = ts.tz_convert("UTC")
-                raw = ts.year.to_numpy() * 12 + ts.month.to_numpy()
-                month_indices_all = np.nan_to_num(raw, nan=0.0).astype(np.int64, copy=False)
-                day_raw = (
-                    ts.year.to_numpy() * 10000
-                    + ts.month.to_numpy() * 100
-                    + ts.day.to_numpy()
-                )
-                day_indices_all = np.nan_to_num(day_raw, nan=0.0).astype(np.int64, copy=False)
-        except Exception:
-            month_indices_all = np.zeros(len(meta_val), dtype=np.int64)
-            day_indices_all = np.zeros(len(meta_val), dtype=np.int64)
+        month_indices_all, day_indices_all = self._meta_month_day_indices(meta_val, n_meta)
 
         try:
             days_per_month = float(os.environ.get("FOREX_BOT_TRADING_DAYS_PER_MONTH", "21") or 21.0)
@@ -539,10 +819,10 @@ class HyperparameterOptimizer:
                 penalty *= max(0.1, monthly_ret / min_monthly)
             return float(penalty)
 
-        sym_series = meta_val["symbol"] if "symbol" in meta_val.columns else None
+        sym_series = self._meta_column(meta_val, "symbol", dtype=np.str_) if "symbol" in meta_cols else None
         if sym_series is not None:
-            sym_arr = np.asarray(sym_series)
-            uniq_syms = pd.unique(sym_arr)
+            sym_arr = np.asarray(sym_series).reshape(-1)[:n_meta]
+            uniq_syms = np.unique(sym_arr)
             total_trades = 0.0
             weighted_score = 0.0
             weighted_monthly = 0.0
@@ -564,10 +844,10 @@ class HyperparameterOptimizer:
                 pip_size, pip_value_per_lot = infer_pip_metrics(str(sym))
                 if sl_cfg is None or float(sl_cfg) <= 0:
                     atr_vals = atr_all[mask] if atr_all is not None else None
+                    open_all = self._meta_column(meta_val, "open", dtype=np.float64)
+                    open_vals = open_all[mask] if open_all is not None and open_all.size >= n_meta else close
                     auto = infer_sl_tp_pips_auto(
-                        open_prices=meta_val["open"].to_numpy(dtype=np.float64)[mask]
-                        if "open" in meta_val.columns
-                        else close,
+                        open_prices=open_vals,
                         high_prices=high,
                         low_prices=low,
                         close_prices=close,
@@ -647,10 +927,13 @@ class HyperparameterOptimizer:
 
         pip_size, pip_value_per_lot = infer_pip_metrics(getattr(self.settings.system, "symbol", ""))
         if sl_cfg is None or float(sl_cfg) <= 0:
+            open_all = self._meta_column(meta_val, "open", dtype=np.float64)
+            if open_all is not None and open_all.size >= n_meta:
+                open_prices = open_all[:n_meta]
+            else:
+                open_prices = close_all
             auto = infer_sl_tp_pips_auto(
-                open_prices=meta_val["open"].to_numpy(dtype=np.float64)
-                if "open" in meta_val.columns
-                else close_all,
+                open_prices=open_prices,
                 high_prices=high_all,
                 low_prices=low_all,
                 close_prices=close_all,
@@ -718,7 +1001,7 @@ class HyperparameterOptimizer:
             "profit_factor": float(profit_factor),
         }
 
-    def _objective_base(self, y_true: np.ndarray, y_pred_proba: np.ndarray, meta_val: pd.DataFrame | None) -> float:
+    def _objective_base(self, y_true: np.ndarray, y_pred_proba: np.ndarray, meta_val: Any | None) -> float:
         metrics = self._objective_metrics(y_true, y_pred_proba, meta_val)
         return float(metrics.get("prop_score", 0.0))
 
@@ -726,11 +1009,11 @@ class HyperparameterOptimizer:
         self,
         config: dict[str, Any],
         model_name: str,
-        X_train: pd.DataFrame,
-        y_train: pd.Series,
-        X_val: pd.DataFrame,
-        y_val: pd.Series,
-        meta_val: pd.DataFrame | None,
+        X_train: Any,
+        y_train: Any,
+        X_val: Any,
+        y_val: Any,
+        meta_val: Any | None,
     ) -> None:
         if self._should_stop():
             tune.report(prop_score=-1e9, drawdown=1.0, daily_dd=1.0, accuracy=0.0, trades=0.0)
@@ -755,13 +1038,17 @@ class HyperparameterOptimizer:
     def _ray_tune_model(
         self,
         name: str,
-        X_train: pd.DataFrame,
-        y_train: pd.Series,
-        X_val: pd.DataFrame,
-        y_val: pd.Series,
-        meta_val: pd.DataFrame | None,
+        X_train: Any,
+        y_train: Any,
+        X_val: Any,
+        y_val: Any,
+        meta_val: Any | None,
     ) -> dict[str, Any]:
         if not (RAY_AVAILABLE and AX_AVAILABLE):
+            return {}
+        AxSearch = _try_import_ax_search()
+        if AxSearch is None:
+            logger.warning("Ray AxSearch is unavailable; skipping Ray+Ax tuning for %s.", name)
             return {}
         space = self._ax_search_space(name, y_train)
         if not space:
@@ -771,15 +1058,15 @@ class HyperparameterOptimizer:
             max_rows = int(getattr(self.settings.models, "hpo_max_rows", 200_000) or 0)
             if max_rows > 0 and len(X_train) > max_rows:
                 idx_train = np.linspace(0, len(X_train) - 1, max_rows, dtype=int)
-                X_train = X_train.iloc[idx_train]
-                y_train = y_train.iloc[idx_train]
+                X_train = self._slice_rows(X_train, idx_train)
+                y_train = self._slice_rows(y_train, idx_train)
             if max_rows > 0 and len(X_val) > max_rows:
                 idx_val = np.linspace(0, len(X_val) - 1, max_rows, dtype=int)
-                X_val = X_val.iloc[idx_val]
-                y_val = y_val.iloc[idx_val]
+                X_val = self._slice_rows(X_val, idx_val)
+                y_val = self._slice_rows(y_val, idx_val)
                 if meta_val is not None:
                     try:
-                        meta_val = meta_val.iloc[idx_val]
+                        meta_val = self._meta_slice(meta_val, idx_val)
                     except Exception:
                         meta_val = None
 
@@ -787,14 +1074,14 @@ class HyperparameterOptimizer:
         daily_dd_limit = float(getattr(self.settings.risk, "daily_drawdown_limit", 0.04) or 0.04)
         outcome_constraints = []
         strict_constraints = str(os.environ.get("FOREX_BOT_HPO_STRICT_CONSTRAINTS", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
-        if strict_constraints and meta_val is not None and {"close", "high", "low"}.issubset(set(meta_val.columns)):
+        if strict_constraints and meta_val is not None and {"close", "high", "low"}.issubset(self._meta_columns(meta_val)):
             outcome_constraints = [
                 f"drawdown <= {dd_limit}",
                 f"daily_dd <= {daily_dd_limit}",
             ]
 
         ax_search = None
-        if AX_CLIENT_AVAILABLE and AxClient is not None:
+        if _try_import_ax_client() and AxClient is not None:
             try:
                 ax_client = AxClient()
                 ax_client.create_experiment(
@@ -933,17 +1220,18 @@ class HyperparameterOptimizer:
 
         if name == "LightGBM":
             best_config = best_config.copy()
-            best_config["objective"] = "binary" if y_train.nunique() == 2 else "multiclass"
-            best_config["num_class"] = int(y_train.nunique())
+            n_classes = max(2, self._nunique_labels(y_train))
+            best_config["objective"] = "binary" if n_classes == 2 else "multiclass"
+            best_config["num_class"] = int(n_classes)
         return best_config
 
     async def _optimize_all_ray_tune_async(
         self,
-        X_train: pd.DataFrame,
-        y_train: pd.Series,
-        X_val: pd.DataFrame,
-        y_val: pd.Series,
-        meta_val: pd.DataFrame | None,
+        X_train: Any,
+        y_train: Any,
+        X_val: Any,
+        y_val: Any,
+        meta_val: Any | None,
     ) -> dict[str, dict[str, Any]]:
         logger.info(f"HPC HPO: Launching parallel tuning for all models across {len(self.device_pool)} GPUs...")
         best_params: dict[str, dict[str, Any]] = {}
@@ -981,14 +1269,14 @@ class HyperparameterOptimizer:
 
     def _optimize_all_ax_standalone(
         self,
-        X_train: pd.DataFrame,
-        y_train: pd.Series,
-        X_val: pd.DataFrame,
-        y_val: pd.Series,
-        meta_val: pd.DataFrame | None,
+        X_train: Any,
+        y_train: Any,
+        X_val: Any,
+        y_val: Any,
+        meta_val: Any | None,
     ) -> dict[str, Any]:
         """Standalone Ax optimization using AxClient (no Ray required)."""
-        if not AX_CLIENT_AVAILABLE:
+        if not _try_import_ax_client() or AxClient is None or ObjectiveProperties is None:
             logger.warning("AxClient not available, skipping HPO")
             return {}
 
@@ -1063,11 +1351,11 @@ class HyperparameterOptimizer:
         self,
         model_name: str,
         config: dict,
-        X_train: pd.DataFrame,
-        y_train: pd.Series,
-        X_val: pd.DataFrame,
-        y_val: pd.Series,
-        meta_val: pd.DataFrame | None,
+        X_train: Any,
+        y_train: Any,
+        X_val: Any,
+        y_val: Any,
+        meta_val: Any | None,
     ) -> dict[str, float]:
         """Evaluate a single trial configuration."""
         device = self.default_device
@@ -1090,9 +1378,9 @@ class HyperparameterOptimizer:
 
     def optimize_all(
         self,
-        X: pd.DataFrame,
-        y: pd.Series,
-        meta_df: pd.DataFrame | None = None,  # noqa: N803
+        X: Any,
+        y: Any,
+        meta_df: Any | None = None,  # noqa: N803
         stop_event: Any | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Run optimization for all supported models."""
@@ -1109,11 +1397,11 @@ class HyperparameterOptimizer:
         cap = int(getattr(self.settings.models, "hpo_max_rows", 0) or 0)
         if cap > 0 and len(X) > cap:
             idx = np.arange(len(X) - cap, len(X))
-            X = X.iloc[idx]
-            y = y.iloc[idx]
+            X = self._slice_rows(X, idx)
+            y = self._slice_rows(y, idx)
             if self.meta_df is not None:
                 try:
-                    self.meta_df = self.meta_df.iloc[idx]
+                    self.meta_df = self._meta_slice(self.meta_df, idx)
                 except Exception:
                     self.meta_df = None
 
@@ -1130,25 +1418,27 @@ class HyperparameterOptimizer:
         embargo_size = max(50, max_hold)
         val_start = min(len(X), split_idx + embargo_size)
 
-        X_train = X.iloc[:split_idx]
-        y_train = y.iloc[:split_idx]
-
-        X_val = X.iloc[val_start:]
-        y_val = y.iloc[val_start:]
+        train_rows = np.arange(split_idx, dtype=np.int64)
+        val_rows = np.arange(val_start, len(X), dtype=np.int64)
+        X_train = self._slice_rows(X, train_rows)
+        y_train = self._slice_rows(y, train_rows)
+        X_val = self._slice_rows(X, val_rows)
+        y_val = self._slice_rows(y, val_rows)
 
         if len(X_val) < 100:
             logger.info("Validation set too small after embargo. Reducing embargo/split.")
             # Fallback: just use standard split if dataset is tiny
-            X_val = X.iloc[split_idx:]
-            y_val = y.iloc[split_idx:]
+            val_rows = np.arange(split_idx, len(X), dtype=np.int64)
+            X_val = self._slice_rows(X, val_rows)
+            y_val = self._slice_rows(y, val_rows)
 
         meta_val = None
         if self.meta_df is not None:
             try:
                 meta_val = (
-                    self.meta_df.iloc[val_start:]
+                    self._meta_slice(self.meta_df, np.arange(val_start, len(X), dtype=np.int64))
                     if len(X_val) == (len(X) - val_start)
-                    else self.meta_df.iloc[split_idx:]
+                    else self._meta_slice(self.meta_df, np.arange(split_idx, len(X), dtype=np.int64))
                 )
             except Exception:
                 meta_val = None
@@ -1158,10 +1448,10 @@ class HyperparameterOptimizer:
                 "HPO objective: accuracy-only (no OHLC metadata). "
                 "Trial values will not reflect profitability in this mode."
             )
-        elif not {"close", "high", "low"}.issubset(set(meta_val.columns)):
+        elif not {"close", "high", "low"}.issubset(self._meta_columns(meta_val)):
             logger.info(
                 "HPO objective: accuracy-only (metadata missing OHLC columns). "
-                f"Columns={sorted(set(meta_val.columns))}"
+                f"Columns={sorted(self._meta_columns(meta_val))}"
             )
         else:
             dd_limit = float(getattr(self.settings.risk, "total_drawdown_limit", 0.08))
@@ -1206,3 +1496,4 @@ class HyperparameterOptimizer:
             except Exception as e:
                 logger.error(f"Failed to load best_params.json: {e}")
         return {}
+

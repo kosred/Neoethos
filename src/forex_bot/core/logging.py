@@ -1,8 +1,6 @@
-import json
 import logging
 import os
 import queue
-from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler, QueueHandler, QueueListener
 from pathlib import Path
 

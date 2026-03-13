@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import os
 from pathlib import Path
@@ -5,7 +7,6 @@ from typing import Any
 
 import joblib
 import numpy as np
-import pandas as pd
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -27,6 +28,44 @@ logger = logging.getLogger(__name__)
 # Re-use Block definition or import?
 # For file isolation, better to redefine or import from common 'deep_utils.py'.
 # I will redefine to keep files standalone as requested.
+
+
+def _is_dataframe_like(value: Any) -> bool:
+    return bool(hasattr(value, "columns") and hasattr(value, "index"))
+
+
+def _slice_rows(value: Any, start: int, end: int) -> Any:
+    s = max(0, int(start))
+    e = max(s, int(end))
+    if _is_dataframe_like(value):
+        idx = np.arange(s, e, dtype=np.int64)
+        try:
+            return value.take(idx)
+        except Exception:
+            try:
+                base_idx = np.asarray(getattr(value, "index")).reshape(-1)
+                return value.loc[base_idx[idx]]
+            except Exception:
+                pass
+    arr = np.asarray(value)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    return arr[s:e]
+
+
+def _to_1d_int_labels(value: Any) -> np.ndarray:
+    if hasattr(value, "to_numpy"):
+        try:
+            arr = value.to_numpy(copy=False)
+        except Exception:
+            arr = np.asarray(value)
+    else:
+        arr = np.asarray(value)
+    arr = np.asarray(arr).reshape(-1)
+    if arr.size <= 0:
+        return np.zeros(0, dtype=np.int64)
+    arr = np.nan_to_num(arr.astype(np.float64, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+    return arr.astype(np.int64, copy=False)
 
 
 class NBeatsBlock(nn.Module):
@@ -117,7 +156,7 @@ class NBeatsExpert(ExpertModel):
         model, self.device, self.is_ddp, self.rank, self.world_size = wrap_ddp(model, self.device)
         return model
 
-    def fit(self, X: pd.DataFrame, y: pd.Series, tensorboard_writer: Any | None = None) -> None:
+    def fit(self, X: Any, y: Any, tensorboard_writer: Any | None = None) -> None:
         self.input_dim = X.shape[1]
         self.model = self._build_model()
 
@@ -133,12 +172,12 @@ class NBeatsExpert(ExpertModel):
             except Exception as e:
                 logger.warning(f"torch.compile failed for NBeats GPU: {e}")
 
-        y_vals = y.to_numpy()
+        y_vals = _to_1d_int_labels(y)
         if not np.all(np.isin(y_vals, [-1, 0, 1])):
             raise ValueError(f"Labels must be in {{-1, 0, 1}}, got: {np.unique(y_vals)}")
 
         split = int(len(X) * 0.85)
-        X_train, X_val = X.iloc[:split], X.iloc[split:]
+        X_train, X_val = _slice_rows(X, 0, split), _slice_rows(X, split, len(X))
         y_train, y_val = y_vals[:split], y_vals[split:]
 
         # HPC FIX: Unified Protocol Mapping
@@ -286,7 +325,7 @@ class NBeatsExpert(ExpertModel):
             if empty_cache:
                 torch.cuda.empty_cache()
 
-    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, X: Any) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("NBeats GPU model not loaded")
         self.model.eval()
@@ -294,7 +333,7 @@ class NBeatsExpert(ExpertModel):
         is_cuda = str(self.device).startswith("cuda")
         with torch.inference_mode():
             for start in range(0, len(X), self.PRED_BATCH_SIZE):
-                xb_df = X.iloc[start : start + self.PRED_BATCH_SIZE]
+                xb_df = _slice_rows(X, start, start + self.PRED_BATCH_SIZE)
                 xb = torch.as_tensor(dataframe_to_float32_numpy(xb_df), dtype=torch.float32, device=self.device)
                 with torch.amp.autocast("cuda", enabled=is_cuda):
                     logits = self.model(xb)
@@ -337,3 +376,6 @@ class NBeatsExpert(ExpertModel):
             except TypeError as exc:
                 raise RuntimeError("PyTorch too old for weights_only load; upgrade for security.") from exc
             target.load_state_dict(state)
+
+
+

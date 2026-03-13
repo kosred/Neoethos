@@ -46,8 +46,9 @@ def test_get_model_class_prefers_rust_catboost_when_available(monkeypatch):
     reg._CLASS_CACHE.clear()
 
 
-def test_get_model_class_falls_back_to_python_catboost_when_rust_missing(monkeypatch):
+def test_get_model_class_raises_when_rust_catboost_missing(monkeypatch):
     reg._CLASS_CACHE.clear()
+    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE", "0")
     monkeypatch.setenv("FOREX_BOT_TREE_BACKEND", "auto")
     monkeypatch.setattr(reg, "_use_rust_tree_models", lambda name=None: True)
 
@@ -65,6 +66,34 @@ def test_get_model_class_falls_back_to_python_catboost_when_rust_missing(monkeyp
         raise ImportError(module_name)
 
     monkeypatch.setattr(reg.importlib, "import_module", _fake_import)
-    cls = reg.get_model_class("catboost", prefer_gpu=False)
-    assert cls is _PyCat
+    try:
+        reg.get_model_class("catboost", prefer_gpu=False)
+        assert False, "Expected Rust-only tree loading to raise when Rust class is missing."
+    except ImportError as exc:
+        assert "Rust tree model is required" in str(exc)
     reg._CLASS_CACHE.clear()
+
+
+def test_get_model_class_raises_in_rust_strict_mode(monkeypatch):
+    reg._CLASS_CACHE.clear()
+    monkeypatch.setenv("FOREX_BOT_TREE_BACKEND", "rust_strict")
+    monkeypatch.setattr(reg, "_use_rust_tree_models", lambda name=None: True)
+
+    class _RustCatMissing:
+        _model_cls = None
+
+    def _fake_import(module_name: str, package: str | None = None):
+        if module_name == ".trees_rust":
+            return types.SimpleNamespace(RustCatBoostExpert=_RustCatMissing)
+        if module_name == ".trees":
+            return types.SimpleNamespace(CatBoostExpert=object())
+        raise ImportError(module_name)
+
+    monkeypatch.setattr(reg.importlib, "import_module", _fake_import)
+    try:
+        reg.get_model_class("catboost", prefer_gpu=False)
+        assert False, "Expected strict mode to raise when Rust binding class is missing."
+    except ImportError as exc:
+        assert "Rust tree model is required" in str(exc)
+    finally:
+        reg._CLASS_CACHE.clear()

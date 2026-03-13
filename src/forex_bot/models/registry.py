@@ -85,14 +85,43 @@ _RUST_TREE_MAPPING = {
     "catboost_alt": "RustCatBoostAltExpert",
 }
 
+_STRICT_RUNTIME_REDIRECTS = {
+    # Legacy neuralforecast keys are routed to native experts.
+    # In strict Rust/frame-native runtime, avoid legacy tabular conversion paths.
+    "patchtst": "transformer",
+    "timesnet": "transformer",
+    "tide_nf": "tide",
+    "nbeatsx_nf": "nbeats",
+}
+
+
+def _strict_rust_mode_enabled() -> bool:
+    rust_only = str(os.environ.get("FOREX_BOT_RUST_ONLY", "") or "").strip().lower()
+    if rust_only in {"1", "true", "yes", "on"}:
+        return True
+    pandas_free = str(os.environ.get("FOREX_BOT_PANDAS_FREE", "1") or "1").strip().lower()
+    if pandas_free in {"1", "true", "yes", "on"}:
+        return True
+    backend = str(os.environ.get("FOREX_BOT_TREE_BACKEND", "auto") or "auto").strip().lower()
+    return backend in {"rust_strict", "strict_rust", "rust-only", "rust_only"}
+
+
+def _resolve_runtime_model_name(name: str) -> str:
+    canonical = _normalize_model_name(name)
+    if not _strict_rust_mode_enabled():
+        return canonical
+    return _STRICT_RUNTIME_REDIRECTS.get(canonical, canonical)
+
 
 def _use_rust_tree_models(model_name: str | None = None) -> bool:
     """Return True if Rust tree bindings should be preferred for the model."""
     raw = os.environ.get("FOREX_BOT_TREE_BACKEND", "auto").strip().lower()
-    force_rust = raw in {"rust", "1", "true", "yes", "on"}
+    strict_rust = _strict_rust_mode_enabled()
+    force_rust = raw in {"rust", "1", "true", "yes", "on"} or strict_rust
     if raw in {"rust", "1", "true", "yes", "on"}:
         pass
-    if raw in {"python", "py", "0", "false", "no", "off"}:
+    # In strict runtime, do not allow python backend override.
+    if raw in {"python", "py", "0", "false", "no", "off"} and not strict_rust:
         return False
     # auto (or rust): try to detect bindings and feature coverage.
     try:
@@ -123,10 +152,15 @@ def register_model(name: str, module_path: str, class_name: str) -> None:
 
 def get_model_class(name: str, prefer_gpu: bool = False) -> Type['ExpertModel']:
     """Thread-safe lazy-imports the requested model class."""
-    canonical_name = _normalize_model_name(name)
+    requested_name = _normalize_model_name(name)
+    canonical_name = _resolve_runtime_model_name(requested_name)
     with _REGISTRY_LOCK:
+        if requested_name in _CLASS_CACHE:
+            return _CLASS_CACHE[requested_name]
         if canonical_name in _CLASS_CACHE:
-            return _CLASS_CACHE[canonical_name]
+            cls = _CLASS_CACHE[canonical_name]
+            _CLASS_CACHE[requested_name] = cls
+            return cls
         
         if canonical_name not in MODEL_MAPPING:
             raise ValueError(f"Model '{name}' not found in registry.")
@@ -149,29 +183,14 @@ def get_model_class(name: str, prefer_gpu: bool = False) -> Type['ExpertModel']:
             cls = getattr(module, class_name)
             if rust_requested and getattr(cls, "_model_cls", None) is None:
                 raise ImportError(f"Rust bindings missing class for {canonical_name}")
+            _CLASS_CACHE[requested_name] = cls
             _CLASS_CACHE[canonical_name] = cls
             return cls
         except Exception as e:
             if rust_requested:
-                # Rust bindings failed; fall back to Python implementation.
-                base_module, base_class = MODEL_MAPPING[canonical_name]
-                try:
-                    module = importlib.import_module(f".{base_module}", package="forex_bot.models")
-                    cls = getattr(module, base_class)
-                    _CLASS_CACHE[canonical_name] = cls
-                    logger.warning(
-                        "Rust bindings unavailable for '%s' (error: %s); using Python model.",
-                        canonical_name,
-                        e,
-                    )
-                    return cls
-                except Exception as py_exc:
-                    logger.error(
-                        "Python fallback import failed for '%s' after Rust error: %s",
-                        canonical_name,
-                        py_exc,
-                    )
-                    raise ImportError(f"Could not load model {canonical_name}") from py_exc
+                raise ImportError(
+                    f"Rust tree model is required for '{canonical_name}' but Rust bindings are unavailable."
+                ) from e
 
             # If GPU module import fails, try CPU implementation as fallback.
             if canonical_name in {"kan", "nbeats", "tabnet", "tide"} and module_name.endswith("_gpu"):
@@ -179,6 +198,7 @@ def get_model_class(name: str, prefer_gpu: bool = False) -> Type['ExpertModel']:
                     cpu_module = module_name.replace("_gpu", "")
                     module = importlib.import_module(f".{cpu_module}", package="forex_bot.models")
                     cls = getattr(module, class_name)
+                    _CLASS_CACHE[requested_name] = cls
                     _CLASS_CACHE[canonical_name] = cls
                     logger.warning(
                         "Falling back to CPU model for '%s' after GPU import failure: %s",

@@ -29,7 +29,7 @@ impl HardwareInfo {
     /// This is what Python needed multiprocessing to emulate
     pub fn detect() -> Self {
         let cpu_cores = num_cpus::get();
-        let cpu_cores_usable = cpu_cores.saturating_sub(1).max(1); // Reserve 1 for OS 
+        let cpu_cores_usable = cpu_cores.saturating_sub(1).max(1); // Reserve 1 for OS
 
         let (gpu_count, gpu_names, gpu_memory_gb, compute_capabilities) = Self::detect_gpus();
 

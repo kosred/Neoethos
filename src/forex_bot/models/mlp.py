@@ -7,7 +7,6 @@ from typing import Any
 
 import joblib
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -17,6 +16,7 @@ from .base import (
     EarlyStopper,
     ExpertModel,
     compute_class_weights,
+    dataframe_to_float32_numpy,
     get_early_stop_params,
     time_series_train_val_split,
     validate_time_ordering,
@@ -80,7 +80,7 @@ class MLPExpert(ExpertModel):
         # No special reshape needed; exists to let ONNX exporter target self.model.
         return x
 
-    def fit(self, x: pd.DataFrame, y: pd.Series) -> None:
+    def fit(self, x: Any, y: Any) -> None:
         if x is None or len(x) == 0:
             return
         try:
@@ -88,7 +88,7 @@ class MLPExpert(ExpertModel):
         except Exception:
             pass
 
-        x_arr = x.astype(np.float32).to_numpy()
+        x_arr = dataframe_to_float32_numpy(x)
         y_arr = np.asarray(y, dtype=int)
         y_arr = np.where(y_arr == -1, 2, y_arr).astype(int, copy=False)
 
@@ -98,14 +98,14 @@ class MLPExpert(ExpertModel):
             y_arr = y_arr[-max_rows:]
 
         x_train, x_val, y_train, y_val = time_series_train_val_split(
-            x,
-            pd.Series(y_arr, index=x.index),
+            x_arr,
+            y_arr,
             val_ratio=0.15,
             min_train_samples=100,
-            embargo_samples=max(10, int(len(x) * 0.005)),
+            embargo_samples=max(10, int(len(x_arr) * 0.005)),
         )
-        x_train_arr = x_train.astype(np.float32).to_numpy()
-        x_val_arr = x_val.astype(np.float32).to_numpy()
+        x_train_arr = np.asarray(x_train, dtype=np.float32)
+        x_val_arr = np.asarray(x_val, dtype=np.float32)
         y_train_arr = np.asarray(y_train, dtype=int)
         y_val_arr = np.asarray(y_val, dtype=int)
 
@@ -206,13 +206,13 @@ class MLPExpert(ExpertModel):
         if self._ddp and hasattr(self.model, "module"):
             self.model = self.model.module  # unwrap for saving
 
-    def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, x: Any) -> np.ndarray:
         if self.model is None:
             return np.zeros((len(x), 3))
         dev = torch.device(self.device)
         self.model.to(dev)
         self.model.eval()
-        x_arr = x.astype(np.float32).to_numpy()
+        x_arr = dataframe_to_float32_numpy(x)
         probs: list[np.ndarray] = []
         bs = self.PRED_BATCH_SIZE
         with torch.no_grad():
@@ -266,3 +266,5 @@ class MLPExpert(ExpertModel):
             self.model.load_state_dict(state)
         except Exception as exc:
             logger.warning(f"Failed to load MLP model: {exc}")
+
+

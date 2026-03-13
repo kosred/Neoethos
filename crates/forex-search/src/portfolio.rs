@@ -236,14 +236,8 @@ mod tests {
         let optimizer = PortfolioOptimizer::default();
         let symbols = vec!["EURUSD".to_string(), "GBPUSD".to_string()];
         let mut map = HashMap::new();
-        map.insert(
-            "EURUSD".to_string(),
-            metrics(vec![0.01; 20], 1.2, 0.55),
-        );
-        map.insert(
-            "GBPUSD".to_string(),
-            metrics(vec![0.02; 20], 1.0, 0.52),
-        );
+        map.insert("EURUSD".to_string(), metrics(vec![0.01; 20], 1.2, 0.55));
+        map.insert("GBPUSD".to_string(), metrics(vec![0.02; 20], 1.0, 0.52));
 
         let alloc = optimizer.get_optimal_allocation(&symbols, &map);
         assert_eq!(alloc.len(), 2);

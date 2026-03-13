@@ -1,26 +1,42 @@
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Any, Iterable
 
 import numpy as np
-import pandas as pd
+
+try:
+    import forex_bindings as _fb
+except Exception:  # pragma: no cover
+    _fb = None
 
 
-def remap_labels_neutral_buy_sell(y: pd.Series | np.ndarray) -> np.ndarray:
+def remap_labels_neutral_buy_sell(y: Any | np.ndarray) -> np.ndarray:
     """
     Canonical 3-class mapping used by linear/xgboost paths:
     -1 (sell) -> 2, 0 (neutral) -> 0, 1 (buy) -> 1
     """
+    if _fb is not None and hasattr(_fb, "remap_labels_neutral_buy_sell"):
+        try:
+            out = _fb.remap_labels_neutral_buy_sell(np.asarray(y, dtype=np.int64).reshape(-1))
+            return np.asarray(out, dtype=int).reshape(-1)
+        except Exception:
+            pass
     arr = np.asarray(y, dtype=int)
     out = np.where(arr == -1, 2, arr).astype(int, copy=False)
     return np.clip(out, 0, 2)
 
 
-def remap_labels_sell_neutral_buy(y: pd.Series | np.ndarray) -> np.ndarray:
+def remap_labels_sell_neutral_buy(y: Any | np.ndarray) -> np.ndarray:
     """
     Canonical 3-class mapping used by tree/rust paths:
     -1 (sell) -> 0, 0 (neutral) -> 1, 1 (buy) -> 2
     """
+    if _fb is not None and hasattr(_fb, "remap_labels_sell_neutral_buy"):
+        try:
+            out = _fb.remap_labels_sell_neutral_buy(np.asarray(y, dtype=np.int64).reshape(-1))
+            return np.asarray(out, dtype=int).reshape(-1)
+        except Exception:
+            pass
     arr = np.asarray(y, dtype=int)
     out = np.zeros_like(arr, dtype=int)
     out[arr == -1] = 0
@@ -34,6 +50,12 @@ def margins_to_probs(decision: np.ndarray) -> np.ndarray:
     Convert decision margins to probability matrix.
     Binary margins map to 3-class output with sell near-zero.
     """
+    if _fb is not None and hasattr(_fb, "margins_to_probs"):
+        try:
+            out = _fb.margins_to_probs(np.asarray(decision, dtype=np.float64))
+            return np.asarray(out, dtype=float)
+        except Exception:
+            pass
     dec = np.asarray(decision, dtype=float)
     if dec.ndim == 1:
         p1 = 1.0 / (1.0 + np.exp(-np.clip(dec, -30, 30)))
@@ -88,3 +110,4 @@ def probs_to_three_class(
     rs = out.sum(axis=1, keepdims=True)
     rs = np.where(rs <= 0, 1.0, rs)
     return out / rs
+

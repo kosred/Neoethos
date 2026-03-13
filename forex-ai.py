@@ -295,7 +295,9 @@ def bootstrap():
 
     # 1.2 Python Dependencies
     try:
-        import pandas
+        import importlib
+
+        importlib.import_module("pandas")
         import pydantic
         # GPU-specific deps are optional on Windows for local CPU testing
         if platform.system().lower() != "windows":

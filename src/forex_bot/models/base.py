@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Base classes and utilities for machine learning models.
 
@@ -15,11 +17,43 @@ from collections.abc import Callable
 from typing import Any
 
 import numpy as np
-import pandas as pd
 
 from ..core.system import resolve_cpu_budget
 
+try:
+    import forex_bindings as _fb
+except Exception:  # pragma: no cover
+    _fb = None
+
 logger = logging.getLogger(__name__)
+
+
+def _is_dataframe_like(obj: Any) -> bool:
+    return bool(hasattr(obj, "columns") and hasattr(obj, "index"))
+
+
+def _is_frame_like(obj: Any) -> bool:
+    return bool(hasattr(obj, "columns") and hasattr(obj, "__getitem__"))
+
+
+def _slice_frame_rows(obj: Any, start: int, end: int | None = None) -> dict[str, Any]:
+    s = max(0, int(start))
+    e = None if end is None else max(s, int(end))
+    cols = getattr(obj, "columns", None)
+    names: list[str] = []
+    if cols is not None:
+        with contextlib.suppress(Exception):
+            names = [str(c) for c in list(cols)]
+    out: dict[str, Any] = {}
+    for col in names:
+        with contextlib.suppress(Exception):
+            vec = np.asarray(obj[col]).reshape(-1)  # type: ignore[index]
+            out[col] = vec[s:e] if e is not None else vec[s:]
+    idx = getattr(obj, "index", None)
+    if idx is not None:
+        idx_arr = np.asarray(idx).reshape(-1)
+        out["index"] = idx_arr[s:e] if e is not None else idx_arr[s:]
+    return out
 
 
 class EarlyStopper:
@@ -72,12 +106,12 @@ class ExpertModel(abc.ABC):
     """Abstract base class for all expert models."""
 
     @abc.abstractmethod
-    def fit(self, x: pd.DataFrame, y: pd.Series) -> None:
+    def fit(self, x: Any, y: Any) -> None:
         """Train the model."""
         pass
 
     @abc.abstractmethod
-    def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, x: Any) -> np.ndarray:
         """Predict probabilities for classes [-1, 0, 1].
 
         Returns:
@@ -126,20 +160,25 @@ class ExpertModel(abc.ABC):
             raise RuntimeError(f"Atomic save failed for {target_path}: {e}") from e
 
 
-def dataframe_to_float32_numpy(df: pd.DataFrame) -> np.ndarray:
+def dataframe_to_float32_numpy(df: Any) -> np.ndarray:
     """
     Convert a DataFrame to a float32 NumPy array suitable for torch.
 
     Pandas Copy-on-Write can return read-only views; torch warns about creating tensors
     from non-writable arrays. We only copy when needed.
     """
-    arr = df.to_numpy(dtype=np.float32, copy=False)
+    if hasattr(df, "to_numpy"):
+        arr = df.to_numpy(dtype=np.float32, copy=False)
+    else:
+        arr = np.asarray(df, dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
     if not arr.flags.writeable:
         arr = arr.copy()
     return arr
 
 
-def validate_time_ordering(df: pd.DataFrame, context: str = "") -> bool:
+def validate_time_ordering(df: Any, context: str = "") -> bool:
     """
     Validate that DataFrame index is monotonically increasing (time-ordered).
 
@@ -147,8 +186,8 @@ def validate_time_ordering(df: pd.DataFrame, context: str = "") -> bool:
 
     Parameters
     ----------
-    df : pd.DataFrame
-        DataFrame with DatetimeIndex or sortable index
+    df : array-like or DataFrame-like
+        Data with DatetimeIndex-like or sortable index
     context : str
         Context string for error messages
 
@@ -184,13 +223,74 @@ def validate_time_ordering(df: pd.DataFrame, context: str = "") -> bool:
     return True
 
 
+def _slice_rows(obj: Any, start: int, end: int | None = None) -> Any:
+    if obj is None:
+        return None
+    if _is_dataframe_like(obj):
+        n = int(len(obj))
+        s = max(0, int(start))
+        e = n if end is None else min(n, max(s, int(end)))
+        return _slice_by_indices(obj, list(np.arange(s, e, dtype=np.int64)))
+    if _is_frame_like(obj):
+        return _slice_frame_rows(obj, start, end)
+    arr = np.asarray(obj)
+    if arr.ndim == 0:
+        return arr
+    if end is None:
+        return arr[start:]
+    return arr[start:end]
+
+
+def _slice_by_indices(obj: Any, indices: list[int]) -> Any:
+    if obj is None:
+        return None
+    if _is_dataframe_like(obj):
+        arr_idx = np.asarray(indices, dtype=np.int64).reshape(-1)
+        with contextlib.suppress(Exception):
+            return obj.take(arr_idx)
+        with contextlib.suppress(Exception):
+            base_idx = np.asarray(getattr(obj, "index")).reshape(-1)
+            return obj.loc[base_idx[arr_idx]]
+    if _is_frame_like(obj):
+        cols = getattr(obj, "columns", None)
+        names: list[str] = []
+        if cols is not None:
+            with contextlib.suppress(Exception):
+                names = [str(c) for c in list(cols)]
+        out: dict[str, Any] = {}
+        arr_idx = np.asarray(indices, dtype=np.int64)
+        for col in names:
+            with contextlib.suppress(Exception):
+                vec = np.asarray(obj[col]).reshape(-1)  # type: ignore[index]
+                out[col] = vec[arr_idx]
+        idx = getattr(obj, "index", None)
+        if idx is not None:
+            idx_arr = np.asarray(idx).reshape(-1)
+            out["index"] = idx_arr[arr_idx]
+        return out
+    arr = np.asarray(obj)
+    if arr.ndim == 0:
+        return arr
+    return arr[indices]
+
+
+def _to_1d_numpy(y: Any) -> np.ndarray:
+    if hasattr(y, "to_numpy"):
+        arr = y.to_numpy(copy=False)
+    else:
+        arr = np.asarray(y)
+    if arr.ndim == 0:
+        return np.asarray([arr.item()])
+    return arr.reshape(-1)
+
+
 def time_series_train_val_split(
-    X: pd.DataFrame,
-    y: pd.Series,
+    X: Any,
+    y: Any,
     val_ratio: float = 0.15,
     min_train_samples: int = 100,
     embargo_samples: int = 300, # HPC FIX: Guaranteed memory flush
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+) -> tuple[Any, Any, Any, Any]:
     """
     Splits data for time-series training with an embargo gap.
     """
@@ -203,21 +303,21 @@ def time_series_train_val_split(
         embargo_samples = min(embargo_samples, max(100, n // 10))
         train_end = n - val_size - embargo_samples
         
-    X_train = X.iloc[:train_end]
-    y_train = y.iloc[:train_end]
+    X_train = _slice_rows(X, 0, train_end)
+    y_train = _slice_rows(y, 0, train_end)
     
-    X_val = X.iloc[train_end + embargo_samples:]
-    y_val = y.iloc[train_end + embargo_samples:]
+    X_val = _slice_rows(X, train_end + embargo_samples, None)
+    y_val = _slice_rows(y, train_end + embargo_samples, None)
     
     return X_train, X_val, y_train, y_val
 
 
 def stratified_downsample(
-    X: pd.DataFrame,
-    y: pd.Series,
+    X: Any,
+    y: Any,
     max_samples: int,
     random_state: int = 42,
-) -> tuple[pd.DataFrame, pd.Series]:
+) -> tuple[Any, Any]:
     """
     Downsample data while preserving class distribution.
 
@@ -226,9 +326,9 @@ def stratified_downsample(
 
     Parameters
     ----------
-    X : pd.DataFrame
+    X : array-like or DataFrame-like
         Feature matrix
-    y : pd.Series
+    y : array-like
         Labels
     max_samples : int
         Maximum samples to keep (0 = no limit)
@@ -244,17 +344,18 @@ def stratified_downsample(
         return X, y
 
     rng = np.random.default_rng(random_state)
+    y_arr = _to_1d_numpy(y)
 
     # Group by class
     class_indices: dict[Any, list[int]] = {}
-    for idx, label in enumerate(y):
+    for idx, label in enumerate(y_arr):
         label_key = int(label) if isinstance(label, (int, float, np.integer, np.floating)) else label
         if label_key not in class_indices:
             class_indices[label_key] = []
         class_indices[label_key].append(idx)
 
     # Calculate samples per class (proportional)
-    total = len(y)
+    total = len(y_arr)
     sampled_indices: list[int] = []
 
     for _label, indices in class_indices.items():
@@ -278,8 +379,8 @@ def stratified_downsample(
     # Sort to maintain temporal order
     sampled_indices.sort()
 
-    X_out = X.iloc[sampled_indices]
-    y_out = y.iloc[sampled_indices]
+    X_out = _slice_by_indices(X, sampled_indices)
+    y_out = _slice_by_indices(y, sampled_indices)
 
     logger.info(
         f"Downsampled from {len(X)} to {len(X_out)} samples "
@@ -289,7 +390,7 @@ def stratified_downsample(
     return X_out, y_out
 
 
-def compute_class_weights(y: pd.Series | np.ndarray) -> dict[int, float]:
+def compute_class_weights(y: Any) -> dict[int, float]:
     """
     Compute balanced class weights for imbalanced classification.
 
@@ -305,21 +406,30 @@ def compute_class_weights(y: pd.Series | np.ndarray) -> dict[int, float]:
     dict
         Mapping from class label to weight
     """
-    y_arr = np.asarray(y)
+    y_arr = _to_1d_numpy(y)
+    if y_arr.size == 0:
+        return {}
+
+    if _fb is not None and hasattr(_fb, "balanced_class_weights"):
+        try:
+            classes, weights = _fb.balanced_class_weights(np.asarray(y_arr, dtype=np.int64).reshape(-1))
+            cls_arr = np.asarray(classes, dtype=np.int64).reshape(-1)
+            weight_arr = np.asarray(weights, dtype=np.float64).reshape(-1)
+            return {int(cls): float(weight) for cls, weight in zip(cls_arr, weight_arr, strict=False)}
+        except Exception:
+            pass
+
     unique, counts = np.unique(y_arr, return_counts=True)
     n_samples = len(y_arr)
     n_classes = len(unique)
-
-    weights = {}
-    for cls, count in zip(unique, counts, strict=False):
-        if count > 0:
-            # sklearn-style balanced weight
-            weights[int(cls)] = n_samples / (n_classes * count)
-
-    return weights
+    return {
+        int(cls): float(n_samples / (n_classes * count))
+        for cls, count in zip(unique, counts, strict=False)
+        if count > 0
+    }
 
 
-def compute_sample_weights(y: pd.Series | np.ndarray) -> np.ndarray:
+def compute_sample_weights(y: Any) -> np.ndarray:
     """
     Compute per-sample weights based on class frequency.
 
@@ -333,8 +443,18 @@ def compute_sample_weights(y: pd.Series | np.ndarray) -> np.ndarray:
     np.ndarray
         Weight for each sample
     """
-    class_weights = compute_class_weights(y)
-    y_arr = np.asarray(y)
+    y_arr = _to_1d_numpy(y)
+    if y_arr.size == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    if _fb is not None and hasattr(_fb, "sample_weights_from_labels"):
+        try:
+            out = _fb.sample_weights_from_labels(np.asarray(y_arr, dtype=np.int64).reshape(-1))
+            return np.asarray(out, dtype=np.float32).reshape(-1)
+        except Exception:
+            pass
+
+    class_weights = compute_class_weights(y_arr)
 
     sample_weights = np.ones(len(y_arr), dtype=np.float32)
     for cls, weight in class_weights.items():
@@ -344,8 +464,8 @@ def compute_sample_weights(y: pd.Series | np.ndarray) -> np.ndarray:
 
 
 def detect_feature_drift(
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
+    train_df: Any,
+    val_df: Any,
     threshold: float = 0.1,
     method: str = "psi",
 ) -> dict[str, Any]:
@@ -357,9 +477,9 @@ def detect_feature_drift(
 
     Parameters
     ----------
-    train_df : pd.DataFrame
+    train_df : array-like or DataFrame-like
         Training features
-    val_df : pd.DataFrame
+    val_df : array-like or DataFrame-like
         Validation/test features
     threshold : float
         Drift threshold (PSI > threshold indicates significant drift)
@@ -387,12 +507,31 @@ def detect_feature_drift(
             "critical": False,
         }
 
-    # Find common numeric columns
-    common_cols = list(set(train_df.columns) & set(val_df.columns))
-    numeric_cols = [
-        c for c in common_cols
-        if train_df[c].dtype.kind in ('f', 'i') and val_df[c].dtype.kind in ('f', 'i')
-    ]
+    has_columns = hasattr(train_df, "columns") and hasattr(val_df, "columns")
+    if has_columns:
+        common_cols = list(set(train_df.columns) & set(val_df.columns))
+        numeric_cols: list[Any] = []
+        for c in common_cols:
+            try:
+                lhs = train_df[c]
+                rhs = val_df[c]
+                lhs_arr = lhs.to_numpy(copy=False) if hasattr(lhs, "to_numpy") else np.asarray(lhs)
+                rhs_arr = rhs.to_numpy(copy=False) if hasattr(rhs, "to_numpy") else np.asarray(rhs)
+                if np.issubdtype(np.asarray(lhs_arr).dtype, np.number) and np.issubdtype(
+                    np.asarray(rhs_arr).dtype, np.number
+                ):
+                    numeric_cols.append(c)
+            except Exception:
+                continue
+    else:
+        train_arr = np.asarray(train_df)
+        val_arr = np.asarray(val_df)
+        if train_arr.ndim == 1:
+            train_arr = train_arr.reshape(-1, 1)
+        if val_arr.ndim == 1:
+            val_arr = val_arr.reshape(-1, 1)
+        n_cols = min(int(train_arr.shape[1]), int(val_arr.shape[1])) if train_arr.ndim == 2 and val_arr.ndim == 2 else 0
+        numeric_cols = [f"feature_{i}" for i in range(n_cols)]
 
     if not numeric_cols:
         return {
@@ -409,11 +548,12 @@ def detect_feature_drift(
     
     # Increase threshold if market is overall volatile
     vol_scale = 1.0
-    with contextlib.suppress(Exception):
-        if "realized_vol" in train_df.columns:
-            # If current vol is 2x historical, allow 2x more drift
-            vol_scale = max(1.0, val_df["realized_vol"].mean() / (train_df["realized_vol"].mean() + 1e-9))
-            
+    if has_columns:
+        with contextlib.suppress(Exception):
+            if "realized_vol" in train_df.columns:
+                # If current vol is 2x historical, allow 2x more drift
+                vol_scale = max(1.0, val_df["realized_vol"].mean() / (train_df["realized_vol"].mean() + 1e-9))
+             
     threshold = base_threshold * vol_scale
 
     drift_scores: dict[str, float] = {}
@@ -421,10 +561,27 @@ def detect_feature_drift(
 
     import concurrent.futures
     
+    def _extract_column_values(frame: Any, col: Any) -> np.ndarray:
+        if has_columns:
+            data = frame[col]
+            if hasattr(data, "dropna"):
+                data = data.dropna()
+            if hasattr(data, "to_numpy"):
+                return np.asarray(data.to_numpy(copy=False), dtype=np.float64)
+            return np.asarray(data, dtype=np.float64)
+        idx = int(str(col).split("_")[-1])
+        arr = np.asarray(frame)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        if idx >= arr.shape[1]:
+            return np.asarray([], dtype=np.float64)
+        out = np.asarray(arr[:, idx], dtype=np.float64)
+        return out[np.isfinite(out)]
+
     def _check_col(col):
         try:
-            train_vals = train_df[col].dropna().values
-            val_vals = val_df[col].dropna().values
+            train_vals = _extract_column_values(train_df, col)
+            val_vals = _extract_column_values(val_df, col)
             if len(train_vals) < 10 or len(val_vals) < 10:
                 return None
             score = _compute_psi(train_vals, val_vals) if method == "psi" else _compute_stats_drift(train_vals, val_vals)
@@ -552,3 +709,5 @@ def _compute_stats_drift(train_vals: np.ndarray, val_vals: np.ndarray) -> float:
         result = mean_shift + abs(1.0 - std_ratio)
         return float(np.nan_to_num(result, nan=0.0))
     return 0.0
+
+

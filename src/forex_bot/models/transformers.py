@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import os
 from pathlib import Path
@@ -5,7 +7,6 @@ from typing import Any  # Added this import
 
 import joblib
 import numpy as np
-import pandas as pd
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -25,6 +26,142 @@ from .device import (
 from ..core.system import resolve_cpu_budget
 
 logger = logging.getLogger(__name__)
+
+
+def _is_dataframe_like(value: Any) -> bool:
+    return bool(hasattr(value, "columns") and hasattr(value, "index"))
+
+
+class _ArrayFrame:
+    def __init__(self, values: np.ndarray, columns: list[str], index: Any | None = None) -> None:
+        arr = np.asarray(values, dtype=np.float32)
+        if arr.ndim == 0:
+            arr = arr.reshape(1, 1)
+        elif arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        elif arr.ndim > 2:
+            arr = arr.reshape(arr.shape[0], -1)
+        self._values = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        self.columns = [str(c) for c in list(columns)]
+        if len(self.columns) != int(self._values.shape[1]):
+            self.columns = [f"f{i}" for i in range(int(self._values.shape[1]))]
+        if index is None:
+            self.index = np.arange(int(self._values.shape[0]), dtype=np.int64)
+        else:
+            idx = np.asarray(index).reshape(-1)
+            if idx.size == int(self._values.shape[0]):
+                self.index = idx
+            else:
+                self.index = np.arange(int(self._values.shape[0]), dtype=np.int64)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return int(self._values.shape[0]), int(self._values.shape[1])
+
+    def __len__(self) -> int:
+        return int(self._values.shape[0])
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        k = str(key)
+        try:
+            idx = self.columns.index(k)
+        except ValueError as exc:
+            raise KeyError(k) from exc
+        return self._values[:, idx]
+
+    def to_numpy(self, dtype: Any | None = None, copy: bool = False) -> np.ndarray:
+        out = self._values.copy() if copy else self._values
+        if dtype is not None:
+            out = out.astype(dtype, copy=False)
+        return out
+
+    def copy(self) -> "_ArrayFrame":
+        return _ArrayFrame(self._values.copy(), list(self.columns), np.asarray(self.index).copy())
+
+
+def _frame_columns(value: Any) -> list[str]:
+    cols = getattr(value, "columns", None)
+    if cols is None:
+        return []
+    try:
+        return [str(c) for c in list(cols)]
+    except Exception:
+        return []
+
+
+def _frame_to_2d_float32(value: Any) -> np.ndarray:
+    if hasattr(value, "to_numpy"):
+        try:
+            arr = value.to_numpy(dtype=np.float32, copy=False)
+        except Exception:
+            arr = np.asarray(value, dtype=np.float32)
+    elif hasattr(value, "columns") and hasattr(value, "__getitem__"):
+        cols = _frame_columns(value)
+        mats: list[np.ndarray] = []
+        n_rows = 0
+        for col in cols:
+            try:
+                vec = np.asarray(value[col], dtype=np.float32).reshape(-1)  # type: ignore[index]
+                mats.append(vec)
+                n_rows = max(n_rows, int(vec.size))
+            except Exception:
+                continue
+        if mats:
+            arr = np.zeros((n_rows, len(mats)), dtype=np.float32)
+            for j, vec in enumerate(mats):
+                take = min(n_rows, int(vec.size))
+                if take > 0:
+                    arr[:take, j] = vec[:take]
+        else:
+            arr = np.asarray(value, dtype=np.float32)
+    else:
+        arr = np.asarray(value, dtype=np.float32)
+    if arr.ndim == 0:
+        arr = arr.reshape(1, 1)
+    elif arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    elif arr.ndim > 2:
+        arr = arr.reshape(arr.shape[0], -1)
+    return np.nan_to_num(np.asarray(arr, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _coerce_feature_frame(value: Any) -> _ArrayFrame:
+    if isinstance(value, _ArrayFrame):
+        return value
+    arr = _frame_to_2d_float32(value)
+    cols = _frame_columns(value)
+    if len(cols) != int(arr.shape[1]):
+        cols = [f"f{i}" for i in range(int(arr.shape[1]))]
+    idx = getattr(value, "index", None)
+    return _ArrayFrame(arr, cols, idx)
+
+
+def _slice_rows(value: Any, start: int, end: int) -> Any:
+    s = max(0, int(start))
+    e = max(s, int(end))
+    if _is_dataframe_like(value):
+        idx = np.arange(s, e, dtype=np.int64)
+        try:
+            return value.take(idx)
+        except Exception:
+            try:
+                base_idx = np.asarray(getattr(value, "index")).reshape(-1)
+                return value.loc[base_idx[idx]]
+            except Exception:
+                pass
+    if isinstance(value, _ArrayFrame):
+        return _ArrayFrame(value.to_numpy(copy=False)[s:e], list(value.columns), np.asarray(value.index).reshape(-1)[s:e])
+    if hasattr(value, "columns") and hasattr(value, "__getitem__"):
+        frame = _coerce_feature_frame(value)
+        return _ArrayFrame(
+            frame.to_numpy(copy=False)[s:e],
+            list(frame.columns),
+            np.asarray(frame.index).reshape(-1)[s:e],
+        )
+    arr = np.asarray(value)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    return arr[s:e]
 
 
 class TimeframeEmbedding(nn.Module):
@@ -203,9 +340,13 @@ class TransformerExpertTorch(ExpertModel):
 
         return DeployableOmniFormer(backbone, head, self.num_timeframes, self.input_dim).to(self.device)
 
-    def _init_layout(self, x: pd.DataFrame) -> None:
+    def _init_layout(self, x: Any) -> None:
         if self.tf_names and self.base_feats:
             return
+        cols = _frame_columns(x)
+        if not cols:
+            arr = _frame_to_2d_float32(x)
+            cols = [f"f{i}" for i in range(int(arr.shape[1]))]
         prefixes = set()
         # Known timeframes ordered by duration (smallest to largest)
         known_tfs = [
@@ -233,7 +374,7 @@ class TransformerExpertTorch(ExpertModel):
         ]
 
         # Detect present timeframes
-        for c in x.columns:
+        for c in cols:
             parts = c.split("_")
             if parts[0] in known_tfs:
                 prefixes.add(parts[0])
@@ -241,9 +382,9 @@ class TransformerExpertTorch(ExpertModel):
         # If no prefixes found, treat entire input as single timeframe
         if not prefixes:
             self.tf_names = ["BASE"]  # Dummy name
-            self.input_dim = x.shape[1]
+            self.input_dim = len(cols)
             self.num_timeframes = 1
-            self.base_feats = list(x.columns)
+            self.base_feats = list(cols)
             return
 
         # Sort timeframes by their order in known_tfs
@@ -252,7 +393,7 @@ class TransformerExpertTorch(ExpertModel):
 
         # Collect all unique feature suffixes
         feature_set = set()
-        for c in x.columns:
+        for c in cols:
             for tf in self.tf_names:
                 if c.startswith(f"{tf}_"):
                     feature_set.add(c[len(tf) + 1 :])
@@ -265,8 +406,12 @@ class TransformerExpertTorch(ExpertModel):
         self.input_dim = len(self.base_feats)
         self.num_timeframes = len(self.tf_names)
 
-    def _make_dataset(self, x: pd.DataFrame, y: pd.Series | None = None):
+    def _make_dataset(self, x: Any, y: Any | None = None):
         self._init_layout(x)
+        cols = _frame_columns(x)
+        if not cols:
+            x = _coerce_feature_frame(x)
+            cols = _frame_columns(x)
         tf_names = self.tf_names
         base_feats = self.base_feats
         input_dim = self.input_dim
@@ -288,7 +433,7 @@ class TransformerExpertTorch(ExpertModel):
         tf_idx_map = {name: i for i, name in enumerate(tf_names)}
         feat_idx_map = {name: i for i, name in enumerate(base_feats)}
 
-        for col in x.columns:
+        for col in cols:
             # Try to match "TF_Feature" pattern
             matched = False
             for tf in tf_names:
@@ -308,8 +453,16 @@ class TransformerExpertTorch(ExpertModel):
 
         # 2. Fill the array using bulk numpy assignment
         # Iterate over columns (fast) instead of rows (slow)
-        x_values = x.to_numpy(dtype=np.float32, copy=False)
-        col_names = list(x.columns)
+        if hasattr(x, "to_numpy"):
+            x_values = x.to_numpy(dtype=np.float32, copy=False)
+        else:
+            x_values = np.asarray(x, dtype=np.float32)
+            if x_values.ndim == 1:
+                x_values = x_values.reshape(-1, 1)
+        if cols:
+            col_names = list(cols)
+        else:
+            col_names = [f"f{i}" for i in range(int(x_values.shape[1]))]
         
         for col_idx, col_name in enumerate(col_names):
             if col_name in col_map:
@@ -328,15 +481,17 @@ class TransformerExpertTorch(ExpertModel):
                 # Extremely fast slicing
                 return self.data[idx], (self.labels[idx] if self.labels is not None else None)
 
-        y_arr = y.to_numpy(dtype=int) if y is not None else None
+        if y is None:
+            y_arr = None
+        elif hasattr(y, "to_numpy"):
+            y_arr = y.to_numpy(dtype=int)
+        else:
+            y_arr = np.asarray(y, dtype=int).reshape(-1)
         return _DS(X_arr, y_arr)
 
-    def fit(self, x: pd.DataFrame, y: pd.Series, tensorboard_writer: Any | None = None) -> None:
-        # Some callers may provide unnamed numeric columns (e.g., DataFrame from a raw numpy array).
-        # Normalize to string names so layout parsing is stable.
-        if not all(isinstance(c, str) for c in x.columns):
-            x = x.copy()
-            x.columns = [str(c) for c in x.columns]
+    def fit(self, x: Any, y: Any, tensorboard_writer: Any | None = None) -> None:
+        x_frame = _coerce_feature_frame(x)
+        x_cols = _frame_columns(x_frame)
 
         # Align device to local rank if distributed is initialized
         if dist.is_available() and dist.is_initialized() and torch.cuda.is_available():
@@ -348,7 +503,7 @@ class TransformerExpertTorch(ExpertModel):
                 pass
 
         # Robust Normalization (Critical for Transformer Stability)
-        x_vals = x.select_dtypes(include=np.number).to_numpy(dtype=np.float32)
+        x_vals = _frame_to_2d_float32(x_frame)
 
         # Try full array normalization first (HPC mode), fallback to chunked if OOM
         try:
@@ -366,9 +521,9 @@ class TransformerExpertTorch(ExpertModel):
             self.mean_ = np.mean(means, axis=0)
             self.scale_ = np.maximum(np.mean(stds, axis=0), 1e-3)
 
-        # Create normalized DataFrame (preserving index/columns for layout parser)
-        x_norm = x.copy()
-        x_norm[x.select_dtypes(include=np.number).columns] = (x_vals - self.mean_) / self.scale_
+        # Create normalized frame (preserving index/columns for layout parser)
+        x_norm_vals = (x_vals - self.mean_) / self.scale_
+        x_norm = _ArrayFrame(x_norm_vals, x_cols, getattr(x_frame, "index", None))
 
         self._init_layout(x_norm)
         self.model = self._build_model()
@@ -411,8 +566,8 @@ class TransformerExpertTorch(ExpertModel):
                 logger.warning(f"torch.compile failed for Transformer, continuing without: {e}", exc_info=True)
 
         split = int(len(x_norm) * 0.85)
-        x_train, x_val = x_norm.iloc[:split], x_norm.iloc[split:]
-        y_train, y_val = y.iloc[:split], y.iloc[split:]
+        x_train, x_val = _slice_rows(x_norm, 0, split), _slice_rows(x_norm, split, len(x_norm))
+        y_train, y_val = _slice_rows(y, 0, split), _slice_rows(y, split, len(y))
 
         train_ds = self._make_dataset(x_train, y_train)
         val_ds = self._make_dataset(x_val, y_val)
@@ -582,28 +737,29 @@ class TransformerExpertTorch(ExpertModel):
                     logger.info(f"Transformer early stopping at epoch {epoch}, val_loss={val_loss:.4f}")
                     break
 
-    def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, x: Any) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("Transformer model not loaded")
-        if not all(isinstance(c, str) for c in x.columns):
-            x = x.copy()
-            x.columns = [str(c) for c in x.columns]
+        x_frame = _coerce_feature_frame(x)
 
         self.model.eval()
 
         # Apply Normalization
         if hasattr(self, "mean_") and self.mean_ is not None:
-            x_vals = x.select_dtypes(include=np.number).to_numpy(dtype=np.float32)
+            x_vals = _frame_to_2d_float32(x_frame)
             # Safe scale to avoid shape mismatch if columns differ slightly, though usually matched
             try:
-                x_norm = x.copy()
-                x_norm[x.select_dtypes(include=np.number).columns] = (x_vals - self.mean_) / self.scale_
-                x = x_norm
+                x_norm = _ArrayFrame(
+                    (x_vals - self.mean_) / self.scale_,
+                    _frame_columns(x_frame),
+                    getattr(x_frame, "index", None),
+                )
+                x_frame = x_norm
             except Exception as e:
                 logger.warning(f"Transformer norm failed at inference: {e}")
 
-        self._init_layout(x)
-        ds = self._make_dataset(x, None)
+        self._init_layout(x_frame)
+        ds = self._make_dataset(x_frame, None)
 
         def _collate_pred(batch):
             arrs, _ = zip(*batch, strict=False)
@@ -690,3 +846,6 @@ class TransformerExpertTorch(ExpertModel):
             logger.info(f"JIT Compiled {self.__class__.__name__} for CPU.")
         except Exception as e:
             logger.warning(f"CPU optimization failed: {e}")
+
+
+

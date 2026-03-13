@@ -6,9 +6,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pandas as pd
 
-from ..core.config import Settings
+from ..core.config import ALL_TIMEFRAMES, Settings
 
 logger = logging.getLogger(__name__)
 _RUST_DATA_BACKEND_OK: bool | None = None
@@ -29,8 +28,257 @@ _OHLCV_COLUMN_ALIASES = {
     "v",
     "vol",
     "volume",
+    "tick_volume",
+    "real_volume",
 }
 _FRAME_IO_WARNED_UNKNOWN = False
+
+
+class _RustFrame:
+    """Lightweight frame for strict frame-native Rust payloads."""
+
+    def __init__(self, data: dict[str, np.ndarray], index: np.ndarray):
+        self._data = {str(k): np.asarray(v) for k, v in data.items()}
+        self.index = np.asarray(index)
+        self.columns = list(self._data.keys())
+        self.attrs: dict[str, Any] = {}
+
+    @property
+    def empty(self) -> bool:
+        return len(self.index) <= 0
+
+    def __len__(self) -> int:
+        return int(self.index.shape[0])
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        return self._data[str(key)]
+
+    def copy(self) -> "_RustFrame":
+        out = _RustFrame({k: np.asarray(v).copy() for k, v in self._data.items()}, np.asarray(self.index).copy())
+        out.attrs = dict(self.attrs)
+        return out
+
+    def tail(self, n: int) -> "_RustFrame":
+        take = max(0, int(n))
+        if take <= 0:
+            out = _RustFrame({k: v[:0] for k, v in self._data.items()}, self.index[:0])
+            out.attrs = dict(self.attrs)
+            return out
+        out = _RustFrame({k: v[-take:] for k, v in self._data.items()}, self.index[-take:])
+        out.attrs = dict(self.attrs)
+        return out
+
+
+def _to_datetime64_ns(values: Any) -> np.ndarray:
+    arr = np.asarray(values).reshape(-1)
+    if arr.size <= 0:
+        return np.zeros(0, dtype="datetime64[ns]")
+    if np.issubdtype(arr.dtype, np.datetime64):
+        return arr.astype("datetime64[ns]", copy=False)
+    if arr.dtype.kind in {"i", "u"}:
+        vals = arr.astype(np.int64, copy=False)
+        vmax = int(np.max(np.abs(vals))) if vals.size > 0 else 0
+        if vmax > 10**14:
+            return vals.astype("datetime64[ns]")
+        if vmax > 10**11:
+            return vals.astype("datetime64[ms]").astype("datetime64[ns]")
+        return vals.astype("datetime64[s]").astype("datetime64[ns]")
+    if arr.dtype.kind == "f":
+        vals = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.int64, copy=False)
+        return vals.astype("datetime64[s]").astype("datetime64[ns]")
+    with np.errstate(all="ignore"):
+        try:
+            return arr.astype("datetime64[ns]")
+        except Exception:
+            return np.arange(arr.size, dtype=np.int64).astype("datetime64[s]").astype("datetime64[ns]")
+
+
+def _normalize_rust_payload_columns(data: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    rename: dict[str, str] = {}
+    for col in data.keys():
+        low = str(col).lower()
+        if low in {"o", "open"}:
+            rename[col] = "open"
+        elif low in {"h", "high"}:
+            rename[col] = "high"
+        elif low in {"l", "low"}:
+            rename[col] = "low"
+        elif low in {"c", "close"}:
+            rename[col] = "close"
+        elif low in {"v", "vol", "volume"}:
+            rename[col] = "volume"
+        elif low in {"tick_volume", "real_volume"}:
+            rename[col] = "volume"
+        elif low in {"timestamp", "time", "datetime", "date"}:
+            rename[col] = "timestamp"
+    out: dict[str, np.ndarray] = {}
+    for src, vals in data.items():
+        out[rename.get(src, src)] = np.asarray(vals)
+    return out
+
+
+def _is_rust_frame(obj: Any) -> bool:
+    return isinstance(obj, _RustFrame)
+
+
+def _is_frame_like(obj: Any) -> bool:
+    return bool(
+        _is_dataframe(obj)
+        or _is_rust_frame(obj)
+        or (hasattr(obj, "columns") and hasattr(obj, "index") and hasattr(obj, "__getitem__"))
+    )
+
+
+def _frame_empty(obj: Any) -> bool:
+    try:
+        return bool(obj is None or obj.empty)
+    except Exception:
+        return True
+
+
+def _fit_len_array(values: Any, n: int) -> np.ndarray:
+    arr = np.asarray(values).reshape(-1)
+    target = max(0, int(n))
+    if arr.size == target:
+        return arr
+    if arr.size <= 0:
+        return np.zeros(target, dtype=np.float64)
+    if arr.size > target:
+        return arr[:target]
+    pad = np.full(target - arr.size, arr[-1], dtype=arr.dtype)
+    return np.concatenate([arr, pad])
+
+
+def _to_rust_frame(df: Any) -> _RustFrame | None:
+    if _is_rust_frame(df):
+        return df
+    if df is None or _frame_empty(df):
+        return None
+    if not _is_frame_like(df):
+        return None
+
+    cols = getattr(df, "columns", None)
+    try:
+        col_list = [str(c) for c in list(cols or [])]
+    except Exception:
+        col_list = []
+    if not col_list:
+        return None
+
+    raw: dict[str, np.ndarray] = {}
+    for col in col_list:
+        try:
+            src = df[col]  # type: ignore[index]
+        except Exception:
+            continue
+        try:
+            vals = src.to_numpy(copy=False) if hasattr(src, "to_numpy") else np.asarray(src)
+            raw[str(col)] = np.asarray(vals).reshape(-1)
+        except Exception:
+            continue
+    if not raw:
+        return None
+
+    data = _normalize_rust_payload_columns(raw)
+    if "close" not in data:
+        return None
+
+    close_arr = np.asarray(data["close"]).reshape(-1)
+    n = int(close_arr.shape[0])
+    if n <= 0:
+        return None
+
+    ts_src = None
+    for key in ("timestamp", "time", "datetime", "date"):
+        if key in data:
+            ts_src = data.get(key)
+            break
+    idx_src = ts_src if ts_src is not None else getattr(df, "index", None)
+    idx_np = _to_datetime64_ns(idx_src if idx_src is not None else np.arange(n, dtype=np.int64))
+    idx_np = _fit_len_array(idx_np, n).astype("datetime64[ns]")
+
+    clean = {
+        k: _fit_len_array(v, n)
+        for k, v in data.items()
+        if str(k).lower() not in {"timestamp", "time", "datetime", "date"}
+    }
+    clean = _ensure_ohlcv_arrays(clean)
+    out = _RustFrame(clean, idx_np)
+    try:
+        attrs = getattr(df, "attrs", None)
+        if isinstance(attrs, dict):
+            out.attrs = dict(attrs)
+    except Exception:
+        pass
+    return out
+
+
+def _build_frame_from_arrays(
+    data: dict[str, np.ndarray],
+    *,
+    index: np.ndarray,
+    allow_tabular_module: bool = False,
+) -> Any:
+    _ = allow_tabular_module
+    idx_np = _to_datetime64_ns(index)
+    clean = {str(k): np.asarray(v).reshape(-1) for k, v in data.items()}
+    return _RustFrame(clean, idx_np)
+
+
+def _ensure_ohlcv_arrays(data: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    out = {str(k): np.asarray(v).reshape(-1) for k, v in data.items()}
+    close = out.get("close")
+    if close is None:
+        return out
+    close_arr = np.asarray(close).reshape(-1)
+    n = int(close_arr.shape[0])
+    if n <= 0:
+        return out
+    for col in ("open", "high", "low"):
+        if col not in out:
+            out[col] = close_arr.copy()
+    if "volume" not in out:
+        out["volume"] = np.zeros(n, dtype=np.float64)
+    return out
+
+
+def _strict_rust_data_mode_enabled() -> bool:
+    rust_only = str(os.environ.get("FOREX_BOT_RUST_ONLY", "") or "").strip().lower()
+    if rust_only in {"1", "true", "yes", "on"}:
+        return True
+    mode = str(os.environ.get("FOREX_BOT_DATA_BACKEND", "") or "").strip().lower()
+    if mode in {"rust_strict", "strict_rust", "rust_only", "rust-only"}:
+        return True
+    pandas_free = str(os.environ.get("FOREX_BOT_PANDAS_FREE", "1") or "1").strip().lower()
+    if pandas_free in {"1", "true", "yes", "on"}:
+        return True
+    runtime_profile = str(os.environ.get("FOREX_BOT_RUNTIME_PROFILE", "") or "").strip().lower()
+    if runtime_profile.startswith("rust"):
+        return True
+    return False
+
+
+def _strict_tabular_free_enabled() -> bool:
+    raw = str(os.environ.get("FOREX_BOT_PANDAS_FREE_STRICT", "1") or "1").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _tabular_module(*, required: bool = True):
+    _ = required
+    return None
+
+
+def _is_dataframe(obj: Any) -> bool:
+    return bool(hasattr(obj, "columns") and hasattr(obj, "index"))
+
+
+def _is_datetime_index(obj: Any) -> bool:
+    return bool(
+        hasattr(obj, "tz")
+        and hasattr(obj, "tz_localize")
+        and hasattr(obj, "tz_convert")
+        and (hasattr(obj, "year") or hasattr(obj, "asi8"))
+    )
 
 
 def _rust_data_backend_available(*, force_log: bool = False) -> bool:
@@ -44,7 +292,7 @@ def _rust_data_backend_available(*, force_log: bool = False) -> bool:
             _RUST_DATA_BACKEND_OK = False
     if force_log and not _RUST_DATA_BACKEND_OK and not _RUST_DATA_WARNED_UNAVAILABLE:
         logger.warning(
-            "Rust data backend requested but forex_bindings.load_symbol_frames is unavailable; using Python backend."
+            "Rust data backend requested but forex_bindings.load_symbol_frames is unavailable."
         )
         _RUST_DATA_WARNED_UNAVAILABLE = True
     return bool(_RUST_DATA_BACKEND_OK)
@@ -57,9 +305,9 @@ def _disable_rust_data_backend() -> None:
 
 def _frame_io_backend() -> str:
     """
-    Select the dataframe I/O backend for local history files.
+    Select the frame I/O backend for local history files.
 
-    Env (preferred): FOREX_BOT_FRAME_IO_BACKEND=auto|polars|pyarrow|pandas
+    Env (preferred): FOREX_BOT_FRAME_IO_BACKEND=auto|polars|pyarrow|python
     Back-compat:     FOREX_BOT_DATA_IO_BACKEND=...
     """
     global _FRAME_IO_WARNED_UNKNOWN
@@ -75,12 +323,13 @@ def _frame_io_backend() -> str:
         "arrow": "pyarrow",
         "pa": "pyarrow",
         "pyarrow": "pyarrow",
-        "pd": "pandas",
-        "python": "pandas",
-        "pandas": "pandas",
+        "python": "python",
+        "legacy": "python",
     }
     resolved = aliases.get(mode)
     if resolved is not None:
+        if _strict_tabular_free_enabled() and resolved == "python":
+            return "auto"
         return resolved
     if not _FRAME_IO_WARNED_UNKNOWN:
         logger.warning("Unknown frame I/O backend '%s'; using auto.", mode)
@@ -179,14 +428,14 @@ def _ordered_timeframes(tfs: list[str]) -> list[str]:
     return sorted(out, key=_key)
 
 
-def _resample_missing_from_available(frames: dict[str, pd.DataFrame], required_tfs: list[str]) -> dict[str, pd.DataFrame]:
+def _resample_missing_from_available(frames: dict[str, Any], required_tfs: list[str]) -> dict[str, Any]:
     if not frames:
         return frames
     required = _ordered_timeframes(required_tfs)
     if not required:
         return frames
 
-    available = {str(k).upper(): v for k, v in frames.items() if isinstance(v, pd.DataFrame) and not v.empty}
+    available = {str(k).upper(): v for k, v in frames.items() if _is_frame_like(v) and not _frame_empty(v)}
     if not available:
         return frames
 
@@ -196,14 +445,14 @@ def _resample_missing_from_available(frames: dict[str, pd.DataFrame], required_t
         return frames
     source_tf = source_order[0]
     source_df = available.get(source_tf)
-    if source_df is None or source_df.empty:
+    if source_df is None or _frame_empty(source_df):
         return frames
 
     for tf in required:
         if tf in available:
             continue
         resampled = _resample_ohlcv(source_df, tf)
-        if resampled is None or resampled.empty:
+        if resampled is None or _frame_empty(resampled):
             continue
         try:
             resampled.attrs["source"] = str(source_df.attrs.get("source", "resampled"))
@@ -215,8 +464,14 @@ def _resample_missing_from_available(frames: dict[str, pd.DataFrame], required_t
     return frames
 
 
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_columns(df: Any) -> Any:
     if df is None or df.empty:
+        return df
+    if _is_rust_frame(df):
+        return _to_rust_frame(df) or df
+    if not _is_dataframe(df):
+        if _is_frame_like(df):
+            return _to_rust_frame(df) or df
         return df
     out = df.copy()
     rename = {}
@@ -232,6 +487,8 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
             rename[col] = "close"
         elif low in {"v", "vol", "volume"}:
             rename[col] = "volume"
+        elif low in {"tick_volume", "real_volume"}:
+            rename[col] = "volume"
         elif low in {"timestamp", "time", "datetime", "date"}:
             rename[col] = "timestamp"
     if rename:
@@ -239,8 +496,12 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _ensure_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+def _ensure_ohlcv(df: Any) -> Any:
     if df is None or df.empty:
+        return df
+    if not _is_dataframe(df):
+        if _is_frame_like(df):
+            return _to_rust_frame(df) or df
         return df
     out = df.copy()
     if "close" not in out.columns:
@@ -253,129 +514,54 @@ def _ensure_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+def _ensure_datetime_index(df: Any) -> Any:
     if df is None or df.empty:
+        return df
+    if not _is_dataframe(df):
+        if _is_frame_like(df):
+            return _to_rust_frame(df) or df
         return df
     out = df.copy()
     if "timestamp" in out.columns:
-        idx = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
-        out = out.set_index(idx)
-    if not isinstance(out.index, pd.DatetimeIndex):
         try:
-            idx = pd.to_datetime(out.index, utc=True, errors="coerce")
-            if not isinstance(idx, pd.DatetimeIndex):
-                idx = pd.DatetimeIndex(idx)
+            idx = _to_datetime64_ns(out["timestamp"])
+            out = out.set_index(idx)
+        except Exception:
+            pass
+    if not _is_datetime_index(out.index):
+        try:
+            idx = _to_datetime64_ns(out.index)
             out.index = idx
         except Exception:
             # Keep original index as a last resort; caller can still proceed
             # without a strict DatetimeIndex, but we must avoid crashing here.
             return out
-    if isinstance(out.index, pd.DatetimeIndex):
-        if out.index.tz is None:
-            out.index = out.index.tz_localize("UTC")
-        else:
-            out.index = out.index.tz_convert("UTC")
+    if _is_datetime_index(out.index):
+        try:
+            if out.index.tz is None:
+                out.index = out.index.tz_localize("UTC")
+            else:
+                out.index = out.index.tz_convert("UTC")
+        except Exception:
+            pass
     return out
 
 
-def _parquet_ohlcv_columns(path: Path) -> list[str] | None:
-    cols: list[str] | None = None
-    try:
-        import pyarrow.parquet as pq
-
-        names = [str(n) for n in pq.ParquetFile(path).schema.names]
-        keep = [name for name in names if str(name).lower() in _OHLCV_COLUMN_ALIASES]
-        cols = keep or None
-    except Exception:
-        cols = None
-    return cols
-
-
-def _read_frame_polars(path: Path) -> pd.DataFrame | None:
-    try:
-        import polars as pl
-
-        if path.suffix.lower() == ".parquet":
-            cols: list[str] | None = None
-            try:
-                schema = pl.scan_parquet(path).collect_schema()
-                keep = [name for name in schema.names() if str(name).lower() in _OHLCV_COLUMN_ALIASES]
-                cols = keep or None
-            except Exception:
-                cols = None
-            frame = pl.read_parquet(path, columns=cols)
-        else:
-            frame = pl.read_csv(path)
-        with_arrow = str(os.environ.get("FOREX_BOT_POLARS_ARROW_ARRAY", "1") or "1").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        try:
-            return frame.to_pandas(use_pyarrow_extension_array=with_arrow)
-        except Exception:
-            return frame.to_pandas()
-    except Exception:
-        return None
-
-
-def _read_frame_pyarrow(path: Path) -> pd.DataFrame | None:
-    try:
-        if path.suffix.lower() == ".parquet":
-            import pyarrow.parquet as pq
-
-            cols = _parquet_ohlcv_columns(path)
-            table = pq.read_table(path, columns=cols, memory_map=True)
-        else:
-            import pyarrow.csv as pacsv
-
-            table = pacsv.read_csv(path)
-        try:
-            return table.to_pandas(types_mapper=pd.ArrowDtype)
-        except Exception:
-            return table.to_pandas()
-    except Exception:
-        return None
-
-
-def _read_frame_pandas(path: Path) -> pd.DataFrame | None:
-    try:
-        if path.suffix.lower() == ".parquet":
-            return pd.read_parquet(path, columns=_parquet_ohlcv_columns(path))
-        return pd.read_csv(path)
-    except Exception:
-        return None
-
-
-def _read_frame(path: Path) -> pd.DataFrame | None:
-    if not path.exists():
-        return None
-
-    mode = _frame_io_backend()
-    readers = {
-        "polars": (_read_frame_polars, _read_frame_pyarrow, _read_frame_pandas),
-        "pyarrow": (_read_frame_pyarrow, _read_frame_polars, _read_frame_pandas),
-        "pandas": (_read_frame_pandas, _read_frame_pyarrow, _read_frame_polars),
-        "auto": (_read_frame_polars, _read_frame_pyarrow, _read_frame_pandas),
-    }.get(mode, (_read_frame_polars, _read_frame_pyarrow, _read_frame_pandas))
-
-    for reader in readers:
-        df = reader(path)
-        if df is not None:
-            return df
-
-    logger.warning("Failed to read data file %s with all configured backends.", path)
-    return None
-
-
-def _resample_ohlcv(df: pd.DataFrame, tf: str) -> pd.DataFrame | None:
+def _resample_ohlcv(df: Any, tf: str) -> Any | None:
+    if _is_rust_frame(df):
+        return _resample_ohlcv_rust(df, tf)
     if df is None or df.empty:
         return None
+    if _strict_tabular_free_enabled():
+        rust_src = _to_rust_frame(df)
+        return _resample_ohlcv_rust(rust_src, tf) if rust_src is not None else None
+    if not _is_dataframe(df):
+        rust_src = _to_rust_frame(df)
+        return _resample_ohlcv_rust(rust_src, tf) if rust_src is not None else None
     freq = _timeframe_to_freq(tf)
     if freq is None:
         return None
-    if not isinstance(df.index, pd.DatetimeIndex):
+    if not _is_datetime_index(df.index):
         return None
     agg = {
         "open": "first",
@@ -386,6 +572,72 @@ def _resample_ohlcv(df: pd.DataFrame, tf: str) -> pd.DataFrame | None:
     if "volume" in df.columns:
         agg["volume"] = "sum"
     out = df.resample(freq).agg(agg).dropna()
+    return out
+
+
+def _resample_ohlcv_rust(df: _RustFrame, tf: str) -> _RustFrame | None:
+    if _frame_empty(df):
+        return None
+    tf_min = _timeframe_to_minutes(tf)
+    if tf_min is None or tf_min <= 0:
+        return None
+
+    idx_ns = _to_datetime64_ns(df.index).astype(np.int64, copy=False)
+    if idx_ns.size <= 0:
+        return None
+
+    close = np.asarray(df["close"], dtype=np.float64).reshape(-1)
+    n = int(close.shape[0])
+    if n <= 0:
+        return None
+    open_ = np.asarray(df["open"], dtype=np.float64).reshape(-1)[:n]
+    high = np.asarray(df["high"], dtype=np.float64).reshape(-1)[:n]
+    low = np.asarray(df["low"], dtype=np.float64).reshape(-1)[:n]
+    close = close[:n]
+    volume = np.asarray(df["volume"], dtype=np.float64).reshape(-1)[:n]
+    idx_ns = idx_ns[:n]
+
+    bucket_ns = np.int64(int(tf_min) * 60 * 1_000_000_000)
+    if bucket_ns <= 0:
+        return None
+    bucket = idx_ns // bucket_ns
+    if bucket.size <= 0:
+        return None
+
+    starts = np.flatnonzero(np.r_[True, bucket[1:] != bucket[:-1]])
+    ends = np.r_[starts[1:], bucket.size]
+    m = int(starts.size)
+    if m <= 0:
+        return None
+
+    out_open = np.empty(m, dtype=np.float64)
+    out_high = np.empty(m, dtype=np.float64)
+    out_low = np.empty(m, dtype=np.float64)
+    out_close = np.empty(m, dtype=np.float64)
+    out_volume = np.empty(m, dtype=np.float64)
+    out_idx = np.empty(m, dtype=np.int64)
+
+    for i in range(m):
+        s = int(starts[i])
+        e = int(ends[i])
+        out_open[i] = float(open_[s])
+        out_high[i] = float(np.max(high[s:e]))
+        out_low[i] = float(np.min(low[s:e]))
+        out_close[i] = float(close[e - 1])
+        out_volume[i] = float(np.sum(volume[s:e]))
+        out_idx[i] = int(idx_ns[s])
+
+    out = _RustFrame(
+        {
+            "open": out_open,
+            "high": out_high,
+            "low": out_low,
+            "close": out_close,
+            "volume": out_volume,
+        },
+        out_idx.astype("datetime64[ns]"),
+    )
+    out.attrs = dict(getattr(df, "attrs", {}) or {})
     return out
 
 
@@ -565,8 +817,8 @@ class MT5Adapter:
     def is_connected(self) -> bool:
         return bool(self._connected)
 
-    async def get_live_frames(self, symbol: str, *, timeframes: list[str], tail: int = 500) -> dict[str, pd.DataFrame]:
-        frames: dict[str, pd.DataFrame] = {}
+    async def get_live_frames(self, symbol: str, *, timeframes: list[str], tail: int = 500) -> dict[str, Any]:
+        frames: dict[str, Any] = {}
         if not self._connected:
             return frames
         try:
@@ -607,9 +859,41 @@ class MT5Adapter:
                 rates = None
             if rates is None or len(rates) == 0:
                 continue
-            df = pd.DataFrame(rates)
-            df = _normalize_columns(df)
-            df = _ensure_datetime_index(df)
+            try:
+                rates_arr = np.asarray(rates)
+                data_raw: dict[str, np.ndarray] = {}
+                if getattr(rates_arr, "dtype", None) is not None and getattr(rates_arr.dtype, "names", None):
+                    for name in rates_arr.dtype.names or ():
+                        data_raw[str(name)] = np.asarray(rates_arr[name])
+                elif rates_arr.ndim == 2 and rates_arr.shape[1] >= 4:
+                    cols = ("open", "high", "low", "close", "tick_volume")
+                    for i, name in enumerate(cols):
+                        if i >= rates_arr.shape[1]:
+                            break
+                        data_raw[name] = np.asarray(rates_arr[:, i])
+                else:
+                    continue
+                data = _normalize_rust_payload_columns(data_raw)
+                if "close" not in data:
+                    continue
+                data = _ensure_ohlcv_arrays(
+                    {k: v for k, v in data.items() if str(k).lower() not in {"timestamp", "time", "datetime", "date"}}
+                )
+                n = int(np.asarray(data["close"]).reshape(-1).shape[0])
+                if n <= 0:
+                    continue
+                ts_src = data_raw.get("time")
+                idx_np = _to_datetime64_ns(ts_src if ts_src is not None else np.arange(n, dtype=np.int64))
+                for key, vals in list(data.items()):
+                    data[key] = np.asarray(vals).reshape(-1)[:n]
+                df = _build_frame_from_arrays(data, index=idx_np, allow_tabular_module=not _strict_tabular_free_enabled())
+            except Exception:
+                logger.debug("Skipping MT5 frame build for %s/%s because conversion failed.", symbol, tf)
+                continue
+            if _is_frame_like(df):
+                df = _normalize_columns(df)
+                df = _ensure_datetime_index(df)
+                df = _ensure_ohlcv(df)
             try:
                 df.attrs["source"] = "mt5"
             except Exception:
@@ -655,52 +939,33 @@ class DataLoader:
             tfu = str(tf or "").upper()
             if tfu and tfu not in tfs:
                 tfs.append(tfu)
+        use_all_tfs = str(os.environ.get("FOREX_BOT_USE_ALL_TIMEFRAMES", "0") or "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if use_all_tfs:
+            for tf in ALL_TIMEFRAMES:
+                tfu = str(tf or "").upper()
+                if tfu and tfu not in tfs:
+                    tfs.append(tfu)
         return _ordered_timeframes(tfs)
 
-    def _candidate_paths(self, symbol: str, tf: str) -> list[Path]:
-        paths = []
-        root = self.data_dir
-        paths.append(root / f"symbol={symbol}" / f"timeframe={tf}" / "data.parquet")
-        paths.append(root / f"symbol={symbol}" / f"timeframe={tf}" / "data.csv")
-        paths.append(root / f"{symbol}_{tf}.parquet")
-        paths.append(root / f"{symbol}_{tf}.csv")
-        paths.append(root / symbol / f"{tf}.parquet")
-        paths.append(root / symbol / f"{tf}.csv")
-        return paths
-
-    def _load_frames(self, symbol: str, *, tail: int | None = None, allow_resample: bool = True) -> dict[str, pd.DataFrame]:
-        frames: dict[str, pd.DataFrame] = {}
-        if _use_rust_data_backend():
-            try:
-                rust_frames = self._load_frames_rust(symbol, tail=tail, allow_resample=allow_resample)
-                if rust_frames:
-                    return rust_frames
-            except Exception as exc:
-                _disable_rust_data_backend()
-                logger.warning("Rust data loader failed; falling back to Python: %s", exc)
-        if not self.data_dir.exists():
-            return frames
-        for tf in self._timeframes():
-            df = None
-            for path in self._candidate_paths(symbol, tf):
-                df = _read_frame(path)
-                if df is not None and not df.empty:
-                    break
-            if df is None or df.empty:
-                continue
-            df = _normalize_columns(df)
-            df = _ensure_datetime_index(df)
-            df = _ensure_ohlcv(df)
-            try:
-                df.attrs["source"] = "disk"
-            except Exception:
-                pass
-            if tail is not None and tail > 0:
-                df = df.tail(tail)
-            frames[tf] = df
-        if allow_resample:
-            frames = _resample_missing_from_available(frames, self._timeframes())
-        return frames
+    def _load_frames(self, symbol: str, *, tail: int | None = None, allow_resample: bool = True) -> dict[str, Any]:
+        if not _use_rust_data_backend():
+            logger.error("Rust data backend unavailable or disabled; skipping local data load for symbol %s.", symbol)
+            return {}
+        try:
+            rust_frames = self._load_frames_rust(symbol, tail=tail, allow_resample=allow_resample)
+        except Exception as exc:
+            _disable_rust_data_backend()
+            logger.error("Rust data loader failed for symbol %s; Python fallback removed: %s", symbol, exc)
+            return {}
+        if not rust_frames:
+            logger.error("Rust data loader returned no frames for symbol %s; Python fallback removed.", symbol)
+            return {}
+        return rust_frames
 
     def _load_frames_rust(
         self,
@@ -708,7 +973,7 @@ class DataLoader:
         *,
         tail: int | None = None,
         allow_resample: bool = True,
-    ) -> dict[str, pd.DataFrame]:
+    ) -> dict[str, Any]:
         try:
             import forex_bindings  # type: ignore
         except Exception:
@@ -734,18 +999,41 @@ class DataLoader:
         if not isinstance(payload, dict):
             return {}
 
-        frames: dict[str, pd.DataFrame] = {}
+        frames: dict[str, Any] = {}
         for tf, frame in payload.items():
             if not isinstance(frame, dict):
                 continue
             try:
-                data = {k: np.asarray(v) for k, v in frame.items()}
-                df = pd.DataFrame(data)
+                data_raw = {str(k): np.asarray(v) for k, v in frame.items()}
+                data = _normalize_rust_payload_columns(data_raw)
+                if "close" not in data:
+                    continue
+                n = int(np.asarray(data["close"]).reshape(-1).shape[0])
+                if n <= 0:
+                    continue
+                for col in ("open", "high", "low"):
+                    if col not in data:
+                        data[col] = np.asarray(data["close"])
+                if "volume" not in data:
+                    data["volume"] = np.zeros(n, dtype=np.float64)
+                ts_src = None
+                for key in ("timestamp", "time", "datetime", "date"):
+                    if key in data:
+                        ts_src = data.get(key)
+                        break
+                idx_np = _to_datetime64_ns(ts_src if ts_src is not None else np.arange(n, dtype=np.int64))
+                data = {k: np.asarray(v).reshape(-1)[:n] for k, v in data.items() if str(k).lower() not in {"timestamp", "time", "datetime", "date"}}
+                df = _build_frame_from_arrays(
+                    data,
+                    index=idx_np,
+                    allow_tabular_module=not _strict_tabular_free_enabled(),
+                )
             except Exception:
                 continue
-            df = _normalize_columns(df)
-            df = _ensure_datetime_index(df)
-            df = _ensure_ohlcv(df)
+            if _is_frame_like(df):
+                df = _normalize_columns(df)
+                df = _ensure_datetime_index(df)
+                df = _ensure_ohlcv(df)
             try:
                 df.attrs["source"] = "disk"
             except Exception:
@@ -778,10 +1066,10 @@ class DataLoader:
                 logger.warning("History check failed for %s: %s", sym, exc)
         return any_found
 
-    async def get_training_data(self, symbol: str) -> dict[str, pd.DataFrame]:
+    async def get_training_data(self, symbol: str) -> dict[str, Any]:
         return self._load_frames(symbol)
 
-    async def get_live_data(self, symbol: str) -> dict[str, pd.DataFrame]:
+    async def get_live_data(self, symbol: str) -> dict[str, Any]:
         tfs = self._timeframes()
         if self.mt5_adapter.is_connected():
             frames = await self.mt5_adapter.get_live_frames(symbol, timeframes=tfs, tail=500)
@@ -792,3 +1080,5 @@ class DataLoader:
 
 
 __all__ = ["DataLoader"]
+
+

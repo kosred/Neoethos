@@ -19,6 +19,7 @@ forex-data = { path = "../forex-data" }
 forex-models = { path = "../forex-models" }
 forex-search = { path = "../forex-search" }
 polars = { version = "0.52.0", features = ["lazy", "dtype-datetime", "timezones"] }
+chrono = "0.4.38"
 
 [features]
 default = []
@@ -28,5 +29,6 @@ lightgbm = ["forex-models/lightgbm"]
 lightgbm-gpu = ["forex-models/lightgbm-gpu"]
 xgboost = ["forex-models/xgboost"]
 catboost = ["forex-models/catboost"]
-tree-models = ["lightgbm", "xgboost", "catboost"]
-tree-models-gpu = ["tree-models", "lightgbm-gpu"]
+tree-models-core = ["lightgbm", "xgboost"]
+tree-models = ["tree-models-core", "catboost"]
+tree-models-gpu = ["tree-models-core", "lightgbm-gpu"]

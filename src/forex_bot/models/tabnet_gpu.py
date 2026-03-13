@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import os
 from pathlib import Path
@@ -5,7 +7,6 @@ from typing import Any
 
 import numpy as np
 import torch
-import pandas as pd
 
 from .base import ExpertModel
 from .device import select_device, tune_torch_backend
@@ -112,7 +113,7 @@ class TabNetExpert(ExpertModel):
         self.input_dim = 0
         tune_torch_backend(str(self.device))
 
-    def fit(self, X: pd.DataFrame, y: pd.Series, **kwargs: Any) -> None:
+    def fit(self, X: Any, y: Any, **kwargs: Any) -> None:
         tabnet_cls, callback_cls = _try_import_tabnet()
         if tabnet_cls is None:
             logger.warning("pytorch-tabnet not available; skipping TabNet GPU training.")
@@ -206,7 +207,7 @@ class TabNetExpert(ExpertModel):
             if empty_cache:
                 torch.cuda.empty_cache()
 
-    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, X: Any) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("TabNet GPU model not loaded")
         try:
@@ -236,3 +237,6 @@ class TabNetExpert(ExpertModel):
             device_name = "cuda" if str(self.device).startswith("cuda") else "cpu"
             self.model = tabnet_cls(device_name=device_name, verbose=0, **self.hyperparams)
             self.model.load_model(str(p))
+
+
+

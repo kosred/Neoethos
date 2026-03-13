@@ -6,7 +6,7 @@ from ..core.config import Settings
 from ..core.system import normalize_device_preference
 from ..models.base import ExpertModel
 from ..models.device import get_available_gpus
-from ..models.registry import get_model_class
+from ..models.registry import _resolve_runtime_model_name, get_model_class
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +101,14 @@ class ModelFactory:
     def create_model(self, model_name: str, best_params: dict, idx: int) -> ExpertModel:
         """Create and configure a model instance."""
         requested_name = model_name
-        model_name = self._normalize_model_key(model_name)
+        requested_norm = self._normalize_model_key(model_name)
+        model_name = _resolve_runtime_model_name(requested_norm)
+        if model_name != requested_norm:
+            logger.info(
+                "Runtime model redirect: %s -> %s",
+                requested_norm,
+                model_name,
+            )
         prefer_gpu = self.prefer_gpu and bool(self.available_gpus)
         model_cls = get_model_class(model_name, prefer_gpu=prefer_gpu)
 
@@ -132,11 +139,17 @@ class ModelFactory:
             "online_hoeffding": "OnlineHoeffding",
             "vw": "VW",
         }
-        opt_key = opt_key_map.get(model_name) or opt_key_map.get(requested_name)
+        opt_key = (
+            opt_key_map.get(model_name)
+            or opt_key_map.get(requested_norm)
+            or opt_key_map.get(requested_name)
+        )
         if opt_key and opt_key in best_params:
             params = best_params[opt_key].copy()
         elif model_name in best_params:
             params = best_params[model_name].copy()
+        elif requested_norm in best_params:
+            params = best_params[requested_norm].copy()
         elif requested_name in best_params:
             params = best_params[requested_name].copy()
         if model_name == "lightgbm":

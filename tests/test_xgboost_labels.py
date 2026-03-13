@@ -1,5 +1,5 @@
 import numpy as np
-import pandas as pd
+from tests._compat_pd import pd
 import pytest
 
 from forex_bot.models.trees import XGB_AVAILABLE, XGBoostExpert
@@ -29,3 +29,4 @@ def test_xgboost_expert_accepts_negative_label_class():
     probs = model.predict_proba(X)
     assert probs.shape == (len(X), 3)
     np.testing.assert_allclose(probs.sum(axis=1), 1.0, rtol=0, atol=1e-6)
+

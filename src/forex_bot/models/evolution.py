@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import math
 import multiprocessing
@@ -8,7 +10,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-import pandas as pd
 
 try:
     import cupy as cp  # type: ignore
@@ -231,8 +232,6 @@ def _loss_batch_gpu(
 
         # Vectorized Forward Pass
         # X: (Batch, D) -> (1, Batch, D) for broadcasting
-        x_b = x_batch[None, :, :]
-        
         # Layer 1: (Pop, Batch, H) = (Pop, 1, D, H) * (1, Batch, D, 1) ?? No, manual broadcast or matmul
         # Easiest: Pop loop is slow? No, use batched matmul (bmm)
         # Reshape X for matmul: (Batch, D)
@@ -515,7 +514,7 @@ class EvoExpertCMA(ExpertModel):
     island_losses: list[float] | None = None
     _last_device: str | None = None
 
-    def fit(self, x: pd.DataFrame, y: pd.Series) -> None:
+    def fit(self, x: Any, y: Any) -> None:
         if not CMA_AVAILABLE or cma is None:
             logger.warning("CMA-ES not available; skipping Evo training")
             return
@@ -1149,7 +1148,7 @@ class EvoExpertCMA(ExpertModel):
         self.theta = best_theta
         self.island_losses = island_losses
 
-    def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, x: Any) -> np.ndarray:
         n = len(x)
         if self.theta is None or self.mean_ is None or self.scale_ is None:
             raise RuntimeError("EvoExpert parameters not initialized")
@@ -1215,3 +1214,5 @@ class EvoExpertCMA(ExpertModel):
                 self.island_losses = island_losses.tolist() if island_losses is not None else None
             except Exception as exc:
                 logger.warning(f"Failed to load Evo CMA: {exc}")
+
+

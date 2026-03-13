@@ -9,12 +9,11 @@ description = "Forex Trading Bot with Refactored Architecture"
 authors = [{name = "Konstantin", email = "konst@example.com"}]
 requires-python = ">=3.12"
 dependencies = [
-    # Core Scientific Computing (2025 versions)
+    # Core Scientific Computing (2026 targets)
     "numpy>=2.3.4,<3.0.0",
-    "pandas>=2.3.3",
     "pyarrow>=21.0.0",
     "scipy>=1.16.2",
-    "scikit-learn>=1.8.2",
+    "scikit-learn>=1.8.0",  # 1.8.2 not yet published for Py3.13; relax to available max
     "joblib>=1.5.2",
 
     # Networking & Data
@@ -33,7 +32,7 @@ dependencies = [
     "MetaTrader5>=5.0.5200; sys_platform == 'win32'",
     "TA-Lib>=0.6.7",
 
-    # ML/AI - Tree-based Models (2025 versions)
+    # ML/AI - Tree-based Models
     "lightgbm>=4.6.0",
     "xgboost>=3.1.5",
     "catboost>=1.2.7",
@@ -48,17 +47,17 @@ dependencies = [
     # ML/AI - Evolution Strategies
     "cma>=4.4.1",
 
-    # ML/AI - Deep Learning (PyTorch 2.9 ecosystem)
-    "torch>=2.9.1",
-    "torchvision>=0.24.1",
-    "torchaudio>=2.9.1",
+    # ML/AI - Deep Learning (PyTorch 2.10 ecosystem)
+    "torch>=2.10.0",
+    "torchvision>=0.25.0",
+    "torchaudio>=2.10.0",
 
     # ML/AI - Inference & Deployment
-    "onnxruntime>=1.23.1",
+    "onnxruntime>=1.24.0",
 
     # ML/AI - NLP & Transformers
-    "transformers>=4.56.2",
-    "openai>=2.14.0",
+    "transformers>=5.2.0",
+    "openai>=2.24.0",
     
     # ML/AI - Research Implementations (GPU Optimized)
     "pytorch-tabnet>=4.1.0",
@@ -79,7 +78,8 @@ dev = [
     "black>=25.9.0",
     "ruff>=0.15.3",
     "mypy>=1.18.2",
-    "memory-profiler>=0.61.0"
+    "memory-profiler>=0.61.0",
+    "pandas>=2.3.3"
 ]
 
 [tool.setuptools.packages.find]

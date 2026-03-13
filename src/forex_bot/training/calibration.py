@@ -72,7 +72,7 @@ class ProbabilityCalibrator:
             else:
                 # Platt-style one-vs-rest calibration on log-odds.
                 x_cls = np.log(p[:, cls] / (1.0 - p[:, cls])).reshape(-1, 1)
-                lr = LogisticRegression(max_iter=300, n_jobs=1)
+                lr = LogisticRegression(max_iter=300)
                 lr.fit(x_cls, tgt)
                 self.class_models[cls] = _ClassCal(kind="platt", model=lr, constant=None)
         self.fitted = len(self.class_models) == 3
@@ -106,4 +106,3 @@ class ProbabilityCalibrator:
         rs = out.sum(axis=1, keepdims=True)
         rs = np.where(rs <= 0.0, 1.0, rs)
         return out / rs
-

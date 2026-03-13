@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import os
 from pathlib import Path
@@ -5,7 +7,6 @@ from typing import Any
 
 import joblib
 import numpy as np
-import pandas as pd
 import torch
 import torch.distributed as dist  # DDP Support
 
@@ -28,6 +29,44 @@ try:
 except ImportError:
     KAN_LIB_AVAILABLE = False
     KAN = None
+
+
+def _is_dataframe_like(value: Any) -> bool:
+    return bool(hasattr(value, "columns") and hasattr(value, "index"))
+
+
+def _slice_rows(value: Any, start: int, end: int) -> Any:
+    s = max(0, int(start))
+    e = max(s, int(end))
+    if _is_dataframe_like(value):
+        idx = np.arange(s, e, dtype=np.int64)
+        try:
+            return value.take(idx)
+        except Exception:
+            try:
+                base_idx = np.asarray(getattr(value, "index")).reshape(-1)
+                return value.loc[base_idx[idx]]
+            except Exception:
+                pass
+    arr = np.asarray(value)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    return arr[s:e]
+
+
+def _to_1d_int_labels(value: Any) -> np.ndarray:
+    if hasattr(value, "to_numpy"):
+        try:
+            arr = value.to_numpy(copy=False)
+        except Exception:
+            arr = np.asarray(value)
+    else:
+        arr = np.asarray(value)
+    arr = np.asarray(arr).reshape(-1)
+    if arr.size <= 0:
+        return np.zeros(0, dtype=np.int64)
+    arr = np.nan_to_num(arr.astype(np.float64, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+    return arr.astype(np.int64, copy=False)
 
 
 class KANExpert(ExpertModel):
@@ -67,13 +106,13 @@ class KANExpert(ExpertModel):
         self.device = select_device(device)
         self.input_dim = 0
 
-    def fit(self, X: pd.DataFrame, y: pd.Series, tensorboard_writer: Any | None = None) -> None:
+    def fit(self, X: Any, y: Any, tensorboard_writer: Any | None = None) -> None:
         if not KAN_LIB_AVAILABLE:
             logger.error("efficient-kan not installed. GPU Training skipped.")
             return
 
         self.input_dim = X.shape[1]
-        y_vals = y.to_numpy()
+        y_vals = _to_1d_int_labels(y)
         if not np.all(np.isin(y_vals, [-1, 0, 1])):
             raise ValueError(f"Labels must be in {{-1, 0, 1}}, got: {np.unique(y_vals)}")
 
@@ -83,12 +122,13 @@ class KANExpert(ExpertModel):
             )
         except Exception:
             split = int(len(X) * 0.85)
-            X_train, X_val = X.iloc[:split], X.iloc[split:]
-            y_train, y_val = y.iloc[:split], y.iloc[split:]
+            X_train, X_val = _slice_rows(X, 0, split), _slice_rows(X, split, len(X))
+            y_train, y_val = _slice_rows(y, 0, split), _slice_rows(y, split, len(y))
 
         # HPC FIX: Unified Protocol Mapping
         # -1 (Sell) -> 2, 0 (Neutral) -> 0, 1 (Buy) -> 1
-        y_mapped = np.where(y_train.to_numpy() == -1, 2, y_train.to_numpy()).astype(int)
+        y_train_arr = _to_1d_int_labels(y_train)
+        y_mapped = np.where(y_train_arr == -1, 2, y_train_arr).astype(int)
         X_t = torch.as_tensor(
             dataframe_to_float32_numpy(X_train),
             dtype=torch.float32,
@@ -100,7 +140,8 @@ class KANExpert(ExpertModel):
         y_v = None
         if len(X_val) > 0:
             # ...
-            y_v_mapped = np.where(y_val.to_numpy() == -1, 2, y_val.to_numpy()).astype(int)
+            y_val_arr = _to_1d_int_labels(y_val)
+            y_v_mapped = np.where(y_val_arr == -1, 2, y_val_arr).astype(int)
             X_v = torch.as_tensor(
                 dataframe_to_float32_numpy(X_val),
                 dtype=torch.float32,
@@ -236,7 +277,7 @@ class KANExpert(ExpertModel):
             if empty_cache:
                 torch.cuda.empty_cache()
 
-    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, X: Any) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("KAN GPU model not loaded")
         self.model.eval()
@@ -245,7 +286,7 @@ class KANExpert(ExpertModel):
             # Process in chunks to avoid OOM even on GPU if X is huge
             chunk_size = 8192
             for start in range(0, len(X), chunk_size):
-                xb_df = X.iloc[start : start + chunk_size]
+                xb_df = _slice_rows(X, start, start + chunk_size)
                 xb = torch.as_tensor(dataframe_to_float32_numpy(xb_df), dtype=torch.float32, device=self.device)
                 logits = self.model(xb)
                 outs.append(torch.softmax(logits, dim=1).cpu().numpy())
@@ -285,3 +326,6 @@ class KANExpert(ExpertModel):
             except TypeError as exc:
                 raise RuntimeError("PyTorch too old for weights_only load; upgrade for security.") from exc
             self.model.load_state_dict(state)
+
+
+

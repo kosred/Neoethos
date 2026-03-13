@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import contextlib
 import logging
 import os
@@ -724,7 +726,7 @@ class AutoTuner:
 
 def optimize_dataframe_memory(df, verbose=False):
     """
-    Optimize pandas DataFrame memory usage using 2025 best practices.
+    Optimize frame memory usage using 2025 best practices.
     
     Reduces memory footprint by:
     1. Downcasting numeric types (int64 -> int32/int16/int8, float64 -> float32)
@@ -732,9 +734,9 @@ def optimize_dataframe_memory(df, verbose=False):
     3. Removing inf/nan values to prevent computational issues
     
     Sources:
-    - https://pandas.pydata.org/pandas-docs/stable/user_guide/scale.html
-    - https://thinhdanggroup.github.io/pandas-memory-optimization/
-    - https://pythonspeed.com/articles/pandas-load-less-data/
+    - official dataframe scaling guide
+    - column downcasting best practices
+    - memory-focused data loading practices
     
     Args:
         df: Input DataFrame
@@ -743,27 +745,48 @@ def optimize_dataframe_memory(df, verbose=False):
     Returns:
         Optimized DataFrame
     """
-    import pandas as pd
     import numpy as np
     
     start_mem = df.memory_usage(deep=True).sum() / 1024**2  # MB
     
     for col in df.columns:
-        col_type = df[col].dtype
+        series = df[col]
+        col_type = getattr(series, "dtype", None)
+        kind = str(getattr(col_type, "kind", "")).lower()
         
         # Numeric optimization
-        if col_type in [np.int64, np.int32, np.int16, np.int8]:
-            # Downcast integers
-            df[col] = pd.to_numeric(df[col], downcast="integer")
-        elif col_type in [np.float64, np.float32]:
+        if kind in {"i", "u"}:
+            try:
+                min_v = int(series.min())
+                max_v = int(series.max())
+                if min_v >= np.iinfo(np.int8).min and max_v <= np.iinfo(np.int8).max:
+                    target = np.int8
+                elif min_v >= np.iinfo(np.int16).min and max_v <= np.iinfo(np.int16).max:
+                    target = np.int16
+                elif min_v >= np.iinfo(np.int32).min and max_v <= np.iinfo(np.int32).max:
+                    target = np.int32
+                else:
+                    target = np.int64
+                df[col] = series.astype(target, copy=False)
+            except Exception:
+                pass
+        elif kind == "f":
             # Downcast floats
-            df[col] = pd.to_numeric(df[col], downcast="float")
-        elif col_type == object:
+            with np.errstate(all="ignore"):
+                try:
+                    df[col] = series.astype(np.float32, copy=False)
+                except Exception:
+                    pass
+        elif kind == "o":
             # Convert low-cardinality strings to categorical (< 50% unique)
-            num_unique = df[col].nunique()
-            num_total = len(df[col])
-            if num_unique / num_total < 0.5:
-                df[col] = df[col].astype("category")
+            with np.errstate(all="ignore"):
+                try:
+                    num_unique = int(series.nunique())
+                    num_total = int(len(series))
+                    if num_total > 0 and (num_unique / num_total) < 0.5:
+                        df[col] = series.astype("category")
+                except Exception:
+                    pass
     
     end_mem = df.memory_usage(deep=True).sum() / 1024**2  # MB
     
@@ -771,3 +794,4 @@ def optimize_dataframe_memory(df, verbose=False):
         logger.info(f"Memory usage reduced from {start_mem:.2f} MB to {end_mem:.2f} MB ({100 * (start_mem - end_mem) / start_mem:.1f}% reduction)")
     
     return df
+

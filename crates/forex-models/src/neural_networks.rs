@@ -28,7 +28,7 @@ pub use crate::onnx_exporter::ONNXExportable;
 /// MLP Expert - PyO3 wrapper around Python mlp.py MLPExpert class
 /// Keeps Python model AS-IS, provides Rust interface
 pub struct MLPExpert {
-    py_expert: Option<Py<PyAny>>,  // Python MLPExpert instance
+    py_expert: Option<Py<PyAny>>, // Python MLPExpert instance
 }
 
 impl MLPExpert {
@@ -49,7 +49,8 @@ impl MLPExpert {
                 .context("Failed to import forex_bot.models.mlp")?;
 
             // Get MLPExpert class
-            let mlp_class = mlp_module.getattr("MLPExpert")
+            let mlp_class = mlp_module
+                .getattr("MLPExpert")
                 .context("MLPExpert class not found")?;
 
             // Instantiate: MLPExpert(hidden_dim=256, n_layers=3, ...)
@@ -75,7 +76,9 @@ impl MLPExpert {
     /// Python only does model training (no DataLoader workers needed)
     pub fn fit(&mut self, x: &Array2<f32>, y: &[i32]) -> Result<()> {
         Python::attach(|py| {
-            let expert = self.py_expert.as_ref()
+            let expert = self
+                .py_expert
+                .as_ref()
                 .context("MLP expert not initialized")?
                 .bind(py);
 
@@ -83,7 +86,8 @@ impl MLPExpert {
             let numpy = PyModule::import(py, "numpy")?;
             let x_shape = (x.nrows(), x.ncols());
             let x_flat: Vec<f32> = x.iter().copied().collect();
-            let x_np = numpy.call_method1("array", (x_flat,))?
+            let x_np = numpy
+                .call_method1("array", (x_flat,))?
                 .call_method1("reshape", (x_shape,))?;
 
             let y_np = numpy.call_method1("array", (y,))?;
@@ -103,7 +107,9 @@ impl MLPExpert {
     /// Predict probabilities - delegates to Python MLPExpert.predict_proba()
     pub fn predict_proba(&self, x: &Array2<f32>) -> Result<Array2<f32>> {
         Python::attach(|py| {
-            let expert = self.py_expert.as_ref()
+            let expert = self
+                .py_expert
+                .as_ref()
                 .context("MLP expert not initialized")?
                 .bind(py);
 
@@ -113,7 +119,8 @@ impl MLPExpert {
 
             let x_shape = (x.nrows(), x.ncols());
             let x_flat: Vec<f32> = x.iter().copied().collect();
-            let x_np = numpy.call_method1("array", (x_flat,))?
+            let x_np = numpy
+                .call_method1("array", (x_flat,))?
                 .call_method1("reshape", (x_shape,))?;
             let x_df = pd.call_method1("DataFrame", (x_np,))?;
 
@@ -134,7 +141,9 @@ impl MLPExpert {
     /// Save model - delegates to Python MLPExpert.save()
     pub fn save(&self, path: &Path) -> Result<()> {
         Python::attach(|py| {
-            let expert = self.py_expert.as_ref()
+            let expert = self
+                .py_expert
+                .as_ref()
                 .context("MLP expert not initialized")?
                 .bind(py);
 
@@ -148,7 +157,9 @@ impl MLPExpert {
     /// Load model - delegates to Python MLPExpert.load()
     pub fn load(&mut self, path: &Path) -> Result<()> {
         Python::attach(|py| {
-            let expert = self.py_expert.as_ref()
+            let expert = self
+                .py_expert
+                .as_ref()
                 .context("MLP expert not initialized")?
                 .bind(py);
 
@@ -166,7 +177,9 @@ impl MLPExpert {
             let torch = PyModule::import(py, "torch")?;
             let numpy = PyModule::import(py, "numpy")?;
 
-            let expert = self.py_expert.as_ref()
+            let expert = self
+                .py_expert
+                .as_ref()
                 .context("MLP expert not initialized")?
                 .bind(py);
 
@@ -179,10 +192,12 @@ impl MLPExpert {
             // Convert sample_input to torch tensor
             let shape = (sample_input.nrows(), sample_input.ncols());
             let flat: Vec<f32> = sample_input.iter().copied().collect();
-            let np_array = numpy.call_method1("array", (flat,))?
+            let np_array = numpy
+                .call_method1("array", (flat,))?
                 .call_method1("reshape", (shape,))?;
 
-            let tensor = torch.call_method1("from_numpy", (np_array,))?
+            let tensor = torch
+                .call_method1("from_numpy", (np_array,))?
                 .call_method0("float")?;
 
             // Export to ONNX
@@ -202,12 +217,15 @@ impl MLPExpert {
             dynamic_axes.set_item("output", output_axes)?;
             export_params.set_item("dynamic_axes", dynamic_axes)?;
 
-            torch.getattr("onnx")?
-                .call_method(
-                    "export",
-                    (pytorch_model, tensor, output_path.to_string_lossy().as_ref()),
-                    Some(&export_params),
-                )?;
+            torch.getattr("onnx")?.call_method(
+                "export",
+                (
+                    pytorch_model,
+                    tensor,
+                    output_path.to_string_lossy().as_ref(),
+                ),
+                Some(&export_params),
+            )?;
 
             info!("Exported MLP model to ONNX: {:?}", output_path);
             Ok(())
@@ -225,7 +243,15 @@ pub struct NBeatsExpert {
 }
 
 impl NBeatsExpert {
-    pub fn new(hidden_dim: i64, n_layers: i64, n_blocks: i64, lr: f64, max_time_sec: u64, device: &str, batch_size: i64) -> Result<Self> {
+    pub fn new(
+        hidden_dim: i64,
+        n_layers: i64,
+        n_blocks: i64,
+        lr: f64,
+        max_time_sec: u64,
+        device: &str,
+        batch_size: i64,
+    ) -> Result<Self> {
         Python::attach(|py| {
             let deep_module = PyModule::import(py, "forex_bot.models.deep")?;
             let class = deep_module.getattr("NBeatsExpert")?;
@@ -264,7 +290,10 @@ impl NBeatsExpert {
     // Shared helper methods (DRY principle)
     fn call_python_fit(py_expert: &Option<Py<PyAny>>, x: &Array2<f32>, y: &[i32]) -> Result<()> {
         Python::attach(|py| {
-            let expert = py_expert.as_ref().context("Expert not initialized")?.bind(py);
+            let expert = py_expert
+                .as_ref()
+                .context("Expert not initialized")?
+                .bind(py);
             let (x_df, y_series) = Self::arrays_to_pandas(py, x, y)?;
             expert.call_method1("fit", (x_df, y_series))?;
             Ok(())
@@ -273,7 +302,10 @@ impl NBeatsExpert {
 
     fn call_python_predict(py_expert: &Option<Py<PyAny>>, x: &Array2<f32>) -> Result<Array2<f32>> {
         Python::attach(|py| {
-            let expert = py_expert.as_ref().context("Expert not initialized")?.bind(py);
+            let expert = py_expert
+                .as_ref()
+                .context("Expert not initialized")?
+                .bind(py);
             let x_df = Self::array_to_dataframe(py, x)?;
             let probs_np = expert.call_method1("predict_proba", (x_df,))?;
             Self::numpy_to_array2(probs_np)
@@ -282,7 +314,10 @@ impl NBeatsExpert {
 
     fn call_python_save(py_expert: &Option<Py<PyAny>>, path: &Path) -> Result<()> {
         Python::attach(|py| {
-            let expert = py_expert.as_ref().context("Expert not initialized")?.bind(py);
+            let expert = py_expert
+                .as_ref()
+                .context("Expert not initialized")?
+                .bind(py);
             expert.call_method1("save", (path.to_string_lossy().as_ref(),))?;
             Ok(())
         })
@@ -290,19 +325,28 @@ impl NBeatsExpert {
 
     fn call_python_load(py_expert: &Option<Py<PyAny>>, path: &Path) -> Result<()> {
         Python::attach(|py| {
-            let expert = py_expert.as_ref().context("Expert not initialized")?.bind(py);
+            let expert = py_expert
+                .as_ref()
+                .context("Expert not initialized")?
+                .bind(py);
             expert.call_method1("load", (path.to_string_lossy().as_ref(),))?;
             Ok(())
         })
     }
 
-    fn arrays_to_pandas<'py>(py: Python<'py>, x: &Array2<f32>, y: &[i32]) -> Result<(Bound<'py, pyo3::PyAny>, Bound<'py, pyo3::PyAny>)> {
+    fn arrays_to_pandas<'py>(
+        py: Python<'py>,
+        x: &Array2<f32>,
+        y: &[i32],
+    ) -> Result<(Bound<'py, pyo3::PyAny>, Bound<'py, pyo3::PyAny>)> {
         let numpy = PyModule::import(py, "numpy")?;
         let pd = PyModule::import(py, "pandas")?;
 
         let x_shape = (x.nrows(), x.ncols());
         let x_flat: Vec<f32> = x.iter().copied().collect();
-        let x_np = numpy.call_method1("array", (x_flat,))?.call_method1("reshape", (x_shape,))?;
+        let x_np = numpy
+            .call_method1("array", (x_flat,))?
+            .call_method1("reshape", (x_shape,))?;
         let y_np = numpy.call_method1("array", (y,))?;
 
         let x_df = pd.call_method1("DataFrame", (x_np,))?;
@@ -311,13 +355,18 @@ impl NBeatsExpert {
         Ok((x_df, y_series))
     }
 
-    fn array_to_dataframe<'py>(py: Python<'py>, x: &Array2<f32>) -> Result<Bound<'py, pyo3::PyAny>> {
+    fn array_to_dataframe<'py>(
+        py: Python<'py>,
+        x: &Array2<f32>,
+    ) -> Result<Bound<'py, pyo3::PyAny>> {
         let numpy = PyModule::import(py, "numpy")?;
         let pd = PyModule::import(py, "pandas")?;
 
         let x_shape = (x.nrows(), x.ncols());
         let x_flat: Vec<f32> = x.iter().copied().collect();
-        let x_np = numpy.call_method1("array", (x_flat,))?.call_method1("reshape", (x_shape,))?;
+        let x_np = numpy
+            .call_method1("array", (x_flat,))?
+            .call_method1("reshape", (x_shape,))?;
         Ok(pd.call_method1("DataFrame", (x_np,))?)
     }
 
@@ -340,7 +389,8 @@ impl NBeatsExpert {
             let torch = PyModule::import(py, "torch")?;
             let numpy = PyModule::import(py, "numpy")?;
 
-            let expert = py_expert.as_ref()
+            let expert = py_expert
+                .as_ref()
                 .context("Expert not initialized")?
                 .bind(py);
 
@@ -353,10 +403,12 @@ impl NBeatsExpert {
             // Convert sample_input to torch tensor
             let shape = (sample_input.nrows(), sample_input.ncols());
             let flat: Vec<f32> = sample_input.iter().copied().collect();
-            let np_array = numpy.call_method1("array", (flat,))?
+            let np_array = numpy
+                .call_method1("array", (flat,))?
                 .call_method1("reshape", (shape,))?;
 
-            let tensor = torch.call_method1("from_numpy", (np_array,))?
+            let tensor = torch
+                .call_method1("from_numpy", (np_array,))?
                 .call_method0("float")?;
 
             // Export to ONNX
@@ -376,12 +428,15 @@ impl NBeatsExpert {
             dynamic_axes.set_item("output", output_axes)?;
             export_params.set_item("dynamic_axes", dynamic_axes)?;
 
-            torch.getattr("onnx")?
-                .call_method(
-                    "export",
-                    (pytorch_model, tensor, output_path.to_string_lossy().as_ref()),
-                    Some(&export_params),
-                )?;
+            torch.getattr("onnx")?.call_method(
+                "export",
+                (
+                    pytorch_model,
+                    tensor,
+                    output_path.to_string_lossy().as_ref(),
+                ),
+                Some(&export_params),
+            )?;
 
             info!("Exported {} model to ONNX: {:?}", model_name, output_path);
             Ok(())
@@ -400,7 +455,13 @@ pub struct TiDEExpert {
 }
 
 impl TiDEExpert {
-    pub fn new(hidden_dim: i64, lr: f64, batch_size: i64, max_time_sec: u64, device: &str) -> Result<Self> {
+    pub fn new(
+        hidden_dim: i64,
+        lr: f64,
+        batch_size: i64,
+        max_time_sec: u64,
+        device: &str,
+    ) -> Result<Self> {
         Python::attach(|py| {
             let deep_module = PyModule::import(py, "forex_bot.models.deep")?;
             let class = deep_module.getattr("TiDEExpert")?;
@@ -446,7 +507,14 @@ pub struct TabNetExpert {
 }
 
 impl TabNetExpert {
-    pub fn new(hidden_dim: i64, n_steps: i64, lr: f64, batch_size: i64, max_time_sec: u64, device: &str) -> Result<Self> {
+    pub fn new(
+        hidden_dim: i64,
+        n_steps: i64,
+        lr: f64,
+        batch_size: i64,
+        max_time_sec: u64,
+        device: &str,
+    ) -> Result<Self> {
         Python::attach(|py| {
             let deep_module = PyModule::import(py, "forex_bot.models.deep")?;
             let class = deep_module.getattr("TabNetExpert")?;
@@ -493,7 +561,13 @@ pub struct KANExpert {
 }
 
 impl KANExpert {
-    pub fn new(hidden_dim: i64, lr: f64, batch_size: i64, max_time_sec: u64, device: &str) -> Result<Self> {
+    pub fn new(
+        hidden_dim: i64,
+        lr: f64,
+        batch_size: i64,
+        max_time_sec: u64,
+        device: &str,
+    ) -> Result<Self> {
         Python::attach(|py| {
             let deep_module = PyModule::import(py, "forex_bot.models.deep")?;
             let class = deep_module.getattr("KANExpert")?;

@@ -1,15 +1,210 @@
+from __future__ import annotations
+
 import logging
 import multiprocessing
 import time
 from typing import Any
 
-import pandas as pd
+import numpy as np
 import torch
 
 from ..models.device import select_device
 from ..models.registry import get_model_class
 
 logger = logging.getLogger(__name__)
+
+
+def _is_dataframe_like(value: Any) -> bool:
+    return bool(hasattr(value, "columns") and hasattr(value, "index"))
+
+
+def _is_frame_like(value: Any) -> bool:
+    return bool(hasattr(value, "columns") and hasattr(value, "index") and hasattr(value, "__getitem__"))
+
+
+def _frame_columns(value: Any) -> list[str]:
+    cols = getattr(value, "columns", None)
+    if cols is None:
+        return []
+    try:
+        return [str(c) for c in list(cols)]
+    except Exception:
+        return []
+
+
+def _slice_frame_rows(value: Any, rows: int) -> Any:
+    n = max(0, int(rows))
+    cols = _frame_columns(value)
+    if not cols or not hasattr(value, "__getitem__"):
+        return np.asarray(value)[:n].copy()
+    data: dict[str, np.ndarray] = {}
+    for col in cols:
+        try:
+            vec = np.asarray(value[col]).reshape(-1)  # type: ignore[index]
+            data[str(col)] = vec[:n]
+        except Exception:
+            continue
+    idx = getattr(value, "index", None)
+    idx_arr = np.asarray(idx).reshape(-1) if idx is not None else np.arange(n, dtype=np.int64)
+    attrs = getattr(value, "attrs", None)
+    return _FrameSlice(data, idx_arr[:n], attrs=(dict(attrs) if isinstance(attrs, dict) else None))
+
+
+class _FrameSlice:
+    def __init__(self, data: dict[str, np.ndarray], index: np.ndarray, attrs: dict[str, Any] | None = None) -> None:
+        self._data = {str(k): np.asarray(v).reshape(-1) for k, v in data.items()}
+        self.index = np.asarray(index).reshape(-1)
+        self.columns = list(self._data.keys())
+        self.attrs = dict(attrs or {})
+
+    @property
+    def empty(self) -> bool:
+        return int(len(self.index)) <= 0
+
+    def __len__(self) -> int:
+        return int(len(self.index))
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        return self._data[str(key)]
+
+
+def _row_count(data: Any) -> int:
+    if data is None:
+        return 0
+    with np.errstate(all="ignore"):
+        try:
+            if hasattr(data, "shape") and len(getattr(data, "shape", ())) >= 1:
+                return int(data.shape[0])
+        except Exception:
+            pass
+    try:
+        return int(len(data))
+    except Exception:
+        return 0
+
+
+def _feature_dim(data: Any, default: int = 0) -> int:
+    if data is None:
+        return int(default)
+    with np.errstate(all="ignore"):
+        try:
+            shape = getattr(data, "shape", None)
+            if shape is not None and len(shape) >= 2:
+                return int(shape[1])
+        except Exception:
+            pass
+    if _is_dataframe_like(data):
+        try:
+            return int(len(data.columns))
+        except Exception:
+            return int(default)
+    if _is_frame_like(data):
+        try:
+            return int(len(_frame_columns(data)))
+        except Exception:
+            return int(default)
+    arr = np.asarray(data)
+    if arr.ndim >= 2:
+        return int(arr.shape[1])
+    if arr.ndim == 1:
+        return 1
+    return int(default)
+
+
+def _slice_rows(data: Any, rows: int) -> Any:
+    if data is None:
+        return None
+    n = max(0, int(rows))
+    if _is_dataframe_like(data):
+        try:
+            idx = np.arange(n, dtype=np.int64)
+            out = data.take(idx)
+            return out.copy() if hasattr(out, "copy") else out
+        except Exception:
+            pass
+        try:
+            base_idx = np.asarray(getattr(data, "index")).reshape(-1)
+            out = data.loc[base_idx[:n]]
+            return out.copy() if hasattr(out, "copy") else out
+        except Exception:
+            pass
+    if _is_frame_like(data):
+        return _slice_frame_rows(data, n)
+    arr = np.asarray(data)
+    if arr.ndim == 0:
+        return arr.reshape(1)[:n]
+    return arr[:n].copy()
+
+
+def _as_2d_float32(data: Any) -> np.ndarray:
+    if data is None:
+        return np.zeros((0, 0), dtype=np.float32)
+    if _is_dataframe_like(data):
+        try:
+            arr = data.to_numpy(dtype=np.float32, copy=False)
+        except Exception:
+            arr = None
+        if arr is None:
+            cols = _frame_columns(data)
+            mats: list[np.ndarray] = []
+            n_rows = 0
+            for col in cols:
+                try:
+                    vec = np.asarray(data[col], dtype=np.float32).reshape(-1)  # type: ignore[index]
+                    mats.append(vec)
+                    n_rows = max(n_rows, int(vec.size))
+                except Exception:
+                    continue
+            if mats:
+                arr = np.zeros((n_rows, len(mats)), dtype=np.float32)
+                for j, vec in enumerate(mats):
+                    take = min(n_rows, int(vec.size))
+                    if take > 0:
+                        arr[:take, j] = vec[:take]
+            else:
+                arr = np.asarray(data)
+    elif _is_frame_like(data):
+        cols = _frame_columns(data)
+        mats: list[np.ndarray] = []
+        n_rows = 0
+        for col in cols:
+            try:
+                vec = np.asarray(data[col], dtype=np.float32).reshape(-1)  # type: ignore[index]
+                mats.append(vec)
+                n_rows = max(n_rows, int(vec.size))
+            except Exception:
+                continue
+        if mats:
+            arr = np.zeros((n_rows, len(mats)), dtype=np.float32)
+            for j, vec in enumerate(mats):
+                take = min(n_rows, int(vec.size))
+                if take > 0:
+                    arr[:take, j] = vec[:take]
+        else:
+            arr = np.asarray(data)
+    else:
+        arr = np.asarray(data)
+    if arr.ndim == 0:
+        arr = arr.reshape(1, 1)
+    elif arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    elif arr.ndim > 2:
+        arr = arr.reshape(arr.shape[0], -1)
+    out = np.asarray(arr, dtype=np.float32)
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _as_1d_int8(data: Any) -> np.ndarray:
+    if data is None:
+        return np.zeros((0,), dtype=np.int8)
+    arr = np.asarray(data)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    else:
+        arr = arr.reshape(-1)
+    out = np.asarray(arr, dtype=np.float32)
+    out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    return out.astype(np.int8, copy=False)
 
 
 def _gpu_baseline(device_name: str | None) -> float:
@@ -96,19 +291,67 @@ class BenchmarkService:
     # Cache probe throughputs keyed by model + shapes + device
     _probe_cache: dict[tuple, float] = {}
 
-    def run_micro_benchmark(self, X: pd.DataFrame, y: pd.Series, device: str) -> dict:
+    def run_micro_benchmark(self, X: Any, y: Any, device: str) -> dict:
         """
         REAL benchmark: Train small model on actual data, measure ACTUAL time.
         Returns dict with raw measurements, no guessing.
         """
         try:
             # Use a safe sample size that accommodates sequence lookbacks (e.g. 60) and splits
-            n_samples = min(10000, len(X))
+            n_samples = min(10000, _row_count(X))
             if n_samples < 200:  # Too small to benchmark
                 return {"samples_trained": 0, "actual_duration_sec": 0, "samples_per_second": 0, "device": device}
 
-            sub_X = X.iloc[:n_samples].copy()
-            sub_y = y.iloc[:n_samples].copy()
+            # Tensor-native probe for all dataset containers (numpy/frame-like/dataframe).
+            sub_X = _as_2d_float32(_slice_rows(X, n_samples))
+            sub_y = _as_1d_int8(_slice_rows(y, n_samples))
+            if sub_X.shape[0] > 0 and sub_X.shape[1] > 0:
+                rows = min(int(sub_X.shape[0]), int(sub_y.size) if sub_y.size > 0 else int(sub_X.shape[0]))
+                sub_X = sub_X[:rows]
+                if sub_y.size > 0:
+                    sub_y = sub_y[:rows]
+                else:
+                    sub_y = np.zeros(rows, dtype=np.int8)
+                bench_device = select_device(device)
+                probe_model = torch.nn.Sequential(
+                    torch.nn.Linear(sub_X.shape[1], 32),
+                    torch.nn.ReLU(),
+                    torch.nn.Linear(32, 3),
+                ).to(bench_device)
+                optimizer = torch.optim.AdamW(probe_model.parameters(), lr=1e-3)
+                criterion = torch.nn.CrossEntropyLoss()
+                x_tensor = torch.as_tensor(sub_X, dtype=torch.float32, device=bench_device)
+                y_tensor = torch.as_tensor(np.clip(sub_y + 1, 0, 2), dtype=torch.long, device=bench_device)
+                bs = 128
+                steps = max(2, min(24, int(np.ceil(rows / bs))))
+                if torch.cuda.is_available() and str(bench_device).startswith("cuda"):
+                    torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                start = 0
+                for _ in range(steps):
+                    end = min(start + bs, rows)
+                    xb = x_tensor[start:end]
+                    yb = y_tensor[start:end]
+                    logits = probe_model(xb)
+                    loss = criterion(logits, yb)
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    optimizer.step()
+                    start = 0 if end >= rows else end
+                if torch.cuda.is_available() and str(bench_device).startswith("cuda"):
+                    torch.cuda.synchronize()
+                duration = time.perf_counter() - t0
+                return {
+                    "samples_trained": rows,
+                    "actual_duration_sec": duration,
+                    "samples_per_second": rows / duration if duration > 0 else 0,
+                    "device": str(bench_device),
+                }
+            if not _is_dataframe_like(X):
+                return {"samples_trained": 0, "actual_duration_sec": 0, "samples_per_second": 0, "device": device}
+
+            sub_X = _slice_rows(X, n_samples)
+            sub_y = _slice_rows(y, n_samples)
 
             # Use a simplified Transformer for the probe (good representative of heavy compute)
             # Ensure seq_len is small to avoid index errors on small slices
@@ -168,7 +411,7 @@ class BenchmarkService:
     def probe_throughput(
         self,
         model_name: str,
-        X: pd.DataFrame,
+        X: Any,
         batch_size: int,
         device: str,
         steps: int = 10,
@@ -179,7 +422,7 @@ class BenchmarkService:
         Uses cache keyed by model, feature shape, batch size, and hardware signature.
         """
         try:
-            feature_dim = X.shape[1]
+            feature_dim = _feature_dim(X, default=0)
             sig = (model_name, feature_dim, batch_size, device, self._hardware_signature(simulated_gpu))
             if sig in self._probe_cache:
                 return self._probe_cache[sig]
@@ -197,12 +440,15 @@ class BenchmarkService:
             if hasattr(model, "device"):
                 model.device = select_device(device if simulated_gpu is None else "cuda")
 
-            bs = min(batch_size, len(X))
-            Xs = X.iloc[: max(bs * steps, bs)].copy()
+            total_rows = _row_count(X)
+            if total_rows <= 0:
+                return None
+            bs = min(batch_size, total_rows)
+            Xs = _slice_rows(X, max(bs * steps, bs))
             # Build a dataloader-like loop
 
             data = torch.as_tensor(
-                Xs.values,
+                _as_2d_float32(Xs),
                 dtype=torch.float32,
                 device=model.device if hasattr(model, "device") else (device if simulated_gpu is None else "cuda"),
             )
@@ -324,71 +570,39 @@ class BenchmarkService:
 
         return est_time
 
-    def _probe_scaling_law(self, model_name: str, X: pd.DataFrame, y: pd.Series, device: str) -> tuple[float, float]:
+    def _probe_scaling_law(self, model_name: str, X: Any, y: Any, device: str) -> tuple[float, float]:
         """
         Run benchmarks at multiple scales to determine startup cost (c) and per-sample cost (m).
         Returns (m, c) for Time = m * N + c
         """
-        import numpy as np
-
         sizes = [1000, 2000, 4000]
         times = []
         valid_sizes = []
 
         # Use real data if available and sufficient, otherwise fallback to random
-        use_real_data = X is not None and len(X) >= max(sizes)
+        use_real_data = X is not None and _row_count(X) >= max(sizes)
 
         if not use_real_data:
             # Fallback: Create dummy data
             max_size = max(sizes)
-            feature_dim = 100  # Default assumption
-            if X is not None:
-                feature_dim = X.shape[1]
-
-            X_source = pd.DataFrame(np.random.randn(max_size, feature_dim).astype(np.float32))
-            y_source = pd.Series(np.random.randint(0, 3, size=max_size))
-
-            meta_idx = pd.date_range("2024-01-01", periods=max_size, freq="1min")
-            meta_source = pd.DataFrame(
-                {
-                    "open": np.random.rand(max_size) + 100,
-                    "high": np.random.rand(max_size) + 101,
-                    "low": np.random.rand(max_size) + 99,
-                    "close": np.random.rand(max_size) + 100,
-                    "volume": np.random.rand(max_size) * 1000,
-                },
-                index=meta_idx,
-            )
+            feature_dim = max(1, _feature_dim(X, default=100))
+            X_source = np.random.randn(max_size, feature_dim).astype(np.float32)
+            y_source = np.random.randint(0, 3, size=max_size, dtype=np.int8)
+            meta_source = None
         else:
             # Use Real Data
             X_source = X
             y_source = y
-            # Try to infer metadata from X if possible or create aligned dummy meta
-            # Ideally X index is datetime
             meta_source = None
-            if hasattr(X, "index"):
-                # Simple heuristic to extract OHLC if present in X, else dummy
-                # But X usually has features like 'rsi', not 'open'.
-                # We'll create dummy meta aligned to X's index for safety.
-                meta_source = pd.DataFrame(
-                    {
-                        "open": np.random.rand(len(X)) + 100,
-                        "high": np.random.rand(len(X)) + 101,
-                        "low": np.random.rand(len(X)) + 99,
-                        "close": np.random.rand(len(X)) + 100,
-                        "volume": np.random.rand(len(X)) * 1000,
-                    },
-                    index=X.index,
-                )
 
         for size in sizes:
             # If using real data, strict check; for dummy we made enough
-            if size > len(X_source):
+            if size > _row_count(X_source):
                 break
 
-            sub_X = X_source.iloc[:size].copy()
-            sub_y = y_source.iloc[:size].copy()
-            sub_meta = meta_source.iloc[:size].copy() if meta_source is not None else None
+            sub_X = _slice_rows(X_source, size)
+            sub_y = _slice_rows(y_source, size)
+            sub_meta = _slice_rows(meta_source, size) if meta_source is not None else None
 
             # Instantiate model
             try:
@@ -489,7 +703,7 @@ class BenchmarkService:
             elif X_probe is not None and not simulate_gpu:
                 # We can run a real probe on current hardware
                 # Note: We assume y is available or we mock it
-                y_probe = pd.Series(0, index=X_probe.index)  # Mock labels
+                y_probe = np.zeros(_row_count(X_probe), dtype=np.int8)  # Mock labels
                 device = "cuda" if gpu else "cpu"
 
                 slope, intercept = self._probe_scaling_law(m, X_probe, y_probe, device)
@@ -538,3 +752,4 @@ class BenchmarkService:
                 logger.info(f"  → {line}")
 
         return total_time
+

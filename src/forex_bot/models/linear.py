@@ -6,7 +6,6 @@ from typing import Any
 
 import joblib
 import numpy as np
-import pandas as pd
 
 from .base import ExpertModel
 from .label_utils import margins_to_probs, probs_to_three_class, remap_labels_neutral_buy_sell
@@ -42,16 +41,52 @@ except Exception:
     RIVER_AVAILABLE = False
 
 
-def _canon_y(y: pd.Series | np.ndarray) -> np.ndarray:
+def _canon_y(y: Any | np.ndarray) -> np.ndarray:
     # Canonical class order: 0=neutral, 1=buy, 2=sell.
     return remap_labels_neutral_buy_sell(y)
 
 
-def _align_features(x: pd.DataFrame, cols: list[str] | None) -> pd.DataFrame:
-    if cols is None or not cols:
-        return x
-    out = x.reindex(columns=cols, fill_value=0.0)
-    return out
+def _as_numeric_matrix(x: Any, cols: list[str] | None = None) -> tuple[np.ndarray, list[str]]:
+    if x is None:
+        return np.zeros((0, 0), dtype=np.float32), list(cols or [])
+    if hasattr(x, "select_dtypes"):
+        x_num = x.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        arr = np.asarray(x_num.to_numpy(dtype=np.float32, copy=False), dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        source_names = [str(c) for c in x_num.columns]
+        if cols:
+            target_names = [str(c) for c in cols]
+            out = np.zeros((arr.shape[0], len(target_names)), dtype=np.float32)
+            name_to_idx = {name: i for i, name in enumerate(source_names)}
+            for j, name in enumerate(target_names):
+                idx = name_to_idx.get(name)
+                if idx is not None:
+                    out[:, j] = arr[:, idx]
+            return out, target_names
+        return arr, source_names
+    arr = np.asarray(x, dtype=np.float32)
+    if arr.ndim == 0:
+        arr = arr.reshape(1, 1)
+    elif arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    elif arr.ndim > 2:
+        arr = arr.reshape(arr.shape[0], -1)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    n_cols = int(arr.shape[1]) if arr.ndim == 2 else 0
+    if cols and len(cols) == n_cols:
+        names = [str(c) for c in cols]
+    elif cols and len(cols) > 0:
+        names = [str(c) for c in cols]
+        target = len(names)
+        out = np.zeros((arr.shape[0], target), dtype=np.float32)
+        keep = min(target, n_cols)
+        if keep > 0:
+            out[:, :keep] = arr[:, :keep]
+        arr = out
+    else:
+        names = [f"f{i}" for i in range(n_cols)]
+    return arr, names
 
 
 def _pad_probs_with_classes(probs: np.ndarray, classes: np.ndarray | list[int] | None) -> np.ndarray:
@@ -62,12 +97,11 @@ def _decision_to_probs(decision: np.ndarray) -> np.ndarray:
     return margins_to_probs(decision)
 
 
-def _iter_feature_dict_rows(x_df: pd.DataFrame):
+def _iter_feature_dict_rows(x: Any):
     """
-    Convert numeric frame rows to feature dicts with lower overhead than per-row pandas to_dict.
+    Convert numeric rows to feature dicts with low overhead.
     """
-    names = [str(c) for c in x_df.columns]
-    arr = x_df.to_numpy(dtype=np.float32, copy=False)
+    arr, names = _as_numeric_matrix(x)
     n_feat = int(arr.shape[1]) if arr.ndim == 2 else 0
     for row in arr:
         yield {names[j]: float(row[j]) for j in range(n_feat)}
@@ -86,11 +120,10 @@ class _LinearBase(ExpertModel):
     def _build_model(self) -> Any:
         raise NotImplementedError
 
-    def _prepare_x(self, x: pd.DataFrame) -> np.ndarray:
-        x_df = x.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        return x_df.to_numpy(dtype=np.float32, copy=False)
+    def _prepare_x(self, x: Any, cols: list[str] | None = None) -> tuple[np.ndarray, list[str]]:
+        return _as_numeric_matrix(x, cols)
 
-    def fit(self, x: pd.DataFrame, y: pd.Series, **kwargs: Any) -> None:  # noqa: ARG002
+    def fit(self, x: Any, y: Any, **kwargs: Any) -> None:  # noqa: ARG002
         if not SKLEARN_AVAILABLE:
             logger.warning("%s skipped: scikit-learn not available.", self.model_name)
             self.model = None
@@ -98,9 +131,8 @@ class _LinearBase(ExpertModel):
         if x is None or len(x) == 0:
             self.model = None
             return
-        x_df = x.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        self.feature_columns = list(x_df.columns)
-        x_arr = x_df.to_numpy(dtype=np.float32, copy=False)
+        x_arr, x_cols = self._prepare_x(x)
+        self.feature_columns = list(x_cols)
         y_arr = _canon_y(y)
         uniq, cnt = np.unique(y_arr, return_counts=True)
         if len(uniq) < 2:
@@ -116,19 +148,15 @@ class _LinearBase(ExpertModel):
         self.model.fit(x_arr, y_arr)
         self.classes_ = np.asarray(getattr(self.model, "classes_", np.array([0, 1, 2], dtype=int)))
 
-    def predict_proba(self, x: pd.DataFrame, **kwargs: Any) -> np.ndarray:  # noqa: ARG002
+    def predict_proba(self, x: Any, **kwargs: Any) -> np.ndarray:  # noqa: ARG002
         if x is None:
             return np.zeros((0, 3), dtype=float)
+        x_arr, _x_cols = self._prepare_x(x, self.feature_columns)
+        n_rows = int(x_arr.shape[0])
         if self.constant_proba is not None:
-            n = len(x)
-            return np.tile(self.constant_proba.reshape(1, -1), (n, 1))
+            return np.tile(self.constant_proba.reshape(1, -1), (n_rows, 1))
         if self.model is None:
-            return np.zeros((len(x), 3), dtype=float)
-        x_df = _align_features(
-            x.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan).fillna(0.0),
-            self.feature_columns,
-        )
-        x_arr = x_df.to_numpy(dtype=np.float32, copy=False)
+            return np.zeros((n_rows, 3), dtype=float)
         if hasattr(self.model, "predict_proba"):
             probs = self.model.predict_proba(x_arr)
             classes = getattr(self.model, "classes_", self.classes_)
@@ -203,8 +231,6 @@ class BayesianLogitExpert(_LinearBase):
             solver="lbfgs",
             class_weight="balanced",
             C=max(1e-4, c_val),
-            multi_class="auto",
-            n_jobs=1,
             random_state=42,
         )
 
@@ -234,13 +260,13 @@ class OnlineHoeffdingExpert(_LinearBase):
             raise RuntimeError("scikit-learn missing")
         return DecisionTreeClassifier(max_depth=6, min_samples_leaf=20, random_state=42)
 
-    def fit(self, x: pd.DataFrame, y: pd.Series, **kwargs: Any) -> None:  # noqa: ARG002
+    def fit(self, x: Any, y: Any, **kwargs: Any) -> None:  # noqa: ARG002
         if RIVER_AVAILABLE:
-            x_df = x.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-            self.feature_columns = list(x_df.columns)
+            x_arr, x_cols = self._prepare_x(x)
+            self.feature_columns = list(x_cols)
             y_arr = _canon_y(y)
             model = self._build_model()
-            for feats, yi in zip(_iter_feature_dict_rows(x_df), y_arr, strict=False):
+            for feats, yi in zip(_iter_feature_dict_rows(x_arr), y_arr, strict=False):
                 model.learn_one(feats, int(yi))
             self.model = model
             self.classes_ = np.array([0, 1, 2], dtype=int)
@@ -248,16 +274,13 @@ class OnlineHoeffdingExpert(_LinearBase):
             return
         super().fit(x, y, **kwargs)
 
-    def predict_proba(self, x: pd.DataFrame, **kwargs: Any) -> np.ndarray:  # noqa: ARG002
+    def predict_proba(self, x: Any, **kwargs: Any) -> np.ndarray:  # noqa: ARG002
         if RIVER_AVAILABLE and self.model is not None:
             if x is None or len(x) == 0:
                 return np.zeros((0, 3), dtype=float)
-            x_df = _align_features(
-                x.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan).fillna(0.0),
-                self.feature_columns,
-            )
-            out = np.zeros((len(x_df), 3), dtype=float)
-            for i, row in enumerate(_iter_feature_dict_rows(x_df)):
+            x_arr, _x_cols = self._prepare_x(x, self.feature_columns)
+            out = np.zeros((len(x_arr), 3), dtype=float)
+            for i, row in enumerate(_iter_feature_dict_rows(x_arr)):
                 p = self.model.predict_proba_one(row) or {}
                 out[i, 0] = float(p.get(0, 0.0))
                 out[i, 1] = float(p.get(1, 0.0))
@@ -279,9 +302,11 @@ class VowpalWabbitExpert(_LinearBase):
             raise RuntimeError("vowpalwabbit not available")
         return VWClassifier(loss_function="logistic", oaa=3, passes=3, random_seed=42)
 
-    def fit(self, x: pd.DataFrame, y: pd.Series, **kwargs: Any) -> None:  # noqa: ARG002
+    def fit(self, x: Any, y: Any, **kwargs: Any) -> None:  # noqa: ARG002
         if not VW_AVAILABLE:
             logger.warning("vw skipped: vowpalwabbit not available.")
             self.model = None
             return
         super().fit(x, y, **kwargs)
+
+

@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 import logging
 import time
+from typing import Any
 
 import gymnasium as gym
 import numpy as np
-import pandas as pd
 from gymnasium import spaces
 
 try:
@@ -183,6 +185,162 @@ else:
         
         return new_position, new_entry_price, new_balance, equity, new_high_water, reward, done
 
+
+def _is_dataframe_like(value: Any) -> bool:
+    return bool(hasattr(value, "columns") and hasattr(value, "index"))
+
+
+def _is_frame_like(value: Any) -> bool:
+    return bool(hasattr(value, "columns") and hasattr(value, "__getitem__"))
+
+
+def _row_count(value: Any) -> int:
+    if value is None:
+        return 0
+    shape = getattr(value, "shape", None)
+    if isinstance(shape, tuple) and len(shape) > 0:
+        try:
+            return int(shape[0])
+        except Exception:
+            pass
+    if isinstance(value, dict):
+        for v in value.values():
+            try:
+                return int(np.asarray(v).reshape(-1).shape[0])
+            except Exception:
+                continue
+        return 0
+    try:
+        return int(len(value))
+    except Exception:
+        arr = np.asarray(value)
+        if arr.ndim == 0:
+            return 1
+        return int(arr.shape[0])
+
+
+def _slice_by_indices(obj: Any, indices: Any) -> Any:
+    if obj is None:
+        return None
+    idx = np.asarray(indices, dtype=np.int64).reshape(-1)
+    if _is_dataframe_like(obj):
+        try:
+            return obj.take(idx)
+        except Exception:
+            try:
+                base_idx = np.asarray(getattr(obj, "index")).reshape(-1)
+                return obj.loc[base_idx[idx]]
+            except Exception:
+                pass
+    if _is_frame_like(obj):
+        cols = getattr(obj, "columns", None)
+        names: list[str] = []
+        if cols is not None:
+            try:
+                names = [str(c) for c in list(cols)]
+            except Exception:
+                names = []
+        out: dict[str, Any] = {}
+        for col in names:
+            try:
+                vec = np.asarray(obj[col]).reshape(-1)  # type: ignore[index]
+                out[col] = vec[idx]
+            except Exception:
+                continue
+        src_idx = getattr(obj, "index", None)
+        if src_idx is not None:
+            src_arr = np.asarray(src_idx).reshape(-1)
+            out["index"] = src_arr[idx]
+        return out
+    arr = np.asarray(obj)
+    if arr.ndim == 0:
+        return arr
+    return arr[idx]
+
+
+def _slice_rows(obj: Any, start: int, end: int | None = None) -> Any:
+    if obj is None:
+        return None
+    s = max(0, int(start))
+    if _is_dataframe_like(obj) or _is_frame_like(obj):
+        n = _row_count(obj)
+        e = n if end is None else min(n, max(s, int(end)))
+        return _slice_by_indices(obj, np.arange(s, e, dtype=np.int64))
+    arr = np.asarray(obj)
+    if arr.ndim == 0:
+        return arr
+    if end is None:
+        return arr[s:]
+    return arr[s:end]
+
+
+def _tail_rows(obj: Any, max_rows: int) -> Any:
+    n = _row_count(obj)
+    keep = max(0, int(max_rows))
+    if keep <= 0 or n <= keep:
+        return obj
+    return _slice_rows(obj, n - keep, None)
+
+
+def _to_numpy_1d(values: Any, *, dtype: Any | None = None) -> np.ndarray:
+    if hasattr(values, "to_numpy"):
+        if dtype is None:
+            arr = np.asarray(values.to_numpy(copy=False))
+        else:
+            arr = np.asarray(values.to_numpy(dtype=dtype, copy=False), dtype=dtype)
+    else:
+        arr = np.asarray(values, dtype=dtype)
+    if arr.ndim == 0:
+        return np.asarray([arr.item()], dtype=arr.dtype)
+    return arr.reshape(-1)
+
+
+def _to_numpy_2d_float32(values: Any) -> np.ndarray:
+    if hasattr(values, "to_numpy"):
+        arr = np.asarray(values.to_numpy(dtype=np.float32, copy=False), dtype=np.float32)
+    else:
+        arr = np.asarray(values, dtype=np.float32)
+    if arr.ndim == 0:
+        arr = arr.reshape(1, 1)
+    elif arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    elif arr.ndim > 2:
+        arr = arr.reshape(arr.shape[0], -1)
+    if not arr.flags.writeable:
+        arr = arr.copy()
+    return arr
+
+
+def _column_to_numpy(df: Any, column: str, *, dtype: Any | None = None) -> np.ndarray:
+    if not hasattr(df, "__getitem__"):
+        raise ValueError(f"Input does not support column access for {column!r}.")
+    try:
+        col = df[column]  # type: ignore[index]
+    except Exception as exc:
+        raise KeyError(f"Missing required column {column!r}") from exc
+    return _to_numpy_1d(col, dtype=dtype)
+
+
+def _day_of_month(values: Any, *, n_rows: int) -> np.ndarray:
+    arr = np.asarray(values).reshape(-1)
+    if arr.size == 0:
+        return np.ones(n_rows, dtype=np.int32)
+    try:
+        if np.issubdtype(arr.dtype, np.datetime64):
+            day = (arr.astype("datetime64[D]") - arr.astype("datetime64[M]")).astype(np.int32) + 1
+            return day.astype(np.int32, copy=False)
+    except Exception:
+        pass
+    out = np.ones(arr.shape[0], dtype=np.int32)
+    for i, val in enumerate(arr):
+        d = getattr(val, "day", None)
+        if d is not None:
+            try:
+                out[i] = int(d)
+            except Exception:
+                out[i] = 1
+    return out
+
 class PropFirmTradingEnv(gym.Env):
     """
     A specialized Reinforcement Learning environment for Prop Firm challenges.
@@ -204,8 +362,8 @@ class PropFirmTradingEnv(gym.Env):
 
     def __init__(
         self,
-        df: pd.DataFrame,
-        features: np.ndarray,
+        df: Any,
+        features: Any,
         initial_balance: float = 100000.0,
         max_daily_dd: float = 0.04,
         max_total_dd: float = 0.08,
@@ -226,17 +384,21 @@ class PropFirmTradingEnv(gym.Env):
             )
 
         self.df = df
-        self.features = features.astype(np.float32)
+        self.features = _to_numpy_2d_float32(features)
         # HPC: Vectorized price access
-        self.prices = df["close"].to_numpy(dtype=np.float32)
-        self.highs = df["high"].to_numpy(dtype=np.float32)
-        self.lows = df["low"].to_numpy(dtype=np.float32)
+        self.prices = _column_to_numpy(df, "close", dtype=np.float32)
+        self.highs = _column_to_numpy(df, "high", dtype=np.float32)
+        self.lows = _column_to_numpy(df, "low", dtype=np.float32)
         
         # Track days vectorized for speed
-        if "timestamp" in df.columns:
-            self.day_indices = df["timestamp"].dt.day.to_numpy(dtype=np.int32)
+        if hasattr(df, "columns") and "timestamp" in df.columns:
+            ts = _column_to_numpy(df, "timestamp")
+            self.day_indices = _day_of_month(ts, n_rows=len(df))
         else:
-            self.day_indices = df.index.day.to_numpy(dtype=np.int32)
+            idx = getattr(df, "index", None)
+            self.day_indices = _day_of_month(idx if idx is not None else np.arange(len(df)), n_rows=len(df))
+        if self.day_indices.shape[0] != len(df):
+            self.day_indices = np.ones(len(df), dtype=np.int32)
             
         self.n_steps = len(df)
         self.initial_balance = initial_balance
@@ -273,11 +435,7 @@ class PropFirmTradingEnv(gym.Env):
         self.entry_price = 0.0
 
         # Determine day index for daily reset
-        if "timestamp" in self.df.columns:
-            ts = self.df.iloc[0]["timestamp"]
-        else:
-            ts = self.df.index[0]
-        self.current_day_idx = ts.day
+        self.current_day_idx = int(self.day_indices[0]) if self.day_indices.size > 0 else 1
 
         return self._get_obs(), {}
 
@@ -418,34 +576,36 @@ class RLExpertPPO(ExpertModel):
 
     def _split_env_data(
         self,
-        X: pd.DataFrame,
-        y: pd.Series,
-        metadata: pd.DataFrame,
-    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None]:
+        X: Any,
+        y: Any,
+        metadata: Any,
+    ) -> tuple[Any, Any, Any | None, Any | None]:
         try:
             X_train, X_val, _, _ = time_series_train_val_split(
                 X, y, val_ratio=self.eval_ratio, min_train_samples=100, embargo_samples=0
             )
         except Exception:
             split = int(len(X) * (1.0 - self.eval_ratio))
-            X_train = X.iloc[:split]
-            X_val = X.iloc[split:]
+            X_train = _slice_rows(X, 0, split)
+            X_val = _slice_rows(X, split, None)
 
         meta_train = None
         meta_val = None
         if metadata is not None:
             try:
                 # Align metadata with the split data using index
-                meta_train = metadata.loc[X_train.index] if len(X_train) else None
-                meta_val = metadata.loc[X_val.index] if len(X_val) else None
+                if _row_count(X_train) > 0 and hasattr(metadata, "loc") and hasattr(X_train, "index"):
+                    meta_train = metadata.loc[X_train.index]
+                if _row_count(X_val) > 0 and hasattr(metadata, "loc") and hasattr(X_val, "index"):
+                    meta_val = metadata.loc[X_val.index]
             except Exception:
-                # Fallback: use iloc slicing if index alignment fails
-                split_idx = len(X_train)
-                meta_train = metadata.iloc[:split_idx] if len(X_train) else None
-                meta_val = metadata.iloc[split_idx:] if len(X_val) else None
+                # Fallback: positional slicing if index alignment fails
+                split_idx = _row_count(X_train)
+                meta_train = _slice_rows(metadata, 0, split_idx) if split_idx > 0 else None
+                meta_val = _slice_rows(metadata, split_idx, None) if _row_count(X_val) > 0 else None
         return X_train, X_val, meta_train, meta_val
 
-    def fit(self, X: pd.DataFrame, y: pd.Series, **kwargs):
+    def fit(self, X: Any, y: Any, **kwargs):
         if not SB3_AVAILABLE:
             logger.warning("StableBaselines3 not installed. RL skipped.")
             return
@@ -459,13 +619,15 @@ class RLExpertPPO(ExpertModel):
             return
 
         X_train, X_val, meta_train, meta_val = self._split_env_data(X, y, metadata)
-        if meta_train is None or len(X_train) == 0:
+        if meta_train is None or _row_count(X_train) == 0:
             logger.warning("RL Expert: training metadata unavailable or empty.")
             return
 
-        if meta_val is not None and self.eval_max_rows > 0 and len(X_val) > self.eval_max_rows:
-            X_val = X_val.iloc[-self.eval_max_rows:]
-            meta_val = meta_val.iloc[-self.eval_max_rows:]
+        if meta_val is not None and self.eval_max_rows > 0 and _row_count(X_val) > self.eval_max_rows:
+            X_val = _tail_rows(X_val, self.eval_max_rows)
+            meta_val = _tail_rows(meta_val, self.eval_max_rows)
+        x_train_arr = _to_numpy_2d_float32(X_train)
+        x_val_arr = _to_numpy_2d_float32(X_val) if _row_count(X_val) > 0 else np.zeros((0, 0), dtype=np.float32)
 
         # Create environment with high-speed parallel execution
         import os
@@ -477,13 +639,13 @@ class RLExpertPPO(ExpertModel):
         n_envs = max(1, min(requested, cpu_budget))
 
         # Use default arguments to capture closure variables at function creation time
-        def make_env(m=meta_train, x=X_train.values):
+        def make_env(m=meta_train, x=x_train_arr):
             return PropFirmTradingEnv(m, x)
 
         # RAM-aware parallelization: Check if we have memory for parallel envs
         if n_envs > 1 and psutil:
             available_gb = psutil.virtual_memory().available / 1e9
-            data_size_gb = X_train.values.nbytes / 1e9
+            data_size_gb = x_train_arr.nbytes / 1e9
             # Each SubprocVecEnv process needs a copy of data (2x safety margin)
             affordable_envs = max(1, int(available_gb / (data_size_gb * 2.0)))
             if n_envs > affordable_envs:
@@ -504,9 +666,9 @@ class RLExpertPPO(ExpertModel):
 
         env_is_subproc = SubprocVecEnv is not None and isinstance(self.env, SubprocVecEnv)
         eval_env = None
-        if meta_val is not None and len(X_val) > 0 and EvalCallback is not None:
+        if meta_val is not None and x_val_arr.shape[0] > 0 and EvalCallback is not None:
             # Use default arguments to capture closure variables (named function for pickling)
-            def make_eval_env(m=meta_val, x=X_val.values):
+            def make_eval_env(m=meta_val, x=x_val_arr):
                 return PropFirmTradingEnv(m, x)
             if env_is_subproc:
                 try:
@@ -571,15 +733,15 @@ class RLExpertPPO(ExpertModel):
             self.model = None
             return
 
-    def predict_proba(self, X: pd.DataFrame, **kwargs) -> np.ndarray:
+    def predict_proba(self, X: Any, **kwargs) -> np.ndarray:
         if self.model is None:
-            return np.zeros((len(X), 3))
+            return np.zeros((_row_count(X), 3))
 
         # This is tricky: RL agents are sequential. Predicting a batch 'offline'
         # requires simulating the env state for each row.
         # For ensemble compatibility, we run a deterministic pass.
-
-        actions, _ = self.model.predict(X.values, deterministic=True)
+        x_arr = _to_numpy_2d_float32(X)
+        actions, _ = self.model.predict(x_arr, deterministic=True)
 
         # Map actions (0,1,2) to probas (one-hot)
         probs = np.zeros((len(actions), 3))
@@ -602,7 +764,7 @@ class RLExpertPPO(ExpertModel):
 class RLExpertSAC(RLExpertPPO):
     """SAC Agent wrapper."""
 
-    def fit(self, X: pd.DataFrame, y: pd.Series, **kwargs):
+    def fit(self, X: Any, y: Any, **kwargs):
         if not SB3_AVAILABLE:
             logger.warning("StableBaselines3 not installed. RL skipped.")
             return
@@ -616,13 +778,15 @@ class RLExpertSAC(RLExpertPPO):
             return
 
         X_train, X_val, meta_train, meta_val = self._split_env_data(X, y, metadata)
-        if meta_train is None or len(X_train) == 0:
+        if meta_train is None or _row_count(X_train) == 0:
             logger.warning("RL Expert: training metadata unavailable or empty.")
             return
 
-        if meta_val is not None and self.eval_max_rows > 0 and len(X_val) > self.eval_max_rows:
-            X_val = X_val.iloc[-self.eval_max_rows:]
-            meta_val = meta_val.iloc[-self.eval_max_rows:]
+        if meta_val is not None and self.eval_max_rows > 0 and _row_count(X_val) > self.eval_max_rows:
+            X_val = _tail_rows(X_val, self.eval_max_rows)
+            meta_val = _tail_rows(meta_val, self.eval_max_rows)
+        x_train_arr = _to_numpy_2d_float32(X_train)
+        x_val_arr = _to_numpy_2d_float32(X_val) if _row_count(X_val) > 0 else np.zeros((0, 0), dtype=np.float32)
 
         # Create environment with high-speed parallel execution
         import os
@@ -634,13 +798,13 @@ class RLExpertSAC(RLExpertPPO):
         n_envs = max(1, min(requested, cpu_budget))
 
         # Use default arguments to capture closure variables at function creation time
-        def make_env(m=meta_train, x=X_train.values):
+        def make_env(m=meta_train, x=x_train_arr):
             return PropFirmTradingEnv(m, x)
 
         # RAM-aware parallelization: Check if we have memory for parallel envs
         if n_envs > 1 and psutil:
             available_gb = psutil.virtual_memory().available / 1e9
-            data_size_gb = X_train.values.nbytes / 1e9
+            data_size_gb = x_train_arr.nbytes / 1e9
             # Each SubprocVecEnv process needs a copy of data (2x safety margin)
             affordable_envs = max(1, int(available_gb / (data_size_gb * 2.0)))
             if n_envs > affordable_envs:
@@ -661,9 +825,9 @@ class RLExpertSAC(RLExpertPPO):
 
         env_is_subproc = SubprocVecEnv is not None and isinstance(self.env, SubprocVecEnv)
         eval_env = None
-        if meta_val is not None and len(X_val) > 0 and EvalCallback is not None:
+        if meta_val is not None and x_val_arr.shape[0] > 0 and EvalCallback is not None:
             # Use default arguments to capture closure variables (named function for pickling)
-            def make_eval_env(m=meta_val, x=X_val.values):
+            def make_eval_env(m=meta_val, x=x_val_arr):
                 return PropFirmTradingEnv(m, x)
             if env_is_subproc:
                 try:
@@ -748,6 +912,9 @@ class RLExpertSAC(RLExpertPPO):
                 pass
 
 
-def _build_continuous_env(df: pd.DataFrame, y: pd.Series) -> gym.Env:
+def _build_continuous_env(df: Any, y: Any) -> gym.Env:
     """Helper to build env for optimization (placeholder)."""
-    return PropFirmTradingEnv(df, df.values)
+    return PropFirmTradingEnv(df, _to_numpy_2d_float32(df))
+
+
+

@@ -4,28 +4,6 @@ pub mod discovery;
 pub mod discovery_gpu;
 #[cfg(not(feature = "gpu"))]
 pub mod discovery_gpu {
-
-// HPC-specific modules - only compiled on GPU-enabled builds
-#[cfg(feature = "gpu")]
-pub mod hpc;
-#[cfg(feature = "gpu")]
-pub mod hpc_gpu_discovery;
-#[cfg(feature = "gpu")]
-pub mod hpc_simd;
-
-// Re-export HPC functions when GPU feature is enabled
-#[cfg(feature = "gpu")]
-pub use hpc::{
-    detect_hyperstack_n3, force_hpc_mode, get_gpu_cpu_affinity, get_optimal_chunk_size,
-    get_optimal_population, get_validation_cpu_cores, is_hpc_mode, is_nvlink_pair,
-    print_hpc_config, set_thread_affinity,
-};
-#[cfg(feature = "gpu")]
-pub use hpc_gpu_discovery::{run_island_model_discovery, IslandConfig};
-#[cfg(feature = "gpu")]
-pub use hpc_simd::{
-    batch_evaluate_simd, compute_sharpe_ratio, has_avx2
-};
     use anyhow::{bail, Result};
     use forex_data::{FeatureCache, FeatureFrame, Ohlcv, SymbolDataset};
     use serde::Serialize;
@@ -97,7 +75,10 @@ pub use hpc_simd::{
     pub fn save_gpu_genomes(path: impl AsRef<Path>, result: &GpuDiscoveryResult) -> Result<()> {
         let mut payload = Vec::new();
         for (g, f) in result.genomes.iter().zip(result.fitness.iter()) {
-            payload.push(GenomeExport { fitness: *f, genome: g });
+            payload.push(GenomeExport {
+                fitness: *f,
+                genome: g,
+            });
         }
         let json = serde_json::to_string_pretty(&payload)?;
         std::fs::write(path, json)?;
@@ -122,6 +103,27 @@ pub use hpc_simd::{
         bail!("GPU discovery is disabled (compile with feature 'gpu' to enable).");
     }
 }
+
+// HPC-specific modules - only compiled on GPU-enabled builds.
+#[cfg(feature = "gpu")]
+pub mod hpc;
+#[cfg(feature = "gpu")]
+pub mod hpc_gpu_discovery;
+#[cfg(feature = "gpu")]
+pub mod hpc_simd;
+
+// Re-export HPC functions when GPU feature is enabled.
+#[cfg(feature = "gpu")]
+pub use hpc::{
+    detect_hyperstack_n3, force_hpc_mode, get_gpu_cpu_affinity, get_optimal_chunk_size,
+    get_optimal_population, get_validation_cpu_cores, is_hpc_mode, is_nvlink_pair,
+    print_hpc_config, set_thread_affinity,
+};
+#[cfg(feature = "gpu")]
+pub use hpc_gpu_discovery::{run_island_model_discovery, IslandConfig};
+#[cfg(feature = "gpu")]
+pub use hpc_simd::{batch_evaluate_simd, compute_sharpe_ratio, has_avx2};
+
 pub mod eval;
 pub mod gauntlet;
 pub mod genetic;
@@ -136,7 +138,10 @@ pub use discovery_gpu::{
 };
 pub use eval::{evaluate_population_core, fast_evaluate_strategy_core};
 pub use gauntlet::{GauntletConfig, StrategyGauntlet};
-pub use genetic::{evaluate_genes, evolve_search, random_search, signals_for_gene, EvaluationConfig, Gene, SearchResult};
+pub use genetic::{
+    evaluate_genes, evolve_search, random_search, signals_for_gene, EvaluationConfig, Gene,
+    SearchResult,
+};
 pub use portfolio::{AllocationResult, PortfolioOptimizer, SymbolMetrics};
 pub use quality::{StrategyMetrics, StrategyQualityAnalyzer, StrategyRanker, Trade};
 pub use stop_target::{compute_stop_distance_series, infer_stop_target_pips, StopTargetSettings};

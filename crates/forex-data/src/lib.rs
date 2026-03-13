@@ -60,6 +60,59 @@ fn sort_ohlcv_by_timestamp(ohlcv: &Ohlcv) -> Ohlcv {
     }
 }
 
+fn sort_dedup_ohlcv_by_timestamp(ohlcv: &Ohlcv) -> Ohlcv {
+    let sorted = sort_ohlcv_by_timestamp(ohlcv);
+    let Some(ts) = &sorted.timestamp else {
+        return sorted;
+    };
+    if ts.len() != sorted.len() || ts.is_empty() {
+        return sorted;
+    }
+
+    let mut keep: Vec<usize> = Vec::with_capacity(ts.len());
+    let mut last_ts: Option<i64> = None;
+    for (idx, &timestamp) in ts.iter().enumerate() {
+        if last_ts != Some(timestamp) {
+            keep.push(idx);
+            last_ts = Some(timestamp);
+        }
+    }
+    if keep.len() == ts.len() {
+        return sorted;
+    }
+
+    let reorder = |src: &Vec<f64>| keep.iter().map(|&i| src[i]).collect::<Vec<f64>>();
+    let dedup_ts = keep.iter().map(|&i| ts[i]).collect::<Vec<i64>>();
+    let volume = sorted
+        .volume
+        .as_ref()
+        .map(|v| keep.iter().map(|&i| v[i]).collect::<Vec<f64>>());
+
+    Ohlcv {
+        timestamp: Some(dedup_ts),
+        open: reorder(&sorted.open),
+        high: reorder(&sorted.high),
+        low: reorder(&sorted.low),
+        close: reorder(&sorted.close),
+        volume,
+    }
+}
+
+fn tail_ohlcv(ohlcv: &Ohlcv, rows: usize) -> Ohlcv {
+    if rows == 0 || ohlcv.len() <= rows {
+        return ohlcv.clone();
+    }
+    let start = ohlcv.len() - rows;
+    Ohlcv {
+        timestamp: ohlcv.timestamp.as_ref().map(|ts| ts[start..].to_vec()),
+        open: ohlcv.open[start..].to_vec(),
+        high: ohlcv.high[start..].to_vec(),
+        low: ohlcv.low[start..].to_vec(),
+        close: ohlcv.close[start..].to_vec(),
+        volume: ohlcv.volume.as_ref().map(|v| v[start..].to_vec()),
+    }
+}
+
 fn pad_vec(mut values: Vec<f64>, len: usize) -> Vec<f64> {
     if values.len() < len {
         values.resize(len, f64::NAN);
@@ -67,6 +120,200 @@ fn pad_vec(mut values: Vec<f64>, len: usize) -> Vec<f64> {
         values.truncate(len);
     }
     values
+}
+
+fn compute_smc_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
+    let n = ohlcv.len();
+    let mut ob = vec![0.0_f64; n];
+    let mut fvg = vec![0.0_f64; n];
+    let mut liq = vec![0.0_f64; n];
+    let mut trend = vec![0.0_f64; n];
+    let mut premium = vec![0.0_f64; n];
+    let mut inducement = vec![0.0_f64; n];
+    let mut bos = vec![0.0_f64; n];
+    let mut choch = vec![0.0_f64; n];
+    let mut eqh = vec![0.0_f64; n];
+    let mut eql = vec![0.0_f64; n];
+    let mut displacement = vec![0.0_f64; n];
+
+    if n == 0 {
+        return vec![
+            ("smc_ob".to_string(), ob),
+            ("smc_fvg".to_string(), fvg),
+            ("smc_liq".to_string(), liq),
+            ("smc_trend".to_string(), trend),
+            ("smc_premium".to_string(), premium),
+            ("smc_inducement".to_string(), inducement),
+            ("smc_bos".to_string(), bos),
+            ("smc_choch".to_string(), choch),
+            ("smc_eqh".to_string(), eqh),
+            ("smc_eql".to_string(), eql),
+            ("smc_displacement".to_string(), displacement),
+        ];
+    }
+
+    const TREND_LOOKBACK: usize = 12;
+    const STRUCTURE_LOOKBACK: usize = 20;
+    const EQUAL_LOOKBACK: usize = 20;
+    const DISPLACEMENT_LOOKBACK: usize = 20;
+    const DISPLACEMENT_MULT: f64 = 1.8;
+
+    for i in 0..n {
+        let high_i = ohlcv.high[i];
+        let low_i = ohlcv.low[i];
+        let open_i = ohlcv.open[i];
+        let close_i = ohlcv.close[i];
+
+        if i >= TREND_LOOKBACK {
+            let d = close_i - ohlcv.close[i - TREND_LOOKBACK];
+            trend[i] = if d > 0.0 {
+                1.0
+            } else if d < 0.0 {
+                -1.0
+            } else {
+                0.0
+            };
+        } else if i >= 1 {
+            let d = close_i - ohlcv.close[i - 1];
+            trend[i] = if d > 0.0 {
+                1.0
+            } else if d < 0.0 {
+                -1.0
+            } else {
+                0.0
+            };
+        }
+
+        let range_i = (high_i - low_i).abs();
+        if range_i > 1e-12 {
+            let rel = (close_i - low_i) / range_i;
+            premium[i] = if rel <= 0.5 { 1.0 } else { -1.0 };
+        }
+
+        if i >= 1 {
+            let prev_open = ohlcv.open[i - 1];
+            let prev_close = ohlcv.close[i - 1];
+            let prev_high = ohlcv.high[i - 1];
+            let prev_low = ohlcv.low[i - 1];
+
+            let bull_ob = close_i > open_i && prev_close < prev_open && close_i >= prev_high;
+            let bear_ob = close_i < open_i && prev_close > prev_open && close_i <= prev_low;
+            ob[i] = if bull_ob {
+                1.0
+            } else if bear_ob {
+                -1.0
+            } else {
+                0.0
+            };
+
+            let body = (close_i - open_i).abs();
+            let upper_wick = high_i - open_i.max(close_i);
+            let lower_wick = open_i.min(close_i) - low_i;
+            if body > 1e-12 && ((upper_wick / body) > 2.0 || (lower_wick / body) > 2.0) {
+                inducement[i] = 1.0;
+            }
+
+            if i >= DISPLACEMENT_LOOKBACK {
+                let mut avg_body = 0.0_f64;
+                for j in (i - DISPLACEMENT_LOOKBACK)..i {
+                    avg_body += (ohlcv.close[j] - ohlcv.open[j]).abs();
+                }
+                avg_body /= DISPLACEMENT_LOOKBACK as f64;
+                if avg_body > 1e-12 && body >= avg_body * DISPLACEMENT_MULT {
+                    displacement[i] = if close_i > open_i {
+                        1.0
+                    } else if close_i < open_i {
+                        -1.0
+                    } else {
+                        0.0
+                    };
+                }
+            }
+        }
+
+        if i >= 2 {
+            if low_i > ohlcv.high[i - 2] {
+                fvg[i] = 1.0;
+            } else if high_i < ohlcv.low[i - 2] {
+                fvg[i] = -1.0;
+            }
+        }
+
+        if i >= 3 {
+            let prev_low = ohlcv.low[(i - 3)..i]
+                .iter()
+                .fold(f64::INFINITY, |a, b| a.min(*b));
+            let prev_high = ohlcv.high[(i - 3)..i]
+                .iter()
+                .fold(f64::NEG_INFINITY, |a, b| a.max(*b));
+            if low_i < prev_low && close_i > prev_low {
+                liq[i] = 1.0;
+            } else if high_i > prev_high && close_i < prev_high {
+                liq[i] = -1.0;
+            }
+        }
+
+        if i >= 2 {
+            let lookback = STRUCTURE_LOOKBACK.min(i);
+            let start = i - lookback;
+            let prev_struct_high = ohlcv.high[start..i]
+                .iter()
+                .fold(f64::NEG_INFINITY, |a, b| a.max(*b));
+            let prev_struct_low = ohlcv.low[start..i]
+                .iter()
+                .fold(f64::INFINITY, |a, b| a.min(*b));
+            if close_i > prev_struct_high {
+                bos[i] = 1.0;
+            } else if close_i < prev_struct_low {
+                bos[i] = -1.0;
+            }
+            if i >= 1 {
+                if bos[i] > 0.0 && trend[i - 1] < 0.0 {
+                    choch[i] = 1.0;
+                } else if bos[i] < 0.0 && trend[i - 1] > 0.0 {
+                    choch[i] = -1.0;
+                }
+            }
+        }
+
+        if i >= 1 {
+            let lookback = EQUAL_LOOKBACK.min(i);
+            let start = i - lookback;
+            let mut atr_proxy = 0.0_f64;
+            for j in start..=i {
+                atr_proxy += (ohlcv.high[j] - ohlcv.low[j]).abs();
+            }
+            atr_proxy /= (i - start + 1) as f64;
+            let tol = (atr_proxy * 0.1).max(1e-6);
+
+            for j in start..i {
+                if (high_i - ohlcv.high[j]).abs() <= tol {
+                    eqh[i] = 1.0;
+                    break;
+                }
+            }
+            for j in start..i {
+                if (low_i - ohlcv.low[j]).abs() <= tol {
+                    eql[i] = 1.0;
+                    break;
+                }
+            }
+        }
+    }
+
+    vec![
+        ("smc_ob".to_string(), ob),
+        ("smc_fvg".to_string(), fvg),
+        ("smc_liq".to_string(), liq),
+        ("smc_trend".to_string(), trend),
+        ("smc_premium".to_string(), premium),
+        ("smc_inducement".to_string(), inducement),
+        ("smc_bos".to_string(), bos),
+        ("smc_choch".to_string(), choch),
+        ("smc_eqh".to_string(), eqh),
+        ("smc_eql".to_string(), eql),
+        ("smc_displacement".to_string(), displacement),
+    ]
 }
 
 static TALIB_INIT: OnceLock<Result<(), anyhow::Error>> = OnceLock::new();
@@ -250,7 +497,40 @@ fn unique_name(base: &str, counts: &mut HashMap<String, usize>) -> String {
     }
 }
 
-fn compute_talib_indicators(ohlcv: &Ohlcv) -> Result<Vec<(String, Vec<f64>)>> {
+const CORE_FUNCTION_PREFIXES: &[&str] = &[
+    "adx", "adxr", "aroon", "aroonosc", "atr", "natr", "trange", "rsi", "stoch", "stochf",
+    "stochrsi", "willr", "cci", "mfi", "obv", "ad", "adosc", "macd", "macdext", "macdfix", "ppo",
+    "roc", "rocp", "rocr", "mom", "trix", "minus_di", "plus_di", "minus_dm", "plus_dm", "ema",
+    "sma", "wma", "tema", "kama", "bbands",
+];
+
+const COMPACT_FUNCTION_PREFIXES: &[&str] = &[
+    "adx", "atr", "natr", "rsi", "stoch", "stochrsi", "cci", "mfi", "obv", "macd", "ppo", "roc",
+    "mom", "ema", "sma", "kama", "bbands",
+];
+
+fn profile_prefixes(profile: FeatureProfile) -> Option<&'static [&'static str]> {
+    match profile {
+        FeatureProfile::Full => None,
+        FeatureProfile::Core => Some(CORE_FUNCTION_PREFIXES),
+        FeatureProfile::Compact => Some(COMPACT_FUNCTION_PREFIXES),
+    }
+}
+
+fn profile_allows_function(profile: FeatureProfile, normalized_fn: &str) -> bool {
+    let Some(prefixes) = profile_prefixes(profile) else {
+        return true;
+    };
+    prefixes
+        .iter()
+        .any(|p| normalized_fn == *p || normalized_fn.starts_with(&format!("{p}_")))
+}
+
+fn compute_talib_indicators(
+    ohlcv: &Ohlcv,
+    profile: FeatureProfile,
+    max_outputs: usize,
+) -> Result<Vec<(String, Vec<f64>)>> {
     if ohlcv.is_empty() {
         bail!("empty OHLCV data");
     }
@@ -260,8 +540,20 @@ fn compute_talib_indicators(ohlcv: &Ohlcv) -> Result<Vec<(String, Vec<f64>)>> {
     let func_names = list_talib_functions()?;
     let mut out: Vec<(String, Vec<f64>)> = Vec::new();
     let mut name_counts: HashMap<String, usize> = HashMap::new();
+    let max_outputs = if max_outputs == 0 {
+        usize::MAX
+    } else {
+        max_outputs
+    };
 
-    for func_name in func_names {
+    'func_loop: for func_name in func_names {
+        if out.len() >= max_outputs {
+            break;
+        }
+        let func_lower = normalize_name(&func_name);
+        if !profile_allows_function(profile, &func_lower) {
+            continue;
+        }
         let c_name = CString::new(func_name.as_bytes())
             .map_err(|_| anyhow::anyhow!("TA function name contains null byte"))?;
         let mut handle_ptr: *const TA_FuncHandle = ptr::null();
@@ -295,7 +587,8 @@ fn compute_talib_indicators(ohlcv: &Ohlcv) -> Result<Vec<(String, Vec<f64>)>> {
 
         for input_idx in 0..info.nbInput {
             let mut input_info_ptr: *const TA_InputParameterInfo = ptr::null();
-            let ret = unsafe { TA_GetInputParameterInfo(handle_ptr, input_idx, &mut input_info_ptr) };
+            let ret =
+                unsafe { TA_GetInputParameterInfo(handle_ptr, input_idx, &mut input_info_ptr) };
             if ret != TA_RetCode::TA_SUCCESS || input_info_ptr.is_null() {
                 skip = true;
                 break;
@@ -369,7 +662,8 @@ fn compute_talib_indicators(ohlcv: &Ohlcv) -> Result<Vec<(String, Vec<f64>)>> {
 
         for opt_idx in 0..info.nbOptInput {
             let mut opt_info_ptr: *const TA_OptInputParameterInfo = ptr::null();
-            let ret = unsafe { TA_GetOptInputParameterInfo(handle_ptr, opt_idx, &mut opt_info_ptr) };
+            let ret =
+                unsafe { TA_GetOptInputParameterInfo(handle_ptr, opt_idx, &mut opt_info_ptr) };
             if ret != TA_RetCode::TA_SUCCESS || opt_info_ptr.is_null() {
                 continue;
             }
@@ -378,22 +672,29 @@ fn compute_talib_indicators(ohlcv: &Ohlcv) -> Result<Vec<(String, Vec<f64>)>> {
                 x if x == TA_OptInputParameterType_TA_OptInput_RealRange
                     || x == TA_OptInputParameterType_TA_OptInput_RealList =>
                 {
-                    let _ = unsafe { TA_SetOptInputParamReal(params, opt_idx, opt_info.defaultValue) };
+                    let _ =
+                        unsafe { TA_SetOptInputParamReal(params, opt_idx, opt_info.defaultValue) };
                 }
                 x if x == TA_OptInputParameterType_TA_OptInput_IntegerRange
                     || x == TA_OptInputParameterType_TA_OptInput_IntegerList =>
                 {
                     let _ = unsafe {
-                        TA_SetOptInputParamInteger(params, opt_idx, opt_info.defaultValue as TA_Integer)
+                        TA_SetOptInputParamInteger(
+                            params,
+                            opt_idx,
+                            opt_info.defaultValue as TA_Integer,
+                        )
                     };
                 }
                 _ => {}
             }
         }
 
-        let func_lower = normalize_name(&func_name);
         let mut outputs: Vec<(String, OutputBuffer)> = Vec::new();
         for out_idx in 0..info.nbOutput {
+            if out.len() + outputs.len() >= max_outputs {
+                break;
+            }
             let mut out_info_ptr: *const TA_OutputParameterInfo = ptr::null();
             let ret = unsafe { TA_GetOutputParameterInfo(handle_ptr, out_idx, &mut out_info_ptr) };
             if ret != TA_RetCode::TA_SUCCESS || out_info_ptr.is_null() {
@@ -414,14 +715,16 @@ fn compute_talib_indicators(ohlcv: &Ohlcv) -> Result<Vec<(String, Vec<f64>)>> {
             match out_info.type_ {
                 x if x == TA_OutputParameterType_TA_Output_Integer => {
                     let mut buf = vec![0 as TA_Integer; len];
-                    let ret = unsafe { TA_SetOutputParamIntegerPtr(params, out_idx, buf.as_mut_ptr()) };
+                    let ret =
+                        unsafe { TA_SetOutputParamIntegerPtr(params, out_idx, buf.as_mut_ptr()) };
                     if ret == TA_RetCode::TA_SUCCESS {
                         outputs.push((name, OutputBuffer::Int(buf)));
                     }
                 }
                 _ => {
                     let mut buf = vec![0.0 as TA_Real; len];
-                    let ret = unsafe { TA_SetOutputParamRealPtr(params, out_idx, buf.as_mut_ptr()) };
+                    let ret =
+                        unsafe { TA_SetOutputParamRealPtr(params, out_idx, buf.as_mut_ptr()) };
                     if ret == TA_RetCode::TA_SUCCESS {
                         outputs.push((name, OutputBuffer::Real(buf)));
                     }
@@ -435,7 +738,15 @@ fn compute_talib_indicators(ohlcv: &Ohlcv) -> Result<Vec<(String, Vec<f64>)>> {
 
         let mut out_beg: TA_Integer = 0;
         let mut out_nb: TA_Integer = 0;
-        let ret = unsafe { TA_CallFunc(params, 0, (len as TA_Integer).saturating_sub(1), &mut out_beg, &mut out_nb) };
+        let ret = unsafe {
+            TA_CallFunc(
+                params,
+                0,
+                (len as TA_Integer).saturating_sub(1),
+                &mut out_beg,
+                &mut out_nb,
+            )
+        };
         if ret != TA_RetCode::TA_SUCCESS || out_nb <= 0 || out_beg < 0 {
             continue;
         }
@@ -457,6 +768,9 @@ fn compute_talib_indicators(ohlcv: &Ohlcv) -> Result<Vec<(String, Vec<f64>)>> {
                 series[idx] = value;
             }
             out.push((name, series));
+            if out.len() >= max_outputs {
+                break 'func_loop;
+            }
         }
     }
 
@@ -477,6 +791,50 @@ pub struct FeatureFrame {
     pub timestamps: Vec<i64>,
     pub names: Vec<String>,
     pub data: Array2<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeatureProfile {
+    Full,
+    Core,
+    Compact,
+}
+
+impl FeatureProfile {
+    pub fn from_str(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "core" | "stable" | "robust" => Self::Core,
+            "compact" | "small" | "lite" => Self::Compact,
+            _ => Self::Full,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Core => "core",
+            Self::Compact => "compact",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FeatureBuildOptions {
+    pub base_profile: FeatureProfile,
+    pub htf_profile: FeatureProfile,
+    pub max_base_features: usize,
+    pub max_htf_features: usize,
+}
+
+impl Default for FeatureBuildOptions {
+    fn default() -> Self {
+        Self {
+            base_profile: FeatureProfile::Full,
+            htf_profile: FeatureProfile::Full,
+            max_base_features: 0,
+            max_htf_features: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -532,9 +890,23 @@ impl FeatureCache {
         if !self.is_fresh(&path) {
             return Ok(None);
         }
-        let file = std::fs::File::open(&path)?;
-        let df = ParquetReader::new(file).finish()?;
-        Ok(Some(df_to_feature_frame(&df)?))
+        let read_result: Result<FeatureFrame> = (|| {
+            let file = std::fs::File::open(&path)
+                .with_context(|| format!("failed to open cached feature parquet: {}", path.display()))?;
+            let df = ParquetReader::new(file)
+                .finish()
+                .with_context(|| format!("failed to read cached feature parquet: {}", path.display()))?;
+            df_to_feature_frame(&df)
+                .with_context(|| format!("failed to decode cached feature frame: {}", path.display()))
+        })();
+
+        match read_result {
+            Ok(frame) => Ok(Some(frame)),
+            Err(_) => {
+                let _ = std::fs::remove_file(&path);
+                Ok(None)
+            }
+        }
     }
 
     pub fn store(&self, key: &str, frame: &FeatureFrame) -> Result<()> {
@@ -544,9 +916,15 @@ impl FeatureCache {
         std::fs::create_dir_all(&self.dir)?;
         let mut path = self.dir.clone();
         path.push(format!("{key}.parquet"));
+        let mut tmp_path = self.dir.clone();
+        tmp_path.push(format!("{key}.parquet.tmp"));
         let mut df = feature_frame_to_df(frame)?;
-        let file = std::fs::File::create(&path)?;
+        let file = std::fs::File::create(&tmp_path)?;
         ParquetWriter::new(file).finish(&mut df)?;
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        std::fs::rename(&tmp_path, &path)?;
         Ok(())
     }
 }
@@ -561,11 +939,26 @@ impl SymbolDataset {
         out.sort();
         out
     }
+
+    pub fn tail_rows(&self, rows: usize) -> Self {
+        if rows == 0 {
+            return self.clone();
+        }
+        let frames = self
+            .frames
+            .iter()
+            .map(|(tf, ohlcv)| (tf.clone(), tail_ohlcv(ohlcv, rows)))
+            .collect();
+        Self {
+            symbol: self.symbol.clone(),
+            frames,
+        }
+    }
 }
 
 pub const MANDATORY_TFS: [&str; 21] = [
-    "M1", "M2", "M3", "M4", "M5", "M6", "M10", "M12", "M15", "M20", "M30", "H1", "H2", "H3", "H4", "H6",
-    "H8", "H12", "D1", "W1", "MN1",
+    "M1", "M2", "M3", "M4", "M5", "M6", "M10", "M12", "M15", "M20", "M30", "H1", "H2", "H3", "H4",
+    "H6", "H8", "H12", "D1", "W1", "MN1",
 ];
 
 fn series_to_f64(series: &Series) -> Result<Vec<f64>> {
@@ -592,7 +985,10 @@ fn find_series(df: &DataFrame, candidates: &[&str]) -> Option<Series> {
         let lower = name.to_ascii_lowercase();
         if candidates.iter().any(|c| lower == *c) {
             // In polars 0.47, column() returns &Column, convert to Series
-            return df.column(name).ok().map(|col| col.as_materialized_series().clone());
+            return df
+                .column(name)
+                .ok()
+                .map(|col| col.as_materialized_series().clone());
         }
     }
     None
@@ -627,7 +1023,11 @@ fn df_to_feature_frame(df: &DataFrame) -> Result<FeatureFrame> {
     let n_cols = df
         .get_columns()
         .iter()
-        .filter(|col| !col.as_materialized_series().name().eq_ignore_ascii_case("timestamp"))
+        .filter(|col| {
+            !col.as_materialized_series()
+                .name()
+                .eq_ignore_ascii_case("timestamp")
+        })
         .count();
     let mut names = Vec::with_capacity(n_cols);
     let mut data = Array2::<f32>::zeros((n_rows, n_cols));
@@ -706,7 +1106,7 @@ pub fn load_symbol_dataset(root: impl AsRef<Path>, symbol: &str) -> Result<Symbo
     }
     let mut frames = HashMap::new();
     for tf in tfs {
-        let ohlcv = load_symbol_timeframe(&root, symbol, &tf)?;
+        let ohlcv = sort_dedup_ohlcv_by_timestamp(&load_symbol_timeframe(&root, symbol, &tf)?);
         frames.insert(tf, ohlcv);
     }
     Ok(SymbolDataset {
@@ -722,7 +1122,7 @@ pub fn load_symbol_dataset_with_timeframes(
 ) -> Result<SymbolDataset> {
     let mut frames = HashMap::new();
     for tf in timeframes {
-        let ohlcv = load_symbol_timeframe(&root, symbol, tf)?;
+        let ohlcv = sort_dedup_ohlcv_by_timestamp(&load_symbol_timeframe(&root, symbol, tf)?);
         frames.insert(tf.to_string(), ohlcv);
     }
     Ok(SymbolDataset {
@@ -732,14 +1132,15 @@ pub fn load_symbol_dataset_with_timeframes(
 }
 
 pub fn compute_talib_features(ohlcv: &Ohlcv) -> Result<FeatureMatrix> {
-    let sorted = sort_ohlcv_by_timestamp(ohlcv);
+    let sorted = sort_dedup_ohlcv_by_timestamp(ohlcv);
     let n_rows = sorted.len();
     if n_rows == 0 {
         bail!("empty OHLCV data");
     }
 
-    let indicators = compute_talib_indicators(&sorted)?;
-    let n_cols = indicators.len();
+    let indicators = compute_talib_indicators(&sorted, FeatureProfile::Full, 0)?;
+    let smc_cols = compute_smc_feature_columns(&sorted);
+    let n_cols = indicators.len() + smc_cols.len();
     let mut names = Vec::with_capacity(n_cols);
     let mut out = Array2::<f32>::zeros((n_rows, n_cols));
     for (col_idx, (name, values)) in indicators.into_iter().enumerate() {
@@ -751,11 +1152,27 @@ pub fn compute_talib_features(ohlcv: &Ohlcv) -> Result<FeatureMatrix> {
         }
     }
 
+    let mut col_idx = names.len();
+    for (name, values) in smc_cols {
+        names.push(name);
+        let vals = pad_vec(values, n_rows);
+        let len = vals.len().min(n_rows);
+        for i in 0..len {
+            out[(i, col_idx)] = vals[i] as f32;
+        }
+        col_idx += 1;
+    }
+
     Ok(FeatureMatrix { data: out, names })
 }
 
-pub fn compute_talib_feature_frame(ohlcv: &Ohlcv, include_raw: bool) -> Result<FeatureFrame> {
-    let sorted = sort_ohlcv_by_timestamp(ohlcv);
+pub fn compute_talib_feature_frame_with_options(
+    ohlcv: &Ohlcv,
+    include_raw: bool,
+    profile: FeatureProfile,
+    max_features: usize,
+) -> Result<FeatureFrame> {
+    let sorted = sort_dedup_ohlcv_by_timestamp(ohlcv);
     let n_rows = sorted.len();
     if n_rows == 0 {
         bail!("empty OHLCV data");
@@ -766,13 +1183,14 @@ pub fn compute_talib_feature_frame(ohlcv: &Ohlcv, include_raw: bool) -> Result<F
         .clone()
         .unwrap_or_else(|| (0..n_rows as i64).collect());
 
-    let indicators = compute_talib_indicators(&sorted)?;
+    let indicators = compute_talib_indicators(&sorted, profile, max_features)?;
+    let smc_cols = compute_smc_feature_columns(&sorted);
     let raw_cols = if include_raw {
         4 + usize::from(sorted.volume.is_some())
     } else {
         0
     };
-    let n_cols = raw_cols + indicators.len();
+    let n_cols = raw_cols + indicators.len() + smc_cols.len();
     let mut names = Vec::with_capacity(n_cols);
     let mut out = Array2::<f32>::zeros((n_rows, n_cols));
     let mut col_idx = 0usize;
@@ -821,6 +1239,16 @@ pub fn compute_talib_feature_frame(ohlcv: &Ohlcv, include_raw: bool) -> Result<F
         col_idx += 1;
     }
 
+    for (name, values) in smc_cols {
+        names.push(name);
+        let vals = pad_vec(values, n_rows);
+        let len = vals.len().min(n_rows);
+        for i in 0..len {
+            out[(i, col_idx)] = vals[i] as f32;
+        }
+        col_idx += 1;
+    }
+
     Ok(FeatureFrame {
         timestamps,
         names,
@@ -828,8 +1256,45 @@ pub fn compute_talib_feature_frame(ohlcv: &Ohlcv, include_raw: bool) -> Result<F
     })
 }
 
-fn select_htf_indices(names: &[String]) -> Vec<usize> {
-    (0..names.len()).collect()
+pub fn compute_talib_feature_frame(ohlcv: &Ohlcv, include_raw: bool) -> Result<FeatureFrame> {
+    compute_talib_feature_frame_with_options(ohlcv, include_raw, FeatureProfile::Full, 0)
+}
+
+fn select_htf_indices(
+    names: &[String],
+    profile: FeatureProfile,
+    max_features: usize,
+) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut count = 0usize;
+    let cap = if max_features == 0 {
+        usize::MAX
+    } else {
+        max_features
+    };
+    for (idx, name) in names.iter().enumerate() {
+        let mut keep = true;
+        if name.to_ascii_lowercase().starts_with("smc_") {
+            keep = true;
+        } else if !name.eq_ignore_ascii_case("open")
+            && !name.eq_ignore_ascii_case("high")
+            && !name.eq_ignore_ascii_case("low")
+            && !name.eq_ignore_ascii_case("close")
+            && !name.eq_ignore_ascii_case("volume")
+        {
+            let norm = normalize_name(name.strip_prefix("ta_").unwrap_or(name));
+            keep = profile_allows_function(profile, &norm);
+        }
+        if !keep {
+            continue;
+        }
+        out.push(idx);
+        count += 1;
+        if count >= cap {
+            break;
+        }
+    }
+    out
 }
 
 fn select_columns(data: &Array2<f32>, indices: &[usize]) -> Array2<f32> {
@@ -1034,6 +1499,22 @@ pub fn prepare_multitimeframe_features(
     higher_tfs: &[&str],
     cache: Option<&FeatureCache>,
 ) -> Result<FeatureFrame> {
+    prepare_multitimeframe_features_with_options(
+        dataset,
+        base_tf,
+        higher_tfs,
+        cache,
+        &FeatureBuildOptions::default(),
+    )
+}
+
+pub fn prepare_multitimeframe_features_with_options(
+    dataset: &SymbolDataset,
+    base_tf: &str,
+    higher_tfs: &[&str],
+    cache: Option<&FeatureCache>,
+    options: &FeatureBuildOptions,
+) -> Result<FeatureFrame> {
     let base_tf = if dataset.frames.contains_key(base_tf) {
         base_tf.to_string()
     } else if dataset.frames.contains_key("M5") {
@@ -1054,17 +1535,33 @@ pub fn prepare_multitimeframe_features(
         .get(&base_tf)
         .context("base timeframe data missing")?;
 
-    let base_key = format!("{}_{}_base", dataset.symbol, base_tf);
+    let base_key = format!(
+        "{}_{}_base_{}_{}",
+        dataset.symbol,
+        base_tf,
+        options.base_profile.as_str(),
+        options.max_base_features
+    );
     let base_frame = if let Some(cache) = cache {
         if let Some(frame) = cache.load(&base_key)? {
             frame
         } else {
-            let frame = compute_talib_feature_frame(base_ohlcv, true)?;
+            let frame = compute_talib_feature_frame_with_options(
+                base_ohlcv,
+                true,
+                options.base_profile,
+                options.max_base_features,
+            )?;
             cache.store(&base_key, &frame)?;
             frame
         }
     } else {
-        compute_talib_feature_frame(base_ohlcv, true)?
+        compute_talib_feature_frame_with_options(
+            base_ohlcv,
+            true,
+            options.base_profile,
+            options.max_base_features,
+        )?
     };
 
     let base_ts = base_frame.timestamps.clone();
@@ -1091,23 +1588,43 @@ pub fn prepare_multitimeframe_features(
             Some(val) => val,
             None => continue,
         };
-        let htf_key = format!("{}_{}_htf", dataset.symbol, tf);
+        let htf_key = format!(
+            "{}_{}_htf_{}_{}",
+            dataset.symbol,
+            tf,
+            options.htf_profile.as_str(),
+            options.max_htf_features
+        );
         let htf_frame = if let Some(cache) = cache {
             if let Some(frame) = cache.load(&htf_key)? {
                 frame
             } else {
-                let frame = compute_talib_feature_frame(htf_ohlcv, false)?;
+                let frame = compute_talib_feature_frame_with_options(
+                    htf_ohlcv,
+                    false,
+                    options.htf_profile,
+                    options.max_htf_features,
+                )?;
                 cache.store(&htf_key, &frame)?;
                 frame
             }
         } else {
-            compute_talib_feature_frame(htf_ohlcv, false)?
+            compute_talib_feature_frame_with_options(
+                htf_ohlcv,
+                false,
+                options.htf_profile,
+                options.max_htf_features,
+            )?
         };
 
         if htf_frame.timestamps.is_empty() {
             continue;
         }
-        let indices = select_htf_indices(&htf_frame.names);
+        let indices = select_htf_indices(
+            &htf_frame.names,
+            options.htf_profile,
+            options.max_htf_features,
+        );
         if indices.is_empty() {
             continue;
         }

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import os
 from pathlib import Path
@@ -5,7 +7,6 @@ from typing import Any
 
 import joblib
 import numpy as np
-import pandas as pd
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -25,7 +26,22 @@ try:  # pragma: no cover
     _KAN_AVAILABLE = True
 except Exception:  # pragma: no cover
     EfficientKAN = None  # type: ignore
-    _KAN_AVAILABLE = False
+_KAN_AVAILABLE = False
+
+
+def _to_1d_int_labels(y: Any) -> np.ndarray:
+    if hasattr(y, "to_numpy"):
+        try:
+            arr = y.to_numpy(copy=False)
+        except Exception:
+            arr = np.asarray(y)
+    else:
+        arr = np.asarray(y)
+    arr = np.asarray(arr).reshape(-1)
+    if arr.size <= 0:
+        return np.zeros(0, dtype=np.int64)
+    arr = np.nan_to_num(arr.astype(np.float64, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+    return arr.astype(np.int64, copy=False)
 
 
 class KANLayerBSpline(nn.Module):
@@ -101,7 +117,7 @@ class KANExpert(ExpertModel):
 
         return KANNet(self.input_dim, self.hidden_dim).to(self.device)
 
-    def fit(self, X: pd.DataFrame, y: pd.Series, tensorboard_writer: Any | None = None) -> None:
+    def fit(self, X: Any, y: Any, tensorboard_writer: Any | None = None) -> None:
         # Robust Normalization with NaN/Inf handling (2025 best practice)
         x_np = dataframe_to_float32_numpy(X)
         # Replace inf with nan first, then use nanmean/nanstd which ignore NaN
@@ -128,12 +144,14 @@ class KANExpert(ExpertModel):
         split = int(len(x_norm) * 0.85)
         # Use normalized data
         X_train_norm, X_val_norm = x_norm[:split], x_norm[split:]
-        y_train, y_val = y.iloc[:split], y.iloc[split:]
+        y_all = _to_1d_int_labels(y)
+        y_train = y_all[:split]
+        y_val = y_all[split:]
 
         X_t = torch.as_tensor(X_train_norm, dtype=torch.float32, device=self.device)
-        y_t = torch.as_tensor(y_train.values + 1, dtype=torch.long, device=self.device)
+        y_t = torch.as_tensor(y_train + 1, dtype=torch.long, device=self.device)
         X_v = torch.as_tensor(X_val_norm, dtype=torch.float32, device=self.device)
-        y_v = torch.as_tensor(y_val.values + 1, dtype=torch.long, device=self.device)
+        y_v = torch.as_tensor(y_val + 1, dtype=torch.long, device=self.device)
 
         dataset = TensorDataset(X_t, y_t)
         world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
@@ -225,7 +243,7 @@ class KANExpert(ExpertModel):
         except Exception as e:
             logger.warning(f"CPU optimization failed: {e}")
 
-    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, X: Any) -> np.ndarray:
         if self.model is None:
             return np.zeros((len(X), 3))
         self.model.eval()
@@ -302,3 +320,6 @@ class KANExpert(ExpertModel):
             self.model.load_state_dict(state)
             if str(self.device) == "cpu" and not _KAN_AVAILABLE:
                 self._optimize_for_cpu_inference()
+
+
+

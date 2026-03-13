@@ -9,7 +9,6 @@ import asyncio
 import json
 import logging
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -19,8 +18,6 @@ from pathlib import Path
 from typing import Any
 
 import joblib
-import numpy as np
-import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +164,7 @@ class GitHubBackupManager:
         
         try:
             # Check if git is available
-            result = subprocess.run(
+            subprocess.run(
                 ["git", "--version"],
                 capture_output=True,
                 check=True,
@@ -645,3 +642,4 @@ if __name__ == "__main__":
     
     results = run_hpc_unified(MockSettings(), ["EURUSD", "GBPUSD"])
     print(f"Results: {results}")
+

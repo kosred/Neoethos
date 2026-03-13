@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -8,9 +9,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
-import pandas as pd
 
-from ..core.config import Settings
+from ..core.config import ALL_TIMEFRAMES, Settings
 from ..domain.events import PreparedDataset
 
 logger = logging.getLogger(__name__)
@@ -18,6 +18,42 @@ _RUST_FEATURES_BACKEND_OK: bool | None = None
 _RUST_FEATURES_WARNED_UNAVAILABLE = False
 _RUST_LABELS_BACKEND_OK: bool | None = None
 _RUST_LABELS_WARNED_UNAVAILABLE = False
+
+
+def _tabular_module(*, required: bool = True):
+    _ = required
+    return None
+
+
+def _make_series(
+    values: Any,
+    *,
+    index: Any | None = None,
+    dtype: Any | None = None,
+    template: Any | None = None,
+) -> Any:
+    if template is not None:
+        ctor = getattr(template, "__class__", None)
+        if ctor is not None:
+            with contextlib.suppress(Exception):
+                if dtype is None:
+                    return ctor(values, index=index)
+                return ctor(values, index=index, dtype=dtype)
+    arr = np.asarray(values)
+    if dtype is not None:
+        with contextlib.suppress(Exception):
+            arr = arr.astype(dtype, copy=False)
+    return arr.reshape(-1)
+
+
+def _is_datetime_index(value: Any) -> bool:
+    return bool(
+        value is not None
+        and hasattr(value, "tz")
+        and hasattr(value, "tz_localize")
+        and hasattr(value, "tz_convert")
+        and (hasattr(value, "year") or hasattr(value, "asi8"))
+    )
 
 
 def _rust_features_backend_available(*, force_log: bool = False) -> bool:
@@ -31,7 +67,7 @@ def _rust_features_backend_available(*, force_log: bool = False) -> bool:
             _RUST_FEATURES_BACKEND_OK = False
     if force_log and not _RUST_FEATURES_BACKEND_OK and not _RUST_FEATURES_WARNED_UNAVAILABLE:
         logger.warning(
-            "Rust features backend requested but forex_bindings.load_symbol_features is unavailable; using Python features."
+            "Rust features backend requested but forex_bindings.load_symbol_features is unavailable."
         )
         _RUST_FEATURES_WARNED_UNAVAILABLE = True
     return bool(_RUST_FEATURES_BACKEND_OK)
@@ -53,7 +89,7 @@ def _rust_labels_backend_available(*, force_log: bool = False) -> bool:
             _RUST_LABELS_BACKEND_OK = False
     if force_log and not _RUST_LABELS_BACKEND_OK and not _RUST_LABELS_WARNED_UNAVAILABLE:
         logger.warning(
-            "Rust labels backend requested but forex_bindings.triple_barrier_labels is unavailable; using Python labels."
+            "Rust labels backend requested but forex_bindings.triple_barrier_labels is unavailable."
         )
         _RUST_LABELS_WARNED_UNAVAILABLE = True
     return bool(_RUST_LABELS_BACKEND_OK)
@@ -64,34 +100,159 @@ def _disable_rust_labels_backend() -> None:
     _RUST_LABELS_BACKEND_OK = False
 
 
-def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+def _ensure_datetime_index(df: Any) -> Any:
     if df is None or df.empty:
         return df
     out = df.copy()
-    if not isinstance(out.index, pd.DatetimeIndex):
+    if not _is_datetime_index(out.index):
         ts_col = None
         for candidate in ("timestamp", "time", "datetime", "date"):
             if candidate in out.columns:
                 ts_col = candidate
                 break
+        idx_np: np.ndarray | None = None
         if ts_col is not None:
-            idx = pd.to_datetime(out[ts_col], utc=True, errors="coerce")
-            out = out.set_index(idx)
+            idx_np = _index_to_ns_like(out[ts_col])
         else:
-            out.index = pd.to_datetime(out.index, utc=True, errors="coerce")
+            idx_np = _index_to_ns_like(out.index)
+        if idx_np is not None:
+            out.index = idx_np.astype("datetime64[ns]")
     else:
-        if out.index.tz is None:
-            out.index = out.index.tz_localize("UTC")
-        else:
-            out.index = out.index.tz_convert("UTC")
+        idx_np = _index_to_ns_like(out.index)
+        if idx_np is not None:
+            out.index = idx_np.astype("datetime64[ns]")
     return out
 
 
-def _ema(series: pd.Series, span: int) -> pd.Series:
+def _index_to_ns_like(index: Any) -> np.ndarray | None:
+    try:
+        if hasattr(index, "asi8"):
+            arr = np.asarray(index.asi8, dtype=np.int64).reshape(-1)
+            return arr if arr.size > 0 else np.zeros(0, dtype=np.int64)
+    except Exception:
+        pass
+    try:
+        arr = np.asarray(index).reshape(-1)
+    except Exception:
+        return None
+    if arr.size <= 0:
+        return np.zeros(0, dtype=np.int64)
+    with np.errstate(all="ignore"):
+        try:
+            if np.issubdtype(arr.dtype, np.datetime64):
+                return arr.astype("datetime64[ns]").astype(np.int64, copy=False)
+        except Exception:
+            pass
+    if arr.dtype.kind in {"i", "u"}:
+        vals = arr.astype(np.int64, copy=False)
+        vmax = int(np.max(np.abs(vals))) if vals.size > 0 else 0
+        if vmax > 10**14:
+            return vals
+        if vmax > 10**11:
+            return vals * 1_000_000
+        return vals * 1_000_000_000
+    if arr.dtype.kind == "f":
+        vals = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.int64, copy=False)
+        return vals * 1_000_000_000
+    out = np.zeros(arr.size, dtype=np.int64)
+    for i, v in enumerate(arr):
+        try:
+            ns = getattr(v, "value", None)
+            if ns is not None:
+                out[i] = int(ns)
+                continue
+            out[i] = int(np.datetime64(v, "ns").astype(np.int64))
+        except Exception:
+            out[i] = 0
+    return out
+
+
+def _rust_align_by_ts(
+    source_ts: np.ndarray,
+    values: object,
+    target_ts: np.ndarray,
+    *,
+    default: float,
+    forward_fill: bool,
+) -> np.ndarray | None:
+    try:
+        import forex_bindings as _fb  # type: ignore
+    except Exception:
+        return None
+    fn_name = "align_ffill_values_by_ns" if forward_fill else "align_exact_values_by_ns"
+    if not hasattr(_fb, fn_name):
+        return None
+    try:
+        fn = getattr(_fb, fn_name)
+        out = fn(
+            np.asarray(source_ts, dtype=np.int64),
+            np.asarray(values, dtype=np.float64),
+            np.asarray(target_ts, dtype=np.int64),
+            float(default),
+        )
+    except Exception:
+        return None
+    arr = np.asarray(out, dtype=np.float64).reshape(-1)
+    if arr.size != int(np.asarray(target_ts).size):
+        return None
+    return arr
+
+
+def _rust_sorted_index_order(index_like: Any) -> np.ndarray | None:
+    try:
+        import forex_bindings as _fb  # type: ignore
+    except Exception:
+        return None
+    if not hasattr(_fb, "sorted_index_order"):
+        return None
+    idx_ns = _index_to_ns_like(index_like)
+    if idx_ns is None:
+        return None
+    try:
+        out = _fb.sorted_index_order(np.asarray(idx_ns, dtype=np.int64))
+    except Exception:
+        return None
+    order = np.asarray(out, dtype=np.int64).reshape(-1)
+    if order.size != idx_ns.size:
+        return None
+    return order
+
+
+def _rust_rank_scores_desc(scores: Any, *, absolute: bool = False) -> np.ndarray | None:
+    try:
+        import forex_bindings as _fb  # type: ignore
+    except Exception:
+        return None
+    if not hasattr(_fb, "rank_scores_desc"):
+        return None
+    arr = np.asarray(scores, dtype=np.float64).reshape(-1)
+    try:
+        out = _fb.rank_scores_desc(arr, bool(absolute))
+    except Exception:
+        return None
+    order = np.asarray(out, dtype=np.int64).reshape(-1)
+    if order.size != arr.size:
+        return None
+    return order
+
+
+def _sorted_time_order(index_like: Any) -> np.ndarray | None:
+    idx_ns = _index_to_ns_like(index_like)
+    if idx_ns is None or idx_ns.size <= 1:
+        return None
+    if not bool(np.any(idx_ns[1:] < idx_ns[:-1])):
+        return None
+    order = _rust_sorted_index_order(idx_ns)
+    if order is not None:
+        return order
+    return np.argsort(idx_ns, kind="mergesort")
+
+
+def _ema(series: Any, span: int) -> Any:
     return series.ewm(span=span, adjust=False).mean()
 
 
-def _compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+def _compute_rsi(series: Any, period: int = 14) -> Any:
     delta = series.diff()
     gain = delta.where(delta > 0.0, 0.0)
     loss = -delta.where(delta < 0.0, 0.0)
@@ -102,7 +263,7 @@ def _compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return rsi.fillna(50.0)
 
 
-def _compute_macd(series: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
+def _compute_macd(series: Any) -> tuple[Any, Any, Any]:
     ema12 = _ema(series, 12)
     ema26 = _ema(series, 26)
     macd = ema12 - ema26
@@ -111,18 +272,68 @@ def _compute_macd(series: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
     return macd, signal, hist
 
 
-def _compute_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            (high - low).abs(),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    atr = tr.rolling(period, min_periods=period).mean()
-    return atr.bfill().fillna(0.0)
+def _compute_atr(high: Any, low: Any, close: Any, period: int = 14) -> Any:
+    close_arr = np.asarray(close, dtype=np.float64).reshape(-1)
+    n = int(close_arr.shape[0])
+    idx = getattr(close, "index", None)
+    if n <= 0:
+        return _make_series(np.zeros(0, dtype=np.float64), index=idx, template=close)
+
+    hi_arr = np.asarray(high, dtype=np.float64).reshape(-1)
+    lo_arr = np.asarray(low, dtype=np.float64).reshape(-1)
+    if hi_arr.size != n:
+        if hi_arr.size <= 0:
+            hi_arr = np.copy(close_arr)
+        elif hi_arr.size > n:
+            hi_arr = hi_arr[:n]
+        else:
+            hi_arr = np.concatenate([hi_arr, np.full(n - hi_arr.size, float(hi_arr[-1]), dtype=np.float64)])
+    if lo_arr.size != n:
+        if lo_arr.size <= 0:
+            lo_arr = np.copy(close_arr)
+        elif lo_arr.size > n:
+            lo_arr = lo_arr[:n]
+        else:
+            lo_arr = np.concatenate([lo_arr, np.full(n - lo_arr.size, float(lo_arr[-1]), dtype=np.float64)])
+
+    atr_np = _compute_atr_numpy(hi_arr, lo_arr, close_arr, period=period)
+    return _make_series(atr_np, index=idx, template=close)
+
+
+def _compute_atr_numpy(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    period: int = 14,
+) -> np.ndarray:
+    h = np.asarray(high, dtype=np.float64).reshape(-1)
+    l = np.asarray(low, dtype=np.float64).reshape(-1)
+    c = np.asarray(close, dtype=np.float64).reshape(-1)
+    n = int(c.shape[0])
+    if n <= 0:
+        return np.zeros(0, dtype=np.float64)
+
+    prev_close = np.empty_like(c)
+    prev_close[0] = c[0]
+    if n > 1:
+        prev_close[1:] = c[:-1]
+    tr = np.maximum.reduce(
+        (
+            np.abs(h - l),
+            np.abs(h - prev_close),
+            np.abs(l - prev_close),
+        )
+    )
+    p = int(max(2, period))
+    atr = np.full(n, np.nan, dtype=np.float64)
+    if n >= p:
+        kernel = np.ones(p, dtype=np.float64)
+        vals = np.convolve(tr, kernel, mode="valid") / float(p)
+        atr[p - 1 :] = vals
+    valid = np.flatnonzero(np.isfinite(atr))
+    if valid.size > 0 and valid[0] > 0:
+        atr[: valid[0]] = atr[valid[0]]
+    return np.nan_to_num(atr, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def _compute_adx_numba(high: Iterable[float], low: Iterable[float], close: Iterable[float], period: int = 14) -> np.ndarray:
@@ -234,10 +445,45 @@ class FeatureEngineer:
             tfu = str(tf or "").upper()
             if tfu and tfu not in tfs:
                 tfs.append(tfu)
+        use_all_tfs = str(os.environ.get("FOREX_BOT_USE_ALL_TIMEFRAMES", "0") or "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if use_all_tfs:
+            for tf in ALL_TIMEFRAMES:
+                tfu = str(tf or "").upper()
+                if tfu and tfu not in tfs:
+                    tfs.append(tfu)
         tfs = sorted(set(tfs), key=self._tf_minutes)
+        drop_lower = str(os.environ.get("FOREX_BOT_DROP_LOWER_TFS", "0") or "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if drop_lower:
+            base_mins = self._tf_minutes(base_tf)
+            tfs = [tf for tf in tfs if self._tf_minutes(tf) >= base_mins]
         if base_tf not in tfs:
             tfs.insert(0, base_tf)
         return tfs
+
+    def _downcast_training_float32(self) -> bool:
+        raw = os.environ.get("FOREX_BOT_DOWNCAST_FLOAT32")
+        if raw is not None and str(raw).strip() != "":
+            return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+        return bool(getattr(self.settings.system, "downcast_training_float32", True))
+
+    def _maybe_downcast_features(self, df: Any) -> Any:
+        if df is None or df.empty or not self._downcast_training_float32():
+            return df
+        try:
+            # Pandas 3+ deprecates `copy=` for astype in favor of CoW semantics.
+            return df.astype(np.float32)
+        except Exception:
+            return df
 
     @staticmethod
     def _use_rust_backend() -> bool:
@@ -254,6 +500,34 @@ class FeatureEngineer:
         if mode in {"python", "py", "0", "false", "no", "off"}:
             return False
         return _rust_features_backend_available()
+
+    @staticmethod
+    def _pandas_free_enabled() -> bool:
+        raw = str(os.environ.get("FOREX_BOT_PANDAS_FREE", "1") or "1").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _rust_only_enabled() -> bool:
+        raw = str(os.environ.get("FOREX_BOT_RUST_ONLY", "") or "").strip().lower()
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        backend = str(os.environ.get("FOREX_BOT_FEATURES_BACKEND", "") or "").strip().lower()
+        if backend in {"rust_strict", "strict_rust", "rust_only", "rust-only"}:
+            return True
+        tree_backend = str(os.environ.get("FOREX_BOT_TREE_BACKEND", "") or "").strip().lower()
+        if tree_backend in {"rust_strict", "strict_rust", "rust_only", "rust-only"}:
+            return True
+        runtime_profile = str(os.environ.get("FOREX_BOT_RUNTIME_PROFILE", "") or "").strip().lower()
+        if runtime_profile.startswith("rust"):
+            return True
+        return False
+
+    @staticmethod
+    def _empty_numpy_dataset() -> PreparedDataset:
+        x = np.zeros((0, 0), dtype=np.float32)
+        y = np.zeros(0, dtype=np.int8)
+        idx = np.zeros(0, dtype=np.int64)
+        return PreparedDataset(X=x, y=y, index=idx, feature_names=[], metadata=None, labels=y)
 
     def _label_config(self) -> _LabelConfig:
         horizon = 1
@@ -318,7 +592,7 @@ class FeatureEngineer:
             return 0.01
         return 0.0001
 
-    def _compute_basic_features(self, df: pd.DataFrame, *, use_gpu: bool = False) -> pd.DataFrame:
+    def _compute_basic_features(self, df: Any, *, use_gpu: bool = False) -> Any:
         if df is None or df.empty:
             return df
         out = df.copy()
@@ -333,7 +607,7 @@ class FeatureEngineer:
         out["adx"] = _compute_adx_numba(high.to_numpy(), low.to_numpy(), close.to_numpy())
         return out
 
-    def _compute_volatility_features(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _compute_volatility_features(self, df: Any) -> Any:
         if df is None or df.empty:
             return df
         out = df.copy()
@@ -349,14 +623,14 @@ class FeatureEngineer:
         out["bb_width"] = ((upper - lower) / (ma.replace(0.0, np.nan))).fillna(0.0)
         return out
 
-    def _compute_volume_profile_features(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _compute_volume_profile_features(self, df: Any) -> Any:
         if df is None or df.empty:
             return df
         out = df.copy()
         if "volume" in out.columns:
             volume = out["volume"].astype(float)
         else:
-            volume = pd.Series(np.ones(len(out), dtype=float), index=out.index)
+            volume = _make_series(np.ones(len(out), dtype=float), index=out.index)
         close = out["close"].astype(float)
         window = 20
         vol_sum = volume.rolling(window, min_periods=1).sum().replace(0.0, np.nan)
@@ -367,7 +641,7 @@ class FeatureEngineer:
         out["in_value_area"] = ((close >= (poc - std)) & (close <= (poc + std))).astype(float)
         return out
 
-    def _compute_obi_features(self, df: pd.DataFrame, *, use_gpu: bool = False) -> pd.DataFrame:
+    def _compute_obi_features(self, df: Any, *, use_gpu: bool = False) -> Any:
         if df is None or df.empty:
             return df
         out = df.copy()
@@ -379,7 +653,7 @@ class FeatureEngineer:
         if "volume" in out.columns:
             volume = out["volume"].astype(float)
         else:
-            volume = pd.Series(np.ones(len(out), dtype=float), index=out.index)
+            volume = _make_series(np.ones(len(out), dtype=float), index=out.index)
         imbalance = ((close - open_) / rng).fillna(0.0) * volume
         out["vol_imbalance"] = imbalance.fillna(0.0)
         out["obi_mom3"] = out["vol_imbalance"].rolling(3, min_periods=1).mean().fillna(0.0)
@@ -387,11 +661,11 @@ class FeatureEngineer:
         out["obi_seq_dn5"] = (out["vol_imbalance"] < 0).astype(float).rolling(5, min_periods=1).mean().fillna(0.0)
         return out
 
-    def _compute_session_features(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _compute_session_features(self, df: Any) -> Any:
         if df is None or df.empty:
             return df
         out = df.copy()
-        if not isinstance(out.index, pd.DatetimeIndex):
+        if not _is_datetime_index(out.index):
             return out
         try:
             idx_utc = out.index.tz_convert("UTC") if out.index.tz is not None else out.index.tz_localize("UTC")
@@ -404,7 +678,7 @@ class FeatureEngineer:
         out["hour_sin"] = np.sin((2.0 * np.pi * hour) / 24.0)
         out["hour_cos"] = np.cos((2.0 * np.pi * hour) / 24.0)
         if {"high", "low", "close"}.issubset(out.columns):
-            day = pd.Series(idx_utc.date, index=out.index)
+            day = _make_series(idx_utc.date, index=out.index)
             asia_mask = (hour >= 0) & (hour < 7)
             asia_high = out["high"].where(asia_mask).groupby(day).transform("max")
             asia_low = out["low"].where(asia_mask).groupby(day).transform("min")
@@ -459,7 +733,7 @@ class FeatureEngineer:
     def _parse_discovered_gene(
         *,
         raw: dict[str, Any],
-        available: set[str],
+        available: set[str] | None,
         payload_symbol: str,
         payload_tf: str,
         TALibStrategyGene: Any,
@@ -470,11 +744,19 @@ class FeatureEngineer:
             except Exception:
                 return float(default)
 
+        def _to_bool(key: str, default: bool = False) -> bool:
+            val = raw.get(key, default)
+            if isinstance(val, bool):
+                return val
+            if isinstance(val, (int, float)):
+                return float(val) != 0.0
+            return str(val).strip().lower() in {"1", "true", "yes", "on"}
+
         inds_raw = raw.get("indicators") or []
         indicators: list[str] = []
         for ind in inds_raw:
             name = str(ind).strip().upper()
-            if name and name in available and name not in indicators:
+            if name and (not available or name in available) and name not in indicators:
                 indicators.append(name)
         if not indicators:
             return None
@@ -517,16 +799,43 @@ class FeatureEngineer:
                 net_profit=_to_float("net_profit", 0.0),
                 profit_factor=_to_float("profit_factor", 0.0),
                 expectancy=_to_float("expectancy", 0.0),
-                use_ob=bool(raw.get("use_ob", False)),
-                use_fvg=bool(raw.get("use_fvg", False)),
-                use_liq_sweep=bool(raw.get("use_liq_sweep", False)),
-                mtf_confirmation=bool(raw.get("mtf_confirmation", False)),
-                use_premium_discount=bool(raw.get("use_premium_discount", False)),
-                use_inducement=bool(raw.get("use_inducement", False)),
+                use_ob=_to_bool("use_ob", False),
+                use_fvg=_to_bool("use_fvg", False),
+                use_liq_sweep=_to_bool("use_liq_sweep", False),
+                mtf_confirmation=_to_bool("mtf_confirmation", False),
+                use_premium_discount=_to_bool("use_premium_discount", False),
+                use_inducement=_to_bool("use_inducement", False),
                 tp_pips=_to_float("tp_pips", 40.0),
                 sl_pips=_to_float("sl_pips", 20.0),
                 source_symbol=payload_symbol,
                 source_timeframe=payload_tf,
+                in_sample_net_profit=_to_float("in_sample_net_profit", 0.0),
+                in_sample_sharpe_ratio=_to_float("in_sample_sharpe_ratio", 0.0),
+                in_sample_win_rate=_to_float("in_sample_win_rate", 0.0),
+                in_sample_profit_factor=_to_float("in_sample_profit_factor", 0.0),
+                in_sample_trades=_to_float("in_sample_trades", 0.0),
+                in_sample_max_dd_pct=_to_float("in_sample_max_dd_pct", 0.0),
+                in_sample_months=_to_float("in_sample_months", 0.0),
+                holdout_net_profit=_to_float("holdout_net_profit", 0.0),
+                holdout_sharpe_ratio=_to_float("holdout_sharpe_ratio", 0.0),
+                holdout_win_rate=_to_float("holdout_win_rate", 0.0),
+                holdout_profit_factor=_to_float("holdout_profit_factor", 0.0),
+                holdout_trades=_to_float("holdout_trades", 0.0),
+                holdout_max_dd_pct=_to_float(
+                    "holdout_max_dd_pct",
+                    _to_float("holdout_max_drawdown", _to_float("holdout_max_dd", 0.0)),
+                ),
+                holdout_months=_to_float("holdout_months", 0.0),
+                holdout_trades_per_month=_to_float("holdout_trades_per_month", 0.0),
+                holdout_monthly_profit_pct=_to_float("holdout_monthly_profit_pct", 0.0),
+                truth_probability=_to_float("truth_probability", 0.0),
+                forward_test_passed=_to_bool("forward_test_passed", _to_bool("holdout_passed", False)),
+                in_sample_journal=dict(raw.get("in_sample_journal", {}) or {})
+                if isinstance(raw.get("in_sample_journal"), dict)
+                else {},
+                holdout_journal=dict(raw.get("holdout_journal", {}) or {})
+                if isinstance(raw.get("holdout_journal"), dict)
+                else {},
             )
         except Exception:
             return None
@@ -536,7 +845,12 @@ class FeatureEngineer:
             from .talib_mixer import TALIB_AVAILABLE, TALibStrategyGene, TALibStrategyMixer
         except Exception:
             return []
-        if not TALIB_AVAILABLE:
+        rust_talib_available = False
+        with contextlib.suppress(Exception):
+            import forex_bindings  # type: ignore
+
+            rust_talib_available = bool(hasattr(forex_bindings, "talib_bulk_signals_ohlcv"))
+        if not TALIB_AVAILABLE and not rust_talib_available:
             return []
 
         candidates = self._prop_gene_artifact_paths(symbol)
@@ -551,13 +865,15 @@ class FeatureEngineer:
             "on",
         }
 
-        mixer = TALibStrategyMixer(
-            device="cpu",
-            use_volume_features=bool(getattr(self.settings.system, "use_volume_features", False)),
-        )
-        available = {str(i).upper() for i in getattr(mixer, "available_indicators", [])}
-        if not available:
-            return []
+        available: set[str] | None = None
+        if TALIB_AVAILABLE:
+            mixer = TALibStrategyMixer(
+                device="cpu",
+                use_volume_features=bool(getattr(self.settings.system, "use_volume_features", False)),
+            )
+            candidate_available = {str(i).upper() for i in getattr(mixer, "available_indicators", [])}
+            if candidate_available:
+                available = candidate_available
 
         try:
             max_dd = float(
@@ -579,7 +895,44 @@ class FeatureEngineer:
         except Exception:
             min_trades = 5.0
         min_trades = float(max(0.0, min_trades))
-        strict_prefilter = str(os.environ.get("FOREX_BOT_PROP_BASE_SIGNAL_STRICT_FILTER", "0") or "0").strip().lower() in {
+        runtime_profile = str(os.environ.get("FOREX_BOT_RUNTIME_PROFILE", "") or "").strip().lower()
+        elite_default = runtime_profile.startswith("rust")
+        elite_filter = str(
+            os.environ.get("FOREX_BOT_PROP_ELITE_FILTER", "1" if elite_default else "0") or ("1" if elite_default else "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        require_forward = str(
+            os.environ.get("FOREX_BOT_PROP_REQUIRE_FORWARD_PASS", "1" if elite_filter else "0") or ("1" if elite_filter else "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            min_holdout_months = float(os.environ.get("FOREX_BOT_PROP_MIN_HOLDOUT_MONTHS", "6.0" if elite_filter else "0.0") or (6.0 if elite_filter else 0.0))
+        except Exception:
+            min_holdout_months = 6.0 if elite_filter else 0.0
+        min_holdout_months = float(max(0.0, min_holdout_months))
+        try:
+            holdout_max_dd = float(os.environ.get("FOREX_BOT_PROP_HOLDOUT_MAX_DD", "0.03" if elite_filter else "1.0") or (0.03 if elite_filter else 1.0))
+        except Exception:
+            holdout_max_dd = 0.03 if elite_filter else 1.0
+        holdout_max_dd = float(min(1.0, max(0.0, holdout_max_dd)))
+        try:
+            min_truth = float(
+                os.environ.get(
+                    "FOREX_BOT_PROP_MIN_TRUTH_PROBABILITY",
+                    os.environ.get(
+                        "FOREX_BOT_MIN_TRUTH_PROBABILITY",
+                        str(getattr(self.settings.models, "prop_search_holdout_min_truth_probability", 0.0) or 0.0),
+                    ),
+                )
+                or 0.0
+            )
+        except Exception:
+            min_truth = 0.0
+        if min_truth > 1.0:
+            min_truth *= 0.01
+        min_truth = float(min(1.0, max(0.0, min_truth)))
+        strict_prefilter = str(
+            os.environ.get("FOREX_BOT_PROP_BASE_SIGNAL_STRICT_FILTER", "1" if elite_filter else "0")
+            or ("1" if elite_filter else "0")
+        ).strip().lower() in {
             "1",
             "true",
             "yes",
@@ -627,7 +980,30 @@ class FeatureEngineer:
                         trades = float(getattr(gene, "trades", 0.0) or 0.0)
                     except Exception:
                         trades = 0.0
-                    if dd <= max_dd and profit > min_profit and trades >= min_trades:
+                    try:
+                        truth = float(getattr(gene, "truth_probability", 0.0) or 0.0)
+                    except Exception:
+                        truth = 0.0
+                    if truth > 1.0:
+                        truth *= 0.01
+                    try:
+                        hold_months = float(getattr(gene, "holdout_months", 0.0) or 0.0)
+                    except Exception:
+                        hold_months = 0.0
+                    try:
+                        hold_dd = float(getattr(gene, "holdout_max_dd_pct", 0.0) or 0.0)
+                    except Exception:
+                        hold_dd = 0.0
+                    forward_ok = bool(getattr(gene, "forward_test_passed", False))
+                    if (
+                        dd <= max_dd
+                        and profit > min_profit
+                        and trades >= min_trades
+                        and (not require_forward or forward_ok)
+                        and truth >= min_truth
+                        and (min_holdout_months <= 0.0 or hold_months >= min_holdout_months)
+                        and (holdout_max_dd >= 1.0 or hold_dd <= holdout_max_dd)
+                    ):
                         parsed_filtered.append(gene)
 
         if not parsed_all:
@@ -670,25 +1046,41 @@ class FeatureEngineer:
         )
         return out[: max(1, int(max_genes))]
 
-    def _compute_discovered_base_signal(self, df: pd.DataFrame, *, symbol: str | None) -> np.ndarray | None:
+    def _compute_discovered_base_signal(self, df: Any, *, symbol: str | None) -> np.ndarray | None:
         if df is None or df.empty:
             return None
-        try:
-            from .talib_mixer import TALIB_AVAILABLE, TALibStrategyMixer
-        except Exception:
+        rust_signal: np.ndarray | None = None
+        with contextlib.suppress(Exception):
+            volume_arr = (
+                np.asarray(df["volume"], dtype=np.float64)
+                if bool(getattr(self.settings.system, "use_volume_features", False)) and "volume" in df.columns
+                else None
+            )
+            rust_signal = self._compute_discovered_base_signal_ohlcv_numpy(
+                open_arr=np.asarray(df["open"], dtype=np.float64),
+                high_arr=np.asarray(df["high"], dtype=np.float64),
+                low_arr=np.asarray(df["low"], dtype=np.float64),
+                close_arr=np.asarray(df["close"], dtype=np.float64),
+                volume_arr=volume_arr,
+                symbol=symbol,
+            )
+        if rust_signal is None:
             return None
-        if not TALIB_AVAILABLE:
-            return None
+        out = np.asarray(rust_signal, dtype=np.int8).reshape(-1)
+        if out.size != len(df):
+            out = self._fit_len(out, len(df), default=0.0, dtype=np.int8)
+        return out
 
+    def _discovered_base_signal_settings(self) -> tuple[int, float, float, float]:
         try:
-            max_genes = int(os.environ.get("FOREX_BOT_PROP_BASE_SIGNAL_GENES", "100") or 100)
+            default_genes = int(getattr(getattr(self.settings, "models", None), "prop_search_portfolio_size", 4) or 4)
         except Exception:
-            max_genes = 100
+            default_genes = 4
+        try:
+            max_genes = int(os.environ.get("FOREX_BOT_PROP_BASE_SIGNAL_GENES", str(default_genes)) or default_genes)
+        except Exception:
+            max_genes = default_genes
         max_genes = max(1, max_genes)
-
-        genes = self._load_discovered_base_signal_genes(symbol, max_genes=max_genes)
-        if not genes:
-            return None
 
         try:
             threshold = float(os.environ.get("FOREX_BOT_PROP_BASE_SIGNAL_THRESHOLD", "0.15") or 0.15)
@@ -705,35 +1097,23 @@ class FeatureEngineer:
             max_coverage = 1.0
         min_coverage = float(min(0.95, max(0.0, min_coverage)))
         max_coverage = float(min(0.99, max(min_coverage, max_coverage)))
+        return max_genes, threshold, min_coverage, max_coverage
 
-        mixer = TALibStrategyMixer(
-            device="cpu",
-            use_volume_features=bool(getattr(self.settings.system, "use_volume_features", False)),
-        )
-        cache = mixer.bulk_calculate_indicators(df, genes)
+    @staticmethod
+    def _score_to_discovered_signal(
+        score: np.ndarray,
+        *,
+        threshold: float,
+        min_coverage: float,
+        max_coverage: float,
+    ) -> np.ndarray:
+        score_arr = np.asarray(score, dtype=np.float64).reshape(-1)
+        if score_arr.size <= 0:
+            return np.zeros(0, dtype=np.int8)
 
-        score_sum = np.zeros(len(df), dtype=np.float64)
-        weight_sum = 0.0
-        for gene in genes:
-            try:
-                sig = mixer.compute_signals(df, gene, cache=cache)
-                aligned = sig.reindex(df.index).ffill().fillna(0.0).to_numpy(dtype=np.float64, copy=False)
-            except Exception:
-                continue
-
-            w = float(getattr(gene, "fitness", 0.0) or 0.0)
-            if not np.isfinite(w) or w <= 0.0:
-                w = 1.0
-            score_sum += w * aligned
-            weight_sum += abs(w)
-
-        if weight_sum <= 0.0:
-            return None
-
-        score = score_sum / weight_sum
-        abs_score = np.abs(score)
-        signal = np.where(score >= threshold, 1, np.where(score <= -threshold, -1, 0)).astype(np.int8)
-        n = int(len(signal))
+        abs_score = np.abs(score_arr)
+        signal = np.where(score_arr >= threshold, 1, np.where(score_arr <= -threshold, -1, 0)).astype(np.int8)
+        n = int(signal.shape[0])
         if n <= 0:
             return signal
 
@@ -744,32 +1124,209 @@ class FeatureEngineer:
 
         active_now = int(np.count_nonzero(signal))
         if target_max > 0 and active_now > target_max:
-            keep = np.zeros(n, dtype=bool)
-            top_idx = np.argsort(abs_score)[::-1][:target_max]
-            keep[top_idx] = True
+            top_idx = _rust_rank_scores_desc(abs_score, absolute=False)
+            if top_idx is None:
+                top_idx = np.argsort(abs_score)[::-1]
+            top_idx = np.asarray(top_idx, dtype=np.int64)[:target_max]
             trimmed = np.zeros(n, dtype=np.int8)
-            sel = score[top_idx]
+            sel = score_arr[top_idx]
             trimmed[top_idx] = np.where(sel > 0.0, 1, np.where(sel < 0.0, -1, 0)).astype(np.int8)
-            signal = trimmed
-        elif target_min > 0 and active_now < target_min:
-            keep = np.zeros(n, dtype=bool)
-            top_idx = np.argsort(abs_score)[::-1][:target_min]
-            keep[top_idx] = True
+            return trimmed
+        if target_min > 0 and active_now < target_min:
+            top_idx = _rust_rank_scores_desc(abs_score, absolute=False)
+            if top_idx is None:
+                top_idx = np.argsort(abs_score)[::-1]
+            top_idx = np.asarray(top_idx, dtype=np.int64)[:target_min]
             boosted = np.zeros(n, dtype=np.int8)
-            sel = score[top_idx]
+            sel = score_arr[top_idx]
             boosted[top_idx] = np.where(sel > 0.0, 1, np.where(sel < 0.0, -1, 0)).astype(np.int8)
-            signal = boosted
+            return boosted
         return signal
 
-    def _compute_base_signal(self, df: pd.DataFrame, *, symbol: str | None = None) -> pd.DataFrame:
+    @staticmethod
+    def _gene_has_custom_params(gene: Any) -> bool:
+        params = getattr(gene, "params", {}) or {}
+        if not isinstance(params, dict) or not params:
+            return False
+        for value in params.values():
+            if isinstance(value, dict):
+                if len(value) == 0:
+                    continue
+                return True
+            if value:
+                return True
+        return False
+
+    def _compute_discovered_base_signal_ohlcv_numpy(
+        self,
+        *,
+        open_arr: np.ndarray,
+        high_arr: np.ndarray,
+        low_arr: np.ndarray,
+        close_arr: np.ndarray,
+        volume_arr: np.ndarray | None,
+        symbol: str | None,
+    ) -> np.ndarray | None:
+        try:
+            import forex_bindings  # type: ignore
+        except Exception:
+            return None
+        if not hasattr(forex_bindings, "talib_bulk_signals_ohlcv"):
+            return None
+
+        max_genes, threshold, min_coverage, max_coverage = self._discovered_base_signal_settings()
+        genes = self._load_discovered_base_signal_genes(symbol, max_genes=max_genes)
+        if not genes:
+            return None
+
+        o = np.asarray(open_arr, dtype=np.float64).reshape(-1)
+        h = np.asarray(high_arr, dtype=np.float64).reshape(-1)
+        l = np.asarray(low_arr, dtype=np.float64).reshape(-1)
+        c = np.asarray(close_arr, dtype=np.float64).reshape(-1)
+        n = int(min(o.size, h.size, l.size, c.size))
+        if n <= 0:
+            return None
+        o = np.nan_to_num(o[:n], nan=0.0, posinf=0.0, neginf=0.0)
+        h = np.nan_to_num(h[:n], nan=0.0, posinf=0.0, neginf=0.0)
+        l = np.nan_to_num(l[:n], nan=0.0, posinf=0.0, neginf=0.0)
+        c = np.nan_to_num(c[:n], nan=0.0, posinf=0.0, neginf=0.0)
+
+        use_volume = bool(getattr(self.settings.system, "use_volume_features", False))
+        vol: np.ndarray | None = None
+        if use_volume and volume_arr is not None:
+            raw_vol = np.asarray(volume_arr, dtype=np.float64).reshape(-1)
+            if raw_vol.size > 0:
+                vol = np.nan_to_num(
+                    self._fit_len(raw_vol, n, default=0.0, dtype=np.float64),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+
+        indicator_sets: list[list[str]] = []
+        weight_sets: list[list[float]] = []
+        long_thresholds: list[float] = []
+        short_thresholds: list[float] = []
+        gene_weights: list[float] = []
+
+        for gene in genes:
+            if self._gene_has_custom_params(gene):
+                continue
+            indicators: list[str] = []
+            for raw_ind in getattr(gene, "indicators", []) or []:
+                name = str(raw_ind).strip().upper()
+                if name and name not in indicators:
+                    indicators.append(name)
+            if not indicators:
+                continue
+
+            weights_raw = getattr(gene, "weights", {}) or {}
+            wset: list[float] = []
+            for ind in indicators:
+                val = weights_raw.get(ind, weights_raw.get(ind.lower(), 1.0))
+                try:
+                    w = float(val)
+                except Exception:
+                    w = 1.0
+                if not np.isfinite(w):
+                    w = 1.0
+                wset.append(w)
+
+            try:
+                long_thr = float(getattr(gene, "long_threshold", 0.66) or 0.66)
+            except Exception:
+                long_thr = 0.66
+            try:
+                short_thr = float(getattr(gene, "short_threshold", -0.66) or -0.66)
+            except Exception:
+                short_thr = -0.66
+
+            w_gene = float(getattr(gene, "fitness", 0.0) or 0.0)
+            if not np.isfinite(w_gene) or w_gene <= 0.0:
+                w_gene = 1.0
+
+            indicator_sets.append(indicators)
+            weight_sets.append(wset)
+            long_thresholds.append(long_thr)
+            short_thresholds.append(short_thr)
+            gene_weights.append(w_gene)
+
+        if not indicator_sets:
+            return None
+
+        try:
+            causal_min_bars = int(os.environ.get("FOREX_BOT_TALIB_CAUSAL_MIN_BARS", "30") or 30)
+        except Exception:
+            causal_min_bars = 30
+        causal_min_bars = max(2, causal_min_bars)
+
+        try:
+            raw = forex_bindings.talib_bulk_signals_ohlcv(
+                o,
+                h,
+                l,
+                c,
+                indicator_sets=indicator_sets,
+                weight_sets=weight_sets,
+                long_thresholds=long_thresholds,
+                short_thresholds=short_thresholds,
+                volume=vol,
+                include_raw=False,
+                causal_min_bars=causal_min_bars,
+            )
+        except TypeError:
+            raw = forex_bindings.talib_bulk_signals_ohlcv(
+                o,
+                h,
+                l,
+                c,
+                indicator_sets=indicator_sets,
+                weight_sets=weight_sets,
+                long_thresholds=long_thresholds,
+                short_thresholds=short_thresholds,
+                volume=vol,
+                include_raw=False,
+            )
+        except Exception as exc:
+            logger.debug("Rust discovered base-signal bulk call failed: %s", exc)
+            return None
+
+        signals = np.asarray(raw, dtype=np.float64)
+        expected_genes = len(gene_weights)
+        if signals.ndim != 2:
+            return None
+        if signals.shape[0] == expected_genes and signals.shape[1] == n:
+            signals = signals.T
+        if signals.shape[0] != n or signals.shape[1] != expected_genes:
+            logger.debug(
+                "Rust discovered base-signal shape mismatch (got=%s expected=(%s,%s)).",
+                signals.shape,
+                n,
+                expected_genes,
+            )
+            return None
+
+        w = np.asarray(gene_weights, dtype=np.float64).reshape(-1)
+        weight_sum = float(np.sum(np.abs(w)))
+        if weight_sum <= 0.0:
+            return None
+
+        sig_mat = np.nan_to_num(np.asarray(signals, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+        score = (sig_mat @ w) / weight_sum
+        return self._score_to_discovered_signal(
+            score,
+            threshold=threshold,
+            min_coverage=min_coverage,
+            max_coverage=max_coverage,
+        )
+
+    def _compute_base_signal(self, df: Any, *, symbol: str | None = None) -> Any:
         if df is None or df.empty:
             return df
         out = df.copy()
 
         signal_source = str(os.environ.get("FOREX_BOT_BASE_SIGNAL_SOURCE", "discovery_first") or "discovery_first").strip().lower()
         use_discovery = signal_source in {"discovery", "discovery_first", "prop", "talib", "mixer", "auto"}
-        strict_discovery = signal_source in {"discovery", "prop", "talib", "mixer"}
-
         target_symbol = symbol
         if not target_symbol:
             target_symbol = str(getattr(out, "attrs", {}).get("symbol", "") or "").strip()
@@ -777,93 +1334,315 @@ class FeatureEngineer:
         if use_discovery:
             discovered_signal = self._compute_discovered_base_signal(out, symbol=target_symbol)
         if discovered_signal is not None:
-            cov = float(np.count_nonzero(discovered_signal)) / float(max(1, len(discovered_signal)))
-            try:
-                min_cov = float(os.environ.get("FOREX_BOT_DISCOVERY_BASE_SIGNAL_MIN_COVERAGE", "0.005") or 0.005)
-            except Exception:
-                min_cov = 0.005
-            if signal_source == "discovery_first" and cov < max(0.0, min(1.0, min_cov)):
-                logger.warning(
-                    "Discovery base_signal coverage too low (%.3f%% < %.3f%%); falling back to classic rules.",
-                    cov * 100.0,
-                    min_cov * 100.0,
-                )
-            else:
-                out["base_signal"] = discovered_signal.astype(int, copy=False)
-                return out
-        if strict_discovery:
-            out["base_signal"] = 0
+            out["base_signal"] = discovered_signal.astype(int, copy=False)
             return out
-
-        rsi = out.get("rsi")
-        macd_hist = out.get("macd_hist")
-        if rsi is None or macd_hist is None:
-            out["base_signal"] = 0
-            return out
-        buy = (rsi < 30.0) & (macd_hist > 0)
-        sell = (rsi > 70.0) & (macd_hist < 0)
-        signal = np.where(buy, 1, np.where(sell, -1, 0))
-        out["base_signal"] = signal.astype(int)
+        out["base_signal"] = 0
         return out
+
+    @staticmethod
+    def _find_rsi_feature_column(columns: Iterable[str]) -> str | None:
+        cols = [str(c) for c in columns]
+        if "rsi" in cols:
+            return "rsi"
+        if "ta_rsi" in cols:
+            return "ta_rsi"
+        matches = [c for c in cols if c.lower().endswith("ta_rsi")]
+        if matches:
+            return min(matches, key=len)
+        return None
+
+    @staticmethod
+    def _find_macd_hist_feature_column(columns: Iterable[str]) -> str | None:
+        cols = [str(c) for c in columns]
+        if "macd_hist" in cols:
+            return "macd_hist"
+        preferred = (
+            "ta_macd_outmacdhist",
+            "ta_macdext_outmacdhist",
+            "ta_macdfix_outmacdhist",
+        )
+        for name in preferred:
+            if name in cols:
+                return name
+        matches = [c for c in cols if c.lower().endswith("outmacdhist")]
+        if matches:
+            return min(matches, key=len)
+        return None
 
     def _compute_labels(
         self,
-        close: pd.Series,
+        close: Any,
         cfg: _LabelConfig,
         *,
-        high: pd.Series | None = None,
-        low: pd.Series | None = None,
+        high: Any | None = None,
+        low: Any | None = None,
         symbol: str | None = None,
-        base_signal: pd.Series | None = None,
-    ) -> pd.Series:
-        close_f = close.astype(float)
-        if not cfg.use_triple_barrier:
-            future = close_f.shift(-cfg.horizon)
-            delta = (future - close_f).astype(float)
-            up = delta > cfg.min_dist
-            down = delta < -cfg.min_dist
-            labels = np.where(up, 1, np.where(down, -1, 0)).astype(int)
-            return pd.Series(labels, index=close_f.index)
+        base_signal: Any | None = None,
+    ) -> Any:
+        close_idx = getattr(close, "index", None)
+        close_arr = np.asarray(close, dtype=np.float64).reshape(-1)
+        n = int(close_arr.shape[0])
+        if n <= 0:
+            return _make_series(np.zeros(0, dtype=np.int8), index=close_idx, template=close)
+        close_ts = self._to_timestamp_ns(close_idx, n)
 
-        hi = (high.astype(float) if high is not None else close_f).reindex(close_f.index)
-        lo = (low.astype(float) if low is not None else close_f).reindex(close_f.index)
-        n = len(close_f)
+        def _aligned(values: Any | None, *, default: float) -> np.ndarray:
+            if values is None:
+                return np.full(n, float(default), dtype=np.float64)
+            src = values
+            arr = np.asarray(src, dtype=np.float64).reshape(-1)
+            if close_idx is not None:
+                src_idx = getattr(src, "index", None)
+                if src_idx is not None:
+                    src_ts = self._to_timestamp_ns(src_idx, arr.shape[0])
+                    arr = self._align_series_exact_by_ts(
+                        close_ts,
+                        src_ts,
+                        arr,
+                        default=float(default),
+                        dtype=np.float64,
+                    )
+            return self._fit_len(arr, n, default=float(default), dtype=np.float64)
+
+        close_arr = self._fit_len(close_arr, n, default=0.0, dtype=np.float64)
+        hi_arr = _aligned(high if high is not None else close_arr, default=float(close_arr[-1]))
+        lo_arr = _aligned(low if low is not None else close_arr, default=float(close_arr[-1]))
+
+        sig_arr: np.ndarray | None = None
+        if base_signal is not None:
+            sig_src = base_signal
+            sig_np = np.asarray(sig_src, dtype=np.float64).reshape(-1)
+            if close_idx is not None:
+                sig_idx = getattr(sig_src, "index", None)
+                if sig_idx is not None:
+                    sig_ts = self._to_timestamp_ns(sig_idx, sig_np.shape[0])
+                    sig_np = self._align_series_exact_by_ts(
+                        close_ts,
+                        sig_ts,
+                        sig_np,
+                        default=0.0,
+                        dtype=np.float64,
+                    )
+            sig_arr = self._fit_len(sig_np, n, default=0.0, dtype=np.float64)
+            sig_arr = np.nan_to_num(sig_arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.int8, copy=False)
+
+        labels = self._compute_labels_numpy(
+            close_arr,
+            cfg,
+            high=hi_arr,
+            low=lo_arr,
+            symbol=symbol,
+            base_signal=sig_arr,
+        )
+        return _make_series(
+            np.asarray(labels, dtype=np.int8).astype(int, copy=False),
+            index=close_idx,
+            template=close,
+        )
+
+    @staticmethod
+    def _to_timestamp_ns(values: object, rows: int) -> np.ndarray:
+        n = max(0, int(rows))
+        if values is None:
+            return np.arange(n, dtype=np.int64)
+        try:
+            if hasattr(values, "asi8"):
+                out = np.asarray(values.asi8, dtype=np.int64).reshape(-1)
+                if out.size < n:
+                    if out.size <= 0:
+                        return np.arange(n, dtype=np.int64)
+                    pad = np.full(n - out.size, int(out[-1]), dtype=np.int64)
+                    return np.concatenate([out, pad])
+                if out.size > n:
+                    return out[:n]
+                return out
+        except Exception:
+            pass
+        arr = np.asarray(values).reshape(-1)
+        if arr.size == 0:
+            return np.arange(n, dtype=np.int64)
+        out: np.ndarray
+        try:
+            if np.issubdtype(arr.dtype, np.datetime64):
+                out = arr.astype("datetime64[ns]").astype(np.int64, copy=False)
+            elif arr.dtype.kind in {"i", "u"}:
+                out = arr.astype(np.int64, copy=False)
+            elif arr.dtype.kind == "f":
+                out = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.int64, copy=False)
+            else:
+                out = np.zeros(arr.size, dtype=np.int64)
+                for i, v in enumerate(arr):
+                    try:
+                        ns = getattr(v, "value", None)
+                        if ns is not None:
+                            out[i] = int(ns)
+                            continue
+                        out[i] = int(np.datetime64(v, "ns").astype(np.int64))
+                    except Exception:
+                        out[i] = 0
+        except Exception:
+            out = np.arange(arr.size, dtype=np.int64)
+        if out.size < n:
+            if out.size <= 0:
+                return np.arange(n, dtype=np.int64)
+            pad = np.full(n - out.size, int(out[-1]), dtype=np.int64)
+            return np.concatenate([out, pad])
+        if out.size > n:
+            return out[:n]
+        return out
+
+    @staticmethod
+    def _align_series_by_ts(
+        target_ts: np.ndarray,
+        source_ts: np.ndarray,
+        values: object,
+        *,
+        default: float = 0.0,
+        dtype: Any = np.float32,
+    ) -> np.ndarray:
+        tgt = np.asarray(target_ts, dtype=np.int64).reshape(-1)
+        src = np.asarray(source_ts, dtype=np.int64).reshape(-1)
+        vals = np.asarray(values, dtype=np.float64).reshape(-1)
+        if tgt.size == 0:
+            return np.zeros(0, dtype=dtype)
+        if vals.size == 0 or src.size == 0:
+            return np.full(tgt.shape, float(default), dtype=dtype)
+
+        m = min(src.size, vals.size)
+        src = src[:m]
+        vals = vals[:m]
+        if m <= 0:
+            return np.full(tgt.shape, float(default), dtype=dtype)
+
+        out = _rust_align_by_ts(src, vals, tgt, default=float(default), forward_fill=True)
+        if out is None:
+            order = _sorted_time_order(src)
+            src_sorted = src if order is None else src[order]
+            vals_sorted = vals if order is None else vals[order]
+            pos = np.searchsorted(src_sorted, tgt, side="right") - 1
+            out = np.full(tgt.shape, float(default), dtype=np.float64)
+            valid = pos >= 0
+            if valid.any():
+                idx = np.clip(pos[valid], 0, vals_sorted.size - 1)
+                out[valid] = vals_sorted[idx]
+        return np.nan_to_num(out, nan=float(default), posinf=float(default), neginf=float(default)).astype(
+            dtype, copy=False
+        )
+
+    @staticmethod
+    def _align_series_exact_by_ts(
+        target_ts: np.ndarray,
+        source_ts: np.ndarray,
+        values: object,
+        *,
+        default: float = 0.0,
+        dtype: Any = np.float32,
+    ) -> np.ndarray:
+        tgt = np.asarray(target_ts, dtype=np.int64).reshape(-1)
+        src = np.asarray(source_ts, dtype=np.int64).reshape(-1)
+        vals = np.asarray(values, dtype=np.float64).reshape(-1)
+        if tgt.size == 0:
+            return np.zeros(0, dtype=dtype)
+        if vals.size == 0 or src.size == 0:
+            return np.full(tgt.shape, float(default), dtype=dtype)
+
+        m = min(src.size, vals.size)
+        src = src[:m]
+        vals = vals[:m]
+        if m <= 0:
+            return np.full(tgt.shape, float(default), dtype=dtype)
+
+        out = _rust_align_by_ts(src, vals, tgt, default=float(default), forward_fill=False)
+        if out is None:
+            order = _sorted_time_order(src)
+            src_sorted = src if order is None else src[order]
+            vals_sorted = vals if order is None else vals[order]
+            pos = np.searchsorted(src_sorted, tgt, side="left")
+            out = np.full(tgt.shape, float(default), dtype=np.float64)
+            valid = pos < src_sorted.size
+            if valid.any():
+                matched = np.zeros(tgt.shape[0], dtype=bool)
+                valid_pos = pos[valid]
+                matched[valid] = src_sorted[valid_pos] == tgt[valid]
+                take = valid & matched
+                if take.any():
+                    out[take] = vals_sorted[pos[take]]
+        return np.nan_to_num(out, nan=float(default), posinf=float(default), neginf=float(default)).astype(
+            dtype, copy=False
+        )
+
+    @staticmethod
+    def _fit_len(arr: object, n: int, *, default: float = 0.0, dtype: Any = np.float64) -> np.ndarray:
+        out = np.asarray(arr, dtype=dtype).reshape(-1)
+        target = max(0, int(n))
+        if out.size == target:
+            return out
+        if out.size <= 0:
+            return np.full(target, default, dtype=dtype)
+        if out.size > target:
+            return out[:target]
+        pad = np.full(target - out.size, float(out[-1]), dtype=dtype)
+        return np.concatenate([out, pad])
+
+    def _compute_labels_numpy(
+        self,
+        close: np.ndarray,
+        cfg: _LabelConfig,
+        *,
+        high: np.ndarray | None = None,
+        low: np.ndarray | None = None,
+        symbol: str | None = None,
+        base_signal: np.ndarray | None = None,
+    ) -> np.ndarray:
+        close_arr = self._fit_len(close, len(np.asarray(close).reshape(-1)), default=0.0, dtype=np.float64)
+        n = int(close_arr.shape[0])
+        if n <= 0:
+            return np.zeros(0, dtype=np.int8)
+
+        if not cfg.use_triple_barrier:
+            h = int(max(1, cfg.horizon))
+            future = np.empty_like(close_arr)
+            if h < n:
+                future[:-h] = close_arr[h:]
+                future[-h:] = np.nan
+            else:
+                future[:] = np.nan
+            delta = future - close_arr
+            up = delta > float(cfg.min_dist)
+            down = delta < -float(cfg.min_dist)
+            return np.where(up, 1, np.where(down, -1, 0)).astype(np.int8, copy=False)
+
+        hi = self._fit_len(high if high is not None else close_arr, n, default=0.0, dtype=np.float64)
+        lo = self._fit_len(low if low is not None else close_arr, n, default=0.0, dtype=np.float64)
         if n <= 2:
-            return pd.Series(np.zeros(n, dtype=int), index=close_f.index)
+            return np.zeros(n, dtype=np.int8)
 
         pip_size = self._infer_pip_size(symbol)
         sl_pips = cfg.sl_pips if (cfg.sl_pips is not None and cfg.sl_pips > 0) else None
         tp_pips = cfg.tp_pips if (cfg.tp_pips is not None and cfg.tp_pips > 0) else None
         rr = float(getattr(self.settings.risk, "min_risk_reward", 2.0) or 2.0)
         atr_mult = float(getattr(self.settings.risk, "atr_stop_multiplier", 1.5) or 1.5)
-
-        atr = _compute_atr(hi, lo, close_f, period=max(2, int(getattr(self.settings.risk, "atr_period", 14) or 14)))
-        atr = atr.ffill().fillna(0.0)
+        atr_period = max(2, int(getattr(self.settings.risk, "atr_period", 14) or 14))
+        atr = _compute_atr_numpy(hi, lo, close_arr, period=atr_period)
 
         if sl_pips is not None:
             sl_dist = np.full(n, max(0.0, sl_pips * pip_size), dtype=np.float64)
         else:
-            sl_dist = np.maximum(np.asarray(atr, dtype=np.float64) * max(0.1, atr_mult), cfg.min_dist)
+            sl_dist = np.maximum(np.asarray(atr, dtype=np.float64) * max(0.1, atr_mult), float(cfg.min_dist))
 
         if tp_pips is not None:
             tp_dist = np.full(n, max(0.0, tp_pips * pip_size), dtype=np.float64)
         else:
-            tp_dist = np.maximum(sl_dist * max(0.1, rr), cfg.min_dist)
+            tp_dist = np.maximum(sl_dist * max(0.1, rr), float(cfg.min_dist))
 
-        close_arr = np.asarray(close_f, dtype=np.float64)
-        high_arr = np.asarray(hi, dtype=np.float64)
-        low_arr = np.asarray(lo, dtype=np.float64)
         sig_arr: np.ndarray | None = None
         if base_signal is not None:
-            try:
-                sig_arr = np.asarray(base_signal.reindex(close_f.index).fillna(0).astype(int), dtype=np.int8)
-            except Exception:
-                sig_arr = None
+            sig_arr = self._fit_len(base_signal, n, default=0.0, dtype=np.float64).astype(np.int8, copy=False)
 
         max_hold = int(max(cfg.horizon, cfg.max_hold))
         max_hold = max(1, max_hold)
 
-        if _rust_labels_backend_available():
+        if _rust_labels_backend_available(force_log=True):
             try:
                 import forex_bindings  # type: ignore
 
@@ -871,8 +1650,8 @@ class FeatureEngineer:
                 labels_rs = np.asarray(
                     forex_bindings.triple_barrier_labels(
                         close_arr,
-                        high_arr,
-                        low_arr,
+                        hi,
+                        lo,
                         sl_dist,
                         tp_dist,
                         int(max_hold),
@@ -881,90 +1660,127 @@ class FeatureEngineer:
                     dtype=np.int8,
                 )
                 if labels_rs.shape[0] == n:
-                    return pd.Series(labels_rs.astype(int, copy=False), index=close_f.index)
-                logger.debug(
-                    "Rust triple-barrier labels shape mismatch (got=%s expected=%s); falling back to Python.",
+                    return labels_rs.astype(np.int8, copy=False)
+                logger.error(
+                    "Rust triple-barrier labels shape mismatch (got=%s expected=%s); returning neutral labels.",
                     labels_rs.shape,
                     n,
                 )
             except Exception as exc:
                 _disable_rust_labels_backend()
-                logger.debug("Rust triple-barrier labels failed; falling back to Python: %s", exc)
+                logger.error("Rust triple-barrier labels failed; returning neutral labels: %s", exc)
+        else:
+            logger.error("Rust triple-barrier labels backend unavailable; returning neutral labels.")
+        return np.zeros(n, dtype=np.int8)
 
-        labels = np.zeros(n, dtype=np.int8)
+    def _prepare_rust_features_numpy(
+        self,
+        *,
+        payload: dict[str, Any],
+        features: np.ndarray,
+        feature_names: list[str],
+        symbol: str | None,
+    ) -> PreparedDataset:
+        X = np.asarray(features, dtype=np.float32)
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        rows = int(X.shape[0]) if X.ndim == 2 else 0
+        if rows <= 0 or X.ndim != 2:
+            return self._empty_numpy_dataset()
 
-        for i in range(n):
-            if not np.isfinite(close_arr[i]):
-                continue
-            j_end = min(n - 1, i + max_hold)
-            if j_end <= i:
-                continue
+        ts = self._to_timestamp_ns(payload.get("timestamps"), rows)
 
-            entry = close_arr[i]
-            s = int(sig_arr[i]) if sig_arr is not None else 0
-            sd = float(max(sl_dist[i], cfg.min_dist))
-            td = float(max(tp_dist[i], cfg.min_dist))
-            if sd <= 0.0 and td <= 0.0:
-                continue
+        open_raw = np.asarray(payload.get("open"), dtype=np.float64).reshape(-1)
+        high_raw = np.asarray(payload.get("high"), dtype=np.float64).reshape(-1)
+        low_raw = np.asarray(payload.get("low"), dtype=np.float64).reshape(-1)
+        close_raw = np.asarray(payload.get("close"), dtype=np.float64).reshape(-1)
+        volume_raw_val = payload.get("volume")
+        volume_raw: np.ndarray | None = None
+        if volume_raw_val is not None:
+            volume_raw = np.asarray(volume_raw_val, dtype=np.float64).reshape(-1)
+        base_rows = int(close_raw.shape[0]) if close_raw.size > 0 else rows
+        base_ts_values = payload.get("base_timestamps")
+        if base_ts_values is None:
+            base_ts_values = payload.get("timestamps")
+        base_ts = self._to_timestamp_ns(base_ts_values, base_rows)
 
-            if s > 0:
-                tp_lvl = entry + td
-                sl_lvl = entry - sd
-                out = 0
-                for j in range(i + 1, j_end + 1):
-                    hit_tp = high_arr[j] >= tp_lvl
-                    hit_sl = low_arr[j] <= sl_lvl
-                    if hit_tp and hit_sl:
-                        out = 1 if close_arr[j] >= entry else -1
-                        break
-                    if hit_tp:
-                        out = 1
-                        break
-                    if hit_sl:
-                        out = -1
-                        break
-                labels[i] = np.int8(out)
-            elif s < 0:
-                tp_lvl = entry - td
-                sl_lvl = entry + sd
-                out = 0
-                for j in range(i + 1, j_end + 1):
-                    hit_tp = low_arr[j] <= tp_lvl
-                    hit_sl = high_arr[j] >= sl_lvl
-                    if hit_tp and hit_sl:
-                        out = 1 if close_arr[j] <= entry else -1
-                        break
-                    if hit_tp:
-                        out = 1
-                        break
-                    if hit_sl:
-                        out = -1
-                        break
-                labels[i] = np.int8(out)
-            else:
-                up_lvl = entry + td
-                dn_lvl = entry - sd
-                out = 0
-                for j in range(i + 1, j_end + 1):
-                    hit_up = high_arr[j] >= up_lvl
-                    hit_dn = low_arr[j] <= dn_lvl
-                    if hit_up and hit_dn:
-                        out = 1 if close_arr[j] >= entry else -1
-                        break
-                    if hit_up:
-                        out = 1
-                        break
-                    if hit_dn:
-                        out = -1
-                        break
-                labels[i] = np.int8(out)
+        high_arr = self._align_series_by_ts(ts, base_ts, payload.get("high"), default=0.0, dtype=np.float32)
+        low_arr = self._align_series_by_ts(ts, base_ts, payload.get("low"), default=0.0, dtype=np.float32)
+        close_arr = self._align_series_by_ts(ts, base_ts, payload.get("close"), default=0.0, dtype=np.float32)
 
-        return pd.Series(labels.astype(int), index=close_f.index)
+        cols = [str(c) for c in feature_names]
+        col_pos = {name: i for i, name in enumerate(cols)}
+        use_base_signal = str(os.environ.get("FOREX_BOT_BASE_SIGNAL", "1") or "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        base_signal_np: np.ndarray | None = None
+        base_col_idx = col_pos.get("base_signal")
+        if base_col_idx is not None:
+            base_signal_np = np.asarray(X[:, base_col_idx], dtype=np.int8)
+        elif use_base_signal:
+            signal_source = str(os.environ.get("FOREX_BOT_BASE_SIGNAL_SOURCE", "discovery_first") or "discovery_first").strip().lower()
+            use_discovery = signal_source in {"discovery", "discovery_first", "prop", "talib", "mixer", "auto"}
+
+            discovered_signal_np: np.ndarray | None = None
+            if use_discovery:
+                discovered_raw = self._compute_discovered_base_signal_ohlcv_numpy(
+                    open_arr=open_raw,
+                    high_arr=high_raw,
+                    low_arr=low_raw,
+                    close_arr=close_raw,
+                    volume_arr=volume_raw,
+                    symbol=symbol,
+                )
+                if discovered_raw is not None and discovered_raw.size > 0:
+                    discovered_signal_np = self._align_series_by_ts(
+                        ts,
+                        base_ts,
+                        discovered_raw,
+                        default=0.0,
+                        dtype=np.float32,
+                    ).astype(np.int8, copy=False)
+
+            if discovered_signal_np is not None:
+                base_signal_np = discovered_signal_np
+
+            if base_signal_np is None:
+                base_signal_np = np.zeros(rows, dtype=np.int8)
+            X = np.column_stack([X, base_signal_np.astype(np.float32, copy=False)]).astype(np.float32, copy=False)
+            cols.append("base_signal")
+
+        label_cfg = self._label_config()
+        labels = self._compute_labels_numpy(
+            close_arr.astype(np.float64, copy=False),
+            label_cfg,
+            high=high_arr.astype(np.float64, copy=False),
+            low=low_arr.astype(np.float64, copy=False),
+            symbol=symbol,
+            base_signal=base_signal_np,
+        )
+        trim = int(max(label_cfg.horizon, label_cfg.max_hold if label_cfg.use_triple_barrier else label_cfg.horizon))
+        if trim > 0 and rows > trim:
+            end = rows - trim
+            X = X[:end]
+            labels = labels[:end]
+            ts = ts[:end]
+        elif trim > 0:
+            return self._empty_numpy_dataset()
+
+        return PreparedDataset(
+            X=np.asarray(X, dtype=np.float32),
+            y=np.asarray(labels, dtype=np.int8),
+            index=np.asarray(ts, dtype=np.int64),
+            feature_names=list(cols),
+            metadata=None,
+            labels=np.asarray(labels, dtype=np.int8),
+        )
 
     def _prepare_rust_features(
         self,
         *,
-        news_features: pd.DataFrame | None = None,
+        news_features: Any | None = None,
         symbol: str | None = None,
     ) -> PreparedDataset | None:
         if not symbol:
@@ -975,7 +1791,7 @@ class FeatureEngineer:
             import forex_bindings  # type: ignore
         except Exception as exc:
             _disable_rust_features_backend()
-            logger.warning("Rust bindings unavailable; falling back to Python features: %s", exc)
+            logger.error("Rust feature bindings unavailable; feature preparation is blocked: %s", exc)
             return None
         if not hasattr(forex_bindings, "load_symbol_features"):
             _disable_rust_features_backend()
@@ -1004,6 +1820,79 @@ class FeatureEngineer:
             "on",
         }
 
+        def _parse_pos_int_env(name: str, default: int = 0) -> int:
+            raw = os.environ.get(name)
+            if raw is None or str(raw).strip() == "":
+                return int(default)
+            try:
+                value = int(str(raw).strip())
+            except Exception:
+                return int(default)
+            return int(max(0, value))
+
+        use_all_features = str(os.environ.get("FOREX_BOT_USE_ALL_FEATURES", "0") or "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+        profile_raw = str(os.environ.get("FOREX_BOT_RUST_FEATURE_PROFILE", "auto") or "auto").strip().lower()
+        valid_profiles = {"full", "core", "compact"}
+        if use_all_features:
+            feature_profile = "full"
+        elif profile_raw in valid_profiles:
+            feature_profile = profile_raw
+        else:
+            feature_profile = "full"
+            with contextlib.suppress(Exception):
+                import psutil
+
+                total_gb = float(psutil.virtual_memory().total) / float(1024**3)
+                if total_gb <= 96.0 and (len(all_tfs) >= 4 or self._tf_minutes(base_tf) <= 5):
+                    feature_profile = "core"
+
+        htf_profile_raw = str(os.environ.get("FOREX_BOT_RUST_HTF_FEATURE_PROFILE", "auto") or "auto").strip().lower()
+        if use_all_features:
+            htf_profile = "full"
+        elif htf_profile_raw in valid_profiles:
+            htf_profile = htf_profile_raw
+        elif htf_profile_raw in {"auto", "", "detect"}:
+            htf_profile = "compact" if feature_profile in {"core", "compact"} else feature_profile
+        else:
+            htf_profile = feature_profile
+
+        default_max_features = 0
+        if use_all_features:
+            default_max_features = 0
+        elif feature_profile == "core":
+            default_max_features = 96
+        elif feature_profile == "compact":
+            default_max_features = 64
+        max_features = _parse_pos_int_env("FOREX_BOT_RUST_MAX_FEATURES", default_max_features)
+
+        default_max_htf = 0
+        if use_all_features:
+            default_max_htf = 0
+        elif htf_profile == "core":
+            default_max_htf = 24
+        elif htf_profile == "compact":
+            default_max_htf = 12
+        max_htf_features = _parse_pos_int_env("FOREX_BOT_RUST_MAX_HTF_FEATURES", default_max_htf)
+        tail_rows = _parse_pos_int_env(
+            "FOREX_BOT_RUST_TAIL_ROWS",
+            _parse_pos_int_env("FOREX_BOT_GLOBAL_MAX_ROWS_PER_SYMBOL", 0),
+        )
+        logger.info(
+            "Rust feature profile: symbol=%s base=%s(%s) htf=%s(%s) tail_rows=%s",
+            symbol,
+            feature_profile,
+            max_features if max_features > 0 else "unlimited",
+            htf_profile,
+            max_htf_features if max_htf_features > 0 else "unlimited",
+            tail_rows if tail_rows > 0 else "all",
+        )
+
         cache_dir = str(getattr(self.settings.system, "cache_dir", "cache") or "cache")
         cache_enabled = bool(getattr(self.settings.system, "cache_enabled", False))
         cache_override = os.environ.get("FOREX_BOT_RUST_FEATURE_CACHE")
@@ -1026,22 +1915,41 @@ class FeatureEngineer:
                 cache_enabled=cache_enabled,
                 resample_missing=resample_missing,
                 arrow_tensor=arrow_tensor,
+                feature_profile=feature_profile,
+                htf_feature_profile=htf_profile,
+                max_features=max_features,
+                max_htf_features=max_htf_features,
+                tail_rows=tail_rows,
             )
         except TypeError:
-            payload = forex_bindings.load_symbol_features(
-                root=root,
-                symbol=symbol,
-                base_tf=base_tf,
-                higher_tfs=higher or None,
-                include_raw=include_raw,
-                cache_dir=cache_dir,
-                cache_ttl_minutes=cache_ttl,
-                cache_enabled=cache_enabled,
-                resample_missing=resample_missing,
-            )
+            try:
+                payload = forex_bindings.load_symbol_features(
+                    root=root,
+                    symbol=symbol,
+                    base_tf=base_tf,
+                    higher_tfs=higher or None,
+                    include_raw=include_raw,
+                    cache_dir=cache_dir,
+                    cache_ttl_minutes=cache_ttl,
+                    cache_enabled=cache_enabled,
+                    resample_missing=resample_missing,
+                    arrow_tensor=arrow_tensor,
+                )
+            except TypeError:
+                payload = forex_bindings.load_symbol_features(
+                    root=root,
+                    symbol=symbol,
+                    base_tf=base_tf,
+                    higher_tfs=higher or None,
+                    include_raw=include_raw,
+                    cache_dir=cache_dir,
+                    cache_ttl_minutes=cache_ttl,
+                    cache_enabled=cache_enabled,
+                    resample_missing=resample_missing,
+                )
         except Exception as exc:
             _disable_rust_features_backend()
-            logger.warning("Rust feature load failed; falling back to Python: %s", exc)
+            logger.error("Rust feature load failed; feature preparation is blocked: %s", exc)
             return None
 
         try:
@@ -1052,131 +1960,65 @@ class FeatureEngineer:
                 with contextlib.suppress(Exception):
                     features_obj = arrow_obj.to_numpy()
             features = np.asarray(features_obj, dtype=np.float32)
+            rows_hint = 0
+            with contextlib.suppress(Exception):
+                rows_hint = int(len(payload.get("timestamps") or []))
+            # Some Arrow paths expose transposed 2D tensors (features, rows).
+            # Align to canonical shape: (rows, features).
+            if (
+                features.ndim == 2
+                and rows_hint > 0
+                and features.shape[0] != rows_hint
+                and features.shape[1] == rows_hint
+            ):
+                features = features.T
+            if (
+                features.ndim == 2
+                and feature_names
+                and features.shape[1] != len(feature_names)
+                and features.shape[0] == len(feature_names)
+            ):
+                features = features.T
         except Exception as exc:
-            logger.warning("Rust feature payload malformed; falling back: %s", exc)
+            logger.error("Rust feature payload malformed; feature preparation is blocked: %s", exc)
             return None
 
         if features.ndim != 2 or not feature_names or features.shape[1] != len(feature_names):
-            logger.warning("Rust feature payload shape mismatch; falling back.")
+            logger.error("Rust feature payload shape mismatch; feature preparation is blocked.")
             return None
 
-        def _to_index(values: object) -> pd.Index:
-            if values is None:
-                return pd.RangeIndex(features.shape[0])
-            arr = np.asarray(values)
-            if arr.size == 0:
-                return pd.RangeIndex(0)
-            try:
-                return pd.to_datetime(arr.astype("int64", copy=False), utc=True)
-            except Exception:
-                return pd.to_datetime(arr, utc=True, errors="coerce")
-
-        idx = _to_index(payload.get("timestamps"))
-        X = pd.DataFrame(features, columns=feature_names, index=idx)
-
-        base_ts = payload.get("base_timestamps") or payload.get("timestamps")
-        base_idx = _to_index(base_ts)
-        base_df = pd.DataFrame(
-            {
-                "open": np.asarray(payload.get("open"), dtype=np.float64),
-                "high": np.asarray(payload.get("high"), dtype=np.float64),
-                "low": np.asarray(payload.get("low"), dtype=np.float64),
-                "close": np.asarray(payload.get("close"), dtype=np.float64),
-            },
-            index=base_idx,
-        )
-        if "volume" in payload:
-            base_df["volume"] = np.asarray(payload.get("volume"), dtype=np.float64)
-
-        base_df = base_df.reindex(X.index, method="ffill").fillna(0.0)
-        try:
-            if symbol:
-                base_df.attrs["symbol"] = symbol
-        except Exception:
-            pass
-
-        use_base_signal = str(os.environ.get("FOREX_BOT_BASE_SIGNAL", "1") or "1").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        if use_base_signal and "base_signal" not in X.columns:
-            try:
-                tmp = self._compute_basic_features(base_df, use_gpu=False)
-                tmp = self._compute_base_signal(tmp, symbol=symbol)
-                sig = tmp.get("base_signal")
-                if sig is not None:
-                    X["base_signal"] = sig.reindex(X.index).fillna(0).astype(int)
-            except Exception:
-                X["base_signal"] = 0
-
-        feature_blocks: list[pd.DataFrame] = [X]
-        try:
-            session_src = base_df[["high", "low", "close"]]
-            session_feats = self._compute_session_features(session_src)
-            new_cols = [c for c in session_feats.columns if c not in {"high", "low", "close"} and c not in X.columns]
-            if new_cols:
-                feature_blocks.append(session_feats[new_cols].reindex(X.index).fillna(0.0))
-        except Exception:
-            pass
-
-        if news_features is not None and not news_features.empty:
-            nf = _ensure_datetime_index(news_features)
-            nf = nf.reindex(X.index, method="ffill").fillna(0.0)
-            nf = nf.rename(columns={c: f"news_{c}" for c in nf.columns})
-            feature_blocks.append(nf)
-
-        if len(feature_blocks) > 1:
-            X = pd.concat(feature_blocks, axis=1, copy=False)
-
-        X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-        label_cfg = self._label_config()
-        labels = self._compute_labels(
-            base_df["close"].astype(float),
-            label_cfg,
-            high=base_df["high"].astype(float) if "high" in base_df.columns else None,
-            low=base_df["low"].astype(float) if "low" in base_df.columns else None,
+        # Pandas fallback removed: always use numpy/Rust prepared dataset.
+        if news_features is not None:
+            with contextlib.suppress(Exception):
+                if hasattr(news_features, "empty") and not news_features.empty:
+                    logger.info("Pandas-free rust path: news feature merge is skipped.")
+        return self._prepare_rust_features_numpy(
+            payload=payload,
+            features=features,
+            feature_names=feature_names,
             symbol=symbol,
-            base_signal=X["base_signal"] if "base_signal" in X.columns else None,
-        )
-        trim = int(max(label_cfg.horizon, label_cfg.max_hold if label_cfg.use_triple_barrier else label_cfg.horizon))
-        if trim > 0:
-            X = X.iloc[:-trim]
-            labels = labels.iloc[:-trim]
-            meta = base_df.iloc[:-trim]
-        else:
-            meta = base_df
-
-        return PreparedDataset(
-            X=X,
-            y=labels,
-            index=X.index,
-            feature_names=list(X.columns),
-            metadata=meta,
-            labels=labels,
         )
 
     def prepare(
         self,
-        frames: dict[str, pd.DataFrame],
+        frames: dict[str, Any],
         *,
-        news_features: pd.DataFrame | None = None,
+        news_features: Any | None = None,
         symbol: str | None = None,
     ) -> PreparedDataset:
         use_rust = self._use_rust_backend()
+        if not use_rust:
+            logger.error("Rust feature path requires rust backend.")
+            return self._empty_numpy_dataset()
         if use_rust and frames:
-            # If caller passed in-memory/manual frames (no source marker), honor them directly.
-            # This keeps tests and custom pipelines deterministic and avoids unexpected disk reloads.
             sources = {
                 str(getattr(df, "attrs", {}).get("source", "")).strip().lower()
                 for df in (frames or {}).values()
                 if df is not None
             }
             if not any(sources):
-                use_rust = False
-        if use_rust:
+                logger.error("Rust feature path cannot use in-memory Python frames.")
+                return self._empty_numpy_dataset()
             live_source = False
             try:
                 for df in (frames or {}).values():
@@ -1186,109 +2028,18 @@ class FeatureEngineer:
             except Exception:
                 live_source = False
             if live_source:
-                logger.info("Live MT5 frames detected; using Python feature pipeline.")
-            else:
-                rust_ds = self._prepare_rust_features(news_features=news_features, symbol=symbol)
-                if rust_ds is not None:
-                    return rust_ds
-
-        if frames is None or len(frames) == 0:
-            empty = pd.DataFrame()
-            return PreparedDataset(X=empty, y=pd.Series(dtype=int), index=empty.index, feature_names=[], metadata=None, labels=None)
-
-        base_tf = str(getattr(self.settings.system, "base_timeframe", "M1") or "M1").upper()
-        base_df = frames.get(base_tf)
-        if base_df is None:
-            base_df = frames.get("M1")
-        if base_df is None:
-            base_df = next(iter(frames.values()))
-        base_df = _ensure_datetime_index(base_df)
-        base_df = base_df.sort_index()
-        try:
-            if symbol:
-                base_df.attrs["symbol"] = symbol
-        except Exception:
-            pass
-
-        features = self._compute_basic_features(base_df, use_gpu=False)
-        features = self._compute_volatility_features(features)
-        features = self._compute_volume_profile_features(features)
-        features = self._compute_obi_features(features, use_gpu=False)
-        features = self._compute_session_features(features)
-        features = self._compute_base_signal(features, symbol=symbol)
-
-        base_blocks: list[pd.DataFrame] = [features]
-        if news_features is not None and not news_features.empty:
-            nf = _ensure_datetime_index(news_features)
-            nf = nf.reindex(features.index, method="ffill").fillna(0.0)
-            nf = nf.rename(columns={c: f"news_{c}" for c in nf.columns})
-            base_blocks.append(nf)
-        if len(base_blocks) > 1:
-            features = pd.concat(base_blocks, axis=1, copy=False)
-
-        all_tfs = self._resolved_timeframes(base_tf)
-        prefix_base = bool(getattr(self.settings.system, "multi_resolution_prefix_base", False))
-        if prefix_base:
-            base_pref = features.add_prefix(f"{base_tf}_")
-        else:
-            base_pref = None
-
-        aligned_higher: list[pd.DataFrame] = []
-        for tf in all_tfs:
-            if tf == base_tf:
-                continue
-            htf = frames.get(tf)
-            if htf is None or htf.empty:
-                continue
-            htf = _ensure_datetime_index(htf).sort_index()
-            htf = self._compute_basic_features(htf, use_gpu=False)
-            htf = self._compute_volatility_features(htf)
-            htf = self._compute_volume_profile_features(htf)
-            htf = self._compute_obi_features(htf, use_gpu=False)
-            htf = self._compute_session_features(htf)
-            htf_shifted = htf.shift(1)
-            htf_shifted.columns = [f"{tf}_{c}" for c in htf_shifted.columns]
-            aligned = htf_shifted.reindex(features.index, method="ffill").fillna(0.0)
-            aligned_higher.append(aligned)
-
-        final_blocks: list[pd.DataFrame] = [features]
-        if base_pref is not None:
-            final_blocks.append(base_pref)
-        if aligned_higher:
-            final_blocks.extend(aligned_higher)
-        if len(final_blocks) > 1:
-            features = pd.concat(final_blocks, axis=1, copy=False)
-
-        features = features.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-        label_cfg = self._label_config()
-        labels = self._compute_labels(
-            base_df["close"].astype(float),
-            label_cfg,
-            high=base_df["high"].astype(float) if "high" in base_df.columns else None,
-            low=base_df["low"].astype(float) if "low" in base_df.columns else None,
-            symbol=symbol,
-            base_signal=features["base_signal"] if "base_signal" in features.columns else None,
-        )
-        trim = int(max(label_cfg.horizon, label_cfg.max_hold if label_cfg.use_triple_barrier else label_cfg.horizon))
-        if trim > 0:
-            features = features.iloc[:-trim]
-            labels = labels.iloc[:-trim]
-            meta = base_df.iloc[:-trim]
-        else:
-            meta = base_df
-
-        return PreparedDataset(
-            X=features,
-            y=labels,
-            index=features.index,
-            feature_names=list(features.columns),
-            metadata=meta,
-            labels=labels,
-        )
+                logger.error("Rust feature path cannot use live MT5 Python frames.")
+                return self._empty_numpy_dataset()
+        rust_ds = self._prepare_rust_features(news_features=news_features, symbol=symbol)
+        if rust_ds is not None:
+            return rust_ds
+        logger.error("Rust feature preparation failed; feature pipeline is blocked.")
+        return self._empty_numpy_dataset()
 
 
 __all__ = [
     "FeatureEngineer",
     "_compute_adx_numba",
 ]
+
+

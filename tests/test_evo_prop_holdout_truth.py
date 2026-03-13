@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
-import pandas as pd
+from tests._compat_pd import pd
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -151,3 +151,4 @@ def test_holdout_validation_keeps_high_truth_probability(monkeypatch):
     assert len(out) == 1
     assert bool(out[0].forward_test_passed)
     assert float(out[0].truth_probability) >= 0.70
+

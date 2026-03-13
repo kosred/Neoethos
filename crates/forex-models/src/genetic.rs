@@ -26,18 +26,15 @@ pub struct GeneticStrategyExpert {
 impl GeneticStrategyExpert {
     /// Create new Genetic Strategy Expert
     /// Python lines 15-30
-    pub fn new(
-        population_size: usize,
-        generations: usize,
-        max_indicators: usize,
-    ) -> Result<Self> {
+    pub fn new(population_size: usize, generations: usize, max_indicators: usize) -> Result<Self> {
         let py_expert = Python::attach(|py| {
             // Import the Python module
             let genetic_module = PyModule::import(py, "forex_bot.models.genetic")
                 .context("Failed to import forex_bot.models.genetic")?;
 
             // Get the GeneticStrategyExpert class
-            let genetic_class = genetic_module.getattr("GeneticStrategyExpert")
+            let genetic_class = genetic_module
+                .getattr("GeneticStrategyExpert")
                 .context("GeneticStrategyExpert class not found")?;
 
             // Create instance with kwargs
@@ -68,7 +65,9 @@ impl GeneticStrategyExpert {
     /// 2. Fall back to internal evolution if no cached strategies found
     pub fn fit(&mut self, x: &DataFrame, y: &Series, metadata: Option<&DataFrame>) -> Result<()> {
         Python::attach(|py| {
-            let expert = self.py_expert.as_ref()
+            let expert = self
+                .py_expert
+                .as_ref()
                 .context("Genetic expert not initialized")?
                 .bind(py);
 
@@ -82,7 +81,9 @@ impl GeneticStrategyExpert {
                 CsvWriter::new(&mut buf).finish(&mut x_clone)?;
                 String::from_utf8(buf)?
             };
-            let x_str_io = PyModule::import(py, "io")?.getattr("StringIO")?.call1((x_csv,))?;
+            let x_str_io = PyModule::import(py, "io")?
+                .getattr("StringIO")?
+                .call1((x_csv,))?;
             let x_pd = pd.call_method1("read_csv", (x_str_io,))?;
 
             // Convert y to pandas Series
@@ -97,7 +98,9 @@ impl GeneticStrategyExpert {
                     CsvWriter::new(&mut buf).finish(&mut meta_clone)?;
                     String::from_utf8(buf)?
                 };
-                let meta_str_io = PyModule::import(py, "io")?.getattr("StringIO")?.call1((meta_csv,))?;
+                let meta_str_io = PyModule::import(py, "io")?
+                    .getattr("StringIO")?
+                    .call1((meta_csv,))?;
                 Some(pd.call_method1("read_csv", (meta_str_io,))?)
             } else {
                 None
@@ -122,9 +125,15 @@ impl GeneticStrategyExpert {
     ///
     /// Returns 3-class probabilities: [Neutral, Buy, Sell]
     /// Uses portfolio voting across multiple evolved strategies
-    pub fn predict_proba(&self, x: &DataFrame, metadata: Option<&DataFrame>) -> Result<Array2<f32>> {
+    pub fn predict_proba(
+        &self,
+        x: &DataFrame,
+        metadata: Option<&DataFrame>,
+    ) -> Result<Array2<f32>> {
         Python::attach(|py| {
-            let expert = self.py_expert.as_ref()
+            let expert = self
+                .py_expert
+                .as_ref()
                 .context("Genetic expert not initialized")?
                 .bind(py);
 
@@ -137,7 +146,9 @@ impl GeneticStrategyExpert {
                 CsvWriter::new(&mut buf).finish(&mut x_clone)?;
                 String::from_utf8(buf)?
             };
-            let x_str_io = PyModule::import(py, "io")?.getattr("StringIO")?.call1((x_csv,))?;
+            let x_str_io = PyModule::import(py, "io")?
+                .getattr("StringIO")?
+                .call1((x_csv,))?;
             let x_pd = pd.call_method1("read_csv", (x_str_io,))?;
 
             // Convert metadata if provided
@@ -148,7 +159,9 @@ impl GeneticStrategyExpert {
                     CsvWriter::new(&mut buf).finish(&mut meta_clone)?;
                     String::from_utf8(buf)?
                 };
-                let meta_str_io = PyModule::import(py, "io")?.getattr("StringIO")?.call1((meta_csv,))?;
+                let meta_str_io = PyModule::import(py, "io")?
+                    .getattr("StringIO")?
+                    .call1((meta_csv,))?;
                 Some(pd.call_method1("read_csv", (meta_str_io,))?)
             } else {
                 None
@@ -181,7 +194,9 @@ impl GeneticStrategyExpert {
     /// Python lines 238-244
     pub fn save(&self, path: &Path) -> Result<()> {
         Python::attach(|py| {
-            let expert = self.py_expert.as_ref()
+            let expert = self
+                .py_expert
+                .as_ref()
                 .context("Genetic expert not initialized")?
                 .bind(py);
 
@@ -197,7 +212,9 @@ impl GeneticStrategyExpert {
     /// Python lines 246-256
     pub fn load(&mut self, path: &Path) -> Result<()> {
         Python::attach(|py| {
-            let expert = self.py_expert.as_ref()
+            let expert = self
+                .py_expert
+                .as_ref()
                 .context("Genetic expert not initialized")?
                 .bind(py);
 
@@ -212,7 +229,9 @@ impl GeneticStrategyExpert {
     /// Get the number of strategies in the portfolio
     pub fn portfolio_size(&self) -> Result<usize> {
         Python::attach(|py| {
-            let expert = self.py_expert.as_ref()
+            let expert = self
+                .py_expert
+                .as_ref()
                 .context("Genetic expert not initialized")?
                 .bind(py);
 
@@ -226,7 +245,9 @@ impl GeneticStrategyExpert {
     /// Get the best gene's fitness score
     pub fn best_fitness(&self) -> Result<f64> {
         Python::attach(|py| {
-            let expert = self.py_expert.as_ref()
+            let expert = self
+                .py_expert
+                .as_ref()
                 .context("Genetic expert not initialized")?
                 .bind(py);
 

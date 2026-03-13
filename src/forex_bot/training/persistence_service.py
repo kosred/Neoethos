@@ -74,10 +74,22 @@ class PersistenceService:
         except Exception as e:
             logger.warning(f"Failed to save incremental stats: {e}")
 
-    def save_active_models_list(self, models: dict[str, ExpertModel]) -> None:
-        _atomic_joblib_dump(list(models.keys()), self.models_dir / "active_models.pkl")
+    def _model_names(self, models: dict[str, ExpertModel] | list[str] | tuple[str, ...]) -> list[str]:
+        if isinstance(models, dict):
+            return [str(name) for name in models.keys()]
+        try:
+            return [str(name) for name in list(models)]
+        except Exception:
+            return []
 
-    def save_models_bundle(self, models: dict[str, ExpertModel], scaler: Any = None) -> None:
+    def save_active_models_list(self, models: dict[str, ExpertModel] | list[str] | tuple[str, ...]) -> None:
+        _atomic_joblib_dump(self._model_names(models), self.models_dir / "active_models.pkl")
+
+    def save_models_bundle(
+        self,
+        models: dict[str, ExpertModel] | list[str] | tuple[str, ...],
+        scaler: Any = None,
+    ) -> None:
         """
         Save a consolidated bundle for OnlineLearner and legacy loaders.
 
@@ -86,7 +98,7 @@ class PersistenceService:
         actual model state.
         """
         try:
-            thin = {"models": {}, "model_names": list(models.keys()), "scaler": scaler, "schema_version": 2}
+            thin = {"models": {}, "model_names": self._model_names(models), "scaler": scaler, "schema_version": 2}
             _atomic_joblib_dump(thin, self.models_dir / "models.joblib")
             logger.info(f"Saved models bundle to {self.models_dir / 'models.joblib'}")
         except Exception as e:

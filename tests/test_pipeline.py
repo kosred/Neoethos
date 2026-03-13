@@ -1,5 +1,7 @@
 import numpy as np
 
+from forex_bot.core.config import Settings
+from forex_bot.features.pipeline import FeatureEngineer
 from forex_bot.features.pipeline import _compute_adx_numba
 
 
@@ -27,3 +29,15 @@ def test_adx_calculation_continuity():
     # We just assert it's not zero, assuming there's trend.
     assert adx[period] != 0.0, "ADX at index 'period' should not be zero (init skip bug)"
     assert not np.isnan(adx).any(), "ADX should not contain NaNs"
+
+
+def test_rust_signal_alias_prefers_base_tf_columns():
+    fe = FeatureEngineer(Settings())
+    cols = [
+        "H1_ta_rsi",
+        "ta_rsi",
+        "H1_ta_macd_outmacdhist",
+        "ta_macd_outmacdhist",
+    ]
+    assert fe._find_rsi_feature_column(cols) == "ta_rsi"
+    assert fe._find_macd_hist_feature_column(cols) == "ta_macd_outmacdhist"

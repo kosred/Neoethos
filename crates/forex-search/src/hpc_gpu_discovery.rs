@@ -1,5 +1,5 @@
 //! HPC-optimized GPU discovery using Island Model GA for 8×A6000.
-//! 
+//!
 //! This module implements:
 //! - Island Model: Each GPU evolves its own population
 //! - NVLink elite migration between islands
@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::thread;
 use tch::{Device, Kind, Tensor};
 
-use crate::hpc::{get_gpu_cpu_affinity, is_hpc_mode, is_nvlink_pair, set_thread_affinity};
 use crate::discovery_gpu::{GpuDiscoveryConfig, GpuDiscoveryResult};
+use crate::hpc::{get_gpu_cpu_affinity, is_hpc_mode, is_nvlink_pair, set_thread_affinity};
 
 /// Island-based GPU evolution configuration
 #[derive(Debug, Clone)]
@@ -165,20 +165,13 @@ impl Island {
         ohlc_cube: &Tensor,
         config: &GpuDiscoveryConfig,
     ) -> Result<()> {
-        self.fitness = evaluate_population_hpc(
-            data_cube,
-            ohlc_cube,
-            &self.population,
-            config,
-            self.device,
-        )?;
+        self.fitness =
+            evaluate_population_hpc(data_cube, ohlc_cube, &self.population, config, self.device)?;
         Ok(())
     }
 
     fn select_elites(&mut self, fraction: f64) {
-        let elite_count = ((self.population.len() as f64) * fraction)
-            .round()
-            .max(2.0) as usize;
+        let elite_count = ((self.population.len() as f64) * fraction).round().max(2.0) as usize;
 
         let mut scored: Vec<(f32, Vec<f32>)> = self
             .population
@@ -189,7 +182,11 @@ impl Island {
 
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        self.elites = scored.iter().take(elite_count).map(|(_, g)| g.clone()).collect();
+        self.elites = scored
+            .iter()
+            .take(elite_count)
+            .map(|(_, g)| g.clone())
+            .collect();
         self.elite_fitness = scored.iter().take(elite_count).map(|(f, _)| *f).collect();
     }
 
@@ -312,7 +309,11 @@ fn evaluate_population_hpc(
     device: Device,
 ) -> Result<Vec<f32>> {
     // Use larger chunk size for A6000
-    let chunk_size = if is_hpc_mode() { 8192 } else { config.chunk_size };
+    let chunk_size = if is_hpc_mode() {
+        8192
+    } else {
+        config.chunk_size
+    };
 
     let mut results = vec![0.0_f32; genomes.len()];
     let mut offset = 0usize;
@@ -326,8 +327,8 @@ fn evaluate_population_hpc(
             chunk_buf.extend_from_slice(g);
         }
 
-        let chunk_tensor = Tensor::from_slice(&chunk_buf)
-            .reshape(&[chunk.len() as i64, chunk[0].len() as i64]);
+        let chunk_tensor =
+            Tensor::from_slice(&chunk_buf).reshape(&[chunk.len() as i64, chunk[0].len() as i64]);
 
         let fit = evaluate_chunk_hpc(data_cube, ohlc_cube, &chunk_tensor, config, device)?;
         let vec: Vec<f32> = Vec::from(&fit);
@@ -367,14 +368,10 @@ fn evaluate_chunk_hpc(
         .clamp(-config.threshold_clip, config.threshold_clip)
         * (config.threshold_scale as f32);
 
-    let buy_th = thresholds
-        .select(1, 0)
-        .maximum(&thresholds.select(1, 1))
-        + config.threshold_margin as f32;
-    let sell_th = thresholds
-        .select(1, 0)
-        .minimum(&thresholds.select(1, 1))
-        - config.threshold_margin as f32;
+    let buy_th =
+        thresholds.select(1, 0).maximum(&thresholds.select(1, 1)) + config.threshold_margin as f32;
+    let sell_th =
+        thresholds.select(1, 0).minimum(&thresholds.select(1, 1)) - config.threshold_margin as f32;
 
     // Build segments for walk-forward analysis
     let segments = build_segments_hpc(n_samples as usize, config.window_bars, config.segments);
@@ -426,10 +423,16 @@ fn evaluate_chunk_hpc(
         let steps = Tensor::arange((len - 1) as i64, (Kind::Float, device));
         let equity_mean = equity.mean_dim(&[1], true, Kind::Float);
         let steps_mean = steps.mean(Kind::Float);
-        let num = ((&equity - &equity_mean) * (&steps - steps_mean)).sum_dim_intlist(&[1], false, Kind::Float);
-        let den = ((&equity - &equity_mean).pow(2).sum_dim_intlist(&[1], false, Kind::Float)
+        let num = ((&equity - &equity_mean) * (&steps - steps_mean)).sum_dim_intlist(
+            &[1],
+            false,
+            Kind::Float,
+        );
+        let den = ((&equity - &equity_mean)
+            .pow(2)
+            .sum_dim_intlist(&[1], false, Kind::Float)
             * (&steps - steps_mean).pow(2).sum(Kind::Float))
-            .sqrt();
+        .sqrt();
         let consistency = num / (den + 1e-9);
 
         // Penalties
@@ -438,9 +441,8 @@ fn evaluate_chunk_hpc(
         let freq_penalty = (Tensor::from(expected as f32).to_device(device) - &trade_count)
             .clamp_min(0.0)
             * config.trade_penalty as f32;
-        let dd_penalty = (max_dd - config.dd_limit as f32)
-            .clamp_min(0.0)
-            * config.dd_penalty as f32;
+        let dd_penalty =
+            (max_dd - config.dd_limit as f32).clamp_min(0.0) * config.dd_penalty as f32;
 
         let mut window_fit = sortino * 10.0 + consistency * 5.0 - freq_penalty - dd_penalty;
         let profit_pct = equity.select(1, (len - 2) as i64);
@@ -455,8 +457,7 @@ fn evaluate_chunk_hpc(
 
     let avg_fit = fitness_sum / (segments.len() as f64);
     let min_pos = (segments.len() as f64 * config.pos_window_fraction).ceil();
-    let pos_penalty = (Tensor::from(min_pos as f32).to_device(device) - pos_windows)
-        .clamp_min(0.0)
+    let pos_penalty = (Tensor::from(min_pos as f32).to_device(device) - pos_windows).clamp_min(0.0)
         * config.pos_penalty as f32;
     let final_fit = avg_fit + min_fitness * config.robust_weight as f32 - pos_penalty;
 

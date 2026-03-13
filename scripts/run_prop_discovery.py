@@ -12,7 +12,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import pandas as pd
+import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = PROJECT_ROOT / "src"
@@ -62,40 +62,135 @@ def _rows_for_days(timeframe: str, days: int) -> int:
     return int(max(1, math.ceil(days * bars_per_day * 1.1)))
 
 
-def _with_lookback(df: pd.DataFrame, days: int) -> pd.DataFrame:
+class _ScriptFrame:
+    def __init__(self, data: dict[str, np.ndarray], index: np.ndarray, attrs: dict[str, object] | None = None) -> None:
+        self._data = {str(k): np.asarray(v).reshape(-1) for k, v in data.items()}
+        self.index = np.asarray(index).reshape(-1)
+        self.columns = list(self._data.keys())
+        self.attrs = dict(attrs or {})
+
+    @property
+    def empty(self) -> bool:
+        return len(self.index) <= 0
+
+    def __len__(self) -> int:
+        return int(self.index.shape[0])
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        return self._data[str(key)]
+
+    def copy(self) -> _ScriptFrame:
+        return _ScriptFrame(
+            {k: np.asarray(v).copy() for k, v in self._data.items()},
+            np.asarray(self.index).copy(),
+            attrs=dict(self.attrs),
+        )
+
+
+def _index_to_ns_int64(index: object) -> np.ndarray | None:
+    if index is None:
+        return None
+    try:
+        if hasattr(index, "asi8"):
+            arr = np.asarray(index.asi8, dtype=np.int64).reshape(-1)
+            return arr if arr.size > 0 else np.zeros(0, dtype=np.int64)
+    except Exception:
+        pass
+    try:
+        arr = np.asarray(index).reshape(-1)
+    except Exception:
+        return None
+    if arr.size <= 0:
+        return np.zeros(0, dtype=np.int64)
+    try:
+        if np.issubdtype(arr.dtype, np.datetime64):
+            return arr.astype("datetime64[ns]").astype(np.int64, copy=False)
+        if arr.dtype.kind in {"i", "u"}:
+            return arr.astype(np.int64, copy=False)
+        if arr.dtype.kind == "f":
+            return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.int64, copy=False)
+    except Exception:
+        pass
+    out = np.zeros(arr.size, dtype=np.int64)
+    for i, value in enumerate(arr.tolist()):
+        try:
+            ns = getattr(value, "value", None)
+            if ns is not None:
+                out[i] = int(ns)
+            else:
+                out[i] = int(np.datetime64(value, "ns").astype(np.int64))
+        except Exception:
+            try:
+                out[i] = int(value)
+            except Exception:
+                out[i] = 0
+    return out
+
+
+def _slice_frame_mask(df: object, mask: np.ndarray) -> object:
+    m = np.asarray(mask, dtype=bool).reshape(-1)
+    if hasattr(df, "loc"):
+        try:
+            out = df.loc[m]  # type: ignore[index]
+            return out.copy() if hasattr(out, "copy") else out
+        except Exception:
+            pass
+    if hasattr(df, "take"):
+        try:
+            rows = np.flatnonzero(m).astype(np.int64, copy=False)
+            out = df.take(rows)  # type: ignore[attr-defined]
+            return out.copy() if hasattr(out, "copy") else out
+        except Exception:
+            pass
+    idx = getattr(df, "index", None)
+    cols = getattr(df, "columns", None)
+    if idx is None or cols is None:
+        return df
+    idx_arr = np.asarray(idx).reshape(-1)
+    idx_n = min(int(idx_arr.size), int(m.size))
+    out_idx = idx_arr[:idx_n][m[:idx_n]]
+    data: dict[str, np.ndarray] = {}
+    for col in list(cols):
+        try:
+            values = np.asarray(df[col]).reshape(-1)  # type: ignore[index]
+        except Exception:
+            continue
+        n = min(int(values.size), int(m.size))
+        data[str(col)] = values[:n][m[:n]]
+    attrs = getattr(df, "attrs", None)
+    return _ScriptFrame(data, out_idx, attrs=(dict(attrs) if isinstance(attrs, dict) else None))
+
+
+def _with_lookback(df: object, days: int) -> object:
     if days <= 0 or df is None or df.empty:
         return df
-    out = df
-    idx = out.index
-    if not isinstance(idx, pd.DatetimeIndex):
-        return out
-    if idx.tz is None:
-        idx = idx.tz_localize("UTC")
-    else:
-        idx = idx.tz_convert("UTC")
-    out = out.copy()
-    out.index = idx
-    cutoff = idx.max() - pd.Timedelta(days=int(days))
-    return out.loc[out.index >= cutoff]
+    idx_ns = _index_to_ns_int64(getattr(df, "index", None))
+    n_rows = int(len(df))
+    if idx_ns is None or idx_ns.size != n_rows:
+        return df
+    nat = np.iinfo(np.int64).min
+    valid = idx_ns != nat
+    if not np.any(valid):
+        return df
+    cutoff_ns = int(np.max(idx_ns[valid])) - int(days) * 86_400 * 1_000_000_000
+    mask = valid & (idx_ns >= cutoff_ns)
+    if mask.shape[0] != n_rows or np.all(mask):
+        return df
+    return _slice_frame_mask(df, mask)
 
 
-def _history_span_days_months(df: pd.DataFrame) -> tuple[float, float]:
+def _history_span_days_months(df: object) -> tuple[float, float]:
     if df is None or df.empty:
         return 0.0, 0.0
-    idx = df.index
-    if not isinstance(idx, pd.DatetimeIndex) or len(idx) < 2:
+    idx_ns = _index_to_ns_int64(getattr(df, "index", None))
+    if idx_ns is None or idx_ns.size < 2:
         return 0.0, 0.0
-    try:
-        if idx.tz is None:
-            i2 = idx.tz_localize("UTC")
-        else:
-            i2 = idx.tz_convert("UTC")
-    except Exception:
-        i2 = idx
-    try:
-        span_days = float((i2.max() - i2.min()).total_seconds() / 86400.0)
-    except Exception:
+    nat = np.iinfo(np.int64).min
+    valid = idx_ns[idx_ns != nat]
+    if valid.size < 2:
         span_days = 0.0
+    else:
+        span_days = float((int(np.max(valid)) - int(np.min(valid))) / 86_400_000_000_000.0)
     span_days = max(0.0, span_days)
     span_months = (span_days / 30.4375) if span_days > 0.0 else 0.0
     return float(span_days), float(span_months)
@@ -390,6 +485,7 @@ def _default_state_db_path(
     dd_safe = _safe_tag(dd_tag)
     holdout_frac = _safe_tag(str(os.environ.get("FOREX_BOT_PROP_HOLDOUT_FRACTION", "0") or "0"))
     holdout_years = _safe_tag(str(os.environ.get("FOREX_BOT_PROP_HOLDOUT_YEARS", "0") or "0"))
+    holdout_from = _safe_tag(str(os.environ.get("FOREX_BOT_PROP_HOLDOUT_FROM", "") or ""))
     holdout_req = _safe_tag(str(os.environ.get("FOREX_BOT_PROP_HOLDOUT_REQUIRED", "0") or "0"))
     forward_req = _safe_tag(str(os.environ.get("FOREX_BOT_PROP_FORWARD_TEST_REQUIRED", "0") or "0"))
     min_truth = _safe_tag(
@@ -405,7 +501,7 @@ def _default_state_db_path(
         Path("cache")
         / (
             f"prop_discovery_state_{stem}_{key_tag}_{thr_tag}_{tr_tag}_{tpm_tag}_{mpp_tag}_{sh_tag}_{wr_tag}_{pf_tag}_"
-            f"{dd_safe}_{holdout_frac}_{holdout_years}_{holdout_req}_{forward_req}_{min_truth}.sqlite"
+            f"{dd_safe}_{holdout_frac}_{holdout_years}_{holdout_from}_{holdout_req}_{forward_req}_{min_truth}.sqlite"
         )
     )
 
@@ -921,6 +1017,9 @@ async def _run(args: argparse.Namespace) -> int:
     )
     if float(args.holdout_years) > 0.0:
         os.environ["FOREX_BOT_PROP_HOLDOUT_YEARS"] = f"{float(args.holdout_years):.6g}"
+    holdout_from_raw = str(args.holdout_from or "").strip()
+    if holdout_from_raw:
+        os.environ["FOREX_BOT_PROP_HOLDOUT_FROM"] = holdout_from_raw
     if float(args.min_truth_probability) > 0.0:
         tp = float(args.min_truth_probability)
         if tp > 1.0:
@@ -949,6 +1048,7 @@ async def _run(args: argparse.Namespace) -> int:
             f"min_pf={float(args.challenge_min_profit_factor):g} "
             f"holdout={os.environ.get('FOREX_BOT_PROP_HOLDOUT_FRACTION','0')} "
             f"holdout_years={os.environ.get('FOREX_BOT_PROP_HOLDOUT_YEARS','0')} "
+            f"holdout_from={os.environ.get('FOREX_BOT_PROP_HOLDOUT_FROM','')} "
             f"min_truth={os.environ.get('FOREX_BOT_PROP_MIN_TRUTH_PROBABILITY', os.environ.get('FOREX_BOT_MIN_TRUTH_PROBABILITY','0'))} "
             f"journal_top_k={os.environ.get('FOREX_BOT_PROP_JOURNAL_TOP_K','0')} "
             f"hb_pop={args.hb_stage_pop_mults} hb_gen={args.hb_stage_gen_mults} hb_hours={args.hb_stage_hour_mults}"
@@ -1576,6 +1676,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Use strict calendar holdout on latest N years (0 disables year-based holdout).",
+    )
+    parser.add_argument(
+        "--holdout-from",
+        default="",
+        help="Use strict forward holdout starting from this UTC date/time (e.g. 2025-08-01).",
     )
     parser.add_argument(
         "--min-truth-probability",

@@ -110,14 +110,6 @@ class ForexBot:
                 except Exception:
                     pass
 
-                # Clear pandas string cache
-                try:
-                    import pandas as pd
-                    if hasattr(pd.core.strings, 'accessor'):
-                        pd.core.strings.accessor.StringMethods._cache.clear()
-                except Exception:
-                    pass
-
                 # Clear matplotlib figures
                 try:
                     import matplotlib.pyplot as plt
@@ -165,3 +157,4 @@ class ForexBot:
                     logger.info("Data loader disconnected.")
                 except Exception as e:
                     logger.error(f"Error during data loader disconnect: {e}", exc_info=True)
+

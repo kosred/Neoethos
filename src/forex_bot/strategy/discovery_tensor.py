@@ -3,24 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pandas as pd
-
-from ..features.talib_mixer import (
-    ALL_INDICATORS,
-    TALibStrategyGene,
-    TALibStrategyMixer,
-)
-from .fast_backtest import (
-    batch_evaluate_strategies,
-    fast_evaluate_strategy,
-    infer_pip_metrics,
-    infer_sl_tp_pips_auto,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -28,40 +16,269 @@ try:
     import forex_bindings as _fb  # type: ignore
 
     _RUST_DISCOVERY = hasattr(_fb, "search_discovery_ohlcv")
+    _RUST_TALIB_POP = hasattr(_fb, "evaluate_population_talib_ohlcv")
 except Exception:
     _fb = None  # type: ignore
     _RUST_DISCOVERY = False
+    _RUST_TALIB_POP = False
 
 
-def _allow_python_discovery_fallback(settings: Any | None) -> bool:
-    override = os.environ.get("FOREX_BOT_DISCOVERY_ALLOW_PY_FALLBACK")
-    if override is not None and str(override).strip() != "":
-        return str(override).strip().lower() in {"1", "true", "yes", "on"}
-    rust_only = os.environ.get("FOREX_BOT_DISCOVERY_RUST_ONLY")
-    if rust_only is not None and str(rust_only).strip() != "":
-        if str(rust_only).strip().lower() in {"1", "true", "yes", "on"}:
-            return False
-    runtime_mode = str(os.environ.get("FOREX_BOT_RUNTIME_MODE", "") or "").strip().lower()
-    if runtime_mode in {"prod", "production", "live"}:
+@dataclass(slots=True)
+class DiscoveryGene:
+    indicators: list[str]
+    params: dict[str, dict[str, Any]] = field(default_factory=dict)
+    combination_method: str = "weighted_vote"
+    long_threshold: float = 0.66
+    short_threshold: float = -0.66
+    weights: dict[str, float] = field(default_factory=dict)
+    preferred_regime: str = "any"
+    strategy_id: str = ""
+    fitness: float = 0.0
+    sharpe_ratio: float = 0.0
+    win_rate: float = 0.0
+    max_dd_pct: float = 0.0
+    trades: float = 0.0
+    use_ob: bool = False
+    use_fvg: bool = False
+    use_liq_sweep: bool = False
+    mtf_confirmation: bool = False
+    use_premium_discount: bool = False
+    use_inducement: bool = False
+    use_bos: bool = False
+    use_choch: bool = False
+    use_eqh: bool = False
+    use_eql: bool = False
+    use_displacement: bool = False
+    tp_pips: float = 40.0
+    sl_pips: float = 20.0
+    net_profit: float = 0.0
+    profit_factor: float = 0.0
+    expectancy: float = 0.0
+
+
+def _is_datetime_index(idx: Any) -> bool:
+    if idx is None:
         return False
-    try:
-        if settings is not None and bool(getattr(settings.system, "discovery_stream", False)):
+    if hasattr(idx, "year") and hasattr(idx, "month") and hasattr(idx, "day"):
+        return True
+    with np.errstate(all="ignore"):
+        try:
+            arr = np.asarray(idx).reshape(-1)
+        except Exception:
             return False
+    if arr.size <= 0:
+        return False
+    return bool(np.issubdtype(arr.dtype, np.datetime64))
+
+
+def _index_to_ns_int64(idx: Any) -> np.ndarray:
+    if idx is None:
+        return np.zeros(0, dtype=np.int64)
+    try:
+        if hasattr(idx, "asi8"):
+            return np.asarray(idx.asi8, dtype=np.int64).reshape(-1)
     except Exception:
         pass
-    return True
+    with np.errstate(all="ignore"):
+        arr = np.asarray(idx).reshape(-1)
+    if arr.size <= 0:
+        return np.zeros(0, dtype=np.int64)
+    try:
+        if np.issubdtype(arr.dtype, np.datetime64):
+            return arr.astype("datetime64[ns]").astype(np.int64, copy=False)
+        if arr.dtype.kind in {"i", "u"}:
+            return arr.astype(np.int64, copy=False)
+        if arr.dtype.kind == "f":
+            return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.int64, copy=False)
+        if hasattr(idx, "view"):
+            viewed = idx.view("int64")
+            if hasattr(viewed, "to_numpy"):
+                return np.asarray(viewed.to_numpy(dtype=np.int64, copy=False), dtype=np.int64).reshape(-1)
+            return np.asarray(viewed, dtype=np.int64).reshape(-1)
+        if arr.dtype.kind == "O":
+            out = np.zeros(arr.size, dtype=np.int64)
+            for i, value in enumerate(arr.tolist()):
+                try:
+                    ns = getattr(value, "value", None)
+                    if ns is not None:
+                        out[i] = int(ns)
+                    else:
+                        out[i] = int(np.datetime64(value, "ns").astype(np.int64))
+                except Exception:
+                    out[i] = 0
+            return out
+    except Exception:
+        pass
+    try:
+        return arr.astype("datetime64[ns]").astype(np.int64, copy=False)
+    except Exception:
+        return np.zeros(arr.size, dtype=np.int64)
 
 
-def _safe_indices(idx: pd.Index, n: int) -> tuple[np.ndarray, np.ndarray]:
-    if isinstance(idx, pd.DatetimeIndex):
-        month_idx = (idx.year.astype(np.int32) * 12 + idx.month.astype(np.int32)).to_numpy(dtype=np.int64)
-        day_idx = (idx.year.astype(np.int32) * 10000 + idx.month.astype(np.int32) * 100 + idx.day.astype(np.int32)).to_numpy(dtype=np.int64)
+def _rust_time_index_arrays(idx: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    if _fb is None or not hasattr(_fb, "derive_time_index_arrays"):
+        return None
+    ns = _index_to_ns_int64(idx)
+    if ns.size <= 0:
+        z = np.zeros(0, dtype=np.int64)
+        return z, z, z
+    try:
+        unix_ms, month_idx, day_idx = _fb.derive_time_index_arrays(np.asarray(ns, dtype=np.int64))
+    except Exception:
+        return None
+    return (
+        np.asarray(unix_ms, dtype=np.int64).reshape(-1),
+        np.asarray(month_idx, dtype=np.int64).reshape(-1),
+        np.asarray(day_idx, dtype=np.int64).reshape(-1),
+    )
+
+
+def _safe_indices(idx: Any, n: int) -> tuple[np.ndarray, np.ndarray]:
+    rust = _rust_time_index_arrays(idx)
+    if rust is not None:
+        _unix_ms, month_idx, day_idx = rust
         return month_idx[:n], day_idx[:n]
+    if _is_datetime_index(idx):
+        if hasattr(idx, "year") and hasattr(idx, "month") and hasattr(idx, "day"):
+            month_idx = (idx.year.astype(np.int32) * 12 + idx.month.astype(np.int32)).to_numpy(dtype=np.int64)
+            day_idx = (
+                idx.year.astype(np.int32) * 10000 + idx.month.astype(np.int32) * 100 + idx.day.astype(np.int32)
+            ).to_numpy(dtype=np.int64)
+            return month_idx[:n], day_idx[:n]
+        with np.errstate(all="ignore"):
+            arr = np.asarray(idx).reshape(-1)
+        if arr.size > 0 and np.issubdtype(arr.dtype, np.datetime64):
+            month_idx = arr.astype("datetime64[M]").astype(np.int64)
+            day_idx = arr.astype("datetime64[D]").astype(np.int64)
+            return month_idx[:n], day_idx[:n]
+    ns = _index_to_ns_int64(idx)
+    if ns.size > 0:
+        vmax = int(np.max(np.abs(ns))) if ns.size > 0 else 0
+        if vmax > 10**14:
+            dt = np.asarray(ns, dtype=np.int64).astype("datetime64[ns]")
+            month_idx = dt.astype("datetime64[M]").astype(np.int64)
+            day_idx = dt.astype("datetime64[D]").astype(np.int64)
+            return month_idx[:n], day_idx[:n]
     seq = np.arange(n, dtype=np.int64)
     return seq, seq
 
 
-def _gene_to_dict(gene: TALibStrategyGene) -> dict[str, Any]:
+def _datetime_index_to_unix_ms(idx: Any) -> np.ndarray:
+    rust = _rust_time_index_arrays(idx)
+    if rust is not None:
+        unix_ms, _month_idx, _day_idx = rust
+        return unix_ms
+    ns = _index_to_ns_int64(idx)
+    if ns.size <= 0:
+        return np.zeros(0, dtype=np.int64)
+    return (np.asarray(ns, dtype=np.int64) // 1_000_000).astype(np.int64, copy=False)
+
+
+def _frame_empty(frame: Any) -> bool:
+    if frame is None:
+        return True
+    try:
+        return bool(frame.empty)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        return int(len(frame)) <= 0
+    except Exception:
+        return True
+
+
+def _frame_len(frame: Any) -> int:
+    try:
+        return int(len(frame))
+    except Exception:
+        return 0
+
+
+def _frame_copy(frame: Any) -> Any:
+    if frame is None:
+        return None
+    try:
+        return frame.copy()
+    except Exception:
+        return frame
+
+
+def _frame_tail(frame: Any, n: int) -> Any:
+    if frame is None:
+        return None
+    try:
+        return frame.tail(int(n))
+    except Exception:
+        return frame
+
+
+def _frame_attr(frame: Any, key: str, default: Any = None) -> Any:
+    attrs = getattr(frame, "attrs", None)
+    if isinstance(attrs, dict):
+        return attrs.get(key, default)
+    return default
+
+
+def _frame_columns(frame: Any) -> list[str]:
+    cols = getattr(frame, "columns", None)
+    if cols is None:
+        return []
+    try:
+        return [str(c) for c in list(cols)]
+    except Exception:
+        return []
+
+
+def _resolve_column_name(frame: Any, name: str) -> str | None:
+    target = str(name).strip().lower()
+    if not target:
+        return None
+    for col in _frame_columns(frame):
+        if str(col).strip().lower() == target:
+            return col
+    return None
+
+
+def _to_numpy_1d(values: Any, *, dtype: Any) -> np.ndarray:
+    if hasattr(values, "to_numpy"):
+        with np.errstate(all="ignore"):
+            arr = values.to_numpy(dtype=dtype, copy=False)  # type: ignore[call-arg]
+    else:
+        arr = np.asarray(values, dtype=dtype)
+    return np.asarray(arr, dtype=dtype).reshape(-1)
+
+
+def _fit_len(values: Any, n: int, *, fill: float = 0.0, dtype: Any = np.float64) -> np.ndarray:
+    out = _to_numpy_1d(values, dtype=dtype)
+    target = max(0, int(n))
+    if out.size == target:
+        return out
+    if out.size <= 0:
+        return np.full(target, float(fill), dtype=dtype)
+    if out.size > target:
+        return out[:target]
+    pad = np.full(target - out.size, float(out[-1]), dtype=dtype)
+    return np.concatenate([out, pad])
+
+
+def _frame_column_numpy(
+    frame: Any,
+    name: str,
+    *,
+    n_rows: int,
+    dtype: Any = np.float64,
+    default: Any | None = None,
+) -> np.ndarray:
+    col = _resolve_column_name(frame, name)
+    if col is None:
+        if default is None:
+            raise KeyError(name)
+        return _fit_len(default, n_rows, fill=0.0, dtype=dtype)
+    values = frame[col]  # type: ignore[index]
+    return _fit_len(values, n_rows, fill=0.0, dtype=dtype)
+
+
+def _gene_to_dict(gene: Any) -> dict[str, Any]:
     return {
         "indicators": list(gene.indicators),
         "params": gene.params,
@@ -87,6 +304,11 @@ def _gene_to_dict(gene: TALibStrategyGene) -> dict[str, Any]:
         "mtf_confirmation": bool(getattr(gene, "mtf_confirmation", False)),
         "use_premium_discount": bool(getattr(gene, "use_premium_discount", False)),
         "use_inducement": bool(getattr(gene, "use_inducement", False)),
+        "use_bos": bool(getattr(gene, "use_bos", False)),
+        "use_choch": bool(getattr(gene, "use_choch", False)),
+        "use_eqh": bool(getattr(gene, "use_eqh", False)),
+        "use_eql": bool(getattr(gene, "use_eql", False)),
+        "use_displacement": bool(getattr(gene, "use_displacement", False)),
         "tp_pips": float(getattr(gene, "tp_pips", 40.0)),
         "sl_pips": float(getattr(gene, "sl_pips", 20.0)),
     }
@@ -99,6 +321,10 @@ def _feature_to_indicator(name: str, available: set[str]) -> str | None:
     if raw.lower().startswith("ta_"):
         raw = raw[3:]
     cand = raw.upper()
+    if cand.startswith("SMC_"):
+        return cand
+    if not available:
+        return cand.split("_")[0] if "_" in cand else cand
     if cand in available:
         return cand
     base = cand.split("_")[0]
@@ -107,7 +333,7 @@ def _feature_to_indicator(name: str, available: set[str]) -> str | None:
     return None
 
 
-def _convert_rust_gene(gene: dict[str, Any], feature_names: list[str], available: set[str]) -> TALibStrategyGene | None:
+def _convert_rust_gene(gene: dict[str, Any], feature_names: list[str], available: set[str]) -> DiscoveryGene | None:
     indices = gene.get("indices") or []
     weights = gene.get("weights") or []
     indicators: list[str] = []
@@ -149,7 +375,7 @@ def _convert_rust_gene(gene: dict[str, Any], feature_names: list[str], available
     profit_factor = _to_float(gene.get("profit_factor", 0.0), 0.0)
     expectancy = _to_float(gene.get("expectancy", 0.0), 0.0)
 
-    return TALibStrategyGene(
+    return DiscoveryGene(
         indicators=indicators,
         params=params,
         weights=weight_map,
@@ -172,78 +398,17 @@ def _convert_rust_gene(gene: dict[str, Any], feature_names: list[str], available
         mtf_confirmation=bool(gene.get("mtf_confirmation", False)),
         use_premium_discount=bool(gene.get("use_premium_discount", False)),
         use_inducement=bool(gene.get("use_inducement", False)),
+        use_bos=bool(gene.get("use_bos", False)),
+        use_choch=bool(gene.get("use_choch", False)),
+        use_eqh=bool(gene.get("use_eqh", False)),
+        use_eql=bool(gene.get("use_eql", False)),
+        use_displacement=bool(gene.get("use_displacement", False)),
         tp_pips=float(gene.get("tp_pips", 40.0)),
         sl_pips=float(gene.get("sl_pips", 20.0)),
     )
 
 
-def _resolve_sl_tp(
-    *,
-    gene: TALibStrategyGene,
-    settings: Any | None,
-    pip_size: float,
-    open_prices: np.ndarray,
-    high_prices: np.ndarray,
-    low_prices: np.ndarray,
-    close_prices: np.ndarray,
-    atr_values: np.ndarray | None,
-) -> tuple[float, float]:
-    sl_cfg = None
-    tp_cfg = None
-    if settings is not None:
-        try:
-            sl_cfg = getattr(settings.risk, "meta_label_sl_pips", None)
-            tp_cfg = getattr(settings.risk, "meta_label_tp_pips", None)
-        except Exception:
-            sl_cfg = None
-            tp_cfg = None
-
-    if sl_cfg is not None or tp_cfg is not None:
-        sl_pips = float(sl_cfg) if sl_cfg is not None else float(getattr(gene, "sl_pips", 30.0) or 30.0)
-        rr = 2.0
-        try:
-            if settings is not None:
-                rr = float(getattr(settings.risk, "min_risk_reward", 2.0) or 2.0)
-        except Exception:
-            rr = 2.0
-        if tp_cfg is None:
-            tp_pips = sl_pips * rr
-        else:
-            tp_pips = max(float(tp_cfg), sl_pips * rr)
-        return float(sl_pips), float(tp_pips)
-
-    atr_mult = 1.5
-    min_rr = 2.0
-    min_dist = 0.0
-    if settings is not None:
-        try:
-            atr_mult = float(getattr(settings.risk, "atr_stop_multiplier", 1.5) or 1.5)
-            min_rr = float(getattr(settings.risk, "min_risk_reward", 2.0) or 2.0)
-            min_dist = float(getattr(settings.risk, "meta_label_min_dist", 0.0) or 0.0)
-        except Exception:
-            pass
-
-    auto = infer_sl_tp_pips_auto(
-        open_prices=open_prices,
-        high_prices=high_prices,
-        low_prices=low_prices,
-        close_prices=close_prices,
-        atr_values=atr_values,
-        pip_size=pip_size,
-        atr_mult=atr_mult,
-        min_rr=min_rr,
-        min_dist=min_dist,
-        settings=settings,
-    )
-    if auto:
-        return float(auto[0]), float(auto[1])
-
-    sl_pips = float(getattr(gene, "sl_pips", 30.0) or 30.0)
-    tp_pips = float(getattr(gene, "tp_pips", 60.0) or 60.0)
-    return float(sl_pips), float(tp_pips)
-
-
-def _gene_key(gene: TALibStrategyGene) -> str:
+def _gene_key(gene: Any) -> str:
     sid = str(getattr(gene, "strategy_id", "") or "").strip()
     if sid:
         return f"id:{sid}"
@@ -253,8 +418,8 @@ def _gene_key(gene: TALibStrategyGene) -> str:
     )
 
 
-def _dedupe_ranked(genes: list[TALibStrategyGene]) -> list[TALibStrategyGene]:
-    out: list[TALibStrategyGene] = []
+def _dedupe_ranked(genes: list[Any]) -> list[Any]:
+    out: list[Any] = []
     seen: set[str] = set()
     for gene in sorted(
         genes,
@@ -350,7 +515,7 @@ def _strategy_quality_limits(settings: Any | None) -> tuple[float, float, float]
 
 
 def _passes_quality(
-    gene: TALibStrategyGene,
+    gene: Any,
     *,
     min_sharpe: float,
     min_profit_factor: float,
@@ -378,7 +543,7 @@ def _passes_quality(
     )
 
 
-def _profit_value(gene: TALibStrategyGene) -> float:
+def _profit_value(gene: Any) -> float:
     metric = str(os.environ.get("FOREX_BOT_DISCOVERY_KEEP_PROFIT_METRIC", "fitness") or "fitness").strip().lower()
     if metric in {"net", "net_profit", "pnl"}:
         try:
@@ -392,12 +557,12 @@ def _profit_value(gene: TALibStrategyGene) -> float:
 
 
 def _select_ranked(
-    candidates: list[TALibStrategyGene],
+    candidates: list[Any],
     *,
-    filtered: list[TALibStrategyGene],
+    filtered: list[Any],
     min_keep: int,
     cap: int,
-) -> tuple[list[TALibStrategyGene], int, int]:
+) -> tuple[list[Any], int, int]:
     ranked_all = _dedupe_ranked(candidates)
     ranked_filtered = _dedupe_ranked(filtered) if filtered else []
     selected = list(ranked_filtered)
@@ -416,176 +581,6 @@ def _select_ranked(
     if cap > 0:
         selected = selected[:cap]
     return selected, len(ranked_filtered), len(ranked_all)
-
-
-def _apply_eval_metrics(gene: TALibStrategyGene, metrics: np.ndarray | list[float] | tuple[float, ...] | None) -> float:
-    if metrics is None:
-        score = 0.0
-        gene.sharpe_ratio = 0.0
-        gene.max_dd_pct = 0.0
-        gene.win_rate = 0.0
-        gene.trades = 0.0
-        gene.net_profit = 0.0
-        gene.profit_factor = 0.0
-        gene.expectancy = 0.0
-        gene.fitness = score
-        return score
-    arr = np.asarray(metrics, dtype=np.float64).reshape(-1)
-    if arr.size < 9:
-        score = 0.0
-        gene.sharpe_ratio = 0.0
-        gene.max_dd_pct = 0.0
-        gene.win_rate = 0.0
-        gene.trades = 0.0
-        gene.net_profit = 0.0
-        gene.profit_factor = 0.0
-        gene.expectancy = 0.0
-        gene.fitness = score
-        return score
-    score = float(arr[0])
-    gene.sharpe_ratio = float(arr[1])
-    gene.max_dd_pct = float(arr[3])
-    gene.win_rate = float(arr[4])
-    gene.net_profit = float(arr[0])
-    gene.profit_factor = float(arr[5])
-    gene.expectancy = float(arr[6])
-    gene.trades = float(arr[8])
-    gene.fitness = score
-    return score
-
-
-def _score_genes_python_fallback(
-    *,
-    df: pd.DataFrame,
-    genes: list[TALibStrategyGene],
-    mixer: TALibStrategyMixer,
-    cache: dict[str, pd.Series],
-    settings: Any | None,
-    pip_size: float,
-    pip_val: float,
-    close: np.ndarray,
-    high: np.ndarray,
-    low: np.ndarray,
-    open_: np.ndarray,
-    atr_vals: np.ndarray | None,
-    month_idx: np.ndarray,
-    day_idx: np.ndarray,
-) -> list[tuple[float, TALibStrategyGene]]:
-    scored: list[tuple[float, TALibStrategyGene]] = []
-    batch_eval_enabled = str(os.environ.get("FOREX_BOT_DISCOVERY_BATCH_EVAL", "1") or "1").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    try:
-        batch_size = int(os.environ.get("FOREX_BOT_DISCOVERY_BATCH_SIZE", "32") or 32)
-    except Exception:
-        batch_size = 32
-    batch_size = max(1, min(batch_size, 512))
-
-    eval_genes: list[TALibStrategyGene] = []
-    eval_signals: list[np.ndarray] = []
-    sl_vals: list[float] = []
-    tp_vals: list[float] = []
-
-    for gene in genes:
-        try:
-            sig = mixer.compute_signals(df, gene, cache=cache).fillna(0.0).to_numpy(dtype=np.int8)
-            sl_pips, tp_pips = _resolve_sl_tp(
-                gene=gene,
-                settings=settings,
-                pip_size=pip_size,
-                open_prices=open_,
-                high_prices=high,
-                low_prices=low,
-                close_prices=close,
-                atr_values=atr_vals,
-            )
-            eval_genes.append(gene)
-            eval_signals.append(sig)
-            sl_vals.append(float(sl_pips))
-            tp_vals.append(float(tp_pips))
-        except Exception as exc:
-            logger.debug("Discovery: gene setup failed: %s", exc)
-            score = _apply_eval_metrics(gene, None)
-            scored.append((score, gene))
-
-    if not eval_genes:
-        return scored
-
-    # Prefer batched Rust backtest path when available; fall back safely on mismatch/errors.
-    if batch_eval_enabled:
-        batch_failed = False
-        for start in range(0, len(eval_genes), batch_size):
-            stop = min(start + batch_size, len(eval_genes))
-            chunk_genes = eval_genes[start:stop]
-            chunk_signals = eval_signals[start:stop]
-            if not chunk_genes:
-                continue
-            try:
-                sig_mat = np.ascontiguousarray(np.stack(chunk_signals, axis=0), dtype=np.int8)
-                rows = sig_mat.shape[0]
-                close_mat = np.ascontiguousarray(np.broadcast_to(close, (rows, close.size)), dtype=np.float64)
-                high_mat = np.ascontiguousarray(np.broadcast_to(high, (rows, high.size)), dtype=np.float64)
-                low_mat = np.ascontiguousarray(np.broadcast_to(low, (rows, low.size)), dtype=np.float64)
-                month_mat = np.ascontiguousarray(np.broadcast_to(month_idx, (rows, month_idx.size)), dtype=np.int64)
-                day_mat = np.ascontiguousarray(np.broadcast_to(day_idx, (rows, day_idx.size)), dtype=np.int64)
-                sl_arr = np.ascontiguousarray(np.asarray(sl_vals[start:stop], dtype=np.float64))
-                tp_arr = np.ascontiguousarray(np.asarray(tp_vals[start:stop], dtype=np.float64))
-                metrics_mat = batch_evaluate_strategies(
-                    close_mat,
-                    high_mat,
-                    low_mat,
-                    sig_mat,
-                    month_mat,
-                    day_mat,
-                    sl_arr,
-                    tp_arr,
-                    pip_value=pip_size,
-                    pip_value_per_lot=pip_val,
-                    spread_pips=1.5,
-                    commission_per_trade=7.0,
-                )
-                metrics_arr = np.asarray(metrics_mat, dtype=np.float64)
-                if metrics_arr.ndim != 2 or metrics_arr.shape[0] != rows or metrics_arr.shape[1] < 9:
-                    raise ValueError(f"unexpected batch metrics shape: {metrics_arr.shape}")
-                for i, gene in enumerate(chunk_genes):
-                    score = _apply_eval_metrics(gene, metrics_arr[i])
-                    scored.append((score, gene))
-            except Exception as exc:
-                logger.debug("Discovery batch evaluation failed; reverting to per-gene: %s", exc)
-                batch_failed = True
-                break
-        if not batch_failed and len(scored) >= len(genes):
-            return scored
-
-    # Per-gene fallback for any unevaluated genes or when batch mode fails.
-    already = {id(g) for _, g in scored}
-    for i, gene in enumerate(eval_genes):
-        if id(gene) in already:
-            continue
-        try:
-            metrics = fast_evaluate_strategy(
-                close_prices=close,
-                high_prices=high,
-                low_prices=low,
-                signals=eval_signals[i],
-                month_indices=month_idx,
-                day_indices=day_idx,
-                sl_pips=sl_vals[i],
-                tp_pips=tp_vals[i],
-                pip_value=pip_size,
-                pip_value_per_lot=pip_val,
-                spread_pips=1.5,
-                commission_per_trade=7.0,
-            )
-            score = _apply_eval_metrics(gene, metrics)
-        except Exception as exc:
-            logger.debug("Discovery: gene eval failed: %s", exc)
-            score = _apply_eval_metrics(gene, None)
-        scored.append((score, gene))
-    return scored
 
 
 class TensorDiscoveryEngine:
@@ -611,24 +606,24 @@ class TensorDiscoveryEngine:
 
     def run_unsupervised_search(
         self,
-        frames: dict[str, pd.DataFrame],
+        frames: dict[str, Any],
         *,
         iterations: int = 1000,
-        news_features: pd.DataFrame | None = None,
+        news_features: Any | None = None,
     ) -> None:
         if frames is None or len(frames) == 0:
             return
         base_tf = self.timeframes[0] if self.timeframes else next(iter(frames.keys()))
         base_df = frames.get(base_tf)
-        if base_df is None or base_df.empty:
+        if _frame_empty(base_df):
             return
-        df = base_df.copy()
-        if self.max_rows > 0 and len(df) > self.max_rows:
-            df = df.tail(self.max_rows)
-        if len(df) < 50:
+        df = _frame_copy(base_df)
+        if self.max_rows > 0 and _frame_len(df) > self.max_rows:
+            df = _frame_tail(df, self.max_rows)
+        n_rows = _frame_len(df)
+        if n_rows < 50:
             return
         iter_budget = max(1, int(iterations or 1))
-        allow_python_fallback = _allow_python_discovery_fallback(self.settings)
 
         def _env_int(name: str, default: int) -> int:
             raw = os.environ.get(name)
@@ -642,19 +637,16 @@ class TensorDiscoveryEngine:
         if _RUST_DISCOVERY and _fb is not None:
             try:
                 ts = None
-                idx = df.index
-                if isinstance(idx, pd.DatetimeIndex):
-                    idx_i64 = idx.view("int64")
-                    if hasattr(idx_i64, "to_numpy"):
-                        idx_i64 = idx_i64.to_numpy(dtype=np.int64, copy=False)
-                    else:
-                        idx_i64 = np.asarray(idx_i64, dtype=np.int64)
-                    ts = (np.asarray(idx_i64, dtype=np.int64) // 1_000_000).astype(np.int64, copy=False)
-                close = df["close"].to_numpy(dtype=np.float64)
-                high = df["high"].to_numpy(dtype=np.float64)
-                low = df["low"].to_numpy(dtype=np.float64)
-                open_ = df["open"].to_numpy(dtype=np.float64) if "open" in df.columns else close
-                volume = df["volume"].to_numpy(dtype=np.float64) if "volume" in df.columns else None
+                idx = getattr(df, "index", None)
+                if _is_datetime_index(idx):
+                    ts = _datetime_index_to_unix_ms(idx)
+                close = _frame_column_numpy(df, "close", n_rows=n_rows, dtype=np.float64)
+                high = _frame_column_numpy(df, "high", n_rows=n_rows, dtype=np.float64)
+                low = _frame_column_numpy(df, "low", n_rows=n_rows, dtype=np.float64)
+                open_ = _frame_column_numpy(df, "open", n_rows=n_rows, dtype=np.float64, default=close)
+                volume = None
+                if _resolve_column_name(df, "volume") is not None:
+                    volume = _frame_column_numpy(df, "volume", n_rows=n_rows, dtype=np.float64)
 
                 default_pop = max(8, min(100, iter_budget))
                 default_gens = max(1, min(5, (iter_budget + 19) // 20))
@@ -668,8 +660,8 @@ class TensorDiscoveryEngine:
                         )
                     except Exception:
                         default_portfolio = 3000
-                default_portfolio = max(100, default_portfolio)
-                default_candidates = max(default_candidates, min(10_000, max(100, default_portfolio // 2)))
+                default_portfolio = max(1, default_portfolio)
+                default_candidates = max(default_candidates, min(10_000, max(10, default_portfolio * 4)))
 
                 keep_max_dd, keep_min_profit, keep_min_trades, keep_min_count, keep_cap = _strategy_keep_limits(
                     self.settings,
@@ -680,7 +672,7 @@ class TensorDiscoveryEngine:
                 rust_gens = max(1, _env_int("FOREX_BOT_DISCOVERY_GENS", default_gens))
                 rust_max_ind = max(2, _env_int("FOREX_BOT_DISCOVERY_MAX_INDICATORS", 12))
                 rust_candidates = max(10, _env_int("FOREX_BOT_DISCOVERY_CANDIDATES", default_candidates))
-                rust_portfolio = max(5, _env_int("FOREX_BOT_DISCOVERY_PORTFOLIO", default_portfolio))
+                rust_portfolio = max(1, _env_int("FOREX_BOT_DISCOVERY_PORTFOLIO", default_portfolio))
                 rust_corr = float(os.environ.get("FOREX_BOT_DISCOVERY_CORR", "0.7") or 0.7)
                 rust_min_trades_day = float(os.environ.get("FOREX_BOT_DISCOVERY_MIN_TRADES", "1.0") or 1.0)
                 try:
@@ -726,8 +718,9 @@ class TensorDiscoveryEngine:
 
                 feature_names = list(result.get("feature_names") or [])
                 portfolio = list(result.get("portfolio") or [])
-                available = {str(x).upper() for x in ALL_INDICATORS}
-                best: list[TALibStrategyGene] = []
+                # Keep Rust path independent from Python TA-Lib imports.
+                available: set[str] = set()
+                best: list[Any] = []
                 for g in portfolio:
                     if not isinstance(g, dict):
                         continue
@@ -780,12 +773,12 @@ class TensorDiscoveryEngine:
                         min_keep=keep_min_count,
                         cap=keep_cap,
                     )
-                symbol = str(df.attrs.get("symbol", "") or "")
+                symbol = str(_frame_attr(df, "symbol", "") or "")
 
                 payload = {
                     "generated_at": datetime.now(timezone.utc).isoformat(),
                     "symbol": symbol,
-                    "timeframe": str(df.attrs.get("timeframe", df.attrs.get("tf", "")) or ""),
+                    "timeframe": str(_frame_attr(df, "timeframe", _frame_attr(df, "tf", "")) or ""),
                     "best_genes": [_gene_to_dict(g) for g in selected],
                 }
                 out_dir = Path("cache")
@@ -813,135 +806,11 @@ class TensorDiscoveryEngine:
                 )
                 return
             except Exception as exc:
-                if not allow_python_fallback:
-                    logger.error("Rust discovery failed and Python fallback is disabled: %s", exc, exc_info=True)
-                    return
-                logger.warning("Rust discovery failed, falling back to Python: %s", exc, exc_info=True)
-        elif not allow_python_fallback:
-            logger.warning("Rust discovery backend unavailable and Python fallback is disabled; skipping discovery.")
+                logger.error("Rust discovery failed; skipping Python fallback: %s", exc, exc_info=True)
+                return
+        else:
+            logger.warning("Rust discovery backend unavailable; skipping discovery.")
             return
-        mixer = TALibStrategyMixer()
-        if not mixer.available_indicators:
-            logger.warning("Discovery: no TA-Lib indicators available.")        
-            return
-
-        n = max(1, min(self.n_experts, int(os.environ.get("FOREX_BOT_DISCOVERY_SAMPLE", "64") or 64)))
-        max_indicators = 0
-        env_max = os.environ.get("FOREX_BOT_DISCOVERY_MAX_INDICATORS") or os.environ.get(
-            "FOREX_BOT_PROP_SEARCH_MAX_INDICATORS"
-        )
-        if env_max:
-            try:
-                max_indicators = int(env_max)
-            except Exception:
-                max_indicators = 0
-        if max_indicators <= 0:
-            try:
-                max_indicators = int(
-                    getattr(self.settings.models, "prop_search_max_indicators", 0) or 0
-                )
-            except Exception:
-                max_indicators = 0
-        if max_indicators <= 0:
-            max_indicators = len(mixer.available_indicators)
-        max_indicators = max(2, min(max_indicators, len(mixer.available_indicators)))
-        genes = [mixer.generate_random_strategy(max_indicators=max_indicators) for _ in range(n)]
-        cache = mixer.bulk_calculate_indicators(df, genes)
-
-        symbol = str(df.attrs.get("symbol", "") or "")
-        pip_size, pip_val = infer_pip_metrics(symbol)
-        close = df["close"].to_numpy(dtype=np.float64)
-        high = df["high"].to_numpy(dtype=np.float64)
-        low = df["low"].to_numpy(dtype=np.float64)
-        open_ = df["open"].to_numpy(dtype=np.float64) if "open" in df.columns else close
-        atr_vals = df["atr"].to_numpy(dtype=np.float64) if "atr" in df.columns else None
-        month_idx, day_idx = _safe_indices(df.index, len(df))
-        default_cap = 3000
-        if self.settings is not None:
-            try:
-                default_cap = int(
-                    getattr(self.settings.models, "prop_search_portfolio_size", default_cap) or default_cap
-                )
-            except Exception:
-                default_cap = 3000
-        keep_max_dd, keep_min_profit, keep_min_trades, keep_min_count, keep_cap = _strategy_keep_limits(
-            self.settings,
-            default_cap=default_cap,
-        )
-        min_sharpe, min_profit_factor, min_win_rate = _strategy_quality_limits(self.settings)
-
-        scored = _score_genes_python_fallback(
-            df=df,
-            genes=genes,
-            mixer=mixer,
-            cache=cache,
-            settings=self.settings,
-            pip_size=pip_size,
-            pip_val=pip_val,
-            close=close,
-            high=high,
-            low=low,
-            open_=open_,
-            atr_vals=atr_vals,
-            month_idx=month_idx,
-            day_idx=day_idx,
-        )
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        merged = [g for _, g in scored]
-        base_filtered = [
-            g
-            for g in merged
-            if _profit_value(g) > keep_min_profit
-            and float(getattr(g, "max_dd_pct", 0.0) or 0.0) <= keep_max_dd
-            and float(getattr(g, "trades", 0.0) or 0.0) >= keep_min_trades
-        ]
-        filtered = [
-            g
-            for g in base_filtered
-            if _passes_quality(
-                g,
-                min_sharpe=min_sharpe,
-                min_profit_factor=min_profit_factor,
-                min_win_rate=min_win_rate,
-            )
-        ]
-        best, strict_kept, ranked_total = _select_ranked(
-            merged,
-            filtered=filtered,
-            min_keep=keep_min_count,
-            cap=keep_cap,
-        )
-
-        payload = {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "symbol": symbol,
-            "timeframe": str(df.attrs.get("timeframe", df.attrs.get("tf", "")) or ""),
-            "best_genes": [_gene_to_dict(g) for g in best],
-        }
-        out_dir = Path("cache")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / "talib_knowledge.json"
-        if symbol:
-            safe = "".join(c for c in symbol if c.isalnum() or c in ("-", "_"))
-            out_path = out_dir / f"talib_knowledge_{safe}.json"
-        out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        self._last_payload = payload
-        logger.info(
-            "Discovery: kept %s/%s genes (strict=%s, min_keep=%s) "
-            "(profit>%.3f, max_dd<=%.3f, trades>=%.0f, sharpe>=%.2f, pf>=%.2f, win>=%.2f). Wrote %s",
-            len(best),
-            ranked_total,
-            strict_kept,
-            keep_min_count,
-            keep_min_profit,
-            keep_max_dd,
-            keep_min_trades,
-            min_sharpe,
-            min_profit_factor,
-            min_win_rate,
-            out_path,
-        )
 
     def save_experts(self, path: str) -> None:
         """
@@ -963,3 +832,4 @@ class TensorDiscoveryEngine:
 
 
 __all__ = ["TensorDiscoveryEngine"]
+

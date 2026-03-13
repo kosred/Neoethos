@@ -55,12 +55,7 @@ fn cmd_load(args: &[String]) -> Result<()> {
     let timeframe = timeframe.unwrap_or_else(|| "M1".to_string());
 
     let ohlcv = forex_data::load_symbol_timeframe(&root, &symbol, &timeframe)?;
-    println!(
-        "Loaded {} {} rows: {}",
-        symbol,
-        timeframe,
-        ohlcv.len()
-    );
+    println!("Loaded {} {} rows: {}", symbol, timeframe, ohlcv.len());
     Ok(())
 }
 
@@ -114,12 +109,8 @@ fn cmd_prepare(args: &[String]) -> Result<()> {
     let higher_refs: Vec<&str> = higher_list.iter().map(|s| s.as_str()).collect();
     let dataset = forex_data::load_symbol_dataset(&root, &symbol)?;
     let cache = forex_data::FeatureCache::new("cache/features", 60, true);
-    let features = forex_data::prepare_multitimeframe_features(
-        &dataset,
-        &base,
-        &higher_refs,
-        Some(&cache),
-    )?;
+    let features =
+        forex_data::prepare_multitimeframe_features(&dataset, &base, &higher_refs, Some(&cache))?;
     println!(
         "Prepared {} base={} rows={} cols={}",
         symbol,
@@ -168,7 +159,8 @@ fn cmd_train(args: &[String]) -> Result<()> {
     let higher_refs: Vec<&str> = higher_list.iter().map(|s| s.as_str()).collect();
 
     let dataset = forex_data::load_symbol_dataset(&root, &symbol)?;
-    let dataset = forex_data::ensure_timeframes_with_resample(&dataset, &base, &forex_data::MANDATORY_TFS)?;
+    let dataset =
+        forex_data::ensure_timeframes_with_resample(&dataset, &base, &forex_data::MANDATORY_TFS)?;
     let features = forex_data::prepare_multitimeframe_features(
         &dataset,
         &base,
@@ -233,7 +225,8 @@ fn cmd_search(args: &[String]) -> Result<()> {
     let higher_refs: Vec<&str> = higher_list.iter().map(|s| s.as_str()).collect();
 
     let dataset = forex_data::load_symbol_dataset(&root, &symbol)?;
-    let dataset = forex_data::ensure_timeframes_with_resample(&dataset, &base, &forex_data::MANDATORY_TFS)?;
+    let dataset =
+        forex_data::ensure_timeframes_with_resample(&dataset, &base, &forex_data::MANDATORY_TFS)?;
     let features = forex_data::prepare_multitimeframe_features(
         &dataset,
         &base,
@@ -245,7 +238,8 @@ fn cmd_search(args: &[String]) -> Result<()> {
         .get(&base)
         .ok_or_else(|| anyhow::anyhow!("base timeframe missing: {}", base))?;
 
-    let result = forex_search::evolve_search(&features, base_ohlcv, genes, generations, max_indicators)?;
+    let result =
+        forex_search::evolve_search(&features, base_ohlcv, genes, generations, max_indicators)?;
     let mut best_idx = 0usize;
     let mut best_profit = f64::MIN;
     for (idx, metrics) in result.metrics.iter().enumerate() {
@@ -257,10 +251,7 @@ fn cmd_search(args: &[String]) -> Result<()> {
     }
     println!(
         "Search {} genes={} best_idx={} net_profit={:.2}",
-        symbol,
-        genes,
-        best_idx,
-        best_profit
+        symbol, genes, best_idx, best_profit
     );
     Ok(())
 }
@@ -301,7 +292,8 @@ fn cmd_discover(args: &[String]) -> Result<()> {
     let higher_refs: Vec<&str> = higher_list.iter().map(|s| s.as_str()).collect();
 
     let dataset = forex_data::load_symbol_dataset(&root, &symbol)?;
-    let dataset = forex_data::ensure_timeframes_with_resample(&dataset, &base, &&forex_data::MANDATORY_TFS)?;
+    let dataset =
+        forex_data::ensure_timeframes_with_resample(&dataset, &base, &forex_data::MANDATORY_TFS)?;
     let features = forex_data::prepare_multitimeframe_features(
         &dataset,
         &base,
@@ -346,6 +338,9 @@ fn cmd_stop_target(args: &[String]) -> Result<()> {
     let pip_size: f64 = parse_flag(args, "--pip")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.0001);
+    let signal: i8 = parse_flag(args, "--signal")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     let ohlcv = forex_data::load_symbol_timeframe(&root, &symbol, &timeframe)?;
     let settings = forex_search::StopTargetSettings::default();
@@ -356,6 +351,7 @@ fn cmd_stop_target(args: &[String]) -> Result<()> {
         &ohlcv.close,
         &settings,
         pip_size,
+        signal,
     );
     if let Some((sl, tp, rr)) = result {
         println!(
@@ -393,5 +389,5 @@ fn print_help() {
     println!("  train --symbol EURUSD --base M1 --higher H1,H4 --horizon 1 --root data");
     println!("  search --symbol EURUSD --base M1 --higher H1,H4 --genes 64 --generations 5 --max-indicators 12 --root data");
     println!("  discover --symbol EURUSD --base M1 --higher H1,H4 --population 100 --generations 5 --max-indicators 12 --portfolio-size 100 --candidates 200 --corr 0.7 --min-trades 1 --out cache/talib_knowledge.json --root data");
-    println!("  stop-target --symbol EURUSD --timeframe M1 --pip 0.0001 --root data");
+    println!("  stop-target --symbol EURUSD --timeframe M1 --pip 0.0001 --signal 1 --root data");
 }

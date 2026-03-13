@@ -50,15 +50,15 @@ impl ONNXExporter {
         let onnx_dir = models_dir.join("onnx");
 
         // Create ONNX directory
-        std::fs::create_dir_all(&onnx_dir)
-            .context("Failed to create ONNX directory")?;
+        std::fs::create_dir_all(&onnx_dir).context("Failed to create ONNX directory")?;
 
         // Initialize Python exporter
         let py_exporter = Python::attach(|py| {
             let exporter_module = PyModule::import(py, "forex_bot.models.onnx_exporter")
                 .context("Failed to import forex_bot.models.onnx_exporter")?;
 
-            let exporter_class = exporter_module.getattr("ONNXExporter")
+            let exporter_class = exporter_module
+                .getattr("ONNXExporter")
                 .context("ONNXExporter class not found")?;
 
             let kwargs = PyDict::new(py);
@@ -85,7 +85,9 @@ impl ONNXExporter {
         sample_input: &Array2<f32>,
     ) -> Result<PathBuf> {
         Python::attach(|py| {
-            let exporter = self.py_exporter.as_ref()
+            let exporter = self
+                .py_exporter
+                .as_ref()
                 .context("ONNX exporter not initialized")?
                 .bind(py);
 
@@ -95,7 +97,8 @@ impl ONNXExporter {
 
             let shape = (sample_input.nrows(), sample_input.ncols());
             let flat: Vec<f32> = sample_input.iter().copied().collect();
-            let np_array = numpy.call_method1("array", (flat,))?
+            let np_array = numpy
+                .call_method1("array", (flat,))?
                 .call_method1("reshape", (shape,))?;
             let df = pd.call_method1("DataFrame", (np_array,))?;
 
@@ -110,13 +113,11 @@ impl ONNXExporter {
 
     /// Export LightGBM model to ONNX using onnxmltools
     /// Python lines 209-233
-    pub fn export_lightgbm_model(
-        &self,
-        name: &str,
-        sample_input: &Array2<f32>,
-    ) -> Result<PathBuf> {
+    pub fn export_lightgbm_model(&self, name: &str, sample_input: &Array2<f32>) -> Result<PathBuf> {
         Python::attach(|py| {
-            let exporter = self.py_exporter.as_ref()
+            let exporter = self
+                .py_exporter
+                .as_ref()
                 .context("ONNX exporter not initialized")?
                 .bind(py);
 
@@ -126,7 +127,8 @@ impl ONNXExporter {
 
             let shape = (sample_input.nrows(), sample_input.ncols());
             let flat: Vec<f32> = sample_input.iter().copied().collect();
-            let np_array = numpy.call_method1("array", (flat,))?
+            let np_array = numpy
+                .call_method1("array", (flat,))?
                 .call_method1("reshape", (shape,))?;
             let df = pd.call_method1("DataFrame", (np_array,))?;
 
@@ -149,13 +151,11 @@ impl ONNXExporter {
 
     /// Export XGBoost model to ONNX using onnxmltools
     /// Python lines 235-259
-    pub fn export_xgboost_model(
-        &self,
-        name: &str,
-        sample_input: &Array2<f32>,
-    ) -> Result<PathBuf> {
+    pub fn export_xgboost_model(&self, name: &str, sample_input: &Array2<f32>) -> Result<PathBuf> {
         Python::attach(|py| {
-            let exporter = self.py_exporter.as_ref()
+            let exporter = self
+                .py_exporter
+                .as_ref()
                 .context("ONNX exporter not initialized")?
                 .bind(py);
 
@@ -164,7 +164,8 @@ impl ONNXExporter {
 
             let shape = (sample_input.nrows(), sample_input.ncols());
             let flat: Vec<f32> = sample_input.iter().copied().collect();
-            let np_array = numpy.call_method1("array", (flat,))?
+            let np_array = numpy
+                .call_method1("array", (flat,))?
                 .call_method1("reshape", (shape,))?;
             let df = pd.call_method1("DataFrame", (np_array,))?;
 
@@ -185,13 +186,11 @@ impl ONNXExporter {
 
     /// Export CatBoost model to ONNX using CatBoost's native exporter
     /// Python lines 193-207
-    pub fn export_catboost_model(
-        &self,
-        name: &str,
-        sample_input: &Array2<f32>,
-    ) -> Result<PathBuf> {
+    pub fn export_catboost_model(&self, name: &str, sample_input: &Array2<f32>) -> Result<PathBuf> {
         Python::attach(|py| {
-            let exporter = self.py_exporter.as_ref()
+            let exporter = self
+                .py_exporter
+                .as_ref()
                 .context("ONNX exporter not initialized")?
                 .bind(py);
 
@@ -200,7 +199,8 @@ impl ONNXExporter {
 
             let shape = (sample_input.nrows(), sample_input.ncols());
             let flat: Vec<f32> = sample_input.iter().copied().collect();
-            let np_array = numpy.call_method1("array", (flat,))?
+            let np_array = numpy
+                .call_method1("array", (flat,))?
                 .call_method1("reshape", (shape,))?;
             let df = pd.call_method1("DataFrame", (np_array,))?;
 
@@ -269,7 +269,8 @@ impl ONNXExporter {
                 || model_type_str.contains("NBeats")
                 || model_type_str.contains("TiDE")
                 || model_type_str.contains("TabNet")
-                || model_type_str.contains("KAN") {
+                || model_type_str.contains("KAN")
+            {
                 // PyTorch neural network
                 self.export_pytorch_model(name, model, sample_input)?
             } else if name.contains("lightgbm") || name.contains("lgbm") {
@@ -320,7 +321,12 @@ impl ONNXExporter {
 /// Trait for models that can be exported to ONNX
 pub trait ONNXExportable {
     /// Export this model to ONNX format
-    fn export_to_onnx(&self, name: &str, sample_input: &Array2<f32>, output_path: &Path) -> Result<()>;
+    fn export_to_onnx(
+        &self,
+        name: &str,
+        sample_input: &Array2<f32>,
+        output_path: &Path,
+    ) -> Result<()>;
 }
 
 // NOTE: We'll implement this trait for MLPExpert, NBeatsExpert, etc. in neural_networks.rs

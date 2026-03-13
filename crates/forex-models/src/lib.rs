@@ -35,13 +35,13 @@ pub mod parallel_trainer;
 // pub mod transformers;
 
 #[cfg(feature = "onnx")]
-use ort::{inputs, Session, Value};
-#[cfg(feature = "onnx")]
-use std::collections::HashMap;
-#[cfg(feature = "onnx")]
 use anyhow::{Context, Result};
 #[cfg(feature = "onnx")]
 use ndarray::Array2;
+#[cfg(feature = "onnx")]
+use ort::{inputs, Session, Value};
+#[cfg(feature = "onnx")]
+use std::collections::HashMap;
 #[cfg(feature = "onnx")]
 use tracing::{info, warn};
 

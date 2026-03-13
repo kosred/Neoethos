@@ -10,20 +10,257 @@ from itertools import combinations
 from typing import Any
 
 import numpy as np
-import pandas as pd
 from sklearn.model_selection import KFold
 
 logger = logging.getLogger(__name__)
+try:
+    import forex_bindings as _fb  # type: ignore
+except Exception:
+    _fb = None  # type: ignore
+
+
+def _is_dataframe_like(values: Any) -> bool:
+    return bool(
+        hasattr(values, "columns")
+        and hasattr(values, "index")
+        and callable(getattr(values, "to_numpy", None))
+    )
+
+
+class _NumpyFrame:
+    """Minimal frame-like container used when CPCV slices non-dataframe-module frames."""
+
+    def __init__(self, data: dict[str, Any], index: Any, attrs: dict[str, Any] | None = None) -> None:
+        self._data = {str(k): np.asarray(v).reshape(-1) for k, v in data.items()}
+        self.index = np.asarray(index).reshape(-1)
+        self.columns = list(self._data.keys())
+        self.attrs = dict(attrs or {})
+
+    @property
+    def empty(self) -> bool:
+        return int(len(self.index)) <= 0
+
+    def __len__(self) -> int:
+        return int(len(self.index))
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        return self._data[str(key)]
+
+
+def _frame_columns(frame: Any) -> list[str]:
+    cols = getattr(frame, "columns", None)
+    if cols is None:
+        return []
+    try:
+        return [str(c) for c in list(cols)]
+    except Exception:
+        return []
+
+
+def _frame_resolve_column(frame: Any, name: str) -> str | None:
+    target = str(name).strip().lower()
+    for col in _frame_columns(frame):
+        if str(col).strip().lower() == target:
+            return col
+    return None
+
+
+def _slice_frame_rows(values: Any, rows: np.ndarray) -> Any:
+    rows_arr = np.asarray(rows, dtype=np.int64).reshape(-1)
+    if rows_arr.size <= 0:
+        return _NumpyFrame({}, np.zeros(0, dtype=np.int64))
+    cols = _frame_columns(values)
+    if not cols:
+        return np.asarray(values)[rows_arr]
+    out_data: dict[str, np.ndarray] = {}
+    max_i = int(np.max(rows_arr)) if rows_arr.size > 0 else -1
+    for col in cols:
+        try:
+            arr = np.asarray(values[col]).reshape(-1)  # type: ignore[index]
+            if arr.shape[0] > max_i >= 0:
+                out_data[str(col)] = arr[rows_arr]
+            else:
+                out_data[str(col)] = arr
+        except Exception:
+            continue
+    idx = getattr(values, "index", None)
+    if idx is None:
+        out_idx = rows_arr.copy()
+    else:
+        idx_arr = np.asarray(idx).reshape(-1)
+        if idx_arr.shape[0] > max_i >= 0:
+            out_idx = idx_arr[rows_arr]
+        else:
+            out_idx = rows_arr.copy()
+    attrs = getattr(values, "attrs", None)
+    return _NumpyFrame(out_data, out_idx, attrs=(dict(attrs) if isinstance(attrs, dict) else None))
+
+
+def _default_scoring_func(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_t = np.asarray(y_true).reshape(-1)
+    y_p = np.asarray(y_pred).reshape(-1)
+    n = int(min(y_t.size, y_p.size))
+    if n <= 0:
+        return 0.0
+    return float((y_t[:n] == y_p[:n]).mean())
+
+
+def _slice_rows(values: Any, rows: np.ndarray) -> Any:
+    if isinstance(values, dict):
+        out: dict[str, Any] = {}
+        max_i = int(np.max(rows)) if len(rows) > 0 else -1
+        for k, v in values.items():
+            try:
+                arr = np.asarray(v)
+                if arr.ndim <= 0:
+                    out[str(k)] = v
+                elif arr.shape[0] > max_i >= 0:
+                    out[str(k)] = arr[rows]
+                else:
+                    out[str(k)] = arr
+            except Exception:
+                out[str(k)] = v
+        return out
+    if _is_dataframe_like(values):
+        idx = np.asarray(rows, dtype=np.int64).reshape(-1)
+        try:
+            return values.take(idx)
+        except Exception:
+            try:
+                base_idx = np.asarray(getattr(values, "index")).reshape(-1)
+                return values.loc[base_idx[idx]]
+            except Exception:
+                pass
+    if hasattr(values, "columns") and hasattr(values, "__getitem__"):
+        try:
+            return _slice_frame_rows(values, rows)
+        except Exception:
+            pass
+    arr = np.asarray(values)
+    return arr[rows]
+
+
+def _extract_column(frame: Any, name: str) -> np.ndarray:
+    col = None
+    if isinstance(frame, dict):
+        col = frame.get(name)
+        if col is None:
+            target = str(name).strip().lower()
+            for k, v in frame.items():
+                if str(k).strip().lower() == target:
+                    col = v
+                    break
+    else:
+        col_name = _frame_resolve_column(frame, name)
+        if col_name is not None:
+            try:
+                col = frame[col_name]
+            except Exception:
+                col = None
+    if col is None:
+        return np.zeros(0, dtype=np.float64)
+    try:
+        if hasattr(col, "to_numpy"):
+            return np.asarray(col.to_numpy(dtype=np.float64, copy=False), dtype=np.float64).reshape(-1)
+    except Exception:
+        pass
+    return np.asarray(col, dtype=np.float64).reshape(-1)
+
+
+def _extract_index(frame: Any, n_rows: int) -> np.ndarray:
+    idx = None
+    try:
+        idx = getattr(frame, "index", None)
+    except Exception:
+        idx = None
+    if idx is None and isinstance(frame, dict):
+        idx = frame.get("index")
+    if idx is None:
+        return np.arange(n_rows, dtype=np.int64)
+    arr = np.asarray(idx).reshape(-1)
+    if arr.size != n_rows:
+        return np.arange(n_rows, dtype=np.int64)
+    return arr
+
+
+def _month_day_indices(index: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    arr = np.asarray(index).reshape(-1)
+    n = int(arr.size)
+    if n <= 0:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+
+    def _rust_from_ns(ns_values: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+        if _fb is None or not hasattr(_fb, "derive_time_index_arrays"):
+            return None
+        try:
+            _unix_ms, month_idx, day_idx = _fb.derive_time_index_arrays(
+                np.asarray(ns_values, dtype=np.int64).reshape(-1)
+            )
+        except Exception:
+            return None
+        month_arr = np.asarray(month_idx, dtype=np.int64).reshape(-1)
+        day_arr = np.asarray(day_idx, dtype=np.int64).reshape(-1)
+        if month_arr.size != n or day_arr.size != n:
+            return None
+        return month_arr, day_arr
+
+    if np.issubdtype(arr.dtype, np.datetime64):
+        dt = arr.astype("datetime64[ns]")
+        rust = _rust_from_ns(dt.astype(np.int64, copy=False))
+        if rust is not None:
+            return rust
+        return dt.astype("datetime64[M]").astype(np.int64), dt.astype("datetime64[D]").astype(np.int64)
+
+    if arr.dtype.kind in {"i", "u"}:
+        ints = arr.astype(np.int64, copy=False)
+        if ints.size > 0 and int(np.max(np.abs(ints))) > 10**12:
+            rust = _rust_from_ns(ints)
+            if rust is not None:
+                return rust
+            dt = ints.astype("datetime64[ns]")
+            return dt.astype("datetime64[M]").astype(np.int64), dt.astype("datetime64[D]").astype(np.int64)
+        return ints // 31, ints
+
+    if arr.dtype.kind == "f":
+        ints = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.int64, copy=False)
+        return ints // 31, ints
+
+    day = np.arange(n, dtype=np.int64)
+    return day // 31, day
+
+
+def _index_is_monotonic(index: Any) -> bool:
+    if index is None:
+        return True
+    raw = getattr(index, "is_monotonic_increasing", None)
+    if raw is not None:
+        try:
+            return bool(raw)
+        except Exception:
+            pass
+    arr = np.asarray(index).reshape(-1)
+    if arr.size <= 1:
+        return True
+    if np.issubdtype(arr.dtype, np.datetime64):
+        vals = arr.astype("datetime64[ns]").astype(np.int64, copy=False)
+    elif arr.dtype.kind in {"i", "u"}:
+        vals = arr.astype(np.int64, copy=False)
+    elif arr.dtype.kind == "f":
+        vals = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.int64, copy=False)
+    else:
+        # If index is non-numeric/non-datetime, keep original behavior permissive.
+        return True
+    return bool(np.all(vals[1:] >= vals[:-1]))
 
 
 def _evaluate_split_task(
-    x: pd.DataFrame,
-    y: pd.Series,
+    x: Any,
+    y: Any,
     train_idx: np.ndarray,
     test_idx: np.ndarray,
     model_factory: Callable,
     scoring_func: Callable,
-    sample_weights: pd.Series | None,
+    sample_weights: Any | None,
     max_daily_loss_pct: float,
     max_trades_per_day: int,
     min_trading_days: int,
@@ -32,13 +269,13 @@ def _evaluate_split_task(
     if len(train_idx) == 0 or len(test_idx) == 0:
         return 0.0, {}
 
-    x_train = x.iloc[train_idx] if hasattr(x, "iloc") else x[train_idx]
-    y_train = y.iloc[train_idx] if hasattr(y, "iloc") else y[train_idx]
-    x_test = x.iloc[test_idx] if hasattr(x, "iloc") else x[test_idx]
-    y_test = y.iloc[test_idx] if hasattr(y, "iloc") else y[test_idx]
+    x_train = _slice_rows(x, train_idx)
+    y_train = _slice_rows(y, train_idx)
+    x_test = _slice_rows(x, test_idx)
+    y_test = _slice_rows(y, test_idx)
 
     if sample_weights is not None:
-        w_train = sample_weights.iloc[train_idx] if hasattr(sample_weights, "iloc") else sample_weights[train_idx]
+        w_train = _slice_rows(sample_weights, train_idx)
     else:
         w_train = None
 
@@ -68,7 +305,7 @@ def _evaluate_split_task(
         return 0.0, {}
 
     try:
-        score = scoring_func(y_test.values, y_pred)
+        score = scoring_func(np.asarray(y_test), y_pred)
     except Exception as e:
         logger.error(f"Scoring failed: {e}")
         return 0.0, {}
@@ -79,17 +316,27 @@ def _evaluate_split_task(
     win_rate = 0.0
     trades = 0
 
-    if hasattr(x_test, "index") and "close" in x_test.columns:
+    close = _extract_column(x_test, "close")
+    high = _extract_column(x_test, "high")
+    low = _extract_column(x_test, "low")
+    if close.size > 0 and high.size > 0 and low.size > 0:
         try:
-            close = x_test["close"].to_numpy(dtype=np.float64)
-            high = x_test["high"].to_numpy(dtype=np.float64)
-            low = x_test["low"].to_numpy(dtype=np.float64)
+            n_bt = int(min(close.size, high.size, low.size, len(y_pred)))
+            close = close[:n_bt]
+            high = high[:n_bt]
+            low = low[:n_bt]
+            signals = np.asarray(y_pred, dtype=np.int8).reshape(-1)[:n_bt]
+            idx = _extract_index(x_test, n_bt)
+            month_idx, day_idx = _month_day_indices(idx)
 
-            idx = x_test.index
-            month_idx = (idx.year.astype(np.int32) * 12 + idx.month.astype(np.int32)).to_numpy(dtype=np.int64)
-            day_idx = (idx.year.astype(np.int32) * 10000 + idx.month.astype(np.int32) * 100 + idx.day.astype(np.int32)).to_numpy(dtype=np.int64)
-
-            symbol = x_test.attrs.get("symbol", "EURUSD")
+            symbol = "EURUSD"
+            with np.errstate(all="ignore"):
+                try:
+                    attrs = getattr(x_test, "attrs", None)
+                    if isinstance(attrs, dict):
+                        symbol = str(attrs.get("symbol", "EURUSD") or "EURUSD")
+                except Exception:
+                    symbol = "EURUSD"
             pip_size, pip_val_lot = infer_pip_metrics(symbol)
 
             # HPC Unified Backtest
@@ -97,7 +344,7 @@ def _evaluate_split_task(
                 close_prices=close,
                 high_prices=high,
                 low_prices=low,
-                signals=y_pred.astype(np.int8),
+                signals=signals,
                 month_indices=month_idx,
                 day_indices=day_idx,
                 sl_pips=30.0,
@@ -195,9 +442,9 @@ class CombinatorialPurgedCV:
 
     def split(
         self,
-        x: pd.DataFrame,
-        y: pd.Series | None = None,
-        sample_weights: pd.Series | None = None,
+        x: Any,
+        y: Any | None = None,
+        sample_weights: Any | None = None,
     ) -> list[tuple[np.ndarray, np.ndarray]]:
         """
         Generate combinatorial purged train/test splits.
@@ -210,7 +457,8 @@ class CombinatorialPurgedCV:
         Returns list of (train_indices, test_indices) tuples.
         """
         # CPCV relies on time-ordered data for purging/embargo to be meaningful.
-        if hasattr(x, "index") and not x.index.is_monotonic_increasing:
+        idx = getattr(x, "index", None)
+        if idx is not None and not _index_is_monotonic(idx):
             raise ValueError(
                 "CPCV requires time-ordered data (monotonic increasing index). "
                 "Sort by timestamp before running CPCV to avoid look-ahead bias."
@@ -304,7 +552,7 @@ class CombinatorialPurgedCV:
 
     def calculate_phi(
         self,
-        x: pd.DataFrame,
+        x: Any,
     ) -> float:
         """
         Calculate uniqueness score φ (phi).
@@ -339,11 +587,11 @@ class CombinatorialPurgedCV:
 
     def score(
         self,
-        x: pd.DataFrame,
-        y: pd.Series,
+        x: Any,
+        y: Any,
         model_factory: Callable,
         scoring_func: Callable | None = None,
-        sample_weights: pd.Series | None = None,
+        sample_weights: Any | None = None,
         n_jobs: int = 1,
         max_daily_loss_pct: float = 0.05,
         max_trades_per_day: int = 15,
@@ -354,16 +602,16 @@ class CombinatorialPurgedCV:
 
         Parameters
         ----------
-        x : pd.DataFrame
-            Features
-        y : pd.Series
-            Labels
+        x : Any
+            Feature matrix (NumPy array or dataframe-like).
+        y : Any
+            Labels (NumPy array or series-like).
         model_factory : Callable
             Function that returns a new untrained model instance
         scoring_func : Callable, optional
             Function(y_true, y_pred) -> score. If None, uses accuracy.
-        sample_weights : pd.Series, optional
-            Sample weights for training
+        sample_weights : Any, optional
+            Sample weights for training.
         n_jobs : int
             Number of parallel jobs (default 1)
 
@@ -374,11 +622,8 @@ class CombinatorialPurgedCV:
         """
         splits = self.split(x, y, sample_weights)
 
-        def default_scoring_func(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-            return (y_true == y_pred).mean()
-
         if scoring_func is None:
-            scoring_func = default_scoring_func
+            scoring_func = _default_scoring_func
 
         scores = []
         dd_list: list[float] = []
@@ -491,13 +736,13 @@ class CombinatorialPurgedCV:
 
     @staticmethod
     def _evaluate_split(
-        x: pd.DataFrame,
-        y: pd.Series,
+        x: Any,
+        y: Any,
         train_idx: np.ndarray,
         test_idx: np.ndarray,
         model_factory: Callable,
         scoring_func: Callable,
-        sample_weights: pd.Series | None,
+        sample_weights: Any | None,
         max_daily_loss_pct: float,
         max_trades_per_day: int,
         min_trading_days: int,
@@ -517,9 +762,9 @@ class CombinatorialPurgedCV:
 
 
 def cpcv_backtest(
-    x: pd.DataFrame,
-    y: pd.Series,
-    metadata: pd.DataFrame,
+    x: Any,
+    y: Any,
+    metadata: Any,
     model_factory: Callable,
     n_splits: int = 5,
     n_test_groups: int = 2,
@@ -532,7 +777,7 @@ def cpcv_backtest(
 
     Returns detailed metrics including PnL, win rate, Sharpe, etc.
     """
-    from ..training.evaluation import probs_to_signals, quick_backtest
+    from ..training.evaluation import probs_to_signals, prop_backtest, quick_backtest
 
     cv = CombinatorialPurgedCV(
         n_splits=n_splits,
@@ -549,9 +794,9 @@ def cpcv_backtest(
         if len(train_idx) == 0 or len(test_idx) == 0:
             continue
 
-        x_train = x.iloc[train_idx]
-        y_train = y.iloc[train_idx]
-        x_test = x.iloc[test_idx]
+        x_train = _slice_rows(x, train_idx)
+        y_train = _slice_rows(y, train_idx)
+        x_test = _slice_rows(x, test_idx)
 
         model = model_factory()
 
@@ -564,12 +809,20 @@ def cpcv_backtest(
             else:
                 signals = model.predict(x_test)
 
-            test_metadata = metadata.iloc[test_idx]
-            signals_series = pd.Series(signals, index=test_metadata.index)
-
-            bt_metrics = quick_backtest(test_metadata, signals_series)
+            test_metadata = _slice_rows(metadata, test_idx)
+            bt_metrics: dict[str, Any] = {}
+            try:
+                bt_metrics = prop_backtest(test_metadata, signals)
+            except Exception:
+                bt_metrics = {}
+            if not bt_metrics:
+                bt_metrics = quick_backtest(test_metadata, signals)
 
             if bt_metrics:
+                if "pnl_score" not in bt_metrics and "net_profit" in bt_metrics:
+                    bt_metrics["pnl_score"] = float(bt_metrics.get("net_profit", 0.0))
+                if "max_dd" not in bt_metrics and "max_dd_pct" in bt_metrics:
+                    bt_metrics["max_dd"] = float(bt_metrics.get("max_dd_pct", 0.0))
                 bt_metrics["split"] = i + 1
                 all_backtests.append(bt_metrics)
 
@@ -592,3 +845,4 @@ def cpcv_backtest(
     }
 
     return result
+

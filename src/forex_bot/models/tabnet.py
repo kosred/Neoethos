@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import os
 from pathlib import Path
@@ -5,7 +7,6 @@ from typing import Any
 
 import joblib
 import numpy as np
-import pandas as pd
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -29,6 +30,92 @@ def _try_import_tabnet() -> Any | None:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _is_dataframe_like(value: Any) -> bool:
+    return bool(hasattr(value, "columns") and hasattr(value, "index"))
+
+
+def _is_frame_like(value: Any) -> bool:
+    return bool(hasattr(value, "columns") and hasattr(value, "__getitem__"))
+
+
+def _frame_columns(value: Any) -> list[str]:
+    cols = getattr(value, "columns", None)
+    if cols is None:
+        return []
+    try:
+        return [str(c) for c in list(cols)]
+    except Exception:
+        return []
+
+
+def _slice_rows(value: Any, start: int, end: int) -> Any:
+    s = max(0, int(start))
+    e = max(s, int(end))
+    if _is_dataframe_like(value):
+        idx = np.arange(s, e, dtype=np.int64)
+        try:
+            return value.take(idx)
+        except Exception:
+            try:
+                base_idx = np.asarray(getattr(value, "index")).reshape(-1)
+                return value.loc[base_idx[idx]]
+            except Exception:
+                pass
+    if _is_frame_like(value):
+        cols = _frame_columns(value)
+        if not cols:
+            arr = np.asarray(value)
+            return arr[s:e]
+        out: dict[str, np.ndarray] = {}
+        for col in cols:
+            try:
+                vec = np.asarray(value[col]).reshape(-1)  # type: ignore[index]
+                out[str(col)] = vec[s:e]
+            except Exception:
+                continue
+        return out
+    arr = np.asarray(value)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    return arr[s:e]
+
+
+def _to_2d_float32(value: Any) -> np.ndarray:
+    if isinstance(value, dict):
+        mats: list[np.ndarray] = []
+        n_rows = 0
+        for col in value.keys():
+            try:
+                vec = np.asarray(value[col], dtype=np.float32).reshape(-1)
+                mats.append(vec)
+                n_rows = max(n_rows, int(vec.size))
+            except Exception:
+                continue
+        if mats:
+            out = np.zeros((n_rows, len(mats)), dtype=np.float32)
+            for j, vec in enumerate(mats):
+                take = min(n_rows, int(vec.size))
+                if take > 0:
+                    out[:take, j] = vec[:take]
+            return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    return dataframe_to_float32_numpy(value)
+
+
+def _to_1d_int_labels(value: Any) -> np.ndarray:
+    if hasattr(value, "to_numpy"):
+        try:
+            arr = value.to_numpy(copy=False)
+        except Exception:
+            arr = np.asarray(value)
+    else:
+        arr = np.asarray(value)
+    arr = np.asarray(arr).reshape(-1)
+    if arr.size <= 0:
+        return np.zeros(0, dtype=np.int64)
+    arr = np.nan_to_num(arr.astype(np.float64, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+    return arr.astype(np.int64, copy=False)
 
 
 class AttentiveTransformer(nn.Module):
@@ -142,7 +229,7 @@ class TabNetExpert(ExpertModel):
 
         return TabNetReal(self.input_dim, self.hidden_dim, n_steps=self.n_steps).to(self.device)
 
-    def fit(self, X: pd.DataFrame, y: pd.Series, tensorboard_writer: Any | None = None) -> None:
+    def fit(self, X: Any, y: Any, tensorboard_writer: Any | None = None) -> None:
         self.input_dim = X.shape[1]
         self.model = self._build_model()
 
@@ -156,13 +243,13 @@ class TabNetExpert(ExpertModel):
                 pass
 
         split = int(len(X) * 0.85)
-        X_train, X_val = X.iloc[:split], X.iloc[split:]
-        y_train, y_val = y.iloc[:split], y.iloc[split:]
+        X_train, X_val = _slice_rows(X, 0, split), _slice_rows(X, split, len(X))
+        y_train, y_val = _slice_rows(y, 0, split), _slice_rows(y, split, len(y))
 
-        X_t = torch.as_tensor(dataframe_to_float32_numpy(X_train), dtype=torch.float32, device=self.device)
-        y_t = torch.as_tensor(y_train.values + 1, dtype=torch.long, device=self.device)
-        X_v = torch.as_tensor(dataframe_to_float32_numpy(X_val), dtype=torch.float32, device=self.device)
-        y_v = torch.as_tensor(y_val.values + 1, dtype=torch.long, device=self.device)
+        X_t = torch.as_tensor(_to_2d_float32(X_train), dtype=torch.float32, device=self.device)
+        y_t = torch.as_tensor(_to_1d_int_labels(y_train) + 1, dtype=torch.long, device=self.device)
+        X_v = torch.as_tensor(_to_2d_float32(X_val), dtype=torch.float32, device=self.device)
+        y_v = torch.as_tensor(_to_1d_int_labels(y_val) + 1, dtype=torch.long, device=self.device)
 
         dataset = TensorDataset(X_t, y_t)
         world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
@@ -239,7 +326,7 @@ class TabNetExpert(ExpertModel):
         except Exception as e:
             logger.warning(f"CPU optimization failed: {e}")
 
-    def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, x: Any) -> np.ndarray:
         if self._lib_model is not None:
             raw = self._lib_model.predict_proba(dataframe_to_float32_numpy(x))
             classes: list[int] | None = None
@@ -256,8 +343,8 @@ class TabNetExpert(ExpertModel):
         batch_size = max(32, int(getattr(self, "batch_size", self.PRED_BATCH_SIZE)) * 4)
         with torch.no_grad():
             for start in range(0, len(x), batch_size):
-                xb_df = x.iloc[start : start + batch_size]
-                xb = torch.as_tensor(dataframe_to_float32_numpy(xb_df), dtype=torch.float32, device=self.device)
+                xb_np = _to_2d_float32(_slice_rows(x, start, start + batch_size))
+                xb = torch.as_tensor(xb_np, dtype=torch.float32, device=self.device)
                 logits = self.model(xb)
                 outs.append(torch.softmax(logits, dim=1).cpu().float().numpy())
         if not outs:
@@ -319,3 +406,6 @@ class TabNetExpert(ExpertModel):
                 raise RuntimeError("PyTorch too old for weights_only load; upgrade for security.") from exc
             self.model.load_state_dict(state)
             self._optimize_for_cpu_inference()
+
+
+

@@ -17,7 +17,6 @@ from typing import Any
 
 import joblib
 import numpy as np
-import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +41,23 @@ except ImportError:
     SKL2ONNX_AVAILABLE = False
 
 
+def _to_float32_2d(x: Any) -> np.ndarray:
+    if hasattr(x, "to_numpy"):
+        try:
+            arr = np.asarray(x.to_numpy(dtype=np.float32, copy=False), dtype=np.float32)
+        except TypeError:
+            arr = np.asarray(x.to_numpy(dtype=np.float32), dtype=np.float32)
+    else:
+        arr = np.asarray(x, dtype=np.float32)
+    if arr.ndim == 0:
+        arr = arr.reshape(1, 1)
+    elif arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    elif arr.ndim > 2:
+        arr = arr.reshape(arr.shape[0], -1)
+    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+
+
 class ONNXExporter:
     """
     Exports trained models to ONNX format for ultra-fast inference.
@@ -58,9 +74,7 @@ class ONNXExporter:
         self.onnx_dir = self.models_dir / "onnx"
         self.onnx_dir.mkdir(exist_ok=True, parents=True)
 
-    def export_all(
-        self, models: dict[str, Any], sample_input: pd.DataFrame, meta_blender: Any | None = None
-    ) -> dict[str, Any]:
+    def export_all(self, models: dict[str, Any], sample_input: Any, meta_blender: Any | None = None) -> dict[str, Any]:
         """
         Export all models to ONNX format.
 
@@ -68,7 +82,7 @@ class ONNXExporter:
         ----------
         models : Dict[str, Any]
             Dictionary of trained models {name: model_instance}
-        sample_input : pd.DataFrame
+        sample_input : Any
             Sample input for shape inference (single row)
         meta_blender : Optional[Any]
             Meta-blender ensemble model
@@ -105,10 +119,7 @@ class ONNXExporter:
         if meta_blender is not None:
             try:
                 n_models = len(models)
-                meta_input = pd.DataFrame(
-                    np.random.randn(1, n_models * 3),  # 3 classes per model
-                    columns=[f"model_{i}_class_{j}" for i in range(n_models) for j in range(3)],
-                )
+                meta_input = np.random.randn(1, n_models * 3).astype(np.float32)
 
                 onnx_path = self._export_model("meta_blender", meta_blender, meta_input)
                 if onnx_path:
@@ -130,7 +141,7 @@ class ONNXExporter:
 
         return exported
 
-    def _export_model(self, name: str, model: Any, sample_input: pd.DataFrame) -> Path | None:
+    def _export_model(self, name: str, model: Any, sample_input: Any) -> Path | None:
         """Export a single model to ONNX"""
 
         base = getattr(model, "model", model)
@@ -163,7 +174,7 @@ class ONNXExporter:
             logger.debug(f"ONNX export not supported for model type: {model_type}")
             return None
 
-    def _export_sklearn_model(self, name: str, model: Any, sample_input: pd.DataFrame) -> Path | None:
+    def _export_sklearn_model(self, name: str, model: Any, sample_input: Any) -> Path | None:
         """Export sklearn-compatible model to ONNX"""
 
         if not SKL2ONNX_AVAILABLE:
@@ -171,7 +182,8 @@ class ONNXExporter:
             return None
 
         try:
-            n_features = sample_input.shape[1]
+            x_np = _to_float32_2d(sample_input)
+            n_features = int(x_np.shape[1])
             initial_type = [("float_input", FloatTensorType([None, n_features]))]
 
             # Disable ZipMap so ONNXRuntime returns a numeric (N, C) probabilities array
@@ -191,7 +203,7 @@ class ONNXExporter:
             return None
 
     def _export_catboost_model(
-        self, name: str, model: Any, sample_input: pd.DataFrame, *, original_model: Any
+        self, name: str, model: Any, sample_input: Any, *, original_model: Any
     ) -> Path | None:
         """Export CatBoost to ONNX using CatBoost's native exporter."""
         if not ONNX_AVAILABLE:
@@ -207,7 +219,7 @@ class ONNXExporter:
             return None
 
     def _export_lightgbm_model(
-        self, name: str, model: Any, sample_input: pd.DataFrame, *, original_model: Any
+        self, name: str, model: Any, sample_input: Any, *, original_model: Any
     ) -> Path | None:
         """Export LightGBM to ONNX via onnxmltools (optional dependency)."""
         if not ONNX_AVAILABLE:
@@ -221,7 +233,8 @@ class ONNXExporter:
             return None
 
         try:
-            n_features = sample_input.shape[1]
+            x_np = _to_float32_2d(sample_input)
+            n_features = int(x_np.shape[1])
             initial_type = [("float_input", FloatTensorType([None, n_features]))]
             onnx_model = convert_lightgbm(model, initial_types=initial_type, target_opset=12)
             onnx_path = self.onnx_dir / f"{name}.onnx"
@@ -233,7 +246,7 @@ class ONNXExporter:
             return None
 
     def _export_xgboost_model(
-        self, name: str, model: Any, sample_input: pd.DataFrame, *, original_model: Any
+        self, name: str, model: Any, sample_input: Any, *, original_model: Any
     ) -> Path | None:
         """Export XGBoost to ONNX via onnxmltools (optional dependency)."""
         if not ONNX_AVAILABLE:
@@ -247,7 +260,8 @@ class ONNXExporter:
             return None
 
         try:
-            n_features = sample_input.shape[1]
+            x_np = _to_float32_2d(sample_input)
+            n_features = int(x_np.shape[1])
             initial_type = [("float_input", FloatTensorType([None, n_features]))]
             onnx_model = convert_xgboost(model, initial_types=initial_type, target_opset=12)
             onnx_path = self.onnx_dir / f"{name}.onnx"
@@ -258,21 +272,21 @@ class ONNXExporter:
             logger.info(f"XGBoost ONNX export failed for {name}: {e}")
             return None
 
-    def _export_pytorch_model(self, name: str, model: Any, sample_input: pd.DataFrame) -> Path | None:
+    def _export_pytorch_model(self, name: str, model: Any, sample_input: Any) -> Path | None:
         """Export PyTorch model to ONNX"""
 
         try:
             import torch
 
             if hasattr(model, "_reshape_data"):
-                x = torch.FloatTensor(np.array(sample_input.values, copy=True))
+                x = torch.FloatTensor(np.array(_to_float32_2d(sample_input), copy=True))
 
                 if hasattr(model, "model"):
                     export_target = model.model
                 else:
                     export_target = model
             else:
-                x = torch.FloatTensor(np.array(sample_input.values, copy=True))
+                x = torch.FloatTensor(np.array(_to_float32_2d(sample_input), copy=True))
                 export_target = model
 
             if hasattr(export_target, "eval"):
@@ -395,7 +409,7 @@ class ONNXExporter:
 
         return np.asarray(result)
 
-    def _verify_onnx_model(self, onnx_path: Path, sample_input: pd.DataFrame, original_model: Any) -> None:
+    def _verify_onnx_model(self, onnx_path: Path, sample_input: Any, original_model: Any) -> None:
         """Verify ONNX model produces same output as original"""
 
         try:
@@ -403,7 +417,8 @@ class ONNXExporter:
 
             input_name = sess.get_inputs()[0].name
 
-            raw = sess.run(None, {input_name: sample_input.values.astype(np.float32)})
+            sample_np = _to_float32_2d(sample_input)
+            raw = sess.run(None, {input_name: sample_np})
 
             base = getattr(original_model, "model", original_model)
             classes = self._extract_classes(base)
@@ -556,7 +571,7 @@ class ONNXInferenceEngine:
         if not self.sessions:
             raise RuntimeError(f"No ONNX models could be loaded (failed={failed})")
 
-    def predict_proba(self, model_name: str, x: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, model_name: str, x: Any) -> np.ndarray:
         """
         Fast inference using ONNX Runtime.
 
@@ -564,7 +579,7 @@ class ONNXInferenceEngine:
         ----------
         model_name : str
             Name of the model to use
-        x : pd.DataFrame
+        x : Any
             Input features
 
         Returns
@@ -579,7 +594,7 @@ class ONNXInferenceEngine:
         input_name = sess.get_inputs()[0].name
 
         output_name = self.model_proba_output.get(model_name)
-        x_np = x.to_numpy(dtype=np.float32, copy=False)
+        x_np = _to_float32_2d(x)
         if output_name:
             # Request only the probability output to avoid ONNXRuntime warnings about the label output shape.
             result = sess.run([output_name], {input_name: x_np})
@@ -625,7 +640,7 @@ class ONNXInferenceEngine:
         # Fallback: probability output is almost always the last output for sklearn-converted graphs.
         return outputs[-1].name
 
-    def predict_ensemble(self, x: pd.DataFrame) -> np.ndarray:
+    def predict_ensemble(self, x: Any) -> np.ndarray:
         """
         Get ensemble predictions from all models (excluding meta_blender).
 
@@ -647,11 +662,12 @@ class ONNXInferenceEngine:
                 logger.info(f"Prediction failed for {name}: {e}")
 
         if not probas:
-            return np.zeros((len(x), 3))
+            n_rows = int(_to_float32_2d(x).shape[0])
+            return np.zeros((n_rows, 3))
 
         return np.mean(probas, axis=0)
 
-    def predict_with_meta_blender(self, x: pd.DataFrame) -> np.ndarray:
+    def predict_with_meta_blender(self, x: Any) -> np.ndarray:
         """
         Full ensemble prediction with meta-blender.
 
@@ -671,20 +687,20 @@ class ONNXInferenceEngine:
                 logger.info(f"Base prediction failed for {name}: {e}")
 
         if not base_probas:
-            return np.zeros((len(x), 3))
+            n_rows = int(_to_float32_2d(x).shape[0])
+            return np.zeros((n_rows, 3))
 
         meta_features = np.hstack(base_probas)
-        meta_df = pd.DataFrame(meta_features)
 
         if "meta_blender" in self.sessions:
             try:
-                return self.predict_proba("meta_blender", meta_df)
+                return self.predict_proba("meta_blender", meta_features)
             except Exception as e:
                 logger.info(f"Meta-blender prediction failed: {e}")
 
         return np.mean(base_probas, axis=0)
 
-    def benchmark(self, x: pd.DataFrame, n_iterations: int = 100) -> dict[str, float]:
+    def benchmark(self, x: Any, n_iterations: int = 100) -> dict[str, float]:
         """
         Benchmark inference speed for all models.
 
@@ -710,3 +726,5 @@ class ONNXInferenceEngine:
                 results[name] = np.mean(times)
 
         return results
+
+

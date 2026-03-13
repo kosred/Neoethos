@@ -7,26 +7,26 @@ use std::collections::HashMap;
 /// Assumes [Neutral, Buy, Sell] convention at indices [0, 1, 2].
 pub fn probs_to_signals(probs: &Array2<f32>) -> Array1<i32> {
     let mut signals = Array1::zeros(probs.nrows());
-    
+
     for i in 0..probs.nrows() {
         let row = probs.row(i);
         let mut max_val = row[0];
         let mut max_idx = 0;
-        
+
         for (j, &val) in row.iter().enumerate() {
             if val > max_val {
                 max_val = val;
                 max_idx = j;
             }
         }
-        
+
         signals[i] = match max_idx {
-            1 => 1,   // Buy
-            2 => -1,  // Sell
-            _ => 0,   // Neutral
+            1 => 1,  // Buy
+            2 => -1, // Sell
+            _ => 0,  // Neutral
         };
     }
-    
+
     signals
 }
 
@@ -37,7 +37,8 @@ pub fn simple_backtest(df: &DataFrame, signals: &Array1<i32>) -> Result<HashMap<
     }
 
     let close_col = df.column("close")?.as_materialized_series();
-    let close: Vec<f64> = close_col.cast(&DataType::Float64)?
+    let close: Vec<f64> = close_col
+        .cast(&DataType::Float64)?
         .f64()?
         .into_iter()
         .map(|v| v.unwrap_or(0.0))

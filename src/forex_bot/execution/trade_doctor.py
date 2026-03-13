@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 import numpy as np
-import pandas as pd
 
 from ..models.exit_agent import ExitAgent
 from .mt5_state_manager import MT5Position
@@ -18,6 +20,62 @@ class CloseInstruction:
     volume: float  # 0.0 means close all
     reason: str
     score: float
+
+
+def _frame_empty(df: Any) -> bool:
+    if df is None:
+        return True
+    try:
+        return bool(df.empty)
+    except Exception:
+        pass
+    try:
+        return int(len(df)) <= 0
+    except Exception:
+        return True
+
+
+def _frame_columns(df: Any) -> list[str]:
+    cols = getattr(df, "columns", None)
+    if cols is None:
+        return []
+    try:
+        return [str(c) for c in list(cols)]
+    except Exception:
+        return []
+
+
+def _frame_has_column(df: Any, name: str) -> bool:
+    target = str(name).strip().lower()
+    for col in _frame_columns(df):
+        if str(col).strip().lower() == target:
+            return True
+    return False
+
+
+def _frame_resolve_column(df: Any, name: str) -> str | None:
+    target = str(name).strip().lower()
+    for col in _frame_columns(df):
+        if str(col).strip().lower() == target:
+            return col
+    return None
+
+
+def _frame_column_numpy(df: Any, name: str, *, dtype: Any = np.float64) -> np.ndarray:
+    col = _frame_resolve_column(df, name)
+    if col is None:
+        raise KeyError(name)
+    values = df[col]  # type: ignore[index]
+    if hasattr(values, "to_numpy"):
+        try:
+            arr = np.asarray(values.to_numpy(dtype=dtype, copy=False), dtype=dtype)
+        except TypeError:
+            arr = np.asarray(values.to_numpy(dtype=dtype), dtype=dtype)
+        except Exception:
+            arr = np.asarray(values, dtype=dtype)
+    else:
+        arr = np.asarray(values, dtype=dtype)
+    return arr.reshape(-1)
 
 
 try:
@@ -129,7 +187,7 @@ class TradeDoctor:
             f"TimeStop={self.time_stop_minutes:.1f}m"
         )
 
-    def diagnose(self, positions: list[MT5Position], frames: dict[str, pd.DataFrame]) -> list[CloseInstruction]:
+    def diagnose(self, positions: list[MT5Position], frames: dict[str, Any]) -> list[CloseInstruction]:
         """
         HPC Optimized: Evaluate all open positions using Numba.
         """
@@ -143,14 +201,27 @@ class TradeDoctor:
             return instructions
 
         df = frames.get("M1") or frames.get("M5")
-        if df is None or df.empty:
+        if _frame_empty(df):
             return instructions
 
-        current_price = float(df["close"].iloc[-1])
-        recent_closes = df["close"].iloc[-5:].values
+        close_arr = _frame_column_numpy(df, "close", dtype=np.float64)
+        if close_arr.size <= 0:
+            return instructions
+        current_price = float(close_arr[-1])
+        recent_closes = close_arr[-min(5, int(close_arr.size)) :]
         momentum = float(recent_closes[-1] - recent_closes[0]) if len(recent_closes) > 1 else 0.0
-        rsi = float(df["rsi"].iloc[-1]) if "rsi" in df.columns else 50.0
-        vol = float(df["atr"].iloc[-1]) if "atr" in df.columns else 0.001
+        if _frame_has_column(df, "rsi"):
+            rsi_vals = _frame_column_numpy(df, "rsi", dtype=np.float64)
+            rsi = float(rsi_vals[-1]) if rsi_vals.size > 0 else 50.0
+        else:
+            rsi = 50.0
+        if _frame_has_column(df, "atr"):
+            atr_vals = _frame_column_numpy(df, "atr", dtype=np.float64)
+            vol = float(atr_vals[-1]) if atr_vals.size > 0 else 0.001
+        else:
+            vol = 0.001
+        if not np.isfinite(vol) or vol <= 0.0:
+            vol = 0.001
         now = datetime.now(UTC)
 
         # Prepare arrays for Numba
@@ -292,3 +363,4 @@ class TradeDoctor:
                 )
 
         return None
+

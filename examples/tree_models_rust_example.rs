@@ -5,7 +5,7 @@
 //! This example shows how to use tree models from pure Rust without Python.
 //! Compare this to tree_models_example.py to see the difference.
 //!
-//! Build: cargo run --example tree_models_rust_example --features tree-models --release
+//! Build: cargo run --example tree_models_rust_example --features tree-models-core --release
 //!
 //! Performance Expectations:
 //! - Training: 5-10x faster than Python

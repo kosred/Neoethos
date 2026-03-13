@@ -8,10 +8,14 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pandas as pd
 
 from .base import ExpertModel, get_early_stop_params, time_series_train_val_split, validate_time_ordering
 from .label_utils import probs_to_three_class, remap_labels_sell_neutral_buy
+
+try:
+    import forex_bindings as _fb  # type: ignore
+except Exception:
+    _fb = None  # type: ignore
 
 try:
     import lightgbm as lgb
@@ -40,6 +44,245 @@ except Exception:
 import joblib
 
 logger = logging.getLogger(__name__)
+
+
+def _is_dataframe_like(value: Any) -> bool:
+    return bool(hasattr(value, "columns") and hasattr(value, "index"))
+
+
+def _is_frame_like(value: Any) -> bool:
+    return bool(hasattr(value, "columns") and hasattr(value, "__getitem__"))
+
+
+def _is_datetime_index(value: Any) -> bool:
+    if value is None:
+        return False
+    if hasattr(value, "year") and hasattr(value, "month") and hasattr(value, "day"):
+        return True
+    try:
+        arr = np.asarray(value).reshape(-1)
+        if arr.size <= 0:
+            return False
+        if np.issubdtype(arr.dtype, np.datetime64):
+            return True
+        if arr.dtype.kind == "O":
+            for item in arr.tolist():
+                if item is None:
+                    continue
+                if hasattr(item, "year") and hasattr(item, "month") and hasattr(item, "day"):
+                    return True
+                try:
+                    np.datetime64(item, "ns")
+                    return True
+                except Exception:
+                    continue
+        return False
+    except Exception:
+        return False
+
+
+def _index_to_ns_int64(index: Any) -> np.ndarray | None:
+    if index is None:
+        return None
+    try:
+        if hasattr(index, "asi8"):
+            arr = np.asarray(index.asi8, dtype=np.int64).reshape(-1)
+            return arr if arr.size > 0 else np.zeros(0, dtype=np.int64)
+    except Exception:
+        pass
+    try:
+        arr = np.asarray(index).reshape(-1)
+    except Exception:
+        return None
+    if arr.size <= 0:
+        return np.zeros(0, dtype=np.int64)
+    try:
+        if np.issubdtype(arr.dtype, np.datetime64):
+            return arr.astype("datetime64[ns]").astype(np.int64, copy=False)
+        if arr.dtype.kind in {"i", "u"}:
+            return arr.astype(np.int64, copy=False)
+        if arr.dtype.kind == "f":
+            return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.int64, copy=False)
+    except Exception:
+        pass
+    out = np.zeros(arr.size, dtype=np.int64)
+    for i, value in enumerate(arr.tolist()):
+        try:
+            ns = getattr(value, "value", None)
+            if ns is not None:
+                out[i] = int(ns)
+            else:
+                out[i] = int(np.datetime64(value, "ns").astype(np.int64))
+        except Exception:
+            try:
+                out[i] = int(value)
+            except Exception:
+                out[i] = 0
+    return out
+
+
+def _rust_sorted_index_order(index: Any) -> np.ndarray | None:
+    if _fb is None or not hasattr(_fb, "sorted_index_order"):
+        return None
+    idx_ns = _index_to_ns_int64(index)
+    if idx_ns is None:
+        return None
+    try:
+        out = _fb.sorted_index_order(np.asarray(idx_ns, dtype=np.int64))
+    except Exception:
+        return None
+    order = np.asarray(out, dtype=np.int64).reshape(-1)
+    if order.shape[0] != idx_ns.shape[0]:
+        return None
+    return order
+
+
+def _sorted_time_order(index: Any) -> np.ndarray | None:
+    idx_ns = _index_to_ns_int64(index)
+    if idx_ns is None or idx_ns.size <= 1:
+        return None
+    if not bool(np.any(idx_ns[1:] < idx_ns[:-1])):
+        return None
+    order = _rust_sorted_index_order(idx_ns)
+    if order is not None:
+        return order
+    return np.argsort(np.asarray(idx_ns, dtype=np.int64), kind="mergesort")
+
+
+def _to_numpy_1d(values: Any, *, dtype: Any = np.float64) -> np.ndarray:
+    if hasattr(values, "to_numpy"):
+        arr = np.asarray(values.to_numpy(copy=False), dtype=dtype)
+    else:
+        arr = np.asarray(values, dtype=dtype)
+    if arr.ndim == 0:
+        return np.asarray([arr.item()], dtype=dtype)
+    return arr.reshape(-1)
+
+
+def _pct_change(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    n = int(arr.shape[0])
+    out = np.zeros(n, dtype=np.float64)
+    if n <= 1:
+        return out
+    prev = arr[:-1]
+    curr = arr[1:]
+    delta = curr - prev
+    np.divide(delta, prev, out=out[1:], where=np.abs(prev) > 1e-12)
+    out[~np.isfinite(out)] = 0.0
+    return out
+
+
+def _rolling_std(values: np.ndarray, window: int) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    n = int(arr.shape[0])
+    out = np.zeros(n, dtype=np.float64)
+    w = max(1, int(window))
+    if n <= 0 or n < w:
+        return out
+    arr2 = arr * arr
+    c1 = np.cumsum(arr)
+    c2 = np.cumsum(arr2)
+    sum_w = c1[w - 1 :] - np.concatenate(([0.0], c1[:-w]))
+    sq_w = c2[w - 1 :] - np.concatenate(([0.0], c2[:-w]))
+    mean_w = sum_w / float(w)
+    var_w = np.maximum((sq_w / float(w)) - (mean_w * mean_w), 0.0)
+    out[w - 1 :] = np.sqrt(var_w)
+    out[~np.isfinite(out)] = 0.0
+    return out
+
+
+def _feature_names(x: Any) -> list[str]:
+    if hasattr(x, "columns"):
+        return [str(c) for c in list(x.columns)]
+    arr = np.asarray(x)
+    if arr.ndim == 0:
+        return ["f0"]
+    if arr.ndim == 1:
+        return ["f0"]
+    return [f"f{i}" for i in range(int(arr.shape[1]))]
+
+
+def _replace_inf_with_nan(x: Any) -> Any:
+    if hasattr(x, "replace"):
+        return x.replace([np.inf, -np.inf], np.nan)
+    arr = np.asarray(x, dtype=np.float64)
+    if arr.ndim == 0:
+        arr = arr.reshape(1, 1)
+    elif arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    elif arr.ndim > 2:
+        arr = arr.reshape(arr.shape[0], -1)
+    return np.where(np.isinf(arr), np.nan, arr)
+
+
+def _sort_by_datetime_index(x: Any, y: Any) -> tuple[Any, Any]:
+    idx = getattr(x, "index", None)
+    if not _is_datetime_index(idx):
+        return x, y
+    try:
+        monotonic_attr = getattr(idx, "is_monotonic_increasing", None)
+        if monotonic_attr is None:
+            idx_ns = _index_to_ns_int64(idx)
+            is_monotonic = bool(
+                idx_ns is not None and (idx_ns.size <= 1 or bool(np.all(idx_ns[1:] >= idx_ns[:-1])))
+            )
+        else:
+            is_monotonic = bool(monotonic_attr)
+        if not is_monotonic:
+            order = _sorted_time_order(idx)
+            if order is None:
+                return x, y
+            x = _slice_by_indices(x, order)
+            y = _slice_by_indices(y, order)
+    except Exception:
+        return x, y
+    return x, y
+
+
+def _slice_by_indices(obj: Any, indices: Any) -> Any:
+    if obj is None:
+        return None
+    idx = np.asarray(indices, dtype=np.int64).reshape(-1)
+    if _is_dataframe_like(obj):
+        with contextlib.suppress(Exception):
+            return obj.take(idx)
+        with contextlib.suppress(Exception):
+            base_idx = np.asarray(getattr(obj, "index")).reshape(-1)
+            if base_idx.shape[0] > 0:
+                return obj.loc[base_idx[idx]]
+    if _is_frame_like(obj):
+        cols = getattr(obj, "columns", None)
+        names: list[str] = []
+        if cols is not None:
+            with contextlib.suppress(Exception):
+                names = [str(c) for c in list(cols)]
+        out: dict[str, Any] = {}
+        for col in names:
+            with contextlib.suppress(Exception):
+                vec = np.asarray(obj[col]).reshape(-1)  # type: ignore[index]
+                out[col] = vec[idx]
+        src_idx = getattr(obj, "index", None)
+        if src_idx is not None:
+            src_arr = np.asarray(src_idx).reshape(-1)
+            out["index"] = src_arr[idx]
+        return out
+    arr = np.asarray(obj)
+    if arr.ndim == 0:
+        return arr
+    return arr[idx]
+
+
+def _slice_rows(obj: Any, start: int, end: int | None = None) -> Any:
+    if obj is None:
+        return None
+    s = max(0, int(start))
+    if _is_dataframe_like(obj) or _is_frame_like(obj):
+        n = int(len(obj))
+        e = n if end is None else min(n, max(s, int(end)))
+        return _slice_by_indices(obj, np.arange(s, e, dtype=np.int64))
+    arr = np.asarray(obj)
+    return arr[s:end] if end is not None else arr[s:]
 
 
 def _cpu_threads_hint() -> int:
@@ -160,36 +403,49 @@ def _reorder_to_neutral_buy_sell(probs: np.ndarray, classes: list[int] | None) -
     )
 
 
-def _augment_time_features(df: pd.DataFrame) -> pd.DataFrame:
+def _augment_time_features(df: Any) -> Any:
     """
     Add lightweight lag/volatility features for tree models when raw close is available.
     If 'close' is absent, returns the input unchanged.
     """
-    if "close" not in df.columns:
+    if not _is_dataframe_like(df) or "close" not in df.columns:
         return df
     required = ("ret1", "ret1_lag1", "ret1_lag2", "ret1_lag5", "ret1_lag8", "vol14", "vol50", "mom5", "mom15")
     if all(col in df.columns for col in required):
         return df
     try:
         cached = df.attrs.get("_tree_augmented_cache")
-        if isinstance(cached, pd.DataFrame):
+        if _is_dataframe_like(cached):
             if all(col in cached.columns for col in required):
                 return cached
     except Exception:
         pass
     try:
         out = df.copy()
-        close = pd.to_numeric(out["close"], errors="coerce")
-        ret1 = close.pct_change().fillna(0.0)
+        close = _to_numpy_1d(out["close"], dtype=np.float64)
+        n = int(close.shape[0])
+        ret1 = _pct_change(close)
         out["ret1"] = ret1
-        out["ret1_lag1"] = ret1.shift(1).fillna(0.0)
-        out["ret1_lag2"] = ret1.shift(2).fillna(0.0)
-        out["ret1_lag5"] = ret1.shift(5).fillna(0.0)
-        out["ret1_lag8"] = ret1.shift(8).fillna(0.0)
-        out["vol14"] = ret1.rolling(14).std().fillna(0.0)
-        out["vol50"] = ret1.rolling(50).std().fillna(0.0)
-        out["mom5"] = close.diff(5).fillna(0.0)
-        out["mom15"] = close.diff(15).fillna(0.0)
+        out["ret1_lag1"] = np.concatenate(([0.0], ret1[:-1])) if n > 0 else ret1
+        out["ret1_lag2"] = np.concatenate((np.zeros(2, dtype=np.float64), ret1[:-2])) if n > 2 else np.zeros(
+            n, dtype=np.float64
+        )
+        out["ret1_lag5"] = np.concatenate((np.zeros(5, dtype=np.float64), ret1[:-5])) if n > 5 else np.zeros(
+            n, dtype=np.float64
+        )
+        out["ret1_lag8"] = np.concatenate((np.zeros(8, dtype=np.float64), ret1[:-8])) if n > 8 else np.zeros(
+            n, dtype=np.float64
+        )
+        out["vol14"] = _rolling_std(ret1, 14)
+        out["vol50"] = _rolling_std(ret1, 50)
+        mom5 = np.zeros(n, dtype=np.float64)
+        mom15 = np.zeros(n, dtype=np.float64)
+        if n > 5:
+            mom5[5:] = close[5:] - close[:-5]
+        if n > 15:
+            mom15[15:] = close[15:] - close[:-15]
+        out["mom5"] = mom5
+        out["mom15"] = mom15
         try:
             df.attrs["_tree_augmented_cache"] = out
         except Exception:
@@ -199,7 +455,7 @@ def _augment_time_features(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
 
-def _remap_labels_to_contiguous(y: pd.Series | np.ndarray) -> tuple[np.ndarray, dict[int, int]]:
+def _remap_labels_to_contiguous(y: Any | np.ndarray) -> tuple[np.ndarray, dict[int, int]]:
     """
     HPC FIX: Hardcoded Deterministic Mapping.
     Prevents 'Label Drift' where Buy/Sell columns are swapped depending on data.
@@ -282,24 +538,20 @@ class LightGBMExpert(ExpertModel):
         }
         _apply_quick_tree_caps(self.params, family="lgbm")
 
-    def fit(self, x: pd.DataFrame, y: pd.Series) -> bool:
+    def fit(self, x: Any, y: Any) -> bool:
         if not LGBM_AVAILABLE:
             logger.warning("LightGBM not available.")
             return False
 
         try:
             x = _augment_time_features(x)
-            # Enforce time ordering if index is datetime and not monotonic
-            if isinstance(x.index, pd.DatetimeIndex) and not x.index.is_monotonic_increasing:
-                order = np.argsort(x.index.view("int64"))
-                x = x.iloc[order]
-                y = y.iloc[order]
+            x, y = _sort_by_datetime_index(x, y)
 
             # Clean inf values (replace with nan)
-            x = x.replace([np.inf, -np.inf], np.nan)
+            x = _replace_inf_with_nan(x)
 
             params = self.params.copy()
-            mono = _resolve_lgbm_monotone_constraints(params, list(x.columns))
+            mono = _resolve_lgbm_monotone_constraints(params, _feature_names(x))
             if mono is not None:
                 params["monotone_constraints"] = mono
             else:
@@ -351,18 +603,14 @@ class LightGBMExpert(ExpertModel):
                     y_arr, mapping = _remap_labels_to_contiguous(y)
                     embargo = max(24, int(len(y_arr) * 0.01))
                     x_train, x_val, y_train, y_val = time_series_train_val_split(
-                        x,
-                        pd.Series(y_arr, index=y.index),
-                        val_ratio=0.15,
-                        min_train_samples=100,
-                        embargo_samples=embargo,
+                        x, y_arr, val_ratio=0.15, min_train_samples=100, embargo_samples=embargo
                     )
                     eval_set = [(x_val, y_val)]
                 except ValueError:
                     # Fall back to simple positional split if validation fails
                     split_idx = int(len(x) * 0.85)
                     y_arr, mapping = _remap_labels_to_contiguous(y)
-                    x_train, x_val = x.iloc[:split_idx], x.iloc[split_idx:]
+                    x_train, x_val = _slice_rows(x, 0, split_idx), _slice_rows(x, split_idx, None)
                     y_train, y_val = y_arr[:split_idx], y_arr[split_idx:]
                     eval_set = [(x_val, y_val)]
             else:
@@ -428,7 +676,7 @@ class LightGBMExpert(ExpertModel):
             self.model = None
             return False
 
-    def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, x: Any) -> np.ndarray:
         if self._gpu_only_disabled:
             raise RuntimeError("GPU-only mode: LightGBM skipped.")
         if self.model is None:
@@ -505,7 +753,7 @@ class XGBoostExpert(ExpertModel):
             if _gpu_only_mode():
                 self._gpu_only_disabled = True
 
-    def fit(self, x: pd.DataFrame, y: pd.Series) -> None:
+    def fit(self, x: Any, y: Any) -> None:
         if self._gpu_only_disabled:
             logger.warning("GPU-only mode: XGBoost GPU unavailable; skipping.")
             self.model = None
@@ -514,13 +762,10 @@ class XGBoostExpert(ExpertModel):
             logger.warning("XGBoost not available")
             return
         try:
-            if isinstance(x.index, pd.DatetimeIndex) and not x.index.is_monotonic_increasing:
-                order = np.argsort(x.index.view("int64"))
-                x = x.iloc[order]
-                y = y.iloc[order]
+            x, y = _sort_by_datetime_index(x, y)
 
             # XGBoost can't handle inf values - replace with nan (which XGBoost handles natively)
-            x = x.replace([np.inf, -np.inf], np.nan)
+            x = _replace_inf_with_nan(x)
 
             # XGBoost's sklearn wrapper expects multiclass labels to be contiguous: {0,1,2,...}.
             # Our project uses {-1,0,1} where -1=sell, 0=neutral, 1=buy.
@@ -536,18 +781,14 @@ class XGBoostExpert(ExpertModel):
                     validate_time_ordering(x, context="XGBoostExpert.fit")
                     embargo = max(24, int(len(y_arr) * 0.01))
                     x_train, x_val, y_train_s, y_val_s = time_series_train_val_split(
-                        x,
-                        pd.Series(y_arr, index=y.index),
-                        val_ratio=0.15,
-                        min_train_samples=100,
-                        embargo_samples=embargo,
+                        x, y_arr, val_ratio=0.15, min_train_samples=100, embargo_samples=embargo
                     )
-                    y_train = y_train_s.to_numpy(dtype=int)
-                    y_val = y_val_s.to_numpy(dtype=int)
+                    y_train = np.asarray(y_train_s, dtype=int)
+                    y_val = np.asarray(y_val_s, dtype=int)
                     eval_set = [(x_val, y_val)]
                 except ValueError:
                     split_idx = int(len(x) * 0.85)
-                    x_train, x_val = x.iloc[:split_idx], x.iloc[split_idx:]
+                    x_train, x_val = _slice_rows(x, 0, split_idx), _slice_rows(x, split_idx, None)
                     y_train = y_arr[:split_idx]
                     y_val = y_arr[split_idx:]
                     eval_set = [(x_val, y_val)]
@@ -573,7 +814,7 @@ class XGBoostExpert(ExpertModel):
         except Exception as e:
             logger.error(f"XGBoost training failed: {e}")
 
-    def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, x: Any) -> np.ndarray:
         if self._gpu_only_disabled:
             raise RuntimeError("GPU-only mode: XGBoost skipped.")
         if self.model is None:
@@ -645,7 +886,7 @@ class CatBoostExpert(ExpertModel):
             if _gpu_only_mode():
                 self._gpu_only_disabled = True
 
-    def fit(self, x: pd.DataFrame, y: pd.Series) -> None:
+    def fit(self, x: Any, y: Any) -> None:
         if self._gpu_only_disabled:
             logger.warning("GPU-only mode: CatBoost GPU unavailable; skipping.")
             self.model = None
@@ -654,44 +895,44 @@ class CatBoostExpert(ExpertModel):
             logger.warning("CatBoost not available")
             return
         try:
-            if isinstance(x.index, pd.DatetimeIndex) and not x.index.is_monotonic_increasing:
-                order = np.argsort(x.index.view("int64"))
-                x = x.iloc[order]
-                y = y.iloc[order]
+            x, y = _sort_by_datetime_index(x, y)
 
             # Clean inf values (replace with nan)
-            x = x.replace([np.inf, -np.inf], np.nan)
+            x = _replace_inf_with_nan(x)
 
-            uniq, counts = np.unique(y, return_counts=True)
+            y_arr = np.asarray(y, dtype=int).reshape(-1)
+            uniq, counts = np.unique(y_arr, return_counts=True)
             class_weights = {
-                int(cls): float(len(y) / (len(uniq) * cnt)) for cls, cnt in zip(uniq, counts, strict=False) if cnt > 0
+                int(cls): float(len(y_arr) / (len(uniq) * cnt))
+                for cls, cnt in zip(uniq, counts, strict=False)
+                if cnt > 0
             }
 
             params = self.params.copy()
             params["class_weights"] = list(class_weights.values()) if class_weights else None
 
             x_train = x
-            y_train = y
+            y_train = y_arr
             eval_set = None
-            if len(y) > 500:
+            if len(y_arr) > 500:
                 try:
                     validate_time_ordering(x, context="CatBoostExpert.fit")
-                    embargo = max(24, int(len(y) * 0.01))
+                    embargo = max(24, int(len(y_arr) * 0.01))
                     x_train, x_val, y_train_s, y_val_s = time_series_train_val_split(
                         x,
-                        y,
+                        y_arr,
                         val_ratio=0.15,
                         min_train_samples=100,
                         embargo_samples=embargo,
                     )
-                    y_train = y_train_s
-                    y_val = y_val_s
+                    y_train = np.asarray(y_train_s, dtype=int)
+                    y_val = np.asarray(y_val_s, dtype=int)
                     eval_set = (x_val, y_val)
                 except ValueError:
                     split_idx = int(len(x) * 0.85)
-                    x_train, x_val = x.iloc[:split_idx], x.iloc[split_idx:]
-                    y_train = y.iloc[:split_idx]
-                    y_val = y.iloc[split_idx:]
+                    x_train, x_val = _slice_rows(x, 0, split_idx), _slice_rows(x, split_idx, None)
+                    y_train = y_arr[:split_idx]
+                    y_val = y_arr[split_idx:]
                     eval_set = (x_val, y_val)
 
             if eval_set is not None:
@@ -709,7 +950,7 @@ class CatBoostExpert(ExpertModel):
         except Exception as e:
             logger.error(f"CatBoost training failed: {e}")
 
-    def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, x: Any) -> np.ndarray:
         if self._gpu_only_disabled:
             raise RuntimeError("GPU-only mode: CatBoost skipped.")
         if self.model is None:
@@ -809,3 +1050,5 @@ class XGBoostDARTExpert(XGBoostExpert):
         if params:
             defaults.update(params)
         super().__init__(params=defaults)
+
+

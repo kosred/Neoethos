@@ -1,7 +1,6 @@
 import hashlib
 import logging
 import sqlite3
-import threading
 import sys
 import contextlib
 from collections.abc import Iterable, Sequence

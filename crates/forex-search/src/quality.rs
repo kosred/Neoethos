@@ -77,7 +77,12 @@ impl Default for StrategyQualityAnalyzer {
 }
 
 impl StrategyQualityAnalyzer {
-    pub fn analyze_strategy(&self, strategy_id: &str, trades: &[Trade], initial_balance: f64) -> StrategyMetrics {
+    pub fn analyze_strategy(
+        &self,
+        strategy_id: &str,
+        trades: &[Trade],
+        initial_balance: f64,
+    ) -> StrategyMetrics {
         if trades.is_empty() {
             return empty_metrics(strategy_id);
         }
@@ -116,11 +121,20 @@ impl StrategyQualityAnalyzer {
         } else {
             returns.iter().map(|v| -v.abs()).collect()
         };
-        let avg_loss_pct = if !losses_cleaned.is_empty() { mean(&losses_cleaned) } else { 0.0 };
+        let avg_loss_pct = if !losses_cleaned.is_empty() {
+            mean(&losses_cleaned)
+        } else {
+            0.0
+        };
         let avg_loss_mag = avg_loss_pct.abs();
 
         let gross_profit: f64 = pnls.iter().cloned().filter(|v| *v > 0.0).sum();
-        let gross_loss: f64 = pnls.iter().cloned().filter(|v| *v < 0.0).map(|v| v.abs()).sum();
+        let gross_loss: f64 = pnls
+            .iter()
+            .cloned()
+            .filter(|v| *v < 0.0)
+            .map(|v| v.abs())
+            .sum();
         let eps = 1e-7;
         let mut profit_factor = (gross_profit + eps) / (gross_loss + eps);
         if profit_factor > 100.0 {
@@ -135,18 +149,30 @@ impl StrategyQualityAnalyzer {
             if equity > peak {
                 peak = equity;
             }
-            let dd = if peak > 0.0 { (peak - equity) / peak } else { 0.0 };
+            let dd = if peak > 0.0 {
+                (peak - equity) / peak
+            } else {
+                0.0
+            };
             drawdowns.push(dd);
         }
         let max_dd = drawdowns.iter().cloned().fold(0.0, f64::max);
-        let avg_dd = if !drawdowns.is_empty() { mean(&drawdowns) } else { 0.0 };
+        let avg_dd = if !drawdowns.is_empty() {
+            mean(&drawdowns)
+        } else {
+            0.0
+        };
 
         let sharpe = calculate_sharpe(&returns);
         let sortino = calculate_sortino(&returns);
 
         let total_return = pnls.iter().sum::<f64>();
         let total_return_pct = total_return / initial_balance;
-        let calmar = if max_dd > 1e-9 { total_return_pct / max_dd } else { 0.0 };
+        let calmar = if max_dd > 1e-9 {
+            total_return_pct / max_dd
+        } else {
+            0.0
+        };
 
         let longest_win_streak = longest_streak(&pnls, true);
         let longest_loss_streak = longest_streak(&pnls, false);
@@ -159,7 +185,11 @@ impl StrategyQualityAnalyzer {
         let monthly_win_rate = monthly_metrics.monthly_win_rate;
         let avg_monthly_return_pct = monthly_metrics.avg_return_pct;
 
-        let avg_duration = if durations.is_empty() { 0.0 } else { mean(&durations) };
+        let avg_duration = if durations.is_empty() {
+            0.0
+        } else {
+            mean(&durations)
+        };
         let trades_per_month = calculate_trade_frequency(trades);
 
         let mut metrics = StrategyMetrics {
@@ -249,10 +279,18 @@ fn analyze_monthly_consistency(trades: &[Trade], initial_balance: f64) -> Monthl
         }
     }
     let total = monthly_pnl.len();
-    let avg_return_pct = if total > 0 { (sum / total as f64) / initial_balance } else { 0.0 };
+    let avg_return_pct = if total > 0 {
+        (sum / total as f64) / initial_balance
+    } else {
+        0.0
+    };
 
     MonthlyMetrics {
-        monthly_win_rate: if total > 0 { positive as f64 / total as f64 } else { 0.0 },
+        monthly_win_rate: if total > 0 {
+            positive as f64 / total as f64
+        } else {
+            0.0
+        },
         positive,
         negative,
         avg_return_pct,
@@ -271,7 +309,8 @@ fn calculate_trade_frequency(trades: &[Trade]) -> f64 {
         }
         if let Some(dt) = Utc.timestamp_millis_opt(trade.entry_time).single() {
             if dt.weekday().num_days_from_monday() < 5 {
-                let day_key = (dt.year() as i64) * 10000 + (dt.month() as i64) * 100 + dt.day() as i64;
+                let day_key =
+                    (dt.year() as i64) * 10000 + (dt.month() as i64) * 100 + dt.day() as i64;
                 days.insert(day_key);
             }
         }
@@ -533,17 +572,28 @@ impl StrategyRanker {
     ) -> Vec<StrategyMetrics> {
         let mut results = Vec::new();
         for (strategy_id, trades) in strategies {
-            let metrics = self.analyzer.analyze_strategy(strategy_id, trades, initial_balance);
-            self.strategy_metrics.insert(strategy_id.clone(), metrics.clone());
+            let metrics = self
+                .analyzer
+                .analyze_strategy(strategy_id, trades, initial_balance);
+            self.strategy_metrics
+                .insert(strategy_id.clone(), metrics.clone());
             results.push(metrics);
         }
-        results.sort_by(|a, b| b.quality_score.partial_cmp(&a.quality_score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.quality_score
+                .partial_cmp(&a.quality_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results
     }
 
     pub fn get_top_strategies(&self, n: usize, min_quality: f64) -> Vec<String> {
         let mut ranked: Vec<_> = self.strategy_metrics.iter().collect();
-        ranked.sort_by(|a, b| b.1.quality_score.partial_cmp(&a.1.quality_score).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.sort_by(|a, b| {
+            b.1.quality_score
+                .partial_cmp(&a.1.quality_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         ranked
             .into_iter()
             .filter(|(_, m)| m.quality_score >= min_quality && m.has_edge)

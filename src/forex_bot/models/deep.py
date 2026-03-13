@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Deep Learning Expert Models for Trading Signal Classification.
 
@@ -16,14 +18,12 @@ All models support:
 """
 
 import logging
-import os
 import time
 from pathlib import Path
 from typing import Any
 
 import joblib
 import numpy as np
-import pandas as pd
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -43,6 +43,130 @@ from .device import gpu_supports_bf16, maybe_init_distributed, select_device, tu
 from ..core.system import resolve_cpu_budget
 
 logger = logging.getLogger(__name__)
+
+
+def _is_dataframe_like(value: Any) -> bool:
+    return bool(hasattr(value, "columns") and hasattr(value, "index"))
+
+
+def _is_frame_like(value: Any) -> bool:
+    return bool(hasattr(value, "columns") and hasattr(value, "__getitem__"))
+
+
+def _frame_columns(value: Any) -> list[str]:
+    cols = getattr(value, "columns", None)
+    if cols is None:
+        return []
+    try:
+        return [str(c) for c in list(cols)]
+    except Exception:
+        return []
+
+
+def _slice_rows(value: Any, start: int, end: int) -> Any:
+    s = max(0, int(start))
+    e = max(s, int(end))
+    if _is_dataframe_like(value):
+        idx = np.arange(s, e, dtype=np.int64)
+        try:
+            return value.take(idx)
+        except Exception:
+            try:
+                base_idx = np.asarray(getattr(value, "index")).reshape(-1)
+                return value.loc[base_idx[idx]]
+            except Exception:
+                pass
+    if _is_frame_like(value):
+        cols = _frame_columns(value)
+        if not cols:
+            arr = np.asarray(value)
+            return arr[s:e]
+        out: dict[str, np.ndarray] = {}
+        for col in cols:
+            try:
+                vec = np.asarray(value[col]).reshape(-1)  # type: ignore[index]
+                out[str(col)] = vec[s:e]
+            except Exception:
+                continue
+        idx = getattr(value, "index", None)
+        out_idx = np.asarray(idx).reshape(-1)[s:e] if idx is not None else np.arange(max(0, e - s), dtype=np.int64)
+        return {"data": out, "index": out_idx}
+    arr = np.asarray(value)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    return arr[s:e]
+
+
+def _to_2d_float32(value: Any) -> np.ndarray:
+    if isinstance(value, dict) and "data" in value:
+        data = value.get("data") or {}
+        if isinstance(data, dict):
+            mats: list[np.ndarray] = []
+            n_rows = 0
+            for col in data.keys():
+                try:
+                    vec = np.asarray(data[col], dtype=np.float32).reshape(-1)
+                    mats.append(vec)
+                    n_rows = max(n_rows, int(vec.size))
+                except Exception:
+                    continue
+            if mats:
+                out = np.zeros((n_rows, len(mats)), dtype=np.float32)
+                for j, vec in enumerate(mats):
+                    take = min(n_rows, int(vec.size))
+                    if take > 0:
+                        out[:take, j] = vec[:take]
+                return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    if hasattr(value, "to_numpy"):
+        try:
+            arr = value.to_numpy(dtype=np.float32, copy=False)
+        except Exception:
+            arr = np.asarray(value, dtype=np.float32)
+    elif _is_frame_like(value):
+        cols = _frame_columns(value)
+        mats: list[np.ndarray] = []
+        n_rows = 0
+        for col in cols:
+            try:
+                vec = np.asarray(value[col], dtype=np.float32).reshape(-1)  # type: ignore[index]
+                mats.append(vec)
+                n_rows = max(n_rows, int(vec.size))
+            except Exception:
+                continue
+        if mats:
+            arr = np.zeros((n_rows, len(mats)), dtype=np.float32)
+            for j, vec in enumerate(mats):
+                take = min(n_rows, int(vec.size))
+                if take > 0:
+                    arr[:take, j] = vec[:take]
+        else:
+            arr = np.asarray(value, dtype=np.float32)
+    else:
+        arr = np.asarray(value, dtype=np.float32)
+    if arr.ndim == 0:
+        arr = arr.reshape(1, 1)
+    elif arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    elif arr.ndim > 2:
+        arr = arr.reshape(arr.shape[0], -1)
+    arr = np.asarray(arr, dtype=np.float32)
+    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _to_1d_int_labels(value: Any) -> np.ndarray:
+    if hasattr(value, "to_numpy"):
+        try:
+            arr = value.to_numpy(copy=False)
+        except Exception:
+            arr = np.asarray(value)
+    else:
+        arr = np.asarray(value)
+    arr = np.asarray(arr).reshape(-1)
+    if arr.size <= 0:
+        return np.zeros(0, dtype=np.int64)
+    arr = np.nan_to_num(arr.astype(np.float64, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+    mapped = np.where(arr == -1.0, 2.0, arr).astype(np.int64, copy=False)
+    return mapped
 
 
 def _safe_load_state_dict(model: nn.Module, path: Path, device: str | torch.device) -> None:
@@ -163,7 +287,7 @@ class NBeatsExpert(ExpertModel):
         model, self.device, self.is_ddp, self.rank, self.world_size = wrap_ddp(model, self.device)
         return model
 
-    def fit(self, X: pd.DataFrame, y: pd.Series, tensorboard_writer: Any | None = None) -> None:
+    def fit(self, X: Any, y: Any, tensorboard_writer: Any | None = None) -> None:
         # Validate time ordering
         validate_time_ordering(X, context="NBeatsExpert.fit")
 
@@ -190,16 +314,16 @@ class NBeatsExpert(ExpertModel):
         except ValueError as e:
             logger.warning(f"Time-series split failed, using simple split: {e}")
             split = int(len(X) * 0.85)
-            X_train, X_val = X.iloc[:split], X.iloc[split:]
-            y_train, y_val = y.iloc[:split], y.iloc[split:]
+            X_train, X_val = _slice_rows(X, 0, split), _slice_rows(X, split, len(X))
+            y_train, y_val = _slice_rows(y, 0, split), _slice_rows(y, split, len(y))
 
         # HPC FIX: Unified Protocol Mapping
-        y_train_mapped = np.where(y_train.values == -1, 2, y_train.values).astype(int)
-        y_val_mapped = np.where(y_val.values == -1, 2, y_val.values).astype(int)
+        y_train_mapped = _to_1d_int_labels(y_train)
+        y_val_mapped = _to_1d_int_labels(y_val)
 
-        X_t = torch.as_tensor(X_train.values, dtype=torch.float32, device="cpu")
+        X_t = torch.as_tensor(_to_2d_float32(X_train), dtype=torch.float32, device="cpu")
         y_t = torch.as_tensor(y_train_mapped, dtype=torch.long, device="cpu")
-        X_v = torch.as_tensor(X_val.values, dtype=torch.float32, device=self.device)
+        X_v = torch.as_tensor(_to_2d_float32(X_val), dtype=torch.float32, device=self.device)
         y_v = torch.as_tensor(y_val_mapped, dtype=torch.long, device=self.device)
 
         # Compute class weights for balanced loss
@@ -292,7 +416,7 @@ class NBeatsExpert(ExpertModel):
                     logger.info(f"N-BEATS Early stopping at epoch {epoch}, val_loss={val_loss:.4f}")
                     break
 
-    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, X: Any) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("NBeats model not loaded")
         self.model.eval()
@@ -301,9 +425,8 @@ class NBeatsExpert(ExpertModel):
         use_amp = torch.cuda.is_available() and str(self.device).startswith("cuda")
         with torch.inference_mode():
             for start in range(0, len(X), batch_size):
-                xb = torch.as_tensor(
-                    X.iloc[start : start + batch_size].values, dtype=torch.float32, device=self.device
-                )
+                xb_np = _to_2d_float32(_slice_rows(X, start, start + batch_size))
+                xb = torch.as_tensor(xb_np, dtype=torch.float32, device=self.device)
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     logits = self.model(xb)
                 outs.append(torch.softmax(logits, dim=1).cpu().float().numpy())
@@ -422,7 +545,7 @@ class TiDEExpert(ExpertModel):
         model, self.device, self.is_ddp, self.rank, self.world_size = wrap_ddp(model, self.device)
         return model
 
-    def fit(self, x: pd.DataFrame, y: pd.Series, tensorboard_writer: Any | None = None) -> None:
+    def fit(self, x: Any, y: Any, tensorboard_writer: Any | None = None) -> None:
         validate_time_ordering(x, context="TiDEExpert.fit")
 
         max_rows = getattr(self, "max_train_rows", self.MAX_TRAIN_ROWS)
@@ -446,16 +569,16 @@ class TiDEExpert(ExpertModel):
         except ValueError as e:
             logger.warning(f"Time-series split failed, using simple split: {e}")
             split = int(len(x) * 0.85)
-            X_train, X_val = x.iloc[:split], x.iloc[split:]
-            y_train, y_val = y.iloc[:split], y.iloc[split:]
+            X_train, X_val = _slice_rows(x, 0, split), _slice_rows(x, split, len(x))
+            y_train, y_val = _slice_rows(y, 0, split), _slice_rows(y, split, len(y))
 
         # HPC FIX: Unified Protocol Mapping
-        y_train_mapped = np.where(y_train.values == -1, 2, y_train.values).astype(int)
-        y_val_mapped = np.where(y_val.values == -1, 2, y_val.values).astype(int)
+        y_train_mapped = _to_1d_int_labels(y_train)
+        y_val_mapped = _to_1d_int_labels(y_val)
 
-        X_t = torch.as_tensor(X_train.values, dtype=torch.float32, device=self.device)
+        X_t = torch.as_tensor(_to_2d_float32(X_train), dtype=torch.float32, device=self.device)
         y_t = torch.as_tensor(y_train_mapped, dtype=torch.long, device=self.device)
-        X_v = torch.as_tensor(X_val.values, dtype=torch.float32, device=self.device)
+        X_v = torch.as_tensor(_to_2d_float32(X_val), dtype=torch.float32, device=self.device)
         y_v = torch.as_tensor(y_val_mapped, dtype=torch.long, device=self.device)
 
         class_weights = _compute_class_weight_tensor(y_train_mapped, self.device, num_classes=3)
@@ -509,6 +632,15 @@ class TiDEExpert(ExpertModel):
                     out = self.model(bx)
                     raw_loss = nn.functional.cross_entropy(out, by, weight=class_weights, reduction='none')
                     loss = (raw_loss * vol_weight).mean()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                epoch_loss += loss.item()
+                steps += 1
+
+            avg_train_loss = epoch_loss / max(1, steps)
+            if tensorboard_writer:
+                tensorboard_writer.add_scalar("Loss/train_TiDE", avg_train_loss, epoch)
 
             if len(X_val) > 0:
                 self.model.eval()
@@ -524,7 +656,7 @@ class TiDEExpert(ExpertModel):
                     logger.info(f"TiDE Early stopping at epoch {epoch}, val_loss={val_loss:.4f}")
                     break
 
-    def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, x: Any) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("TiDE model not loaded")
         self.model.eval()
@@ -533,9 +665,8 @@ class TiDEExpert(ExpertModel):
         use_amp = torch.cuda.is_available() and str(self.device).startswith("cuda")
         with torch.no_grad():
             for start in range(0, len(x), batch_size):
-                xb = torch.as_tensor(
-                    x.iloc[start : start + batch_size].values, dtype=torch.float32, device=self.device
-                )
+                xb_np = _to_2d_float32(_slice_rows(x, start, start + batch_size))
+                xb = torch.as_tensor(xb_np, dtype=torch.float32, device=self.device)
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     logits = self.model(xb)
                 outs.append(torch.softmax(logits, dim=1).cpu().float().numpy())
@@ -646,7 +777,7 @@ class TabNetExpert(ExpertModel):
         model, self.device, self.is_ddp, self.rank, self.world_size = wrap_ddp(model, self.device)
         return model
 
-    def fit(self, x: pd.DataFrame, y: pd.Series, tensorboard_writer: Any | None = None) -> None:
+    def fit(self, x: Any, y: Any, tensorboard_writer: Any | None = None) -> None:
         validate_time_ordering(x, context="TabNetExpert.fit")
 
         max_rows = getattr(self, "max_train_rows", self.MAX_TRAIN_ROWS)
@@ -670,16 +801,16 @@ class TabNetExpert(ExpertModel):
         except ValueError as e:
             logger.warning(f"Time-series split failed, using simple split: {e}")
             split = int(len(x) * 0.85)
-            x_train, x_val = x.iloc[:split], x.iloc[split:]
-            y_train, y_val = y.iloc[:split], y.iloc[split:]
+            x_train, x_val = _slice_rows(x, 0, split), _slice_rows(x, split, len(x))
+            y_train, y_val = _slice_rows(y, 0, split), _slice_rows(y, split, len(y))
 
         # HPC FIX: Unified Protocol Mapping
-        y_train_mapped = np.where(y_train.values == -1, 2, y_train.values).astype(int)
-        y_val_mapped = np.where(y_val.values == -1, 2, y_val.values).astype(int)
+        y_train_mapped = _to_1d_int_labels(y_train)
+        y_val_mapped = _to_1d_int_labels(y_val)
 
-        x_t = torch.as_tensor(x_train.values, dtype=torch.float32, device=self.device)
+        x_t = torch.as_tensor(_to_2d_float32(x_train), dtype=torch.float32, device=self.device)
         y_t = torch.as_tensor(y_train_mapped, dtype=torch.long, device=self.device)
-        x_v = torch.as_tensor(x_val.values, dtype=torch.float32, device=self.device)
+        x_v = torch.as_tensor(_to_2d_float32(x_val), dtype=torch.float32, device=self.device)
         y_v = torch.as_tensor(y_val_mapped, dtype=torch.long, device=self.device)
 
         class_weights = _compute_class_weight_tensor(y_train_mapped, self.device, num_classes=3)
@@ -757,7 +888,7 @@ class TabNetExpert(ExpertModel):
                     logger.info(f"TabNet Early stopping at epoch {epoch}, val_loss={val_loss:.4f}")
                     break
 
-    def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, x: Any) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("TabNet model not loaded")
         self.model.eval()
@@ -766,9 +897,8 @@ class TabNetExpert(ExpertModel):
         use_amp = torch.cuda.is_available() and str(self.device).startswith("cuda")
         with torch.no_grad():
             for start in range(0, len(x), batch_size):
-                xb = torch.as_tensor(
-                    x.iloc[start : start + batch_size].values, dtype=torch.float32, device=self.device
-                )
+                xb_np = _to_2d_float32(_slice_rows(x, start, start + batch_size))
+                xb = torch.as_tensor(xb_np, dtype=torch.float32, device=self.device)
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     logits = self.model(xb)
                 outs.append(torch.softmax(logits, dim=1).cpu().float().numpy())
@@ -868,7 +998,7 @@ class KANExpert(ExpertModel):
         model, self.device, self.is_ddp, self.rank, self.world_size = wrap_ddp(model, self.device)
         return model
 
-    def fit(self, x: pd.DataFrame, y: pd.Series, tensorboard_writer: Any | None = None) -> None:
+    def fit(self, x: Any, y: Any, tensorboard_writer: Any | None = None) -> None:
         validate_time_ordering(x, context="KANExpert.fit")
 
         max_rows = getattr(self, "max_train_rows", self.MAX_TRAIN_ROWS)
@@ -892,16 +1022,16 @@ class KANExpert(ExpertModel):
         except ValueError as e:
             logger.warning(f"Time-series split failed, using simple split: {e}")
             split = int(len(x) * 0.85)
-            x_train, x_val = x.iloc[:split], x.iloc[split:]
-            y_train, y_val = y.iloc[:split], y.iloc[split:]
+            x_train, x_val = _slice_rows(x, 0, split), _slice_rows(x, split, len(x))
+            y_train, y_val = _slice_rows(y, 0, split), _slice_rows(y, split, len(y))
 
         # HPC FIX: Unified Protocol Mapping
-        y_train_mapped = np.where(y_train.values == -1, 2, y_train.values).astype(int)
-        y_val_mapped = np.where(y_val.values == -1, 2, y_val.values).astype(int)
+        y_train_mapped = _to_1d_int_labels(y_train)
+        y_val_mapped = _to_1d_int_labels(y_val)
 
-        x_t = torch.as_tensor(x_train.values, dtype=torch.float32, device=self.device)
+        x_t = torch.as_tensor(_to_2d_float32(x_train), dtype=torch.float32, device=self.device)
         y_t = torch.as_tensor(y_train_mapped, dtype=torch.long, device=self.device)
-        x_v = torch.as_tensor(x_val.values, dtype=torch.float32, device=self.device)
+        x_v = torch.as_tensor(_to_2d_float32(x_val), dtype=torch.float32, device=self.device)
         y_v = torch.as_tensor(y_val_mapped, dtype=torch.long, device=self.device)
 
         class_weights = _compute_class_weight_tensor(y_train_mapped, self.device, num_classes=3)
@@ -979,7 +1109,7 @@ class KANExpert(ExpertModel):
                     logger.info(f"KAN Early stopping at epoch {epoch}, val_loss={val_loss:.4f}")
                     break
 
-    def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, x: Any) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("KAN model not loaded")
         self.model.eval()
@@ -988,9 +1118,8 @@ class KANExpert(ExpertModel):
         use_amp = torch.cuda.is_available() and str(self.device).startswith("cuda")
         with torch.no_grad():
             for start in range(0, len(x), batch_size):
-                xb = torch.as_tensor(
-                    x.iloc[start : start + batch_size].values, dtype=torch.float32, device=self.device
-                )
+                xb_np = _to_2d_float32(_slice_rows(x, start, start + batch_size))
+                xb = torch.as_tensor(xb_np, dtype=torch.float32, device=self.device)
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     logits = self.model(xb)
                 outs.append(torch.softmax(logits, dim=1).cpu().float().numpy())
@@ -1033,3 +1162,6 @@ class KANExpert(ExpertModel):
             logger.info(f"JIT Compiled {self.__class__.__name__} for CPU.")
         except Exception as e:
             logger.warning(f"CPU optimization failed: {e}")
+
+
+

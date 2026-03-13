@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import time
 from dataclasses import dataclass, field
@@ -5,10 +7,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pandas as pd
 
 from .base import ExpertModel, get_early_stop_params
-from .device import get_available_gpus
 from ..core.system import resolve_cpu_budget
 
 logger = logging.getLogger(__name__)
@@ -256,7 +256,7 @@ class RLlibPPOAgent(ExpertModel):
     algo: Any = None
     ray_owned: bool = False
 
-    def fit(self, x: pd.DataFrame, y: pd.Series, env_fn: Any | None = None) -> None:
+    def fit(self, x: Any, y: Any, env_fn: Any | None = None) -> None:
         if not _deps_ready("RLlib PPO fit") or PPOConfig is None:
             return
         if not _maybe_init_ray():
@@ -305,7 +305,7 @@ class RLlibPPOAgent(ExpertModel):
             if self.ray_owned:
                 _maybe_shutdown_ray()
 
-    def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, x: Any) -> np.ndarray:
         if self.algo is None:
             raise RuntimeError("RLlib PPO not loaded")
         if not _deps_ready("RLlib PPO predict"):
@@ -386,7 +386,7 @@ class RLlibSACAgent(ExpertModel):
     algo: Any = None
     ray_owned: bool = False
 
-    def fit(self, x: pd.DataFrame, y: pd.Series, env_fn: Any | None = None) -> None:
+    def fit(self, x: Any, y: Any, env_fn: Any | None = None) -> None:
         if not _deps_ready("RLlib SAC fit") or SACConfig is None:
             return
         if not _maybe_init_ray():
@@ -425,7 +425,7 @@ class RLlibSACAgent(ExpertModel):
             if self.ray_owned:
                 _maybe_shutdown_ray()
 
-    def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, x: Any) -> np.ndarray:
         if self.algo is None:
             raise RuntimeError("RLlib SAC not loaded")
         if not _deps_ready("RLlib SAC predict"):
@@ -490,3 +490,5 @@ class RLlibSACAgent(ExpertModel):
             self.algo = None
             if self.ray_owned:
                 _maybe_shutdown_ray()
+
+

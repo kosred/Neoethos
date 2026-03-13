@@ -9,7 +9,6 @@ from typing import Any
 
 import joblib
 import numpy as np
-import pandas as pd
 
 from ..core.config import Settings
 from ..domain.events import PreparedDataset, SignalResult
@@ -19,6 +18,131 @@ from ..training.evaluation import pad_probs, probs_to_signals
 from ..training.persistence_service import PersistenceService
 
 logger = logging.getLogger(__name__)
+try:
+    import forex_bindings as _fb  # type: ignore
+except Exception:
+    _fb = None  # type: ignore
+
+
+def _is_dataframe_like(value: Any) -> bool:
+    return bool(hasattr(value, "columns") and hasattr(value, "index") and hasattr(value, "iloc"))
+
+
+def _is_frame_like(value: Any) -> bool:
+    return bool(hasattr(value, "columns") and hasattr(value, "__getitem__"))
+
+
+def _frame_columns(value: Any) -> list[str]:
+    cols = getattr(value, "columns", None)
+    if cols is None:
+        return []
+    try:
+        return [str(c) for c in list(cols)]
+    except Exception:
+        return []
+
+
+def _frame_index(value: Any) -> Any | None:
+    return getattr(value, "index", None)
+
+
+def _frame_extract_column(value: Any, name: str) -> np.ndarray | None:
+    col_name = str(name).strip().lower()
+    if isinstance(value, dict):
+        for key, arr in value.items():
+            if str(key).strip().lower() == col_name:
+                return np.asarray(arr).reshape(-1)
+        return None
+    if not _is_frame_like(value):
+        return None
+    resolved = None
+    for col in _frame_columns(value):
+        if str(col).strip().lower() == col_name:
+            resolved = col
+            break
+    if resolved is None:
+        return None
+    try:
+        raw = value[resolved]  # type: ignore[index]
+        arr = raw.to_numpy(copy=False) if hasattr(raw, "to_numpy") else np.asarray(raw)
+        return np.asarray(arr).reshape(-1)
+    except Exception:
+        return None
+
+
+def _vector_scalar_at(values: np.ndarray | None, idx: int, *, default: float = 0.0) -> float:
+    if values is None:
+        return float(default)
+
+
+def _column_index_mapping(src_names: list[str], dst_names: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    dst_lookup = {str(name): i for i, name in enumerate(dst_names)}
+    src_cols: list[int] = []
+    dst_cols: list[int] = []
+    for src_i, raw_name in enumerate(src_names):
+        dst_i = dst_lookup.get(str(raw_name))
+        if dst_i is None:
+            continue
+        src_cols.append(int(src_i))
+        dst_cols.append(int(dst_i))
+    if not src_cols or not dst_cols:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+    return np.asarray(src_cols, dtype=np.int64), np.asarray(dst_cols, dtype=np.int64)
+
+
+def _align_feature_matrix(
+    src_matrix: Any,
+    src_col_idx: np.ndarray,
+    dst_col_idx: np.ndarray,
+    *,
+    dst_width: int,
+) -> np.ndarray:
+    src = np.asarray(src_matrix, dtype=np.float32)
+    if src.ndim == 0:
+        src = src.reshape(1, 1)
+    elif src.ndim == 1:
+        src = src.reshape(-1, 1)
+    elif src.ndim > 2:
+        src = src.reshape(src.shape[0], -1)
+    rows = int(src.shape[0])
+    width = int(max(0, dst_width))
+    if rows <= 0 or width <= 0:
+        return np.zeros((rows, width), dtype=np.float32)
+
+    src_idx = np.asarray(src_col_idx, dtype=np.int64).reshape(-1)
+    dst_idx = np.asarray(dst_col_idx, dtype=np.int64).reshape(-1)
+    m = min(int(src_idx.size), int(dst_idx.size))
+    if m <= 0:
+        return np.zeros((rows, width), dtype=np.float32)
+    src_idx = src_idx[:m]
+    dst_idx = dst_idx[:m]
+
+    if _fb is not None and hasattr(_fb, "align_feature_matrix"):
+        try:
+            out = _fb.align_feature_matrix(src, src_idx, dst_idx, width)
+            arr = np.asarray(out, dtype=np.float32)
+            if arr.ndim == 2 and arr.shape == (rows, width):
+                return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+        except Exception:
+            pass
+
+    out = np.zeros((rows, width), dtype=np.float32)
+    out[:, dst_idx] = src[:, src_idx]
+    return out
+    try:
+        arr = np.asarray(values).reshape(-1)
+        if arr.size <= 0:
+            return float(default)
+        pos = int(idx)
+        if pos < 0:
+            pos = int(arr.size + pos)
+        if pos < 0 or pos >= int(arr.size):
+            return float(default)
+        with np.errstate(all="ignore"):
+            out = float(arr[pos])
+        return out if np.isfinite(out) else float(default)
+    except Exception:
+        return float(default)
 
 
 @dataclass(slots=True)
@@ -133,7 +257,71 @@ class SignalEngine:
                 logger.warning("ONNX load failed: %s", exc)
                 self._onnx = None
 
-    def _align_selected_features(self, X: pd.DataFrame, regime_bucket: str | None = None) -> pd.DataFrame:
+    @staticmethod
+    def _as_2d_float32(values: Any) -> np.ndarray:
+        arr = None
+        if hasattr(values, "to_numpy"):
+            try:
+                arr = np.asarray(values.to_numpy(dtype=np.float32, copy=False), dtype=np.float32)
+            except Exception:
+                arr = None
+        if arr is None and _is_frame_like(values):
+            cols = _frame_columns(values)
+            mats: list[np.ndarray] = []
+            n_rows = 0
+            for col in cols:
+                vec = _frame_extract_column(values, col)
+                if vec is None:
+                    continue
+                try:
+                    arr_col = np.asarray(vec, dtype=np.float32).reshape(-1)
+                except Exception:
+                    continue
+                mats.append(np.nan_to_num(arr_col, nan=0.0, posinf=0.0, neginf=0.0))
+                n_rows = max(n_rows, int(arr_col.size))
+            if mats:
+                arr = np.zeros((n_rows, len(mats)), dtype=np.float32)
+                for j, vec in enumerate(mats):
+                    take = min(n_rows, int(vec.size))
+                    if take > 0:
+                        arr[:take, j] = vec[:take]
+        if arr is None:
+            arr = np.asarray(values, dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        if not arr.flags.writeable:
+            arr = arr.copy()
+        return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+
+    @staticmethod
+    def _resolve_feature_names(feature_names: Any, n_features: int) -> list[str]:
+        try:
+            names = [str(c) for c in list(feature_names)]
+        except Exception:
+            names = []
+        if len(names) != int(n_features):
+            return [f"f{i}" for i in range(int(n_features))]
+        return names
+
+    @staticmethod
+    def _resolve_index(index_like: Any, n_rows: int) -> np.ndarray:
+        if index_like is None:
+            return np.arange(int(n_rows), dtype=np.int64)
+        try:
+            arr = np.asarray(index_like).reshape(-1)
+        except Exception:
+            return np.arange(int(n_rows), dtype=np.int64)
+        if arr.size != int(n_rows):
+            return np.arange(int(n_rows), dtype=np.int64)
+        return arr
+
+    def _align_selected_features(
+        self,
+        X: Any,
+        regime_bucket: str | None = None,
+        *,
+        feature_names: list[str] | None = None,
+    ) -> tuple[Any, list[str] | None]:
         cols: list[str] = []
         use_regime = bool(getattr(self.settings.models, "l1_feature_selection_per_regime", True))
         if use_regime and regime_bucket:
@@ -141,10 +329,32 @@ class SignalEngine:
         if not cols:
             cols = list(self.selected_features or [])
         if not cols:
-            return X
-        return X.reindex(columns=cols, fill_value=0.0)
+            return X, list(feature_names) if feature_names is not None else None
+        if _is_dataframe_like(X):
+            X_arr = self._as_2d_float32(X)
+            names = _frame_columns(X)
+            if not names:
+                names = self._resolve_feature_names(feature_names, X_arr.shape[1])
+            src_cols, dst_cols = _column_index_mapping(names, cols)
+            aligned = _align_feature_matrix(X_arr, src_cols, dst_cols, dst_width=len(cols))
+            try:
+                frame_cls = X.__class__
+                out = frame_cls(aligned, index=_frame_index(X), columns=cols)
+                return out, list(cols)
+            except Exception:
+                return aligned, list(cols)
 
-    def _predict_model_proba(self, name: str, model: Any, X: pd.DataFrame) -> np.ndarray | None:
+        if _is_frame_like(X):
+            frame_names = _frame_columns(X)
+            if frame_names:
+                feature_names = frame_names
+        X_arr = self._as_2d_float32(X)
+        names = self._resolve_feature_names(feature_names, X_arr.shape[1])
+        src_cols, dst_cols = _column_index_mapping(names, cols)
+        aligned = _align_feature_matrix(X_arr, src_cols, dst_cols, dst_width=len(cols))
+        return aligned, list(cols)
+
+    def _predict_model_proba(self, name: str, model: Any, X: Any) -> np.ndarray | None:
         try:
             proba = pad_probs(model.predict_proba(X))
             if proba.shape[0] != len(X):
@@ -157,7 +367,7 @@ class SignalEngine:
             logger.debug("Model prediction failed (%s): %s", name, exc)
             return None
 
-    def _collect_model_probas(self, X: pd.DataFrame, models_subset: dict[str, Any] | None = None) -> dict[str, np.ndarray]:
+    def _collect_model_probas(self, X: Any, models_subset: dict[str, Any] | None = None) -> dict[str, np.ndarray]:
         models = models_subset if models_subset is not None else self.models
         out: dict[str, np.ndarray] = {}
         for name, model in models.items():
@@ -168,7 +378,7 @@ class SignalEngine:
 
     def _ensemble_proba(
         self,
-        X: pd.DataFrame,
+        X: Any,
         models_subset: dict[str, Any] | None = None,
         *,
         proba_cache: dict[str, np.ndarray] | None = None,
@@ -181,33 +391,51 @@ class SignalEngine:
 
     def _meta_features(
         self,
-        X: pd.DataFrame,
+        X: Any,
         models_subset: dict[str, Any] | None = None,
         *,
         proba_cache: dict[str, np.ndarray] | None = None,
-    ) -> pd.DataFrame:
+    ) -> Any:
         cache = proba_cache if proba_cache is not None else self._collect_model_probas(X, models_subset=models_subset)
-        feats = pd.DataFrame(index=X.index)
+        names: list[str] = []
+        cols: list[np.ndarray] = []
         for name, proba in cache.items():
-            feats[f"{name}_buy"] = proba[:, 1]
-        if feats.empty:
-            feats = pd.DataFrame(np.zeros((len(X), 1)), columns=["dummy"], index=X.index)
-        return feats
+            names.append(f"{name}_buy")
+            cols.append(np.asarray(proba[:, 1], dtype=np.float32).reshape(-1, 1))
+        if not cols:
+            return {"X": np.zeros((len(X), 1), dtype=np.float32), "feature_names": ["dummy"]}
+        return {"X": np.column_stack(cols).astype(np.float32, copy=False), "feature_names": names}
 
-    def _infer_regime_bucket(self, X: pd.DataFrame, last_idx: int) -> str:
+    def _infer_regime_bucket(self, X: Any, last_idx: int, *, feature_names: list[str] | None = None) -> str:
         # Heuristic regime routing from ADX + realized volatility proxy.
         adx = 0.0
-        vol = self._latest_market_volatility(X, last_idx)
-        row = X.iloc[last_idx]
-        if "adx" in row.index:
-            with np.errstate(all="ignore"):
-                adx = float(row.get("adx", 0.0) or 0.0)
+        vol = self._latest_market_volatility(X, last_idx, feature_names=feature_names)
+        if _is_frame_like(X):
+            adx_vec = _frame_extract_column(X, "adx")
+            if adx_vec is None:
+                for c in _frame_columns(X):
+                    if str(c).strip().lower().endswith("_adx"):
+                        adx_vec = _frame_extract_column(X, c)
+                        if adx_vec is not None:
+                            break
+            adx = _vector_scalar_at(adx_vec, last_idx, default=0.0)
         else:
-            for c in row.index:
-                if str(c).endswith("_adx"):
+            arr = self._as_2d_float32(X)
+            if arr.shape[0] > 0 and arr.shape[1] > 0:
+                if _is_frame_like(X):
+                    names = self._resolve_feature_names(_frame_columns(X), arr.shape[1])
+                else:
+                    names = self._resolve_feature_names(feature_names, arr.shape[1])
+                idx_map = {str(name): i for i, name in enumerate(names)}
+                adx_idx = idx_map.get("adx")
+                if adx_idx is None:
+                    for name, pos in idx_map.items():
+                        if name.endswith("_adx"):
+                            adx_idx = pos
+                            break
+                if adx_idx is not None and adx_idx < arr.shape[1]:
                     with np.errstate(all="ignore"):
-                        adx = float(row.get(c, 0.0) or 0.0)
-                    break
+                        adx = float(arr[last_idx, int(adx_idx)])
         trend_thr = float(getattr(self.settings.risk, "regime_adx_trend", 25.0) or 25.0)
         range_thr = float(getattr(self.settings.risk, "regime_adx_range", 20.0) or 20.0)
         if adx >= trend_thr:
@@ -219,12 +447,18 @@ class SignalEngine:
             return "high_vol"
         return "neutral"
 
-    def _select_models_for_regime(self, X: pd.DataFrame, last_idx: int) -> tuple[dict[str, Any], str]:
+    def _select_models_for_regime(
+        self,
+        X: Any,
+        last_idx: int,
+        *,
+        feature_names: list[str] | None = None,
+    ) -> tuple[dict[str, Any], str]:
         if not bool(getattr(self.settings.models, "regime_router_enabled", True)):
             return self.models, "neutral"
         if not self.models:
             return {}, "neutral"
-        bucket = self._infer_regime_bucket(X, last_idx)
+        bucket = self._infer_regime_bucket(X, last_idx, feature_names=feature_names)
         if bucket == "trend":
             candidates = set(getattr(self.settings.models, "regime_trend_models", []) or [])
         elif bucket == "range":
@@ -239,7 +473,7 @@ class SignalEngine:
 
     def _predict_proba(
         self,
-        X: pd.DataFrame,
+        X: Any,
         models_subset: dict[str, Any] | None = None,
     ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
         model_probas = self._collect_model_probas(X, models_subset=models_subset)
@@ -258,28 +492,44 @@ class SignalEngine:
         return self._ensemble_proba(X, models_subset=models_subset, proba_cache=model_probas), model_probas
 
     @staticmethod
-    def _latest_market_volatility(X: pd.DataFrame, last_idx: int) -> float:
+    def _latest_market_volatility(X: Any, last_idx: int, *, feature_names: list[str] | None = None) -> float:
         if X is None or len(X) == 0:
             return 0.0
-        row = X.iloc[last_idx]
         close = 0.0
-        for c in ("close", "Close", "price"):
-            if c in row.index:
-                try:
-                    close = float(row[c])
-                except Exception:
-                    close = 0.0
-                if close > 0:
-                    break
         atr_val = 0.0
-        for c in ("atr14", "atr", "ATR", "M1_atr14", "M5_atr14"):
-            if c in row.index:
-                try:
-                    atr_val = float(row[c])
-                except Exception:
-                    atr_val = 0.0
-                if np.isfinite(atr_val) and atr_val > 0:
+        if _is_frame_like(X):
+            close_vec = None
+            for c in ("close", "price"):
+                close_vec = _frame_extract_column(X, c)
+                if close_vec is not None:
                     break
+            atr_vec = None
+            for c in ("atr14", "atr", "M1_atr14", "M5_atr14"):
+                atr_vec = _frame_extract_column(X, c)
+                if atr_vec is not None:
+                    break
+            close = _vector_scalar_at(close_vec, last_idx, default=0.0)
+            atr_val = _vector_scalar_at(atr_vec, last_idx, default=0.0)
+        else:
+            arr = SignalEngine._as_2d_float32(X)
+            if arr.shape[0] == 0 or arr.shape[1] == 0:
+                return 0.0
+            names = SignalEngine._resolve_feature_names(feature_names, arr.shape[1])
+            idx_map = {str(name): i for i, name in enumerate(names)}
+            close_idx = None
+            for c in ("close", "Close", "price"):
+                if c in idx_map:
+                    close_idx = idx_map[c]
+                    break
+            atr_idx = None
+            for c in ("atr14", "atr", "ATR", "M1_atr14", "M5_atr14"):
+                if c in idx_map:
+                    atr_idx = idx_map[c]
+                    break
+            if close_idx is not None:
+                close = float(arr[last_idx, int(close_idx)])
+            if atr_idx is not None:
+                atr_val = float(arr[last_idx, int(atr_idx)])
         if close > 0 and atr_val > 0:
             return float(max(0.0, atr_val / close))
         return 0.0
@@ -309,16 +559,26 @@ class SignalEngine:
                 regime="Normal",
                 meta_features={},
                 probs=np.zeros(3, dtype=float),
-                signals=pd.Series(dtype=int),
+                signals=np.zeros(0, dtype=int),
             )
 
-        if not isinstance(X, pd.DataFrame):
-            X = pd.DataFrame(X)
-        X_raw = X
+        if _is_dataframe_like(X):
+            X_raw = X
+            feature_names = [str(c) for c in list(X_raw.columns)]
+        elif _is_frame_like(X):
+            X_raw = self._as_2d_float32(X)
+            feature_names = self._resolve_feature_names(_frame_columns(X), X_raw.shape[1])
+        else:
+            X_raw = self._as_2d_float32(X)
+            feature_names = self._resolve_feature_names(getattr(dataset, "feature_names", None), X_raw.shape[1])
 
-        last_idx = -1 if len(X) > 0 else None
-        active_models, regime_bucket = self._select_models_for_regime(X_raw, last_idx or -1)
-        X = self._align_selected_features(X_raw, regime_bucket=regime_bucket)
+        last_idx = -1 if len(X_raw) > 0 else None
+        active_models, regime_bucket = self._select_models_for_regime(
+            X_raw,
+            last_idx or -1,
+            feature_names=feature_names,
+        )
+        X, _ = self._align_selected_features(X_raw, regime_bucket=regime_bucket, feature_names=feature_names)
 
         probas, model_proba_cache = self._predict_proba(X, models_subset=active_models)
         signals = probs_to_signals(probas)
@@ -336,7 +596,7 @@ class SignalEngine:
             last_signal = int(signals[last_idx])
             last_probs = probas[last_idx]
             confidence = float(np.max(last_probs)) if last_probs is not None else 0.0
-            market_volatility = self._latest_market_volatility(X_raw, last_idx)
+            market_volatility = self._latest_market_volatility(X_raw, last_idx, feature_names=feature_names)
             disagreement = 0.0
             uncertainty_value = max(0.0, min(1.0, 1.0 - confidence))
             conformal_set_size = 1
@@ -364,10 +624,9 @@ class SignalEngine:
 
         uncertainty_series = None
         if last_idx is not None:
-            try:
-                uncertainty_series = pd.Series([float(uncertainty_value)], index=[X.index[last_idx]])
-            except Exception:
-                uncertainty_series = pd.Series([float(uncertainty_value)])
+            uncertainty_series = np.asarray([float(uncertainty_value)], dtype=np.float64)
+
+        signals_out = np.asarray(signals, dtype=int)
 
         return SignalResult(
             signal=last_signal,
@@ -383,9 +642,10 @@ class SignalEngine:
                 "conformal_abstained": bool(conformal_abstained),
             },
             probs=np.asarray(last_probs, dtype=float),
-            signals=pd.Series(signals, index=X.index),
+            signals=signals_out,
             uncertainty=uncertainty_series,
         )
 
 
 __all__ = ["SignalEngine"]
+

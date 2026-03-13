@@ -1,9 +1,10 @@
+from __future__ import annotations
+
 import logging
 import os
 from typing import Any
 
 import numpy as np
-import pandas as pd
 
 try:
     import cupy as cp
@@ -13,12 +14,185 @@ except Exception:
     cp = None
     CUPY_AVAILABLE = False
 
+try:
+    import forex_bindings as _fb  # type: ignore
+except Exception:
+    _fb = None  # type: ignore
+
 logger = logging.getLogger(__name__)
 
 
+def _is_dataframe_like(values: Any) -> bool:
+    return bool(hasattr(values, "columns") and hasattr(values, "index"))
+
+
+class _NumpyFrame:
+    """Minimal frame-like container used for slicing non-dataframe-module datasets."""
+
+    def __init__(self, data: dict[str, Any], index: Any, attrs: dict[str, Any] | None = None) -> None:
+        self._data = {str(k): np.asarray(v).reshape(-1) for k, v in data.items()}
+        self.index = np.asarray(index).reshape(-1)
+        self.columns = list(self._data.keys())
+        self.attrs = dict(attrs or {})
+
+    @property
+    def empty(self) -> bool:
+        return int(len(self.index)) <= 0
+
+    def __len__(self) -> int:
+        return int(len(self.index))
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        return self._data[str(key)]
+
+
+def _frame_columns(values: Any) -> list[str]:
+    cols = getattr(values, "columns", None)
+    if cols is None:
+        return []
+    try:
+        return [str(c) for c in list(cols)]
+    except Exception:
+        return []
+
+
+def _frame_resolve_column(values: Any, name: str) -> str | None:
+    target = str(name).strip().lower()
+    for col in _frame_columns(values):
+        if str(col).strip().lower() == target:
+            return col
+    return None
+
+
+def _slice_frame_rows(values: Any, start: int, end: int) -> Any:
+    cols = _frame_columns(values)
+    s = max(0, int(start))
+    e = max(s, int(end))
+    if not cols:
+        arr = np.asarray(values)
+        return arr[s:e]
+    data: dict[str, np.ndarray] = {}
+    for col in cols:
+        try:
+            arr = np.asarray(values[col]).reshape(-1)  # type: ignore[index]
+            data[str(col)] = arr[s:e]
+        except Exception:
+            continue
+    idx = getattr(values, "index", None)
+    if idx is None:
+        out_idx = np.arange(max(0, e - s), dtype=np.int64)
+    else:
+        idx_arr = np.asarray(idx).reshape(-1)
+        out_idx = idx_arr[s:e] if idx_arr.size >= e else np.arange(max(0, e - s), dtype=np.int64)
+    attrs = getattr(values, "attrs", None)
+    return _NumpyFrame(data, out_idx, attrs=(dict(attrs) if isinstance(attrs, dict) else None))
+
+
+def _slice_rows(values: Any, start: int, end: int) -> Any:
+    if _is_dataframe_like(values):
+        s = max(0, int(start))
+        e = max(s, int(end))
+        idx = np.arange(s, e, dtype=np.int64)
+        try:
+            return values.take(idx)
+        except Exception:
+            try:
+                base_idx = np.asarray(getattr(values, "index")).reshape(-1)
+                return values.loc[base_idx[idx]]
+            except Exception:
+                pass
+    if hasattr(values, "columns") and hasattr(values, "__getitem__"):
+        return _slice_frame_rows(values, start, end)
+    arr = np.asarray(values)
+    return arr[start:end]
+
+
+def _to_numpy_1d(values: Any, *, dtype: Any | None = None) -> np.ndarray:
+    if hasattr(values, "to_numpy"):
+        arr = values.to_numpy(copy=False)
+    else:
+        arr = np.asarray(values)
+    arr = np.asarray(arr, dtype=dtype) if dtype is not None else np.asarray(arr)
+    return arr.reshape(-1)
+
+
+def _extract_close(values: Any) -> np.ndarray:
+    try:
+        col = _frame_resolve_column(values, "close")
+        if col is not None:
+            close = values[col]  # type: ignore[index]
+            return _to_numpy_1d(close, dtype=np.float64)
+    except Exception:
+        pass
+    arr = np.asarray(values)
+    if arr.ndim == 0:
+        return arr.reshape(1).astype(np.float64, copy=False)
+    if arr.ndim == 1:
+        return arr.astype(np.float64, copy=False)
+    return np.asarray(arr[:, 0], dtype=np.float64).reshape(-1)
+
+
+def _extract_index_ns(values: Any, n_rows: int) -> np.ndarray:
+    idx = getattr(values, "index", None)
+    if idx is None:
+        return np.arange(n_rows, dtype=np.int64)
+    try:
+        if hasattr(idx, "asi8"):
+            arr_ns = np.asarray(idx.asi8, dtype=np.int64).reshape(-1)
+            if arr_ns.size == n_rows:
+                return arr_ns
+    except Exception:
+        pass
+    try:
+        arr = np.asarray(idx).reshape(-1)
+    except Exception:
+        return np.arange(n_rows, dtype=np.int64)
+    if arr.size != n_rows:
+        return np.arange(n_rows, dtype=np.int64)
+    try:
+        if np.issubdtype(arr.dtype, np.datetime64):
+            return arr.astype("datetime64[ns]").astype(np.int64, copy=False)
+        if arr.dtype.kind in {"i", "u"}:
+            return arr.astype(np.int64, copy=False)
+        if arr.dtype.kind == "f":
+            return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.int64, copy=False)
+    except Exception:
+        pass
+    out = np.zeros(n_rows, dtype=np.int64)
+    for i, value in enumerate(arr.tolist()):
+        try:
+            ns = getattr(value, "value", None)
+            if ns is not None:
+                out[i] = int(ns)
+            else:
+                out[i] = int(np.datetime64(value, "ns").astype(np.int64))
+        except Exception:
+            out[i] = i
+    return out
+
+
+def _extract_day_keys(values: Any, n_rows: int) -> np.ndarray:
+    idx_ns = _extract_index_ns(values, n_rows)
+    if idx_ns.size != n_rows:
+        return np.zeros(n_rows, dtype=np.int64)
+    is_timestamp_like = idx_ns.size > 0 and int(np.max(np.abs(idx_ns))) > 10**14
+    if is_timestamp_like and _fb is not None and hasattr(_fb, "derive_time_index_arrays"):
+        try:
+            _unix_ms, _month_idx, day_idx = _fb.derive_time_index_arrays(np.asarray(idx_ns, dtype=np.int64))
+        except Exception:
+            day_idx = None
+        if day_idx is not None:
+            arr = np.asarray(day_idx, dtype=np.int64).reshape(-1)
+            if arr.size == n_rows:
+                return arr
+    if is_timestamp_like:
+        return (np.asarray(idx_ns, dtype=np.int64) // (24 * 60 * 60 * 1_000_000_000)).astype(np.int64, copy=False)
+    return np.zeros(n_rows, dtype=np.int64)
+
+
 def embargoed_walkforward_backtest(
-    df: pd.DataFrame,
-    signals: pd.Series,
+    df: Any,
+    signals: Any,
     train_ratio: float = 0.7,
     n_splits: int = 5,
     embargo_minutes: int = 120,
@@ -55,14 +229,14 @@ def embargoed_walkforward_backtest(
         if test_start >= end or (train_end - start) < 40 or (end - test_start) < 40:
             continue
 
-        df_test = df.iloc[test_start:end]
-        sig = signals.iloc[test_start:end]
+        df_test = _slice_rows(df, test_start, end)
+        sig = _slice_rows(signals, test_start, end)
 
         # GPU toggle auto
         if use_gpu is None:
             use_gpu = CUPY_AVAILABLE and bool(int(os.environ.get("GPU_BACKTEST", "1")))
 
-        close = df_test["close"].values
+        close = _extract_close(df_test)
         future = np.roll(close, -1)
         ret = (future - close) / close
         if len(ret) > 0:
@@ -75,9 +249,9 @@ def embargoed_walkforward_backtest(
                 c_ret = (c_future - c_close) / c_close
                 c_ret[-1] = 0.0
                 c_ret = cp.nan_to_num(c_ret, nan=0.0, posinf=0.0, neginf=0.0)
-                c_sig = cp.asarray(sig.to_numpy(), dtype=cp.int8)
-                c_idx = cp.asarray(df_test.index.astype("datetime64[ns]").view("int64"))
-                days = (c_idx // (24 * 60 * 60 * 1_000_000_000)).astype(cp.int64)
+                c_sig = cp.asarray(_to_numpy_1d(sig, dtype=np.int8), dtype=cp.int8)
+                day_keys = _extract_day_keys(df_test, len(close))
+                days = cp.asarray(day_keys, dtype=cp.int64)
 
                 equity = cp.float32(1.0)
                 peak = cp.float32(1.0)
@@ -199,16 +373,17 @@ def embargoed_walkforward_backtest(
         consec_losses = 0
         daily_stats: dict[object, dict[str, float | int]] = {}
 
+        day_keys = _extract_day_keys(df_test, len(close))
+        sig_arr = _to_numpy_1d(sig, dtype=np.int8)
         for idx in range(max(0, len(close) - 1)):
-            ts = df_test.index[idx]
-            day_key = ts.date()
+            day_key = int(day_keys[idx]) if idx < len(day_keys) else 0
             stats = daily_stats.get(day_key)
             if stats is None:
                 stats = {"equity_start": equity, "equity_end": equity, "trades": 0}
                 daily_stats[day_key] = stats
 
             # HPC FIX: Unified HPC Backtest Math (CPU/GPU Parity)
-            sig_val = int(sig.iloc[idx])
+            sig_val = int(sig_arr[idx]) if idx < len(sig_arr) else 0
             bar_ret = float(ret[idx])
             
             pnl_i = 0.0
@@ -239,7 +414,7 @@ def embargoed_walkforward_backtest(
                 consec_losses = 0
 
         pnl_arr = np.array(pnl, dtype=float)
-        trades = int(np.count_nonzero(sig.to_numpy()[:-1]))
+        trades = int(np.count_nonzero(sig_arr[:-1]))
 
         daily_loss_breach = False
         consistency_violation = False
@@ -302,3 +477,4 @@ def embargoed_walkforward_backtest(
         "splits": results,
     }
     return agg
+

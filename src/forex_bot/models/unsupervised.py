@@ -1,10 +1,17 @@
+from __future__ import annotations
+
 import logging
 from pathlib import Path
+from typing import Any
 
 import joblib
 import numpy as np
-import pandas as pd
 from sklearn.preprocessing import StandardScaler
+
+try:
+    import forex_bindings as _fb  # type: ignore
+except Exception:
+    _fb = None  # type: ignore
 
 try:
     from numba import njit, prange
@@ -22,6 +29,63 @@ except ImportError:
 from .base import ExpertModel
 
 logger = logging.getLogger(__name__)
+
+
+def _frame_columns(df: Any) -> list[str]:
+    cols = getattr(df, "columns", None)
+    if cols is None:
+        return []
+    try:
+        return [str(c) for c in list(cols)]
+    except Exception:
+        return []
+
+
+def _frame_resolve_column(df: Any, name: str) -> str | None:
+    target = str(name).strip().lower()
+    for col in _frame_columns(df):
+        if str(col).strip().lower() == target:
+            return col
+    return None
+
+
+def _frame_column_numpy(df: Any, name: str, *, dtype: Any = np.float64) -> np.ndarray:
+    col = _frame_resolve_column(df, name)
+    if col is None:
+        raise KeyError(name)
+    values = df[col]  # type: ignore[index]
+    if hasattr(values, "to_numpy"):
+        try:
+            arr = values.to_numpy(dtype=dtype, copy=False)  # type: ignore[call-arg]
+        except TypeError:
+            arr = values.to_numpy(dtype=dtype)  # type: ignore[call-arg]
+        except Exception:
+            arr = np.asarray(values, dtype=dtype)
+    else:
+        arr = np.asarray(values, dtype=dtype)
+    return np.asarray(arr, dtype=dtype).reshape(-1)
+
+
+def _rust_extract_regime_features(
+    close: np.ndarray,
+    *,
+    adx: np.ndarray | None = None,
+    volatility_window: int = 20,
+) -> np.ndarray | None:
+    if _fb is None or not hasattr(_fb, "extract_regime_features"):
+        return None
+    try:
+        out = _fb.extract_regime_features(
+            np.asarray(close, dtype=np.float64).reshape(-1),
+            None if adx is None else np.asarray(adx, dtype=np.float64).reshape(-1),
+            int(max(1, volatility_window)),
+        )
+    except Exception:
+        return None
+    arr = np.asarray(out, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        return None
+    return np.nan_to_num(arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
 
 if NUMBA_AVAILABLE:
     @njit(cache=True, fastmath=True, parallel=True)
@@ -69,7 +133,7 @@ class MarketRegimeClassifier(ExpertModel):
         # Backward compatibility for older callers/tests.
         self.regime_map: dict[int, str] = {}
 
-    def fit(self, df: pd.DataFrame, y=None, **kwargs) -> None:
+    def fit(self, df: Any, y=None, **kwargs) -> None:
         features = self._extract_features(df)
         if features.size == 0:
             return
@@ -85,7 +149,7 @@ class MarketRegimeClassifier(ExpertModel):
         self.is_fitted = True
         logger.info(f"Unsupervised GMM fitted: {self.n_regimes} latent regimes discovered.")
 
-    def predict_regime_distribution(self, df: pd.DataFrame) -> np.ndarray:
+    def predict_regime_distribution(self, df: Any) -> np.ndarray:
         """
         HPC FIX: Multi-Regime Posterior Distribution.
         Returns a vector of probabilities [p0, p1, ..., p7].
@@ -106,13 +170,13 @@ class MarketRegimeClassifier(ExpertModel):
         except Exception:
             return np.zeros(self.n_regimes)
 
-    def predict(self, df: pd.DataFrame) -> str:
+    def predict(self, df: Any) -> str:
         """Fallback for legacy components: returns the 'primary' regime ID."""
         dist = self.predict_regime_distribution(df)
         regime_idx = int(np.argmax(dist))
         return self.regime_map.get(regime_idx, str(regime_idx))
 
-    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, X: Any) -> np.ndarray:
         """
         Mock implementation for ExpertModel compatibility.
         Does not actually predict buy/sell signals, just used for regime detection.
@@ -123,15 +187,23 @@ class MarketRegimeClassifier(ExpertModel):
         probs[:, 0] = 1.0  # All Neutral
         return probs
 
-    def _extract_features(self, df: pd.DataFrame) -> np.ndarray:
+    def _extract_features(self, df: Any) -> np.ndarray:
         """
         HPC Optimized: feature extraction without intermediate DataFrames.
         """
         try:
-            closes = df["close"].to_numpy(dtype=np.float32, copy=False)
+            closes = _frame_column_numpy(df, "close", dtype=np.float32)
             n = int(closes.shape[0])
             if n < 3:
                 return np.empty((0, 3), dtype=np.float32)
+
+            adx = None
+            if _frame_resolve_column(df, "adx") is not None:
+                adx = _frame_column_numpy(df, "adx", dtype=np.float32)
+
+            rust = _rust_extract_regime_features(closes, adx=adx, volatility_window=20)
+            if rust is not None:
+                return rust
 
             # Log Returns (vectorized, guarded against zero/invalid prices)
             returns = np.zeros(n, dtype=np.float32)
@@ -145,8 +217,7 @@ class MarketRegimeClassifier(ExpertModel):
             volatility = _rolling_std_numba(returns, 20)
 
             # Use precomputed ADX if present, else volatility proxy.
-            if "adx" in df.columns:
-                adx = df["adx"].to_numpy(dtype=np.float32, copy=False)
+            if adx is not None:
                 if adx.shape[0] != n:
                     adx = np.resize(adx, n).astype(np.float32, copy=False)
             else:
@@ -183,3 +254,5 @@ class MarketRegimeClassifier(ExpertModel):
 
 # Alias for registry
 ClusterExpert = MarketRegimeClassifier
+
+

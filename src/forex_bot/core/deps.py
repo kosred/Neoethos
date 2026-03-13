@@ -5,15 +5,14 @@ Does NOT attempt runtime installation or process restarts.
 """
 
 from __future__ import annotations
+import importlib
 import importlib.metadata
 import logging
-import sys
 
 logger = logging.getLogger(__name__)
 
 CRITICAL_PACKAGES = [
     "numpy",
-    "pandas",
     "torch",
     "cupy",
     "numba",
@@ -37,12 +36,12 @@ def ensure_dependencies() -> None:
             # Check for alternative names used in some environments
             if pkg == "talib":
                 try:
-                    import talib
+                    importlib.import_module("talib")
                 except ImportError:
                     missing.append(pkg)
             elif pkg == "cupy":
                 try:
-                    import cupy
+                    importlib.import_module("cupy")
                 except ImportError:
                     missing.append(pkg)
             else:

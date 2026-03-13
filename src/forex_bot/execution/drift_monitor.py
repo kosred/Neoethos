@@ -1,13 +1,35 @@
+from __future__ import annotations
+
 import logging
 from collections import deque
 from datetime import UTC, datetime
 from typing import Any
 
 import numpy as np
-import pandas as pd
 from scipy.stats import ks_2samp
 
 logger = logging.getLogger(__name__)
+
+
+def _frame_like_latest_scalar(frame: Any, col: str) -> float | None:
+    try:
+        if hasattr(frame, "take"):
+            tail = frame.take([-1])
+            if hasattr(tail, "__getitem__"):
+                values = tail[col]  # type: ignore[index]
+                arr = np.asarray(values, dtype=np.float64).reshape(-1)
+                if arr.size > 0:
+                    return float(arr[-1])
+    except Exception:
+        pass
+    try:
+        values = frame[col]
+    except Exception:
+        return None
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.size <= 0:
+        return None
+    return float(arr[-1])
 
 
 class ConceptDriftMonitor:
@@ -189,7 +211,7 @@ class ConceptDriftMonitor:
         self.drift_method_used = ""
         logger.info("Drift monitor reset after retraining.")
 
-    def initialize_feature_monitor(self, baseline_features: pd.DataFrame, symbol: str):
+    def initialize_feature_monitor(self, baseline_features: Any, symbol: str):
         """
         Initialize adaptive feature monitor.
         Uses EMA to track shifting mean/std of features (handling non-stationarity).
@@ -218,7 +240,7 @@ class ConceptDriftMonitor:
                 logger.warning(f"Drift monitoring failed: {e}", exc_info=True)
         logger.info(f"Adaptive Feature Monitor initialized for {symbol}. Tracking {len(self.feature_stats)} features.")
 
-    def check_feature_drift(self, current_features: pd.DataFrame, threshold: float | None = None) -> bool:
+    def check_feature_drift(self, current_features: Any, threshold: float | None = None) -> bool:
         """
         Check for drift using Z-score against ADAPTIVE statistics.
         Updates statistics online (EMA) to follow market regimes.
@@ -233,13 +255,11 @@ class ConceptDriftMonitor:
         try:
             if len(current_features) == 0:
                 return False
-            row = current_features.iloc[-1]
 
             for col, stats in self.feature_stats.items():
-                if col not in row:
+                val = _frame_like_latest_scalar(current_features, col)
+                if val is None:
                     continue
-
-                val = float(row[col])
 
                 z_score = abs(val - stats["mean"]) / stats["std"]
 
@@ -281,3 +301,4 @@ class ConceptDriftMonitor:
 
 def get_drift_monitor(cache_dir):
     return ConceptDriftMonitor()
+

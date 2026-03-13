@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import types
 from datetime import datetime
 
 from forex_bot.core.config import Settings
@@ -8,6 +10,9 @@ from forex_bot.execution.risk import RiskManager
 
 def _build_risk_manager(tmp_path, monkeypatch) -> RiskManager:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("FOREX_BOT_RUST_ONLY", raising=False)
+    monkeypatch.delenv("FOREX_BOT_RUNTIME_PROFILE", raising=False)
+    monkeypatch.delenv("FOREX_BOT_RUST_RISK", raising=False)
     settings = Settings()
     settings.system.symbol = "EURUSD_TEST"
     settings.system.trading_session_start = "00:00"
@@ -16,6 +21,31 @@ def _build_risk_manager(tmp_path, monkeypatch) -> RiskManager:
     settings.risk.challenge_mode = True
     settings.risk.challenge_phase = "phase_1"
     rm = RiskManager(settings)
+    monkeypatch.setattr("forex_bot.execution.risk._rust_risk_backend_available", lambda **_: True)
+
+    def _compute_position_size_lots(
+        *,
+        equity: float,
+        risk_pct: float,
+        stop_loss_pips: float,
+        pip_value: float,
+        max_lot_size: float,
+        lot_step: float = 0.01,
+        min_lot: float = 0.0,
+    ) -> float:
+        raw = float(equity) * float(risk_pct) / max(float(stop_loss_pips) * float(pip_value), 1e-9)
+        raw = max(float(min_lot), min(float(max_lot_size), raw))
+        step = max(float(lot_step), 1e-6)
+        return float(int(raw / step) * step)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "forex_bindings",
+        types.SimpleNamespace(
+            compute_position_size_lots=_compute_position_size_lots,
+            infer_pip_metrics=lambda *_args, **_kwargs: (0.0001, 10.0),
+        ),
+    )
     rm.is_trading_session = lambda: True  # type: ignore[method-assign]
     return rm
 

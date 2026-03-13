@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import sys
+from types import SimpleNamespace
 
 import numpy as np
-import pandas as pd
+from tests._compat_pd import pd
 
 from forex_bot.core.config import Settings
 from forex_bot.features.pipeline import FeatureEngineer
@@ -59,27 +61,20 @@ def test_base_signal_prefers_discovered_talib_knowledge(tmp_path, monkeypatch):
         encoding="utf-8",
     )
 
-    from forex_bot.features import talib_mixer
+    n = 12
+    discovered = np.zeros(n, dtype=np.int8)
+    discovered[::3] = 1
+    discovered[2::3] = -1
 
-    class _DummyMixer:
-        def __init__(self, *, device: str = "cpu", use_volume_features: bool = False) -> None:
-            self.available_indicators = ["RSI"]
+    def _bulk(*_args, **_kwargs):
+        return discovered.reshape(-1, 1)
 
-        @staticmethod
-        def bulk_calculate_indicators(df: pd.DataFrame, population) -> dict[str, pd.Series]:
-            return {}
-
-        @staticmethod
-        def compute_signals(df: pd.DataFrame, gene, *, cache=None) -> pd.Series:
-            arr = np.zeros(len(df), dtype=np.float64)
-            arr[::3] = 1.0
-            arr[2::3] = -1.0
-            return pd.Series(arr, index=df.index)
-
-    monkeypatch.setattr(talib_mixer, "TALIB_AVAILABLE", True, raising=False)
-    monkeypatch.setattr(talib_mixer, "TALibStrategyMixer", _DummyMixer, raising=False)
+    monkeypatch.setitem(sys.modules, "forex_bindings", SimpleNamespace(talib_bulk_signals_ohlcv=_bulk))
     monkeypatch.setenv("FOREX_BOT_BASE_SIGNAL_SOURCE", "discovery")
     monkeypatch.setenv("FOREX_BOT_PROP_SYMBOL_STRICT", "1")
+    monkeypatch.setenv("FOREX_BOT_PROP_ELITE_FILTER", "0")
+    monkeypatch.setenv("FOREX_BOT_PROP_REQUIRE_FORWARD_PASS", "0")
+    monkeypatch.setenv("FOREX_BOT_PROP_BASE_SIGNAL_STRICT_FILTER", "0")
 
     fe = FeatureEngineer(settings)
     idx = pd.date_range("2025-01-01", periods=12, freq="min", tz="UTC")
@@ -88,18 +83,18 @@ def test_base_signal_prefers_discovered_talib_knowledge(tmp_path, monkeypatch):
     out = fe._compute_base_signal(df, symbol="EURUSD")
     got = out["base_signal"].to_numpy(dtype=np.int8)
 
-    expected = np.zeros(len(idx), dtype=np.int8)
-    expected[::3] = 1
-    expected[2::3] = -1
-    np.testing.assert_array_equal(got, expected)
+    np.testing.assert_array_equal(got, discovered)
 
 
-def test_base_signal_discovery_first_falls_back_to_legacy_when_no_artifact(monkeypatch):
+def test_base_signal_discovery_first_without_artifact_returns_neutral(monkeypatch):
     settings = Settings()
     settings.system.cache_dir = "cache_missing_for_test"
     settings.models.prop_search_checkpoint = "models/missing_checkpoint.json"
 
     monkeypatch.setenv("FOREX_BOT_BASE_SIGNAL_SOURCE", "discovery_first")
+    monkeypatch.setenv("FOREX_BOT_PROP_ELITE_FILTER", "0")
+    monkeypatch.setenv("FOREX_BOT_PROP_REQUIRE_FORWARD_PASS", "0")
+    monkeypatch.setenv("FOREX_BOT_PROP_BASE_SIGNAL_STRICT_FILTER", "0")
 
     fe = FeatureEngineer(settings)
     idx = pd.date_range("2025-01-01", periods=3, freq="min", tz="UTC")
@@ -117,4 +112,134 @@ def test_base_signal_discovery_first_falls_back_to_legacy_when_no_artifact(monke
     )
 
     out = fe._compute_base_signal(df, symbol="EURUSD")
-    np.testing.assert_array_equal(out["base_signal"].to_numpy(dtype=np.int8), np.array([1, -1, 0], dtype=np.int8))
+    np.testing.assert_array_equal(out["base_signal"].to_numpy(dtype=np.int8), np.zeros(3, dtype=np.int8))
+
+
+def test_base_signal_discovery_first_defaults_to_no_classic_fallback(monkeypatch):
+    settings = Settings()
+    settings.system.cache_dir = "cache_missing_for_test"
+    settings.models.prop_search_checkpoint = "models/missing_checkpoint.json"
+
+    monkeypatch.setenv("FOREX_BOT_BASE_SIGNAL_SOURCE", "discovery_first")
+    monkeypatch.delenv("FOREX_BOT_BASE_SIGNAL_ALLOW_CLASSIC_FALLBACK", raising=False)
+    monkeypatch.setenv("FOREX_BOT_PROP_ELITE_FILTER", "0")
+    monkeypatch.setenv("FOREX_BOT_PROP_REQUIRE_FORWARD_PASS", "0")
+    monkeypatch.setenv("FOREX_BOT_PROP_BASE_SIGNAL_STRICT_FILTER", "0")
+
+    fe = FeatureEngineer(settings)
+    idx = pd.date_range("2025-01-01", periods=3, freq="min", tz="UTC")
+    df = pd.DataFrame(
+        {
+            "open": [1.0, 1.0, 1.0],
+            "high": [1.1, 1.1, 1.1],
+            "low": [0.9, 0.9, 0.9],
+            "close": [1.0, 1.0, 1.0],
+            "volume": [100.0, 100.0, 100.0],
+            "rsi": [25.0, 75.0, 50.0],
+            "macd_hist": [0.5, -0.5, 0.0],
+        },
+        index=idx,
+    )
+
+    out = fe._compute_base_signal(df, symbol="EURUSD")
+    np.testing.assert_array_equal(out["base_signal"].to_numpy(dtype=np.int8), np.zeros(3, dtype=np.int8))
+
+
+def test_base_signal_discovery_uses_rust_bulk_when_talib_unavailable(monkeypatch):
+    settings = Settings()
+    settings.system.cache_dir = "cache_missing_for_test"
+    settings.models.prop_search_checkpoint = "models/missing_checkpoint.json"
+
+    from forex_bot.features import talib_mixer
+
+    monkeypatch.setattr(talib_mixer, "TALIB_AVAILABLE", False, raising=False)
+    monkeypatch.setenv("FOREX_BOT_BASE_SIGNAL_SOURCE", "discovery")
+    monkeypatch.setenv("FOREX_BOT_PROP_ELITE_FILTER", "0")
+    monkeypatch.setenv("FOREX_BOT_PROP_REQUIRE_FORWARD_PASS", "0")
+    monkeypatch.setenv("FOREX_BOT_PROP_BASE_SIGNAL_STRICT_FILTER", "0")
+    monkeypatch.setenv("FOREX_BOT_PROP_BASE_SIGNAL_MIN_COVERAGE", "0.0")
+
+    n = 12
+    discovered = np.zeros(n, dtype=np.int8)
+    discovered[::3] = 1
+    discovered[2::3] = -1
+    calls = {"bulk": 0}
+
+    def _bulk(*_args, **_kwargs):
+        calls["bulk"] += 1
+        return discovered.reshape(-1, 1)
+
+    monkeypatch.setitem(sys.modules, "forex_bindings", SimpleNamespace(talib_bulk_signals_ohlcv=_bulk))
+
+    fe = FeatureEngineer(settings)
+    gene = SimpleNamespace(
+        indicators=["RSI"],
+        params={},
+        weights={"RSI": 1.0},
+        long_threshold=0.3,
+        short_threshold=-0.3,
+        fitness=2.0,
+    )
+    monkeypatch.setattr(fe, "_load_discovered_base_signal_genes", lambda _symbol, max_genes=100: [gene])
+
+    idx = pd.date_range("2025-01-01", periods=n, freq="min", tz="UTC")
+    df = _make_ohlcv(idx)
+    out = fe._compute_base_signal(df, symbol="EURUSD")
+    got = out["base_signal"].to_numpy(dtype=np.int8)
+
+    assert calls["bulk"] > 0
+    np.testing.assert_array_equal(got, discovered)
+
+
+def test_base_signal_discovery_strict_rust_skips_python_talib_fallback(monkeypatch):
+    settings = Settings()
+    settings.system.cache_dir = "cache_missing_for_test"
+    settings.models.prop_search_checkpoint = "models/missing_checkpoint.json"
+
+    from forex_bot.features import talib_mixer
+
+    class _DummyMixer:
+        def __init__(self, *, device: str = "cpu", use_volume_features: bool = False) -> None:
+            self.available_indicators = ["RSI"]
+
+        @staticmethod
+        def bulk_calculate_indicators(df: pd.DataFrame, population) -> dict[str, pd.Series]:
+            return {}
+
+        @staticmethod
+        def compute_signals(df: pd.DataFrame, gene, *, cache=None) -> pd.Series:
+            arr = np.zeros(len(df), dtype=np.float64)
+            arr[::2] = 1.0
+            return pd.Series(arr, index=df.index)
+
+    monkeypatch.setattr(talib_mixer, "TALIB_AVAILABLE", True, raising=False)
+    monkeypatch.setattr(talib_mixer, "TALibStrategyMixer", _DummyMixer, raising=False)
+    monkeypatch.setenv("FOREX_BOT_BASE_SIGNAL_SOURCE", "discovery")
+    monkeypatch.setenv("FOREX_BOT_RUST_ONLY", "1")
+    monkeypatch.setenv("FOREX_BOT_PANDAS_FREE", "1")
+    monkeypatch.setenv("FOREX_BOT_PROP_BASE_SIGNAL_MIN_COVERAGE", "0.0")
+
+    fe = FeatureEngineer(settings)
+    monkeypatch.setattr(
+        fe,
+        "_compute_discovered_base_signal_ohlcv_numpy",
+        lambda **_kwargs: np.zeros(10, dtype=np.int8),
+    )
+    gene = SimpleNamespace(
+        indicators=["RSI"],
+        params={},
+        weights={"RSI": 1.0},
+        long_threshold=0.3,
+        short_threshold=-0.3,
+        fitness=2.0,
+    )
+    monkeypatch.setattr(fe, "_load_discovered_base_signal_genes", lambda _symbol, max_genes=100: [gene])
+
+    idx = pd.date_range("2025-01-01", periods=10, freq="min", tz="UTC")
+    df = _make_ohlcv(idx)
+    out = fe._compute_base_signal(df, symbol="EURUSD")
+    got = out["base_signal"].to_numpy(dtype=np.int8)
+
+    # In strict Rust mode we should keep Rust result (zeros) and not fallback to Python TA-Lib mixer.
+    np.testing.assert_array_equal(got, np.zeros(10, dtype=np.int8))
+

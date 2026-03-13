@@ -1,10 +1,10 @@
 //! HPC-specific optimizations for Hyperstack N3-RTX-A6000x8 instances.
-//! 
+//!
 //! These optimizations ONLY activate when the specific hardware is detected:
 //! - 8× RTX A6000 (48GB each = 384GB VRAM)
 //! - 252 CPU cores (AMD EPYC Milan)
 //! - 464GB RAM
-//! 
+//!
 //! The topology is expected to be:
 //! - Socket 0 (NUMA 0): Cores 0-125, RAM 232GB, GPUs 0-3
 //! - Socket 1 (NUMA 1): Cores 126-251, RAM 232GB, GPUs 4-7
@@ -17,14 +17,14 @@ use tracing::{info, warn};
 static HPC_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Hardware profile for Hyperstack N3 detection
-/// 
+///
 /// N3-RTX-A6000x8: 252 physical cores + SMT = 504 logical threads
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HyperstackN3Profile {
     pub gpu_count: usize,
     pub gpu_min_vram_gb: f64,
-    pub cpu_logical_threads: usize,  // 504 with SMT
-    pub cpu_physical_cores: usize,   // 252 physical
+    pub cpu_logical_threads: usize, // 504 with SMT
+    pub cpu_physical_cores: usize,  // 252 physical
     pub total_ram_gb: f64,
     pub is_numa_dual_socket: bool,
 }
@@ -33,10 +33,10 @@ impl Default for HyperstackN3Profile {
     fn default() -> Self {
         Self {
             gpu_count: 8,
-            gpu_min_vram_gb: 40.0,     // Expect at least 40GB per GPU (A6000 has 48GB)
-            cpu_logical_threads: 500,  // Allow slight variation from 504
-            cpu_physical_cores: 250,   // Allow slight variation from 252
-            total_ram_gb: 450.0,       // Allow slight variation from 464GB
+            gpu_min_vram_gb: 40.0, // Expect at least 40GB per GPU (A6000 has 48GB)
+            cpu_logical_threads: 500, // Allow slight variation from 504
+            cpu_physical_cores: 250, // Allow slight variation from 252
+            total_ram_gb: 450.0,   // Allow slight variation from 464GB
             is_numa_dual_socket: true,
         }
     }
@@ -50,7 +50,7 @@ pub fn detect_hyperstack_n3() -> bool {
     }
 
     let profile = HyperstackN3Profile::default();
-    
+
     // Get GPU info
     let gpu_count = tch::Cuda::device_count() as usize;
     if gpu_count < profile.gpu_count {
@@ -65,7 +65,7 @@ pub fn detect_hyperstack_n3() -> bool {
             min_vram_gb = min_vram_gb.min(vram_gb);
         }
     }
-    
+
     if min_vram_gb < profile.gpu_min_vram_gb {
         return false;
     }
@@ -74,7 +74,7 @@ pub fn detect_hyperstack_n3() -> bool {
     let cpu_threads = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(1);
-    
+
     if cpu_threads < profile.cpu_logical_threads {
         return false;
     }
@@ -87,12 +87,12 @@ pub fn detect_hyperstack_n3() -> bool {
 
     // All checks passed - we're on Hyperstack N3!
     HPC_MODE_ACTIVE.store(true, Ordering::Relaxed);
-    
+
     info!(
         "🚀 Hyperstack N3 HPC Mode ACTIVATED: {} GPUs @ {:.1}GB+ VRAM, {} logical threads ({} physical cores), {:.1}GB RAM",
         gpu_count, min_vram_gb, cpu_threads, cpu_threads / 2, total_ram_gb
     );
-    
+
     true
 }
 
@@ -127,13 +127,13 @@ fn detect_total_ram_gb() -> f64 {
             }
         }
     }
-    
+
     // Fallback: use sysinfo if available
     0.0
 }
 
 /// Get GPU-CPU affinity mapping for NUMA optimization
-/// 
+///
 /// With 252 physical cores + SMT = 504 logical threads
 /// Socket 0 (NUMA 0): Physical 0-125 → Logical 0-125 (primary) + 252-377 (SMT)
 /// Socket 1 (NUMA 1): Physical 126-251 → Logical 126-251 (primary) + 378-503 (SMT)
@@ -147,13 +147,13 @@ pub fn get_gpu_cpu_affinity(gpu_id: i64) -> Vec<usize> {
     // Socket 1: GPUs 4-7 → Logical 126-251 (primary) + 378-503 (SMT) = 252 threads
     match gpu_id {
         0..=3 => {
-            let mut cores: Vec<usize> = (0..=125).collect();      // Primary threads
-            cores.extend(252..=377);                               // SMT threads
+            let mut cores: Vec<usize> = (0..=125).collect(); // Primary threads
+            cores.extend(252..=377); // SMT threads
             cores
         }
         4..=7 => {
-            let mut cores: Vec<usize> = (126..=251).collect();     // Primary threads  
-            cores.extend(378..=503);                               // SMT threads
+            let mut cores: Vec<usize> = (126..=251).collect(); // Primary threads
+            cores.extend(378..=503); // SMT threads
             cores
         }
         _ => Vec::new(),
@@ -169,14 +169,14 @@ pub fn is_nvlink_pair(gpu_a: i64, gpu_b: i64) -> bool {
     // NVLink topology on Hyperstack N3:
     // Pairs: (0,1), (2,3), (4,5), (6,7)
     let pairs = [(0, 1), (2, 3), (4, 5), (6, 7)];
-    
-    pairs.iter().any(|(a, b)| {
-        (gpu_a == *a && gpu_b == *b) || (gpu_a == *b && gpu_b == *a)
-    })
+
+    pairs
+        .iter()
+        .any(|(a, b)| (gpu_a == *a && gpu_b == *b) || (gpu_a == *b && gpu_b == *a))
 }
 
 /// Get optimal CPU cores for CPU-bound validation work
-/// 
+///
 /// With SMT: Use primary threads for compute, SMT threads for I/O
 /// Reserve 24 logical threads (12 physical) for GPU coordination
 pub fn get_validation_cpu_cores() -> Vec<usize> {
@@ -187,17 +187,17 @@ pub fn get_validation_cpu_cores() -> Vec<usize> {
     // Use 480 logical threads (240 physical) for validation
     // Reserve 24 logical threads (12 physical) for GPU coordination
     let mut cores = Vec::with_capacity(480);
-    
+
     // Socket 0: Primary threads 0-119 (leave 120-125 for GPU 0-3 coordination)
     cores.extend(0..120);
     // Socket 0: SMT threads 252-371 (leave 372-377 for GPU 0-3 coordination)
     cores.extend(252..372);
-    
+
     // Socket 1: Primary threads 126-245 (leave 246-251 for GPU 4-7 coordination)
     cores.extend(126..246);
     // Socket 1: SMT threads 378-497 (leave 498-503 for GPU 4-7 coordination)
     cores.extend(378..497);
-    
+
     cores
 }
 
@@ -214,22 +214,23 @@ pub fn set_thread_affinity(cores: &[usize]) -> Result<()> {
     unsafe {
         let mut cpuset: cpu_set_t = mem::zeroed();
         CPU_ZERO(&mut cpuset);
-        
+
         for &core in cores {
-            if core < 1024 { // CPU_SETSIZE is typically 1024
+            if core < 1024 {
+                // CPU_SETSIZE is typically 1024
                 CPU_SET(core, &mut cpuset);
             }
         }
-        
+
         let pid = 0; // Current thread
         let size = mem::size_of::<cpu_set_t>();
-        
+
         let result = sched_setaffinity(pid, size, &cpuset);
         if result != 0 {
             return Err(anyhow::anyhow!("sched_setaffinity failed"));
         }
     }
-    
+
     Ok(())
 }
 
@@ -296,31 +297,31 @@ mod tests {
     #[test]
     fn test_gpu_cpu_affinity() {
         force_hpc_mode(true);
-        
+
         let socket0 = get_gpu_cpu_affinity(0);
         assert!(socket0.contains(&0));
         assert!(socket0.contains(&125));
         assert!(!socket0.contains(&126));
-        
+
         let socket1 = get_gpu_cpu_affinity(4);
         assert!(socket1.contains(&126));
         assert!(socket1.contains(&251));
         assert!(!socket1.contains(&125));
-        
+
         force_hpc_mode(false);
     }
 
     #[test]
     fn test_nvlink_pairs() {
         force_hpc_mode(true);
-        
+
         assert!(is_nvlink_pair(0, 1));
         assert!(is_nvlink_pair(1, 0));
         assert!(is_nvlink_pair(2, 3));
         assert!(is_nvlink_pair(6, 7));
         assert!(!is_nvlink_pair(0, 2));
         assert!(!is_nvlink_pair(3, 4));
-        
+
         force_hpc_mode(false);
     }
 }

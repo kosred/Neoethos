@@ -1,10 +1,11 @@
+from __future__ import annotations
+
 import asyncio
 import logging
 import math
+import os
 from datetime import UTC, datetime, timedelta
 from typing import Any
-
-import pandas as pd
 
 from ..core.config import Settings
 from ..core.storage import RiskLedger
@@ -39,11 +40,24 @@ class NewsService:
         self.breaking_news: list = []
         self.last_advice: dict | None = None
 
+    @staticmethod
+    def _rust_only_enabled() -> bool:
+        raw = str(os.environ.get("FOREX_BOT_RUST_ONLY", "") or "").strip().lower()
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        profile = str(os.environ.get("FOREX_BOT_RUNTIME_PROFILE", "") or "").strip().lower()
+        if profile.startswith("rust"):
+            return True
+        backend = str(os.environ.get("FOREX_BOT_FEATURES_BACKEND", "") or "").strip().lower()
+        return backend in {"rust_strict", "strict_rust", "rust_only", "rust-only"}
+
     async def get_news_policy(self, symbol: str) -> dict[str, Any]:
         """
         Fetch news, update internal state, and return the current News Policy
         (flags for tier1 events, confidence scores, etc).
         """
+        if self._rust_only_enabled():
+            return {}
         # Lazy-init analyzer
         if not self.analyzer and getattr(self.settings.news, "enable_news", True):
             self.analyzer = await get_sentiment_analyzer(self.settings)
@@ -227,8 +241,10 @@ class NewsService:
             logger.warning(f"Strategist overlay failed: {e}")
         return None
 
-    def get_news_features(self, base_idx: pd.Index) -> pd.DataFrame | None:
+    def get_news_features(self, base_idx: Any) -> Any | None:
         """Build feature dataframe from current news events."""
+        if self._rust_only_enabled():
+            return None
         if not self.analyzer or not self.latest_events:
             return None
         try:
@@ -236,3 +252,4 @@ class NewsService:
         except Exception as e:
             logger.warning(f"News feature build failed: {e}")
             return None
+

@@ -33,6 +33,154 @@ def _default_all_timeframes() -> list[str]:
     return list(ALL_TIMEFRAMES)
 
 
+_RUNTIME_PROFILE_ALIASES: dict[str, str] = {
+    "rust": "rust_32gb",
+    "rust32": "rust_32gb",
+    "rust_32": "rust_32gb",
+    "rust_32gb": "rust_32gb",
+    "rust-safe": "rust_32gb",
+    "rust_safe": "rust_32gb",
+    "rustmax": "rust_max",
+    "rust_max": "rust_max",
+    "rust-fast": "rust_max",
+    "rust_fast": "rust_max",
+}
+
+_RUNTIME_PROFILE_PRESETS: dict[str, dict[str, str]] = {
+    # Safe defaults for 32GB-class machines.
+    "rust_32gb": {
+        "FOREX_BOT_PANDAS_FREE": "1",
+        "FOREX_BOT_RUST_ONLY": "1",
+        "FOREX_BOT_TREE_BACKEND": "rust_strict",
+        "FOREX_BOT_TREE_RUST_FALLBACK": "0",
+        "FOREX_BOT_RUST_FEATURES": "1",
+        "FOREX_BOT_FEATURES_BACKEND": "rust_strict",
+        "FOREX_BOT_DATA_BACKEND": "rust_strict",
+        "FOREX_BOT_FRAME_IO_BACKEND": "polars",
+        "FOREX_BOT_USE_ALL_TIMEFRAMES": "1",
+        "FOREX_BOT_PARALLEL_FEATURES": "auto",
+        "FOREX_BOT_FEATURE_WORKER_GB": "6",
+        "FOREX_BOT_RUST_FEATURE_PROFILE": "core",
+        "FOREX_BOT_RUST_HTF_FEATURE_PROFILE": "compact",
+        "FOREX_BOT_RUST_MAX_FEATURES": "96",
+        "FOREX_BOT_RUST_MAX_HTF_FEATURES": "12",
+        "FOREX_BOT_PROP_SEARCH_TRAIN_YEARS": "10",
+        "FOREX_BOT_PROP_HOLDOUT_YEARS": "3",
+        "FOREX_BOT_PROP_HOLDOUT_REQUIRED": "1",
+        "FOREX_BOT_PROP_HOLDOUT_FRACTION": "0",
+        "FOREX_BOT_PROP_ELITE_FILTER": "1",
+        "FOREX_BOT_PROP_REQUIRE_FORWARD_PASS": "1",
+        "FOREX_BOT_PROP_MIN_HOLDOUT_MONTHS": "6",
+        "FOREX_BOT_PROP_HOLDOUT_MAX_DD": "0.03",
+        "FOREX_BOT_PROP_REQUIRE_ALL_TFS": "1",
+        "FOREX_BOT_PROP_KEEP_MIN_SHARPE": "1.20",
+        "FOREX_BOT_PROP_KEEP_MIN_WIN_RATE": "0.52",
+        "FOREX_BOT_PROP_KEEP_MIN_PROFIT_FACTOR": "1.30",
+        "FOREX_BOT_PROP_KEEP_MIN_MONTHLY_PROFIT_PCT": "0.01",
+        "FOREX_BOT_PROP_SEARCH_MAX_ROWS": "0",
+        "FOREX_BOT_RUST_BASE_SIGNAL_MODE": "auto",
+        "FOREX_BOT_BASE_SIGNAL_ALLOW_PY_MIXER": "0",
+        "FOREX_BOT_BASE_SIGNAL_ALLOW_CLASSIC_FALLBACK": "0",
+        "FOREX_BOT_FEATURES_ALLOW_PY_FALLBACK": "0",
+        "FOREX_BOT_DISCOVERY_RUST_ONLY": "1",
+        "FOREX_BOT_GENETIC_ALLOW_PY_FALLBACK": "0",
+        "FOREX_BOT_TALIB_ALLOW_PY_FALLBACK": "0",
+        "FOREX_BOT_PROP_PY_FALLBACK": "0",
+        "FOREX_BOT_PROP_ALLOW_PY_RESCORING": "0",
+        "FOREX_BOT_PROP_ALLOW_PY_EXPANSION": "0",
+        "FOREX_BOT_STOP_TARGET_ALLOW_PY_FALLBACK": "0",
+    },
+    # More aggressive profile for larger RAM/CPU machines.
+    "rust_max": {
+        "FOREX_BOT_PANDAS_FREE": "1",
+        "FOREX_BOT_RUST_ONLY": "1",
+        "FOREX_BOT_TREE_BACKEND": "rust_strict",
+        "FOREX_BOT_TREE_RUST_FALLBACK": "0",
+        "FOREX_BOT_RUST_FEATURES": "1",
+        "FOREX_BOT_FEATURES_BACKEND": "rust_strict",
+        "FOREX_BOT_DATA_BACKEND": "rust_strict",
+        "FOREX_BOT_FRAME_IO_BACKEND": "polars",
+        "FOREX_BOT_USE_ALL_FEATURES": "1",
+        "FOREX_BOT_USE_ALL_TIMEFRAMES": "1",
+        "FOREX_BOT_PARALLEL_FEATURES": "auto",
+        "FOREX_BOT_FEATURE_WORKER_GB": "8",
+        "FOREX_BOT_RUST_FEATURE_PROFILE": "full",
+        "FOREX_BOT_RUST_HTF_FEATURE_PROFILE": "full",
+        "FOREX_BOT_RUST_MAX_FEATURES": "0",
+        "FOREX_BOT_RUST_MAX_HTF_FEATURES": "0",
+        "FOREX_BOT_PROP_SEARCH_TRAIN_YEARS": "10",
+        "FOREX_BOT_PROP_HOLDOUT_YEARS": "3",
+        "FOREX_BOT_PROP_HOLDOUT_REQUIRED": "1",
+        "FOREX_BOT_PROP_HOLDOUT_FRACTION": "0",
+        "FOREX_BOT_PROP_ELITE_FILTER": "1",
+        "FOREX_BOT_PROP_REQUIRE_FORWARD_PASS": "1",
+        "FOREX_BOT_PROP_MIN_HOLDOUT_MONTHS": "6",
+        "FOREX_BOT_PROP_HOLDOUT_MAX_DD": "0.03",
+        "FOREX_BOT_PROP_REQUIRE_ALL_TFS": "1",
+        "FOREX_BOT_PROP_KEEP_MIN_SHARPE": "1.20",
+        "FOREX_BOT_PROP_KEEP_MIN_WIN_RATE": "0.52",
+        "FOREX_BOT_PROP_KEEP_MIN_PROFIT_FACTOR": "1.30",
+        "FOREX_BOT_PROP_KEEP_MIN_MONTHLY_PROFIT_PCT": "0.01",
+        "FOREX_BOT_PROP_SEARCH_MAX_ROWS": "0",
+        "FOREX_BOT_RUST_BASE_SIGNAL_MODE": "auto",
+        "FOREX_BOT_BASE_SIGNAL_ALLOW_PY_MIXER": "0",
+        "FOREX_BOT_BASE_SIGNAL_ALLOW_CLASSIC_FALLBACK": "0",
+        "FOREX_BOT_FEATURES_ALLOW_PY_FALLBACK": "0",
+        "FOREX_BOT_DISCOVERY_RUST_ONLY": "1",
+        "FOREX_BOT_GENETIC_ALLOW_PY_FALLBACK": "0",
+        "FOREX_BOT_TALIB_ALLOW_PY_FALLBACK": "0",
+        "FOREX_BOT_PROP_PY_FALLBACK": "0",
+        "FOREX_BOT_PROP_ALLOW_PY_RESCORING": "0",
+        "FOREX_BOT_PROP_ALLOW_PY_EXPANSION": "0",
+        "FOREX_BOT_STOP_TARGET_ALLOW_PY_FALLBACK": "0",
+    },
+}
+
+
+def apply_runtime_profile_defaults(profile: str | None = None) -> str:
+    """
+    Apply grouped runtime defaults so users can set one profile instead of many env vars.
+
+    Resolution order:
+    1) explicit `profile` argument
+    2) FOREX_BOT_RUNTIME_PROFILE
+    3) FOREX_BOT_PROFILE (legacy alias)
+    """
+    raw = profile
+    if raw is None or str(raw).strip() == "":
+        raw = os.environ.get("FOREX_BOT_RUNTIME_PROFILE")
+    if raw is None or str(raw).strip() == "":
+        raw = os.environ.get("FOREX_BOT_PROFILE")
+
+    mode = str(raw or "").strip().lower().replace("-", "_")
+    mode = _RUNTIME_PROFILE_ALIASES.get(mode, mode)
+    if mode in {"", "off", "none", "default", "auto"}:
+        return ""
+
+    preset = _RUNTIME_PROFILE_PRESETS.get(mode)
+    if not preset:
+        return ""
+
+    for key, value in preset.items():
+        os.environ.setdefault(key, value)
+
+    # CPU/thread defaults tuned per profile so Rust workers don't collapse to single-core.
+    cpu_total = max(1, os.cpu_count() or 1)
+    if mode == "rust_32gb":
+        cpu_budget = max(1, min(cpu_total - 1, 8))
+    else:
+        cpu_budget = max(1, cpu_total - 1)
+    os.environ.setdefault("FOREX_BOT_DISCOVERY_CPU_BUDGET", str(cpu_budget))
+    os.environ.setdefault("FOREX_BOT_PROP_SEARCH_WORKERS", str(cpu_budget))
+    os.environ.setdefault("RAYON_NUM_THREADS", str(cpu_budget))
+    os.environ.setdefault("OMP_NUM_THREADS", str(cpu_budget))
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", str(cpu_budget))
+    os.environ.setdefault("MKL_NUM_THREADS", str(cpu_budget))
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", str(cpu_budget))
+    os.environ.setdefault("FOREX_BOT_RUNTIME_PROFILE", mode)
+    return mode
+
+
 class YamlConfigSettingsSource(PydanticBaseSettingsSource):
     def get_field_value(self, field: object, field_name: str) -> tuple[object, str, bool]:
         return super().get_field_value(field, field_name)
@@ -274,7 +422,7 @@ class RiskConfig(BaseModel):
     @field_validator("min_risk_reward")
     @classmethod
     def validate_rr(cls, v: float) -> float:
-        return max(0.1, v)
+        return max(1.5, v)
 
 class ModelsConfig(BaseModel):
     ml_models: list[str] = Field(
@@ -317,7 +465,7 @@ class ModelsConfig(BaseModel):
     prop_search_max_hours: float = 2.0
     prop_search_max_rows: int = 0
     prop_search_max_rows_by_tf: dict[str, int] = Field(default_factory=dict)
-    prop_search_portfolio_size: int = 5000
+    prop_search_portfolio_size: int = 4
     # 0 = allow full indicator set (no hard cap)
     prop_search_max_indicators: int = 0
     prop_search_checkpoint: str = "models/strategy_evo_checkpoint.json"
@@ -518,4 +666,6 @@ class Settings(BaseSettings):
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         return (init_settings, YamlConfigSettingsSource(settings_cls), env_settings, file_secret_settings)
 
+# Apply preset env defaults before constructing the singleton settings object.
+apply_runtime_profile_defaults()
 settings = Settings()

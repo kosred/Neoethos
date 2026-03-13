@@ -40,7 +40,7 @@ def _rust_risk_backend_available(*, force_log: bool = False) -> bool:
             _RUST_RISK_BACKEND_OK = False
     if force_log and not _RUST_RISK_BACKEND_OK and not _RUST_RISK_WARNED_UNAVAILABLE:
         logger.warning(
-            "Rust risk backend requested but forex_bindings.compute_position_size_lots is unavailable; using Python risk sizing."
+            "Rust risk backend requested but forex_bindings.compute_position_size_lots is unavailable."
         )
         _RUST_RISK_WARNED_UNAVAILABLE = True
     return bool(_RUST_RISK_BACKEND_OK)
@@ -1058,88 +1058,73 @@ class RiskManager:
         risk_pct = min(self.settings.risk.max_risk_per_trade, max(risk_floor, risk_pct))
 
         pip_size, pip_value = self._compute_pip_metrics(symbol_info)
-        _ = pip_size
+        if not np.isfinite(pip_size) or pip_size <= 0.0 or not np.isfinite(pip_value) or pip_value <= 0.0:
+            logger.error("Rust pip metrics unavailable; position sizing is blocked.")
+            return 0.0
 
-        use_rust = str(os.environ.get("FOREX_BOT_RUST_RISK", "1") or "1").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-            "rust",
-        }
-        if use_rust and _rust_risk_backend_available(force_log=True):
-            try:
-                import forex_bindings  # type: ignore
+        backend_ok = _rust_risk_backend_available(force_log=True)
+        if not backend_ok:
+            logger.error("Rust risk backend unavailable; position sizing is blocked.")
+            return 0.0
 
-                lot_size_rs = float(
-                    forex_bindings.compute_position_size_lots(
-                        equity=float(equity),
-                        risk_pct=float(risk_pct),
-                        stop_loss_pips=float(stop_loss_pips),
-                        pip_value=float(pip_value),
-                        max_lot_size=float(self.prop_rules.max_lot_size),
-                        lot_step=0.01,
-                        min_lot=0.0,
-                    )
+        try:
+            import forex_bindings  # type: ignore
+
+            lot_size_rs = float(
+                forex_bindings.compute_position_size_lots(
+                    equity=float(equity),
+                    risk_pct=float(risk_pct),
+                    stop_loss_pips=float(stop_loss_pips),
+                    pip_value=float(pip_value),
+                    max_lot_size=float(self.prop_rules.max_lot_size),
+                    lot_step=0.01,
+                    min_lot=0.0,
                 )
-                if np.isfinite(lot_size_rs):
-                    return max(0.0, min(float(lot_size_rs), self.prop_rules.max_lot_size))
-            except Exception as exc:
-                _disable_rust_risk_backend()
-                logger.debug("Rust risk sizing failed; falling back to Python: %s", exc)
+            )
+            if np.isfinite(lot_size_rs):
+                return max(0.0, min(float(lot_size_rs), self.prop_rules.max_lot_size))
+        except Exception as exc:
+            _disable_rust_risk_backend()
+            logger.error("Rust risk sizing failed; position sizing is blocked: %s", exc)
+            return 0.0
 
-        risk_amount = equity * risk_pct
-        lot_size = risk_amount / max(stop_loss_pips * pip_value, 1e-9)
-
-        lot_size = int(lot_size * 100) / 100.0
-        return max(0.0, min(lot_size, self.prop_rules.max_lot_size))
+        logger.error("Rust risk sizing produced non-finite lot size; position sizing is blocked.")
+        return 0.0
 
     def _compute_pip_metrics(self, symbol_info: dict | None) -> tuple[float, float]:
         """
-        Return (pip_size, pip_value_per_lot) using broker metadata when available.
-        Falls back to symbol heuristics instead of a flat 10 USD pip value.
+        Return (pip_size, pip_value_per_lot) from Rust bindings only.
         """
         sym = (self.settings.system.symbol or "").upper()
-        default_point = 0.0001
-        digits = 5
+        price_hint = None
         if symbol_info:
-            default_point = float(symbol_info.get("point", default_point) or default_point)
-            digits = int(symbol_info.get("digits", digits) or digits)
-        # Infer pip size from digits with symbol overrides
-        if sym.startswith("XAU") or sym.startswith("XAG"):
-            pip_size = 0.01
-        elif "BTC" in sym or "ETH" in sym or "LTC" in sym:
-            pip_size = 1.0
-        elif sym.endswith("JPY") or sym.startswith("JPY"):
-            pip_size = 0.01
-        else:
-            pip_size = default_point * (10 if digits >= 4 else 1)
+            try:
+                px = float(symbol_info.get("bid") or symbol_info.get("ask") or symbol_info.get("last") or 0.0)
+                if np.isfinite(px) and px > 0.0:
+                    price_hint = px
+            except Exception:
+                price_hint = None
 
-        tick_size = pip_size
-        tick_value = 0.0
-        contract_size = 100000.0
-        price_hint = 0.0
-        if symbol_info:
-            tick_size = float(symbol_info.get("trade_tick_size", symbol_info.get("tick_size", tick_size)) or tick_size)
-            tick_value = float(symbol_info.get("trade_tick_value", symbol_info.get("tick_value", 0.0)) or 0.0)
-            contract_size = float(
-                symbol_info.get("trade_contract_size", symbol_info.get("contract_size", contract_size)) or contract_size
-            )
-            price_hint = float(symbol_info.get("bid") or symbol_info.get("ask") or symbol_info.get("last") or 0.0)
-
-        pip_value = 0.0
         try:
-            if tick_value > 0 and tick_size > 0:
-                pip_value = tick_value * (pip_size / tick_size)
-            elif contract_size > 0 and price_hint > 0:
-                pip_value = (pip_size / price_hint) * contract_size
-            elif contract_size > 0:
-                pip_value = pip_size * contract_size
-        except Exception as exc:
-            logger.warning(f"Dynamic pip calc failed: {exc}")
+            import forex_bindings  # type: ignore
 
-        # Ensure we never return zero to avoid divide-by-zero above
-        return pip_size, max(pip_value, 1e-6)
+            if not hasattr(forex_bindings, "infer_pip_metrics"):
+                logger.error("Rust infer_pip_metrics is unavailable for %s.", sym)
+                return 0.0, 0.0
+            pip_size, pip_value = forex_bindings.infer_pip_metrics(
+                sym,
+                price=price_hint,
+                account_currency="USD",
+                reference_prices=None,
+            )
+            if np.isfinite(pip_size) and pip_size > 0.0 and np.isfinite(pip_value) and pip_value > 0.0:
+                return float(pip_size), float(pip_value)
+        except Exception as exc:
+            logger.error("Rust pip metric inference failed for %s: %s", sym, exc)
+            return 0.0, 0.0
+
+        logger.error("Rust pip metric inference returned invalid values for %s.", sym)
+        return 0.0, 0.0
 
     def on_trade_opened(self, timestamp: datetime) -> None:
         """Increment trade counter on open."""

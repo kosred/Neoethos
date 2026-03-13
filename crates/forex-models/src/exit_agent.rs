@@ -32,7 +32,8 @@ impl ExitAgent {
                 .context("Failed to import forex_bot.models.exit_agent")?;
 
             // Get the ExitAgent class
-            let exit_class = exit_module.getattr("ExitAgent")
+            let exit_class = exit_module
+                .getattr("ExitAgent")
                 .context("ExitAgent class not found")?;
 
             // Import Settings (or create a mock one)
@@ -64,7 +65,9 @@ impl ExitAgent {
     /// Returns: 0 (Hold) or 1 (Close)
     pub fn get_action(&self, state: &[f64], eval_mode: bool) -> Result<i32> {
         Python::attach(|py| {
-            let agent = self.py_agent.as_ref()
+            let agent = self
+                .py_agent
+                .as_ref()
                 .context("Exit agent not initialized")?
                 .bind(py);
 
@@ -73,7 +76,9 @@ impl ExitAgent {
             let state_np = numpy.call_method1("array", (state,))?;
 
             // Call get_action
-            let action: i32 = agent.call_method1("get_action", (state_np, eval_mode))?.extract()?;
+            let action: i32 = agent
+                .call_method1("get_action", (state_np, eval_mode))?
+                .extract()?;
 
             Ok(action)
         })
@@ -90,7 +95,9 @@ impl ExitAgent {
         timestamp: i64,
     ) -> Result<()> {
         Python::attach(|py| {
-            let agent = self.py_agent.as_ref()
+            let agent = self
+                .py_agent
+                .as_ref()
                 .context("Exit agent not initialized")?
                 .bind(py);
 
@@ -118,7 +125,9 @@ impl ExitAgent {
         direction: i32,
     ) -> Result<()> {
         Python::attach(|py| {
-            let agent = self.py_agent.as_ref()
+            let agent = self
+                .py_agent
+                .as_ref()
                 .context("Exit agent not initialized")?
                 .bind(py);
 
@@ -135,7 +144,9 @@ impl ExitAgent {
     /// Python lines 130-150
     pub fn train_step(&mut self) -> Result<()> {
         Python::attach(|py| {
-            let agent = self.py_agent.as_ref()
+            let agent = self
+                .py_agent
+                .as_ref()
                 .context("Exit agent not initialized")?
                 .bind(py);
 
@@ -148,7 +159,9 @@ impl ExitAgent {
     /// Get current epsilon (exploration rate)
     pub fn get_epsilon(&self) -> Result<f64> {
         Python::attach(|py| {
-            let agent = self.py_agent.as_ref()
+            let agent = self
+                .py_agent
+                .as_ref()
                 .context("Exit agent not initialized")?
                 .bind(py);
 
@@ -161,7 +174,9 @@ impl ExitAgent {
     /// Set epsilon (exploration rate)
     pub fn set_epsilon(&mut self, epsilon: f64) -> Result<()> {
         Python::attach(|py| {
-            let agent = self.py_agent.as_ref()
+            let agent = self
+                .py_agent
+                .as_ref()
                 .context("Exit agent not initialized")?
                 .bind(py);
 
@@ -174,7 +189,9 @@ impl ExitAgent {
     /// Get memory size
     pub fn memory_size(&self) -> Result<usize> {
         Python::attach(|py| {
-            let agent = self.py_agent.as_ref()
+            let agent = self
+                .py_agent
+                .as_ref()
                 .context("Exit agent not initialized")?
                 .bind(py);
 
@@ -189,7 +206,9 @@ impl ExitAgent {
     /// Python lines 158-159
     pub fn save(&self, path: &Path) -> Result<()> {
         Python::attach(|py| {
-            let agent = self.py_agent.as_ref()
+            let agent = self
+                .py_agent
+                .as_ref()
                 .context("Exit agent not initialized")?
                 .bind(py);
 
@@ -205,7 +224,9 @@ impl ExitAgent {
     /// Python lines 161-169
     pub fn load(&mut self, path: &Path) -> Result<()> {
         Python::attach(|py| {
-            let agent = self.py_agent.as_ref()
+            let agent = self
+                .py_agent
+                .as_ref()
                 .context("Exit agent not initialized")?
                 .bind(py);
 

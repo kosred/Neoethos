@@ -48,6 +48,13 @@ pub struct StopTargetSettings {
     pub rr_trend: f64,
     pub rr_range: f64,
     pub rr_neutral: f64,
+    pub min_risk_reward: f64,
+    pub atr_stop_multiplier: f64,
+    pub stop_target_mode: String,
+    pub structure_lookback_bars: usize,
+    pub structure_swing_window: usize,
+    pub structure_min_atr_mult: f64,
+    pub structure_max_atr_mult: f64,
     pub ema_fast_period: usize,
     pub ema_slow_period: usize,
     pub atr_period: usize,
@@ -80,6 +87,13 @@ impl Default for StopTargetSettings {
             rr_trend,
             rr_range,
             rr_neutral: (rr_trend + rr_range) / 2.0,
+            min_risk_reward: 2.0,
+            atr_stop_multiplier: 1.5,
+            stop_target_mode: "blend".to_string(),
+            structure_lookback_bars: 120,
+            structure_swing_window: 2,
+            structure_min_atr_mult: 0.8,
+            structure_max_atr_mult: 4.0,
             ema_fast_period: 20,
             ema_slow_period: 50,
             atr_period: 14,
@@ -134,8 +148,7 @@ fn rolling_var(values: &[f64], window: usize) -> Vec<f64> {
 }
 
 fn vol_parkinson(high: &[f64], low: &[f64]) -> Vec<f64> {
-    high
-        .iter()
+    high.iter()
         .zip(low.iter())
         .map(|(h, l)| {
             let hl = safe_log(*h) - safe_log(*l);
@@ -171,7 +184,13 @@ fn vol_garman_klass(open: &[f64], high: &[f64], low: &[f64], close: &[f64]) -> V
     out
 }
 
-fn vol_yang_zhang(open: &[f64], high: &[f64], low: &[f64], close: &[f64], window: usize) -> Vec<f64> {
+fn vol_yang_zhang(
+    open: &[f64],
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    window: usize,
+) -> Vec<f64> {
     let n = close.len();
     if n < 2 {
         return vec![0.0; n];
@@ -300,11 +319,20 @@ pub fn estimate_volatility(
     let method = method.to_lowercase();
     if method == "ensemble" || method == "mix" || method == "blend" {
         let v_pk = vol_parkinson(high, low);
-        let sigma_pk = rolling_mean(&v_pk, window).into_iter().map(|v| v.max(0.0).sqrt()).collect::<Vec<_>>();
+        let sigma_pk = rolling_mean(&v_pk, window)
+            .into_iter()
+            .map(|v| v.max(0.0).sqrt())
+            .collect::<Vec<_>>();
         let v_gk = vol_garman_klass(open, high, low, close);
-        let sigma_gk = rolling_mean(&v_gk, window).into_iter().map(|v| v.max(0.0).sqrt()).collect::<Vec<_>>();
+        let sigma_gk = rolling_mean(&v_gk, window)
+            .into_iter()
+            .map(|v| v.max(0.0).sqrt())
+            .collect::<Vec<_>>();
         let v_rs = vol_rogers_satchell(open, high, low, close);
-        let sigma_rs = rolling_mean(&v_rs, window).into_iter().map(|v| v.max(0.0).sqrt()).collect::<Vec<_>>();
+        let sigma_rs = rolling_mean(&v_rs, window)
+            .into_iter()
+            .map(|v| v.max(0.0).sqrt())
+            .collect::<Vec<_>>();
         let sigma_yz = vol_yang_zhang(open, high, low, close, window);
 
         let mut out = vec![0.0; close.len()];
@@ -312,7 +340,8 @@ pub fn estimate_volatility(
         for i in 0..out.len() {
             let stacked = [sigma_yz[i], sigma_gk[i], sigma_rs[i], sigma_pk[i]];
             if let Some(w) = weights {
-                out[i] = stacked[0] * w[0] + stacked[1] * w[1] + stacked[2] * w[2] + stacked[3] * w[3];
+                out[i] =
+                    stacked[0] * w[0] + stacked[1] * w[1] + stacked[2] * w[2] + stacked[3] * w[3];
             } else {
                 let med = median_ignore_nan(&stacked);
                 out[i] = if med.is_finite() { med } else { 0.0 };
@@ -322,15 +351,24 @@ pub fn estimate_volatility(
     }
     if method == "parkinson" || method == "park" {
         let v = vol_parkinson(high, low);
-        return rolling_mean(&v, window).into_iter().map(|v| v.max(0.0).sqrt()).collect();
+        return rolling_mean(&v, window)
+            .into_iter()
+            .map(|v| v.max(0.0).sqrt())
+            .collect();
     }
     if method == "garman_klass" || method == "gk" {
         let v = vol_garman_klass(open, high, low, close);
-        return rolling_mean(&v, window).into_iter().map(|v| v.max(0.0).sqrt()).collect();
+        return rolling_mean(&v, window)
+            .into_iter()
+            .map(|v| v.max(0.0).sqrt())
+            .collect();
     }
     if method == "rogers_satchell" || method == "rs" {
         let v = vol_rogers_satchell(open, high, low, close);
-        return rolling_mean(&v, window).into_iter().map(|v| v.max(0.0).sqrt()).collect();
+        return rolling_mean(&v, window)
+            .into_iter()
+            .map(|v| v.max(0.0).sqrt())
+            .collect();
     }
     if method == "ewma" || method == "riskmetrics" {
         return vol_ewma(close, window, ewma_lambda);
@@ -532,8 +570,16 @@ fn compute_adx(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Optio
         plus_sum = plus_sum - (plus_sum / period as f64) + plus_dm[i];
         minus_sum = minus_sum - (minus_sum / period as f64) + minus_dm[i];
 
-        let plus_di = if tr_sum > 0.0 { 100.0 * plus_sum / tr_sum } else { 0.0 };
-        let minus_di = if tr_sum > 0.0 { 100.0 * minus_sum / tr_sum } else { 0.0 };
+        let plus_di = if tr_sum > 0.0 {
+            100.0 * plus_sum / tr_sum
+        } else {
+            0.0
+        };
+        let minus_di = if tr_sum > 0.0 {
+            100.0 * minus_sum / tr_sum
+        } else {
+            0.0
+        };
         let denom = (plus_di + minus_di).max(1e-9);
         dx.push(100.0 * (plus_di - minus_di).abs() / denom);
     }
@@ -603,6 +649,160 @@ pub fn infer_regime(
     }
 
     "neutral".to_string()
+}
+
+fn regime_rr(regime: &str, settings: &StopTargetSettings) -> f64 {
+    match regime {
+        "trend" => settings.rr_trend,
+        "range" => settings.rr_range,
+        _ => settings.rr_neutral,
+    }
+}
+
+fn atr_last_distances(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    settings: &StopTargetSettings,
+    regime: &str,
+) -> Option<(f64, f64, f64)> {
+    let atr = compute_atr(high, low, close, settings.atr_period)
+        .last()
+        .copied()
+        .unwrap_or(f64::NAN);
+    if !atr.is_finite() || atr <= 0.0 {
+        return None;
+    }
+    let sl = (atr * settings.atr_stop_multiplier.max(0.1)).max(settings.meta_label_min_dist);
+    if !sl.is_finite() || sl <= 0.0 {
+        return None;
+    }
+    let rr_floor = settings.min_risk_reward.max(1.5);
+    let rr = regime_rr(regime, settings).max(rr_floor);
+    let tp = (sl * rr).max(settings.meta_label_min_dist);
+    if !tp.is_finite() || tp <= 0.0 {
+        return None;
+    }
+    Some((sl, tp, rr))
+}
+
+fn swing_levels(
+    high: &[f64],
+    low: &[f64],
+    lookback: usize,
+    swing_window: usize,
+) -> Option<(f64, f64)> {
+    if high.is_empty() || low.is_empty() || high.len() != low.len() {
+        return None;
+    }
+    let span = (2 * swing_window.max(1)) + 1;
+    let lb = lookback.max(span + 2).min(high.len());
+    if lb < span {
+        return None;
+    }
+    let hs = &high[(high.len() - lb)..];
+    let ls = &low[(low.len() - lb)..];
+    let half = swing_window.max(1);
+    let eps = 1e-12;
+
+    let mut swing_highs: Vec<f64> = Vec::new();
+    let mut swing_lows: Vec<f64> = Vec::new();
+    for i in half..(lb - half) {
+        let mut max_w = f64::NEG_INFINITY;
+        let mut min_w = f64::INFINITY;
+        for j in (i - half)..=(i + half) {
+            max_w = max_w.max(hs[j]);
+            min_w = min_w.min(ls[j]);
+        }
+        if hs[i].is_finite() && max_w.is_finite() && hs[i] >= (max_w - eps) {
+            swing_highs.push(hs[i]);
+        }
+        if ls[i].is_finite() && min_w.is_finite() && ls[i] <= (min_w + eps) {
+            swing_lows.push(ls[i]);
+        }
+    }
+
+    let resistance = swing_highs
+        .last()
+        .copied()
+        .unwrap_or_else(|| hs.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+    let support = swing_lows
+        .last()
+        .copied()
+        .unwrap_or_else(|| ls.iter().copied().fold(f64::INFINITY, f64::min));
+    if !resistance.is_finite() || !support.is_finite() {
+        return None;
+    }
+    Some((support, resistance))
+}
+
+fn structure_distances(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    settings: &StopTargetSettings,
+    signal: i8,
+    regime: &str,
+) -> Option<(f64, f64, f64)> {
+    let (support, resistance) = swing_levels(
+        high,
+        low,
+        settings.structure_lookback_bars.max(20),
+        settings.structure_swing_window.max(1),
+    )?;
+    let px = *close.last()?;
+    if !px.is_finite() || px <= 0.0 {
+        return None;
+    }
+
+    let (sl_raw, tp_raw) = if signal > 0 {
+        (px - support, resistance - px)
+    } else if signal < 0 {
+        (resistance - px, px - support)
+    } else {
+        let down = px - support;
+        let up = resistance - px;
+        (
+            down.max(0.0).min(up.max(0.0)),
+            down.max(0.0).max(up.max(0.0)),
+        )
+    };
+    if !sl_raw.is_finite() || sl_raw <= 0.0 {
+        return None;
+    }
+
+    let atr = compute_atr(high, low, close, settings.atr_period)
+        .last()
+        .copied()
+        .unwrap_or(f64::NAN);
+    let min_dist = settings.meta_label_min_dist.max(0.0);
+    let mut sl = sl_raw.max(min_dist);
+    if atr.is_finite() && atr > 0.0 {
+        let lo = (atr * settings.structure_min_atr_mult.max(0.1)).max(min_dist);
+        let hi = (atr
+            * settings
+                .structure_max_atr_mult
+                .max(settings.structure_min_atr_mult))
+        .max(lo);
+        sl = sl.clamp(lo, hi);
+    }
+
+    let rr_floor = settings.min_risk_reward.max(1.5);
+    let rr_regime = regime_rr(regime, settings).max(rr_floor);
+    let rr_struct = if tp_raw.is_finite() && tp_raw > 0.0 {
+        tp_raw / sl.max(1e-9)
+    } else {
+        rr_regime
+    };
+    let rr = rr_struct.max(rr_regime).clamp(rr_floor, 6.0);
+    let mut tp = (sl * rr).max(settings.meta_label_min_dist);
+    if tp_raw.is_finite() && tp_raw > 0.0 {
+        tp = tp.max(tp_raw);
+    }
+    if !tp.is_finite() || tp <= 0.0 {
+        return None;
+    }
+    Some((sl, tp, rr))
 }
 
 pub fn compute_stop_distance_series(
@@ -683,6 +883,7 @@ pub fn infer_stop_target_pips(
     close: &[f64],
     settings: &StopTargetSettings,
     pip_size: f64,
+    signal: i8,
 ) -> Option<(f64, f64, f64)> {
     if close.len() < settings.vol_window.max(settings.tail_window).max(5) {
         return None;
@@ -706,7 +907,8 @@ pub fn infer_stop_target_pips(
         settings.ewma_lambda,
     );
     let sigma_last = *sigma.last().unwrap_or(&0.0);
-    let es = estimate_expected_shortfall(close, settings.tail_window, settings.tail_alpha).unwrap_or(0.0);
+    let es = estimate_expected_shortfall(close, settings.tail_window, settings.tail_alpha)
+        .unwrap_or(0.0);
     let price = *close.last().unwrap_or(&0.0);
     let scale = (settings.vol_horizon_bars.max(1) as f64).sqrt();
     let vol_dist = price * sigma_last * scale;
@@ -714,19 +916,57 @@ pub fn infer_stop_target_pips(
     let dist = (settings.stop_k_vol * vol_dist)
         .max(settings.stop_k_tail * tail_dist)
         .max(settings.meta_label_min_dist);
-    if !dist.is_finite() || dist <= 0.0 {
-        return None;
-    }
-
-    let sl_pips = dist / pip_size.max(1e-9);
-    let rr = match regime.as_str() {
-        "trend" => settings.rr_trend,
-        "range" => settings.rr_range,
-        _ => settings.rr_neutral,
+    let base = if dist.is_finite() && dist > 0.0 {
+        let rr = regime_rr(&regime, settings);
+        Some((dist, dist * rr, rr))
+    } else {
+        None
     };
-    let tp_pips = sl_pips * rr;
-    if !tp_pips.is_finite() || tp_pips <= 0.0 {
+    let atr = atr_last_distances(high, low, close, settings, &regime);
+    let structure = structure_distances(high, low, close, settings, signal, &regime);
+
+    let mode = settings.stop_target_mode.trim().to_ascii_lowercase();
+    let selected = if matches!(mode.as_str(), "structure" | "market_structure" | "swing") {
+        structure.or(atr).or(base)
+    } else if matches!(mode.as_str(), "atr" | "atr_only") {
+        atr.or(base).or(structure)
+    } else {
+        let base_eff = base.or(atr);
+        match (structure, base_eff, atr) {
+            (Some(s), Some(b), _) => {
+                let w_struct = if regime == "trend" {
+                    0.70
+                } else if regime == "range" {
+                    0.35
+                } else {
+                    0.55
+                };
+                let w_atr = 1.0 - w_struct;
+                let sl = (w_struct * s.0) + (w_atr * b.0);
+                let rr_floor = settings.min_risk_reward.max(1.5);
+                let rr = ((w_struct * s.2) + (w_atr * b.2)).max(rr_floor);
+                let tp = (sl * rr).max((w_struct * s.1) + (w_atr * b.1));
+                Some((sl, tp, rr))
+            }
+            _ => structure.or(base_eff).or(atr),
+        }
+    };
+    let (sl_dist, tp_dist, rr_selected) = selected?;
+    if !sl_dist.is_finite() || !tp_dist.is_finite() || sl_dist <= 0.0 || tp_dist <= 0.0 {
         return None;
     }
-    Some((sl_pips, tp_pips, rr))
+    let mut sl_pips = sl_dist / pip_size.max(1e-9);
+    let mut tp_pips = tp_dist / pip_size.max(1e-9);
+    if !sl_pips.is_finite() || !tp_pips.is_finite() || sl_pips <= 0.0 || tp_pips <= 0.0 {
+        return None;
+    }
+    let rr_floor = settings.min_risk_reward.max(1.5);
+    let mut rr_out = (tp_pips / sl_pips.max(1e-9)).max(rr_selected.max(0.0));
+    if rr_out < rr_floor {
+        tp_pips = sl_pips * rr_floor;
+        rr_out = rr_floor;
+    }
+    // Ensure positive bounded values.
+    sl_pips = sl_pips.max(1e-9);
+    Some((sl_pips, tp_pips.max(1e-9), rr_out))
 }

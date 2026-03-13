@@ -146,7 +146,7 @@ models:
   prop_search_generations: 20  # Evolution iterations (budget-safe default)
   prop_search_max_hours: 2.0  # Budget-safe time cap
   prop_search_max_rows: 0  # 0 = USE FULL DATASET for strategy discovery (2.2M rows)
-  prop_search_portfolio_size: 5000  # Keep many strategies for downstream evaluation
+  prop_search_portfolio_size: 4  # Cap discovered strategies per pair
   # 0 = allow full indicator set (no hard cap)
   prop_search_max_indicators: 0
   prop_search_async: true

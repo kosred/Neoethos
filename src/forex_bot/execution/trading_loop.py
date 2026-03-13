@@ -1,10 +1,13 @@
+from __future__ import annotations
+
 import asyncio
 import contextlib
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
-import pandas as pd
+import numpy as np
 
 from ..core.config import Settings
 from ..execution.drift_monitor import ConceptDriftMonitor
@@ -24,6 +27,55 @@ from ..strategy.fast_backtest import infer_pip_metrics
 from ..training.online_learner import OnlineLearner
 
 logger = logging.getLogger(__name__)
+
+
+def _frame_empty(value: object) -> bool:
+    if value is None:
+        return True
+    try:
+        return bool(getattr(value, "empty"))
+    except Exception:
+        pass
+    try:
+        return int(len(value)) <= 0  # type: ignore[arg-type]
+    except Exception:
+        return True
+
+
+def _frame_columns(frame: object) -> list[str]:
+    cols = getattr(frame, "columns", None)
+    if cols is None:
+        return []
+    try:
+        return [str(c) for c in list(cols)]
+    except Exception:
+        return []
+
+
+def _frame_resolve_column(frame: object, name: str) -> str | None:
+    target = str(name).strip().lower()
+    for col in _frame_columns(frame):
+        if str(col).strip().lower() == target:
+            return col
+    return None
+
+
+def _frame_column_numpy(frame: object, name: str, *, dtype: Any = np.float64):
+    col = _frame_resolve_column(frame, name)
+    if col is None:
+        raise KeyError(name)
+    values = frame[col]  # type: ignore[index]
+    if hasattr(values, "to_numpy"):
+        try:
+            out = values.to_numpy(dtype=dtype, copy=False)
+        except TypeError:
+            out = values.to_numpy(dtype=dtype)
+        return np.asarray(out, dtype=dtype).reshape(-1)
+    return np.asarray(values, dtype=dtype).reshape(-1)
+
+
+def _is_dataframe_like(value: object) -> bool:
+    return bool(hasattr(value, "columns") and hasattr(value, "index") and hasattr(value, "iloc"))
 
 
 class TradingEngine:
@@ -141,14 +193,16 @@ class TradingEngine:
                     df_m1 = frames.get(self.settings.system.base_timeframe)
                     if df_m1 is None:
                         df_m1 = frames.get("M1")
-                    if df_m1 is not None and not df_m1.empty:
-                        current_close = float(df_m1.iloc[-1]["close"])
+                    if not _frame_empty(df_m1):
+                        close_arr = _frame_column_numpy(df_m1, "close", dtype=np.float64)
+                        if close_arr.size > 0:
+                            current_close = float(close_arr[-1])
                 except Exception:
                     pass
 
                 # 3. Regime Update (Thinking Step)
                 regime = "Normal"
-                if df_m1 is not None and not df_m1.empty:
+                if not _frame_empty(df_m1):
                     # Periodically refit (Self-Tuning)
                     if self.iters % 100 == 0:
                         try:
@@ -203,7 +257,7 @@ class TradingEngine:
                 base_df = frames.get(self.settings.system.base_timeframe)
                 if base_df is None:
                     base_df = frames.get("M1")
-                base_idx = base_df.index if base_df is not None else pd.Index([])
+                base_idx = getattr(base_df, "index", []) if base_df is not None else []
                 news_feats = self.news.get_news_features(base_idx)
                 dataset = self.trainer.feature_engineer.prepare(
                     frames,
@@ -211,7 +265,7 @@ class TradingEngine:
                     symbol=self.settings.system.symbol,
                 )
                 feature_drift_alert = False
-                if self.drift and isinstance(getattr(dataset, "X", None), pd.DataFrame) and len(dataset.X) > 0:
+                if self.drift and _is_dataframe_like(getattr(dataset, "X", None)) and len(dataset.X) > 0:
                     if not self._feature_monitor_ready:
                         with contextlib.suppress(Exception):
                             baseline_rows = min(len(dataset.X), 2000)
@@ -447,3 +501,4 @@ class TradingEngine:
             self.drift.reset_after_retrain()
         except Exception as e:
             logger.error(f"Drift retraining failed: {e}", exc_info=True)
+

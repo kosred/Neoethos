@@ -13,7 +13,9 @@ fn init_rayon() {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&v| v > 0);
         if let Some(n) = threads {
-            let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
+            let _ = rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build_global();
         }
     });
 }
@@ -402,12 +404,22 @@ fn evaluate_population_impl(
     trend_arr: &[i8],
     premium_arr: &[i8],
     inducement_arr: &[i8],
+    bos_arr: &[i8],
+    choch_arr: &[i8],
+    eqh_arr: &[i8],
+    eql_arr: &[i8],
+    displacement_arr: &[i8],
     use_ob_arr: &[i8],
     use_fvg_arr: &[i8],
     use_liq_arr: &[i8],
     use_mtf_arr: &[i8],
     use_premium_arr: &[i8],
     use_inducement_arr: &[i8],
+    use_bos_arr: &[i8],
+    use_choch_arr: &[i8],
+    use_eqh_arr: &[i8],
+    use_eql_arr: &[i8],
+    use_displacement_arr: &[i8],
     smc_gate_threshold: f32,
     smc_weight_ob: f32,
     smc_weight_fvg: f32,
@@ -415,6 +427,11 @@ fn evaluate_population_impl(
     smc_weight_mtf: f32,
     smc_weight_premium: f32,
     smc_weight_inducement: f32,
+    smc_weight_bos: f32,
+    smc_weight_choch: f32,
+    smc_weight_eqh: f32,
+    smc_weight_eql: f32,
+    smc_weight_displacement: f32,
     max_hold_bars: usize,
     trailing_enabled: bool,
     trailing_atr_multiplier: f64,
@@ -444,6 +461,11 @@ fn evaluate_population_impl(
         || trend_arr.len() != n_samples
         || premium_arr.len() != n_samples
         || inducement_arr.len() != n_samples
+        || bos_arr.len() != n_samples
+        || choch_arr.len() != n_samples
+        || eqh_arr.len() != n_samples
+        || eql_arr.len() != n_samples
+        || displacement_arr.len() != n_samples
     {
         return Err("SMC arrays must match OHLC length".to_string());
     }
@@ -453,6 +475,11 @@ fn evaluate_population_impl(
         || use_mtf_arr.len() != n_genes
         || use_premium_arr.len() != n_genes
         || use_inducement_arr.len() != n_genes
+        || use_bos_arr.len() != n_genes
+        || use_choch_arr.len() != n_genes
+        || use_eqh_arr.len() != n_genes
+        || use_eql_arr.len() != n_genes
+        || use_displacement_arr.len() != n_genes
     {
         return Err("per-gene gate flags must match gene count".to_string());
     }
@@ -499,6 +526,11 @@ fn evaluate_population_impl(
                 let use_mtf_g = use_mtf_arr[g] != 0;
                 let use_premium_g = use_premium_arr[g] != 0;
                 let use_inducement_g = use_inducement_arr[g] != 0;
+                let use_bos_g = use_bos_arr[g] != 0;
+                let use_choch_g = use_choch_arr[g] != 0;
+                let use_eqh_g = use_eqh_arr[g] != 0;
+                let use_eql_g = use_eql_arr[g] != 0;
+                let use_displacement_g = use_displacement_arr[g] != 0;
 
                 let mut active_weight_sum = 0.0_f32;
                 if use_ob_g {
@@ -518,6 +550,21 @@ fn evaluate_population_impl(
                 }
                 if use_inducement_g {
                     active_weight_sum += smc_weight_inducement;
+                }
+                if use_bos_g {
+                    active_weight_sum += smc_weight_bos;
+                }
+                if use_choch_g {
+                    active_weight_sum += smc_weight_choch;
+                }
+                if use_eqh_g {
+                    active_weight_sum += smc_weight_eqh;
+                }
+                if use_eql_g {
+                    active_weight_sum += smc_weight_eql;
+                }
+                if use_displacement_g {
+                    active_weight_sum += smc_weight_displacement;
                 }
 
                 if active_weight_sum > 0.0 {
@@ -545,6 +592,21 @@ fn evaluate_population_impl(
                         }
                         if use_inducement_g && inducement_arr[i] == 1 {
                             score += smc_weight_inducement;
+                        }
+                        if use_bos_g && bos_arr[i] == dir {
+                            score += smc_weight_bos;
+                        }
+                        if use_choch_g && choch_arr[i] == dir {
+                            score += smc_weight_choch;
+                        }
+                        if use_eqh_g && eqh_arr[i] == dir {
+                            score += smc_weight_eqh;
+                        }
+                        if use_eql_g && eql_arr[i] == dir {
+                            score += smc_weight_eql;
+                        }
+                        if use_displacement_g && displacement_arr[i] == dir {
+                            score += smc_weight_displacement;
                         }
                         if score < gate_threshold {
                             signals[i] = 0;
@@ -597,12 +659,22 @@ pub fn evaluate_population_core(
     trend_arr: &[i8],
     premium_arr: &[i8],
     inducement_arr: &[i8],
+    bos_arr: &[i8],
+    choch_arr: &[i8],
+    eqh_arr: &[i8],
+    eql_arr: &[i8],
+    displacement_arr: &[i8],
     use_ob_arr: &[i8],
     use_fvg_arr: &[i8],
     use_liq_arr: &[i8],
     use_mtf_arr: &[i8],
     use_premium_arr: &[i8],
     use_inducement_arr: &[i8],
+    use_bos_arr: &[i8],
+    use_choch_arr: &[i8],
+    use_eqh_arr: &[i8],
+    use_eql_arr: &[i8],
+    use_displacement_arr: &[i8],
     smc_gate_threshold: f32,
     smc_weight_ob: f32,
     smc_weight_fvg: f32,
@@ -610,6 +682,11 @@ pub fn evaluate_population_core(
     smc_weight_mtf: f32,
     smc_weight_premium: f32,
     smc_weight_inducement: f32,
+    smc_weight_bos: f32,
+    smc_weight_choch: f32,
+    smc_weight_eqh: f32,
+    smc_weight_eql: f32,
+    smc_weight_displacement: f32,
     max_hold_bars: usize,
     trailing_enabled: bool,
     trailing_atr_multiplier: f64,
@@ -640,12 +717,22 @@ pub fn evaluate_population_core(
         trend_arr,
         premium_arr,
         inducement_arr,
+        bos_arr,
+        choch_arr,
+        eqh_arr,
+        eql_arr,
+        displacement_arr,
         use_ob_arr,
         use_fvg_arr,
         use_liq_arr,
         use_mtf_arr,
         use_premium_arr,
         use_inducement_arr,
+        use_bos_arr,
+        use_choch_arr,
+        use_eqh_arr,
+        use_eql_arr,
+        use_displacement_arr,
         smc_gate_threshold,
         smc_weight_ob,
         smc_weight_fvg,
@@ -653,6 +740,11 @@ pub fn evaluate_population_core(
         smc_weight_mtf,
         smc_weight_premium,
         smc_weight_inducement,
+        smc_weight_bos,
+        smc_weight_choch,
+        smc_weight_eqh,
+        smc_weight_eql,
+        smc_weight_displacement,
         max_hold_bars,
         trailing_enabled,
         trailing_atr_multiplier,

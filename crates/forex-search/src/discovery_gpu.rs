@@ -73,7 +73,10 @@ struct GenomeExport<'a> {
 pub fn save_gpu_genomes(path: impl AsRef<Path>, result: &GpuDiscoveryResult) -> Result<()> {
     let mut payload = Vec::new();
     for (g, f) in result.genomes.iter().zip(result.fitness.iter()) {
-        payload.push(GenomeExport { fitness: *f, genome: g });
+        payload.push(GenomeExport {
+            fitness: *f,
+            genome: g,
+        });
     }
     let json = serde_json::to_string_pretty(&payload)?;
     std::fs::write(path, json)?;
@@ -220,13 +223,8 @@ pub fn run_gpu_discovery(
     let mut best_scores = Vec::new();
 
     for gen in 0..config.generations {
-        let fitness = evaluate_population_multi_gpu(
-            &data_cube,
-            &ohlc_cube,
-            &genomes,
-            config,
-            &device_ids,
-        )?;
+        let fitness =
+            evaluate_population_multi_gpu(&data_cube, &ohlc_cube, &genomes, config, &device_ids)?;
 
         let mut scored: Vec<(f32, Vec<f32>)> = genomes
             .into_iter()
@@ -239,7 +237,11 @@ pub fn run_gpu_discovery(
             .round()
             .max(2.0) as usize;
         let elite_count = elite_count.min(scored.len());
-        let elites: Vec<Vec<f32>> = scored.iter().take(elite_count).map(|(_, g)| g.clone()).collect();
+        let elites: Vec<Vec<f32>> = scored
+            .iter()
+            .take(elite_count)
+            .map(|(_, g)| g.clone())
+            .collect();
         let elite_scores: Vec<f32> = scored.iter().take(elite_count).map(|(f, _)| *f).collect();
 
         if gen + 1 == config.generations {
@@ -343,8 +345,8 @@ fn evaluate_population_multi_gpu(
         for g in chunk {
             chunk_buf.extend_from_slice(g);
         }
-        let chunk_tensor = Tensor::from_slice(&chunk_buf)
-            .reshape(&[chunk.len() as i64, chunk[0].len() as i64]);
+        let chunk_tensor =
+            Tensor::from_slice(&chunk_buf).reshape(&[chunk.len() as i64, chunk[0].len() as i64]);
 
         let mut per_device = Vec::new();
         let split = split_tensor(&chunk_tensor, device_ids.len());
@@ -415,22 +417,16 @@ fn evaluate_population_gpu(
     };
     let genomes = genomes.to_device(device).to_kind(Kind::Float);
 
-    let tf_weights = genomes
-        .narrow(1, 0, tf_count)
-        .softmax(-1, Kind::Float);
+    let tf_weights = genomes.narrow(1, 0, tf_count).softmax(-1, Kind::Float);
     let logic_weights = genomes.narrow(1, tf_count, n_features);
     let thresholds = genomes
         .narrow(1, tf_count + n_features, 2)
         .clamp(-config.threshold_clip, config.threshold_clip)
         * (config.threshold_scale as f32);
-    let buy_th = thresholds
-        .select(1, 0)
-        .maximum(&thresholds.select(1, 1))
-        + config.threshold_margin as f32;
-    let sell_th = thresholds
-        .select(1, 0)
-        .minimum(&thresholds.select(1, 1))
-        - config.threshold_margin as f32;
+    let buy_th =
+        thresholds.select(1, 0).maximum(&thresholds.select(1, 1)) + config.threshold_margin as f32;
+    let sell_th =
+        thresholds.select(1, 0).minimum(&thresholds.select(1, 1)) - config.threshold_margin as f32;
 
     let segments = build_segments(n_samples as usize, config.window_bars, config.segments);
 
@@ -475,10 +471,16 @@ fn evaluate_population_gpu(
         let steps = Tensor::arange((len - 1) as i64, (Kind::Float, device));
         let equity_mean = equity.mean_dim(&[1], true, Kind::Float);
         let steps_mean = steps.mean(Kind::Float);
-        let num = ((&equity - &equity_mean) * (&steps - steps_mean)).sum_dim_intlist(&[1], false, Kind::Float);
-        let den = ((&equity - &equity_mean).pow(2).sum_dim_intlist(&[1], false, Kind::Float)
+        let num = ((&equity - &equity_mean) * (&steps - steps_mean)).sum_dim_intlist(
+            &[1],
+            false,
+            Kind::Float,
+        );
+        let den = ((&equity - &equity_mean)
+            .pow(2)
+            .sum_dim_intlist(&[1], false, Kind::Float)
             * (&steps - steps_mean).pow(2).sum(Kind::Float))
-            .sqrt();
+        .sqrt();
         let consistency = num / (den + 1e-9);
 
         let trade_count = actions.abs().sum_dim_intlist(&[1], false, Kind::Float);
@@ -486,9 +488,8 @@ fn evaluate_population_gpu(
         let freq_penalty = (Tensor::from(expected as f32).to_device(device) - &trade_count)
             .clamp_min(0.0)
             * config.trade_penalty as f32;
-        let dd_penalty = (max_dd - config.dd_limit as f32)
-            .clamp_min(0.0)
-            * config.dd_penalty as f32;
+        let dd_penalty =
+            (max_dd - config.dd_limit as f32).clamp_min(0.0) * config.dd_penalty as f32;
 
         let mut window_fit = sortino * 10.0 + consistency * 5.0 - freq_penalty - dd_penalty;
         let profit_pct = equity.select(1, (len - 2) as i64);
@@ -503,8 +504,7 @@ fn evaluate_population_gpu(
 
     let avg_fit = fitness_sum / (segments.len() as f64);
     let min_pos = (segments.len() as f64 * config.pos_window_fraction).ceil();
-    let pos_penalty = (Tensor::from(min_pos as f32).to_device(device) - pos_windows)
-        .clamp_min(0.0)
+    let pos_penalty = (Tensor::from(min_pos as f32).to_device(device) - pos_windows).clamp_min(0.0)
         * config.pos_penalty as f32;
     let final_fit = avg_fit + min_fitness * config.robust_weight as f32 - pos_penalty;
     Ok(final_fit.to_device(Device::Cpu))
@@ -526,7 +526,11 @@ fn build_segments(n_samples: usize, window: usize, segments: usize) -> Vec<(usiz
     out
 }
 
-fn align_features(base_ts: &[i64], htf_ts: &[i64], htf_data: &ndarray::Array2<f32>) -> ndarray::Array2<f32> {
+fn align_features(
+    base_ts: &[i64],
+    htf_ts: &[i64],
+    htf_data: &ndarray::Array2<f32>,
+) -> ndarray::Array2<f32> {
     let n_base = base_ts.len();
     let n_htf = htf_ts.len();
     let n_cols = htf_data.ncols();
@@ -641,4 +645,3 @@ fn std_vector(elites: &[Vec<f32>], mean: &[f32]) -> Vec<f32> {
     }
     out
 }
-
