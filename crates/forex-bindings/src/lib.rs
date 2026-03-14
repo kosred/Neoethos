@@ -6042,8 +6042,333 @@ impl MLPModel {
     }
 }
 
+// ============================================================================
+// BURN NEURAL NETWORK MODELS — Pure Rust, no Python, no GIL
+// ============================================================================
+
+#[cfg(feature = "burn-backend")]
+mod burn_bindings {
+    use super::*;
+    use forex_models::burn_models::*;
+
+    /// Helper macro to create PyO3 wrappers for each Burn model
+    macro_rules! burn_model_wrapper {
+        (
+            $py_name:ident,
+            $config_type:ident,
+            $model_type:ident,
+            $default_hidden:expr,
+            $default_layers:expr
+        ) => {
+            #[pyclass(unsendable, module = "forex_bindings")]
+            pub struct $py_name {
+                model: Option<$model_type<TrainBackend>>,
+                input_dim: usize,
+                hidden_dim: usize,
+                n_classes: usize,
+                lr: f64,
+                batch_size: usize,
+                max_epochs: usize,
+                patience: usize,
+            }
+
+            #[pymethods]
+            impl $py_name {
+                #[new]
+                #[pyo3(signature = (
+                    input_dim=96,
+                    hidden_dim=$default_hidden,
+                    n_classes=3,
+                    lr=1e-3,
+                    batch_size=64,
+                    max_epochs=100,
+                    patience=8,
+                ))]
+                fn new(
+                    input_dim: usize,
+                    hidden_dim: usize,
+                    n_classes: usize,
+                    lr: f64,
+                    batch_size: usize,
+                    max_epochs: usize,
+                    patience: usize,
+                ) -> Self {
+                    Self {
+                        model: None,
+                        input_dim,
+                        hidden_dim,
+                        n_classes,
+                        lr,
+                        batch_size,
+                        max_epochs,
+                        patience,
+                    }
+                }
+
+                fn fit<'py>(
+                    &mut self,
+                    _py: Python<'py>,
+                    features: PyReadonlyArray2<'py, f32>,
+                    labels: PyReadonlyArray1<'py, i32>,
+                ) -> PyResult<f64> {
+                    let x = features.as_array().to_owned();
+                    let y: Vec<i32> = labels.as_array().iter().copied().collect();
+
+                    // Auto-detect input_dim from features
+                    self.input_dim = x.ncols();
+
+                    let device = <TrainBackend as burn::tensor::backend::Backend>::Device::default();
+                    let config = $config_type::new(self.input_dim)
+                        .with_hidden_dim(self.hidden_dim)
+                        .with_n_classes(self.n_classes);
+                    let model = config.init::<TrainBackend>(&device);
+
+                    let train_config = TrainConfig {
+                        lr: self.lr,
+                        batch_size: self.batch_size,
+                        max_epochs: self.max_epochs,
+                        patience: self.patience,
+                        n_classes: self.n_classes,
+                    };
+
+                    let (trained, best_loss) = train_model::<TrainBackend, _>(
+                        model, &x, &y, &train_config,
+                    );
+                    self.model = Some(trained);
+                    Ok(best_loss as f64)
+                }
+
+                fn predict_proba<'py>(
+                    &self,
+                    py: Python<'py>,
+                    features: PyReadonlyArray2<'py, f32>,
+                ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+                    let x = features.as_array().to_owned();
+                    let model = self.model.as_ref().ok_or_else(|| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                            "Model not trained yet. Call fit() first.",
+                        )
+                    })?;
+                    let probs = predict_proba::<TrainBackend, _>(model, &x, self.batch_size);
+                    Ok(probs.into_pyarray(py))
+                }
+            }
+        };
+    }
+
+    burn_model_wrapper!(BurnMLPModel, BurnMLPConfig, BurnMLP, 256, 3);
+    burn_model_wrapper!(BurnNBeatsModel, BurnNBeatsConfig, BurnNBeats, 64, 3);
+    burn_model_wrapper!(BurnTiDEModel, BurnTiDEConfig, BurnTiDE, 128, 2);
+    burn_model_wrapper!(BurnKANModel, BurnKANConfig, BurnKAN, 32, 2);
+    burn_model_wrapper!(BurnTransformerModel, BurnTransformerConfig, BurnTransformer, 128, 4);
+
+    // TabNet needs special handling (n_steps instead of n_layers)
+    #[pyclass(unsendable, name = "BurnTabNetModel", module = "forex_bindings")]
+    pub struct BurnTabNetModel {
+        model: Option<BurnTabNet<TrainBackend>>,
+        input_dim: usize,
+        hidden_dim: usize,
+        n_classes: usize,
+        lr: f64,
+        batch_size: usize,
+        max_epochs: usize,
+        patience: usize,
+    }
+
+    #[pymethods]
+    impl BurnTabNetModel {
+        #[new]
+        #[pyo3(signature = (input_dim=96, hidden_dim=64, n_classes=3, lr=2e-3, batch_size=64, max_epochs=100, patience=8))]
+        fn new(
+            input_dim: usize, hidden_dim: usize, n_classes: usize,
+            lr: f64, batch_size: usize, max_epochs: usize, patience: usize,
+        ) -> Self {
+            Self { model: None, input_dim, hidden_dim, n_classes, lr, batch_size, max_epochs, patience }
+        }
+
+        fn fit<'py>(
+            &mut self, _py: Python<'py>,
+            features: PyReadonlyArray2<'py, f32>,
+            labels: PyReadonlyArray1<'py, i32>,
+        ) -> PyResult<f64> {
+            let x = features.as_array().to_owned();
+            let y: Vec<i32> = labels.as_array().iter().copied().collect();
+            self.input_dim = x.ncols();
+
+            let device = <TrainBackend as burn::tensor::backend::Backend>::Device::default();
+            let config = BurnTabNetConfig::new(self.input_dim)
+                .with_hidden_dim(self.hidden_dim)
+                .with_n_classes(self.n_classes);
+            let model = config.init::<TrainBackend>(&device);
+
+            let train_config = TrainConfig {
+                lr: self.lr, batch_size: self.batch_size,
+                max_epochs: self.max_epochs, patience: self.patience, n_classes: self.n_classes,
+            };
+            let (trained, best_loss) = train_model::<TrainBackend, _>(model, &x, &y, &train_config);
+            self.model = Some(trained);
+            Ok(best_loss as f64)
+        }
+
+        fn predict_proba<'py>(
+            &self, py: Python<'py>,
+            features: PyReadonlyArray2<'py, f32>,
+        ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+            let x = features.as_array().to_owned();
+            let model = self.model.as_ref().ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Model not trained. Call fit() first.")
+            })?;
+            let probs = predict_proba::<TrainBackend, _>(model, &x, self.batch_size);
+            Ok(probs.into_pyarray(py))
+        }
+    }
+
+    /// Register all Burn model classes in the pymodule
+    pub fn register_burn_models(m: &Bound<'_, PyModule>) -> PyResult<()> {
+        m.add_class::<BurnMLPModel>()?;
+        m.add_class::<BurnNBeatsModel>()?;
+        m.add_class::<BurnTiDEModel>()?;
+        m.add_class::<BurnTabNetModel>()?;
+        m.add_class::<BurnKANModel>()?;
+        m.add_class::<BurnTransformerModel>()?;
+        Ok(())
+    }
+}
+
+use forex_core::domain::consistency::{ConsistencyTracker as CoreConsistencyTracker, TradeEvent};
+use forex_core::domain::meta_controller::{MetaController as CoreMetaController, PropMetaState};
+
+#[pyclass(name = "ConsistencyTracker")]
+pub struct ConsistencyTracker {
+    inner: CoreConsistencyTracker,
+}
+
+#[pymethods]
+impl ConsistencyTracker {
+    #[new]
+    #[pyo3(signature = (cache_dir, lookback_days=30))]
+    fn new(cache_dir: &Bound<'_, PyAny>, lookback_days: i64) -> Self {
+        let _ = cache_dir;
+        // We ignore cache_dir as the Rust implementation handles logic purely in-memory
+        Self {
+            inner: CoreConsistencyTracker::new(lookback_days),
+        }
+    }
+
+    fn update(&mut self, trade_event: &Bound<'_, PyDict>) -> PyResult<()> {
+        let entry_time: String = trade_event.get_item("entry_time")?.unwrap().extract()?;
+        let pnl: f64 = trade_event.get_item("pnl")?.map(|x| x.extract().unwrap_or(0.0)).unwrap_or(0.0);
+        let risk_pct: f64 = trade_event.get_item("risk_pct")?.map(|x| x.extract().unwrap_or(0.0)).unwrap_or(0.0);
+        let size: f64 = trade_event.get_item("size")?.map(|x| x.extract().unwrap_or(0.0)).unwrap_or(0.0);
+        let hold_minutes: f64 = trade_event.get_item("hold_minutes")?.map(|x| x.extract().unwrap_or(0.0)).unwrap_or(0.0);
+        
+        let win: Option<i32> = match trade_event.get_item("win")? {
+            Some(v) => {
+                if let Ok(b) = v.extract::<bool>() {
+                    Some(if b { 1 } else { 0 })
+                } else if let Ok(i) = v.extract::<i32>() {
+                    Some(i)
+                } else {
+                    None
+                }
+            },
+            None => None,
+        };
+
+        let event = TradeEvent { entry_time, pnl, risk_pct, size, hold_minutes, win };
+        self.inner.update(&event);
+        Ok(())
+    }
+
+    fn get_metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let metrics = self.inner.get_metrics();
+        
+        // We return an object that quacks like the Python ConsistencyMetrics dataclass
+        let dict = PyDict::new(py);
+        dict.set_item("score", metrics.score)?;
+        dict.set_item("daily_profit_consistency", metrics.daily_profit_consistency)?;
+        dict.set_item("daily_trade_consistency", metrics.daily_trade_consistency)?;
+        dict.set_item("daily_risk_consistency", metrics.daily_risk_consistency)?;
+        dict.set_item("weekly_profit_consistency", metrics.weekly_profit_consistency)?;
+        dict.set_item("weekly_drawdown_consistency", metrics.weekly_drawdown_consistency)?;
+        dict.set_item("trade_size_consistency", metrics.trade_size_consistency)?;
+        dict.set_item("hold_time_consistency", metrics.hold_time_consistency)?;
+        dict.set_item("win_rate_rolling", metrics.win_rate_rolling)?;
+        dict.set_item("grade", metrics.grade)?;
+        
+        // Return a mock dataclass object in Python
+        let dataclass_module = PyModule::import(py, "forex_bot.execution.consistency")?;
+        let class = dataclass_module.getattr("ConsistencyMetrics")?;
+        let inst = class.call((), Some(&dict))?;
+        Ok(inst)
+    }
+}
+
+#[pyclass(name = "MetaController")]
+pub struct MetaController {
+    inner: CoreMetaController,
+}
+
+#[pymethods]
+impl MetaController {
+    #[new]
+    #[pyo3(signature = (max_daily_dd=None, safety_buffer=None, base_risk_per_trade=None, base_confidence=None, settings=None, silent=None))]
+    fn new(
+        max_daily_dd: Option<f64>,
+        safety_buffer: Option<f64>,
+        base_risk_per_trade: Option<f64>,
+        base_confidence: Option<f64>,
+        settings: Option<&Bound<'_, PyAny>>,
+        silent: Option<bool>,
+    ) -> PyResult<Self> {
+        let mut k_steepness = 200.0;
+        let mut final_base_confidence = base_confidence.unwrap_or(0.55);
+
+        if let Some(s) = settings {
+            if let Ok(dyn_cfg) = s.getattr("dynamic") {
+                if let Ok(risk_params) = dyn_cfg.call_method0("get") { // Might be dict
+                    if let Ok(k) = risk_params.call_method1("get", ("risk_curve_steepness", 200.0)) {
+                        k_steepness = k.extract().unwrap_or(200.0);
+                    }
+                    if let Ok(c) = risk_params.call_method1("get", ("confidence_threshold",)) {
+                        if let Ok(c_val) = c.extract::<f64>() {
+                            final_base_confidence = c_val;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            inner: CoreMetaController::new(max_daily_dd, safety_buffer, base_risk_per_trade, Some(final_base_confidence), silent, Some(k_steepness)),
+        })
+    }
+
+    fn get_risk_parameters(&mut self, state: &Bound<'_, PyAny>) -> PyResult<(f64, f64, bool)> {
+        let mut m_regime = "Normal".to_string();
+        if let Ok(regime) = state.getattr("market_regime") {
+            if let Ok(r) = regime.extract::<String>() {
+                m_regime = r;
+            }
+        }
+        
+        let s = PropMetaState {
+            daily_dd_pct: state.getattr("daily_dd_pct")?.extract()?,
+            volatility_regime: state.getattr("volatility_regime")?.extract()?,
+            recent_win_rate: state.getattr("recent_win_rate")?.extract()?,
+            consecutive_losses: state.getattr("consecutive_losses")?.extract()?,
+            model_confidence: state.getattr("model_confidence")?.extract()?,
+            hour_of_day: state.getattr("hour_of_day")?.extract()?,
+            market_regime: m_regime,
+        };
+        Ok(self.inner.get_risk_parameters(&s))
+    }
+}
+
 #[pymodule]
 fn forex_bindings(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<ConsistencyTracker>()?;
+    m.add_class::<MetaController>()?;
     m.add_class::<ForexCore>()?;
     m.add_class::<ConformalGate>()?;
     #[cfg(feature = "onnx")]
@@ -6107,5 +6432,10 @@ fn forex_bindings(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MLPModel>()?;
     m.add_class::<GeneticModel>()?;
 
+    // Burn deep learning models (pure Rust)
+    #[cfg(feature = "burn-backend")]
+    burn_bindings::register_burn_models(m)?;
+
     Ok(())
 }
+

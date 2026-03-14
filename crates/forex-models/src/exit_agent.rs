@@ -1,281 +1,254 @@
-// Exit Agent - RL-Based Trade Exit Expert
+// Exit Agent - Pure Rust Burn RL-Based Trade Exit Expert
 // Ported from src/forex_bot/models/exit_agent.py
 //
 // Lightweight RL Network for Trade Exit Decisions.
 // Learns to balance Greed (Holding for TP) vs Fear (Cutting Loss/Stall).
 
-use anyhow::{Context, Result};
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyModule};
+#![cfg(feature = "burn-backend")]
+
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+
+use anyhow::{Result, anyhow};
+use burn::nn;
+use burn::prelude::*;
+use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
+use burn::tensor::backend::AutodiffBackend;
+use burn_ndarray::NdArray;
+use burn::backend::Autodiff;
+
+use rand::Rng;
 use tracing::info;
 
-/// ExitAgent - RL-based trade exit decision model
-///
-/// Uses PyTorch DQN to learn optimal exit timing:
-/// - Input: Trade State (PnL, Duration, Volatility, Momentum)
-/// - Output: Action (Hold=0, Close=1)
-/// - Training: Regret analysis on historical exits
+pub type TrainBackend = Autodiff<NdArray>;
+
+// ============================================================================
+// BURN Q-NETWORK
+// ============================================================================
+
+#[derive(Module, Debug)]
+pub struct ExitAgentNet<B: Backend> {
+    fc1: nn::Linear<B>,
+    fc2: nn::Linear<B>,
+    output: nn::Linear<B>,
+}
+
+#[derive(Config, Debug)]
+pub struct ExitAgentNetConfig {
+    #[config(default = 6)]
+    pub input_dim: usize,
+    #[config(default = 64)]
+    pub hidden_dim: usize,
+}
+
+impl ExitAgentNetConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> ExitAgentNet<B> {
+        ExitAgentNet {
+            fc1: nn::LinearConfig::new(self.input_dim, self.hidden_dim).init(device),
+            fc2: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
+            output: nn::LinearConfig::new(self.hidden_dim, 2).init(device),
+        }
+    }
+}
+
+impl<B: Backend> ExitAgentNet<B> {
+    pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let x = burn::tensor::activation::relu(self.fc1.forward(x));
+        let x = burn::tensor::activation::relu(self.fc2.forward(x));
+        self.output.forward(x)
+    }
+}
+
+// ============================================================================
+// AGENT STATE & EXPERIENCE
+// ============================================================================
+
+#[derive(Clone, Debug)]
+pub struct Experience {
+    pub state: Vec<f32>,
+    pub action: i64,
+    pub reward: f32,
+    pub done: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingRegret {
+    pub state: Vec<f32>,
+    pub action: i64,
+    pub exit_price: f64,
+    pub time: i64,
+    pub direction: i32,
+}
+
+/// Pure-Rust Burn ExitAgent
 pub struct ExitAgent {
-    py_agent: Option<Py<PyAny>>,
+    model: ExitAgentNet<TrainBackend>,
+    optim: burn::optim::AdamW<TrainBackend>,
+    memory: VecDeque<Experience>,
+    pending_regret: HashMap<i32, PendingRegret>,
+    gamma: f32,
+    epsilon: f32,
+    device: <TrainBackend as Backend>::Device,
 }
 
 impl ExitAgent {
-    /// Create new Exit Agent
-    /// Python lines 39-52
-    pub fn new(device: Option<String>) -> Result<Self> {
-        let device_str = device.unwrap_or_else(|| "cpu".to_string());
-
-        let py_agent = Python::attach(|py| {
-            // Import the Python module
-            let exit_module = PyModule::import(py, "forex_bot.models.exit_agent")
-                .context("Failed to import forex_bot.models.exit_agent")?;
-
-            // Get the ExitAgent class
-            let exit_class = exit_module
-                .getattr("ExitAgent")
-                .context("ExitAgent class not found")?;
-
-            // Import Settings (or create a mock one)
-            // The Python ExitAgent expects Settings, but we'll just pass device
-            let settings_module = PyModule::import(py, "forex_bot.core.config")?;
-            let settings_class = settings_module.getattr("Settings")?;
-            let settings = settings_class.call0()?;
-
-            // Create instance with kwargs
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("settings", settings)?;
-            kwargs.set_item("device", device_str.clone())?;
-
-            // Instantiate
-            let py_agent = exit_class.call((), Some(&kwargs))?;
-
-            Ok::<Py<PyAny>, anyhow::Error>(py_agent.into())
-        })?;
-
-        Ok(Self {
-            py_agent: Some(py_agent),
-        })
+    pub fn new() -> Self {
+        let device = <TrainBackend as Backend>::Device::default();
+        let model = ExitAgentNetConfig::new().init(&device);
+        let optim = AdamWConfig::new().with_weight_decay(1e-4).init();
+        
+        Self {
+            model,
+            optim,
+            memory: VecDeque::with_capacity(10000),
+            pending_regret: HashMap::new(),
+            gamma: 0.99,
+            epsilon: 0.2,
+            device,
+        }
     }
 
-    /// Get action for a given trade state
-    /// Python lines 56-67
-    ///
-    /// state: [pnl, duration, volatility, momentum, ...] (6-dim vector)
-    /// Returns: 0 (Hold) or 1 (Close)
-    pub fn get_action(&self, state: &[f64], eval_mode: bool) -> Result<i32> {
-        Python::attach(|py| {
-            let agent = self
-                .py_agent
-                .as_ref()
-                .context("Exit agent not initialized")?
-                .bind(py);
+    /// Returns 0 (Hold) or 1 (Close).
+    pub fn get_action(&self, state: &[f32], eval_mode: bool) -> i32 {
+        let mut rng = rand::rng();
+        if !eval_mode && rng.random::<f32>() < self.epsilon {
+            return rng.random_range(0..=1);
+        }
 
-            // Convert state to numpy array
-            let numpy = PyModule::import(py, "numpy")?;
-            let state_np = numpy.call_method1("array", (state,))?;
-
-            // Call get_action
-            let action: i32 = agent
-                .call_method1("get_action", (state_np, eval_mode))?
-                .extract()?;
-
-            Ok(action)
-        })
+        // Forward pass
+        let state_tensor = Tensor::<TrainBackend, 1>::from_data(
+            TensorData::new(state.to_vec(), [state.len()]), &self.device
+        ).unsqueeze::<2>();
+        
+        let logits = self.model.forward(state_tensor);
+        let action = logits.argmax(1).into_data().to_vec::<i64>().unwrap_or(vec![0])[0];
+        action as i32
     }
 
-    /// Observe an exit decision for later regret analysis
-    /// Python lines 69-82
     pub fn observe_exit(
         &mut self,
         ticket: i32,
-        state: &[f64],
+        state: &[f32],
         action: i32,
         current_price: f64,
         timestamp: i64,
-    ) -> Result<()> {
-        Python::attach(|py| {
-            let agent = self
-                .py_agent
-                .as_ref()
-                .context("Exit agent not initialized")?
-                .bind(py);
-
-            let numpy = PyModule::import(py, "numpy")?;
-            let state_np = numpy.call_method1("array", (state,))?;
-
-            agent.call_method1(
-                "observe_exit",
-                (ticket, state_np, action, current_price, timestamp),
-            )?;
-
-            Ok(())
-        })
+    ) {
+        // Infer direction from the sign of the first state element (PnL typically)
+        let direction = if !state.is_empty() && state[0] > 0.0 { 1 } else { -1 };
+        
+        self.pending_regret.insert(ticket, PendingRegret {
+            state: state.to_vec(),
+            action: action as i64,
+            exit_price: current_price,
+            time: timestamp,
+            direction,
+        });
     }
 
-    /// Process regret and calculate reward
-    /// Python lines 84-128
-    ///
-    /// future_price_trace: Array of prices that occurred after the exit
-    /// direction: 1 for Long, -1 for Short
     pub fn process_regret(
         &mut self,
         ticket: i32,
         future_price_trace: &[f64],
         direction: i32,
-    ) -> Result<()> {
-        Python::attach(|py| {
-            let agent = self
-                .py_agent
-                .as_ref()
-                .context("Exit agent not initialized")?
-                .bind(py);
+    ) {
+        if let Some(data) = self.pending_regret.remove(&ticket) {
+            let exit_price = data.exit_price;
+            let action = data.action;
 
-            let numpy = PyModule::import(py, "numpy")?;
-            let trace_np = numpy.call_method1("array", (future_price_trace,))?;
+            if future_price_trace.is_empty() {
+                return;
+            }
 
-            agent.call_method1("process_regret", (ticket, trace_np, direction))?;
+            let mut min_future_price = f64::MAX;
+            let mut max_future_price = f64::MIN;
+            for &p in future_price_trace {
+                if p < min_future_price { min_future_price = p; }
+                if p > max_future_price { max_future_price = p; }
+            }
 
-            Ok(())
-        })
+            let (potential_gain, potential_loss) = if direction == 1 {
+                (max_future_price - exit_price, exit_price - min_future_price)
+            } else {
+                (exit_price - min_future_price, max_future_price - exit_price)
+            };
+
+            let mut reward = 0.0f32;
+            if action == 1 {
+                if potential_gain > (potential_loss * 1.5) {
+                    reward = -1.0;
+                } else if potential_loss > (potential_gain * 1.5) {
+                    reward = 1.0;
+                }
+            } else {
+                if potential_gain > (potential_loss * 1.5) {
+                    reward = 1.0;
+                } else if potential_loss > (potential_gain * 1.5) {
+                    reward = -1.0;
+                } else {
+                    reward = 0.1;
+                }
+            }
+
+            if self.memory.len() >= 10000 {
+                self.memory.pop_front();
+            }
+            self.memory.push_back(Experience {
+                state: data.state,
+                action,
+                reward,
+                done: true,
+            });
+        }
     }
 
-    /// Train the agent on accumulated experience
-    /// Python lines 130-150
-    pub fn train_step(&mut self) -> Result<()> {
-        Python::attach(|py| {
-            let agent = self
-                .py_agent
-                .as_ref()
-                .context("Exit agent not initialized")?
-                .bind(py);
+    pub fn train_step(&mut self) {
+        if self.memory.len() < 32 { return; }
 
-            agent.call_method0("train_step")?;
+        let mut rng = rand::rng();
+        let mut batch_indices: Vec<usize> = (0..self.memory.len()).collect();
+        // Naive shuffling strategy for sampling
+        use rand::seq::SliceRandom;
+        batch_indices.shuffle(&mut rng);
+        let batch_indices = &batch_indices[0..32];
 
-            Ok(())
-        })
+        let mut states_flat = Vec::with_capacity(32 * 6);
+        let mut actions = Vec::with_capacity(32);
+        let mut rewards = Vec::with_capacity(32);
+
+        for &idx in batch_indices {
+            let exp = &self.memory[idx];
+            states_flat.extend_from_slice(&exp.state);
+            actions.push(exp.action);
+            rewards.push(exp.reward);
+        }
+
+        let states_tensor: Tensor<TrainBackend, 2> = Tensor::from_data(
+            TensorData::new(states_flat, [32, 6]), &self.device
+        );
+        let actions_tensor: Tensor<TrainBackend, 1, Int> = Tensor::from_data(
+            TensorData::new(actions, [32]), &self.device
+        );
+        let rewards_tensor: Tensor<TrainBackend, 1> = Tensor::from_data(
+            TensorData::new(rewards, [32]), &self.device
+        );
+
+        let q_values = self.model.forward(states_tensor);
+        let q_value = q_values.gather(1, actions_tensor.unsqueeze_dim(1)).squeeze(1);
+
+        let loss = burn::nn::loss::MseLoss::new().forward(
+            q_value, 
+            rewards_tensor, 
+            burn::nn::loss::Reduction::Mean
+        );
+
+        let grads = loss.backward();
+        let grads_params = GradientsParams::from_grads(grads, &self.model);
+        self.model = self.optim.step(1e-4, self.model.clone(), grads_params);
+
+        self.epsilon = 0.05f32.max(self.epsilon * 0.999);
     }
 
-    /// Get current epsilon (exploration rate)
-    pub fn get_epsilon(&self) -> Result<f64> {
-        Python::attach(|py| {
-            let agent = self
-                .py_agent
-                .as_ref()
-                .context("Exit agent not initialized")?
-                .bind(py);
-
-            let epsilon: f64 = agent.getattr("epsilon")?.extract()?;
-
-            Ok(epsilon)
-        })
-    }
-
-    /// Set epsilon (exploration rate)
-    pub fn set_epsilon(&mut self, epsilon: f64) -> Result<()> {
-        Python::attach(|py| {
-            let agent = self
-                .py_agent
-                .as_ref()
-                .context("Exit agent not initialized")?
-                .bind(py);
-
-            agent.setattr("epsilon", epsilon)?;
-
-            Ok(())
-        })
-    }
-
-    /// Get memory size
-    pub fn memory_size(&self) -> Result<usize> {
-        Python::attach(|py| {
-            let agent = self
-                .py_agent
-                .as_ref()
-                .context("Exit agent not initialized")?
-                .bind(py);
-
-            let memory = agent.getattr("memory")?;
-            let size: usize = memory.len()?;
-
-            Ok(size)
-        })
-    }
-
-    /// Save the model
-    /// Python lines 158-159
-    pub fn save(&self, path: &Path) -> Result<()> {
-        Python::attach(|py| {
-            let agent = self
-                .py_agent
-                .as_ref()
-                .context("Exit agent not initialized")?
-                .bind(py);
-
-            agent.call_method1("save", (path.to_string_lossy().as_ref(),))?;
-
-            info!("Saved exit agent to: {:?}", path);
-
-            Ok(())
-        })
-    }
-
-    /// Load the model
-    /// Python lines 161-169
-    pub fn load(&mut self, path: &Path) -> Result<()> {
-        Python::attach(|py| {
-            let agent = self
-                .py_agent
-                .as_ref()
-                .context("Exit agent not initialized")?
-                .bind(py);
-
-            agent.call_method1("load", (path.to_string_lossy().as_ref(),))?;
-
-            info!("Loaded exit agent from: {:?}", path);
-
-            Ok(())
-        })
-    }
+    pub fn get_epsilon(&self) -> f32 { self.epsilon }
+    pub fn set_epsilon(&mut self, e: f32) { self.epsilon = e; }
+    pub fn memory_size(&self) -> usize { self.memory.len() }
 }
-
-// ============================================================================
-// SUMMARY
-// ============================================================================
-//
-// Exit Agent - RL-Based Trade Exit Expert
-//
-// FEATURES:
-// ✅ PyTorch DQN for learning optimal exit timing
-// ✅ Input: 6-dimensional trade state (PnL, duration, volatility, momentum, etc.)
-// ✅ Output: Binary action (Hold=0, Close=1)
-// ✅ Regret analysis: learns from what COULD have happened
-// ✅ Epsilon-greedy exploration (starts at 0.2, decays to 0.05)
-// ✅ Experience replay with 10K memory buffer
-// ✅ Save/Load support via PyTorch checkpoint
-//
-// REGRET ANALYSIS:
-// The agent learns by analyzing the counterfactual:
-// "What if I had held longer?" or "What if I had closed earlier?"
-//
-// Reward Function (Balanced - No Fear Bias):
-// - If closed early and missed rally: -1.0 (regret)
-// - If closed early and avoided crash: +1.0 (protection)
-// - If held and captured rally: +1.0 (great hold)
-// - If held and suffered drawdown: -1.0 (failed protection)
-// - If held and market was neutral: +0.1 (patience)
-//
-// TRAINING WORKFLOW:
-// 1. observe_exit() - Record exit decision
-// 2. process_regret() - Analyze what happened after
-// 3. train_step() - Update policy via gradient descent
-//
-// INTEGRATION WITH RUST:
-// - Rust handles orchestration and data flow
-// - Python handles PyTorch model and RL logic
-// - No GIL issues (exits are infrequent, not bottleneck)
-// - Fast inference (<1ms per decision)
-//
-// This agent specializes in the hardest problem in trading:
-// "When to close a position to maximize profit and minimize regret"
-//

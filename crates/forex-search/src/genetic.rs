@@ -1014,7 +1014,7 @@ fn new_random_gene(
     smc_cfg: &SmcSearchConfig,
 ) -> Gene {
     let mut rng = rand::rng();
-    let min_indicators = 1.min(n_indicators.max(1));
+    let min_indicators = 1;
     let max_indicators = max_indicators.max(min_indicators).min(n_indicators.max(1));
     let count = rng.random_range(min_indicators..=max_indicators);
     let sample = sample(&mut rng, n_indicators.max(1), count);

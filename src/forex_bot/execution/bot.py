@@ -10,7 +10,6 @@ from ..execution.mt5_state_manager import MT5StateManager
 from ..execution.news_service import NewsService
 from ..execution.order_execution import OrderExecutor
 from ..execution.risk import RiskManager
-from ..execution.trade_doctor import TradeDoctor
 from ..execution.trading_loop import TradingEngine
 
 # New Services
@@ -47,7 +46,6 @@ class ForexBot:
         self.trainer = ModelTrainer(settings)
         self.discovery_engine = AutonomousDiscoveryEngine(Path(settings.system.cache_dir))
         self.drift_monitor = get_drift_monitor(Path(settings.system.cache_dir))
-        self.trade_doctor = TradeDoctor(settings)
 
         # 3. Services
         self.training_service = TrainingService(
@@ -138,7 +136,6 @@ class ForexBot:
                 mt5=self.mt5_manager,
                 risk=self.risk_manager,
                 signal=self.signal_engine,
-                doctor=self.trade_doctor,
                 news=self.news_service,
                 executor=order_executor,
                 trainer=self.training_service,

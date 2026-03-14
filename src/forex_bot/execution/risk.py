@@ -262,6 +262,7 @@ class RiskManager:
             max_trades_per_day=max_trades,
         )
         self._base_prop_max_trades = self.prop_rules.max_trades_per_day
+        self._today_max_trades = self.prop_rules.max_trades_per_day
 
         self.risk_ledger = RiskLedger(max_events=int(getattr(settings.system, "risk_ledger_max_events", 1000) or 1000))
         self.revenge_trading_detector = RevengeTradeDetector()
@@ -1159,7 +1160,9 @@ class RiskManager:
                 self.day_start_equity - (self.day_start_equity + self.daily_profit - self.daily_loss)
             ) / self.day_start_equity
             if dd_pct >= (0.5 * self.settings.risk.daily_drawdown_limit):
-                self.prop_rules.max_trades_per_day = max(3, int(self.prop_rules.max_trades_per_day / 2))
+                # Use a temporary per-day limit instead of permanently mutating config.
+                # _base_prop_max_trades preserves the original value for next-day recovery.
+                self._today_max_trades = max(3, int(self._base_prop_max_trades // 2))
         except Exception as e:
             logger.warning(f"Trade-close drawdown update failed: {e}", exc_info=True)
 

@@ -34,6 +34,10 @@ pub mod parallel_trainer;
 // pub mod rl;
 // pub mod transformers;
 
+// Pure-Rust neural networks via Burn framework (no Python, no GIL)
+#[cfg(feature = "burn-backend")]
+pub mod burn_models;
+
 #[cfg(feature = "onnx")]
 use anyhow::{Context, Result};
 #[cfg(feature = "onnx")]

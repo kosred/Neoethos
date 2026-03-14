@@ -16,7 +16,6 @@ from ..execution.mt5_state_manager import MT5StateManager
 from ..execution.news_service import NewsService
 from ..execution.order_execution import OrderExecutor
 from ..execution.risk import RiskManager
-from ..execution.trade_doctor import TradeDoctor
 
 # Note: ForexBot import removed to avoid circular dependency
 # TradingEngine receives individual components, not the bot itself
@@ -152,7 +151,6 @@ class TradingEngine:
         mt5: MT5StateManager,
         risk: RiskManager,
         signal: SignalEngine,
-        doctor: TradeDoctor,
         news: NewsService,
         executor: OrderExecutor,
         trainer: TrainingService,
@@ -163,7 +161,6 @@ class TradingEngine:
         self.mt5 = mt5
         self.risk = risk
         self.signal = signal
-        self.doctor = doctor
         self.news = news
         self.executor = executor
         self.trainer = trainer
@@ -278,22 +275,9 @@ class TradingEngine:
                     # Predict current state
                     regime = self.regime_classifier.predict(df_m1)
 
-                # 4. MT5 Sync & Doctor (Now Doctor receives frames)
+                # 4. MT5 Sync
                 await self.mt5.sync_with_mt5()
                 positions = list(self.mt5.cached_positions)
-
-                # Run Trade Doctor with frames
-                diagnoses = self.doctor.diagnose(positions, frames)
-
-                # Execute close instructions from Doctor
-                for instruction in diagnoses:
-                    try:
-                        await self.executor.close_position(
-                            instruction.ticket, instruction.volume, f"Doctor: {instruction.reason}"
-                        )
-                        logger.info(f"Doctor closed #{instruction.ticket}: {instruction.reason}")
-                    except Exception as e:
-                        logger.warning(f"Failed to execute doctor instruction for #{instruction.ticket}: {e}")
 
                 # 5. News & Policy
                 news_policy = await self.news.get_news_policy(self.settings.system.symbol)

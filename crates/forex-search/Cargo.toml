@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.100"
 chrono = "0.4.42"
-ndarray = { version = "0.17.1", features = ["rayon"] }
+ndarray = { version = "0.17.2", features = ["rayon"] }
 rand = "0.9.2"
 rand_distr = { version = "0.5.1", optional = true }
 rayon = "1.11.0"

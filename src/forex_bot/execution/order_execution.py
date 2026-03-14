@@ -315,9 +315,11 @@ class OrderExecutor:
             last = float(recent[-1])
             prior = recent[:-1]
             if signal > 0:
-                return bool(last >= (float(np.nanmax(prior)) - pullback))
-            if signal < 0:
+                # BUY: wait for pullback — enter near recent low, not recent high
                 return bool(last <= (float(np.nanmin(prior)) + pullback))
+            if signal < 0:
+                # SELL: wait for pullback — enter near recent high, not recent low
+                return bool(last >= (float(np.nanmax(prior)) - pullback))
             return False
         except Exception:
             return False

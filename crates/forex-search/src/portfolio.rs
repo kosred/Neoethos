@@ -15,6 +15,8 @@ pub struct SymbolMetrics {
     pub returns: Vec<f64>,
     pub sharpe: f64,
     pub win_rate: f64,
+    pub avg_win_pct: f64,
+    pub avg_loss_pct: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -153,7 +155,13 @@ impl PortfolioOptimizer {
 
             for (i, s) in names.iter().enumerate() {
                 let win_rate = *win_map.get(s).unwrap_or(&0.5);
-                let kelly_val = self.kelly_fraction * win_rate;
+                // Proper Kelly criterion: f* = p - (1-p)/b where b = avg_win / avg_loss
+                let m = metrics_map.get(s);
+                let avg_win = m.map(|x| x.avg_win_pct).unwrap_or(0.0);
+                let avg_loss_mag = m.map(|x| x.avg_loss_pct.abs()).unwrap_or(1.0).max(1e-9);
+                let b = avg_win / avg_loss_mag;
+                let kelly_raw = win_rate - (1.0 - win_rate) / b.max(1e-9);
+                let kelly_val = self.kelly_fraction * kelly_raw.clamp(0.0, 0.5);
                 weights.insert(
                     s.clone(),
                     AllocationResult {
@@ -228,6 +236,8 @@ mod tests {
             returns,
             sharpe,
             win_rate,
+            avg_win_pct: 0.0,
+            avg_loss_pct: 0.0,
         }
     }
 

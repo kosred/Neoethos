@@ -107,7 +107,7 @@ impl StrategyQualityAnalyzer {
 
         let total_trades = returns.len();
         let wins: Vec<f64> = returns.iter().cloned().filter(|v| *v > 0.0).collect();
-        let losses: Vec<f64> = returns.iter().cloned().filter(|v| *v <= 0.0).collect();
+        let losses: Vec<f64> = returns.iter().cloned().filter(|v| *v < 0.0).collect();
 
         let win_rate = if total_trades > 0 {
             wins.len() as f64 / total_trades as f64
@@ -351,10 +351,12 @@ fn calculate_sortino(returns: &[f64]) -> f64 {
     if downside.len() < 2 {
         return 0.0;
     }
-    let std_down = stddev_sample(&downside, mean(&downside));
+    // Standard Sortino uses 0.0 (MAR) as target, not mean of downside
+    let std_down = stddev_sample(&downside, 0.0);
     if std_down < 1e-9 {
         return 0.0;
     }
+    // Note: √252 annualization assumes daily-frequency returns
     (mean_ret / std_down) * 252_f64.sqrt()
 }
 

@@ -271,7 +271,7 @@ class CloudCostMonitor:
         signal.signal(signal.SIGINT, handle_shutdown)
         
         # Hyperstack-specific: Check for termination warning
-        if os.environ.get("HYPERSTACK_INSTANCE_ID"):
+        if os.environ.get("HYPERSTACK_INSTANCE_ID") and hasattr(signal, "SIGUSR1"):
             signal.signal(signal.SIGUSR1, handle_shutdown)  # Pre-termination warning
     
     def check_credits(self) -> float | None:
