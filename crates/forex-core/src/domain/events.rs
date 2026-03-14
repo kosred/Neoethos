@@ -18,7 +18,7 @@ pub struct SignalResult {
     // Python code implies these are Series, possibly single row or full history?
     // "SignalResult" implies a single point in time, likely scalars.
     // If it's a history, it should be Vec<f64>.
-    // Looking at usage: "signals: pd.Series | None = None # Full series for backtest"
+    // Looking at usage: signal history can also be carried as a full numeric series for backtests.
     // So some are scalars, some are series.
     pub stacking_confidence: Option<f64>,
     pub recommended_rr: Option<f64>,

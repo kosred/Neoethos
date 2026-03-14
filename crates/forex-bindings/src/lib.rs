@@ -1663,6 +1663,153 @@ fn threshold_signals_and_accuracy<'py>(
 }
 
 #[pyfunction]
+#[pyo3(signature = (
+    net_profit,
+    sortino,
+    drawdown,
+    profit_factor,
+    trades,
+    daily_dd,
+    months,
+    dd_limit,
+    daily_dd_limit,
+    min_monthly,
+    initial_balance,
+    acc,
+    prop_weight,
+    acc_weight,
+    win_rate=None,
+    include_win_rate_bonus=false,
+    ignore_zero_trade_entries=true
+))]
+fn aggregate_prop_score_metrics(
+    net_profit: PyReadonlyArray1<'_, f64>,
+    sortino: PyReadonlyArray1<'_, f64>,
+    drawdown: PyReadonlyArray1<'_, f64>,
+    profit_factor: PyReadonlyArray1<'_, f64>,
+    trades: PyReadonlyArray1<'_, f64>,
+    daily_dd: PyReadonlyArray1<'_, f64>,
+    months: f64,
+    dd_limit: f64,
+    daily_dd_limit: f64,
+    min_monthly: f64,
+    initial_balance: f64,
+    acc: f64,
+    prop_weight: f64,
+    acc_weight: f64,
+    win_rate: Option<PyReadonlyArray1<'_, f64>>,
+    include_win_rate_bonus: bool,
+    ignore_zero_trade_entries: bool,
+) -> PyResult<(f64, f64, f64, f64, f64, f64, f64, f64)> {
+    let net_profit_vec = vec_from_py_f64(&net_profit);
+    let sortino_vec = vec_from_py_f64(&sortino);
+    let drawdown_vec = vec_from_py_f64(&drawdown);
+    let profit_factor_vec = vec_from_py_f64(&profit_factor);
+    let trades_vec = vec_from_py_f64(&trades);
+    let daily_dd_vec = vec_from_py_f64(&daily_dd);
+    let win_rate_vec = win_rate.as_ref().map(vec_from_py_f64);
+
+    let mut n = net_profit_vec.len();
+    n = n.min(sortino_vec.len());
+    n = n.min(drawdown_vec.len());
+    n = n.min(profit_factor_vec.len());
+    n = n.min(trades_vec.len());
+    n = n.min(daily_dd_vec.len());
+    if include_win_rate_bonus {
+        if let Some(ref values) = win_rate_vec {
+            n = n.min(values.len());
+        }
+    }
+
+    let penalty_factor = |drawdown_value: f64, daily_dd_value: f64, monthly_ret: f64| -> f64 {
+        let mut penalty = 1.0_f64;
+        if dd_limit > 0.0 && drawdown_value > dd_limit {
+            let excess = (drawdown_value - dd_limit).max(0.0);
+            penalty *= (1.0 - (excess / dd_limit)).max(0.1);
+        }
+        if daily_dd_limit > 0.0 && daily_dd_value > daily_dd_limit {
+            let excess = (daily_dd_value - daily_dd_limit).max(0.0);
+            penalty *= (1.0 - (excess / daily_dd_limit)).max(0.1);
+        }
+        if min_monthly > 0.0 && monthly_ret < min_monthly {
+            penalty *= (monthly_ret / min_monthly).max(0.1);
+        }
+        penalty
+    };
+
+    let mut total_trades = 0.0_f64;
+    let mut aggregation_weight = 0.0_f64;
+    let mut weighted_score = 0.0_f64;
+    let mut weighted_monthly = 0.0_f64;
+    let mut weighted_sortino = 0.0_f64;
+    let mut weighted_calmar = 0.0_f64;
+    let mut weighted_pf = 0.0_f64;
+    let mut max_dd = 0.0_f64;
+    let mut max_daily = 0.0_f64;
+
+    for i in 0..n {
+        let dd_value = drawdown_vec[i];
+        let daily_dd_value = daily_dd_vec[i];
+        if dd_value > max_dd {
+            max_dd = dd_value;
+        }
+        if daily_dd_value > max_daily {
+            max_daily = daily_dd_value;
+        }
+
+        let trade_count = trades_vec[i];
+        let weight = if trade_count > 0.0 {
+            trade_count
+        } else if ignore_zero_trade_entries {
+            0.0
+        } else {
+            1.0
+        };
+        if weight <= 0.0 {
+            continue;
+        }
+
+        let monthly_ret = (net_profit_vec[i] / initial_balance) / months;
+        let calmar = if dd_value > 1e-9 {
+            monthly_ret / dd_value
+        } else {
+            0.0
+        };
+        let mut prop_score =
+            monthly_ret * 100.0 + 0.6 * sortino_vec[i] + 0.4 * calmar + 0.2 * profit_factor_vec[i]
+                - 50.0 * (dd_value - dd_limit).max(0.0);
+        if include_win_rate_bonus {
+            if let Some(ref values) = win_rate_vec {
+                prop_score += 0.1 * (values[i] * 100.0);
+            }
+        }
+        prop_score *= penalty_factor(dd_value, daily_dd_value, monthly_ret);
+
+        if trade_count > 0.0 {
+            total_trades += trade_count;
+        }
+        aggregation_weight += weight;
+        weighted_score += weight * prop_score;
+        weighted_monthly += weight * monthly_ret;
+        weighted_sortino += weight * sortino_vec[i];
+        weighted_calmar += weight * calmar;
+        weighted_pf += weight * profit_factor_vec[i];
+    }
+
+    let denom = aggregation_weight.max(1.0);
+    Ok((
+        prop_weight * (weighted_score / denom) + acc_weight * acc,
+        max_dd,
+        max_daily,
+        total_trades,
+        weighted_monthly / denom,
+        weighted_sortino / denom,
+        weighted_calmar / denom,
+        weighted_pf / denom,
+    ))
+}
+
+#[pyfunction]
 #[pyo3(signature = (labels))]
 fn balanced_class_weights<'py>(
     py: Python<'py>,
@@ -5933,6 +6080,7 @@ fn forex_bindings(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(margins_to_probs, m)?)?;
     m.add_function(wrap_pyfunction!(probs_to_signals, m)?)?;
     m.add_function(wrap_pyfunction!(threshold_signals_and_accuracy, m)?)?;
+    m.add_function(wrap_pyfunction!(aggregate_prop_score_metrics, m)?)?;
     m.add_function(wrap_pyfunction!(balanced_class_weights, m)?)?;
     m.add_function(wrap_pyfunction!(sample_weights_from_labels, m)?)?;
     m.add_function(wrap_pyfunction!(quick_backtest_metrics, m)?)?;

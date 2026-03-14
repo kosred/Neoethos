@@ -98,6 +98,8 @@ try:
 except Exception:
     _fb = None  # type: ignore
 
+_AGGREGATE_PROP_SCORE_RUST_FALLBACK_WARNED = False
+
 
 def _is_dataframe_like(values: Any) -> bool:
     return bool(
@@ -211,6 +213,204 @@ def _rust_count_weekday_trading_days(index_like: Any) -> float | None:
         return float(out)
     except Exception:
         return None
+
+
+def _aggregate_prop_score_metrics_python(
+    *,
+    net_profit: Any,
+    sortino: Any,
+    drawdown: Any,
+    profit_factor: Any,
+    trades: Any,
+    daily_dd: Any,
+    months: float,
+    dd_limit: float,
+    daily_dd_limit: float,
+    min_monthly: float,
+    initial_balance: float,
+    acc: float,
+    prop_weight: float,
+    acc_weight: float,
+    win_rate: Any | None = None,
+    include_win_rate_bonus: bool = False,
+    ignore_zero_trade_entries: bool = True,
+) -> dict[str, float]:
+    net_profit_arr = np.asarray(net_profit, dtype=np.float64).reshape(-1)
+    sortino_arr = np.asarray(sortino, dtype=np.float64).reshape(-1)
+    drawdown_arr = np.asarray(drawdown, dtype=np.float64).reshape(-1)
+    profit_factor_arr = np.asarray(profit_factor, dtype=np.float64).reshape(-1)
+    trades_arr = np.asarray(trades, dtype=np.float64).reshape(-1)
+    daily_dd_arr = np.asarray(daily_dd, dtype=np.float64).reshape(-1)
+    n = min(
+        net_profit_arr.size,
+        sortino_arr.size,
+        drawdown_arr.size,
+        profit_factor_arr.size,
+        trades_arr.size,
+        daily_dd_arr.size,
+    )
+    win_rate_arr: np.ndarray | None = None
+    if include_win_rate_bonus and win_rate is not None:
+        win_rate_arr = np.asarray(win_rate, dtype=np.float64).reshape(-1)
+        n = min(n, win_rate_arr.size)
+
+    def _penalty_factor(drawdown_value: float, daily_dd_value: float, monthly_ret: float) -> float:
+        penalty = 1.0
+        if dd_limit > 0 and drawdown_value > dd_limit:
+            excess = max(0.0, drawdown_value - dd_limit)
+            penalty *= max(0.1, 1.0 - (excess / dd_limit))
+        if daily_dd_limit > 0 and daily_dd_value > daily_dd_limit:
+            excess = max(0.0, daily_dd_value - daily_dd_limit)
+            penalty *= max(0.1, 1.0 - (excess / daily_dd_limit))
+        if min_monthly > 0 and monthly_ret < min_monthly:
+            penalty *= max(0.1, monthly_ret / min_monthly)
+        return float(penalty)
+
+    total_trades = 0.0
+    aggregation_weight = 0.0
+    weighted_score = 0.0
+    weighted_monthly = 0.0
+    weighted_sortino = 0.0
+    weighted_calmar = 0.0
+    weighted_pf = 0.0
+    max_dd = 0.0
+    max_daily = 0.0
+
+    for i in range(int(n)):
+        dd_value = float(drawdown_arr[i])
+        daily_dd_value = float(daily_dd_arr[i])
+        max_dd = max(max_dd, dd_value)
+        max_daily = max(max_daily, daily_dd_value)
+
+        trade_count = float(trades_arr[i])
+        weight = trade_count if trade_count > 0.0 else (0.0 if ignore_zero_trade_entries else 1.0)
+        if weight <= 0.0:
+            continue
+
+        monthly_ret = (float(net_profit_arr[i]) / float(initial_balance)) / float(months)
+        calmar = (monthly_ret / dd_value) if dd_value > 1e-9 else 0.0
+        prop_score = (
+            monthly_ret * 100.0
+            + 0.6 * float(sortino_arr[i])
+            + 0.4 * float(calmar)
+            + 0.2 * float(profit_factor_arr[i])
+            - 50.0 * max(0.0, dd_value - float(dd_limit))
+        )
+        if include_win_rate_bonus and win_rate_arr is not None:
+            prop_score += 0.1 * (float(win_rate_arr[i]) * 100.0)
+        prop_score *= _penalty_factor(dd_value, daily_dd_value, monthly_ret)
+
+        if trade_count > 0.0:
+            total_trades += trade_count
+        aggregation_weight += weight
+        weighted_score += weight * float(prop_score)
+        weighted_monthly += weight * float(monthly_ret)
+        weighted_sortino += weight * float(sortino_arr[i])
+        weighted_calmar += weight * float(calmar)
+        weighted_pf += weight * float(profit_factor_arr[i])
+
+    denom = max(aggregation_weight, 1.0)
+    return {
+        "prop_score": float(float(prop_weight) * (weighted_score / denom) + float(acc_weight) * float(acc)),
+        "drawdown": float(max_dd),
+        "daily_dd": float(max_daily),
+        "trades": float(total_trades),
+        "monthly_return": float(weighted_monthly / denom),
+        "sortino": float(weighted_sortino / denom),
+        "calmar": float(weighted_calmar / denom),
+        "profit_factor": float(weighted_pf / denom),
+    }
+
+
+def _aggregate_prop_score_metrics(
+    *,
+    net_profit: Any,
+    sortino: Any,
+    drawdown: Any,
+    profit_factor: Any,
+    trades: Any,
+    daily_dd: Any,
+    months: float,
+    dd_limit: float,
+    daily_dd_limit: float,
+    min_monthly: float,
+    initial_balance: float,
+    acc: float,
+    prop_weight: float,
+    acc_weight: float,
+    win_rate: Any | None = None,
+    include_win_rate_bonus: bool = False,
+    ignore_zero_trade_entries: bool = True,
+) -> dict[str, float]:
+    net_profit_arr = np.asarray(net_profit, dtype=np.float64).reshape(-1)
+    sortino_arr = np.asarray(sortino, dtype=np.float64).reshape(-1)
+    drawdown_arr = np.asarray(drawdown, dtype=np.float64).reshape(-1)
+    profit_factor_arr = np.asarray(profit_factor, dtype=np.float64).reshape(-1)
+    trades_arr = np.asarray(trades, dtype=np.float64).reshape(-1)
+    daily_dd_arr = np.asarray(daily_dd, dtype=np.float64).reshape(-1)
+    win_rate_arr = None if win_rate is None else np.asarray(win_rate, dtype=np.float64).reshape(-1)
+
+    if _fb is not None and hasattr(_fb, "aggregate_prop_score_metrics"):
+        try:
+            summary = _fb.aggregate_prop_score_metrics(
+                net_profit_arr,
+                sortino_arr,
+                drawdown_arr,
+                profit_factor_arr,
+                trades_arr,
+                daily_dd_arr,
+                float(months),
+                float(dd_limit),
+                float(daily_dd_limit),
+                float(min_monthly),
+                float(initial_balance),
+                float(acc),
+                float(prop_weight),
+                float(acc_weight),
+                win_rate=win_rate_arr,
+                include_win_rate_bonus=bool(include_win_rate_bonus),
+                ignore_zero_trade_entries=bool(ignore_zero_trade_entries),
+            )
+            values = np.asarray(summary, dtype=np.float64).reshape(-1)
+            if values.size == 8:
+                return {
+                    "prop_score": float(values[0]),
+                    "drawdown": float(values[1]),
+                    "daily_dd": float(values[2]),
+                    "trades": float(values[3]),
+                    "monthly_return": float(values[4]),
+                    "sortino": float(values[5]),
+                    "calmar": float(values[6]),
+                    "profit_factor": float(values[7]),
+                }
+        except Exception:
+            global _AGGREGATE_PROP_SCORE_RUST_FALLBACK_WARNED
+            if not _AGGREGATE_PROP_SCORE_RUST_FALLBACK_WARNED:
+                logger.warning(
+                    "Rust aggregate_prop_score_metrics failed; using Python fallback",
+                    exc_info=True,
+                )
+                _AGGREGATE_PROP_SCORE_RUST_FALLBACK_WARNED = True
+
+    return _aggregate_prop_score_metrics_python(
+        net_profit=net_profit_arr,
+        sortino=sortino_arr,
+        drawdown=drawdown_arr,
+        profit_factor=profit_factor_arr,
+        trades=trades_arr,
+        daily_dd=daily_dd_arr,
+        months=months,
+        dd_limit=dd_limit,
+        daily_dd_limit=daily_dd_limit,
+        min_monthly=min_monthly,
+        initial_balance=initial_balance,
+        acc=acc,
+        prop_weight=prop_weight,
+        acc_weight=acc_weight,
+        win_rate=win_rate_arr,
+        include_win_rate_bonus=include_win_rate_bonus,
+        ignore_zero_trade_entries=ignore_zero_trade_entries,
+    )
 
 
 class HyperparameterOptimizer:
@@ -822,30 +1022,17 @@ class HyperparameterOptimizer:
                 "trades": 0.0,
             }
 
-        def _penalty_factor(drawdown: float, daily_dd: float, monthly_ret: float) -> float:
-            penalty = 1.0
-            if dd_limit > 0 and drawdown > dd_limit:
-                excess = max(0.0, drawdown - dd_limit)
-                penalty *= max(0.1, 1.0 - (excess / dd_limit))
-            if daily_dd_limit > 0 and daily_dd > daily_dd_limit:
-                excess = max(0.0, daily_dd - daily_dd_limit)
-                penalty *= max(0.1, 1.0 - (excess / daily_dd_limit))
-            if min_monthly > 0 and monthly_ret < min_monthly:
-                penalty *= max(0.1, monthly_ret / min_monthly)
-            return float(penalty)
-
         sym_series = self._meta_column(meta_val, "symbol", dtype=np.str_) if "symbol" in meta_cols else None
+        init_balance = float(getattr(self.settings.risk, "initial_balance", 100000.0) or 100000.0)
         if sym_series is not None:
             sym_arr = np.asarray(sym_series).reshape(-1)[:n_meta]
             uniq_syms = np.unique(sym_arr)
-            total_trades = 0.0
-            weighted_score = 0.0
-            weighted_monthly = 0.0
-            weighted_sortino = 0.0
-            weighted_calmar = 0.0
-            weighted_pf = 0.0
-            max_dd = 0.0
-            max_daily = 0.0
+            net_profit_vals: list[float] = []
+            sortino_vals: list[float] = []
+            drawdown_vals: list[float] = []
+            profit_factor_vals: list[float] = []
+            trade_vals: list[float] = []
+            daily_dd_vals: list[float] = []
             for sym in uniq_syms:
                 mask = sym_arr == sym
                 if not np.any(mask):
@@ -902,42 +1089,35 @@ class HyperparameterOptimizer:
                 )
 
                 net_profit, _sharpe, sortino, dd, _win_rate, profit_factor, _exp, _sqn, trades, _r2, daily_dd = metrics
-                max_dd = max(max_dd, float(dd))
-                max_daily = max(max_daily, float(daily_dd))
-                if trades <= 0:
-                    continue
-                init_balance = float(getattr(self.settings.risk, "initial_balance", 100000.0) or 100000.0)
-                monthly_ret = (net_profit / init_balance) / months
-                calmar = (monthly_ret / dd) if dd > 1e-9 else 0.0
-                prop_score = (
-                    monthly_ret * 100.0
-                    + 0.6 * sortino
-                    + 0.4 * calmar
-                    + 0.2 * profit_factor
-                    - 50.0 * max(0.0, dd - dd_limit)
-                )
-                prop_score *= _penalty_factor(float(dd), float(daily_dd), float(monthly_ret))
-                total_trades += float(trades)
-                weighted_score += float(trades) * float(prop_score)
-                weighted_monthly += float(trades) * float(monthly_ret)
-                weighted_sortino += float(trades) * float(sortino)
-                weighted_calmar += float(trades) * float(calmar)
-                weighted_pf += float(trades) * float(profit_factor)
+                net_profit_vals.append(float(net_profit))
+                sortino_vals.append(float(sortino))
+                drawdown_vals.append(float(dd))
+                profit_factor_vals.append(float(profit_factor))
+                trade_vals.append(float(trades))
+                daily_dd_vals.append(float(daily_dd))
 
             required = float(self._prop_required_trades(meta_val))
-            if required > 0 and total_trades < required:
-                return _invalid(max_dd, max_daily)
-            denom = max(total_trades, 1.0)
+            summary = _aggregate_prop_score_metrics(
+                net_profit=np.asarray(net_profit_vals, dtype=np.float64),
+                sortino=np.asarray(sortino_vals, dtype=np.float64),
+                drawdown=np.asarray(drawdown_vals, dtype=np.float64),
+                profit_factor=np.asarray(profit_factor_vals, dtype=np.float64),
+                trades=np.asarray(trade_vals, dtype=np.float64),
+                daily_dd=np.asarray(daily_dd_vals, dtype=np.float64),
+                months=months,
+                dd_limit=dd_limit,
+                daily_dd_limit=daily_dd_limit,
+                min_monthly=min_monthly,
+                initial_balance=init_balance,
+                acc=acc,
+                prop_weight=self.prop_weight,
+                acc_weight=self.acc_weight,
+            )
+            if required > 0 and summary["trades"] < required:
+                return _invalid(summary["drawdown"], summary["daily_dd"])
             return {
-                "prop_score": float(self.prop_weight * (weighted_score / denom) + self.acc_weight * acc),
-                "drawdown": float(max_dd),
-                "daily_dd": float(max_daily),
+                **summary,
                 "accuracy": float(acc),
-                "trades": float(total_trades),
-                "monthly_return": float(weighted_monthly / denom),
-                "sortino": float(weighted_sortino / denom),
-                "calmar": float(weighted_calmar / denom),
-                "profit_factor": float(weighted_pf / denom),
             }
 
         pip_size, pip_value_per_lot = infer_pip_metrics(getattr(self.settings.system, "symbol", ""))
@@ -989,31 +1169,30 @@ class HyperparameterOptimizer:
 
         net_profit, _sharpe, sortino, dd, win_rate, profit_factor, _exp, _sqn, trades, _r2, daily_dd = metrics
         required = float(self._prop_required_trades(meta_val))
-        if required > 0 and trades < required:
-            return _invalid(dd, daily_dd)
-
-        init_balance = float(getattr(self.settings.risk, "initial_balance", 100000.0) or 100000.0)
-        monthly_ret = (net_profit / init_balance) / months
-        calmar = (monthly_ret / dd) if dd > 1e-9 else 0.0
-        prop_score = (
-            monthly_ret * 100.0
-            + 0.6 * sortino
-            + 0.4 * calmar
-            + 0.2 * profit_factor
-            + 0.1 * (win_rate * 100.0)
-            - 50.0 * max(0.0, dd - dd_limit)
+        summary = _aggregate_prop_score_metrics(
+            net_profit=np.asarray([net_profit], dtype=np.float64),
+            sortino=np.asarray([sortino], dtype=np.float64),
+            drawdown=np.asarray([dd], dtype=np.float64),
+            profit_factor=np.asarray([profit_factor], dtype=np.float64),
+            trades=np.asarray([trades], dtype=np.float64),
+            daily_dd=np.asarray([daily_dd], dtype=np.float64),
+            months=months,
+            dd_limit=dd_limit,
+            daily_dd_limit=daily_dd_limit,
+            min_monthly=min_monthly,
+            initial_balance=init_balance,
+            acc=acc,
+            prop_weight=self.prop_weight,
+            acc_weight=self.acc_weight,
+            win_rate=np.asarray([win_rate], dtype=np.float64),
+            include_win_rate_bonus=True,
+            ignore_zero_trade_entries=False,
         )
-        prop_score *= _penalty_factor(float(dd), float(daily_dd), float(monthly_ret))
+        if required > 0 and summary["trades"] < required:
+            return _invalid(summary["drawdown"], summary["daily_dd"])
         return {
-            "prop_score": float(self.prop_weight * prop_score + self.acc_weight * acc),
-            "drawdown": float(dd),
-            "daily_dd": float(daily_dd),
+            **summary,
             "accuracy": float(acc),
-            "trades": float(trades),
-            "monthly_return": float(monthly_ret),
-            "sortino": float(sortino),
-            "calmar": float(calmar),
-            "profit_factor": float(profit_factor),
         }
 
     def _objective_base(self, y_true: np.ndarray, y_pred_proba: np.ndarray, meta_val: Any | None) -> float:
@@ -1250,7 +1429,7 @@ class HyperparameterOptimizer:
     ) -> dict[str, dict[str, Any]]:
         logger.info(f"HPC HPO: Launching parallel tuning for all models across {len(self.device_pool)} GPUs...")
         best_params: dict[str, dict[str, Any]] = {}
-        
+
         all_models = [
             "LightGBM", "XGBoostRF", "XGBoostDART", "CatBoostAlt", "MLP",
             "TabNet", "N-BEATS", "TiDE", "KAN", "Transformer"
@@ -1270,7 +1449,7 @@ class HyperparameterOptimizer:
 
         # HPC BLITZ: Launch every model study at the same time
         results = await asyncio.gather(*[_tune_single(m) for m in all_models])
-        
+
         for name, params in results:
             if params:
                 best_params[name] = params
@@ -1511,5 +1690,4 @@ class HyperparameterOptimizer:
             except Exception as e:
                 logger.error(f"Failed to load best_params.json: {e}")
         return {}
-
 
