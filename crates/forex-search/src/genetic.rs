@@ -45,7 +45,7 @@ fn env_bool(name: &str, default: bool) -> bool {
 }
 
 fn clamp01(v: f64) -> f64 {
-    v.max(0.0).min(1.0)
+    v.clamp(0.0, 1.0)
 }
 
 const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
@@ -265,7 +265,7 @@ fn unique_candidate_or_retry(
     candidate
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Gene {
     pub indices: Vec<usize>,
     pub weights: Vec<f32>,
@@ -299,9 +299,93 @@ pub struct Gene {
     pub tp_pips: f64,
     pub sl_pips: f64,
     pub slice_pass_rate: f64,
+    pub consistency: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct FilteringConfig {
+    pub max_dd: f64,
+    pub min_profit: f64,
+    pub min_trades: f64,
+    pub min_sharpe: f64,
+    pub min_win_rate: f64,
+    pub min_profit_factor: f64,
+    pub anomaly_guard: bool,
+    pub elite_mode: bool,
+}
+
+impl Default for FilteringConfig {
+    fn default() -> Self {
+        Self {
+            max_dd: 0.15,
+            min_profit: 10.0,
+            min_trades: 10.0,
+            min_sharpe: 0.3,
+            min_win_rate: 0.50,
+            min_profit_factor: 1.05,
+            anomaly_guard: true,
+            elite_mode: false,
+        }
+    }
 }
 
 impl Gene {
+    pub fn is_anomalous(&self) -> bool {
+        let trades = self.trades_count as f64;
+        let win_rate = self.win_rate;
+        let profit_factor = self.profit_factor;
+        let profit = self.fitness; // Using fitness as profit proxy
+        let dd = self.max_drawdown;
+        let ppt = if trades > 0.0 { profit / trades } else { 0.0 };
+
+        // Thresholds from evo_prop.py
+        let min_trades = 120.0;
+        let max_dd = 0.0025;
+        let min_win_rate = 0.92;
+        let min_pf = 12.0;
+        let min_profit = 200_000.0;
+        let max_ppt = 2_000.0;
+
+        let suspicious_combo = trades >= min_trades
+            && dd <= max_dd
+            && win_rate >= min_win_rate
+            && profit_factor >= min_pf
+            && profit >= min_profit;
+
+        let suspicious_ppt = trades >= 40.0 && dd <= 0.01 && ppt >= max_ppt;
+
+        let suspicious_ultra = trades >= 50.0 && dd <= 0.001 && profit >= 150_000.0 && ppt >= 1_000.0;
+
+        let suspicious_low_dd = trades >= 80.0 && dd <= 0.001 && profit >= 50_000.0;
+
+        suspicious_combo || suspicious_ppt || suspicious_ultra || suspicious_low_dd
+    }
+
+    pub fn passes_filter(&self, cfg: &FilteringConfig) -> bool {
+        if self.fitness <= cfg.min_profit {
+            return false;
+        }
+        if self.max_drawdown > cfg.max_dd {
+            return false;
+        }
+        if (self.trades_count as f64) < cfg.min_trades {
+            return false;
+        }
+        if self.sharpe_ratio < cfg.min_sharpe {
+            return false;
+        }
+        if self.win_rate < cfg.min_win_rate {
+            return false;
+        }
+        if self.profit_factor < cfg.min_profit_factor {
+            return false;
+        }
+        if cfg.anomaly_guard && self.is_anomalous() {
+            return false;
+        }
+        true
+    }
+
     fn normalize(&mut self, n_indicators: usize, min_indicators: usize) {
         if self.indices.is_empty() {
             self.indices.push(0);
@@ -315,7 +399,7 @@ impl Gene {
                 *idx %= n_indicators;
             }
         }
-        let min_indicators = min_indicators.min(n_indicators.max(1));
+        let min_indicators = min_indicators.clamp(1, n_indicators);
         if self.indices.len() < min_indicators {
             let mut rng = rand::rng();
             let mut seen = std::collections::HashSet::new();
@@ -1015,7 +1099,7 @@ fn new_random_gene(
 ) -> Gene {
     let mut rng = rand::rng();
     let min_indicators = 1;
-    let max_indicators = max_indicators.max(min_indicators).min(n_indicators.max(1));
+    let max_indicators = max_indicators.clamp(min_indicators, n_indicators.max(1));
     let count = rng.random_range(min_indicators..=max_indicators);
     let sample = sample(&mut rng, n_indicators.max(1), count);
     let indices: Vec<usize> = sample.iter().collect();
@@ -1059,6 +1143,7 @@ fn new_random_gene(
         tp_pips,
         sl_pips,
         slice_pass_rate: 0.0,
+        consistency: 0.0,
     };
     randomize_smc_flags(&mut gene, smc_cfg, &mut rng);
     enforce_min_structural_smc_flags(&mut gene, smc_cfg, &mut rng);
@@ -1283,11 +1368,12 @@ fn score_from_metrics(metrics: &[f64; 11]) -> f64 {
     let sharpe = metrics[1];
     let max_dd = metrics[3];
     let profit_factor = metrics[5];
+    let consistency = metrics[9];
     let dd_cap = 0.07;
     let pfloor = 1.0;
     let dd_penalty = 10.0 * (max_dd - dd_cap).max(0.0);
     let pf_penalty = if profit_factor <= pfloor { 5.0 } else { 0.0 };
-    sharpe + (net_profit / 10_000.0) - dd_penalty - pf_penalty
+    sharpe + (net_profit / 10_000.0) + (consistency * 0.5) - dd_penalty - pf_penalty
 }
 
 fn apply_metrics(genes: &mut [Gene], metrics: &[[f64; 11]]) {
@@ -1300,6 +1386,7 @@ fn apply_metrics(genes: &mut [Gene], metrics: &[[f64; 11]]) {
         gene.expectancy = m[6];
         gene.trades_count = m[8].max(0.0) as usize;
         gene.slice_pass_rate = 1.0;
+        gene.consistency = m[9];
     }
 }
 
@@ -1421,6 +1508,7 @@ fn crossover(a: &Gene, b: &Gene, generation: usize) -> Gene {
         tp_pips,
         sl_pips,
         slice_pass_rate: 0.0,
+        consistency: 0.0,
     }
 }
 
@@ -1441,8 +1529,8 @@ fn mutate(
                 mutated.indices[idx] = rng.random_range(0..n_indicators.max(1));
                 mutated.weights[idx] = rng.random_range(0.1..1.0);
             } else {
-                let min_indicators = 1.min(n_indicators.max(1));
-                let max_indicators = max_indicators.max(min_indicators).min(n_indicators.max(1));
+                let min_indicators = 1.clamp(1, n_indicators.max(1));
+                let max_indicators = max_indicators.clamp(min_indicators, n_indicators.max(1));
                 let count = rng.random_range(min_indicators..=max_indicators);
                 let sample = sample(&mut rng, n_indicators.max(1), count);
                 mutated.indices = sample.iter().collect();

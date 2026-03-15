@@ -1,0 +1,420 @@
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChallengePhase {
+    Phase1,
+    Phase2,
+    Funded,
+}
+
+impl Default for ChallengePhase {
+    fn default() -> Self {
+        Self::Phase1
+    }
+}
+
+impl From<&str> for ChallengePhase {
+    fn from(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "phase2" | "phase_2" | "verification" | "verify" => Self::Phase2,
+            "funded" | "live" => Self::Funded,
+            _ => Self::Phase1,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PropFirmRules {
+    pub max_daily_loss_pct: f64,
+    pub max_total_loss_pct: f64,
+    pub profit_target_pct: f64,
+    pub min_trading_days: usize,
+    pub max_trading_days: usize,
+    pub max_lot_size: f64,
+    pub news_trading_allowed: bool,
+    pub weekend_holding: bool,
+    pub scaling_enabled: bool,
+    pub daily_dd_warning_pct: f64,
+    pub daily_dd_stop_trading_pct: f64,
+    pub daily_profit_lock_pct: f64,
+    pub max_trades_per_day: usize,
+}
+
+impl Default for PropFirmRules {
+    fn default() -> Self {
+        Self {
+            max_daily_loss_pct: 0.045,
+            max_total_loss_pct: 0.10,
+            profit_target_pct: 0.10,
+            min_trading_days: 5,
+            max_trading_days: 60,
+            max_lot_size: 10.0,
+            news_trading_allowed: false,
+            weekend_holding: false,
+            scaling_enabled: true,
+            daily_dd_warning_pct: 0.035,
+            daily_dd_stop_trading_pct: 0.040,
+            daily_profit_lock_pct: 0.03,
+            max_trades_per_day: 15,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChallengeRiskPreset {
+    pub phase: String,
+    pub risk_per_trade: f64,
+    pub max_risk_per_trade: f64,
+    pub min_confidence_threshold: f64,
+    pub max_trades_per_day: usize,
+    pub daily_drawdown_limit: f64,
+    pub total_drawdown_limit: f64,
+    pub daily_profit_lock_pct: f64,
+    pub monthly_profit_target_pct: f64,
+    pub challenge_target_return_pct: f64,
+    pub challenge_target_trading_days: usize,
+}
+
+pub fn resolve_challenge_risk_preset(phase: &str) -> ChallengeRiskPreset {
+    let phase_enum = ChallengePhase::from(phase);
+    match phase_enum {
+        ChallengePhase::Phase2 => ChallengeRiskPreset {
+            phase: "phase_2".to_string(),
+            risk_per_trade: 0.0025,
+            max_risk_per_trade: 0.0040,
+            min_confidence_threshold: 0.68,
+            max_trades_per_day: 3,
+            daily_drawdown_limit: 0.045,
+            total_drawdown_limit: 0.10,
+            daily_profit_lock_pct: 0.012,
+            monthly_profit_target_pct: 0.05,
+            challenge_target_return_pct: 0.05,
+            challenge_target_trading_days: 22,
+        },
+        ChallengePhase::Funded => ChallengeRiskPreset {
+            phase: "funded".to_string(),
+            risk_per_trade: 0.0030,
+            max_risk_per_trade: 0.0050,
+            min_confidence_threshold: 0.65,
+            max_trades_per_day: 4,
+            daily_drawdown_limit: 0.045,
+            total_drawdown_limit: 0.10,
+            daily_profit_lock_pct: 0.0,
+            monthly_profit_target_pct: 0.06,
+            challenge_target_return_pct: 0.06,
+            challenge_target_trading_days: 22,
+        },
+        ChallengePhase::Phase1 => ChallengeRiskPreset {
+            phase: "phase_1".to_string(),
+            risk_per_trade: 0.0030,
+            max_risk_per_trade: 0.0050,
+            min_confidence_threshold: 0.66,
+            max_trades_per_day: 3,
+            daily_drawdown_limit: 0.045,
+            total_drawdown_limit: 0.10,
+            daily_profit_lock_pct: 0.015,
+            monthly_profit_target_pct: 0.10,
+            challenge_target_return_pct: 0.10,
+            challenge_target_trading_days: 22,
+        },
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TradeRecord {
+    pub entry_time_sec: u64,
+    pub exit_time_sec: u64,
+    pub pnl: f64,
+    pub was_stopped: bool,
+    pub duration_minutes: f64,
+    pub size: f64,
+    pub direction: Option<i32>,
+}
+
+pub struct RevengeTradeDetector {
+    pub recent_trades: Vec<TradeRecord>,
+    pub max_trades_tracked: usize,
+}
+
+impl Default for RevengeTradeDetector {
+    fn default() -> Self {
+        Self {
+            recent_trades: Vec::new(),
+            max_trades_tracked: 10,
+        }
+    }
+}
+
+impl RevengeTradeDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record_trade(
+        &mut self,
+        entry_time_sec: u64,
+        exit_time_sec: u64,
+        pnl: f64,
+        was_stopped: bool,
+        size: f64,
+        direction: Option<i32>,
+    ) {
+        let duration_minutes = (exit_time_sec.saturating_sub(entry_time_sec)) as f64 / 60.0;
+        self.recent_trades.push(TradeRecord {
+            entry_time_sec,
+            exit_time_sec,
+            pnl,
+            was_stopped,
+            duration_minutes,
+            size,
+            direction,
+        });
+
+        if self.recent_trades.len() > self.max_trades_tracked {
+            self.recent_trades.remove(0);
+        }
+    }
+
+    pub fn is_revenge_trading(&self, current_time_sec: u64, current_hour: u32) -> bool {
+        if self.recent_trades.len() < 2 {
+            return false;
+        }
+
+        let last_trade = self.recent_trades.last().unwrap();
+        let time_since_last_min = (current_time_sec.saturating_sub(last_trade.exit_time_sec)) as f64 / 60.0;
+
+        // Condition 1: Less than 15 mins after a loss
+        if time_since_last_min < 15.0 && last_trade.pnl < 0.0 {
+            return true;
+        }
+
+        // Condition 2: 3 consecutive losses outside optimal times
+        let mut consecutive_losses = 0;
+        for trade in self.recent_trades.iter().rev().take(5) {
+            if trade.pnl < 0.0 {
+                consecutive_losses += 1;
+            } else {
+                break;
+            }
+        }
+        
+        if consecutive_losses >= 3 {
+            let optimal_times = (current_hour >= 7 && current_hour < 9) || (current_hour >= 13 && current_hour < 15);
+            if !optimal_times {
+                return true;
+            }
+        }
+
+        // Condition 3: Increasing size after a loss
+        if self.recent_trades.len() >= 3 {
+            let recent_idx = self.recent_trades.len() - 3;
+            let recent = &self.recent_trades[recent_idx..];
+            let mut sum_prev_sizes = 0.0;
+            let mut count_prev = 0;
+            for t in &recent[..recent.len() - 1] {
+                sum_prev_sizes += t.size;
+                count_prev += 1;
+            }
+            if count_prev > 0 {
+                let mean_prev = sum_prev_sizes / (count_prev as f64);
+                let last_size = recent.last().unwrap().size;
+                let prev_pnl = recent[recent.len() - 2].pnl;
+                if mean_prev > 0.0 && last_size > 1.5 * mean_prev && prev_pnl < 0.0 {
+                    return true;
+                }
+            }
+        }
+
+        // Condition 4: 3 successive losses in same direction
+        if self.recent_trades.len() >= 3 {
+            let n = self.recent_trades.len();
+            let t1 = &self.recent_trades[n - 3];
+            let t2 = &self.recent_trades[n - 2];
+            let t3 = &self.recent_trades[n - 1];
+
+            if t1.direction.is_some() 
+                && t1.direction == t2.direction 
+                && t2.direction == t3.direction 
+                && t3.pnl < 0.0 
+                && t2.pnl < 0.0 
+            {
+                return true;
+            }
+        }
+
+        // Condition 5: Repeated losses in same direction under 30min gap
+        if self.recent_trades.len() >= 2 {
+            let n = self.recent_trades.len();
+            let prev = &self.recent_trades[n - 2];
+            let last = &self.recent_trades[n - 1];
+            let gap_min = (last.entry_time_sec.saturating_sub(prev.exit_time_sec)) as f64 / 60.0;
+
+            if gap_min < 30.0 && last.pnl < 0.0 && prev.pnl < 0.0 {
+                if last.direction.is_some() && last.direction == prev.direction {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RiskManager {
+    pub prop_rules: PropFirmRules,
+    pub challenge_mode: bool,
+
+    pub total_peak_equity: f64,
+    pub day_start_equity: f64,
+    pub day_peak_equity: f64,
+    pub month_start_equity: f64,
+    pub challenge_start_equity: f64,
+
+    pub daily_loss: f64,
+    pub daily_profit: f64,
+    pub session_trades: usize,
+    pub consecutive_losses: usize,
+
+    pub circuit_breaker_triggered: bool,
+    pub recovery_mode: bool,
+    pub reflection_mode: bool,
+    pub monthly_target_hit: bool,
+    pub challenge_target_hit: bool,
+
+    pub monthly_profit_target_pct: f64,
+    pub challenge_target_return_pct: f64,
+
+    pub monthly_return_pct: f64,
+    pub challenge_return_pct: f64,
+
+    // Store date IDs (e.g., YYYYMMDD) for day resets
+    pub last_session_date_id: Option<u32>,
+    pub month_start_date_id: Option<u32>,
+    pub challenge_start_date_id: Option<u32>,
+}
+
+impl RiskManager {
+    pub fn new(prop_rules: PropFirmRules, challenge_mode: bool, initial_balance: f64) -> Self {
+        Self {
+            prop_rules,
+            challenge_mode,
+            total_peak_equity: initial_balance,
+            day_start_equity: initial_balance,
+            day_peak_equity: initial_balance,
+            month_start_equity: initial_balance,
+            challenge_start_equity: if challenge_mode { initial_balance } else { 0.0 },
+            daily_loss: 0.0,
+            daily_profit: 0.0,
+            session_trades: 0,
+            consecutive_losses: 0,
+            circuit_breaker_triggered: false,
+            recovery_mode: false,
+            reflection_mode: false,
+            monthly_target_hit: false,
+            challenge_target_hit: false,
+            monthly_profit_target_pct: 0.04,
+            challenge_target_return_pct: 0.10,
+            monthly_return_pct: 0.0,
+            challenge_return_pct: 0.0,
+            last_session_date_id: None,
+            month_start_date_id: None,
+            challenge_start_date_id: None,
+        }
+    }
+
+    pub fn drawdown_state(&self, equity: f64) -> (f64, f64, f64, f64) {
+        let daily_dd_pct = if self.day_start_equity > 0.0 {
+            (self.day_start_equity - equity) / self.day_start_equity
+        } else {
+            0.0
+        };
+        let intraday_dd_pct = if self.day_peak_equity > 0.0 {
+            (self.day_peak_equity - equity) / self.day_peak_equity
+        } else {
+            0.0
+        };
+        let dd_used = daily_dd_pct.max(intraday_dd_pct).max(0.0);
+        let dd_limit = self.prop_rules.daily_dd_stop_trading_pct.max(1e-9);
+        (daily_dd_pct, intraday_dd_pct, dd_used, dd_limit)
+    }
+
+    pub fn update_recovery_state(&mut self, equity: f64) {
+        if self.day_start_equity <= 0.0 {
+            return;
+        }
+        let daily_dd_pct = (self.day_start_equity - equity) / self.day_start_equity;
+
+        if daily_dd_pct >= self.prop_rules.daily_dd_warning_pct {
+            if !self.recovery_mode {
+                self.recovery_mode = true;
+            }
+        } else if self.recovery_mode {
+            let recovery_threshold_pct = 0.005;
+            let half_warning = self.prop_rules.daily_dd_warning_pct / 2.0;
+            if equity >= (self.day_start_equity * (1.0 - recovery_threshold_pct))
+                || daily_dd_pct <= half_warning
+            {
+                self.recovery_mode = false;
+            }
+        }
+    }
+
+    pub fn calculate_position_size(
+        &mut self,
+        equity: f64,
+        base_risk_pct: f64,
+        max_risk_cap: f64,
+        confidence: f64,
+        uncertainty: f64,
+        market_volatility: f64,
+        target_volatility: f64,
+        is_volatile_regime: bool,
+    ) -> f64 {
+        let signal_multiplier = if confidence >= 0.80 {
+            1.00
+        } else if confidence >= 0.60 {
+            0.50 + (confidence - 0.60) * 2.5
+        } else {
+            0.30
+        };
+
+        let uncertainty_penalty = 1.0 - (uncertainty * 0.5);
+        let mut risk_pct = base_risk_pct * signal_multiplier * uncertainty_penalty;
+
+        let mut current_cap = max_risk_cap;
+        if self.recovery_mode {
+            current_cap = max_risk_cap * 0.5;
+        }
+        risk_pct = risk_pct.min(current_cap);
+
+        if target_volatility > 0.0 && market_volatility > 0.0 {
+            let mut vol_scale = target_volatility / market_volatility;
+            vol_scale = vol_scale.clamp(0.35, 1.30);
+            risk_pct *= vol_scale;
+        }
+
+        if is_volatile_regime {
+            risk_pct *= 0.5;
+        }
+
+        let (_, _, dd_used, dd_limit) = self.drawdown_state(equity);
+        let dd_frac = dd_used / dd_limit.max(1e-9);
+
+        if dd_frac >= 0.75 {
+            risk_pct *= 0.35;
+        } else if dd_frac >= 0.50 {
+            risk_pct *= 0.60;
+        }
+
+        if self.total_peak_equity > 0.0 {
+            let dd_total_pct = (self.total_peak_equity - equity) / self.total_peak_equity;
+            if dd_total_pct > 0.0 {
+                let scale = 1.0 - (dd_total_pct / self.prop_rules.max_total_loss_pct.max(1e-6));
+                risk_pct *= scale.max(0.3);
+            }
+        }
+
+        risk_pct.clamp(0.0, max_risk_cap)
+    }
+}
+

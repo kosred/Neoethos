@@ -1,0 +1,169 @@
+   Compiling talib-sys v0.1.0 (C:\Users\konst\development\forex-ai\vendor\talib-sys)
+    Checking forex-data v0.1.0 (C:\Users\konst\development\forex-ai\crates\forex-data)
+warning: function `detect_divergence` is never used
+   --> crates\forex-data\src\lib.rs:392:8
+    |
+392 | pub fn detect_divergence(price: &[f64], indicator: &[f64], window: usize) -> Vec<f64> {
+    |        ^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `forex-data` (lib) generated 1 warning
+    Checking forex-models v0.1.0 (C:\Users\konst\development\forex-ai\crates\forex-models)
+    Checking forex-search v0.1.0 (C:\Users\konst\development\forex-ai\crates\forex-search)
+    Checking forex-bindings v0.1.0 (C:\Users\konst\development\forex-ai\crates\forex-bindings)
+error: expected argument from function definition `_timestamps` but got argument `timestamps`
+   --> crates\forex-bindings\src\evaluation.rs:515:28
+    |
+515 | #[pyo3(signature = (close, timestamps=None))]
+    |                            ^^^^^^^^^^
+
+error: expected argument from function definition `_journal_df` but got argument `journal_df`
+   --> crates\forex-bindings\src\evaluation.rs:552:21
+    |
+552 | #[pyo3(signature = (journal_df))]
+    |                     ^^^^^^^^^^
+
+error: expected argument from function definition `_open` but got argument `open`
+   --> crates\forex-bindings\src\evaluation.rs:564:21
+    |
+564 | #[pyo3(signature = (open, high, low, close, window=500))]
+    |                     ^^^^
+
+warning: unused imports: `Ix1` and `Ix2`
+ --> crates\forex-bindings\src\utils.rs:1:23
+  |
+1 | use ndarray::{Array2, Ix1, Ix2};
+  |                       ^^^  ^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `PyReadonlyArrayDyn`
+ --> crates\forex-bindings\src\utils.rs:2:72
+  |
+2 | use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn};
+  |                                                                        ^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `PyAny` and `PyDict`
+ --> crates\forex-bindings\src\utils.rs:6:19
+  |
+6 | use pyo3::types::{PyAny, PyDict};
+  |                   ^^^^^  ^^^^^^
+
+warning: unused imports: `PyArray2` and `PyReadonlyArray2`
+ --> crates\forex-bindings\src\inference.rs:3:13
+  |
+3 | use numpy::{PyArray2, PyReadonlyArray2};
+  |             ^^^^^^^^  ^^^^^^^^^^^^^^^^
+
+warning: unused import: `pyo3::prelude::*`
+ --> crates\forex-bindings\src\inference.rs:4:5
+  |
+4 | use pyo3::prelude::*;
+  |     ^^^^^^^^^^^^^^^^
+
+warning: unused imports: `Arc` and `Mutex`
+ --> crates\forex-bindings\src\inference.rs:5:17
+  |
+5 | use std::sync::{Arc, Mutex};
+  |                 ^^^  ^^^^^
+
+warning: unused import: `ndarray::Array2`
+ --> crates\forex-bindings\src\inference.rs:6:5
+  |
+6 | use ndarray::Array2;
+  |     ^^^^^^^^^^^^^^^
+
+warning: unused imports: `Ix1` and `Ix2`
+ --> crates\forex-bindings\src\models.rs:1:23
+  |
+1 | use ndarray::{Array2, Ix1, Ix2};
+  |                       ^^^  ^^^
+
+warning: unused import: `PyArray1`
+ --> crates\forex-bindings\src\models.rs:2:26
+  |
+2 | use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+  |                          ^^^^^^^^
+
+warning: unused imports: `PyAny` and `PyDict`
+ --> crates\forex-bindings\src\models.rs:4:19
+  |
+4 | use pyo3::types::{PyAny, PyDict};
+  |                   ^^^^^  ^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> crates\forex-bindings\src\models.rs:5:5
+  |
+5 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Mutex`
+ --> crates\forex-bindings\src\data.rs:6:5
+  |
+6 | use std::sync::Mutex;
+  |     ^^^^^^^^^^^^^^^^
+
+warning: unused import: `Axis`
+ --> crates\forex-bindings\src\data.rs:7:23
+  |
+7 | use ndarray::{Array2, Axis};
+  |                       ^^^^
+
+warning: unused import: `build_ohlcv`
+  --> crates\forex-bindings\src\data.rs:15:5
+   |
+15 |     build_ohlcv, parse_feature_profile, resolve_base_tf, vec_from_py_i64, vec_from_py_f64,
+   |     ^^^^^^^^^^^
+
+warning: unused imports: `IntoPyArray`, `PyArray1`, `PyArray2`, and `PyReadonlyArray2`
+ --> crates\forex-bindings\src\search.rs:1:13
+  |
+1 | use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+  |             ^^^^^^^^^^^  ^^^^^^^^  ^^^^^^^^                    ^^^^^^^^^^^^^^^^
+
+warning: unused import: `PyArray2`
+ --> crates\forex-bindings\src\evaluation.rs:1:36
+  |
+1 | use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+  |                                    ^^^^^^^^
+
+warning: unused import: `month_day_indices`
+  --> crates\forex-bindings\src\evaluation.rs:10:29
+   |
+10 |     Gene, EvaluationConfig, month_day_indices,
+   |                             ^^^^^^^^^^^^^^^^^
+
+error[E0433]: failed to resolve: function `wrapped_pyfunction` is not a crate or module
+  --> crates\forex-bindings\src\lib.rs:49:20
+   |
+49 |     m.add_function(wrap_pyfunction!(evaluation::infer_stop_target_pips_ohlcv, m)?)?;
+   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `wrapped_pyfunction` is not a crate or module
+   |
+   = note: this error originates in the macro `wrap_pyfunction` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0433]: failed to resolve: function `wrapped_pyfunction` is not a crate or module
+  --> crates\forex-bindings\src\lib.rs:54:20
+   |
+54 |     m.add_function(wrap_pyfunction!(evaluation::trade_journal_metrics, m)?)?;
+   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `wrapped_pyfunction` is not a crate or module
+   |
+   = note: this error originates in the macro `wrap_pyfunction` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0433]: failed to resolve: function `wrapped_pyfunction` is not a crate or module
+  --> crates\forex-bindings\src\lib.rs:55:20
+   |
+55 |     m.add_function(wrap_pyfunction!(evaluation::triple_barrier_labels, m)?)?;
+   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `wrapped_pyfunction` is not a crate or module
+   |
+   = note: this error originates in the macro `wrap_pyfunction` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused import: `polars::prelude`
+ --> crates\forex-bindings\src\evaluation.rs:2:5
+  |
+2 | use polars::prelude::*;
+  |     ^^^^^^^^^^^^^^^
+
+For more information about this error, try `rustc --explain E0433`.
+warning: `forex-bindings` (lib) generated 18 warnings
+error: could not compile `forex-bindings` (lib) due to 6 previous errors; 18 warnings emitted

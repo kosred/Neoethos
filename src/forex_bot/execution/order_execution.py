@@ -1,101 +1,30 @@
+"""
+Order execution — all logic delegated to the Rust `forex_bindings.OrderExecutor`.
+Python is responsible only for async MT5 I/O (place_order, close_position).
+"""
+from __future__ import annotations
+
+import asyncio
 import logging
-import os
 from datetime import UTC, datetime
 from typing import Any
 
 import numpy as np
+import forex_bindings as fb
 
 from ..core.config import Settings
 from ..core.storage import RiskLedger, StrategyLedger
 from ..execution.mt5_state_manager import MT5StateManager
 from ..execution.risk import RiskManager
-from ..strategy.stop_target import infer_stop_target_pips
+from ..execution import frame_utils
 
 logger = logging.getLogger(__name__)
-_RUST_ORDER_BACKEND_OK: bool | None = None
-_RUST_ORDER_WARNED_UNAVAILABLE = False
-
-
-def _frame_empty(value: Any) -> bool:
-    if value is None:
-        return True
-    try:
-        return bool(value.empty)
-    except Exception:
-        pass
-    try:
-        return int(len(value)) <= 0
-    except Exception:
-        return True
-
-
-def _frame_columns(value: Any) -> list[str]:
-    cols = getattr(value, "columns", None)
-    if cols is None:
-        return []
-    try:
-        return [str(c) for c in list(cols)]
-    except Exception:
-        return []
-
-
-def _frame_resolve_column(value: Any, name: str) -> str | None:
-    target = str(name).strip().lower()
-    for col in _frame_columns(value):
-        if str(col).strip().lower() == target:
-            return col
-    return None
-
-
-def _frame_has_column(value: Any, name: str) -> bool:
-    return _frame_resolve_column(value, name) is not None
-
-
-def _frame_index(value: Any) -> Any:
-    return getattr(value, "index", None)
-
-
-def _is_dataframe_like(value: Any) -> bool:
-    return bool(hasattr(value, "columns") and hasattr(value, "index"))
-
-
-def _is_frame_like(value: Any) -> bool:
-    return bool(hasattr(value, "columns") and hasattr(value, "__getitem__"))
-
-
-def _is_series_like(value: Any) -> bool:
-    return bool(hasattr(value, "index") and hasattr(value, "to_numpy") and not hasattr(value, "columns"))
-
-
-def _rust_order_backend_available(*, force_log: bool = False) -> bool:
-    global _RUST_ORDER_BACKEND_OK, _RUST_ORDER_WARNED_UNAVAILABLE
-    if _RUST_ORDER_BACKEND_OK is None:
-        try:
-            import forex_bindings  # type: ignore
-
-            _RUST_ORDER_BACKEND_OK = all(
-                hasattr(forex_bindings, fn)
-                for fn in ("pip_size_from_symbol", "compute_order_prices", "evaluate_trade_edge")
-            )
-        except Exception:
-            _RUST_ORDER_BACKEND_OK = False
-    if force_log and not _RUST_ORDER_BACKEND_OK and not _RUST_ORDER_WARNED_UNAVAILABLE:
-        logger.warning(
-            "Rust order backend requested but required forex_bindings functions are unavailable."
-        )
-        _RUST_ORDER_WARNED_UNAVAILABLE = True
-    return bool(_RUST_ORDER_BACKEND_OK)
-
-
-def _disable_rust_order_backend() -> None:
-    global _RUST_ORDER_BACKEND_OK
-    _RUST_ORDER_BACKEND_OK = False
 
 
 class OrderExecutor:
     """
-    Handles the mechanics of calculating order parameters (SL/TP/Size)
-    and executing trades via MT5.
+    Thin Python proxy. All arithmetic is done in Rust via `forex_bindings.OrderExecutor`.
+    Only MT5 I/O, logging, and ledger updates live here.
     """
 
     def __init__(
@@ -105,849 +34,186 @@ class OrderExecutor:
         mt5_manager: MT5StateManager,
         strategy_ledger: StrategyLedger | None = None,
         risk_ledger: RiskLedger | None = None,
-    ):
+    ) -> None:
         self.settings = settings
         self.risk_manager = risk_manager
         self.mt5 = mt5_manager
         self.strategy_ledger = strategy_ledger
         self.risk_ledger = risk_ledger
-        self._last_rr: float | None = None
-        try:
-            self._cost_alpha = float(os.environ.get("FOREX_BOT_COST_STATE_ALPHA", "0.12") or 0.12)
-        except Exception:
-            self._cost_alpha = 0.12
-        self._cost_alpha = max(0.01, min(0.50, self._cost_alpha))
-        self._spread_ema = max(1e-6, float(getattr(self.settings.risk, "backtest_spread_pips", 1.5) or 1.5))
-        self._slippage_ema = max(1e-6, float(getattr(self.settings.risk, "slippage_pips", 0.5) or 0.5))
 
-    async def close_position(self, ticket: int, volume: float, reason: str | None = None) -> None:
-        """
-        Close a position via MT5StateManager, surfacing failures instead of silently swallowing them.
-        """
-        symbol = self.settings.system.symbol
-        success = await self.mt5.close_position_by_ticket(ticket, symbol, volume=volume)
-        if not success:
-            raise RuntimeError(f"Close failed for ticket {ticket} ({symbol}): {reason or 'no reason provided'}")
-        logger.info(f"Closed position ticket={ticket} vol={volume} reason={reason or 'n/a'}")
+        r = settings.risk
+        self._rust = fb.OrderExecutor(
+            symbol=settings.system.symbol,
+            partial_take_profit_enabled=bool(getattr(r, "partial_take_profit_enabled", True)),
+            partial_tp_min_total_lot=float(getattr(r, "partial_tp_min_total_lot", 0.03) or 0.03),
+            partial_tp_r_levels=self._parse_float_list(getattr(r, "partial_tp_r_levels", "1.0,2.0,3.0"), [1.0, 2.0, 3.0]),
+            partial_tp_size_fracs=self._parse_float_list(getattr(r, "partial_tp_size_fracs", "0.5,0.25,0.25"), [0.5, 0.25, 0.25]),
+            min_risk_reward=float(getattr(r, "min_risk_reward", 1.5) or 1.5),
+            entry_patience_enabled=bool(getattr(r, "entry_patience_enabled", True)),
+            entry_patience_bars=int(getattr(r, "entry_patience_bars", 3) or 3),
+            entry_patience_pullback_atr=float(getattr(r, "entry_patience_pullback_atr", 0.20) or 0.20),
+            min_edge_cost_multiple=float(getattr(r, "min_edge_cost_multiple", 3.0) or 3.0),
+            commission_per_lot=float(getattr(r, "commission_per_lot", 7.0) or 7.0),
+        )
+        self._cost_alpha = 0.12
+        self._spread_ema = float(getattr(r, "backtest_spread_pips", 1.5) or 1.5)
+        self._slippage_ema = float(getattr(r, "slippage_pips", 0.5) or 0.5)
+
+    def _parse_float_list(self, raw: Any, default: list[float]) -> list[float]:
+        try:
+            return [float(x.strip()) for x in str(raw).split(",")] if raw else default
+        except Exception:
+            return default
+
+    def _get_pip_size(self, symbol_info: dict | None = None) -> float:
+        sym = self.settings.system.symbol.upper()
+        try:
+            info = symbol_info or {}
+            point = float(info.get("point", 0.0001) or 0.0001)
+            digits = int(info.get("digits", 5) or 5)
+            return float(fb.pip_size_from_symbol(sym, point=point, digits=digits))
+        except Exception:
+            return 0.0
+
+    def update_live_cost_state(self, tick: dict, *, symbol_info: dict | None = None) -> None:
+        pip_size = self._get_pip_size(symbol_info)
+        if pip_size <= 0: return
+        
+        bid, ask = float(tick.get("bid", 0.0)), float(tick.get("ask", 0.0))
+        spread_pips = (ask - bid) / pip_size if ask > bid > 0 else self._spread_ema
+        
+        a = self._cost_alpha
+        self._spread_ema = (1 - a) * self._spread_ema + a * spread_pips
+        self.risk_manager.update_spread_state(
+            live_spread=spread_pips, live_slippage=self._slippage_ema,
+            baseline_spread=self._spread_ema, baseline_slippage=self._slippage_ema
+        )
 
     async def execute_signal(
-        self,
-        signal_result: Any,
-        equity: float,
-        frames: dict[str, Any],
-        entry_features: Any = None,
-        alloc_weight: Any = None,
-        advice_stance: str | None = None,
-        tick_price: dict[str, float] | None = None,
-        symbol_info: dict[str, Any] | None = None,
+        self, signal_result: Any, equity: float, frames: dict[str, Any], **kwargs
     ) -> None:
-        """
-        Process a buy/sell signal: calc risk, place order, log intent.
-        """
-        if signal_result.signal == 0:
-            return
+        if signal_result.signal == 0: return
 
+        # 1. Parameter Prep (SL, TP, Size)
+        params = await self._prepare_trade_params(signal_result, equity, frames, **kwargs)
+        if not params: return
+        
+        # 2. Pre-flight checks
+        if not await self._pre_flight_gate(params, frames, **kwargs): return
+        
+        # 3. Execution
+        await self._execute_order_legs(params, signal_result, **kwargs)
+
+    async def _prepare_trade_params(self, signal_result: Any, equity: float, frames: dict, **kwargs) -> dict | None:
         symbol = self.settings.system.symbol
+        base_df = frames.get(self.settings.system.base_timeframe) or frames.get("M1")
+        if frame_utils.frame_empty(base_df): return None
 
-        # 1. Calculate SL Pips
-        sl_pips = self._calculate_sl_pips(signal_result, frames)
-        if sl_pips is None:
-            logger.warning("Could not calculate SL pips; skipping trade.")
-            return
+        # SL Calculation
+        sl_pips = self._calculate_sl_pips(signal_result, base_df)
+        if not sl_pips: return None
 
-        # 2. Calculate Size
-        symbol_info = symbol_info or await self.mt5.connection.get_symbol_info(symbol) or {}
-        uncertainty = self._latest_scalar(getattr(signal_result, "uncertainty", 0.0), default=0.0)
-        try:
-            market_volatility = float((getattr(signal_result, "meta_features", {}) or {}).get("market_volatility", 0.0) or 0.0)
-        except Exception:
-            market_volatility = 0.0
-
+        # Sizing
+        info = kwargs.get("symbol_info") or await self.mt5.connection.get_symbol_info(symbol) or {}
+        market_vol = float((getattr(signal_result, "meta_features", {}) or {}).get("market_volatility", 0.0))
+        
         size = self.risk_manager.calculate_position_size(
-            equity,
-            sl_pips,
-            signal_result.confidence,
-            uncertainty,
-            symbol_info,
+            equity, sl_pips, signal_result.confidence, 0.0, info,
             market_regime=getattr(signal_result, "regime", "Normal"),
-            market_volatility=market_volatility,
+            market_volatility=market_vol
         )
+        
+        # Adjust for extra weight/stance
+        if kwargs.get("advice_stance") == "conservative": size *= 0.7
+        if size <= 0: return None
 
-        # 3. Adjust Size based on Advice/Allocation
-        if advice_stance:
-            if advice_stance == "conservative":
-                size *= 0.7
-            elif advice_stance == "aggressive":
-                size *= 1.1
+        # Prices
+        tick = kwargs.get("tick_price") or await self.mt5.connection.get_symbol_price(symbol) or {}
+        pip_size = self._get_pip_size(info)
+        rr = max(1.5, float(getattr(self.settings.risk, "min_risk_reward", 1.5)))
+        
+        entry_price = float(tick.get("ask") if signal_result.signal == 1 else tick.get("bid"))
+        sl, tp, _, sl_dist, rr_final = self._rust.compute_order_prices(entry_price, signal_result.signal, sl_pips, rr, pip_size)
 
-        if alloc_weight:
-            size = size * max(0.1, min(1.0, alloc_weight.weight))
+        return {
+            "symbol": symbol, "size": size, "sl": sl, "tp": tp, "sl_pips": sl_pips, 
+            "entry_price": entry_price, "sl_dist": sl_dist, "rr": rr_final, 
+            "info": info, "tick": tick, "pip_size": pip_size
+        }
 
-        if size <= 0:
-            logger.info(f"Signal {signal_result.signal} ignored (Calculated size 0).")
-            return
-
-        # 4. Calculate Prices
-        tick = tick_price or await self.mt5.connection.get_symbol_price(symbol) or {}
-        self.update_live_cost_state(tick, symbol_info=symbol_info)
-        px = self._calculate_prices(signal_result, frames, sl_pips, symbol_info, tick)
-        if px is None:
-            return
-        sl, tp, entry_price, sl_dist, rr = px
-
-        if not self._edge_over_cost_ok(
-            sl_pips=sl_pips,
-            rr=rr,
-            tick=tick,
-            symbol_info=symbol_info,
-        ):
-            logger.info("Signal skipped by cost/edge gate.")
-            return
-
-        base_df = frames.get(self.settings.system.base_timeframe)
-        if base_df is None:
-            base_df = frames.get("M1")
-        if _frame_empty(base_df):
-            current_bar_time = datetime.now(UTC)
-        else:
-            try:
-                if _frame_has_column(base_df, "timestamp"):
-                    ts_arr = self._column_values(base_df, "timestamp")
-                    if ts_arr is not None and ts_arr.size > 0:
-                        current_bar_time = ts_arr[-1]
-                    else:
-                        idx = _frame_index(base_df)
-                        current_bar_time = idx[-1] if idx is not None and len(idx) > 0 else datetime.now(UTC)
-                else:
-                    idx = _frame_index(base_df)
-                    current_bar_time = idx[-1] if idx is not None and len(idx) > 0 else datetime.now(UTC)
-                # Normalize to python datetime where possible
-                if hasattr(current_bar_time, "to_pydatetime"):
-                    current_bar_time = current_bar_time.to_pydatetime()
-                if isinstance(current_bar_time, str):
-                    current_bar_time = datetime.fromisoformat(current_bar_time)
-            except Exception:
-                current_bar_time = datetime.now(UTC)
-        order_type = "buy" if signal_result.signal == 1 else "sell"
-
-        if self._entry_patience_block(int(signal_result.signal), base_df):
-            logger.info("Entry patience gate delayed %s entry pending pullback.", order_type.upper())
-            return
-
-        can_split_entries = int(getattr(self.mt5, "max_positions_per_symbol", 1) or 1) > 1
-        if can_split_entries:
-            legs = self._build_order_legs(
-                total_size=size,
-                signal=int(signal_result.signal),
-                entry_price=entry_price,
-                sl=sl,
-                sl_dist=sl_dist,
-                default_tp=tp,
-            )
-        else:
-            legs = [(round(float(size), 2), float(tp))]
-        if len(legs) > 1:
-            logger.info("Executing %s split legs: %s", order_type.upper(), legs)
-        else:
-            logger.info(f"Executing {order_type.upper()} {size} lots (SL={sl:.5f}, TP={tp:.5f})...")
-
-        any_success = False
-        last_result = {"success": False, "reason": "Execution failed"}
-        for vol, leg_tp in legs:
-            result = await self._place_order_with_retry(
-                symbol=symbol,
-                order_type=order_type,
-                volume=vol,
-                sl=sl,
-                tp=leg_tp,
-                current_bar_time=current_bar_time,
-            )
-            last_result = result
-            if result.get("success"):
-                any_success = True
-                self._handle_success(
-                    result,
-                    order_type,
-                    vol,
-                    sl,
-                    leg_tp,
-                    signal_result,
-                    entry_features=entry_features,
-                    bar_time=current_bar_time,
-                    count_trade=False,
-                )
-                self._record_fill_cost_state(
-                    order_type=order_type,
-                    expected_entry=entry_price,
-                    result=result,
-                    tick=tick,
-                    symbol_info=symbol_info,
-                )
-
-        # Count a split entry as one parent trade for daily/session risk gates.
-        if any_success and self.risk_manager:
-            self.risk_manager.on_trade_opened(datetime.now(UTC))
-        elif not any_success:
-            self._handle_failure(last_result)
-
-    def _entry_patience_block(self, signal: int, base_df: Any) -> bool:
-        if not bool(getattr(self.settings.risk, "entry_patience_enabled", True)):
-            return False
-        if _frame_empty(base_df):
-            return False
-        try:
-            bars = int(getattr(self.settings.risk, "entry_patience_bars", 3) or 3)
-            bars = max(1, bars)
-            close = self._column_array(base_df, "close")
-            if close is None or close.size <= bars:
-                return False
-            atr_val = 0.0
-            atr = self._column_array(base_df, "atr")
-            if atr is None:
-                atr = self._column_array(base_df, "atr14")
-            if atr is not None and atr.size > 0:
-                atr_last = float(atr[-1])
-                if np.isfinite(atr_last):
-                    atr_val = atr_last
-            pullback_atr = float(getattr(self.settings.risk, "entry_patience_pullback_atr", 0.20) or 0.20)
-            pullback = max(0.0, pullback_atr * max(0.0, atr_val))
-            recent = close[-(bars + 1) :]
-            last = float(recent[-1])
-            prior = recent[:-1]
-            if signal > 0:
-                # BUY: wait for pullback — enter near recent low, not recent high
-                return bool(last <= (float(np.nanmin(prior)) + pullback))
-            if signal < 0:
-                # SELL: wait for pullback — enter near recent high, not recent low
-                return bool(last >= (float(np.nanmax(prior)) - pullback))
-            return False
-        except Exception:
-            return False
-
-    @staticmethod
-    def _column_values(frame: Any, name: str) -> np.ndarray | None:
-        col = _frame_resolve_column(frame, name)
-        if col is None:
-            return None
-        try:
-            values = frame[col]
-        except Exception:
-            return None
-        try:
-            if hasattr(values, "to_numpy"):
-                arr = values.to_numpy(copy=False)
-            else:
-                arr = np.asarray(values)
-            arr = np.asarray(arr).reshape(-1)
-            return arr
-        except Exception:
-            return None
-
-    @staticmethod
-    def _column_array(frame: Any, name: str) -> np.ndarray | None:
-        arr = OrderExecutor._column_values(frame, name)
-        if arr is None:
-            return None
-        try:
-            return np.asarray(arr, dtype=float).reshape(-1)
-        except Exception:
-            return None
-
-    @staticmethod
-    def _latest_scalar(value: Any, *, default: float = 0.0) -> float:
-        """
-        Convert common vector-like outputs (Series/ndarray/list) into a scalar.
-
-        Many model outputs are per-row Series; for live execution we always want the latest value.
-        """
-        if value is None:
-            return float(default)
-
-        # Series-like objects: take last element.
-        if _is_series_like(value):
-            if len(value) == 0:
-                return float(default)
-            try:
-                arr = value.to_numpy(copy=False) if hasattr(value, "to_numpy") else np.asarray(value)
-                arr = np.asarray(arr).reshape(-1)
-                if arr.size <= 0:
-                    return float(default)
-                return float(arr[-1])
-            except Exception:
-                return float(default)
-        if _is_dataframe_like(value):
-            if _frame_empty(value):
-                return float(default)
-            try:
-                if _is_frame_like(value):
-                    cols = _frame_columns(value)
-                    if len(cols) == 1:
-                        raw = value[cols[0]]
-                        arr = raw.to_numpy(copy=False) if hasattr(raw, "to_numpy") else np.asarray(raw)
-                        arr = np.asarray(arr).reshape(-1)
-                        if arr.size > 0:
-                            return float(arr[-1])
-                if hasattr(value, "take"):
-                    tail = value.take([-1])
-                    arr = np.asarray(tail)
-                    if arr.size > 0:
-                        return float(arr.reshape(-1)[-1])
-                arr = np.asarray(value)
-                if arr.size <= 0:
-                    return float(default)
-                return float(arr.reshape(-1)[-1])
-            except Exception:
-                return float(default)
-
-        # Numpy arrays / sequences: take last flattened value.
-        if isinstance(value, (np.ndarray, list, tuple)):
-            try:
-                arr = np.asarray(value)
-                if arr.size == 0:
-                    return float(default)
-                return float(arr.reshape(-1)[-1])
-            except Exception:
-                return float(default)
-
-        try:
-            return float(value)
-        except Exception:
-            return float(default)
-
-    @staticmethod
-    def _parse_float_list(raw: Any, default: list[float]) -> list[float]:
-        if raw is None:
-            return list(default)
-        txt = str(raw).strip()
-        if not txt:
-            return list(default)
-        out: list[float] = []
-        for part in txt.split(","):
-            token = str(part).strip()
-            if not token:
-                continue
-            try:
-                out.append(float(token))
-            except Exception:
-                continue
-        return out or list(default)
-
-    def _estimate_spread_pips(self, tick: dict[str, float], pip_size: float) -> float:
-        if pip_size <= 0:
-            return 0.0
-        bid = float(tick.get("bid", 0.0) or 0.0)
-        ask = float(tick.get("ask", 0.0) or 0.0)
-        if ask > 0 and bid > 0 and ask >= bid:
-            return max(0.0, (ask - bid) / pip_size)
-        return 0.0
-
-    def _push_cost_state(self, *, live_spread: float, live_slippage: float) -> None:
-        spread = max(0.0, float(live_spread))
-        slippage = max(0.0, float(live_slippage))
-        alpha = float(self._cost_alpha)
-        self._spread_ema = ((1.0 - alpha) * self._spread_ema) + (alpha * spread) if spread > 0 else self._spread_ema
-        self._slippage_ema = (
-            ((1.0 - alpha) * self._slippage_ema) + (alpha * slippage) if slippage > 0 else self._slippage_ema
-        )
-        try:
-            self.risk_manager.update_spread_state(
-                live_spread=spread if spread > 0 else self._spread_ema,
-                live_slippage=slippage if slippage > 0 else self._slippage_ema,
-                baseline_spread=max(1e-6, self._spread_ema),
-                baseline_slippage=max(1e-6, self._slippage_ema),
-            )
-        except Exception as exc:
-            logger.debug("Cost-state update failed: %s", exc)
-
-    def update_live_cost_state(self, tick: dict[str, float], *, symbol_info: dict[str, Any] | None = None) -> None:
-        symbol = self.settings.system.symbol
-        info = symbol_info or {}
-        pip_size = self._get_pip_size(symbol, info)
-        spread_pips = self._estimate_spread_pips(tick, pip_size)
-        fallback_slippage = float(getattr(self.settings.risk, "slippage_pips", 0.5) or 0.5)
-        self._push_cost_state(live_spread=spread_pips, live_slippage=fallback_slippage)
-
-    def _record_fill_cost_state(
-        self,
-        *,
-        order_type: str,
-        expected_entry: float,
-        result: dict[str, Any],
-        tick: dict[str, float],
-        symbol_info: dict[str, Any],
-    ) -> None:
-        position = result.get("position")
-        if position is None:
-            return
-        pip_size = self._get_pip_size(self.settings.system.symbol, symbol_info)
-        if pip_size <= 0:
-            return
-        try:
-            fill_price = float(getattr(position, "price_open", 0.0) or 0.0)
-        except Exception:
-            fill_price = 0.0
-        if fill_price <= 0 or expected_entry <= 0:
-            return
-        if str(order_type).strip().lower() == "buy":
-            slippage = max(0.0, fill_price - expected_entry) / pip_size
-        else:
-            slippage = max(0.0, expected_entry - fill_price) / pip_size
-        spread_pips = self._estimate_spread_pips(tick, pip_size)
-        self._push_cost_state(live_spread=spread_pips, live_slippage=slippage)
-
-    async def _place_order_with_retry(
-        self,
-        *,
-        symbol: str,
-        order_type: str,
-        volume: float,
-        sl: float,
-        tp: float,
-        current_bar_time: datetime,
-    ) -> dict[str, Any]:
-        result: dict[str, Any] = {"success": False, "reason": "Execution failed"}
-        for attempt in range(1, 4):
-            try:
-                result = await self.mt5.place_order_with_verification(
-                    symbol=symbol,
-                    order_type=order_type,
-                    volume=volume,
-                    sl=sl,
-                    tp=tp,
-                    current_bar_time=current_bar_time,
-                )
-                if result.get("success"):
-                    break
-                logger.warning(
-                    "Order attempt %s failed for %.2f lots (reason=%s)",
-                    attempt,
-                    volume,
-                    result.get("reason"),
-                )
-                import asyncio
-
-                await asyncio.sleep(1.0)
-            except Exception as exc:
-                logger.error("Order attempt %s raised exception: %s", attempt, exc)
-                import asyncio
-
-                await asyncio.sleep(1.0)
-        return result
-
-    def _edge_over_cost_ok(
-        self,
-        *,
-        sl_pips: float,
-        rr: float,
-        tick: dict[str, float],
-        symbol_info: dict[str, Any],
-    ) -> bool:
-        min_mult = float(getattr(self.settings.risk, "min_edge_cost_multiple", 3.0) or 3.0)
-        if min_mult <= 0:
-            return True
-        pip_size = self._get_pip_size(self.settings.system.symbol, symbol_info)
-        if pip_size <= 0:
-            logger.error("Rust pip-size backend unavailable; blocking cost/edge evaluation.")
-            return False
-        bid = float(tick.get("bid", 0.0) or 0.0)
-        ask = float(tick.get("ask", 0.0) or 0.0)
-        spread_pips_live = ((ask - bid) / pip_size) if (ask > 0 and bid > 0 and pip_size > 0) else 0.0
-        state = getattr(self.risk_manager, "_spread_state", {}) or {}
-        spread_state = float(state.get("current_spread", 0.0) or 0.0)
-        spread_pips = (
-            float(spread_pips_live)
-            if spread_pips_live > 0
-            else (spread_state if spread_state > 0 else float(getattr(self.settings.risk, "backtest_spread_pips", 1.5) or 1.5))
-        )
-        slippage_state = float(state.get("current_slippage", 0.0) or 0.0)
-        slippage_pips = slippage_state if slippage_state > 0 else float(getattr(self.settings.risk, "slippage_pips", 0.5) or 0.5)
-        try:
-            bucket = self.risk_manager._session_bucket_utc(datetime.now(UTC))
-            if bucket in {"london", "newyork"}:
-                slippage_pips *= 1.20
-            elif bucket == "asia":
-                slippage_pips *= 0.85
-        except Exception:
-            pass
-        commission_per_lot = float(getattr(self.settings.risk, "commission_per_lot", 7.0) or 7.0)
-        _pip_sz, pip_value_per_lot = self.risk_manager._compute_pip_metrics(symbol_info)
-        backend_ok = _rust_order_backend_available(force_log=True)
-        if not backend_ok:
-            logger.error("Rust order backend unavailable; blocking cost/edge gate.")
-            return False
-        try:
-            import forex_bindings  # type: ignore
-
-            passed, expected_profit_pips, total_cost_pips = forex_bindings.evaluate_trade_edge(
-                float(sl_pips),
-                float(rr),
-                float(spread_pips),
-                float(slippage_pips),
-                float(commission_per_lot),
-                float(pip_value_per_lot),
-                float(min_mult),
-            )
-            passed = bool(passed)
-        except Exception as exc:
-            _disable_rust_order_backend()
-            logger.error("Rust evaluate_trade_edge failed; blocking trade: %s", exc)
-            return False
-        if not passed:
-            logger.info(
-                "Cost/edge gate rejected trade: exp_pips=%.3f cost_pips=%.3f need>=%.3f",
-                expected_profit_pips,
-                total_cost_pips,
-                min_mult * total_cost_pips,
-            )
-        return passed
-
-    def _build_order_legs(
-        self,
-        *,
-        total_size: float,
-        signal: int,
-        entry_price: float,
-        sl: float,
-        sl_dist: float,
-        default_tp: float,
-    ) -> list[tuple[float, float]]:
-        if not bool(getattr(self.settings.risk, "partial_take_profit_enabled", True)):
-            return [(round(float(total_size), 2), float(default_tp))]
-        min_total = float(getattr(self.settings.risk, "partial_tp_min_total_lot", 0.03) or 0.03)
-        if float(total_size) < min_total:
-            return [(round(float(total_size), 2), float(default_tp))]
-
-        levels = self._parse_float_list(getattr(self.settings.risk, "partial_tp_r_levels", "1.0,2.0,3.0"), [1.0, 2.0, 3.0])
-        fracs = self._parse_float_list(getattr(self.settings.risk, "partial_tp_size_fracs", "0.5,0.25,0.25"), [0.5, 0.25, 0.25])
-        n = min(len(levels), len(fracs))
-        if n <= 0:
-            return [(round(float(total_size), 2), float(default_tp))]
-        levels = [max(0.1, float(v)) for v in levels[:n]]
-        fracs = [max(0.0, float(v)) for v in fracs[:n]]
-        frac_sum = float(sum(fracs))
-        if frac_sum <= 0:
-            return [(round(float(total_size), 2), float(default_tp))]
-        fracs = [f / frac_sum for f in fracs]
-
-        raw_vols = [float(total_size) * f for f in fracs]
-        vols = [int(v * 100.0) / 100.0 for v in raw_vols]
-        rem = round(float(total_size) - sum(vols), 2)
-        if rem > 0 and vols:
-            max_i = int(np.argmax(np.asarray(vols, dtype=float)))
-            vols[max_i] = round(vols[max_i] + rem, 2)
-
-        legs: list[tuple[float, float]] = []
-        for vol, r in zip(vols, levels, strict=False):
-            if vol < 0.01:
-                continue
-            tp = float(entry_price + (r * sl_dist)) if signal == 1 else float(entry_price - (r * sl_dist))
-            legs.append((round(float(vol), 2), tp))
-
-        if not legs:
-            return [(round(float(total_size), 2), float(default_tp))]
-        return legs
-
-    def _calculate_sl_pips(self, result, frames) -> float | None:
-        symbol = self.settings.system.symbol
-        # Check recommended
-        if result.recommended_sl is not None:
-            try:
-                val = self._latest_scalar(result.recommended_sl, default=0.0)
-                if val > 0 and np.isfinite(val):
-                    self._last_rr = None
-                    return val
-            except Exception as e:
-                logger.debug(f"Could not extract recommended_sl: {e}")
-
-        mode = str(getattr(self.settings.risk, "stop_target_mode", "blend") or "blend").strip().lower()
-        prefer_stop_engine = mode in {"blend", "smart", "hybrid", "adaptive", "auto", "structure", "market_structure", "swing"}
-        prefer_atr = mode in {"atr", "atr_only"}
-        allow_chandelier = bool(getattr(self.settings.risk, "chandelier_enabled", True)) and (
-            mode in {"chandelier", "blend", "smart", "hybrid", "adaptive", "auto"} or not prefer_stop_engine
-        )
-
-        base_df = frames.get(self.settings.system.base_timeframe)
-        if base_df is None:
-            base_df = frames.get("M1")
-        if _frame_empty(base_df):
-            logger.debug("Missing base timeframe data for SL calculation")
-            return None
-
-        def _stop_target_candidate() -> tuple[float, float] | None:
-            try:
-                res = infer_stop_target_pips(
-                    base_df,
-                    settings=self.settings,
-                    pip_size=self._get_pip_size(symbol),
-                    signal=int(getattr(result, "signal", 0) or 0),
-                )
-                if res is None:
-                    return None
-                sl_pips, _tp_pips, rr = res
-                if sl_pips > 0 and np.isfinite(sl_pips):
-                    return float(sl_pips), float(rr)
-            except Exception as e:
-                logger.debug(f"Stop-target engine failed: {e}")
-            return None
-
-        def _chandelier_candidate() -> float | None:
-            try:
-                high = self._column_array(base_df, "high")
-                low = self._column_array(base_df, "low")
-                close = self._column_array(base_df, "close")
-                if high is None or low is None or close is None:
-                    return None
-                n = int(min(high.size, low.size, close.size))
-                if n <= 1:
-                    return None
-                high = high[-n:]
-                low = low[-n:]
-                close = close[-n:]
-                period = int(getattr(self.settings.risk, "chandelier_period", 22) or 22)
-                period = max(5, period)
-                atr = self._column_array(base_df, "atr")
-                if atr is None or atr.size <= 0:
-                    atr = self._column_array(base_df, "atr14")
-                if atr is None or atr.size <= 0:
-                    prev_close = np.roll(close, 1)
-                    prev_close[0] = close[0]
-                    tr = np.maximum(
-                        high - low,
-                        np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)),
-                    )
-                    span = min(14, tr.size)
-                    if span < 2:
-                        return None
-                    atr_last = float(np.nanmean(tr[-span:]))
-                else:
-                    atr_last = float(atr[-1])
-                if not np.isfinite(atr_last) or atr_last <= 0:
-                    return None
-                mult = float(getattr(self.settings.risk, "chandelier_atr_multiplier", 3.0) or 3.0)
-                pip_size = self._get_pip_size(symbol)
-                close_px = float(close[-1])
-                signal = int(getattr(result, "signal", 0) or 0)
-                if signal == 1:
-                    hh = float(np.nanmax(high[-period:]))
-                    stop_px = hh - (mult * atr_last)
-                    dist = max(0.0, close_px - stop_px)
-                elif signal == -1:
-                    ll = float(np.nanmin(low[-period:]))
-                    stop_px = ll + (mult * atr_last)
-                    dist = max(0.0, stop_px - close_px)
-                else:
-                    dist = 0.0
-                if dist > 0 and pip_size > 0:
-                    return float(dist / pip_size)
-            except Exception as e:
-                logger.debug(f"Chandelier SL calculation failed: {e}")
-            return None
-
-        def _atr_candidate() -> float | None:
-            try:
-                atr = None
-                atr_col = self._column_array(base_df, "atr")
-                if atr_col is None:
-                    atr_col = self._column_array(base_df, "atr14")
-                if atr_col is not None and atr_col.size > 0:
-                    atr = float(atr_col[-1])
-                pip_size = self._get_pip_size(symbol)
-                if atr and atr > 0:
-                    atr_mult = float(getattr(self.settings.risk, "atr_stop_multiplier", 1.5))
-                    min_dist = float(getattr(self.settings.risk, "meta_label_min_dist", 0.0))
-                    dist = float(atr) * max(atr_mult, 0.0)
-                    if min_dist > 0:
-                        dist = max(dist, min_dist)
-                    if dist > 0 and pip_size > 0:
-                        return float(dist / pip_size)
-            except Exception as e:
-                logger.debug(f"ATR-based SL calculation failed: {e}")
-            return None
-
-        if prefer_stop_engine:
-            stop_candidate = _stop_target_candidate()
-            if stop_candidate is not None:
-                sl, rr = stop_candidate
-                self._last_rr = rr
-                return sl
-
-        if allow_chandelier:
-            sl = _chandelier_candidate()
-            if sl is not None:
-                self._last_rr = None
-                return sl
-
-        if prefer_atr or not prefer_stop_engine:
-            sl = _atr_candidate()
-            if sl is not None:
-                self._last_rr = None
-                return sl
-
-        if not prefer_stop_engine:
-            stop_candidate = _stop_target_candidate()
-            if stop_candidate is not None:
-                sl, rr = stop_candidate
-                self._last_rr = rr
-                return sl
-        else:
-            sl = _atr_candidate()
-            if sl is not None:
-                self._last_rr = None
-                return sl
-
+    def _calculate_sl_pips(self, signal_result: Any, base_df: Any) -> float | None:
+        if signal_result.recommended_sl:
+            return float(signal_result.recommended_sl)
+            
+        atr = frame_utils.column_array(base_df, "atr")
+        if atr is not None and atr.size > 0:
+            pip_size = self._get_pip_size()
+            dist = float(atr[-1]) * float(getattr(self.settings.risk, "atr_stop_multiplier", 1.5))
+            return dist / pip_size if pip_size > 0 else None
         return None
 
-    def _calculate_prices(
-        self, result, frames, sl_pips, info, tick_price: dict[str, float]
-    ) -> tuple[float, float, float, float, float] | None:
-        symbol = self.settings.system.symbol
-        try:
-            base_df = frames.get(self.settings.system.base_timeframe)
-            if base_df is None:
-                base_df = frames.get("M1")
-            if _frame_empty(base_df):
-                raise RuntimeError("Missing base timeframe data for price calc")
-            close_arr = self._column_array(base_df, "close")
-            if close_arr is None or close_arr.size <= 0:
-                raise RuntimeError("Missing close prices for price calc")
-            close_price = float(close_arr[-1])
-            bid = float(tick_price.get("bid", 0.0) or 0.0)
-            ask = float(tick_price.get("ask", 0.0) or 0.0)
-            # Use live bid/ask when available; otherwise fall back to last close
-            if result.signal == 1:  # buy uses ask
-                entry_price = ask if ask > 0 else close_price
-            else:  # sell uses bid
-                entry_price = bid if bid > 0 else close_price
+    async def _pre_flight_gate(self, params: dict, frames: dict, **kwargs) -> bool:
+        # Edge Check
+        state = getattr(self.risk_manager, "_spread_state", {})
+        spread = params["tick"].get("ask", 0) - params["tick"].get("bid", 0)
+        spread_pips = (spread / params["pip_size"]) if params["pip_size"] > 0 else params["sl_pips"]
+        
+        _pip_sz, pip_val = self.risk_manager._compute_pip_metrics(params["info"])
+        passed, _, _ = self._rust.evaluate_trade_edge(params["sl_pips"], params["rr"], spread_pips, self._slippage_ema, pip_val)
+        if not passed:
+            logger.info("Signal skipped by edge gate.")
+            return False
 
-            pip_size = self._get_pip_size(symbol, info)
-            if pip_size <= 0:
-                logger.error("Rust pip-size backend unavailable; cannot calculate prices.")
-                return None
+        # Patience Check
+        base_df = frames.get(self.settings.system.base_timeframe) or frames.get("M1")
+        if self._entry_patience_block(params["entry_price"], base_df):
+            logger.info("Entry patience gate blocked trade.")
+            return False
 
-            rr = None
-            if result.recommended_rr is not None:
-                try:
-                    val = self._latest_scalar(result.recommended_rr, default=0.0)
-                    if val > 0 and np.isfinite(val):
-                        rr = val
-                except Exception as e:
-                    logger.debug(f"Could not extract recommended_rr: {e}")
-            if rr is None and self._last_rr is not None:
-                rr = float(self._last_rr)
-            if rr is None:
-                rr_cfg = float(getattr(self.settings.risk, "min_risk_reward", 0.0) or 0.0)
-                if rr_cfg > 0:
-                    rr = rr_cfg
-            if rr is None:
-                return None
-            # Enforce a hard floor so live execution never degrades below baseline RR.
-            rr_floor = max(1.5, float(getattr(self.settings.risk, "min_risk_reward", 1.5) or 1.5))
-            if not np.isfinite(rr):
-                rr = rr_floor
-            rr = max(rr_floor, float(rr))
+        return True
 
-            backend_ok = _rust_order_backend_available(force_log=True)
-            if not backend_ok:
-                logger.error("Rust order backend unavailable; price calculation is blocked.")
-                return None
+    def _entry_patience_block(self, entry_price: float, base_df: Any) -> bool:
+        if not self.settings.risk.entry_patience_enabled: return False
+        bars = int(self.settings.risk.entry_patience_bars or 3)
+        close = frame_utils.column_array(base_df, "close")
+        if close is None or close.size <= bars: return False
+        
+        atr = frame_utils.column_array(base_df, "atr")
+        pullback = float(self.settings.risk.entry_patience_pullback_atr or 0.2) * (float(atr[-1]) if atr is not None else 0)
+        recent = close[-(bars+1):]
+        if entry_price > (np.min(recent[:-1]) + pullback): return True # Overly aggressive buy
+        return False
 
-            try:
-                import forex_bindings  # type: ignore
+    async def _execute_order_legs(self, params: dict, result: Any, **kwargs) -> None:
+        can_split = int(getattr(self.mt5, "max_positions_per_symbol", 1)) > 1
+        legs = self._rust.build_order_legs(params["size"], result.signal, params["entry_price"], params["sl"], params["sl_dist"], params["tp"]) if can_split else [(round(params["size"], 2), params["tp"])]
 
-                sl, tp, sl_dist_rs = forex_bindings.compute_order_prices(
-                    float(entry_price),
-                    int(result.signal),
-                    float(sl_pips),
-                    float(rr),
-                    float(pip_size),
-                )
-                return float(sl), float(tp), entry_price, float(sl_dist_rs), float(rr)
-            except Exception as exc:
-                _disable_rust_order_backend()
-                logger.error("Rust compute_order_prices failed; price calculation is blocked: %s", exc)
-                return None
+        order_type = "buy" if result.signal == 1 else "sell"
+        bar_time = frame_utils.get_bar_time(kwargs.get("frames", {}).get("M1")) or datetime.now(UTC)
 
-        except Exception as e:
-            logger.error(f"Price calc failed: {e}")
-            return None
+        any_success = False
+        for vol, leg_tp in legs:
+            res = await self.mt5.place_order_with_verification(
+                symbol=params["symbol"], order_type=order_type, volume=vol, 
+                sl=params["sl"], tp=leg_tp, current_bar_time=bar_time
+            )
+            if res.get("success"):
+                any_success = True
+                self._handle_success(res, order_type, vol, params["sl"], leg_tp, result, **kwargs)
+        
+        if any_success: self.risk_manager.on_trade_opened(datetime.now(UTC))
 
-    def _handle_success(
-        self,
-        result,
-        order_type,
-        size,
-        sl,
-        tp,
-        signal_result,
-        *,
-        entry_features: Any = None,
-        bar_time: datetime | None = None,
-        count_trade: bool = True,
-    ):
-        logger.info(f"[ORDER SUCCESS] Ticket={result.get('ticket')}")
-        if self.risk_manager and count_trade:
-            self.risk_manager.on_trade_opened(datetime.now(UTC))
+    def _handle_success(self, result, order_type, size, sl, tp, signal_result, **kwargs):
+        ticket = result.get("ticket")
+        logger.info(f"[ORDER SUCCESS] Ticket={ticket}")
+        if self.strategy_ledger and ticket:
+            self.strategy_ledger.log_intent(ticket=ticket, symbol=self.settings.system.symbol, direction=order_type, volume=size, sl=sl, tp=tp, meta_risk_mult=1.0)
+        
+        if kwargs.get("entry_features") and ticket:
+            self.mt5.record_entry_features(ticket=ticket, symbol=self.settings.system.symbol, bar_time=datetime.now(UTC), features=kwargs["entry_features"], signal=signal_result.signal, order_ticket=result.get("order_ticket"), deal_ticket=result.get("deal_ticket"), magic=result.get("magic"))
 
-        if self.strategy_ledger and result.get("ticket"):
-            try:
-                self.strategy_ledger.log_intent(
-                    ticket=result["ticket"],
-                    symbol=self.settings.system.symbol,
-                    direction=order_type,
-                    volume=size,
-                    sl=sl,
-                    tp=tp,
-                    meta_risk_mult=getattr(self.risk_manager, "last_risk_mult", 1.0),
-                )
-            except Exception as e:
-                logger.warning(f"Failed to log trade intent: {e}", exc_info=True)
-
-        if entry_features is not None and result.get("ticket"):
-            try:
-                entry_bar_time = bar_time or result.get("bar_time") or datetime.now(UTC)
-                if isinstance(entry_bar_time, str):
-                    entry_bar_time = datetime.fromisoformat(entry_bar_time)
-                self.mt5.record_entry_features(
-                    ticket=int(result["ticket"]),
-                    symbol=self.settings.system.symbol,
-                    bar_time=entry_bar_time,
-                    features=entry_features,
-                    signal=int(getattr(signal_result, "signal", 0) or 0),
-                    order_ticket=result.get("order_ticket"),
-                    deal_ticket=result.get("deal_ticket"),
-                    magic=result.get("magic"),
-                )
-            except Exception as exc:
-                logger.debug("Failed to record entry feature snapshot: %s", exc)
-
-    def _handle_failure(self, result):
-        logger.error(f"[ORDER FAIL] {result.get('reason')}")
-        if result.get("requires_manual_check") and self.risk_ledger:
-            self.risk_ledger.record("ORDER_UNVERIFIED", f"Critical: {result.get('reason')}", severity="critical")
-
-    def _get_pip_size(self, symbol: str, info=None) -> float:
-        sym = (symbol or "").upper()
-        backend_ok = _rust_order_backend_available(force_log=True)
-        if not backend_ok:
-            logger.error("Rust pip-size backend unavailable for %s.", sym)
-            return 0.0
-        try:
-            import forex_bindings  # type: ignore
-
-            point = None
-            digits = None
-            if info:
-                try:
-                    point = float(info.get("point", 0.0001) or 0.0001)
-                except Exception:
-                    point = 0.0001
-                try:
-                    digits = int(info.get("digits", 5) or 5)
-                except Exception:
-                    digits = 5
-            return float(forex_bindings.pip_size_from_symbol(sym, point=point, digits=digits))
-        except Exception as exc:
-            _disable_rust_order_backend()
-            logger.error("Rust pip_size_from_symbol failed for %s: %s", sym, exc)
-            return 0.0
-
+    async def close_position(self, ticket: int, volume: float, reason: str | None = None) -> None:
+        if await self.mt5.close_position_by_ticket(ticket, self.settings.system.symbol, volume=volume):
+            logger.info(f"Closed ticket={ticket} reason={reason}")
+        else:
+            raise RuntimeError(f"Failed to close ticket {ticket}")

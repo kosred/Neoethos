@@ -1,0 +1,140 @@
+warning: function `detect_divergence` is never used
+   --> crates\forex-data\src\lib.rs:392:8
+    |
+392 | pub fn detect_divergence(price: &[f64], indicator: &[f64], window: usize) -> Vec<f64> {
+    |        ^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `Ix1` and `Ix2`
+ --> crates\forex-bindings\src\utils.rs:1:23
+  |
+1 | use ndarray::{Array2, Ix1, Ix2};
+  |                       ^^^  ^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `PyReadonlyArrayDyn`
+ --> crates\forex-bindings\src\utils.rs:2:72
+  |
+2 | use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn};
+  |                                                                        ^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `PyAny` and `PyDict`
+ --> crates\forex-bindings\src\utils.rs:6:19
+  |
+6 | use pyo3::types::{PyAny, PyDict};
+  |                   ^^^^^  ^^^^^^
+
+warning: unused imports: `PyArray2` and `PyReadonlyArray2`
+ --> crates\forex-bindings\src\inference.rs:3:13
+  |
+3 | use numpy::{PyArray2, PyReadonlyArray2};
+  |             ^^^^^^^^  ^^^^^^^^^^^^^^^^
+
+warning: unused import: `pyo3::prelude::*`
+ --> crates\forex-bindings\src\inference.rs:4:5
+  |
+4 | use pyo3::prelude::*;
+  |     ^^^^^^^^^^^^^^^^
+
+warning: unused imports: `Arc` and `Mutex`
+ --> crates\forex-bindings\src\inference.rs:5:17
+  |
+5 | use std::sync::{Arc, Mutex};
+  |                 ^^^  ^^^^^
+
+warning: unused import: `ndarray::Array2`
+ --> crates\forex-bindings\src\inference.rs:6:5
+  |
+6 | use ndarray::Array2;
+  |     ^^^^^^^^^^^^^^^
+
+warning: unused imports: `Ix1` and `Ix2`
+ --> crates\forex-bindings\src\models.rs:1:23
+  |
+1 | use ndarray::{Array2, Ix1, Ix2};
+  |                       ^^^  ^^^
+
+warning: unused import: `PyArray1`
+ --> crates\forex-bindings\src\models.rs:2:26
+  |
+2 | use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+  |                          ^^^^^^^^
+
+warning: unused imports: `PyAny` and `PyDict`
+ --> crates\forex-bindings\src\models.rs:4:19
+  |
+4 | use pyo3::types::{PyAny, PyDict};
+  |                   ^^^^^  ^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> crates\forex-bindings\src\models.rs:5:5
+  |
+5 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Mutex`
+ --> crates\forex-bindings\src\data.rs:6:5
+  |
+6 | use std::sync::Mutex;
+  |     ^^^^^^^^^^^^^^^^
+
+warning: unused import: `Axis`
+ --> crates\forex-bindings\src\data.rs:7:23
+  |
+7 | use ndarray::{Array2, Axis};
+  |                       ^^^^
+
+warning: unused import: `build_ohlcv`
+  --> crates\forex-bindings\src\data.rs:15:5
+   |
+15 |     build_ohlcv, parse_feature_profile, resolve_base_tf, vec_from_py_i64, vec_from_py_f64,
+   |     ^^^^^^^^^^^
+
+warning: unused imports: `IntoPyArray`, `PyArray1`, `PyArray2`, and `PyReadonlyArray2`
+ --> crates\forex-bindings\src\search.rs:1:13
+  |
+1 | use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+  |             ^^^^^^^^^^^  ^^^^^^^^  ^^^^^^^^                    ^^^^^^^^^^^^^^^^
+
+warning: unused import: `PyArray2`
+ --> crates\forex-bindings\src\evaluation.rs:1:36
+  |
+1 | use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+  |                                    ^^^^^^^^
+
+warning: unused imports: `SearchResult`, `fast_evaluate_strategy_core`, `month_day_indices`, and `signals_for_gene`
+  --> crates\forex-bindings\src\evaluation.rs:9:21
+   |
+ 9 |     evaluate_genes, signals_for_gene, fast_evaluate_strategy_core,
+   |                     ^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+10 |     Gene, EvaluationConfig, SearchResult, month_day_indices,
+   |                             ^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `polars::prelude`
+ --> crates\forex-bindings\src\evaluation.rs:2:5
+  |
+2 | use polars::prelude::*;
+  |     ^^^^^^^^^^^^^^^
+
+warning: unused variable: `timestamps`
+   --> crates\forex-bindings\src\evaluation.rs:519:5
+    |
+519 |     timestamps: Option<PyReadonlyArray1<'py, i64>>,
+    |     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_timestamps`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `journal_df`
+   --> crates\forex-bindings\src\evaluation.rs:553:42
+    |
+553 | pub fn trade_journal_metrics(py: Python, journal_df: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    |                                          ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_journal_df`
+
+warning: unused variable: `open`
+   --> crates\forex-bindings\src\evaluation.rs:566:5
+    |
+566 |     open: PyReadonlyArray1<f64>,
+    |     ^^^^ help: if this is intentional, prefix it with an underscore: `_open`
+

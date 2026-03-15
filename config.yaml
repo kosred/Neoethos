@@ -14,7 +14,7 @@ system:
   session_timezone: UTC
   broker_backend: mt5_local
   mt5_required: false  # Set true for live trading on Windows
-  mt5_terminal_path: 'C:\Program Files\MetaTrader 5\terminal64.exe'
+  mt5_terminal_path: 'C:/Program Files/MetaTrader 5/terminal64.exe'
   mt5_login: 0
   mt5_password: ""
   mt5_server: ""

@@ -514,73 +514,7 @@ def _strategy_quality_limits(settings: Any | None) -> tuple[float, float, float]
     return min_sharpe, min_profit_factor, min_win_rate
 
 
-def _passes_quality(
-    gene: Any,
-    *,
-    min_sharpe: float,
-    min_profit_factor: float,
-    min_win_rate: float,
-) -> bool:
-    try:
-        sharpe = float(getattr(gene, "sharpe_ratio", 0.0) or 0.0)
-    except Exception:
-        sharpe = 0.0
-    try:
-        profit_factor = float(getattr(gene, "profit_factor", 0.0) or 0.0)
-    except Exception:
-        profit_factor = 0.0
-    try:
-        win_rate = float(getattr(gene, "win_rate", 0.0) or 0.0)
-    except Exception:
-        win_rate = 0.0
-    if win_rate > 1.0:
-        win_rate *= 0.01
 
-    return (
-        sharpe >= float(min_sharpe)
-        and profit_factor >= float(min_profit_factor)
-        and win_rate >= float(min_win_rate)
-    )
-
-
-def _profit_value(gene: Any) -> float:
-    metric = str(os.environ.get("FOREX_BOT_DISCOVERY_KEEP_PROFIT_METRIC", "fitness") or "fitness").strip().lower()
-    if metric in {"net", "net_profit", "pnl"}:
-        try:
-            return float(getattr(gene, "net_profit", 0.0) or 0.0)
-        except Exception:
-            return 0.0
-    try:
-        return float(getattr(gene, "fitness", 0.0) or 0.0)
-    except Exception:
-        return 0.0
-
-
-def _select_ranked(
-    candidates: list[Any],
-    *,
-    filtered: list[Any],
-    min_keep: int,
-    cap: int,
-) -> tuple[list[Any], int, int]:
-    ranked_all = _dedupe_ranked(candidates)
-    ranked_filtered = _dedupe_ranked(filtered) if filtered else []
-    selected = list(ranked_filtered)
-    if min_keep > 0 and len(selected) < min_keep:
-        seen = {_gene_key(g) for g in selected}
-        for gene in ranked_all:
-            key = _gene_key(gene)
-            if key in seen:
-                continue
-            selected.append(gene)
-            seen.add(key)
-            if len(selected) >= min_keep:
-                break
-    if not selected:
-        selected = ranked_all
-    if cap > 0:
-        selected = selected[:cap]
-    return selected, len(ranked_filtered), len(ranked_all)
 
 
 class TensorDiscoveryEngine:
@@ -651,7 +585,7 @@ class TensorDiscoveryEngine:
                 default_pop = max(8, min(100, iter_budget))
                 default_gens = max(1, min(5, (iter_budget + 19) // 20))
                 default_candidates = max(10, min(200, default_pop * 2))
-                default_portfolio = 3000
+                default_portfolio = float(os.environ.get("FOREX_BOT_DISCOVERY_PORTFOLIO", "3000"))
                 if self.settings is not None:
                     try:
                         default_portfolio = int(
@@ -660,8 +594,8 @@ class TensorDiscoveryEngine:
                         )
                     except Exception:
                         default_portfolio = 3000
-                default_portfolio = max(1, default_portfolio)
-                default_candidates = max(default_candidates, min(10_000, max(10, default_portfolio * 4)))
+                default_portfolio = max(1, int(default_portfolio))
+                default_candidates = max(default_candidates, min(20000, max(10, default_portfolio * 4)))
 
                 keep_max_dd, keep_min_profit, keep_min_trades, keep_min_count, keep_cap = _strategy_keep_limits(
                     self.settings,
@@ -673,48 +607,37 @@ class TensorDiscoveryEngine:
                 rust_max_ind = max(2, _env_int("FOREX_BOT_DISCOVERY_MAX_INDICATORS", 12))
                 rust_candidates = max(10, _env_int("FOREX_BOT_DISCOVERY_CANDIDATES", default_candidates))
                 rust_portfolio = max(1, _env_int("FOREX_BOT_DISCOVERY_PORTFOLIO", default_portfolio))
-                rust_corr = float(os.environ.get("FOREX_BOT_DISCOVERY_CORR", "0.7") or 0.7)
-                rust_min_trades_day = float(os.environ.get("FOREX_BOT_DISCOVERY_MIN_TRADES", "1.0") or 1.0)
-                try:
-                    result = _fb.search_discovery_ohlcv(
-                        open_,
-                        high,
-                        low,
-                        close,
-                        ts,
-                        volume,
-                        rust_pop,
-                        rust_gens,
-                        rust_max_ind,
-                        rust_candidates,
-                        rust_portfolio,
-                        rust_corr,
-                        rust_min_trades_day,
-                        True,
-                        keep_max_dd,
-                        keep_min_profit,
-                        keep_min_trades,
-                        keep_min_count,
-                        keep_cap,
-                    )
-                except TypeError:
-                    # Backward compatibility for older bindings without Rust-side ranking arguments.
-                    result = _fb.search_discovery_ohlcv(
-                        open_,
-                        high,
-                        low,
-                        close,
-                        ts,
-                        volume,
-                        rust_pop,
-                        rust_gens,
-                        rust_max_ind,
-                        rust_candidates,
-                        rust_portfolio,
-                        rust_corr,
-                        rust_min_trades_day,
-                        True,
-                    )
+                rust_corr = float(os.environ.get("FOREX_BOT_DISCOVERY_CORR", "0.85") or 0.85)
+                rust_min_trades_day = float(os.environ.get("FOREX_BOT_DISCOVERY_MIN_TRADES", "0.5") or 0.5)
+                anomaly_guard = str(os.environ.get("FOREX_BOT_DISCOVERY_ANOMALY_GUARD", "true")).lower() == "true"
+                elite_mode = str(os.environ.get("FOREX_BOT_DISCOVERY_ELITE_MODE", "false")).lower() == "true"
+
+                result = _fb.search_discovery_ohlcv(
+                    open_,
+                    high,
+                    low,
+                    close,
+                    ts,
+                    volume,
+                    rust_pop,
+                    rust_gens,
+                    rust_max_ind,
+                    rust_candidates,
+                    rust_portfolio,
+                    rust_corr,
+                    rust_min_trades_day,
+                    True,
+                    keep_max_dd,
+                    keep_min_profit,
+                    keep_min_trades,
+                    keep_min_count,
+                    keep_cap,
+                    min_sharpe,
+                    min_win_rate,
+                    min_profit_factor,
+                    anomaly_guard,
+                    elite_mode,
+                )
 
                 feature_names = list(result.get("feature_names") or [])
                 portfolio = list(result.get("portfolio") or [])
@@ -730,49 +653,12 @@ class TensorDiscoveryEngine:
                 if not best:
                     raise RuntimeError("Rust discovery produced no usable genes")
 
+                # Rust now handles strict ranking and filtering.
                 rust_ranked = bool(result.get("rust_ranked", False))
-                if rust_ranked:
-                    base_filtered = list(best)
-                    quality_filtered = [
-                        g
-                        for g in base_filtered
-                        if _passes_quality(
-                            g,
-                            min_sharpe=min_sharpe,
-                            min_profit_factor=min_profit_factor,
-                            min_win_rate=min_win_rate,
-                        )
-                    ]
-                    selected, strict_kept, ranked_total = _select_ranked(
-                        best,
-                        filtered=quality_filtered,
-                        min_keep=keep_min_count,
-                        cap=keep_cap,
-                    )
-                else:
-                    base_filtered = [
-                        g
-                        for g in best
-                        if _profit_value(g) > keep_min_profit
-                        and float(getattr(g, "max_dd_pct", 0.0) or 0.0) <= keep_max_dd
-                        and float(getattr(g, "trades", 0.0) or 0.0) >= keep_min_trades
-                    ]
-                    quality_filtered = [
-                        g
-                        for g in base_filtered
-                        if _passes_quality(
-                            g,
-                            min_sharpe=min_sharpe,
-                            min_profit_factor=min_profit_factor,
-                            min_win_rate=min_win_rate,
-                        )
-                    ]
-                    selected, strict_kept, ranked_total = _select_ranked(
-                        best,
-                        filtered=quality_filtered,
-                        min_keep=keep_min_count,
-                        cap=keep_cap,
-                    )
+                selected = best
+                # If these are missing from the dict, use defaults from the 'best' list.
+                strict_kept = result.get("strict_kept", len(selected))
+                ranked_total = result.get("ranked_total", len(selected))
                 symbol = str(_frame_attr(df, "symbol", "") or "")
 
                 payload = {

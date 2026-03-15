@@ -313,6 +313,7 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         portfolio_size,
         corr_threshold,
         min_trades_per_day,
+        filtering: Default::default(),
     };
     let result = forex_search::run_discovery_cycle(&features, base_ohlcv, &config)?;
     if let Some(parent) = std::path::Path::new(&out).parent() {

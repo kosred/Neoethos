@@ -1,3 +1,8 @@
+"""
+Survial brain auto-tuning risk parameters.
+"""
+# pylint: disable=import-outside-toplevel
+
 import logging
 from dataclasses import dataclass
 
@@ -34,7 +39,7 @@ class MetaController:
         silent: bool = False,
     ):
         try:
-            from forex_bindings import MetaController as RustMetaController
+            from forex_bindings import MetaController as RustMetaController  # type: ignore
             self._backend = RustMetaController(
                 max_daily_dd,
                 safety_buffer,
@@ -56,4 +61,5 @@ class MetaController:
             confidence_threshold (float): 0.0 to 1.0
             allow_trading (bool): Hard stop flag
         """
-        return self._backend.get_risk_parameters(state)
+        rm, ct, at = self._backend.get_risk_parameters(state)
+        return float(rm), float(ct), bool(at)

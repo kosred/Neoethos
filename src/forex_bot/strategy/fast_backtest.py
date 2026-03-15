@@ -323,3 +323,65 @@ def batch_evaluate_strategies(
     out = _forex_core.batch_evaluate_strategies(*args)
     return np.asarray(out, dtype=np.float64)
 
+def fast_pip_backtest(
+    close: np.ndarray,
+    signals: np.ndarray,
+    pip_size: float,
+    pip_value_per_lot: float,
+    fee_pips: float = 1.5,
+) -> dict[str, Any]:
+    """
+    Simplified backtest for fast strategy evaluation in Python.
+    Used when full Rust SignalEngine is not needed.
+    """
+    # Simply simulate fixed-pip TP/SL or just cumulative profit for speed
+    # In a real system, this would call a fast specialized evaluator.
+    n = close.shape[0]
+    trades = signals.astype(np.int8)
+    
+    # Simple cumulative return simulation
+    diffs = np.diff(close, prepend=close[0])
+    pnl = diffs * trades * (pip_value_per_lot / pip_size)
+    
+    # Apply fees on signal changes (entries)
+    entries = np.abs(np.diff(trades, prepend=0)) > 0
+    pnl[entries] -= fee_pips * (pip_value_per_lot / 1.0) # simplified fee
+    
+    cum_pnl = np.cumsum(pnl)
+    total_profit = float(cum_pnl[-1])
+    
+    # Calculate basic metrics
+    trade_count = int(np.count_nonzero(entries))
+    if trade_count > 0:
+        win_mask = pnl[pnl > 0]
+        loss_mask = pnl[pnl < 0]
+        win_rate = float(win_mask.size / trade_count)
+        pf = float(np.sum(win_mask) / abs(np.sum(loss_mask))) if loss_mask.size > 0 else 10.0
+        
+        # Monthly trade distribution for consistency
+        # Assuming M1 data here for simplicity of example, but in practice we use month_indices
+        # For now, we'll just return the trade_count as a proxy or use a fixed bucket size
+        trade_indices = np.where(entries)[0]
+        buckets = 12
+        if n > buckets:
+            counts, _ = np.histogram(trade_indices, bins=buckets, range=(0, n))
+            trade_distribution = counts.tolist()
+        else:
+            trade_distribution = [trade_count]
+    else:
+        win_rate = 0.0
+        pf = 0.0
+        trade_distribution = []
+
+    sharpe = float(total_profit / (np.std(pnl) * np.sqrt(252)) if np.std(pnl) > 0 else 0.0)
+    
+    return {
+        "metrics": {
+            "total_profit_pips": total_profit,
+            "trade_count": trade_count,
+            "win_rate": win_rate,
+            "profit_factor": pf,
+            "sharpe_ratio": sharpe,
+            "trade_distribution": trade_distribution,
+        }
+    }

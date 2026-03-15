@@ -1,0 +1,344 @@
+warning: function `detect_divergence` is never used
+   --> crates\forex-data\src\lib.rs:392:8
+    |
+392 | pub fn detect_divergence(price: &[f64], indicator: &[f64], window: usize) -> Vec<f64> {
+    |        ^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0425]: cannot find type `PyArray2` in this scope
+   --> crates\forex-bindings\src\utils.rs:533:37
+    |
+533 | ) -> PyResult<(Vec<i64>, Bound<'py, PyArray2<f32>>, Vec<i64>)> {
+    |                                     ^^^^^^^^
+    |
+   ::: C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ndarray-0.17.2\src\aliases.rs:114:1
+    |
+114 | pub type Array2<A> = Array<A, Ix2>;
+    | ------------------ similarly named type alias `Array2` defined here
+    |
+help: a type alias with a similar name exists
+    |
+533 - ) -> PyResult<(Vec<i64>, Bound<'py, PyArray2<f32>>, Vec<i64>)> {
+533 + ) -> PyResult<(Vec<i64>, Bound<'py, Array2<f32>>, Vec<i64>)> {
+    |
+help: consider importing this type alias
+    |
+  1 + use numpy::PyArray2;
+    |
+
+error[E0425]: cannot find type `PyArray2` in this scope
+   --> crates\forex-bindings\src\utils.rs:560:37
+    |
+560 | ) -> PyResult<(Vec<i64>, Bound<'py, PyArray2<f32>>)> {
+    |                                     ^^^^^^^^
+    |
+   ::: C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ndarray-0.17.2\src\aliases.rs:114:1
+    |
+114 | pub type Array2<A> = Array<A, Ix2>;
+    | ------------------ similarly named type alias `Array2` defined here
+    |
+help: a type alias with a similar name exists
+    |
+560 - ) -> PyResult<(Vec<i64>, Bound<'py, PyArray2<f32>>)> {
+560 + ) -> PyResult<(Vec<i64>, Bound<'py, Array2<f32>>)> {
+    |
+help: consider importing this type alias
+    |
+  1 + use numpy::PyArray2;
+    |
+
+error[E0433]: failed to resolve: use of undeclared type `Series`
+   --> crates\forex-bindings\src\models.rs:568:33
+    |
+568 |             let labels_series = Series::new("label".into(), labels_vec);
+    |                                 ^^^^^^ use of undeclared type `Series`
+    |
+help: consider importing this struct
+    |
+  1 + use polars::series::Series;
+    |
+
+warning: unused imports: `Ix1` and `Ix2`
+ --> crates\forex-bindings\src\utils.rs:1:23
+  |
+1 | use ndarray::{Array2, Ix1, Ix2};
+  |                       ^^^  ^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `PyReadonlyArrayDyn`
+ --> crates\forex-bindings\src\utils.rs:2:49
+  |
+2 | use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn};
+  |                                                 ^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `PyAny` and `PyDict`
+ --> crates\forex-bindings\src\utils.rs:6:19
+  |
+6 | use pyo3::types::{PyAny, PyDict};
+  |                   ^^^^^  ^^^^^^
+
+warning: unused imports: `PyArray2` and `PyReadonlyArray2`
+ --> crates\forex-bindings\src\inference.rs:3:13
+  |
+3 | use numpy::{PyArray2, PyReadonlyArray2};
+  |             ^^^^^^^^  ^^^^^^^^^^^^^^^^
+
+warning: unused import: `pyo3::prelude::*`
+ --> crates\forex-bindings\src\inference.rs:4:5
+  |
+4 | use pyo3::prelude::*;
+  |     ^^^^^^^^^^^^^^^^
+
+warning: unused imports: `Arc` and `Mutex`
+ --> crates\forex-bindings\src\inference.rs:5:17
+  |
+5 | use std::sync::{Arc, Mutex};
+  |                 ^^^  ^^^^^
+
+warning: unused import: `ndarray::Array2`
+ --> crates\forex-bindings\src\inference.rs:6:5
+  |
+6 | use ndarray::Array2;
+  |     ^^^^^^^^^^^^^^^
+
+warning: unused imports: `Ix1` and `Ix2`
+ --> crates\forex-bindings\src\models.rs:1:23
+  |
+1 | use ndarray::{Array2, Ix1, Ix2};
+  |                       ^^^  ^^^
+
+warning: unused import: `PyArray1`
+ --> crates\forex-bindings\src\models.rs:2:26
+  |
+2 | use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+  |                          ^^^^^^^^
+
+warning: unused imports: `PyAny` and `PyDict`
+ --> crates\forex-bindings\src\models.rs:4:19
+  |
+4 | use pyo3::types::{PyAny, PyDict};
+  |                   ^^^^^  ^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> crates\forex-bindings\src\models.rs:5:5
+  |
+5 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Mutex`
+ --> crates\forex-bindings\src\data.rs:6:5
+  |
+6 | use std::sync::Mutex;
+  |     ^^^^^^^^^^^^^^^^
+
+warning: unused import: `Axis`
+ --> crates\forex-bindings\src\data.rs:7:23
+  |
+7 | use ndarray::{Array2, Axis};
+  |                       ^^^^
+
+warning: unused import: `build_ohlcv`
+  --> crates\forex-bindings\src\data.rs:15:5
+   |
+15 |     build_ohlcv, parse_feature_profile, resolve_base_tf, vec_from_py_i64, vec_from_py_f64,
+   |     ^^^^^^^^^^^
+
+warning: unused imports: `IntoPyArray`, `PyArray1`, `PyArray2`, and `PyReadonlyArray2`
+ --> crates\forex-bindings\src\search.rs:1:13
+  |
+1 | use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+  |             ^^^^^^^^^^^  ^^^^^^^^  ^^^^^^^^                    ^^^^^^^^^^^^^^^^
+
+warning: unused import: `PyArray2`
+ --> crates\forex-bindings\src\evaluation.rs:1:36
+  |
+1 | use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+  |                                    ^^^^^^^^
+
+warning: unused imports: `SearchResult`, `fast_evaluate_strategy_core`, `month_day_indices`, and `signals_for_gene`
+  --> crates\forex-bindings\src\evaluation.rs:10:21
+   |
+10 |     evaluate_genes, signals_for_gene, fast_evaluate_strategy_core,
+   |                     ^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+11 |     Gene, EvaluationConfig, SearchResult, month_day_indices,
+   |                             ^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+
+error[E0599]: no method named `into_pyarray` found for struct `ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>, f32>` in the current scope
+   --> crates\forex-bindings\src\utils.rs:552:30
+    |
+552 |     Ok((sorted_idx, sorted_f.into_pyarray(py), sorted_l))
+    |                              ^^^^^^^^^^^^
+    |
+   ::: C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\numpy-0.28.0\src\convert.rs:44:8
+    |
+ 44 |     fn into_pyarray<'py>(self, py: Python<'py>) -> Bound<'py, PyArray<Self::Item, Self::Dim>>;
+    |        ------------ the method is available for `ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>, f32>` here
+    |
+    = help: items from traits can only be used if the trait is in scope
+help: trait `IntoPyArray` which provides `into_pyarray` is implemented but not in scope; perhaps you want to import it
+    |
+  1 + use numpy::IntoPyArray;
+    |
+help: there is a method `to_pyarray` with a similar name
+    |
+552 -     Ok((sorted_idx, sorted_f.into_pyarray(py), sorted_l))
+552 +     Ok((sorted_idx, sorted_f.to_pyarray(py), sorted_l))
+    |
+
+error[E0034]: multiple applicable items in scope
+   --> crates\forex-bindings\src\utils.rs:533:6
+    |
+533 | ) -> PyResult<(Vec<i64>, Bound<'py, PyArray2<f32>>, Vec<i64>)> {
+    |      ^^^^^^^^ multiple `wrap` found
+    |
+    = note: candidate #1 is defined in an impl for the type `IntoPyObjectConverter<Result<T, E>>`
+    = note: candidate #2 is defined in an impl for the type `IntoPyObjectConverter<T>`
+
+error[E0599]: no method named `into_pyarray` found for struct `ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>, f32>` in the current scope
+   --> crates\forex-bindings\src\utils.rs:585:30
+    |
+585 |     Ok((sorted_idx, sorted_f.into_pyarray(py)))
+    |                              ^^^^^^^^^^^^
+    |
+   ::: C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\numpy-0.28.0\src\convert.rs:44:8
+    |
+ 44 |     fn into_pyarray<'py>(self, py: Python<'py>) -> Bound<'py, PyArray<Self::Item, Self::Dim>>;
+    |        ------------ the method is available for `ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>, f32>` here
+    |
+    = help: items from traits can only be used if the trait is in scope
+help: trait `IntoPyArray` which provides `into_pyarray` is implemented but not in scope; perhaps you want to import it
+    |
+  1 + use numpy::IntoPyArray;
+    |
+help: there is a method `to_pyarray` with a similar name
+    |
+585 -     Ok((sorted_idx, sorted_f.into_pyarray(py)))
+585 +     Ok((sorted_idx, sorted_f.to_pyarray(py)))
+    |
+
+error[E0034]: multiple applicable items in scope
+   --> crates\forex-bindings\src\utils.rs:560:6
+    |
+560 | ) -> PyResult<(Vec<i64>, Bound<'py, PyArray2<f32>>)> {
+    |      ^^^^^^^^ multiple `wrap` found
+    |
+    = note: candidate #1 is defined in an impl for the type `IntoPyObjectConverter<Result<T, E>>`
+    = note: candidate #2 is defined in an impl for the type `IntoPyObjectConverter<T>`
+
+error[E0277]: `*mut pyo3::Python<'static>` cannot be shared between threads safely
+   --> crates\forex-bindings\src\evaluation.rs:186:17
+    |
+186 |           .detach(|| {
+    |  __________------_^
+    | |          |
+    | |          required by a bound introduced by this call
+187 | |             let features = compute_talib_feature_frame(&ohlcv, include_raw)
+188 | |                 .map_err(|e| format!("Feature computation failed: {}", e))?;
+189 | |             let mut genes = Vec::new();
+...   |
+199 | |             Ok::<_, String>(res)
+200 | |         })
+    | |_________^ `*mut pyo3::Python<'static>` cannot be shared between threads safely
+    |
+    = help: within `pyo3::Python<'_>`, the trait `Sync` is not implemented for `*mut pyo3::Python<'static>`
+note: required because it appears within the type `PhantomData<*mut pyo3::Python<'static>>`
+   --> C:\Users\konst\.rustup\toolchains\stable-x86_64-pc-windows-msvc\lib/rustlib/src/rust\library\core\src\marker.rs:819:12
+    |
+819 | pub struct PhantomData<T: PointeeSized>;
+    |            ^^^^^^^^^^^
+note: required because it appears within the type `pyo3::marker::NotSend`
+   --> C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pyo3-0.28.2\src\marker.rs:357:8
+    |
+357 | struct NotSend(PhantomData<*mut Python<'static>>);
+    |        ^^^^^^^
+note: required because it appears within the type `PhantomData<pyo3::marker::NotSend>`
+   --> C:\Users\konst\.rustup\toolchains\stable-x86_64-pc-windows-msvc\lib/rustlib/src/rust\library\core\src\marker.rs:819:12
+    |
+819 | pub struct PhantomData<T: PointeeSized>;
+    |            ^^^^^^^^^^^
+note: required because it appears within the type `pyo3::Python<'_>`
+   --> C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pyo3-0.28.2\src\marker.rs:353:12
+    |
+353 | pub struct Python<'py>(PhantomData<&'py AttachGuard>, PhantomData<NotSend>);
+    |            ^^^^^^
+    = note: required for `&pyo3::Python<'_>` to implement `Send`
+note: required because it's used within this closure
+   --> crates\forex-bindings\src\evaluation.rs:186:17
+    |
+186 |         .detach(|| {
+    |                 ^^
+    = note: required for `{closure@crates\forex-bindings\src\evaluation.rs:186:17: 186:19}` to implement `Ungil`
+note: required by a bound in `pyo3::Python::<'py>::detach`
+   --> C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pyo3-0.28.2\src\marker.rs:560:12
+    |
+558 |     pub fn detach<T, F>(self, f: F) -> T
+    |            ------ required by a bound in this associated function
+559 |     where
+560 |         F: Ungil + FnOnce() -> T,
+    |            ^^^^^ required by this bound in `Python::<'py>::detach`
+
+error[E0277]: the trait bound `Vec<Gene>: pyo3::FromPyObject<'_, '_>` is not satisfied
+   --> crates\forex-bindings\src\evaluation.rs:339:10
+    |
+339 |         .extract()
+    |          ^^^^^^^ the trait `pyo3::FromPyObject<'_, '_>` is not implemented for `Vec<Gene>`
+    |
+help: the trait `pyo3::FromPyObject<'_, '_>` is implemented for `Vec<T>`
+   --> C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pyo3-0.28.2\src\conversions\std\vec.rs:65:1
+    |
+ 65 | / impl<'py, T> FromPyObject<'_, 'py> for Vec<T>
+ 66 | | where
+ 67 | |     T: FromPyObjectOwned<'py>,
+    | |______________________________^
+note: required by a bound in `pyo3::types::PyAnyMethods::extract`
+   --> C:\Users\konst\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pyo3-0.28.2\src\types\any.rs:881:12
+    |
+879 |     fn extract<'a, T>(&'a self) -> Result<T, T::Error>
+    |        ------- required by a bound in this associated function
+880 |     where
+881 |         T: FromPyObject<'a, 'py>;
+    |            ^^^^^^^^^^^^^^^^^^^^^ required by this bound in `PyAnyMethods::extract`
+
+warning: unused import: `polars::prelude::NamedFrom`
+ --> crates\forex-bindings\src\evaluation.rs:3:5
+  |
+3 | use polars::prelude::NamedFrom;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `polars::prelude::NamedFrom`
+  --> crates\forex-bindings\src\models.rs:11:5
+   |
+11 | use polars::prelude::NamedFrom;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `polars::prelude`
+ --> crates\forex-bindings\src\evaluation.rs:2:5
+  |
+2 | use polars::prelude::*;
+  |     ^^^^^^^^^^^^^^^
+
+warning: unused variable: `timestamps`
+   --> crates\forex-bindings\src\evaluation.rs:503:5
+    |
+503 |     timestamps: Option<PyReadonlyArray1<'py, i64>>,
+    |     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_timestamps`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `journal_df`
+   --> crates\forex-bindings\src\evaluation.rs:537:42
+    |
+537 | pub fn trade_journal_metrics(py: Python, journal_df: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    |                                          ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_journal_df`
+
+warning: unused variable: `open`
+   --> crates\forex-bindings\src\evaluation.rs:550:5
+    |
+550 |     open: PyReadonlyArray1<f64>,
+    |     ^^^^ help: if this is intentional, prefix it with an underscore: `_open`
+
+Some errors have detailed explanations: E0034, E0277, E0425, E0433, E0599.
+For more information about an error, try `rustc --explain E0034`.
+error: could not compile `forex-bindings` (lib) due to 9 previous errors; 23 warnings emitted

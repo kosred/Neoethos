@@ -1,8 +1,6 @@
 // Integration test for forex-models crate
 // Tests all ported models can be instantiated
 
-use forex_models::*;
-
 #[test]
 fn test_compilation() {
     // This test just verifies that all modules compile

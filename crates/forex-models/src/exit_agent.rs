@@ -13,7 +13,7 @@ use anyhow::{Result, anyhow};
 use burn::nn;
 use burn::prelude::*;
 use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
-use burn::tensor::backend::AutodiffBackend;
+use burn::optim::adaptor::OptimizerAdaptor;
 use burn_ndarray::NdArray;
 use burn::backend::Autodiff;
 
@@ -83,7 +83,7 @@ pub struct PendingRegret {
 /// Pure-Rust Burn ExitAgent
 pub struct ExitAgent {
     model: ExitAgentNet<TrainBackend>,
-    optim: burn::optim::AdamW<TrainBackend>,
+    optim: OptimizerAdaptor<burn::optim::AdamW, ExitAgentNet<TrainBackend>, TrainBackend>,
     memory: VecDeque<Experience>,
     pending_regret: HashMap<i32, PendingRegret>,
     gamma: f32,
@@ -233,7 +233,7 @@ impl ExitAgent {
         );
 
         let q_values = self.model.forward(states_tensor);
-        let q_value = q_values.gather(1, actions_tensor.unsqueeze_dim(1)).squeeze(1);
+        let q_value = q_values.gather(1, actions_tensor.unsqueeze_dim(1)).squeeze::<1>();
 
         let loss = burn::nn::loss::MseLoss::new().forward(
             q_value, 

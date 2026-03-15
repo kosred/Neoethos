@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use tracing::{info, warn, debug};
+use tracing::{info, warn};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
@@ -167,21 +167,20 @@ impl ConceptDriftMonitor {
         while i < data1.len() && j < data2.len() {
             let val1 = data1[i];
             let val2 = data2[j];
-            let mut d = 0.0;
-            
-            if val1 <= val2 {
+
+            let d = if val1 <= val2 {
                 while i < data1.len() && data1[i] <= val1 { i += 1; }
                 let cdf1 = i as f64 / n1;
                 while j < data2.len() && data2[j] <= val1 { j += 1; }
                 let cdf2 = j as f64 / n2;
-                d = (cdf1 - cdf2).abs();
+                (cdf1 - cdf2).abs()
             } else {
                 while j < data2.len() && data2[j] <= val2 { j += 1; }
                 let cdf2 = j as f64 / n2;
                 while i < data1.len() && data1[i] <= val2 { i += 1; }
                 let cdf1 = i as f64 / n1;
-                d = (cdf1 - cdf2).abs();
-            }
+                (cdf1 - cdf2).abs()
+            };
 
             if d > max_d {
                 max_d = d;

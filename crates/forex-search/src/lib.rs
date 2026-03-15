@@ -139,8 +139,8 @@ pub use discovery_gpu::{
 pub use eval::{evaluate_population_core, fast_evaluate_strategy_core};
 pub use gauntlet::{GauntletConfig, StrategyGauntlet};
 pub use genetic::{
-    evaluate_genes, evolve_search, random_search, signals_for_gene, EvaluationConfig, Gene,
-    SearchResult,
+    evaluate_genes, evolve_search, month_day_indices, random_search, signals_for_gene, EvaluationConfig,
+    FilteringConfig, Gene, SearchResult,
 };
 pub use portfolio::{AllocationResult, PortfolioOptimizer, SymbolMetrics};
 pub use quality::{StrategyMetrics, StrategyQualityAnalyzer, StrategyRanker, Trade};

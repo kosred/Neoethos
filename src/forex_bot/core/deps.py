@@ -48,10 +48,13 @@ def ensure_dependencies() -> None:
                 missing.append(pkg)
 
     if missing:
-        print("\n" + "!" * 60)
-        print(f"[WARNING] Missing critical dependencies: {missing}")
-        print("Please run the following command to set up your environment:")
-        print("  python3 -m pip install -e . --user --break-system-packages")
-        print("!" * 60 + "\n")
+        msg = (
+            f"\n{'!' * 60}\n"
+            f"[WARNING] Missing critical dependencies: {missing}\n"
+            "Please run the following command to set up your environment:\n"
+            "  python3 -m pip install -e . --user --break-system-packages\n"
+            f"{'!' * 60}\n"
+        )
+        logger.warning(msg)
     else:
         logger.info("✓ Environment dependencies verified.")

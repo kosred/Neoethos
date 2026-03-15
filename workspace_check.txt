@@ -1,0 +1,26 @@
+   Compiling talib-sys v0.1.0 (C:\Users\konst\development\forex-ai\vendor\talib-sys)
+    Checking forex-core v0.1.0 (C:\Users\konst\development\forex-ai\crates\forex-core)
+    Checking forex-data v0.1.0 (C:\Users\konst\development\forex-ai\crates\forex-data)
+    Checking forex-models v0.1.0 (C:\Users\konst\development\forex-ai\crates\forex-models)
+    Checking forex-search v0.1.0 (C:\Users\konst\development\forex-ai\crates\forex-search)
+    Checking forex-bindings v0.1.0 (C:\Users\konst\development\forex-ai\crates\forex-bindings)
+    Checking forex-cli v0.1.0 (C:\Users\konst\development\forex-ai\crates\forex-cli)
+warning: unused import: `forex_models::*`
+ --> crates\forex-models\tests\integration_test.rs:4:5
+  |
+4 | use forex_models::*;
+  |     ^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `forex-models` (test "integration_test") generated 1 warning (run `cargo fix --test "integration_test" -p forex-models` to apply 1 suggestion)
+error[E0063]: missing field `filtering` in initializer of `DiscoveryConfig`
+   --> crates\forex-cli\src\main.rs:308:18
+    |
+308 |     let config = forex_search::DiscoveryConfig {
+    |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `filtering`
+
+For more information about this error, try `rustc --explain E0063`.
+error: could not compile `forex-cli` (bin "forex-cli") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `forex-cli` (bin "forex-cli" test) due to 1 previous error

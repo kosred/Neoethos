@@ -1,3 +1,10 @@
+"""
+Orchestrates the main forex trading logic and loops.
+"""
+# pylint: disable=broad-exception-caught,logging-fstring-interpolation,protected-access
+# pylint: disable=attribute-defined-outside-init,unused-variable,missing-function-docstring
+# pylint: disable=line-too-long,missing-module-docstring,import-outside-toplevel
+
 from __future__ import annotations
 
 import asyncio
@@ -16,127 +23,20 @@ from ..execution.mt5_state_manager import MT5StateManager
 from ..execution.news_service import NewsService
 from ..execution.order_execution import OrderExecutor
 from ..execution.risk import RiskManager
-
-# Note: ForexBot import removed to avoid circular dependency
-# TradingEngine receives individual components, not the bot itself
 from ..execution.training_service import TrainingService
 from ..features.engine import SignalEngine
 from ..models.unsupervised import MarketRegimeClassifier
 from ..strategy.fast_backtest import infer_pip_metrics
 from ..training.online_learner import OnlineLearner
+from . import frame_utils
 
 logger = logging.getLogger(__name__)
 
 
-class _FrameTailView:
-    def __init__(self, data: dict[str, np.ndarray], index: np.ndarray):
-        self._data = {str(k): np.asarray(v).reshape(-1) for k, v in data.items()}
-        self.columns = list(self._data.keys())
-        self.index = np.asarray(index).reshape(-1)
-
-    @property
-    def empty(self) -> bool:
-        return int(len(self.index)) <= 0
-
-    def __len__(self) -> int:
-        return int(len(self.index))
-
-    def __getitem__(self, key):
-        return self._data[str(key)]
-
-
-def _frame_empty(value: object) -> bool:
-    if value is None:
-        return True
-    try:
-        return bool(getattr(value, "empty"))
-    except Exception:
-        pass
-    try:
-        return int(len(value)) <= 0  # type: ignore[arg-type]
-    except Exception:
-        return True
-
-
-def _frame_columns(frame: object) -> list[str]:
-    cols = getattr(frame, "columns", None)
-    if cols is None:
-        return []
-    try:
-        return [str(c) for c in list(cols)]
-    except Exception:
-        return []
-
-
-def _frame_resolve_column(frame: object, name: str) -> str | None:
-    target = str(name).strip().lower()
-    for col in _frame_columns(frame):
-        if str(col).strip().lower() == target:
-            return col
-    return None
-
-
-def _frame_column_numpy(frame: object, name: str, *, dtype: Any = np.float64):
-    col = _frame_resolve_column(frame, name)
-    if col is None:
-        raise KeyError(name)
-    values = frame[col]  # type: ignore[index]
-    if hasattr(values, "to_numpy"):
-        try:
-            out = values.to_numpy(dtype=dtype, copy=False)
-        except TypeError:
-            out = values.to_numpy(dtype=dtype)
-        return np.asarray(out, dtype=dtype).reshape(-1)
-    return np.asarray(values, dtype=dtype).reshape(-1)
-
-
-def _is_frame_like(value: object) -> bool:
-    return bool(hasattr(value, "columns") and hasattr(value, "index") and hasattr(value, "__getitem__"))
-
-
-def _frame_tail(value: object, n_rows: int) -> object:
-    if value is None:
-        return value
-    take = max(0, int(n_rows))
-    if take <= 0:
-        return value
-    if hasattr(value, "tail"):
-        with contextlib.suppress(Exception):
-            return value.tail(take)  # type: ignore[no-any-return]
-    if _is_frame_like(value):
-        try:
-            row_count = int(len(value))  # type: ignore[arg-type]
-        except Exception:
-            row_count = 0
-        if row_count <= 0:
-            return value
-        start = max(0, row_count - take)
-        data: dict[str, np.ndarray] = {}
-        cols = _frame_columns(value)
-        for col in cols:
-            raw = value[col]  # type: ignore[index]
-            arr = raw.to_numpy(copy=False) if hasattr(raw, "to_numpy") else np.asarray(raw)
-            vec = np.asarray(arr).reshape(-1)
-            data[str(col)] = vec[start:row_count]
-        idx_obj = getattr(value, "index", None)
-        idx_arr = np.asarray(idx_obj).reshape(-1) if idx_obj is not None else np.arange(row_count, dtype=np.int64)
-        if idx_arr.size < row_count:
-            idx_arr = np.arange(row_count, dtype=np.int64)
-        return _FrameTailView(data, idx_arr[start:row_count])
-    arr = np.asarray(value)
-    if arr.ndim == 0:
-        return arr.reshape(1)
-    return arr[-take:]
-
-
 def _entry_feature_snapshot(dataset: object) -> dict[str, Any] | None:
-    x = getattr(dataset, "X", None)
     feature_names = getattr(dataset, "feature_names", None)
-    try:
-        names = [str(name) for name in list(feature_names)] if feature_names is not None else None
-    except Exception:
-        names = None
-    return MT5StateManager.build_feature_row_payload(x, feature_names=names)
+    names = [str(name) for name in list(feature_names)] if feature_names is not None else None
+    return MT5StateManager.build_feature_row_payload(getattr(dataset, "X", None), feature_names=names)
 
 
 class TradingEngine:
@@ -170,20 +70,17 @@ class TradingEngine:
         self._poll_interval = settings.system.poll_interval_seconds
         self._consecutive_failures = 0
 
-        # State for drift monitoring (requires previous prediction vs current outcome)
         self.last_prob = None
         self.last_close_price = None
         self.last_signal = None
         self._feature_monitor_ready = False
 
-        # Drift "neutral" band should be symbol-aware (pip size differs across FX/JPY/metals/crypto).
         try:
-            pip_size, _pip_value_per_lot = infer_pip_metrics(getattr(self.settings.system, "symbol", ""))
-            self._drift_epsilon = max(1e-12, float(pip_size) * 0.1)  # 0.1 pip
+            pip_size, _ = infer_pip_metrics(getattr(self.settings.system, "symbol", ""))
+            self._drift_epsilon = max(1e-12, float(pip_size) * 0.1)
         except Exception:
             self._drift_epsilon = 1e-5
 
-        # Unsupervised Regime Classifier
         self.regime_classifier = MarketRegimeClassifier()
         model_path = Path("models")
         try:
@@ -210,344 +107,224 @@ class TradingEngine:
                 self.iters += 1
 
                 # 1. Market Hours Check
-                if not self.risk.is_trading_session():
-                    now = datetime.now(UTC)
-                    weekday = now.weekday()  # 0=Mon, 6=Sun
-
-                    # Weekend Logic (Saturday=5, Sunday=6)
-                    if weekday >= 5:
-                        if not self._market_closed_logged:
-                            logger.info("Market closed (Weekend). Sleeping intelligently until Monday...")
-                            self._market_closed_logged = True
-                        # Sleep for 1 hour on weekends to save resources
-                        await asyncio.sleep(3600)
-                        continue
-                    else:
-                        if not self._market_closed_logged:
-                            logger.info("Market closed (Session break). Sleeping...")
-                            self._market_closed_logged = True
-                        await asyncio.sleep(60)
-                        continue
-                else:
-                    # Reset logging flag when market opens
-                    if self._market_closed_logged:
-                        logger.info("Market Open! Resuming trading...")
-                        self._market_closed_logged = False
-
-                # 2. Data Fetch (REORDERED: Fetch first to have frames for Doctor)
-                frames = await self.trainer.data_loader.get_live_data(self.settings.system.symbol)
-                if not frames:
-                    self._consecutive_failures += 1
-                    if self._consecutive_failures > 10:
-                        logger.error("Critical data failure.")
-                        await asyncio.sleep(60)
-                    await asyncio.sleep(5)
+                if not await self._process_market_hours():
                     continue
-                self._consecutive_failures = 0
 
-                # Get current close for drift calculation
-                current_close = None
-                df_m1 = None
-                try:
-                    df_m1 = frames.get(self.settings.system.base_timeframe)
-                    if df_m1 is None:
-                        df_m1 = frames.get("M1")
-                    if not _frame_empty(df_m1):
-                        close_arr = _frame_column_numpy(df_m1, "close", dtype=np.float64)
-                        if close_arr.size > 0:
-                            current_close = float(close_arr[-1])
-                except Exception:
-                    pass
+                # 2. Data Fetch & Prep
+                frames = await self._fetch_and_prepare_data()
+                if not frames:
+                    continue
 
-                # 3. Regime Update (Thinking Step)
-                regime = "Normal"
-                if not _frame_empty(df_m1):
-                    # Periodically refit (Self-Tuning)
-                    if self.iters % 100 == 0:
-                        try:
-                            # Use daily data if available for broader context, else M1
-                            fit_df = frames.get("D1", df_m1)
-                            self.regime_classifier.fit(fit_df)
-                            self.regime_classifier.save(Path("models"))
-                        except Exception as e:
-                            logger.warning(f"Regime refit failed: {e}")
+                # 3. State Sync & Regime
+                await self._sync_and_update_state(frames)
 
-                    # Predict current state
-                    regime = self.regime_classifier.predict(df_m1)
+                # 4. News & Policy
+                news_policy = await self._apply_news_policy()
 
-                # 4. MT5 Sync
-                await self.mt5.sync_with_mt5()
-                positions = list(self.mt5.cached_positions)
+                # 5. Features & Drift Monitoring
+                dataset, feature_drift_alert = self._process_features_and_drift(frames)
 
-                # 5. News & Policy
-                news_policy = await self.news.get_news_policy(self.settings.system.symbol)
-                self.risk.update_news_state(news_policy)
-                if bool(news_policy.get("tier1_nearby")) and positions:
-                    # MT5 wrapper currently has no robust SL-modify path; safest fallback is flattening
-                    # non-profitable exposure into high-impact events.
-                    for pos in positions:
-                        if pos.symbol != self.settings.system.symbol:
-                            continue
-                        try:
-                            if float(getattr(pos, "profit", 0.0) or 0.0) <= 0.0:
-                                await self.executor.close_position(
-                                    pos.ticket,
-                                    pos.volume,
-                                    "News protection: flattening non-profitable position",
-                                )
-                                logger.info("News protection closed ticket=%s before high-impact event.", pos.ticket)
-                        except Exception as exc:
-                            logger.warning("News protection close failed for ticket=%s: %s", pos.ticket, exc)
+                # 6. Signal Generation
+                result = self._generate_signal(dataset, news_policy, feature_drift_alert)
 
-                # 6. Feature Engineering & Signal
-                base_df = frames.get(self.settings.system.base_timeframe)
-                if base_df is None:
-                    base_df = frames.get("M1")
-                base_idx = getattr(base_df, "index", []) if base_df is not None else []
-                news_feats = self.news.get_news_features(base_idx)
-                dataset = self.trainer.feature_engineer.prepare(
-                    frames,
-                    news_features=news_feats,
-                    symbol=self.settings.system.symbol,
-                )
-                feature_drift_alert = False
-                dataset_x = getattr(dataset, "X", None)
-                if self.drift and dataset_x is not None and len(dataset_x) > 0:
-                    if not self._feature_monitor_ready:
-                        with contextlib.suppress(Exception):
-                            baseline_rows = min(len(dataset_x), 2000)
-                            if baseline_rows > 0:
-                                self.drift.initialize_feature_monitor(
-                                    _frame_tail(dataset_x, baseline_rows), self.settings.system.symbol
-                                )
-                                self._feature_monitor_ready = True
-                    with contextlib.suppress(Exception):
-                        feature_drift_alert = bool(
-                            self.drift.check_feature_drift(
-                                dataset_x,
-                                threshold=float(getattr(self.settings.risk, "feature_drift_threshold", 0.30) or 0.30),
-                            )
-                        )
+                # 7. Concept Drift Update
+                self._update_concept_drift(frames, result)
 
-                # 7. Signal
-                result = self.signal.generate_ensemble_signals(dataset)
-                if feature_drift_alert:
-                    logger.warning("Feature drift alert triggered; abstaining this cycle.")
-                    meta = dict(getattr(result, "meta_features", {}) or {})
-                    meta["feature_drift_alert"] = True
-                    result.meta_features = meta
-                    result.signal = 0
-                    result.confidence = 0.0
-                try:
-                    news_conf = float(news_policy.get("news_confidence", 0.0) or 0.0)
-                    news_sent = float(news_policy.get("news_surprise", 0.0) or 0.0)
-                    contrarian_thr = float(getattr(self.settings.news, "news_trade_confidence_threshold", 0.90) or 0.90)
-                    if (
-                        bool(getattr(self.settings.news, "news_trade_on_event", False))
-                        and int(getattr(result, "signal", 0) or 0) != 0
-                        and news_conf >= contrarian_thr
-                        and abs(news_sent) >= 0.90
-                    ):
-                        result.signal = int(-1 * int(result.signal))
-                        logger.info(
-                            "News contrarian override applied (conf=%.2f sent=%.2f).",
-                            news_conf,
-                            news_sent,
-                        )
-                except Exception:
-                    pass
+                # 8. Execution
+                await self._execute_signal_with_risk(result, dataset, news_policy)
 
-                # 8. Drift Check (Corrected Logic: Compare LAST prediction with CURRENT outcome)
-                if (
-                    self.drift
-                    and self.last_prob is not None
-                    and self.last_close_price is not None
-                    and current_close is not None
-                    and self.last_signal is not None
-                    and int(self.last_signal) != 0
-                ):
-                    # Determine true label for the *previous* period
-                    # If price went up, y_true=1 (Buy). Down, y_true=-1 (Sell). Flat, y_true=0 (Neutral).
-                    price_change = current_close - self.last_close_price
-                    eps = float(getattr(self, "_drift_epsilon", 1e-5))
-                    if price_change > eps:
-                        y_true = 1  # Buy/Up
-                    elif price_change < -eps:
-                        y_true = -1  # Sell/Down
-                    else:
-                        y_true = 0  # Neutral
-
-                    # Update monitor with (Actual, Predicted_Prob_From_Last_Step)
-                    self.drift.update(y_true, self.last_prob)
-
-                    if self.drift.should_retrain():
-                        logger.warning("Concept drift detected; triggering background retraining...")
-                        task = asyncio.create_task(self._trigger_retraining())
-                        if not hasattr(self, "_background_tasks"):
-                            self._background_tasks = set()
-                        self._background_tasks.add(task)
-                        task.add_done_callback(self._background_tasks.discard)
-
-                # Store current state for NEXT iteration's drift check
-                if result and hasattr(result, "probs"):
-                    self.last_prob = result.probs
-                if result and hasattr(result, "signal"):
-                    self.last_signal = result.signal
-                if current_close is not None:
-                    self.last_close_price = current_close
-
-                # 9. Execution (With Thinking Brain)
-                # We need to manually invoke risk check to inject the regime
-                equity = self.mt5.get_real_equity()
-                entry_features = _entry_feature_snapshot(dataset)
-                live_tick = {}
-                live_symbol_info = {}
-                with contextlib.suppress(Exception):
-                    live_symbol_info = await self.mt5.connection.get_symbol_info(self.settings.system.symbol) or {}
-                    live_tick = await self.mt5.connection.get_symbol_price(self.settings.system.symbol) or {}
-                    if live_tick:
-                        self.executor.update_live_cost_state(live_tick, symbol_info=live_symbol_info)
-
-                # Override internal risk check to inject regime
-                meta_state = PropMetaState(
-                    daily_dd_pct=(self.risk.day_start_equity - equity) / self.risk.day_start_equity
-                    if self.risk.day_start_equity > 0
-                    else 0.0,
-                    volatility_regime=self._infer_vol_regime(regime),
-                    recent_win_rate=sum(self.risk.rolling_outcomes) / len(self.risk.rolling_outcomes)
-                    if self.risk.rolling_outcomes
-                    else 0.5,
-                    consecutive_losses=self.risk.consecutive_losses,
-                    model_confidence=result.confidence,
-                    hour_of_day=datetime.now(UTC).hour,
-                    market_regime=regime,
-                )
-
-                # Get smart parameters
-                risk_mult, req_conf, allowed = self.risk.meta_controller.get_risk_parameters(meta_state)
-                meta_feats = getattr(result, "meta_features", {}) or {}
-                try:
-                    market_volatility = float(meta_feats.get("market_volatility", 0.0) or 0.0)
-                except Exception:
-                    market_volatility = 0.0
-                try:
-                    ensemble_disagreement = float(meta_feats.get("ensemble_disagreement", 0.0) or 0.0)
-                except Exception:
-                    ensemble_disagreement = 0.0
-                trade_allowed, trade_reason = self.risk.check_trade_allowed(
-                    equity,
-                    float(getattr(result, "confidence", 0.0) or 0.0),
-                    datetime.now(self.risk._session_tz),
-                    market_volatility=market_volatility,
-                    ensemble_disagreement=ensemble_disagreement,
-                )
-
-                # Inject back into risk manager for this tick
-                # We can't easily monkey-patch, but we can respect the outcome
-                if result.signal == 0:
-                    pass
-                elif not trade_allowed:
-                    logger.info("Risk gate blocked trade: %s", trade_reason)
-                elif not allowed:
-                    logger.info(f"Meta-Controller blocked trade (Regime: {regime})")
-                elif result.confidence >= req_conf:
-                    correlation_blocked = False
-                    if bool(getattr(self.settings.risk, "correlation_filter_enabled", True)):
-                        cur_sym = str(self.settings.system.symbol or "")
-                        cur_bias = self._usd_exposure_bias(cur_sym, int(result.signal))
-                        same_bias_open = 0
-                        if cur_bias != 0:
-                            for pos in positions:
-                                if str(pos.symbol).upper() == cur_sym.upper():
-                                    continue
-                                pos_sig = 1 if int(getattr(pos, "type", 0)) == 0 else -1
-                                pos_bias = self._usd_exposure_bias(str(pos.symbol), pos_sig)
-                                if pos_bias == cur_bias:
-                                    same_bias_open += 1
-                        max_corr = int(getattr(self.settings.risk, "max_correlated_positions", 1) or 1)
-                        if same_bias_open >= max_corr:
-                            logger.info(
-                                "Correlation filter blocked trade: %s open USD-correlated positions.",
-                                same_bias_open,
-                            )
-                            correlation_blocked = True
-                    # Check repeat mistake guard
-                    if correlation_blocked:
-                        logger.debug("Trade skipped due to cross-symbol correlation exposure.")
-                    elif self.learner and self.learner.is_repeat_mistake(dataset.X):
-                        logger.warning("Similarity guard blocked trade (matches past loss pattern)")
-                    else:
-                        # Pass risk_mult implicitly by scaling size or handling inside executor?
-                        # Executor calls risk_manager.calculate_position_size which calls meta_controller.
-                        # BUT risk_manager.calculate_position_size re-creates PropMetaState without our regime!
-                        # FIX: We need to patch risk manager or pass regime to it.
-                        # For now, we trust risk_manager to re-calculate, but we need to inject regime into it?
-                        # No, risk_manager doesn't have 'market_regime' field yet.
-                        # Wait, we updated PropMetaState definition globally in meta_controller.py
-                        # But risk.py creates PropMetaState. It needs to know about 'market_regime'.
-                        # See next step.
-
-                        await self.executor.execute_signal(
-                            result,
-                            self.mt5.get_real_equity(),
-                            frames,
-                            entry_features=entry_features,
-                            advice_stance=self.news.last_advice.get("stance") if self.news.last_advice else None,
-                            tick_price=live_tick,
-                            symbol_info=live_symbol_info,
-                        )
-                else:
-                    logger.debug(
-                        "Trade skipped by confidence gate: conf=%.3f required=%.3f regime=%s",
-                        float(result.confidence),
-                        float(req_conf),
-                        regime,
-                    )
-
-                # 10. Online Learning Update
-                # ... (Online learning logic)
-
-                # HPC FIX: Market-Aligned Precision Sleep
-                # Sync with the next minute boundary to ensure we catch the fresh candle immediately
-                now = datetime.now(UTC)
-                seconds_to_wait = 60 - now.second - (now.microsecond / 1_000_000.0)
-                
-                # Add a tiny buffer (50ms) to ensure the broker has the data ready
-                await asyncio.sleep(max(0.1, seconds_to_wait + 0.05))
+                # 9. Precision Sleep
+                await self._precision_sleep()
 
             except Exception as e:
                 logger.error(f"Loop error: {e}", exc_info=True)
                 await asyncio.sleep(5)
 
-    def _infer_vol_regime(self, regime_str: str) -> str:
-        if "Volatile" in regime_str:
-            return "high"
-        if "Quiet" in regime_str:
-            return "low"
-        return "normal"
+    async def _process_market_hours(self) -> bool:
+        if not self.risk.is_trading_session():
+            now = datetime.now(UTC)
+            if now.weekday() >= 5:
+                if not self._market_closed_logged:
+                    logger.info("Market closed (Weekend). Sleeping intelligently until Monday...")
+                    self._market_closed_logged = True
+                await asyncio.sleep(3600)
+            else:
+                if not self._market_closed_logged:
+                    logger.info("Market closed (Session break). Sleeping...")
+                    self._market_closed_logged = True
+                await asyncio.sleep(60)
+            return False
+        
+        if self._market_closed_logged:
+            logger.info("Market Open! Resuming trading...")
+            self._market_closed_logged = False
+        return True
 
-    @staticmethod
-    def _usd_exposure_bias(symbol: str, signal: int) -> int:
-        sym = "".join(ch for ch in str(symbol or "").upper() if ch.isalpha())
-        if len(sym) < 6 or signal == 0:
-            return 0
-        base, quote = sym[:3], sym[3:6]
-        sgn = 1 if signal > 0 else -1
-        if quote == "USD":
-            # Buy EURUSD => short USD (-1); Sell EURUSD => long USD (+1)
-            return -sgn
-        if base == "USD":
-            # Buy USDJPY => long USD (+1); Sell USDJPY => short USD (-1)
-            return sgn
-        return 0
+    async def _fetch_and_prepare_data(self) -> dict | None:
+        frames = await self.trainer.data_loader.get_live_data(self.settings.system.symbol)
+        if not frames:
+            self._consecutive_failures += 1
+            if self._consecutive_failures > 10:
+                logger.error("Critical data failure.")
+                await asyncio.sleep(60)
+            await asyncio.sleep(5)
+            return None
+        self._consecutive_failures = 0
+        return frames
 
-    async def _trigger_retraining(self) -> None:
-        """Background retraining triggered by drift detection."""
+    async def _sync_and_update_state(self, frames: dict) -> None:
+        # Predict regime
+        df_m1 = frames.get(self.settings.system.base_timeframe) or frames.get("M1")
+        if not frame_utils.frame_empty(df_m1):
+            if self.iters % 100 == 0:
+                try:
+                    fit_df = frames.get("D1", df_m1)
+                    self.regime_classifier.fit(fit_df)
+                    self.regime_classifier.save(Path("models"))
+                except Exception as e:
+                    logger.warning(f"Regime refit failed: {e}")
+            self._current_regime = self.regime_classifier.predict(df_m1)
+        else:
+            self._current_regime = "Normal"
+
+        await self.mt5.sync_with_mt5()
+
+    async def _apply_news_policy(self) -> dict:
+        news_policy = await self.news.get_news_policy(self.settings.system.symbol)
+        self.risk.update_news_state(news_policy)
+        
+        if bool(news_policy.get("tier1_nearby")) and self.mt5.cached_positions:
+            for pos in self.mt5.cached_positions:
+                if pos.symbol == self.settings.system.symbol and pos.profit <= 0:
+                    try:
+                        await self.executor.close_position(pos.ticket, pos.volume, "News protection")
+                        logger.info(f"News protection closed ticket={pos.ticket} before high-impact event.")
+                    except Exception as exc:
+                        logger.warning(f"News protection close failed for ticket={pos.ticket}: {exc}")
+        return news_policy
+
+    def _process_features_and_drift(self, frames: dict) -> tuple[Any, bool]:
+        base_df = frames.get(self.settings.system.base_timeframe) or frames.get("M1")
+        base_idx = frame_utils.frame_index(base_df)
+        news_feats = self.news.get_news_features(base_idx)
+        dataset = self.trainer.feature_engineer.prepare(frames, news_features=news_feats, symbol=self.settings.system.symbol)
+        
+        drift_alert = False
+        dataset_x = getattr(dataset, "X", None)
+        if self.drift and not frame_utils.frame_empty(dataset_x):
+            if not self._feature_monitor_ready:
+                baseline = min(len(dataset_x), 2000)
+                if baseline > 0:
+                    self.drift.initialize_feature_monitor(frame_utils.NumpyFrame(dataset_x).tail(baseline), self.settings.system.symbol)
+                    self._feature_monitor_ready = True
+            
+            threshold = float(getattr(self.settings.risk, "feature_drift_threshold", 0.30) or 0.30)
+            drift_alert = bool(self.drift.check_feature_drift(dataset_x, threshold=threshold))
+            
+        return dataset, drift_alert
+
+    def _generate_signal(self, dataset: Any, news_policy: dict, drift_alert: bool) -> Any:
+        result = self.signal.generate_ensemble_signals(dataset)
+        if drift_alert:
+            logger.warning("Feature drift alert triggered; abstaining this cycle.")
+            result.signal = 0
+            result.confidence = 0.0
+            return result
+            
+        # News override
         try:
-            logger.info("Starting drift-triggered retraining...")
-            await self.trainer.train_incremental_all()
-            logger.info("Drift retraining completed")
-            self.drift.reset_after_retrain()
-        except Exception as e:
-            logger.error(f"Drift retraining failed: {e}", exc_info=True)
+            news_conf = float(news_policy.get("news_confidence", 0.0) or 0.0)
+            news_sent = float(news_policy.get("news_surprise", 0.0) or 0.0)
+            contrarian_thr = float(getattr(self.settings.news, "news_trade_confidence_threshold", 0.90) or 0.90)
+            if (bool(getattr(self.settings.news, "news_trade_on_event", False)) and 
+                result.signal != 0 and news_conf >= contrarian_thr and abs(news_sent) >= 0.90):
+                result.signal = -1 * result.signal
+                logger.info(f"News contrarian override applied (conf={news_conf:.2f} sent={news_sent:.2f}).")
+        except Exception:
+            pass
+        return result
 
+    def _update_concept_drift(self, frames: dict, result: Any) -> None:
+        df_m1 = frames.get(self.settings.system.base_timeframe) or frames.get("M1")
+        current_close = None
+        if not frame_utils.frame_empty(df_m1):
+            close_arr = frame_utils.frame_column_numpy(df_m1, "close")
+            if close_arr.size > 0:
+                current_close = float(close_arr[-1])
+
+        if (self.drift and self.last_prob is not None and self.last_close_price is not None and 
+            current_close is not None and self.last_signal is not None and self.last_signal != 0):
+            
+            price_change = current_close - self.last_close_price
+            y_true = 1 if price_change > self._drift_epsilon else (-1 if price_change < -self._drift_epsilon else 0)
+            self.drift.update(y_true, self.last_prob)
+
+            if self.drift.should_retrain():
+                logger.warning("Concept drift detected; triggering background retraining...")
+                task = asyncio.create_task(self.trainer.train_incremental_all())
+                task.add_done_callback(lambda _: self.drift.reset_after_retrain())
+
+        self.last_prob = getattr(result, "probs", None)
+        self.last_signal = getattr(result, "signal", 0)
+        self.last_close_price = current_close
+
+    async def _execute_signal_with_risk(self, result: Any, dataset: Any, news_policy: dict) -> None:
+        if result.signal == 0:
+            return
+
+        equity = self.mt5.get_real_equity()
+        regime = getattr(self, "_current_regime", "Normal")
+        
+        meta_state = PropMetaState(
+            daily_dd_pct=(self.risk.day_start_equity - equity) / self.risk.day_start_equity if self.risk.day_start_equity > 0 else 0.0,
+            volatility_regime=self._infer_vol_regime(regime),
+            recent_win_rate=sum(self.risk.rolling_outcomes) / len(self.risk.rolling_outcomes) if self.risk.rolling_outcomes else 0.5,
+            consecutive_losses=self.risk.consecutive_losses,
+            model_confidence=result.confidence,
+            hour_of_day=datetime.now(UTC).hour,
+            market_regime=regime,
+        )
+
+        risk_mult, req_conf, allowed = self.risk.meta_controller.get_risk_parameters(meta_state)
+        meta_feats = getattr(result, "meta_features", {}) or {}
+        market_vol = float(meta_feats.get("market_volatility", 0.0) or 0.0)
+        disagreement = float(meta_feats.get("ensemble_disagreement", 0.0) or 0.0)
+
+        trade_allowed, trade_reason = self.risk.check_trade_allowed(
+            equity, result.confidence, datetime.now(self.risk._session_tz),
+            market_volatility=market_vol, ensemble_disagreement=disagreement
+        )
+
+        if not trade_allowed:
+            logger.info(f"Risk gate blocked trade: {trade_reason}")
+        elif not allowed:
+            logger.info(f"Meta-Controller blocked trade (Regime: {regime})")
+        elif result.confidence >= req_conf:
+            if self.learner and self.learner.is_repeat_mistake(dataset.X):
+                logger.warning("Similarity guard blocked trade (matches past loss pattern)")
+                return
+
+            # Live symbol/tick update
+            with contextlib.suppress(Exception):
+                info = await self.mt5.connection.get_symbol_info(self.settings.system.symbol) or {}
+                tick = await self.mt5.connection.get_symbol_price(self.settings.system.symbol) or {}
+                if tick:
+                    self.executor.update_live_cost_state(tick, symbol_info=info)
+
+            await self.executor.execute_signal(
+                result, equity, dataset.frames if hasattr(dataset, "frames") else {},
+                entry_features=_entry_feature_snapshot(dataset),
+                advice_stance=self.news.last_advice.get("stance") if self.news.last_advice else None,
+            )
+        else:
+            logger.debug(f"Trade skipped by confidence gate: conf={result.confidence:.3f} required={req_conf:.3f} regime={regime}")
+
+    async def _precision_sleep(self) -> None:
+        now = datetime.now(UTC)
+        seconds_to_wait = 60 - now.second - (now.microsecond / 1_000_000.0)
+        await asyncio.sleep(max(0.1, seconds_to_wait + 0.05))
+
+    def _infer_vol_regime(self, regime_str: str) -> str:
+        if "Volatile" in regime_str: return "high"
+        if "Quiet" in regime_str: return "low"
+        return "normal"

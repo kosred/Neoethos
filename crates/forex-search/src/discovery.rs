@@ -16,18 +16,20 @@ pub struct DiscoveryConfig {
     pub portfolio_size: usize,
     pub corr_threshold: f64,
     pub min_trades_per_day: f64,
+    pub filtering: crate::genetic::FilteringConfig,
 }
 
 impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
-            population: 100,
-            generations: 5,
+            population: 1000,
+            generations: 10,
             max_indicators: 12,
-            candidate_count: 200,
-            portfolio_size: 100,
-            corr_threshold: 0.7,
-            min_trades_per_day: 1.0,
+            candidate_count: 5000,
+            portfolio_size: 2000,
+            corr_threshold: 0.85,
+            min_trades_per_day: 0.2,
+            filtering: crate::genetic::FilteringConfig::default(),
         }
     }
 }
@@ -67,12 +69,15 @@ pub fn run_discovery_cycle(
     )?;
 
     let mut candidates = search.genes;
+    // Sort by a weighted combo of fitness and consistency to find reliably profitable ones
     candidates.sort_by(|a, b| {
-        b.fitness
-            .partial_cmp(&a.fitness)
+        let score_a = a.fitness + (a.consistency * 0.5);
+        let score_b = b.fitness + (b.consistency * 0.5);
+        score_b
+            .partial_cmp(&score_a)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let max_candidates = config.candidate_count.max(10).min(candidates.len());
+    let max_candidates = config.candidate_count.max(100).min(candidates.len());
     candidates.truncate(max_candidates);
 
     let min_trades = min_trades_required(
@@ -83,6 +88,9 @@ pub fn run_discovery_cycle(
     let mut filtered = Vec::new();
     let mut signals_map = Vec::new();
     for gene in &candidates {
+        if !gene.passes_filter(&config.filtering) {
+            continue;
+        }
         let sig = signals_for_gene(features, gene);
         let trade_count = sig.iter().filter(|v| **v != 0).count() as f64;
         if trade_count >= min_trades as f64 {

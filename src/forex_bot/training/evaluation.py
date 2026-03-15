@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 try:
     import cupy as cp
@@ -20,6 +23,62 @@ except Exception:
     _fb = None  # type: ignore
 
 from .probability_utils import pad_probs_neutral_buy_sell
+
+
+def calculate_consistency_score(trade_counts_per_month: list[int]) -> float:
+    """
+    Calculates a consistency score (0.0 to 1.0) based on trade distribution.
+    Uses normalized Shannon entropy of trades per month.
+    """
+    counts = np.asarray(trade_counts_per_month, dtype=np.float64)
+    if counts.size < 3:
+        return 1.0  # Not enough data to judge inconsistency
+
+    total_trades = np.sum(counts)
+    if total_trades <= 0:
+        return 0.0
+
+    # Probabilities of trades in each month
+    probs = counts / total_trades
+    probs = probs[probs > 0]
+
+    if probs.size <= 1:
+        return 0.1  # All trades in one month is very inconsistent
+
+    # Shannon Entropy
+    entropy = -np.sum(probs * np.log(probs))
+    # Normalized Entropy (max is log(n_months))
+    max_entropy = np.log(counts.size)
+    score = entropy / max_entropy if max_entropy > 0 else 0.0
+
+    return float(max(0.0, min(1.0, score)))
+
+
+def truth_probability(metrics: dict[str, Any]) -> float:
+    """Estimates 'truth' probability that strategy is not overfitting based on signal counts."""
+    tc = int(metrics.get("trades", 0))
+    if tc < 5:
+        return 0.0
+    # Estimate months from trade distribution length if spans not provided
+    months = len(metrics.get("trade_distribution", []))
+    if months <= 0:
+        months = 12 # fallback
+
+    tpm = tc / months if months > 0.0 else 0.0
+    if tpm < 0.5:
+        return 0.2
+    if tpm > 100:
+        return 0.3
+    sharpe = float(metrics.get("sharpe", metrics.get("sharpe_ratio", 0.0)))
+    pf = float(metrics.get("profit_factor", 1.0))
+    score = 0.5
+    if sharpe > 2.0:
+        score -= min(0.3, (sharpe - 2.0) * 0.1)
+    if pf > 3.0:
+        score -= min(0.2, (pf - 3.0) * 0.05)
+    if tc > 50:
+        score += min(0.4, (tc - 50) * 0.002)
+    return float(max(0.1, min(0.99, score)))
 
 
 def _as_1d(values: Any, *, dtype: np.dtype) -> np.ndarray:
@@ -150,6 +209,56 @@ def _month_day_indices(index: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     day_idx = np.arange(n, dtype=np.int64)
     month_idx = day_idx // 31
     return month_idx, day_idx
+
+
+def split_discovery_holdout(
+    df: Any,
+    holdout_frac: float = 0.0,
+    min_rows: int = 0,
+    holdout_years: float = 0.0,
+) -> tuple[Any, Any]:
+    """
+    Split a dataframe/frame into discovery (train) and holdout (forward test) sets.
+    Prioritizes holdout_years if provided and valid.
+    """
+    from ..strategy.evo_prop_types import frame_len, frame_index, frame_slice, is_datetime_index, index_to_ns_int64
+    
+    n = frame_len(df)
+    if n <= 0:
+        return None, None
+    if n < min_rows:
+        return df, None
+
+    pivot_idx = n
+    if holdout_years > 0.0:
+        idx = frame_index(df)
+        if is_datetime_index(idx):
+            try:
+                ns = index_to_ns_int64(idx)
+                if ns.size > 0:
+                    # Use numpy's resolution-aware subtraction if possible, or standardize to ns
+                    days_to_subtract = float(holdout_years) * 365.2425
+                    cutoff_delta = np.timedelta64(int(days_to_subtract * 24 * 3600), "s").astype("timedelta64[ns]").astype(np.int64)
+                    cutoff_ns = ns[-1] - cutoff_delta
+                    mask = ns >= cutoff_ns
+                    pivot_idx = int(np.argmax(mask)) if np.any(mask) else n
+                    if pivot_idx <= 0:
+                        pivot_idx = n
+            except Exception:
+                pivot_idx = n
+
+    if pivot_idx >= n and holdout_frac > 0.0:
+        pivot_idx = int(n * (1.0 - max(0.0, min(1.0, holdout_frac))))
+
+    if 0 < pivot_idx < n:
+        discovery = frame_slice(df, 0, pivot_idx)
+        holdout = frame_slice(df, pivot_idx, n)
+        return discovery, holdout
+
+    # Return df as discovery and an empty frame as holdout if no split possible
+    discovery = df
+    holdout = frame_slice(df, n, n)
+    return discovery, holdout
 
 
 def _extract_symbol(frame: Any) -> str:
@@ -300,7 +409,12 @@ def prop_backtest(
         "daily_dd",
     ]
     out = {k: float(v) for k, v in zip(keys, arr.tolist())}
+    # Monthly distribution for Shannon consistency
+    # (Note: fast_evaluate_strategy would need to return this array or we derive it from signals)
+    # For now we use the 'consistency' from Rust and complement it if needed.
+    
     # Compatibility aliases used by older evaluation aggregators.
     out["pnl_score"] = float(out.get("net_profit", 0.0))
     out["max_dd"] = float(out.get("max_dd_pct", 0.0))
+    out["truth_prob"] = truth_probability(out)
     return out

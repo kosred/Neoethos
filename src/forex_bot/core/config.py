@@ -678,5 +678,10 @@ class Settings(BaseSettings):
         return (init_settings, YamlConfigSettingsSource(settings_cls), env_settings, file_secret_settings)
 
 # Apply preset env defaults before constructing the singleton settings object.
-apply_runtime_profile_defaults()
+# apply_runtime_profile_defaults() # Moved to on-demand or application entry point
 settings = Settings()
+
+def get_settings() -> Settings:
+    """Safely get settings, ensuring profile defaults are applied."""
+    apply_runtime_profile_defaults()
+    return settings
