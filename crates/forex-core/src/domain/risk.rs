@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChallengePhase {
@@ -22,7 +24,7 @@ impl From<&str> for ChallengePhase {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PropFirmRules {
     pub max_daily_loss_pct: f64,
     pub max_total_loss_pct: f64,
@@ -119,7 +121,7 @@ pub fn resolve_challenge_risk_preset(phase: &str) -> ChallengeRiskPreset {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TradeRecord {
     pub entry_time_sec: u64,
     pub exit_time_sec: u64,
@@ -130,6 +132,7 @@ pub struct TradeRecord {
     pub direction: Option<i32>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RevengeTradeDetector {
     pub recent_trades: Vec<TradeRecord>,
     pub max_trades_tracked: usize,
@@ -182,12 +185,10 @@ impl RevengeTradeDetector {
         let last_trade = self.recent_trades.last().unwrap();
         let time_since_last_min = (current_time_sec.saturating_sub(last_trade.exit_time_sec)) as f64 / 60.0;
 
-        // Condition 1: Less than 15 mins after a loss
         if time_since_last_min < 15.0 && last_trade.pnl < 0.0 {
             return true;
         }
 
-        // Condition 2: 3 consecutive losses outside optimal times
         let mut consecutive_losses = 0;
         for trade in self.recent_trades.iter().rev().take(5) {
             if trade.pnl < 0.0 {
@@ -204,7 +205,6 @@ impl RevengeTradeDetector {
             }
         }
 
-        // Condition 3: Increasing size after a loss
         if self.recent_trades.len() >= 3 {
             let recent_idx = self.recent_trades.len() - 3;
             let recent = &self.recent_trades[recent_idx..];
@@ -224,7 +224,6 @@ impl RevengeTradeDetector {
             }
         }
 
-        // Condition 4: 3 successive losses in same direction
         if self.recent_trades.len() >= 3 {
             let n = self.recent_trades.len();
             let t1 = &self.recent_trades[n - 3];
@@ -241,7 +240,6 @@ impl RevengeTradeDetector {
             }
         }
 
-        // Condition 5: Repeated losses in same direction under 30min gap
         if self.recent_trades.len() >= 2 {
             let n = self.recent_trades.len();
             let prev = &self.recent_trades[n - 2];
@@ -259,7 +257,7 @@ impl RevengeTradeDetector {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RiskManager {
     pub prop_rules: PropFirmRules,
     pub challenge_mode: bool,
@@ -273,6 +271,7 @@ pub struct RiskManager {
     pub daily_loss: f64,
     pub daily_profit: f64,
     pub session_trades: usize,
+    pub session_trade_counts: HashMap<String, usize>,
     pub consecutive_losses: usize,
 
     pub circuit_breaker_triggered: bool,
@@ -287,10 +286,21 @@ pub struct RiskManager {
     pub monthly_return_pct: f64,
     pub challenge_return_pct: f64,
 
-    // Store date IDs (e.g., YYYYMMDD) for day resets
     pub last_session_date_id: Option<u32>,
     pub month_start_date_id: Option<u32>,
     pub challenge_start_date_id: Option<u32>,
+
+    pub kill_window_until_sec: Option<u64>,
+    pub session_start_hour: u32,
+    pub session_start_min: u32,
+    pub session_end_hour: u32,
+    pub session_end_min: u32,
+    pub block_night_session: bool,
+    pub night_block_start_hour: u32,
+    pub night_block_end_hour: u32,
+    pub night_min_volatility: f64,
+
+    pub revenge_detector: RevengeTradeDetector,
 }
 
 impl RiskManager {
@@ -306,6 +316,7 @@ impl RiskManager {
             daily_loss: 0.0,
             daily_profit: 0.0,
             session_trades: 0,
+            session_trade_counts: HashMap::new(),
             consecutive_losses: 0,
             circuit_breaker_triggered: false,
             recovery_mode: false,
@@ -319,7 +330,35 @@ impl RiskManager {
             last_session_date_id: None,
             month_start_date_id: None,
             challenge_start_date_id: None,
+            kill_window_until_sec: None,
+            session_start_hour: 0,
+            session_start_min: 0,
+            session_end_hour: 23,
+            session_end_min: 59,
+            block_night_session: true,
+            night_block_start_hour: 0,
+            night_block_end_hour: 6,
+            night_min_volatility: 0.0008,
+            revenge_detector: RevengeTradeDetector::new(),
         }
+    }
+
+    pub fn set_session_times(&mut self, start_h: u32, start_m: u32, end_h: u32, end_m: u32) {
+        self.session_start_hour = start_h;
+        self.session_start_min = start_m;
+        self.session_end_hour = end_h;
+        self.session_end_min = end_m;
+    }
+
+    pub fn set_night_block(&mut self, enabled: bool, start_h: u32, end_h: u32, min_vol: f64) {
+        self.block_night_session = enabled;
+        self.night_block_start_hour = start_h;
+        self.night_block_end_hour = end_h;
+        self.night_min_volatility = min_vol;
+    }
+
+    pub fn update_kill_window(&mut self, until_sec: u64) {
+        self.kill_window_until_sec = Some(until_sec);
     }
 
     pub fn drawdown_state(&self, equity: f64) -> (f64, f64, f64, f64) {
@@ -357,6 +396,107 @@ impl RiskManager {
                 self.recovery_mode = false;
             }
         }
+    }
+
+    pub fn is_trading_session(&self, current_hour: u32, current_min: u32, weekday: u32) -> bool {
+        if weekday >= 5 {
+            return false;
+        }
+        let cur_total_min = current_hour * 60 + current_min;
+        let start_total_min = self.session_start_hour * 60 + self.session_start_min;
+        let end_total_min = self.session_end_hour * 60 + self.session_end_min;
+
+        if end_total_min < start_total_min {
+            cur_total_min >= start_total_min || cur_total_min <= end_total_min
+        } else {
+            cur_total_min >= start_total_min && cur_total_min <= end_total_min
+        }
+    }
+
+    pub fn check_trade_allowed(
+        &mut self,
+        equity: f64,
+        confidence: f64,
+        current_time_sec: u64,
+        current_hour: u32,
+        current_min: u32,
+        weekday: u32,
+        market_volatility: f64,
+    ) -> (bool, String) {
+        if self.challenge_mode && self.challenge_target_hit {
+            return (false, "Challenge target reached".to_string());
+        }
+        if !self.challenge_mode && self.monthly_target_hit {
+            return (false, "Monthly profit target reached".to_string());
+        }
+
+        if self.circuit_breaker_triggered {
+            return (false, "Circuit breaker active".to_string());
+        }
+
+        if !self.is_trading_session(current_hour, current_min, weekday) {
+            return (false, "Outside trading session".to_string());
+        }
+
+        if self.block_night_session {
+            let s = self.night_block_start_hour;
+            let e = self.night_block_end_hour;
+            let in_window = if e < s {
+                current_hour >= s || current_hour < e
+            } else {
+                current_hour >= s && current_hour < e
+            };
+            if in_window && market_volatility < self.night_min_volatility {
+                return (false, format!("Night session blocked (vol={:.5}<{:.5})", market_volatility, self.night_min_volatility));
+            }
+        }
+
+        if let Some(kill_until) = self.kill_window_until_sec {
+            if current_time_sec < kill_until {
+                return (false, "News kill window active".to_string());
+            }
+        }
+
+        if self.revenge_detector.is_revenge_trading(current_time_sec, current_hour) {
+            return (false, "Revenge trading detected".to_string());
+        }
+
+        let (daily_dd, intraday_dd, _dd_used, _dd_limit) = self.drawdown_state(equity);
+        if daily_dd >= self.prop_rules.daily_dd_stop_trading_pct {
+            self.circuit_breaker_triggered = true;
+            return (false, format!("Daily drawdown limit ({:.2}%)", daily_dd * 100.0));
+        }
+        if intraday_dd >= self.prop_rules.daily_dd_stop_trading_pct {
+            self.circuit_breaker_triggered = true;
+            return (false, format!("Intraday trailing limit ({:.2}%)", intraday_dd * 100.0));
+        }
+
+        if self.session_trades >= self.prop_rules.max_trades_per_day {
+            return (false, "Max trades per day reached".to_string());
+        }
+
+        if confidence < 0.55 { // Simplified, should be dynamic
+             return (false, format!("Confidence {:.2} too low", confidence));
+        }
+
+        (true, "OK".to_string())
+    }
+
+    pub fn on_trade_opened(&mut self) {
+        self.session_trades += 1;
+    }
+
+    pub fn on_trade_closed(&mut self, pnl: f64, equity: f64) {
+        if pnl > 0.0 {
+            self.daily_profit += pnl;
+            self.consecutive_losses = 0;
+        } else {
+            self.daily_loss += pnl.abs();
+            self.consecutive_losses += 1;
+        }
+        if equity > self.total_peak_equity { self.total_peak_equity = equity; }
+        if equity > self.day_peak_equity { self.day_peak_equity = equity; }
+        self.update_recovery_state(equity);
     }
 
     pub fn calculate_position_size(
@@ -417,4 +557,3 @@ impl RiskManager {
         risk_pct.clamp(0.0, max_risk_cap)
     }
 }
-

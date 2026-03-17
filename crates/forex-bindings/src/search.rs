@@ -3,7 +3,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
 use std::collections::HashSet;
 use pythonize::pythonize;
-use forex_data::compute_talib_feature_frame;
+use forex_data::{compute_talib_feature_frame, FeatureProfile};
 use forex_search::{evolve_search, run_gpu_discovery, GpuDiscoveryConfig};
 use crate::utils::{build_ohlcv};
 
@@ -34,7 +34,8 @@ pub fn search_evolve_ohlcv(
 
     let (features, result) = py
         .detach(|| {
-            let features = compute_talib_feature_frame(&ohlcv, include_raw)
+            let prof = if include_raw { FeatureProfile::Full } else { FeatureProfile::Standard };
+            let features = compute_talib_feature_frame(&ohlcv, prof)
                 .map_err(|e| format!("Feature computation failed: {}", e))?;
             let result = evolve_search(&features, &ohlcv, population, generations, max_indicators)
                 .map_err(|e| format!("Search failed: {}", e))?;
@@ -42,7 +43,7 @@ pub fn search_evolve_ohlcv(
         })
         .map_err(|msg| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg))?;
 
-    let metrics: Vec<Vec<f64>> = result.metrics.iter().map(|m| m.to_vec()).collect();
+    let metrics: Vec<Vec<f64>> = result.metrics.iter().map(|m: &[f64; 11]| m.to_vec()).collect();
     let genes_py: Vec<Py<PyAny>> = result
         .genes
         .iter()
@@ -57,7 +58,7 @@ pub fn search_evolve_ohlcv(
     dict.set_item("genes", genes_py)?;
     dict.set_item("metrics", metrics)?;
     dict.set_item("feature_names", features.names)?;
-    Ok(dict.into_any().into())
+    Ok(dict.into_any().unbind())
 }
 
 #[pyfunction]
@@ -151,7 +152,8 @@ pub fn search_evolve_gpu_ohlcv(
 
     let (features, result) = py
         .detach(|| {
-            let features = compute_talib_feature_frame(&ohlcv, include_raw)
+            let prof = if include_raw { FeatureProfile::Full } else { FeatureProfile::Standard };
+            let features = compute_talib_feature_frame(&ohlcv, prof)
                 .map_err(|e| format!("Feature computation failed: {}", e))?;
             let result = {
                 #[cfg(feature = "gpu")]
@@ -177,7 +179,7 @@ pub fn search_evolve_gpu_ohlcv(
     dict.set_item("feature_names", features.names)?;
     dict.set_item("timeframes", result.timeframes)?;
     dict.set_item("gpu", true)?;
-    Ok(dict.into_any().into())
+    Ok(dict.into_any().unbind())
 }
 
 #[pyfunction]
@@ -211,7 +213,7 @@ pub fn search_discovery_ohlcv(
 
     let (features, result) = py
         .detach(|| {
-            let features = compute_talib_feature_frame(&ohlcv, true)
+            let features = compute_talib_feature_frame(&ohlcv, FeatureProfile::Standard)
                 .map_err(|e| format!("Feature computation failed: {}", e))?;
             let result = forex_search::run_discovery_cycle(&features, &ohlcv, &config)
                 .map_err(|e| format!("Discovery failed: {}", e))?;
@@ -232,7 +234,7 @@ pub fn search_discovery_ohlcv(
     let dict = PyDict::new(py);
     dict.set_item("genes", genes_py)?;
     dict.set_item("feature_names", features.names)?;
-    Ok(dict.into_any().into())
+    Ok(dict.into_any().unbind())
 }
 
 pub fn discovery_gene_key(gene: &forex_search::Gene) -> String {

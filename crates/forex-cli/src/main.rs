@@ -16,6 +16,7 @@ fn main() -> Result<()> {
         "train" => cmd_train(&args[2..]),
         "search" => cmd_search(&args[2..]),
         "discover" => cmd_discover(&args[2..]),
+        "batch-discover" => cmd_batch_discover(&args[2..]),
         "stop-target" => cmd_stop_target(&args[2..]),
         _ => {
             print_help();
@@ -143,62 +144,18 @@ fn cmd_resample(args: &[String]) -> Result<()> {
 }
 
 fn cmd_train(args: &[String]) -> Result<()> {
-    let root = parse_root(args);
+    let _root = parse_root(args);
     let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| "EURUSD".to_string());
     let base = parse_flag(args, "--base").unwrap_or_else(|| "M1".to_string());
-    let higher = parse_flag(args, "--higher").unwrap_or_else(|| "".to_string());
-    let horizon: usize = parse_flag(args, "--horizon")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
+    let models_dir = parse_flag(args, "--models-dir").unwrap_or_else(|| "models".to_string());
+    let config_path = parse_flag(args, "--config").unwrap_or_else(|| "config.yaml".to_string());
 
-    let higher_list: Vec<String> = higher
-        .split(',')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.trim().to_string())
-        .collect();
-    let higher_refs: Vec<&str> = higher_list.iter().map(|s| s.as_str()).collect();
-
-    let dataset = forex_data::load_symbol_dataset(&root, &symbol)?;
-    let dataset =
-        forex_data::ensure_timeframes_with_resample(&dataset, &base, &forex_data::MANDATORY_TFS)?;
-    let features = forex_data::prepare_multitimeframe_features(
-        &dataset,
-        &base,
-        &higher_refs,
-        Some(&forex_data::FeatureCache::new("cache/features", 60, true)),
-    )?;
-    let base_ohlcv = dataset
-        .frames
-        .get(&base)
-        .ok_or_else(|| anyhow::anyhow!("base timeframe missing: {}", base))?;
-    let n = base_ohlcv.close.len();
-    if n <= horizon {
-        return Err(anyhow::anyhow!("not enough rows for horizon={}", horizon));
-    }
-    let mut labels = Vec::with_capacity(n - horizon);
-    let mut up = 0usize;
-    let mut down = 0usize;
-    for i in 0..(n - horizon) {
-        let now = base_ohlcv.close[i];
-        let future = base_ohlcv.close[i + horizon];
-        let label = if future > now { 1 } else { 0 };
-        if label == 1 {
-            up += 1;
-        } else {
-            down += 1;
-        }
-        labels.push(label);
-    }
-    println!(
-        "Train prep {} base={} rows={} features={} horizon={} up={} down={}",
-        symbol,
-        base,
-        features.data.nrows(),
-        features.data.ncols(),
-        horizon,
-        up,
-        down
-    );
+    let settings = forex_core::Settings::from_yaml(&config_path)?;
+    let orchestrator = forex_models::TrainingOrchestrator::new(settings, std::path::PathBuf::from(models_dir));
+    
+    orchestrator.train_symbol(&symbol, &base)?;
+    
+    println!("Pure Rust training complete for {}", symbol);
     Ok(())
 }
 
@@ -329,6 +286,29 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         result.candidates.len(),
         out
     );
+    Ok(())
+}
+
+fn cmd_batch_discover(args: &[String]) -> Result<()> {
+    let root = parse_root(args);
+    let symbols_raw = parse_flag(args, "--symbols").unwrap_or_else(|| "".to_string());
+    let tfs_raw = parse_flag(args, "--timeframes").unwrap_or_else(|| "M1,M5,M15,H1,H4".to_string());
+    let out_dir = parse_flag(args, "--out-dir").unwrap_or_else(|| "cache/discovery".to_string());
+    
+    let symbols: Vec<String> = if symbols_raw.is_empty() {
+        forex_data::discover_symbols(&root)?
+    } else {
+        symbols_raw.split(',').map(|s| s.trim().to_uppercase()).collect()
+    };
+    
+    let tfs: Vec<String> = tfs_raw.split(',').map(|s| s.trim().to_uppercase()).collect();
+    
+    let config = forex_search::DiscoveryConfig::default();
+    let orchestrator = forex_search::DiscoveryOrchestrator::new(&root, &out_dir, config);
+    
+    orchestrator.run_batch(&symbols, &tfs)?;
+    
+    println!("Batch discovery complete. Results in {}", out_dir);
     Ok(())
 }
 

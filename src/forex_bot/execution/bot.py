@@ -1,81 +1,58 @@
 import asyncio
 import logging
 from pathlib import Path
+import forex_bindings as fb
 
 from ..core.config import Settings
 from ..core.system import AutoTuner, HardwareProbe
 from ..data.loader import DataLoader
-from ..execution.drift_monitor import get_drift_monitor
-from ..execution.mt5_state_manager import MT5StateManager
-from ..execution.news_service import NewsService
-from ..execution.order_execution import OrderExecutor
-from ..execution.risk import RiskManager
-from ..execution.trading_loop import TradingEngine
-
-# New Services
-from ..execution.training_service import TrainingService
-from ..features.engine import SignalEngine
-from ..features.pipeline import FeatureEngineer
-from ..strategy.discovery import AutonomousDiscoveryEngine
-from ..training.online_learner import OnlineLearner
-from ..training.trainer import ModelTrainer
+from .risk import RiskManager
+from .trading_loop import TradingEngine
+from .mt5_state_manager import MT5StateManager
+from .news_service import NewsService
 
 logger = logging.getLogger(__name__)
-
 
 class ForexBot:
     """
     The Coordinator.
-    Initializes services and delegates execution.
+    Initializes Pure-Rust services via forex_bindings and delegates execution.
     """
 
     def __init__(self, settings: Settings):
         self.settings = settings
 
-        # 1. Hardware & Config
-        probe = HardwareProbe()
-        self.hardware_profile = probe.detect()
-        tuner = AutoTuner(settings, self.hardware_profile)
-        self.autotune_hints = tuner.apply()
-
-        # 2. Core Components
+        # 1. Hardware & Core
+        self._rust_core = fb.ForexCore()
+        self.hardware_profile = self._rust_core.detect_hardware()
+        
+        # 2. Rust-Backed Components
         self.data_loader = DataLoader(settings)
         self.risk_manager = RiskManager(settings)
-        self.feature_engineer = FeatureEngineer(settings)
-        self.signal_engine = SignalEngine(settings)
-        self.trainer = ModelTrainer(settings)
-        self.discovery_engine = AutonomousDiscoveryEngine(Path(settings.system.cache_dir))
-        self.drift_monitor = get_drift_monitor(Path(settings.system.cache_dir))
-
-        # 3. Services
-        self.training_service = TrainingService(
-            settings, self.data_loader, self.trainer, self.feature_engineer, self.discovery_engine, self.autotune_hints
+        
+        # 3. Rust Orchestrators
+        self._rust_trainer = fb.TrainingOrchestrator(
+            config_path=str(settings.config_path) if hasattr(settings, "config_path") else "config.yaml",
+            models_dir="models"
         )
 
         self.news_service = NewsService(settings, risk_ledger=getattr(self.risk_manager, "risk_ledger", None))
-
+        
         # MT5 Manager (lazy init)
         self.mt5_manager = None
 
-        # Online Learner (lazy init)
-        self.online_learner = None
-
     async def train(self, optimize: bool = True, stop_event: asyncio.Event | None = None) -> None:
-        """Delegate to TrainingService."""
-        await self.training_service.train(optimize, stop_event)
-
-    async def train_global(
-        self, symbols: list[str], optimize: bool = True, stop_event: asyncio.Event | None = None
-    ) -> None:
-        """Delegate to TrainingService."""
-        await self.training_service.train_global(symbols, optimize, stop_event)
+        """Delegate to Pure-Rust Training Orchestrator."""
+        symbol = self.settings.system.symbol or "EURUSD"
+        base_tf = self.settings.system.base_timeframe or "M1"
+        await asyncio.to_thread(self._rust_trainer.train_symbol, symbol, base_tf)
 
     async def run(self, paper_mode: bool = True, stop_event: asyncio.Event | None = None) -> None:
-        """Initialize runtime components and start the Trading Engine loop."""
-        logger.info("Initializing Runtime...")
+        """Start the Trading Engine loop with Rust-native components."""
+        logger.info("Initializing Pure-Rust Runtime...")
 
         try:
-            # Connect Data
+            # Connect Data (MT5)
             await self.data_loader.connect()
             if self.settings.system.mt5_required and not self.data_loader.is_connected():
                 raise RuntimeError("MT5 Connection Failed.")
@@ -83,51 +60,10 @@ class ForexBot:
             # Init MT5 State
             self.mt5_manager = MT5StateManager(self.data_loader.mt5_adapter.connection, self.settings)
 
-            # Init Models
-            self.signal_engine.load_models("models")
-            if not self.signal_engine.models:
-                logger.warning("Models missing. Training first...")
-                await self.train(optimize=True, stop_event=stop_event)
-                # HPC FIX: Comprehensive post-training memory cleanup
-                import gc
-
-                # Clear PyTorch cache
-                try:
-                    import torch
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
-                except ImportError:
-                    pass
-
-                # Clear NumPy temp files
-                try:
-                    import numpy as np
-                    if hasattr(np, '_cleanup_tmp'):
-                        np._cleanup_tmp()
-                except Exception:
-                    pass
-
-                # Clear matplotlib figures
-                try:
-                    import matplotlib.pyplot as plt
-                    plt.close('all')
-                except ImportError:
-                    pass
-
-                # Force garbage collection (run twice for cyclic refs)
-                gc.collect()
-                gc.collect()
-
-                self.signal_engine.load_models("models")
-
-            # Init Online Learner
-            self.online_learner = OnlineLearner("models")
-            self.online_learner.load_models(self.signal_engine.models)
-
-            # Init Executor
-            order_executor = OrderExecutor(
-                self.settings, self.risk_manager, self.mt5_manager, strategy_ledger=None, risk_ledger=None
+            # Rust Risk & Order Execution
+            order_executor = fb.OrderExecutor(
+                symbol=self.settings.system.symbol or "EURUSD",
+                partial_take_profit_enabled=True
             )
 
             # Create Engine
@@ -135,23 +71,15 @@ class ForexBot:
                 settings=self.settings,
                 mt5=self.mt5_manager,
                 risk=self.risk_manager,
-                signal=self.signal_engine,
                 news=self.news_service,
                 executor=order_executor,
-                trainer=self.training_service,
-                drift=self.drift_monitor,
-                learner=self.online_learner,
+                drift=fb.ConceptDriftMonitor(window_size=500), # Rust native
+                consistency=fb.ConsistencyTracker() # Rust native
             )
 
             # Run Loop
             await engine.run_loop(stop_event)
 
         finally:
-            # Ensure connection is always closed
             if hasattr(self.data_loader, "disconnect"):
-                try:
-                    await self.data_loader.disconnect()
-                    logger.info("Data loader disconnected.")
-                except Exception as e:
-                    logger.error(f"Error during data loader disconnect: {e}", exc_info=True)
-
+                await self.data_loader.disconnect()

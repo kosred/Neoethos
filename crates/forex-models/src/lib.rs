@@ -1,14 +1,17 @@
 // Base classes and utilities (ported from models/base.py)
 pub mod base;
 
-// Tree models module (LightGBM, XGBoost, CatBoost)
+// Machine learning models
 pub mod tree_models;
+pub mod ensemble;
+pub mod training_orchestrator;
+pub mod parallel_trainer;
+
+pub use ensemble::MetaBlender;
+pub use training_orchestrator::TrainingOrchestrator;
 
 // Hardware detection (ported from models/device.py)
 pub mod hardware;
-
-// Neural networks (ported from models/mlp.py + models/deep.py using PyO3)
-pub mod neural_networks;
 
 // ONNX export for ultra-fast inference
 pub mod onnx_exporter;
@@ -25,14 +28,20 @@ pub mod genetic;
 // Exit agent (RL-based trade exit decisions)
 pub mod exit_agent;
 
-// Parallel trainer - multi-core training (Python-backed work still obeys GIL)
-pub mod parallel_trainer;
+// Pure Rust ML Modular Modules
+pub mod evolution;
+pub mod rl;
+pub mod streaming;
+pub mod forecasting;
+pub mod statistical;
+pub mod anomaly;
 
-// Temporarily disabled modules (dependency issues - will re-enable after porting core files)
-// pub mod evolution;
-// pub mod unsupervised;
-// pub mod rl;
-// pub mod transformers;
+pub use evolution::NeuroEvoOptimizer;
+pub use streaming::AdaptiveGradientBooster;
+pub use forecasting::SwarmForecaster;
+pub use rl::TradingReinforcementLearner;
+pub use statistical::{ElasticNetExpert, LogisticExpert, BayesianLogitExpert};
+pub use anomaly::IsolationForestExpert;
 
 // Pure-Rust neural networks via Burn framework (no Python, no GIL)
 #[cfg(feature = "burn-backend")]
@@ -48,6 +57,7 @@ use ort::{inputs, Session, Value};
 use std::collections::HashMap;
 #[cfg(feature = "onnx")]
 use tracing::{info, warn};
+use std::path::Path;
 
 #[cfg(feature = "onnx")]
 pub struct ONNXInferenceEngine {
@@ -67,8 +77,6 @@ impl ONNXInferenceEngine {
             ])
             .commit()
         {
-            // This verifies we initialized, or warns if it was already done.
-            // In 2.0 if already initialized it might return error, which we log as warn.
             warn!("ORT Init (or check): {}", e);
         }
 
@@ -139,14 +147,7 @@ impl ONNXInferenceEngine {
             .get(model_name)
             .context(format!("Model {} not loaded", model_name))?;
 
-        // ort 2.0: Create tensor from array.
-        // Value::from_array takes the array directly.
-        // Assuming features is Array2<f32>
-        // Note: from_array in 2.0 might typically need ownership or specific view.
-        // Passing clone for safety.
         let input_tensor = Value::from_array(features.clone())?;
-
-        // Run
         let outputs = session.run(ort::inputs![input_tensor]?)?;
 
         let output_name = self
@@ -154,16 +155,9 @@ impl ONNXInferenceEngine {
             .get(model_name)
             .context("Output name not found")?;
         let output_value = outputs.get(output_name).context("Output tensor missing")?;
-
-        // Extract features
-        // try_extract_tensor returns valid tensor data, we can convert to ndarray
-        // <f32> specifies expected type.
         let output_tensor = output_value.try_extract_tensor::<f32>()?;
-
-        // Convert to ndarray owned
         let output_array = output_tensor.into_owned();
 
-        // Reshape logic
         let shape = output_array.shape();
         if shape.len() == 1 {
             Ok(output_array.into_shape((shape[0], 1))?)

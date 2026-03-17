@@ -1,7 +1,9 @@
 use pyo3::prelude::*;
+use pyo3::wrap_pyfunction;
 
 pub mod utils;
 pub mod conformal;
+pub mod calibration;
 pub mod core;
 pub mod inference;
 pub mod indicators;
@@ -11,6 +13,8 @@ pub mod models;
 pub mod data;
 pub mod search;
 pub mod evaluation;
+pub mod validation;
+pub mod training;
 
 #[cfg(feature = "burn-backend")]
 pub mod burn_bindings;
@@ -31,9 +35,13 @@ fn forex_bindings(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     
     // Prediction & Inference
     m.add_class::<conformal::ConformalGate>()?;
+    m.add_class::<calibration::ProbabilityCalibrator>()?;
     
     #[cfg(feature = "onnx")]
     m.add_class::<inference::ModelEngine>()?;
+    
+    // Training Orchestration
+    m.add_class::<training::TrainingOrchestrator>()?;
     
     // Strategy Search & Evolution
     m.add_function(wrap_pyfunction!(search::search_evolve_ohlcv, m)?)?;
@@ -55,6 +63,10 @@ fn forex_bindings(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(evaluation::triple_barrier_labels, m)?)?;
     m.add_function(wrap_pyfunction!(evaluation::quick_backtest_metrics, m)?)?;
     m.add_function(wrap_pyfunction!(evaluation::talib_bulk_signals_ohlcv, m)?)?;
+
+    // Validation
+    m.add_function(wrap_pyfunction!(validation::embargoed_walkforward_backtest_py, m)?)?;
+    m.add_class::<validation::PyCombinatorialPurgedCV>()?;
 
     // Utility Functions
     m.add_function(wrap_pyfunction!(executor::compute_position_size_lots, m)?)?;
@@ -91,21 +103,7 @@ fn forex_bindings(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(indicators::fisher_transform_py, m)?)?;
 
     // Machine Learning Models
-    #[cfg(feature = "lightgbm")]
-    m.add_class::<models::LightGBMModel>()?;
-    #[cfg(feature = "xgboost")]
-    {
-        m.add_class::<models::XGBoostModel>()?;
-        m.add_class::<models::XGBoostRFModel>()?;
-        m.add_class::<models::XGBoostDARTModel>()?;
-    }
-    #[cfg(feature = "catboost")]
-    {
-        m.add_class::<models::CatBoostModel>()?;
-        m.add_class::<models::CatBoostAltModel>()?;
-    }
-    m.add_class::<models::MLPModel>()?;
-    m.add_class::<models::GeneticModel>()?;
+    models::register_models(m)?;
 
     // Burn deep learning models (pure Rust)
     #[cfg(feature = "burn-backend")]

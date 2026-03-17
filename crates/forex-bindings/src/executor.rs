@@ -114,7 +114,7 @@ pub fn infer_pip_metrics(
 
     let mut refs: HashMap<String, f64> = HashMap::new();
     if let Some(raw) = reference_prices {
-        if let Ok(dict) = raw.cast::<PyDict>() {
+        if let Ok(dict) = raw.downcast::<PyDict>() {
             for (k, v) in dict.iter() {
                 let key = match k.extract::<String>() {
                     Ok(s) => norm_symbol(&s),
@@ -184,6 +184,47 @@ impl RiskManager {
         }
     }
 
+    pub fn set_session_times(&mut self, start_h: u32, start_m: u32, end_h: u32, end_m: u32) {
+        self.inner.set_session_times(start_h, start_m, end_h, end_m);
+    }
+
+    pub fn set_night_block(&mut self, enabled: bool, start_h: u32, end_h: u32, min_vol: f64) {
+        self.inner.set_night_block(enabled, start_h, end_h, min_vol);
+    }
+
+    pub fn update_kill_window(&mut self, until_sec: u64) {
+        self.inner.update_kill_window(until_sec);
+    }
+
+    pub fn check_trade_allowed(
+        &mut self,
+        equity: f64,
+        confidence: f64,
+        current_time_sec: u64,
+        current_hour: u32,
+        current_min: u32,
+        weekday: u32,
+        market_volatility: f64,
+    ) -> (bool, String) {
+        self.inner.check_trade_allowed(
+            equity,
+            confidence,
+            current_time_sec,
+            current_hour,
+            current_min,
+            weekday,
+            market_volatility,
+        )
+    }
+
+    pub fn on_trade_opened(&mut self) {
+        self.inner.on_trade_opened();
+    }
+
+    pub fn on_trade_closed(&mut self, pnl: f64, equity: f64) {
+        self.inner.on_trade_closed(pnl, equity);
+    }
+
     pub fn calculate_position_size(
         &mut self,
         equity: f64,
@@ -209,6 +250,15 @@ impl RiskManager {
 
     pub fn update_recovery_state(&mut self, equity: f64) {
         self.inner.update_recovery_state(equity);
+    }
+
+    pub fn save_state_json(&self) -> PyResult<String> {
+        serde_json::to_string(&self.inner).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    pub fn load_state_json(&mut self, json: String) -> PyResult<()> {
+        self.inner = serde_json::from_str(&json).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+        Ok(())
     }
 }
 

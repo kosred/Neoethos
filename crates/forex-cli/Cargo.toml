@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+forex-core = { path = "../forex-core" }
 forex-data = { path = "../forex-data" }
 forex-models = { path = "../forex-models" }
 forex-search = { path = "../forex-search" }

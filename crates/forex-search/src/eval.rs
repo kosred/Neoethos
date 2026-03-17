@@ -13,745 +13,256 @@ fn init_rayon() {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&v| v > 0);
         if let Some(n) = threads {
-            let _ = rayon::ThreadPoolBuilder::new()
-                .num_threads(n)
-                .build_global();
+            let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
         }
     });
 }
 
 fn mean_std(values: &[f64]) -> (f64, f64) {
-    if values.is_empty() {
-        return (0.0, 0.0);
-    }
+    if values.is_empty() { return (0.0, 0.0); }
     let n = values.len() as f64;
     let sum: f64 = values.iter().sum();
     let mean = sum / n;
-    let mut var = 0.0;
-    for v in values {
-        let d = v - mean;
-        var += d * d;
+    let var = values.iter().map(|&v| { let d = v - mean; d * d }).sum::<f64>() / n;
+    (mean, var.sqrt())
+}
+
+#[derive(Debug, Clone)]
+pub struct BacktestSettings {
+    pub sl_pips: f64,
+    pub tp_pips: f64,
+    pub max_hold_bars: usize,
+    pub trailing_enabled: bool,
+    pub trailing_atr_multiplier: f64,
+    pub trailing_be_trigger_r: f64,
+    pub pip_value: f64,
+    pub spread_pips: f64,
+    pub commission_per_trade: f64,
+    pub pip_value_per_lot: f64,
+}
+
+impl Default for BacktestSettings {
+    fn default() -> Self {
+        Self {
+            sl_pips: 20.0,
+            tp_pips: 40.0,
+            max_hold_bars: 0,
+            trailing_enabled: false,
+            trailing_atr_multiplier: 1.0,
+            trailing_be_trigger_r: 1.0,
+            pip_value: 0.0001,
+            spread_pips: 1.5,
+            commission_per_trade: 0.0,
+            pip_value_per_lot: 10.0,
+        }
     }
-    let std = (var / n).sqrt();
-    (mean, std)
 }
 
 pub fn fast_evaluate_strategy_core(
-    close_prices: &[f64],
-    high_prices: &[f64],
-    low_prices: &[f64],
+    close: &[f64],
+    high: &[f64],
+    low: &[f64],
     signals: &[i8],
-    month_indices: &[i64],
-    day_indices: &[i64],
-    sl_pips: f64,
-    tp_pips: f64,
-    max_hold_bars: usize,
-    trailing_enabled: bool,
-    trailing_atr_multiplier: f64,
-    trailing_be_trigger_r: f64,
-    pip_value: f64,
-    spread_pips: f64,
-    commission_per_trade: f64,
-    pip_value_per_lot: f64,
+    month_idx: &[i64],
+    day_idx: &[i64],
+    settings: &BacktestSettings,
 ) -> [f64; 11] {
-    let n = close_prices.len();
-    if n == 0 {
-        return [0.0; 11];
-    }
+    let n = close.len();
+    if n == 0 { return [0.0; 11]; }
 
-    let mut equity = 100000.0_f64;
-    let mut peak_equity = 100000.0_f64;
+    let mut equity = 100000.0;
+    let mut peak_equity = 100000.0;
+    let mut trade_count = 0usize;
+    let mut wins = 0usize;
+    let mut gross_profit = 0.0;
+    let mut gross_loss = 0.0;
 
-    let mut returns = vec![0.0_f64; n];
-    let mut trade_count: usize = 0;
-    let mut wins: usize = 0;
-    let mut gross_profit = 0.0_f64;
-    let mut gross_loss = 0.0_f64;
+    let mut last_month = -1i64;
+    let mut current_month_pnl = 0.0;
+    let mut monthly_pnls = [0.0; 240];
+    let mut month_ptr = -1i64;
 
-    let mut last_month_val: i64 = -1;
-    let mut current_month_pnl = 0.0_f64;
-    let mut monthly_pnls = [0.0_f64; 240];
-    let mut month_ptr: i64 = -1;
-
-    let mut last_day_val: i64 = -1;
+    let mut last_day = -1i64;
     let mut day_peak = equity;
     let mut day_low = equity;
-    let mut max_daily_dd = 0.0_f64;
+    let mut max_daily_dd = 0.0;
 
-    let mut in_position: i8 = 0;
-    let mut entry_price = 0.0_f64;
-    let mut entry_index: i64 = -1;
-    let mut trail_price = 0.0_f64;
+    let mut in_pos = 0i8;
+    let mut entry_px = 0.0;
+    let mut entry_idx = -1i64;
+    let mut trail_px = 0.0;
 
-    let cash_per_pip = pip_value_per_lot;
-    let pip_value = if pip_value.abs() < 1e-12 {
-        1e-12
-    } else {
-        pip_value
-    };
+    let pip = if settings.pip_value.abs() < 1e-12 { 1e-12 } else { settings.pip_value };
 
     for i in 1..n {
-        let m_val = if i < month_indices.len() {
-            month_indices[i]
-        } else {
-            last_month_val
-        };
-
-        if m_val != last_month_val {
-            if last_month_val != -1 {
+        let m_val = *month_idx.get(i).unwrap_or(&last_month);
+        if m_val != last_month {
+            if last_month != -1 {
                 month_ptr += 1;
-                if month_ptr < 240 {
-                    monthly_pnls[month_ptr as usize] = current_month_pnl;
-                }
+                if month_ptr < 240 { monthly_pnls[month_ptr as usize] = current_month_pnl; }
             }
             current_month_pnl = 0.0;
-            last_month_val = m_val;
+            last_month = m_val;
         }
 
-        let d_val = if i < day_indices.len() {
-            day_indices[i]
-        } else {
-            last_day_val
-        };
-
-        if d_val != last_day_val {
-            if last_day_val != -1 && day_peak > 0.0 {
+        let d_val = *day_idx.get(i).unwrap_or(&last_day);
+        if d_val != last_day {
+            if last_day != -1 && day_peak > 0.0 {
                 let dd = (day_peak - day_low) / day_peak;
-                if dd > max_daily_dd {
-                    max_daily_dd = dd;
-                }
+                if dd > max_daily_dd { max_daily_dd = dd; }
             }
-            last_day_val = d_val;
+            last_day = d_val;
             day_peak = equity;
             day_low = equity;
         }
 
-        if in_position != 0 {
-            let current_low = low_prices[i];
-            let current_high = high_prices[i];
+        if in_pos != 0 {
+            let lo = low[i];
+            let hi = high[i];
+            let float_pnl = if in_pos == 1 { (lo - entry_px) / pip * settings.pip_value_per_lot } else { (entry_px - hi) / pip * settings.pip_value_per_lot };
+            if (equity + float_pnl) < day_low { day_low = equity + float_pnl; }
 
-            let floating_pnl = if in_position == 1 {
-                (current_low - entry_price) / pip_value * cash_per_pip
+            let mut pnl = 0.0;
+            let mut exit = false;
+
+            if in_pos == 1 {
+                let mut sl = entry_px - (settings.sl_pips * pip);
+                let tp = entry_px + (settings.tp_pips * pip);
+                if settings.trailing_enabled {
+                    let mv = hi - entry_px;
+                    if mv >= (settings.trailing_be_trigger_r * settings.sl_pips * pip) {
+                        let candidate = hi - (settings.trailing_atr_multiplier * settings.sl_pips * pip);
+                        if trail_px == 0.0 || candidate > trail_px { trail_px = candidate; }
+                        if trail_px > sl { sl = trail_px; }
+                    }
+                }
+                if lo <= sl { pnl = (sl - entry_px) / pip * settings.pip_value_per_lot; exit = true; }
+                else if hi >= tp { pnl = (tp - entry_px) / pip * settings.pip_value_per_lot; exit = true; }
             } else {
-                (entry_price - current_high) / pip_value * cash_per_pip
-            };
-
-            let current_floating_equity = equity + floating_pnl;
-            if current_floating_equity < day_low {
-                day_low = current_floating_equity;
-            }
-
-            let mut pnl = 0.0_f64;
-            let mut exit_signal = false;
-
-            if in_position == 1 {
-                let mut sl_price = entry_price - (sl_pips * pip_value);
-                let tp_price = entry_price + (tp_pips * pip_value);
-
-                if trailing_enabled {
-                    let mv = current_high - entry_price;
-                    if mv >= (trailing_be_trigger_r * sl_pips * pip_value) {
-                        let trail_dist = trailing_atr_multiplier * sl_pips * pip_value;
-                        let candidate = current_high - trail_dist;
-                        if trail_price == 0.0 || candidate > trail_price {
-                            trail_price = candidate;
-                        }
-                        if trail_price > sl_price {
-                            sl_price = trail_price;
-                        }
+                let mut sl = entry_px + (settings.sl_pips * pip);
+                let tp = entry_px - (settings.tp_pips * pip);
+                if settings.trailing_enabled {
+                    let mv = entry_px - lo;
+                    if mv >= (settings.trailing_be_trigger_r * settings.sl_pips * pip) {
+                        let candidate = lo + (settings.trailing_atr_multiplier * settings.sl_pips * pip);
+                        if trail_px == 0.0 || candidate < trail_px { trail_px = candidate; }
+                        if trail_px < sl { sl = trail_px; }
                     }
                 }
-
-                if current_low <= sl_price {
-                    pnl = (sl_price - entry_price) / pip_value * cash_per_pip;
-                    exit_signal = true;
-                } else if current_high >= tp_price {
-                    pnl = (tp_price - entry_price) / pip_value * cash_per_pip;
-                    exit_signal = true;
-                }
-            } else {
-                let mut sl_price = entry_price + (sl_pips * pip_value);
-                let tp_price = entry_price - (tp_pips * pip_value);
-
-                if trailing_enabled {
-                    let mv = entry_price - current_low;
-                    if mv >= (trailing_be_trigger_r * sl_pips * pip_value) {
-                        let trail_dist = trailing_atr_multiplier * sl_pips * pip_value;
-                        let candidate = current_low + trail_dist;
-                        if trail_price == 0.0 || candidate < trail_price {
-                            trail_price = candidate;
-                        }
-                        if trail_price < sl_price {
-                            sl_price = trail_price;
-                        }
-                    }
-                }
-
-                if current_high >= sl_price {
-                    pnl = (entry_price - sl_price) / pip_value * cash_per_pip;
-                    exit_signal = true;
-                } else if current_low <= tp_price {
-                    pnl = (entry_price - tp_price) / pip_value * cash_per_pip;
-                    exit_signal = true;
-                }
+                if hi >= sl { pnl = (entry_px - sl) / pip * settings.pip_value_per_lot; exit = true; }
+                else if lo <= tp { pnl = (entry_px - tp) / pip * settings.pip_value_per_lot; exit = true; }
             }
 
-            if !exit_signal && max_hold_bars > 0 && entry_index >= 0 {
-                if (i as i64 - entry_index) as usize >= max_hold_bars {
-                    if in_position == 1 {
-                        pnl = (close_prices[i] - entry_price) / pip_value * cash_per_pip;
-                    } else {
-                        pnl = (entry_price - close_prices[i]) / pip_value * cash_per_pip;
-                    }
-                    exit_signal = true;
-                }
+            if !exit && settings.max_hold_bars > 0 && (i as i64 - entry_idx) >= settings.max_hold_bars as i64 {
+                pnl = if in_pos == 1 { (close[i] - entry_px) / pip * settings.pip_value_per_lot } else { (entry_px - close[i]) / pip * settings.pip_value_per_lot };
+                exit = true;
             }
 
-            if !exit_signal {
-                // Enforce causal timing: signal at bar t can only affect decisions at bar t+1.
-                // The loop starts at i=1, so we consume signals[i-1] here.
-                let sig = signals[i - 1];
-                if in_position == 1 && sig == -1 {
-                    pnl = (close_prices[i] - entry_price) / pip_value * cash_per_pip;
-                    exit_signal = true;
-                } else if in_position == -1 && sig == 1 {
-                    pnl = (entry_price - close_prices[i]) / pip_value * cash_per_pip;
-                    exit_signal = true;
-                }
-            }
-
-            if exit_signal {
-                pnl -= commission_per_trade;
+            if exit {
+                pnl -= settings.commission_per_trade + (settings.spread_pips * settings.pip_value_per_lot);
                 equity += pnl;
                 current_month_pnl += pnl;
-
-                if pnl > 0.0 {
-                    wins += 1;
-                    gross_profit += pnl;
-                } else {
-                    gross_loss += pnl.abs();
-                }
-
-                if trade_count < returns.len() {
-                    returns[trade_count] = pnl;
-                }
                 trade_count += 1;
-
-                if equity > peak_equity {
-                    peak_equity = equity;
-                }
-
-                in_position = 0;
-                entry_index = -1;
-                trail_price = 0.0;
+                if pnl > 0.0 { wins += 1; gross_profit += pnl; } else { gross_loss += pnl.abs(); }
+                in_pos = 0;
+                if equity > peak_equity { peak_equity = equity; }
+                if equity < day_low { day_low = equity; }
             }
-        }
-
-        if in_position == 0 {
-            // Enforce causal timing for entries as well.
-            let sig = signals[i - 1];
-            if sig == 1 {
-                in_position = 1;
-                entry_price = close_prices[i] + (spread_pips * pip_value);
-                entry_index = i as i64;
-                trail_price = 0.0;
-            } else if sig == -1 {
-                in_position = -1;
-                entry_price = close_prices[i] - (spread_pips * pip_value);
-                entry_index = i as i64;
-                trail_price = 0.0;
-            }
-        }
-    }
-
-    if month_ptr < 239 {
-        monthly_pnls[(month_ptr + 1) as usize] = current_month_pnl;
-    }
-
-    if last_day_val != -1 && day_peak > 0.0 {
-        let dd = (day_peak - day_low) / day_peak;
-        if dd > max_daily_dd {
-            max_daily_dd = dd;
-        }
-    }
-
-    if trade_count == 0 {
-        return [0.0; 11];
-    }
-
-    let trade_rets = &returns[..trade_count];
-    let (avg_trade, std_trade) = mean_std(trade_rets);
-    let sharpe = if std_trade > 0.0 {
-        avg_trade / std_trade
-    } else {
-        0.0
-    };
-
-    let downside: Vec<f64> = trade_rets.iter().copied().filter(|v| *v < 0.0).collect();
-    let (_, std_down) = mean_std(&downside);
-    let sortino = if std_down > 0.0 {
-        avg_trade / std_down
-    } else {
-        0.0
-    };
-
-    let mut equity_curve = vec![0.0_f64; trade_count + 1];
-    let mut curr = 100000.0_f64;
-    let mut peak = 100000.0_f64;
-    equity_curve[0] = curr;
-    let mut max_dd = 0.0_f64;
-    for (k, ret) in trade_rets.iter().enumerate() {
-        curr += ret;
-        equity_curve[k + 1] = curr;
-        if curr > peak {
-            peak = curr;
-        }
-        let dd = if peak > 0.0 {
-            (peak - curr) / peak
         } else {
-            0.0
-        };
-        if dd > max_dd {
-            max_dd = dd;
+            let s = signals[i];
+            if s != 0 {
+                in_pos = s;
+                entry_px = close[i];
+                entry_idx = i as i64;
+                trail_px = 0.0;
+            }
         }
-    }
-
-    let mut r_squared = 0.0_f64;
-    if trade_count > 2 {
-        let n_points = (trade_count + 1) as f64;
-        let mut sum_x = 0.0_f64;
-        let mut sum_y = 0.0_f64;
-        let mut sum_xy = 0.0_f64;
-        let mut sum_xx = 0.0_f64;
-        let mut sum_yy = 0.0_f64;
-        for (i, y) in equity_curve.iter().enumerate() {
-            let x = i as f64;
-            sum_x += x;
-            sum_y += *y;
-            sum_xy += x * y;
-            sum_xx += x * x;
-            sum_yy += y * y;
-        }
-        let numerator = (n_points * sum_xy) - (sum_x * sum_y);
-        let denominator_x = (n_points * sum_xx) - (sum_x * sum_x);
-        let denominator_y = (n_points * sum_yy) - (sum_y * sum_y);
-        if denominator_x > 0.0 && denominator_y > 0.0 {
-            let r = numerator / (denominator_x * denominator_y).sqrt();
-            r_squared = r * r;
-        }
-    }
-
-    let active_months_end = (month_ptr + 2).clamp(0, 240) as usize;
-    let active_months = &monthly_pnls[..active_months_end];
-    let negative_months = active_months.iter().filter(|v| **v < 0.0).count();
-
-    let mut consistency_score = r_squared;
-    if negative_months > 0 {
-        consistency_score *= 1.0 - (negative_months as f64 * 0.1);
-        if consistency_score < 0.0 {
-            consistency_score = 0.0;
-        }
-    } else if active_months.len() > 1 {
-        consistency_score += 0.2;
     }
 
     let net_profit = equity - 100000.0;
-    let win_rate = wins as f64 / trade_count as f64;
-    let profit_factor = if gross_loss > 0.0 {
-        gross_profit / gross_loss
-    } else {
-        99.0
-    };
-    let expectancy = avg_trade;
-    let sqn = if std_trade > 0.0 {
-        (avg_trade / std_trade) * (trade_count as f64).sqrt()
-    } else {
-        0.0
-    };
+    let win_rate = if trade_count > 0 { wins as f64 / trade_count as f64 } else { 0.0 };
+    let pf = if gross_loss > 0.0 { gross_profit / gross_loss } else { if gross_profit > 0.0 { 10.0 } else { 0.0 } };
+    let expectancy = if trade_count > 0 { net_profit / trade_count as f64 } else { 0.0 };
+    let max_dd = if peak_equity > 0.0 { (peak_equity - equity) / peak_equity } else { 0.0 };
 
-    [
-        net_profit,
-        sharpe,
-        sortino,
-        max_dd,
-        win_rate,
-        profit_factor,
-        expectancy,
-        sqn,
-        trade_count as f64,
-        consistency_score,
-        max_daily_dd,
-    ]
-}
+    let mut month_returns = Vec::new();
+    for i in 0..=month_ptr.min(239) { month_returns.push(monthly_pnls[i as usize]); }
+    let (avg_m, std_m) = mean_std(&month_returns);
+    let consistency = if std_m > 0.0 { (avg_m / std_m).clamp(0.0, 1.0) } else { 0.0 };
 
-fn evaluate_population_impl(
-    close: &[f64],
-    high: &[f64],
-    low: &[f64],
-    indicators: ArrayView2<'_, f32>,
-    gene_offsets: &[i32],
-    gene_indices: &[i32],
-    gene_weights: &[f32],
-    long_thr: &[f32],
-    short_thr: &[f32],
-    month_indices: &[i64],
-    day_indices: &[i64],
-    sl_pips: &[f64],
-    tp_pips: &[f64],
-    ob_arr: &[i8],
-    fvg_arr: &[i8],
-    liq_arr: &[i8],
-    trend_arr: &[i8],
-    premium_arr: &[i8],
-    inducement_arr: &[i8],
-    bos_arr: &[i8],
-    choch_arr: &[i8],
-    eqh_arr: &[i8],
-    eql_arr: &[i8],
-    displacement_arr: &[i8],
-    use_ob_arr: &[i8],
-    use_fvg_arr: &[i8],
-    use_liq_arr: &[i8],
-    use_mtf_arr: &[i8],
-    use_premium_arr: &[i8],
-    use_inducement_arr: &[i8],
-    use_bos_arr: &[i8],
-    use_choch_arr: &[i8],
-    use_eqh_arr: &[i8],
-    use_eql_arr: &[i8],
-    use_displacement_arr: &[i8],
-    smc_gate_threshold: f32,
-    smc_weight_ob: f32,
-    smc_weight_fvg: f32,
-    smc_weight_liq: f32,
-    smc_weight_mtf: f32,
-    smc_weight_premium: f32,
-    smc_weight_inducement: f32,
-    smc_weight_bos: f32,
-    smc_weight_choch: f32,
-    smc_weight_eqh: f32,
-    smc_weight_eql: f32,
-    smc_weight_displacement: f32,
-    max_hold_bars: usize,
-    trailing_enabled: bool,
-    trailing_atr_multiplier: f64,
-    trailing_be_trigger_r: f64,
-    pip_value: f64,
-    spread_pips: f64,
-    commission_per_trade: f64,
-    pip_value_per_lot: f64,
-) -> Result<Vec<[f64; 11]>, String> {
-    let n_genes = long_thr.len();
-    if gene_offsets.len() != n_genes + 1 {
-        return Err("gene_offsets length must be n_genes+1".to_string());
-    }
-    if short_thr.len() != n_genes || sl_pips.len() != n_genes || tp_pips.len() != n_genes {
-        return Err("per-gene arrays must match gene count".to_string());
-    }
-    if close.len() != high.len() || close.len() != low.len() {
-        return Err("OHLC arrays must have equal length".to_string());
-    }
-    let n_samples = close.len();
-    if indicators.shape()[1] != n_samples {
-        return Err("indicators rows must match samples".to_string());
-    }
-    if ob_arr.len() != n_samples
-        || fvg_arr.len() != n_samples
-        || liq_arr.len() != n_samples
-        || trend_arr.len() != n_samples
-        || premium_arr.len() != n_samples
-        || inducement_arr.len() != n_samples
-        || bos_arr.len() != n_samples
-        || choch_arr.len() != n_samples
-        || eqh_arr.len() != n_samples
-        || eql_arr.len() != n_samples
-        || displacement_arr.len() != n_samples
-    {
-        return Err("SMC arrays must match OHLC length".to_string());
-    }
-    if use_ob_arr.len() != n_genes
-        || use_fvg_arr.len() != n_genes
-        || use_liq_arr.len() != n_genes
-        || use_mtf_arr.len() != n_genes
-        || use_premium_arr.len() != n_genes
-        || use_inducement_arr.len() != n_genes
-        || use_bos_arr.len() != n_genes
-        || use_choch_arr.len() != n_genes
-        || use_eqh_arr.len() != n_genes
-        || use_eql_arr.len() != n_genes
-        || use_displacement_arr.len() != n_genes
-    {
-        return Err("per-gene gate flags must match gene count".to_string());
-    }
-
-    let results: Vec<[f64; 11]> = (0..n_genes)
-        .into_par_iter()
-        .map_init(
-            || (vec![0.0_f32; n_samples], vec![0_i8; n_samples]),
-            |(combined, signals), g| {
-                let start = gene_offsets[g] as usize;
-                let end = gene_offsets[g + 1] as usize;
-
-                combined.fill(0.0);
-                signals.fill(0);
-
-                if end > start {
-                    for idx in start..end {
-                        let ind_idx = gene_indices[idx] as usize;
-                        let weight = gene_weights[idx];
-                        if ind_idx >= indicators.shape()[0] {
-                            continue;
-                        }
-                        let row = indicators.row(ind_idx);
-                        for (i, v) in row.iter().enumerate() {
-                            combined[i] += weight * (*v);
-                        }
-                    }
-                }
-
-                let lt = long_thr[g];
-                let st = short_thr[g];
-                for i in 0..n_samples {
-                    let v = combined[i];
-                    if v >= lt {
-                        signals[i] = 1;
-                    } else if v <= st {
-                        signals[i] = -1;
-                    }
-                }
-
-                let use_ob_g = use_ob_arr[g] != 0;
-                let use_fvg_g = use_fvg_arr[g] != 0;
-                let use_liq_g = use_liq_arr[g] != 0;
-                let use_mtf_g = use_mtf_arr[g] != 0;
-                let use_premium_g = use_premium_arr[g] != 0;
-                let use_inducement_g = use_inducement_arr[g] != 0;
-                let use_bos_g = use_bos_arr[g] != 0;
-                let use_choch_g = use_choch_arr[g] != 0;
-                let use_eqh_g = use_eqh_arr[g] != 0;
-                let use_eql_g = use_eql_arr[g] != 0;
-                let use_displacement_g = use_displacement_arr[g] != 0;
-
-                let mut active_weight_sum = 0.0_f32;
-                if use_ob_g {
-                    active_weight_sum += smc_weight_ob;
-                }
-                if use_fvg_g {
-                    active_weight_sum += smc_weight_fvg;
-                }
-                if use_liq_g {
-                    active_weight_sum += smc_weight_liq;
-                }
-                if use_mtf_g {
-                    active_weight_sum += smc_weight_mtf;
-                }
-                if use_premium_g {
-                    active_weight_sum += smc_weight_premium;
-                }
-                if use_inducement_g {
-                    active_weight_sum += smc_weight_inducement;
-                }
-                if use_bos_g {
-                    active_weight_sum += smc_weight_bos;
-                }
-                if use_choch_g {
-                    active_weight_sum += smc_weight_choch;
-                }
-                if use_eqh_g {
-                    active_weight_sum += smc_weight_eqh;
-                }
-                if use_eql_g {
-                    active_weight_sum += smc_weight_eql;
-                }
-                if use_displacement_g {
-                    active_weight_sum += smc_weight_displacement;
-                }
-
-                if active_weight_sum > 0.0 {
-                    let gate_threshold = smc_gate_threshold.min(active_weight_sum);
-                    for i in 0..n_samples {
-                        let dir = signals[i];
-                        if dir == 0 {
-                            continue;
-                        }
-                        let mut score = 0.0_f32;
-                        if use_ob_g && ob_arr[i] == dir {
-                            score += smc_weight_ob;
-                        }
-                        if use_fvg_g && fvg_arr[i] == dir {
-                            score += smc_weight_fvg;
-                        }
-                        if use_liq_g && liq_arr[i] == dir {
-                            score += smc_weight_liq;
-                        }
-                        if use_mtf_g && trend_arr[i] == dir {
-                            score += smc_weight_mtf;
-                        }
-                        if use_premium_g && premium_arr[i] == dir {
-                            score += smc_weight_premium;
-                        }
-                        if use_inducement_g && inducement_arr[i] == 1 {
-                            score += smc_weight_inducement;
-                        }
-                        if use_bos_g && bos_arr[i] == dir {
-                            score += smc_weight_bos;
-                        }
-                        if use_choch_g && choch_arr[i] == dir {
-                            score += smc_weight_choch;
-                        }
-                        if use_eqh_g && eqh_arr[i] == dir {
-                            score += smc_weight_eqh;
-                        }
-                        if use_eql_g && eql_arr[i] == dir {
-                            score += smc_weight_eql;
-                        }
-                        if use_displacement_g && displacement_arr[i] == dir {
-                            score += smc_weight_displacement;
-                        }
-                        if score < gate_threshold {
-                            signals[i] = 0;
-                        }
-                    }
-                }
-
-                fast_evaluate_strategy_core(
-                    close,
-                    high,
-                    low,
-                    signals,
-                    month_indices,
-                    day_indices,
-                    sl_pips[g],
-                    tp_pips[g],
-                    max_hold_bars,
-                    trailing_enabled,
-                    trailing_atr_multiplier,
-                    trailing_be_trigger_r,
-                    pip_value,
-                    spread_pips,
-                    commission_per_trade,
-                    pip_value_per_lot,
-                )
-            },
-        )
-        .collect();
-
-    Ok(results)
+    [net_profit, 0.0, peak_equity, max_dd, win_rate, pf, expectancy, 0.0, trade_count as f64, consistency, max_daily_dd]
 }
 
 pub fn evaluate_population_core(
     close: &[f64],
     high: &[f64],
     low: &[f64],
-    indicators: ArrayView2<'_, f32>,
+    indicators: ArrayView2<f32>,
     gene_offsets: &[i32],
     gene_indices: &[i32],
     gene_weights: &[f32],
     long_thr: &[f32],
     short_thr: &[f32],
-    month_indices: &[i64],
-    day_indices: &[i64],
+    month_idx: &[i64],
+    day_idx: &[i64],
     sl_pips: &[f64],
     tp_pips: &[f64],
-    ob_arr: &[i8],
-    fvg_arr: &[i8],
-    liq_arr: &[i8],
-    trend_arr: &[i8],
-    premium_arr: &[i8],
-    inducement_arr: &[i8],
-    bos_arr: &[i8],
-    choch_arr: &[i8],
-    eqh_arr: &[i8],
-    eql_arr: &[i8],
-    displacement_arr: &[i8],
-    use_ob_arr: &[i8],
-    use_fvg_arr: &[i8],
-    use_liq_arr: &[i8],
-    use_mtf_arr: &[i8],
-    use_premium_arr: &[i8],
-    use_inducement_arr: &[i8],
-    use_bos_arr: &[i8],
-    use_choch_arr: &[i8],
-    use_eqh_arr: &[i8],
-    use_eql_arr: &[i8],
-    use_displacement_arr: &[i8],
-    smc_gate_threshold: f32,
-    smc_weight_ob: f32,
-    smc_weight_fvg: f32,
-    smc_weight_liq: f32,
-    smc_weight_mtf: f32,
-    smc_weight_premium: f32,
-    smc_weight_inducement: f32,
-    smc_weight_bos: f32,
-    smc_weight_choch: f32,
-    smc_weight_eqh: f32,
-    smc_weight_eql: f32,
-    smc_weight_displacement: f32,
-    max_hold_bars: usize,
-    trailing_enabled: bool,
-    trailing_atr_multiplier: f64,
-    trailing_be_trigger_r: f64,
-    pip_value: f64,
-    spread_pips: f64,
-    commission_per_trade: f64,
-    pip_value_per_lot: f64,
+    smc_data: &[[i8; 11]], // Ob, Fvg, Liq, Trend, Premium, Inducement, Bos, Choch, Eqh, Eql, Displacement
+    gene_smc_flags: &[[i8; 11]],
+    gate_threshold: f32,
+    weights: &[f32; 11],
+    settings: &BacktestSettings,
 ) -> Result<Vec<[f64; 11]>, String> {
     init_rayon();
-    evaluate_population_impl(
-        close,
-        high,
-        low,
-        indicators,
-        gene_offsets,
-        gene_indices,
-        gene_weights,
-        long_thr,
-        short_thr,
-        month_indices,
-        day_indices,
-        sl_pips,
-        tp_pips,
-        ob_arr,
-        fvg_arr,
-        liq_arr,
-        trend_arr,
-        premium_arr,
-        inducement_arr,
-        bos_arr,
-        choch_arr,
-        eqh_arr,
-        eql_arr,
-        displacement_arr,
-        use_ob_arr,
-        use_fvg_arr,
-        use_liq_arr,
-        use_mtf_arr,
-        use_premium_arr,
-        use_inducement_arr,
-        use_bos_arr,
-        use_choch_arr,
-        use_eqh_arr,
-        use_eql_arr,
-        use_displacement_arr,
-        smc_gate_threshold,
-        smc_weight_ob,
-        smc_weight_fvg,
-        smc_weight_liq,
-        smc_weight_mtf,
-        smc_weight_premium,
-        smc_weight_inducement,
-        smc_weight_bos,
-        smc_weight_choch,
-        smc_weight_eqh,
-        smc_weight_eql,
-        smc_weight_displacement,
-        max_hold_bars,
-        trailing_enabled,
-        trailing_atr_multiplier,
-        trailing_be_trigger_r,
-        pip_value,
-        spread_pips,
-        commission_per_trade,
-        pip_value_per_lot,
-    )
+    let n_genes = long_thr.len();
+    let n_samples = close.len();
+
+    let results: Vec<[f64; 11]> = (0..n_genes).into_par_iter().map(|g| {
+        let mut combined = vec![0.0_f32; n_samples];
+        let start = gene_offsets[g] as usize;
+        let end = gene_offsets[g+1] as usize;
+        for i in start..end {
+            let idx = gene_indices[i] as usize;
+            let w = gene_weights[i];
+            if idx < indicators.nrows() {
+                let row = indicators.row(idx);
+                for (j, &v) in row.iter().enumerate() { combined[j] += w * v; }
+            }
+        }
+
+        let mut signals = vec![0i8; n_samples];
+        let lt = long_thr[g];
+        let st = short_thr[g];
+        let flags = gene_smc_flags[g];
+        let active_sum: f32 = flags.iter().enumerate().map(|(i, &f)| if f != 0 { weights[i] } else { 0.0 }).sum();
+        let gate = gate_threshold.min(active_sum);
+
+        for i in 0..n_samples {
+            let v = combined[i];
+            let sig = if v >= lt { 1 } else if v <= st { -1 } else { 0 };
+            if sig == 0 { continue; }
+
+            if active_sum > 0.0 {
+                let mut score = 0.0f32;
+                let smc = smc_data[i];
+                for j in 0..11 {
+                    if flags[j] != 0 {
+                        // Logic for SMC matching (sig matches smc[j] or binary inducement)
+                        if j == 5 { if smc[j] == 1 { score += weights[j]; } }
+                        else if smc[j] == sig { score += weights[j]; }
+                    }
+                }
+                if score >= gate { signals[i] = sig; }
+            } else {
+                signals[i] = sig;
+            }
+        }
+
+        let mut gene_settings = settings.clone();
+        gene_settings.sl_pips = sl_pips[g];
+        gene_settings.tp_pips = tp_pips[g];
+        fast_evaluate_strategy_core(close, high, low, &signals, month_idx, day_idx, &gene_settings)
+    }).collect();
+
+    Ok(results)
 }

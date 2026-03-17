@@ -7,12 +7,14 @@ edition = "2021"
 anyhow = "1.0.100"
 chrono = "0.4.42"
 ndarray = { version = "0.17.2", features = ["rayon"] }
+itertools = "0.14.0"
 rand = "0.9.2"
 rand_distr = { version = "0.5.1", optional = true }
 rayon = "1.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 statrs = "0.18.0"
+tracing = "0.1.41"
 forex-data = { path = "../forex-data" }
 tch = { version = "0.22.0", optional = true }
 

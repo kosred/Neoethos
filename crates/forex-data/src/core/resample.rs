@@ -1,0 +1,100 @@
+use super::super::{Ohlcv, SymbolDataset};
+use anyhow::{bail, Result};
+
+pub fn parse_timeframe_to_minutes(tf: &str) -> Result<i64> {
+    let tf = tf.to_uppercase();
+    if tf.starts_with('M') && !tf.starts_with("MN") {
+        return Ok(tf[1..].parse::<i64>()?);
+    }
+    match tf.as_str() {
+        "H1" => Ok(60),
+        "H2" => Ok(120),
+        "H4" => Ok(240),
+        "H6" => Ok(360),
+        "H8" => Ok(480),
+        "H12" => Ok(720),
+        "D1" => Ok(1440),
+        "W1" => Ok(10080),
+        "MN1" => Ok(43200),
+        _ => bail!("unsupported timeframe: {}", tf),
+    }
+}
+
+pub fn resample_ohlcv(src: &Ohlcv, target_tf: &str) -> Result<Ohlcv> {
+    let mins = parse_timeframe_to_minutes(target_tf)?;
+    let period_ns = mins * 60 * 1_000_000_000;
+    
+    let ts = src.timestamp.as_ref().ok_or_else(|| anyhow::anyhow!("source has no timestamps"))?;
+    if ts.is_empty() { return Ok(src.clone()); }
+
+    let mut resampled_ts = Vec::new();
+    let mut resampled_open = Vec::new();
+    let mut resampled_high = Vec::new();
+    let mut resampled_low = Vec::new();
+    let mut resampled_close = Vec::new();
+    let mut resampled_volume = if src.volume.is_some() { Some(Vec::new()) } else { None };
+
+    let mut current_bucket_start = (ts[0] / period_ns) * period_ns;
+    let mut b_open = src.open[0];
+    let mut b_high = src.high[0];
+    let mut b_low = src.low[0];
+    let mut b_close = src.close[0];
+    let mut b_vol = src.volume.as_ref().map(|v| v[0]).unwrap_or(0.0);
+
+    for i in 1..ts.len() {
+        let bucket = (ts[i] / period_ns) * period_ns;
+        if bucket > current_bucket_start {
+            resampled_ts.push(current_bucket_start);
+            resampled_open.push(b_open);
+            resampled_high.push(b_high);
+            resampled_low.push(b_low);
+            resampled_close.push(b_close);
+            if let Some(ref mut v) = resampled_volume { v.push(b_vol); }
+
+            current_bucket_start = bucket;
+            b_open = src.open[i];
+            b_high = src.high[i];
+            b_low = src.low[i];
+            b_close = src.close[i];
+            b_vol = src.volume.as_ref().map(|v| v[i]).unwrap_or(0.0);
+        } else {
+            b_high = b_high.max(src.high[i]);
+            b_low = b_low.min(src.low[i]);
+            b_close = src.close[i];
+            b_vol += src.volume.as_ref().map(|v| v[i]).unwrap_or(0.0);
+        }
+    }
+    // Last bucket
+    resampled_ts.push(current_bucket_start);
+    resampled_open.push(b_open);
+    resampled_high.push(b_high);
+    resampled_low.push(b_low);
+    resampled_close.push(b_close);
+    if let Some(ref mut v) = resampled_volume { v.push(b_vol); }
+
+    Ok(Ohlcv {
+        timestamp: Some(resampled_ts),
+        open: resampled_open,
+        high: resampled_high,
+        low: resampled_low,
+        close: resampled_close,
+        volume: resampled_volume,
+    })
+}
+
+pub const MANDATORY_TFS: &[&str] = &["M1", "M5", "M15", "H1", "H4", "D1"];
+
+pub fn ensure_timeframes_with_resample(ds: &SymbolDataset, base_tf: &str, target_tfs: &[&str]) -> Result<SymbolDataset> {
+    let mut new_frames = ds.frames.clone();
+    let base_ohlcv = ds.frames.get(base_tf).ok_or_else(|| anyhow::anyhow!("base timeframe {} not found", base_tf))?;
+    
+    for tf in target_tfs {
+        if !new_frames.contains_key(*tf) {
+            if parse_timeframe_to_minutes(tf)? > parse_timeframe_to_minutes(base_tf)? {
+                let resampled = resample_ohlcv(base_ohlcv, tf)?;
+                new_frames.insert(tf.to_string(), resampled);
+            }
+        }
+    }
+    Ok(SymbolDataset { symbol: ds.symbol.clone(), frames: new_frames })
+}

@@ -1,9 +1,9 @@
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
 use std::collections::HashMap;
 use ndarray::{Array2};
-use forex_data::compute_talib_feature_frame;
+use forex_data::{compute_talib_feature_frame, FeatureProfile};
 use forex_search::{
     evaluate_genes,
     Gene, EvaluationConfig,
@@ -13,6 +13,7 @@ use crate::utils::{
     map_indicator_index, normalize_indicator_name,
 };
 use crate::indicators::causal_tanh_zscore_column;
+use forex_search::eval::BacktestSettings;
 
 #[pyfunction]
 #[pyo3(signature = (signals, close, initial_balance=10000.0, leverage=1.0))]
@@ -106,37 +107,34 @@ pub fn fast_evaluate_strategy(
     )
     .map_err(|msg| PyErr::new::<pyo3::exceptions::PyValueError, _>(msg))?;
 
-    let result = py
-        .detach(|| {
-            let features = compute_talib_feature_frame(&ohlcv, include_raw)
-                .map_err(|e| format!("Feature computation failed: {}", e))?;
-            let mut indices = Vec::new();
-            let mut w_vec = Vec::new();
-            for (idx, name) in indicator_names.iter().enumerate() {
-                if let Some(col) = map_indicator_index(name, &features.names) {
-                    indices.push(col);
-                    let w = weights.as_ref().and_then(|v| v.get(idx)).copied().unwrap_or(1.0);
-                    w_vec.push(w as f32);
-                }
-            }
-            if indices.is_empty() {
-                return Err("No indicators found in feature frame".to_string());
-            }
+    let prof = if include_raw { FeatureProfile::Full } else { FeatureProfile::Standard };
+    let features = compute_talib_feature_frame(&ohlcv, prof)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Feature computation failed: {}", e)))?;
+    let mut indices = Vec::new();
+    let mut w_vec = Vec::new();
+    for (idx, name) in indicator_names.iter().enumerate() {
+        if let Some(col) = map_indicator_index(name, &features.names) {
+            indices.push(col);
+            let w = weights.as_ref().and_then(|v| v.get(idx)).copied().unwrap_or(1.0);
+            w_vec.push(w as f32);
+        }
+    }
+    if indices.is_empty() {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("No indicators found in feature frame"));
+    }
 
-            let gene = Gene {
-                indices,
-                weights: w_vec,
-                long_threshold,
-                short_threshold,
-                ..Default::default()
-            };
+    let gene = Gene {
+        indices,
+        weights: w_vec,
+        long_threshold,
+        short_threshold,
+        ..Default::default()
+    };
 
-            let config = EvaluationConfig::default();
-            let res_vec = evaluate_genes(&features, &ohlcv, &[gene], &config)
-                .map_err(|e| format!("Evaluation failed: {}", e))?;
-            Ok::<_, String>(res_vec[0])
-        })
-        .map_err(|msg| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg))?;
+    let config = EvaluationConfig::default();
+    let res_vec = evaluate_genes(&features, &ohlcv, &[gene], &config)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Evaluation failed: {}", e)))?;
+    let result = res_vec[0];
 
     let dict = PyDict::new(py);
     dict.set_item("fitness", result[0])?;
@@ -180,27 +178,20 @@ pub fn batch_evaluate_strategies(
     )
     .map_err(|msg| PyErr::new::<pyo3::exceptions::PyValueError, _>(msg))?;
 
-    let genes: Vec<Gene> = {
-        let mut out = Vec::with_capacity(strategies.len());
-        for s in strategies {
-            let gene: Gene = pythonize::depythonize(s.bind(py))
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to parse strategy: {}", e)))?;
-            out.push(gene);
-        }
-        out
-    };
+    let mut genes = Vec::with_capacity(strategies.len());
+    for s in strategies {
+        let gene: Gene = pythonize::depythonize(s.bind(py))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to parse strategy: {}", e)))?;
+        genes.push(gene);
+    }
 
-    let results = py
-        .detach(|| {
-            let features = compute_talib_feature_frame(&ohlcv, include_raw)
-                .map_err(|e| format!("Feature computation failed: {}", e))?;
-            
-            let config = EvaluationConfig::default();
-            let res = evaluate_genes(&features, &ohlcv, &genes, &config)
-                .map_err(|e| format!("Evaluation failed: {}", e))?;
-            Ok::<_, String>(res)
-        })
-        .map_err(|msg| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg))?;
+    let prof = if include_raw { FeatureProfile::Full } else { FeatureProfile::Standard };
+    let features = compute_talib_feature_frame(&ohlcv, prof)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Feature computation failed: {}", e)))?;
+    
+    let config = EvaluationConfig::default();
+    let results = evaluate_genes(&features, &ohlcv, &genes, &config)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Evaluation failed: {}", e)))?;
 
     let mut out = Vec::new();
     for res in results {
@@ -210,7 +201,7 @@ pub fn batch_evaluate_strategies(
         dict.set_item("win_rate", res[4])?;
         dict.set_item("max_drawdown", res[3])?;
         dict.set_item("trades_count", res[8])?;
-        out.push(dict.into_any().into());
+        out.push(dict.into_any().unbind());
     }
     Ok(out)
 }
@@ -253,45 +244,41 @@ pub fn evaluate_population_talib_ohlcv(
     )
     .map_err(|msg| PyErr::new::<pyo3::exceptions::PyValueError, _>(msg))?;
 
-    let results = py
-        .detach(|| {
-            let features = compute_talib_feature_frame(&ohlcv, include_raw)
-                .map_err(|e| format!("Feature computation failed: {}", e))?;
-            let mut genes = Vec::new();
-            for i in 0..indicator_sets.len() {
-                let indicators = &indicator_sets[i];
-                let mut indices = Vec::new();
-                let mut w_vec = Vec::new();
-                for (j, name) in indicators.iter().enumerate() {
-                    if let Some(col) = map_indicator_index(name, &features.names) {
-                        indices.push(col);
-                        let w = weight_sets
-                            .as_ref()
-                            .and_then(|v| v.get(i))
-                            .and_then(|v| v.get(j))
-                            .copied()
-                            .unwrap_or(1.0);
-                        w_vec.push(w as f32);
-                    }
-                }
-                let long = long_thresholds.as_ref().and_then(|v| v.get(i)).copied().unwrap_or(0.66);
-                let short = short_thresholds.as_ref().and_then(|v| v.get(i)).copied().unwrap_or(-0.66);
-
-                genes.push(Gene {
-                    indices,
-                    weights: w_vec,
-                    long_threshold: long as f32,
-                    short_threshold: short as f32,
-                    ..Default::default()
-                });
+    let prof = if include_raw { FeatureProfile::Full } else { FeatureProfile::Standard };
+    let features = compute_talib_feature_frame(&ohlcv, prof)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Feature computation failed: {}", e)))?;
+    let mut genes = Vec::new();
+    for i in 0..indicator_sets.len() {
+        let indicators = &indicator_sets[i];
+        let mut indices = Vec::new();
+        let mut w_vec = Vec::new();
+        for (j, name) in indicators.iter().enumerate() {
+            if let Some(col) = map_indicator_index(name, &features.names) {
+                indices.push(col);
+                let w = weight_sets
+                    .as_ref()
+                    .and_then(|v| v.get(i))
+                    .and_then(|v| v.get(j))
+                    .copied()
+                    .unwrap_or(1.0);
+                w_vec.push(w as f32);
             }
+        }
+        let long = long_thresholds.as_ref().and_then(|v| v.get(i)).copied().unwrap_or(0.66);
+        let short = short_thresholds.as_ref().and_then(|v| v.get(i)).copied().unwrap_or(-0.66);
 
-            let config = EvaluationConfig::default();
-            let res = evaluate_genes(&features, &ohlcv, &genes, &config)
-                .map_err(|e| format!("Evaluation failed: {}", e))?;
-            Ok::<_, String>(res)
-        })
-        .map_err(|msg| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg))?;
+        genes.push(Gene {
+            indices,
+            weights: w_vec,
+            long_threshold: long as f32,
+            short_threshold: short as f32,
+            ..Default::default()
+        });
+    }
+
+    let config = EvaluationConfig::default();
+    let results = evaluate_genes(&features, &ohlcv, &genes, &config)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Evaluation failed: {}", e)))?;
 
     let mut out = Vec::new();
     for res in results {
@@ -301,7 +288,7 @@ pub fn evaluate_population_talib_ohlcv(
         dict.set_item("win_rate", res[4])?;
         dict.set_item("max_drawdown", res[3])?;
         dict.set_item("trades_count", res[8])?;
-        out.push(dict.into_any().into());
+        out.push(dict.into_any().unbind());
     }
     Ok(out)
 }
@@ -349,14 +336,10 @@ pub fn evaluate_population_core_py(
         out
     };
 
-    let results = py
-        .detach(|| {
-            let config = EvaluationConfig::default();
-            let res = evaluate_genes(&frame_res, &ohlcv_res, &genes, &config)
-                .map_err(|e| e.to_string())?;
-            Ok::<_, String>(res)
-        })
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
+    let config = EvaluationConfig::default();
+    let results = evaluate_genes(&frame_res, &ohlcv_res, &genes, &config)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    
     let mut out = Vec::new();
     for res in results {
         let dict = PyDict::new(py);
@@ -378,7 +361,7 @@ pub fn aggregate_prop_score_metrics<'py>(
     prop_signals: PyReadonlyArray2<'py, i8>,
     prop_returns: PyReadonlyArray2<'py, f64>,
     prop_masks: PyReadonlyArray2<'py, bool>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
+) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
     let sigs = prop_signals.as_array();
     let rets = prop_returns.as_array();
     let masks = prop_masks.as_array();
@@ -406,8 +389,8 @@ pub fn aggregate_prop_score_metrics<'py>(
     }
 
     Ok((
-        out_score.into_pyarray(py),
-        out_certainty.into_pyarray(py),
+        out_score.to_pyarray(py).into_any().unbind(),
+        out_certainty.to_pyarray(py).into_any().unbind(),
     ))
 }
 
@@ -451,63 +434,59 @@ pub fn talib_bulk_signals_ohlcv(
     )
     .map_err(|msg| PyErr::new::<pyo3::exceptions::PyValueError, _>(msg))?;
 
-    let signals = py
-        .detach(|| {
-            let frame = compute_talib_feature_frame(&ohlcv, include_raw)
-                .map_err(|e| format!("Feature computation failed: {}", e))?;
-            let n_rows = frame.data.nrows();
-            let n_genes = indicator_sets.len();
-            let mut out = Array2::<i8>::zeros((n_rows, n_genes));
-            if n_rows == 0 || n_genes == 0 {
-                return Ok::<Array2<i8>, String>(out);
+    let prof = if include_raw { FeatureProfile::Full } else { FeatureProfile::Standard };
+    let frame = compute_talib_feature_frame(&ohlcv, prof)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Feature computation failed: {}", e)))?;
+    let n_rows = frame.data.nrows();
+    let n_genes = indicator_sets.len();
+    let mut out = Array2::<i8>::zeros((n_rows, n_genes));
+    if n_rows == 0 || n_genes == 0 {
+        return Ok(out.to_pyarray(py).into_any().unbind());
+    }
+
+    let mut idx_map: HashMap<String, usize> = HashMap::with_capacity(frame.names.len() * 2);
+    for (idx, name) in frame.names.iter().enumerate() {
+        let key = normalize_indicator_name(name.strip_prefix("ta_").unwrap_or(name));
+        if !key.is_empty() {
+            idx_map.entry(key).or_insert(idx);
+        }
+    }
+
+    for g in 0..n_genes {
+        let indicators = &indicator_sets[g];
+        if indicators.is_empty() {
+            continue;
+        }
+        let weights = weight_sets.as_ref().and_then(|v| v.get(g));
+        let long_thr = long_thresholds.as_ref().and_then(|v| v.get(g)).copied().unwrap_or(0.66);
+        let short_thr = short_thresholds.as_ref().and_then(|v| v.get(g)).copied().unwrap_or(-0.66);
+
+        let mut votes = vec![0.0_f64; n_rows];
+        let mut weight_total = 0.0_f64;
+
+        for (k, indicator) in indicators.iter().enumerate() {
+            let norm = normalize_indicator_name(indicator);
+            let col_idx = idx_map.get(&norm).copied().or_else(|| map_indicator_index(indicator, &frame.names));
+            let Some(col_idx) = col_idx else { continue; };
+
+            let w = weights.and_then(|w| w.get(k)).copied().unwrap_or(1.0);
+            if !w.is_finite() || w.abs() <= 0.0 { continue; }
+
+            let score = causal_tanh_zscore_column(&frame.data, col_idx, causal_min_bars);
+            for r in 0..n_rows {
+                votes[r] += w * score[r];
             }
+            weight_total += w.abs();
+        }
 
-            let mut idx_map: HashMap<String, usize> = HashMap::with_capacity(frame.names.len() * 2);
-            for (idx, name) in frame.names.iter().enumerate() {
-                let key = normalize_indicator_name(name.strip_prefix("ta_").unwrap_or(name));
-                if !key.is_empty() {
-                    idx_map.entry(key).or_insert(idx);
-                }
-            }
+        let denom = if weight_total > 0.0 { weight_total } else { 1.0 };
+        for r in 0..n_rows {
+            let combined = votes[r] / denom;
+            out[(r, g)] = if combined > long_thr { 1 } else if combined < short_thr { -1 } else { 0 };
+        }
+    }
 
-            for g in 0..n_genes {
-                let indicators = &indicator_sets[g];
-                if indicators.is_empty() {
-                    continue;
-                }
-                let weights = weight_sets.as_ref().and_then(|v| v.get(g));
-                let long_thr = long_thresholds.as_ref().and_then(|v| v.get(g)).copied().unwrap_or(0.66);
-                let short_thr = short_thresholds.as_ref().and_then(|v| v.get(g)).copied().unwrap_or(-0.66);
-
-                let mut votes = vec![0.0_f64; n_rows];
-                let mut weight_total = 0.0_f64;
-
-                for (k, indicator) in indicators.iter().enumerate() {
-                    let norm = normalize_indicator_name(indicator);
-                    let col_idx = idx_map.get(&norm).copied().or_else(|| map_indicator_index(indicator, &frame.names));
-                    let Some(col_idx) = col_idx else { continue; };
-
-                    let w = weights.and_then(|w| w.get(k)).copied().unwrap_or(1.0);
-                    if !w.is_finite() || w.abs() <= 0.0 { continue; }
-
-                    let score = causal_tanh_zscore_column(&frame.data, col_idx, causal_min_bars);
-                    for r in 0..n_rows {
-                        votes[r] += w * score[r];
-                    }
-                    weight_total += w.abs();
-                }
-
-                let denom = if weight_total > 0.0 { weight_total } else { 1.0 };
-                for r in 0..n_rows {
-                    let combined = votes[r] / denom;
-                    out[(r, g)] = if combined > long_thr { 1 } else if combined < short_thr { -1 } else { 0 };
-                }
-            }
-            Ok::<Array2<i8>, String>(out)
-        })
-        .map_err(|msg| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg))?;
-
-    Ok(signals.into_pyarray(py).into_any().unbind())
+    Ok(out.to_pyarray(py).into_any().unbind())
 }
 
 #[allow(unused_variables)]
@@ -517,15 +496,14 @@ pub fn triple_barrier_labels<'py>(
     py: Python<'py>,
     close: PyReadonlyArray1<'py, f64>,
     timestamps: Option<PyReadonlyArray1<'py, i64>>,
-) -> PyResult<Bound<'py, PyArray1<i8>>> {
+) -> PyResult<Py<PyAny>> {
     let cl = vec_from_py_f64(&close);
     let n = cl.len();
     let mut labels = vec![0_i8; n];
     if n < 30 {
-        return Ok(labels.into_pyarray(py));
+        return Ok(labels.to_pyarray(py).into_any().unbind());
     }
 
-    // Simplified triple barrier for now, just look ahead 20 bars
     let lookahead = 20;
     let threshold = 0.001; 
 
@@ -545,16 +523,13 @@ pub fn triple_barrier_labels<'py>(
         labels[i] = hit;
     }
 
-    Ok(labels.into_pyarray(py))
+    Ok(labels.to_pyarray(py).into_any().unbind())
 }
 
 #[allow(unused_variables)]
 #[pyfunction]
 #[pyo3(signature = (journal_df))]
 pub fn trade_journal_metrics(py: Python, journal_df: Py<PyAny>) -> PyResult<Py<PyAny>> {
-    // This is a placeholder for actual complex journal metrics calculation
-    // Usually involves polars operations which are better handled in Python or via polars-rs
-    // For now returning a simple dict as expected by the caller if they were to use it.
     let dict = PyDict::new(py);
     dict.set_item("sharpe", 0.0)?;
     dict.set_item("win_rate", 0.0)?;
@@ -565,6 +540,7 @@ pub fn trade_journal_metrics(py: Python, journal_df: Py<PyAny>) -> PyResult<Py<P
 #[pyfunction]
 #[pyo3(signature = (open, high, low, close, window=500))]
 pub fn infer_stop_target_pips_ohlcv(
+    _py: Python,
     open: PyReadonlyArray1<f64>,
     high: PyReadonlyArray1<f64>,
     low: PyReadonlyArray1<f64>,
@@ -586,7 +562,6 @@ pub fn infer_stop_target_pips_ohlcv(
     }
     let atr = atr_sum / window as f64;
     
-    // Crude pip estimation: assume 1 pip = 0.0001
     let sl_pips = (atr * 1.5) / 0.0001;
     let tp_pips = (atr * 4.5) / 0.0001;
 

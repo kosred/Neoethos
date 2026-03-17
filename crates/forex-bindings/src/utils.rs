@@ -1,9 +1,11 @@
 use ndarray::Array2;
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use polars::prelude::*;
 use pyo3::prelude::*;
 use std::collections::HashMap;
+use std::str::FromStr;
 use forex_data::{FeatureProfile, Ohlcv};
+pub use forex_models::tree_models::config::ParamValue;
 
 pub fn dataframe_from_ndarray(features: &Array2<f64>) -> Result<DataFrame, String> {
     let mut df_data: Vec<Column> = Vec::with_capacity(features.ncols());
@@ -187,7 +189,7 @@ pub fn parse_feature_profile(raw: Option<&str>, default: FeatureProfile) -> Feat
     if trimmed.is_empty() {
         return default;
     }
-    forex_data::FeatureProfile::from_str(trimmed)
+    forex_data::FeatureProfile::from_str(trimmed).unwrap_or(default)
 }
 
 pub fn norm_symbol(symbol: &str) -> String {
@@ -329,16 +331,7 @@ pub fn quote_to_account_rate(
 
     None
 }
-#[cfg(any(feature = "lightgbm", feature = "xgboost", feature = "catboost"))]
-#[derive(Debug, Clone)]
-pub enum ParamValue {
-    Bool(bool),
-    Int(i32),
-    Float(f64),
-    String(String),
-}
 
-#[cfg(any(feature = "lightgbm", feature = "xgboost", feature = "catboost"))]
 pub fn param_value_from_py(value: &Bound<'_, PyAny>) -> Option<ParamValue> {
     if let Ok(v) = value.extract::<bool>() {
         return Some(ParamValue::Bool(v));
@@ -355,15 +348,15 @@ pub fn param_value_from_py(value: &Bound<'_, PyAny>) -> Option<ParamValue> {
     None
 }
 
-#[cfg(any(feature = "lightgbm", feature = "xgboost", feature = "catboost"))]
 pub fn params_from_py(
     params: Option<&Bound<'_, PyAny>>,
 ) -> Result<Option<HashMap<String, ParamValue>>, String> {
     let Some(obj) = params else {
         return Ok(None);
     };
+    use pyo3::types::PyDict;
     let dict = obj
-        .cast::<PyDict>()
+        .downcast::<PyDict>()
         .map_err(|_| "params must be a dict".to_string())?;
     let mut map = HashMap::new();
     for (k, v) in dict.iter() {
@@ -547,7 +540,7 @@ pub fn sort_rows_with_labels_by_index<'py>(
             sorted_f[(new_row, col)] = f[(old_row, col)];
         }
     }
-    Ok((sorted_idx, sorted_f.into_pyarray(py), sorted_l))
+    Ok((sorted_idx, sorted_f.to_pyarray(py), sorted_l))
 }
 
 #[pyfunction]
@@ -580,5 +573,5 @@ pub fn sort_dedup_rows_by_index<'py>(
             sorted_f[(new_row, col)] = f[(old_row, col)];
         }
     }
-    Ok((sorted_idx, sorted_f.into_pyarray(py)))
+    Ok((sorted_idx, sorted_f.to_pyarray(py)))
 }

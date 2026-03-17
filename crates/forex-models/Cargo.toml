@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 forex-data = { path = "../forex-data" }
+forex-core = { path = "../forex-core" }
 ndarray = { version = "0.17.2", features = ["rayon", "serde"] }
 tch = { version = "0.22.0", optional = true }
 ort = { version = "2.0.0-rc.10", optional = true, features = ["cuda", "copy-dylibs"] }
@@ -22,6 +23,21 @@ serde_json = "1.0.149"
 lightgbm3 = { version = "1.0.8", optional = true }
 xgb = { version = "3.0.5", optional = true }
 catboost-rust = { version = "0.3.6", optional = true, features = ["gpu"] }
+sklears = { version = "0.1.0-rc.1", optional = true, features = ["tree"] }
+
+# Pure Rust Evolutionary & Reinforcement Learning
+crfmnes = { version = "1.0.0", optional = true }
+rlkit = { version = "0.0.3", optional = true }
+irithyll = { version = "6.3.0", optional = true }
+ruv-swarm-ml = { version = "1.0.5", optional = true }
+
+# Statistical & Anomaly Detection
+linfa = { version = "0.7.0", optional = true }
+linfa-linear = { version = "0.7.0", optional = true }
+linfa-logistic = { version = "0.7.0", optional = true }
+linfa-clustering = { version = "0.7.0", optional = true }
+variational-regression = { version = "0.1.0", optional = true }
+extended-isolation-forest = { version = "0.2.0", optional = true }
 
 # Burn framework — use autodiff only (no train/dataset to avoid rusqlite conflict)
 # burn-nn is always included in burn-core, no extra dep needed
@@ -33,6 +49,8 @@ rand = "0.9.2"
 rayon = "1.11.0"
 chrono = "0.4.42"
 lazy_static = "1.5.0"
+rand_xoshiro = "0.7.0"
+nalgebra = "0.33.0"
 
 [features]
 default = []
@@ -42,8 +60,18 @@ lightgbm = ["dep:lightgbm3"]
 lightgbm-gpu = ["lightgbm", "lightgbm3/gpu", "lightgbm3/cuda"]
 xgboost = ["dep:xgb"]
 catboost = ["dep:catboost-rust"]
-tree-models-core = ["lightgbm", "xgboost"]
+sklears-tree = ["dep:sklears"]
+tree-models-core = ["lightgbm", "xgboost", "sklears-tree"]
 tree-models = ["tree-models-core", "catboost"]
+
+# Pure Rust ML features
+neuro-evolution = ["dep:crfmnes"]
+reinforcement-learning = ["dep:rlkit"]
+adaptive-models = ["dep:irithyll"]
+swarm-forecasting = ["dep:ruv-swarm-ml"]
+statistical-models = ["dep:linfa", "dep:linfa-linear", "dep:linfa-logistic", "dep:linfa-clustering", "dep:variational-regression"]
+anomaly-detection = ["dep:extended-isolation-forest"]
 
 # Burn pure-Rust deep learning (production backend)
 burn-backend = ["dep:burn", "dep:burn-ndarray"]
+pure-rust-ml = ["neuro-evolution", "reinforcement-learning", "adaptive-models", "swarm-forecasting", "burn-backend", "statistical-models", "anomaly-detection"]
