@@ -6,7 +6,7 @@ members = [
   "crates/forex-data",
   "crates/forex-models",
   "crates/forex-core",
-  "crates/forex-bindings",
+  "crates/forex-bindings", "crates/forex-app", "crates/mt5-bridge", "crates/forex-news",
 ]
 
 [patch.crates-io]
