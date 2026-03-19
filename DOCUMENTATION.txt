@@ -1,0 +1,51 @@
+FOREX AI - SYSTEM DOCUMENTATION (100% RUST)
+=========================================
+
+1. ARCHITECTURE OVERVIEW
+-----------------------
+The Forex AI system is a professional-grade, high-frequency trading engine 
+rewritten entirely in Rust to eliminate Global Interpreter Lock (GIL) 
+bottlenecks and ensure sub-millisecond execution safety.
+
+2. CRATE SYSTEM (THE ENGINE)
+---------------------------
+- forex-app: Central binary. Desktop GUI (egui) & Headless Server mode.
+- forex-core: Hardcoded Prop-Firm Risk Guard, Portfolio Math, & Configuration.
+- forex-data: High-speed OHLCV engine, Parquet loading, & TA-Lib integration.
+- forex-models: Pure Rust Machine Learning (XGBoost, Neural Nets via Burn).
+- forex-search: Genetic algorithms for strategy discovery & SMC tracking.
+- forex-news: Async news aggregator (Perplexity) & sentiment analyzer (OpenAI).
+- mt5-bridge: Embedded Python runtime calling native MetaTrader 5 APIs.
+
+3. OPERATION MODES
+------------------
+- GUI Mode: Native dashboard for Windows/Linux Desktop.
+  Run: ./forex-app
+- Headless Mode: Performance-optimized daemon for VPS/Linux servers.
+  Run: ./forex-app --headless --config config.yaml
+
+4. HARDWARE OPTIMIZATION
+------------------------
+The engine is designed for High-Performance Computing (HPC):
+- Multi-Threading: Native Rayon thread pool utilizes 100% of available cores.
+- GPU Acceleration: CUDA-enabled discovery engine for processing massive 
+  strategy populations (250k+ genomes).
+- Memory Safety: Zero-copy data sharing between modules.
+
+5. RISK & COMPLIANCE
+--------------------
+Mathematically rigid constraints are compiled into the Rust binary:
+- Daily Drawdown: Real-time equity tracking with hard stops.
+- Sizing: Dynamic position sizing based on inverse-volatility parity.
+- Security: Logic is isolated from the trading terminal to prevent GIL lag 
+  during high-volatility events.
+
+6. METATRADER 5 BRIDGE
+----------------------
+Maintains 100% compatibility with official MT5 APIs by embedding an isolated 
+Python runtime inside the Rust process. All order execution and account 
+polling are handled via memory pointers, bypassing typical API latency.
+
+=========================================
+STATUS: STABLE | VERSION: 2.0 (PURE RUST)
+=========================================
