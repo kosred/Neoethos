@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Produce a complete evidence-first audit of the current Rust-first repository, identify all active warnings/errors/runtime regressions, and leave the project with a verified findings ledger and a prioritized stabilization backlog.
+**Goal:** Produce a complete evidence-first audit of the current Rust-first repository, identify active warnings/errors/runtime regressions, and leave the project with a verified findings ledger, verification matrix, and prioritized stabilization backlog.
 
-**Architecture:** The audit runs in four layers: repository census, static verification, real-path runtime validation, and line-by-line code review. Every finding must be written into a shared audit report with file references, evidence, severity, and root-cause notes before any broad stabilization refactor begins.
+**Architecture:** The audit runs in five layers: repository census, static verification, real-path runtime validation, line-by-line subsystem review, and contract/operational hardening review. Every finding must be recorded with evidence, severity, root cause, and recommended fix direction before stabilization work begins.
 
-**Tech Stack:** Rust workspace (`cargo`, `clippy`, `cargo test`), existing app/CLI binaries, PowerShell command automation, targeted web verification against official docs when behavior or APIs are uncertain.
+**Tech Stack:** Rust workspace tooling (`cargo`, `clippy`, `cargo test`, `cargo build`), existing app/CLI binaries, PowerShell command automation, targeted Python contract probes where Python is still runtime-relevant, and official online documentation when any API or platform behavior is uncertain.
 
 ---
 
@@ -14,47 +14,66 @@
 
 - Create: `docs/superpowers/reports/2026-03-20-repo-audit-report.md`
 - Create: `docs/superpowers/reports/2026-03-20-verification-matrix.md`
+- Create: `docs/superpowers/reports/2026-03-20-stabilization-backlog.md`
 - Create: `cache/audit/2026-03-20-file-manifest.txt`
 - Create: `cache/audit/2026-03-20-command-log.txt`
 - Create: `cache/audit/2026-03-20-findings.jsonl`
-- Modify: `docs/superpowers/reports/2026-03-20-repo-audit-report.md`
-- Modify: `docs/superpowers/reports/2026-03-20-verification-matrix.md`
 
-## Chunk 1: Evidence Baseline And Findings Ledger
+## Chunk 1: Audit Artifacts, Census, And Static Baseline
 
-### Task 1: Create the audit ledger and verification matrix
+### Task 1: Create the audit artifacts and schemas
 
 **Files:**
 - Create: `docs/superpowers/reports/2026-03-20-repo-audit-report.md`
 - Create: `docs/superpowers/reports/2026-03-20-verification-matrix.md`
+- Create: `docs/superpowers/reports/2026-03-20-stabilization-backlog.md`
 - Create: `cache/audit/2026-03-20-command-log.txt`
 - Create: `cache/audit/2026-03-20-findings.jsonl`
 
 - [ ] **Step 1: Create the report skeleton**
 
-Add sections for:
+Create sections:
 - Executive Summary
 - Repository Census
-- Build Findings
+- Static Verification Findings
 - Runtime Findings
 - File-By-File Findings
-- Contract Findings
+- Contract And Operational Findings
 - Warning Inventory
 - Recommended Fix Tranches
 
 - [ ] **Step 2: Create the verification matrix skeleton**
 
-Add one row placeholder section for each critical path:
-- workspace build
-- workspace tests
-- clippy
-- CLI load/features/prepare
-- CLI discover/train
-- app headless local mode
-- app GUI startup smoke
-- MT5 bridge contract smoke
+Create columns/sections for:
+- lane
+- command or probe
+- prerequisites
+- timeout
+- environment
+- result state
+- evidence location
 
-- [ ] **Step 3: Create the command log and findings ledger files**
+Required lanes:
+- `baseline-windows`
+- `baseline-linux`
+- `python-contract`
+- `optional-informational-heavy-features`
+- `runtime-gui`
+- `runtime-headless`
+- `runtime-mt5`
+
+- [ ] **Step 3: Create the stabilization backlog skeleton**
+
+Create sections:
+- Build Blockers
+- Runtime Blockers
+- Warning Cleanup
+- Contract Repairs
+- Observability And Recovery
+- Structural Cleanup Candidates
+- UI Integration Entry Criteria
+
+- [ ] **Step 4: Create the command log and findings ledger files**
 
 Run:
 ```powershell
@@ -63,70 +82,73 @@ New-Item -ItemType Directory -Force docs/superpowers/reports | Out-Null
 Set-Content cache/audit/2026-03-20-command-log.txt ''
 Set-Content cache/audit/2026-03-20-findings.jsonl ''
 ```
-Expected: files exist and are empty.
+Expected: all files exist and are empty.
 
-- [ ] **Step 4: Commit the audit scaffolding**
+- [ ] **Step 5: Define the findings ledger schema**
+
+Document that each JSON line must include:
+- `category`
+- `severity`
+- `lane`
+- `command`
+- `file`
+- `line`
+- `summary`
+- `evidence`
+- `root_cause`
+- `recommended_fix`
+
+- [ ] **Step 6: Commit the audit scaffolding**
 
 Run:
 ```powershell
-git add docs/superpowers/reports/2026-03-20-repo-audit-report.md docs/superpowers/reports/2026-03-20-verification-matrix.md cache/audit/2026-03-20-command-log.txt cache/audit/2026-03-20-findings.jsonl
-git commit -m "docs: scaffold repo audit ledger"
+git add docs/superpowers/reports/2026-03-20-repo-audit-report.md docs/superpowers/reports/2026-03-20-verification-matrix.md docs/superpowers/reports/2026-03-20-stabilization-backlog.md cache/audit/2026-03-20-command-log.txt cache/audit/2026-03-20-findings.jsonl
+git commit -m "docs: scaffold repo audit artifacts"
 ```
-Expected: one commit containing only the audit scaffolding files.
+Expected: one commit containing only the audit artifact files.
 
-### Task 2: Generate the repository census manifest
+### Task 2: Generate the repository census and classification matrices
 
 **Files:**
 - Create: `cache/audit/2026-03-20-file-manifest.txt`
 - Modify: `docs/superpowers/reports/2026-03-20-repo-audit-report.md`
 - Modify: `cache/audit/2026-03-20-command-log.txt`
 
-- [ ] **Step 1: Generate the current file manifest**
+- [ ] **Step 1: Generate the first-party tracked file manifest**
 
 Run:
 ```powershell
-@(
-  '## Rust'
-  (rg --files . -g "*.rs")
-  '## Python'
-  (rg --files . -g "*.py")
-  '## TOML'
-  (rg --files . -g "*.toml")
-  '## YAML'
-  (rg --files . -g "*.yaml" -g "*.yml")
-  '## JSON'
-  (rg --files . -g "*.json")
-) | Set-Content cache/audit/2026-03-20-file-manifest.txt
+git ls-files | Set-Content cache/audit/2026-03-20-file-manifest.txt
 ```
-Expected: one manifest file containing the current repository surface grouped by file type.
+Expected: manifest contains the tracked repository surface.
 
-- [ ] **Step 2: Record the high-level census counts**
+- [ ] **Step 2: Record explicit excluded classes**
+
+Add to the audit report:
+- `vendor/`
+- `cache/`
+- `logs/`
+- `target/`
+- generated local output files
+
+Each must be marked as `excluded` or `evidence-only` with a reason.
+
+- [ ] **Step 3: Record high-level census counts**
 
 Run:
 ```powershell
+"tracked=$((git ls-files).Count)" | Add-Content cache/audit/2026-03-20-command-log.txt
 "rust=$((rg --files . -g '*.rs').Count)" | Add-Content cache/audit/2026-03-20-command-log.txt
 "python=$((rg --files . -g '*.py').Count)" | Add-Content cache/audit/2026-03-20-command-log.txt
 "toml=$((rg --files . -g '*.toml').Count)" | Add-Content cache/audit/2026-03-20-command-log.txt
 ```
-Expected: command log contains current file counts.
-
-- [ ] **Step 3: Write the census summary into the audit report**
-
-Add:
-- workspace members
-- binaries/entrypoints
-- UI crate
-- MT5 bridge crate
-- Python-dependent crates and bindings
-- remaining Python/shim presence
-- test surface size
+Expected: command log contains the census counts.
 
 - [ ] **Step 4: Add the subsystem classification matrix**
 
-Write one table row per subsystem and mark it as:
+Write one row per subsystem using only these statuses:
 - `runtime-critical`
-- `static-only`
-- `audit-required bridge`
+- `audit-required`
 - `evidence-only`
 - `excluded`
 
@@ -147,14 +169,34 @@ Required rows:
 - `vendor/`
 - generated/cache/log/build output directories
 
-- [ ] **Step 5: Commit the census baseline**
+- [ ] **Step 5: Add the active-file classification matrix**
+
+Write one row per file class using only these statuses:
+- `runtime-critical`
+- `static-only`
+- `audit-required bridge`
+- `evidence-only`
+- `excluded`
+
+- [ ] **Step 6: Record workspace members, binaries, and Python-dependent seams**
+
+Add to the audit report:
+- workspace members from `Cargo.toml`
+- binaries and entrypoints
+- Python-dependent crates and bindings
+- UI crate
+- MT5 bridge crate
+- remaining Python/shim presence
+- test and examples surface
+
+- [ ] **Step 7: Commit the census baseline**
 
 Run:
 ```powershell
 git add cache/audit/2026-03-20-file-manifest.txt cache/audit/2026-03-20-command-log.txt docs/superpowers/reports/2026-03-20-repo-audit-report.md
 git commit -m "docs: record repo audit census"
 ```
-Expected: one commit with the repository census artifacts.
+Expected: one commit with the census artifacts only.
 
 ### Task 3: Capture the static verification baseline
 
@@ -164,39 +206,50 @@ Expected: one commit with the repository census artifacts.
 - Modify: `cache/audit/2026-03-20-command-log.txt`
 - Modify: `cache/audit/2026-03-20-findings.jsonl`
 
-- [ ] **Step 1: Run workspace build verification**
+- [ ] **Step 1: Add the baseline verification lanes to the matrix**
 
-Before executing, write the supported verification lanes into the verification matrix:
-- `baseline-windows`
-- `baseline-linux` if reviewable without execution
-- `python-contract`
-- `optional-informational-heavy-features`
+Define:
+- `baseline-windows`: supported local developer/runtime profile on the current OS
+- `baseline-linux`: review-only or run elsewhere if available
+- `python-contract`: active Python-dependent runtime contracts
+- `optional-informational-heavy-features`: heavyweight optional integrations
+
+- [ ] **Step 2: Run workspace check**
 
 Run:
 ```powershell
 cargo check --workspace
 ```
-Expected: either exit `0` or concrete compiler findings captured.
+Expected: exit `0` or captured findings.
 
-- [ ] **Step 2: Run workspace tests**
+- [ ] **Step 3: Run workspace tests**
 
 Run:
 ```powershell
 cargo test --workspace
 ```
-Expected: either exit `0` or concrete failing tests captured.
+Expected: exit `0` or captured findings.
 
-- [ ] **Step 3: Run workspace clippy under warning denial**
+- [ ] **Step 4: Run clippy on the supported baseline**
 
 Run:
 ```powershell
 cargo clippy --workspace --all-targets -- -D warnings
 ```
-Expected: either exit `0` or a full warning/error inventory.
+Expected: exit `0` or captured findings.
 
-- [ ] **Step 4: Run Python-contract validation for active runtime seams**
+- [ ] **Step 5: Run targeted binary builds**
 
-Run the minimal checks required to prove currently active Python-dependent contracts are present or explicitly broken, for example:
+Run:
+```powershell
+cargo build -p forex-cli
+cargo build -p forex-app
+```
+Expected: successful link/build or captured findings.
+
+- [ ] **Step 6: Run Python-contract validation**
+
+Run:
 ```powershell
 python -c "import sys; print(sys.version)"
 python -c "import forex_bindings"
@@ -204,46 +257,57 @@ python -c "import MetaTrader5"
 ```
 Expected: explicit success, explicit failure, or a documented `BLOCKED` state where the environment is not expected to provide the dependency.
 
-- [ ] **Step 5: Run informational heavy-feature lanes separately if needed**
+- [ ] **Step 7: Run informational heavy-feature lanes if needed**
 
-Examples:
+Run:
 ```powershell
 cargo check -p forex-models
 cargo check -p forex-search
 ```
-Expected: findings labeled `informational` unless they affect the supported baseline.
+Expected: findings marked `informational` unless they affect the supported baseline.
 
-- [ ] **Step 6: Record every failure or warning into the findings ledger**
+- [ ] **Step 8: Record every static finding into the ledger**
 
-For each issue, append one JSON line with:
-- `category`
-- `severity`
-- `lane`
-- `command`
-- `file`
-- `line`
-- `summary`
-- `evidence`
+For each issue, append one JSON line with the required schema:
+- category
+- severity
+- lane
+- command
+- file
+- line
+- summary
+- evidence
+- root_cause
+- recommended_fix
 
-- [ ] **Step 7: Update the verification matrix and audit report**
+- [ ] **Step 9: Update the verification matrix with result states**
 
-Mark each command as:
-- PASS
-- FAIL
-- PASS WITH FINDINGS
-- BLOCKED
-- N/A
+Allowed states:
+- `PASS`
+- `FAIL`
+- `PASS WITH FINDINGS`
+- `BLOCKED`
+- `N/A`
 
-- [ ] **Step 8: Commit the static verification results**
+- [ ] **Step 10: Record exit status for every command in the command log**
+
+Each command entry must include:
+- timestamp
+- lane
+- command
+- exit status
+- output location or inline summary
+
+- [ ] **Step 11: Commit the static verification baseline**
 
 Run:
 ```powershell
 git add docs/superpowers/reports/2026-03-20-repo-audit-report.md docs/superpowers/reports/2026-03-20-verification-matrix.md cache/audit/2026-03-20-command-log.txt cache/audit/2026-03-20-findings.jsonl
 git commit -m "docs: capture static verification baseline"
 ```
-Expected: one commit containing only evidence and report updates.
+Expected: one commit containing the static verification evidence only.
 
-## Chunk 2: Runtime Sweep, Line-By-Line Audit, And Stabilization Triage
+## Chunk 2: Runtime Sweep, File Audit, And Contract Review
 
 ### Task 4: Execute the real-path runtime sweep
 
@@ -253,15 +317,18 @@ Expected: one commit containing only evidence and report updates.
 - Modify: `cache/audit/2026-03-20-command-log.txt`
 - Modify: `cache/audit/2026-03-20-findings.jsonl`
 
-- [ ] **Step 1: Run the CLI data path smoke checks**
+- [ ] **Step 1: Define runtime probe prerequisites and timeouts**
 
-Before executing, write prerequisites and timeout rules into the verification matrix:
-- command
+For every runtime probe, write:
+- command or manual probe
 - OS
 - required files/config
 - required services/modules
 - timeout
+- expected environment
 - result state
+
+- [ ] **Step 2: Run the CLI data path smoke checks**
 
 Run:
 ```powershell
@@ -270,61 +337,74 @@ cargo run -p forex-cli -- timeframes --root data --symbol EURUSD
 cargo run -p forex-cli -- load --root data --symbol EURUSD --timeframe M1
 cargo run -p forex-cli -- features --root data --symbol EURUSD --timeframe M1
 ```
-Expected: successful command output or concrete reproducible failures.
+Expected: successful output or concrete failures.
 
-- [ ] **Step 2: Run the CLI preparation and discovery path**
+- [ ] **Step 3: Run the CLI preparation and discovery path**
 
 Run:
 ```powershell
 cargo run -p forex-cli -- prepare --root data --symbol EURUSD --base M1 --higher M5,M15,H1
 cargo run -p forex-cli -- discover --root data --symbol EURUSD --base M1 --higher M5,M15,H1 --population 10 --generations 1 --candidates 20 --portfolio-size 10
 ```
-Expected: either successful preparation/discovery output or concrete contract/runtime failures.
+Expected: successful output or concrete failures.
 
-- [ ] **Step 3: Run the CLI training path**
+- [ ] **Step 4: Run the CLI training path**
 
 Run:
 ```powershell
 cargo run -p forex-cli -- train --root data --symbol EURUSD --base M1 --config config.yaml --models-dir models
 ```
-Expected: either successful training startup/completion or concrete reproducible failures.
+Expected: successful startup/completion or concrete failures.
 
-- [ ] **Step 4: Run the app headless local path**
+- [ ] **Step 5: Run the app headless local path**
 
 Run:
 ```powershell
 cargo run -p forex-app -- --headless --local --config config.yaml
 ```
-Expected: successful startup and steady keep-alive behavior, or a concrete failure with logs.
+Expected: successful startup and keep-alive, or concrete failures.
 
-- [ ] **Step 5: Run the app GUI smoke path**
+- [ ] **Step 6: Run the app GUI smoke path**
 
 Run:
 ```powershell
 cargo run -p forex-app -- --local --config config.yaml
 ```
-Expected: successful startup to a visible window, or a concrete startup failure.
+Expected: `PASS`, `FAIL`, or `BLOCKED` if the current session cannot support GUI startup.
 
-- [ ] **Step 6: Run the MT5 bridge smoke path**
+- [ ] **Step 7: Run the MT5 prerequisite probe**
 
-Use the app trading tab connection flow or a targeted minimal probe if startup alone is insufficient.
-Expected: explicit success, explicit graceful offline behavior, a `BLOCKED` result because prerequisites are missing, or concrete bridge failure details.
+Run:
+```powershell
+python -c "import MetaTrader5 as mt5; ok = mt5.initialize(); print({'initialize': ok, 'terminal_info': str(mt5.terminal_info()) if ok else None, 'last_error': None if ok else mt5.last_error()}); mt5.shutdown() if ok else None"
+```
+Expected: explicit success, explicit failure, or `BLOCKED` if the environment does not provide MT5.
 
-- [ ] **Step 7: Record every runtime finding and update the verification matrix**
+- [ ] **Step 8: Run the MT5 bridge contract probe**
 
-No runtime issue is “known” unless:
-- the command is written down
-- the exact observed result is captured
-- the finding is added to the ledger
+Probe:
+- launch `forex-app` in MT5 mode on Windows
+- use the Trading tab connect action
+- capture whether status changes and whether terminal-info is surfaced
 
-- [ ] **Step 8: Commit the runtime evidence**
+Expected: `PASS`, `FAIL`, or `BLOCKED` with explicit reason. A graceful offline/not-available path is not a failure if it is handled explicitly and consistently.
+
+- [ ] **Step 9: Record every runtime finding**
+
+No runtime issue is known unless:
+- the exact probe is recorded
+- the observed result is captured
+- the result state is assigned
+- the finding is written to the ledger
+
+- [ ] **Step 10: Commit the runtime evidence**
 
 Run:
 ```powershell
 git add docs/superpowers/reports/2026-03-20-repo-audit-report.md docs/superpowers/reports/2026-03-20-verification-matrix.md cache/audit/2026-03-20-command-log.txt cache/audit/2026-03-20-findings.jsonl
 git commit -m "docs: capture runtime audit evidence"
 ```
-Expected: one commit containing runtime evidence updates only.
+Expected: one commit containing runtime evidence only.
 
 ### Task 5: Perform the line-by-line code audit by subsystem
 
@@ -342,44 +422,58 @@ Review:
 - `config.yaml`
 - service and script wrappers
 
-Record mismatches, stale deps, feature-gate drift, and startup inconsistencies.
+- [ ] **Step 2: Audit `crates/forex-app/src/`**
 
-- [ ] **Step 2: Audit app and MT5 boundary files**
+Record UI runtime assumptions, async behavior, message flow issues, and startup/warning concerns.
 
-Review all files listed in the manifest under:
-- `crates/forex-app/src/`
-- `crates/mt5-bridge/src/`
+- [ ] **Step 3: Audit `crates/mt5-bridge/src/`**
 
-Record UI/backend contract gaps, async issues, MT5 bridge assumptions, and warning-prone code.
+Record Python contract assumptions, error handling, bridge lifecycle issues, and MT5 failure visibility gaps.
 
-- [ ] **Step 3: Audit core/data/search/model crates**
+- [ ] **Step 4: Audit `crates/forex-core/src/`**
 
-Review all files listed in the manifest under:
-- `crates/forex-core/src/`
-- `crates/forex-data/src/`
-- `crates/forex-search/src/`
-- `crates/forex-models/src/`
-- `crates/forex-news/src/`
-- `crates/forex-cli/src/`
-- `crates/forex-bindings/src/`
+Record stale comments, contract mismatches, utility drift, and warning-prone code.
 
-Record migration leftovers, contract mismatches, silent fallbacks, and error-handling gaps.
+- [ ] **Step 5: Audit `crates/forex-data/src/`**
 
-- [ ] **Step 4: Audit remaining Python/shim files**
+Record data-loading assumptions, resampling/feature-prep issues, and runtime contract gaps.
 
-Review every remaining active Python file listed in the manifest.
-For each file, classify it as:
+- [ ] **Step 6: Audit `crates/forex-search/src/`**
+
+Record discovery/search correctness risks, feature-gate assumptions, and warning-prone code.
+
+- [ ] **Step 7: Audit `crates/forex-models/src/`**
+
+Record model orchestration issues, Python dependency seams, error handling gaps, and performance/safety risks.
+
+- [ ] **Step 8: Audit `crates/forex-bindings/src/`**
+
+Record FFI contract issues, PyO3 lifecycle assumptions, and silent failure risks.
+
+- [ ] **Step 9: Audit `crates/forex-news/src/` and `crates/forex-cli/src/`**
+
+Record command-surface issues, integration mismatches, and stale migration assumptions.
+
+- [ ] **Step 10: Audit remaining Python and shim files**
+
+For each remaining Python file, classify it as:
 - active runtime code
 - temporary bridge
 - dead/reachable compatibility seam
 - config/bootstrap only
 
-- [ ] **Step 5: Verify uncertain API or platform assumptions online**
+- [ ] **Step 11: Audit `tests/` and `examples/` as evidence-bearing assets**
 
-For any uncertain behavior, check official docs before writing the finding as actionable.
-Record the source URL next to the finding.
+Look for:
+- stale assumptions
+- missing coverage on active paths
+- examples that no longer match runtime reality
 
-- [ ] **Step 6: Group findings by severity and subsystem**
+- [ ] **Step 12: Verify uncertain API or platform assumptions online**
+
+For any uncertain behavior, use official documentation and record the source URL next to the finding.
+
+- [ ] **Step 13: Group findings by severity and subsystem**
 
 The report must end this task with:
 - Critical
@@ -388,48 +482,117 @@ The report must end this task with:
 
 Each group must be subdivided by subsystem.
 
-- [ ] **Step 7: Commit the completed audit report**
+- [ ] **Step 14: Commit the line-by-line audit findings**
 
 Run:
 ```powershell
 git add docs/superpowers/reports/2026-03-20-repo-audit-report.md cache/audit/2026-03-20-findings.jsonl
 git commit -m "docs: complete repo line-by-line audit report"
 ```
-Expected: one commit containing the complete findings ledger and report updates.
+Expected: one commit containing the completed findings ledger and report updates.
 
-### Task 6: Produce the stabilization backlog and execution handoff
+### Task 6: Perform the contract and operational hardening audit
+
+**Files:**
+- Modify: `docs/superpowers/reports/2026-03-20-repo-audit-report.md`
+- Modify: `docs/superpowers/reports/2026-03-20-stabilization-backlog.md`
+
+- [ ] **Step 1: Audit CLI contracts**
+
+Check:
+- argument surfaces
+- config expectations
+- failure visibility
+- reproducibility of commands
+
+- [ ] **Step 2: Audit app-to-engine contracts**
+
+Check:
+- app state ownership
+- UI action to runtime action mapping
+- progress/result propagation
+- explicit failure behavior
+
+- [ ] **Step 3: Audit MT5 bridge operational behavior**
+
+Check:
+- initialize/shutdown lifecycle
+- terminal-info surfacing
+- explicit offline behavior
+- dependency and environment visibility
+
+- [ ] **Step 4: Audit logging, metrics, and progress reporting**
+
+Check:
+- actionable log messages
+- hidden failures
+- missing progress or checkpoint visibility
+
+- [ ] **Step 5: Audit checkpointing and recovery points**
+
+Check:
+- recoverable long-running operations
+- restart expectations
+- persistence boundaries
+
+- [ ] **Step 6: Record contract and operational findings**
+
+Every finding must still include:
+- evidence
+- root cause
+- recommended fix
+
+- [ ] **Step 7: Commit the contract/operational audit**
+
+Run:
+```powershell
+git add docs/superpowers/reports/2026-03-20-repo-audit-report.md docs/superpowers/reports/2026-03-20-stabilization-backlog.md
+git commit -m "docs: record contract and operational audit findings"
+```
+Expected: one commit containing only contract/operational audit updates.
+
+## Chunk 3: Stabilization Backlog And Execution Handoff
+
+### Task 7: Produce the stabilization backlog and handoff
 
 **Files:**
 - Modify: `docs/superpowers/reports/2026-03-20-repo-audit-report.md`
 - Modify: `docs/superpowers/reports/2026-03-20-verification-matrix.md`
+- Modify: `docs/superpowers/reports/2026-03-20-stabilization-backlog.md`
 
 - [ ] **Step 1: Convert findings into fix tranches**
 
 Create tranches in this order:
 - build blockers
 - runtime blockers
-- warnings and lint cleanup
+- warning and lint cleanup
 - contract repairs
-- observability/checkpoint upgrades
+- observability and recovery upgrades
 - structural cleanup candidates
 
-- [ ] **Step 2: Add explicit entry criteria for the UI integration phase**
+- [ ] **Step 2: Define entry criteria for UI integration**
 
-Define what must be true before UI/backend integration starts:
-- stable app startup
-- stable engine contract
-- stable MT5 bridge behavior
-- no unresolved critical runtime findings
+The UI phase must not start until:
+- app startup is stable
+- backend contracts are explicit
+- MT5 bridge behavior is verified or explicitly blocked by environment only
+- no critical runtime findings remain unresolved
 
-- [ ] **Step 3: Add a short “recommended next execution order” section**
+- [ ] **Step 3: Name the first concrete fix tranche**
 
-This section must name the first concrete fix tranche to execute after the audit.
+This section must identify the first stabilization execution step after the audit, with rationale.
 
-- [ ] **Step 4: Commit the stabilization handoff**
+- [ ] **Step 4: Cross-check the backlog against the audit report**
+
+Every critical or important finding must either:
+- appear in the backlog
+- be explicitly deferred with reason
+
+- [ ] **Step 5: Commit the stabilization handoff**
 
 Run:
 ```powershell
-git add docs/superpowers/reports/2026-03-20-repo-audit-report.md docs/superpowers/reports/2026-03-20-verification-matrix.md
+git add docs/superpowers/reports/2026-03-20-repo-audit-report.md docs/superpowers/reports/2026-03-20-verification-matrix.md docs/superpowers/reports/2026-03-20-stabilization-backlog.md
 git commit -m "docs: add stabilization backlog and handoff"
 ```
 Expected: one commit containing the prioritized stabilization handoff.
