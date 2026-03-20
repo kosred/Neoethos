@@ -374,7 +374,10 @@ Initial line-by-line findings from the runtime-critical entrypoints audited so f
 
 ## Contract And Operational Findings
 
-Pending contract audit.
+- the highest-risk operational pattern in the current codebase is `false success`: training, discovery, model loading, and provider-backed news paths can all currently return or appear successful while doing placeholder work or operating in degraded mode
+- the second recurring pattern is `public contract drift`: the bindings and CLI surfaces expose parameters, flags, or helper functions that are ignored, stubbed, or no longer aligned with runtime behavior
+- the third recurring pattern is `operator visibility loss`: important states are downgraded to log lines, placeholder defaults, or dropped guards rather than explicit result states and durable logging
+- these three patterns define the first stabilization order more reliably than a crate-by-crate cleanup pass
 
 ## Warning Inventory
 
@@ -382,7 +385,12 @@ Pending baseline and runtime sweeps.
 
 ## Recommended Fix Tranches
 
-Pending stabilization backlog population.
+- `Tranche 1`: remove false-success training and parallel failure suppression
+- `Tranche 2`: make dataset/discovery degradation explicit and fail fast on corrupt timestamps
+- `Tranche 3`: repair MT5 error surfacing and unify logging/observability contracts
+- `Tranche 4`: remove or implement placeholder public bindings and CLI/help contract drift
+- `Tranche 5`: clear the enforced warning/lint baseline
+- detailed breakdown lives in [`docs/superpowers/reports/2026-03-20-stabilization-backlog.md`](C:/Users/konst/development/forex-ai/docs/superpowers/reports/2026-03-20-stabilization-backlog.md)
 
 ## Findings Ledger Schema
 
