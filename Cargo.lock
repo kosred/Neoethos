@@ -3293,6 +3293,7 @@ dependencies = [
  "forex-models",
  "forex-search",
  "mt5-bridge",
+ "num_cpus",
  "tokio",
  "tracing",
  "tracing-subscriber",
