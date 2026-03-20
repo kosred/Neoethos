@@ -5,7 +5,7 @@
 ## Repository Census
 
 Tracked surface:
-- `tracked files`: 1080
+- `tracked files`: 1081
 - `Rust source files`: 106
 - `Python files`: 6
 - `TOML files`: 14
@@ -102,8 +102,77 @@ Tracked surface:
 
 ## Static Verification Findings
 
-Pending Chunk 1 baseline execution.
+### cargo check --workspace
 
+- Exit code: 0
+- Result state: PASS WITH FINDINGS
+- Warning clusters: 7
+- Total warnings observed: 58
+
+#### Warnings by subsystem
+
+- crates/forex-core/src/domain/risk.rs: unused imports in risk module
+- crates/forex-core/src/domain/portfolio.rs: unused imports and dead correlation_threshold field
+- crates/forex-news/src/openai.rs, crates/forex-news/src/perplexity.rs, crates/forex-news/src/lib.rs: unused imports
+- crates/forex-data/src/core/features.rs: unused imports and unused bail import
+- crates/forex-search/src/validation.rs: unused imports
+- crates/forex-models/src/*: many unused imports, unused variables, and dead model fields across tree/evolution/RL/statistical/anomaly modules
+- crates/forex-bindings/src/*: unused imports and deprecated downcast calls
+- crates/forex-app/src/main.rs: unused imports and deprecated downcast call
+
+
+### cargo test --workspace
+
+- Exit code: 1
+- Result state: FAIL
+- Failing test: `crates/forex-models/src/hardware.rs:377` in `hardware::tests::test_gpu_distribution`
+- Root cause: `distribute_gpu_assignment()` uses zero-based modulo arithmetic, but the test contract is explicitly written as one-based model numbering (`Model 1 -> GPU 0`, `Model 2 -> GPU 1`, etc.), so implementation and test disagree on indexing semantics.
+- Evidence: `cargo test --workspace` failed with `left: 1 right: 0` at `crates\forex-models\src\hardware.rs:377`
+- Recommended fix direction: normalize the index before modulo or change the contract to explicit 0-based indexing and update the test accordingly
+### cargo clippy --workspace --all-targets -- -D warnings
+
+- Exit code: 1
+- Result state: FAIL
+- High-signal clippy errors in `crates/forex-core`:
+  - `crates/forex-core/src/domain/risk.rs`: unused imports, `manual_range_contains`, `collapsible_if`, `too_many_arguments`, `manual_clamp`, and `derivable_impls`
+  - `crates/forex-core/src/domain/portfolio.rs`: unused imports, dead `correlation_threshold` field, and `needless_range_loop`
+  - `crates/forex-core/src/domain/drift_monitor.rs`: `manual_clamp`
+  - `crates/forex-core/src/system.rs`: `new_without_default` and `needless_borrows_for_generic_args`
+- High-signal clippy errors in `crates/forex-data`:
+  - `crates/forex-data/src/core/features.rs`: unused imports and `derivable_impls`
+  - `crates/forex-data/src/core/indicators.rs`: `needless_range_loop`
+  - `crates/forex-data/src/core/resample.rs`: `collapsible_if`
+  - `crates/forex-data/src/lib.rs`: `unnecessary_map_or`
+- Evidence: `cargo clippy --workspace --all-targets -- -D warnings` stopped on `forex-core` after surfacing 16 errors there and additional errors in `forex-data`
+- Recommended fix direction: clean the shared core/data crates first, then rerun clippy before touching higher-level layers
+
+### cargo build -p forex-cli
+
+- Exit code: 0
+- Result state: PASS WITH FINDINGS
+- Build completed successfully in `dev` profile
+- Repeated warning clusters observed in `crates/forex-core`, `crates/forex-data`, `crates/forex-search`, and `crates/forex-models`
+- No new build-only blocker surfaced beyond the existing warning inventory
+
+### cargo build -p forex-app
+
+- Exit code: 0
+- Result state: PASS WITH FINDINGS
+- Build completed successfully in `dev` profile
+- Repeated upstream warning clusters remained visible
+- App-local warnings still present in `crates/forex-app/src/main.rs` for unused `Arc` and `Mutex` imports
+
+### Python Contract Probes
+
+- `python -c "import sys; print(sys.version)"`: PASS, Python `3.13.9`
+- `python -c "import forex_bindings"`: PASS
+- `python -c "import MetaTrader5"`: PASS
+
+### Informational Lanes
+
+- `cargo check -p forex-models`: PASS WITH FINDINGS, repeated warning cluster in `crates/forex-models`
+- `cargo check -p forex-search`: PASS WITH FINDINGS, repeated warning cluster in `crates/forex-search` plus shared warnings from `crates/forex-data`
+- `baseline-linux`: N/A in the current Windows-only session; retain as review-only lane until a Linux host is available
 ## Runtime Findings
 
 Pending Chunk 2 runtime execution.
