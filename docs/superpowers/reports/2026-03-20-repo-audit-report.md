@@ -175,7 +175,53 @@ Tracked surface:
 - `baseline-linux`: N/A in the current Windows-only session; retain as review-only lane until a Linux host is available
 ## Runtime Findings
 
-Pending Chunk 2 runtime execution.
+Runtime probes were executed against the already-built `target/debug` binaries after the static baseline confirmed the binaries link successfully. This avoided repeated `cargo run` rebuild noise while preserving the same runtime code path.
+
+### CLI Data And Feature Paths
+
+- `symbols`: PASS
+  - discovered 7 symbols from `data/`
+- `timeframes EURUSD`: PASS
+  - discovered 21 timeframes for EURUSD
+- `load EURUSD M1`: PASS
+  - loaded `5267265` rows
+- `features EURUSD M1`: PASS
+  - produced a feature frame with `5267265` rows and `11` columns
+- `prepare EURUSD base=M1 higher=M5,M15,H1`: PASS
+  - produced a multitimeframe feature frame with `5267265` rows and `44` columns
+
+### CLI Discovery And Training Paths
+
+- `discover EURUSD ... population=10 generations=1 candidates=20 portfolio-size=10`: PASS WITH FINDINGS
+  - command exited `0`
+  - result was operationally degraded: `portfolio=0` and `candidates=3`
+  - follow-up needed in the line-by-line audit to determine whether this is expected under the minimal smoke configuration or whether the CLI should surface an explicit degraded-state warning/non-zero outcome
+- `train EURUSD ...`: PASS
+  - completed with `Pure Rust training complete for EURUSD`
+
+### App Startup Paths
+
+- `forex-app --headless --local --config config.yaml`: PASS
+  - process started successfully
+  - remained alive for a 6-second smoke window
+  - required controlled termination
+  - emitted no stderr
+- `forex-app --local --config config.yaml`: PASS
+  - GUI process started successfully
+  - remained alive for a 6-second smoke window
+  - required controlled termination
+  - emitted no stderr
+
+### MT5 Runtime Surface
+
+- MT5 prerequisite probe: PASS WITH FINDINGS
+  - `MetaTrader5` imported successfully
+  - `initialize()` returned `False`
+  - runtime evidence: `last_error = (-6, 'Terminal: Authorization failed')`
+- MT5 bridge contract probe: BLOCKED
+  - the interactive Trading-tab connect action could not be automated from the current terminal-driven audit session
+  - this is environment/tooling blocked, not yet a proven code failure
+  - the prerequisite probe already shows the local MT5 environment is not authorized, so a connect attempt is expected to fail unless terminal authorization is fixed
 
 ## File-By-File Findings
 
