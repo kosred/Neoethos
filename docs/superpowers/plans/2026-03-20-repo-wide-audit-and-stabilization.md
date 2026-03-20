@@ -47,6 +47,7 @@ Create sections:
 Create columns/sections for:
 - lane
 - command or probe
+- expected outcome
 - prerequisites
 - timeout
 - environment
@@ -73,18 +74,29 @@ Create sections:
 - Structural Cleanup Candidates
 - UI Integration Entry Criteria
 
-- [ ] **Step 4: Create the command log and findings ledger files**
+- [ ] **Step 4: Create every audit artifact on disk**
 
 Run:
 ```powershell
 New-Item -ItemType Directory -Force cache/audit | Out-Null
 New-Item -ItemType Directory -Force docs/superpowers/reports | Out-Null
+Set-Content docs/superpowers/reports/2026-03-20-repo-audit-report.md ''
+Set-Content docs/superpowers/reports/2026-03-20-verification-matrix.md ''
+Set-Content docs/superpowers/reports/2026-03-20-stabilization-backlog.md ''
 Set-Content cache/audit/2026-03-20-command-log.txt ''
 Set-Content cache/audit/2026-03-20-findings.jsonl ''
 ```
-Expected: all files exist and are empty.
+Expected: all six audit artifact files exist on disk.
 
-- [ ] **Step 5: Define the findings ledger schema**
+- [ ] **Step 5: Verify every audit artifact contains the required structure**
+
+Verify before the first commit:
+- `2026-03-20-repo-audit-report.md` contains all required report sections
+- `2026-03-20-verification-matrix.md` contains all required lanes and the `expected outcome` field
+- `2026-03-20-stabilization-backlog.md` contains all required backlog sections
+- `2026-03-20-command-log.txt` and `2026-03-20-findings.jsonl` exist and are writable
+
+- [ ] **Step 6: Define the findings ledger schema**
 
 Document that each JSON line must include:
 - `category`
@@ -98,7 +110,19 @@ Document that each JSON line must include:
 - `root_cause`
 - `recommended_fix`
 
-- [ ] **Step 6: Commit the audit scaffolding**
+Allowed `category` values:
+- `build breakage`
+- `test failure`
+- `lint/warning`
+- `runtime breakage`
+- `correctness bug`
+- `contract mismatch`
+- `dead or unreachable code`
+- `observability gap`
+- `performance risk`
+- `architectural smell`
+
+- [ ] **Step 7: Commit the audit scaffolding**
 
 Run:
 ```powershell
@@ -137,10 +161,11 @@ Each must be marked as `excluded` or `evidence-only` with a reason.
 
 Run:
 ```powershell
-"tracked=$((git ls-files).Count)" | Add-Content cache/audit/2026-03-20-command-log.txt
-"rust=$((rg --files . -g '*.rs').Count)" | Add-Content cache/audit/2026-03-20-command-log.txt
-"python=$((rg --files . -g '*.py').Count)" | Add-Content cache/audit/2026-03-20-command-log.txt
-"toml=$((rg --files . -g '*.toml').Count)" | Add-Content cache/audit/2026-03-20-command-log.txt
+$tracked = @(git ls-files)
+"tracked=$($tracked.Count)" | Add-Content cache/audit/2026-03-20-command-log.txt
+"rust=$((@($tracked | Where-Object { $_ -like '*.rs' })).Count)" | Add-Content cache/audit/2026-03-20-command-log.txt
+"python=$((@($tracked | Where-Object { $_ -like '*.py' })).Count)" | Add-Content cache/audit/2026-03-20-command-log.txt
+"toml=$((@($tracked | Where-Object { $_ -like '*.toml' })).Count)" | Add-Content cache/audit/2026-03-20-command-log.txt
 ```
 Expected: command log contains the census counts.
 
@@ -222,7 +247,14 @@ cargo check --workspace
 ```
 Expected: exit `0` or captured findings.
 
-- [ ] **Step 3: Run workspace tests**
+- [ ] **Step 3: Immediately record the workspace-check result**
+
+Before moving on:
+- append the command, timestamp, exit status, and output summary to `cache/audit/2026-03-20-command-log.txt`
+- update the `baseline-windows` row in the verification matrix
+- append any findings from this command to the findings ledger
+
+- [ ] **Step 4: Run workspace tests**
 
 Run:
 ```powershell
@@ -230,7 +262,14 @@ cargo test --workspace
 ```
 Expected: exit `0` or captured findings.
 
-- [ ] **Step 4: Run clippy on the supported baseline**
+- [ ] **Step 5: Immediately record the workspace-test result**
+
+Before moving on:
+- append the command, timestamp, exit status, and output summary to `cache/audit/2026-03-20-command-log.txt`
+- update the `baseline-windows` row in the verification matrix
+- append any findings from this command to the findings ledger
+
+- [ ] **Step 6: Run clippy on the supported baseline**
 
 Run:
 ```powershell
@@ -238,37 +277,121 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 Expected: exit `0` or captured findings.
 
-- [ ] **Step 5: Run targeted binary builds**
+- [ ] **Step 7: Immediately record the clippy result**
+
+Before moving on:
+- append the command, timestamp, exit status, and output summary to `cache/audit/2026-03-20-command-log.txt`
+- update the `baseline-windows` row in the verification matrix
+- append any findings from this command to the findings ledger
+
+- [ ] **Step 8: Run the `forex-cli` binary build**
 
 Run:
 ```powershell
 cargo build -p forex-cli
+```
+Expected: successful link/build or captured findings.
+
+- [ ] **Step 9: Immediately record the `forex-cli` build result**
+
+Before moving on:
+- append the command, timestamp, exit status, and output summary to `cache/audit/2026-03-20-command-log.txt`
+- update the relevant verification-matrix row
+- append any findings from this command to the findings ledger
+
+- [ ] **Step 10: Run the `forex-app` binary build**
+
+Run:
+```powershell
 cargo build -p forex-app
 ```
 Expected: successful link/build or captured findings.
 
-- [ ] **Step 6: Run Python-contract validation**
+- [ ] **Step 11: Immediately record the `forex-app` build result**
+
+Before moving on:
+- append the command, timestamp, exit status, and output summary to `cache/audit/2026-03-20-command-log.txt`
+- update the relevant verification-matrix row
+- append any findings from this command to the findings ledger
+
+- [ ] **Step 12: Run the Python version probe**
 
 Run:
 ```powershell
 python -c "import sys; print(sys.version)"
+```
+Expected: explicit success or captured failure.
+
+- [ ] **Step 13: Immediately record the Python version result**
+
+Before moving on:
+- append the command, timestamp, exit status, and output summary to `cache/audit/2026-03-20-command-log.txt`
+- update the `python-contract` row in the verification matrix
+- append any findings from this command to the findings ledger
+
+- [ ] **Step 14: Run the `forex_bindings` import probe**
+
+Run:
+```powershell
 python -c "import forex_bindings"
+```
+Expected: explicit success, explicit failure, or documented `BLOCKED`.
+
+- [ ] **Step 15: Immediately record the `forex_bindings` import result**
+
+Before moving on:
+- append the command, timestamp, exit status, and output summary to `cache/audit/2026-03-20-command-log.txt`
+- update the `python-contract` row in the verification matrix
+- append any findings from this command to the findings ledger
+
+- [ ] **Step 16: Run the `MetaTrader5` import probe**
+
+Run:
+```powershell
 python -c "import MetaTrader5"
 ```
 Expected: explicit success, explicit failure, or a documented `BLOCKED` state where the environment is not expected to provide the dependency.
 
-- [ ] **Step 7: Run informational heavy-feature lanes if needed**
+- [ ] **Step 17: Immediately record the `MetaTrader5` import result**
+
+Before moving on:
+- append the command, timestamp, exit status, and output summary to `cache/audit/2026-03-20-command-log.txt`
+- update the `python-contract` row in the verification matrix
+- append any findings from this command to the findings ledger
+
+- [ ] **Step 18: Run the `forex-models` informational lane if needed**
 
 Run:
 ```powershell
 cargo check -p forex-models
+```
+Expected: findings marked `informational` unless they affect the supported baseline.
+
+- [ ] **Step 19: Immediately record the `forex-models` informational result**
+
+Before moving on:
+- append the command, timestamp, exit status, and output summary to `cache/audit/2026-03-20-command-log.txt`
+- update the `optional-informational-heavy-features` row in the verification matrix
+- append any findings from this command to the findings ledger
+
+- [ ] **Step 20: Run the `forex-search` informational lane if needed**
+
+Run:
+```powershell
 cargo check -p forex-search
 ```
 Expected: findings marked `informational` unless they affect the supported baseline.
 
-- [ ] **Step 8: Record every static finding into the ledger**
+- [ ] **Step 21: Immediately record the `forex-search` informational result**
 
-For each issue, append one JSON line with the required schema:
+Before moving on:
+- append the command, timestamp, exit status, and output summary to `cache/audit/2026-03-20-command-log.txt`
+- update the `optional-informational-heavy-features` row in the verification matrix
+- append any findings from this command to the findings ledger
+
+- [ ] **Step 22: Verify the findings ledger schema was respected**
+
+For every issue, ensure each JSON line includes:
 - category
 - severity
 - lane
@@ -280,7 +403,7 @@ For each issue, append one JSON line with the required schema:
 - root_cause
 - recommended_fix
 
-- [ ] **Step 9: Update the verification matrix with result states**
+- [ ] **Step 23: Verify the matrix uses only allowed result states**
 
 Allowed states:
 - `PASS`
@@ -289,7 +412,7 @@ Allowed states:
 - `BLOCKED`
 - `N/A`
 
-- [ ] **Step 10: Record exit status for every command in the command log**
+- [ ] **Step 24: Verify every command entry in the command log is complete**
 
 Each command entry must include:
 - timestamp
@@ -298,7 +421,7 @@ Each command entry must include:
 - exit status
 - output location or inline summary
 
-- [ ] **Step 11: Commit the static verification baseline**
+- [ ] **Step 25: Commit the static verification baseline**
 
 Run:
 ```powershell
@@ -328,27 +451,97 @@ For every runtime probe, write:
 - expected environment
 - result state
 
-- [ ] **Step 2: Run the CLI data path smoke checks**
+- [ ] **Step 2: Run the `symbols` CLI data probe**
 
 Run:
 ```powershell
 cargo run -p forex-cli -- symbols --root data
+```
+Expected: successful output or concrete failures.
+
+- [ ] **Step 3: Immediately record the `symbols` probe result**
+
+Before moving on:
+- append the command, timestamp, exit status, and output summary to `cache/audit/2026-03-20-command-log.txt`
+- update the relevant runtime row in the verification matrix
+- append any findings from this probe to the findings ledger
+
+- [ ] **Step 4: Run the `timeframes` CLI data probe**
+
+Run:
+```powershell
 cargo run -p forex-cli -- timeframes --root data --symbol EURUSD
+```
+Expected: successful output or concrete failures.
+
+- [ ] **Step 5: Immediately record the `timeframes` probe result**
+
+Before moving on:
+- append the command, timestamp, exit status, and output summary to `cache/audit/2026-03-20-command-log.txt`
+- update the relevant runtime row in the verification matrix
+- append any findings from this probe to the findings ledger
+
+- [ ] **Step 6: Run the `load` CLI data probe**
+
+Run:
+```powershell
 cargo run -p forex-cli -- load --root data --symbol EURUSD --timeframe M1
+```
+Expected: successful output or concrete failures.
+
+- [ ] **Step 7: Immediately record the `load` probe result**
+
+Before moving on:
+- append the command, timestamp, exit status, and output summary to `cache/audit/2026-03-20-command-log.txt`
+- update the relevant runtime row in the verification matrix
+- append any findings from this probe to the findings ledger
+
+- [ ] **Step 8: Run the `features` CLI data probe**
+
+Run:
+```powershell
 cargo run -p forex-cli -- features --root data --symbol EURUSD --timeframe M1
 ```
 Expected: successful output or concrete failures.
 
-- [ ] **Step 3: Run the CLI preparation and discovery path**
+- [ ] **Step 9: Immediately record the `features` probe result**
+
+Before moving on:
+- append the command, timestamp, exit status, and output summary to `cache/audit/2026-03-20-command-log.txt`
+- update the relevant runtime row in the verification matrix
+- append any findings from this probe to the findings ledger
+
+- [ ] **Step 10: Run the `prepare` CLI runtime probe**
 
 Run:
 ```powershell
 cargo run -p forex-cli -- prepare --root data --symbol EURUSD --base M1 --higher M5,M15,H1
+```
+Expected: successful output or concrete failures.
+
+- [ ] **Step 11: Immediately record the `prepare` probe result**
+
+Before moving on:
+- append the command, timestamp, exit status, and output summary to `cache/audit/2026-03-20-command-log.txt`
+- update the relevant runtime row in the verification matrix
+- append any findings from this probe to the findings ledger
+
+- [ ] **Step 12: Run the `discover` CLI runtime probe**
+
+Run:
+```powershell
 cargo run -p forex-cli -- discover --root data --symbol EURUSD --base M1 --higher M5,M15,H1 --population 10 --generations 1 --candidates 20 --portfolio-size 10
 ```
 Expected: successful output or concrete failures.
 
-- [ ] **Step 4: Run the CLI training path**
+- [ ] **Step 13: Immediately record the `discover` probe result**
+
+Before moving on:
+- append the command, timestamp, exit status, and output summary to `cache/audit/2026-03-20-command-log.txt`
+- update the relevant runtime row in the verification matrix
+- append any findings from this probe to the findings ledger
+
+- [ ] **Step 14: Run the CLI training probe**
 
 Run:
 ```powershell
@@ -356,7 +549,14 @@ cargo run -p forex-cli -- train --root data --symbol EURUSD --base M1 --config c
 ```
 Expected: successful startup/completion or concrete failures.
 
-- [ ] **Step 5: Run the app headless local path**
+- [ ] **Step 15: Immediately record the CLI training result**
+
+Before moving on:
+- append the command, timestamp, exit status, and output summary to `cache/audit/2026-03-20-command-log.txt`
+- update the relevant runtime row in the verification matrix
+- append any findings from this probe to the findings ledger
+
+- [ ] **Step 16: Run the app headless local path**
 
 Run:
 ```powershell
@@ -364,7 +564,14 @@ cargo run -p forex-app -- --headless --local --config config.yaml
 ```
 Expected: successful startup and keep-alive, or concrete failures.
 
-- [ ] **Step 6: Run the app GUI smoke path**
+- [ ] **Step 17: Immediately record the headless-app result**
+
+Before moving on:
+- append the command, timestamp, exit status, and output summary to `cache/audit/2026-03-20-command-log.txt`
+- update the `runtime-headless` row in the verification matrix
+- append any findings from this probe to the findings ledger
+
+- [ ] **Step 18: Run the app GUI smoke path**
 
 Run:
 ```powershell
@@ -372,7 +579,14 @@ cargo run -p forex-app -- --local --config config.yaml
 ```
 Expected: `PASS`, `FAIL`, or `BLOCKED` if the current session cannot support GUI startup.
 
-- [ ] **Step 7: Run the MT5 prerequisite probe**
+- [ ] **Step 19: Immediately record the GUI-app result**
+
+Before moving on:
+- append the command, timestamp, exit status, and output summary to `cache/audit/2026-03-20-command-log.txt`
+- update the `runtime-gui` row in the verification matrix
+- append any findings from this probe to the findings ledger
+
+- [ ] **Step 20: Run the MT5 prerequisite probe**
 
 Run:
 ```powershell
@@ -380,7 +594,14 @@ python -c "import MetaTrader5 as mt5; ok = mt5.initialize(); print({'initialize'
 ```
 Expected: explicit success, explicit failure, or `BLOCKED` if the environment does not provide MT5.
 
-- [ ] **Step 8: Run the MT5 bridge contract probe**
+- [ ] **Step 21: Immediately record the MT5 prerequisite result**
+
+Before moving on:
+- append the command, timestamp, exit status, and output summary to `cache/audit/2026-03-20-command-log.txt`
+- update the `runtime-mt5` row in the verification matrix
+- append any findings from this probe to the findings ledger
+
+- [ ] **Step 22: Run the MT5 bridge contract probe**
 
 Probe:
 - launch `forex-app` in MT5 mode on Windows
@@ -389,7 +610,14 @@ Probe:
 
 Expected: `PASS`, `FAIL`, or `BLOCKED` with explicit reason. A graceful offline/not-available path is not a failure if it is handled explicitly and consistently.
 
-- [ ] **Step 9: Record every runtime finding**
+- [ ] **Step 23: Immediately record the MT5 bridge-contract result**
+
+Before moving on:
+- append the probe description, timestamp, result state, and evidence summary to `cache/audit/2026-03-20-command-log.txt`
+- update the `runtime-mt5` row in the verification matrix
+- append any findings from this probe to the findings ledger
+
+- [ ] **Step 24: Verify no runtime issue is claimed without evidence**
 
 No runtime issue is known unless:
 - the exact probe is recorded
@@ -397,7 +625,7 @@ No runtime issue is known unless:
 - the result state is assigned
 - the finding is written to the ledger
 
-- [ ] **Step 10: Commit the runtime evidence**
+- [ ] **Step 25: Commit the runtime evidence**
 
 Run:
 ```powershell
