@@ -225,7 +225,69 @@ Runtime probes were executed against the already-built `target/debug` binaries a
 
 ## File-By-File Findings
 
-Pending line-by-line audit.
+Initial line-by-line findings from the runtime-critical entrypoints audited so far:
+
+### Important
+
+#### `crates/forex-app`
+
+- [`crates/forex-app/src/main.rs:298`](C:/Users/konst/development/forex-ai/crates/forex-app/src/main.rs#L298)
+  - the Discovery tab still runs a mock progress loop and never invokes the real Rust discovery backend
+  - this explains the current UI/backend disconnect: the screen can show apparent progress without any actual search work
+- [`crates/forex-app/src/main.rs:327`](C:/Users/konst/development/forex-ai/crates/forex-app/src/main.rs#L327)
+  - the Training tab button only logs `Training logic triggered.` and does not call any backend training path
+  - the current UI therefore cannot truthfully represent training state or failures
+- [`crates/forex-app/src/main.rs:71`](C:/Users/konst/development/forex-ai/crates/forex-app/src/main.rs#L71)
+  - local/headless mode hardcodes `"data"` and ignores the supplied config path for symbol discovery
+- [`crates/forex-app/src/main.rs:135`](C:/Users/konst/development/forex-ai/crates/forex-app/src/main.rs#L135)
+  - GUI local mode repeats the same hardcoded `"data"` assumption during initial symbol enumeration and refresh
+
+#### `crates/mt5-bridge`
+
+- [`crates/mt5-bridge/src/lib.rs:29`](C:/Users/konst/development/forex-ai/crates/mt5-bridge/src/lib.rs#L29)
+  - `last_error()` is extracted as `String`, but the official MetaTrader 5 Python docs state that `last_error()` returns an error code and description as a tuple
+  - consequence: on failed `initialize()`, the bridge can raise a PyO3 extraction error instead of surfacing the underlying MT5 failure cleanly
+  - source: [MQL5 last_error docs](https://www.mql5.com/en/docs/python_metatrader5/mt5lasterror_py)
+
+#### `crates/forex-data`
+
+- [`crates/forex-data/src/lib.rs:93`](C:/Users/konst/development/forex-ai/crates/forex-data/src/lib.rs#L93)
+  - `load_symbol_dataset()` silently drops any timeframe that fails to load and still returns `Ok(SymbolDataset { ... })`
+  - this can turn missing/corrupt timeframe inputs into partial datasets without any explicit degraded-state signal
+- [`crates/forex-data/src/lib.rs:103`](C:/Users/konst/development/forex-ai/crates/forex-data/src/lib.rs#L103)
+  - `load_symbol_dataset_with_timeframes()` repeats the same silent-drop behavior for targeted timeframe loads
+- [`crates/forex-data/src/lib.rs:116`](C:/Users/konst/development/forex-ai/crates/forex-data/src/lib.rs#L116)
+  - timestamp casting failure falls back to a synthetic `0` value vector and then unwraps into integer iteration
+  - this is a silent data-corruption path: malformed or unexpected timestamp columns can be converted into apparently valid rows anchored at epoch-zero instead of surfacing a load failure
+
+#### `crates/forex-bindings`
+
+- [`crates/forex-bindings/src/models.rs:71`](C:/Users/konst/development/forex-ai/crates/forex-bindings/src/models.rs#L71)
+  - the public `MLPModel` binding is explicitly marked as a placeholder and stores a `Gene` rather than a trained model backend
+  - it exposes only a constructor, so the API surface suggests an available model while providing no fit/predict contract
+- [`crates/forex-bindings/src/models.rs:81`](C:/Users/konst/development/forex-ai/crates/forex-bindings/src/models.rs#L81)
+  - `GeneticModel` is also exported publicly but only exposes a constructor in this module
+  - unless methods are attached elsewhere, this is a skeletal API surface rather than a usable production binding
+
+#### `crates/forex-core`
+
+- [`crates/forex-core/src/logging.rs:29`](C:/Users/konst/development/forex-ai/crates/forex-core/src/logging.rs#L29)
+  - the `WorkerGuard` returned by `tracing_appender::non_blocking` is stored only in a local `_guard` and dropped when `setup_logging()` returns
+  - the official tracing-appender docs state that the guard must be held by the entrypoint to preserve the flush guarantee for buffered logs
+  - source: [tracing-appender non_blocking docs](https://docs.rs/tracing-appender/latest/tracing_appender/non_blocking/)
+- [`crates/forex-app/src/main.rs:43`](C:/Users/konst/development/forex-ai/crates/forex-app/src/main.rs#L43)
+  - the active app entrypoint calls `tracing_subscriber::fmt::init()` directly and never uses `forex-core::logging::setup_logging()`
+  - consequence: the file logging/JSON logging policy in `crates/forex-core/src/logging.rs` is not applied to the current desktop app at all
+- [`crates/forex-core/src/logging.rs:28`](C:/Users/konst/development/forex-ai/crates/forex-core/src/logging.rs#L28)
+  - the comment says file rotation is enabled (`50MB max, 3 backups`), but the implementation uses `tracing_appender::rolling::never(...)`
+  - this is a contract/documentation drift issue and will mislead operators during log retention planning
+
+### Minor
+
+- [`crates/forex-app/src/main.rs:5`](C:/Users/konst/development/forex-ai/crates/forex-app/src/main.rs#L5)
+  - unused `Arc` import remains on the active UI entrypoint
+- [`crates/forex-app/src/main.rs:6`](C:/Users/konst/development/forex-ai/crates/forex-app/src/main.rs#L6)
+  - unused `Mutex` import remains on the active UI entrypoint
 
 ## Contract And Operational Findings
 
