@@ -27,6 +27,16 @@ This design covers only the first subproject:
 - backend contract audit across CLI, app, data, model, search, and MT5 seams
 - stabilization findings and prioritized fix plan
 
+For this subproject, “full repository audit” means:
+
+- all workspace crates
+- all top-level runtime/config/build assets
+- all remaining Python files
+- all scripts and service wrappers
+- tests and examples as evidence-bearing supporting assets
+
+It does not mean auditing generated logs, caches, build artifacts, or vendored third-party code as if they were first-party runtime modules.
+
 ## Out Of Scope
 
 The following are explicitly out of scope for this first subproject:
@@ -39,6 +49,38 @@ The following are explicitly out of scope for this first subproject:
 - full live trading validation against a real broker session
 
 The UI is not ignored; it is inventoried and audited as code, but UI integration work is deferred until the runtime and backend contracts are stable.
+
+## Subsystem Classification Matrix
+
+Every top-level subsystem must be classified before the audit begins:
+
+| Subsystem | Status | Audit Treatment |
+|----------|--------|-----------------|
+| `crates/forex-app` | runtime-critical | full static + runtime + line-by-line audit |
+| `crates/forex-cli` | runtime-critical | full static + runtime + line-by-line audit |
+| `crates/mt5-bridge` | runtime-critical | full static + contract + environment audit |
+| `crates/forex-core` | runtime-critical | full static + line-by-line audit |
+| `crates/forex-data` | runtime-critical | full static + runtime-path + line-by-line audit |
+| `crates/forex-search` | runtime-critical | full static + runtime-path + line-by-line audit |
+| `crates/forex-models` | runtime-critical | full static + runtime-path + line-by-line audit |
+| `crates/forex-bindings` | runtime-critical | full static + Python-contract audit |
+| `crates/forex-news` | audit-required | static + line-by-line audit, runtime only if reachable from active paths |
+| remaining Python files | audit-required | classify as runtime code, bridge, bootstrap, or dead seam |
+| top-level configs/scripts/services | audit-required | audit as integration assets |
+| `tests/` and `examples/` | evidence-only | audit for coverage gaps and stale assumptions |
+| `vendor/` | excluded from code-quality findings | inventory only unless a local patch affects behavior |
+| `cache/`, `logs/`, `target/`, generated artifacts | excluded | evidence only, not first-party source |
+
+## Active File Definition
+
+For this subproject, a file is considered “active” if it falls into one of these classes:
+
+- `runtime-critical`: directly used by supported app/CLI/runtime paths
+- `static-only`: not exercised in the default runtime path, but compiled, loaded, or required by supported builds
+- `audit-required bridge`: shim, binding, or compatibility file that can affect runtime contracts
+- `evidence-only`: tests/examples used to validate assumptions but not treated as runtime modules
+
+Every file or directory class outside those buckets must be marked explicitly as `excluded`, not left ambiguous.
 
 ## Primary Priorities
 
@@ -84,14 +126,26 @@ This layer defines what “all files” means in the active repository, so later
 
 ### Layer B: Static Verification Sweep
 
-Run the repository-wide verification baseline for the active Rust-first system, including:
+Run the repository-wide verification baseline for the supported profiles, not an unbounded “all optional features everywhere” sweep.
+
+The baseline must be split into named lanes:
+
+- `required baseline lane`: supported local developer/runtime profile on the current OS
+- `required Python-contract lane`: verifies Python-dependent runtime contracts that are still active
+- `optional informational lanes`: heavyweight or platform-specific integrations that can surface issues without being promoted to baseline blockers
+
+The baseline must not treat unsupported optional integrations as release blockers unless the project explicitly declares them supported for this environment.
+
+Required static checks for the supported baseline include:
 
 - `cargo check --workspace`
 - `cargo test --workspace`
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- targeted `cargo build` where binaries or feature gates require it
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- targeted `cargo build` where binaries or supported feature gates require it
 
-If Python tooling or generated bindings are still involved in the current build path, those checks are included as supporting evidence but do not redefine the runtime architecture.
+Informational lanes may include feature-specific or platform-specific builds, but those findings must be labeled `informational` unless they affect a supported baseline profile.
+
+If Python tooling or generated bindings are still involved in the current build path, they are part of the audit baseline and must be verified explicitly rather than treated as historical leftovers.
 
 ### Layer C: Real-Path Runtime Sweep
 
@@ -101,6 +155,26 @@ Exercise the actual paths that define whether the system is alive:
 - `forex-app --headless --local`
 - `forex-app` GUI startup smoke validation
 - MT5 bridge initialization and terminal-info contract checks without requiring full live trading
+
+Every runtime probe must declare:
+
+- prerequisites
+- timeout
+- expected environment
+- result state
+
+Allowed result states:
+
+- `PASS`: command/path worked as expected
+- `FAIL`: reproducible code or contract defect
+- `BLOCKED`: environment prerequisite missing, with explicit reason
+- `N/A`: path not applicable to the current OS or profile
+
+Examples:
+
+- GUI startup may be `BLOCKED` in a non-interactive session
+- MT5 bridge may be `BLOCKED` if the local MT5 installation or `MetaTrader5` Python module is missing
+- a graceful, explicit “offline/not available” path is not a `FAIL` if the code handles it as designed
 
 This layer is the primary guard against false confidence from clean compilation but broken runtime behavior.
 
@@ -134,6 +208,13 @@ Evaluate subsystem boundaries and operational qualities:
 - reproducibility of startup and training flows
 
 This layer translates “enterprise level” into concrete engineering checks rather than vague aesthetic goals.
+
+This layer does not authorize broad redesign. It asks concrete audit questions:
+
+- does this boundary have an explicit contract?
+- does failure become visible and diagnosable?
+- is recovery/checkpoint behavior explicit?
+- are supported startup and execution paths reproducible?
 
 ## Finding Taxonomy
 
@@ -207,6 +288,7 @@ It does not mean “maximum abstraction” or “feature bloat”. The objective
 
 - The repo has changed recently enough that historical mental models may be wrong.
 - Some MT5 behavior is platform- and installation-dependent, so official docs and runtime probes may both be needed.
+- Some active runtime paths still depend on Python environments and bindings, so Python validation remains part of the supported audit surface.
 - Some crates may compile cleanly while still having runtime contract gaps.
 - The codebase may still contain intentionally temporary seams from the migration; these should be identified explicitly rather than erased blindly.
 
@@ -218,4 +300,3 @@ The next step is to write a concrete implementation plan for executing this audi
 2. real-path runtime audit
 3. full file-by-file audit
 4. findings ledger and stabilization priorities
-
