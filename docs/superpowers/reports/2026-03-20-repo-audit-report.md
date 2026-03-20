@@ -276,12 +276,42 @@ Initial line-by-line findings from the runtime-critical entrypoints audited so f
 - [`crates/forex-bindings/src/models.rs:81`](C:/Users/konst/development/forex-ai/crates/forex-bindings/src/models.rs#L81)
   - `GeneticModel` is also exported publicly but only exposes a constructor in this module
   - unless methods are attached elsewhere, this is a skeletal API surface rather than a usable production binding
+- [`crates/forex-bindings/src/data.rs:29`](C:/Users/konst/development/forex-ai/crates/forex-bindings/src/data.rs#L29)
+  - `load_symbol_features()` accepts `max_features`, `max_htf_features`, and `htf_feature_profile`, then explicitly discards them via `_ = ...`
+  - the public binding contract therefore advertises feature-budget and HTF-profile control that the implementation does not honor
+- [`crates/forex-bindings/src/data.rs:123`](C:/Users/konst/development/forex-ai/crates/forex-bindings/src/data.rs#L123)
+  - `load_strategy_signals()` is exported publicly but always returns an empty dictionary
+  - callers receive a formally successful response from a placeholder bridge with no real signal-loading behavior
+- [`crates/forex-bindings/src/data.rs:138`](C:/Users/konst/development/forex-ai/crates/forex-bindings/src/data.rs#L138)
+  - `count_weekday_trading_days()` always returns `0`, and the exported alignment/news helpers at lines `143` through `169` all return `None`
+  - these are live public PyO3 functions registered in [`crates/forex-bindings/src/lib.rs:79`](C:/Users/konst/development/forex-ai/crates/forex-bindings/src/lib.rs#L79), so the current bindings surface exposes multiple stubbed contracts as if they were implemented
+- [`crates/forex-bindings/src/search.rs:51`](C:/Users/konst/development/forex-ai/crates/forex-bindings/src/search.rs#L51)
+  - both `search_evolve_ohlcv()` and `search_discovery_ohlcv()` convert gene-serialization failures into `None` entries via `unwrap_or_else(|_| py.None())`
+  - that means the binding can silently corrupt result payloads instead of surfacing that Pythonization failed for returned genes
+- [`crates/forex-bindings/src/search.rs:181`](C:/Users/konst/development/forex-ai/crates/forex-bindings/src/search.rs#L181)
+  - the GPU discovery binding always returns `"gpu": true` even though the function contains a `#[cfg(not(feature = "gpu"))]` execution path as well
+  - callers cannot trust the returned payload to indicate whether GPU-backed discovery actually happened
+- [`crates/forex-bindings/src/validation.rs:42`](C:/Users/konst/development/forex-ai/crates/forex-bindings/src/validation.rs#L42)
+  - `embargoed_walkforward_backtest_py()` accepts a `settings` argument and then ignores it, always using `BacktestSettings::default()`
+  - the Python validation contract therefore exposes configurable backtest settings that never reach the Rust engine
+- [`crates/forex-bindings/src/evaluation.rs:532`](C:/Users/konst/development/forex-ai/crates/forex-bindings/src/evaluation.rs#L532)
+  - `trade_journal_metrics()` is a public binding that returns hardcoded `sharpe=0.0` and `win_rate=0.0`
+  - this is a placeholder analytics contract presented as a real metric endpoint
 
 #### `crates/forex-models`
 
 - [`crates/forex-models/src/training_orchestrator.rs:62`](C:/Users/konst/development/forex-ai/crates/forex-models/src/training_orchestrator.rs#L62)
   - `get_enabled_models()` is hardcoded to `xgboost` and `genetic`, ignoring the loaded settings surface
   - this means the training runtime contract is currently not configuration-driven
+- [`crates/forex-models/src/parallel_trainer.rs:111`](C:/Users/konst/development/forex-ai/crates/forex-models/src/parallel_trainer.rs#L111)
+  - `train_models_parallel()` logs individual model failures but still returns `Ok(successes)` without surfacing which models failed or converting all-failed runs into an error
+  - any caller that treats `Ok(...)` as a successful training pass can silently accept partial or total model-training failure
+- [`crates/forex-models/src/lib.rs:89`](C:/Users/konst/development/forex-ai/crates/forex-models/src/lib.rs#L89)
+  - `ONNXInferenceEngine::load_models()` returns `Ok(())` when the models directory or `onnx/` subdirectory is missing
+  - the binding caller can therefore treat model loading as successful even when no ONNX assets were available at all
+- [`crates/forex-models/src/lib.rs:119`](C:/Users/konst/development/forex-ai/crates/forex-models/src/lib.rs#L119)
+  - ONNX inference hardcodes both `with_intra_threads(4)` and `with_inter_threads(4)`
+  - this bypasses the repo-wide hardware-adaptive CPU budget and will underutilize large hosts while oversubscribing smaller ones
 
 #### `crates/forex-search`
 
@@ -297,6 +327,30 @@ Initial line-by-line findings from the runtime-critical entrypoints audited so f
 - [`crates/forex-search/src/portfolio.rs:24`](C:/Users/konst/development/forex-ai/crates/forex-search/src/portfolio.rs#L24)
   - `lookback_days` is part of the public optimizer contract but is never used when computing allocations
   - callers can believe they are constraining history while the optimizer actually uses the full return series every time
+- [`crates/forex-search/src/discovery.rs:80`](C:/Users/konst/development/forex-ai/crates/forex-search/src/discovery.rs#L80)
+  - discovery forces `candidate_count` to a minimum of `100` via `config.candidate_count.max(100)`
+  - any caller trying to run a smaller bounded discovery pass cannot actually get the requested limit, so the tuning/runtime contract is not respected
+- [`crates/forex-search/src/orchestration.rs:22`](C:/Users/konst/development/forex-ai/crates/forex-search/src/orchestration.rs#L22)
+  - `run_batch()` downgrades dataset-load, resample, and feature-prep failures to `info!` logs plus `continue`, then still returns `Ok(())`
+  - a batch discovery run can therefore succeed operationally while skipping every symbol or timeframe without surfacing a degraded result to the caller
+
+#### `crates/forex-cli`
+
+- [`crates/forex-cli/src/main.rs:147`](C:/Users/konst/development/forex-ai/crates/forex-cli/src/main.rs#L147)
+  - `cmd_train()` parses `--root` into `_root` and then ignores it completely
+  - the training CLI advertises a data-root flag that never reaches the orchestrator, so runtime behavior depends on the environment variable fallback inside `TrainingOrchestrator` instead
+- [`crates/forex-cli/src/main.rs:370`](C:/Users/konst/development/forex-ai/crates/forex-cli/src/main.rs#L370)
+  - the printed help for `train` still documents `--higher` and `--horizon`, but `cmd_train()` does not parse either flag
+  - the CLI help surface is therefore no longer aligned with the executable command contract
+
+#### `crates/forex-news`
+
+- [`crates/forex-news/src/openai.rs:22`](C:/Users/konst/development/forex-ai/crates/forex-news/src/openai.rs#L22)
+  - when `OPENAI_API_KEY` is missing, `analyze_sentiment()` logs a warning and returns a neutral `0.0` score
+  - missing provider configuration is therefore downgraded into a seemingly valid sentiment result instead of an explicit unavailable/degraded-state response
+- [`crates/forex-news/src/perplexity.rs:22`](C:/Users/konst/development/forex-ai/crates/forex-news/src/perplexity.rs#L22)
+  - when `PERPLEXITY_API_KEY` is missing, `search_news()` logs a warning and returns an empty string
+  - callers cannot distinguish “provider unavailable” from “provider found no news” without parsing logs
 
 #### `crates/forex-core`
 
