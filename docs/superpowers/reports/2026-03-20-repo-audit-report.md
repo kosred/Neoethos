@@ -283,6 +283,21 @@ Initial line-by-line findings from the runtime-critical entrypoints audited so f
   - `get_enabled_models()` is hardcoded to `xgboost` and `genetic`, ignoring the loaded settings surface
   - this means the training runtime contract is currently not configuration-driven
 
+#### `crates/forex-search`
+
+- [`crates/forex-search/src/validation.rs:63`](C:/Users/konst/development/forex-ai/crates/forex-search/src/validation.rs#L63)
+  - `embargoed_walkforward_backtest()` divides by `n_splits` without validating `n_splits > 0`
+  - a zero-splits call will panic instead of failing as a normal `Result`
+- [`crates/forex-search/src/validation.rs:111`](C:/Users/konst/development/forex-ai/crates/forex-search/src/validation.rs#L111)
+  - `prop_compliant` is hardcoded against `0.05` instead of the supplied `max_daily_loss_pct`
+  - this makes the returned compliance flag disagree with the actual runtime policy input
+- [`crates/forex-search/src/validation.rs:102`](C:/Users/konst/development/forex-ai/crates/forex-search/src/validation.rs#L102)
+  - several reported walk-forward fields are still placeholder values (`max_consec_losses`, `consistency_violation`, `trade_limit_violation`, `min_trading_days_ok`)
+  - the summary therefore looks richer than the implementation really is
+- [`crates/forex-search/src/portfolio.rs:24`](C:/Users/konst/development/forex-ai/crates/forex-search/src/portfolio.rs#L24)
+  - `lookback_days` is part of the public optimizer contract but is never used when computing allocations
+  - callers can believe they are constraining history while the optimizer actually uses the full return series every time
+
 #### `crates/forex-core`
 
 - [`crates/forex-core/src/logging.rs:29`](C:/Users/konst/development/forex-ai/crates/forex-core/src/logging.rs#L29)
