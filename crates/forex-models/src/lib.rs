@@ -57,6 +57,7 @@ use ort::{inputs, Session, Value};
 use std::collections::HashMap;
 #[cfg(feature = "onnx")]
 use tracing::{info, warn};
+#[cfg(feature = "onnx")]
 use std::path::Path;
 
 #[cfg(feature = "onnx")]

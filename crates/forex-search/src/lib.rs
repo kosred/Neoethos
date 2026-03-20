@@ -134,7 +134,9 @@ pub mod stop_target;
 pub mod validation;
 
 pub use challenge::{ChallengeOptimizer, ChallengeTarget};
-pub use discovery::{run_discovery_cycle, save_portfolio_json, DiscoveryConfig, DiscoveryResult};
+pub use discovery::{
+    ensure_non_empty_portfolio, run_discovery_cycle, save_portfolio_json, DiscoveryConfig, DiscoveryResult,
+};
 pub use discovery_gpu::{
     build_feature_cube, run_gpu_discovery, save_gpu_genomes, GpuDiscoveryConfig, GpuDiscoveryResult,
 };
@@ -144,7 +146,7 @@ pub use genetic::{
     evaluate_genes, evolve_search, month_day_indices, random_search, signals_for_gene, EvaluationConfig,
     FilteringConfig, Gene, SearchResult,
 };
-pub use orchestration::DiscoveryOrchestrator;
+pub use orchestration::{BatchDiscoverySummary, DiscoveryOrchestrator};
 pub use portfolio::{AllocationResult, PortfolioOptimizer, SymbolMetrics};
 pub use quality::{StrategyMetrics, StrategyQualityAnalyzer, StrategyRanker, Trade};
 pub use stop_target::{compute_stop_distance_series, infer_stop_target_pips, StopTargetSettings};

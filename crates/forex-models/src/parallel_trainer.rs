@@ -41,6 +41,10 @@ pub fn train_models_parallel<F>(
 where
     F: Fn(&str, &Array2<f32>, &[i32]) -> Result<()> + Send + Sync + Clone + 'static,
 {
+    if model_configs.is_empty() {
+        anyhow::bail!("No model configs provided for parallel training");
+    }
+
     let threads = rust_threads_hint();
     info!(
         "Starting parallel training for {} models (threads={})",
@@ -107,6 +111,14 @@ where
         successes.len(),
         failures.len()
     );
+
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "Parallel training failed for [{}]; successful models: [{}]",
+            failures.join(", "),
+            successes.join(", ")
+        );
+    }
 
     Ok(successes)
 }
@@ -180,5 +192,47 @@ mod tests {
 
         assert_eq!(results.len(), 3);
         println!("Successfully trained: {:?}", results);
+    }
+
+    #[test]
+    fn test_parallel_training_returns_error_when_any_model_fails() {
+        let x = Arc::new(Array2::<f32>::zeros((16, 4)));
+        let y = Arc::new(vec![0i32; 16]);
+        let configs = vec![
+            ModelConfig {
+                name: "ok_model".to_string(),
+                model_type: ModelType::LightGBM,
+                params: Default::default(),
+            },
+            ModelConfig {
+                name: "bad_model".to_string(),
+                model_type: ModelType::XGBoost,
+                params: Default::default(),
+            },
+        ];
+
+        let train_fn = |name: &str, _x: &Array2<f32>, _y: &[i32]| -> Result<()> {
+            if name == "bad_model" {
+                anyhow::bail!("synthetic failure");
+            }
+            Ok(())
+        };
+
+        let err = train_models_parallel(configs, x, y, train_fn).expect_err("expected aggregated failure");
+        let msg = err.to_string();
+        assert!(msg.contains("bad_model"), "unexpected error: {msg}");
+        assert!(msg.contains("ok_model"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_parallel_training_rejects_empty_model_set() {
+        let x = Arc::new(Array2::<f32>::zeros((8, 2)));
+        let y = Arc::new(vec![0i32; 8]);
+        let configs: Vec<ModelConfig> = Vec::new();
+
+        let train_fn = |_name: &str, _x: &Array2<f32>, _y: &[i32]| -> Result<()> { Ok(()) };
+
+        let err = train_models_parallel(configs, x, y, train_fn).expect_err("expected empty-config error");
+        assert!(err.to_string().contains("No model configs"));
     }
 }

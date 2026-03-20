@@ -40,6 +40,17 @@ pub struct DiscoveryResult {
     pub candidates: Vec<Gene>,
 }
 
+pub fn ensure_non_empty_portfolio(result: &DiscoveryResult, context: &str) -> Result<()> {
+    if result.portfolio.is_empty() {
+        anyhow::bail!(
+            "Discovery produced an empty portfolio for {} (candidates={})",
+            context,
+            result.candidates.len()
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize)]
 struct GeneExport<'a> {
     strategy_id: &'a str,
@@ -202,4 +213,33 @@ pub fn save_portfolio_json(
     let payload = serde_json::to_string_pretty(&exports)?;
     fs::write(path, payload)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_portfolio_is_an_explicit_error() {
+        let result = DiscoveryResult {
+            portfolio: Vec::new(),
+            candidates: vec![Gene::default()],
+        };
+
+        let err = ensure_non_empty_portfolio(&result, "EURUSD M1")
+            .expect_err("expected empty discovery portfolio to fail");
+        let msg = err.to_string();
+        assert!(msg.contains("empty portfolio"), "unexpected error: {msg}");
+        assert!(msg.contains("candidates=1"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn non_empty_portfolio_is_accepted() {
+        let result = DiscoveryResult {
+            portfolio: vec![Gene::default()],
+            candidates: vec![Gene::default()],
+        };
+
+        ensure_non_empty_portfolio(&result, "EURUSD M1").expect("expected non-empty portfolio to pass");
+    }
 }

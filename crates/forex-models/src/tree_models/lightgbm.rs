@@ -1,6 +1,8 @@
 #[cfg(feature = "lightgbm")]
 use lightgbm3;
-use anyhow::{Result, Context};
+use anyhow::Result;
+#[cfg(feature = "lightgbm")]
+use anyhow::Context;
 use ndarray::Array2;
 use polars::prelude::*;
 use crate::base::ExpertModel;

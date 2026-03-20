@@ -1,6 +1,8 @@
 #[cfg(feature = "catboost")]
 use catboost_rust as catboost;
-use anyhow::{Result, Context};
+use anyhow::Result;
+#[cfg(feature = "catboost")]
+use anyhow::Context;
 use ndarray::Array2;
 use polars::prelude::*;
 use crate::base::ExpertModel;

@@ -1,14 +1,10 @@
 use anyhow::{Context, Result};
-use ndarray::Array2;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use std::path::PathBuf;
+use tracing::info;
 use std::sync::Arc;
 
 use forex_data::{load_symbol_dataset, prepare_multitimeframe_features_with_options, FeatureBuildOptions, Ohlcv};
-use crate::base::ExpertModel;
-use crate::tree_models::XGBoostExpert;
-use crate::genetic::GeneticStrategyExpert;
 use crate::parallel_trainer::{train_models_parallel, ModelConfig, ModelType};
 
 pub struct TrainingOrchestrator {
@@ -31,7 +27,7 @@ impl TrainingOrchestrator {
         let frame = prepare_multitimeframe_features_with_options(&dataset, base_tf, &opts, None)?;
         let base_ohlcv = dataset.frames.get(base_tf).context("base tf missing")?;
 
-        let enabled_models = self.get_enabled_models();
+        let enabled_models = self.get_enabled_models()?;
         let configs: Vec<ModelConfig> = enabled_models.into_iter().map(|m| {
             ModelConfig {
                 name: m.clone(),
@@ -44,23 +40,47 @@ impl TrainingOrchestrator {
         let labels = self.derive_labels(base_ohlcv);
         let y = Arc::new(labels);
 
-        let out_dir = self.models_dir.clone();
-        let trained = train_models_parallel(configs, x, y, move |name, x_data, y_data| {
+        let trained = train_models_parallel(configs, x, y, move |name, _x_data, _y_data| {
             info!("Training model instance: {}", name);
-            
-            // Logic to select and train the specific model type
-            // This is where we call the .fit() methods of our Rust models.
-            
-            // For now, a placeholder implementation:
-            Ok(())
+            anyhow::bail!(
+                "Training dispatch for model `{}` is not implemented in the Rust orchestrator",
+                name
+            )
         })?;
 
         info!("Successfully trained models: {:?}", trained);
         Ok(())
     }
 
-    fn get_enabled_models(&self) -> Vec<String> {
-        vec!["xgboost".to_string(), "genetic".to_string()]
+    fn get_enabled_models(&self) -> Result<Vec<String>> {
+        let mut models: Vec<String> = self
+            .settings
+            .models
+            .ml_models
+            .iter()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect();
+
+        models.sort();
+        models.dedup();
+
+        if models.is_empty() {
+            anyhow::bail!("No model configs enabled in settings.models.ml_models");
+        }
+
+        let unsupported: Vec<String> = models
+            .iter()
+            .filter_map(|name| self.training_support_error(name))
+            .collect();
+        if !unsupported.is_empty() {
+            anyhow::bail!(
+                "Pure Rust training is not production-ready for the configured models: {}",
+                unsupported.join("; ")
+            );
+        }
+
+        Ok(models)
     }
 
     fn map_model_type(&self, name: &str) -> ModelType {
@@ -68,6 +88,24 @@ impl TrainingOrchestrator {
             "xgboost" => ModelType::XGBoost,
             "genetic" => ModelType::Genetic,
             _ => ModelType::MLP,
+        }
+    }
+
+    fn training_support_error(&self, name: &str) -> Option<String> {
+        match name {
+            "xgboost" => Some(format!("{name} (fit/save path is still a placeholder)")),
+            "xgboost_rf" => Some(format!("{name} (fit/save path is not wired in the Rust orchestrator)")),
+            "xgboost_dart" => Some(format!("{name} (fit/save path is not wired in the Rust orchestrator)")),
+            "lightgbm" => Some(format!("{name} (fit/save path is not wired in the Rust orchestrator)")),
+            "catboost" => Some(format!("{name} (fit/save path is not wired in the Rust orchestrator)")),
+            "catboost_alt" => Some(format!("{name} (fit/save path is not wired in the Rust orchestrator)")),
+            "mlp" | "nbeats" | "tide" | "tabnet" | "kan" => Some(format!(
+                "{name} (Rust orchestrator has no active deep-model trainer dispatch)"
+            )),
+            "genetic" => Some(format!(
+                "{name} (requires forex_bot.models.genetic, which is not present in the tracked repo/runtime)"
+            )),
+            other => Some(format!("{other} (unknown or unsupported training model)")),
         }
     }
 
@@ -79,5 +117,36 @@ impl TrainingOrchestrator {
             else if ohlcv.close[i+1] < ohlcv.close[i] { labels[i] = -1; }
         }
         labels
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn orchestrator_with_models(models: &[&str]) -> TrainingOrchestrator {
+        let mut settings = forex_core::Settings::default();
+        settings.models.ml_models = models.iter().map(|name| (*name).to_string()).collect();
+        TrainingOrchestrator::new(settings, PathBuf::from("models"))
+    }
+
+    #[test]
+    fn get_enabled_models_reads_from_settings_and_fails_for_unwired_models() {
+        let orchestrator = orchestrator_with_models(&["xgboost", "mlp"]);
+        let err = orchestrator
+            .get_enabled_models()
+            .expect_err("expected explicit unsupported-model error");
+        let msg = err.to_string();
+        assert!(msg.contains("xgboost"), "unexpected error: {msg}");
+        assert!(msg.contains("mlp"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn get_enabled_models_rejects_empty_model_config() {
+        let orchestrator = orchestrator_with_models(&[]);
+        let err = orchestrator
+            .get_enabled_models()
+            .expect_err("expected empty-config error");
+        assert!(err.to_string().contains("settings.models.ml_models"));
     }
 }

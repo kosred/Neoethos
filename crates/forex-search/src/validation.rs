@@ -1,7 +1,5 @@
-use ndarray::ArrayView1;
 use anyhow::{Result, bail};
 use crate::eval::{BacktestSettings, fast_evaluate_strategy_core};
-use std::collections::HashSet;
 use itertools::Itertools;
 
 #[derive(Debug, Clone, serde::Serialize)]

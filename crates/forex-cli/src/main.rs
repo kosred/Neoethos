@@ -273,6 +273,7 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         filtering: Default::default(),
     };
     let result = forex_search::run_discovery_cycle(&features, base_ohlcv, &config)?;
+    forex_search::ensure_non_empty_portfolio(&result, &format!("{} {}", symbol, base))?;
     if let Some(parent) = std::path::Path::new(&out).parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -306,9 +307,18 @@ fn cmd_batch_discover(args: &[String]) -> Result<()> {
     let config = forex_search::DiscoveryConfig::default();
     let orchestrator = forex_search::DiscoveryOrchestrator::new(&root, &out_dir, config);
     
-    orchestrator.run_batch(&symbols, &tfs)?;
+    let summary = orchestrator.run_batch(&symbols, &tfs)?;
     
-    println!("Batch discovery complete. Results in {}", out_dir);
+    println!(
+        "Batch discovery complete. Results in {} (saved={} work_units={} skipped_symbols={} skipped_timeframes={} feature_failures={} empty_portfolios={})",
+        out_dir,
+        summary.portfolios_saved,
+        summary.work_units_seen,
+        summary.skipped_symbols,
+        summary.skipped_timeframes,
+        summary.feature_failures,
+        summary.empty_portfolios
+    );
     Ok(())
 }
 

@@ -1,4 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
+#[cfg(feature = "xgboost")]
+use anyhow::Context;
 use ndarray::Array2;
 use polars::prelude::*;
 use std::collections::HashMap;
