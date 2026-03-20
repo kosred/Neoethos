@@ -227,6 +227,14 @@ Runtime probes were executed against the already-built `target/debug` binaries a
 
 Initial line-by-line findings from the runtime-critical entrypoints audited so far:
 
+### Critical
+
+#### `crates/forex-models`
+
+- [`crates/forex-models/src/training_orchestrator.rs:48`](C:/Users/konst/development/forex-ai/crates/forex-models/src/training_orchestrator.rs#L48)
+  - the runtime training closure passed into `train_models_parallel()` is still a placeholder that only logs and returns `Ok(())`
+  - consequence: the CLI/runtime path can report `Pure Rust training complete` without actually fitting or persisting any model
+
 ### Important
 
 #### `crates/forex-app`
@@ -268,6 +276,12 @@ Initial line-by-line findings from the runtime-critical entrypoints audited so f
 - [`crates/forex-bindings/src/models.rs:81`](C:/Users/konst/development/forex-ai/crates/forex-bindings/src/models.rs#L81)
   - `GeneticModel` is also exported publicly but only exposes a constructor in this module
   - unless methods are attached elsewhere, this is a skeletal API surface rather than a usable production binding
+
+#### `crates/forex-models`
+
+- [`crates/forex-models/src/training_orchestrator.rs:62`](C:/Users/konst/development/forex-ai/crates/forex-models/src/training_orchestrator.rs#L62)
+  - `get_enabled_models()` is hardcoded to `xgboost` and `genetic`, ignoring the loaded settings surface
+  - this means the training runtime contract is currently not configuration-driven
 
 #### `crates/forex-core`
 
