@@ -1,5 +1,8 @@
 use crate::app_services::{
-    jobs::{push_recent_event, CancellationFlag, JobKind, JobProgress, JobReport, JobSnapshot, JobState},
+    jobs::{
+        push_recent_event, CancellationFlag, JobEventLevel, JobKind, JobProgress, JobReport,
+        JobSnapshot, JobState,
+    },
     ServiceEvent,
 };
 use anyhow::Result;
@@ -101,6 +104,7 @@ pub fn completed_snapshot(mut snapshot: JobSnapshot, result: &DiscoveryResult) -
         entries,
         events: push_recent_event(
             &snapshot.report.events,
+            JobEventLevel::Info,
             format!(
                 "completed discovery with {portfolio} portfolio strategies out of {candidates} candidates"
             ),
@@ -124,7 +128,11 @@ fn failed_snapshot_from(mut snapshot: JobSnapshot, err: anyhow::Error) -> JobSna
     snapshot.state = JobState::Failed;
     snapshot.report = JobReport {
         errors: vec![message.clone()],
-        events: push_recent_event(&snapshot.report.events, format!("discovery failed: {message}")),
+        events: push_recent_event(
+            &snapshot.report.events,
+            JobEventLevel::Error,
+            format!("discovery failed: {message}"),
+        ),
         summary: message,
         log_path: Some(canonical_log_path().display().to_string()),
         ..JobReport::default()
@@ -141,7 +149,11 @@ fn cancelled_snapshot_from(mut snapshot: JobSnapshot, message: impl Into<String>
     let message = message.into();
     snapshot.state = JobState::Cancelled;
     snapshot.report = JobReport {
-        events: push_recent_event(&snapshot.report.events, format!("discovery cancelled: {message}")),
+        events: push_recent_event(
+            &snapshot.report.events,
+            JobEventLevel::Warning,
+            format!("discovery cancelled: {message}"),
+        ),
         summary: message,
         log_path: Some(canonical_log_path().display().to_string()),
         ..JobReport::default()
@@ -205,6 +217,7 @@ pub fn start_discovery_job(
             ],
             events: push_recent_event(
                 &snapshot.report.events,
+                JobEventLevel::Info,
                 format!(
                     "loaded {} timeframe frame(s) for {}",
                     dataset.frames.len(),
@@ -280,6 +293,7 @@ pub fn start_discovery_job(
             ],
             events: push_recent_event(
                 &snapshot.report.events,
+                JobEventLevel::Info,
                 format!(
                     "prepared feature frame {}x{} for {}",
                     features.data.nrows(),
@@ -479,6 +493,6 @@ mod tests {
             .report
             .events
             .iter()
-            .any(|event| event.contains("completed discovery")));
+            .any(|event| event.message.contains("completed discovery")));
     }
 }

@@ -1,4 +1,4 @@
-use crate::app_services::jobs::{JobSnapshot, JobState};
+use crate::app_services::jobs::{JobEventLevel, JobSnapshot, JobState};
 use eframe::egui;
 use std::path::Path;
 use std::process::Command;
@@ -81,7 +81,10 @@ pub fn render_report(ui: &mut egui::Ui, snapshot: &JobSnapshot) {
         ui.separator();
         ui.strong("Live Events");
         for event in snapshot.report.events.iter().rev() {
-            ui.label(format!("• {event}"));
+            ui.colored_label(
+                event_color(event.level),
+                format!("• {}", event.message),
+            );
         }
     }
 
@@ -114,6 +117,14 @@ pub fn open_log(path: &Path) -> anyhow::Result<()> {
         anyhow::bail!("failed to open log path {}", path.display());
     }
     Ok(())
+}
+
+fn event_color(level: JobEventLevel) -> egui::Color32 {
+    match level {
+        JobEventLevel::Info => egui::Color32::LIGHT_BLUE,
+        JobEventLevel::Warning => egui::Color32::from_rgb(255, 165, 0),
+        JobEventLevel::Error => egui::Color32::RED,
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -150,6 +161,13 @@ mod tests {
         assert_eq!(status_color(JobState::Succeeded), egui::Color32::GREEN);
         assert_eq!(status_color(JobState::Failed), egui::Color32::RED);
         assert_eq!(status_color(JobState::Cancelled), egui::Color32::LIGHT_RED);
+    }
+
+    #[test]
+    fn event_color_maps_event_levels() {
+        assert_eq!(event_color(JobEventLevel::Info), egui::Color32::LIGHT_BLUE);
+        assert_eq!(event_color(JobEventLevel::Warning), egui::Color32::from_rgb(255, 165, 0));
+        assert_eq!(event_color(JobEventLevel::Error), egui::Color32::RED);
     }
 
     #[test]

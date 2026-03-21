@@ -43,9 +43,22 @@ pub struct JobReport {
     pub counters: Vec<(String, u64)>,
     pub highlights: Vec<(String, String)>,
     pub entries: Vec<String>,
-    pub events: Vec<String>,
+    pub events: Vec<JobEvent>,
     pub summary: String,
     pub log_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobEventLevel {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobEvent {
+    pub level: JobEventLevel,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -88,9 +101,16 @@ impl CancellationFlag {
     }
 }
 
-pub fn push_recent_event(events: &[String], event: impl Into<String>) -> Vec<String> {
+pub fn push_recent_event(
+    events: &[JobEvent],
+    level: JobEventLevel,
+    message: impl Into<String>,
+) -> Vec<JobEvent> {
     let mut next = events.to_vec();
-    next.push(event.into());
+    next.push(JobEvent {
+        level,
+        message: message.into(),
+    });
     if next.len() > 8 {
         next.drain(0..(next.len() - 8));
     }
@@ -143,7 +163,10 @@ mod tests {
         snapshot
             .report
             .events
-            .push("loaded dataset for EURUSD".to_string());
+            .push(JobEvent {
+                level: JobEventLevel::Info,
+                message: "loaded dataset for EURUSD".to_string(),
+            });
         snapshot.report.summary = "7 accepted strategies".to_string();
 
         assert_eq!(snapshot.progress.percent, Some(0.42));
@@ -159,7 +182,10 @@ mod tests {
         );
         assert_eq!(
             snapshot.report.events,
-            vec!["loaded dataset for EURUSD".to_string()]
+            vec![JobEvent {
+                level: JobEventLevel::Info,
+                message: "loaded dataset for EURUSD".to_string(),
+            }]
         );
         assert_eq!(snapshot.report.summary, "7 accepted strategies");
     }
@@ -168,12 +194,13 @@ mod tests {
     fn push_recent_event_keeps_only_latest_eight_items() {
         let mut events = Vec::new();
         for idx in 1..=10 {
-            events = push_recent_event(&events, format!("event-{idx}"));
+            events = push_recent_event(&events, JobEventLevel::Info, format!("event-{idx}"));
         }
 
         assert_eq!(events.len(), 8);
-        assert_eq!(events.first().map(String::as_str), Some("event-3"));
-        assert_eq!(events.last().map(String::as_str), Some("event-10"));
+        assert_eq!(events.first().map(|event| event.message.as_str()), Some("event-3"));
+        assert_eq!(events.last().map(|event| event.message.as_str()), Some("event-10"));
+        assert!(events.iter().all(|event| event.level == JobEventLevel::Info));
     }
 
     #[test]

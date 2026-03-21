@@ -1,5 +1,8 @@
 use crate::app_services::{
-    jobs::{push_recent_event, CancellationFlag, JobKind, JobProgress, JobReport, JobSnapshot, JobState},
+    jobs::{
+        push_recent_event, CancellationFlag, JobEventLevel, JobKind, JobProgress, JobReport,
+        JobSnapshot, JobState,
+    },
     ServiceEvent,
 };
 use anyhow::Result;
@@ -102,6 +105,7 @@ fn completed_snapshot_from(
             .collect(),
         events: push_recent_event(
             &snapshot.report.events,
+            JobEventLevel::Info,
             format!(
                 "training finished with {} completed and {} failed model(s)",
                 completed_models.len(),
@@ -125,7 +129,11 @@ fn failed_snapshot_from(mut snapshot: JobSnapshot, err: anyhow::Error) -> JobSna
     snapshot.state = JobState::Failed;
     snapshot.report = JobReport {
         errors: vec![message.clone()],
-        events: push_recent_event(&snapshot.report.events, format!("training failed: {message}")),
+        events: push_recent_event(
+            &snapshot.report.events,
+            JobEventLevel::Error,
+            format!("training failed: {message}"),
+        ),
         summary: message,
         log_path: Some(canonical_log_path().display().to_string()),
         ..JobReport::default()
@@ -142,7 +150,11 @@ fn cancelled_snapshot_from(mut snapshot: JobSnapshot, message: impl Into<String>
     let message = message.into();
     snapshot.state = JobState::Cancelled;
     snapshot.report = JobReport {
-        events: push_recent_event(&snapshot.report.events, format!("training cancelled: {message}")),
+        events: push_recent_event(
+            &snapshot.report.events,
+            JobEventLevel::Warning,
+            format!("training cancelled: {message}"),
+        ),
         summary: message,
         log_path: Some(canonical_log_path().display().to_string()),
         ..JobReport::default()
@@ -219,6 +231,7 @@ pub fn start_training_job(
                 .collect(),
             events: push_recent_event(
                 &snapshot.report.events,
+                JobEventLevel::Info,
                 format!(
                     "loaded {} planned model(s) for {}",
                     planned_models.len(),
@@ -388,7 +401,7 @@ mod tests {
             .report
             .events
             .iter()
-            .any(|event| event.contains("training finished")));
+            .any(|event| event.message.contains("training finished")));
         assert!(snapshot.report.summary.contains("xgboost"));
         assert!(snapshot.report.summary.contains("mlp"));
     }
