@@ -1,8 +1,13 @@
 use eframe::egui;
+use forex_core::logging::{setup_logging, write_subsystem_record};
+use forex_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
+use forex_core::Settings;
 use mt5_bridge::MT5Engine;
 use clap::Parser;
 use tracing::{info, error, warn};
 use tokio::sync::mpsc;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -37,14 +42,44 @@ enum AppMessage {
     DiscoveryFinished(String),
 }
 
+#[derive(Debug, Clone)]
+struct AppRuntimeConfig {
+    config_path: String,
+    data_dir: PathBuf,
+    start_local: bool,
+}
+
+impl AppRuntimeConfig {
+    fn from_settings(config_path: String, start_local: bool, settings: &Settings) -> Self {
+        Self {
+            config_path,
+            data_dir: settings.system.data_dir.clone(),
+            start_local,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
     let args = Args::parse();
+    setup_logging(false)?;
+    let settings = Settings::from_yaml(&args.config)?;
+    let runtime = AppRuntimeConfig::from_settings(args.config.clone(), args.local, &settings);
+    write_subsystem_record(
+        SubsystemSection::App,
+        app_record(
+            "app_startup",
+            "STARTED",
+            format!(
+                "starting app headless={} local={} config={}",
+                args.headless, args.local, args.config
+            ),
+        ),
+    )?;
 
     if args.headless {
         info!("Starting Forex AI in Headless Server Mode...");
-        run_headless_loop(args).await;
+        run_headless_loop(runtime).await;
         Ok(())
     } else {
         info!("Starting Forex AI in GUI Mode...");
@@ -56,19 +91,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eframe::run_native(
             "Forex AI - Pure Rust Terminal",
             options,
-            Box::new(|cc| Ok(Box::new(ForexApp::new(cc, args.local)))),
+            Box::new(|cc| Ok(Box::new(ForexApp::new(cc, runtime.clone())))),
         )?;
         Ok(())
     }
 }
 
-async fn run_headless_loop(args: Args) {
-    info!("Loading configuration from: {}", args.config);
+async fn run_headless_loop(runtime: AppRuntimeConfig) {
+    info!("Loading configuration from: {}", runtime.config_path);
     
-    if args.local {
+    if runtime.start_local {
         info!("Running in Pure Local Mode (Linux Server Discovery/Training).");
-        let symbols = forex_data::discover_symbols("data").unwrap_or_default();
-        info!("Successfully mapped {} local symbols in 'data/' directory.", symbols.len());
+        let symbols = forex_data::discover_symbols(&runtime.data_dir).unwrap_or_default();
+        info!(
+            "Successfully mapped {} local symbols in '{}' directory.",
+            symbols.len(),
+            runtime.data_dir.display()
+        );
+        if let Err(err) = write_subsystem_record(
+            SubsystemSection::App,
+            app_record(
+                "headless_local_start",
+                "SUCCESS",
+                format!(
+                    "mapped {} symbols from {}",
+                    symbols.len(),
+                    runtime.data_dir.display()
+                ),
+            ),
+        ) {
+            error!("Failed to write APP section log: {}", err);
+        }
         for sym in &symbols {
             info!("  - Symbol available: {}", sym);
         }
@@ -84,16 +137,38 @@ async fn run_headless_loop(args: Args) {
             Ok(mut engine) => {
                 if let Ok(true) = engine.initialize() {
                     info!("MT5 successfully connected. Ready for Live Trading.");
+                    if let Err(err) = write_subsystem_record(
+                        SubsystemSection::App,
+                        app_record("headless_mt5_start", "SUCCESS", "MT5 connected for headless mode"),
+                    ) {
+                        error!("Failed to write APP section log: {}", err);
+                    }
                     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
                     loop {
                         interval.tick().await;
                     }
                 } else {
                     warn!("MT5 Connection failed or MetaTrader5 module missing. Headless trading disabled.");
+                    if let Err(err) = write_subsystem_record(
+                        SubsystemSection::App,
+                        app_record(
+                            "headless_mt5_start",
+                            "DEGRADED",
+                            "MT5 connection failed or MetaTrader5 module missing",
+                        ),
+                    ) {
+                        error!("Failed to write APP section log: {}", err);
+                    }
                 }
             }
             Err(e) => {
                 error!("Fatal Bridge Error: {:?}", e);
+                if let Err(log_err) = write_subsystem_record(
+                    SubsystemSection::App,
+                    app_record("headless_mt5_start", "FAILED", format!("fatal bridge error: {e}")),
+                ) {
+                    error!("Failed to write APP section log: {}", log_err);
+                }
             }
         }
     }
@@ -101,6 +176,7 @@ async fn run_headless_loop(args: Args) {
 
 struct ForexApp {
     mt5: Option<MT5Engine>,
+    runtime: AppRuntimeConfig,
     current_tab: Tab,
     data_source: DataSource,
     
@@ -129,17 +205,18 @@ struct ForexApp {
 }
 
 impl ForexApp {
-    fn new(_cc: &eframe::CreationContext<'_>, start_local: bool) -> Self {
+    fn new(_cc: &eframe::CreationContext<'_>, runtime: AppRuntimeConfig) -> Self {
         let (tx, rx) = mpsc::channel(100);
-        let symbols = forex_data::discover_symbols("data").unwrap_or_default();
+        let symbols = forex_data::discover_symbols(&runtime.data_dir).unwrap_or_default();
         
         Self {
             mt5: None,
+            runtime: runtime.clone(),
             current_tab: Tab::Trading,
-            data_source: if start_local { DataSource::Local } else { DataSource::MT5 },
+            data_source: if runtime.start_local { DataSource::Local } else { DataSource::MT5 },
             tx,
             rx,
-            status_msg: if start_local { "Local Mode".to_string() } else { "Offline".to_string() },
+            status_msg: if runtime.start_local { "Local Mode".to_string() } else { "Offline".to_string() },
             terminal_info: String::new(),
             selected_pair: symbols.first().cloned().unwrap_or_else(|| "EURUSD".to_string()),
             available_symbols: symbols,
@@ -154,7 +231,7 @@ impl ForexApp {
     }
 
     fn refresh_symbols(&mut self) {
-        self.available_symbols = forex_data::discover_symbols("data").unwrap_or_default();
+        self.available_symbols = forex_data::discover_symbols(&self.runtime.data_dir).unwrap_or_default();
     }
 
     fn process_messages(&mut self) {
@@ -254,11 +331,37 @@ impl ForexApp {
                                 self.status_msg = "Connected".to_string();
                                 self.terminal_info = engine.terminal_info().unwrap_or_default();
                                 self.mt5 = Some(engine);
+                                if let Err(err) = write_subsystem_record(
+                                    SubsystemSection::App,
+                                    app_record("ui_mt5_connect", "SUCCESS", "UI MT5 connection succeeded"),
+                                ) {
+                                    error!("Failed to write APP section log: {}", err);
+                                }
                             }
-                            _ => self.status_msg = "Connection Failed (module missing or terminal closed)".to_string(),
+                            _ => {
+                                self.status_msg = "Connection Failed (module missing or terminal closed)".to_string();
+                                if let Err(err) = write_subsystem_record(
+                                    SubsystemSection::App,
+                                    app_record(
+                                        "ui_mt5_connect",
+                                        "DEGRADED",
+                                        "UI MT5 connection failed (module missing or terminal closed)",
+                                    ),
+                                ) {
+                                    error!("Failed to write APP section log: {}", err);
+                                }
+                            }
                         }
                     }
-                    Err(e) => self.status_msg = format!("Error: {:?}", e),
+                    Err(e) => {
+                        self.status_msg = format!("Error: {:?}", e);
+                        if let Err(log_err) = write_subsystem_record(
+                            SubsystemSection::App,
+                            app_record("ui_mt5_connect", "FAILED", format!("UI MT5 bridge error: {e}")),
+                        ) {
+                            error!("Failed to write APP section log: {}", log_err);
+                        }
+                    }
                 }
             }
         } else {
@@ -269,6 +372,12 @@ impl ForexApp {
             if ui.button("🛑 Disconnect").clicked() {
                 self.mt5 = None;
                 self.status_msg = "Offline".to_string();
+                if let Err(err) = write_subsystem_record(
+                    SubsystemSection::App,
+                    app_record("ui_mt5_disconnect", "SUCCESS", "UI MT5 connection closed"),
+                ) {
+                    error!("Failed to write APP section log: {}", err);
+                }
             }
         }
     }
@@ -340,5 +449,63 @@ impl ForexApp {
         ui.separator();
         ui.add(egui::Slider::new(&mut self.daily_drawdown_limit, 0.1..=10.0).text("Daily Drawdown Limit (%)"));
         ui.add(egui::Slider::new(&mut self.max_lot_size, 0.01..=50.0).text("Max Lot Size"));
+    }
+}
+
+fn app_record(
+    operation: &str,
+    status: &str,
+    message: impl Into<String>,
+) -> SectionedRunRecord {
+    let now = system_time_string();
+    SectionedRunRecord {
+        run_id: format!("app-{}-{}", operation, now.replace(':', "-")),
+        parent_run_id: None,
+        started_at: now.clone(),
+        finished_at: now,
+        subsystem: SubsystemSection::App,
+        operation: operation.to_string(),
+        status: status.to_string(),
+        symbol: None,
+        timeframe: None,
+        error_code: None,
+        message: message.into(),
+        body: String::new(),
+    }
+}
+
+fn system_time_string() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_secs();
+    format!("unix:{seconds}")
+}
+
+#[cfg(test)]
+mod tests {
+    use forex_core::Settings;
+    use super::{app_record, AppRuntimeConfig};
+    use std::path::PathBuf;
+
+    #[test]
+    fn app_runtime_config_uses_settings_data_dir() {
+        let mut settings = Settings::default();
+        settings.system.data_dir = PathBuf::from("custom-data-root");
+
+        let runtime = AppRuntimeConfig::from_settings("config.yaml".to_string(), true, &settings);
+
+        assert_eq!(runtime.data_dir, PathBuf::from("custom-data-root"));
+        assert!(runtime.start_local);
+    }
+
+    #[test]
+    fn app_record_targets_app_section() {
+        let record = app_record("headless_start", "STARTED", "headless startup");
+
+        assert_eq!(record.subsystem, forex_core::sectioned_log::SubsystemSection::App);
+        assert_eq!(record.operation, "headless_start");
+        assert_eq!(record.status, "STARTED");
+        assert_eq!(record.message, "headless startup");
     }
 }

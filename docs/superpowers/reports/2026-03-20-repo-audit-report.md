@@ -240,18 +240,24 @@ Runtime probes were executed against the already-built `target/debug` binaries a
 - `cargo clippy --workspace --all-targets -- -D warnings` is now green after the warning-cleanup tranche across `forex-core`, `forex-data`, `forex-search`, `forex-models`, `forex-bindings`, `forex-app`, `forex-cli`, and `forex-news`
 - [`crates/mt5-bridge/src/lib.rs`](C:/Users/konst/development/forex-ai/crates/mt5-bridge/src/lib.rs) no longer extracts `last_error()` as `String`; it now formats the documented `(code, description)` payload with a safe string fallback, backed by unit tests
 - [`crates/forex-data/src/lib.rs`](C:/Users/konst/development/forex-ai/crates/forex-data/src/lib.rs) no longer swallows unreadable timeframes during dataset assembly and no longer converts invalid timestamp columns into synthetic zeroes; targeted regression tests now pin both contracts
-- [`crates/forex-core/src/logging.rs`](C:/Users/konst/development/forex-ai/crates/forex-core/src/logging.rs) now retains the `tracing_appender` `WorkerGuard` globally instead of dropping it immediately after logger setup; targeted unit coverage now pins the flush-retention contract
+- [`crates/forex-core/src/logging.rs`](C:/Users/konst/development/forex-ai/crates/forex-core/src/logging.rs) and [`crates/forex-core/src/sectioned_log.rs`](C:/Users/konst/development/forex-ai/crates/forex-core/src/sectioned_log.rs) now own one canonical sectioned log file at `logs/forex-ai.log`; the active runtime no longer depends on the legacy per-run file appender path
+- [`crates/forex-app/src/main.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/main.rs), [`crates/forex-cli/src/main.rs`](C:/Users/konst/development/forex-ai/crates/forex-cli/src/main.rs), and [`crates/mt5-bridge/src/lib.rs`](C:/Users/konst/development/forex-ai/crates/mt5-bridge/src/lib.rs) now emit explicit subsystem-scoped records into `APP`, `CLI`, `DISCOVERY`, `TRAINING`, and `MT5` sections instead of creating separate runtime log files or relying on ad-hoc logger setup
+- legacy artifacts such as `logs/forex_bot.log` still exist on disk from earlier runs, but the verified current runtime path updates only `logs/forex-ai.log`
 
 ### New Verification Evidence
 
 - `cargo test --workspace` -> PASS
 - `cargo clippy --workspace --all-targets -- -D warnings` -> PASS
 - `cargo test -p mt5-bridge` -> PASS
+- `cargo test -p forex-app -- --nocapture` -> PASS
+- `cargo test -p forex-cli -- --nocapture` -> PASS
 - `cargo test -p forex-data -- --nocapture` -> PASS
-- `cargo run -p forex-app -- --headless --config config.yaml` -> PASS WITH FINDINGS, emitting `MT5 Initialization failed. Last error: code=-6 description=Terminal: Authorization failed`
-- `cargo run -p forex-cli -- load --symbol EURUSD --timeframe M1 --root data` -> PASS, `Loaded EURUSD M1 rows: 5267265`
 - `cargo test -p forex-core -- --nocapture` -> PASS
 - `cargo clippy -p forex-core --all-targets -- -D warnings` -> PASS
+- `cargo run -p forex-app -- --headless --config config.yaml` -> PASS WITH FINDINGS, emitting `MT5 Initialization failed. Last error: code=-6 description=Terminal: Authorization failed`
+- `cargo run -p forex-cli -- load --symbol EURUSD --timeframe M1 --root data` -> PASS, `Loaded EURUSD M1 rows: 5267265`
+- `cargo run -p forex-cli -- discover --root data --symbol EURUSD --base M1 --higher M5,M15,H1 --population 10 --generations 1 --candidates 20 --portfolio-size 10` -> PASS WITH FINDINGS, now failing explicitly with `Discovery produced an empty portfolio for EURUSD M1 (candidates=4)` instead of exiting `0`
+- canonical log inspection after app/CLI reruns -> PASS, with `SYSTEM`, `APP`, `CLI`, `DISCOVERY`, and `MT5` sections updating independently inside `logs/forex-ai.log`
 
 ## File-By-File Findings
 
@@ -383,6 +389,8 @@ Initial line-by-line findings from the runtime-critical entrypoints audited so f
   - callers cannot distinguish “provider unavailable” from “provider found no news” without parsing logs
 
 #### `crates/forex-core`
+
+Historical baseline finding, now resolved by the canonical sectioned logging tranche:
 
 - [`crates/forex-core/src/logging.rs:29`](C:/Users/konst/development/forex-ai/crates/forex-core/src/logging.rs#L29)
   - the `WorkerGuard` returned by `tracing_appender::non_blocking` is stored only in a local `_guard` and dropped when `setup_logging()` returns

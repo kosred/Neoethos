@@ -1,6 +1,9 @@
-use anyhow::{Result};
+use anyhow::Result;
+use forex_core::logging::write_subsystem_record;
+use forex_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
 use pyo3::prelude::*;
-use tracing::{info, error, warn};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{error, info, warn};
 
 fn format_last_error(err: &Bound<'_, PyAny>) -> PyResult<String> {
     if let Ok((code, description)) = err.extract::<(i32, String)>() {
@@ -12,6 +15,49 @@ fn format_last_error(err: &Bound<'_, PyAny>) -> PyResult<String> {
     }
 
     Ok(err.str()?.to_string_lossy().into_owned())
+}
+
+fn mt5_record(operation: &str, status: &str, message: impl Into<String>) -> SectionedRunRecord {
+    let now = system_time_string();
+    let operation = operation.to_string();
+    SectionedRunRecord {
+        run_id: format!("mt5-{}-{}", operation, now.replace(':', "-")),
+        parent_run_id: None,
+        started_at: now.clone(),
+        finished_at: now,
+        subsystem: SubsystemSection::Mt5,
+        operation,
+        status: status.to_string(),
+        symbol: None,
+        timeframe: None,
+        error_code: None,
+        message: message.into(),
+        body: String::new(),
+    }
+}
+
+fn system_time_string() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch");
+    format!("{}.{:09}Z", now.as_secs(), now.subsec_nanos())
+}
+
+fn record_mt5_event(operation: &str, status: &str, message: impl Into<String>) {
+    let message = message.into();
+    if let Err(err) = write_subsystem_record(
+        SubsystemSection::Mt5,
+        mt5_record(operation, status, message.clone()),
+    ) {
+        error!(
+            "Failed to update canonical MT5 log for operation={} status={}: {}",
+            operation, status, err
+        );
+        eprintln!(
+            "Failed to update canonical MT5 log for operation={} status={}: {}",
+            operation, status, err
+        );
+    }
 }
 
 pub struct MT5Engine {
@@ -26,11 +72,17 @@ impl MT5Engine {
     }
 
     pub fn initialize(&mut self) -> Result<bool> {
+        record_mt5_event("initialize", "STARTED", "starting MT5 initialization");
         let res = Python::attach(|py| -> PyResult<bool> {
             let mt5 = match py.import("MetaTrader5") {
                 Ok(m) => m,
                 Err(e) => {
                     warn!("MetaTrader5 module not found: {}", e);
+                    record_mt5_event(
+                        "initialize",
+                        "DEGRADED",
+                        format!("MetaTrader5 module not found: {e}"),
+                    );
                     return Ok(false);
                 }
             };
@@ -41,10 +93,12 @@ impl MT5Engine {
                 let err_obj = mt5.getattr("last_error")?.call0()?;
                 let err = format_last_error(err_obj.as_any())?;
                 error!("MT5 Initialization failed. Last error: {}", err);
+                record_mt5_event("initialize", "FAILED", format!("MT5 initialize returned false: {err}"));
                 return Ok(false);
             }
 
             info!("MT5 successfully initialized from Pure Rust.");
+            record_mt5_event("initialize", "SUCCESS", "MT5 successfully initialized from Pure Rust");
             Ok(true)
         }).map_err(|e| anyhow::anyhow!("PyError: {}", e))?;
         
@@ -75,6 +129,7 @@ impl MT5Engine {
                 Ok(())
             });
             self.connected = false;
+            record_mt5_event("shutdown", "SUCCESS", "MT5 connection shutdown completed");
         }
     }
 }
@@ -127,5 +182,15 @@ mod tests {
             assert_eq!(formatted, "module unavailable");
             Ok(())
         })
+    }
+
+    #[test]
+    fn test_mt5_record_targets_mt5_section() {
+        let record = mt5_record("initialize", "FAILED", "authorization failed");
+
+        assert_eq!(record.subsystem, forex_core::sectioned_log::SubsystemSection::Mt5);
+        assert_eq!(record.operation, "initialize");
+        assert_eq!(record.status, "FAILED");
+        assert_eq!(record.message, "authorization failed");
     }
 }
