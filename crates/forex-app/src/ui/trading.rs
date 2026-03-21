@@ -1,18 +1,7 @@
-use crate::app_record;
+use crate::app_services::trading::{ConnectionSnapshot, TradingPanelMode, TradingSession};
 use crate::app_state::{AppState, DataSource};
 use crate::ui::components::open_log;
 use eframe::egui;
-use forex_core::logging::write_subsystem_record;
-use forex_core::sectioned_log::SubsystemSection;
-use mt5_bridge::MT5Engine;
-use tracing::error;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TradingPanelMode {
-    LocalOnly,
-    Disconnected,
-    Connected,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct DashboardCard {
@@ -32,25 +21,16 @@ struct ConnectionDashboard {
     sections: Vec<DashboardSection>,
 }
 
-pub fn panel_mode(data_source: DataSource, connected: bool) -> TradingPanelMode {
-    match (data_source, connected) {
-        (DataSource::Local, _) => TradingPanelMode::LocalOnly,
-        (DataSource::MT5, false) => TradingPanelMode::Disconnected,
-        (DataSource::MT5, true) => TradingPanelMode::Connected,
-    }
-}
-
 pub fn render(
     ui: &mut egui::Ui,
     state: &mut AppState,
-    mt5: &mut Option<MT5Engine>,
-    terminal_info: &mut String,
+    session: &mut TradingSession,
 ) {
     ui.heading("Live Trading Terminal");
     ui.separator();
 
-    let mode = panel_mode(state.data_source, mt5.is_some());
-    render_connection_dashboard(ui, state, mode, terminal_info);
+    let snapshot = session.snapshot(state);
+    render_connection_dashboard(ui, state, &snapshot);
 
     ui.separator();
     ui.horizontal(|ui| {
@@ -65,25 +45,23 @@ pub fn render(
     });
 
     ui.separator();
-    match mode {
+    match snapshot.mode {
         TradingPanelMode::LocalOnly => {
             ui.label("Live trading is disabled in Local mode.");
             ui.label("Please switch to MT5 source if you are on Windows.");
         }
         TradingPanelMode::Disconnected => {
             if ui.button("🚀 Connect to MetaTrader 5").clicked() {
-                connect_mt5(state, mt5, terminal_info);
+                session.connect(state);
             }
         }
         TradingPanelMode::Connected => {
             ui.group(|ui| {
                 ui.label("Account Details:");
-                ui.label(terminal_info.as_str());
+                ui.label(snapshot.terminal_info.as_str());
             });
             if ui.button("🛑 Disconnect").clicked() {
-                *mt5 = None;
-                state.status_msg = "Offline".to_string();
-                record_app_event("ui_mt5_disconnect", "SUCCESS", "UI MT5 connection closed");
+                session.disconnect(state);
             }
         }
     }
@@ -92,10 +70,9 @@ pub fn render(
 fn render_connection_dashboard(
     ui: &mut egui::Ui,
     state: &AppState,
-    mode: TradingPanelMode,
-    terminal_info: &str,
+    snapshot: &ConnectionSnapshot,
 ) {
-    let dashboard = build_connection_dashboard(state, mode, terminal_info);
+    let dashboard = build_connection_dashboard(state, snapshot);
 
     if !dashboard.summary_cards.is_empty() {
         ui.strong("Connection Center");
@@ -136,19 +113,18 @@ fn render_connection_dashboard(
 
 fn build_connection_dashboard(
     state: &AppState,
-    mode: TradingPanelMode,
-    terminal_info: &str,
+    snapshot: &ConnectionSnapshot,
 ) -> ConnectionDashboard {
     let source = match state.data_source {
         DataSource::MT5 => "MT5",
         DataSource::Local => "Local",
     };
-    let mode_label = match mode {
+    let mode_label = match snapshot.mode {
         TradingPanelMode::LocalOnly => "LocalOnly",
         TradingPanelMode::Disconnected => "Disconnected",
         TradingPanelMode::Connected => "Connected",
     };
-    let capability = match mode {
+    let capability = match snapshot.mode {
         TradingPanelMode::LocalOnly => "Discovery/Training",
         TradingPanelMode::Disconnected => "Connect Required",
         TradingPanelMode::Connected => "Live Trading Ready",
@@ -165,7 +141,7 @@ fn build_connection_dashboard(
         },
         DashboardCard {
             label: "Status".to_string(),
-            value: state.status_msg.clone(),
+            value: snapshot.status_text.clone(),
         },
         DashboardCard {
             label: "Capabilities".to_string(),
@@ -190,7 +166,7 @@ fn build_connection_dashboard(
         ],
     });
 
-    match mode {
+    match snapshot.mode {
         TradingPanelMode::LocalOnly => sections.push(DashboardSection {
             title: "Guidance".to_string(),
             rows: vec![
@@ -226,13 +202,14 @@ fn build_connection_dashboard(
             ],
         }),
         TradingPanelMode::Connected => {
-            let terminal_summary = if terminal_info.trim().is_empty() {
+            let terminal_summary = if snapshot.terminal_info.trim().is_empty() {
                 "Connected but terminal info is empty".to_string()
             } else {
-                terminal_info
+                snapshot
+                    .terminal_info
                     .lines()
                     .next()
-                    .unwrap_or(terminal_info)
+                    .unwrap_or(snapshot.terminal_info.as_str())
                     .trim()
                     .to_string()
             };
@@ -253,41 +230,6 @@ fn build_connection_dashboard(
     ConnectionDashboard {
         summary_cards,
         sections,
-    }
-}
-
-fn connect_mt5(state: &mut AppState, mt5: &mut Option<MT5Engine>, terminal_info: &mut String) {
-    match MT5Engine::new() {
-        Ok(mut engine) => match engine.initialize() {
-            Ok(true) => {
-                state.status_msg = "Connected".to_string();
-                *terminal_info = engine.terminal_info().unwrap_or_default();
-                *mt5 = Some(engine);
-                record_app_event("ui_mt5_connect", "SUCCESS", "UI MT5 connection succeeded");
-            }
-            _ => {
-                state.status_msg =
-                    "Connection Failed (module missing or terminal closed)".to_string();
-                record_app_event(
-                    "ui_mt5_connect",
-                    "DEGRADED",
-                    "UI MT5 connection failed (module missing or terminal closed)",
-                );
-            }
-        },
-        Err(err) => {
-            state.status_msg = format!("Error: {:?}", err);
-            record_app_event("ui_mt5_connect", "FAILED", format!("UI MT5 bridge error: {err}"));
-        }
-    }
-}
-
-fn record_app_event(operation: &str, status: &str, message: impl Into<String>) {
-    if let Err(err) = write_subsystem_record(
-        SubsystemSection::App,
-        app_record(operation, status, message),
-    ) {
-        error!("Failed to write APP section log: {}", err);
     }
 }
 
@@ -320,8 +262,14 @@ mod tests {
     #[test]
     fn connection_dashboard_describes_local_mode_operations() {
         let state = sample_state(DataSource::Local, "Local Mode");
+        let snapshot = ConnectionSnapshot {
+            mode: TradingPanelMode::LocalOnly,
+            connected: false,
+            status_text: "Local Mode".to_string(),
+            terminal_info: String::new(),
+        };
 
-        let dashboard = build_connection_dashboard(&state, TradingPanelMode::LocalOnly, "");
+        let dashboard = build_connection_dashboard(&state, &snapshot);
 
         assert_eq!(dashboard.summary_cards[0].value, "Local");
         assert_eq!(dashboard.summary_cards[1].value, "LocalOnly");
@@ -338,12 +286,14 @@ mod tests {
     #[test]
     fn connection_dashboard_surfaces_connected_terminal_snapshot() {
         let state = sample_state(DataSource::MT5, "Connected");
+        let snapshot = ConnectionSnapshot {
+            mode: TradingPanelMode::Connected,
+            connected: true,
+            status_text: "Connected".to_string(),
+            terminal_info: "TerminalInfo(community_account=False, connected=True)".to_string(),
+        };
 
-        let dashboard = build_connection_dashboard(
-            &state,
-            TradingPanelMode::Connected,
-            "TerminalInfo(community_account=False, connected=True)",
-        );
+        let dashboard = build_connection_dashboard(&state, &snapshot);
 
         assert_eq!(dashboard.summary_cards[0].value, "MT5");
         assert_eq!(dashboard.summary_cards[1].value, "Connected");

@@ -2,7 +2,12 @@ mod app_services;
 mod app_state;
 mod ui;
 
-use app_services::{discovery::DiscoveryJobHandle, training::TrainingJobHandle, ServiceEvent};
+use app_services::{
+    discovery::DiscoveryJobHandle,
+    trading::TradingSession,
+    training::TrainingJobHandle,
+    ServiceEvent,
+};
 use app_state::{AppRuntimeConfig, AppState, Tab};
 use eframe::egui;
 use forex_core::logging::{setup_logging, write_subsystem_record};
@@ -143,7 +148,7 @@ async fn run_headless_loop(runtime: AppRuntimeConfig) {
 }
 
 struct ForexApp {
-    mt5: Option<MT5Engine>,
+    trading_session: TradingSession,
     state: AppState,
     
     // Message Bus
@@ -152,8 +157,6 @@ struct ForexApp {
     discovery_handle: Option<DiscoveryJobHandle>,
     training_handle: Option<TrainingJobHandle>,
     
-    // Trading State
-    terminal_info: String,
 }
 
 impl ForexApp {
@@ -163,13 +166,12 @@ impl ForexApp {
         let state = AppState::new(runtime.clone(), symbols);
         
         Self {
-            mt5: None,
+            trading_session: TradingSession::new(),
             state,
             tx,
             rx,
             discovery_handle: None,
             training_handle: None,
-            terminal_info: String::new(),
         }
     }
 
@@ -230,7 +232,7 @@ impl eframe::App for ForexApp {
 
         egui::SidePanel::left("left_status").show(ctx, |ui| {
             let refresh_requested =
-                ui::system_status::render(ui, &mut self.state, self.mt5.is_some());
+                ui::system_status::render(ui, &mut self.state, self.trading_session.is_connected());
             if refresh_requested {
                 self.refresh_symbols();
             }
@@ -241,8 +243,7 @@ impl eframe::App for ForexApp {
                 Tab::Trading => ui::trading::render(
                     ui,
                     &mut self.state,
-                    &mut self.mt5,
-                    &mut self.terminal_info,
+                    &mut self.trading_session,
                 ),
                 Tab::Discovery => ui::discovery::render(
                     ui,
@@ -350,16 +351,16 @@ mod tests {
 
     #[test]
     fn trading_panel_mode_disables_live_controls_in_local_mode() {
-        let mode = crate::ui::trading::panel_mode(DataSource::Local, false);
+        let mode = crate::app_services::trading::panel_mode(DataSource::Local, false);
 
-        assert_eq!(mode, crate::ui::trading::TradingPanelMode::LocalOnly);
+        assert_eq!(mode, crate::app_services::trading::TradingPanelMode::LocalOnly);
     }
 
     #[test]
     fn trading_panel_mode_switches_to_disconnect_when_mt5_is_connected() {
-        let mode = crate::ui::trading::panel_mode(DataSource::MT5, true);
+        let mode = crate::app_services::trading::panel_mode(DataSource::MT5, true);
 
-        assert_eq!(mode, crate::ui::trading::TradingPanelMode::Connected);
+        assert_eq!(mode, crate::app_services::trading::TradingPanelMode::Connected);
     }
 
     #[test]

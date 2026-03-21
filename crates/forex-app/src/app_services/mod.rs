@@ -1,5 +1,6 @@
 pub mod discovery;
 pub mod jobs;
+pub mod trading;
 pub mod training;
 
 use crate::app_services::jobs::JobSnapshot;
