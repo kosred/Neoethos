@@ -1,0 +1,124 @@
+use crate::app_services::jobs::JobSnapshot;
+use forex_core::{logging::canonical_log_path, Settings};
+use std::path::PathBuf;
+
+#[derive(Debug, Clone)]
+pub struct AppRuntimeConfig {
+    pub config_path: String,
+    pub data_dir: PathBuf,
+    pub start_local: bool,
+}
+
+impl AppRuntimeConfig {
+    pub fn from_settings(config_path: String, start_local: bool, settings: &Settings) -> Self {
+        Self {
+            config_path,
+            data_dir: settings.system.data_dir.clone(),
+            start_local,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Trading,
+    Discovery,
+    Training,
+    Hardware,
+    Risk,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataSource {
+    MT5,
+    Local,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppState {
+    pub runtime: AppRuntimeConfig,
+    pub current_tab: Tab,
+    pub data_source: DataSource,
+    pub status_msg: String,
+    pub selected_pair: String,
+    pub available_symbols: Vec<String>,
+    pub discovery_job: Option<JobSnapshot>,
+    pub training_job: Option<JobSnapshot>,
+    pub canonical_log_path: PathBuf,
+}
+
+impl AppState {
+    pub fn new(runtime: AppRuntimeConfig, available_symbols: Vec<String>) -> Self {
+        let selected_pair = available_symbols
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "EURUSD".to_string());
+
+        Self {
+            current_tab: Tab::Trading,
+            data_source: if runtime.start_local {
+                DataSource::Local
+            } else {
+                DataSource::MT5
+            },
+            status_msg: if runtime.start_local {
+                "Local Mode".to_string()
+            } else {
+                "Offline".to_string()
+            },
+            canonical_log_path: canonical_log_path(),
+            runtime,
+            selected_pair,
+            available_symbols,
+            discovery_job: None,
+            training_job: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn app_runtime_config_uses_settings_data_dir() {
+        let mut settings = Settings::default();
+        settings.system.data_dir = PathBuf::from("custom-data-root");
+
+        let runtime = AppRuntimeConfig::from_settings("config.yaml".to_string(), true, &settings);
+
+        assert_eq!(runtime.data_dir, PathBuf::from("custom-data-root"));
+        assert!(runtime.start_local);
+    }
+
+    #[test]
+    fn app_state_uses_first_symbol_and_keeps_job_slots_empty() {
+        let runtime = AppRuntimeConfig {
+            config_path: "config.yaml".to_string(),
+            data_dir: PathBuf::from("data"),
+            start_local: true,
+        };
+
+        let state = AppState::new(runtime, vec!["GBPUSD".to_string(), "EURUSD".to_string()]);
+
+        assert_eq!(state.selected_pair, "GBPUSD");
+        assert!(state.discovery_job.is_none());
+        assert!(state.training_job.is_none());
+        assert_eq!(state.canonical_log_path, PathBuf::from("logs").join("forex-ai.log"));
+    }
+
+    #[test]
+    fn app_state_falls_back_to_eurusd_when_symbol_list_is_empty() {
+        let runtime = AppRuntimeConfig {
+            config_path: "config.yaml".to_string(),
+            data_dir: PathBuf::from("data"),
+            start_local: false,
+        };
+
+        let state = AppState::new(runtime, Vec::new());
+
+        assert_eq!(state.selected_pair, "EURUSD");
+        assert_eq!(state.status_msg, "Offline");
+    }
+}

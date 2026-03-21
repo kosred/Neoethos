@@ -1,12 +1,15 @@
+mod app_services;
+mod app_state;
+
+use app_state::AppRuntimeConfig;
 use eframe::egui;
 use forex_core::logging::{setup_logging, write_subsystem_record};
 use forex_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
 use forex_core::Settings;
 use mt5_bridge::MT5Engine;
 use clap::Parser;
-use tracing::{info, error, warn};
 use tokio::sync::mpsc;
-use std::path::PathBuf;
+use tracing::{error, info, warn};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Parser, Debug)]
@@ -40,23 +43,6 @@ enum DataSource {
 enum AppMessage {
     DiscoveryProgress(f32),
     DiscoveryFinished(String),
-}
-
-#[derive(Debug, Clone)]
-struct AppRuntimeConfig {
-    config_path: String,
-    data_dir: PathBuf,
-    start_local: bool,
-}
-
-impl AppRuntimeConfig {
-    fn from_settings(config_path: String, start_local: bool, settings: &Settings) -> Self {
-        Self {
-            config_path,
-            data_dir: settings.system.data_dir.clone(),
-            start_local,
-        }
-    }
 }
 
 #[tokio::main]
