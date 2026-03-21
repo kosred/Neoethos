@@ -3,7 +3,7 @@ mod app_state;
 mod ui;
 
 use app_services::{discovery::DiscoveryJobHandle, training::TrainingJobHandle, ServiceEvent};
-use app_state::{AppRuntimeConfig, AppState, DataSource, Tab};
+use app_state::{AppRuntimeConfig, AppState, Tab};
 use eframe::egui;
 use forex_core::logging::{setup_logging, write_subsystem_record};
 use forex_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
@@ -229,39 +229,9 @@ impl eframe::App for ForexApp {
         });
 
         egui::SidePanel::left("left_status").show(ctx, |ui| {
-            ui.heading("System Status");
-            ui.separator();
-            
-            ui.label("Data Source:");
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.state.data_source, DataSource::MT5, "MT5");
-                ui.selectable_value(&mut self.state.data_source, DataSource::Local, "Local");
-            });
-
-            ui.separator();
-            if self.state.data_source == DataSource::MT5 {
-                ui.label(format!("MT5: {}", self.state.status_msg));
-                if self.mt5.is_some() {
-                    ui.colored_label(egui::Color32::GREEN, "● Online");
-                } else {
-                    ui.colored_label(egui::Color32::RED, "○ Offline");
-                }
-            } else {
-                ui.colored_label(egui::Color32::BLUE, "🏠 Local Mode");
-            }
-
-            ui.separator();
-            ui.label(format!("CPU Cores: {}", self.state.hardware.cpu_cores));
-            ui.label(format!(
-                "GPU: {}",
-                if self.state.hardware.gpu_enabled {
-                    "Enabled"
-                } else {
-                    "Disabled"
-                }
-            ));
-            
-            if ui.button("🔄 Refresh Data").clicked() {
+            let refresh_requested =
+                ui::system_status::render(ui, &mut self.state, self.mt5.is_some());
+            if refresh_requested {
                 self.refresh_symbols();
             }
         });
