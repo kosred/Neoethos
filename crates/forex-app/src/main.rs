@@ -161,6 +161,7 @@ struct ForexApp {
 
 impl ForexApp {
     fn new(_cc: &eframe::CreationContext<'_>, runtime: AppRuntimeConfig) -> Self {
+        ui::theme::apply_theme(&_cc.egui_ctx);
         let (tx, rx) = mpsc::unbounded_channel();
         let symbols = forex_data::discover_symbols(&runtime.data_dir).unwrap_or_default();
         let state = AppState::new(runtime.clone(), symbols);
@@ -218,7 +219,9 @@ impl eframe::App for ForexApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_messages();
 
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+        egui::TopBottomPanel::top("top_panel")
+            .frame(ui::theme::top_panel_frame(ctx.style().as_ref()))
+            .show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.selectable_value(&mut self.state.current_tab, Tab::Trading, "📊 Trading");
@@ -230,7 +233,9 @@ impl eframe::App for ForexApp {
             });
         });
 
-        egui::SidePanel::left("left_status").show(ctx, |ui| {
+        egui::SidePanel::left("left_status")
+            .frame(ui::theme::side_panel_frame(ctx.style().as_ref()))
+            .show(ctx, |ui| {
             let refresh_requested =
                 ui::system_status::render(ui, &mut self.state, self.trading_session.is_connected());
             if refresh_requested {
@@ -238,7 +243,9 @@ impl eframe::App for ForexApp {
             }
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default()
+            .frame(ui::theme::central_panel_frame(ctx.style().as_ref()))
+            .show(ctx, |ui| {
             match self.state.current_tab {
                 Tab::Trading => ui::trading::render(
                     ui,

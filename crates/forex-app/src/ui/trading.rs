@@ -2,20 +2,11 @@ use crate::app_services::trading::{
     ConnectionSnapshot, TradingPanelMode, TradingSession, SUPPORTED_TRADING_ADAPTERS,
 };
 use crate::app_state::{AppState, DataSource};
-use crate::ui::components::open_log;
+use crate::ui::components::{
+    open_log, render_dashboard_sections, render_summary_cards, render_view_header, DashboardCard,
+    DashboardSection,
+};
 use eframe::egui;
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct DashboardCard {
-    label: String,
-    value: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct DashboardSection {
-    title: String,
-    rows: Vec<(String, String)>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct ConnectionDashboard {
@@ -28,7 +19,11 @@ pub fn render(
     state: &mut AppState,
     session: &mut TradingSession,
 ) {
-    ui.heading("Live Trading Terminal");
+    render_view_header(
+        ui,
+        "Live Trading Terminal",
+        "Inspect broker connectivity, adapter capabilities, and the execution-ready runtime before enabling live trading.",
+    );
     ui.separator();
 
     let snapshot = session.snapshot(state);
@@ -75,42 +70,8 @@ fn render_connection_dashboard(
     snapshot: &ConnectionSnapshot,
 ) {
     let dashboard = build_connection_dashboard(state, snapshot);
-
-    if !dashboard.summary_cards.is_empty() {
-        ui.strong("Connection Center");
-        ui.horizontal_wrapped(|ui| {
-            for card in &dashboard.summary_cards {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.set_min_size(egui::vec2(155.0, 54.0));
-                    ui.small(&card.label);
-                    ui.strong(&card.value);
-                });
-            }
-        });
-    }
-
-    if !dashboard.sections.is_empty() {
-        ui.add_space(8.0);
-        ui.columns(2, |columns| {
-            for (idx, section) in dashboard.sections.iter().enumerate() {
-                columns[idx % 2].group(|ui| {
-                    ui.set_min_width(260.0);
-                    ui.strong(&section.title);
-                    ui.add_space(6.0);
-                    egui::Grid::new(format!("connection_dashboard_{}_{}", section.title, idx))
-                        .num_columns(2)
-                        .spacing([12.0, 6.0])
-                        .show(ui, |ui| {
-                            for (label, value) in &section.rows {
-                                ui.label(label);
-                                ui.strong(value);
-                                ui.end_row();
-                            }
-                        });
-                });
-            }
-        });
-    }
+    render_summary_cards(ui, "Connection Center", &dashboard.summary_cards);
+    render_dashboard_sections(ui, "connection_dashboard", &dashboard.sections);
 }
 
 fn build_connection_dashboard(

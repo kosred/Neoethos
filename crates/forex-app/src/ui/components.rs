@@ -1,25 +1,100 @@
 use crate::app_services::jobs::{JobEventLevel, JobSnapshot, JobState};
+use crate::ui::theme;
 use eframe::egui;
 use std::path::Path;
 use std::process::Command;
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DashboardCard {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DashboardSection {
+    pub title: String,
+    pub rows: Vec<(String, String)>,
+}
+
 pub fn status_color(state: JobState) -> egui::Color32 {
     match state {
-        JobState::Queued => egui::Color32::GRAY,
-        JobState::Running => egui::Color32::YELLOW,
-        JobState::Succeeded => egui::Color32::GREEN,
-        JobState::Degraded => egui::Color32::from_rgb(255, 165, 0),
-        JobState::Failed => egui::Color32::RED,
-        JobState::Cancelled => egui::Color32::LIGHT_RED,
+        JobState::Queued => theme::TEXT_MUTED,
+        JobState::Running => theme::ACCENT,
+        JobState::Succeeded => theme::SUCCESS,
+        JobState::Degraded => theme::WARNING,
+        JobState::Failed => theme::DANGER,
+        JobState::Cancelled => egui::Color32::from_rgb(255, 128, 128),
+    }
+}
+
+pub fn render_view_header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
+    ui.heading(egui::RichText::new(title).color(theme::TEXT_PRIMARY));
+    if !subtitle.trim().is_empty() {
+        ui.label(egui::RichText::new(subtitle).color(theme::TEXT_MUTED));
     }
 }
 
 pub fn render_status_badge(ui: &mut egui::Ui, label: &str, snapshot: Option<&JobSnapshot>) {
     let (text, color) = match snapshot {
         Some(snapshot) => (format!("{label}: {:?}", snapshot.state), status_color(snapshot.state)),
-        None => (format!("{label}: Idle"), egui::Color32::GRAY),
+        None => (format!("{label}: Idle"), theme::TEXT_MUTED),
     };
-    ui.colored_label(color, text);
+    let mut frame = theme::card_frame(ui.style());
+    frame.fill = color.linear_multiply(0.14);
+    frame.stroke = egui::Stroke::new(1.0, color);
+    frame.show(ui, |ui| {
+        ui.label(egui::RichText::new(text).color(color).strong());
+    });
+}
+
+pub fn render_summary_cards(ui: &mut egui::Ui, title: &str, cards: &[DashboardCard]) {
+    if cards.is_empty() {
+        return;
+    }
+
+    ui.separator();
+    ui.strong(egui::RichText::new(title).color(theme::TEXT_PRIMARY));
+    ui.horizontal_wrapped(|ui| {
+        for card in cards {
+            theme::card_frame(ui.style()).show(ui, |ui| {
+                ui.set_min_size(egui::vec2(165.0, 68.0));
+                ui.label(egui::RichText::new(&card.label).small().color(theme::TEXT_MUTED));
+                ui.strong(egui::RichText::new(&card.value).color(theme::TEXT_PRIMARY));
+            });
+        }
+    });
+}
+
+pub fn render_dashboard_sections(
+    ui: &mut egui::Ui,
+    id_prefix: &str,
+    sections: &[DashboardSection],
+) {
+    if sections.is_empty() {
+        return;
+    }
+
+    ui.separator();
+    ui.columns(2, |columns| {
+        for (idx, section) in sections.iter().enumerate() {
+            columns[idx % 2].add_space(2.0);
+            theme::section_frame(columns[idx % 2].style()).show(&mut columns[idx % 2], |ui| {
+                ui.set_min_width(280.0);
+                ui.strong(egui::RichText::new(&section.title).color(theme::TEXT_PRIMARY));
+                ui.add_space(8.0);
+                egui::Grid::new(format!("{id_prefix}_{idx}"))
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        for (label, value) in &section.rows {
+                            ui.label(egui::RichText::new(label).color(theme::TEXT_MUTED));
+                            ui.strong(egui::RichText::new(value).color(theme::TEXT_PRIMARY));
+                            ui.end_row();
+                        }
+                    });
+            });
+        }
+    });
 }
 
 pub fn render_report(ui: &mut egui::Ui, snapshot: &JobSnapshot) {
@@ -90,7 +165,7 @@ pub fn render_report(ui: &mut egui::Ui, snapshot: &JobSnapshot) {
 
     if !snapshot.report.warnings.is_empty() {
         ui.separator();
-        ui.colored_label(egui::Color32::from_rgb(255, 165, 0), "Warnings");
+        ui.colored_label(theme::WARNING, "Warnings");
         for warning in &snapshot.report.warnings {
             ui.label(warning);
         }
@@ -98,7 +173,7 @@ pub fn render_report(ui: &mut egui::Ui, snapshot: &JobSnapshot) {
 
     if !snapshot.report.errors.is_empty() {
         ui.separator();
-        ui.colored_label(egui::Color32::RED, "Errors");
+        ui.colored_label(theme::DANGER, "Errors");
         for error in &snapshot.report.errors {
             ui.label(error);
         }
@@ -122,8 +197,8 @@ pub fn open_log(path: &Path) -> anyhow::Result<()> {
 fn event_color(level: JobEventLevel) -> egui::Color32 {
     match level {
         JobEventLevel::Info => egui::Color32::LIGHT_BLUE,
-        JobEventLevel::Warning => egui::Color32::from_rgb(255, 165, 0),
-        JobEventLevel::Error => egui::Color32::RED,
+        JobEventLevel::Warning => theme::WARNING,
+        JobEventLevel::Error => theme::DANGER,
     }
 }
 
@@ -158,16 +233,36 @@ mod tests {
 
     #[test]
     fn status_color_maps_terminal_states() {
-        assert_eq!(status_color(JobState::Succeeded), egui::Color32::GREEN);
-        assert_eq!(status_color(JobState::Failed), egui::Color32::RED);
-        assert_eq!(status_color(JobState::Cancelled), egui::Color32::LIGHT_RED);
+        assert_eq!(status_color(JobState::Succeeded), theme::SUCCESS);
+        assert_eq!(status_color(JobState::Failed), theme::DANGER);
+        assert_eq!(
+            status_color(JobState::Cancelled),
+            egui::Color32::from_rgb(255, 128, 128)
+        );
     }
 
     #[test]
     fn event_color_maps_event_levels() {
         assert_eq!(event_color(JobEventLevel::Info), egui::Color32::LIGHT_BLUE);
-        assert_eq!(event_color(JobEventLevel::Warning), egui::Color32::from_rgb(255, 165, 0));
-        assert_eq!(event_color(JobEventLevel::Error), egui::Color32::RED);
+        assert_eq!(event_color(JobEventLevel::Warning), theme::WARNING);
+        assert_eq!(event_color(JobEventLevel::Error), theme::DANGER);
+    }
+
+    #[test]
+    fn dashboard_card_and_section_preserve_values() {
+        let card = DashboardCard {
+            label: "Adapter".to_string(),
+            value: "cTrader".to_string(),
+        };
+        let section = DashboardSection {
+            title: "Runtime".to_string(),
+            rows: vec![("Mode".to_string(), "Remote Open API".to_string())],
+        };
+
+        assert_eq!(card.label, "Adapter");
+        assert_eq!(card.value, "cTrader");
+        assert_eq!(section.title, "Runtime");
+        assert_eq!(section.rows[0], ("Mode".to_string(), "Remote Open API".to_string()));
     }
 
     #[test]

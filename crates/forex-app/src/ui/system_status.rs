@@ -1,17 +1,9 @@
 use crate::app_state::{AppState, DataSource};
+use crate::ui::components::{
+    render_dashboard_sections, render_summary_cards, render_view_header, DashboardCard,
+    DashboardSection,
+};
 use eframe::egui;
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct DashboardCard {
-    label: String,
-    value: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct DashboardSection {
-    title: String,
-    rows: Vec<(String, String)>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct SystemStatusDashboard {
@@ -23,7 +15,11 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, connected: bool) -> bool 
     let dashboard = build_system_status_dashboard(state, connected);
     let mut refresh_requested = false;
 
-    ui.heading("System Status");
+    render_view_header(
+        ui,
+        "System Status",
+        "Control the active runtime source and inspect the local or broker-backed operating envelope.",
+    );
     ui.separator();
 
     ui.label("Data Source:");
@@ -32,37 +28,8 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, connected: bool) -> bool 
         ui.selectable_value(&mut state.data_source, DataSource::Local, "Local");
     });
 
-    ui.add_space(8.0);
-    ui.horizontal_wrapped(|ui| {
-        for card in &dashboard.summary_cards {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.set_min_size(egui::vec2(132.0, 52.0));
-                ui.small(&card.label);
-                ui.strong(&card.value);
-            });
-        }
-    });
-
-    if !dashboard.sections.is_empty() {
-        ui.add_space(8.0);
-        for (idx, section) in dashboard.sections.iter().enumerate() {
-            ui.group(|ui| {
-                ui.strong(&section.title);
-                ui.add_space(6.0);
-                egui::Grid::new(format!("system_status_section_{}", idx))
-                    .num_columns(2)
-                    .spacing([12.0, 6.0])
-                    .show(ui, |ui| {
-                        for (label, value) in &section.rows {
-                            ui.label(label);
-                            ui.strong(value);
-                            ui.end_row();
-                        }
-                    });
-            });
-            ui.add_space(6.0);
-        }
-    }
+    render_summary_cards(ui, "Runtime Snapshot", &dashboard.summary_cards);
+    render_dashboard_sections(ui, "system_status_section", &dashboard.sections);
 
     if ui.button("🔄 Refresh Data").clicked() {
         refresh_requested = true;

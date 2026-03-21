@@ -4,21 +4,12 @@ use crate::app_services::{
     ServiceEvent,
 };
 use crate::app_state::AppState;
-use crate::ui::components::{open_log, render_report, render_status_badge};
+use crate::ui::components::{
+    open_log, render_dashboard_sections, render_report, render_status_badge, render_summary_cards,
+    render_view_header, DashboardCard, DashboardSection,
+};
 use eframe::egui;
 use tokio::sync::mpsc;
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct DashboardCard {
-    label: String,
-    value: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct DashboardSection {
-    title: String,
-    rows: Vec<(String, String)>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct DiscoveryDashboard {
@@ -32,7 +23,11 @@ pub fn render(
     tx: &mpsc::UnboundedSender<ServiceEvent>,
     handle: &mut Option<DiscoveryJobHandle>,
 ) {
-    ui.heading("Strategy Discovery Engine");
+    render_view_header(
+        ui,
+        "Strategy Discovery Engine",
+        "Search, rank, and assemble tradable strategy portfolios from the active symbol universe.",
+    );
     ui.separator();
 
     ui.horizontal(|ui| {
@@ -116,43 +111,12 @@ pub fn render(
 
 fn render_discovery_dashboard(ui: &mut egui::Ui, snapshot: &JobSnapshot) {
     let dashboard = build_discovery_dashboard(snapshot);
-
-    if !dashboard.summary_cards.is_empty() {
-        ui.separator();
-        ui.strong("Discovery Overview");
-        ui.horizontal_wrapped(|ui| {
-            for card in &dashboard.summary_cards {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.set_min_size(egui::vec2(155.0, 54.0));
-                    ui.small(&card.label);
-                    ui.strong(&card.value);
-                });
-            }
-        });
-    }
-
-    if !dashboard.sections.is_empty() {
-        ui.separator();
-        ui.columns(2, |columns| {
-            for (idx, section) in dashboard.sections.iter().enumerate() {
-                columns[idx % 2].group(|ui| {
-                    ui.set_min_width(260.0);
-                    ui.strong(&section.title);
-                    ui.add_space(6.0);
-                    egui::Grid::new(format!("discovery_dashboard_{:?}_{}", snapshot.id, idx))
-                        .num_columns(2)
-                        .spacing([12.0, 6.0])
-                        .show(ui, |ui| {
-                            for (label, value) in &section.rows {
-                                ui.label(label);
-                                ui.strong(value);
-                                ui.end_row();
-                            }
-                        });
-                });
-            }
-        });
-    }
+    render_summary_cards(ui, "Discovery Overview", &dashboard.summary_cards);
+    render_dashboard_sections(
+        ui,
+        &format!("discovery_dashboard_{:?}", snapshot.id),
+        &dashboard.sections,
+    );
 }
 
 fn build_discovery_dashboard(snapshot: &JobSnapshot) -> DiscoveryDashboard {
