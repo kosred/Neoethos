@@ -1,4 +1,6 @@
-use crate::app_services::trading::{ConnectionSnapshot, TradingPanelMode, TradingSession};
+use crate::app_services::trading::{
+    ConnectionSnapshot, TradingPanelMode, TradingSession, SUPPORTED_TRADING_ADAPTERS,
+};
 use crate::app_state::{AppState, DataSource};
 use crate::ui::components::open_log;
 use eframe::egui;
@@ -115,6 +117,11 @@ fn build_connection_dashboard(
     state: &AppState,
     snapshot: &ConnectionSnapshot,
 ) -> ConnectionDashboard {
+    let supported_adapters = SUPPORTED_TRADING_ADAPTERS
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     let source = match state.data_source {
         DataSource::MT5 => "MT5",
         DataSource::Local => "Local",
@@ -136,6 +143,10 @@ fn build_connection_dashboard(
             value: source.to_string(),
         },
         DashboardCard {
+            label: "Adapter".to_string(),
+            value: snapshot.adapter_name.clone(),
+        },
+        DashboardCard {
             label: "Mode".to_string(),
             value: mode_label.to_string(),
         },
@@ -154,6 +165,11 @@ fn build_connection_dashboard(
         title: "Runtime".to_string(),
         rows: vec![
             ("Data Source".to_string(), source.to_string()),
+            ("Adapter".to_string(), snapshot.adapter_name.clone()),
+            (
+                "Integration".to_string(),
+                snapshot.integration_mode.clone(),
+            ),
             (
                 "Config".to_string(),
                 state.runtime.config_path.clone(),
@@ -189,15 +205,23 @@ fn build_connection_dashboard(
             rows: vec![
                 (
                     "Bridge".to_string(),
-                    "MetaTrader5 Python bridge must initialize".to_string(),
+                    snapshot.integration_mode.clone(),
                 ),
                 (
-                    "Terminal".to_string(),
-                    "Desktop terminal and account auth must be available".to_string(),
+                    "Local Terminal".to_string(),
+                    if snapshot.requires_local_terminal {
+                        "Required".to_string()
+                    } else {
+                        "Not required".to_string()
+                    },
                 ),
                 (
                     "Next Action".to_string(),
-                    "Use Connect to probe the MT5 runtime".to_string(),
+                    format!("Use Connect to probe the {} runtime", snapshot.adapter_name),
+                ),
+                (
+                    "Available Adapters".to_string(),
+                    supported_adapters,
                 ),
             ],
         }),
@@ -217,6 +241,7 @@ fn build_connection_dashboard(
                 title: "Terminal Snapshot".to_string(),
                 rows: vec![
                     ("Session".to_string(), "Connected".to_string()),
+                    ("Adapter".to_string(), snapshot.adapter_name.clone()),
                     ("Terminal".to_string(), terminal_summary),
                     (
                         "Available Operations".to_string(),
@@ -264,6 +289,10 @@ mod tests {
         let state = sample_state(DataSource::Local, "Local Mode");
         let snapshot = ConnectionSnapshot {
             adapter_name: "MT5".to_string(),
+            integration_mode: "Local terminal bridge".to_string(),
+            requires_local_terminal: true,
+            supports_market_data: true,
+            supports_live_orders: true,
             mode: TradingPanelMode::LocalOnly,
             connected: false,
             status_text: "Local Mode".to_string(),
@@ -273,8 +302,9 @@ mod tests {
         let dashboard = build_connection_dashboard(&state, &snapshot);
 
         assert_eq!(dashboard.summary_cards[0].value, "Local");
-        assert_eq!(dashboard.summary_cards[1].value, "LocalOnly");
-        assert_eq!(dashboard.summary_cards[3].value, "Discovery/Training");
+        assert_eq!(dashboard.summary_cards[1].value, "MT5");
+        assert_eq!(dashboard.summary_cards[2].value, "LocalOnly");
+        assert_eq!(dashboard.summary_cards[4].value, "Discovery/Training");
         assert_eq!(dashboard.sections[0].title, "Runtime");
         assert_eq!(dashboard.sections[1].title, "Guidance");
         assert!(dashboard.sections[1]
@@ -289,6 +319,10 @@ mod tests {
         let state = sample_state(DataSource::MT5, "Connected");
         let snapshot = ConnectionSnapshot {
             adapter_name: "MT5".to_string(),
+            integration_mode: "Local terminal bridge".to_string(),
+            requires_local_terminal: true,
+            supports_market_data: true,
+            supports_live_orders: true,
             mode: TradingPanelMode::Connected,
             connected: true,
             status_text: "Connected".to_string(),
@@ -298,14 +332,41 @@ mod tests {
         let dashboard = build_connection_dashboard(&state, &snapshot);
 
         assert_eq!(dashboard.summary_cards[0].value, "MT5");
-        assert_eq!(dashboard.summary_cards[1].value, "Connected");
-        assert_eq!(dashboard.summary_cards[3].value, "Live Trading Ready");
+        assert_eq!(dashboard.summary_cards[1].value, "MT5");
+        assert_eq!(dashboard.summary_cards[2].value, "Connected");
+        assert_eq!(dashboard.summary_cards[4].value, "Live Trading Ready");
         assert_eq!(dashboard.sections[1].title, "Terminal Snapshot");
         assert!(dashboard.sections[1]
             .rows
             .iter()
             .any(|(label, value)| label == "Terminal"
                 && value.contains("TerminalInfo")));
+    }
+
+    #[test]
+    fn connection_dashboard_lists_supported_adapters_for_disconnected_runtime() {
+        let state = sample_state(DataSource::MT5, "Offline");
+        let snapshot = ConnectionSnapshot {
+            adapter_name: "MT5".to_string(),
+            integration_mode: "Local terminal bridge".to_string(),
+            requires_local_terminal: true,
+            supports_market_data: true,
+            supports_live_orders: true,
+            mode: TradingPanelMode::Disconnected,
+            connected: false,
+            status_text: "Offline".to_string(),
+            terminal_info: String::new(),
+        };
+
+        let dashboard = build_connection_dashboard(&state, &snapshot);
+
+        assert!(dashboard.sections[1]
+            .rows
+            .iter()
+            .any(|(label, value)| label == "Available Adapters"
+                && value.contains("MT5")
+                && value.contains("cTrader")
+                && value.contains("DXtrade")));
     }
 }
 
