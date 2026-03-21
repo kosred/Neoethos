@@ -1,5 +1,5 @@
 use crate::app_services::{
-    jobs::JobState,
+    jobs::{JobSnapshot, JobState},
     training::{failed_snapshot, start_training_job, TrainingJobHandle, TrainingRequest},
     ServiceEvent,
 };
@@ -8,6 +8,27 @@ use crate::ui::components::{open_log, render_report, render_status_badge};
 use eframe::egui;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct DashboardCard {
+    label: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct DashboardSection {
+    title: String,
+    rows: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct TrainingDashboard {
+    summary_cards: Vec<DashboardCard>,
+    sections: Vec<DashboardSection>,
+}
+
+type SectionRows = Vec<(String, String)>;
+type TrainingEntryGroups = (SectionRows, SectionRows, SectionRows);
 
 pub fn render(
     ui: &mut egui::Ui,
@@ -22,7 +43,10 @@ pub fn render(
     render_status_badge(ui, "Training", state.training_job.as_ref());
 
     if let Some(snapshot) = state.training_job.as_ref() {
-        render_report(ui, snapshot);
+        render_training_dashboard(ui, snapshot);
+        egui::CollapsingHeader::new("Detailed Report & Events")
+            .default_open(true)
+            .show(ui, |ui| render_report(ui, snapshot));
     } else {
         ui.label("No active training job.");
     }
@@ -70,4 +94,289 @@ pub fn render(
             }
         }
     });
+}
+
+fn render_training_dashboard(ui: &mut egui::Ui, snapshot: &JobSnapshot) {
+    let dashboard = build_training_dashboard(snapshot);
+
+    if !dashboard.summary_cards.is_empty() {
+        ui.separator();
+        ui.strong("Training Overview");
+        ui.horizontal_wrapped(|ui| {
+            for card in &dashboard.summary_cards {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_min_size(egui::vec2(155.0, 54.0));
+                    ui.small(&card.label);
+                    ui.strong(&card.value);
+                });
+            }
+        });
+    }
+
+    if !dashboard.sections.is_empty() {
+        ui.separator();
+        ui.columns(2, |columns| {
+            for (idx, section) in dashboard.sections.iter().enumerate() {
+                columns[idx % 2].group(|ui| {
+                    ui.set_min_width(260.0);
+                    ui.strong(&section.title);
+                    ui.add_space(6.0);
+                    egui::Grid::new(format!("training_dashboard_{:?}_{}", snapshot.id, idx))
+                        .num_columns(2)
+                        .spacing([12.0, 6.0])
+                        .show(ui, |ui| {
+                            for (label, value) in &section.rows {
+                                ui.label(label);
+                                ui.strong(value);
+                                ui.end_row();
+                            }
+                        });
+                });
+            }
+        });
+    }
+}
+
+fn build_training_dashboard(snapshot: &JobSnapshot) -> TrainingDashboard {
+    let requested_models = counter_value(snapshot, "requested_models")
+        .or_else(|| counter_value(snapshot, "planned_models"))
+        .unwrap_or(0);
+    let completed_models = counter_value(snapshot, "completed_models").unwrap_or(0);
+
+    let mut summary_cards = vec![
+        DashboardCard {
+            label: "State".to_string(),
+            value: format!("{:?}", snapshot.state),
+        },
+        DashboardCard {
+            label: "Stage".to_string(),
+            value: if snapshot.progress.stage.is_empty() {
+                "idle".to_string()
+            } else {
+                snapshot.progress.stage.clone()
+            },
+        },
+        DashboardCard {
+            label: "Symbol".to_string(),
+            value: highlight_value(snapshot, "symbol")
+                .unwrap_or("-")
+                .to_string(),
+        },
+        DashboardCard {
+            label: "Completion".to_string(),
+            value: format!("{completed_models} / {requested_models}"),
+        },
+    ];
+
+    if requested_models == 0 {
+        summary_cards[3].value = "0 / 0".to_string();
+    }
+
+    let mut sections = Vec::new();
+
+    let mut target_rows = Vec::new();
+    push_highlight_row(snapshot, &mut target_rows, "base_tf", "Base TF");
+    push_highlight_row(snapshot, &mut target_rows, "config_path", "Config");
+    push_highlight_row(snapshot, &mut target_rows, "models_dir", "Models Dir");
+    push_section(&mut sections, "Training Target", target_rows);
+
+    let mut runtime_rows = Vec::new();
+    push_counter_row(snapshot, &mut runtime_rows, "requested_models", "Requested Models");
+    push_counter_row(snapshot, &mut runtime_rows, "planned_models", "Planned Models");
+    push_counter_row(snapshot, &mut runtime_rows, "completed_models", "Completed Models");
+    push_counter_row(snapshot, &mut runtime_rows, "failed_models", "Failed Models");
+    push_section(&mut sections, "Execution Summary", runtime_rows);
+
+    let (planned_models, completed_entries, failed_entries) = parse_training_entries(snapshot);
+    push_section(&mut sections, "Planned Models", planned_models);
+    push_section(&mut sections, "Completed Models", completed_entries);
+    push_section(&mut sections, "Failed Models", failed_entries);
+
+    TrainingDashboard {
+        summary_cards,
+        sections,
+    }
+}
+
+fn parse_training_entries(snapshot: &JobSnapshot) -> TrainingEntryGroups {
+    let mut planned = Vec::new();
+    let mut completed = Vec::new();
+    let mut failed = Vec::new();
+
+    for entry in &snapshot.report.entries {
+        let parts: Vec<&str> = entry.split(" | ").collect();
+        match parts.as_slice() {
+            ["planned", model] => planned.push(((*model).to_string(), "planned".to_string())),
+            ["completed", model] => {
+                completed.push(((*model).to_string(), "completed".to_string()))
+            }
+            ["failed", model, error] => failed.push(((*model).to_string(), (*error).to_string())),
+            _ => {}
+        }
+    }
+
+    (planned, completed, failed)
+}
+
+fn counter_value(snapshot: &JobSnapshot, name: &str) -> Option<u64> {
+    snapshot
+        .report
+        .counters
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| *value)
+}
+
+fn highlight_value<'a>(snapshot: &'a JobSnapshot, name: &str) -> Option<&'a str> {
+    snapshot
+        .report
+        .highlights
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
+}
+
+fn push_counter_row(
+    snapshot: &JobSnapshot,
+    rows: &mut Vec<(String, String)>,
+    key: &str,
+    label: &str,
+) {
+    if let Some(value) = counter_value(snapshot, key) {
+        rows.push((label.to_string(), value.to_string()));
+    }
+}
+
+fn push_highlight_row(
+    snapshot: &JobSnapshot,
+    rows: &mut Vec<(String, String)>,
+    key: &str,
+    label: &str,
+) {
+    if let Some(value) = highlight_value(snapshot, key) {
+        rows.push((label.to_string(), value.to_string()));
+    }
+}
+
+fn push_section(sections: &mut Vec<DashboardSection>, title: &str, rows: Vec<(String, String)>) {
+    if !rows.is_empty() {
+        sections.push(DashboardSection {
+            title: title.to_string(),
+            rows,
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_services::jobs::{JobKind, JobProgress, JobSnapshot};
+
+    #[test]
+    fn training_dashboard_groups_runtime_models_and_failures() {
+        let mut snapshot = JobSnapshot::new(JobKind::Training);
+        snapshot.state = JobState::Degraded;
+        snapshot.progress = JobProgress {
+            percent: Some(0.79),
+            stage: "backend_running".to_string(),
+            message: "backend running with 2 completed and 1 failed model(s) out of 4".to_string(),
+        };
+        snapshot.report.counters = vec![
+            ("requested_models".to_string(), 4),
+            ("planned_models".to_string(), 4),
+            ("completed_models".to_string(), 2),
+            ("failed_models".to_string(), 1),
+        ];
+        snapshot.report.highlights = vec![
+            ("symbol".to_string(), "EURUSD".to_string()),
+            ("base_tf".to_string(), "M1".to_string()),
+            ("config_path".to_string(), "config.yaml".to_string()),
+            ("models_dir".to_string(), "models".to_string()),
+        ];
+        snapshot.report.entries = vec![
+            "planned | xgboost".to_string(),
+            "planned | mlp".to_string(),
+            "planned | elasticnet".to_string(),
+            "completed | xgboost".to_string(),
+            "completed | elasticnet".to_string(),
+            "failed | mlp | cuda oom".to_string(),
+        ];
+
+        let dashboard = build_training_dashboard(&snapshot);
+
+        assert_eq!(dashboard.summary_cards[0].label, "State");
+        assert_eq!(dashboard.summary_cards[0].value, "Degraded");
+        assert_eq!(dashboard.summary_cards[1].label, "Stage");
+        assert_eq!(dashboard.summary_cards[1].value, "backend_running");
+        assert_eq!(dashboard.summary_cards[2].label, "Symbol");
+        assert_eq!(dashboard.summary_cards[2].value, "EURUSD");
+        assert_eq!(dashboard.summary_cards[3].label, "Completion");
+        assert_eq!(dashboard.summary_cards[3].value, "2 / 4");
+
+        assert_eq!(dashboard.sections[0].title, "Training Target");
+        assert_eq!(
+            dashboard.sections[0].rows,
+            vec![
+                ("Base TF".to_string(), "M1".to_string()),
+                ("Config".to_string(), "config.yaml".to_string()),
+                ("Models Dir".to_string(), "models".to_string()),
+            ]
+        );
+
+        assert_eq!(dashboard.sections[1].title, "Execution Summary");
+        assert_eq!(
+            dashboard.sections[1].rows,
+            vec![
+                ("Requested Models".to_string(), "4".to_string()),
+                ("Planned Models".to_string(), "4".to_string()),
+                ("Completed Models".to_string(), "2".to_string()),
+                ("Failed Models".to_string(), "1".to_string()),
+            ]
+        );
+
+        assert_eq!(dashboard.sections[2].title, "Planned Models");
+        assert_eq!(
+            dashboard.sections[2].rows,
+            vec![
+                ("xgboost".to_string(), "planned".to_string()),
+                ("mlp".to_string(), "planned".to_string()),
+                ("elasticnet".to_string(), "planned".to_string()),
+            ]
+        );
+
+        assert_eq!(dashboard.sections[3].title, "Completed Models");
+        assert_eq!(
+            dashboard.sections[3].rows,
+            vec![
+                ("xgboost".to_string(), "completed".to_string()),
+                ("elasticnet".to_string(), "completed".to_string()),
+            ]
+        );
+
+        assert_eq!(dashboard.sections[4].title, "Failed Models");
+        assert_eq!(
+            dashboard.sections[4].rows,
+            vec![("mlp".to_string(), "cuda oom".to_string()),]
+        );
+    }
+
+    #[test]
+    fn training_dashboard_omits_model_sections_when_entries_are_missing() {
+        let mut snapshot = JobSnapshot::new(JobKind::Training);
+        snapshot.state = JobState::Queued;
+        snapshot.report.highlights = vec![("symbol".to_string(), "GBPUSD".to_string())];
+        snapshot.report.counters = vec![("planned_models".to_string(), 0)];
+
+        let dashboard = build_training_dashboard(&snapshot);
+
+        assert_eq!(dashboard.summary_cards.len(), 4);
+        assert_eq!(
+            dashboard
+                .sections
+                .iter()
+                .map(|section| section.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Execution Summary"]
+        );
+    }
 }
