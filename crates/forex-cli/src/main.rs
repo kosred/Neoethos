@@ -101,7 +101,7 @@ fn cmd_prepare(args: &[String]) -> Result<()> {
     let root = parse_root(args);
     let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| "EURUSD".to_string());
     let base = parse_flag(args, "--base").unwrap_or_else(|| "M1".to_string());
-    let higher = parse_flag(args, "--higher").unwrap_or_else(|| "".to_string());
+    let higher = parse_flag(args, "--higher").unwrap_or_default();
     let higher_list: Vec<String> = higher
         .split(',')
         .filter(|s| !s.is_empty())
@@ -163,7 +163,7 @@ fn cmd_search(args: &[String]) -> Result<()> {
     let root = parse_root(args);
     let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| "EURUSD".to_string());
     let base = parse_flag(args, "--base").unwrap_or_else(|| "M1".to_string());
-    let higher = parse_flag(args, "--higher").unwrap_or_else(|| "".to_string());
+    let higher = parse_flag(args, "--higher").unwrap_or_default();
     let genes: usize = parse_flag(args, "--genes")
         .and_then(|v| v.parse().ok())
         .unwrap_or(64);
@@ -183,7 +183,7 @@ fn cmd_search(args: &[String]) -> Result<()> {
 
     let dataset = forex_data::load_symbol_dataset(&root, &symbol)?;
     let dataset =
-        forex_data::ensure_timeframes_with_resample(&dataset, &base, &forex_data::MANDATORY_TFS)?;
+        forex_data::ensure_timeframes_with_resample(&dataset, &base, forex_data::MANDATORY_TFS)?;
     let features = forex_data::prepare_multitimeframe_features(
         &dataset,
         &base,
@@ -217,7 +217,7 @@ fn cmd_discover(args: &[String]) -> Result<()> {
     let root = parse_root(args);
     let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| "EURUSD".to_string());
     let base = parse_flag(args, "--base").unwrap_or_else(|| "M1".to_string());
-    let higher = parse_flag(args, "--higher").unwrap_or_else(|| "".to_string());
+    let higher = parse_flag(args, "--higher").unwrap_or_default();
     let population: usize = parse_flag(args, "--population")
         .and_then(|v| v.parse().ok())
         .unwrap_or(100);
@@ -250,7 +250,7 @@ fn cmd_discover(args: &[String]) -> Result<()> {
 
     let dataset = forex_data::load_symbol_dataset(&root, &symbol)?;
     let dataset =
-        forex_data::ensure_timeframes_with_resample(&dataset, &base, &forex_data::MANDATORY_TFS)?;
+        forex_data::ensure_timeframes_with_resample(&dataset, &base, forex_data::MANDATORY_TFS)?;
     let features = forex_data::prepare_multitimeframe_features(
         &dataset,
         &base,
@@ -292,7 +292,7 @@ fn cmd_discover(args: &[String]) -> Result<()> {
 
 fn cmd_batch_discover(args: &[String]) -> Result<()> {
     let root = parse_root(args);
-    let symbols_raw = parse_flag(args, "--symbols").unwrap_or_else(|| "".to_string());
+    let symbols_raw = parse_flag(args, "--symbols").unwrap_or_default();
     let tfs_raw = parse_flag(args, "--timeframes").unwrap_or_else(|| "M1,M5,M15,H1,H4".to_string());
     let out_dir = parse_flag(args, "--out-dir").unwrap_or_else(|| "cache/discovery".to_string());
     

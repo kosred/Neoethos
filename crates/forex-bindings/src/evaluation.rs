@@ -1,4 +1,4 @@
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
+use numpy::{PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
 use std::collections::HashMap;
@@ -13,8 +13,6 @@ use crate::utils::{
     map_indicator_index, normalize_indicator_name,
 };
 use crate::indicators::causal_tanh_zscore_column;
-use forex_search::eval::BacktestSettings;
-
 #[pyfunction]
 #[pyo3(signature = (signals, close, initial_balance=10000.0, leverage=1.0))]
 pub fn quick_backtest_metrics(
@@ -83,6 +81,7 @@ pub fn quick_backtest_metrics(
     volume=None,
     include_raw=true
 ))]
+#[allow(clippy::too_many_arguments)]
 pub fn fast_evaluate_strategy(
     py: Python,
     open: PyReadonlyArray1<f64>,
@@ -105,7 +104,7 @@ pub fn fast_evaluate_strategy(
         timestamps.as_ref(),
         volume.as_ref(),
     )
-    .map_err(|msg| PyErr::new::<pyo3::exceptions::PyValueError, _>(msg))?;
+    .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
 
     let prof = if include_raw { FeatureProfile::Full } else { FeatureProfile::Standard };
     let features = compute_talib_feature_frame(&ohlcv, prof)
@@ -157,6 +156,7 @@ pub fn fast_evaluate_strategy(
     volume=None,
     include_raw=true
 ))]
+#[allow(clippy::too_many_arguments)]
 pub fn batch_evaluate_strategies(
     py: Python,
     open: PyReadonlyArray1<f64>,
@@ -176,7 +176,7 @@ pub fn batch_evaluate_strategies(
         timestamps.as_ref(),
         volume.as_ref(),
     )
-    .map_err(|msg| PyErr::new::<pyo3::exceptions::PyValueError, _>(msg))?;
+    .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
 
     let mut genes = Vec::with_capacity(strategies.len());
     for s in strategies {
@@ -220,6 +220,7 @@ pub fn batch_evaluate_strategies(
     volume=None,
     include_raw=true
 ))]
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_population_talib_ohlcv(
     py: Python,
     open: PyReadonlyArray1<f64>,
@@ -242,14 +243,13 @@ pub fn evaluate_population_talib_ohlcv(
         timestamps.as_ref(),
         volume.as_ref(),
     )
-    .map_err(|msg| PyErr::new::<pyo3::exceptions::PyValueError, _>(msg))?;
+    .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
 
     let prof = if include_raw { FeatureProfile::Full } else { FeatureProfile::Standard };
     let features = compute_talib_feature_frame(&ohlcv, prof)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Feature computation failed: {}", e)))?;
     let mut genes = Vec::new();
-    for i in 0..indicator_sets.len() {
-        let indicators = &indicator_sets[i];
+    for (i, indicators) in indicator_sets.iter().enumerate() {
         let mut indices = Vec::new();
         let mut w_vec = Vec::new();
         for (j, name) in indicators.iter().enumerate() {
@@ -322,7 +322,7 @@ pub fn evaluate_population_core_py(
         let timestamps: Option<PyReadonlyArray1<i64>> = ohlcv_bound.getattr("timestamp")?.extract().ok();
         let volume: Option<PyReadonlyArray1<f64>> = ohlcv_bound.getattr("volume")?.extract().ok();
         build_ohlcv(&open, &high, &low, &close, timestamps.as_ref(), volume.as_ref())
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e))?
+            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?
     };
 
     let genes: Vec<Gene> = {
@@ -409,6 +409,7 @@ pub fn aggregate_prop_score_metrics<'py>(
     include_raw=false,
     causal_min_bars=30
 ))]
+#[allow(clippy::too_many_arguments)]
 pub fn talib_bulk_signals_ohlcv(
     py: Python,
     open: PyReadonlyArray1<f64>,
@@ -432,7 +433,7 @@ pub fn talib_bulk_signals_ohlcv(
         timestamps.as_ref(),
         volume.as_ref(),
     )
-    .map_err(|msg| PyErr::new::<pyo3::exceptions::PyValueError, _>(msg))?;
+    .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
 
     let prof = if include_raw { FeatureProfile::Full } else { FeatureProfile::Standard };
     let frame = compute_talib_feature_frame(&ohlcv, prof)

@@ -4,7 +4,7 @@ use linfa::prelude::*;
 use linfa_linear::ElasticNet;
 #[cfg(feature = "statistical-models")]
 use linfa_logistic::LogisticRegression;
-use anyhow::{Result, Context};
+use anyhow::Result;
 use ndarray::{Array2};
 use polars::prelude::*;
 use crate::base::ExpertModel;
@@ -57,6 +57,12 @@ pub struct LogisticExpert {
 impl LogisticExpert {
     pub fn new() -> Self {
         Self { model: None }
+    }
+}
+
+impl Default for LogisticExpert {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

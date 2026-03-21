@@ -3,22 +3,26 @@ use sklears::tree::DecisionTreeClassifier;
 #[cfg(feature = "sklears-tree")]
 use sklears::traits::{Fit, Predict};
 use anyhow::Result;
-#[cfg(feature = "sklears-tree")]
-use anyhow::Context;
 use ndarray::Array2;
 use polars::prelude::*;
 use crate::base::ExpertModel;
 
 pub struct SklearsTreeExpert {
     #[cfg(feature = "sklears-tree")]
-    model: Option<DecisionTreeClassifier>,
+    _model: Option<DecisionTreeClassifier>,
     #[cfg(not(feature = "sklears-tree"))]
-    model: Option<()>,
+    _model: Option<()>,
 }
 
 impl SklearsTreeExpert {
     pub fn new() -> Self {
-        Self { model: None }
+        Self { _model: None }
+    }
+}
+
+impl Default for SklearsTreeExpert {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -37,22 +37,40 @@ pub struct WalkforwardSummary {
     pub splits: Vec<WalkforwardSplitResult>,
 }
 
-pub fn embargoed_walkforward_backtest(
-    close: &[f64],
-    high: &[f64],
-    low: &[f64],
-    signals: &[i8],
-    months: &[i64],
-    days: &[i64],
-    train_ratio: f64,
-    n_splits: usize,
-    embargo_bars: usize,
-    settings: &BacktestSettings,
-    max_daily_loss_pct: f64,
-    _max_daily_profit_pct: f64,
-    _min_trading_days: usize,
-    _max_trades_per_day: usize,
-) -> Result<WalkforwardSummary> {
+pub struct WalkforwardBacktestInput<'a> {
+    pub close: &'a [f64],
+    pub high: &'a [f64],
+    pub low: &'a [f64],
+    pub signals: &'a [i8],
+    pub months: &'a [i64],
+    pub days: &'a [i64],
+    pub train_ratio: f64,
+    pub n_splits: usize,
+    pub embargo_bars: usize,
+    pub settings: &'a BacktestSettings,
+    pub max_daily_loss_pct: f64,
+    pub max_daily_profit_pct: f64,
+    pub min_trading_days: usize,
+    pub max_trades_per_day: usize,
+}
+
+pub fn embargoed_walkforward_backtest(input: WalkforwardBacktestInput<'_>) -> Result<WalkforwardSummary> {
+    let WalkforwardBacktestInput {
+        close,
+        high,
+        low,
+        signals,
+        months,
+        days,
+        train_ratio,
+        n_splits,
+        embargo_bars,
+        settings,
+        max_daily_loss_pct,
+        max_daily_profit_pct: _max_daily_profit_pct,
+        min_trading_days: _min_trading_days,
+        max_trades_per_day: _max_trades_per_day,
+    } = input;
     let n = close.len();
     if n == 0 || signals.len() != n {
         bail!("empty data or length mismatch");
@@ -188,9 +206,9 @@ impl CombinatorialPurgedCV {
             let earliest_group: usize = *combination.iter().min().unwrap();
             let mut train_idx: Vec<usize> = (0..warmup_size).collect();
             if earliest_group > 0 {
-                for i in 0..earliest_group {
+                for (i, group) in groups.iter().enumerate().take(earliest_group) {
                     if !combination.contains(&i) {
-                        train_idx.extend(&groups[i]);
+                        train_idx.extend(group);
                     }
                 }
             }

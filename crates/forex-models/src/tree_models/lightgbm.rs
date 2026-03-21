@@ -1,8 +1,6 @@
 #[cfg(feature = "lightgbm")]
 use lightgbm3;
 use anyhow::Result;
-#[cfg(feature = "lightgbm")]
-use anyhow::Context;
 use ndarray::Array2;
 use polars::prelude::*;
 use crate::base::ExpertModel;
@@ -10,14 +8,14 @@ use crate::base::ExpertModel;
 pub struct LightGBMExpert {
     pub idx: usize,
     #[cfg(feature = "lightgbm")]
-    model: Option<lightgbm3::Booster>,
+    _model: Option<lightgbm3::Booster>,
     #[cfg(not(feature = "lightgbm"))]
-    model: Option<()>,
+    _model: Option<()>,
 }
 
 impl LightGBMExpert {
     pub fn new(idx: usize) -> Self {
-        Self { idx, model: None }
+        Self { idx, _model: None }
     }
 }
 

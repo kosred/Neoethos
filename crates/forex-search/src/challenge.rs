@@ -27,6 +27,17 @@ pub struct ChallengeOptimizer {
     pub target: ChallengeTarget,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RiskAllocationInput {
+    pub current_profit: f64,
+    pub days_left: i32,
+    pub current_drawdown: f64,
+    pub win_rate: f64,
+    pub avg_risk_reward: f64,
+    pub daily_loss_pct: f64,
+    pub realized_trades_per_day: f64,
+}
+
 impl ChallengeOptimizer {
     pub fn new(target: Option<ChallengeTarget>) -> Self {
         Self {
@@ -35,26 +46,25 @@ impl ChallengeOptimizer {
     }
 
     pub fn optimize_risk(&self, current_profit: f64, days_left: i32) -> f64 {
-        self.optimize_risk_allocation(current_profit, days_left, 0.0, 0.55, 2.0, 0.0, 2.0)
+        self.optimize_risk_allocation(RiskAllocationInput {
+            current_profit,
+            days_left,
+            current_drawdown: 0.0,
+            win_rate: 0.55,
+            avg_risk_reward: 2.0,
+            daily_loss_pct: 0.0,
+            realized_trades_per_day: 2.0,
+        })
     }
 
-    pub fn optimize_risk_allocation(
-        &self,
-        current_profit: f64,
-        days_left: i32,
-        current_drawdown: f64,
-        win_rate: f64,
-        avg_risk_reward: f64,
-        daily_loss_pct: f64,
-        realized_trades_per_day: f64,
-    ) -> f64 {
-        let remaining_target = self.target.total_profit_target - current_profit;
+    pub fn optimize_risk_allocation(&self, input: RiskAllocationInput) -> f64 {
+        let remaining_target = self.target.total_profit_target - input.current_profit;
         if remaining_target <= 0.0 {
             return 0.0025;
         }
 
-        let est_trades = (days_left.max(1) as f64 * realized_trades_per_day).max(1.0);
-        let expectancy = (win_rate * avg_risk_reward) - (1.0 - win_rate);
+        let est_trades = (input.days_left.max(1) as f64 * input.realized_trades_per_day).max(1.0);
+        let expectancy = (input.win_rate * input.avg_risk_reward) - (1.0 - input.win_rate);
 
         let required_risk = if expectancy <= 0.1 {
             0.01
@@ -62,11 +72,11 @@ impl ChallengeOptimizer {
             remaining_target / (est_trades * expectancy.max(1e-6))
         };
 
-        let kelly = self.kelly_criterion(win_rate, avg_risk_reward);
+        let kelly = self.kelly_criterion(input.win_rate, input.avg_risk_reward);
         let kelly_limit = kelly * 0.5;
 
-        let daily_room = (self.target.max_daily_dd - daily_loss_pct).max(0.0);
-        let total_room = (self.target.max_total_dd - current_drawdown).max(0.0);
+        let daily_room = (self.target.max_daily_dd - input.daily_loss_pct).max(0.0);
+        let total_room = (self.target.max_total_dd - input.current_drawdown).max(0.0);
         let safety_limit = daily_room.min(total_room).max(0.0);
 
         let mut optimal_risk = required_risk.min(kelly_limit).min(safety_limit);

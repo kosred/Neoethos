@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use ndarray::{Array2, Axis};
+use ndarray::Array2;
 use std::path::Path;
 use serde::{Deserialize, Serialize};
 use crate::base::ExpertModel;
@@ -42,5 +42,11 @@ impl MetaBlender {
             m.save(path)?;
         }
         Ok(())
+    }
+}
+
+impl Default for MetaBlender {
+    fn default() -> Self {
+        Self::new()
     }
 }

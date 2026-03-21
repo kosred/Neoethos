@@ -23,6 +23,17 @@ pub struct SavedStrategy {
     pub last_used: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LiveMetricsRecord<'a> {
+    pub symbol: &'a str,
+    pub returns: &'a [f64],
+    pub sharpe: f64,
+    pub volatility: f64,
+    pub drawdown: f64,
+    pub position_count: i64,
+    pub equity: f64,
+}
+
 /// Main storage handler for strategies, trades, and intents
 pub struct StrategyLedger {
     db_path: PathBuf,
@@ -153,31 +164,22 @@ impl StrategyLedger {
         Ok(())
     }
 
-    pub fn log_live_metrics(
-        &self,
-        symbol: &str,
-        returns: &[f64],
-        sharpe: f64,
-        volatility: f64,
-        drawdown: f64,
-        position_count: i64,
-        equity: f64,
-    ) -> Result<()> {
+    pub fn log_live_metrics(&self, metrics: &LiveMetricsRecord<'_>) -> Result<()> {
         let conn = rusqlite::Connection::open(&self.db_path)?;
-        let returns_json = serde_json::to_string(returns)?;
+        let returns_json = serde_json::to_string(metrics.returns)?;
 
         conn.execute(
             "INSERT OR REPLACE INTO live_metrics
             (symbol, timestamp, returns_json, sharpe, volatility, drawdown, position_count, equity)
             VALUES (?1, CURRENT_TIMESTAMP, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
-                symbol,
+                metrics.symbol,
                 returns_json,
-                sharpe,
-                volatility,
-                drawdown,
-                position_count,
-                equity
+                metrics.sharpe,
+                metrics.volatility,
+                metrics.drawdown,
+                metrics.position_count,
+                metrics.equity
             ],
         )
         .context("Failed to log live metrics")?;

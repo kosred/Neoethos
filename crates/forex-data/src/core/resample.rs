@@ -87,13 +87,12 @@ pub const MANDATORY_TFS: &[&str] = &["M1", "M5", "M15", "H1", "H4", "D1"];
 pub fn ensure_timeframes_with_resample(ds: &SymbolDataset, base_tf: &str, target_tfs: &[&str]) -> Result<SymbolDataset> {
     let mut new_frames = ds.frames.clone();
     let base_ohlcv = ds.frames.get(base_tf).ok_or_else(|| anyhow::anyhow!("base timeframe {} not found", base_tf))?;
+    let base_minutes = parse_timeframe_to_minutes(base_tf)?;
     
     for tf in target_tfs {
-        if !new_frames.contains_key(*tf) {
-            if parse_timeframe_to_minutes(tf)? > parse_timeframe_to_minutes(base_tf)? {
-                let resampled = resample_ohlcv(base_ohlcv, tf)?;
-                new_frames.insert(tf.to_string(), resampled);
-            }
+        if !new_frames.contains_key(*tf) && parse_timeframe_to_minutes(tf)? > base_minutes {
+            let resampled = resample_ohlcv(base_ohlcv, tf)?;
+            new_frames.insert(tf.to_string(), resampled);
         }
     }
     Ok(SymbolDataset { symbol: ds.symbol.clone(), frames: new_frames })

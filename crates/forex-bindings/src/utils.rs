@@ -1,5 +1,5 @@
 use ndarray::Array2;
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
+use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use polars::prelude::*;
 use pyo3::prelude::*;
 use std::collections::HashMap;
@@ -356,7 +356,7 @@ pub fn params_from_py(
     };
     use pyo3::types::PyDict;
     let dict = obj
-        .downcast::<PyDict>()
+        .cast::<PyDict>()
         .map_err(|_| "params must be a dict".to_string())?;
     let mut map = HashMap::new();
     for (k, v) in dict.iter() {
@@ -516,6 +516,7 @@ pub fn sample_weights_from_labels(labels: PyReadonlyArray1<i64>, weights: Vec<f6
 }
 
 #[pyfunction]
+#[allow(clippy::type_complexity)]
 pub fn sort_rows_with_labels_by_index<'py>(
     py: Python<'py>,
     index: PyReadonlyArray1<'py, i64>,

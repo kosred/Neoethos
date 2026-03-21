@@ -9,6 +9,8 @@ use tracing::{debug, info, warn};
 #[cfg(feature = "tch")]
 use tch::{Cuda, Device, Kind, Tensor};
 
+type GpuDetection = (usize, Vec<String>, Vec<f64>, Vec<(i64, i64)>);
+
 // ============================================================================
 // HARDWARE INFO STRUCTURE
 // ============================================================================
@@ -64,7 +66,7 @@ impl HardwareInfo {
 
     /// Detect GPUs using tch (PyTorch bindings)
     /// Python lines 61-73
-    fn detect_gpus() -> (usize, Vec<String>, Vec<f64>, Vec<(i64, i64)>) {
+    fn detect_gpus() -> GpuDetection {
         #[cfg(feature = "tch")]
         {
             if !Cuda::is_available() {
@@ -334,13 +336,17 @@ pub fn get_parallel_jobs(hardware: &HardwareInfo, requested: Option<usize>) -> u
 // GPU DISTRIBUTION HELPERS
 // ============================================================================
 
-/// Distribute models across GPUs using round-robin
-/// HPC CRITICAL: Spread 8 models across 8 A6000 GPUs
+/// Distribute 1-based model ordinals across GPUs using round-robin.
+/// HPC CRITICAL: Spread 8 models across 8 A6000 GPUs.
+///
+/// Model numbering in the public examples/tests is 1-based:
+/// model 1 -> GPU 0, model 2 -> GPU 1, ..., model 9 -> GPU 0.
+/// A zero ordinal is treated defensively as the first model.
 pub fn distribute_gpu_assignment(model_idx: usize, hardware: &HardwareInfo) -> usize {
     if hardware.gpu_count == 0 {
         0
     } else {
-        model_idx % hardware.gpu_count
+        model_idx.saturating_sub(1) % hardware.gpu_count
     }
 }
 

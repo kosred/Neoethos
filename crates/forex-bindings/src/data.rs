@@ -1,16 +1,15 @@
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1};
+use numpy::{IntoPyArray, PyReadonlyArray1};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
-use std::path::{Path, PathBuf};
 use forex_data::{
     load_symbol_dataset, load_symbol_dataset_with_timeframes, prepare_multitimeframe_features_with_options,
-    FeatureBuildOptions, FeatureCache, FeatureProfile, Ohlcv,
-    ensure_timeframes_with_resample, FeatureFrame
+    FeatureBuildOptions, FeatureCache, FeatureProfile, ensure_timeframes_with_resample,
 };
-use crate::utils::{build_ohlcv, parse_feature_profile};
+use crate::utils::parse_feature_profile;
 
 #[pyfunction]
 #[pyo3(signature = (root, symbol, base_tf=String::from("M1"), higher_tfs=None, cache_dir=None, cache_ttl_minutes=60, cache_enabled=true, resample_missing=true, feature_profile="standard", htf_feature_profile=None, max_features=0, max_htf_features=0))]
+#[allow(clippy::too_many_arguments)]
 pub fn load_symbol_features(
     py: Python,
     root: String,

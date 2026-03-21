@@ -2,8 +2,12 @@
 use crfmnes::CrfmnesOptimizer;
 #[cfg(feature = "neuro-evolution")]
 use nalgebra::DVector;
-use anyhow::{Result, Context};
+use anyhow::Result;
+#[cfg(feature = "neuro-evolution")]
+use anyhow::Context;
+#[cfg(feature = "neuro-evolution")]
 use rand::SeedableRng;
+#[cfg(feature = "neuro-evolution")]
 use rand_xoshiro::Xoroshiro128PlusPlus;
 
 pub struct NeuroEvoOptimizer {

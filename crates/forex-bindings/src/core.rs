@@ -8,6 +8,12 @@ pub struct ForexCore {
     pub probe: Mutex<HardwareProbe>,
 }
 
+impl Default for ForexCore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[pymethods]
 impl ForexCore {
     #[new]

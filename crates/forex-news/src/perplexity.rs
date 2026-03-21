@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde_json::json;
 use std::env;
-use tracing::{info, warn};
+use tracing::warn;
 
 pub struct PerplexitySearcher {
     client: Client,

@@ -9,6 +9,7 @@ use crate::utils::{build_ohlcv};
 
 #[pyfunction]
 #[pyo3(signature = (open, high, low, close, timestamps=None, volume=None, population=64, generations=20, max_indicators=12, include_raw=true))]
+#[allow(clippy::too_many_arguments)]
 pub fn search_evolve_ohlcv(
     py: Python,
     open: PyReadonlyArray1<f64>,
@@ -30,7 +31,7 @@ pub fn search_evolve_ohlcv(
         timestamps.as_ref(),
         volume.as_ref(),
     )
-    .map_err(|msg| PyErr::new::<pyo3::exceptions::PyValueError, _>(msg))?;
+    .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
 
     let (features, result) = py
         .detach(|| {
@@ -41,7 +42,7 @@ pub fn search_evolve_ohlcv(
                 .map_err(|e| format!("Search failed: {}", e))?;
             Ok::<_, String>((features, result))
         })
-        .map_err(|msg| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg))?;
+        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
 
     let metrics: Vec<Vec<f64>> = result.metrics.iter().map(|m: &[f64; 11]| m.to_vec()).collect();
     let genes_py: Vec<Py<PyAny>> = result
@@ -90,6 +91,7 @@ pub fn search_evolve_ohlcv(
     chunk_size=2048,
     devices=None
 ))]
+#[allow(clippy::too_many_arguments)]
 pub fn search_evolve_gpu_ohlcv(
     py: Python,
     open: PyReadonlyArray1<f64>,
@@ -127,28 +129,29 @@ pub fn search_evolve_gpu_ohlcv(
         timestamps.as_ref(),
         volume.as_ref(),
     )
-    .map_err(|msg| PyErr::new::<pyo3::exceptions::PyValueError, _>(msg))?;
+    .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
 
-    let mut config = GpuDiscoveryConfig::default();
-    config.population = population.max(16);
-    config.generations = generations.max(1);
-    config.elite_fraction = elite_fraction.clamp(0.01, 0.50);
-    config.sigma = sigma.max(0.01);
-    config.crossover_rate = crossover_rate.clamp(0.0, 1.0);
-    config.threshold_scale = threshold_scale.max(0.001);
-    config.threshold_margin = threshold_margin.max(0.0);
-    config.threshold_clip = threshold_clip.max(0.01);
-    config.window_bars = window_bars.max(128);
-    config.segments = segments.max(1);
-    config.min_trades_per_day = min_trades_per_day.max(0.0);
-    config.trade_penalty = trade_penalty.max(0.0);
-    config.dd_limit = dd_limit.clamp(0.0, 1.0);
-    config.dd_penalty = dd_penalty.max(0.0);
-    config.robust_weight = robust_weight.max(0.0);
-    config.pos_window_fraction = pos_window_fraction.clamp(0.0, 1.0);
-    config.pos_penalty = pos_penalty.max(0.0);
-    config.chunk_size = chunk_size.max(64);
-    config.devices = devices.unwrap_or_default();
+    let config = GpuDiscoveryConfig {
+        population: population.max(16),
+        generations: generations.max(1),
+        elite_fraction: elite_fraction.clamp(0.01, 0.50),
+        sigma: sigma.max(0.01),
+        crossover_rate: crossover_rate.clamp(0.0, 1.0),
+        threshold_scale: threshold_scale.max(0.001),
+        threshold_margin: threshold_margin.max(0.0),
+        threshold_clip: threshold_clip.max(0.01),
+        window_bars: window_bars.max(128),
+        segments: segments.max(1),
+        min_trades_per_day: min_trades_per_day.max(0.0),
+        trade_penalty: trade_penalty.max(0.0),
+        dd_limit: dd_limit.clamp(0.0, 1.0),
+        dd_penalty: dd_penalty.max(0.0),
+        robust_weight: robust_weight.max(0.0),
+        pos_window_fraction: pos_window_fraction.clamp(0.0, 1.0),
+        pos_penalty: pos_penalty.max(0.0),
+        chunk_size: chunk_size.max(64),
+        devices: devices.unwrap_or_default(),
+    };
 
     let (features, result) = py
         .detach(|| {
@@ -171,7 +174,7 @@ pub fn search_evolve_gpu_ohlcv(
             };
             Ok::<_, String>((features, result))
         })
-        .map_err(|msg| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg))?;
+        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
 
     let dict = PyDict::new(py);
     dict.set_item("genomes", result.genomes)?;
@@ -184,6 +187,7 @@ pub fn search_evolve_gpu_ohlcv(
 
 #[pyfunction]
 #[pyo3(signature = (open, high, low, close, timestamps=None, volume=None, population=5000, generations=50, max_indicators=8))]
+#[allow(clippy::too_many_arguments)]
 pub fn search_discovery_ohlcv(
     py: Python,
     open: PyReadonlyArray1<f64>,
@@ -204,12 +208,14 @@ pub fn search_discovery_ohlcv(
         timestamps.as_ref(),
         volume.as_ref(),
     )
-    .map_err(|msg| PyErr::new::<pyo3::exceptions::PyValueError, _>(msg))?;
+    .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
 
-    let mut config = forex_search::DiscoveryConfig::default();
-    config.population = population;
-    config.generations = generations;
-    config.max_indicators = max_indicators;
+    let config = forex_search::DiscoveryConfig {
+        population,
+        generations,
+        max_indicators,
+        ..forex_search::DiscoveryConfig::default()
+    };
 
     let (features, result) = py
         .detach(|| {
@@ -219,7 +225,7 @@ pub fn search_discovery_ohlcv(
                 .map_err(|e| format!("Discovery failed: {}", e))?;
             Ok::<_, String>((features, result))
         })
-        .map_err(|msg| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg))?;
+        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
 
     let genes_py: Vec<Py<PyAny>> = result
         .portfolio

@@ -1,12 +1,11 @@
 use anyhow::Result;
 use ndarray::{Array1, Array2};
-use nalgebra::{DMatrix, DVector};
 use std::collections::HashMap;
 
 /// Portfolio Strategy Manager and Correlation Risk Math.
 pub struct PortfolioManager {
     max_exposure: f64,
-    correlation_threshold: f64,
+    _correlation_threshold: f64,
     strategy_weights: HashMap<String, f64>,
 }
 
@@ -14,7 +13,7 @@ impl Default for PortfolioManager {
     fn default() -> Self {
         Self {
             max_exposure: 1.0,
-            correlation_threshold: 0.7,
+            _correlation_threshold: 0.7,
             strategy_weights: HashMap::new(),
         }
     }
@@ -24,7 +23,7 @@ impl PortfolioManager {
     pub fn new(max_exposure: f64, correlation_threshold: f64) -> Self {
         Self {
             max_exposure,
-            correlation_threshold,
+            _correlation_threshold: correlation_threshold,
             strategy_weights: HashMap::new(),
         }
     }
@@ -37,11 +36,11 @@ impl PortfolioManager {
         let mut cov_matrix = Array2::<f64>::zeros((n_strats, n_strats));
         let mut std_devs = Array1::<f64>::zeros(n_strats);
 
-        for j in 0..n_strats {
+        for (j, std_dev) in std_devs.iter_mut().enumerate().take(n_strats) {
             let col = returns.column(j);
             let mean = col.sum() / n_obs;
             let variance = col.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / (n_obs - 1.0);
-            std_devs[j] = variance.sqrt();
+            *std_dev = variance.sqrt();
         }
 
         for i in 0..n_strats {
@@ -74,11 +73,11 @@ impl PortfolioManager {
         let n_obs = returns.nrows() as f64;
         
         let mut std_devs = vec![0.0; n_strats];
-        for j in 0..n_strats {
+        for (j, std_dev) in std_devs.iter_mut().enumerate().take(n_strats) {
             let col = returns.column(j);
             let mean = col.sum() / n_obs;
             let variance = col.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / (n_obs - 1.0);
-            std_devs[j] = variance.sqrt();
+            *std_dev = variance.sqrt();
         }
 
         // Inverse volatility weighting (risk parity)

@@ -79,7 +79,7 @@ pub fn load_symbol_timeframe(root: impl AsRef<Path>, symbol: &str, timeframe: &s
     if !path.exists() { bail!("path not found: {:?}", path); }
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
-        if entry.path().extension().map_or(false, |ext| ext == "parquet") {
+        if entry.path().extension().is_some_and(|ext| ext == "parquet") {
             return load_parquet(entry.path());
         }
     }
@@ -90,9 +90,9 @@ pub fn load_symbol_dataset(root: impl AsRef<Path>, symbol: &str) -> Result<Symbo
     let tfs = discover_timeframes(&root, symbol)?;
     let mut frames = HashMap::new();
     for tf in tfs {
-        if let Ok(ohlcv) = load_symbol_timeframe(&root, symbol, &tf) {
-            frames.insert(tf, ohlcv);
-        }
+        let ohlcv = load_symbol_timeframe(&root, symbol, &tf)
+            .with_context(|| format!("failed to load dataset timeframe {} {}", symbol, tf))?;
+        frames.insert(tf, ohlcv);
     }
     Ok(SymbolDataset { symbol: symbol.to_string(), frames })
 }
@@ -100,9 +100,9 @@ pub fn load_symbol_dataset(root: impl AsRef<Path>, symbol: &str) -> Result<Symbo
 pub fn load_symbol_dataset_with_timeframes(root: impl AsRef<Path>, symbol: &str, target_tfs: &[&str]) -> Result<SymbolDataset> {
     let mut frames = HashMap::new();
     for tf in target_tfs {
-        if let Ok(ohlcv) = load_symbol_timeframe(&root, symbol, tf) {
-            frames.insert(tf.to_string(), ohlcv);
-        }
+        let ohlcv = load_symbol_timeframe(&root, symbol, tf)
+            .with_context(|| format!("failed to load requested dataset timeframe {} {}", symbol, tf))?;
+        frames.insert(tf.to_string(), ohlcv);
     }
     Ok(SymbolDataset { symbol: symbol.to_string(), frames })
 }
@@ -111,10 +111,27 @@ pub fn load_parquet(path: impl AsRef<Path>) -> Result<Ohlcv> {
     let file = std::fs::File::open(path)?;
     let df = ParquetReader::new(file).finish()?;
     
-    let ts_series = df.column("timestamp").or_else(|_| df.column("time")).ok();
-    let timestamp = ts_series.map(|s| {
-        s.as_materialized_series().cast(&DataType::Int64).unwrap_or_else(|_| Series::new("".into(), vec![0i64])).i64().unwrap().into_iter().map(|v| v.unwrap_or(0)).collect()
-    });
+    let timestamp = match df.column("timestamp").or_else(|_| df.column("time")) {
+        Ok(series) => {
+            let series_name = series.name().to_string();
+            let casted = series
+                .as_materialized_series()
+                .cast(&DataType::Int64)
+                .with_context(|| format!("failed to cast {series_name} column to Int64"))?;
+            let ints = casted
+                .i64()
+                .with_context(|| format!("{series_name} column is not Int64 after cast"))?;
+            let values = ints
+                .into_iter()
+                .enumerate()
+                .map(|(idx, value)| {
+                    value.with_context(|| format!("{series_name} column contains null at row {idx}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Some(values)
+        }
+        Err(_) => None,
+    };
     
     let get_col = |names: &[&str]| -> Result<Vec<f64>> {
         for n in names {
@@ -207,4 +224,111 @@ pub fn prepare_multitimeframe_features_with_options(ds: &SymbolDataset, base_tf:
         names: all_names,
         data: merged,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_root(test_name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "forex_data_{}_{}_{}",
+            test_name,
+            std::process::id(),
+            nonce
+        ))
+    }
+
+    fn write_valid_ohlcv_parquet(path: &Path) -> Result<()> {
+        let df = DataFrame::new(vec![
+            Series::new("timestamp".into(), vec![1_i64, 2]).into(),
+            Series::new("open".into(), vec![1.0_f64, 1.1]).into(),
+            Series::new("high".into(), vec![1.2_f64, 1.3]).into(),
+            Series::new("low".into(), vec![0.9_f64, 1.0]).into(),
+            Series::new("close".into(), vec![1.05_f64, 1.2]).into(),
+        ])?;
+        let file = File::create(path)?;
+        ParquetWriter::new(file).finish(&mut df.clone())?;
+        Ok(())
+    }
+
+    #[test]
+    fn load_symbol_dataset_rejects_unreadable_discovered_timeframe() -> Result<()> {
+        let root = unique_temp_root("unreadable_discovered_timeframe");
+        let m1_dir = root.join("symbol=EURUSD").join("timeframe=M1");
+        let m5_dir = root.join("symbol=EURUSD").join("timeframe=M5");
+        fs::create_dir_all(&m1_dir)?;
+        fs::create_dir_all(&m5_dir)?;
+
+        write_valid_ohlcv_parquet(&m1_dir.join("data.parquet"))?;
+        let mut corrupt = File::create(m5_dir.join("data.parquet"))?;
+        corrupt.write_all(b"not a parquet file")?;
+
+        let err = load_symbol_dataset(&root, "EURUSD")
+            .expect_err("discovered unreadable timeframe must fail the dataset load");
+        assert!(
+            err.to_string().contains("M5") || err.to_string().contains("parquet"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn load_symbol_dataset_with_timeframes_rejects_requested_timeframe_failure() -> Result<()> {
+        let root = unique_temp_root("requested_timeframe_failure");
+        let m1_dir = root.join("symbol=EURUSD").join("timeframe=M1");
+        let m5_dir = root.join("symbol=EURUSD").join("timeframe=M5");
+        fs::create_dir_all(&m1_dir)?;
+        fs::create_dir_all(&m5_dir)?;
+
+        write_valid_ohlcv_parquet(&m1_dir.join("data.parquet"))?;
+        let mut corrupt = File::create(m5_dir.join("data.parquet"))?;
+        corrupt.write_all(b"not a parquet file")?;
+
+        let err = load_symbol_dataset_with_timeframes(&root, "EURUSD", &["M1", "M5"])
+            .expect_err("requested unreadable timeframe must fail the dataset load");
+        assert!(
+            err.to_string().contains("M5") || err.to_string().contains("parquet"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn load_parquet_rejects_invalid_timestamp_column() -> Result<()> {
+        let root = unique_temp_root("invalid_timestamp_column");
+        fs::create_dir_all(&root)?;
+        let parquet_path = root.join("invalid_timestamp.parquet");
+
+        let mut df = DataFrame::new(vec![
+            Series::new("timestamp".into(), vec!["bad", "worse"]).into(),
+            Series::new("open".into(), vec![1.0_f64, 1.1]).into(),
+            Series::new("high".into(), vec![1.2_f64, 1.3]).into(),
+            Series::new("low".into(), vec![0.9_f64, 1.0]).into(),
+            Series::new("close".into(), vec![1.05_f64, 1.2]).into(),
+        ])?;
+        let file = File::create(&parquet_path)?;
+        ParquetWriter::new(file).finish(&mut df)?;
+
+        let err = load_parquet(&parquet_path)
+            .expect_err("invalid timestamp values must fail instead of becoming synthetic zeroes");
+        assert!(
+            err.to_string().contains("timestamp"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
 }

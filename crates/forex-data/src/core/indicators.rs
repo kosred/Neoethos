@@ -71,9 +71,9 @@ pub fn fisher_transform(price: &[f64], period: usize) -> Vec<f64> {
     for i in period..n {
         let mut p_min = f64::INFINITY;
         let mut p_max = f64::NEG_INFINITY;
-        for j in (i - period + 1)..=i {
-            p_min = p_min.min(price[j]);
-            p_max = p_max.max(price[j]);
+        for &sample in price.iter().take(i + 1).skip(i - period + 1) {
+            p_min = p_min.min(sample);
+            p_max = p_max.max(sample);
         }
         let mut val = if p_max != p_min {
             0.66 * ((price[i] - p_min) / (p_max - p_min) - 0.5) + 0.67 * value[i - 1]

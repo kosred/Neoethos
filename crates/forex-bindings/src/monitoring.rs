@@ -31,10 +31,8 @@ impl ConsistencyTracker {
             Some(v) => {
                 if let Ok(b) = v.extract::<bool>() {
                     Some(if b { 1 } else { 0 })
-                } else if let Ok(i) = v.extract::<i32>() {
-                    Some(i)
                 } else {
-                    None
+                    v.extract::<i32>().ok()
                 }
             },
             None => None,

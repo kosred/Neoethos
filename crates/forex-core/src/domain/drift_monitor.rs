@@ -192,7 +192,7 @@ impl ConceptDriftMonitor {
         let arg = (en.sqrt() + 0.12 + 0.11 / en.sqrt()) * max_d;
         let p_val = if arg < 0.0 { 1.0 } else { smirnov_p(arg) };
         
-        (max_d, p_val.max(0.0).min(1.0))
+        (max_d, p_val.clamp(0.0, 1.0))
     }
 
     fn calculate_psi(&self, expected: &[f64], actual: &[f64], bins: usize) -> f64 {

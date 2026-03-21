@@ -1,6 +1,11 @@
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
-use forex_core::domain::risk::{PropFirmRules, RiskManager as CoreRiskManager};
+use forex_core::domain::risk::{
+    PositionSizingInput,
+    PropFirmRules,
+    RiskManager as CoreRiskManager,
+    TradeGateInput,
+};
 use crate::utils::{split_symbol, pip_size_from_parts, contract_size_from_parts, norm_symbol, quote_to_account_rate};
 use std::collections::HashMap;
 use pyo3::types::PyDict;
@@ -87,9 +92,11 @@ pub fn pip_size_from_symbol(symbol: &str, point: Option<f64>, digits: Option<i64
         } else {
             ptv * if d >= 4 { 10.0 } else { 1.0 }
         }
-    } else if sym.ends_with("JPY") || sym.starts_with("JPY") {
-        0.01
-    } else if sym.starts_with("XAU") || sym.starts_with("XAG") {
+    } else if sym.ends_with("JPY")
+        || sym.starts_with("JPY")
+        || sym.starts_with("XAU")
+        || sym.starts_with("XAG")
+    {
         0.01
     } else if sym.contains("BTC") || sym.contains("ETH") || sym.contains("LTC") {
         1.0
@@ -114,7 +121,7 @@ pub fn infer_pip_metrics(
 
     let mut refs: HashMap<String, f64> = HashMap::new();
     if let Some(raw) = reference_prices {
-        if let Ok(dict) = raw.downcast::<PyDict>() {
+        if let Ok(dict) = raw.cast::<PyDict>() {
             for (k, v) in dict.iter() {
                 let key = match k.extract::<String>() {
                     Ok(s) => norm_symbol(&s),
@@ -196,6 +203,7 @@ impl RiskManager {
         self.inner.update_kill_window(until_sec);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn check_trade_allowed(
         &mut self,
         equity: f64,
@@ -206,7 +214,7 @@ impl RiskManager {
         weekday: u32,
         market_volatility: f64,
     ) -> (bool, String) {
-        self.inner.check_trade_allowed(
+        self.inner.check_trade_allowed(TradeGateInput {
             equity,
             confidence,
             current_time_sec,
@@ -214,7 +222,7 @@ impl RiskManager {
             current_min,
             weekday,
             market_volatility,
-        )
+        })
     }
 
     pub fn on_trade_opened(&mut self) {
@@ -225,6 +233,7 @@ impl RiskManager {
         self.inner.on_trade_closed(pnl, equity);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn calculate_position_size(
         &mut self,
         equity: f64,
@@ -236,7 +245,7 @@ impl RiskManager {
         target_volatility: f64,
         is_volatile_regime: bool,
     ) -> f64 {
-        self.inner.calculate_position_size(
+        self.inner.calculate_position_size(PositionSizingInput {
             equity,
             base_risk_pct,
             max_risk_cap,
@@ -245,7 +254,7 @@ impl RiskManager {
             market_volatility,
             target_volatility,
             is_volatile_regime,
-        )
+        })
     }
 
     pub fn update_recovery_state(&mut self, equity: f64) {
@@ -283,6 +292,7 @@ impl OrderExecutor {
         min_edge_cost_multiple=3.0,
         commission_per_lot=7.0
     ))]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         symbol: String,
         partial_take_profit_enabled: bool,
@@ -336,7 +346,7 @@ impl OrderExecutor {
     ) -> PyResult<(f64, f64, f64)> {
         self.inner
             .compute_order_prices(entry_price, signal, sl_pips, rr, pip_size)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e))
+            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)
     }
 
     pub fn evaluate_trade_edge(
@@ -349,6 +359,6 @@ impl OrderExecutor {
     ) -> PyResult<(bool, f64, f64)> {
         self.inner
             .evaluate_trade_edge(sl_pips, rr, spread_pips, slippage_pips, pip_value_per_lot)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e))
+            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)
     }
 }

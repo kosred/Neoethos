@@ -2,8 +2,7 @@ use eframe::egui;
 use mt5_bridge::MT5Engine;
 use clap::Parser;
 use tracing::{info, error, warn};
-use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]

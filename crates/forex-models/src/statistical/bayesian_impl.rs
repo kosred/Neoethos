@@ -1,6 +1,6 @@
 #[cfg(feature = "statistical-models")]
 use variational_regression::BayesianLinearRegression;
-use anyhow::{Result, Context};
+use anyhow::Result;
 use ndarray::Array2;
 use polars::prelude::*;
 use crate::base::ExpertModel;
@@ -17,6 +17,12 @@ impl BayesianLogitExpert {
         Self {
             model: None,
         }
+    }
+}
+
+impl Default for BayesianLogitExpert {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

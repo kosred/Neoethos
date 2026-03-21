@@ -1,8 +1,6 @@
 #[cfg(feature = "catboost")]
 use catboost_rust as catboost;
 use anyhow::Result;
-#[cfg(feature = "catboost")]
-use anyhow::Context;
 use ndarray::Array2;
 use polars::prelude::*;
 use crate::base::ExpertModel;
@@ -10,14 +8,14 @@ use crate::base::ExpertModel;
 pub struct CatBoostExpert {
     pub idx: usize,
     #[cfg(feature = "catboost")]
-    model: Option<catboost::Model>,
+    _model: Option<catboost::Model>,
     #[cfg(not(feature = "catboost"))]
-    model: Option<()>,
+    _model: Option<()>,
 }
 
 impl CatBoostExpert {
     pub fn new(idx: usize) -> Self {
-        Self { idx, model: None }
+        Self { idx, _model: None }
     }
 }
 

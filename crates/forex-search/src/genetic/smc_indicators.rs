@@ -150,8 +150,22 @@ struct SmcColumns {
     displacement: Option<usize>,
 }
 
+pub type SmcSignalTuple = (
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+    Vec<i8>,
+);
+
 fn normalize_feature_name(name: &str) -> String {
-    name.to_ascii_lowercase().replace('-', "_").replace(' ', "_")
+    name.to_ascii_lowercase().replace(['-', ' '], "_")
 }
 
 fn find_feature_column(names: &[String], aliases: &[&str]) -> Option<usize> {
@@ -189,7 +203,7 @@ fn detect_smc_columns(names: &[String]) -> SmcColumns {
     }
 }
 
-pub fn derive_smc_arrays(ohlcv: &Ohlcv) -> (Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>) {
+pub fn derive_smc_arrays(ohlcv: &Ohlcv) -> SmcSignalTuple {
     let n = ohlcv.close.len();
     let mut ob = vec![0_i8; n];
     let mut fvg = vec![0_i8; n];
@@ -289,7 +303,7 @@ pub fn derive_smc_arrays(ohlcv: &Ohlcv) -> (Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, 
     (ob, fvg, liq, trend, premium, inducement, bos, choch, eqh, eql, displacement)
 }
 
-pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> (Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>) {
+pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> SmcSignalTuple {
     let n = frame.data.nrows();
     let cols = detect_smc_columns(&frame.names);
     let (mut ob, mut fvg, mut liq, mut trend, mut premium, mut inducement, mut bos, mut choch, mut eqh, mut eql, mut displacement) = derive_smc_arrays(ohlcv);
@@ -297,24 +311,28 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> (Vec<i8>, Vec<i8
     let apply_dir_col = |target: &mut Vec<i8>, col_opt: Option<usize>| {
         if let Some(col) = col_opt {
             if col < frame.data.ncols() {
-                for i in 0..n { target[i] = quantize_dir(frame.data[(i, col)]); }
+                for (i, slot) in target.iter_mut().enumerate().take(n) {
+                    *slot = quantize_dir(frame.data[(i, col)]);
+                }
             }
         }
     };
     let apply_binary_col = |target: &mut Vec<i8>, col_opt: Option<usize>| {
         if let Some(col) = col_opt {
             if col < frame.data.ncols() {
-                for i in 0..n { target[i] = quantize_binary(frame.data[(i, col)]); }
+                for (i, slot) in target.iter_mut().enumerate().take(n) {
+                    *slot = quantize_binary(frame.data[(i, col)]);
+                }
             }
         }
     };
     let apply_eqh_col = |target: &mut Vec<i8>, col_opt: Option<usize>| {
         if let Some(col) = col_opt {
             if col < frame.data.ncols() {
-                for i in 0..n {
+                for (i, slot) in target.iter_mut().enumerate().take(n) {
                     let v = frame.data[(i, col)];
                     let q = quantize_dir(v);
-                    target[i] = if q != 0 { q } else if quantize_binary(v) != 0 { -1 } else { 0 };
+                    *slot = if q != 0 { q } else if quantize_binary(v) != 0 { -1 } else { 0 };
                 }
             }
         }
@@ -322,10 +340,10 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> (Vec<i8>, Vec<i8
     let apply_eql_col = |target: &mut Vec<i8>, col_opt: Option<usize>| {
         if let Some(col) = col_opt {
             if col < frame.data.ncols() {
-                for i in 0..n {
+                for (i, slot) in target.iter_mut().enumerate().take(n) {
                     let v = frame.data[(i, col)];
                     let q = quantize_dir(v);
-                    target[i] = if q != 0 { q } else if quantize_binary(v) != 0 { 1 } else { 0 };
+                    *slot = if q != 0 { q } else if quantize_binary(v) != 0 { 1 } else { 0 };
                 }
             }
         }
@@ -333,8 +351,10 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> (Vec<i8>, Vec<i8
     let apply_dir_fill_zeros = |target: &mut Vec<i8>, col_opt: Option<usize>| {
         if let Some(col) = col_opt {
             if col < frame.data.ncols() {
-                for i in 0..n {
-                    if target[i] == 0 { target[i] = quantize_dir(frame.data[(i, col)]); }
+                for (i, slot) in target.iter_mut().enumerate().take(n) {
+                    if *slot == 0 {
+                        *slot = quantize_dir(frame.data[(i, col)]);
+                    }
                 }
             }
         }
@@ -342,15 +362,19 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> (Vec<i8>, Vec<i8
     let apply_eq_levels = |target: &mut Vec<i8>, eqh_col: Option<usize>, eql_col: Option<usize>| {
         if let Some(col) = eqh_col {
             if col < frame.data.ncols() {
-                for i in 0..n {
-                    if quantize_binary(frame.data[(i, col)]) != 0 { target[i] = -1; }
+                for (i, slot) in target.iter_mut().enumerate().take(n) {
+                    if quantize_binary(frame.data[(i, col)]) != 0 {
+                        *slot = -1;
+                    }
                 }
             }
         }
         if let Some(col) = eql_col {
             if col < frame.data.ncols() {
-                for i in 0..n {
-                    if quantize_binary(frame.data[(i, col)]) != 0 { target[i] = 1; }
+                for (i, slot) in target.iter_mut().enumerate().take(n) {
+                    if quantize_binary(frame.data[(i, col)]) != 0 {
+                        *slot = 1;
+                    }
                 }
             }
         }
@@ -376,10 +400,18 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> (Vec<i8>, Vec<i8
     
     if let Some(col) = cols.displacement {
         if col < frame.data.ncols() {
-            for i in 0..n { if quantize_dir(frame.data[(i, col)]) != 0 { inducement[i] = 1; } }
+            for (i, slot) in inducement.iter_mut().enumerate().take(n) {
+                if quantize_dir(frame.data[(i, col)]) != 0 {
+                    *slot = 1;
+                }
+            }
         }
     }
-    for i in 0..n { if displacement[i] != 0 { inducement[i] = 1; } }
+    for (disp, slot) in displacement.iter().zip(inducement.iter_mut()) {
+        if *disp != 0 {
+            *slot = 1;
+        }
+    }
 
     (ob, fvg, liq, trend, premium, inducement, bos, choch, eqh, eql, displacement)
 }

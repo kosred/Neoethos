@@ -2,6 +2,15 @@
 
 ## Executive Summary
 
+Current stabilized baseline as of `2026-03-21`:
+
+- `cargo test --workspace`: PASS
+- `cargo clippy --workspace --all-targets -- -D warnings`: PASS
+- `crates/mt5-bridge` now formats the official MetaTrader 5 `last_error()` tuple contract correctly; real headless app startup surfaces `code=-6 description=Terminal: Authorization failed` instead of a PyO3 extraction mismatch
+- `crates/forex-data` now fails fast on unreadable discovered/requested timeframes and rejects invalid timestamp columns instead of constructing synthetic zero timestamps
+
+This report still contains the original baseline findings for historical audit traceability. Resolved items are summarized in the stabilization update below.
+
 ## Repository Census
 
 Tracked surface:
@@ -222,6 +231,27 @@ Runtime probes were executed against the already-built `target/debug` binaries a
   - the interactive Trading-tab connect action could not be automated from the current terminal-driven audit session
   - this is environment/tooling blocked, not yet a proven code failure
   - the prerequisite probe already shows the local MT5 environment is not authorized, so a connect attempt is expected to fail unless terminal authorization is fixed
+
+## 2026-03-21 Stabilization Update
+
+### Resolved Since Baseline
+
+- `cargo test --workspace` is now green after fixing the GPU distribution contract in [`crates/forex-models/src/hardware.rs`](C:/Users/konst/development/forex-ai/crates/forex-models/src/hardware.rs)
+- `cargo clippy --workspace --all-targets -- -D warnings` is now green after the warning-cleanup tranche across `forex-core`, `forex-data`, `forex-search`, `forex-models`, `forex-bindings`, `forex-app`, `forex-cli`, and `forex-news`
+- [`crates/mt5-bridge/src/lib.rs`](C:/Users/konst/development/forex-ai/crates/mt5-bridge/src/lib.rs) no longer extracts `last_error()` as `String`; it now formats the documented `(code, description)` payload with a safe string fallback, backed by unit tests
+- [`crates/forex-data/src/lib.rs`](C:/Users/konst/development/forex-ai/crates/forex-data/src/lib.rs) no longer swallows unreadable timeframes during dataset assembly and no longer converts invalid timestamp columns into synthetic zeroes; targeted regression tests now pin both contracts
+- [`crates/forex-core/src/logging.rs`](C:/Users/konst/development/forex-ai/crates/forex-core/src/logging.rs) now retains the `tracing_appender` `WorkerGuard` globally instead of dropping it immediately after logger setup; targeted unit coverage now pins the flush-retention contract
+
+### New Verification Evidence
+
+- `cargo test --workspace` -> PASS
+- `cargo clippy --workspace --all-targets -- -D warnings` -> PASS
+- `cargo test -p mt5-bridge` -> PASS
+- `cargo test -p forex-data -- --nocapture` -> PASS
+- `cargo run -p forex-app -- --headless --config config.yaml` -> PASS WITH FINDINGS, emitting `MT5 Initialization failed. Last error: code=-6 description=Terminal: Authorization failed`
+- `cargo run -p forex-cli -- load --symbol EURUSD --timeframe M1 --root data` -> PASS, `Loaded EURUSD M1 rows: 5267265`
+- `cargo test -p forex-core -- --nocapture` -> PASS
+- `cargo clippy -p forex-core --all-targets -- -D warnings` -> PASS
 
 ## File-By-File Findings
 

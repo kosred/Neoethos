@@ -298,7 +298,7 @@ fn median_ignore_nan(values: &[f64]) -> f64 {
     let mid = vals.len() / 2;
     let (_, upper_ref, _) = vals.select_nth_unstable_by(mid, cmp_f64);
     let upper = *upper_ref;
-    if vals.len() % 2 == 0 {
+    if vals.len().is_multiple_of(2) {
         let (_, lower_ref, _) = vals[..mid].select_nth_unstable_by(mid - 1, cmp_f64);
         (*lower_ref + upper) / 2.0
     } else {
@@ -306,16 +306,28 @@ fn median_ignore_nan(values: &[f64]) -> f64 {
     }
 }
 
-pub fn estimate_volatility(
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    window: usize,
-    method: &str,
-    weights: Option<VolEnsembleWeights>,
-    ewma_lambda: f64,
-) -> Vec<f64> {
+pub struct VolatilityEstimateInput<'a> {
+    pub open: &'a [f64],
+    pub high: &'a [f64],
+    pub low: &'a [f64],
+    pub close: &'a [f64],
+    pub window: usize,
+    pub method: &'a str,
+    pub weights: Option<VolEnsembleWeights>,
+    pub ewma_lambda: f64,
+}
+
+pub fn estimate_volatility(input: VolatilityEstimateInput<'_>) -> Vec<f64> {
+    let VolatilityEstimateInput {
+        open,
+        high,
+        low,
+        close,
+        window,
+        method,
+        weights,
+        ewma_lambda,
+    } = input;
     let method = method.to_lowercase();
     if method == "ensemble" || method == "mix" || method == "blend" {
         let v_pk = vol_parkinson(high, low);
@@ -517,8 +529,8 @@ fn compute_ema(values: &[f64], period: usize) -> Vec<f64> {
     let mut out = Vec::with_capacity(values.len());
     let mut prev = values[0];
     out.push(prev);
-    for i in 1..values.len() {
-        prev = alpha * values[i] + (1.0 - alpha) * prev;
+    for &value in values.iter().skip(1) {
+        prev = alpha * value + (1.0 - alpha) * prev;
         out.push(prev);
     }
     out
@@ -589,8 +601,8 @@ fn compute_adx(high: &[f64], low: &[f64], close: &[f64], period: usize) -> Optio
     }
 
     let mut adx = mean(&dx[..period]);
-    for i in period..dx.len() {
-        adx = ((adx * (period as f64 - 1.0)) + dx[i]) / period as f64;
+    for value in dx.iter().skip(period) {
+        adx = ((adx * (period as f64 - 1.0)) + *value) / period as f64;
     }
     Some(adx)
 }
@@ -823,16 +835,16 @@ pub fn compute_stop_distance_series(
         _ => settings.weights,
     };
 
-    let sigma = estimate_volatility(
+    let sigma = estimate_volatility(VolatilityEstimateInput {
         open,
         high,
         low,
         close,
-        settings.vol_window,
-        &settings.vol_estimator,
+        window: settings.vol_window,
+        method: &settings.vol_estimator,
         weights,
-        settings.ewma_lambda,
-    );
+        ewma_lambda: settings.ewma_lambda,
+    });
     let scale = (settings.vol_horizon_bars.max(1) as f64).sqrt();
     let vol_dist: Vec<f64> = close
         .iter()
@@ -896,16 +908,16 @@ pub fn infer_stop_target_pips(
         _ => settings.weights,
     };
 
-    let sigma = estimate_volatility(
+    let sigma = estimate_volatility(VolatilityEstimateInput {
         open,
         high,
         low,
         close,
-        settings.vol_window,
-        &settings.vol_estimator,
+        window: settings.vol_window,
+        method: &settings.vol_estimator,
         weights,
-        settings.ewma_lambda,
-    );
+        ewma_lambda: settings.ewma_lambda,
+    });
     let sigma_last = *sigma.last().unwrap_or(&0.0);
     let es = estimate_expected_shortfall(close, settings.tail_window, settings.tail_alpha)
         .unwrap_or(0.0);

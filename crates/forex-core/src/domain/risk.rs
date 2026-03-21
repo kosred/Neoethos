@@ -1,17 +1,11 @@
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum ChallengePhase {
+    #[default]
     Phase1,
     Phase2,
     Funded,
-}
-
-impl Default for ChallengePhase {
-    fn default() -> Self {
-        Self::Phase1
-    }
 }
 
 impl From<&str> for ChallengePhase {
@@ -132,6 +126,29 @@ pub struct TradeRecord {
     pub direction: Option<i32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TradeGateInput {
+    pub equity: f64,
+    pub confidence: f64,
+    pub current_time_sec: u64,
+    pub current_hour: u32,
+    pub current_min: u32,
+    pub weekday: u32,
+    pub market_volatility: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PositionSizingInput {
+    pub equity: f64,
+    pub base_risk_pct: f64,
+    pub max_risk_cap: f64,
+    pub confidence: f64,
+    pub uncertainty: f64,
+    pub market_volatility: f64,
+    pub target_volatility: f64,
+    pub is_volatile_regime: bool,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RevengeTradeDetector {
     pub recent_trades: Vec<TradeRecord>,
@@ -199,7 +216,7 @@ impl RevengeTradeDetector {
         }
         
         if consecutive_losses >= 3 {
-            let optimal_times = (current_hour >= 7 && current_hour < 9) || (current_hour >= 13 && current_hour < 15);
+            let optimal_times = (7..9).contains(&current_hour) || (13..15).contains(&current_hour);
             if !optimal_times {
                 return true;
             }
@@ -246,10 +263,13 @@ impl RevengeTradeDetector {
             let last = &self.recent_trades[n - 1];
             let gap_min = (last.entry_time_sec.saturating_sub(prev.exit_time_sec)) as f64 / 60.0;
 
-            if gap_min < 30.0 && last.pnl < 0.0 && prev.pnl < 0.0 {
-                if last.direction.is_some() && last.direction == prev.direction {
-                    return true;
-                }
+            if gap_min < 30.0
+                && last.pnl < 0.0
+                && prev.pnl < 0.0
+                && last.direction.is_some()
+                && last.direction == prev.direction
+            {
+                return true;
             }
         }
 
@@ -413,16 +433,7 @@ impl RiskManager {
         }
     }
 
-    pub fn check_trade_allowed(
-        &mut self,
-        equity: f64,
-        confidence: f64,
-        current_time_sec: u64,
-        current_hour: u32,
-        current_min: u32,
-        weekday: u32,
-        market_volatility: f64,
-    ) -> (bool, String) {
+    pub fn check_trade_allowed(&mut self, input: TradeGateInput) -> (bool, String) {
         if self.challenge_mode && self.challenge_target_hit {
             return (false, "Challenge target reached".to_string());
         }
@@ -434,7 +445,7 @@ impl RiskManager {
             return (false, "Circuit breaker active".to_string());
         }
 
-        if !self.is_trading_session(current_hour, current_min, weekday) {
+        if !self.is_trading_session(input.current_hour, input.current_min, input.weekday) {
             return (false, "Outside trading session".to_string());
         }
 
@@ -442,26 +453,26 @@ impl RiskManager {
             let s = self.night_block_start_hour;
             let e = self.night_block_end_hour;
             let in_window = if e < s {
-                current_hour >= s || current_hour < e
+                input.current_hour >= s || input.current_hour < e
             } else {
-                current_hour >= s && current_hour < e
+                input.current_hour >= s && input.current_hour < e
             };
-            if in_window && market_volatility < self.night_min_volatility {
-                return (false, format!("Night session blocked (vol={:.5}<{:.5})", market_volatility, self.night_min_volatility));
+            if in_window && input.market_volatility < self.night_min_volatility {
+                return (false, format!("Night session blocked (vol={:.5}<{:.5})", input.market_volatility, self.night_min_volatility));
             }
         }
 
         if let Some(kill_until) = self.kill_window_until_sec {
-            if current_time_sec < kill_until {
+            if input.current_time_sec < kill_until {
                 return (false, "News kill window active".to_string());
             }
         }
 
-        if self.revenge_detector.is_revenge_trading(current_time_sec, current_hour) {
+        if self.revenge_detector.is_revenge_trading(input.current_time_sec, input.current_hour) {
             return (false, "Revenge trading detected".to_string());
         }
 
-        let (daily_dd, intraday_dd, _dd_used, _dd_limit) = self.drawdown_state(equity);
+        let (daily_dd, intraday_dd, _dd_used, _dd_limit) = self.drawdown_state(input.equity);
         if daily_dd >= self.prop_rules.daily_dd_stop_trading_pct {
             self.circuit_breaker_triggered = true;
             return (false, format!("Daily drawdown limit ({:.2}%)", daily_dd * 100.0));
@@ -475,8 +486,8 @@ impl RiskManager {
             return (false, "Max trades per day reached".to_string());
         }
 
-        if confidence < 0.55 { // Simplified, should be dynamic
-             return (false, format!("Confidence {:.2} too low", confidence));
+        if input.confidence < 0.55 { // Simplified, should be dynamic
+             return (false, format!("Confidence {:.2} too low", input.confidence));
         }
 
         (true, "OK".to_string())
@@ -499,45 +510,35 @@ impl RiskManager {
         self.update_recovery_state(equity);
     }
 
-    pub fn calculate_position_size(
-        &mut self,
-        equity: f64,
-        base_risk_pct: f64,
-        max_risk_cap: f64,
-        confidence: f64,
-        uncertainty: f64,
-        market_volatility: f64,
-        target_volatility: f64,
-        is_volatile_regime: bool,
-    ) -> f64 {
-        let signal_multiplier = if confidence >= 0.80 {
+    pub fn calculate_position_size(&mut self, input: PositionSizingInput) -> f64 {
+        let signal_multiplier = if input.confidence >= 0.80 {
             1.00
-        } else if confidence >= 0.60 {
-            0.50 + (confidence - 0.60) * 2.5
+        } else if input.confidence >= 0.60 {
+            0.50 + (input.confidence - 0.60) * 2.5
         } else {
             0.30
         };
 
-        let uncertainty_penalty = 1.0 - (uncertainty * 0.5);
-        let mut risk_pct = base_risk_pct * signal_multiplier * uncertainty_penalty;
+        let uncertainty_penalty = 1.0 - (input.uncertainty * 0.5);
+        let mut risk_pct = input.base_risk_pct * signal_multiplier * uncertainty_penalty;
 
-        let mut current_cap = max_risk_cap;
+        let mut current_cap = input.max_risk_cap;
         if self.recovery_mode {
-            current_cap = max_risk_cap * 0.5;
+            current_cap = input.max_risk_cap * 0.5;
         }
         risk_pct = risk_pct.min(current_cap);
 
-        if target_volatility > 0.0 && market_volatility > 0.0 {
-            let mut vol_scale = target_volatility / market_volatility;
+        if input.target_volatility > 0.0 && input.market_volatility > 0.0 {
+            let mut vol_scale = input.target_volatility / input.market_volatility;
             vol_scale = vol_scale.clamp(0.35, 1.30);
             risk_pct *= vol_scale;
         }
 
-        if is_volatile_regime {
+        if input.is_volatile_regime {
             risk_pct *= 0.5;
         }
 
-        let (_, _, dd_used, dd_limit) = self.drawdown_state(equity);
+        let (_, _, dd_used, dd_limit) = self.drawdown_state(input.equity);
         let dd_frac = dd_used / dd_limit.max(1e-9);
 
         if dd_frac >= 0.75 {
@@ -547,13 +548,13 @@ impl RiskManager {
         }
 
         if self.total_peak_equity > 0.0 {
-            let dd_total_pct = (self.total_peak_equity - equity) / self.total_peak_equity;
+            let dd_total_pct = (self.total_peak_equity - input.equity) / self.total_peak_equity;
             if dd_total_pct > 0.0 {
                 let scale = 1.0 - (dd_total_pct / self.prop_rules.max_total_loss_pct.max(1e-6));
                 risk_pct *= scale.max(0.3);
             }
         }
 
-        risk_pct.clamp(0.0, max_risk_cap)
+        risk_pct.clamp(0.0, input.max_risk_cap)
     }
 }

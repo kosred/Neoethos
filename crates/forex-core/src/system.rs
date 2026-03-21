@@ -21,6 +21,12 @@ pub struct HardwareProbe {
     sys: System,
 }
 
+impl Default for HardwareProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HardwareProbe {
     pub fn new() -> Self {
         let mut sys = System::new_all();
@@ -72,7 +78,7 @@ impl HardwareProbe {
 
         for cmd in smi_candidates {
             if let Ok(output) = Command::new(cmd)
-                .args(&["--query-gpu=name", "--format=csv,noheader"])
+                .args(["--query-gpu=name", "--format=csv,noheader"])
                 .output()
             {
                 if output.status.success() {
@@ -85,7 +91,7 @@ impl HardwareProbe {
                     }
                     if !names.is_empty() {
                         if let Ok(mem_out) = Command::new(cmd)
-                            .args(&["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+                            .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
                             .output()
                         {
                             let mem_str = String::from_utf8_lossy(&mem_out.stdout);

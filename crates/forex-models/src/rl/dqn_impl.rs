@@ -4,8 +4,7 @@ use rlkit::algs::dqn::{DQN, DNQStateMode};
 use rlkit::types::{EnvTrait, Status, Reward, Action, TrainArgs};
 #[cfg(feature = "reinforcement-learning")]
 use rlkit::policies::EpsilonGreedy;
-use anyhow::{Result, Context};
-use ndarray::Array2;
+use anyhow::Result;
 
 pub struct TradingReinforcementLearner {
     #[cfg(feature = "reinforcement-learning")]
@@ -26,5 +25,11 @@ impl TradingReinforcementLearner {
         { anyhow::bail!("Reinforcement learning feature not enabled") }
         #[cfg(feature = "reinforcement-learning")]
         { Ok(()) }
+    }
+}
+
+impl Default for TradingReinforcementLearner {
+    fn default() -> Self {
+        Self::new()
     }
 }

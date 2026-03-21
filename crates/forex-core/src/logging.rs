@@ -2,8 +2,32 @@
 // Port of src/forex_bot/core/logging.py
 
 use std::path::PathBuf;
-use tracing::Level;
+use std::sync::Mutex;
+use tracing::{Level, warn};
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+static FILE_LOG_GUARD: Mutex<Option<WorkerGuard>> = Mutex::new(None);
+
+fn install_log_guard(guard: WorkerGuard) -> bool {
+    let mut slot = FILE_LOG_GUARD
+        .lock()
+        .expect("file log guard mutex should not be poisoned");
+    if slot.is_some() {
+        false
+    } else {
+        *slot = Some(guard);
+        true
+    }
+}
+
+#[cfg(test)]
+fn logging_guard_installed() -> bool {
+    FILE_LOG_GUARD
+        .lock()
+        .map(|slot| slot.is_some())
+        .unwrap_or(false)
+}
 
 /// Setup structured logging with tracing
 ///
@@ -27,7 +51,10 @@ pub fn setup_logging(verbose: bool) -> anyhow::Result<()> {
 
     // File appender with rotation (50MB max, 3 backups)
     let file_appender = tracing_appender::rolling::never(&log_dir, log_file.file_name().unwrap());
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    if !install_log_guard(guard) {
+        warn!("File log guard already installed; reusing existing flush guard");
+    }
 
     // Create environment filter that silences noisy libraries
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -92,6 +119,18 @@ pub fn setup_minimal_logging(verbose: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_install_log_guard_retains_worker_guard() {
+        let (writer, guard) = tracing_appender::non_blocking(std::io::sink());
+        drop(writer);
+
+        assert!(
+            install_log_guard(guard),
+            "first guard installation should succeed"
+        );
+        assert!(logging_guard_installed(), "guard should be retained globally");
+    }
 
     #[test]
     fn test_minimal_logging() {

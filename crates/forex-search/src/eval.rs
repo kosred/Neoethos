@@ -3,6 +3,29 @@ use rayon::prelude::*;
 use std::env;
 use std::sync::Once;
 
+pub type SmcRow = [i8; 11];
+
+pub struct PopulationEvalInputs<'a> {
+    pub close: &'a [f64],
+    pub high: &'a [f64],
+    pub low: &'a [f64],
+    pub indicators: ArrayView2<'a, f32>,
+    pub gene_offsets: &'a [i32],
+    pub gene_indices: &'a [i32],
+    pub gene_weights: &'a [f32],
+    pub long_thr: &'a [f32],
+    pub short_thr: &'a [f32],
+    pub month_idx: &'a [i64],
+    pub day_idx: &'a [i64],
+    pub sl_pips: &'a [f64],
+    pub tp_pips: &'a [f64],
+    pub smc_data: &'a [SmcRow],
+    pub gene_smc_flags: &'a [SmcRow],
+    pub gate_threshold: f32,
+    pub weights: &'a [f32; 11],
+    pub settings: &'a BacktestSettings,
+}
+
 static RAYON_INIT: Once = Once::new();
 
 fn init_rayon() {
@@ -193,26 +216,27 @@ pub fn fast_evaluate_strategy_core(
     [net_profit, 0.0, peak_equity, max_dd, win_rate, pf, expectancy, 0.0, trade_count as f64, consistency, max_daily_dd]
 }
 
-pub fn evaluate_population_core(
-    close: &[f64],
-    high: &[f64],
-    low: &[f64],
-    indicators: ArrayView2<f32>,
-    gene_offsets: &[i32],
-    gene_indices: &[i32],
-    gene_weights: &[f32],
-    long_thr: &[f32],
-    short_thr: &[f32],
-    month_idx: &[i64],
-    day_idx: &[i64],
-    sl_pips: &[f64],
-    tp_pips: &[f64],
-    smc_data: &[[i8; 11]], // Ob, Fvg, Liq, Trend, Premium, Inducement, Bos, Choch, Eqh, Eql, Displacement
-    gene_smc_flags: &[[i8; 11]],
-    gate_threshold: f32,
-    weights: &[f32; 11],
-    settings: &BacktestSettings,
-) -> Result<Vec<[f64; 11]>, String> {
+pub fn evaluate_population_core(inputs: PopulationEvalInputs<'_>) -> Result<Vec<[f64; 11]>, String> {
+    let PopulationEvalInputs {
+        close,
+        high,
+        low,
+        indicators,
+        gene_offsets,
+        gene_indices,
+        gene_weights,
+        long_thr,
+        short_thr,
+        month_idx,
+        day_idx,
+        sl_pips,
+        tp_pips,
+        smc_data,
+        gene_smc_flags,
+        gate_threshold,
+        weights,
+        settings,
+    } = inputs;
     init_rayon();
     let n_genes = long_thr.len();
     let n_samples = close.len();

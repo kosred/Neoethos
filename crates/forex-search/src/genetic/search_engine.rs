@@ -10,6 +10,8 @@ use ndarray::Array2;
 use rand::Rng;
 use std::collections::HashSet;
 
+type GeneArrays = (Vec<i32>, Vec<i32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
 pub fn month_day_indices(timestamps: &[i64]) -> (Vec<i64>, Vec<i64>) {
     let mut months = Vec::with_capacity(timestamps.len());
     let mut days = Vec::with_capacity(timestamps.len());
@@ -27,7 +29,7 @@ pub fn month_day_indices(timestamps: &[i64]) -> (Vec<i64>, Vec<i64>) {
     (months, days)
 }
 
-fn build_gene_arrays(genes: &[Gene]) -> (Vec<i32>, Vec<i32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+fn build_gene_arrays(genes: &[Gene]) -> GeneArrays {
     let mut offsets = Vec::with_capacity(genes.len() + 1);
     let mut indices = Vec::new();
     let mut weights = Vec::new();
@@ -80,7 +82,7 @@ pub fn evaluate_genes(features: &FeatureFrame, ohlcv: &Ohlcv, genes: &[Gene], co
     let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) = build_smc_arrays(features, ohlcv);
     let mut smc_data = Vec::with_capacity(n_samples);
     for i in 0..n_samples {
-        smc_data.push([ob[i], fvg[i], liq[i], trend[i], prem[i], ind[i] as i8, bos[i], choch[i], eqh[i], eql[i], disp[i]]);
+        smc_data.push([ob[i], fvg[i], liq[i], trend[i], prem[i], ind[i], bos[i], choch[i], eqh[i], eql[i], disp[i]]);
     }
 
     let mut gene_smc_flags = Vec::with_capacity(genes.len());
@@ -110,10 +112,26 @@ pub fn evaluate_genes(features: &FeatureFrame, ohlcv: &Ohlcv, genes: &[Gene], co
         ..Default::default()
     };
 
-    crate::eval::evaluate_population_core(
-        &ohlcv.close, &ohlcv.high, &ohlcv.low, indicators.view(), &offsets, &indices, &weights, &long_thr, &short_thr,
-        &months, &days, &sl_pips, &tp_pips, &smc_data, &gene_smc_flags, config.smc_gate_threshold, &smc_weights, &b_settings,
-    ).map_err(|e| anyhow!(e))
+    crate::eval::evaluate_population_core(crate::eval::PopulationEvalInputs {
+        close: &ohlcv.close,
+        high: &ohlcv.high,
+        low: &ohlcv.low,
+        indicators: indicators.view(),
+        gene_offsets: &offsets,
+        gene_indices: &indices,
+        gene_weights: &weights,
+        long_thr: &long_thr,
+        short_thr: &short_thr,
+        month_idx: &months,
+        day_idx: &days,
+        sl_pips: &sl_pips,
+        tp_pips: &tp_pips,
+        smc_data: &smc_data,
+        gene_smc_flags: &gene_smc_flags,
+        gate_threshold: config.smc_gate_threshold,
+        weights: &smc_weights,
+        settings: &b_settings,
+    }).map_err(|e| anyhow!(e))
 }
 
 fn resolve_stop_target_arrays(genes: &[Gene], ohlcv: &Ohlcv, config: &EvaluationConfig) -> (Vec<f64>, Vec<f64>) {
@@ -152,8 +170,10 @@ pub fn evolve_search(features: &FeatureFrame, ohlcv: &Ohlcv, population: usize, 
     let gate_stagnation_step = env_f32("FOREX_BOT_PROP_SMC_GATE_STAGNATION_STEP", 0.03).max(0.0);
     let (gate_lo, gate_hi) = (gate_start.min(gate_end), gate_start.max(gate_end));
     
-    let mut eval_cfg = EvaluationConfig::default();
-    eval_cfg.smc_gate_threshold = gate_start.clamp(gate_lo, gate_hi);
+    let mut eval_cfg = EvaluationConfig {
+        smc_gate_threshold: gate_start.clamp(gate_lo, gate_hi),
+        ..EvaluationConfig::default()
+    };
 
     let seen_retry_attempts = std::env::var("FOREX_BOT_PROP_SEEN_RETRY").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(16).max(1);
     let mut seen_memory = SeenSignatureMemory::from_env();

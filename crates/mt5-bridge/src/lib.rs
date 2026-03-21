@@ -2,6 +2,18 @@ use anyhow::{Result};
 use pyo3::prelude::*;
 use tracing::{info, error, warn};
 
+fn format_last_error(err: &Bound<'_, PyAny>) -> PyResult<String> {
+    if let Ok((code, description)) = err.extract::<(i32, String)>() {
+        return Ok(format!("code={} description={}", code, description));
+    }
+
+    if let Ok(description) = err.extract::<String>() {
+        return Ok(description);
+    }
+
+    Ok(err.str()?.to_string_lossy().into_owned())
+}
+
 pub struct MT5Engine {
     connected: bool,
 }
@@ -26,7 +38,8 @@ impl MT5Engine {
             let init_result: bool = mt5.getattr("initialize")?.call0()?.extract()?;
             
             if !init_result {
-                let err: String = mt5.getattr("last_error")?.call0()?.extract()?;
+                let err_obj = mt5.getattr("last_error")?.call0()?;
+                let err = format_last_error(err_obj.as_any())?;
                 error!("MT5 Initialization failed. Last error: {}", err);
                 return Ok(false);
             }
@@ -68,4 +81,51 @@ impl MT5Engine {
 
 impl Drop for MT5Engine {
     fn drop(&mut self) { self.shutdown(); }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::types::PyDict;
+    use std::ffi::CString;
+
+    fn run_py(py: Python<'_>, code: &str, locals: &Bound<'_, PyDict>) -> PyResult<()> {
+        let code = CString::new(code).expect("python code should not contain embedded nulls");
+        py.run(code.as_c_str(), Some(locals), Some(locals))
+    }
+
+    #[test]
+    fn test_format_last_error_handles_mt5_tuple_payload() -> Result<()> {
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            run_py(py, r#"err = (-6, "Terminal: Authorization failed")"#, &locals)?;
+            let err = locals
+                .get_item("err")?
+                .expect("err should be defined");
+
+            let formatted = format_last_error(err.as_any())?;
+
+            assert_eq!(
+                formatted,
+                "code=-6 description=Terminal: Authorization failed"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_format_last_error_falls_back_to_string_payload() -> Result<()> {
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            run_py(py, r#"err = "module unavailable""#, &locals)?;
+            let err = locals
+                .get_item("err")?
+                .expect("err should be defined");
+
+            let formatted = format_last_error(err.as_any())?;
+
+            assert_eq!(formatted, "module unavailable");
+            Ok(())
+        })
+    }
 }

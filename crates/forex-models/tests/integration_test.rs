@@ -12,7 +12,7 @@ fn test_registry() {
     use forex_models::registry::*;
 
     // Test available models
-    assert!(AVAILABLE_MODELS.len() > 0, "Should have available models");
+    assert!(!AVAILABLE_MODELS.is_empty(), "Should have available models");
     println!("Available models: {:?}", AVAILABLE_MODELS);
 
     // Test model info
@@ -38,7 +38,7 @@ fn test_model_categories() {
         println!("  {:?}: {} models", category, models.len());
     }
 
-    assert!(categories.len() > 0, "Should have model categories");
+    assert!(!categories.is_empty(), "Should have model categories");
     println!("✓ Model category tests passed");
 }
 

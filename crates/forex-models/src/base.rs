@@ -14,6 +14,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use tracing::*;
 
+type ModelSaveFn = Box<dyn FnOnce(&Path) -> Result<()>>;
+
 // ============================================================================
 // EARLY STOPPING
 // ============================================================================
@@ -124,7 +126,7 @@ pub trait ExpertModel {
     /// Ported from Python _atomic_save method (lines 101-126)
     fn atomic_save(
         &self,
-        save_func: Box<dyn FnOnce(&Path) -> Result<()>>,
+        save_func: ModelSaveFn,
         target_path: &Path,
     ) -> Result<()> {
         let temp_path = target_path.with_extension("tmp");
@@ -284,7 +286,7 @@ pub fn stratified_downsample(
     let mut class_indices: HashMap<i64, Vec<usize>> = HashMap::new();
     for (idx, label) in y_ca.into_iter().enumerate() {
         if let Some(lbl) = label {
-            class_indices.entry(lbl).or_insert_with(Vec::new).push(idx);
+            class_indices.entry(lbl).or_default().push(idx);
         }
     }
 
@@ -577,7 +579,7 @@ pub struct FeatureDriftReport {
 fn extract_numeric_values(series: &Series) -> Result<Vec<f64>> {
     let series_f64 = series.cast(&DataType::Float64)?;
     let ca = series_f64.f64()?;
-    let values: Vec<f64> = ca.into_iter().filter_map(|v| v).collect();
+    let values: Vec<f64> = ca.into_iter().flatten().collect();
     Ok(values)
 }
 
@@ -735,6 +737,12 @@ pub fn compute_stats_drift(train_vals: &[f64], val_vals: &[f64]) -> f64 {
 pub struct RobustScaler {
     pub mean: Option<Array2<f32>>,
     pub scale: Option<Array2<f32>>,
+}
+
+impl Default for RobustScaler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RobustScaler {

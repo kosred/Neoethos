@@ -1,6 +1,6 @@
 #[cfg(feature = "anomaly-detection")]
 use extended_isolation_forest::{Forest, ForestOptions};
-use anyhow::{Result, Context};
+use anyhow::Result;
 use ndarray::Array2;
 use polars::prelude::*;
 use crate::base::ExpertModel;

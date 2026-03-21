@@ -3,6 +3,8 @@ use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArrayDy
 use pyo3::prelude::*;
 use crate::utils::{vec_from_py_f64, vec_from_py_i64};
 
+type PyArray1Pair<'py> = (Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>);
+
 pub fn causal_tanh_zscore_column(data: &Array2<f32>, col_idx: usize, min_periods: usize) -> Vec<f64> {
     let n = data.nrows();
     let mut out = vec![0.0_f64; n];
@@ -99,7 +101,7 @@ pub fn vortex_indicator_py<'py>(
     low: PyReadonlyArray1<'py, f64>,
     close: PyReadonlyArray1<'py, f64>,
     period: usize,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
+) -> PyResult<PyArray1Pair<'py>> {
     let (vp, vm) = forex_data::vortex_indicator(
         high.as_array().as_slice().unwrap_or(&[]),
         low.as_array().as_slice().unwrap_or(&[]),

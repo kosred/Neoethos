@@ -112,9 +112,12 @@ impl TrainingOrchestrator {
     fn derive_labels(&self, ohlcv: &Ohlcv) -> Vec<i32> {
         let n = ohlcv.close.len();
         let mut labels = vec![0; n];
-        for i in 0..(n-1) {
-            if ohlcv.close[i+1] > ohlcv.close[i] { labels[i] = 1; }
-            else if ohlcv.close[i+1] < ohlcv.close[i] { labels[i] = -1; }
+        for (i, slot) in labels.iter_mut().enumerate().take(n.saturating_sub(1)) {
+            if ohlcv.close[i + 1] > ohlcv.close[i] {
+                *slot = 1;
+            } else if ohlcv.close[i + 1] < ohlcv.close[i] {
+                *slot = -1;
+            }
         }
         labels
     }

@@ -3,16 +3,13 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum FeatureProfile {
+    #[default]
     Standard,
     Full,
     HPC,
     Adaptive,
-}
-
-impl Default for FeatureProfile {
-    fn default() -> Self { Self::Standard }
 }
 
 impl FromStr for FeatureProfile {

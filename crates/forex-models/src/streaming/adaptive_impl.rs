@@ -1,6 +1,8 @@
 #[cfg(feature = "adaptive-models")]
 use irithyll::{SGBT, SGBTConfig, Sample};
-use anyhow::{Result, Context};
+use anyhow::Result;
+#[cfg(feature = "adaptive-models")]
+use anyhow::Context;
 
 pub struct AdaptiveGradientBooster {
     #[cfg(feature = "adaptive-models")]
@@ -48,5 +50,11 @@ impl AdaptiveGradientBooster {
         {
             anyhow::bail!("Adaptive models feature not enabled")
         }
+    }
+}
+
+impl Default for AdaptiveGradientBooster {
+    fn default() -> Self {
+        Self::new()
     }
 }

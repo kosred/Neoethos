@@ -1,10 +1,6 @@
-use ndarray::Array2;
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
-use std::path::Path;
 use std::sync::Mutex;
-use crate::utils::{dataframe_from_named_ndarray, params_from_py};
-use polars::prelude::*;
+use crate::utils::params_from_py;
 
 use forex_models::tree_models::{XGBoostExpert};
 use forex_search::Gene;
@@ -20,7 +16,7 @@ impl XGBoostModel {
     #[new]
     #[pyo3(signature = (params=None))]
     fn new(params: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
-        let rs_params = params_from_py(params).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e))?;
+        let rs_params = params_from_py(params).map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
         Ok(Self { inner: Mutex::new(XGBoostExpert::new(0, rs_params)) })
     }
 }

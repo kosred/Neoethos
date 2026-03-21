@@ -1,8 +1,7 @@
-use numpy::{PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
+use numpy::PyReadonlyArray1;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
 use crate::utils::{vec_from_py_f64, vec_from_py_i8, vec_from_py_i64};
-use forex_search::validation::{embargoed_walkforward_backtest, CombinatorialPurgedCV};
+use forex_search::validation::{embargoed_walkforward_backtest, CombinatorialPurgedCV, WalkforwardBacktestInput};
 use forex_search::eval::BacktestSettings;
 
 #[pyfunction]
@@ -22,6 +21,7 @@ use forex_search::eval::BacktestSettings;
     min_trading_days=3,
     max_trades_per_day=15
 ))]
+#[allow(clippy::too_many_arguments)]
 pub fn embargoed_walkforward_backtest_py(
     py: Python,
     close: PyReadonlyArray1<f64>,
@@ -49,13 +49,22 @@ pub fn embargoed_walkforward_backtest_py(
 
     let b_settings = BacktestSettings::default();
 
-    let res = embargoed_walkforward_backtest(
-        &cl, &hi, &lo, &sig, &m, &d,
-        train_ratio, n_splits, embargo_bars,
-        &b_settings,
-        max_daily_loss_pct, max_daily_profit_pct,
-        min_trading_days, max_trades_per_day
-    ).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    let res = embargoed_walkforward_backtest(WalkforwardBacktestInput {
+        close: &cl,
+        high: &hi,
+        low: &lo,
+        signals: &sig,
+        months: &m,
+        days: &d,
+        train_ratio,
+        n_splits,
+        embargo_bars,
+        settings: &b_settings,
+        max_daily_loss_pct,
+        max_daily_profit_pct,
+        min_trading_days,
+        max_trades_per_day,
+    }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
     pythonize::pythonize(py, &res).map(|b| b.unbind()).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
 }

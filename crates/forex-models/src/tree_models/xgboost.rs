@@ -15,9 +15,9 @@ pub struct XGBoostExpert {
     pub config: TreeModelConfig,
     gpu_only_disabled: bool,
     #[cfg(feature = "xgboost")]
-    model: Option<xgb::Booster>,
+    _model: Option<xgb::Booster>,
     #[cfg(not(feature = "xgboost"))]
-    model: Option<()>,
+    _model: Option<()>,
 }
 
 impl XGBoostExpert {
@@ -32,7 +32,7 @@ impl XGBoostExpert {
                 cpu_threads: Some(cpu_threads_hint()),
             },
             gpu_only_disabled: false,
-            model: None,
+            _model: None,
         }
     }
 
@@ -63,7 +63,7 @@ impl ExpertModel for XGBoostExpert {
         if self.gpu_only_disabled { return Ok(Array2::zeros((x.height(), 3))); }
         #[cfg(feature = "xgboost")]
         {
-            let _model = self.model.as_ref().context("XGBoost not trained")?;
+            let _model = self._model.as_ref().context("XGBoost not trained")?;
             // Prediction logic...
             Ok(Array2::zeros((x.height(), 3)))
         }
@@ -73,13 +73,13 @@ impl ExpertModel for XGBoostExpert {
 
     fn save(&self, _path: &std::path::Path) -> Result<()> {
         #[cfg(feature = "xgboost")]
-        { if let Some(m) = &self.model { m.save(_path)?; } }
+        { if let Some(m) = &self._model { m.save(_path)?; } }
         Ok(())
     }
 
     fn load(&mut self, _path: &std::path::Path) -> Result<()> {
         #[cfg(feature = "xgboost")]
-        { self.model = Some(xgb::Booster::load(_path)?); }
+        { self._model = Some(xgb::Booster::load(_path)?); }
         Ok(())
     }
 }
