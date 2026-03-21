@@ -15,10 +15,11 @@ use forex_data::{
     FeatureCache, MANDATORY_TFS,
 };
 use forex_search::{
-    ensure_non_empty_portfolio, run_discovery_cycle, save_portfolio_json, DiscoveryConfig,
-    DiscoveryResult,
+    ensure_non_empty_portfolio, run_discovery_cycle_with_progress, save_portfolio_json,
+    DiscoveryConfig, DiscoveryProgress, DiscoveryResult,
 };
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
@@ -89,6 +90,257 @@ fn requested_discovery_highlights(request: &DiscoveryRequest) -> Vec<(String, St
             },
         ),
     ]
+}
+
+fn upsert_counter(counters: &mut Vec<(String, u64)>, name: &str, value: u64) {
+    if let Some((_, existing)) = counters.iter_mut().find(|(key, _)| key == name) {
+        *existing = value;
+    } else {
+        counters.push((name.to_string(), value));
+    }
+}
+
+fn push_recent_entry(entries: &[String], entry: impl Into<String>) -> Vec<String> {
+    let mut next = entries.to_vec();
+    next.push(entry.into());
+    if next.len() > 12 {
+        next.drain(0..(next.len() - 12));
+    }
+    next
+}
+
+fn apply_backend_discovery_event(snapshot: &mut JobSnapshot, event: &DiscoveryProgress) {
+    match event {
+        DiscoveryProgress::SearchStarted {
+            population,
+            generations,
+            max_indicators,
+        } => {
+            snapshot.progress = JobProgress {
+                percent: Some(0.78),
+                stage: "search_started".to_string(),
+                message: format!(
+                    "genetic search started with population={} and generations={}",
+                    population, generations
+                ),
+            };
+            upsert_counter(
+                &mut snapshot.report.counters,
+                "population",
+                *population as u64,
+            );
+            upsert_counter(
+                &mut snapshot.report.counters,
+                "generations",
+                *generations as u64,
+            );
+            upsert_counter(
+                &mut snapshot.report.counters,
+                "max_indicators",
+                *max_indicators as u64,
+            );
+            snapshot.report.events = push_recent_event(
+                &snapshot.report.events,
+                JobEventLevel::Info,
+                format!(
+                    "search started with population={} generations={} max_indicators={}",
+                    population, generations, max_indicators
+                ),
+            );
+        }
+        DiscoveryProgress::GenerationCompleted {
+            generation,
+            total_generations,
+            best_fitness,
+            stagnant_generations,
+            archived_profitable,
+        } => {
+            let ratio = if *total_generations == 0 {
+                0.0
+            } else {
+                *generation as f32 / *total_generations as f32
+            };
+            snapshot.progress = JobProgress {
+                percent: Some((0.8 + 0.1 * ratio).clamp(0.8, 0.9)),
+                stage: "search_generations".to_string(),
+                message: format!(
+                    "generation {}/{} complete (best fitness {:.2})",
+                    generation, total_generations, best_fitness
+                ),
+            };
+            upsert_counter(
+                &mut snapshot.report.counters,
+                "generation",
+                *generation as u64,
+            );
+            upsert_counter(
+                &mut snapshot.report.counters,
+                "archived_profitable",
+                *archived_profitable as u64,
+            );
+            upsert_counter(
+                &mut snapshot.report.counters,
+                "stagnant_generations",
+                *stagnant_generations as u64,
+            );
+            snapshot.report.entries = push_recent_entry(
+                &snapshot.report.entries,
+                format!(
+                    "generation | {}/{} | best_fitness={:.2} | archived={}",
+                    generation, total_generations, best_fitness, archived_profitable
+                ),
+            );
+            snapshot.report.events = push_recent_event(
+                &snapshot.report.events,
+                JobEventLevel::Info,
+                format!(
+                    "generation {}/{} completed with best fitness {:.2}",
+                    generation, total_generations, best_fitness
+                ),
+            );
+        }
+        DiscoveryProgress::CandidatesRanked {
+            candidate_count,
+            truncated_to,
+        } => {
+            snapshot.progress = JobProgress {
+                percent: Some(0.91),
+                stage: "ranking_candidates".to_string(),
+                message: format!(
+                    "ranked {} candidates and kept top {}",
+                    candidate_count, truncated_to
+                ),
+            };
+            upsert_counter(
+                &mut snapshot.report.counters,
+                "candidates",
+                *candidate_count as u64,
+            );
+            upsert_counter(
+                &mut snapshot.report.counters,
+                "truncated_candidates",
+                *truncated_to as u64,
+            );
+            snapshot.report.events = push_recent_event(
+                &snapshot.report.events,
+                JobEventLevel::Info,
+                format!(
+                    "ranked {} candidates and truncated to {}",
+                    candidate_count, truncated_to
+                ),
+            );
+        }
+        DiscoveryProgress::CandidatesFiltered {
+            passed_filters,
+            evaluated_candidates,
+            min_trades_required,
+        } => {
+            snapshot.progress = JobProgress {
+                percent: Some(0.94),
+                stage: "filtering_candidates".to_string(),
+                message: format!(
+                    "{} of {} candidates passed filters",
+                    passed_filters, evaluated_candidates
+                ),
+            };
+            upsert_counter(
+                &mut snapshot.report.counters,
+                "filtered_candidates",
+                *passed_filters as u64,
+            );
+            upsert_counter(
+                &mut snapshot.report.counters,
+                "min_trades_required",
+                *min_trades_required as u64,
+            );
+            snapshot.report.events = push_recent_event(
+                &snapshot.report.events,
+                JobEventLevel::Info,
+                format!(
+                    "{} of {} candidates passed filters (min trades {})",
+                    passed_filters, evaluated_candidates, min_trades_required
+                ),
+            );
+        }
+        DiscoveryProgress::PortfolioSelected {
+            portfolio_size,
+            rejected_by_correlation,
+            target_portfolio,
+        } => {
+            snapshot.progress = JobProgress {
+                percent: Some(0.97),
+                stage: "portfolio_construction".to_string(),
+                message: format!(
+                    "portfolio selection accepted {} of target {}",
+                    portfolio_size, target_portfolio
+                ),
+            };
+            upsert_counter(
+                &mut snapshot.report.counters,
+                "portfolio",
+                *portfolio_size as u64,
+            );
+            upsert_counter(
+                &mut snapshot.report.counters,
+                "rejected_by_correlation",
+                *rejected_by_correlation as u64,
+            );
+            snapshot.report.entries = push_recent_entry(
+                &snapshot.report.entries,
+                format!(
+                    "portfolio | accepted={} | rejected_by_correlation={} | target={}",
+                    portfolio_size, rejected_by_correlation, target_portfolio
+                ),
+            );
+            snapshot.report.events = push_recent_event(
+                &snapshot.report.events,
+                JobEventLevel::Info,
+                format!(
+                    "portfolio selection accepted {} and rejected {} by correlation",
+                    portfolio_size, rejected_by_correlation
+                ),
+            );
+        }
+        DiscoveryProgress::Completed {
+            candidate_count,
+            filtered_count,
+            portfolio_size,
+        } => {
+            snapshot.progress = JobProgress {
+                percent: Some(0.99),
+                stage: "finalizing_discovery".to_string(),
+                message: format!(
+                    "discovery finalized with {} portfolio strategies",
+                    portfolio_size
+                ),
+            };
+            upsert_counter(
+                &mut snapshot.report.counters,
+                "candidates",
+                *candidate_count as u64,
+            );
+            upsert_counter(
+                &mut snapshot.report.counters,
+                "filtered_candidates",
+                *filtered_count as u64,
+            );
+            upsert_counter(
+                &mut snapshot.report.counters,
+                "portfolio",
+                *portfolio_size as u64,
+            );
+            snapshot.report.events = push_recent_event(
+                &snapshot.report.events,
+                JobEventLevel::Info,
+                format!(
+                    "discovery finalized with {} candidates, {} filtered, {} portfolio",
+                    candidate_count, filtered_count, portfolio_size
+                ),
+            );
+        }
+    }
+
+    snapshot.report.log_path = Some(canonical_log_path().display().to_string());
 }
 
 pub fn completed_snapshot(mut snapshot: JobSnapshot, result: &DiscoveryResult) -> JobSnapshot {
@@ -412,9 +664,25 @@ pub fn start_discovery_job(
             return;
         }
 
+        let live_snapshot = Arc::new(Mutex::new(snapshot.clone()));
         let search_request = request.clone();
+        let tx_progress = tx.clone();
+        let live_snapshot_for_progress = Arc::clone(&live_snapshot);
         let search_result = tokio::task::spawn_blocking(move || {
-            let result = run_discovery_cycle(&features, &base_ohlcv, &search_request.config)?;
+            let result = run_discovery_cycle_with_progress(
+                &features,
+                &base_ohlcv,
+                &search_request.config,
+                move |event| {
+                    if let Ok(mut snapshot) = live_snapshot_for_progress.lock() {
+                        apply_backend_discovery_event(&mut snapshot, &event);
+                        send_event(
+                            &tx_progress,
+                            ServiceEvent::DiscoveryUpdated(snapshot.clone()),
+                        );
+                    }
+                },
+            )?;
             ensure_non_empty_portfolio(
                 &result,
                 &format!("{} {}", search_request.symbol, search_request.base_tf),
@@ -435,21 +703,35 @@ pub fn start_discovery_job(
         let result = match search_result {
             Ok(Ok(result)) => result,
             Ok(Err(err)) => {
-                let failed = failed_snapshot_from(snapshot, err);
+                let base_snapshot = live_snapshot
+                    .lock()
+                    .map(|snapshot| snapshot.clone())
+                    .unwrap_or(snapshot);
+                let failed = failed_snapshot_from(base_snapshot, err);
                 send_event(&tx, ServiceEvent::DiscoveryUpdated(failed.clone()));
                 log_discovery_event("ui_discovery_job", "FAILED", failed.report.summary.clone());
                 return;
             }
             Err(err) => {
-                let failed =
-                    failed_snapshot_from(snapshot, anyhow::anyhow!("discovery join error: {err}"));
+                let base_snapshot = live_snapshot
+                    .lock()
+                    .map(|snapshot| snapshot.clone())
+                    .unwrap_or(snapshot);
+                let failed = failed_snapshot_from(
+                    base_snapshot,
+                    anyhow::anyhow!("discovery join error: {err}"),
+                );
                 send_event(&tx, ServiceEvent::DiscoveryUpdated(failed.clone()));
                 log_discovery_event("ui_discovery_job", "FAILED", failed.report.summary.clone());
                 return;
             }
         };
 
-        let completed = completed_snapshot(snapshot, &result);
+        let base_snapshot = live_snapshot
+            .lock()
+            .map(|snapshot| snapshot.clone())
+            .unwrap_or(snapshot);
+        let completed = completed_snapshot(base_snapshot, &result);
         send_event(&tx, ServiceEvent::DiscoveryUpdated(completed.clone()));
         log_discovery_event(
             "ui_discovery_job",
@@ -655,5 +937,56 @@ mod tests {
             snapshot.report.log_path,
             Some(canonical_log_path().display().to_string())
         );
+    }
+
+    #[test]
+    fn backend_portfolio_milestone_updates_discovery_snapshot_with_live_counts() {
+        let request = sample_request();
+        let mut snapshot = JobSnapshot::new(JobKind::Discovery);
+        snapshot.state = JobState::Running;
+        snapshot.progress = JobProgress {
+            percent: Some(0.75),
+            stage: "running_discovery".to_string(),
+            message: "evaluating strategy candidates for EURUSD".to_string(),
+        };
+        snapshot.report = JobReport {
+            counters: requested_discovery_counters(&request),
+            highlights: requested_discovery_highlights(&request),
+            log_path: Some(canonical_log_path().display().to_string()),
+            ..JobReport::default()
+        };
+
+        apply_backend_discovery_event(
+            &mut snapshot,
+            &forex_search::DiscoveryProgress::PortfolioSelected {
+                portfolio_size: 12,
+                rejected_by_correlation: 5,
+                target_portfolio: 24,
+            },
+        );
+
+        assert_eq!(snapshot.state, JobState::Running);
+        assert_eq!(snapshot.progress.stage, "portfolio_construction");
+        assert!(snapshot.progress.percent.expect("percent should exist") >= 0.9);
+        assert!(snapshot
+            .report
+            .counters
+            .iter()
+            .any(|(name, value)| name == "portfolio" && *value == 12));
+        assert!(snapshot
+            .report
+            .counters
+            .iter()
+            .any(|(name, value)| name == "rejected_by_correlation" && *value == 5));
+        assert!(snapshot
+            .report
+            .events
+            .iter()
+            .any(|event| event.message.contains("portfolio selection")));
+        assert!(snapshot
+            .report
+            .entries
+            .iter()
+            .any(|entry| entry.contains("portfolio | accepted=12")));
     }
 }

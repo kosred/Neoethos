@@ -1,9 +1,12 @@
-use super::strategy_gene::{Gene, SearchResult, EvaluationConfig};
-use super::smc_indicators::{SmcSearchConfig, build_smc_arrays, enforce_population_smc_ratio};
-use super::evolution_math::{SeenSignatureMemory, unique_candidate_or_retry, new_random_gene, generate_random_genes, crossover, mutate, apply_metrics};
+use super::evolution_math::{
+    apply_metrics, crossover, generate_random_genes, mutate, new_random_gene,
+    unique_candidate_or_retry, SeenSignatureMemory,
+};
+use super::smc_indicators::{build_smc_arrays, enforce_population_smc_ratio, SmcSearchConfig};
+use super::strategy_gene::{EvaluationConfig, Gene, SearchResult};
 use crate::eval::BacktestSettings;
 use crate::stop_target::{infer_stop_target_pips, StopTargetSettings};
-use anyhow::{bail, Result, anyhow};
+use anyhow::{anyhow, bail, Result};
 use chrono::{Datelike, TimeZone, Utc};
 use forex_data::{FeatureFrame, Ohlcv};
 use ndarray::Array2;
@@ -56,48 +59,84 @@ pub fn signals_for_gene(features: &FeatureFrame, gene: &Gene) -> Vec<i8> {
     let n_samples = features.data.nrows();
     let mut combined = vec![0.0_f32; n_samples];
     for (idx, weight) in gene.indices.iter().zip(gene.weights.iter()) {
-        if *idx >= features.data.ncols() { continue; }
+        if *idx >= features.data.ncols() {
+            continue;
+        }
         let col = features.data.column(*idx);
-        for (i, v) in col.iter().enumerate() { combined[i] += *weight * *v; }
+        for (i, v) in col.iter().enumerate() {
+            combined[i] += *weight * *v;
+        }
     }
     let mut signals = vec![0_i8; n_samples];
     for i in 0..n_samples {
         let v = combined[i];
-        if v >= gene.long_threshold { signals[i] = 1; }
-        else if v <= gene.short_threshold { signals[i] = -1; }
+        if v >= gene.long_threshold {
+            signals[i] = 1;
+        } else if v <= gene.short_threshold {
+            signals[i] = -1;
+        }
     }
     signals
 }
 
-pub fn evaluate_genes(features: &FeatureFrame, ohlcv: &Ohlcv, genes: &[Gene], config: &EvaluationConfig) -> Result<Vec<[f64; 11]>> {
-    if features.data.nrows() == 0 || features.data.ncols() == 0 { bail!("empty feature matrix"); }
+pub fn evaluate_genes(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    genes: &[Gene],
+    config: &EvaluationConfig,
+) -> Result<Vec<[f64; 11]>> {
+    if features.data.nrows() == 0 || features.data.ncols() == 0 {
+        bail!("empty feature matrix");
+    }
     let n_samples = features.data.nrows();
-    if ohlcv.close.len() != n_samples { bail!("ohlcv length does not match feature rows"); }
+    if ohlcv.close.len() != n_samples {
+        bail!("ohlcv length does not match feature rows");
+    }
 
     let indicators = transpose_features(features);
     let (offsets, indices, weights, long_thr, short_thr) = build_gene_arrays(genes);
     let (sl_pips, tp_pips) = resolve_stop_target_arrays(genes, ohlcv, config);
     let (months, days) = month_day_indices(&features.timestamps);
-    
-    let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) = build_smc_arrays(features, ohlcv);
+
+    let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) =
+        build_smc_arrays(features, ohlcv);
     let mut smc_data = Vec::with_capacity(n_samples);
     for i in 0..n_samples {
-        smc_data.push([ob[i], fvg[i], liq[i], trend[i], prem[i], ind[i], bos[i], choch[i], eqh[i], eql[i], disp[i]]);
+        smc_data.push([
+            ob[i], fvg[i], liq[i], trend[i], prem[i], ind[i], bos[i], choch[i], eqh[i], eql[i],
+            disp[i],
+        ]);
     }
 
     let mut gene_smc_flags = Vec::with_capacity(genes.len());
     for g in genes {
         gene_smc_flags.push([
-            g.use_ob as i8, g.use_fvg as i8, g.use_liq_sweep as i8, g.mtf_confirmation as i8,
-            g.use_premium_discount as i8, g.use_inducement as i8, g.use_bos as i8, g.use_choch as i8,
-            g.use_eqh as i8, g.use_eql as i8, g.use_displacement as i8,
+            g.use_ob as i8,
+            g.use_fvg as i8,
+            g.use_liq_sweep as i8,
+            g.mtf_confirmation as i8,
+            g.use_premium_discount as i8,
+            g.use_inducement as i8,
+            g.use_bos as i8,
+            g.use_choch as i8,
+            g.use_eqh as i8,
+            g.use_eql as i8,
+            g.use_displacement as i8,
         ]);
     }
 
     let smc_weights = [
-        config.smc_weight_ob, config.smc_weight_fvg, config.smc_weight_liq, config.smc_weight_mtf,
-        config.smc_weight_premium, config.smc_weight_inducement, config.smc_weight_bos,
-        config.smc_weight_choch, config.smc_weight_eqh, config.smc_weight_eql, config.smc_weight_displacement,
+        config.smc_weight_ob,
+        config.smc_weight_fvg,
+        config.smc_weight_liq,
+        config.smc_weight_mtf,
+        config.smc_weight_premium,
+        config.smc_weight_inducement,
+        config.smc_weight_bos,
+        config.smc_weight_choch,
+        config.smc_weight_eqh,
+        config.smc_weight_eql,
+        config.smc_weight_displacement,
     ];
 
     let b_settings = BacktestSettings {
@@ -131,69 +170,178 @@ pub fn evaluate_genes(features: &FeatureFrame, ohlcv: &Ohlcv, genes: &[Gene], co
         gate_threshold: config.smc_gate_threshold,
         weights: &smc_weights,
         settings: &b_settings,
-    }).map_err(|e| anyhow!(e))
+    })
+    .map_err(|e| anyhow!(e))
 }
 
-fn resolve_stop_target_arrays(genes: &[Gene], ohlcv: &Ohlcv, config: &EvaluationConfig) -> (Vec<f64>, Vec<f64>) {
-    let pip_size = if config.pip_value.is_finite() && config.pip_value > 0.0 { config.pip_value } else { 0.0001 };
-    let default = infer_stop_target_pips(&ohlcv.open, &ohlcv.high, &ohlcv.low, &ohlcv.close, &StopTargetSettings::default(), pip_size, 0);
-    let (default_sl, default_tp) = default.map(|(sl, tp, _rr)| (sl, tp)).unwrap_or((20.0, 40.0));
+fn resolve_stop_target_arrays(
+    genes: &[Gene],
+    ohlcv: &Ohlcv,
+    config: &EvaluationConfig,
+) -> (Vec<f64>, Vec<f64>) {
+    let pip_size = if config.pip_value.is_finite() && config.pip_value > 0.0 {
+        config.pip_value
+    } else {
+        0.0001
+    };
+    let default = infer_stop_target_pips(
+        &ohlcv.open,
+        &ohlcv.high,
+        &ohlcv.low,
+        &ohlcv.close,
+        &StopTargetSettings::default(),
+        pip_size,
+        0,
+    );
+    let (default_sl, default_tp) = default
+        .map(|(sl, tp, _rr)| (sl, tp))
+        .unwrap_or((20.0, 40.0));
 
     let mut sl_pips = Vec::with_capacity(genes.len());
     let mut tp_pips = Vec::with_capacity(genes.len());
     for gene in genes {
-        sl_pips.push(if gene.sl_pips.is_finite() && gene.sl_pips > 0.0 { gene.sl_pips } else { default_sl });
-        tp_pips.push(if gene.tp_pips.is_finite() && gene.tp_pips > 0.0 { gene.tp_pips } else { default_tp });
+        sl_pips.push(if gene.sl_pips.is_finite() && gene.sl_pips > 0.0 {
+            gene.sl_pips
+        } else {
+            default_sl
+        });
+        tp_pips.push(if gene.tp_pips.is_finite() && gene.tp_pips > 0.0 {
+            gene.tp_pips
+        } else {
+            default_tp
+        });
     }
     (sl_pips, tp_pips)
 }
 
-pub fn random_search(features: &FeatureFrame, ohlcv: &Ohlcv, n_genes: usize, max_indicators: usize) -> Result<SearchResult> {
+pub fn random_search(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    n_genes: usize,
+    max_indicators: usize,
+) -> Result<SearchResult> {
     let n_indicators = features.data.ncols();
     let smc_cfg = SmcSearchConfig::from_env();
     let mut genes = generate_random_genes(n_genes, n_indicators, max_indicators, 0, &smc_cfg);
     enforce_population_smc_ratio(&mut genes, &smc_cfg);
-    for gene in genes.iter_mut() { gene.normalize(n_indicators, 1); }
+    for gene in genes.iter_mut() {
+        gene.normalize(n_indicators, 1);
+    }
     let metrics = evaluate_genes(features, ohlcv, &genes, &EvaluationConfig::default())?;
     Ok(SearchResult { genes, metrics })
 }
 
-pub fn evolve_search(features: &FeatureFrame, ohlcv: &Ohlcv, population: usize, generations: usize, max_indicators: usize) -> Result<SearchResult> {
-    if population == 0 { bail!("population must be > 0"); }
+pub fn evolve_search(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    population: usize,
+    generations: usize,
+    max_indicators: usize,
+) -> Result<SearchResult> {
+    evolve_search_with_progress(
+        features,
+        ohlcv,
+        population,
+        generations,
+        max_indicators,
+        |_, _, _, _, _| {},
+    )
+}
+
+pub fn evolve_search_with_progress<F>(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    population: usize,
+    generations: usize,
+    max_indicators: usize,
+    mut progress_fn: F,
+) -> Result<SearchResult>
+where
+    F: FnMut(usize, usize, f64, usize, usize),
+{
+    if population == 0 {
+        bail!("population must be > 0");
+    }
     let n_indicators = features.data.ncols();
     let smc_cfg = SmcSearchConfig::from_env();
-    
-    let env_f32 = |n, d| std::env::var(n).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
-    let gate_start = env_f32("FOREX_BOT_PROP_SMC_GATE_START", env_f32("FOREX_BOT_PROP_SMC_GATE", 0.75));
+
+    let env_f32 = |n, d| {
+        std::env::var(n)
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(d)
+    };
+    let gate_start = env_f32(
+        "FOREX_BOT_PROP_SMC_GATE_START",
+        env_f32("FOREX_BOT_PROP_SMC_GATE", 0.75),
+    );
     let gate_end = env_f32("FOREX_BOT_PROP_SMC_GATE_END", 0.35);
     let gate_curve = env_f32("FOREX_BOT_PROP_SMC_GATE_CURVE", 1.0).max(0.1);
     let gate_stagnation_step = env_f32("FOREX_BOT_PROP_SMC_GATE_STAGNATION_STEP", 0.03).max(0.0);
     let (gate_lo, gate_hi) = (gate_start.min(gate_end), gate_start.max(gate_end));
-    
+
     let mut eval_cfg = EvaluationConfig {
         smc_gate_threshold: gate_start.clamp(gate_lo, gate_hi),
         ..EvaluationConfig::default()
     };
 
-    let seen_retry_attempts = std::env::var("FOREX_BOT_PROP_SEEN_RETRY").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(16).max(1);
+    let seen_retry_attempts = std::env::var("FOREX_BOT_PROP_SEEN_RETRY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(16)
+        .max(1);
     let mut seen_memory = SeenSignatureMemory::from_env();
     let mut genes = generate_random_genes(population, n_indicators, max_indicators, 0, &smc_cfg);
     enforce_population_smc_ratio(&mut genes, &smc_cfg);
-    
-    genes = genes.into_iter().map(|g| unique_candidate_or_retry(g, &mut seen_memory, n_indicators, max_indicators, 0, seen_retry_attempts, &smc_cfg)).collect();
-    
+
+    genes = genes
+        .into_iter()
+        .map(|g| {
+            unique_candidate_or_retry(
+                g,
+                &mut seen_memory,
+                n_indicators,
+                max_indicators,
+                0,
+                seen_retry_attempts,
+                &smc_cfg,
+            )
+        })
+        .collect();
+
     let mut best_metrics = Vec::new();
     let mut profitable_archive: Vec<(Gene, [f64; 11])> = Vec::new();
     let mut seen_strategy_ids: HashSet<String> = HashSet::new();
-    
-    let env_str = |n, d: &str| std::env::var(n).unwrap_or_else(|_| d.to_string()).to_ascii_lowercase();
-    let env_f64 = |n, d| std::env::var(n).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
+
+    let env_str = |n, d: &str| {
+        std::env::var(n)
+            .unwrap_or_else(|_| d.to_string())
+            .to_ascii_lowercase()
+    };
+    let env_f64 = |n, d| {
+        std::env::var(n)
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(d)
+    };
     let archive_mode = env_str("FOREX_BOT_PROP_ARCHIVE_MODE", "net");
-    let (archive_min_net, archive_min_pf, archive_min_sharpe) = (env_f64("FOREX_BOT_PROP_ARCHIVE_MIN_NET", 0.0), env_f64("FOREX_BOT_PROP_ARCHIVE_MIN_PF", 1.0), env_f64("FOREX_BOT_PROP_ARCHIVE_MIN_SHARPE", 0.0));
-    let archive_cap = std::env::var("FOREX_BOT_PROP_ARCHIVE_CAP").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(population * generations.max(1)).max(population);
+    let (archive_min_net, archive_min_pf, archive_min_sharpe) = (
+        env_f64("FOREX_BOT_PROP_ARCHIVE_MIN_NET", 0.0),
+        env_f64("FOREX_BOT_PROP_ARCHIVE_MIN_PF", 1.0),
+        env_f64("FOREX_BOT_PROP_ARCHIVE_MIN_SHARPE", 0.0),
+    );
+    let archive_cap = std::env::var("FOREX_BOT_PROP_ARCHIVE_CAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(population * generations.max(1))
+        .max(population);
     let base_immigrant_ratio = env_f64("FOREX_BOT_PROP_RANDOM_IMMIGRANTS", 0.25).clamp(0.0, 0.95);
-    let stagnation_patience = std::env::var("FOREX_BOT_PROP_STAGNATION_GENS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2).max(1);
-    
+    let stagnation_patience = std::env::var("FOREX_BOT_PROP_STAGNATION_GENS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2)
+        .max(1);
+
     let mut best_score_seen = f64::NEG_INFINITY;
     let mut stagnant_gens = 0usize;
 
@@ -207,69 +355,150 @@ pub fn evolve_search(features: &FeatureFrame, ohlcv: &Ohlcv, population: usize, 
     for gen in 0..generations {
         let progress = (gen as f32) / ((generations - 1) as f32).max(1.0);
         let mut gate_now = gate_start + (gate_end - gate_start) * progress.powf(gate_curve);
-        if stagnant_gens >= stagnation_patience { gate_now -= gate_stagnation_step * (stagnant_gens as f32); }
+        if stagnant_gens >= stagnation_patience {
+            gate_now -= gate_stagnation_step * (stagnant_gens as f32);
+        }
         eval_cfg.smc_gate_threshold = gate_now.clamp(gate_lo, gate_hi);
 
         let metrics = evaluate_genes(features, ohlcv, &genes, &eval_cfg)?;
         apply_metrics(&mut genes, &metrics);
 
-        let mut scored: Vec<(f64, Gene, [f64; 11])> = genes.iter().cloned().zip(metrics.into_iter()).map(|(g, m)| (g.fitness, g, m)).collect();
+        let mut scored: Vec<(f64, Gene, [f64; 11])> = genes
+            .iter()
+            .cloned()
+            .zip(metrics.into_iter())
+            .map(|(g, m)| (g.fitness, g, m))
+            .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        
+
         let top_score = scored.first().map(|x| x.0).unwrap_or(f64::NEG_INFINITY);
-        if top_score > best_score_seen + 1e-12 { best_score_seen = top_score; stagnant_gens = 0; }
-        else { stagnant_gens += 1; }
+        if top_score > best_score_seen + 1e-12 {
+            best_score_seen = top_score;
+            stagnant_gens = 0;
+        } else {
+            stagnant_gens += 1;
+        }
 
         for (_score, gene, m) in scored.iter() {
-            if profitable_archive.len() >= archive_cap { break; }
+            if profitable_archive.len() >= archive_cap {
+                break;
+            }
             let (net, sharpe, pf, trades) = (m[0], m[1], m[5], m[8]);
-            if !net.is_finite() || !sharpe.is_finite() || !pf.is_finite() || !trades.is_finite() { continue; }
+            if !net.is_finite() || !sharpe.is_finite() || !pf.is_finite() || !trades.is_finite() {
+                continue;
+            }
             let keep = match archive_mode.as_str() {
                 "active" => trades > 0.0,
                 "pf" | "profit_factor" => trades > 0.0 && pf > archive_min_pf,
                 "sharpe" => trades > 0.0 && sharpe > archive_min_sharpe,
                 _ => trades > 0.0 && net > archive_min_net,
             };
-            if !keep { continue; }
-            let sid = if gene.strategy_id.is_empty() { format!("{:?}|{:?}|{:.3}|{:.3}", gene.indices, gene.weights, gene.long_threshold, gene.short_threshold) } else { gene.strategy_id.clone() };
-            if !seen_strategy_ids.insert(sid) { continue; }
+            if !keep {
+                continue;
+            }
+            let sid = if gene.strategy_id.is_empty() {
+                format!(
+                    "{:?}|{:?}|{:.3}|{:.3}",
+                    gene.indices, gene.weights, gene.long_threshold, gene.short_threshold
+                )
+            } else {
+                gene.strategy_id.clone()
+            };
+            if !seen_strategy_ids.insert(sid) {
+                continue;
+            }
             profitable_archive.push((gene.clone(), *m));
         }
 
+        progress_fn(
+            gen + 1,
+            generations,
+            top_score,
+            stagnant_gens,
+            profitable_archive.len(),
+        );
+
         let elite_count = ((population as f32) * 0.2) as usize;
         let elite_count = elite_count.clamp(2, scored.len());
-        let elites: Vec<Gene> = scored.iter().take(elite_count).map(|(_, g, _)| g.clone()).collect();
-        best_metrics = scored.iter().take(elite_count).map(|(_, _, m)| *m).collect();
+        let elites: Vec<Gene> = scored
+            .iter()
+            .take(elite_count)
+            .map(|(_, g, _)| g.clone())
+            .collect();
+        best_metrics = scored
+            .iter()
+            .take(elite_count)
+            .map(|(_, _, m)| *m)
+            .collect();
 
         if gen + 1 == generations {
             seen_memory.flush();
             if !profitable_archive.is_empty() {
-                profitable_archive.sort_by(|a, b| b.1[0].partial_cmp(&a.1[0]).unwrap_or(std::cmp::Ordering::Equal));
-                return Ok(SearchResult { genes: profitable_archive.iter().map(|(g, _)| g.clone()).collect(), metrics: profitable_archive.iter().map(|(_, m)| *m).collect() });
+                profitable_archive.sort_by(|a, b| {
+                    b.1[0]
+                        .partial_cmp(&a.1[0])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                return Ok(SearchResult {
+                    genes: profitable_archive.iter().map(|(g, _)| g.clone()).collect(),
+                    metrics: profitable_archive.iter().map(|(_, m)| *m).collect(),
+                });
             }
-            return Ok(SearchResult { genes: elites, metrics: best_metrics });
+            return Ok(SearchResult {
+                genes: elites,
+                metrics: best_metrics,
+            });
         }
 
         let mut next = Vec::with_capacity(population);
         next.extend(elites.clone());
-        let immigrant_ratio = if stagnant_gens >= stagnation_patience { base_immigrant_ratio.max(0.5) } else { base_immigrant_ratio };
+        let immigrant_ratio = if stagnant_gens >= stagnation_patience {
+            base_immigrant_ratio.max(0.5)
+        } else {
+            base_immigrant_ratio
+        };
         let immigrant_count = ((population as f64) * immigrant_ratio).round() as usize;
         let immigrant_count = immigrant_count.min(population - next.len());
         for _ in 0..immigrant_count {
-            next.push(unique_candidate_or_retry(new_random_gene(n_indicators, max_indicators, gen + 1, &smc_cfg), &mut seen_memory, n_indicators, max_indicators, gen + 1, seen_retry_attempts, &smc_cfg));
+            next.push(unique_candidate_or_retry(
+                new_random_gene(n_indicators, max_indicators, gen + 1, &smc_cfg),
+                &mut seen_memory,
+                n_indicators,
+                max_indicators,
+                gen + 1,
+                seen_retry_attempts,
+                &smc_cfg,
+            ));
         }
-        
+
         let mut rng = rand::rng();
         let parent_pool_len = (elite_count * 3).min(scored.len()).max(elite_count);
         while next.len() < population {
             let a = &scored[rng.random_range(0..parent_pool_len)].1;
             let b = &scored[rng.random_range(0..parent_pool_len)].1;
-            next.push(unique_candidate_or_retry(mutate(&crossover(a, b, gen + 1), n_indicators, max_indicators, gen + 1, &smc_cfg), &mut seen_memory, n_indicators, max_indicators, gen + 1, seen_retry_attempts, &smc_cfg));
+            next.push(unique_candidate_or_retry(
+                mutate(
+                    &crossover(a, b, gen + 1),
+                    n_indicators,
+                    max_indicators,
+                    gen + 1,
+                    &smc_cfg,
+                ),
+                &mut seen_memory,
+                n_indicators,
+                max_indicators,
+                gen + 1,
+                seen_retry_attempts,
+                &smc_cfg,
+            ));
         }
         enforce_population_smc_ratio(&mut next, &smc_cfg);
         genes = next;
         seen_memory.flush();
     }
     seen_memory.flush();
-    Ok(SearchResult { genes, metrics: best_metrics })
+    Ok(SearchResult {
+        genes,
+        metrics: best_metrics,
+    })
 }
