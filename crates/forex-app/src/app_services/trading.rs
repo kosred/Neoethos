@@ -6,6 +6,19 @@ use mt5_bridge::MT5Engine;
 use tracing::error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradingAdapterKind {
+    Mt5,
+}
+
+impl TradingAdapterKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mt5 => "MT5",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradingPanelMode {
     LocalOnly,
     Disconnected,
@@ -14,6 +27,7 @@ pub enum TradingPanelMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionSnapshot {
+    pub adapter_name: String,
     pub mode: TradingPanelMode,
     pub connected: bool,
     pub status_text: String,
@@ -22,9 +36,13 @@ pub struct ConnectionSnapshot {
 
 #[derive(Default)]
 pub struct TradingSession {
-    engine: Option<MT5Engine>,
+    adapter: Option<TradingAdapter>,
     connected: bool,
     terminal_info: String,
+}
+
+enum TradingAdapter {
+    Mt5(MT5Engine),
 }
 
 impl TradingSession {
@@ -35,7 +53,7 @@ impl TradingSession {
     #[cfg(test)]
     pub fn from_connected_terminal_for_test(terminal_info: impl Into<String>) -> Self {
         Self {
-            engine: None,
+            adapter: None,
             connected: true,
             terminal_info: terminal_info.into(),
         }
@@ -47,6 +65,13 @@ impl TradingSession {
 
     pub fn snapshot(&self, state: &AppState) -> ConnectionSnapshot {
         let mode = panel_mode(state.data_source, self.connected);
+        let adapter_name = self
+            .adapter
+            .as_ref()
+            .map(TradingAdapter::kind)
+            .unwrap_or(TradingAdapterKind::Mt5)
+            .as_str()
+            .to_string();
         let status_text = match mode {
             TradingPanelMode::LocalOnly => "Local Mode".to_string(),
             TradingPanelMode::Disconnected => state.status_msg.clone(),
@@ -60,6 +85,7 @@ impl TradingSession {
         };
 
         ConnectionSnapshot {
+            adapter_name,
             mode,
             connected: self.connected,
             status_text,
@@ -72,14 +98,18 @@ impl TradingSession {
             Ok(mut engine) => match engine.initialize() {
                 Ok(true) => {
                     state.status_msg = "Connected".to_string();
-                    self.terminal_info = engine.terminal_info().unwrap_or_default();
                     self.connected = true;
-                    self.engine = Some(engine);
+                    self.adapter = Some(TradingAdapter::Mt5(engine));
+                    self.terminal_info = self
+                        .adapter
+                        .as_ref()
+                        .map(TradingAdapter::terminal_info)
+                        .unwrap_or_default();
                     record_app_event("ui_mt5_connect", "SUCCESS", "UI MT5 connection succeeded");
                 }
                 _ => {
                     self.connected = false;
-                    self.engine = None;
+                    self.adapter = None;
                     self.terminal_info.clear();
                     state.status_msg =
                         "Connection Failed (module missing or terminal closed)".to_string();
@@ -92,7 +122,7 @@ impl TradingSession {
             },
             Err(err) => {
                 self.connected = false;
-                self.engine = None;
+                self.adapter = None;
                 self.terminal_info.clear();
                 state.status_msg = format!("Error: {:?}", err);
                 record_app_event("ui_mt5_connect", "FAILED", format!("UI MT5 bridge error: {err}"));
@@ -101,11 +131,25 @@ impl TradingSession {
     }
 
     pub fn disconnect(&mut self, state: &mut AppState) {
-        self.engine = None;
+        self.adapter = None;
         self.connected = false;
         self.terminal_info.clear();
         state.status_msg = "Offline".to_string();
         record_app_event("ui_mt5_disconnect", "SUCCESS", "UI MT5 connection closed");
+    }
+}
+
+impl TradingAdapter {
+    fn kind(&self) -> TradingAdapterKind {
+        match self {
+            Self::Mt5(_) => TradingAdapterKind::Mt5,
+        }
+    }
+
+    fn terminal_info(&self) -> String {
+        match self {
+            Self::Mt5(engine) => engine.terminal_info().unwrap_or_default(),
+        }
     }
 }
 
@@ -187,5 +231,18 @@ mod tests {
         assert_eq!(panel_mode(DataSource::Local, false), TradingPanelMode::LocalOnly);
         assert_eq!(panel_mode(DataSource::MT5, false), TradingPanelMode::Disconnected);
         assert_eq!(panel_mode(DataSource::MT5, true), TradingPanelMode::Connected);
+    }
+
+    #[test]
+    fn connection_snapshot_reports_adapter_kind_for_connected_runtime() {
+        let state = sample_state(DataSource::MT5, "Connected");
+        let session = TradingSession::from_connected_terminal_for_test(
+            "TerminalInfo(community_account=False, connected=True)",
+        );
+
+        let snapshot = session.snapshot(&state);
+
+        assert_eq!(snapshot.adapter_name, "MT5");
+        assert_eq!(snapshot.mode, TradingPanelMode::Connected);
     }
 }

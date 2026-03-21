@@ -263,6 +263,7 @@ mod tests {
     fn connection_dashboard_describes_local_mode_operations() {
         let state = sample_state(DataSource::Local, "Local Mode");
         let snapshot = ConnectionSnapshot {
+            adapter_name: "MT5".to_string(),
             mode: TradingPanelMode::LocalOnly,
             connected: false,
             status_text: "Local Mode".to_string(),
@@ -287,6 +288,7 @@ mod tests {
     fn connection_dashboard_surfaces_connected_terminal_snapshot() {
         let state = sample_state(DataSource::MT5, "Connected");
         let snapshot = ConnectionSnapshot {
+            adapter_name: "MT5".to_string(),
             mode: TradingPanelMode::Connected,
             connected: true,
             status_text: "Connected".to_string(),
