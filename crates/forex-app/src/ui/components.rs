@@ -77,6 +77,14 @@ pub fn render_report(ui: &mut egui::Ui, snapshot: &JobSnapshot) {
         }
     }
 
+    if !snapshot.report.events.is_empty() {
+        ui.separator();
+        ui.strong("Live Events");
+        for event in snapshot.report.events.iter().rev() {
+            ui.label(format!("• {event}"));
+        }
+    }
+
     if !snapshot.report.warnings.is_empty() {
         ui.separator();
         ui.colored_label(egui::Color32::from_rgb(255, 165, 0), "Warnings");

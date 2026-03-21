@@ -43,6 +43,7 @@ pub struct JobReport {
     pub counters: Vec<(String, u64)>,
     pub highlights: Vec<(String, String)>,
     pub entries: Vec<String>,
+    pub events: Vec<String>,
     pub summary: String,
     pub log_path: Option<String>,
 }
@@ -85,6 +86,15 @@ impl CancellationFlag {
     pub fn is_requested(&self) -> bool {
         self.requested.load(Ordering::SeqCst)
     }
+}
+
+pub fn push_recent_event(events: &[String], event: impl Into<String>) -> Vec<String> {
+    let mut next = events.to_vec();
+    next.push(event.into());
+    if next.len() > 8 {
+        next.drain(0..(next.len() - 8));
+    }
+    next
 }
 
 #[cfg(test)]
@@ -130,6 +140,10 @@ mod tests {
             .report
             .entries
             .push("alpha-7 | sharpe=1.92 | win_rate=0.61".to_string());
+        snapshot
+            .report
+            .events
+            .push("loaded dataset for EURUSD".to_string());
         snapshot.report.summary = "7 accepted strategies".to_string();
 
         assert_eq!(snapshot.progress.percent, Some(0.42));
@@ -143,7 +157,23 @@ mod tests {
             snapshot.report.entries,
             vec!["alpha-7 | sharpe=1.92 | win_rate=0.61".to_string()]
         );
+        assert_eq!(
+            snapshot.report.events,
+            vec!["loaded dataset for EURUSD".to_string()]
+        );
         assert_eq!(snapshot.report.summary, "7 accepted strategies");
+    }
+
+    #[test]
+    fn push_recent_event_keeps_only_latest_eight_items() {
+        let mut events = Vec::new();
+        for idx in 1..=10 {
+            events = push_recent_event(&events, format!("event-{idx}"));
+        }
+
+        assert_eq!(events.len(), 8);
+        assert_eq!(events.first().map(String::as_str), Some("event-3"));
+        assert_eq!(events.last().map(String::as_str), Some("event-10"));
     }
 
     #[test]

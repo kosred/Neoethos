@@ -1,5 +1,5 @@
 use crate::app_services::{
-    jobs::{CancellationFlag, JobKind, JobProgress, JobReport, JobSnapshot, JobState},
+    jobs::{push_recent_event, CancellationFlag, JobKind, JobProgress, JobReport, JobSnapshot, JobState},
     ServiceEvent,
 };
 use anyhow::Result;
@@ -99,6 +99,12 @@ pub fn completed_snapshot(mut snapshot: JobSnapshot, result: &DiscoveryResult) -
         ],
         highlights,
         entries,
+        events: push_recent_event(
+            &snapshot.report.events,
+            format!(
+                "completed discovery with {portfolio} portfolio strategies out of {candidates} candidates"
+            ),
+        ),
         summary: format!(
             "discovery completed with {} portfolio strategies out of {} candidates",
             portfolio, candidates
@@ -114,10 +120,12 @@ pub fn failed_snapshot(kind: JobKind, err: anyhow::Error) -> JobSnapshot {
 }
 
 fn failed_snapshot_from(mut snapshot: JobSnapshot, err: anyhow::Error) -> JobSnapshot {
+    let message = err.to_string();
     snapshot.state = JobState::Failed;
     snapshot.report = JobReport {
-        errors: vec![err.to_string()],
-        summary: err.to_string(),
+        errors: vec![message.clone()],
+        events: push_recent_event(&snapshot.report.events, format!("discovery failed: {message}")),
+        summary: message,
         log_path: Some(canonical_log_path().display().to_string()),
         ..JobReport::default()
     };
@@ -133,6 +141,7 @@ fn cancelled_snapshot_from(mut snapshot: JobSnapshot, message: impl Into<String>
     let message = message.into();
     snapshot.state = JobState::Cancelled;
     snapshot.report = JobReport {
+        events: push_recent_event(&snapshot.report.events, format!("discovery cancelled: {message}")),
         summary: message,
         log_path: Some(canonical_log_path().display().to_string()),
         ..JobReport::default()
@@ -194,6 +203,14 @@ pub fn start_discovery_job(
                 ("symbol".to_string(), request.symbol.clone()),
                 ("base_tf".to_string(), request.base_tf.clone()),
             ],
+            events: push_recent_event(
+                &snapshot.report.events,
+                format!(
+                    "loaded {} timeframe frame(s) for {}",
+                    dataset.frames.len(),
+                    request.symbol
+                ),
+            ),
             summary: format!(
                 "loaded {} timeframe frames for {}",
                 dataset.frames.len(),
@@ -261,6 +278,15 @@ pub fn start_discovery_job(
                 ("base_tf".to_string(), request.base_tf.clone()),
                 ("higher_tfs".to_string(), request.higher_tfs.join(", ")),
             ],
+            events: push_recent_event(
+                &snapshot.report.events,
+                format!(
+                    "prepared feature frame {}x{} for {}",
+                    features.data.nrows(),
+                    features.names.len(),
+                    request.symbol
+                ),
+            ),
             summary: format!(
                 "prepared {} rows x {} columns for discovery",
                 features.data.nrows(),
@@ -449,5 +475,10 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.contains("alpha-1") && entry.contains("win_rate=0.64")));
+        assert!(snapshot
+            .report
+            .events
+            .iter()
+            .any(|event| event.contains("completed discovery")));
     }
 }

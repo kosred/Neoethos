@@ -1,5 +1,5 @@
 use crate::app_services::{
-    jobs::{CancellationFlag, JobKind, JobProgress, JobReport, JobSnapshot, JobState},
+    jobs::{push_recent_event, CancellationFlag, JobKind, JobProgress, JobReport, JobSnapshot, JobState},
     ServiceEvent,
 };
 use anyhow::Result;
@@ -100,6 +100,14 @@ fn completed_snapshot_from(
             .map(|model| format!("completed | {model}"))
             .chain(failed_models.iter().map(|model| format!("failed | {model}")))
             .collect(),
+        events: push_recent_event(
+            &snapshot.report.events,
+            format!(
+                "training finished with {} completed and {} failed model(s)",
+                completed_models.len(),
+                failed_models.len()
+            ),
+        ),
         warnings,
         summary,
         log_path: Some(canonical_log_path().display().to_string()),
@@ -113,10 +121,12 @@ pub fn failed_snapshot(err: anyhow::Error) -> JobSnapshot {
 }
 
 fn failed_snapshot_from(mut snapshot: JobSnapshot, err: anyhow::Error) -> JobSnapshot {
+    let message = err.to_string();
     snapshot.state = JobState::Failed;
     snapshot.report = JobReport {
-        errors: vec![err.to_string()],
-        summary: err.to_string(),
+        errors: vec![message.clone()],
+        events: push_recent_event(&snapshot.report.events, format!("training failed: {message}")),
+        summary: message,
         log_path: Some(canonical_log_path().display().to_string()),
         ..JobReport::default()
     };
@@ -132,6 +142,7 @@ fn cancelled_snapshot_from(mut snapshot: JobSnapshot, message: impl Into<String>
     let message = message.into();
     snapshot.state = JobState::Cancelled;
     snapshot.report = JobReport {
+        events: push_recent_event(&snapshot.report.events, format!("training cancelled: {message}")),
         summary: message,
         log_path: Some(canonical_log_path().display().to_string()),
         ..JobReport::default()
@@ -206,6 +217,14 @@ pub fn start_training_job(
                 .take(8)
                 .map(|model| format!("planned | {model}"))
                 .collect(),
+            events: push_recent_event(
+                &snapshot.report.events,
+                format!(
+                    "loaded {} planned model(s) for {}",
+                    planned_models.len(),
+                    request.symbol
+                ),
+            ),
             summary: format!(
                 "loaded {} planned model(s) for training",
                 planned_models.len()
@@ -365,6 +384,11 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry == "failed | mlp"));
+        assert!(snapshot
+            .report
+            .events
+            .iter()
+            .any(|event| event.contains("training finished")));
         assert!(snapshot.report.summary.contains("xgboost"));
         assert!(snapshot.report.summary.contains("mlp"));
     }
