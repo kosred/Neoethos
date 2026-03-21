@@ -45,6 +45,8 @@ pub struct AppState {
     pub discovery_job: Option<JobSnapshot>,
     pub training_job: Option<JobSnapshot>,
     pub canonical_log_path: PathBuf,
+    pub hardware: HardwareState,
+    pub risk: RiskState,
 }
 
 impl AppState {
@@ -72,6 +74,38 @@ impl AppState {
             available_symbols,
             discovery_job: None,
             training_job: None,
+            hardware: HardwareState::default(),
+            risk: RiskState::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HardwareState {
+    pub cpu_cores: i32,
+    pub gpu_enabled: bool,
+}
+
+impl Default for HardwareState {
+    fn default() -> Self {
+        Self {
+            cpu_cores: num_cpus::get() as i32,
+            gpu_enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RiskState {
+    pub daily_drawdown_limit: f32,
+    pub max_lot_size: f32,
+}
+
+impl Default for RiskState {
+    fn default() -> Self {
+        Self {
+            daily_drawdown_limit: 4.5,
+            max_lot_size: 10.0,
         }
     }
 }
@@ -106,6 +140,10 @@ mod tests {
         assert!(state.discovery_job.is_none());
         assert!(state.training_job.is_none());
         assert_eq!(state.canonical_log_path, PathBuf::from("logs").join("forex-ai.log"));
+        assert_eq!(state.hardware.cpu_cores, num_cpus::get() as i32);
+        assert!(state.hardware.gpu_enabled);
+        assert_eq!(state.risk.daily_drawdown_limit, 4.5);
+        assert_eq!(state.risk.max_lot_size, 10.0);
     }
 
     #[test]
@@ -120,5 +158,21 @@ mod tests {
 
         assert_eq!(state.selected_pair, "EURUSD");
         assert_eq!(state.status_msg, "Offline");
+    }
+
+    #[test]
+    fn hardware_state_defaults_match_host_core_count_and_gpu_enabled() {
+        let state = HardwareState::default();
+
+        assert_eq!(state.cpu_cores, num_cpus::get() as i32);
+        assert!(state.gpu_enabled);
+    }
+
+    #[test]
+    fn risk_state_defaults_match_existing_guard_values() {
+        let state = RiskState::default();
+
+        assert_eq!(state.daily_drawdown_limit, 4.5);
+        assert_eq!(state.max_lot_size, 10.0);
     }
 }

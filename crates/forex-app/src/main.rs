@@ -154,14 +154,6 @@ struct ForexApp {
     
     // Trading State
     terminal_info: String,
-    
-    // Hardware State
-    cpu_cores: i32,
-    gpu_enabled: bool,
-    
-    // Risk State
-    daily_drawdown_limit: f32,
-    max_lot_size: f32,
 }
 
 impl ForexApp {
@@ -178,10 +170,6 @@ impl ForexApp {
             discovery_handle: None,
             training_handle: None,
             terminal_info: String::new(),
-            cpu_cores: num_cpus::get() as i32,
-            gpu_enabled: true,
-            daily_drawdown_limit: 4.5,
-            max_lot_size: 10.0,
         }
     }
 
@@ -263,8 +251,15 @@ impl eframe::App for ForexApp {
             }
 
             ui.separator();
-            ui.label(format!("CPU Cores: {}", self.cpu_cores));
-            ui.label(format!("GPU: {}", if self.gpu_enabled { "Enabled" } else { "Disabled" }));
+            ui.label(format!("CPU Cores: {}", self.state.hardware.cpu_cores));
+            ui.label(format!(
+                "GPU: {}",
+                if self.state.hardware.gpu_enabled {
+                    "Enabled"
+                } else {
+                    "Disabled"
+                }
+            ));
             
             if ui.button("🔄 Refresh Data").clicked() {
                 self.refresh_symbols();
@@ -291,8 +286,8 @@ impl eframe::App for ForexApp {
                     &self.tx,
                     &mut self.training_handle,
                 ),
-                Tab::Hardware => self.ui_hardware(ui),
-                Tab::Risk => self.ui_risk(ui),
+                Tab::Hardware => ui::hardware::render(ui, &mut self.state.hardware),
+                Tab::Risk => ui::risk::render(ui, &mut self.state.risk),
             }
         });
 
@@ -322,22 +317,6 @@ impl eframe::App for ForexApp {
         if discovery_active || training_active {
             ctx.request_repaint();
         }
-    }
-}
-
-impl ForexApp {
-    fn ui_hardware(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Hardware Allocation");
-        ui.separator();
-        ui.add(egui::Slider::new(&mut self.cpu_cores, 1..=252).text("CPU Cores"));
-        ui.checkbox(&mut self.gpu_enabled, "Enable GPU Acceleration (CUDA)");
-    }
-
-    fn ui_risk(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Prop-Firm Risk Guard");
-        ui.separator();
-        ui.add(egui::Slider::new(&mut self.daily_drawdown_limit, 0.1..=10.0).text("Daily Drawdown Limit (%)"));
-        ui.add(egui::Slider::new(&mut self.max_lot_size, 0.01..=50.0).text("Max Lot Size"));
     }
 }
 
@@ -411,5 +390,24 @@ mod tests {
         let mode = crate::ui::trading::panel_mode(DataSource::MT5, true);
 
         assert_eq!(mode, crate::ui::trading::TradingPanelMode::Connected);
+    }
+
+    #[test]
+    fn hardware_slider_bounds_preserve_existing_cpu_range() {
+        let bounds = crate::ui::hardware::cpu_slider_bounds();
+
+        assert_eq!(bounds.start(), &1);
+        assert_eq!(bounds.end(), &252);
+    }
+
+    #[test]
+    fn risk_slider_bounds_preserve_existing_guard_ranges() {
+        let drawdown = crate::ui::risk::drawdown_slider_bounds();
+        let lot_size = crate::ui::risk::lot_size_slider_bounds();
+
+        assert_eq!(drawdown.start(), &0.1);
+        assert_eq!(drawdown.end(), &10.0);
+        assert_eq!(lot_size.start(), &0.01);
+        assert_eq!(lot_size.end(), &50.0);
     }
 }

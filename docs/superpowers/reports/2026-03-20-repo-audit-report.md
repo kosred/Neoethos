@@ -245,6 +245,7 @@ Runtime probes were executed against the already-built `target/debug` binaries a
 - [`crates/forex-app/src/app_services/jobs.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/app_services/jobs.rs), [`crates/forex-app/src/app_services/discovery.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/app_services/discovery.rs), and [`crates/forex-app/src/app_services/training.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/app_services/training.rs) now provide a real app-owned service layer with explicit job state, progress, cancellation, and report contracts
 - [`crates/forex-app/src/ui/discovery.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/ui/discovery.rs) and [`crates/forex-app/src/ui/training.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/ui/training.rs) no longer rely on mock progress or log-only placeholders; both tabs now start real backend services and expose `Stop` and `Open Log` actions
 - [`crates/forex-app/src/ui/trading.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/ui/trading.rs) now owns the MT5/local trading-panel routing that previously lived inline in [`crates/forex-app/src/main.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/main.rs), preserving the connect/disconnect and canonical `APP` logging contract while shrinking the entrypoint
+- [`crates/forex-app/src/ui/hardware.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/ui/hardware.rs), [`crates/forex-app/src/ui/risk.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/ui/risk.rs), and the focused state holders in [`crates/forex-app/src/app_state.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/app_state.rs) now own the remaining operator-panel defaults and slider bounds that previously sat inline in [`crates/forex-app/src/main.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/main.rs)
 - legacy artifacts such as `logs/forex_bot.log` still exist on disk from earlier runs, but the verified current runtime path updates only `logs/forex-ai.log`
 
 ### New Verification Evidence
@@ -288,8 +289,10 @@ Historical baseline findings, now resolved by the Phase 1 app-service-layer tran
   - the Training tab now starts a real backend training service instead of a log-only placeholder
 - [`crates/forex-app/src/ui/trading.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/ui/trading.rs)
   - the Trading tab logic is now isolated from the app entrypoint and keeps explicit `LocalOnly` / `Disconnected` / `Connected` modes under test instead of mixing MT5 state changes directly into the top-level UI shell
+- [`crates/forex-app/src/ui/hardware.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/ui/hardware.rs) and [`crates/forex-app/src/ui/risk.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/ui/risk.rs)
+  - the Hardware and Risk tabs now render through focused modules with tested slider bounds, instead of leaving more operator state and control ranges embedded in the main entrypoint
 - [`crates/forex-app/src/app_state.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/app_state.rs)
-  - runtime data-root selection is now held in app state and reused by the UI/service layer instead of repeating hardcoded `"data"` assumptions
+  - runtime data-root selection, hardware defaults, and risk defaults are now held in app state and reused by the UI/service layer instead of repeating hardcoded inline assumptions
 
 No new high-severity `forex-app` findings were introduced on the verified Windows lane in this tranche.
 
