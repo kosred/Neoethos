@@ -41,6 +41,8 @@ pub struct JobReport {
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
     pub counters: Vec<(String, u64)>,
+    pub highlights: Vec<(String, String)>,
+    pub entries: Vec<String>,
     pub summary: String,
     pub log_path: Option<String>,
 }
@@ -120,11 +122,27 @@ mod tests {
             message: "evaluating accepted strategies".to_string(),
         };
         snapshot.report.counters.push(("accepted".to_string(), 7));
+        snapshot
+            .report
+            .highlights
+            .push(("best_strategy".to_string(), "alpha-7".to_string()));
+        snapshot
+            .report
+            .entries
+            .push("alpha-7 | sharpe=1.92 | win_rate=0.61".to_string());
         snapshot.report.summary = "7 accepted strategies".to_string();
 
         assert_eq!(snapshot.progress.percent, Some(0.42));
         assert_eq!(snapshot.progress.stage, "validation");
         assert_eq!(snapshot.report.counters, vec![("accepted".to_string(), 7)]);
+        assert_eq!(
+            snapshot.report.highlights,
+            vec![("best_strategy".to_string(), "alpha-7".to_string())]
+        );
+        assert_eq!(
+            snapshot.report.entries,
+            vec!["alpha-7 | sharpe=1.92 | win_rate=0.61".to_string()]
+        );
         assert_eq!(snapshot.report.summary, "7 accepted strategies");
     }
 

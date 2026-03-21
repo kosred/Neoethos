@@ -33,13 +33,48 @@ pub fn render_report(ui: &mut egui::Ui, snapshot: &JobSnapshot) {
         ui.label(&snapshot.progress.message);
     }
 
-    for (name, value) in &snapshot.report.counters {
-        ui.label(format!("{name}: {value}"));
+    if !snapshot.report.counters.is_empty() {
+        ui.separator();
+        ui.strong("Counters");
+        egui::Grid::new(format!("report_counters_{:?}", snapshot.kind))
+            .num_columns(2)
+            .spacing([16.0, 6.0])
+            .show(ui, |ui| {
+                for (name, value) in &snapshot.report.counters {
+                    ui.label(name);
+                    ui.monospace(value.to_string());
+                    ui.end_row();
+                }
+            });
+    }
+
+    if !snapshot.report.highlights.is_empty() {
+        ui.separator();
+        ui.strong("Highlights");
+        egui::Grid::new(format!("report_highlights_{:?}", snapshot.kind))
+            .num_columns(2)
+            .spacing([16.0, 6.0])
+            .show(ui, |ui| {
+                for (name, value) in &snapshot.report.highlights {
+                    ui.label(name);
+                    ui.strong(value);
+                    ui.end_row();
+                }
+            });
     }
 
     if !snapshot.report.summary.is_empty() {
         ui.separator();
+        ui.strong("Summary");
         ui.label(&snapshot.report.summary);
+    }
+
+    if !snapshot.report.entries.is_empty() {
+        ui.separator();
+        ui.strong("Latest Results");
+        for entry in &snapshot.report.entries {
+            ui.label(format!("• {entry}"));
+        }
     }
 
     if !snapshot.report.warnings.is_empty() {
@@ -56,6 +91,11 @@ pub fn render_report(ui: &mut egui::Ui, snapshot: &JobSnapshot) {
         for error in &snapshot.report.errors {
             ui.label(error);
         }
+    }
+
+    if let Some(log_path) = snapshot.report.log_path.as_ref() {
+        ui.separator();
+        ui.label(format!("Log: {log_path}"));
     }
 }
 

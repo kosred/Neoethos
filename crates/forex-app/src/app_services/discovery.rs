@@ -61,6 +61,34 @@ pub fn completed_snapshot(mut snapshot: JobSnapshot, result: &DiscoveryResult) -
     let candidates = result.candidates.len() as u64;
     let portfolio = result.portfolio.len() as u64;
     let rejected = candidates.saturating_sub(portfolio);
+    let best_gene = result
+        .portfolio
+        .iter()
+        .max_by(|left, right| left.fitness.partial_cmp(&right.fitness).unwrap_or(std::cmp::Ordering::Equal));
+    let mut highlights = vec![
+        ("accepted".to_string(), portfolio.to_string()),
+        ("rejected".to_string(), rejected.to_string()),
+    ];
+    if let Some(best) = best_gene {
+        highlights.push(("best_strategy".to_string(), best.strategy_id.clone()));
+        highlights.push(("best_sharpe".to_string(), format!("{:.2}", best.sharpe_ratio)));
+        highlights.push(("best_win_rate".to_string(), format!("{:.2}", best.win_rate)));
+    }
+    let entries = result
+        .portfolio
+        .iter()
+        .take(3)
+        .map(|gene| {
+            format!(
+                "{} | fitness={:.2} | sharpe={:.2} | win_rate={:.2} | trades={}",
+                gene.strategy_id,
+                gene.fitness,
+                gene.sharpe_ratio,
+                gene.win_rate,
+                gene.trades_count
+            )
+        })
+        .collect();
 
     snapshot.state = JobState::Succeeded;
     snapshot.report = JobReport {
@@ -69,6 +97,8 @@ pub fn completed_snapshot(mut snapshot: JobSnapshot, result: &DiscoveryResult) -
             ("portfolio".to_string(), portfolio),
             ("rejected".to_string(), rejected),
         ],
+        highlights,
+        entries,
         summary: format!(
             "discovery completed with {} portfolio strategies out of {} candidates",
             portfolio, candidates
@@ -158,6 +188,20 @@ pub fn start_discovery_job(
             stage: "preparing_features".to_string(),
             message: format!("preparing multi-timeframe features for {}", request.symbol),
         };
+        snapshot.report = JobReport {
+            counters: vec![("loaded_timeframes".to_string(), dataset.frames.len() as u64)],
+            highlights: vec![
+                ("symbol".to_string(), request.symbol.clone()),
+                ("base_tf".to_string(), request.base_tf.clone()),
+            ],
+            summary: format!(
+                "loaded {} timeframe frames for {}",
+                dataset.frames.len(),
+                request.symbol
+            ),
+            log_path: Some(canonical_log_path().display().to_string()),
+            ..JobReport::default()
+        };
         send_event(&tx, ServiceEvent::DiscoveryUpdated(snapshot.clone()));
 
         if cancel.is_requested() {
@@ -206,6 +250,24 @@ pub fn start_discovery_job(
             percent: Some(0.75),
             stage: "running_discovery".to_string(),
             message: format!("evaluating strategy candidates for {}", request.symbol),
+        };
+        snapshot.report = JobReport {
+            counters: vec![
+                ("feature_rows".to_string(), features.data.nrows() as u64),
+                ("feature_columns".to_string(), features.names.len() as u64),
+            ],
+            highlights: vec![
+                ("symbol".to_string(), request.symbol.clone()),
+                ("base_tf".to_string(), request.base_tf.clone()),
+                ("higher_tfs".to_string(), request.higher_tfs.join(", ")),
+            ],
+            summary: format!(
+                "prepared {} rows x {} columns for discovery",
+                features.data.nrows(),
+                features.names.len()
+            ),
+            log_path: Some(canonical_log_path().display().to_string()),
+            ..JobReport::default()
         };
         send_event(&tx, ServiceEvent::DiscoveryUpdated(snapshot.clone()));
 
@@ -344,9 +406,25 @@ mod tests {
 
     #[test]
     fn success_snapshot_carries_candidate_and_portfolio_counters() {
+        let best = Gene {
+            strategy_id: "alpha-1".to_string(),
+            fitness: 1450.0,
+            sharpe_ratio: 1.82,
+            win_rate: 0.64,
+            ..Gene::default()
+        };
+
+        let second = Gene {
+            strategy_id: "alpha-2".to_string(),
+            fitness: 1200.0,
+            sharpe_ratio: 1.55,
+            win_rate: 0.59,
+            ..Gene::default()
+        };
+
         let result = DiscoveryResult {
-            portfolio: vec![Gene::default(), Gene::default()],
-            candidates: vec![Gene::default(), Gene::default(), Gene::default()],
+            portfolio: vec![best.clone(), second],
+            candidates: vec![best, Gene::default(), Gene::default()],
         };
 
         let snapshot = completed_snapshot(JobSnapshot::new(JobKind::Discovery), &result);
@@ -360,5 +438,16 @@ mod tests {
                 ("rejected".to_string(), 1),
             ]
         );
+        assert!(snapshot.report.highlights.iter().any(|(name, value)| {
+            name == "best_strategy" && value == "alpha-1"
+        }));
+        assert!(snapshot.report.highlights.iter().any(|(name, value)| {
+            name == "best_sharpe" && value == "1.82"
+        }));
+        assert!(snapshot
+            .report
+            .entries
+            .iter()
+            .any(|entry| entry.contains("alpha-1") && entry.contains("win_rate=0.64")));
     }
 }

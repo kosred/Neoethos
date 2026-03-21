@@ -75,11 +75,32 @@ fn completed_snapshot_from(
     } else {
         JobState::Degraded
     };
+    let mut warnings = Vec::new();
+    if !failed_models.is_empty() {
+        warnings.push(format!(
+            "{} model(s) failed during training",
+            failed_models.len()
+        ));
+    }
     snapshot.report = JobReport {
         counters: vec![
             ("completed_models".to_string(), completed_models.len() as u64),
             ("failed_models".to_string(), failed_models.len() as u64),
         ],
+        highlights: vec![
+            ("completed_models".to_string(), completed_models.len().to_string()),
+            ("failed_models".to_string(), failed_models.len().to_string()),
+            (
+                "requested_models".to_string(),
+                (completed_models.len() + failed_models.len()).to_string(),
+            ),
+        ],
+        entries: completed_models
+            .iter()
+            .map(|model| format!("completed | {model}"))
+            .chain(failed_models.iter().map(|model| format!("failed | {model}")))
+            .collect(),
+        warnings,
         summary,
         log_path: Some(canonical_log_path().display().to_string()),
         ..JobReport::default()
@@ -167,10 +188,30 @@ pub fn start_training_job(
             }
         };
 
+        let (settings, planned_models) = settings_and_models;
+
         snapshot.progress = JobProgress {
             percent: Some(0.6),
             stage: "training_models".to_string(),
             message: format!("training symbol {} on {}", request.symbol, request.base_tf),
+        };
+        snapshot.report = JobReport {
+            counters: vec![("planned_models".to_string(), planned_models.len() as u64)],
+            highlights: vec![
+                ("symbol".to_string(), request.symbol.clone()),
+                ("base_tf".to_string(), request.base_tf.clone()),
+            ],
+            entries: planned_models
+                .iter()
+                .take(8)
+                .map(|model| format!("planned | {model}"))
+                .collect(),
+            summary: format!(
+                "loaded {} planned model(s) for training",
+                planned_models.len()
+            ),
+            log_path: Some(canonical_log_path().display().to_string()),
+            ..JobReport::default()
         };
         send_event(&tx, ServiceEvent::TrainingUpdated(snapshot.clone()));
 
@@ -181,7 +222,6 @@ pub fn start_training_job(
             return;
         }
 
-        let (settings, planned_models) = settings_and_models;
         let train_request = request.clone();
         let train_result = tokio::task::spawn_blocking(move || {
             let orchestrator = TrainingOrchestrator::new(settings, train_request.models_dir.clone());
@@ -309,6 +349,22 @@ mod tests {
                 ("failed_models".to_string(), 1),
             ]
         );
+        assert!(snapshot.report.highlights.iter().any(|(name, value)| {
+            name == "completed_models" && value == "2"
+        }));
+        assert!(snapshot.report.highlights.iter().any(|(name, value)| {
+            name == "failed_models" && value == "1"
+        }));
+        assert!(snapshot
+            .report
+            .entries
+            .iter()
+            .any(|entry| entry == "completed | xgboost"));
+        assert!(snapshot
+            .report
+            .entries
+            .iter()
+            .any(|entry| entry == "failed | mlp"));
         assert!(snapshot.report.summary.contains("xgboost"));
         assert!(snapshot.report.summary.contains("mlp"));
     }
