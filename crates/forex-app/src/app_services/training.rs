@@ -11,8 +11,9 @@ use forex_core::{
     sectioned_log::{SectionedRunRecord, SubsystemSection},
     Settings,
 };
-use forex_models::TrainingOrchestrator;
+use forex_models::{ModelTrainingProgress, TrainingOrchestrator, TrainingRunSummary};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
@@ -67,6 +68,204 @@ fn requested_training_highlights(request: &TrainingRequest) -> Vec<(String, Stri
             request.models_dir.display().to_string(),
         ),
     ]
+}
+
+fn upsert_counter(counters: &mut Vec<(String, u64)>, name: &str, value: u64) {
+    if let Some((_, existing)) = counters.iter_mut().find(|(key, _)| key == name) {
+        *existing = value;
+    } else {
+        counters.push((name.to_string(), value));
+    }
+}
+
+fn push_recent_entry(entries: &[String], entry: impl Into<String>) -> Vec<String> {
+    let mut next = entries.to_vec();
+    next.push(entry.into());
+    if next.len() > 12 {
+        next.drain(0..(next.len() - 12));
+    }
+    next
+}
+
+fn push_unique_text(items: &[String], value: impl Into<String>) -> Vec<String> {
+    let value = value.into();
+    let mut next = items.to_vec();
+    if !next.iter().any(|item| item == &value) {
+        next.push(value);
+    }
+    next
+}
+
+fn backend_progress_percent(
+    completed_models: usize,
+    failed_models: usize,
+    total_models: usize,
+) -> Option<f32> {
+    if total_models == 0 {
+        return None;
+    }
+
+    let done = (completed_models + failed_models) as f32;
+    let total = total_models as f32;
+    Some((0.7 + 0.15 * (done / total)).clamp(0.7, 0.85))
+}
+
+fn apply_backend_progress_event(snapshot: &mut JobSnapshot, event: &ModelTrainingProgress) {
+    let (
+        model,
+        completed_models,
+        failed_models,
+        total_models,
+        event_level,
+        event_message,
+        entry,
+        error_text,
+    ) = match event {
+        ModelTrainingProgress::Started {
+            model,
+            total_models,
+        } => (
+            model.as_str(),
+            0usize,
+            0usize,
+            *total_models,
+            JobEventLevel::Info,
+            format!("backend started model {model}"),
+            format!("started | {model}"),
+            None,
+        ),
+        ModelTrainingProgress::Succeeded {
+            model,
+            completed_models,
+            failed_models,
+            total_models,
+        } => (
+            model.as_str(),
+            *completed_models,
+            *failed_models,
+            *total_models,
+            JobEventLevel::Info,
+            format!(
+                "model {model} completed ({}/{total_models} finished, {} failed)",
+                completed_models + failed_models,
+                failed_models
+            ),
+            format!("completed | {model}"),
+            None,
+        ),
+        ModelTrainingProgress::Failed {
+            model,
+            error,
+            completed_models,
+            failed_models,
+            total_models,
+        } => (
+            model.as_str(),
+            *completed_models,
+            *failed_models,
+            *total_models,
+            JobEventLevel::Warning,
+            format!(
+                "model {model} failed ({}/{total_models} finished): {error}",
+                completed_models + failed_models
+            ),
+            format!("failed | {model} | {error}"),
+            Some(format!("model {model}: {error}")),
+        ),
+    };
+
+    snapshot.progress = JobProgress {
+        percent: backend_progress_percent(completed_models, failed_models, total_models),
+        stage: "backend_running".to_string(),
+        message: format!(
+            "backend running: {} of {} model(s) finished ({} failed)",
+            completed_models + failed_models,
+            total_models,
+            failed_models
+        ),
+    };
+    upsert_counter(
+        &mut snapshot.report.counters,
+        "requested_models",
+        total_models as u64,
+    );
+    upsert_counter(
+        &mut snapshot.report.counters,
+        "planned_models",
+        total_models as u64,
+    );
+    upsert_counter(
+        &mut snapshot.report.counters,
+        "completed_models",
+        completed_models as u64,
+    );
+    upsert_counter(
+        &mut snapshot.report.counters,
+        "failed_models",
+        failed_models as u64,
+    );
+    snapshot.report.entries = push_recent_entry(&snapshot.report.entries, entry);
+    snapshot.report.events = push_recent_event(&snapshot.report.events, event_level, event_message);
+    snapshot.report.summary = format!(
+        "backend running with {} completed and {} failed model(s) out of {}",
+        completed_models, failed_models, total_models
+    );
+    snapshot.report.log_path = Some(canonical_log_path().display().to_string());
+
+    if let Some(error_text) = error_text {
+        snapshot.report.warnings = push_unique_text(
+            &snapshot.report.warnings,
+            format!("model `{model}` failed during backend training"),
+        );
+        snapshot.report.errors = push_unique_text(&snapshot.report.errors, error_text);
+    }
+}
+
+fn completed_snapshot_from_run_summary(
+    snapshot: JobSnapshot,
+    summary: TrainingRunSummary,
+) -> JobSnapshot {
+    let failed_names: Vec<String> = summary
+        .failed_models
+        .iter()
+        .map(|failure| failure.name.clone())
+        .collect();
+    let mut completed = completed_snapshot_from(snapshot, summary.completed_models, failed_names);
+
+    if !summary.failed_models.is_empty() {
+        completed.report.errors =
+            summary
+                .failed_models
+                .iter()
+                .fold(completed.report.errors, |errors, failure| {
+                    push_unique_text(
+                        &errors,
+                        format!("model {}: {}", failure.name, failure.error),
+                    )
+                });
+        completed.report.warnings =
+            summary
+                .failed_models
+                .iter()
+                .fold(completed.report.warnings, |warnings, failure| {
+                    push_unique_text(
+                        &warnings,
+                        format!("model `{}` failed during backend training", failure.name),
+                    )
+                });
+        completed.report.entries =
+            summary
+                .failed_models
+                .iter()
+                .fold(completed.report.entries, |entries, failure| {
+                    push_recent_entry(
+                        &entries,
+                        format!("failed | {} | {}", failure.name, failure.error),
+                    )
+                });
+    }
+
+    completed
 }
 
 #[cfg(test)]
@@ -362,17 +561,36 @@ pub fn start_training_job(
         };
         send_event(&tx, ServiceEvent::TrainingUpdated(snapshot.clone()));
 
+        let live_snapshot = Arc::new(Mutex::new(snapshot.clone()));
         let train_request = request.clone();
+        let tx_progress = tx.clone();
+        let live_snapshot_for_progress = Arc::clone(&live_snapshot);
         let train_result = tokio::task::spawn_blocking(move || {
             let orchestrator =
                 TrainingOrchestrator::new(settings, train_request.models_dir.clone());
-            orchestrator.train_symbol(&train_request.symbol, &train_request.base_tf)
+            orchestrator.train_symbol_with_progress(
+                &train_request.symbol,
+                &train_request.base_tf,
+                move |event| {
+                    if let Ok(mut snapshot) = live_snapshot_for_progress.lock() {
+                        apply_backend_progress_event(&mut snapshot, &event);
+                        send_event(
+                            &tx_progress,
+                            ServiceEvent::TrainingUpdated(snapshot.clone()),
+                        );
+                    }
+                },
+            )
         })
         .await;
 
         match train_result {
-            Ok(Ok(())) => {
-                let completed = completed_snapshot_from(snapshot, planned_models, Vec::new());
+            Ok(Ok(summary)) => {
+                let base_snapshot = live_snapshot
+                    .lock()
+                    .map(|snapshot| snapshot.clone())
+                    .unwrap_or(snapshot);
+                let completed = completed_snapshot_from_run_summary(base_snapshot, summary);
                 send_event(&tx, ServiceEvent::TrainingUpdated(completed.clone()));
                 log_training_event(
                     "ui_training_job",
@@ -381,13 +599,23 @@ pub fn start_training_job(
                 );
             }
             Ok(Err(err)) => {
-                let failed = failed_snapshot_from(snapshot, err);
+                let base_snapshot = live_snapshot
+                    .lock()
+                    .map(|snapshot| snapshot.clone())
+                    .unwrap_or(snapshot);
+                let failed = failed_snapshot_from(base_snapshot, err);
                 send_event(&tx, ServiceEvent::TrainingUpdated(failed.clone()));
                 log_training_event("ui_training_job", "FAILED", failed.report.summary.clone());
             }
             Err(err) => {
-                let failed =
-                    failed_snapshot_from(snapshot, anyhow::anyhow!("training join error: {err}"));
+                let base_snapshot = live_snapshot
+                    .lock()
+                    .map(|snapshot| snapshot.clone())
+                    .unwrap_or(snapshot);
+                let failed = failed_snapshot_from(
+                    base_snapshot,
+                    anyhow::anyhow!("training join error: {err}"),
+                );
                 send_event(&tx, ServiceEvent::TrainingUpdated(failed.clone()));
                 log_training_event("ui_training_job", "FAILED", failed.report.summary.clone());
             }
@@ -444,6 +672,7 @@ mod tests {
         jobs::{JobEventLevel, JobState},
         ServiceEvent,
     };
+    use forex_models::ModelTrainingProgress;
     use std::path::PathBuf;
     use tokio::sync::mpsc;
 
@@ -565,5 +794,69 @@ mod tests {
             snapshot.report.log_path,
             Some(canonical_log_path().display().to_string())
         );
+    }
+
+    #[test]
+    fn backend_failure_event_updates_training_snapshot_with_live_model_status() {
+        let request = sample_request();
+        let mut snapshot = JobSnapshot::new(JobKind::Training);
+        snapshot.state = JobState::Running;
+        snapshot.progress = JobProgress {
+            percent: Some(0.7),
+            stage: "dispatching_backend".to_string(),
+            message: "dispatching backend training for 3 planned model(s)".to_string(),
+        };
+        snapshot.report = JobReport {
+            counters: vec![("planned_models".to_string(), 3)],
+            highlights: requested_training_highlights(&request),
+            entries: vec!["planned | xgboost".to_string()],
+            log_path: Some(canonical_log_path().display().to_string()),
+            ..JobReport::default()
+        };
+
+        apply_backend_progress_event(
+            &mut snapshot,
+            &ModelTrainingProgress::Failed {
+                model: "mlp".to_string(),
+                error: "synthetic backend failure".to_string(),
+                completed_models: 1,
+                failed_models: 1,
+                total_models: 3,
+            },
+        );
+
+        assert_eq!(snapshot.state, JobState::Running);
+        assert_eq!(snapshot.progress.stage, "backend_running");
+        assert_eq!(snapshot.progress.percent, Some(0.8));
+        assert!(snapshot
+            .report
+            .counters
+            .iter()
+            .any(|(name, value)| name == "completed_models" && *value == 1));
+        assert!(snapshot
+            .report
+            .counters
+            .iter()
+            .any(|(name, value)| name == "failed_models" && *value == 1));
+        assert!(snapshot
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("mlp")));
+        assert!(snapshot
+            .report
+            .errors
+            .iter()
+            .any(|error| error.contains("synthetic backend failure")));
+        assert!(snapshot
+            .report
+            .events
+            .iter()
+            .any(|event| event.level == JobEventLevel::Warning && event.message.contains("mlp")));
+        assert!(snapshot
+            .report
+            .entries
+            .iter()
+            .any(|entry| entry.contains("failed | mlp")));
     }
 }

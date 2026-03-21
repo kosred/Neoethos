@@ -2,13 +2,14 @@
 pub mod base;
 
 // Machine learning models
-pub mod tree_models;
 pub mod ensemble;
-pub mod training_orchestrator;
 pub mod parallel_trainer;
+pub mod training_orchestrator;
+pub mod tree_models;
 
 pub use ensemble::MetaBlender;
-pub use training_orchestrator::TrainingOrchestrator;
+pub use parallel_trainer::{ModelTrainingFailure, ModelTrainingProgress, ParallelTrainingSummary};
+pub use training_orchestrator::{TrainingOrchestrator, TrainingRunSummary};
 
 // Hardware detection (ported from models/device.py)
 pub mod hardware;
@@ -29,19 +30,19 @@ pub mod genetic;
 pub mod exit_agent;
 
 // Pure Rust ML Modular Modules
-pub mod evolution;
-pub mod rl;
-pub mod streaming;
-pub mod forecasting;
-pub mod statistical;
 pub mod anomaly;
+pub mod evolution;
+pub mod forecasting;
+pub mod rl;
+pub mod statistical;
+pub mod streaming;
 
+pub use anomaly::IsolationForestExpert;
 pub use evolution::NeuroEvoOptimizer;
-pub use streaming::AdaptiveGradientBooster;
 pub use forecasting::SwarmForecaster;
 pub use rl::TradingReinforcementLearner;
-pub use statistical::{ElasticNetExpert, LogisticExpert, BayesianLogitExpert};
-pub use anomaly::IsolationForestExpert;
+pub use statistical::{BayesianLogitExpert, ElasticNetExpert, LogisticExpert};
+pub use streaming::AdaptiveGradientBooster;
 
 // Pure-Rust neural networks via Burn framework (no Python, no GIL)
 #[cfg(feature = "burn-backend")]
@@ -56,9 +57,9 @@ use ort::{inputs, Session, Value};
 #[cfg(feature = "onnx")]
 use std::collections::HashMap;
 #[cfg(feature = "onnx")]
-use tracing::{info, warn};
-#[cfg(feature = "onnx")]
 use std::path::Path;
+#[cfg(feature = "onnx")]
+use tracing::{info, warn};
 
 #[cfg(feature = "onnx")]
 pub struct ONNXInferenceEngine {

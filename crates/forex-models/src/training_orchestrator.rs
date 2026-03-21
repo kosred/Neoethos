@@ -1,11 +1,23 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tracing::info;
 use std::sync::Arc;
+use tracing::info;
 
-use forex_data::{load_symbol_dataset, prepare_multitimeframe_features_with_options, FeatureBuildOptions, Ohlcv};
-use crate::parallel_trainer::{train_models_parallel, ModelConfig, ModelType};
+use crate::parallel_trainer::{
+    train_models_parallel_with_progress, ModelConfig, ModelTrainingFailure, ModelTrainingProgress,
+    ModelType,
+};
+use forex_data::{
+    load_symbol_dataset, prepare_multitimeframe_features_with_options, FeatureBuildOptions, Ohlcv,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrainingRunSummary {
+    pub planned_models: Vec<String>,
+    pub completed_models: Vec<String>,
+    pub failed_models: Vec<ModelTrainingFailure>,
+}
 
 pub struct TrainingOrchestrator {
     pub settings: forex_core::Settings,
@@ -14,42 +26,86 @@ pub struct TrainingOrchestrator {
 
 impl TrainingOrchestrator {
     pub fn new(settings: forex_core::Settings, models_dir: PathBuf) -> Self {
-        Self { settings, models_dir }
+        Self {
+            settings,
+            models_dir,
+        }
     }
 
     pub fn train_symbol(&self, symbol: &str, base_tf: &str) -> Result<()> {
+        let summary = self.train_symbol_with_progress(symbol, base_tf, |_| {})?;
+        if !summary.failed_models.is_empty() {
+            anyhow::bail!(
+                "Training failed for [{}]; successful models: [{}]",
+                summary
+                    .failed_models
+                    .iter()
+                    .map(|failure| failure.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                summary.completed_models.join(", ")
+            );
+        }
+
+        Ok(())
+    }
+
+    pub fn train_symbol_with_progress<R>(
+        &self,
+        symbol: &str,
+        base_tf: &str,
+        progress_fn: R,
+    ) -> Result<TrainingRunSummary>
+    where
+        R: Fn(ModelTrainingProgress) + Send + Sync + Clone + 'static,
+    {
         info!("Starting Pure-Rust training for symbol: {}", symbol);
-        
+
         let data_root = std::env::var("FOREX_BOT_DATA_ROOT").unwrap_or_else(|_| "data".to_string());
         let dataset = load_symbol_dataset(&data_root, symbol)?;
-        
+
         let opts = FeatureBuildOptions::default();
         let frame = prepare_multitimeframe_features_with_options(&dataset, base_tf, &opts, None)?;
         let base_ohlcv = dataset.frames.get(base_tf).context("base tf missing")?;
 
         let enabled_models = self.get_enabled_models()?;
-        let configs: Vec<ModelConfig> = enabled_models.into_iter().map(|m| {
-            ModelConfig {
+        let planned_models = enabled_models.clone();
+        let configs: Vec<ModelConfig> = enabled_models
+            .into_iter()
+            .map(|m| ModelConfig {
                 name: m.clone(),
                 model_type: self.map_model_type(&m),
                 params: HashMap::new(),
-            }
-        }).collect();
+            })
+            .collect();
 
         let x = Arc::new(frame.data);
         let labels = self.derive_labels(base_ohlcv);
         let y = Arc::new(labels);
 
-        let trained = train_models_parallel(configs, x, y, move |name, _x_data, _y_data| {
-            info!("Training model instance: {}", name);
-            anyhow::bail!(
-                "Training dispatch for model `{}` is not implemented in the Rust orchestrator",
-                name
-            )
-        })?;
+        let trained = train_models_parallel_with_progress(
+            configs,
+            x,
+            y,
+            progress_fn,
+            move |name, _x_data, _y_data| {
+                info!("Training model instance: {}", name);
+                anyhow::bail!(
+                    "Training dispatch for model `{}` is not implemented in the Rust orchestrator",
+                    name
+                )
+            },
+        )?;
 
-        info!("Successfully trained models: {:?}", trained);
-        Ok(())
+        info!(
+            "Successfully trained models: {:?}",
+            trained.successful_models
+        );
+        Ok(TrainingRunSummary {
+            planned_models,
+            completed_models: trained.successful_models,
+            failed_models: trained.failed_models,
+        })
     }
 
     fn get_enabled_models(&self) -> Result<Vec<String>> {
