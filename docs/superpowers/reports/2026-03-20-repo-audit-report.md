@@ -242,6 +242,9 @@ Runtime probes were executed against the already-built `target/debug` binaries a
 - [`crates/forex-data/src/lib.rs`](C:/Users/konst/development/forex-ai/crates/forex-data/src/lib.rs) no longer swallows unreadable timeframes during dataset assembly and no longer converts invalid timestamp columns into synthetic zeroes; targeted regression tests now pin both contracts
 - [`crates/forex-core/src/logging.rs`](C:/Users/konst/development/forex-ai/crates/forex-core/src/logging.rs) and [`crates/forex-core/src/sectioned_log.rs`](C:/Users/konst/development/forex-ai/crates/forex-core/src/sectioned_log.rs) now own one canonical sectioned log file at `logs/forex-ai.log`; the active runtime no longer depends on the legacy per-run file appender path
 - [`crates/forex-app/src/main.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/main.rs), [`crates/forex-cli/src/main.rs`](C:/Users/konst/development/forex-ai/crates/forex-cli/src/main.rs), and [`crates/mt5-bridge/src/lib.rs`](C:/Users/konst/development/forex-ai/crates/mt5-bridge/src/lib.rs) now emit explicit subsystem-scoped records into `APP`, `CLI`, `DISCOVERY`, `TRAINING`, and `MT5` sections instead of creating separate runtime log files or relying on ad-hoc logger setup
+- [`crates/forex-app/src/app_services/jobs.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/app_services/jobs.rs), [`crates/forex-app/src/app_services/discovery.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/app_services/discovery.rs), and [`crates/forex-app/src/app_services/training.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/app_services/training.rs) now provide a real app-owned service layer with explicit job state, progress, cancellation, and report contracts
+- [`crates/forex-app/src/ui/discovery.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/ui/discovery.rs) and [`crates/forex-app/src/ui/training.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/ui/training.rs) no longer rely on mock progress or log-only placeholders; both tabs now start real backend services and expose `Stop` and `Open Log` actions
+- [`crates/forex-app/src/ui/trading.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/ui/trading.rs) now owns the MT5/local trading-panel routing that previously lived inline in [`crates/forex-app/src/main.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/main.rs), preserving the connect/disconnect and canonical `APP` logging contract while shrinking the entrypoint
 - legacy artifacts such as `logs/forex_bot.log` still exist on disk from earlier runs, but the verified current runtime path updates only `logs/forex-ai.log`
 
 ### New Verification Evidence
@@ -250,11 +253,13 @@ Runtime probes were executed against the already-built `target/debug` binaries a
 - `cargo clippy --workspace --all-targets -- -D warnings` -> PASS
 - `cargo test -p mt5-bridge` -> PASS
 - `cargo test -p forex-app -- --nocapture` -> PASS
+- `cargo clippy -p forex-app --all-targets -- -D warnings` -> PASS
 - `cargo test -p forex-cli -- --nocapture` -> PASS
 - `cargo test -p forex-data -- --nocapture` -> PASS
 - `cargo test -p forex-core -- --nocapture` -> PASS
 - `cargo clippy -p forex-core --all-targets -- -D warnings` -> PASS
 - `cargo run -p forex-app -- --headless --config config.yaml` -> PASS WITH FINDINGS, emitting `MT5 Initialization failed. Last error: code=-6 description=Terminal: Authorization failed`
+- `target/debug/forex-app.exe --headless --local --config config.yaml` -> PASS WITH CONTROLLED STOP after a 6-second local-mode smoke window
 - `cargo run -p forex-cli -- load --symbol EURUSD --timeframe M1 --root data` -> PASS, `Loaded EURUSD M1 rows: 5267265`
 - `cargo run -p forex-cli -- discover --root data --symbol EURUSD --base M1 --higher M5,M15,H1 --population 10 --generations 1 --candidates 20 --portfolio-size 10` -> PASS WITH FINDINGS, now failing explicitly with `Discovery produced an empty portfolio for EURUSD M1 (candidates=4)` instead of exiting `0`
 - canonical log inspection after app/CLI reruns -> PASS, with `SYSTEM`, `APP`, `CLI`, `DISCOVERY`, and `MT5` sections updating independently inside `logs/forex-ai.log`
@@ -275,16 +280,18 @@ Initial line-by-line findings from the runtime-critical entrypoints audited so f
 
 #### `crates/forex-app`
 
-- [`crates/forex-app/src/main.rs:298`](C:/Users/konst/development/forex-ai/crates/forex-app/src/main.rs#L298)
-  - the Discovery tab still runs a mock progress loop and never invokes the real Rust discovery backend
-  - this explains the current UI/backend disconnect: the screen can show apparent progress without any actual search work
-- [`crates/forex-app/src/main.rs:327`](C:/Users/konst/development/forex-ai/crates/forex-app/src/main.rs#L327)
-  - the Training tab button only logs `Training logic triggered.` and does not call any backend training path
-  - the current UI therefore cannot truthfully represent training state or failures
-- [`crates/forex-app/src/main.rs:71`](C:/Users/konst/development/forex-ai/crates/forex-app/src/main.rs#L71)
-  - local/headless mode hardcodes `"data"` and ignores the supplied config path for symbol discovery
-- [`crates/forex-app/src/main.rs:135`](C:/Users/konst/development/forex-ai/crates/forex-app/src/main.rs#L135)
-  - GUI local mode repeats the same hardcoded `"data"` assumption during initial symbol enumeration and refresh
+Historical baseline findings, now resolved by the Phase 1 app-service-layer tranche:
+
+- [`crates/forex-app/src/ui/discovery.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/ui/discovery.rs)
+  - the Discovery tab now starts a real backend discovery service instead of a mock progress loop
+- [`crates/forex-app/src/ui/training.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/ui/training.rs)
+  - the Training tab now starts a real backend training service instead of a log-only placeholder
+- [`crates/forex-app/src/ui/trading.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/ui/trading.rs)
+  - the Trading tab logic is now isolated from the app entrypoint and keeps explicit `LocalOnly` / `Disconnected` / `Connected` modes under test instead of mixing MT5 state changes directly into the top-level UI shell
+- [`crates/forex-app/src/app_state.rs`](C:/Users/konst/development/forex-ai/crates/forex-app/src/app_state.rs)
+  - runtime data-root selection is now held in app state and reused by the UI/service layer instead of repeating hardcoded `"data"` assumptions
+
+No new high-severity `forex-app` findings were introduced on the verified Windows lane in this tranche.
 
 #### `crates/mt5-bridge`
 

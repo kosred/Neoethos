@@ -29,21 +29,11 @@ impl JobId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct JobProgress {
     pub percent: Option<f32>,
     pub stage: String,
     pub message: String,
-}
-
-impl Default for JobProgress {
-    fn default() -> Self {
-        Self {
-            percent: None,
-            stage: String::new(),
-            message: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

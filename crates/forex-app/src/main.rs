@@ -1,7 +1,9 @@
 mod app_services;
 mod app_state;
+mod ui;
 
-use app_state::AppRuntimeConfig;
+use app_services::{discovery::DiscoveryJobHandle, training::TrainingJobHandle, ServiceEvent};
+use app_state::{AppRuntimeConfig, AppState, DataSource, Tab};
 use eframe::egui;
 use forex_core::logging::{setup_logging, write_subsystem_record};
 use forex_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
@@ -23,26 +25,6 @@ struct Args {
 
     #[arg(short, long, default_value_t = false)]
     local: bool,
-}
-
-#[derive(PartialEq, Clone, Copy)]
-enum Tab {
-    Trading,
-    Discovery,
-    Training,
-    Hardware,
-    Risk,
-}
-
-#[derive(PartialEq, Clone, Copy)]
-enum DataSource {
-    MT5,
-    Local,
-}
-
-enum AppMessage {
-    DiscoveryProgress(f32),
-    DiscoveryFinished(String),
 }
 
 #[tokio::main]
@@ -162,24 +144,16 @@ async fn run_headless_loop(runtime: AppRuntimeConfig) {
 
 struct ForexApp {
     mt5: Option<MT5Engine>,
-    runtime: AppRuntimeConfig,
-    current_tab: Tab,
-    data_source: DataSource,
+    state: AppState,
     
     // Message Bus
-    tx: mpsc::Sender<AppMessage>,
-    rx: mpsc::Receiver<AppMessage>,
+    tx: mpsc::UnboundedSender<ServiceEvent>,
+    rx: mpsc::UnboundedReceiver<ServiceEvent>,
+    discovery_handle: Option<DiscoveryJobHandle>,
+    training_handle: Option<TrainingJobHandle>,
     
     // Trading State
-    status_msg: String,
     terminal_info: String,
-    
-    // Discovery State
-    selected_pair: String,
-    available_symbols: Vec<String>,
-    discovery_progress: f32,
-    is_discovering: bool,
-    discovery_log: String,
     
     // Hardware State
     cpu_cores: i32,
@@ -192,23 +166,18 @@ struct ForexApp {
 
 impl ForexApp {
     fn new(_cc: &eframe::CreationContext<'_>, runtime: AppRuntimeConfig) -> Self {
-        let (tx, rx) = mpsc::channel(100);
+        let (tx, rx) = mpsc::unbounded_channel();
         let symbols = forex_data::discover_symbols(&runtime.data_dir).unwrap_or_default();
+        let state = AppState::new(runtime.clone(), symbols);
         
         Self {
             mt5: None,
-            runtime: runtime.clone(),
-            current_tab: Tab::Trading,
-            data_source: if runtime.start_local { DataSource::Local } else { DataSource::MT5 },
+            state,
             tx,
             rx,
-            status_msg: if runtime.start_local { "Local Mode".to_string() } else { "Offline".to_string() },
+            discovery_handle: None,
+            training_handle: None,
             terminal_info: String::new(),
-            selected_pair: symbols.first().cloned().unwrap_or_else(|| "EURUSD".to_string()),
-            available_symbols: symbols,
-            discovery_progress: 0.0,
-            is_discovering: false,
-            discovery_log: String::new(),
             cpu_cores: num_cpus::get() as i32,
             gpu_enabled: true,
             daily_drawdown_limit: 4.5,
@@ -217,16 +186,38 @@ impl ForexApp {
     }
 
     fn refresh_symbols(&mut self) {
-        self.available_symbols = forex_data::discover_symbols(&self.runtime.data_dir).unwrap_or_default();
+        self.state.available_symbols =
+            forex_data::discover_symbols(&self.state.runtime.data_dir).unwrap_or_default();
     }
 
     fn process_messages(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                AppMessage::DiscoveryProgress(p) => self.discovery_progress = p,
-                AppMessage::DiscoveryFinished(log) => {
-                    self.is_discovering = false;
-                    self.discovery_log = log;
+                ServiceEvent::DiscoveryUpdated(snapshot) => {
+                    let terminal = matches!(
+                        snapshot.state,
+                        app_services::jobs::JobState::Succeeded
+                            | app_services::jobs::JobState::Degraded
+                            | app_services::jobs::JobState::Failed
+                            | app_services::jobs::JobState::Cancelled
+                    );
+                    self.state.discovery_job = Some(snapshot);
+                    if terminal {
+                        self.discovery_handle = None;
+                    }
+                }
+                ServiceEvent::TrainingUpdated(snapshot) => {
+                    let terminal = matches!(
+                        snapshot.state,
+                        app_services::jobs::JobState::Succeeded
+                            | app_services::jobs::JobState::Degraded
+                            | app_services::jobs::JobState::Failed
+                            | app_services::jobs::JobState::Cancelled
+                    );
+                    self.state.training_job = Some(snapshot);
+                    if terminal {
+                        self.training_handle = None;
+                    }
                 }
             }
         }
@@ -240,11 +231,11 @@ impl eframe::App for ForexApp {
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.selectable_value(&mut self.current_tab, Tab::Trading, "📊 Trading");
-                    ui.selectable_value(&mut self.current_tab, Tab::Discovery, "🔍 Discovery");
-                    ui.selectable_value(&mut self.current_tab, Tab::Training, "🧠 Training");
-                    ui.selectable_value(&mut self.current_tab, Tab::Hardware, "⚙️ Hardware");
-                    ui.selectable_value(&mut self.current_tab, Tab::Risk, "🛡️ Risk");
+                    ui.selectable_value(&mut self.state.current_tab, Tab::Trading, "📊 Trading");
+                    ui.selectable_value(&mut self.state.current_tab, Tab::Discovery, "🔍 Discovery");
+                    ui.selectable_value(&mut self.state.current_tab, Tab::Training, "🧠 Training");
+                    ui.selectable_value(&mut self.state.current_tab, Tab::Hardware, "⚙️ Hardware");
+                    ui.selectable_value(&mut self.state.current_tab, Tab::Risk, "🛡️ Risk");
                 });
             });
         });
@@ -255,13 +246,13 @@ impl eframe::App for ForexApp {
             
             ui.label("Data Source:");
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.data_source, DataSource::MT5, "MT5");
-                ui.selectable_value(&mut self.data_source, DataSource::Local, "Local");
+                ui.selectable_value(&mut self.state.data_source, DataSource::MT5, "MT5");
+                ui.selectable_value(&mut self.state.data_source, DataSource::Local, "Local");
             });
 
             ui.separator();
-            if self.data_source == DataSource::MT5 {
-                ui.label(format!("MT5: {}", self.status_msg));
+            if self.state.data_source == DataSource::MT5 {
+                ui.label(format!("MT5: {}", self.state.status_msg));
                 if self.mt5.is_some() {
                     ui.colored_label(egui::Color32::GREEN, "● Online");
                 } else {
@@ -281,148 +272,60 @@ impl eframe::App for ForexApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            match self.current_tab {
-                Tab::Trading => self.ui_trading(ui),
-                Tab::Discovery => self.ui_discovery(ui),
-                Tab::Training => self.ui_training(ui),
+            match self.state.current_tab {
+                Tab::Trading => ui::trading::render(
+                    ui,
+                    &mut self.state,
+                    &mut self.mt5,
+                    &mut self.terminal_info,
+                ),
+                Tab::Discovery => ui::discovery::render(
+                    ui,
+                    &mut self.state,
+                    &self.tx,
+                    &mut self.discovery_handle,
+                ),
+                Tab::Training => ui::training::render(
+                    ui,
+                    &mut self.state,
+                    &self.tx,
+                    &mut self.training_handle,
+                ),
                 Tab::Hardware => self.ui_hardware(ui),
                 Tab::Risk => self.ui_risk(ui),
             }
         });
 
-        // Repaint if discovering to update progress bar
-        if self.is_discovering {
+        let discovery_active = self
+            .state
+            .discovery_job
+            .as_ref()
+            .map(|snapshot| {
+                matches!(
+                    snapshot.state,
+                    app_services::jobs::JobState::Queued | app_services::jobs::JobState::Running
+                )
+            })
+            .unwrap_or(false);
+        let training_active = self
+            .state
+            .training_job
+            .as_ref()
+            .map(|snapshot| {
+                matches!(
+                    snapshot.state,
+                    app_services::jobs::JobState::Queued | app_services::jobs::JobState::Running
+                )
+            })
+            .unwrap_or(false);
+
+        if discovery_active || training_active {
             ctx.request_repaint();
         }
     }
 }
 
 impl ForexApp {
-    fn ui_trading(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Live Trading Terminal");
-        ui.separator();
-        
-        if self.data_source == DataSource::Local {
-            ui.label("Live trading is disabled in Local mode.");
-            ui.label("Please switch to MT5 source if you are on Windows.");
-            return;
-        }
-
-        if self.mt5.is_none() {
-            if ui.button("🚀 Connect to MetaTrader 5").clicked() {
-                match MT5Engine::new() {
-                    Ok(mut engine) => {
-                        match engine.initialize() {
-                            Ok(true) => {
-                                self.status_msg = "Connected".to_string();
-                                self.terminal_info = engine.terminal_info().unwrap_or_default();
-                                self.mt5 = Some(engine);
-                                if let Err(err) = write_subsystem_record(
-                                    SubsystemSection::App,
-                                    app_record("ui_mt5_connect", "SUCCESS", "UI MT5 connection succeeded"),
-                                ) {
-                                    error!("Failed to write APP section log: {}", err);
-                                }
-                            }
-                            _ => {
-                                self.status_msg = "Connection Failed (module missing or terminal closed)".to_string();
-                                if let Err(err) = write_subsystem_record(
-                                    SubsystemSection::App,
-                                    app_record(
-                                        "ui_mt5_connect",
-                                        "DEGRADED",
-                                        "UI MT5 connection failed (module missing or terminal closed)",
-                                    ),
-                                ) {
-                                    error!("Failed to write APP section log: {}", err);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        self.status_msg = format!("Error: {:?}", e);
-                        if let Err(log_err) = write_subsystem_record(
-                            SubsystemSection::App,
-                            app_record("ui_mt5_connect", "FAILED", format!("UI MT5 bridge error: {e}")),
-                        ) {
-                            error!("Failed to write APP section log: {}", log_err);
-                        }
-                    }
-                }
-            }
-        } else {
-            ui.group(|ui| {
-                ui.label("Account Details:");
-                ui.label(&self.terminal_info);
-            });
-            if ui.button("🛑 Disconnect").clicked() {
-                self.mt5 = None;
-                self.status_msg = "Offline".to_string();
-                if let Err(err) = write_subsystem_record(
-                    SubsystemSection::App,
-                    app_record("ui_mt5_disconnect", "SUCCESS", "UI MT5 connection closed"),
-                ) {
-                    error!("Failed to write APP section log: {}", err);
-                }
-            }
-        }
-    }
-
-    fn ui_discovery(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Strategy Discovery Engine");
-        ui.separator();
-        
-        ui.horizontal(|ui| {
-            ui.label("Target Pair:");
-            egui::ComboBox::from_label("")
-                .selected_text(&self.selected_pair)
-                .show_ui(ui, |ui| {
-                    for sym in &self.available_symbols {
-                        ui.selectable_value(&mut self.selected_pair, sym.clone(), sym);
-                    }
-                });
-        });
-
-        if self.is_discovering {
-            ui.add(egui::ProgressBar::new(self.discovery_progress).text("Evolving..."));
-            if ui.button("Stop Search").clicked() {
-                self.is_discovering = false;
-            }
-        } else {
-            if ui.button("🔥 Start Genetic Discovery").clicked() {
-                self.is_discovering = true;
-                let tx = self.tx.clone();
-                let pair = self.selected_pair.clone();
-                
-                // Spawn the Rust native discovery task
-                tokio::spawn(async move {
-                    info!("Launching Pure-Rust Discovery for {}", pair);
-                    // Mock progress simulation
-                    for i in 0..=100 {
-                        let _ = tx.send(AppMessage::DiscoveryProgress(i as f32 / 100.0)).await;
-                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                    }
-                    let _ = tx.send(AppMessage::DiscoveryFinished(format!("Discovery complete for {}", pair))).await;
-                });
-            }
-        }
-
-        if !self.discovery_log.is_empty() {
-            ui.separator();
-            ui.label("Latest Results:");
-            ui.code(&self.discovery_log);
-        }
-    }
-
-    fn ui_training(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Model Swarm Training");
-        ui.separator();
-        ui.label("Train and update the model swarm using local or live data.");
-        if ui.button("🚀 Run Swarm Training").clicked() {
-            info!("Training logic triggered.");
-        }
-    }
-
     fn ui_hardware(&mut self, ui: &mut egui::Ui) {
         ui.heading("Hardware Allocation");
         ui.separator();
@@ -438,7 +341,7 @@ impl ForexApp {
     }
 }
 
-fn app_record(
+pub(crate) fn app_record(
     operation: &str,
     status: &str,
     message: impl Into<String>,
@@ -470,6 +373,7 @@ fn system_time_string() -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::app_state::DataSource;
     use forex_core::Settings;
     use super::{app_record, AppRuntimeConfig};
     use std::path::PathBuf;
@@ -493,5 +397,19 @@ mod tests {
         assert_eq!(record.operation, "headless_start");
         assert_eq!(record.status, "STARTED");
         assert_eq!(record.message, "headless startup");
+    }
+
+    #[test]
+    fn trading_panel_mode_disables_live_controls_in_local_mode() {
+        let mode = crate::ui::trading::panel_mode(DataSource::Local, false);
+
+        assert_eq!(mode, crate::ui::trading::TradingPanelMode::LocalOnly);
+    }
+
+    #[test]
+    fn trading_panel_mode_switches_to_disconnect_when_mt5_is_connected() {
+        let mode = crate::ui::trading::panel_mode(DataSource::MT5, true);
+
+        assert_eq!(mode, crate::ui::trading::TradingPanelMode::Connected);
     }
 }
