@@ -255,7 +255,7 @@ fn record_app_event(operation: &str, status: &str, message: impl Into<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_state::{AppRuntimeConfig, HardwareState, RiskState, Tab};
+    use crate::app_state::{AppRuntimeConfig, HardwareState, RiskState};
     use std::path::PathBuf;
 
     fn sample_state(source: DataSource, status_msg: &str) -> AppState {
@@ -265,7 +265,6 @@ mod tests {
                 data_dir: PathBuf::from("data"),
                 start_local: matches!(source, DataSource::Local),
             },
-            current_tab: Tab::Trading,
             data_source: source,
             status_msg: status_msg.to_string(),
             selected_pair: "EURUSD".to_string(),

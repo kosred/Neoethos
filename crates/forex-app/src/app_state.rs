@@ -20,15 +20,6 @@ impl AppRuntimeConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tab {
-    Trading,
-    Discovery,
-    Training,
-    Hardware,
-    Risk,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataSource {
     MT5,
     Local,
@@ -37,7 +28,6 @@ pub enum DataSource {
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub runtime: AppRuntimeConfig,
-    pub current_tab: Tab,
     pub data_source: DataSource,
     pub status_msg: String,
     pub selected_pair: String,
@@ -57,7 +47,6 @@ impl AppState {
             .unwrap_or_else(|| "EURUSD".to_string());
 
         Self {
-            current_tab: Tab::Trading,
             data_source: if runtime.start_local {
                 DataSource::Local
             } else {

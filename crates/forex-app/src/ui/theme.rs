@@ -83,14 +83,6 @@ pub fn top_panel_frame(style: &egui::Style) -> egui::Frame {
     frame
 }
 
-pub fn side_panel_frame(style: &egui::Style) -> egui::Frame {
-    let mut frame = egui::Frame::side_top_panel(style);
-    frame.fill = PANEL_BG;
-    frame.stroke = egui::Stroke::new(1.0, BORDER);
-    frame.inner_margin = egui::Margin::same(12);
-    frame
-}
-
 pub fn central_panel_frame(style: &egui::Style) -> egui::Frame {
     let mut frame = egui::Frame::central_panel(style);
     frame.fill = APP_BG;

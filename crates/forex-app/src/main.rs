@@ -1,6 +1,7 @@
 mod app_services;
 mod app_state;
 mod ui;
+mod workspace;
 
 use app_services::{
     discovery::DiscoveryJobHandle,
@@ -8,7 +9,7 @@ use app_services::{
     training::TrainingJobHandle,
     ServiceEvent,
 };
-use app_state::{AppRuntimeConfig, AppState, Tab};
+use app_state::{AppRuntimeConfig, AppState};
 use eframe::egui;
 use forex_core::logging::{setup_logging, write_subsystem_record};
 use forex_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
@@ -18,6 +19,7 @@ use clap::Parser;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use std::time::{SystemTime, UNIX_EPOCH};
+use workspace::{render_workspace, WorkspaceState, WorkspaceViewer};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -149,6 +151,7 @@ async fn run_headless_loop(runtime: AppRuntimeConfig) {
 
 struct ForexApp {
     trading_session: TradingSession,
+    workspace: WorkspaceState,
     state: AppState,
     
     // Message Bus
@@ -168,6 +171,7 @@ impl ForexApp {
         
         Self {
             trading_session: TradingSession::new(),
+            workspace: WorkspaceState::default(),
             state,
             tx,
             rx,
@@ -223,49 +227,37 @@ impl eframe::App for ForexApp {
             .frame(ui::theme::top_panel_frame(ctx.style().as_ref()))
             .show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.selectable_value(&mut self.state.current_tab, Tab::Trading, "📊 Trading");
-                    ui.selectable_value(&mut self.state.current_tab, Tab::Discovery, "🔍 Discovery");
-                    ui.selectable_value(&mut self.state.current_tab, Tab::Training, "🧠 Training");
-                    ui.selectable_value(&mut self.state.current_tab, Tab::Hardware, "⚙️ Hardware");
-                    ui.selectable_value(&mut self.state.current_tab, Tab::Risk, "🛡️ Risk");
+                ui.horizontal_wrapped(|ui| {
+                    let source = match self.state.data_source {
+                        app_state::DataSource::MT5 => "MT5",
+                        app_state::DataSource::Local => "Local",
+                    };
+                    ui.heading("Forex AI Terminal");
+                    ui.separator();
+                    ui.label(format!("Symbol: {}", self.state.selected_pair));
+                    ui.separator();
+                    ui.label(format!("Source: {source}"));
+                    ui.separator();
+                    ui.label(format!("Status: {}", self.state.status_msg));
+                    ui.separator();
+                    ui.label("Workspace: Dockable");
                 });
             });
-        });
-
-        egui::SidePanel::left("left_status")
-            .frame(ui::theme::side_panel_frame(ctx.style().as_ref()))
-            .show(ctx, |ui| {
-            let refresh_requested =
-                ui::system_status::render(ui, &mut self.state, self.trading_session.is_connected());
-            if refresh_requested {
-                self.refresh_symbols();
-            }
         });
 
         egui::CentralPanel::default()
             .frame(ui::theme::central_panel_frame(ctx.style().as_ref()))
             .show(ctx, |ui| {
-            match self.state.current_tab {
-                Tab::Trading => ui::trading::render(
-                    ui,
-                    &mut self.state,
-                    &mut self.trading_session,
-                ),
-                Tab::Discovery => ui::discovery::render(
-                    ui,
-                    &mut self.state,
-                    &self.tx,
-                    &mut self.discovery_handle,
-                ),
-                Tab::Training => ui::training::render(
-                    ui,
-                    &mut self.state,
-                    &self.tx,
-                    &mut self.training_handle,
-                ),
-                Tab::Hardware => ui::hardware::render(ui, &mut self.state.hardware),
-                Tab::Risk => ui::risk::render(ui, &mut self.state.risk),
+            let mut viewer = WorkspaceViewer::new(
+                &mut self.state,
+                &mut self.trading_session,
+                &self.tx,
+                &mut self.discovery_handle,
+                &mut self.training_handle,
+            );
+            render_workspace(ui, &mut self.workspace, &mut viewer);
+            if viewer.refresh_requested() {
+                self.refresh_symbols();
             }
         });
 

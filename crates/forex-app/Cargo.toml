@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 eframe = "0.31.0" # UI framework (egui)
 egui = "0.31.0"
+egui_dock = "0.16.0"
 tokio = { version = "1.43.0", features = ["full", "rt-multi-thread"] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
