@@ -2,6 +2,9 @@ use crate::app_record;
 use crate::app_services::broker_config::{
     AdapterReadinessSnapshot, BrokerSessionState, BrokerSettingsState,
 };
+use crate::app_services::ctrader_auth::{
+    CTraderAccountSummary, CTraderAuthSession, CTraderAuthSnapshot, CTraderTokenExchangeRequest,
+};
 use crate::app_state::{AppState, DataSource};
 use forex_data::{discover_timeframes, load_symbol_timeframe, Ohlcv};
 use forex_core::logging::write_subsystem_record;
@@ -136,6 +139,7 @@ pub struct BrokerExecutionSnapshot {
 pub struct TradingSession {
     configured_adapter: TradingAdapterKind,
     broker_settings: BrokerSettingsState,
+    ctrader_auth: Option<CTraderAuthSession>,
     adapter: Option<TradingAdapter>,
     connected: bool,
     terminal_info: String,
@@ -191,6 +195,7 @@ impl TradingSession {
         Self {
             configured_adapter: TradingAdapterKind::Mt5,
             broker_settings: BrokerSettingsState::default(),
+            ctrader_auth: None,
             adapter: None,
             connected: true,
             terminal_info: terminal_info.into(),
@@ -204,6 +209,7 @@ impl TradingSession {
         Self {
             configured_adapter: kind,
             broker_settings: BrokerSettingsState::default(),
+            ctrader_auth: None,
             adapter: None,
             connected: false,
             terminal_info: String::new(),
@@ -236,6 +242,90 @@ impl TradingSession {
 
     pub fn can_attempt_connect(&self) -> bool {
         self.adapter_readiness().can_attempt_connect
+    }
+
+    pub fn ctrader_auth_snapshot(&self) -> Option<CTraderAuthSnapshot> {
+        match self.configured_adapter {
+            TradingAdapterKind::CTrader => {
+                if let Some(session) = &self.ctrader_auth {
+                    Some(session.snapshot())
+                } else {
+                    let client_id = self.broker_settings.ctrader.client_id.trim();
+                    let redirect_uri = self.broker_settings.ctrader.redirect_uri.trim();
+                    if client_id.is_empty() || redirect_uri.is_empty() {
+                        None
+                    } else {
+                        Some(CTraderAuthSession::new(client_id, redirect_uri).snapshot())
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub fn start_ctrader_auth(&mut self) -> anyhow::Result<CTraderAuthSnapshot> {
+        let client_id = self.broker_settings.ctrader.client_id.trim().to_string();
+        let redirect_uri = self.broker_settings.ctrader.redirect_uri.trim().to_string();
+        if client_id.is_empty() || redirect_uri.is_empty() {
+            return Err(anyhow::anyhow!(
+                "cTrader auth requires client_id and redirect_uri"
+            ));
+        }
+        let mut session = CTraderAuthSession::new(client_id, redirect_uri);
+        session.start_authorization("trading");
+        let snapshot = session.snapshot();
+        self.ctrader_auth = Some(session);
+        Ok(snapshot)
+    }
+
+    pub fn receive_ctrader_authorization_code(
+        &mut self,
+        code: impl Into<String>,
+    ) -> CTraderAuthSnapshot {
+        let session = self
+            .ctrader_auth
+            .get_or_insert_with(|| {
+                CTraderAuthSession::new(
+                    self.broker_settings.ctrader.client_id.clone(),
+                    self.broker_settings.ctrader.redirect_uri.clone(),
+                )
+            });
+        session.receive_authorization_code(code);
+        session.snapshot()
+    }
+
+    pub fn build_ctrader_token_exchange_request(
+        &mut self,
+    ) -> anyhow::Result<CTraderTokenExchangeRequest> {
+        let client_secret = self.broker_settings.ctrader.client_secret.trim().to_string();
+        if client_secret.is_empty() {
+            if let Some(session) = self.ctrader_auth.as_mut() {
+                session.mark_failed();
+            }
+            return Err(anyhow::anyhow!(
+                "cTrader token exchange requires client_secret"
+            ));
+        }
+        let session = self
+            .ctrader_auth
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("cTrader auth has not started"))?;
+        let request = session.build_token_exchange_request(client_secret);
+        if !self.broker_settings.ctrader.accounts.is_empty() {
+            session.set_accounts(
+                self.broker_settings
+                    .ctrader
+                    .accounts
+                    .iter()
+                    .map(|account| CTraderAccountSummary {
+                        account_id: account.account_id.clone(),
+                        broker_title: account.label.clone(),
+                        enabled_for_execution: account.enabled_for_execution,
+                    })
+                    .collect(),
+            );
+        }
+        Ok(request)
     }
 
     pub fn snapshot(&self, state: &AppState) -> ConnectionSnapshot {
@@ -510,6 +600,7 @@ impl TradingSession {
         self.terminal_info.clear();
         self.market_chart_cache = None;
         self.execution_surface_cache = None;
+        self.ctrader_auth = None;
     }
 }
 
@@ -518,6 +609,7 @@ impl Default for TradingSession {
         Self {
             configured_adapter: TradingAdapterKind::Mt5,
             broker_settings: BrokerSettingsState::default(),
+            ctrader_auth: None,
             adapter: None,
             connected: false,
             terminal_info: String::new(),
@@ -1091,5 +1183,93 @@ mod tests {
             "cTrader credentials ready · live auth is not wired yet"
         );
         assert!(!session.is_connected());
+    }
+
+    #[test]
+    fn start_ctrader_auth_exposes_authorize_url_when_ready() {
+        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.redirect_uri =
+            "http://localhost:3000/callback".to_string();
+
+        let snapshot = session.start_ctrader_auth().expect("auth snapshot");
+
+        assert_eq!(
+            snapshot.state,
+            crate::app_services::ctrader_auth::CTraderAuthState::AwaitingAuthorizationCode
+        );
+        assert!(snapshot
+            .authorize_url
+            .as_deref()
+            .unwrap_or_default()
+            .contains("client_id=client"));
+    }
+
+    #[test]
+    fn receive_ctrader_authorization_code_updates_auth_snapshot() {
+        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.redirect_uri =
+            "http://localhost:3000/callback".to_string();
+        session.start_ctrader_auth().expect("auth snapshot");
+
+        let snapshot = session.receive_ctrader_authorization_code("code-123");
+
+        assert_eq!(
+            snapshot.state,
+            crate::app_services::ctrader_auth::CTraderAuthState::AuthorizationCodeReceived
+        );
+        assert!(snapshot.authorization_code_present);
+    }
+
+    #[test]
+    fn build_ctrader_token_exchange_request_uses_configured_secret() {
+        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
+        session.broker_settings_mut().ctrader.redirect_uri =
+            "http://localhost:3000/callback".to_string();
+        session.start_ctrader_auth().expect("auth snapshot");
+        session.receive_ctrader_authorization_code("code-123");
+
+        let request = session
+            .build_ctrader_token_exchange_request()
+            .expect("token request");
+
+        assert_eq!(request.code, "code-123");
+        assert_eq!(request.client_secret, "secret");
+        assert_eq!(request.redirect_uri, "http://localhost:3000/callback");
+    }
+
+    #[test]
+    fn build_ctrader_token_exchange_request_syncs_staged_account_targets() {
+        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
+        session.broker_settings_mut().ctrader.redirect_uri =
+            "http://localhost:3000/callback".to_string();
+        session
+            .broker_settings_mut()
+            .ctrader
+            .accounts
+            .push(crate::app_services::broker_config::BrokerAccountTarget {
+                account_id: "acct-1".to_string(),
+                label: "Primary".to_string(),
+                enabled_for_execution: true,
+            });
+        session.start_ctrader_auth().expect("auth snapshot");
+        session.receive_ctrader_authorization_code("code-123");
+
+        let _ = session
+            .build_ctrader_token_exchange_request()
+            .expect("token request");
+        let auth = session.ctrader_auth_snapshot().expect("auth snapshot");
+
+        assert_eq!(
+            auth.state,
+            crate::app_services::ctrader_auth::CTraderAuthState::AccountsAvailable
+        );
+        assert_eq!(auth.account_count, 1);
+        assert_eq!(auth.enabled_target_count, 1);
     }
 }

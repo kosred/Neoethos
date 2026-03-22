@@ -1,5 +1,6 @@
 use crate::app_state::{AppState, DataSource};
 use crate::app_services::broker_config::{AdapterReadinessSnapshot, BrokerAccountTarget};
+use crate::app_services::ctrader_auth::CTraderAuthSnapshot;
 use crate::app_services::trading::{TradingSession, SUPPORTED_TRADING_ADAPTERS};
 use crate::ui::components::{
     render_dashboard_sections, render_summary_cards, render_view_header, DashboardCard,
@@ -17,7 +18,8 @@ struct SystemStatusDashboard {
 pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSession) -> bool {
     let snapshot = session.snapshot(state);
     let readiness = session.adapter_readiness();
-    let dashboard = build_system_status_dashboard(state, &snapshot, &readiness);
+    let ctrader_auth = session.ctrader_auth_snapshot();
+    let dashboard = build_system_status_dashboard(state, &snapshot, &readiness, ctrader_auth.as_ref());
     let mut refresh_requested = false;
 
     render_view_header(
@@ -61,6 +63,7 @@ fn build_system_status_dashboard(
     state: &AppState,
     connection: &crate::app_services::trading::ConnectionSnapshot,
     readiness: &AdapterReadinessSnapshot,
+    ctrader_auth: Option<&CTraderAuthSnapshot>,
 ) -> SystemStatusDashboard {
     let source = match state.data_source {
         DataSource::MT5 => "MT5",
@@ -197,6 +200,41 @@ fn build_system_status_dashboard(
         }),
     }
 
+    if let Some(auth) = ctrader_auth {
+        sections.push(DashboardSection {
+            title: "cTrader Auth".to_string(),
+            rows: vec![
+                ("State".to_string(), format!("{:?}", auth.state)),
+                ("Status".to_string(), auth.status_line.clone()),
+                (
+                    "Authorize URL".to_string(),
+                    if auth.authorize_url.is_some() {
+                        "Ready".to_string()
+                    } else {
+                        "Unavailable".to_string()
+                    },
+                ),
+                (
+                    "Authorization Code".to_string(),
+                    if auth.authorization_code_present {
+                        "Received".to_string()
+                    } else {
+                        "Missing".to_string()
+                    },
+                ),
+                (
+                    "Token Request".to_string(),
+                    if auth.token_request_ready {
+                        "Ready".to_string()
+                    } else {
+                        "Not ready".to_string()
+                    },
+                ),
+                ("Accounts".to_string(), auth.account_count.to_string()),
+            ],
+        });
+    }
+
     SystemStatusDashboard {
         summary_cards,
         sections,
@@ -217,11 +255,44 @@ fn render_adapter_configuration(ui: &mut egui::Ui, session: &mut TradingSession)
                 render_account_targets(ui, &mut settings.accounts, "MT5 Account");
             }
             crate::app_services::trading::TradingAdapterKind::CTrader => {
-                let settings = &mut session.broker_settings_mut().ctrader;
-                labeled_text_edit(ui, "Client ID", &mut settings.client_id);
-                labeled_text_edit(ui, "Client Secret", &mut settings.client_secret);
-                labeled_text_edit(ui, "Redirect URI", &mut settings.redirect_uri);
-                render_account_targets(ui, &mut settings.accounts, "cTrader Account");
+                let mut start_auth = false;
+                let mut accept_code = false;
+                let mut prepare_token_request = false;
+                let code_to_accept = {
+                    let settings = &mut session.broker_settings_mut().ctrader;
+                    labeled_text_edit(ui, "Client ID", &mut settings.client_id);
+                    labeled_text_edit(ui, "Client Secret", &mut settings.client_secret);
+                    labeled_text_edit(ui, "Redirect URI", &mut settings.redirect_uri);
+                    labeled_text_edit(
+                        ui,
+                        "Authorization Code",
+                        &mut settings.authorization_code_input,
+                    );
+                    let code = settings.authorization_code_input.clone();
+                    ui.horizontal(|ui| {
+                        if ui.button("Start cTrader Auth").clicked() {
+                            start_auth = true;
+                        }
+                        if ui.button("Accept Code").clicked() && !code.trim().is_empty() {
+                            accept_code = true;
+                        }
+                        if ui.button("Prepare Token Request").clicked() {
+                            prepare_token_request = true;
+                        }
+                    });
+                    render_account_targets(ui, &mut settings.accounts, "cTrader Account");
+                    code
+                };
+
+                if start_auth {
+                    let _ = session.start_ctrader_auth();
+                }
+                if accept_code {
+                    session.receive_ctrader_authorization_code(code_to_accept);
+                }
+                if prepare_token_request {
+                    let _ = session.build_ctrader_token_exchange_request();
+                }
             }
             crate::app_services::trading::TradingAdapterKind::DxTrade => {
                 let settings = &mut session.broker_settings_mut().dxtrade;
@@ -302,8 +373,10 @@ mod tests {
         let session = TradingSession::new();
         let connection = session.snapshot(&state);
         let readiness = session.adapter_readiness();
+        let ctrader_auth = session.ctrader_auth_snapshot();
 
-        let dashboard = build_system_status_dashboard(&state, &connection, &readiness);
+        let dashboard =
+            build_system_status_dashboard(&state, &connection, &readiness, ctrader_auth.as_ref());
 
         assert_eq!(dashboard.summary_cards[0].value, "Local");
         assert_eq!(dashboard.summary_cards[1].value, "Local Runtime");
@@ -325,8 +398,10 @@ mod tests {
         let session = TradingSession::from_connected_terminal_for_test("TerminalInfo(connected=True)");
         let connection = session.snapshot(&state);
         let readiness = session.adapter_readiness();
+        let ctrader_auth = session.ctrader_auth_snapshot();
 
-        let dashboard = build_system_status_dashboard(&state, &connection, &readiness);
+        let dashboard =
+            build_system_status_dashboard(&state, &connection, &readiness, ctrader_auth.as_ref());
 
         assert_eq!(dashboard.summary_cards[0].value, "MT5");
         assert_eq!(dashboard.summary_cards[1].value, "Broker Runtime");
@@ -347,8 +422,10 @@ mod tests {
         session.select_adapter(&mut state, TradingAdapterKind::CTrader);
         let connection = session.snapshot(&state);
         let readiness = session.adapter_readiness();
+        let ctrader_auth = session.ctrader_auth_snapshot();
 
-        let dashboard = build_system_status_dashboard(&state, &connection, &readiness);
+        let dashboard =
+            build_system_status_dashboard(&state, &connection, &readiness, ctrader_auth.as_ref());
 
         assert_eq!(dashboard.summary_cards[3].value, "cTrader");
         assert!(dashboard.summary_cards[4]
@@ -385,8 +462,10 @@ mod tests {
             });
         let connection = session.snapshot(&state);
         let readiness = session.adapter_readiness();
+        let ctrader_auth = session.ctrader_auth_snapshot();
 
-        let dashboard = build_system_status_dashboard(&state, &connection, &readiness);
+        let dashboard =
+            build_system_status_dashboard(&state, &connection, &readiness, ctrader_auth.as_ref());
 
         assert!(dashboard.sections.iter().any(|section| {
             section.rows.iter().any(|(label, value)| {
@@ -398,6 +477,57 @@ mod tests {
                 .rows
                 .iter()
                 .any(|(label, value)| label == "Execution Targets" && value == "1 enabled")
+        }));
+    }
+
+    #[test]
+    fn system_status_dashboard_surfaces_ctrader_auth_state() {
+        let mut state = sample_state(DataSource::MT5, "Offline");
+        let mut session = TradingSession::new();
+        session.select_adapter(&mut state, TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
+        session.broker_settings_mut().ctrader.redirect_uri =
+            "http://localhost:3000/callback".to_string();
+        session.start_ctrader_auth().expect("auth start");
+        let connection = session.snapshot(&state);
+        let readiness = session.adapter_readiness();
+        let ctrader_auth = session.ctrader_auth_snapshot();
+
+        let dashboard =
+            build_system_status_dashboard(&state, &connection, &readiness, ctrader_auth.as_ref());
+
+        assert!(dashboard.sections.iter().any(|section| {
+            section.title == "cTrader Auth"
+                && section.rows.iter().any(|(label, value)| {
+                    label == "State" && value == "AwaitingAuthorizationCode"
+                })
+        }));
+    }
+
+    #[test]
+    fn system_status_dashboard_surfaces_ctrader_received_code_and_accounts() {
+        let mut state = sample_state(DataSource::MT5, "Offline");
+        let mut session = TradingSession::new();
+        session.select_adapter(&mut state, TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
+        session.broker_settings_mut().ctrader.redirect_uri =
+            "http://localhost:3000/callback".to_string();
+        session.start_ctrader_auth().expect("auth start");
+        session.receive_ctrader_authorization_code("code-123");
+        let connection = session.snapshot(&state);
+        let readiness = session.adapter_readiness();
+        let ctrader_auth = session.ctrader_auth_snapshot();
+
+        let dashboard =
+            build_system_status_dashboard(&state, &connection, &readiness, ctrader_auth.as_ref());
+
+        assert!(dashboard.sections.iter().any(|section| {
+            section.title == "cTrader Auth"
+                && section.rows.iter().any(|(label, value)| {
+                    label == "Authorization Code" && value == "Received"
+                })
         }));
     }
 }

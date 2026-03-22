@@ -39,6 +39,7 @@ pub struct CTraderBrokerSettings {
     pub client_id: String,
     pub client_secret: String,
     pub redirect_uri: String,
+    pub authorization_code_input: String,
     pub accounts: Vec<BrokerAccountTarget>,
 }
 

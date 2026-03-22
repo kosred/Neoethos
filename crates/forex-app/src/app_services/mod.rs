@@ -1,4 +1,5 @@
 pub mod broker_config;
+pub mod ctrader_auth;
 pub mod discovery;
 pub mod jobs;
 pub mod trading;
