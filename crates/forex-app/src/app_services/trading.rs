@@ -210,6 +210,10 @@ impl TradingSession {
         self.connected
     }
 
+    pub fn configured_adapter(&self) -> TradingAdapterKind {
+        self.configured_adapter
+    }
+
     pub fn snapshot(&self, state: &AppState) -> ConnectionSnapshot {
         let mode = panel_mode(state.data_source, self.connected);
         let adapter_kind = self
@@ -362,11 +366,7 @@ impl TradingSession {
                         record_app_event("ui_mt5_connect", "SUCCESS", "UI MT5 connection succeeded");
                     }
                     _ => {
-                        self.connected = false;
-                        self.adapter = None;
-                        self.terminal_info.clear();
-                        self.market_chart_cache = None;
-                        self.execution_surface_cache = None;
+                        self.reset_runtime_state();
                         state.status_msg =
                             "Connection Failed (module missing or terminal closed)".to_string();
                         record_app_event(
@@ -377,11 +377,7 @@ impl TradingSession {
                     }
                 },
                 Err(err) => {
-                    self.connected = false;
-                    self.adapter = None;
-                    self.terminal_info.clear();
-                    self.market_chart_cache = None;
-                    self.execution_surface_cache = None;
+                    self.reset_runtime_state();
                     state.status_msg = format!("Error: {:?}", err);
                     record_app_event(
                         "ui_mt5_connect",
@@ -391,11 +387,7 @@ impl TradingSession {
                 }
             },
             TradingAdapterKind::CTrader | TradingAdapterKind::DxTrade => {
-                self.connected = false;
-                self.adapter = None;
-                self.terminal_info.clear();
-                self.market_chart_cache = None;
-                self.execution_surface_cache = None;
+                self.reset_runtime_state();
                 state.status_msg = format!(
                     "{} adapter is defined but not wired yet",
                     self.configured_adapter.as_str()
@@ -413,13 +405,28 @@ impl TradingSession {
     }
 
     pub fn disconnect(&mut self, state: &mut AppState) {
-        self.adapter = None;
-        self.connected = false;
-        self.terminal_info.clear();
-        self.market_chart_cache = None;
-        self.execution_surface_cache = None;
+        self.reset_runtime_state();
         state.status_msg = "Offline".to_string();
         record_app_event("ui_mt5_disconnect", "SUCCESS", "UI MT5 connection closed");
+    }
+
+    pub fn select_adapter(&mut self, state: &mut AppState, kind: TradingAdapterKind) {
+        let previous = self.active_adapter_kind();
+        self.reset_runtime_state();
+        self.configured_adapter = kind;
+        state.status_msg = match state.data_source {
+            DataSource::Local => "Local Mode".to_string(),
+            DataSource::MT5 => format!("{} selected · disconnected", kind.as_str()),
+        };
+        record_app_event(
+            "ui_adapter_select",
+            "SUCCESS",
+            format!(
+                "selected trading adapter {} (previous {})",
+                kind.as_str(),
+                previous.as_str()
+            ),
+        );
     }
 
     fn overlay_status(&self, state: &AppState) -> String {
@@ -455,6 +462,14 @@ impl TradingSession {
                 },
             },
         }
+    }
+
+    fn reset_runtime_state(&mut self) {
+        self.adapter = None;
+        self.connected = false;
+        self.terminal_info.clear();
+        self.market_chart_cache = None;
+        self.execution_surface_cache = None;
     }
 }
 
@@ -989,5 +1004,19 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("cTrader execution feed is not wired yet")));
+    }
+
+    #[test]
+    fn selecting_adapter_updates_configured_runtime_and_status_message() {
+        let mut state = sample_state(DataSource::MT5, "Offline");
+        let mut session = TradingSession::new();
+
+        session.select_adapter(&mut state, TradingAdapterKind::CTrader);
+        let snapshot = session.snapshot(&state);
+
+        assert_eq!(snapshot.adapter_name, "cTrader");
+        assert_eq!(snapshot.integration_mode, "Remote Open API");
+        assert!(!session.is_connected());
+        assert_eq!(state.status_msg, "cTrader selected · disconnected");
     }
 }

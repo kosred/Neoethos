@@ -73,11 +73,7 @@ impl TabViewer for WorkspaceViewer<'_> {
             }
             WorkspaceTab::System => {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    let refresh = ui::system_status::render(
-                        ui,
-                        self.state,
-                        self.trading_session.is_connected(),
-                    );
+                    let refresh = ui::system_status::render(ui, self.state, self.trading_session);
                     if refresh {
                         self.refresh_requested = true;
                     }

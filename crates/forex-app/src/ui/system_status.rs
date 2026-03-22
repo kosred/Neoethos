@@ -1,4 +1,5 @@
 use crate::app_state::{AppState, DataSource};
+use crate::app_services::trading::{TradingSession, SUPPORTED_TRADING_ADAPTERS};
 use crate::ui::components::{
     render_dashboard_sections, render_summary_cards, render_view_header, DashboardCard,
     DashboardSection,
@@ -11,8 +12,9 @@ struct SystemStatusDashboard {
     sections: Vec<DashboardSection>,
 }
 
-pub fn render(ui: &mut egui::Ui, state: &mut AppState, connected: bool) -> bool {
-    let dashboard = build_system_status_dashboard(state, connected);
+pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSession) -> bool {
+    let snapshot = session.snapshot(state);
+    let dashboard = build_system_status_dashboard(state, &snapshot);
     let mut refresh_requested = false;
 
     render_view_header(
@@ -27,6 +29,17 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, connected: bool) -> bool 
         ui.selectable_value(&mut state.data_source, DataSource::MT5, "MT5");
         ui.selectable_value(&mut state.data_source, DataSource::Local, "Local");
     });
+    ui.add_space(8.0);
+    ui.label("Broker Adapter:");
+    ui.horizontal_wrapped(|ui| {
+        for adapter in SUPPORTED_TRADING_ADAPTERS {
+            let selected = session.configured_adapter() == adapter;
+            if ui.selectable_label(selected, adapter.as_str()).clicked() {
+                session.select_adapter(state, adapter);
+            }
+        }
+    });
+    ui.add_space(8.0);
 
     render_summary_cards(ui, "Runtime Snapshot", &dashboard.summary_cards);
     render_dashboard_sections(ui, "system_status_section", &dashboard.sections);
@@ -38,7 +51,10 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, connected: bool) -> bool 
     refresh_requested
 }
 
-fn build_system_status_dashboard(state: &AppState, connected: bool) -> SystemStatusDashboard {
+fn build_system_status_dashboard(
+    state: &AppState,
+    connection: &crate::app_services::trading::ConnectionSnapshot,
+) -> SystemStatusDashboard {
     let source = match state.data_source {
         DataSource::MT5 => "MT5",
         DataSource::Local => "Local",
@@ -61,6 +77,10 @@ fn build_system_status_dashboard(state: &AppState, connected: bool) -> SystemSta
         DashboardCard {
             label: "Status".to_string(),
             value: state.status_msg.clone(),
+        },
+        DashboardCard {
+            label: "Adapter".to_string(),
+            value: connection.adapter_name.clone(),
         },
         DashboardCard {
             label: "Symbols".to_string(),
@@ -92,6 +112,14 @@ fn build_system_status_dashboard(state: &AppState, connected: bool) -> SystemSta
                     "Disabled".to_string()
                 },
             ),
+            (
+                "Adapter".to_string(),
+                connection.adapter_name.clone(),
+            ),
+            (
+                "Integration".to_string(),
+                connection.integration_mode.clone(),
+            ),
         ],
     }];
 
@@ -111,6 +139,10 @@ fn build_system_status_dashboard(state: &AppState, connected: bool) -> SystemSta
                     "Broker Dependency".to_string(),
                     "None required".to_string(),
                 ),
+                (
+                    "Armed Broker Adapter".to_string(),
+                    connection.adapter_name.clone(),
+                ),
             ],
         }),
         DataSource::MT5 => sections.push(DashboardSection {
@@ -118,22 +150,28 @@ fn build_system_status_dashboard(state: &AppState, connected: bool) -> SystemSta
             rows: vec![
                 (
                     "Connection".to_string(),
-                    if connected {
+                    if connection.connected {
                         "Online".to_string()
                     } else {
                         "Offline".to_string()
                     },
                 ),
                 (
+                    "Adapter".to_string(),
+                    connection.adapter_name.clone(),
+                ),
+                (
                     "Bridge".to_string(),
-                    "MetaTrader5 Python bridge".to_string(),
+                    connection.integration_mode.clone(),
                 ),
                 (
                     "Guidance".to_string(),
-                    if connected {
+                    if connection.connected {
                         "Broker runtime is available".to_string()
-                    } else {
+                    } else if connection.requires_local_terminal {
                         "Use the Trading tab to connect and inspect terminal state".to_string()
+                    } else {
+                        "Remote adapter selected; runtime contract is staged but not wired yet".to_string()
                     },
                 ),
             ],
@@ -149,6 +187,7 @@ fn build_system_status_dashboard(state: &AppState, connected: bool) -> SystemSta
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_services::trading::{TradingAdapterKind, TradingSession};
     use crate::app_state::{AppRuntimeConfig, HardwareState, RiskState};
     use std::path::PathBuf;
 
@@ -175,13 +214,16 @@ mod tests {
     #[test]
     fn system_status_dashboard_describes_local_runtime_capabilities() {
         let state = sample_state(DataSource::Local, "Local Mode");
+        let session = TradingSession::new();
+        let connection = session.snapshot(&state);
 
-        let dashboard = build_system_status_dashboard(&state, false);
+        let dashboard = build_system_status_dashboard(&state, &connection);
 
         assert_eq!(dashboard.summary_cards[0].value, "Local");
         assert_eq!(dashboard.summary_cards[1].value, "Local Runtime");
         assert_eq!(dashboard.summary_cards[2].value, "Local Mode");
-        assert_eq!(dashboard.summary_cards[3].value, "2");
+        assert_eq!(dashboard.summary_cards[3].value, "MT5");
+        assert_eq!(dashboard.summary_cards[4].value, "2");
         assert_eq!(dashboard.sections[0].title, "Runtime");
         assert_eq!(dashboard.sections[1].title, "Capabilities");
         assert!(dashboard.sections[1]
@@ -194,16 +236,40 @@ mod tests {
     #[test]
     fn system_status_dashboard_surfaces_mt5_connectivity_summary() {
         let state = sample_state(DataSource::MT5, "Connected");
+        let session = TradingSession::from_connected_terminal_for_test("TerminalInfo(connected=True)");
+        let connection = session.snapshot(&state);
 
-        let dashboard = build_system_status_dashboard(&state, true);
+        let dashboard = build_system_status_dashboard(&state, &connection);
 
         assert_eq!(dashboard.summary_cards[0].value, "MT5");
         assert_eq!(dashboard.summary_cards[1].value, "Broker Runtime");
         assert_eq!(dashboard.summary_cards[2].value, "Connected");
+        assert_eq!(dashboard.summary_cards[3].value, "MT5");
         assert_eq!(dashboard.sections[1].title, "Broker Status");
         assert!(dashboard.sections[1]
             .rows
             .iter()
             .any(|(label, value)| label == "Connection" && value == "Online"));
+    }
+
+    #[test]
+    fn system_status_dashboard_surfaces_selected_remote_adapter_metadata() {
+        let mut state = sample_state(DataSource::MT5, "Offline");
+        let mut session = TradingSession::new();
+        session.select_adapter(&mut state, TradingAdapterKind::CTrader);
+        let connection = session.snapshot(&state);
+
+        let dashboard = build_system_status_dashboard(&state, &connection);
+
+        assert_eq!(dashboard.summary_cards[3].value, "cTrader");
+        assert!(dashboard.sections[0]
+            .rows
+            .iter()
+            .any(|(label, value)| label == "Integration" && value == "Remote Open API"));
+        assert!(dashboard.sections[1]
+            .rows
+            .iter()
+            .any(|(label, value)| label == "Guidance"
+                && value.contains("Remote adapter selected")));
     }
 }
