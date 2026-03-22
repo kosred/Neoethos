@@ -1,10 +1,15 @@
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CTraderAuthState {
     NotConfigured,
     ReadyToAuthorize,
     AwaitingAuthorizationCode,
+    ListeningForCallback,
     AuthorizationCodeReceived,
+    ExchangingToken,
     AccessTokenReady,
+    RestoredFromStorage,
     AccountsAvailable,
     Failed,
 }
@@ -25,13 +30,26 @@ pub struct CTraderAccountSummary {
     pub enabled_for_execution: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CTraderTokenBundle {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub token_type: String,
+    pub expires_in: i64,
+    pub scope: String,
+    pub created_at_unix: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CTraderAuthSnapshot {
     pub state: CTraderAuthState,
     pub status_line: String,
     pub authorize_url: Option<String>,
+    pub callback_port: Option<u16>,
     pub authorization_code_present: bool,
     pub token_request_ready: bool,
+    pub token_persisted: bool,
+    pub persistence_status: String,
     pub account_count: usize,
     pub enabled_target_count: usize,
 }
@@ -42,7 +60,9 @@ pub struct CTraderAuthSession {
     redirect_uri: String,
     state: CTraderAuthState,
     authorize_url: Option<String>,
+    callback_port: Option<u16>,
     authorization_code: Option<String>,
+    token_bundle: Option<CTraderTokenBundle>,
     accounts: Vec<CTraderAccountSummary>,
 }
 
@@ -61,7 +81,9 @@ impl CTraderAuthSession {
                 CTraderAuthState::NotConfigured
             },
             authorize_url: None,
+            callback_port: None,
             authorization_code: None,
+            token_bundle: None,
             accounts: Vec::new(),
         }
     }
@@ -78,6 +100,11 @@ impl CTraderAuthSession {
         url
     }
 
+    pub fn mark_listening_for_callback(&mut self, callback_port: u16) {
+        self.callback_port = Some(callback_port);
+        self.state = CTraderAuthState::ListeningForCallback;
+    }
+
     pub fn receive_authorization_code(&mut self, code: impl Into<String>) {
         self.authorization_code = Some(code.into());
         self.state = CTraderAuthState::AuthorizationCodeReceived;
@@ -87,6 +114,7 @@ impl CTraderAuthSession {
         &mut self,
         client_secret: impl Into<String>,
     ) -> CTraderTokenExchangeRequest {
+        self.state = CTraderAuthState::ExchangingToken;
         let request = CTraderTokenExchangeRequest {
             grant_type: "authorization_code".to_string(),
             code: self.authorization_code.clone().unwrap_or_default(),
@@ -96,6 +124,11 @@ impl CTraderAuthSession {
         };
         self.state = CTraderAuthState::AccessTokenReady;
         request
+    }
+
+    pub fn restore_from_storage(&mut self, token_bundle: CTraderTokenBundle) {
+        self.token_bundle = Some(token_bundle);
+        self.state = CTraderAuthState::RestoredFromStorage;
     }
 
     pub fn set_accounts(&mut self, accounts: Vec<CTraderAccountSummary>) {
@@ -116,11 +149,20 @@ impl CTraderAuthSession {
                 CTraderAuthState::AwaitingAuthorizationCode => {
                     "Waiting for cTrader authorization code.".to_string()
                 }
+                CTraderAuthState::ListeningForCallback => {
+                    "Listening for cTrader callback.".to_string()
+                }
                 CTraderAuthState::AuthorizationCodeReceived => {
                     "Authorization code received.".to_string()
                 }
+                CTraderAuthState::ExchangingToken => {
+                    "Exchanging cTrader authorization code for tokens.".to_string()
+                }
                 CTraderAuthState::AccessTokenReady => {
                     "Token exchange request is ready.".to_string()
+                }
+                CTraderAuthState::RestoredFromStorage => {
+                    "cTrader session restored from secure storage.".to_string()
                 }
                 CTraderAuthState::AccountsAvailable => {
                     format!("{} cTrader accounts are available.", self.accounts.len())
@@ -128,11 +170,18 @@ impl CTraderAuthSession {
                 CTraderAuthState::Failed => "cTrader auth failed.".to_string(),
             },
             authorize_url: self.authorize_url.clone(),
+            callback_port: self.callback_port,
             authorization_code_present: self.authorization_code.is_some(),
             token_request_ready: matches!(
                 self.state,
-                CTraderAuthState::AccessTokenReady | CTraderAuthState::AccountsAvailable
+                CTraderAuthState::AccessTokenReady | CTraderAuthState::RestoredFromStorage | CTraderAuthState::AccountsAvailable
             ),
+            token_persisted: self.token_bundle.is_some(),
+            persistence_status: if self.token_bundle.is_some() {
+                "Stored securely".to_string()
+            } else {
+                "Not stored".to_string()
+            },
             account_count: self.accounts.len(),
             enabled_target_count: self
                 .accounts
@@ -208,5 +257,36 @@ mod tests {
         assert_eq!(snapshot.state, CTraderAuthState::AccountsAvailable);
         assert_eq!(snapshot.account_count, 2);
         assert_eq!(snapshot.enabled_target_count, 1);
+    }
+
+    #[test]
+    fn listener_state_tracks_callback_port_and_persistence_status() {
+        let mut auth = CTraderAuthSession::new("client-id", "http://localhost:43001/callback");
+        auth.start_authorization("trading");
+
+        auth.mark_listening_for_callback(43001);
+
+        let snapshot = auth.snapshot();
+        assert_eq!(snapshot.state, CTraderAuthState::ListeningForCallback);
+        assert_eq!(snapshot.callback_port, Some(43001));
+        assert_eq!(snapshot.persistence_status, "Not stored");
+    }
+
+    #[test]
+    fn restored_session_snapshot_reports_persisted_token_bundle() {
+        let mut auth = CTraderAuthSession::new("client-id", "http://localhost:43001/callback");
+        auth.restore_from_storage(CTraderTokenBundle {
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            token_type: "bearer".to_string(),
+            expires_in: 3600,
+            scope: "trading".to_string(),
+            created_at_unix: 1_774_147_200,
+        });
+
+        let snapshot = auth.snapshot();
+        assert_eq!(snapshot.state, CTraderAuthState::RestoredFromStorage);
+        assert!(snapshot.token_persisted);
+        assert_eq!(snapshot.persistence_status, "Stored securely");
     }
 }

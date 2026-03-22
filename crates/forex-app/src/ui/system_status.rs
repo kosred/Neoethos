@@ -16,6 +16,7 @@ struct SystemStatusDashboard {
 }
 
 pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSession) -> bool {
+    let _ = session.poll_ctrader_live_auth();
     let snapshot = session.snapshot(state);
     let readiness = session.adapter_readiness();
     let ctrader_auth = session.ctrader_auth_snapshot();
@@ -230,6 +231,16 @@ fn build_system_status_dashboard(
                         "Not ready".to_string()
                     },
                 ),
+                (
+                    "Callback Port".to_string(),
+                    auth.callback_port
+                        .map(|port| port.to_string())
+                        .unwrap_or_else(|| "Unassigned".to_string()),
+                ),
+                (
+                    "Persistence".to_string(),
+                    auth.persistence_status.clone(),
+                ),
                 ("Accounts".to_string(), auth.account_count.to_string()),
             ],
         });
@@ -255,6 +266,9 @@ fn render_adapter_configuration(ui: &mut egui::Ui, session: &mut TradingSession)
                 render_account_targets(ui, &mut settings.accounts, "MT5 Account");
             }
             crate::app_services::trading::TradingAdapterKind::CTrader => {
+                let mut start_live_auth = false;
+                let mut restore_saved_session = false;
+                let mut clear_saved_session = false;
                 let mut start_auth = false;
                 let mut accept_code = false;
                 let mut prepare_token_request = false;
@@ -270,6 +284,17 @@ fn render_adapter_configuration(ui: &mut egui::Ui, session: &mut TradingSession)
                     );
                     let code = settings.authorization_code_input.clone();
                     ui.horizontal(|ui| {
+                        if ui.button("Start cTrader Login").clicked() {
+                            start_live_auth = true;
+                        }
+                        if ui.button("Restore Saved Session").clicked() {
+                            restore_saved_session = true;
+                        }
+                        if ui.button("Clear Saved Session").clicked() {
+                            clear_saved_session = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
                         if ui.button("Start cTrader Auth").clicked() {
                             start_auth = true;
                         }
@@ -284,6 +309,15 @@ fn render_adapter_configuration(ui: &mut egui::Ui, session: &mut TradingSession)
                     code
                 };
 
+                if start_live_auth {
+                    let _ = session.start_ctrader_live_auth();
+                }
+                if restore_saved_session {
+                    let _ = session.restore_ctrader_session();
+                }
+                if clear_saved_session {
+                    let _ = session.clear_ctrader_saved_session();
+                }
                 if start_auth {
                     let _ = session.start_ctrader_auth();
                 }
@@ -527,6 +561,80 @@ mod tests {
             section.title == "cTrader Auth"
                 && section.rows.iter().any(|(label, value)| {
                     label == "Authorization Code" && value == "Received"
+                })
+        }));
+    }
+
+    #[test]
+    fn system_status_dashboard_surfaces_ctrader_live_auth_waiting_state() {
+        let mut state = sample_state(DataSource::MT5, "Offline");
+        let mut session = TradingSession::new();
+        session.select_adapter(&mut state, TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
+        session.broker_settings_mut().ctrader.redirect_uri =
+            "http://127.0.0.1:43001/callback".to_string();
+        session.set_ctrader_store_for_test(
+            crate::app_services::secure_store::MemorySecretStoreBackend::default(),
+        );
+        session.set_ctrader_live_auth_backend_for_test(
+            crate::app_services::ctrader_live_auth::StubCTraderLiveAuthBackend::failure(
+                "delayed for UI state probe",
+            ),
+        );
+        session.start_ctrader_live_auth().expect("live auth start");
+        let connection = session.snapshot(&state);
+        let readiness = session.adapter_readiness();
+        let ctrader_auth = session.ctrader_auth_snapshot();
+
+        let dashboard =
+            build_system_status_dashboard(&state, &connection, &readiness, ctrader_auth.as_ref());
+
+        assert!(dashboard.sections.iter().any(|section| {
+            section.title == "cTrader Auth"
+                && section
+                    .rows
+                    .iter()
+                    .any(|(label, value)| label == "Callback Port" && value == "43001")
+        }));
+    }
+
+    #[test]
+    fn system_status_dashboard_surfaces_ctrader_restored_session_status() {
+        let mut state = sample_state(DataSource::MT5, "Offline");
+        let mut session = TradingSession::new();
+        session.select_adapter(&mut state, TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
+        session.broker_settings_mut().ctrader.redirect_uri =
+            "http://127.0.0.1:43001/callback".to_string();
+        session.set_ctrader_store_for_test(
+            crate::app_services::secure_store::MemorySecretStoreBackend::default(),
+        );
+        session
+            .seed_ctrader_token_bundle_for_test(crate::app_services::ctrader_auth::CTraderTokenBundle {
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                token_type: "bearer".to_string(),
+                expires_in: 3600,
+                scope: "trading".to_string(),
+                created_at_unix: 1_774_147_200,
+            })
+            .expect("seed should succeed");
+        session
+            .restore_ctrader_session()
+            .expect("restore should succeed");
+        let connection = session.snapshot(&state);
+        let readiness = session.adapter_readiness();
+        let ctrader_auth = session.ctrader_auth_snapshot();
+
+        let dashboard =
+            build_system_status_dashboard(&state, &connection, &readiness, ctrader_auth.as_ref());
+
+        assert!(dashboard.sections.iter().any(|section| {
+            section.title == "cTrader Auth"
+                && section.rows.iter().any(|(label, value)| {
+                    label == "Persistence" && value == "Stored securely"
                 })
         }));
     }
