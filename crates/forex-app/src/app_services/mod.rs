@@ -1,3 +1,4 @@
+pub mod broker_config;
 pub mod discovery;
 pub mod jobs;
 pub mod trading;

@@ -14,9 +14,15 @@ pub struct ExecutionPanel {
     pub primary_actions: Vec<String>,
     pub warnings: Vec<String>,
     pub diagnostics: Vec<String>,
+    pub connect_enabled: bool,
+    pub connect_reason: Option<String>,
 }
 
-pub fn build_execution_panel(snapshot: &ExecutionSurfaceSnapshot) -> ExecutionPanel {
+pub fn build_execution_panel(
+    snapshot: &ExecutionSurfaceSnapshot,
+    connect_enabled: bool,
+    connect_reason: Option<String>,
+) -> ExecutionPanel {
     ExecutionPanel {
         symbol: snapshot.symbol.clone(),
         connection_status: snapshot.connection_status.clone(),
@@ -30,12 +36,16 @@ pub fn build_execution_panel(snapshot: &ExecutionSurfaceSnapshot) -> ExecutionPa
             .collect(),
         warnings: snapshot.warnings.clone(),
         diagnostics: snapshot.diagnostics.clone(),
+        connect_enabled,
+        connect_reason,
     }
 }
 
 pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSession) {
     let snapshot = session.execution_surface_snapshot(state);
-    let panel = build_execution_panel(&snapshot);
+    let readiness = session.adapter_readiness();
+    let connect_reason = (!session.is_connected()).then(|| readiness.status_line.clone());
+    let panel = build_execution_panel(&snapshot, session.can_attempt_connect(), connect_reason);
 
     ui.strong(format!("Execution · {}", panel.symbol));
     ui.add_space(8.0);
@@ -114,8 +124,17 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSess
             if ui.button("Disconnect Runtime").clicked() {
                 session.disconnect(state);
             }
-        } else if ui.button("Connect Runtime").clicked() {
-            session.connect(state);
+        } else {
+            let mut response =
+                ui.add_enabled(panel.connect_enabled, egui::Button::new("Connect Runtime"));
+            if let Some(reason) = &panel.connect_reason {
+                if response.hovered() {
+                    response = response.on_hover_text(reason);
+                }
+            }
+            if response.clicked() {
+                session.connect(state);
+            }
         }
     }
 
@@ -158,7 +177,7 @@ mod tests {
         let state = sample_state();
         let mut session = TradingSession::new();
         let snapshot = session.execution_surface_snapshot(&state);
-        let panel = build_execution_panel(&snapshot);
+        let panel = build_execution_panel(&snapshot, true, None);
 
         assert!(panel.primary_actions.contains(&"Buy".to_string()));
         assert!(panel.primary_actions.contains(&"Sell".to_string()));
@@ -168,5 +187,27 @@ mod tests {
             .diagnostics
             .iter()
             .any(|line| line.contains("positions/orders feed is not wired yet")));
+    }
+
+    #[test]
+    fn execution_panel_disables_connect_until_remote_credentials_are_ready() {
+        let state = sample_state();
+        let mut session =
+            crate::app_services::trading::TradingSession::with_configured_adapter_for_test(
+                crate::app_services::trading::TradingAdapterKind::CTrader,
+            );
+        let snapshot = session.execution_surface_snapshot(&state);
+        let readiness = session.adapter_readiness();
+        let panel = build_execution_panel(
+            &snapshot,
+            readiness.can_attempt_connect,
+            Some(readiness.status_line.clone()),
+        );
+
+        assert!(!panel.connect_enabled);
+        assert_eq!(
+            panel.connect_reason.as_deref(),
+            Some("cTrader configuration incomplete: missing client_id, client_secret, redirect_uri")
+        );
     }
 }

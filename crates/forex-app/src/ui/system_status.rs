@@ -1,9 +1,11 @@
 use crate::app_state::{AppState, DataSource};
+use crate::app_services::broker_config::{AdapterReadinessSnapshot, BrokerAccountTarget};
 use crate::app_services::trading::{TradingSession, SUPPORTED_TRADING_ADAPTERS};
 use crate::ui::components::{
     render_dashboard_sections, render_summary_cards, render_view_header, DashboardCard,
     DashboardSection,
 };
+use crate::ui::theme;
 use eframe::egui;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -14,7 +16,8 @@ struct SystemStatusDashboard {
 
 pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSession) -> bool {
     let snapshot = session.snapshot(state);
-    let dashboard = build_system_status_dashboard(state, &snapshot);
+    let readiness = session.adapter_readiness();
+    let dashboard = build_system_status_dashboard(state, &snapshot, &readiness);
     let mut refresh_requested = false;
 
     render_view_header(
@@ -41,6 +44,9 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSess
     });
     ui.add_space(8.0);
 
+    render_adapter_configuration(ui, session);
+    ui.add_space(8.0);
+
     render_summary_cards(ui, "Runtime Snapshot", &dashboard.summary_cards);
     render_dashboard_sections(ui, "system_status_section", &dashboard.sections);
 
@@ -54,6 +60,7 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSess
 fn build_system_status_dashboard(
     state: &AppState,
     connection: &crate::app_services::trading::ConnectionSnapshot,
+    readiness: &AdapterReadinessSnapshot,
 ) -> SystemStatusDashboard {
     let source = match state.data_source {
         DataSource::MT5 => "MT5",
@@ -81,6 +88,10 @@ fn build_system_status_dashboard(
         DashboardCard {
             label: "Adapter".to_string(),
             value: connection.adapter_name.clone(),
+        },
+        DashboardCard {
+            label: "Readiness".to_string(),
+            value: readiness.status_line.clone(),
         },
         DashboardCard {
             label: "Symbols".to_string(),
@@ -119,6 +130,14 @@ fn build_system_status_dashboard(
             (
                 "Integration".to_string(),
                 connection.integration_mode.clone(),
+            ),
+            (
+                "Readiness".to_string(),
+                readiness.status_line.clone(),
+            ),
+            (
+                "Execution Targets".to_string(),
+                format!("{} enabled", readiness.target_count),
             ),
         ],
     }];
@@ -184,6 +203,72 @@ fn build_system_status_dashboard(
     }
 }
 
+fn render_adapter_configuration(ui: &mut egui::Ui, session: &mut TradingSession) {
+    theme::section_frame(ui.style()).show(ui, |ui| {
+        ui.strong("Adapter Configuration");
+        ui.add_space(6.0);
+
+        match session.configured_adapter() {
+            crate::app_services::trading::TradingAdapterKind::Mt5 => {
+                let settings = &mut session.broker_settings_mut().mt5;
+                labeled_text_edit(ui, "Terminal Path", &mut settings.terminal_path);
+                labeled_text_edit(ui, "Server", &mut settings.server);
+                labeled_text_edit(ui, "Login", &mut settings.login);
+                render_account_targets(ui, &mut settings.accounts, "MT5 Account");
+            }
+            crate::app_services::trading::TradingAdapterKind::CTrader => {
+                let settings = &mut session.broker_settings_mut().ctrader;
+                labeled_text_edit(ui, "Client ID", &mut settings.client_id);
+                labeled_text_edit(ui, "Client Secret", &mut settings.client_secret);
+                labeled_text_edit(ui, "Redirect URI", &mut settings.redirect_uri);
+                render_account_targets(ui, &mut settings.accounts, "cTrader Account");
+            }
+            crate::app_services::trading::TradingAdapterKind::DxTrade => {
+                let settings = &mut session.broker_settings_mut().dxtrade;
+                labeled_text_edit(ui, "Platform URL", &mut settings.platform_url);
+                labeled_text_edit(ui, "Username", &mut settings.username);
+                labeled_text_edit(ui, "Password", &mut settings.password);
+                render_account_targets(ui, &mut settings.accounts, "DXtrade Account");
+            }
+        }
+    });
+}
+
+fn labeled_text_edit(ui: &mut egui::Ui, label: &str, value: &mut String) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.add_sized(
+            [ui.available_width().max(200.0), 24.0],
+            egui::TextEdit::singleline(value),
+        );
+    });
+}
+
+fn render_account_targets(
+    ui: &mut egui::Ui,
+    accounts: &mut Vec<BrokerAccountTarget>,
+    default_prefix: &str,
+) {
+    ui.add_space(6.0);
+    ui.strong("Execution Targets");
+    for (idx, account) in accounts.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut account.enabled_for_execution, "");
+            ui.label(format!("Target {}", idx + 1));
+            ui.add_sized([120.0, 24.0], egui::TextEdit::singleline(&mut account.account_id));
+            ui.add_sized([160.0, 24.0], egui::TextEdit::singleline(&mut account.label));
+        });
+    }
+    if ui.button("+ Add Account Target").clicked() {
+        let next = accounts.len() + 1;
+        accounts.push(BrokerAccountTarget {
+            account_id: String::new(),
+            label: format!("{default_prefix} {next}"),
+            enabled_for_execution: false,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,14 +301,15 @@ mod tests {
         let state = sample_state(DataSource::Local, "Local Mode");
         let session = TradingSession::new();
         let connection = session.snapshot(&state);
+        let readiness = session.adapter_readiness();
 
-        let dashboard = build_system_status_dashboard(&state, &connection);
+        let dashboard = build_system_status_dashboard(&state, &connection, &readiness);
 
         assert_eq!(dashboard.summary_cards[0].value, "Local");
         assert_eq!(dashboard.summary_cards[1].value, "Local Runtime");
         assert_eq!(dashboard.summary_cards[2].value, "Local Mode");
         assert_eq!(dashboard.summary_cards[3].value, "MT5");
-        assert_eq!(dashboard.summary_cards[4].value, "2");
+        assert_eq!(dashboard.summary_cards[5].value, "2");
         assert_eq!(dashboard.sections[0].title, "Runtime");
         assert_eq!(dashboard.sections[1].title, "Capabilities");
         assert!(dashboard.sections[1]
@@ -238,13 +324,15 @@ mod tests {
         let state = sample_state(DataSource::MT5, "Connected");
         let session = TradingSession::from_connected_terminal_for_test("TerminalInfo(connected=True)");
         let connection = session.snapshot(&state);
+        let readiness = session.adapter_readiness();
 
-        let dashboard = build_system_status_dashboard(&state, &connection);
+        let dashboard = build_system_status_dashboard(&state, &connection, &readiness);
 
         assert_eq!(dashboard.summary_cards[0].value, "MT5");
         assert_eq!(dashboard.summary_cards[1].value, "Broker Runtime");
         assert_eq!(dashboard.summary_cards[2].value, "Connected");
         assert_eq!(dashboard.summary_cards[3].value, "MT5");
+        assert_eq!(dashboard.summary_cards[4].value, "MT5 connected.");
         assert_eq!(dashboard.sections[1].title, "Broker Status");
         assert!(dashboard.sections[1]
             .rows
@@ -258,10 +346,14 @@ mod tests {
         let mut session = TradingSession::new();
         session.select_adapter(&mut state, TradingAdapterKind::CTrader);
         let connection = session.snapshot(&state);
+        let readiness = session.adapter_readiness();
 
-        let dashboard = build_system_status_dashboard(&state, &connection);
+        let dashboard = build_system_status_dashboard(&state, &connection, &readiness);
 
         assert_eq!(dashboard.summary_cards[3].value, "cTrader");
+        assert!(dashboard.summary_cards[4]
+            .value
+            .contains("configuration incomplete"));
         assert!(dashboard.sections[0]
             .rows
             .iter()
@@ -271,5 +363,41 @@ mod tests {
             .iter()
             .any(|(label, value)| label == "Guidance"
                 && value.contains("Remote adapter selected")));
+    }
+
+    #[test]
+    fn system_status_dashboard_surfaces_remote_readiness_and_target_counts() {
+        let mut state = sample_state(DataSource::MT5, "Offline");
+        let mut session = TradingSession::new();
+        session.select_adapter(&mut state, TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
+        session.broker_settings_mut().ctrader.redirect_uri =
+            "http://localhost:3000/callback".to_string();
+        session
+            .broker_settings_mut()
+            .ctrader
+            .accounts
+            .push(crate::app_services::broker_config::BrokerAccountTarget {
+                account_id: "acct-1".to_string(),
+                label: "Primary".to_string(),
+                enabled_for_execution: true,
+            });
+        let connection = session.snapshot(&state);
+        let readiness = session.adapter_readiness();
+
+        let dashboard = build_system_status_dashboard(&state, &connection, &readiness);
+
+        assert!(dashboard.sections.iter().any(|section| {
+            section.rows.iter().any(|(label, value)| {
+                label == "Readiness" && value.contains("OAuth app credentials ready")
+            })
+        }));
+        assert!(dashboard.sections.iter().any(|section| {
+            section
+                .rows
+                .iter()
+                .any(|(label, value)| label == "Execution Targets" && value == "1 enabled")
+        }));
     }
 }

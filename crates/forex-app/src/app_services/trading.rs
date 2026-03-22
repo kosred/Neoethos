@@ -1,4 +1,7 @@
 use crate::app_record;
+use crate::app_services::broker_config::{
+    AdapterReadinessSnapshot, BrokerSessionState, BrokerSettingsState,
+};
 use crate::app_state::{AppState, DataSource};
 use forex_data::{discover_timeframes, load_symbol_timeframe, Ohlcv};
 use forex_core::logging::write_subsystem_record;
@@ -132,6 +135,7 @@ pub struct BrokerExecutionSnapshot {
 
 pub struct TradingSession {
     configured_adapter: TradingAdapterKind,
+    broker_settings: BrokerSettingsState,
     adapter: Option<TradingAdapter>,
     connected: bool,
     terminal_info: String,
@@ -186,6 +190,7 @@ impl TradingSession {
     pub fn from_connected_terminal_for_test(terminal_info: impl Into<String>) -> Self {
         Self {
             configured_adapter: TradingAdapterKind::Mt5,
+            broker_settings: BrokerSettingsState::default(),
             adapter: None,
             connected: true,
             terminal_info: terminal_info.into(),
@@ -198,6 +203,7 @@ impl TradingSession {
     pub fn with_configured_adapter_for_test(kind: TradingAdapterKind) -> Self {
         Self {
             configured_adapter: kind,
+            broker_settings: BrokerSettingsState::default(),
             adapter: None,
             connected: false,
             terminal_info: String::new(),
@@ -212,6 +218,24 @@ impl TradingSession {
 
     pub fn configured_adapter(&self) -> TradingAdapterKind {
         self.configured_adapter
+    }
+
+    pub fn broker_settings_mut(&mut self) -> &mut BrokerSettingsState {
+        &mut self.broker_settings
+    }
+
+    pub fn adapter_readiness(&self) -> AdapterReadinessSnapshot {
+        let mut readiness = self.broker_settings.readiness(self.configured_adapter);
+        if self.connected {
+            readiness.session_state = BrokerSessionState::Authenticated;
+            readiness.status_line = format!("{} connected.", self.active_adapter_kind().as_str());
+            readiness.can_attempt_connect = false;
+        }
+        readiness
+    }
+
+    pub fn can_attempt_connect(&self) -> bool {
+        self.adapter_readiness().can_attempt_connect
     }
 
     pub fn snapshot(&self, state: &AppState) -> ConnectionSnapshot {
@@ -349,6 +373,7 @@ impl TradingSession {
     }
 
     pub fn connect(&mut self, state: &mut AppState) {
+        let readiness = self.adapter_readiness();
         match self.configured_adapter {
             TradingAdapterKind::Mt5 => match MT5Engine::new() {
                 Ok(mut engine) => match engine.initialize() {
@@ -388,18 +413,33 @@ impl TradingSession {
             },
             TradingAdapterKind::CTrader | TradingAdapterKind::DxTrade => {
                 self.reset_runtime_state();
-                state.status_msg = format!(
-                    "{} adapter is defined but not wired yet",
-                    self.configured_adapter.as_str()
-                );
-                record_app_event(
-                    "ui_adapter_connect",
-                    "DEGRADED",
-                    format!(
-                        "{} adapter requested but not wired yet",
+                if !readiness.can_attempt_connect {
+                    let mut failed_readiness = readiness;
+                    failed_readiness.session_state = BrokerSessionState::Failed;
+                    state.status_msg = failed_readiness.status_line.clone();
+                    record_app_event(
+                        "ui_adapter_connect",
+                        "FAILED",
+                        format!(
+                            "{} connect blocked: {}",
+                            self.configured_adapter.as_str(),
+                            failed_readiness.status_line
+                        ),
+                    );
+                } else {
+                    state.status_msg = format!(
+                        "{} credentials ready · live auth is not wired yet",
                         self.configured_adapter.as_str()
-                    ),
-                );
+                    );
+                    record_app_event(
+                        "ui_adapter_connect",
+                        "DEGRADED",
+                        format!(
+                            "{} credentials ready but live auth is not wired yet",
+                            self.configured_adapter.as_str()
+                        ),
+                    );
+                }
             }
         }
     }
@@ -477,6 +517,7 @@ impl Default for TradingSession {
     fn default() -> Self {
         Self {
             configured_adapter: TradingAdapterKind::Mt5,
+            broker_settings: BrokerSettingsState::default(),
             adapter: None,
             connected: false,
             terminal_info: String::new(),
@@ -1018,5 +1059,37 @@ mod tests {
         assert_eq!(snapshot.integration_mode, "Remote Open API");
         assert!(!session.is_connected());
         assert_eq!(state.status_msg, "cTrader selected · disconnected");
+    }
+
+    #[test]
+    fn connect_sets_missing_credentials_status_for_unready_remote_adapter() {
+        let mut state = sample_state(DataSource::MT5, "Offline");
+        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+
+        session.connect(&mut state);
+
+        assert_eq!(
+            state.status_msg,
+            "cTrader configuration incomplete: missing client_id, client_secret, redirect_uri"
+        );
+        assert!(!session.is_connected());
+    }
+
+    #[test]
+    fn connect_marks_ready_remote_adapter_as_auth_pending_until_live_wiring_exists() {
+        let mut state = sample_state(DataSource::MT5, "Offline");
+        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
+        session.broker_settings_mut().ctrader.redirect_uri =
+            "http://localhost:3000/callback".to_string();
+
+        session.connect(&mut state);
+
+        assert_eq!(
+            state.status_msg,
+            "cTrader credentials ready · live auth is not wired yet"
+        );
+        assert!(!session.is_connected());
     }
 }
