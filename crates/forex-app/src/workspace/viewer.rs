@@ -62,7 +62,9 @@ impl TabViewer for WorkspaceViewer<'_> {
                 ui::trading::execution_panel::render(ui, self.state, self.trading_session)
             }
             WorkspaceTab::News => ui::trading::news_panel::render(ui, self.state),
-            WorkspaceTab::BottomStrip => ui::trading::bottom_strip::render(ui, self.state),
+            WorkspaceTab::BottomStrip => {
+                ui::trading::bottom_strip::render(ui, self.state, self.trading_session)
+            }
             WorkspaceTab::Discovery => {
                 ui::discovery::render(ui, self.state, self.tx, self.discovery_handle)
             }
