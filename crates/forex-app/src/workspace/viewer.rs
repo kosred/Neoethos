@@ -52,7 +52,9 @@ impl TabViewer for WorkspaceViewer<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         match tab {
-            WorkspaceTab::Chart => ui::trading::chart_panel::render(ui, self.state),
+            WorkspaceTab::Chart => {
+                ui::trading::chart_panel::render(ui, self.state, self.trading_session)
+            }
             WorkspaceTab::Watchlist => {
                 ui::trading::watchlist_panel::render(ui, self.state, self.trading_session)
             }

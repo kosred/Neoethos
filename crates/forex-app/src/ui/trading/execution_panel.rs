@@ -1,6 +1,4 @@
-use crate::app_services::trading::{
-    TradingPanelMode, TradingSession, SUPPORTED_TRADING_ADAPTERS,
-};
+use crate::app_services::trading::{build_execution_surface_snapshot, ExecutionSurfaceSnapshot, TradingSession};
 use crate::app_state::AppState;
 use crate::ui::components::open_log;
 use crate::ui::theme;
@@ -8,72 +6,116 @@ use eframe::egui;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionPanel {
+    pub symbol: String,
     pub connection_status: String,
     pub adapter_name: String,
     pub integration_mode: String,
     pub supported_adapters: Vec<String>,
     pub primary_actions: Vec<String>,
+    pub warnings: Vec<String>,
+    pub diagnostics: Vec<String>,
 }
 
-pub fn build_execution_panel(state: &AppState, session: &TradingSession) -> ExecutionPanel {
-    let snapshot = session.snapshot(state);
+pub fn build_execution_panel(snapshot: &ExecutionSurfaceSnapshot) -> ExecutionPanel {
     ExecutionPanel {
-        connection_status: snapshot.status_text,
-        adapter_name: snapshot.adapter_name,
-        integration_mode: snapshot.integration_mode,
-        supported_adapters: SUPPORTED_TRADING_ADAPTERS
+        symbol: snapshot.symbol.clone(),
+        connection_status: snapshot.connection_status.clone(),
+        adapter_name: snapshot.adapter_name.clone(),
+        integration_mode: snapshot.integration_mode.clone(),
+        supported_adapters: snapshot.supported_adapters.clone(),
+        primary_actions: snapshot
+            .primary_actions
             .iter()
-            .map(|kind| kind.as_str().to_string())
+            .map(|action| action.label.clone())
             .collect(),
-        primary_actions: vec!["Buy".to_string(), "Sell".to_string()],
+        warnings: snapshot.warnings.clone(),
+        diagnostics: snapshot.diagnostics.clone(),
     }
 }
 
 pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSession) {
-    let panel = build_execution_panel(state, session);
-    let snapshot = session.snapshot(state);
+    let snapshot = build_execution_surface_snapshot(state, session);
+    let panel = build_execution_panel(&snapshot);
 
-    ui.strong("Execution");
+    ui.strong(format!("Execution · {}", panel.symbol));
     ui.add_space(8.0);
     ui.label(egui::RichText::new(format!("Adapter: {}", panel.adapter_name)).color(theme::TEXT_MUTED));
-    ui.label(egui::RichText::new(format!("Integration: {}", panel.integration_mode)).color(theme::TEXT_MUTED));
-    ui.label(egui::RichText::new(format!("Status: {}", panel.connection_status)).color(theme::TEXT_MUTED));
     ui.label(
-        egui::RichText::new(format!(
-            "Supported: {}",
-            panel.supported_adapters.join(", ")
-        ))
-        .color(theme::TEXT_MUTED),
+        egui::RichText::new(format!("Integration: {}", panel.integration_mode)).color(theme::TEXT_MUTED),
+    );
+    ui.label(
+        egui::RichText::new(format!("Status: {}", panel.connection_status)).color(theme::TEXT_MUTED),
+    );
+    ui.label(
+        egui::RichText::new(format!("Supported: {}", panel.supported_adapters.join(", ")))
+            .color(theme::TEXT_MUTED),
     );
     ui.add_space(8.0);
 
     ui.horizontal(|ui| {
-        ui.add_sized(
-            [ui.available_width() / 2.0 - 4.0, 34.0],
-            egui::Button::new(egui::RichText::new("Buy").color(theme::TEXT_PRIMARY))
-                .fill(theme::SUCCESS.linear_multiply(0.45)),
-        );
-        ui.add_sized(
-            [ui.available_width(), 34.0],
-            egui::Button::new(egui::RichText::new("Sell").color(theme::TEXT_PRIMARY))
-                .fill(theme::DANGER.linear_multiply(0.45)),
-        );
+        for (idx, action) in snapshot.primary_actions.iter().enumerate() {
+            let width = if idx == 0 {
+                ui.available_width() / 2.0 - 4.0
+            } else {
+                ui.available_width()
+            };
+            let fill = if action.label == "Buy" {
+                theme::SUCCESS.linear_multiply(0.45)
+            } else {
+                theme::DANGER.linear_multiply(0.45)
+            };
+            let response = ui.add_enabled(
+                action.enabled,
+                egui::Button::new(egui::RichText::new(&action.label).color(theme::TEXT_PRIMARY))
+                    .fill(fill)
+                    .min_size(egui::vec2(width, 34.0)),
+            );
+            if response.hovered() {
+                if let Some(reason) = &action.reason {
+                    response.on_hover_text(reason);
+                }
+            }
+        }
     });
 
     ui.add_space(8.0);
-    match snapshot.mode {
-        TradingPanelMode::Disconnected => {
-            if ui.button("Connect Runtime").clicked() {
-                session.connect(state);
+    if !snapshot.positions.is_empty() || !snapshot.pending_orders.is_empty() {
+        ui.label(
+            egui::RichText::new(format!(
+                "Positions: {} · Pending Orders: {}",
+                snapshot.positions.len(),
+                snapshot.pending_orders.len()
+            ))
+            .color(theme::TEXT_MUTED),
+        );
+    }
+
+    for warning in &panel.warnings {
+        ui.label(egui::RichText::new(warning).color(theme::WARNING));
+    }
+
+    if !panel.diagnostics.is_empty() {
+        ui.add_space(8.0);
+        theme::section_frame(ui.style()).show(ui, |ui| {
+            ui.strong("Diagnostics");
+            ui.add_space(6.0);
+            for line in &panel.diagnostics {
+                ui.label(egui::RichText::new(line).color(theme::TEXT_MUTED));
             }
-        }
-        TradingPanelMode::Connected => {
+        });
+    }
+
+    ui.add_space(8.0);
+    if snapshot.connection_status == "Local Mode" {
+        ui.label(egui::RichText::new("Execution remains disabled in Local mode.").color(theme::WARNING));
+    }
+    if snapshot.connection_status != "Local Mode" {
+        if session.is_connected() {
             if ui.button("Disconnect Runtime").clicked() {
                 session.disconnect(state);
             }
-        }
-        TradingPanelMode::LocalOnly => {
-            ui.label(egui::RichText::new("Execution remains disabled in Local mode.").color(theme::WARNING));
+        } else if ui.button("Connect Runtime").clicked() {
+            session.connect(state);
         }
     }
 
@@ -101,6 +143,7 @@ mod tests {
             data_source: DataSource::MT5,
             status_msg: "Offline".to_string(),
             selected_pair: "EURUSD".to_string(),
+            chart_timeframe: "M1".to_string(),
             available_symbols: vec!["EURUSD".to_string()],
             discovery_job: None,
             training_job: None,
@@ -111,14 +154,19 @@ mod tests {
     }
 
     #[test]
-    fn execution_panel_surfaces_primary_actions_and_runtime_summary() {
+    fn execution_panel_surfaces_primary_actions_runtime_summary_and_warnings() {
         let state = sample_state();
         let session = TradingSession::new();
-        let panel = build_execution_panel(&state, &session);
+        let snapshot = build_execution_surface_snapshot(&state, &session);
+        let panel = build_execution_panel(&snapshot);
 
         assert!(panel.primary_actions.contains(&"Buy".to_string()));
         assert!(panel.primary_actions.contains(&"Sell".to_string()));
         assert!(panel.supported_adapters.contains(&"cTrader".to_string()));
         assert_eq!(panel.connection_status, "Offline");
+        assert!(panel
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("positions/orders feed is not wired yet")));
     }
 }

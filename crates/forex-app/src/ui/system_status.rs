@@ -162,6 +162,7 @@ mod tests {
             data_source: source,
             status_msg: status_msg.to_string(),
             selected_pair: "EURUSD".to_string(),
+            chart_timeframe: "M1".to_string(),
             available_symbols: vec!["EURUSD".to_string(), "GBPUSD".to_string()],
             discovery_job: None,
             training_job: None,

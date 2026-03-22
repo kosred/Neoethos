@@ -66,6 +66,7 @@ mod tests {
             data_source: DataSource::MT5,
             status_msg: "Offline".to_string(),
             selected_pair: "EURUSD".to_string(),
+            chart_timeframe: "M1".to_string(),
             available_symbols: vec!["EURUSD".to_string(), "GBPUSD".to_string(), "XAUUSD".to_string()],
             discovery_job: None,
             training_job: None,

@@ -31,6 +31,7 @@ pub struct AppState {
     pub data_source: DataSource,
     pub status_msg: String,
     pub selected_pair: String,
+    pub chart_timeframe: String,
     pub available_symbols: Vec<String>,
     pub discovery_job: Option<JobSnapshot>,
     pub training_job: Option<JobSnapshot>,
@@ -60,6 +61,7 @@ impl AppState {
             canonical_log_path: canonical_log_path(),
             runtime,
             selected_pair,
+            chart_timeframe: "M1".to_string(),
             available_symbols,
             discovery_job: None,
             training_job: None,
@@ -126,6 +128,7 @@ mod tests {
         let state = AppState::new(runtime, vec!["GBPUSD".to_string(), "EURUSD".to_string()]);
 
         assert_eq!(state.selected_pair, "GBPUSD");
+        assert_eq!(state.chart_timeframe, "M1");
         assert!(state.discovery_job.is_none());
         assert!(state.training_job.is_none());
         assert_eq!(state.canonical_log_path, PathBuf::from("logs").join("forex-ai.log"));
@@ -146,6 +149,7 @@ mod tests {
         let state = AppState::new(runtime, Vec::new());
 
         assert_eq!(state.selected_pair, "EURUSD");
+        assert_eq!(state.chart_timeframe, "M1");
         assert_eq!(state.status_msg, "Offline");
     }
 
