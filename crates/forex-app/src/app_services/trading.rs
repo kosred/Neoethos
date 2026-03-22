@@ -172,6 +172,11 @@ struct CachedExecutionSnapshot {
     snapshot: ExecutionSurfaceSnapshot,
 }
 
+enum ExecutionFeedHandle<'a> {
+    Mt5(&'a MT5Engine),
+    Unavailable { reason: String },
+}
+
 impl TradingSession {
     pub fn new() -> Self {
         Self::default()
@@ -302,11 +307,7 @@ impl TradingSession {
 
     pub fn execution_surface_snapshot(&mut self, state: &AppState) -> ExecutionSurfaceSnapshot {
         let connection = self.snapshot(state);
-        let adapter_kind = self
-            .adapter
-            .as_ref()
-            .map(TradingAdapter::kind)
-            .unwrap_or(self.configured_adapter);
+        let adapter_kind = self.active_adapter_kind();
         let cache_key = ExecutionSnapshotCacheKey {
             data_source: state.data_source,
             symbol: state.selected_pair.clone(),
@@ -321,18 +322,12 @@ impl TradingSession {
         }
 
         let mut runtime_warnings = Vec::new();
-        let runtime = match (&self.adapter, state.data_source, self.connected) {
-            (Some(TradingAdapter::Mt5(engine)), DataSource::MT5, true) => {
-                match broker_execution_snapshot_from_mt5(engine, Some(&state.selected_pair), 24) {
-                    Ok(snapshot) => Some(snapshot),
-                    Err(err) => {
-                        runtime_warnings
-                            .push(format!("Failed to load MT5 execution feed: {err}"));
-                        None
-                    }
-                }
+        let runtime = match self.execution_feed_handle(state).load_runtime_snapshot(&state.selected_pair, 24) {
+            Ok(snapshot) => Some(snapshot),
+            Err(err) => {
+                runtime_warnings.push(err.to_string());
+                None
             }
-            _ => None,
         };
 
         let snapshot = build_execution_surface_snapshot_with_runtime(
@@ -440,6 +435,27 @@ impl TradingSession {
             }
         }
     }
+
+    fn active_adapter_kind(&self) -> TradingAdapterKind {
+        self.adapter
+            .as_ref()
+            .map(TradingAdapter::kind)
+            .unwrap_or(self.configured_adapter)
+    }
+
+    fn execution_feed_handle(&self, state: &AppState) -> ExecutionFeedHandle<'_> {
+        match state.data_source {
+            DataSource::Local => ExecutionFeedHandle::Unavailable {
+                reason: "Execution feed is unavailable in Local mode.".to_string(),
+            },
+            DataSource::MT5 => match &self.adapter {
+                Some(TradingAdapter::Mt5(engine)) if self.connected => ExecutionFeedHandle::Mt5(engine),
+                _ => ExecutionFeedHandle::Unavailable {
+                    reason: self.active_adapter_kind().execution_feed_unavailable_reason(self.connected),
+                },
+            },
+        }
+    }
 }
 
 impl Default for TradingSession {
@@ -465,6 +481,19 @@ impl TradingAdapter {
     fn terminal_info(&self) -> String {
         match self {
             Self::Mt5(engine) => engine.terminal_info().unwrap_or_default(),
+        }
+    }
+}
+
+impl TradingAdapterKind {
+    fn execution_feed_unavailable_reason(self, connected: bool) -> String {
+        match self {
+            Self::Mt5 if !connected => {
+                "MT5 execution feed is unavailable until the local terminal connects.".to_string()
+            }
+            Self::Mt5 => "MT5 execution feed is currently unavailable.".to_string(),
+            Self::CTrader => "cTrader execution feed is not wired yet.".to_string(),
+            Self::DxTrade => "DXtrade execution feed is not wired yet.".to_string(),
         }
     }
 }
@@ -663,6 +692,19 @@ fn broker_execution_snapshot_from_mt5(
         pending_orders: engine.orders(symbol)?,
         recent_deals: engine.recent_deals(symbol, lookback_hours)?,
     })
+}
+
+impl ExecutionFeedHandle<'_> {
+    fn load_runtime_snapshot(
+        &self,
+        symbol: &str,
+        lookback_hours: i64,
+    ) -> anyhow::Result<BrokerExecutionSnapshot> {
+        match self {
+            Self::Mt5(engine) => broker_execution_snapshot_from_mt5(engine, Some(symbol), lookback_hours),
+            Self::Unavailable { reason } => Err(anyhow::anyhow!(reason.clone())),
+        }
+    }
 }
 
 fn format_position_line(position: &PositionInfo) -> String {
@@ -934,5 +976,18 @@ mod tests {
             .iter()
             .any(|line| line.contains("IN BUY 0.15")));
         assert!(snapshot.warnings.is_empty());
+    }
+
+    #[test]
+    fn execution_surface_snapshot_surfaces_adapter_specific_unwired_feed_reason() {
+        let state = sample_state(DataSource::MT5, "Offline");
+        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+
+        let snapshot = session.execution_surface_snapshot(&state);
+
+        assert!(snapshot
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("cTrader execution feed is not wired yet")));
     }
 }
