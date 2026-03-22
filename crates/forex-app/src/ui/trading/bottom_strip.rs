@@ -1,6 +1,4 @@
-use crate::app_services::trading::{
-    build_execution_surface_snapshot, ExecutionSurfaceSnapshot, TradingSession,
-};
+use crate::app_services::trading::{ExecutionSurfaceSnapshot, TradingSession};
 use crate::app_state::AppState;
 use crate::ui::theme;
 use eframe::egui;
@@ -52,8 +50,8 @@ pub fn build_bottom_strip(snapshot: &ExecutionSurfaceSnapshot) -> BottomStripPan
     }
 }
 
-pub fn render(ui: &mut egui::Ui, state: &AppState, session: &TradingSession) {
-    let snapshot = build_execution_surface_snapshot(state, session);
+pub fn render(ui: &mut egui::Ui, state: &AppState, session: &mut TradingSession) {
+    let snapshot = session.execution_surface_snapshot(state);
     let panel = build_bottom_strip(&snapshot);
 
     ui.columns(panel.sections.len(), |columns| {

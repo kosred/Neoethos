@@ -3,8 +3,9 @@ use crate::app_state::{AppState, DataSource};
 use forex_data::{discover_timeframes, load_symbol_timeframe, Ohlcv};
 use forex_core::logging::write_subsystem_record;
 use forex_core::sectioned_log::SubsystemSection;
-use mt5_bridge::MT5Engine;
+use mt5_bridge::{DealInfo, MT5Engine, PendingOrderInfo, PositionInfo};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use tracing::error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,12 +123,20 @@ pub struct ExecutionSurfaceSnapshot {
     pub bot_timeline: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrokerExecutionSnapshot {
+    pub positions: Vec<PositionInfo>,
+    pub pending_orders: Vec<PendingOrderInfo>,
+    pub recent_deals: Vec<DealInfo>,
+}
+
 pub struct TradingSession {
     configured_adapter: TradingAdapterKind,
     adapter: Option<TradingAdapter>,
     connected: bool,
     terminal_info: String,
     market_chart_cache: Option<CachedMarketSnapshot>,
+    execution_surface_cache: Option<CachedExecutionSnapshot>,
 }
 
 enum TradingAdapter {
@@ -148,6 +157,21 @@ struct CachedMarketSnapshot {
     snapshot: MarketChartSnapshot,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExecutionSnapshotCacheKey {
+    data_source: DataSource,
+    symbol: String,
+    adapter_kind: TradingAdapterKind,
+    connected: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CachedExecutionSnapshot {
+    key: ExecutionSnapshotCacheKey,
+    refreshed_at: Instant,
+    snapshot: ExecutionSurfaceSnapshot,
+}
+
 impl TradingSession {
     pub fn new() -> Self {
         Self::default()
@@ -161,6 +185,7 @@ impl TradingSession {
             connected: true,
             terminal_info: terminal_info.into(),
             market_chart_cache: None,
+            execution_surface_cache: None,
         }
     }
 
@@ -172,6 +197,7 @@ impl TradingSession {
             connected: false,
             terminal_info: String::new(),
             market_chart_cache: None,
+            execution_surface_cache: None,
         }
     }
 
@@ -274,6 +300,55 @@ impl TradingSession {
         snapshot
     }
 
+    pub fn execution_surface_snapshot(&mut self, state: &AppState) -> ExecutionSurfaceSnapshot {
+        let connection = self.snapshot(state);
+        let adapter_kind = self
+            .adapter
+            .as_ref()
+            .map(TradingAdapter::kind)
+            .unwrap_or(self.configured_adapter);
+        let cache_key = ExecutionSnapshotCacheKey {
+            data_source: state.data_source,
+            symbol: state.selected_pair.clone(),
+            adapter_kind,
+            connected: self.connected,
+        };
+
+        if let Some(cache) = &self.execution_surface_cache {
+            if cache.key == cache_key && cache.refreshed_at.elapsed() < Duration::from_secs(1) {
+                return cache.snapshot.clone();
+            }
+        }
+
+        let mut runtime_warnings = Vec::new();
+        let runtime = match (&self.adapter, state.data_source, self.connected) {
+            (Some(TradingAdapter::Mt5(engine)), DataSource::MT5, true) => {
+                match broker_execution_snapshot_from_mt5(engine, Some(&state.selected_pair), 24) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(err) => {
+                        runtime_warnings
+                            .push(format!("Failed to load MT5 execution feed: {err}"));
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        let snapshot = build_execution_surface_snapshot_with_runtime(
+            state,
+            &connection,
+            runtime.as_ref(),
+            runtime_warnings,
+        );
+        self.execution_surface_cache = Some(CachedExecutionSnapshot {
+            key: cache_key,
+            refreshed_at: Instant::now(),
+            snapshot: snapshot.clone(),
+        });
+        snapshot
+    }
+
     pub fn connect(&mut self, state: &mut AppState) {
         match self.configured_adapter {
             TradingAdapterKind::Mt5 => match MT5Engine::new() {
@@ -288,6 +363,7 @@ impl TradingSession {
                             .map(TradingAdapter::terminal_info)
                             .unwrap_or_default();
                         self.market_chart_cache = None;
+                        self.execution_surface_cache = None;
                         record_app_event("ui_mt5_connect", "SUCCESS", "UI MT5 connection succeeded");
                     }
                     _ => {
@@ -295,6 +371,7 @@ impl TradingSession {
                         self.adapter = None;
                         self.terminal_info.clear();
                         self.market_chart_cache = None;
+                        self.execution_surface_cache = None;
                         state.status_msg =
                             "Connection Failed (module missing or terminal closed)".to_string();
                         record_app_event(
@@ -309,6 +386,7 @@ impl TradingSession {
                     self.adapter = None;
                     self.terminal_info.clear();
                     self.market_chart_cache = None;
+                    self.execution_surface_cache = None;
                     state.status_msg = format!("Error: {:?}", err);
                     record_app_event(
                         "ui_mt5_connect",
@@ -322,6 +400,7 @@ impl TradingSession {
                 self.adapter = None;
                 self.terminal_info.clear();
                 self.market_chart_cache = None;
+                self.execution_surface_cache = None;
                 state.status_msg = format!(
                     "{} adapter is defined but not wired yet",
                     self.configured_adapter.as_str()
@@ -343,6 +422,7 @@ impl TradingSession {
         self.connected = false;
         self.terminal_info.clear();
         self.market_chart_cache = None;
+        self.execution_surface_cache = None;
         state.status_msg = "Offline".to_string();
         record_app_event("ui_mt5_disconnect", "SUCCESS", "UI MT5 connection closed");
     }
@@ -370,6 +450,7 @@ impl Default for TradingSession {
             connected: false,
             terminal_info: String::new(),
             market_chart_cache: None,
+            execution_surface_cache: None,
         }
     }
 }
@@ -454,32 +535,34 @@ pub fn build_market_chart_snapshot_from_ohlcv(
     }
 }
 
-pub fn build_execution_surface_snapshot(
+pub fn build_execution_surface_snapshot_with_runtime(
     state: &AppState,
-    session: &TradingSession,
+    connection: &ConnectionSnapshot,
+    runtime: Option<&BrokerExecutionSnapshot>,
+    mut runtime_warnings: Vec<String>,
 ) -> ExecutionSurfaceSnapshot {
-    let snapshot = session.snapshot(state);
-    let action_reason = match snapshot.mode {
+    let action_reason = match connection.mode {
         TradingPanelMode::LocalOnly => Some("Local mode disables live order submission.".to_string()),
         TradingPanelMode::Disconnected => {
             Some("Connect a broker adapter before sending live orders.".to_string())
         }
         TradingPanelMode::Connected => None,
     };
-    let action_enabled = action_reason.is_none() && snapshot.supports_live_orders;
-    let warnings = action_reason
+    let action_enabled = action_reason.is_none() && connection.supports_live_orders;
+    let mut warnings: Vec<String> = action_reason
         .clone()
         .into_iter()
-        .chain((!snapshot.connected && snapshot.requires_local_terminal).then(|| {
+        .chain((!connection.connected && connection.requires_local_terminal).then(|| {
             "The configured adapter requires a local terminal runtime that is not currently connected.".to_string()
         }))
         .collect();
+    warnings.append(&mut runtime_warnings);
     let mut diagnostics = vec![
-        format!("Adapter: {}", snapshot.adapter_name),
-        format!("Integration: {}", snapshot.integration_mode),
+        format!("Adapter: {}", connection.adapter_name),
+        format!("Integration: {}", connection.integration_mode),
         format!(
             "Market data capability: {}",
-            if snapshot.supports_market_data {
+            if connection.supports_market_data {
                 "available"
             } else {
                 "unavailable"
@@ -487,24 +570,41 @@ pub fn build_execution_surface_snapshot(
         ),
         format!(
             "Live order capability: {}",
-            if snapshot.supports_live_orders {
+            if connection.supports_live_orders {
                 "available when connected"
             } else {
                 "unavailable"
             }
         ),
-        "Broker positions/orders feed is not wired yet for the app execution surface.".to_string(),
-        "Bot execution timeline is not wired yet for the app execution surface.".to_string(),
     ];
-    if !snapshot.terminal_info.trim().is_empty() {
-        diagnostics.push(format!("Terminal: {}", snapshot.terminal_info));
+    if !connection.terminal_info.trim().is_empty() {
+        diagnostics.push(format!("Terminal: {}", connection.terminal_info));
     }
+
+    let (positions, pending_orders, bot_timeline) = if let Some(runtime) = runtime {
+        diagnostics.push(format!("Open positions: {}", runtime.positions.len()));
+        diagnostics.push(format!("Pending orders: {}", runtime.pending_orders.len()));
+        diagnostics.push(format!("Recent fills: {}", runtime.recent_deals.len()));
+        (
+            runtime.positions.iter().map(format_position_line).collect(),
+            runtime
+                .pending_orders
+                .iter()
+                .map(format_pending_order_line)
+                .collect(),
+            runtime.recent_deals.iter().map(format_deal_line).collect(),
+        )
+    } else {
+        diagnostics.push("Broker positions/orders feed is not wired yet for the app execution surface.".to_string());
+        diagnostics.push("Bot execution timeline is not wired yet for the app execution surface.".to_string());
+        (Vec::new(), Vec::new(), Vec::new())
+    };
 
     ExecutionSurfaceSnapshot {
         symbol: state.selected_pair.clone(),
-        adapter_name: snapshot.adapter_name,
-        integration_mode: snapshot.integration_mode,
-        connection_status: snapshot.status_text,
+        adapter_name: connection.adapter_name.clone(),
+        integration_mode: connection.integration_mode.clone(),
+        connection_status: connection.status_text.clone(),
         supported_adapters: SUPPORTED_TRADING_ADAPTERS
             .iter()
             .map(|kind| kind.as_str().to_string())
@@ -523,9 +623,9 @@ pub fn build_execution_surface_snapshot(
         ],
         warnings,
         diagnostics,
-        positions: Vec::new(),
-        pending_orders: Vec::new(),
-        bot_timeline: Vec::new(),
+        positions,
+        pending_orders,
+        bot_timeline,
     }
 }
 
@@ -553,6 +653,57 @@ impl MarketChartSnapshot {
     }
 }
 
+fn broker_execution_snapshot_from_mt5(
+    engine: &MT5Engine,
+    symbol: Option<&str>,
+    lookback_hours: i64,
+) -> anyhow::Result<BrokerExecutionSnapshot> {
+    Ok(BrokerExecutionSnapshot {
+        positions: engine.positions(symbol)?,
+        pending_orders: engine.orders(symbol)?,
+        recent_deals: engine.recent_deals(symbol, lookback_hours)?,
+    })
+}
+
+fn format_position_line(position: &PositionInfo) -> String {
+    format!(
+        "#{} · {} {} {:.2} · open {:.5} · current {:.5} · pnl {:+.2}",
+        position.ticket,
+        position.symbol,
+        position.order_side,
+        position.volume,
+        position.price_open,
+        position.price_current,
+        position.profit
+    )
+}
+
+fn format_pending_order_line(order: &PendingOrderInfo) -> String {
+    format!(
+        "#{} · {} {} {:.2} @ {:.5} · sl {:.5} · tp {:.5}",
+        order.ticket,
+        order.symbol,
+        order.order_kind,
+        order.volume_initial,
+        order.price_open,
+        order.stop_loss,
+        order.take_profit
+    )
+}
+
+fn format_deal_line(deal: &DealInfo) -> String {
+    format!(
+        "#{} · {} {} {:.2} @ {:.5} · pnl {:+.2} · fee {:+.2}",
+        deal.ticket,
+        deal.entry_kind,
+        deal.order_side,
+        deal.volume,
+        deal.price,
+        deal.profit,
+        deal.fee
+    )
+}
+
 fn record_app_event(operation: &str, status: &str, message: impl Into<String>) {
     if let Err(err) = write_subsystem_record(
         SubsystemSection::App,
@@ -567,6 +718,7 @@ mod tests {
     use super::*;
     use crate::app_state::{AppRuntimeConfig, HardwareState, RiskState};
     use forex_data::Ohlcv;
+    use mt5_bridge::{DealInfo, PendingOrderInfo, PositionInfo};
     use std::path::PathBuf;
 
     fn sample_state(source: DataSource, status_msg: &str) -> AppState {
@@ -703,9 +855,9 @@ mod tests {
     #[test]
     fn execution_surface_snapshot_disables_live_actions_and_surfaces_unwired_gaps() {
         let state = sample_state(DataSource::Local, "Local Mode");
-        let session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
 
-        let snapshot = build_execution_surface_snapshot(&state, &session);
+        let snapshot = session.execution_surface_snapshot(&state);
 
         assert_eq!(snapshot.symbol, "EURUSD");
         assert_eq!(snapshot.adapter_name, "cTrader");
@@ -719,5 +871,68 @@ mod tests {
             .diagnostics
             .iter()
             .any(|line| line.contains("positions/orders feed is not wired yet")));
+    }
+
+    #[test]
+    fn execution_surface_snapshot_formats_positions_orders_and_recent_fills() {
+        let state = sample_state(DataSource::MT5, "Connected");
+        let connection = TradingSession::from_connected_terminal_for_test(
+            "TerminalInfo(connected=True)",
+        )
+        .snapshot(&state);
+        let runtime = BrokerExecutionSnapshot {
+            positions: vec![PositionInfo {
+                ticket: 1001,
+                symbol: "EURUSD".to_string(),
+                order_side: "BUY".to_string(),
+                volume: 0.20,
+                price_open: 1.1000,
+                price_current: 1.1025,
+                profit: 50.0,
+                stop_loss: 1.0950,
+                take_profit: 1.1100,
+                comment: "trend".to_string(),
+                opened_at: 1710001000,
+            }],
+            pending_orders: vec![PendingOrderInfo {
+                ticket: 2001,
+                symbol: "EURUSD".to_string(),
+                order_kind: "BUY_LIMIT".to_string(),
+                volume_initial: 0.15,
+                price_open: 1.0985,
+                stop_loss: 1.0940,
+                take_profit: 1.1070,
+                comment: "breakout".to_string(),
+                created_at: 1710002000,
+            }],
+            recent_deals: vec![DealInfo {
+                ticket: 3001,
+                order_ticket: 2001,
+                position_id: 4001,
+                symbol: "EURUSD".to_string(),
+                entry_kind: "IN".to_string(),
+                order_side: "BUY".to_string(),
+                volume: 0.15,
+                price: 1.0990,
+                profit: 12.5,
+                fee: -0.4,
+                comment: "filled".to_string(),
+                executed_at: 1710003000,
+            }],
+        };
+
+        let snapshot =
+            build_execution_surface_snapshot_with_runtime(&state, &connection, Some(&runtime), Vec::new());
+
+        assert!(snapshot.positions.iter().any(|line| line.contains("BUY 0.20")));
+        assert!(snapshot
+            .pending_orders
+            .iter()
+            .any(|line| line.contains("BUY_LIMIT 0.15")));
+        assert!(snapshot
+            .bot_timeline
+            .iter()
+            .any(|line| line.contains("IN BUY 0.15")));
+        assert!(snapshot.warnings.is_empty());
     }
 }

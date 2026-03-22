@@ -1,4 +1,4 @@
-use crate::app_services::trading::{build_execution_surface_snapshot, ExecutionSurfaceSnapshot, TradingSession};
+use crate::app_services::trading::{ExecutionSurfaceSnapshot, TradingSession};
 use crate::app_state::AppState;
 use crate::ui::components::open_log;
 use crate::ui::theme;
@@ -34,7 +34,7 @@ pub fn build_execution_panel(snapshot: &ExecutionSurfaceSnapshot) -> ExecutionPa
 }
 
 pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSession) {
-    let snapshot = build_execution_surface_snapshot(state, session);
+    let snapshot = session.execution_surface_snapshot(state);
     let panel = build_execution_panel(&snapshot);
 
     ui.strong(format!("Execution · {}", panel.symbol));
@@ -156,8 +156,8 @@ mod tests {
     #[test]
     fn execution_panel_surfaces_primary_actions_runtime_summary_and_warnings() {
         let state = sample_state();
-        let session = TradingSession::new();
-        let snapshot = build_execution_surface_snapshot(&state, &session);
+        let mut session = TradingSession::new();
+        let snapshot = session.execution_surface_snapshot(&state);
         let panel = build_execution_panel(&snapshot);
 
         assert!(panel.primary_actions.contains(&"Buy".to_string()));

@@ -1,7 +1,8 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use forex_core::logging::write_subsystem_record;
 use forex_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
@@ -64,6 +65,50 @@ pub struct MT5Engine {
     connected: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PositionInfo {
+    pub ticket: i64,
+    pub symbol: String,
+    pub order_side: String,
+    pub volume: f64,
+    pub price_open: f64,
+    pub price_current: f64,
+    pub profit: f64,
+    pub stop_loss: f64,
+    pub take_profit: f64,
+    pub comment: String,
+    pub opened_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingOrderInfo {
+    pub ticket: i64,
+    pub symbol: String,
+    pub order_kind: String,
+    pub volume_initial: f64,
+    pub price_open: f64,
+    pub stop_loss: f64,
+    pub take_profit: f64,
+    pub comment: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DealInfo {
+    pub ticket: i64,
+    pub order_ticket: i64,
+    pub position_id: i64,
+    pub symbol: String,
+    pub entry_kind: String,
+    pub order_side: String,
+    pub volume: f64,
+    pub price: f64,
+    pub profit: f64,
+    pub fee: f64,
+    pub comment: String,
+    pub executed_at: i64,
+}
+
 impl MT5Engine {
     pub fn new() -> Result<Self> {
         // Python::initialize() is the new way in 0.26+
@@ -119,6 +164,66 @@ impl MT5Engine {
         }).map_err(|e| anyhow::anyhow!("PyError: {}", e))
     }
 
+    pub fn positions(&self, symbol: Option<&str>) -> Result<Vec<PositionInfo>> {
+        if !self.connected {
+            bail!("MT5 is not connected.");
+        }
+
+        Python::attach(|py| -> PyResult<Vec<PositionInfo>> {
+            let mt5 = py.import("MetaTrader5")?;
+            let positions = call_mt5_collection(py, &mt5, "positions_get", symbol)?;
+            positions
+                .try_iter()?
+                .map(|item| parse_position_info(&item?))
+                .collect()
+        })
+        .map_err(|e| anyhow::anyhow!("PyError: {}", e))
+    }
+
+    pub fn orders(&self, symbol: Option<&str>) -> Result<Vec<PendingOrderInfo>> {
+        if !self.connected {
+            bail!("MT5 is not connected.");
+        }
+
+        Python::attach(|py| -> PyResult<Vec<PendingOrderInfo>> {
+            let mt5 = py.import("MetaTrader5")?;
+            let orders = call_mt5_collection(py, &mt5, "orders_get", symbol)?;
+            orders
+                .try_iter()?
+                .map(|item| parse_pending_order_info(&item?))
+                .collect()
+        })
+        .map_err(|e| anyhow::anyhow!("PyError: {}", e))
+    }
+
+    pub fn recent_deals(&self, symbol: Option<&str>, lookback_hours: i64) -> Result<Vec<DealInfo>> {
+        if !self.connected {
+            bail!("MT5 is not connected.");
+        }
+
+        Python::attach(|py| -> PyResult<Vec<DealInfo>> {
+            let mt5 = py.import("MetaTrader5")?;
+            let kwargs = PyDict::new(py);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_secs() as i64;
+            let from_ts = now.saturating_sub(lookback_hours.max(1) * 3600);
+            kwargs.set_item("date_from", from_ts)?;
+            kwargs.set_item("date_to", now)?;
+            if let Some(symbol) = symbol {
+                kwargs.set_item("group", symbol)?;
+            }
+            let deals = mt5.getattr("history_deals_get")?.call((), Some(&kwargs))?;
+            let deals = ensure_mt5_collection(&mt5, "history_deals_get", deals)?;
+            deals
+                .try_iter()?
+                .map(|item| parse_deal_info(&item?))
+                .collect()
+        })
+        .map_err(|e| anyhow::anyhow!("PyError: {}", e))
+    }
+
     pub fn shutdown(&mut self) {
         if self.connected {
             let _ = Python::attach(|py| -> PyResult<()> {
@@ -136,6 +241,131 @@ impl MT5Engine {
 
 impl Drop for MT5Engine {
     fn drop(&mut self) { self.shutdown(); }
+}
+
+fn call_mt5_collection<'py>(
+    py: Python<'py>,
+    mt5: &Bound<'py, PyModule>,
+    function_name: &str,
+    symbol: Option<&str>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let function = mt5.getattr(function_name)?;
+    let result = if let Some(symbol) = symbol {
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("symbol", symbol)?;
+        function.call((), Some(&kwargs))?
+    } else {
+        function.call0()?
+    };
+
+    ensure_mt5_collection(mt5, function_name, result)
+}
+
+fn ensure_mt5_collection<'py>(
+    mt5: &Bound<'py, PyModule>,
+    function_name: &str,
+    result: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    if result.is_none() {
+        let err_obj = mt5.getattr("last_error")?.call0()?;
+        let err = format_last_error(err_obj.as_any())?;
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{function_name} returned None: {err}"
+        )));
+    }
+    Ok(result)
+}
+
+fn parse_position_info(item: &Bound<'_, PyAny>) -> PyResult<PositionInfo> {
+    Ok(PositionInfo {
+        ticket: attr_i64(item, "ticket")?,
+        symbol: attr_string(item, "symbol")?,
+        order_side: position_type_name(attr_i64(item, "type")?),
+        volume: attr_f64(item, "volume")?,
+        price_open: attr_f64(item, "price_open")?,
+        price_current: attr_f64(item, "price_current")?,
+        profit: attr_f64(item, "profit")?,
+        stop_loss: attr_f64(item, "sl")?,
+        take_profit: attr_f64(item, "tp")?,
+        comment: attr_string(item, "comment")?,
+        opened_at: attr_i64(item, "time")?,
+    })
+}
+
+fn parse_pending_order_info(item: &Bound<'_, PyAny>) -> PyResult<PendingOrderInfo> {
+    Ok(PendingOrderInfo {
+        ticket: attr_i64(item, "ticket")?,
+        symbol: attr_string(item, "symbol")?,
+        order_kind: order_type_name(attr_i64(item, "type")?),
+        volume_initial: attr_f64(item, "volume_initial")?,
+        price_open: attr_f64(item, "price_open")?,
+        stop_loss: attr_f64(item, "sl")?,
+        take_profit: attr_f64(item, "tp")?,
+        comment: attr_string(item, "comment")?,
+        created_at: attr_i64(item, "time_setup")?,
+    })
+}
+
+fn parse_deal_info(item: &Bound<'_, PyAny>) -> PyResult<DealInfo> {
+    Ok(DealInfo {
+        ticket: attr_i64(item, "ticket")?,
+        order_ticket: attr_i64(item, "order")?,
+        position_id: attr_i64(item, "position_id")?,
+        symbol: attr_string(item, "symbol")?,
+        entry_kind: deal_entry_name(attr_i64(item, "entry")?),
+        order_side: order_type_name(attr_i64(item, "type")?),
+        volume: attr_f64(item, "volume")?,
+        price: attr_f64(item, "price")?,
+        profit: attr_f64(item, "profit")?,
+        fee: attr_f64(item, "fee")?,
+        comment: attr_string(item, "comment")?,
+        executed_at: attr_i64(item, "time")?,
+    })
+}
+
+fn attr_i64(item: &Bound<'_, PyAny>, attr: &str) -> PyResult<i64> {
+    item.getattr(attr)?.extract()
+}
+
+fn attr_f64(item: &Bound<'_, PyAny>, attr: &str) -> PyResult<f64> {
+    item.getattr(attr)?.extract()
+}
+
+fn attr_string(item: &Bound<'_, PyAny>, attr: &str) -> PyResult<String> {
+    item.getattr(attr)?.extract()
+}
+
+fn position_type_name(type_id: i64) -> String {
+    match type_id {
+        0 => "BUY".to_string(),
+        1 => "SELL".to_string(),
+        other => format!("POSITION_TYPE_{other}"),
+    }
+}
+
+fn order_type_name(type_id: i64) -> String {
+    match type_id {
+        0 => "BUY".to_string(),
+        1 => "SELL".to_string(),
+        2 => "BUY_LIMIT".to_string(),
+        3 => "SELL_LIMIT".to_string(),
+        4 => "BUY_STOP".to_string(),
+        5 => "SELL_STOP".to_string(),
+        6 => "BUY_STOP_LIMIT".to_string(),
+        7 => "SELL_STOP_LIMIT".to_string(),
+        8 => "CLOSE_BY".to_string(),
+        other => format!("ORDER_TYPE_{other}"),
+    }
+}
+
+fn deal_entry_name(entry_id: i64) -> String {
+    match entry_id {
+        0 => "IN".to_string(),
+        1 => "OUT".to_string(),
+        2 => "INOUT".to_string(),
+        3 => "OUT_BY".to_string(),
+        other => format!("DEAL_ENTRY_{other}"),
+    }
 }
 
 #[cfg(test)]
@@ -192,5 +422,64 @@ mod tests {
         assert_eq!(record.operation, "initialize");
         assert_eq!(record.status, "FAILED");
         assert_eq!(record.message, "authorization failed");
+    }
+
+    #[test]
+    fn test_positions_orders_and_recent_deals_parse_namedtuple_payloads() -> Result<()> {
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            run_py(
+                py,
+                r#"
+import sys
+import types
+from collections import namedtuple
+
+Position = namedtuple("Position", "ticket time type volume price_open price_current sl tp profit symbol comment")
+Order = namedtuple("Order", "ticket time_setup type volume_initial price_open sl tp symbol comment")
+Deal = namedtuple("Deal", "ticket order position_id time type entry volume price profit fee symbol comment")
+
+mt5 = types.ModuleType("MetaTrader5")
+mt5.positions_get = lambda **kwargs: (
+    Position(1001, 1710001000, 0, 0.20, 1.1000, 1.1025, 1.0950, 1.1100, 50.0, "EURUSD", "trend"),
+)
+mt5.orders_get = lambda **kwargs: (
+    Order(2001, 1710002000, 2, 0.15, 1.0985, 1.0940, 1.1070, "EURUSD", "breakout"),
+)
+mt5.history_deals_get = lambda *args, **kwargs: (
+    Deal(3001, 2001, 4001, 1710003000, 0, 0, 0.15, 1.0990, 12.5, -0.4, "EURUSD", "filled"),
+)
+sys.modules["MetaTrader5"] = mt5
+"#,
+                &locals,
+            )?;
+
+            let engine = MT5Engine { connected: true };
+
+            let positions = engine.positions(Some("EURUSD"))?;
+            let orders = engine.orders(Some("EURUSD"))?;
+            let deals = engine.recent_deals(Some("EURUSD"), 24)?;
+
+            assert_eq!(positions.len(), 1);
+            assert_eq!(positions[0].ticket, 1001);
+            assert_eq!(positions[0].order_side, "BUY");
+            assert_eq!(positions[0].symbol, "EURUSD");
+            assert_eq!(positions[0].profit, 50.0);
+
+            assert_eq!(orders.len(), 1);
+            assert_eq!(orders[0].ticket, 2001);
+            assert_eq!(orders[0].order_kind, "BUY_LIMIT");
+            assert_eq!(orders[0].volume_initial, 0.15);
+
+            assert_eq!(deals.len(), 1);
+            assert_eq!(deals[0].ticket, 3001);
+            assert_eq!(deals[0].order_ticket, 2001);
+            assert_eq!(deals[0].position_id, 4001);
+            assert_eq!(deals[0].order_side, "BUY");
+            assert_eq!(deals[0].entry_kind, "IN");
+            assert_eq!(deals[0].profit, 12.5);
+
+            Ok(())
+        })
     }
 }
