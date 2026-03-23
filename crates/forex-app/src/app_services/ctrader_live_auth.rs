@@ -861,7 +861,8 @@ mod tests {
             "http://127.0.0.1:43001/callback",
             43002,
             "trading",
-        );
+        )
+        .expect("authorize url should build");
 
         assert!(authorize_url.contains("client_id=client-id"));
         assert!(authorize_url.contains(
@@ -871,11 +872,11 @@ mod tests {
     }
 
     #[test]
-    fn authorize_url_falls_back_to_original_redirect_when_rewrite_fails() {
-        let authorize_url =
-            build_authorize_url("client-id", "not-a-valid-redirect", 43002, "trading");
+    fn authorize_url_rejects_malformed_redirect_uri() {
+        let err = build_authorize_url("client-id", "not-a-valid-redirect", 43002, "trading")
+            .expect_err("malformed redirect must fail");
 
-        assert!(authorize_url.contains("redirect_uri=not-a-valid-redirect"));
+        assert!(err.to_string().contains("redirect URI"));
     }
 
     #[test]
