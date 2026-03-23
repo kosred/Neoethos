@@ -245,7 +245,7 @@ impl CTraderLiveAuthBackend for ProductionCTraderLiveAuthBackend {
             &request.redirect_uri,
             callback_port,
             &request.scope,
-        );
+        )?;
         open::that(authorize_url).context("failed to open system browser for cTrader login")?;
         let authorization_code =
             self.capture_authorization_code(listener, request.loopback.callback_path())?;
@@ -372,15 +372,14 @@ pub fn build_authorize_url(
     redirect_uri: &str,
     callback_port: u16,
     scope: &str,
-) -> String {
-    let redirect_uri = rewrite_redirect_uri_port(redirect_uri, callback_port)
-        .unwrap_or_else(|_| redirect_uri.to_string());
-    format!(
+) -> Result<String> {
+    let redirect_uri = rewrite_redirect_uri_port(redirect_uri, callback_port)?;
+    Ok(format!(
         "https://id.ctrader.com/my/settings/openapi/grantingaccess/?client_id={}&redirect_uri={}&scope={}&product=web",
         percent_encode(client_id),
         percent_encode(&redirect_uri),
         percent_encode(scope),
-    )
+    ))
 }
 
 pub fn parse_callback_request(request_target: &str, expected_path: &str) -> Result<CTraderCallbackPayload> {
@@ -391,12 +390,32 @@ pub fn parse_callback_request(request_target: &str, expected_path: &str) -> Resu
         return Err(anyhow!("unexpected callback path: {path}"));
     }
 
-    let authorization_code = query
-        .split('&')
-        .find_map(|pair| {
-            let (key, value) = pair.split_once('=')?;
-            (key == "code").then(|| value.to_string())
-        })
+    let mut authorization_code = None;
+    let mut denial_error = None;
+    let mut denial_description = None;
+
+    for pair in query.split('&').filter(|pair| !pair.trim().is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let decoded_value = percent_decode(value)?;
+        match key {
+            "code" => authorization_code = Some(decoded_value),
+            "error" => denial_error = Some(decoded_value),
+            "error_description" => denial_description = Some(decoded_value),
+            _ => {}
+        }
+    }
+
+    if let Some(error) = denial_error.filter(|error| !error.trim().is_empty()) {
+        let description = denial_description
+            .filter(|description| !description.trim().is_empty())
+            .map(|description| format!(": {description}"))
+            .unwrap_or_default();
+        return Err(anyhow!(
+            "cTrader authorization denied: {error}{description}"
+        ));
+    }
+
+    let authorization_code = authorization_code
         .filter(|code| !code.trim().is_empty())
         .context("missing authorization code")?;
 
@@ -568,6 +587,13 @@ pub fn perform_account_discovery_with_transport<T: CTraderOpenApiTransport>(
         ));
     }
 
+    let account_list_envelope: CTraderOpenApiJsonMessage = serde_json::from_str(&responses[1])
+        .context("failed to parse cTrader account list response envelope")?;
+    if account_list_envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+        let error = parse_ctrader_error_payload(&account_list_envelope.payload)?;
+        return Err(anyhow!("cTrader account list failed: {}", error));
+    }
+
     parse_account_list_by_access_token_json(&responses[1])
 }
 
@@ -627,15 +653,23 @@ impl CTraderOpenApiTransport for StubCTraderOpenApiTransport {
 
         let mut responses = self.responses.lock().expect("responses lock");
         let mut output = Vec::with_capacity(messages.len());
-        for _ in messages {
-            if responses.is_empty() {
-                break;
-            }
-            let response = responses.remove(0).map_err(|err| anyhow!(err))?;
-            let payload_type = parse_open_api_payload_type(&response)?;
-            output.push(response);
-            if payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
-                break;
+        for message in messages {
+            let expected_payload_type = expected_response_payload_type(message.payload_type)?;
+            loop {
+                if responses.is_empty() {
+                    return Err(anyhow!(
+                        "stub cTrader transport ran out of responses before matching payload {}",
+                        expected_payload_type
+                    ));
+                }
+                let response = responses.remove(0).map_err(|err| anyhow!(err))?;
+                let envelope = parse_open_api_envelope(&response)?;
+                if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE
+                    || is_matching_open_api_response(&envelope, message, expected_payload_type)
+                {
+                    output.push(response);
+                    break;
+                }
             }
         }
         Ok(output)
@@ -665,6 +699,7 @@ impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
         let mut responses = Vec::with_capacity(messages.len());
 
         for message in messages {
+            let expected_payload_type = expected_response_payload_type(message.payload_type)?;
             let serialized = serde_json::to_string(message)
                 .context("failed to serialize cTrader open api message")?;
             socket
@@ -677,13 +712,17 @@ impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
                         if text.trim().is_empty() {
                             return Err(anyhow!("empty cTrader open api response"));
                         }
-                        let payload_type = parse_open_api_payload_type(text.as_ref())?;
-                        responses.push(text.to_string());
-                        if payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+                        let envelope = parse_open_api_envelope(text.as_ref())?;
+                        if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+                            responses.push(text.to_string());
                             let _ = socket.close(None);
                             return Ok(responses);
                         }
-                        break;
+                        if is_matching_open_api_response(&envelope, message, expected_payload_type)
+                        {
+                            responses.push(text.to_string());
+                            break;
+                        }
                     }
                     Message::Binary(bytes) => {
                         let text = String::from_utf8(bytes.to_vec())
@@ -691,13 +730,17 @@ impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
                         if text.trim().is_empty() {
                             return Err(anyhow!("empty cTrader open api response"));
                         }
-                        let payload_type = parse_open_api_payload_type(&text)?;
-                        responses.push(text);
-                        if payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+                        let envelope = parse_open_api_envelope(&text)?;
+                        if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+                            responses.push(text);
                             let _ = socket.close(None);
                             return Ok(responses);
                         }
-                        break;
+                        if is_matching_open_api_response(&envelope, message, expected_payload_type)
+                        {
+                            responses.push(text);
+                            break;
+                        }
                     }
                     Message::Ping(payload) => {
                         socket
@@ -718,9 +761,32 @@ impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
 }
 
 fn parse_open_api_payload_type(response_json: &str) -> Result<u32> {
-    let envelope: CTraderOpenApiJsonMessage = serde_json::from_str(response_json)
-        .context("failed to parse cTrader JSON envelope")?;
-    Ok(envelope.payload_type)
+    Ok(parse_open_api_envelope(response_json)?.payload_type)
+}
+
+fn parse_open_api_envelope(response_json: &str) -> Result<CTraderOpenApiJsonMessage> {
+    serde_json::from_str(response_json).context("failed to parse cTrader JSON envelope")
+}
+
+fn expected_response_payload_type(request_payload_type: u32) -> Result<u32> {
+    match request_payload_type {
+        CTRADER_OA_APPLICATION_AUTH_PAYLOAD_TYPE => Ok(CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE),
+        CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RESPONSE_PAYLOAD_TYPE)
+        }
+        payload_type => Err(anyhow!(
+            "unsupported cTrader request payload type: {}",
+            payload_type
+        )),
+    }
+}
+
+fn is_matching_open_api_response(
+    envelope: &CTraderOpenApiJsonMessage,
+    request: &CTraderOpenApiJsonMessage,
+    expected_payload_type: u32,
+) -> bool {
+    envelope.payload_type == expected_payload_type && envelope.client_msg_id == request.client_msg_id
 }
 
 fn rewrite_redirect_uri_port(redirect_uri: &str, callback_port: u16) -> Result<String> {
@@ -753,6 +819,33 @@ fn percent_encode(value: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn percent_decode(value: &str) -> Result<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'%' if idx + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[idx + 1..idx + 3])
+                    .context("invalid percent-encoded callback value")?;
+                let byte = u8::from_str_radix(hex, 16)
+                    .context("invalid percent-encoded callback value")?;
+                decoded.push(byte);
+                idx += 3;
+            }
+            b'+' => {
+                decoded.push(b' ');
+                idx += 1;
+            }
+            byte => {
+                decoded.push(byte);
+                idx += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).context("callback value is not valid UTF-8")
 }
 
 #[cfg(test)]
