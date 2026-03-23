@@ -664,9 +664,11 @@ impl CTraderOpenApiTransport for StubCTraderOpenApiTransport {
                 }
                 let response = responses.remove(0).map_err(|err| anyhow!(err))?;
                 let envelope = parse_open_api_envelope(&response)?;
-                if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE
-                    || is_matching_open_api_response(&envelope, message, expected_payload_type)
-                {
+                if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+                    output.push(response);
+                    return Ok(output);
+                }
+                if is_matching_open_api_response(&envelope, message, expected_payload_type) {
                     output.push(response);
                     break;
                 }
@@ -758,10 +760,6 @@ impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
         let _ = socket.close(None);
     Ok(responses)
     }
-}
-
-fn parse_open_api_payload_type(response_json: &str) -> Result<u32> {
-    Ok(parse_open_api_envelope(response_json)?.payload_type)
 }
 
 fn parse_open_api_envelope(response_json: &str) -> Result<CTraderOpenApiJsonMessage> {
