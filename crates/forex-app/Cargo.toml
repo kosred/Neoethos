@@ -16,6 +16,7 @@ open = "5.3.2"
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
 
 # Our internal core engines
 forex-core = { path = "../forex-core" }

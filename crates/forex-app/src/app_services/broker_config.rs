@@ -16,6 +16,22 @@ pub struct BrokerAccountTarget {
     pub enabled_for_execution: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CTraderBrokerEnvironment {
+    #[default]
+    Live,
+    Demo,
+}
+
+impl CTraderBrokerEnvironment {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "Live",
+            Self::Demo => "Demo",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdapterReadinessSnapshot {
     pub adapter_name: String,
@@ -40,6 +56,7 @@ pub struct CTraderBrokerSettings {
     pub client_secret: String,
     pub redirect_uri: String,
     pub authorization_code_input: String,
+    pub environment: CTraderBrokerEnvironment,
     pub accounts: Vec<BrokerAccountTarget>,
 }
 
@@ -78,11 +95,15 @@ impl BrokerSettingsState {
                     ("client_secret", &self.ctrader.client_secret),
                     ("redirect_uri", &self.ctrader.redirect_uri),
                 ]);
+                let ready_line = format!(
+                    "OAuth app credentials ready for {} environment.",
+                    self.ctrader.environment.as_str()
+                );
                 build_remote_readiness(
                     adapter,
                     missing_fields,
                     count_enabled_targets(&self.ctrader.accounts),
-                    "OAuth app credentials ready.",
+                    &ready_line,
                 )
             }
             TradingAdapterKind::DxTrade => {
@@ -170,6 +191,7 @@ mod tests {
         settings.ctrader.client_id = "app-client".to_string();
         settings.ctrader.client_secret = "top-secret".to_string();
         settings.ctrader.redirect_uri = "http://localhost:3000/callback".to_string();
+        settings.ctrader.environment = CTraderBrokerEnvironment::Demo;
         settings.ctrader.accounts.push(BrokerAccountTarget {
             account_id: "ctr-001".to_string(),
             label: "Primary".to_string(),
@@ -186,6 +208,10 @@ mod tests {
         assert!(ready.missing_fields.is_empty());
         assert_eq!(ready.target_count, 1);
         assert!(ready.can_attempt_connect);
+        assert_eq!(
+            ready.status_line,
+            "OAuth app credentials ready for Demo environment."
+        );
     }
 
     #[test]

@@ -30,6 +30,16 @@ pub struct CTraderAccountSummary {
     pub enabled_for_execution: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CTraderDiscoveredAccount {
+    pub account_id: String,
+    pub broker_title: String,
+    pub account_name: String,
+    pub trader_login: Option<i64>,
+    pub is_live: Option<bool>,
+    pub enabled_for_execution: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CTraderTokenBundle {
     pub access_token: String,
@@ -52,6 +62,7 @@ pub struct CTraderAuthSnapshot {
     pub persistence_status: String,
     pub account_count: usize,
     pub enabled_target_count: usize,
+    pub discovered_accounts: Vec<CTraderDiscoveredAccount>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +75,7 @@ pub struct CTraderAuthSession {
     authorization_code: Option<String>,
     token_bundle: Option<CTraderTokenBundle>,
     accounts: Vec<CTraderAccountSummary>,
+    discovered_accounts: Vec<CTraderDiscoveredAccount>,
 }
 
 impl CTraderAuthSession {
@@ -85,6 +97,7 @@ impl CTraderAuthSession {
             authorization_code: None,
             token_bundle: None,
             accounts: Vec::new(),
+            discovered_accounts: Vec::new(),
         }
     }
 
@@ -127,12 +140,29 @@ impl CTraderAuthSession {
     }
 
     pub fn restore_from_storage(&mut self, token_bundle: CTraderTokenBundle) {
+        self.authorize_url = None;
+        self.callback_port = None;
+        self.authorization_code = None;
         self.token_bundle = Some(token_bundle);
+        self.accounts.clear();
+        self.discovered_accounts.clear();
         self.state = CTraderAuthState::RestoredFromStorage;
     }
 
     pub fn set_accounts(&mut self, accounts: Vec<CTraderAccountSummary>) {
         self.accounts = accounts;
+    }
+
+    pub fn set_discovered_accounts(&mut self, accounts: Vec<CTraderDiscoveredAccount>) {
+        self.discovered_accounts = accounts.clone();
+        self.accounts = accounts
+            .into_iter()
+            .map(|account| CTraderAccountSummary {
+                account_id: account.account_id,
+                broker_title: account.broker_title,
+                enabled_for_execution: account.enabled_for_execution,
+            })
+            .collect();
         self.state = CTraderAuthState::AccountsAvailable;
     }
 
@@ -165,7 +195,7 @@ impl CTraderAuthSession {
                     "cTrader session restored from secure storage.".to_string()
                 }
                 CTraderAuthState::AccountsAvailable => {
-                    format!("{} cTrader accounts are available.", self.accounts.len())
+                    format!("{} cTrader accounts are available.", self.discovered_accounts.len())
                 }
                 CTraderAuthState::Failed => "cTrader auth failed.".to_string(),
             },
@@ -182,12 +212,13 @@ impl CTraderAuthSession {
             } else {
                 "Not stored".to_string()
             },
-            account_count: self.accounts.len(),
+            account_count: self.discovered_accounts.len(),
             enabled_target_count: self
-                .accounts
+                .discovered_accounts
                 .iter()
                 .filter(|account| account.enabled_for_execution)
                 .count(),
+            discovered_accounts: self.discovered_accounts.clone(),
         }
     }
 }
@@ -238,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_session_retains_account_summaries() {
+    fn configured_account_targets_do_not_fabricate_discovered_accounts() {
         let mut auth = CTraderAuthSession::new("client-id", "http://localhost:3000/callback");
         auth.set_accounts(vec![
             CTraderAccountSummary {
@@ -254,9 +285,10 @@ mod tests {
         ]);
 
         let snapshot = auth.snapshot();
-        assert_eq!(snapshot.state, CTraderAuthState::AccountsAvailable);
-        assert_eq!(snapshot.account_count, 2);
-        assert_eq!(snapshot.enabled_target_count, 1);
+        assert_eq!(snapshot.state, CTraderAuthState::ReadyToAuthorize);
+        assert_eq!(snapshot.account_count, 0);
+        assert_eq!(snapshot.enabled_target_count, 0);
+        assert!(snapshot.discovered_accounts.is_empty());
     }
 
     #[test]
@@ -288,5 +320,139 @@ mod tests {
         assert_eq!(snapshot.state, CTraderAuthState::RestoredFromStorage);
         assert!(snapshot.token_persisted);
         assert_eq!(snapshot.persistence_status, "Stored securely");
+    }
+
+    #[test]
+    fn discovered_accounts_are_retained_in_snapshot() {
+        let mut auth = CTraderAuthSession::new("client-id", "http://localhost:43001/callback");
+        auth.set_discovered_accounts(vec![
+            CTraderDiscoveredAccount {
+                account_id: "1001".to_string(),
+                broker_title: "Broker A".to_string(),
+                account_name: "Primary".to_string(),
+                trader_login: Some(9001),
+                is_live: Some(true),
+                enabled_for_execution: true,
+            },
+            CTraderDiscoveredAccount {
+                account_id: "1002".to_string(),
+                broker_title: "Broker A".to_string(),
+                account_name: "Demo".to_string(),
+                trader_login: Some(9002),
+                is_live: Some(false),
+                enabled_for_execution: false,
+            },
+        ]);
+
+        let snapshot = auth.snapshot();
+        assert_eq!(snapshot.state, CTraderAuthState::AccountsAvailable);
+        assert_eq!(snapshot.account_count, 2);
+        assert_eq!(snapshot.enabled_target_count, 1);
+        assert_eq!(snapshot.discovered_accounts.len(), 2);
+        assert_eq!(snapshot.discovered_accounts[0].account_name, "Primary");
+        assert_eq!(snapshot.discovered_accounts[0].trader_login, Some(9001));
+        assert_eq!(snapshot.discovered_accounts[0].is_live, Some(true));
+        assert_eq!(snapshot.discovered_accounts[1].is_live, Some(false));
+    }
+
+    #[test]
+    fn restored_session_remains_distinct_from_accounts_available() {
+        let mut auth = CTraderAuthSession::new("client-id", "http://localhost:43001/callback");
+        auth.restore_from_storage(CTraderTokenBundle {
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            token_type: "bearer".to_string(),
+            expires_in: 3600,
+            scope: "trading".to_string(),
+            created_at_unix: 1_774_147_200,
+        });
+
+        let snapshot = auth.snapshot();
+        assert_eq!(snapshot.state, CTraderAuthState::RestoredFromStorage);
+        assert_eq!(snapshot.account_count, 0);
+        assert_eq!(snapshot.enabled_target_count, 0);
+        assert!(snapshot.discovered_accounts.is_empty());
+    }
+
+    #[test]
+    fn restoring_session_clears_stale_discovered_accounts() {
+        let mut auth = CTraderAuthSession::new("client-id", "http://localhost:43001/callback");
+        auth.set_discovered_accounts(vec![CTraderDiscoveredAccount {
+            account_id: "1001".to_string(),
+            broker_title: "Broker A".to_string(),
+            account_name: "Primary".to_string(),
+            trader_login: Some(9001),
+            is_live: Some(true),
+            enabled_for_execution: true,
+        }]);
+
+        auth.restore_from_storage(CTraderTokenBundle {
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            token_type: "bearer".to_string(),
+            expires_in: 3600,
+            scope: "trading".to_string(),
+            created_at_unix: 1_774_147_200,
+        });
+
+        let snapshot = auth.snapshot();
+        assert_eq!(snapshot.state, CTraderAuthState::RestoredFromStorage);
+        assert_eq!(snapshot.account_count, 0);
+        assert_eq!(snapshot.enabled_target_count, 0);
+        assert!(snapshot.discovered_accounts.is_empty());
+    }
+
+    #[test]
+    fn enabled_target_count_derives_from_discovered_accounts() {
+        let mut auth = CTraderAuthSession::new("client-id", "http://localhost:43001/callback");
+        auth.set_discovered_accounts(vec![
+            CTraderDiscoveredAccount {
+                account_id: "1001".to_string(),
+                broker_title: "Broker A".to_string(),
+                account_name: "Live".to_string(),
+                trader_login: Some(9001),
+                is_live: Some(true),
+                enabled_for_execution: true,
+            },
+            CTraderDiscoveredAccount {
+                account_id: "1002".to_string(),
+                broker_title: "Broker A".to_string(),
+                account_name: "Demo".to_string(),
+                trader_login: Some(9002),
+                is_live: Some(false),
+                enabled_for_execution: false,
+            },
+            CTraderDiscoveredAccount {
+                account_id: "1003".to_string(),
+                broker_title: "Broker A".to_string(),
+                account_name: "Backup".to_string(),
+                trader_login: Some(9003),
+                is_live: Some(true),
+                enabled_for_execution: true,
+            },
+        ]);
+
+        let snapshot = auth.snapshot();
+        assert_eq!(snapshot.enabled_target_count, 2);
+    }
+
+    #[test]
+    fn discovered_accounts_include_identity_needed_for_sync() {
+        let mut auth = CTraderAuthSession::new("client-id", "http://localhost:43001/callback");
+        auth.set_discovered_accounts(vec![CTraderDiscoveredAccount {
+            account_id: "1001".to_string(),
+            broker_title: "Broker A".to_string(),
+            account_name: "Primary Live".to_string(),
+            trader_login: Some(9901),
+            is_live: Some(true),
+            enabled_for_execution: true,
+        }]);
+
+        let snapshot = auth.snapshot();
+        assert_eq!(snapshot.discovered_accounts[0].account_id, "1001");
+        assert_eq!(snapshot.discovered_accounts[0].broker_title, "Broker A");
+        assert_eq!(snapshot.discovered_accounts[0].account_name, "Primary Live");
+        assert_eq!(snapshot.discovered_accounts[0].trader_login, Some(9901));
+        assert_eq!(snapshot.discovered_accounts[0].is_live, Some(true));
     }
 }

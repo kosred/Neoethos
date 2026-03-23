@@ -1,5 +1,7 @@
 use crate::app_state::{AppState, DataSource};
-use crate::app_services::broker_config::{AdapterReadinessSnapshot, BrokerAccountTarget};
+use crate::app_services::broker_config::{
+    AdapterReadinessSnapshot, BrokerAccountTarget, CTraderBrokerEnvironment,
+};
 use crate::app_services::ctrader_auth::CTraderAuthSnapshot;
 use crate::app_services::trading::{TradingSession, SUPPORTED_TRADING_ADAPTERS};
 use crate::ui::components::{
@@ -244,6 +246,43 @@ fn build_system_status_dashboard(
                 ("Accounts".to_string(), auth.account_count.to_string()),
             ],
         });
+
+        if !auth.discovered_accounts.is_empty() {
+            sections.push(DashboardSection {
+                title: "cTrader Accounts".to_string(),
+                rows: auth
+                    .discovered_accounts
+                    .iter()
+                    .map(|account| {
+                        let environment = match account.is_live {
+                            Some(true) => "Live",
+                            Some(false) => "Demo",
+                            None => "Unknown",
+                        };
+                        let name = if !account.account_name.trim().is_empty() {
+                            account.account_name.clone()
+                        } else if !account.broker_title.trim().is_empty() {
+                            account.broker_title.clone()
+                        } else {
+                            format!("cTrader Account {}", account.account_id)
+                        };
+                        (
+                            account.account_id.clone(),
+                            format!(
+                                "{} · {} · {}",
+                                name,
+                                environment,
+                                if account.enabled_for_execution {
+                                    "Execution enabled"
+                                } else {
+                                    "Execution disabled"
+                                }
+                            ),
+                        )
+                    })
+                    .collect(),
+            });
+        }
     }
 
     SystemStatusDashboard {
@@ -267,6 +306,7 @@ fn render_adapter_configuration(ui: &mut egui::Ui, session: &mut TradingSession)
             }
             crate::app_services::trading::TradingAdapterKind::CTrader => {
                 let mut start_live_auth = false;
+                let mut discover_accounts = false;
                 let mut restore_saved_session = false;
                 let mut clear_saved_session = false;
                 let mut start_auth = false;
@@ -277,6 +317,23 @@ fn render_adapter_configuration(ui: &mut egui::Ui, session: &mut TradingSession)
                     labeled_text_edit(ui, "Client ID", &mut settings.client_id);
                     labeled_text_edit(ui, "Client Secret", &mut settings.client_secret);
                     labeled_text_edit(ui, "Redirect URI", &mut settings.redirect_uri);
+                    ui.horizontal(|ui| {
+                        ui.label("Environment");
+                        ui.selectable_value(
+                            &mut settings.environment,
+                            CTraderBrokerEnvironment::Live,
+                            "Live",
+                        );
+                        ui.selectable_value(
+                            &mut settings.environment,
+                            CTraderBrokerEnvironment::Demo,
+                            "Demo",
+                        );
+                    });
+                    ui.label(format!(
+                        "Current cTrader environment: {}",
+                        settings.environment.as_str()
+                    ));
                     labeled_text_edit(
                         ui,
                         "Authorization Code",
@@ -286,6 +343,9 @@ fn render_adapter_configuration(ui: &mut egui::Ui, session: &mut TradingSession)
                     ui.horizontal(|ui| {
                         if ui.button("Start cTrader Login").clicked() {
                             start_live_auth = true;
+                        }
+                        if ui.button("Discover Accounts").clicked() {
+                            discover_accounts = true;
                         }
                         if ui.button("Restore Saved Session").clicked() {
                             restore_saved_session = true;
@@ -311,6 +371,9 @@ fn render_adapter_configuration(ui: &mut egui::Ui, session: &mut TradingSession)
 
                 if start_live_auth {
                     let _ = session.start_ctrader_live_auth();
+                }
+                if discover_accounts {
+                    let _ = session.discover_ctrader_accounts();
                 }
                 if restore_saved_session {
                     let _ = session.restore_ctrader_session();
@@ -503,7 +566,7 @@ mod tests {
 
         assert!(dashboard.sections.iter().any(|section| {
             section.rows.iter().any(|(label, value)| {
-                label == "Readiness" && value.contains("OAuth app credentials ready")
+                label == "Readiness" && value.contains("OAuth app credentials ready for")
             })
         }));
         assert!(dashboard.sections.iter().any(|section| {
@@ -635,6 +698,67 @@ mod tests {
             section.title == "cTrader Auth"
                 && section.rows.iter().any(|(label, value)| {
                     label == "Persistence" && value == "Stored securely"
+                })
+        }));
+    }
+
+    #[test]
+    fn system_status_dashboard_surfaces_ctrader_discovered_accounts() {
+        let state = sample_state(DataSource::MT5, "cTrader accounts discovered");
+        let connection =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader)
+                .snapshot(&state);
+        let readiness = crate::app_services::broker_config::AdapterReadinessSnapshot {
+            adapter_name: "cTrader".to_string(),
+            session_state: crate::app_services::broker_config::BrokerSessionState::ReadyForAuth,
+            status_line: "OAuth app credentials ready for Live environment.".to_string(),
+            missing_fields: Vec::new(),
+            target_count: 1,
+            can_attempt_connect: true,
+        };
+        let auth = crate::app_services::ctrader_auth::CTraderAuthSnapshot {
+            state: crate::app_services::ctrader_auth::CTraderAuthState::AccountsAvailable,
+            status_line: "2 cTrader accounts are available.".to_string(),
+            authorize_url: Some("https://id.ctrader.com/...".to_string()),
+            callback_port: Some(43001),
+            authorization_code_present: true,
+            token_request_ready: true,
+            token_persisted: true,
+            persistence_status: "Stored securely".to_string(),
+            account_count: 2,
+            enabled_target_count: 1,
+            discovered_accounts: vec![
+                crate::app_services::ctrader_auth::CTraderDiscoveredAccount {
+                    account_id: "101".to_string(),
+                    broker_title: "Broker A".to_string(),
+                    account_name: "Primary Live".to_string(),
+                    trader_login: Some(500101),
+                    is_live: Some(true),
+                    enabled_for_execution: true,
+                },
+                crate::app_services::ctrader_auth::CTraderDiscoveredAccount {
+                    account_id: "202".to_string(),
+                    broker_title: "Broker B".to_string(),
+                    account_name: "Secondary Demo".to_string(),
+                    trader_login: Some(500202),
+                    is_live: Some(false),
+                    enabled_for_execution: false,
+                },
+            ],
+        };
+
+        let dashboard = build_system_status_dashboard(&state, &connection, &readiness, Some(&auth));
+
+        assert!(dashboard.sections.iter().any(|section| {
+            section.title == "cTrader Accounts"
+                && section.rows.iter().any(|(label, value)| {
+                    label == "101" && value.contains("Primary Live")
+                })
+        }));
+        assert!(dashboard.sections.iter().any(|section| {
+            section.title == "cTrader Accounts"
+                && section.rows.iter().any(|(label, value)| {
+                    label == "202" && value.contains("Secondary Demo")
                 })
         }));
     }

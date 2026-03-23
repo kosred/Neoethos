@@ -1,13 +1,17 @@
 use crate::app_record;
 use crate::app_services::broker_config::{
-    AdapterReadinessSnapshot, BrokerSessionState, BrokerSettingsState,
+    AdapterReadinessSnapshot, BrokerAccountTarget, BrokerSessionState, BrokerSettingsState,
+    CTraderBrokerEnvironment,
 };
 use crate::app_services::ctrader_auth::{
-    CTraderAccountSummary, CTraderAuthSession, CTraderAuthSnapshot, CTraderTokenExchangeRequest,
+    CTraderAccountSummary, CTraderAuthSession, CTraderAuthSnapshot, CTraderDiscoveredAccount,
+    CTraderTokenExchangeRequest,
 };
 use crate::app_services::ctrader_live_auth::{
-    build_default_loopback_config, CTraderLiveAuthBackend, CTraderLiveAuthRequest,
-    CTraderLiveAuthResult, ProductionCTraderLiveAuthBackend, CTRADER_DEFAULT_SCOPE,
+    build_default_loopback_config, CTraderAccountDiscoveryBackend,
+    CTraderAccountDiscoveryRequest, CTraderEnvironment, CTraderLiveAuthBackend,
+    CTraderLiveAuthRequest, CTraderLiveAuthResult, ProductionCTraderLiveAuthBackend,
+    CTRADER_DEFAULT_SCOPE,
 };
 use crate::app_services::secure_store::{
     CTraderSecureStore, CTraderTokenStore, KeyringSecretStoreBackend,
@@ -150,6 +154,7 @@ pub struct TradingSession {
     broker_settings: BrokerSettingsState,
     ctrader_auth: Option<CTraderAuthSession>,
     ctrader_live_auth_backend: Arc<dyn CTraderLiveAuthBackend>,
+    ctrader_account_discovery_backend: Arc<dyn CTraderAccountDiscoveryBackend>,
     ctrader_token_store: Arc<dyn CTraderTokenStore>,
     ctrader_live_auth_rx: Option<Receiver<Result<CTraderLiveAuthResult, String>>>,
     adapter: Option<TradingAdapter>,
@@ -209,6 +214,7 @@ impl TradingSession {
             broker_settings: BrokerSettingsState::default(),
             ctrader_auth: None,
             ctrader_live_auth_backend: Arc::new(ProductionCTraderLiveAuthBackend),
+            ctrader_account_discovery_backend: Arc::new(ProductionCTraderLiveAuthBackend),
             ctrader_token_store: Arc::new(CTraderSecureStore::new(
                 "forex-ai",
                 "ctrader.default",
@@ -230,6 +236,7 @@ impl TradingSession {
             broker_settings: BrokerSettingsState::default(),
             ctrader_auth: None,
             ctrader_live_auth_backend: Arc::new(ProductionCTraderLiveAuthBackend),
+            ctrader_account_discovery_backend: Arc::new(ProductionCTraderLiveAuthBackend),
             ctrader_token_store: Arc::new(CTraderSecureStore::new(
                 "forex-ai.test",
                 "ctrader.account",
@@ -270,6 +277,14 @@ impl TradingSession {
         backend: crate::app_services::ctrader_live_auth::StubCTraderLiveAuthBackend,
     ) {
         self.ctrader_live_auth_backend = Arc::new(backend);
+    }
+
+    #[cfg(test)]
+    pub fn set_ctrader_account_discovery_backend_for_test(
+        &mut self,
+        backend: crate::app_services::ctrader_live_auth::StubCTraderAccountDiscoveryBackend,
+    ) {
+        self.ctrader_account_discovery_backend = Arc::new(backend);
     }
 
     pub fn is_connected(&self) -> bool {
@@ -490,6 +505,51 @@ impl TradingSession {
         self.ctrader_auth = None;
         self.ctrader_live_auth_rx = None;
         Ok(())
+    }
+
+    pub fn discover_ctrader_accounts(&mut self) -> anyhow::Result<Option<CTraderAuthSnapshot>> {
+        let session = self
+            .ctrader_auth
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("cTrader account discovery requires a restored token session"))?;
+        if !matches!(
+            session.snapshot().state,
+            crate::app_services::ctrader_auth::CTraderAuthState::RestoredFromStorage
+                | crate::app_services::ctrader_auth::CTraderAuthState::AccountsAvailable
+        ) {
+            return Err(anyhow::anyhow!(
+                "cTrader account discovery requires a restored token session"
+            ));
+        }
+
+        let access_token = self
+            .ctrader_token_store
+            .load_token_bundle()?
+            .map(|bundle| bundle.access_token)
+            .ok_or_else(|| anyhow::anyhow!("cTrader account discovery requires a stored token bundle"))?;
+        let request = CTraderAccountDiscoveryRequest {
+            client_id: self.broker_settings.ctrader.client_id.clone(),
+            client_secret: self.broker_settings.ctrader.client_secret.clone(),
+            access_token,
+            environment: match self.broker_settings.ctrader.environment {
+                CTraderBrokerEnvironment::Live => CTraderEnvironment::Live,
+                CTraderBrokerEnvironment::Demo => CTraderEnvironment::Demo,
+            },
+        };
+        let result = self
+            .ctrader_account_discovery_backend
+            .discover_accounts(&request)?;
+
+        let synced_accounts = sync_ctrader_discovered_accounts_into_targets(
+            &self.broker_settings.ctrader.accounts,
+            &result.accounts,
+        );
+        self.broker_settings.ctrader.accounts = synced_accounts.clone();
+        session.set_discovered_accounts(sync_discovered_accounts_with_targets(
+            &result.accounts,
+            &self.broker_settings.ctrader.accounts,
+        ));
+        Ok(Some(session.snapshot()))
     }
 
     pub fn snapshot(&self, state: &AppState) -> ConnectionSnapshot {
@@ -781,6 +841,7 @@ impl Default for TradingSession {
             broker_settings: BrokerSettingsState::default(),
             ctrader_auth: None,
             ctrader_live_auth_backend: Arc::new(ProductionCTraderLiveAuthBackend),
+            ctrader_account_discovery_backend: Arc::new(ProductionCTraderLiveAuthBackend),
             ctrader_token_store: Arc::new(CTraderSecureStore::new(
                 "forex-ai",
                 "ctrader.default",
@@ -821,6 +882,58 @@ impl TradingAdapterKind {
             Self::DxTrade => "DXtrade execution feed is not wired yet.".to_string(),
         }
     }
+}
+
+fn sync_ctrader_discovered_accounts_into_targets(
+    existing_targets: &[BrokerAccountTarget],
+    discovered_accounts: &[CTraderDiscoveredAccount],
+) -> Vec<BrokerAccountTarget> {
+    discovered_accounts
+        .iter()
+        .map(|account| {
+            if let Some(existing) = existing_targets
+                .iter()
+                .find(|target| target.account_id == account.account_id)
+            {
+                BrokerAccountTarget {
+                    account_id: existing.account_id.clone(),
+                    label: existing.label.clone(),
+                    enabled_for_execution: existing.enabled_for_execution,
+                }
+            } else {
+                BrokerAccountTarget {
+                    account_id: account.account_id.clone(),
+                    label: if !account.account_name.trim().is_empty() {
+                        account.account_name.clone()
+                    } else if !account.broker_title.trim().is_empty() {
+                        account.broker_title.clone()
+                    } else {
+                        format!("cTrader Account {}", account.account_id)
+                    },
+                    enabled_for_execution: false,
+                }
+            }
+        })
+        .collect()
+}
+
+fn sync_discovered_accounts_with_targets(
+    discovered_accounts: &[CTraderDiscoveredAccount],
+    targets: &[BrokerAccountTarget],
+) -> Vec<CTraderDiscoveredAccount> {
+    discovered_accounts
+        .iter()
+        .map(|account| {
+            let enabled = targets
+                .iter()
+                .find(|target| target.account_id == account.account_id)
+                .map(|target| target.enabled_for_execution)
+                .unwrap_or(false);
+            let mut synced = account.clone();
+            synced.enabled_for_execution = enabled;
+            synced
+        })
+        .collect()
 }
 
 pub fn panel_mode(data_source: DataSource, connected: bool) -> TradingPanelMode {
@@ -1419,7 +1532,7 @@ mod tests {
     }
 
     #[test]
-    fn build_ctrader_token_exchange_request_syncs_staged_account_targets() {
+    fn build_ctrader_token_exchange_request_keeps_staged_targets_pending_until_discovery() {
         let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
@@ -1444,10 +1557,10 @@ mod tests {
 
         assert_eq!(
             auth.state,
-            crate::app_services::ctrader_auth::CTraderAuthState::AccountsAvailable
+            crate::app_services::ctrader_auth::CTraderAuthState::AccessTokenReady
         );
-        assert_eq!(auth.account_count, 1);
-        assert_eq!(auth.enabled_target_count, 1);
+        assert_eq!(auth.account_count, 0);
+        assert_eq!(auth.enabled_target_count, 0);
     }
 
     #[test]
@@ -1563,5 +1676,245 @@ mod tests {
 
         let restored = session.restore_ctrader_session().expect("restore should succeed");
         assert!(restored.is_none());
+    }
+
+    #[test]
+    fn discover_ctrader_accounts_syncs_discovered_catalog_into_targets() {
+        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
+        session.broker_settings_mut().ctrader.redirect_uri =
+            "http://127.0.0.1:43001/callback".to_string();
+        session
+            .broker_settings_mut()
+            .ctrader
+            .accounts
+            .push(crate::app_services::broker_config::BrokerAccountTarget {
+                account_id: "101".to_string(),
+                label: "Operator Primary".to_string(),
+                enabled_for_execution: true,
+            });
+        session.set_ctrader_store_for_test(
+            crate::app_services::secure_store::MemorySecretStoreBackend::default(),
+        );
+        session
+            .seed_ctrader_token_bundle_for_test(crate::app_services::ctrader_auth::CTraderTokenBundle {
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                token_type: "bearer".to_string(),
+                expires_in: 3600,
+                scope: "trading".to_string(),
+                created_at_unix: 1_774_147_200,
+            })
+            .expect("seed should succeed");
+        session
+            .restore_ctrader_session()
+            .expect("restore should succeed")
+            .expect("snapshot should exist");
+        session.set_ctrader_account_discovery_backend_for_test(
+            crate::app_services::ctrader_live_auth::StubCTraderAccountDiscoveryBackend::success(
+                crate::app_services::ctrader_live_auth::CTraderAccountDiscoveryResult {
+                    access_token: "access".to_string(),
+                    permission_scope: "SCOPE_TRADE".to_string(),
+                    accounts: vec![
+                        crate::app_services::ctrader_auth::CTraderDiscoveredAccount {
+                            account_id: "101".to_string(),
+                            broker_title: "Broker A".to_string(),
+                            account_name: "Primary Live".to_string(),
+                            trader_login: Some(500101),
+                            is_live: Some(true),
+                            enabled_for_execution: false,
+                        },
+                        crate::app_services::ctrader_auth::CTraderDiscoveredAccount {
+                            account_id: "202".to_string(),
+                            broker_title: "Broker B".to_string(),
+                            account_name: "Secondary Demo".to_string(),
+                            trader_login: Some(500202),
+                            is_live: Some(false),
+                            enabled_for_execution: false,
+                        },
+                    ],
+                },
+            ),
+        );
+
+        let snapshot = session
+            .discover_ctrader_accounts()
+            .expect("discovery should succeed")
+            .expect("snapshot should exist");
+
+        assert_eq!(
+            snapshot.state,
+            crate::app_services::ctrader_auth::CTraderAuthState::AccountsAvailable
+        );
+        assert_eq!(snapshot.account_count, 2);
+        assert_eq!(snapshot.enabled_target_count, 1);
+        assert_eq!(session.broker_settings_mut().ctrader.accounts.len(), 2);
+        assert!(session
+            .broker_settings_mut()
+            .ctrader
+            .accounts
+            .iter()
+            .any(|account| account.account_id == "101"
+                && account.label == "Operator Primary"
+                && account.enabled_for_execution));
+        assert!(session
+            .broker_settings_mut()
+            .ctrader
+            .accounts
+            .iter()
+            .any(|account| account.account_id == "202" && !account.enabled_for_execution));
+    }
+
+    #[test]
+    fn discover_ctrader_accounts_uses_configured_demo_environment() {
+        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
+        session.broker_settings_mut().ctrader.redirect_uri =
+            "http://127.0.0.1:43001/callback".to_string();
+        session.broker_settings_mut().ctrader.environment = CTraderBrokerEnvironment::Demo;
+        session.set_ctrader_store_for_test(
+            crate::app_services::secure_store::MemorySecretStoreBackend::default(),
+        );
+        session
+            .seed_ctrader_token_bundle_for_test(crate::app_services::ctrader_auth::CTraderTokenBundle {
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                token_type: "bearer".to_string(),
+                expires_in: 3600,
+                scope: "trading".to_string(),
+                created_at_unix: 1_774_147_200,
+            })
+            .expect("seed should succeed");
+        session
+            .restore_ctrader_session()
+            .expect("restore should succeed")
+            .expect("snapshot should exist");
+
+        let backend =
+            crate::app_services::ctrader_live_auth::StubCTraderAccountDiscoveryBackend::success(
+                crate::app_services::ctrader_live_auth::CTraderAccountDiscoveryResult {
+                    access_token: "access".to_string(),
+                    permission_scope: "SCOPE_TRADE".to_string(),
+                    accounts: Vec::new(),
+                },
+            );
+        session.set_ctrader_account_discovery_backend_for_test(backend.clone());
+
+        session
+            .discover_ctrader_accounts()
+            .expect("discovery should succeed");
+
+        let request = backend
+            .last_request()
+            .expect("stub backend should capture discovery request");
+        assert_eq!(request.environment, CTraderEnvironment::Demo);
+    }
+
+    #[test]
+    fn discover_ctrader_accounts_requires_restored_token_session() {
+        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
+        session.broker_settings_mut().ctrader.redirect_uri =
+            "http://127.0.0.1:43001/callback".to_string();
+
+        let err = session
+            .discover_ctrader_accounts()
+            .expect_err("discovery should fail without a restored token");
+
+        assert!(err
+            .to_string()
+            .contains("cTrader account discovery requires a restored token session"));
+    }
+
+    #[test]
+    fn discover_ctrader_accounts_requires_persisted_token_bundle() {
+        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
+        session.broker_settings_mut().ctrader.redirect_uri =
+            "http://127.0.0.1:43001/callback".to_string();
+        session.set_ctrader_store_for_test(
+            crate::app_services::secure_store::MemorySecretStoreBackend::default(),
+        );
+        session.set_ctrader_account_discovery_backend_for_test(
+            crate::app_services::ctrader_live_auth::StubCTraderAccountDiscoveryBackend::success(
+                crate::app_services::ctrader_live_auth::CTraderAccountDiscoveryResult {
+                    access_token: "access".to_string(),
+                    permission_scope: "SCOPE_TRADE".to_string(),
+                    accounts: Vec::new(),
+                },
+            ),
+        );
+        let mut auth = crate::app_services::ctrader_auth::CTraderAuthSession::new(
+            "client",
+            "http://127.0.0.1:43001/callback",
+        );
+        auth.restore_from_storage(crate::app_services::ctrader_auth::CTraderTokenBundle {
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            token_type: "bearer".to_string(),
+            expires_in: 3600,
+            scope: "trading".to_string(),
+            created_at_unix: 1_774_147_200,
+        });
+        session.ctrader_auth = Some(auth);
+
+        let err = session
+            .discover_ctrader_accounts()
+            .expect_err("discovery should fail without persisted token bundle");
+
+        assert!(err
+            .to_string()
+            .contains("cTrader account discovery requires a stored token bundle"));
+    }
+
+    #[test]
+    fn discover_ctrader_accounts_uses_selected_demo_environment() {
+        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
+        session.broker_settings_mut().ctrader.redirect_uri =
+            "http://127.0.0.1:43001/callback".to_string();
+        session.broker_settings_mut().ctrader.environment =
+            crate::app_services::broker_config::CTraderBrokerEnvironment::Demo;
+        session.set_ctrader_store_for_test(
+            crate::app_services::secure_store::MemorySecretStoreBackend::default(),
+        );
+        session
+            .seed_ctrader_token_bundle_for_test(crate::app_services::ctrader_auth::CTraderTokenBundle {
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                token_type: "bearer".to_string(),
+                expires_in: 3600,
+                scope: "trading".to_string(),
+                created_at_unix: 1_774_147_200,
+            })
+            .expect("seed should succeed");
+        session
+            .restore_ctrader_session()
+            .expect("restore should succeed")
+            .expect("snapshot should exist");
+        let backend =
+            crate::app_services::ctrader_live_auth::StubCTraderAccountDiscoveryBackend::success(
+                crate::app_services::ctrader_live_auth::CTraderAccountDiscoveryResult {
+                    access_token: "access".to_string(),
+                    permission_scope: "SCOPE_TRADE".to_string(),
+                    accounts: Vec::new(),
+                },
+            );
+        session.set_ctrader_account_discovery_backend_for_test(backend.clone());
+
+        session
+            .discover_ctrader_accounts()
+            .expect("discovery should succeed")
+            .expect("snapshot should exist");
+
+        let request = backend
+            .last_request()
+            .expect("stub should capture the discovery request");
+        assert_eq!(request.environment, CTraderEnvironment::Demo);
     }
 }
