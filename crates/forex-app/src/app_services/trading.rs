@@ -9,7 +9,8 @@ use crate::app_services::ctrader_bootstrap::{
 };
 use crate::app_services::ctrader_account::{
     CTraderAccountRuntimeBackend, CTraderAccountRuntimeRequest, CTraderAccountRuntimeSnapshot,
-    CTraderPendingOrderSnapshot, CTraderPositionSnapshot, ProductionCTraderAccountRuntimeBackend,
+    CTraderDealSnapshot, CTraderPendingOrderSnapshot, CTraderPositionSnapshot,
+    ProductionCTraderAccountRuntimeBackend,
 };
 use crate::app_services::jobs::{JobEventLevel, JobKind, JobSnapshot, JobState, push_recent_event};
 use crate::app_services::ctrader_data::{
@@ -24,6 +25,14 @@ use crate::app_services::ctrader_live_auth::{
     CTraderAccountDiscoveryRequest, CTraderEnvironment, CTraderLiveAuthBackend,
     CTraderLiveAuthRequest, CTraderLiveAuthResult, CTraderTokenRefreshRequest,
     ProductionCTraderLiveAuthBackend, CTRADER_DEFAULT_SCOPE,
+};
+use crate::app_services::ctrader_messages::{
+    build_amend_order_request, build_cancel_order_request, build_close_position_request,
+    build_new_order_request, CTraderAmendOrderRequest, CTraderCancelOrderRequest,
+    CTraderClosePositionRequest, CTraderNewOrderRequest, CTraderOrderTriggerMethod,
+    CTraderOrderType, CTraderTimeInForce, CTraderTradeSide,
+    SUPPORTED_CTRADER_ORDER_TRIGGER_METHODS, SUPPORTED_CTRADER_ORDER_TYPES,
+    SUPPORTED_CTRADER_TIME_IN_FORCE, SUPPORTED_CTRADER_TRADE_SIDES,
 };
 use crate::app_services::ctrader_streaming::{
     merge_live_spot_update_into_bars, CTraderLiveChartUpdate, CTraderLiveChartUpdateRequest,
@@ -1743,6 +1752,40 @@ pub fn build_execution_surface_snapshot_with_runtime(
     if !connection.terminal_info.trim().is_empty() {
         diagnostics.push(format!("Terminal: {}", connection.terminal_info));
     }
+    if connection.adapter_name == "cTrader" {
+        diagnostics.push(format!(
+            "Supported trade sides: {}",
+            SUPPORTED_CTRADER_TRADE_SIDES
+                .iter()
+                .map(|side| side.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        diagnostics.push(format!(
+            "Supported order types: {}",
+            SUPPORTED_CTRADER_ORDER_TYPES
+                .iter()
+                .map(|order_type| order_type.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        diagnostics.push(format!(
+            "Supported time-in-force: {}",
+            SUPPORTED_CTRADER_TIME_IN_FORCE
+                .iter()
+                .map(|tif| tif.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        diagnostics.push(format!(
+            "Supported trigger methods: {}",
+            SUPPORTED_CTRADER_ORDER_TRIGGER_METHODS
+                .iter()
+                .map(|trigger| trigger.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
 
     let (positions, pending_orders, bot_timeline) = if let Some(runtime) = runtime {
         match runtime {
@@ -1780,6 +1823,8 @@ pub fn build_execution_surface_snapshot_with_runtime(
                     "Pending orders: {}",
                     runtime.reconcile.pending_orders.len()
                 ));
+                diagnostics.push(format!("Recent fills: {}", runtime.recent_deals.len()));
+                append_ctrader_order_builder_diagnostics(&mut diagnostics, runtime);
                 (
                     runtime
                         .reconcile
@@ -1793,7 +1838,7 @@ pub fn build_execution_surface_snapshot_with_runtime(
                         .iter()
                         .map(format_ctrader_pending_order_line)
                         .collect(),
-                    Vec::new(),
+                    runtime.recent_deals.iter().map(format_ctrader_deal_line).collect(),
                 )
             }
         }
@@ -1988,6 +2033,126 @@ fn format_ctrader_pending_order_line(order: &CTraderPendingOrderSnapshot) -> Str
         line.push_str(&format!(" · tp {:.5}", take_profit));
     }
     line
+}
+
+fn format_ctrader_deal_line(deal: &CTraderDealSnapshot) -> String {
+    let mut line = format!(
+        "#{} · {} {} {:.2}",
+        deal.deal_id, deal.deal_status, deal.trade_side, deal.filled_volume
+    );
+    if let Some(execution_price) = deal.execution_price {
+        line.push_str(&format!(" @ {:.5}", execution_price));
+    }
+    if let Some(gross_profit) = deal.gross_profit {
+        line.push_str(&format!(" · pnl {:+.2}", gross_profit));
+    }
+    if let Some(fee) = deal.fee {
+        line.push_str(&format!(" · fee {:+.2}", fee));
+    }
+    line
+}
+
+fn append_ctrader_order_builder_diagnostics(
+    diagnostics: &mut Vec<String>,
+    runtime: &CTraderAccountRuntimeSnapshot,
+) {
+    let account_id = runtime.trader.account_id;
+    let symbol_id = runtime
+        .reconcile
+        .positions
+        .first()
+        .map(|position| position.symbol_id)
+        .or_else(|| runtime.reconcile.pending_orders.first().map(|order| order.symbol_id));
+
+    if let Some(symbol_id) = symbol_id {
+        let seed_volume = runtime
+            .reconcile
+            .positions
+            .first()
+            .map(|position| position.volume)
+            .or_else(|| runtime.reconcile.pending_orders.first().map(|order| order.volume))
+            .unwrap_or(1.0);
+        let request = build_new_order_request(
+            &CTraderNewOrderRequest {
+                account_id,
+                symbol_id,
+                order_type: CTraderOrderType::Market,
+                trade_side: CTraderTradeSide::Buy,
+                volume: units_to_ctrader_protocol_volume(seed_volume),
+                limit_price: None,
+                stop_price: None,
+                time_in_force: Some(CTraderTimeInForce::ImmediateOrCancel),
+                expiration_timestamp_ms: None,
+                stop_loss: None,
+                take_profit: None,
+                comment: Some("preview".to_string()),
+                base_slippage_price: None,
+                slippage_in_points: Some(10),
+                label: Some("preview".to_string()),
+                position_id: None,
+                client_order_id: Some("preview-new".to_string()),
+                relative_stop_loss: None,
+                relative_take_profit: None,
+                guaranteed_stop_loss: Some(false),
+                trailing_stop_loss: Some(false),
+                stop_trigger_method: Some(CTraderOrderTriggerMethod::Trade),
+            },
+            "preview-new-order",
+        );
+        diagnostics.push(format!("New order builder ready: payload {}", request.payload_type));
+    }
+
+    if let Some(order) = runtime.reconcile.pending_orders.first() {
+        let cancel_request = build_cancel_order_request(
+            &CTraderCancelOrderRequest {
+                account_id,
+                order_id: order.order_id,
+            },
+            "preview-cancel-order",
+        );
+        let amend_request = build_amend_order_request(
+            &CTraderAmendOrderRequest {
+                account_id,
+                order_id: order.order_id,
+                volume: Some(units_to_ctrader_protocol_volume(order.volume)),
+                limit_price: order.limit_price,
+                stop_price: order.stop_price,
+                expiration_timestamp_ms: None,
+                stop_loss: order.stop_loss,
+                take_profit: order.take_profit,
+                slippage_in_points: Some(10),
+                relative_stop_loss: None,
+                relative_take_profit: None,
+                guaranteed_stop_loss: Some(false),
+                trailing_stop_loss: Some(false),
+                stop_trigger_method: Some(CTraderOrderTriggerMethod::Trade),
+            },
+            "preview-amend-order",
+        );
+        diagnostics.push(format!(
+            "Pending-order builders ready: cancel payload {} · amend payload {}",
+            cancel_request.payload_type, amend_request.payload_type
+        ));
+    }
+
+    if let Some(position) = runtime.reconcile.positions.first() {
+        let close_request = build_close_position_request(
+            &CTraderClosePositionRequest {
+                account_id,
+                position_id: position.position_id,
+                volume: units_to_ctrader_protocol_volume(position.volume),
+            },
+            "preview-close-position",
+        );
+        diagnostics.push(format!(
+            "Close-position builder ready: payload {}",
+            close_request.payload_type
+        ));
+    }
+}
+
+fn units_to_ctrader_protocol_volume(volume: f64) -> i64 {
+    (volume * 100.0).round() as i64
 }
 
 fn record_app_event(operation: &str, status: &str, message: impl Into<String>) {
@@ -2424,6 +2589,7 @@ mod tests {
                         positions: Vec::new(),
                         pending_orders: Vec::new(),
                     },
+                    recent_deals: Vec::new(),
                 },
             ),
         );
@@ -2531,6 +2697,20 @@ mod tests {
                             comment: Some("pending".to_string()),
                         }],
                     },
+                    recent_deals: vec![crate::app_services::ctrader_account::CTraderDealSnapshot {
+                        deal_id: 3001,
+                        order_id: 8001,
+                        position_id: 9001,
+                        symbol_id: 14,
+                        trade_side: "BUY".to_string(),
+                        deal_status: "FILLED".to_string(),
+                        volume: 15.0,
+                        filled_volume: 15.0,
+                        execution_timestamp_ms: 1710000201000,
+                        execution_price: Some(1.0990),
+                        gross_profit: Some(12.5),
+                        fee: Some(-0.4),
+                    }],
                 },
             ),
         );
@@ -2540,6 +2720,11 @@ mod tests {
 
         assert!(snapshot.positions.iter().any(|line| line.contains("#9001")));
         assert!(snapshot.pending_orders.iter().any(|line| line.contains("#8001")));
+        assert!(snapshot.bot_timeline.iter().any(|line| line.contains("#3001")));
+        assert!(snapshot
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("Recent fills: 1")));
         assert!(snapshot.diagnostics.iter().any(|line| line.contains("Trader balance")));
         assert!(snapshot.warnings.is_empty());
     }

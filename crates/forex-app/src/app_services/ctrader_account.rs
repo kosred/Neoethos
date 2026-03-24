@@ -1,16 +1,22 @@
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::{
-    build_account_auth_request, build_application_auth_request, build_reconcile_request,
-    build_trader_request, parse_ctrader_error_payload, parse_open_api_envelope,
-    CTraderOpenApiTransport, ProductionCTraderOpenApiTransport,
+    build_account_auth_request, build_application_auth_request, build_deal_list_request,
+    build_reconcile_request, build_trader_request, parse_ctrader_error_payload,
+    parse_open_api_envelope, CTraderDealListRequest, CTraderOpenApiTransport,
+    ProductionCTraderOpenApiTransport,
     CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE,
 };
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const DEFAULT_CTRADER_DEAL_LOOKBACK_HOURS: i64 = 24;
+const DEFAULT_CTRADER_DEAL_MAX_ROWS: i32 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CTraderAccountRuntimeRequest {
@@ -64,6 +70,22 @@ pub struct CTraderPendingOrderSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct CTraderDealSnapshot {
+    pub deal_id: i64,
+    pub order_id: i64,
+    pub position_id: i64,
+    pub symbol_id: i64,
+    pub trade_side: String,
+    pub deal_status: String,
+    pub volume: f64,
+    pub filled_volume: f64,
+    pub execution_timestamp_ms: i64,
+    pub execution_price: Option<f64>,
+    pub gross_profit: Option<f64>,
+    pub fee: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct CTraderReconcileSnapshot {
     pub account_id: i64,
     pub positions: Vec<CTraderPositionSnapshot>,
@@ -74,6 +96,7 @@ pub struct CTraderReconcileSnapshot {
 pub struct CTraderAccountRuntimeSnapshot {
     pub trader: CTraderTraderSnapshot,
     pub reconcile: CTraderReconcileSnapshot,
+    pub recent_deals: Vec<CTraderDealSnapshot>,
 }
 
 pub trait CTraderAccountRuntimeBackend: Send + Sync {
@@ -135,6 +158,19 @@ struct ReconcilePayload {
 }
 
 #[derive(Debug, Deserialize)]
+struct DealListEnvelope {
+    #[serde(rename = "payloadType")]
+    payload_type: u32,
+    payload: DealListPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct DealListPayload {
+    #[serde(default, rename = "deal")]
+    deals: Vec<DealPayload>,
+}
+
+#[derive(Debug, Deserialize)]
 struct PositionPayload {
     #[serde(rename = "positionId")]
     position_id: i64,
@@ -176,6 +212,43 @@ struct TradeDataPayload {
     open_timestamp: Option<i64>,
     label: Option<String>,
     comment: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DealPayload {
+    #[serde(rename = "dealId")]
+    deal_id: i64,
+    #[serde(rename = "orderId")]
+    order_id: i64,
+    #[serde(rename = "positionId")]
+    position_id: i64,
+    volume: i64,
+    #[serde(rename = "filledVolume")]
+    filled_volume: i64,
+    #[serde(rename = "symbolId")]
+    symbol_id: i64,
+    #[serde(rename = "executionTimestamp")]
+    execution_timestamp: i64,
+    #[serde(rename = "executionPrice")]
+    execution_price: Option<f64>,
+    #[serde(rename = "tradeSide")]
+    trade_side: i32,
+    #[serde(rename = "dealStatus")]
+    deal_status: i32,
+    commission: Option<i64>,
+    #[serde(rename = "moneyDigits")]
+    money_digits: Option<u32>,
+    #[serde(rename = "closePositionDetail")]
+    close_position_detail: Option<ClosePositionDetailPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClosePositionDetailPayload {
+    #[serde(rename = "grossProfit")]
+    gross_profit: i64,
+    commission: i64,
+    #[serde(rename = "moneyDigits")]
+    money_digits: Option<u32>,
 }
 
 pub fn parse_trader_response(response_json: &str) -> Result<CTraderTraderSnapshot> {
@@ -254,6 +327,51 @@ pub fn parse_reconcile_response(response_json: &str) -> Result<CTraderReconcileS
     })
 }
 
+pub fn parse_deal_list_response(response_json: &str) -> Result<Vec<CTraderDealSnapshot>> {
+    let envelope: DealListEnvelope =
+        serde_json::from_str(response_json).context("failed to parse cTrader deal list response")?;
+    if envelope.payload_type != CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE {
+        return Err(anyhow!(
+            "unexpected cTrader deal list payload type: {}",
+            envelope.payload_type
+        ));
+    }
+
+    Ok(envelope
+        .payload
+        .deals
+        .into_iter()
+        .map(|deal| {
+            let gross_profit = deal.close_position_detail.as_ref().map(|detail| {
+                scaled_money(detail.gross_profit, detail.money_digits.unwrap_or(0))
+            });
+            let fee = deal
+                .close_position_detail
+                .as_ref()
+                .map(|detail| scaled_money(detail.commission, detail.money_digits.unwrap_or(0)))
+                .or_else(|| {
+                    deal.commission
+                        .map(|commission| scaled_money(commission, deal.money_digits.unwrap_or(0)))
+                });
+
+            CTraderDealSnapshot {
+                deal_id: deal.deal_id,
+                order_id: deal.order_id,
+                position_id: deal.position_id,
+                symbol_id: deal.symbol_id,
+                trade_side: trade_side_label(deal.trade_side),
+                deal_status: deal_status_label(deal.deal_status),
+                volume: volume_to_units(deal.volume),
+                filled_volume: volume_to_units(deal.filled_volume),
+                execution_timestamp_ms: deal.execution_timestamp,
+                execution_price: deal.execution_price,
+                gross_profit,
+                fee,
+            }
+        })
+        .collect())
+}
+
 pub fn load_account_runtime_with_transport<T: CTraderOpenApiTransport>(
     transport: &T,
     request: &CTraderAccountRuntimeRequest,
@@ -267,10 +385,19 @@ pub fn load_account_runtime_with_transport<T: CTraderOpenApiTransport>(
         build_account_auth_request(account_id, &request.access_token, "account-auth-1"),
         build_trader_request(account_id, "trader-1"),
         build_reconcile_request(account_id, request.return_protection_orders, "reconcile-1"),
+        build_deal_list_request(
+            &CTraderDealListRequest {
+                account_id,
+                from_timestamp_ms: Some(current_unix_millis()? - DEFAULT_CTRADER_DEAL_LOOKBACK_HOURS * 60 * 60 * 1000),
+                to_timestamp_ms: Some(current_unix_millis()?),
+                max_rows: Some(DEFAULT_CTRADER_DEAL_MAX_ROWS),
+            },
+            "deals-1",
+        ),
     ])?;
-    if responses.len() != 4 {
+    if responses.len() != 5 {
         return Err(anyhow!(
-            "expected 4 cTrader account runtime responses, received {}",
+            "expected 5 cTrader account runtime responses, received {}",
             responses.len()
         ));
     }
@@ -285,10 +412,12 @@ pub fn load_account_runtime_with_transport<T: CTraderOpenApiTransport>(
     )?;
     ensure_success_payload_type(&responses[2], CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE)?;
     ensure_success_payload_type(&responses[3], CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(&responses[4], CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE)?;
 
     Ok(CTraderAccountRuntimeSnapshot {
         trader: parse_trader_response(&responses[2])?,
         reconcile: parse_reconcile_response(&responses[3])?,
+        recent_deals: parse_deal_list_response(&responses[4])?,
     })
 }
 
@@ -405,6 +534,26 @@ fn order_type_label(value: i32) -> String {
     .to_string()
 }
 
+fn deal_status_label(value: i32) -> String {
+    match value {
+        2 => "FILLED",
+        3 => "PARTIALLY_FILLED",
+        4 => "REJECTED",
+        5 => "INTERNALLY_REJECTED",
+        6 => "ERROR",
+        7 => "MISSED",
+        other => return format!("UNKNOWN({other})"),
+    }
+    .to_string()
+}
+
+fn current_unix_millis() -> Result<i64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| anyhow!("system clock is before unix epoch"))?
+        .as_millis() as i64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,12 +647,61 @@ mod tests {
     }
 
     #[test]
-    fn account_runtime_loader_authenticates_then_loads_trader_and_reconcile() {
+    fn deal_list_response_parses_recent_deals() {
+        let response = serde_json::json!({
+            "clientMsgId": "deals-1",
+            "payloadType": 2134,
+            "payload": {
+                "ctidTraderAccountId": 712345,
+                "deal": [
+                    {
+                        "dealId": 3001,
+                        "orderId": 8001,
+                        "positionId": 9001,
+                        "volume": 1500,
+                        "filledVolume": 1500,
+                        "symbolId": 14,
+                        "createTimestamp": 1710000200000i64,
+                        "executionTimestamp": 1710000201000i64,
+                        "executionPrice": 1.0990,
+                        "tradeSide": 1,
+                        "dealStatus": 2,
+                        "commission": -40,
+                        "moneyDigits": 2,
+                        "closePositionDetail": {
+                            "entryPrice": 1.0980,
+                            "grossProfit": 1250,
+                            "swap": 0,
+                            "commission": -40,
+                            "balance": 1001250,
+                            "moneyDigits": 2
+                        }
+                    }
+                ],
+                "hasMore": false
+            }
+        });
+
+        let deals = parse_deal_list_response(&response.to_string()).expect("deal list");
+
+        assert_eq!(deals.len(), 1);
+        assert_eq!(deals[0].deal_id, 3001);
+        assert_eq!(deals[0].trade_side, "BUY");
+        assert_eq!(deals[0].deal_status, "FILLED");
+        assert!((deals[0].volume - 15.0).abs() < 1e-9);
+        assert_eq!(deals[0].execution_price, Some(1.0990));
+        assert_eq!(deals[0].gross_profit, Some(12.5));
+        assert_eq!(deals[0].fee, Some(-0.4));
+    }
+
+    #[test]
+    fn account_runtime_loader_authenticates_then_loads_trader_reconcile_and_deals() {
         let transport = StubTransport::with_responses(vec![
             Ok(r#"{"clientMsgId":"app-auth-1","payloadType":2101,"payload":{}}"#.to_string()),
             Ok(r#"{"clientMsgId":"account-auth-1","payloadType":2103,"payload":{"ctidTraderAccountId":712345}}"#.to_string()),
             Ok(r#"{"clientMsgId":"trader-1","payloadType":2122,"payload":{"ctidTraderAccountId":712345,"balance":100000,"moneyDigits":2,"leverageInCents":5000,"brokerName":"Demo Broker"}}"#.to_string()),
             Ok(r#"{"clientMsgId":"reconcile-1","payloadType":2125,"payload":{"ctidTraderAccountId":712345,"position":[{"positionId":9001,"tradeData":{"symbolId":14,"volume":2500,"tradeSide":1,"openTimestamp":1710000000000},"positionStatus":1,"price":1.10123}],"order":[]}}"#.to_string()),
+            Ok(r#"{"clientMsgId":"deals-1","payloadType":2134,"payload":{"ctidTraderAccountId":712345,"deal":[{"dealId":3001,"orderId":8001,"positionId":9001,"volume":1500,"filledVolume":1500,"symbolId":14,"createTimestamp":1710000200000,"executionTimestamp":1710000201000,"executionPrice":1.099,"tradeSide":1,"dealStatus":2,"commission":-40,"moneyDigits":2,"closePositionDetail":{"entryPrice":1.098,"grossProfit":1250,"swap":0,"commission":-40,"balance":1001250,"moneyDigits":2}}],"hasMore":false}}"#.to_string()),
         ]);
 
         let runtime = load_account_runtime_with_transport(
@@ -521,7 +719,8 @@ mod tests {
 
         assert_eq!(runtime.trader.account_id, 712345);
         assert_eq!(runtime.reconcile.positions.len(), 1);
-        assert_eq!(transport.sent_len(), 4);
+        assert_eq!(runtime.recent_deals.len(), 1);
+        assert_eq!(transport.sent_len(), 5);
     }
 
     #[test]

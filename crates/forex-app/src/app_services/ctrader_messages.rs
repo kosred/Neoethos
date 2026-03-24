@@ -7,15 +7,23 @@ pub const CTRADER_OA_APPLICATION_AUTH_REQUEST_PAYLOAD_TYPE: u32 = 2100;
 pub const CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE: u32 = 2101;
 pub const CTRADER_OA_ACCOUNT_AUTH_REQUEST_PAYLOAD_TYPE: u32 = 2102;
 pub const CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE: u32 = 2103;
+pub const CTRADER_OA_NEW_ORDER_REQUEST_PAYLOAD_TYPE: u32 = 2106;
+pub const CTRADER_OA_CANCEL_ORDER_REQUEST_PAYLOAD_TYPE: u32 = 2108;
+pub const CTRADER_OA_AMEND_ORDER_REQUEST_PAYLOAD_TYPE: u32 = 2109;
+pub const CTRADER_OA_CLOSE_POSITION_REQUEST_PAYLOAD_TYPE: u32 = 2111;
 pub const CTRADER_OA_TRADER_REQUEST_PAYLOAD_TYPE: u32 = 2121;
 pub const CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE: u32 = 2122;
 pub const CTRADER_OA_RECONCILE_REQUEST_PAYLOAD_TYPE: u32 = 2124;
 pub const CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE: u32 = 2125;
+pub const CTRADER_OA_EXECUTION_EVENT_PAYLOAD_TYPE: u32 = 2126;
 pub const CTRADER_OA_SUBSCRIBE_SPOTS_REQUEST_PAYLOAD_TYPE: u32 = 2127;
 pub const CTRADER_OA_SUBSCRIBE_SPOTS_RESPONSE_PAYLOAD_TYPE: u32 = 2128;
 pub const CTRADER_OA_UNSUBSCRIBE_SPOTS_REQUEST_PAYLOAD_TYPE: u32 = 2129;
 pub const CTRADER_OA_UNSUBSCRIBE_SPOTS_RESPONSE_PAYLOAD_TYPE: u32 = 2130;
 pub const CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE: u32 = 2131;
+pub const CTRADER_OA_ORDER_ERROR_EVENT_PAYLOAD_TYPE: u32 = 2132;
+pub const CTRADER_OA_DEAL_LIST_REQUEST_PAYLOAD_TYPE: u32 = 2133;
+pub const CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE: u32 = 2134;
 pub const CTRADER_OA_SUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE: u32 = 2135;
 pub const CTRADER_OA_UNSUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE: u32 = 2136;
 pub const CTRADER_OA_SYMBOLS_LIST_REQUEST_PAYLOAD_TYPE: u32 = 2114;
@@ -33,6 +41,23 @@ pub const CTRADER_OA_SUBSCRIBE_LIVE_TRENDBAR_RESPONSE_PAYLOAD_TYPE: u32 = 2165;
 pub const CTRADER_OA_UNSUBSCRIBE_LIVE_TRENDBAR_RESPONSE_PAYLOAD_TYPE: u32 = 2166;
 pub const CTRADER_QUOTE_TYPE_BID: i32 = 1;
 pub const CTRADER_QUOTE_TYPE_ASK: i32 = 2;
+pub const CTRADER_TRADE_SIDE_BUY: i32 = 1;
+pub const CTRADER_TRADE_SIDE_SELL: i32 = 2;
+pub const CTRADER_ORDER_TYPE_MARKET: i32 = 1;
+pub const CTRADER_ORDER_TYPE_LIMIT: i32 = 2;
+pub const CTRADER_ORDER_TYPE_STOP: i32 = 3;
+pub const CTRADER_ORDER_TYPE_STOP_LOSS_TAKE_PROFIT: i32 = 4;
+pub const CTRADER_ORDER_TYPE_MARKET_RANGE: i32 = 5;
+pub const CTRADER_ORDER_TYPE_STOP_LIMIT: i32 = 6;
+pub const CTRADER_TIME_IN_FORCE_GOOD_TILL_DATE: i32 = 1;
+pub const CTRADER_TIME_IN_FORCE_GOOD_TILL_CANCEL: i32 = 2;
+pub const CTRADER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL: i32 = 3;
+pub const CTRADER_TIME_IN_FORCE_FILL_OR_KILL: i32 = 4;
+pub const CTRADER_TIME_IN_FORCE_MARKET_ON_OPEN: i32 = 5;
+pub const CTRADER_ORDER_TRIGGER_METHOD_TRADE: i32 = 1;
+pub const CTRADER_ORDER_TRIGGER_METHOD_OPPOSITE: i32 = 2;
+pub const CTRADER_ORDER_TRIGGER_METHOD_DOUBLE_TRADE: i32 = 3;
+pub const CTRADER_ORDER_TRIGGER_METHOD_DOUBLE_OPPOSITE: i32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CTraderOpenApiJsonMessage {
@@ -41,6 +66,213 @@ pub struct CTraderOpenApiJsonMessage {
     #[serde(rename = "payloadType")]
     pub payload_type: u32,
     pub payload: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CTraderTradeSide {
+    Buy,
+    Sell,
+}
+
+pub const SUPPORTED_CTRADER_TRADE_SIDES: [CTraderTradeSide; 2] =
+    [CTraderTradeSide::Buy, CTraderTradeSide::Sell];
+
+impl CTraderTradeSide {
+    fn as_i32(self) -> i32 {
+        match self {
+            Self::Buy => CTRADER_TRADE_SIDE_BUY,
+            Self::Sell => CTRADER_TRADE_SIDE_SELL,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Buy => "BUY",
+            Self::Sell => "SELL",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CTraderOrderType {
+    Market,
+    Limit,
+    Stop,
+    StopLossTakeProfit,
+    MarketRange,
+    StopLimit,
+}
+
+pub const SUPPORTED_CTRADER_ORDER_TYPES: [CTraderOrderType; 6] = [
+    CTraderOrderType::Market,
+    CTraderOrderType::Limit,
+    CTraderOrderType::Stop,
+    CTraderOrderType::StopLossTakeProfit,
+    CTraderOrderType::MarketRange,
+    CTraderOrderType::StopLimit,
+];
+
+impl CTraderOrderType {
+    fn as_i32(self) -> i32 {
+        match self {
+            Self::Market => CTRADER_ORDER_TYPE_MARKET,
+            Self::Limit => CTRADER_ORDER_TYPE_LIMIT,
+            Self::Stop => CTRADER_ORDER_TYPE_STOP,
+            Self::StopLossTakeProfit => CTRADER_ORDER_TYPE_STOP_LOSS_TAKE_PROFIT,
+            Self::MarketRange => CTRADER_ORDER_TYPE_MARKET_RANGE,
+            Self::StopLimit => CTRADER_ORDER_TYPE_STOP_LIMIT,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Market => "MARKET",
+            Self::Limit => "LIMIT",
+            Self::Stop => "STOP",
+            Self::StopLossTakeProfit => "STOP_LOSS_TAKE_PROFIT",
+            Self::MarketRange => "MARKET_RANGE",
+            Self::StopLimit => "STOP_LIMIT",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CTraderTimeInForce {
+    GoodTillDate,
+    GoodTillCancel,
+    ImmediateOrCancel,
+    FillOrKill,
+    MarketOnOpen,
+}
+
+pub const SUPPORTED_CTRADER_TIME_IN_FORCE: [CTraderTimeInForce; 5] = [
+    CTraderTimeInForce::GoodTillDate,
+    CTraderTimeInForce::GoodTillCancel,
+    CTraderTimeInForce::ImmediateOrCancel,
+    CTraderTimeInForce::FillOrKill,
+    CTraderTimeInForce::MarketOnOpen,
+];
+
+impl CTraderTimeInForce {
+    fn as_i32(self) -> i32 {
+        match self {
+            Self::GoodTillDate => CTRADER_TIME_IN_FORCE_GOOD_TILL_DATE,
+            Self::GoodTillCancel => CTRADER_TIME_IN_FORCE_GOOD_TILL_CANCEL,
+            Self::ImmediateOrCancel => CTRADER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+            Self::FillOrKill => CTRADER_TIME_IN_FORCE_FILL_OR_KILL,
+            Self::MarketOnOpen => CTRADER_TIME_IN_FORCE_MARKET_ON_OPEN,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::GoodTillDate => "GOOD_TILL_DATE",
+            Self::GoodTillCancel => "GOOD_TILL_CANCEL",
+            Self::ImmediateOrCancel => "IMMEDIATE_OR_CANCEL",
+            Self::FillOrKill => "FILL_OR_KILL",
+            Self::MarketOnOpen => "MARKET_ON_OPEN",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CTraderOrderTriggerMethod {
+    Trade,
+    Opposite,
+    DoubleTrade,
+    DoubleOpposite,
+}
+
+pub const SUPPORTED_CTRADER_ORDER_TRIGGER_METHODS: [CTraderOrderTriggerMethod; 4] = [
+    CTraderOrderTriggerMethod::Trade,
+    CTraderOrderTriggerMethod::Opposite,
+    CTraderOrderTriggerMethod::DoubleTrade,
+    CTraderOrderTriggerMethod::DoubleOpposite,
+];
+
+impl CTraderOrderTriggerMethod {
+    fn as_i32(self) -> i32 {
+        match self {
+            Self::Trade => CTRADER_ORDER_TRIGGER_METHOD_TRADE,
+            Self::Opposite => CTRADER_ORDER_TRIGGER_METHOD_OPPOSITE,
+            Self::DoubleTrade => CTRADER_ORDER_TRIGGER_METHOD_DOUBLE_TRADE,
+            Self::DoubleOpposite => CTRADER_ORDER_TRIGGER_METHOD_DOUBLE_OPPOSITE,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Trade => "TRADE",
+            Self::Opposite => "OPPOSITE",
+            Self::DoubleTrade => "DOUBLE_TRADE",
+            Self::DoubleOpposite => "DOUBLE_OPPOSITE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CTraderDealListRequest {
+    pub account_id: i64,
+    pub from_timestamp_ms: Option<i64>,
+    pub to_timestamp_ms: Option<i64>,
+    pub max_rows: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CTraderNewOrderRequest {
+    pub account_id: i64,
+    pub symbol_id: i64,
+    pub order_type: CTraderOrderType,
+    pub trade_side: CTraderTradeSide,
+    pub volume: i64,
+    pub limit_price: Option<f64>,
+    pub stop_price: Option<f64>,
+    pub time_in_force: Option<CTraderTimeInForce>,
+    pub expiration_timestamp_ms: Option<i64>,
+    pub stop_loss: Option<f64>,
+    pub take_profit: Option<f64>,
+    pub comment: Option<String>,
+    pub base_slippage_price: Option<f64>,
+    pub slippage_in_points: Option<i32>,
+    pub label: Option<String>,
+    pub position_id: Option<i64>,
+    pub client_order_id: Option<String>,
+    pub relative_stop_loss: Option<i64>,
+    pub relative_take_profit: Option<i64>,
+    pub guaranteed_stop_loss: Option<bool>,
+    pub trailing_stop_loss: Option<bool>,
+    pub stop_trigger_method: Option<CTraderOrderTriggerMethod>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CTraderAmendOrderRequest {
+    pub account_id: i64,
+    pub order_id: i64,
+    pub volume: Option<i64>,
+    pub limit_price: Option<f64>,
+    pub stop_price: Option<f64>,
+    pub expiration_timestamp_ms: Option<i64>,
+    pub stop_loss: Option<f64>,
+    pub take_profit: Option<f64>,
+    pub slippage_in_points: Option<i32>,
+    pub relative_stop_loss: Option<i64>,
+    pub relative_take_profit: Option<i64>,
+    pub guaranteed_stop_loss: Option<bool>,
+    pub trailing_stop_loss: Option<bool>,
+    pub stop_trigger_method: Option<CTraderOrderTriggerMethod>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CTraderCancelOrderRequest {
+    pub account_id: i64,
+    pub order_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CTraderClosePositionRequest {
+    pub account_id: i64,
+    pub position_id: i64,
+    pub volume: i64,
 }
 
 pub trait CTraderOpenApiTransport {
@@ -106,6 +338,178 @@ pub fn build_account_list_by_access_token_request(
         payload_type: CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQUEST_PAYLOAD_TYPE,
         payload: serde_json::json!({
             "accessToken": access_token,
+        }),
+    }
+}
+
+pub fn build_deal_list_request(
+    request: &CTraderDealListRequest,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    let mut payload = serde_json::json!({
+        "ctidTraderAccountId": request.account_id,
+    });
+    if let Some(from_timestamp_ms) = request.from_timestamp_ms {
+        payload["fromTimestamp"] = serde_json::json!(from_timestamp_ms);
+    }
+    if let Some(to_timestamp_ms) = request.to_timestamp_ms {
+        payload["toTimestamp"] = serde_json::json!(to_timestamp_ms);
+    }
+    if let Some(max_rows) = request.max_rows {
+        payload["maxRows"] = serde_json::json!(max_rows);
+    }
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_DEAL_LIST_REQUEST_PAYLOAD_TYPE,
+        payload,
+    }
+}
+
+pub fn build_new_order_request(
+    request: &CTraderNewOrderRequest,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    let mut payload = serde_json::json!({
+        "ctidTraderAccountId": request.account_id,
+        "symbolId": request.symbol_id,
+        "orderType": request.order_type.as_i32(),
+        "tradeSide": request.trade_side.as_i32(),
+        "volume": request.volume,
+    });
+    if let Some(limit_price) = request.limit_price {
+        payload["limitPrice"] = serde_json::json!(limit_price);
+    }
+    if let Some(stop_price) = request.stop_price {
+        payload["stopPrice"] = serde_json::json!(stop_price);
+    }
+    if let Some(time_in_force) = request.time_in_force {
+        payload["timeInForce"] = serde_json::json!(time_in_force.as_i32());
+    }
+    if let Some(expiration_timestamp_ms) = request.expiration_timestamp_ms {
+        payload["expirationTimestamp"] = serde_json::json!(expiration_timestamp_ms);
+    }
+    if let Some(stop_loss) = request.stop_loss {
+        payload["stopLoss"] = serde_json::json!(stop_loss);
+    }
+    if let Some(take_profit) = request.take_profit {
+        payload["takeProfit"] = serde_json::json!(take_profit);
+    }
+    if let Some(comment) = &request.comment {
+        payload["comment"] = serde_json::json!(comment);
+    }
+    if let Some(base_slippage_price) = request.base_slippage_price {
+        payload["baseSlippagePrice"] = serde_json::json!(base_slippage_price);
+    }
+    if let Some(slippage_in_points) = request.slippage_in_points {
+        payload["slippageInPoints"] = serde_json::json!(slippage_in_points);
+    }
+    if let Some(label) = &request.label {
+        payload["label"] = serde_json::json!(label);
+    }
+    if let Some(position_id) = request.position_id {
+        payload["positionId"] = serde_json::json!(position_id);
+    }
+    if let Some(client_order_id) = &request.client_order_id {
+        payload["clientOrderId"] = serde_json::json!(client_order_id);
+    }
+    if let Some(relative_stop_loss) = request.relative_stop_loss {
+        payload["relativeStopLoss"] = serde_json::json!(relative_stop_loss);
+    }
+    if let Some(relative_take_profit) = request.relative_take_profit {
+        payload["relativeTakeProfit"] = serde_json::json!(relative_take_profit);
+    }
+    if let Some(guaranteed_stop_loss) = request.guaranteed_stop_loss {
+        payload["guaranteedStopLoss"] = serde_json::json!(guaranteed_stop_loss);
+    }
+    if let Some(trailing_stop_loss) = request.trailing_stop_loss {
+        payload["trailingStopLoss"] = serde_json::json!(trailing_stop_loss);
+    }
+    if let Some(stop_trigger_method) = request.stop_trigger_method {
+        payload["stopTriggerMethod"] = serde_json::json!(stop_trigger_method.as_i32());
+    }
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_NEW_ORDER_REQUEST_PAYLOAD_TYPE,
+        payload,
+    }
+}
+
+pub fn build_amend_order_request(
+    request: &CTraderAmendOrderRequest,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    let mut payload = serde_json::json!({
+        "ctidTraderAccountId": request.account_id,
+        "orderId": request.order_id,
+    });
+    if let Some(volume) = request.volume {
+        payload["volume"] = serde_json::json!(volume);
+    }
+    if let Some(limit_price) = request.limit_price {
+        payload["limitPrice"] = serde_json::json!(limit_price);
+    }
+    if let Some(stop_price) = request.stop_price {
+        payload["stopPrice"] = serde_json::json!(stop_price);
+    }
+    if let Some(expiration_timestamp_ms) = request.expiration_timestamp_ms {
+        payload["expirationTimestamp"] = serde_json::json!(expiration_timestamp_ms);
+    }
+    if let Some(stop_loss) = request.stop_loss {
+        payload["stopLoss"] = serde_json::json!(stop_loss);
+    }
+    if let Some(take_profit) = request.take_profit {
+        payload["takeProfit"] = serde_json::json!(take_profit);
+    }
+    if let Some(slippage_in_points) = request.slippage_in_points {
+        payload["slippageInPoints"] = serde_json::json!(slippage_in_points);
+    }
+    if let Some(relative_stop_loss) = request.relative_stop_loss {
+        payload["relativeStopLoss"] = serde_json::json!(relative_stop_loss);
+    }
+    if let Some(relative_take_profit) = request.relative_take_profit {
+        payload["relativeTakeProfit"] = serde_json::json!(relative_take_profit);
+    }
+    if let Some(guaranteed_stop_loss) = request.guaranteed_stop_loss {
+        payload["guaranteedStopLoss"] = serde_json::json!(guaranteed_stop_loss);
+    }
+    if let Some(trailing_stop_loss) = request.trailing_stop_loss {
+        payload["trailingStopLoss"] = serde_json::json!(trailing_stop_loss);
+    }
+    if let Some(stop_trigger_method) = request.stop_trigger_method {
+        payload["stopTriggerMethod"] = serde_json::json!(stop_trigger_method.as_i32());
+    }
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_AMEND_ORDER_REQUEST_PAYLOAD_TYPE,
+        payload,
+    }
+}
+
+pub fn build_cancel_order_request(
+    request: &CTraderCancelOrderRequest,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_CANCEL_ORDER_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": request.account_id,
+            "orderId": request.order_id,
+        }),
+    }
+}
+
+pub fn build_close_position_request(
+    request: &CTraderClosePositionRequest,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_CLOSE_POSITION_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": request.account_id,
+            "positionId": request.position_id,
+            "volume": request.volume,
         }),
     }
 }
@@ -311,6 +715,12 @@ pub fn expected_response_payload_type(request_payload_type: u32) -> Result<u32> 
             Ok(CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)
         }
         CTRADER_OA_ACCOUNT_AUTH_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE),
+        CTRADER_OA_NEW_ORDER_REQUEST_PAYLOAD_TYPE
+        | CTRADER_OA_CANCEL_ORDER_REQUEST_PAYLOAD_TYPE
+        | CTRADER_OA_AMEND_ORDER_REQUEST_PAYLOAD_TYPE
+        | CTRADER_OA_CLOSE_POSITION_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_EXECUTION_EVENT_PAYLOAD_TYPE)
+        }
         CTRADER_OA_TRADER_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE),
         CTRADER_OA_RECONCILE_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE),
         CTRADER_OA_SUBSCRIBE_SPOTS_REQUEST_PAYLOAD_TYPE => {
@@ -329,6 +739,7 @@ pub fn expected_response_payload_type(request_payload_type: u32) -> Result<u32> 
         CTRADER_OA_SYMBOL_BY_ID_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_SYMBOL_BY_ID_RESPONSE_PAYLOAD_TYPE),
         CTRADER_OA_GET_TRENDBARS_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_GET_TRENDBARS_RESPONSE_PAYLOAD_TYPE),
         CTRADER_OA_GET_TICK_DATA_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_GET_TICK_DATA_RESPONSE_PAYLOAD_TYPE),
+        CTRADER_OA_DEAL_LIST_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE),
         CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RESPONSE_PAYLOAD_TYPE)
         }
@@ -349,6 +760,19 @@ pub fn is_matching_open_api_response(
 ) -> bool {
     if envelope.payload_type == CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE {
         return false;
+    }
+    if matches!(
+        request.payload_type,
+        CTRADER_OA_NEW_ORDER_REQUEST_PAYLOAD_TYPE
+            | CTRADER_OA_CANCEL_ORDER_REQUEST_PAYLOAD_TYPE
+            | CTRADER_OA_AMEND_ORDER_REQUEST_PAYLOAD_TYPE
+            | CTRADER_OA_CLOSE_POSITION_REQUEST_PAYLOAD_TYPE
+    ) {
+        return envelope.client_msg_id == request.client_msg_id
+            && matches!(
+                envelope.payload_type,
+                CTRADER_OA_EXECUTION_EVENT_PAYLOAD_TYPE | CTRADER_OA_ORDER_ERROR_EVENT_PAYLOAD_TYPE
+            );
     }
     envelope.payload_type == expected_payload_type && envelope.client_msg_id == request.client_msg_id
 }
@@ -677,6 +1101,179 @@ mod tests {
         assert_eq!(
             message.payload.get("type").and_then(serde_json::Value::as_i64),
             Some(i64::from(CTRADER_QUOTE_TYPE_ASK))
+        );
+    }
+
+    #[test]
+    fn deal_list_request_uses_documented_payload_and_optional_filters() {
+        let message = build_deal_list_request(
+            &CTraderDealListRequest {
+                account_id: 7001,
+                from_timestamp_ms: Some(1_700_000_000_000),
+                to_timestamp_ms: Some(1_700_000_100_000),
+                max_rows: Some(50),
+            },
+            "deals-1",
+        );
+
+        assert_eq!(message.client_msg_id, "deals-1");
+        assert_eq!(message.payload_type, CTRADER_OA_DEAL_LIST_REQUEST_PAYLOAD_TYPE);
+        assert_eq!(
+            message.payload.get("ctidTraderAccountId").and_then(serde_json::Value::as_i64),
+            Some(7001)
+        );
+        assert_eq!(
+            message.payload.get("fromTimestamp").and_then(serde_json::Value::as_i64),
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(
+            message.payload.get("toTimestamp").and_then(serde_json::Value::as_i64),
+            Some(1_700_000_100_000)
+        );
+        assert_eq!(
+            message.payload.get("maxRows").and_then(serde_json::Value::as_i64),
+            Some(50)
+        );
+    }
+
+    #[test]
+    fn new_order_request_uses_documented_trade_payload() {
+        let message = build_new_order_request(
+            &CTraderNewOrderRequest {
+                account_id: 7001,
+                symbol_id: 14,
+                order_type: CTraderOrderType::Market,
+                trade_side: CTraderTradeSide::Buy,
+                volume: 1500,
+                limit_price: None,
+                stop_price: None,
+                time_in_force: Some(CTraderTimeInForce::ImmediateOrCancel),
+                expiration_timestamp_ms: None,
+                stop_loss: Some(1.095),
+                take_profit: Some(1.105),
+                comment: Some("bot-entry".to_string()),
+                base_slippage_price: None,
+                slippage_in_points: Some(15),
+                label: Some("trend".to_string()),
+                position_id: None,
+                client_order_id: Some("client-order-1".to_string()),
+                relative_stop_loss: None,
+                relative_take_profit: None,
+                guaranteed_stop_loss: Some(false),
+                trailing_stop_loss: Some(true),
+                stop_trigger_method: Some(CTraderOrderTriggerMethod::Trade),
+            },
+            "new-order-1",
+        );
+
+        assert_eq!(message.client_msg_id, "new-order-1");
+        assert_eq!(message.payload_type, CTRADER_OA_NEW_ORDER_REQUEST_PAYLOAD_TYPE);
+        assert_eq!(
+            message.payload.get("ctidTraderAccountId").and_then(serde_json::Value::as_i64),
+            Some(7001)
+        );
+        assert_eq!(
+            message.payload.get("symbolId").and_then(serde_json::Value::as_i64),
+            Some(14)
+        );
+        assert_eq!(
+            message.payload.get("orderType").and_then(serde_json::Value::as_i64),
+            Some(1)
+        );
+        assert_eq!(
+            message.payload.get("tradeSide").and_then(serde_json::Value::as_i64),
+            Some(1)
+        );
+        assert_eq!(
+            message.payload.get("volume").and_then(serde_json::Value::as_i64),
+            Some(1500)
+        );
+        assert_eq!(
+            message.payload.get("timeInForce").and_then(serde_json::Value::as_i64),
+            Some(3)
+        );
+        assert_eq!(
+            message.payload.get("clientOrderId").and_then(serde_json::Value::as_str),
+            Some("client-order-1")
+        );
+    }
+
+    #[test]
+    fn amend_order_request_uses_documented_identifiers_and_optional_fields() {
+        let message = build_amend_order_request(
+            &CTraderAmendOrderRequest {
+                account_id: 7001,
+                order_id: 8001,
+                volume: Some(1200),
+                limit_price: Some(1.0985),
+                stop_price: None,
+                expiration_timestamp_ms: None,
+                stop_loss: Some(1.0940),
+                take_profit: Some(1.1060),
+                slippage_in_points: Some(12),
+                relative_stop_loss: None,
+                relative_take_profit: None,
+                guaranteed_stop_loss: Some(false),
+                trailing_stop_loss: Some(true),
+                stop_trigger_method: Some(CTraderOrderTriggerMethod::Trade),
+            },
+            "amend-order-1",
+        );
+
+        assert_eq!(message.client_msg_id, "amend-order-1");
+        assert_eq!(message.payload_type, CTRADER_OA_AMEND_ORDER_REQUEST_PAYLOAD_TYPE);
+        assert_eq!(
+            message.payload.get("ctidTraderAccountId").and_then(serde_json::Value::as_i64),
+            Some(7001)
+        );
+        assert_eq!(
+            message.payload.get("orderId").and_then(serde_json::Value::as_i64),
+            Some(8001)
+        );
+        assert_eq!(
+            message.payload.get("limitPrice").and_then(serde_json::Value::as_f64),
+            Some(1.0985)
+        );
+    }
+
+    #[test]
+    fn cancel_order_request_uses_documented_order_id() {
+        let message = build_cancel_order_request(
+            &CTraderCancelOrderRequest {
+                account_id: 7001,
+                order_id: 8001,
+            },
+            "cancel-order-1",
+        );
+
+        assert_eq!(message.client_msg_id, "cancel-order-1");
+        assert_eq!(message.payload_type, CTRADER_OA_CANCEL_ORDER_REQUEST_PAYLOAD_TYPE);
+        assert_eq!(
+            message.payload.get("orderId").and_then(serde_json::Value::as_i64),
+            Some(8001)
+        );
+    }
+
+    #[test]
+    fn close_position_request_uses_documented_position_id_and_volume() {
+        let message = build_close_position_request(
+            &CTraderClosePositionRequest {
+                account_id: 7001,
+                position_id: 9001,
+                volume: 500,
+            },
+            "close-position-1",
+        );
+
+        assert_eq!(message.client_msg_id, "close-position-1");
+        assert_eq!(message.payload_type, CTRADER_OA_CLOSE_POSITION_REQUEST_PAYLOAD_TYPE);
+        assert_eq!(
+            message.payload.get("positionId").and_then(serde_json::Value::as_i64),
+            Some(9001)
+        );
+        assert_eq!(
+            message.payload.get("volume").and_then(serde_json::Value::as_i64),
+            Some(500)
         );
     }
 
