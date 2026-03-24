@@ -3,6 +3,9 @@ use crate::app_services::broker_config::{
     AdapterReadinessSnapshot, BrokerAccountTarget, BrokerSessionState, BrokerSettingsState,
     CTraderBrokerEnvironment,
 };
+use crate::app_services::ctrader_data::{
+    load_chart_history, CTraderChartHistoryRequest, HistoricalBar,
+};
 use crate::app_services::ctrader_auth::{
     CTraderAccountSummary, CTraderAuthSession, CTraderAuthSnapshot, CTraderDiscoveredAccount,
     CTraderTokenExchangeRequest,
@@ -24,7 +27,7 @@ use mt5_bridge::{DealInfo, MT5Engine, PendingOrderInfo, PositionInfo};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,8 +175,11 @@ enum TradingAdapter {
 struct MarketChartCacheKey {
     data_root: PathBuf,
     data_source: DataSource,
+    adapter_kind: TradingAdapterKind,
     symbol: String,
     timeframe: String,
+    ctrader_environment: Option<CTraderEnvironment>,
+    ctrader_account_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -586,15 +592,32 @@ impl TradingSession {
     }
 
     pub fn market_chart_snapshot(&mut self, state: &AppState) -> MarketChartSnapshot {
-        let available_timeframes =
-            discover_timeframes(&state.runtime.data_dir, &state.selected_pair).unwrap_or_default();
+        let adapter_kind = self.active_adapter_kind();
+        let available_timeframes = if matches!(state.data_source, DataSource::Local) {
+            discover_timeframes(&state.runtime.data_dir, &state.selected_pair).unwrap_or_default()
+        } else if matches!(adapter_kind, TradingAdapterKind::CTrader) {
+            supported_ctrader_chart_timeframes()
+        } else {
+            discover_timeframes(&state.runtime.data_dir, &state.selected_pair).unwrap_or_default()
+        };
         let timeframe =
             preferred_chart_timeframe(&available_timeframes, state.chart_timeframe.as_str());
+        let ctrader_environment = matches!(state.data_source, DataSource::MT5)
+            .then_some(adapter_kind)
+            .filter(|kind| matches!(kind, TradingAdapterKind::CTrader))
+            .map(|_| self.selected_ctrader_environment());
+        let ctrader_account_id = matches!(state.data_source, DataSource::MT5)
+            .then_some(adapter_kind)
+            .filter(|kind| matches!(kind, TradingAdapterKind::CTrader))
+            .and_then(|_| self.selected_ctrader_chart_account_id());
         let cache_key = MarketChartCacheKey {
             data_root: state.runtime.data_dir.clone(),
             data_source: state.data_source,
+            adapter_kind,
             symbol: state.selected_pair.clone(),
             timeframe: timeframe.clone(),
+            ctrader_environment,
+            ctrader_account_id,
         };
 
         if let Some(cache) = &self.market_chart_cache {
@@ -604,39 +627,48 @@ impl TradingSession {
         }
 
         let overlay_status = self.overlay_status(state);
-        let snapshot = match load_symbol_timeframe(&state.runtime.data_dir, &state.selected_pair, &timeframe)
-        {
-            Ok(ohlcv) => build_market_chart_snapshot_from_ohlcv(
-                &state.selected_pair,
-                &timeframe,
-                if available_timeframes.is_empty() {
-                    vec![timeframe.clone()]
-                } else {
-                    available_timeframes.clone()
+        let resolved_timeframes = if available_timeframes.is_empty() {
+            vec![timeframe.clone()]
+        } else {
+            available_timeframes.clone()
+        };
+        let snapshot = match (state.data_source, adapter_kind) {
+            (DataSource::MT5, TradingAdapterKind::CTrader) => self
+                .load_ctrader_market_chart_snapshot(
+                    &state.selected_pair,
+                    &timeframe,
+                    resolved_timeframes,
+                    overlay_status,
+                ),
+            _ => match load_symbol_timeframe(&state.runtime.data_dir, &state.selected_pair, &timeframe) {
+                Ok(ohlcv) => build_market_chart_snapshot_from_ohlcv(
+                    &state.selected_pair,
+                    &timeframe,
+                    resolved_timeframes,
+                    &ohlcv,
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .with_overlay_status(overlay_status),
+                Err(err) => MarketChartSnapshot {
+                    symbol: state.selected_pair.clone(),
+                    timeframe: timeframe.clone(),
+                    available_timeframes: if available_timeframes.is_empty() {
+                        vec![timeframe.clone()]
+                    } else {
+                        available_timeframes.clone()
+                    },
+                    candles: Vec::new(),
+                    overlays: Vec::new(),
+                    price_min: 0.0,
+                    price_max: 0.0,
+                    headline: format!("No market data loaded for {} {}", state.selected_pair, timeframe),
+                    overlay_status,
+                    warnings: vec![format!(
+                        "Failed to load {} market data for {}: {}",
+                        timeframe, state.selected_pair, err
+                    )],
                 },
-                &ohlcv,
-                Vec::new(),
-                Vec::new(),
-            )
-            .with_overlay_status(overlay_status),
-            Err(err) => MarketChartSnapshot {
-                symbol: state.selected_pair.clone(),
-                timeframe: timeframe.clone(),
-                available_timeframes: if available_timeframes.is_empty() {
-                    vec![timeframe.clone()]
-                } else {
-                    available_timeframes.clone()
-                },
-                candles: Vec::new(),
-                overlays: Vec::new(),
-                price_min: 0.0,
-                price_max: 0.0,
-                headline: format!("No market data loaded for {} {}", state.selected_pair, timeframe),
-                overlay_status,
-                warnings: vec![format!(
-                    "Failed to load {} market data for {}: {}",
-                    timeframe, state.selected_pair, err
-                )],
             },
         };
 
@@ -793,12 +825,20 @@ impl TradingSession {
             DataSource::Local => {
                 "Trade overlays unavailable in Local mode until execution events are wired.".to_string()
             }
-            DataSource::MT5 if !self.connected => {
-                "Trade overlays unavailable while the trading runtime is disconnected.".to_string()
-            }
-            DataSource::MT5 => {
-                "Trade overlays will appear here once broker-backed fills and bot execution events are wired.".to_string()
-            }
+            DataSource::MT5 => match self.active_adapter_kind() {
+                TradingAdapterKind::Mt5 if !self.connected => {
+                    "Trade overlays unavailable while the trading runtime is disconnected.".to_string()
+                }
+                TradingAdapterKind::Mt5 => {
+                    "Trade overlays will appear here once broker-backed fills and bot execution events are wired.".to_string()
+                }
+                TradingAdapterKind::CTrader => {
+                    "Trade overlays will appear here once cTrader positions, fills, and bot execution events are wired.".to_string()
+                }
+                TradingAdapterKind::DxTrade => {
+                    "Trade overlays will appear here once DXtrade execution events are wired.".to_string()
+                }
+            },
         }
     }
 
@@ -831,6 +871,119 @@ impl TradingSession {
         self.execution_surface_cache = None;
         self.ctrader_auth = None;
         self.ctrader_live_auth_rx = None;
+    }
+
+    fn load_ctrader_market_chart_snapshot(
+        &self,
+        symbol: &str,
+        timeframe: &str,
+        available_timeframes: Vec<String>,
+        overlay_status: String,
+    ) -> MarketChartSnapshot {
+        match self.build_ctrader_chart_history_request(symbol, timeframe) {
+            Ok(request) => match load_chart_history(&request) {
+                Ok(history) => build_market_chart_snapshot_from_historical_bars(
+                    &history.symbol.symbol_name,
+                    timeframe,
+                    available_timeframes,
+                    &history.bars,
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .with_overlay_status(overlay_status),
+                Err(err) => MarketChartSnapshot {
+                    symbol: symbol.to_string(),
+                    timeframe: timeframe.to_string(),
+                    available_timeframes,
+                    candles: Vec::new(),
+                    overlays: Vec::new(),
+                    price_min: 0.0,
+                    price_max: 0.0,
+                    headline: format!("No cTrader market data loaded for {} {}", symbol, timeframe),
+                    overlay_status,
+                    warnings: vec![format!(
+                        "Failed to load cTrader {} market data for {}: {}",
+                        timeframe, symbol, err
+                    )],
+                },
+            },
+            Err(err) => MarketChartSnapshot {
+                symbol: symbol.to_string(),
+                timeframe: timeframe.to_string(),
+                available_timeframes,
+                candles: Vec::new(),
+                overlays: Vec::new(),
+                price_min: 0.0,
+                price_max: 0.0,
+                headline: format!("No cTrader market data loaded for {} {}", symbol, timeframe),
+                overlay_status,
+                warnings: vec![format!(
+                    "cTrader chart history is unavailable for {} {}: {}",
+                    symbol, timeframe, err
+                )],
+            },
+        }
+    }
+
+    fn build_ctrader_chart_history_request(
+        &self,
+        symbol: &str,
+        timeframe: &str,
+    ) -> anyhow::Result<CTraderChartHistoryRequest> {
+        let client_id = self.broker_settings.ctrader.client_id.trim();
+        let client_secret = self.broker_settings.ctrader.client_secret.trim();
+        if client_id.is_empty() || client_secret.is_empty() {
+            return Err(anyhow::anyhow!(
+                "cTrader chart history requires configured client_id and client_secret"
+            ));
+        }
+
+        let access_token = self
+            .ctrader_token_store
+            .load_token_bundle()?
+            .map(|bundle| bundle.access_token)
+            .ok_or_else(|| anyhow::anyhow!("cTrader chart history requires a stored token bundle"))?;
+
+        let account_id = self
+            .selected_ctrader_chart_account_id()
+            .ok_or_else(|| anyhow::anyhow!("cTrader chart history requires at least one discovered account"))?;
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| anyhow::anyhow!("system clock is before unix epoch"))?
+            .as_millis() as i64;
+        let window_ms = chart_history_window_ms(timeframe)
+            .ok_or_else(|| anyhow::anyhow!("unsupported cTrader chart timeframe {}", timeframe))?;
+
+        Ok(CTraderChartHistoryRequest {
+            client_id: client_id.to_string(),
+            client_secret: client_secret.to_string(),
+            access_token,
+            environment: self.selected_ctrader_environment(),
+            account_id,
+            symbol_name: symbol.to_string(),
+            timeframe: timeframe.to_string(),
+            from_timestamp_ms: now_ms.saturating_sub(window_ms),
+            to_timestamp_ms: now_ms,
+            count: Some((MAX_CHART_CANDLES + 24) as u32),
+        })
+    }
+
+    fn selected_ctrader_chart_account_id(&self) -> Option<String> {
+        self.broker_settings
+            .ctrader
+            .accounts
+            .iter()
+            .find(|account| account.enabled_for_execution)
+            .or_else(|| self.broker_settings.ctrader.accounts.first())
+            .map(|account| account.account_id.clone())
+    }
+
+    fn selected_ctrader_environment(&self) -> CTraderEnvironment {
+        match self.broker_settings.ctrader.environment {
+            CTraderBrokerEnvironment::Live => CTraderEnvironment::Live,
+            CTraderBrokerEnvironment::Demo => CTraderEnvironment::Demo,
+        }
     }
 }
 
@@ -945,6 +1098,68 @@ pub fn panel_mode(data_source: DataSource, connected: bool) -> TradingPanelMode 
 }
 
 const MAX_CHART_CANDLES: usize = 96;
+
+fn supported_ctrader_chart_timeframes() -> Vec<String> {
+    ["M1", "M2", "M3", "M4", "M5", "M10", "M15", "M30", "H1", "H4", "H12", "D1", "W1", "MN1"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn chart_history_window_ms(timeframe: &str) -> Option<i64> {
+    let minutes = match timeframe.trim().to_ascii_uppercase().as_str() {
+        "M1" => 1,
+        "M2" => 2,
+        "M3" => 3,
+        "M4" => 4,
+        "M5" => 5,
+        "M10" => 10,
+        "M15" => 15,
+        "M30" => 30,
+        "H1" => 60,
+        "H4" => 240,
+        "H12" => 720,
+        "D1" => 1_440,
+        "W1" => 10_080,
+        "MN1" => 43_200,
+        _ => return None,
+    };
+    Some(minutes * 60_000 * (MAX_CHART_CANDLES as i64 + 24))
+}
+
+fn ohlcv_from_historical_bars(bars: &[HistoricalBar]) -> Ohlcv {
+    Ohlcv {
+        timestamp: Some(bars.iter().map(|bar| bar.timestamp_ms).collect()),
+        open: bars.iter().map(|bar| bar.open).collect(),
+        high: bars.iter().map(|bar| bar.high).collect(),
+        low: bars.iter().map(|bar| bar.low).collect(),
+        close: bars.iter().map(|bar| bar.close).collect(),
+        volume: Some(
+            bars.iter()
+                .map(|bar| bar.volume.unwrap_or_default() as f64)
+                .collect(),
+        ),
+    }
+}
+
+pub fn build_market_chart_snapshot_from_historical_bars(
+    symbol: &str,
+    timeframe: &str,
+    available_timeframes: Vec<String>,
+    bars: &[HistoricalBar],
+    overlays: Vec<ChartOverlay>,
+    warnings: Vec<String>,
+) -> MarketChartSnapshot {
+    let ohlcv = ohlcv_from_historical_bars(bars);
+    build_market_chart_snapshot_from_ohlcv(
+        symbol,
+        timeframe,
+        available_timeframes,
+        &ohlcv,
+        overlays,
+        warnings,
+    )
+}
 
 pub fn build_market_chart_snapshot_from_ohlcv(
     symbol: &str,
@@ -1330,6 +1545,103 @@ mod tests {
         assert_eq!(snapshot.candles.last().and_then(|c| c.timestamp), Some(140));
         assert!(snapshot.price_min < snapshot.price_max);
         assert!(snapshot.headline.contains("96 candles"));
+    }
+
+    #[test]
+    fn build_market_chart_snapshot_from_historical_bars_preserves_recent_candles() {
+        let bars: Vec<HistoricalBar> = (0..140)
+            .map(|idx| HistoricalBar {
+                timestamp_ms: 1_700_000_000_000 + idx as i64 * 60_000,
+                open: 1.1000 + idx as f64 * 0.0001,
+                high: 1.1010 + idx as f64 * 0.0001,
+                low: 1.0990 + idx as f64 * 0.0001,
+                close: 1.1005 + idx as f64 * 0.0001,
+                volume: Some(10 + idx as i64),
+            })
+            .collect();
+
+        let snapshot = build_market_chart_snapshot_from_historical_bars(
+            "EURUSD",
+            "M5",
+            vec!["M1".to_string(), "M5".to_string()],
+            &bars,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(snapshot.candles.len(), 96);
+        assert_eq!(
+            snapshot.candles.first().and_then(|candle| candle.timestamp),
+            Some(1_700_002_640_000)
+        );
+        assert_eq!(snapshot.available_timeframes, vec!["M1", "M5"]);
+    }
+
+    #[test]
+    fn ctrader_chart_history_request_uses_enabled_target_and_selected_environment() {
+        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
+        session.broker_settings_mut().ctrader.redirect_uri =
+            "http://127.0.0.1:8877/callback".to_string();
+        session.broker_settings_mut().ctrader.environment = CTraderBrokerEnvironment::Demo;
+        session.broker_settings_mut().ctrader.accounts = vec![
+            BrokerAccountTarget {
+                account_id: "1001".to_string(),
+                label: "standby".to_string(),
+                enabled_for_execution: false,
+            },
+            BrokerAccountTarget {
+                account_id: "2002".to_string(),
+                label: "primary".to_string(),
+                enabled_for_execution: true,
+            },
+        ];
+        session.set_ctrader_store_for_test(
+            crate::app_services::secure_store::MemorySecretStoreBackend::default(),
+        );
+        session
+            .seed_ctrader_token_bundle_for_test(crate::app_services::ctrader_auth::CTraderTokenBundle {
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                token_type: "Bearer".to_string(),
+                expires_in: 3600,
+                scope: "trading".to_string(),
+                created_at_unix: 1_710_000_000,
+            })
+            .expect("seed token bundle");
+
+        let request = session
+            .build_ctrader_chart_history_request("EURUSD", "M15")
+            .expect("request should build");
+
+        assert_eq!(request.environment, CTraderEnvironment::Demo);
+        assert_eq!(request.account_id, "2002");
+        assert_eq!(request.symbol_name, "EURUSD");
+        assert_eq!(request.timeframe, "M15");
+        assert_eq!(request.count, Some((MAX_CHART_CANDLES + 24) as u32));
+        assert!(request.to_timestamp_ms >= request.from_timestamp_ms);
+    }
+
+    #[test]
+    fn market_chart_snapshot_reports_ctrader_requirements_instead_of_fake_fallback() {
+        let state = sample_state(DataSource::MT5, "Offline");
+        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
+
+        let snapshot = session.market_chart_snapshot(&state);
+
+        assert!(snapshot.candles.is_empty());
+        assert_eq!(snapshot.timeframe, "M1");
+        assert_eq!(snapshot.available_timeframes.first().map(String::as_str), Some("M1"));
+        assert!(snapshot
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("stored token bundle")));
+        assert!(snapshot
+            .headline
+            .contains("No cTrader market data loaded"));
     }
 
     #[test]

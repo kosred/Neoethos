@@ -1,22 +1,27 @@
 use crate::app_services::ctrader_auth::CTraderTokenBundle;
+use crate::app_services::ctrader_messages::{
+    build_account_list_by_access_token_request, build_application_auth_request,
+    CTraderOpenApiJsonMessage, CTraderOpenApiTransport, ProductionCTraderOpenApiTransport,
+    CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RESPONSE_PAYLOAD_TYPE,
+};
 use anyhow::{anyhow, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tungstenite::{connect, Message};
 
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use crate::app_services::ctrader_messages::{
+    expected_response_payload_type, is_matching_open_api_response, parse_open_api_envelope,
+};
 
 pub const CTRADER_DEFAULT_SCOPE: &str = "trading";
 pub const CTRADER_TOKEN_ENDPOINT_BASE: &str = "https://openapi.ctrader.com";
-pub const CTRADER_OA_APPLICATION_AUTH_PAYLOAD_TYPE: u32 = 2100;
-pub const CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE: u32 = 2101;
-pub const CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_PAYLOAD_TYPE: u32 = 2149;
-pub const CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RESPONSE_PAYLOAD_TYPE: u32 = 2150;
-pub const CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE: u32 = 2142;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CTraderLoopbackConfig {
@@ -63,19 +68,6 @@ pub struct CTraderAccountDiscoveryResult {
     pub access_token: String,
     pub permission_scope: String,
     pub accounts: Vec<crate::app_services::ctrader_auth::CTraderDiscoveredAccount>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CTraderOpenApiJsonMessage {
-    #[serde(rename = "clientMsgId")]
-    pub client_msg_id: String,
-    #[serde(rename = "payloadType")]
-    pub payload_type: u32,
-    pub payload: Value,
-}
-
-pub trait CTraderOpenApiTransport {
-    fn send_sequence(&self, messages: &[CTraderOpenApiJsonMessage]) -> Result<Vec<String>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -446,27 +438,14 @@ pub fn build_application_auth_json(
     client_secret: &str,
     client_msg_id: impl Into<String>,
 ) -> CTraderOpenApiJsonMessage {
-    CTraderOpenApiJsonMessage {
-        client_msg_id: client_msg_id.into(),
-        payload_type: CTRADER_OA_APPLICATION_AUTH_PAYLOAD_TYPE,
-        payload: serde_json::json!({
-            "clientId": client_id,
-            "clientSecret": client_secret,
-        }),
-    }
+    build_application_auth_request(client_id, client_secret, client_msg_id)
 }
 
 pub fn build_account_list_by_access_token_json(
     request: &CTraderAccountDiscoveryRequest,
     client_msg_id: impl Into<String>,
 ) -> CTraderOpenApiJsonMessage {
-    CTraderOpenApiJsonMessage {
-        client_msg_id: client_msg_id.into(),
-        payload_type: CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_PAYLOAD_TYPE,
-        payload: serde_json::json!({
-            "accessToken": request.access_token,
-        }),
-    }
+    build_account_list_by_access_token_request(&request.access_token, client_msg_id)
 }
 
 #[derive(Debug, Deserialize)]
@@ -676,115 +655,6 @@ impl CTraderOpenApiTransport for StubCTraderOpenApiTransport {
         }
         Ok(output)
     }
-}
-
-#[allow(dead_code)]
-struct ProductionCTraderOpenApiTransport {
-    endpoint_host: String,
-}
-
-#[allow(dead_code)]
-impl ProductionCTraderOpenApiTransport {
-    fn new(endpoint_host: impl Into<String>) -> Self {
-        Self {
-            endpoint_host: endpoint_host.into(),
-        }
-    }
-}
-
-#[allow(dead_code)]
-impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
-    fn send_sequence(&self, messages: &[CTraderOpenApiJsonMessage]) -> Result<Vec<String>> {
-        let url = format!("wss://{}:5036", self.endpoint_host);
-        let (mut socket, _) =
-            connect(url.as_str()).with_context(|| format!("failed to connect to cTrader endpoint {url}"))?;
-        let mut responses = Vec::with_capacity(messages.len());
-
-        for message in messages {
-            let expected_payload_type = expected_response_payload_type(message.payload_type)?;
-            let serialized = serde_json::to_string(message)
-                .context("failed to serialize cTrader open api message")?;
-            socket
-                .send(Message::Text(serialized.into()))
-                .context("failed to send cTrader open api message")?;
-
-            loop {
-                match socket.read().context("failed to read cTrader open api response")? {
-                    Message::Text(text) => {
-                        if text.trim().is_empty() {
-                            return Err(anyhow!("empty cTrader open api response"));
-                        }
-                        let envelope = parse_open_api_envelope(text.as_ref())?;
-                        if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
-                            responses.push(text.to_string());
-                            let _ = socket.close(None);
-                            return Ok(responses);
-                        }
-                        if is_matching_open_api_response(&envelope, message, expected_payload_type)
-                        {
-                            responses.push(text.to_string());
-                            break;
-                        }
-                    }
-                    Message::Binary(bytes) => {
-                        let text = String::from_utf8(bytes.to_vec())
-                            .context("failed to decode cTrader binary response")?;
-                        if text.trim().is_empty() {
-                            return Err(anyhow!("empty cTrader open api response"));
-                        }
-                        let envelope = parse_open_api_envelope(&text)?;
-                        if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
-                            responses.push(text);
-                            let _ = socket.close(None);
-                            return Ok(responses);
-                        }
-                        if is_matching_open_api_response(&envelope, message, expected_payload_type)
-                        {
-                            responses.push(text);
-                            break;
-                        }
-                    }
-                    Message::Ping(payload) => {
-                        socket
-                            .send(Message::Pong(payload))
-                            .context("failed to reply to cTrader ping")?;
-                    }
-                    Message::Pong(_) => {}
-                    Message::Close(_) => {
-                        return Err(anyhow!("cTrader open api socket closed unexpectedly"));
-                    }
-                    Message::Frame(_) => {}
-                }
-            }
-        }
-        let _ = socket.close(None);
-    Ok(responses)
-    }
-}
-
-fn parse_open_api_envelope(response_json: &str) -> Result<CTraderOpenApiJsonMessage> {
-    serde_json::from_str(response_json).context("failed to parse cTrader JSON envelope")
-}
-
-fn expected_response_payload_type(request_payload_type: u32) -> Result<u32> {
-    match request_payload_type {
-        CTRADER_OA_APPLICATION_AUTH_PAYLOAD_TYPE => Ok(CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE),
-        CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_PAYLOAD_TYPE => {
-            Ok(CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RESPONSE_PAYLOAD_TYPE)
-        }
-        payload_type => Err(anyhow!(
-            "unsupported cTrader request payload type: {}",
-            payload_type
-        )),
-    }
-}
-
-fn is_matching_open_api_response(
-    envelope: &CTraderOpenApiJsonMessage,
-    request: &CTraderOpenApiJsonMessage,
-    expected_payload_type: u32,
-) -> bool {
-    envelope.payload_type == expected_payload_type && envelope.client_msg_id == request.client_msg_id
 }
 
 fn rewrite_redirect_uri_port(redirect_uri: &str, callback_port: u16) -> Result<String> {
