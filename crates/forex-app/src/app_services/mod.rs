@@ -4,6 +4,7 @@ pub mod ctrader_messages;
 pub mod ctrader_auth;
 pub mod ctrader_data;
 pub mod ctrader_live_auth;
+pub mod ctrader_streaming;
 pub mod discovery;
 pub mod jobs;
 pub mod secure_store;

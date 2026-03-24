@@ -20,6 +20,10 @@ use crate::app_services::ctrader_live_auth::{
     CTraderLiveAuthRequest, CTraderLiveAuthResult, ProductionCTraderLiveAuthBackend,
     CTRADER_DEFAULT_SCOPE,
 };
+use crate::app_services::ctrader_streaming::{
+    merge_live_trendbar_into_bars, CTraderLiveChartUpdateRequest,
+    CTraderLiveStreamingBackend, ProductionCTraderLiveStreamingBackend,
+};
 use crate::app_services::secure_store::{
     CTraderSecureStore, CTraderTokenStore, KeyringSecretStoreBackend,
 };
@@ -163,6 +167,7 @@ pub struct TradingSession {
     ctrader_live_auth_backend: Arc<dyn CTraderLiveAuthBackend>,
     ctrader_account_discovery_backend: Arc<dyn CTraderAccountDiscoveryBackend>,
     ctrader_account_runtime_backend: Arc<dyn CTraderAccountRuntimeBackend>,
+    ctrader_live_streaming_backend: Arc<dyn CTraderLiveStreamingBackend>,
     ctrader_token_store: Arc<dyn CTraderTokenStore>,
     ctrader_live_auth_rx: Option<Receiver<Result<CTraderLiveAuthResult, String>>>,
     adapter: Option<TradingAdapter>,
@@ -191,6 +196,7 @@ struct MarketChartCacheKey {
 #[derive(Debug, Clone)]
 struct CachedMarketSnapshot {
     key: MarketChartCacheKey,
+    refreshed_at: Instant,
     snapshot: MarketChartSnapshot,
 }
 
@@ -235,6 +241,7 @@ impl TradingSession {
             ctrader_live_auth_backend: Arc::new(ProductionCTraderLiveAuthBackend),
             ctrader_account_discovery_backend: Arc::new(ProductionCTraderLiveAuthBackend),
             ctrader_account_runtime_backend: Arc::new(ProductionCTraderAccountRuntimeBackend),
+            ctrader_live_streaming_backend: Arc::new(ProductionCTraderLiveStreamingBackend),
             ctrader_token_store: Arc::new(CTraderSecureStore::new(
                 "forex-ai",
                 "ctrader.default",
@@ -258,6 +265,7 @@ impl TradingSession {
             ctrader_live_auth_backend: Arc::new(ProductionCTraderLiveAuthBackend),
             ctrader_account_discovery_backend: Arc::new(ProductionCTraderLiveAuthBackend),
             ctrader_account_runtime_backend: Arc::new(ProductionCTraderAccountRuntimeBackend),
+            ctrader_live_streaming_backend: Arc::new(ProductionCTraderLiveStreamingBackend),
             ctrader_token_store: Arc::new(CTraderSecureStore::new(
                 "forex-ai.test",
                 "ctrader.account",
@@ -645,7 +653,13 @@ impl TradingSession {
         };
 
         if let Some(cache) = &self.market_chart_cache {
-            if cache.key == cache_key {
+            let is_live_ctrader_chart = matches!(state.data_source, DataSource::MT5)
+                && matches!(adapter_kind, TradingAdapterKind::CTrader)
+                && self.connected;
+            if cache.key == cache_key
+                && (!is_live_ctrader_chart
+                    || cache.refreshed_at.elapsed() < Duration::from_secs(1))
+            {
                 return cache.snapshot.clone();
             }
         }
@@ -698,6 +712,7 @@ impl TradingSession {
 
         self.market_chart_cache = Some(CachedMarketSnapshot {
             key: cache_key,
+            refreshed_at: Instant::now(),
             snapshot: snapshot.clone(),
         });
         snapshot
@@ -951,15 +966,67 @@ impl TradingSession {
     ) -> MarketChartSnapshot {
         match self.build_ctrader_chart_history_request(symbol, timeframe) {
             Ok(request) => match load_chart_history(&request) {
-                Ok(history) => build_market_chart_snapshot_from_historical_bars(
-                    &history.symbol.symbol_name,
-                    timeframe,
-                    available_timeframes,
-                    &history.bars,
-                    Vec::new(),
-                    Vec::new(),
-                )
-                .with_overlay_status(overlay_status),
+                Ok(history) => {
+                    let mut warnings = Vec::new();
+                    let live_update = if self.connected {
+                        match self.build_ctrader_live_chart_update_request(
+                            &request,
+                            history.symbol.symbol_id,
+                            history.symbol.digits,
+                        ) {
+                            Ok(live_request) => match self
+                                .ctrader_live_streaming_backend
+                                .load_live_chart_update(&live_request)
+                            {
+                                Ok(update) => Some(update),
+                                Err(err) => {
+                                    warnings.push(format!(
+                                        "Failed to load cTrader live {} update for {}: {}",
+                                        timeframe, symbol, err
+                                    ));
+                                    None
+                                }
+                            },
+                            Err(err) => {
+                                warnings.push(format!(
+                                    "cTrader live {} update is unavailable for {}: {}",
+                                    timeframe, symbol, err
+                                ));
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    let bars = if let Some(update) = &live_update {
+                        merge_live_trendbar_into_bars(&history.bars, update.latest_trendbar.as_ref())
+                    } else {
+                        history.bars.clone()
+                    };
+
+                    let mut snapshot = build_market_chart_snapshot_from_historical_bars(
+                        &history.symbol.symbol_name,
+                        timeframe,
+                        available_timeframes,
+                        &bars,
+                        Vec::new(),
+                        warnings,
+                    )
+                    .with_overlay_status(overlay_status);
+                    if let Some(update) = live_update {
+                        let quote_line = match (update.bid, update.ask) {
+                            (Some(bid), Some(ask)) => format!(" · live bid {:.5} · ask {:.5}", bid, ask),
+                            (Some(bid), None) => format!(" · live bid {:.5}", bid),
+                            (None, Some(ask)) => format!(" · live ask {:.5}", ask),
+                            (None, None) => String::new(),
+                        };
+                        if !quote_line.is_empty() {
+                            snapshot.headline.push_str(&quote_line);
+                        }
+                    }
+                    snapshot
+                }
                 Err(err) => MarketChartSnapshot {
                     symbol: symbol.to_string(),
                     timeframe: timeframe.to_string(),
@@ -1035,6 +1102,31 @@ impl TradingSession {
             from_timestamp_ms: now_ms.saturating_sub(window_ms),
             to_timestamp_ms: now_ms,
             count: Some((MAX_CHART_CANDLES + 24) as u32),
+        })
+    }
+
+    fn build_ctrader_live_chart_update_request(
+        &self,
+        history_request: &CTraderChartHistoryRequest,
+        symbol_id: i64,
+        digits: i32,
+    ) -> anyhow::Result<CTraderLiveChartUpdateRequest> {
+        if history_request.account_id.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "cTrader live chart update requires a discovered account"
+            ));
+        }
+
+        Ok(CTraderLiveChartUpdateRequest {
+            client_id: history_request.client_id.clone(),
+            client_secret: history_request.client_secret.clone(),
+            access_token: history_request.access_token.clone(),
+            environment: history_request.environment,
+            account_id: history_request.account_id.clone(),
+            symbol_id,
+            digits,
+            timeframe: history_request.timeframe.clone(),
+            subscribe_to_spot_timestamp: true,
         })
     }
 
@@ -1129,6 +1221,7 @@ impl Default for TradingSession {
             ctrader_live_auth_backend: Arc::new(ProductionCTraderLiveAuthBackend),
             ctrader_account_discovery_backend: Arc::new(ProductionCTraderLiveAuthBackend),
             ctrader_account_runtime_backend: Arc::new(ProductionCTraderAccountRuntimeBackend),
+            ctrader_live_streaming_backend: Arc::new(ProductionCTraderLiveStreamingBackend),
             ctrader_token_store: Arc::new(CTraderSecureStore::new(
                 "forex-ai",
                 "ctrader.default",
