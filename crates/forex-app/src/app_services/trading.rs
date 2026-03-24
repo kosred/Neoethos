@@ -26,7 +26,7 @@ use crate::app_services::ctrader_live_auth::{
     ProductionCTraderLiveAuthBackend, CTRADER_DEFAULT_SCOPE,
 };
 use crate::app_services::ctrader_streaming::{
-    merge_live_trendbar_into_bars, CTraderLiveChartUpdateRequest,
+    merge_live_spot_update_into_bars, CTraderLiveChartUpdate, CTraderLiveChartUpdateRequest,
     CTraderLiveStreamingBackend, ProductionCTraderLiveStreamingBackend,
 };
 use crate::app_services::secure_store::{
@@ -182,6 +182,7 @@ pub struct TradingSession {
     terminal_info: String,
     market_chart_cache: Option<CachedMarketSnapshot>,
     execution_surface_cache: Option<CachedExecutionSnapshot>,
+    ctrader_live_spot_cache: Option<CachedCTraderLiveSpotUpdate>,
 }
 
 enum TradingAdapter {
@@ -222,6 +223,21 @@ struct CachedExecutionSnapshot {
     snapshot: ExecutionSurfaceSnapshot,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CTraderLiveSpotCacheKey {
+    environment: CTraderEnvironment,
+    account_id: String,
+    symbol_id: i64,
+    timeframe: String,
+}
+
+#[derive(Debug, Clone)]
+struct CachedCTraderLiveSpotUpdate {
+    key: CTraderLiveSpotCacheKey,
+    refreshed_at: Instant,
+    update: CTraderLiveChartUpdate,
+}
+
 enum ExecutionFeedHandle<'a> {
     Mt5(&'a MT5Engine),
     CTrader(&'a CTraderAccountRuntimeSnapshot),
@@ -260,6 +276,7 @@ impl TradingSession {
             terminal_info: terminal_info.into(),
             market_chart_cache: None,
             execution_surface_cache: None,
+            ctrader_live_spot_cache: None,
         }
     }
 
@@ -284,6 +301,7 @@ impl TradingSession {
             terminal_info: String::new(),
             market_chart_cache: None,
             execution_surface_cache: None,
+            ctrader_live_spot_cache: None,
         }
     }
 
@@ -329,6 +347,15 @@ impl TradingSession {
         backend: crate::app_services::ctrader_account::StubCTraderAccountRuntimeBackend,
     ) {
         self.ctrader_account_runtime_backend = Arc::new(backend);
+    }
+
+    #[cfg(test)]
+    pub fn set_ctrader_live_streaming_backend_for_test(
+        &mut self,
+        backend: crate::app_services::ctrader_streaming::StubCTraderLiveStreamingBackend,
+    ) {
+        self.ctrader_live_streaming_backend = Arc::new(backend);
+        self.ctrader_live_spot_cache = None;
     }
 
     pub fn is_connected(&self) -> bool {
@@ -1101,6 +1128,7 @@ impl TradingSession {
         self.terminal_info.clear();
         self.market_chart_cache = None;
         self.execution_surface_cache = None;
+        self.ctrader_live_spot_cache = None;
     }
 
     fn load_ctrader_market_chart_snapshot(
@@ -1121,8 +1149,7 @@ impl TradingSession {
                             history.symbol.digits,
                         ) {
                             Ok(live_request) => match self
-                                .ctrader_live_streaming_backend
-                                .load_live_chart_update(&live_request)
+                                .load_ctrader_live_chart_update_cached(&live_request)
                             {
                                 Ok(update) => Some(update),
                                 Err(err) => {
@@ -1145,11 +1172,7 @@ impl TradingSession {
                         None
                     };
 
-                    let bars = if let Some(update) = &live_update {
-                        merge_live_trendbar_into_bars(&history.bars, update.latest_trendbar.as_ref())
-                    } else {
-                        history.bars.clone()
-                    };
+                    let bars = merge_live_spot_update_into_bars(&history.bars, live_update.as_ref());
 
                     let mut snapshot = build_market_chart_snapshot_from_historical_bars(
                         &history.symbol.symbol_name,
@@ -1162,9 +1185,9 @@ impl TradingSession {
                     .with_overlay_status(overlay_status);
                     if let Some(update) = live_update {
                         let quote_line = match (update.bid, update.ask) {
-                            (Some(bid), Some(ask)) => format!(" · live bid {:.5} · ask {:.5}", bid, ask),
-                            (Some(bid), None) => format!(" · live bid {:.5}", bid),
-                            (None, Some(ask)) => format!(" · live ask {:.5}", ask),
+                            (Some(bid), Some(ask)) => format!(" · live tick bid {:.5} · ask {:.5}", bid, ask),
+                            (Some(bid), None) => format!(" · live tick bid {:.5}", bid),
+                            (None, Some(ask)) => format!(" · live tick ask {:.5}", ask),
                             (None, None) => String::new(),
                         };
                         if !quote_line.is_empty() {
@@ -1205,6 +1228,34 @@ impl TradingSession {
                 )],
             },
         }
+    }
+
+    fn load_ctrader_live_chart_update_cached(
+        &mut self,
+        request: &CTraderLiveChartUpdateRequest,
+    ) -> anyhow::Result<CTraderLiveChartUpdate> {
+        let cache_key = CTraderLiveSpotCacheKey {
+            environment: request.environment,
+            account_id: request.account_id.clone(),
+            symbol_id: request.symbol_id,
+            timeframe: request.timeframe.clone(),
+        };
+
+        if let Some(cache) = &self.ctrader_live_spot_cache {
+            if cache.key == cache_key && cache.refreshed_at.elapsed() < Duration::from_secs(1) {
+                return Ok(cache.update.clone());
+            }
+        }
+
+        let update = self
+            .ctrader_live_streaming_backend
+            .load_live_chart_update(request)?;
+        self.ctrader_live_spot_cache = Some(CachedCTraderLiveSpotUpdate {
+            key: cache_key,
+            refreshed_at: Instant::now(),
+            update: update.clone(),
+        });
+        Ok(update)
     }
 
     fn build_ctrader_chart_history_request(
@@ -1413,6 +1464,7 @@ impl Default for TradingSession {
             terminal_info: String::new(),
             market_chart_cache: None,
             execution_surface_cache: None,
+            ctrader_live_spot_cache: None,
         }
     }
 }
@@ -2380,6 +2432,43 @@ mod tests {
 
         assert!(session.is_connected());
         assert_eq!(state.status_msg, "cTrader connected");
+    }
+
+    #[test]
+    fn ctrader_live_spot_cache_reuses_backend_update_within_ttl() {
+        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let backend = crate::app_services::ctrader_streaming::StubCTraderLiveStreamingBackend::success(
+            crate::app_services::ctrader_streaming::CTraderLiveChartUpdate {
+                symbol_id: 14,
+                bid: Some(1.09995),
+                ask: Some(1.10015),
+                timestamp_ms: Some(1_710_000_200_000),
+                latest_trendbar: None,
+            },
+        );
+        session.set_ctrader_live_streaming_backend_for_test(backend.clone());
+
+        let request = crate::app_services::ctrader_streaming::CTraderLiveChartUpdateRequest {
+            client_id: "client".to_string(),
+            client_secret: "secret".to_string(),
+            access_token: "access".to_string(),
+            environment: crate::app_services::ctrader_live_auth::CTraderEnvironment::Demo,
+            account_id: "712345".to_string(),
+            symbol_id: 14,
+            digits: 5,
+            timeframe: "M1".to_string(),
+            subscribe_to_spot_timestamp: true,
+        };
+
+        let first = session
+            .load_ctrader_live_chart_update_cached(&request)
+            .expect("first live update");
+        let second = session
+            .load_ctrader_live_chart_update_cached(&request)
+            .expect("second live update");
+
+        assert_eq!(first, second);
+        assert_eq!(backend.call_count(), 1);
     }
 
     #[test]

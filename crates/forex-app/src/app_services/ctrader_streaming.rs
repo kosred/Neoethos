@@ -32,6 +32,17 @@ pub struct CTraderLiveChartUpdate {
     pub latest_trendbar: Option<HistoricalBar>,
 }
 
+impl CTraderLiveChartUpdate {
+    pub fn mid_price(&self) -> Option<f64> {
+        match (self.bid, self.ask) {
+            (Some(bid), Some(ask)) => Some((bid + ask) / 2.0),
+            (Some(bid), None) => Some(bid),
+            (None, Some(ask)) => Some(ask),
+            (None, None) => None,
+        }
+    }
+}
+
 pub trait CTraderLiveStreamingBackend: Send + Sync {
     fn load_live_chart_update(
         &self,
@@ -154,6 +165,39 @@ pub fn merge_live_trendbar_into_bars(
         }
         Some(last_timestamp) if last_timestamp > live_trendbar.timestamp_ms => {}
         _ => merged.push(live_trendbar.clone()),
+    }
+    merged
+}
+
+pub fn merge_live_spot_update_into_bars(
+    existing_bars: &[HistoricalBar],
+    live_update: Option<&CTraderLiveChartUpdate>,
+) -> Vec<HistoricalBar> {
+    let Some(live_update) = live_update else {
+        return existing_bars.to_vec();
+    };
+
+    if live_update.latest_trendbar.is_some() {
+        return merge_live_trendbar_into_bars(existing_bars, live_update.latest_trendbar.as_ref());
+    }
+
+    let Some(mid_price) = live_update.mid_price() else {
+        return existing_bars.to_vec();
+    };
+    let Some(last_bar) = existing_bars.last() else {
+        return existing_bars.to_vec();
+    };
+
+    let mut merged = existing_bars.to_vec();
+    if let Some(last) = merged.last_mut() {
+        *last = HistoricalBar {
+            timestamp_ms: last_bar.timestamp_ms,
+            open: last_bar.open,
+            high: last_bar.high.max(mid_price),
+            low: last_bar.low.min(mid_price),
+            close: mid_price,
+            volume: last_bar.volume,
+        };
     }
     merged
 }
@@ -412,6 +456,41 @@ fn scaled_price(value: i64, digits: i32) -> f64 {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct StubCTraderLiveStreamingBackend {
+    update: CTraderLiveChartUpdate,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<CTraderLiveChartUpdateRequest>>>,
+}
+
+#[cfg(test)]
+impl StubCTraderLiveStreamingBackend {
+    pub fn success(update: CTraderLiveChartUpdate) -> Self {
+        Self {
+            update,
+            requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn call_count(&self) -> usize {
+        self.requests.lock().expect("requests lock").len()
+    }
+}
+
+#[cfg(test)]
+impl CTraderLiveStreamingBackend for StubCTraderLiveStreamingBackend {
+    fn load_live_chart_update(
+        &self,
+        request: &CTraderLiveChartUpdateRequest,
+    ) -> Result<CTraderLiveChartUpdate> {
+        self.requests
+            .lock()
+            .expect("requests lock")
+            .push(request.clone());
+        Ok(self.update.clone())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::app_services::ctrader_messages::CTraderOpenApiJsonMessage;
@@ -538,6 +617,35 @@ mod tests {
         assert_eq!(replaced[1], replacement);
         assert_eq!(appended_result.len(), 3);
         assert_eq!(appended_result[2], appended);
+    }
+
+    #[test]
+    fn merge_live_spot_update_uses_mid_quote_when_no_trendbar_is_present() {
+        let existing = vec![HistoricalBar {
+            timestamp_ms: 2_000,
+            open: 1.1000,
+            high: 1.1010,
+            low: 1.0990,
+            close: 1.1005,
+            volume: Some(2),
+        }];
+
+        let merged = merge_live_spot_update_into_bars(
+            &existing,
+            Some(&CTraderLiveChartUpdate {
+                symbol_id: 14,
+                bid: Some(1.0985),
+                ask: Some(1.1015),
+                timestamp_ms: Some(2_100),
+                latest_trendbar: None,
+            }),
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].timestamp_ms, 2_000);
+        assert!((merged[0].close - 1.1000).abs() < 1e-9);
+        assert!((merged[0].high - 1.1010).abs() < 1e-9);
+        assert!((merged[0].low - 1.0990).abs() < 1e-9);
     }
 
     struct StubStreamingTransport {
