@@ -86,8 +86,17 @@ pub struct CTraderLiveAuthResult {
     pub token_bundle: CTraderTokenBundle,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CTraderTokenRefreshRequest {
+    pub client_id: String,
+    pub client_secret: String,
+    pub refresh_token: String,
+    pub scope: String,
+}
+
 pub trait CTraderLiveAuthBackend: Send + Sync {
     fn run(&self, request: CTraderLiveAuthRequest) -> Result<CTraderLiveAuthResult>;
+    fn refresh_token_bundle(&self, request: &CTraderTokenRefreshRequest) -> Result<CTraderTokenBundle>;
 }
 
 pub trait CTraderAccountDiscoveryBackend: Send + Sync {
@@ -104,6 +113,7 @@ pub struct ProductionCTraderLiveAuthBackend;
 #[derive(Clone)]
 pub struct StubCTraderLiveAuthBackend {
     outcome: Arc<Mutex<Option<Result<CTraderLiveAuthResult, String>>>>,
+    refresh_outcome: Arc<Mutex<Option<Result<CTraderTokenBundle, String>>>>,
 }
 
 #[cfg(test)]
@@ -116,14 +126,17 @@ pub struct StubCTraderAccountDiscoveryBackend {
 #[derive(Debug, Deserialize)]
 struct CTraderTokenExchangeResponse {
     #[serde(rename = "accessToken")]
-    access_token: String,
+    access_token: Option<String>,
     #[serde(rename = "refreshToken")]
-    refresh_token: String,
+    refresh_token: Option<String>,
     #[serde(rename = "tokenType")]
-    token_type: String,
+    token_type: Option<String>,
     #[serde(rename = "expiresIn")]
-    expires_in: i64,
+    expires_in: Option<i64>,
     scope: Option<String>,
+    #[serde(rename = "errorCode")]
+    error_code: Option<String>,
+    description: Option<String>,
 }
 
 impl CTraderLoopbackConfig {
@@ -211,22 +224,11 @@ impl ProductionCTraderLiveAuthBackend {
             .context("failed to call cTrader token endpoint")?
             .error_for_status()
             .context("cTrader token endpoint returned an error status")?;
-        let payload: CTraderTokenExchangeResponse = response
-            .json()
-            .context("failed to parse cTrader token response")?;
-        Ok(CTraderTokenBundle {
-            access_token: payload.access_token,
-            refresh_token: payload.refresh_token,
-            token_type: payload.token_type,
-            expires_in: payload.expires_in,
-            scope: payload.scope.unwrap_or_else(|| request.scope.clone()),
-            created_at_unix: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .context("system clock is before UNIX_EPOCH")?
-                .as_secs() as i64,
-        })
+        let body = response
+            .text()
+            .context("failed to read cTrader token response body")?;
+        parse_token_bundle_response(&body, &request.scope, current_unix_seconds()?)
     }
-
 }
 
 impl CTraderLiveAuthBackend for ProductionCTraderLiveAuthBackend {
@@ -249,6 +251,23 @@ impl CTraderLiveAuthBackend for ProductionCTraderLiveAuthBackend {
         })
     }
 
+    fn refresh_token_bundle(&self, request: &CTraderTokenRefreshRequest) -> Result<CTraderTokenBundle> {
+        let url = build_refresh_token_exchange_url(
+            CTRADER_TOKEN_ENDPOINT_BASE,
+            &request.refresh_token,
+            &request.client_id,
+            &request.client_secret,
+        );
+        let response = reqwest::blocking::get(url)
+            .context("failed to call cTrader refresh token endpoint")?
+            .error_for_status()
+            .context("cTrader refresh token endpoint returned an error status")?;
+        let body = response
+            .text()
+            .context("failed to read cTrader refresh token response body")?;
+        parse_token_bundle_response(&body, &request.scope, current_unix_seconds()?)
+    }
+
 }
 
 #[cfg(test)]
@@ -256,12 +275,36 @@ impl StubCTraderLiveAuthBackend {
     pub fn success(result: CTraderLiveAuthResult) -> Self {
         Self {
             outcome: Arc::new(Mutex::new(Some(Ok(result)))),
+            refresh_outcome: Arc::new(Mutex::new(Some(Err(
+                "stub cTrader refresh backend was not configured".to_string(),
+            )))),
         }
     }
 
     pub fn failure(message: impl Into<String>) -> Self {
         Self {
             outcome: Arc::new(Mutex::new(Some(Err(message.into())))),
+            refresh_outcome: Arc::new(Mutex::new(Some(Err(
+                "stub cTrader refresh backend was not configured".to_string(),
+            )))),
+        }
+    }
+
+    pub fn with_refresh_success(result: CTraderTokenBundle) -> Self {
+        Self {
+            outcome: Arc::new(Mutex::new(Some(Err(
+                "stub cTrader live auth backend was not configured".to_string(),
+            )))),
+            refresh_outcome: Arc::new(Mutex::new(Some(Ok(result)))),
+        }
+    }
+
+    pub fn with_refresh_failure(message: impl Into<String>) -> Self {
+        Self {
+            outcome: Arc::new(Mutex::new(Some(Err(
+                "stub cTrader live auth backend was not configured".to_string(),
+            )))),
+            refresh_outcome: Arc::new(Mutex::new(Some(Err(message.into())))),
         }
     }
 }
@@ -331,6 +374,19 @@ impl CTraderLiveAuthBackend for StubCTraderLiveAuthBackend {
             .expect("stub cTrader live auth backend lock poisoned")
             .take()
             .unwrap_or_else(|| Err("stub cTrader live auth backend was already consumed".to_string()))
+        {
+            Ok(result) => Ok(result),
+            Err(message) => Err(anyhow!(message)),
+        }
+    }
+
+    fn refresh_token_bundle(&self, _request: &CTraderTokenRefreshRequest) -> Result<CTraderTokenBundle> {
+        match self
+            .refresh_outcome
+            .lock()
+            .expect("stub cTrader refresh backend lock poisoned")
+            .take()
+            .unwrap_or_else(|| Err("stub cTrader refresh backend was already consumed".to_string()))
         {
             Ok(result) => Ok(result),
             Err(message) => Err(anyhow!(message)),
@@ -428,6 +484,21 @@ pub fn build_token_exchange_url(
         percent_encode(grant_type),
         percent_encode(code),
         percent_encode(redirect_uri),
+        percent_encode(client_id),
+        percent_encode(client_secret),
+    )
+}
+
+pub fn build_refresh_token_exchange_url(
+    base_url: &str,
+    refresh_token: &str,
+    client_id: &str,
+    client_secret: &str,
+) -> String {
+    format!(
+        "{}/apps/token?grant_type=refresh_token&refresh_token={}&client_id={}&client_secret={}",
+        base_url.trim_end_matches('/'),
+        percent_encode(refresh_token),
         percent_encode(client_id),
         percent_encode(client_secret),
     )
@@ -583,6 +654,46 @@ pub fn discover_ctrader_accounts(
     perform_account_discovery_with_transport(&transport, request)
 }
 
+pub fn parse_token_bundle_response(
+    response_json: &str,
+    fallback_scope: &str,
+    created_at_unix: i64,
+) -> Result<CTraderTokenBundle> {
+    let payload: CTraderTokenExchangeResponse = serde_json::from_str(response_json)
+        .context("failed to parse cTrader token response")?;
+    if let Some(error_code) = payload.error_code.filter(|value| !value.trim().is_empty()) {
+        let description = payload
+            .description
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!(": {value}"))
+            .unwrap_or_default();
+        return Err(anyhow!("cTrader token exchange failed: {error_code}{description}"));
+    }
+
+    Ok(CTraderTokenBundle {
+        access_token: payload
+            .access_token
+            .filter(|value| !value.trim().is_empty())
+            .context("cTrader token response did not include accessToken")?,
+        refresh_token: payload
+            .refresh_token
+            .filter(|value| !value.trim().is_empty())
+            .context("cTrader token response did not include refreshToken")?,
+        token_type: payload
+            .token_type
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "bearer".to_string()),
+        expires_in: payload
+            .expires_in
+            .context("cTrader token response did not include expiresIn")?,
+        scope: payload
+            .scope
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| fallback_scope.to_string()),
+        created_at_unix,
+    })
+}
+
 fn parse_ctrader_error_payload(payload: &Value) -> Result<String> {
     #[derive(Debug, Deserialize)]
     struct CTraderErrorPayload {
@@ -599,6 +710,13 @@ fn parse_ctrader_error_payload(payload: &Value) -> Result<String> {
         }
         _ => error.error_code,
     })
+}
+
+fn current_unix_seconds() -> Result<i64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before UNIX_EPOCH")?
+        .as_secs() as i64)
 }
 
 #[cfg(test)]
@@ -790,6 +908,43 @@ mod tests {
             url,
             "https://openapi.ctrader.com/apps/token?grant_type=authorization_code&code=auth-code-123&redirect_uri=http%3A%2F%2F127.0.0.1%3A43001%2Fcallback&client_id=client-id&client_secret=secret-456"
         );
+    }
+
+    #[test]
+    fn refresh_token_request_uses_documented_query_parameters() {
+        let url = build_refresh_token_exchange_url(
+            "https://openapi.ctrader.com",
+            "refresh-token-123",
+            "client-id",
+            "secret-456",
+        );
+
+        assert_eq!(
+            url,
+            "https://openapi.ctrader.com/apps/token?grant_type=refresh_token&refresh_token=refresh-token-123&client_id=client-id&client_secret=secret-456"
+        );
+    }
+
+    #[test]
+    fn refreshed_token_response_parses_new_token_values() {
+        let response = serde_json::json!({
+            "accessToken": "new-access",
+            "refreshToken": "new-refresh",
+            "tokenType": "bearer",
+            "expiresIn": 2628000,
+            "errorCode": null,
+            "description": null
+        });
+
+        let bundle = parse_token_bundle_response(&response.to_string(), "trading", 1_774_147_200)
+            .expect("refresh response should parse");
+
+        assert_eq!(bundle.access_token, "new-access");
+        assert_eq!(bundle.refresh_token, "new-refresh");
+        assert_eq!(bundle.token_type, "bearer");
+        assert_eq!(bundle.expires_in, 2_628_000);
+        assert_eq!(bundle.scope, "trading");
+        assert_eq!(bundle.created_at_unix, 1_774_147_200);
     }
 
     #[test]

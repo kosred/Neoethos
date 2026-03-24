@@ -12,13 +12,13 @@ use crate::app_services::ctrader_data::{
 };
 use crate::app_services::ctrader_auth::{
     CTraderAccountSummary, CTraderAuthSession, CTraderAuthSnapshot, CTraderDiscoveredAccount,
-    CTraderTokenExchangeRequest,
+    CTraderTokenBundle, CTraderTokenExchangeRequest,
 };
 use crate::app_services::ctrader_live_auth::{
     build_default_loopback_config, CTraderAccountDiscoveryBackend,
     CTraderAccountDiscoveryRequest, CTraderEnvironment, CTraderLiveAuthBackend,
-    CTraderLiveAuthRequest, CTraderLiveAuthResult, ProductionCTraderLiveAuthBackend,
-    CTRADER_DEFAULT_SCOPE,
+    CTraderLiveAuthRequest, CTraderLiveAuthResult, CTraderTokenRefreshRequest,
+    ProductionCTraderLiveAuthBackend, CTRADER_DEFAULT_SCOPE,
 };
 use crate::app_services::ctrader_streaming::{
     merge_live_trendbar_into_bars, CTraderLiveChartUpdateRequest,
@@ -37,6 +37,8 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::error;
+
+const CTRADER_TOKEN_REFRESH_WINDOW_SECS: i64 = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradingAdapterKind {
@@ -546,12 +548,12 @@ impl TradingSession {
     }
 
     pub fn discover_ctrader_accounts(&mut self) -> anyhow::Result<Option<CTraderAuthSnapshot>> {
-        let session = self
+        let auth_state = self
             .ctrader_auth
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("cTrader account discovery requires a restored token session"))?;
         if !matches!(
-            session.snapshot().state,
+            auth_state.snapshot().state,
             crate::app_services::ctrader_auth::CTraderAuthState::RestoredFromStorage
                 | crate::app_services::ctrader_auth::CTraderAuthState::AccountsAvailable
         ) {
@@ -561,10 +563,10 @@ impl TradingSession {
         }
 
         let access_token = self
-            .ctrader_token_store
-            .load_token_bundle()?
-            .map(|bundle| bundle.access_token)
-            .ok_or_else(|| anyhow::anyhow!("cTrader account discovery requires a stored token bundle"))?;
+            .ensure_fresh_ctrader_token_bundle(
+                "cTrader account discovery requires a stored token bundle",
+            )?
+            .access_token;
         let request = CTraderAccountDiscoveryRequest {
             client_id: self.broker_settings.ctrader.client_id.clone(),
             client_secret: self.broker_settings.ctrader.client_secret.clone(),
@@ -583,6 +585,10 @@ impl TradingSession {
             &result.accounts,
         );
         self.broker_settings.ctrader.accounts = synced_accounts.clone();
+        let session = self
+            .ctrader_auth
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("cTrader account discovery requires a restored token session"))?;
         session.set_discovered_accounts(sync_discovered_accounts_with_targets(
             &result.accounts,
             &self.broker_settings.ctrader.accounts,
@@ -958,7 +964,7 @@ impl TradingSession {
     }
 
     fn load_ctrader_market_chart_snapshot(
-        &self,
+        &mut self,
         symbol: &str,
         timeframe: &str,
         available_timeframes: Vec<String>,
@@ -1062,12 +1068,12 @@ impl TradingSession {
     }
 
     fn build_ctrader_chart_history_request(
-        &self,
+        &mut self,
         symbol: &str,
         timeframe: &str,
     ) -> anyhow::Result<CTraderChartHistoryRequest> {
-        let client_id = self.broker_settings.ctrader.client_id.trim();
-        let client_secret = self.broker_settings.ctrader.client_secret.trim();
+        let client_id = self.broker_settings.ctrader.client_id.trim().to_string();
+        let client_secret = self.broker_settings.ctrader.client_secret.trim().to_string();
         if client_id.is_empty() || client_secret.is_empty() {
             return Err(anyhow::anyhow!(
                 "cTrader chart history requires configured client_id and client_secret"
@@ -1075,10 +1081,8 @@ impl TradingSession {
         }
 
         let access_token = self
-            .ctrader_token_store
-            .load_token_bundle()?
-            .map(|bundle| bundle.access_token)
-            .ok_or_else(|| anyhow::anyhow!("cTrader chart history requires a stored token bundle"))?;
+            .ensure_fresh_ctrader_token_bundle("cTrader chart history requires a stored token bundle")?
+            .access_token;
 
         let account_id = self
             .selected_ctrader_chart_account_id()
@@ -1092,8 +1096,8 @@ impl TradingSession {
             .ok_or_else(|| anyhow::anyhow!("unsupported cTrader chart timeframe {}", timeframe))?;
 
         Ok(CTraderChartHistoryRequest {
-            client_id: client_id.to_string(),
-            client_secret: client_secret.to_string(),
+            client_id,
+            client_secret,
             access_token,
             environment: self.selected_ctrader_environment(),
             account_id,
@@ -1182,10 +1186,8 @@ impl TradingSession {
         }
 
         let access_token = self
-            .ctrader_token_store
-            .load_token_bundle()?
-            .map(|bundle| bundle.access_token)
-            .ok_or_else(|| anyhow::anyhow!("cTrader connect requires a stored token bundle"))?;
+            .ensure_fresh_ctrader_token_bundle("cTrader connect requires a stored token bundle")?
+            .access_token;
 
         let account_id = self.selected_ctrader_execution_account_id().ok_or_else(|| {
             anyhow::anyhow!("cTrader account runtime requires at least one discovered account")
@@ -1209,6 +1211,44 @@ impl TradingSession {
             .find(|account| account.enabled_for_execution)
             .or_else(|| self.broker_settings.ctrader.accounts.first())
             .map(|account| account.account_id.clone())
+    }
+
+    fn ensure_fresh_ctrader_token_bundle(
+        &mut self,
+        missing_bundle_message: &str,
+    ) -> anyhow::Result<CTraderTokenBundle> {
+        let client_id = self.broker_settings.ctrader.client_id.trim().to_string();
+        let client_secret = self.broker_settings.ctrader.client_secret.trim().to_string();
+        if client_id.is_empty() || client_secret.is_empty() {
+            return Err(anyhow::anyhow!(
+                "cTrader token refresh requires configured client_id and client_secret"
+            ));
+        }
+
+        let bundle = self
+            .ctrader_token_store
+            .load_token_bundle()?
+            .ok_or_else(|| anyhow::anyhow!(missing_bundle_message.to_string()))?;
+        let now_unix = current_unix_seconds()?;
+        if !bundle.needs_refresh_at(now_unix, CTRADER_TOKEN_REFRESH_WINDOW_SECS) {
+            return Ok(bundle);
+        }
+
+        let refreshed_bundle = self
+            .ctrader_live_auth_backend
+            .refresh_token_bundle(&CTraderTokenRefreshRequest {
+                client_id,
+                client_secret,
+                refresh_token: bundle.refresh_token.clone(),
+                scope: bundle.scope.clone(),
+            })?;
+        self.ctrader_token_store
+            .save_token_bundle(&refreshed_bundle)
+            .map_err(|err| anyhow::anyhow!("failed to persist refreshed cTrader token bundle: {err}"))?;
+        if let Some(session) = self.ctrader_auth.as_mut() {
+            session.replace_persisted_token_bundle(refreshed_bundle.clone());
+        }
+        Ok(refreshed_bundle)
     }
 }
 
@@ -1329,6 +1369,13 @@ fn sync_discovered_accounts_with_targets(
             synced
         })
         .collect()
+}
+
+fn current_unix_seconds() -> anyhow::Result<i64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| anyhow::anyhow!("system clock is before unix epoch"))?
+        .as_secs() as i64)
 }
 
 pub fn panel_mode(data_source: DataSource, connected: bool) -> TradingPanelMode {
@@ -1788,6 +1835,20 @@ mod tests {
         }
     }
 
+    fn fresh_ctrader_token_bundle(
+        access_token: &str,
+        refresh_token: &str,
+    ) -> crate::app_services::ctrader_auth::CTraderTokenBundle {
+        crate::app_services::ctrader_auth::CTraderTokenBundle {
+            access_token: access_token.to_string(),
+            refresh_token: refresh_token.to_string(),
+            token_type: "bearer".to_string(),
+            expires_in: 3600,
+            scope: "trading".to_string(),
+            created_at_unix: current_unix_seconds().expect("current unix time"),
+        }
+    }
+
     #[test]
     fn connection_snapshot_reports_local_mode_without_live_runtime() {
         let state = sample_state(DataSource::Local, "Local Mode");
@@ -1953,14 +2014,7 @@ mod tests {
             crate::app_services::secure_store::MemorySecretStoreBackend::default(),
         );
         session
-            .seed_ctrader_token_bundle_for_test(crate::app_services::ctrader_auth::CTraderTokenBundle {
-                access_token: "access".to_string(),
-                refresh_token: "refresh".to_string(),
-                token_type: "Bearer".to_string(),
-                expires_in: 3600,
-                scope: "trading".to_string(),
-                created_at_unix: 1_710_000_000,
-            })
+            .seed_ctrader_token_bundle_for_test(fresh_ctrader_token_bundle("access", "refresh"))
             .expect("seed token bundle");
 
         let request = session
@@ -2157,14 +2211,7 @@ mod tests {
             crate::app_services::secure_store::MemorySecretStoreBackend::default(),
         );
         session
-            .seed_ctrader_token_bundle_for_test(crate::app_services::ctrader_auth::CTraderTokenBundle {
-                access_token: "access".to_string(),
-                refresh_token: "refresh".to_string(),
-                token_type: "Bearer".to_string(),
-                expires_in: 3600,
-                scope: "trading".to_string(),
-                created_at_unix: 1_710_000_000,
-            })
+            .seed_ctrader_token_bundle_for_test(fresh_ctrader_token_bundle("access", "refresh"))
             .expect("seed token bundle");
         session.set_ctrader_account_runtime_backend_for_test(
             crate::app_services::ctrader_account::StubCTraderAccountRuntimeBackend::success(
@@ -2210,14 +2257,7 @@ mod tests {
             crate::app_services::secure_store::MemorySecretStoreBackend::default(),
         );
         session
-            .seed_ctrader_token_bundle_for_test(crate::app_services::ctrader_auth::CTraderTokenBundle {
-                access_token: "access".to_string(),
-                refresh_token: "refresh".to_string(),
-                token_type: "Bearer".to_string(),
-                expires_in: 3600,
-                scope: "trading".to_string(),
-                created_at_unix: 1_710_000_000,
-            })
+            .seed_ctrader_token_bundle_for_test(fresh_ctrader_token_bundle("access", "refresh"))
             .expect("seed token bundle");
         session.set_ctrader_account_runtime_backend_for_test(
             crate::app_services::ctrader_account::StubCTraderAccountRuntimeBackend::success(
@@ -2372,14 +2412,7 @@ mod tests {
             crate::app_services::secure_store::MemorySecretStoreBackend::default(),
         );
         session
-            .seed_ctrader_token_bundle_for_test(crate::app_services::ctrader_auth::CTraderTokenBundle {
-                access_token: "access".to_string(),
-                refresh_token: "refresh".to_string(),
-                token_type: "bearer".to_string(),
-                expires_in: 3600,
-                scope: "trading".to_string(),
-                created_at_unix: 1_774_147_200,
-            })
+            .seed_ctrader_token_bundle_for_test(fresh_ctrader_token_bundle("access", "refresh"))
             .expect("seed should succeed");
 
         let snapshot = session
@@ -2415,7 +2448,7 @@ mod tests {
                         token_type: "bearer".to_string(),
                         expires_in: 3600,
                         scope: "trading".to_string(),
-                        created_at_unix: 1_774_147_200,
+                        created_at_unix: current_unix_seconds().expect("current unix time"),
                     },
                 },
             ),
@@ -2455,14 +2488,7 @@ mod tests {
             crate::app_services::secure_store::MemorySecretStoreBackend::default(),
         );
         session
-            .seed_ctrader_token_bundle_for_test(crate::app_services::ctrader_auth::CTraderTokenBundle {
-                access_token: "access".to_string(),
-                refresh_token: "refresh".to_string(),
-                token_type: "bearer".to_string(),
-                expires_in: 3600,
-                scope: "trading".to_string(),
-                created_at_unix: 1_774_147_200,
-            })
+            .seed_ctrader_token_bundle_for_test(fresh_ctrader_token_bundle("access", "refresh"))
             .expect("seed should succeed");
         session
             .restore_ctrader_session()
@@ -2496,14 +2522,7 @@ mod tests {
             crate::app_services::secure_store::MemorySecretStoreBackend::default(),
         );
         session
-            .seed_ctrader_token_bundle_for_test(crate::app_services::ctrader_auth::CTraderTokenBundle {
-                access_token: "access".to_string(),
-                refresh_token: "refresh".to_string(),
-                token_type: "bearer".to_string(),
-                expires_in: 3600,
-                scope: "trading".to_string(),
-                created_at_unix: 1_774_147_200,
-            })
+            .seed_ctrader_token_bundle_for_test(fresh_ctrader_token_bundle("access", "refresh"))
             .expect("seed should succeed");
         session
             .restore_ctrader_session()
@@ -2576,14 +2595,7 @@ mod tests {
             crate::app_services::secure_store::MemorySecretStoreBackend::default(),
         );
         session
-            .seed_ctrader_token_bundle_for_test(crate::app_services::ctrader_auth::CTraderTokenBundle {
-                access_token: "access".to_string(),
-                refresh_token: "refresh".to_string(),
-                token_type: "bearer".to_string(),
-                expires_in: 3600,
-                scope: "trading".to_string(),
-                created_at_unix: 1_774_147_200,
-            })
+            .seed_ctrader_token_bundle_for_test(fresh_ctrader_token_bundle("access", "refresh"))
             .expect("seed should succeed");
         session
             .restore_ctrader_session()
@@ -2656,7 +2668,7 @@ mod tests {
             token_type: "bearer".to_string(),
             expires_in: 3600,
             scope: "trading".to_string(),
-            created_at_unix: 1_774_147_200,
+            created_at_unix: current_unix_seconds().expect("current unix time"),
         });
         session.ctrader_auth = Some(auth);
 
@@ -2682,14 +2694,7 @@ mod tests {
             crate::app_services::secure_store::MemorySecretStoreBackend::default(),
         );
         session
-            .seed_ctrader_token_bundle_for_test(crate::app_services::ctrader_auth::CTraderTokenBundle {
-                access_token: "access".to_string(),
-                refresh_token: "refresh".to_string(),
-                token_type: "bearer".to_string(),
-                expires_in: 3600,
-                scope: "trading".to_string(),
-                created_at_unix: 1_774_147_200,
-            })
+            .seed_ctrader_token_bundle_for_test(fresh_ctrader_token_bundle("access", "refresh"))
             .expect("seed should succeed");
         session
             .restore_ctrader_session()
@@ -2714,5 +2719,110 @@ mod tests {
             .last_request()
             .expect("stub should capture the discovery request");
         assert_eq!(request.environment, CTraderEnvironment::Demo);
+    }
+
+    #[test]
+    fn ctrader_runtime_request_refreshes_expired_token_bundle_before_use() {
+        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
+        session.broker_settings_mut().ctrader.redirect_uri =
+            "http://127.0.0.1:43001/callback".to_string();
+        session
+            .broker_settings_mut()
+            .ctrader
+            .accounts
+            .push(crate::app_services::broker_config::BrokerAccountTarget {
+                account_id: "101".to_string(),
+                label: "Primary".to_string(),
+                enabled_for_execution: true,
+            });
+        let store = crate::app_services::secure_store::MemorySecretStoreBackend::default();
+        session.set_ctrader_store_for_test(store.clone());
+        session
+            .seed_ctrader_token_bundle_for_test(crate::app_services::ctrader_auth::CTraderTokenBundle {
+                access_token: "expired-access".to_string(),
+                refresh_token: "expired-refresh".to_string(),
+                token_type: "bearer".to_string(),
+                expires_in: 60,
+                scope: "trading".to_string(),
+                created_at_unix: 1,
+            })
+            .expect("seed should succeed");
+        session
+            .restore_ctrader_session()
+            .expect("restore should succeed")
+            .expect("snapshot should exist");
+        session.set_ctrader_live_auth_backend_for_test(
+            crate::app_services::ctrader_live_auth::StubCTraderLiveAuthBackend::with_refresh_success(
+                crate::app_services::ctrader_auth::CTraderTokenBundle {
+                    access_token: "fresh-access".to_string(),
+                    refresh_token: "fresh-refresh".to_string(),
+                    token_type: "bearer".to_string(),
+                    expires_in: 2628000,
+                    scope: "trading".to_string(),
+                    created_at_unix: 1_900_000_000,
+                },
+            ),
+        );
+
+        let request = session
+            .build_ctrader_account_runtime_request()
+            .expect("runtime request should refresh");
+
+        assert_eq!(request.access_token, "fresh-access");
+        let stored = session
+            .ctrader_token_store
+            .load_token_bundle()
+            .expect("load should succeed")
+            .expect("bundle should exist");
+        assert_eq!(stored.access_token, "fresh-access");
+        assert_eq!(stored.refresh_token, "fresh-refresh");
+    }
+
+    #[test]
+    fn ctrader_runtime_request_fails_closed_when_refresh_fails() {
+        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
+        session.broker_settings_mut().ctrader.redirect_uri =
+            "http://127.0.0.1:43001/callback".to_string();
+        session
+            .broker_settings_mut()
+            .ctrader
+            .accounts
+            .push(crate::app_services::broker_config::BrokerAccountTarget {
+                account_id: "101".to_string(),
+                label: "Primary".to_string(),
+                enabled_for_execution: true,
+            });
+        session.set_ctrader_store_for_test(
+            crate::app_services::secure_store::MemorySecretStoreBackend::default(),
+        );
+        session
+            .seed_ctrader_token_bundle_for_test(crate::app_services::ctrader_auth::CTraderTokenBundle {
+                access_token: "expired-access".to_string(),
+                refresh_token: "expired-refresh".to_string(),
+                token_type: "bearer".to_string(),
+                expires_in: 60,
+                scope: "trading".to_string(),
+                created_at_unix: 1,
+            })
+            .expect("seed should succeed");
+        session
+            .restore_ctrader_session()
+            .expect("restore should succeed")
+            .expect("snapshot should exist");
+        session.set_ctrader_live_auth_backend_for_test(
+            crate::app_services::ctrader_live_auth::StubCTraderLiveAuthBackend::with_refresh_failure(
+                "token refresh failed",
+            ),
+        );
+
+        let err = session
+            .build_ctrader_account_runtime_request()
+            .expect_err("runtime request should fail when refresh fails");
+
+        assert!(err.to_string().contains("token refresh failed"));
     }
 }
