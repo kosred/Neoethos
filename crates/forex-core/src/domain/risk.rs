@@ -381,7 +381,7 @@ impl RiskManager {
         self.kill_window_until_sec = Some(until_sec);
     }
 
-    pub fn drawdown_state(&self, equity: f64) -> (f64, f64, f64, f64) {
+    pub fn drawdown_state(&self, equity: f64) -> (f64, f64, f64, f64, f64) {
         let daily_dd_pct = if self.day_start_equity > 0.0 {
             (self.day_start_equity - equity) / self.day_start_equity
         } else {
@@ -392,9 +392,16 @@ impl RiskManager {
         } else {
             0.0
         };
+        let total_dd_pct = if self.challenge_start_equity > 0.0 {
+            (self.challenge_start_equity - equity) / self.challenge_start_equity
+        } else if self.total_peak_equity > 0.0 {
+            (self.total_peak_equity - equity) / self.total_peak_equity
+        } else {
+            0.0
+        };
         let dd_used = daily_dd_pct.max(intraday_dd_pct).max(0.0);
         let dd_limit = self.prop_rules.daily_dd_stop_trading_pct.max(1e-9);
-        (daily_dd_pct, intraday_dd_pct, dd_used, dd_limit)
+        (daily_dd_pct, intraday_dd_pct, dd_used, dd_limit, total_dd_pct)
     }
 
     pub fn update_recovery_state(&mut self, equity: f64) {
@@ -472,7 +479,11 @@ impl RiskManager {
             return (false, "Revenge trading detected".to_string());
         }
 
-        let (daily_dd, intraday_dd, _dd_used, _dd_limit) = self.drawdown_state(input.equity);
+        let (daily_dd, intraday_dd, _dd_used, _dd_limit, total_dd) = self.drawdown_state(input.equity);
+        if total_dd >= self.prop_rules.max_total_loss_pct {
+            self.circuit_breaker_triggered = true;
+            return (false, format!("Total drawdown limit ({:.2}%)", total_dd * 100.0));
+        }
         if daily_dd >= self.prop_rules.daily_dd_stop_trading_pct {
             self.circuit_breaker_triggered = true;
             return (false, format!("Daily drawdown limit ({:.2}%)", daily_dd * 100.0));
@@ -538,7 +549,7 @@ impl RiskManager {
             risk_pct *= 0.5;
         }
 
-        let (_, _, dd_used, dd_limit) = self.drawdown_state(input.equity);
+        let (_, _, dd_used, dd_limit, total_dd_pct) = self.drawdown_state(input.equity);
         let dd_frac = dd_used / dd_limit.max(1e-9);
 
         if dd_frac >= 0.75 {
@@ -547,14 +558,73 @@ impl RiskManager {
             risk_pct *= 0.60;
         }
 
-        if self.total_peak_equity > 0.0 {
-            let dd_total_pct = (self.total_peak_equity - input.equity) / self.total_peak_equity;
-            if dd_total_pct > 0.0 {
-                let scale = 1.0 - (dd_total_pct / self.prop_rules.max_total_loss_pct.max(1e-6));
-                risk_pct *= scale.max(0.3);
-            }
+        let max_total_loss = self.prop_rules.max_total_loss_pct.max(1e-6);
+        if total_dd_pct >= max_total_loss {
+            return 0.0;
+        } else if total_dd_pct > 0.0 {
+            let scale = 1.0 - (total_dd_pct / max_total_loss);
+            risk_pct *= scale.max(0.3);
         }
 
         risk_pct.clamp(0.0, input.max_risk_cap)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PositionSizingInput, PropFirmRules, RiskManager, TradeGateInput};
+
+    fn test_rules() -> PropFirmRules {
+        PropFirmRules {
+            max_total_loss_pct: 0.10,
+            daily_dd_stop_trading_pct: 0.04,
+            ..PropFirmRules::default()
+        }
+    }
+
+    #[test]
+    fn drawdown_state_reports_total_drawdown_from_challenge_start_equity() {
+        let manager = RiskManager::new(test_rules(), true, 10_000.0);
+
+        let (_, _, _, _, total_dd) = manager.drawdown_state(9_250.0);
+
+        assert!((total_dd - 0.075).abs() < 1e-9);
+    }
+
+    #[test]
+    fn check_trade_allowed_triggers_circuit_breaker_on_total_drawdown_limit() {
+        let mut manager = RiskManager::new(test_rules(), true, 10_000.0);
+
+        let (allowed, reason) = manager.check_trade_allowed(TradeGateInput {
+            equity: 9_000.0,
+            confidence: 0.90,
+            current_time_sec: 1_700_000_000,
+            current_hour: 10,
+            current_min: 0,
+            weekday: 2,
+            market_volatility: 0.0015,
+        });
+
+        assert!(!allowed);
+        assert!(manager.circuit_breaker_triggered);
+        assert!(reason.contains("Total drawdown limit"));
+    }
+
+    #[test]
+    fn calculate_position_size_returns_zero_once_total_drawdown_limit_is_hit() {
+        let mut manager = RiskManager::new(test_rules(), true, 10_000.0);
+
+        let position_size_risk = manager.calculate_position_size(PositionSizingInput {
+            equity: 9_000.0,
+            base_risk_pct: 0.01,
+            max_risk_cap: 0.02,
+            confidence: 0.90,
+            uncertainty: 0.0,
+            market_volatility: 0.0010,
+            target_volatility: 0.0010,
+            is_volatile_regime: false,
+        });
+
+        assert_eq!(position_size_risk, 0.0);
     }
 }
