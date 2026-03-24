@@ -3319,6 +3319,7 @@ dependencies = [
  "mt5-bridge",
  "num_cpus",
  "open",
+ "polars",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

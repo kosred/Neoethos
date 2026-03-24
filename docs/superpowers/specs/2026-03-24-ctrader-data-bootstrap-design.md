@@ -25,6 +25,8 @@ The current repo already has:
 - strict parquet loading via `forex-data`
 - `cTrader` symbol and historical bar access in `ctrader_data.rs`
 
+The current repo does not yet expose historical bar retrieval through the `MT5` bridge, so this tranche must add that bridge seam before `MT5` can serve as a real fallback source.
+
 The existing parquet layout and schema must remain unchanged so that current CLI and UI research flows continue to work without modification.
 
 The observed local schema is:
@@ -49,7 +51,6 @@ The fallback `MT5` path uses documented range-based bars retrieval, but only wit
 
 Add a dedicated app service that accepts:
 
-- adapter source preference
 - selected pairs
 - selected timeframes
 - requested years
@@ -78,7 +79,17 @@ Each pair/timeframe request uses this order:
 4. `Partial result`
    - if the requested range is still not fully covered, the result is `Degraded`, never fake success
 
-### 3. Cleaning And Preparation Pipeline
+### 3. Requested Range Semantics
+
+The `years` input means a trailing UTC time range ending at bootstrap start time:
+
+- `range_end_ms`: current UTC bootstrap start time
+- `range_start_ms`: `range_end_ms - years * 365 days`
+- `range_end_ms` is treated as an exclusive upper bound for coverage math
+
+This tranche does not use calendar-year alignment. The goal is deterministic fetch and coverage planning for operators who want “the last N years” of data.
+
+### 4. Cleaning And Preparation Pipeline
 
 Fetched data must pass through a strict normalization pipeline before it can be written:
 
@@ -104,7 +115,7 @@ Fetched data must pass through a strict normalization pipeline before it can be 
 
 No synthetic bars should be generated in this tranche.
 
-### 4. Parquet Writer
+### 5. Parquet Writer
 
 The writer must:
 
@@ -128,6 +139,15 @@ The `System` area gains a `Data Bootstrap` operator section with:
 - progress and coverage reporting
 
 The UI remains thin. All fetch, cleaning, fallback, and writing logic belongs in app services.
+
+Bootstrap progress reaches the UI through the existing job-style reporting model:
+
+- a `Bootstrap` job snapshot
+- stage/progress updates
+- counters/highlights/warnings/errors
+- final coverage report
+
+The bootstrap service may expose these updates through a synchronous callback or the same snapshot/event pattern already used by discovery and training, but the transport must be explicit and testable.
 
 ## Error Handling
 

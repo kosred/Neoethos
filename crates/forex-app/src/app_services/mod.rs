@@ -1,4 +1,6 @@
 pub mod broker_config;
+pub mod bootstrap_writer;
+pub mod ctrader_bootstrap;
 pub mod ctrader_account;
 pub mod ctrader_messages;
 pub mod ctrader_auth;

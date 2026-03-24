@@ -98,6 +98,13 @@ pub struct CTraderChartHistoryResult {
     pub live_subscription_plan: CTraderLiveSubscriptionPlan,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CTraderHistoricalBarsFetchResult {
+    pub symbol: CTraderSymbolInfo,
+    pub bars: Vec<HistoricalBar>,
+    pub has_more: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CTraderLiveSubscriptionPlan {
     pub subscribe_spots: CTraderOpenApiJsonMessage,
@@ -359,40 +366,12 @@ pub fn load_chart_history_with_transport<T: CTraderOpenApiTransport>(
     transport: &T,
     request: &CTraderChartHistoryRequest,
 ) -> Result<CTraderChartHistoryResult> {
+    let (_account_id, light_symbol, symbol) =
+        resolve_ctrader_symbol_with_transport(transport, request)?;
     let account_id = request
         .account_id
         .parse::<i64>()
         .context("cTrader account id must be numeric")?;
-
-    let auth_responses = transport.send_sequence(&[
-        build_application_auth_request(&request.client_id, &request.client_secret, "app-auth-1"),
-        build_account_auth_request(account_id, &request.access_token, "account-auth-1"),
-        build_symbols_list_request(account_id, false, "symbols-1"),
-    ])?;
-
-    if auth_responses.len() != 3 {
-        return Err(anyhow!(
-            "expected 3 cTrader chart-history responses, received {}",
-            auth_responses.len()
-        ));
-    }
-
-    ensure_success_payload_type(
-        &auth_responses[0],
-        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
-    )?;
-    ensure_success_payload_type(
-        &auth_responses[1],
-        CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
-    )?;
-
-    let symbols = parse_symbols_list_response(&auth_responses[2])?;
-    let requested_key = normalize_symbol_key(&request.symbol_name);
-    let light_symbol = symbols
-        .symbols
-        .into_iter()
-        .find(|symbol| normalize_symbol_key(&symbol.symbol_name) == requested_key)
-        .ok_or_else(|| anyhow!("cTrader symbol '{}' was not found for this account", request.symbol_name))?;
 
     let trendbar_period = trendbar_period_value(&request.timeframe)?;
     let live_subscription_plan = CTraderLiveSubscriptionPlan {
@@ -422,8 +401,6 @@ pub fn load_chart_history_with_transport<T: CTraderOpenApiTransport>(
     };
 
     let detail_responses = transport.send_sequence(&[
-        build_symbol_by_id_request(account_id, &[light_symbol.symbol_id], "symbol-by-id-1"),
-        // cTrader documents trendbar periods as enum values, so convert the UI label first.
         build_get_trendbars_request(
             account_id,
             light_symbol.symbol_id,
@@ -451,9 +428,116 @@ pub fn load_chart_history_with_transport<T: CTraderOpenApiTransport>(
         ),
     ])?;
 
-    if detail_responses.len() != 4 {
+    if detail_responses.len() != 3 {
         return Err(anyhow!(
-            "expected 4 cTrader detail responses, received {}",
+            "expected 3 cTrader detail responses, received {}",
+            detail_responses.len()
+        ));
+    }
+    let trendbars = parse_trendbars_response(&detail_responses[0], &symbol)?;
+    let bid_ticks = parse_tick_data_response(&detail_responses[1], &symbol)?;
+    let ask_ticks = parse_tick_data_response(&detail_responses[2], &symbol)?;
+    Ok(CTraderChartHistoryResult {
+        symbol,
+        bars: trendbars.bars,
+        has_more: trendbars.has_more,
+        bid_ticks: bid_ticks.ticks,
+        ask_ticks: ask_ticks.ticks,
+        live_subscription_plan,
+    })
+}
+
+pub fn load_chart_history(request: &CTraderChartHistoryRequest) -> Result<CTraderChartHistoryResult> {
+    let transport = ProductionCTraderOpenApiTransport::new(request.environment.endpoint_host());
+    load_chart_history_with_transport(&transport, request)
+}
+
+pub fn load_historical_bars_only_with_transport<T: CTraderOpenApiTransport>(
+    transport: &T,
+    request: &CTraderChartHistoryRequest,
+) -> Result<CTraderHistoricalBarsFetchResult> {
+    let (account_id, light_symbol, symbol) =
+        resolve_ctrader_symbol_with_transport(transport, request)?;
+    let trendbar_period = trendbar_period_value(&request.timeframe)?;
+    let responses = transport.send_sequence(&[
+        build_get_trendbars_request(
+            account_id,
+            light_symbol.symbol_id,
+            trendbar_period,
+            request.from_timestamp_ms,
+            request.to_timestamp_ms,
+            request.count,
+            "trendbars-1",
+        ),
+    ])?;
+
+    if responses.len() != 1 {
+        return Err(anyhow!(
+            "expected 1 cTrader bars-only response, received {}",
+            responses.len()
+        ));
+    }
+
+    let trendbars = parse_trendbars_response(&responses[0], &symbol)?;
+    Ok(CTraderHistoricalBarsFetchResult {
+        symbol,
+        bars: trendbars.bars,
+        has_more: trendbars.has_more,
+    })
+}
+
+pub fn load_historical_bars_only(
+    request: &CTraderChartHistoryRequest,
+) -> Result<CTraderHistoricalBarsFetchResult> {
+    let transport = ProductionCTraderOpenApiTransport::new(request.environment.endpoint_host());
+    load_historical_bars_only_with_transport(&transport, request)
+}
+
+fn resolve_ctrader_symbol_with_transport<T: CTraderOpenApiTransport>(
+    transport: &T,
+    request: &CTraderChartHistoryRequest,
+) -> Result<(i64, CTraderLightSymbolInfo, CTraderSymbolInfo)> {
+    let account_id = request
+        .account_id
+        .parse::<i64>()
+        .context("cTrader account id must be numeric")?;
+
+    let auth_responses = transport.send_sequence(&[
+        build_application_auth_request(&request.client_id, &request.client_secret, "app-auth-1"),
+        build_account_auth_request(account_id, &request.access_token, "account-auth-1"),
+        build_symbols_list_request(account_id, false, "symbols-1"),
+    ])?;
+
+    if auth_responses.len() != 3 {
+        return Err(anyhow!(
+            "expected 3 cTrader auth/symbol responses, received {}",
+            auth_responses.len()
+        ));
+    }
+
+    ensure_success_payload_type(
+        &auth_responses[0],
+        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    )?;
+    ensure_success_payload_type(
+        &auth_responses[1],
+        CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
+    )?;
+
+    let symbols = parse_symbols_list_response(&auth_responses[2])?;
+    let requested_key = normalize_symbol_key(&request.symbol_name);
+    let light_symbol = symbols
+        .symbols
+        .into_iter()
+        .find(|symbol| normalize_symbol_key(&symbol.symbol_name) == requested_key)
+        .ok_or_else(|| anyhow!("cTrader symbol '{}' was not found for this account", request.symbol_name))?;
+
+    let detail_responses = transport.send_sequence(&[
+        build_symbol_by_id_request(account_id, &[light_symbol.symbol_id], "symbol-by-id-1"),
+    ])?;
+    if detail_responses.len() != 1 {
+        return Err(anyhow!(
+            "expected 1 cTrader symbol-by-id response, received {}",
             detail_responses.len()
         ));
     }
@@ -469,22 +553,7 @@ pub fn load_chart_history_with_transport<T: CTraderOpenApiTransport>(
         .filter(|description| !description.trim().is_empty())
         .unwrap_or_else(|| light_symbol.symbol_name.clone());
 
-    let trendbars = parse_trendbars_response(&detail_responses[1], &symbol)?;
-    let bid_ticks = parse_tick_data_response(&detail_responses[2], &symbol)?;
-    let ask_ticks = parse_tick_data_response(&detail_responses[3], &symbol)?;
-    Ok(CTraderChartHistoryResult {
-        symbol,
-        bars: trendbars.bars,
-        has_more: trendbars.has_more,
-        bid_ticks: bid_ticks.ticks,
-        ask_ticks: ask_ticks.ticks,
-        live_subscription_plan,
-    })
-}
-
-pub fn load_chart_history(request: &CTraderChartHistoryRequest) -> Result<CTraderChartHistoryResult> {
-    let transport = ProductionCTraderOpenApiTransport::new(request.environment.endpoint_host());
-    load_chart_history_with_transport(&transport, request)
+    Ok((account_id, light_symbol, symbol))
 }
 
 fn ensure_success_payload_type(response_json: &str, expected_payload_type: u32) -> Result<()> {
@@ -828,5 +897,39 @@ mod tests {
         .expect_err("unknown symbol must fail");
 
         assert!(err.to_string().contains("EURUSD"));
+    }
+
+    #[test]
+    fn bars_only_backend_loads_symbol_metadata_then_trendbars_without_ticks() {
+        let transport = StubTransport::with_responses(vec![
+            Ok(r#"{"clientMsgId":"app-auth-1","payloadType":2101,"payload":{}}"#.to_string()),
+            Ok(r#"{"clientMsgId":"account-auth-1","payloadType":2103,"payload":{"ctidTraderAccountId":712345}}"#.to_string()),
+            Ok(r#"{"clientMsgId":"symbols-1","payloadType":2115,"payload":{"ctidTraderAccountId":712345,"symbol":[{"symbolId":14,"symbolName":"EURUSD","enabled":true,"description":"Euro vs Dollar"}]}}"#.to_string()),
+            Ok(r#"{"clientMsgId":"symbol-by-id-1","payloadType":2117,"payload":{"symbol":[{"symbolId":14,"digits":5,"pipPosition":4,"tradingMode":"ENABLED"}]}}"#.to_string()),
+            Ok(r#"{"clientMsgId":"trendbars-1","payloadType":2138,"payload":{"period":"M15","symbolId":14,"trendbar":[{"volume":9,"low":109950,"deltaOpen":50,"deltaClose":125,"deltaHigh":225,"utcTimestampInMinutes":28500000}],"hasMore":false}}"#.to_string()),
+        ]);
+
+        let result = load_historical_bars_only_with_transport(
+            &transport,
+            &CTraderChartHistoryRequest {
+                client_id: "client".to_string(),
+                client_secret: "secret".to_string(),
+                access_token: "token".to_string(),
+                environment: CTraderEnvironment::Demo,
+                account_id: "712345".to_string(),
+                symbol_name: "EURUSD".to_string(),
+                timeframe: "M15".to_string(),
+                from_timestamp_ms: 1_709_000_000_000,
+                to_timestamp_ms: 1_710_000_000_000,
+                count: Some(96),
+            },
+        )
+        .expect("bars-only history");
+
+        assert_eq!(result.symbol.symbol_name, "EURUSD");
+        assert_eq!(result.bars.len(), 1);
+        assert_eq!(result.bars[0].close, 1.10075);
+        assert!(!result.has_more);
+        assert_eq!(transport.sent_len(), 5);
     }
 }

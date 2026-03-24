@@ -1,12 +1,17 @@
 use crate::app_record;
+use anyhow::Context;
 use crate::app_services::broker_config::{
     AdapterReadinessSnapshot, BrokerAccountTarget, BrokerSessionState, BrokerSettingsState,
     CTraderBrokerEnvironment,
+};
+use crate::app_services::ctrader_bootstrap::{
+    bootstrap_from_ctrader_history, plan_bootstrap_chunks,
 };
 use crate::app_services::ctrader_account::{
     CTraderAccountRuntimeBackend, CTraderAccountRuntimeRequest, CTraderAccountRuntimeSnapshot,
     CTraderPendingOrderSnapshot, CTraderPositionSnapshot, ProductionCTraderAccountRuntimeBackend,
 };
+use crate::app_services::jobs::{JobEventLevel, JobKind, JobSnapshot, JobState, push_recent_event};
 use crate::app_services::ctrader_data::{
     load_chart_history, CTraderChartHistoryRequest, HistoricalBar,
 };
@@ -369,6 +374,141 @@ impl TradingSession {
             }
             _ => None,
         }
+    }
+
+    pub fn run_ctrader_bootstrap_batch(
+        &mut self,
+        data_root: &std::path::Path,
+        symbols: &[String],
+        timeframes: &[String],
+        years: u32,
+    ) -> anyhow::Result<JobSnapshot> {
+        if symbols.is_empty() || timeframes.is_empty() {
+            return Err(anyhow::anyhow!(
+                "bootstrap requires at least one symbol and one timeframe"
+            ));
+        }
+
+        let mut snapshot = JobSnapshot::new(JobKind::Bootstrap);
+        snapshot.state = JobState::Running;
+        snapshot.progress.stage = "bootstrap_planning".to_string();
+        snapshot.progress.message = format!(
+            "Preparing {} symbols across {} timeframes",
+            symbols.len(),
+            timeframes.len()
+        );
+        snapshot.report.counters.push(("requested_symbols".to_string(), symbols.len() as u64));
+        snapshot.report.counters.push(("requested_timeframes".to_string(), timeframes.len() as u64));
+        snapshot.report.counters.push(("requested_years".to_string(), years as u64));
+
+        let total_requests = (symbols.len() * timeframes.len()) as u64;
+        let mut completed = 0_u64;
+        let mut successes = 0_u64;
+        let mut degraded = 0_u64;
+        let mut failures = 0_u64;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| anyhow::anyhow!("system clock is before unix epoch"))?
+            .as_millis() as i64;
+
+        for symbol in symbols {
+            for timeframe in timeframes {
+                let planned_chunks = plan_bootstrap_chunks(now_ms, timeframe, years).with_context(|| {
+                    format!(
+                        "failed to plan cTrader bootstrap chunks for {} {} over {} years",
+                        symbol, timeframe, years
+                    )
+                })?;
+                snapshot.progress.stage = "bootstrap_fetch".to_string();
+                snapshot.progress.message = format!("Bootstrapping {symbol} {timeframe}");
+                snapshot.report.events = push_recent_event(
+                    &snapshot.report.events,
+                    JobEventLevel::Info,
+                    format!(
+                        "bootstrap started for {symbol} {timeframe} with {} planned chunks",
+                        planned_chunks.len()
+                    ),
+                );
+
+                let mut request = self.build_ctrader_chart_history_request(symbol, timeframe)?;
+                request.count = None;
+                let outcome = bootstrap_from_ctrader_history(data_root, &request, now_ms, years);
+                completed += 1;
+                snapshot.progress.percent = Some(completed as f32 / total_requests as f32);
+
+                match outcome {
+                    Ok(outcome) => {
+                        let missing_segments = outcome.coverage.missing_segments.len();
+                        if outcome.coverage.fully_covered {
+                            successes += 1;
+                        } else {
+                            degraded += 1;
+                            snapshot.report.warnings.push(format!(
+                                "{} {} has {} uncovered segments after bootstrap",
+                                symbol, timeframe, missing_segments
+                            ));
+                        }
+                        snapshot.report.entries.push(format!(
+                            "{} {} | planned_chunks={} | bars_written={} | covered_segments={} | missing_segments={}",
+                            symbol,
+                            timeframe,
+                            planned_chunks.len(),
+                            outcome.bars_written,
+                            outcome.coverage.covered_segments.len(),
+                            missing_segments
+                        ));
+                        snapshot.report.events = push_recent_event(
+                            &snapshot.report.events,
+                            if outcome.coverage.fully_covered {
+                                JobEventLevel::Info
+                            } else {
+                                JobEventLevel::Warning
+                            },
+                            format!(
+                                "bootstrap finished for {symbol} {timeframe} with {} covered segments",
+                                outcome.coverage.covered_segments.len()
+                            ),
+                        );
+                    }
+                    Err(err) => {
+                        failures += 1;
+                        snapshot
+                            .report
+                            .errors
+                            .push(format!("{symbol} {timeframe}: {err}"));
+                        snapshot.report.events = push_recent_event(
+                            &snapshot.report.events,
+                            JobEventLevel::Error,
+                            format!("bootstrap failed for {symbol} {timeframe}: {err}"),
+                        );
+                    }
+                }
+            }
+        }
+
+        snapshot.report.counters.push(("completed_requests".to_string(), completed));
+        snapshot.report.counters.push(("succeeded_requests".to_string(), successes));
+        snapshot.report.counters.push(("degraded_requests".to_string(), degraded));
+        snapshot.report.counters.push(("failed_requests".to_string(), failures));
+        snapshot.report.highlights.push((
+            "requests".to_string(),
+            format!("{}/{} completed", completed, total_requests),
+        ));
+        snapshot.report.summary = format!(
+            "Bootstrap finished: {} succeeded, {} degraded, {} failed",
+            successes, degraded, failures
+        );
+        snapshot.report.log_path = Some("logs/forex-ai.log".to_string());
+        snapshot.state = if failures == total_requests {
+            JobState::Failed
+        } else if failures > 0 || degraded > 0 {
+            JobState::Degraded
+        } else {
+            JobState::Succeeded
+        };
+        snapshot.progress.stage = "bootstrap_complete".to_string();
+        snapshot.progress.message = snapshot.report.summary.clone();
+        Ok(snapshot)
     }
 
     pub fn start_ctrader_auth(&mut self) -> anyhow::Result<CTraderAuthSnapshot> {
@@ -1829,6 +1969,8 @@ mod tests {
             available_symbols: vec!["EURUSD".to_string()],
             discovery_job: None,
             training_job: None,
+            bootstrap_form: crate::app_state::BootstrapFormState::default_for_symbol("EURUSD"),
+            bootstrap_job: None,
             canonical_log_path: PathBuf::from("logs").join("forex-ai.log"),
             hardware: HardwareState::default(),
             risk: RiskState::default(),

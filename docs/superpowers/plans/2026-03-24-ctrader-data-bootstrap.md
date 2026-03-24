@@ -4,9 +4,9 @@
 
 **Goal:** Add a bars-first operator bootstrap flow that fetches missing historical data from `cTrader`, falls back to `MT5` when needed, cleans and validates the result, and writes it into the existing local parquet layout used by discovery and training.
 
-**Architecture:** Introduce a focused bootstrap orchestration service that sits above existing `cTrader` history helpers and the current local parquet contract. The bootstrap service must inspect existing coverage, fetch uncovered segments through a source ladder, normalize and validate bars into a canonical schema, and write them atomically without changing the downstream research pipeline.
+**Architecture:** Introduce a focused bootstrap orchestration service that sits above existing `cTrader` history helpers and the current local parquet contract. The bootstrap service must inspect existing coverage, fetch uncovered trailing UTC ranges through a fixed `Local -> cTrader -> MT5` ladder, normalize and validate bars into a canonical schema, and write them atomically without changing the downstream research pipeline. Progress must move through an explicit bootstrap job snapshot path so the `System` UI can render truthful operator status.
 
-**Tech Stack:** Rust, `forex-app` app services, `forex-data`, `polars` parquet IO, existing `cTrader` history transport, existing `MT5` bridge path, egui operator UI.
+**Tech Stack:** Rust, `forex-app` app services, `forex-data`, `polars` parquet IO, existing `cTrader` history transport, extended `MT5` bridge path, egui operator UI.
 
 ---
 
@@ -126,6 +126,7 @@ Expected: FAIL because coverage inspection is incomplete or missing.
 Add:
 - local coverage inspection helpers
 - requested-range vs covered-range reporting
+- trailing UTC range semantics using `years * 365 days`
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -164,7 +165,35 @@ Add:
 Run: `cargo test -p forex-app ctrader_bootstrap -- --nocapture`
 Expected: PASS
 
-### Task 6: Add failing MT5-fallback tests
+### Task 6: Add failing MT5 historical-bar bridge tests
+
+**Files:**
+- Modify: `crates/mt5-bridge/src/lib.rs`
+
+- [ ] **Step 1: Write the failing tests**
+
+Add tests covering:
+- range-based MT5 bars retrieval for a symbol/timeframe
+- timestamp normalization to UTC milliseconds or nanoseconds compatible with bootstrap normalization
+- explicit failure when MT5 is disconnected or returns no rates
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test -p mt5-bridge -- --nocapture`
+Expected: FAIL because the bridge does not expose historical bars yet.
+
+- [ ] **Step 3: Write minimal implementation**
+
+Add:
+- typed MT5 historical-bar snapshot
+- documented range-based bars retrieval through the Python bridge
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test -p mt5-bridge -- --nocapture`
+Expected: PASS
+
+### Task 7: Add failing MT5-fallback tests
 
 **Files:**
 - Modify: `crates/forex-app/src/app_services/ctrader_bootstrap.rs`
@@ -196,10 +225,12 @@ Expected: PASS
 
 ## Chunk 4: App State And UI Wiring
 
-### Task 7: Add failing app-state and UI tests
+### Task 8: Add failing bootstrap job-state and UI tests
 
 **Files:**
 - Modify: `crates/forex-app/src/app_state.rs`
+- Modify: `crates/forex-app/src/app_services/jobs.rs`
+- Modify: `crates/forex-app/src/app_services/mod.rs`
 - Modify: `crates/forex-app/src/ui/system_status.rs`
 
 - [ ] **Step 1: Write the failing tests**
@@ -207,6 +238,7 @@ Expected: PASS
 Add tests covering:
 - bootstrap form defaults
 - operator selections for pairs/timeframes/years
+- bootstrap `JobSnapshot` transport to UI
 - progress/result rendering for success, degraded, and failed states
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -218,6 +250,7 @@ Expected: FAIL because bootstrap UI state does not exist yet.
 
 Add:
 - bootstrap form state in `AppState`
+- bootstrap job kind and explicit snapshot transport
 - `Data Bootstrap` operator section in `system_status.rs`
 - service wiring to launch and display bootstrap progress/results
 
@@ -228,15 +261,18 @@ Expected: PASS
 
 ## Chunk 5: Full Verification
 
-### Task 8: Verify crate and workspace
+### Task 9: Verify crate and workspace
 
 **Files:**
 - Create: `crates/forex-app/src/app_services/ctrader_bootstrap.rs`
 - Create: `crates/forex-app/src/app_services/bootstrap_writer.rs`
 - Modify: `crates/forex-app/src/app_services/ctrader_data.rs`
+- Modify: `crates/forex-app/src/app_services/mod.rs`
 - Modify: `crates/forex-app/src/app_state.rs`
+- Modify: `crates/forex-app/src/app_services/jobs.rs`
 - Modify: `crates/forex-app/src/ui/system_status.rs`
 - Modify: `crates/forex-data/src/lib.rs`
+- Modify: `crates/mt5-bridge/src/lib.rs`
 
 - [ ] **Step 1: Run bootstrap-focused tests**
 
@@ -271,6 +307,6 @@ Expected: startup succeeds and writes `SYSTEM`/`APP` records into `logs/forex-ai
 - [ ] **Step 7: Commit**
 
 ```bash
-git add docs/superpowers/specs/2026-03-24-ctrader-data-bootstrap-design.md docs/superpowers/plans/2026-03-24-ctrader-data-bootstrap.md crates/forex-app/src/app_services/ctrader_bootstrap.rs crates/forex-app/src/app_services/bootstrap_writer.rs crates/forex-app/src/app_services/ctrader_data.rs crates/forex-app/src/app_state.rs crates/forex-app/src/ui/system_status.rs crates/forex-data/src/lib.rs
+git add docs/superpowers/specs/2026-03-24-ctrader-data-bootstrap-design.md docs/superpowers/plans/2026-03-24-ctrader-data-bootstrap.md crates/forex-app/src/app_services/ctrader_bootstrap.rs crates/forex-app/src/app_services/bootstrap_writer.rs crates/forex-app/src/app_services/ctrader_data.rs crates/forex-app/src/app_services/mod.rs crates/forex-app/src/app_services/jobs.rs crates/forex-app/src/app_state.rs crates/forex-app/src/ui/system_status.rs crates/forex-data/src/lib.rs crates/mt5-bridge/src/lib.rs
 git commit -m "Add cTrader data bootstrap flow"
 ```

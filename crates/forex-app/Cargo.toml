@@ -17,6 +17,7 @@ reqwest = { version = "0.12.24", default-features = false, features = ["blocking
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
+polars = { version = "0.52.0", features = ["lazy", "parquet", "dtype-full", "temporal", "timezones"] }
 
 # Our internal core engines
 forex-core = { path = "../forex-core" }

@@ -7,6 +7,7 @@ use std::sync::{
 pub enum JobKind {
     Discovery,
     Training,
+    Bootstrap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

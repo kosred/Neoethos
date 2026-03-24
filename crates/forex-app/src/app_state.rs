@@ -35,6 +35,8 @@ pub struct AppState {
     pub available_symbols: Vec<String>,
     pub discovery_job: Option<JobSnapshot>,
     pub training_job: Option<JobSnapshot>,
+    pub bootstrap_form: BootstrapFormState,
+    pub bootstrap_job: Option<JobSnapshot>,
     pub canonical_log_path: PathBuf,
     pub hardware: HardwareState,
     pub risk: RiskState,
@@ -60,13 +62,32 @@ impl AppState {
             },
             canonical_log_path: canonical_log_path(),
             runtime,
-            selected_pair,
+            selected_pair: selected_pair.clone(),
             chart_timeframe: "M1".to_string(),
             available_symbols,
             discovery_job: None,
             training_job: None,
+            bootstrap_form: BootstrapFormState::default_for_symbol(&selected_pair),
+            bootstrap_job: None,
             hardware: HardwareState::default(),
             risk: RiskState::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapFormState {
+    pub pairs_input: String,
+    pub timeframes_input: String,
+    pub years: u32,
+}
+
+impl BootstrapFormState {
+    pub fn default_for_symbol(symbol: &str) -> Self {
+        Self {
+            pairs_input: symbol.to_string(),
+            timeframes_input: "M1,M5,M15,H1".to_string(),
+            years: 1,
         }
     }
 }
@@ -131,6 +152,10 @@ mod tests {
         assert_eq!(state.chart_timeframe, "M1");
         assert!(state.discovery_job.is_none());
         assert!(state.training_job.is_none());
+        assert!(state.bootstrap_job.is_none());
+        assert_eq!(state.bootstrap_form.pairs_input, "GBPUSD");
+        assert_eq!(state.bootstrap_form.timeframes_input, "M1,M5,M15,H1");
+        assert_eq!(state.bootstrap_form.years, 1);
         assert_eq!(state.canonical_log_path, PathBuf::from("logs").join("forex-ai.log"));
         assert_eq!(state.hardware.cpu_cores, num_cpus::get() as i32);
         assert!(state.hardware.gpu_enabled);
@@ -151,6 +176,7 @@ mod tests {
         assert_eq!(state.selected_pair, "EURUSD");
         assert_eq!(state.chart_timeframe, "M1");
         assert_eq!(state.status_msg, "Offline");
+        assert_eq!(state.bootstrap_form.pairs_input, "EURUSD");
     }
 
     #[test]
@@ -167,5 +193,14 @@ mod tests {
 
         assert_eq!(state.daily_drawdown_limit, 4.5);
         assert_eq!(state.max_lot_size, 10.0);
+    }
+
+    #[test]
+    fn bootstrap_form_defaults_can_be_built_for_a_symbol() {
+        let state = BootstrapFormState::default_for_symbol("AUDUSD");
+
+        assert_eq!(state.pairs_input, "AUDUSD");
+        assert_eq!(state.timeframes_input, "M1,M5,M15,H1");
+        assert_eq!(state.years, 1);
     }
 }

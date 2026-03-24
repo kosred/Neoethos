@@ -49,6 +49,8 @@ mod tests {
             available_symbols: vec!["EURUSD".to_string()],
             discovery_job: None,
             training_job: None,
+            bootstrap_form: crate::app_state::BootstrapFormState::default_for_symbol("EURUSD"),
+            bootstrap_job: None,
             canonical_log_path: PathBuf::from("logs").join("forex-ai.log"),
             hardware: HardwareState::default(),
             risk: RiskState::default(),

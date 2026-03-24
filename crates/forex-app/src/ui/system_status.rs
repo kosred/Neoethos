@@ -1,12 +1,13 @@
 use crate::app_state::{AppState, DataSource};
+use crate::app_services::jobs::{JobEventLevel, JobKind, JobSnapshot, JobState, push_recent_event};
 use crate::app_services::broker_config::{
     AdapterReadinessSnapshot, BrokerAccountTarget, CTraderBrokerEnvironment,
 };
 use crate::app_services::ctrader_auth::CTraderAuthSnapshot;
 use crate::app_services::trading::{TradingSession, SUPPORTED_TRADING_ADAPTERS};
 use crate::ui::components::{
-    render_dashboard_sections, render_summary_cards, render_view_header, DashboardCard,
-    DashboardSection,
+    render_dashboard_sections, render_report, render_status_badge, render_summary_cards,
+    render_view_header, DashboardCard, DashboardSection,
 };
 use crate::ui::theme;
 use eframe::egui;
@@ -51,6 +52,8 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSess
 
     render_adapter_configuration(ui, session);
     ui.add_space(8.0);
+    render_bootstrap_controls(ui, state, session);
+    ui.add_space(8.0);
 
     render_summary_cards(ui, "Runtime Snapshot", &dashboard.summary_cards);
     render_dashboard_sections(ui, "system_status_section", &dashboard.sections);
@@ -60,6 +63,78 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSess
     }
 
     refresh_requested
+}
+
+fn render_bootstrap_controls(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSession) {
+    ui.separator();
+    render_status_badge(ui, "Bootstrap", state.bootstrap_job.as_ref());
+    ui.add_space(8.0);
+    ui.strong("Data Bootstrap");
+    ui.label(
+        "Fetch missing historical bars into the local parquet cache for research and training.",
+    );
+
+    ui.horizontal(|ui| {
+        ui.label("Pairs");
+        ui.text_edit_singleline(&mut state.bootstrap_form.pairs_input);
+    });
+    ui.horizontal(|ui| {
+        ui.label("Timeframes");
+        ui.text_edit_singleline(&mut state.bootstrap_form.timeframes_input);
+    });
+    ui.horizontal(|ui| {
+        ui.label("Years");
+        ui.add(egui::DragValue::new(&mut state.bootstrap_form.years).range(1..=25));
+    });
+
+    if ui.button("Start cTrader Bootstrap").clicked() {
+        let symbols = parse_bootstrap_list(&state.bootstrap_form.pairs_input);
+        let timeframes = parse_bootstrap_list(&state.bootstrap_form.timeframes_input);
+        if symbols.is_empty() || timeframes.is_empty() {
+            state.bootstrap_job = Some(failed_bootstrap_snapshot(anyhow::anyhow!(
+                "bootstrap requires at least one symbol and one timeframe"
+            )));
+        } else {
+            match session.run_ctrader_bootstrap_batch(
+                &state.runtime.data_dir,
+                &symbols,
+                &timeframes,
+                state.bootstrap_form.years,
+            ) {
+                Ok(snapshot) => state.bootstrap_job = Some(snapshot),
+                Err(err) => state.bootstrap_job = Some(failed_bootstrap_snapshot(err)),
+            }
+        }
+    }
+
+    if let Some(snapshot) = state.bootstrap_job.as_ref() {
+        theme::section_frame(ui.style()).show(ui, |ui| {
+            render_report(ui, snapshot);
+        });
+    }
+}
+
+fn parse_bootstrap_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_uppercase())
+        .collect()
+}
+
+fn failed_bootstrap_snapshot(err: anyhow::Error) -> JobSnapshot {
+    let mut snapshot = JobSnapshot::new(JobKind::Bootstrap);
+    snapshot.state = JobState::Failed;
+    snapshot.progress.stage = "bootstrap_failed".to_string();
+    snapshot.progress.message = err.to_string();
+    snapshot.report.summary = format!("Bootstrap failed: {}", err);
+    snapshot.report.errors.push(err.to_string());
+    snapshot.report.events = push_recent_event(
+        &snapshot.report.events,
+        JobEventLevel::Error,
+        snapshot.report.summary.clone(),
+    );
+    snapshot
 }
 
 fn build_system_status_dashboard(
@@ -458,6 +533,8 @@ mod tests {
             available_symbols: vec!["EURUSD".to_string(), "GBPUSD".to_string()],
             discovery_job: None,
             training_job: None,
+            bootstrap_form: crate::app_state::BootstrapFormState::default_for_symbol("EURUSD"),
+            bootstrap_job: None,
             canonical_log_path: PathBuf::from("logs").join("forex-ai.log"),
             hardware: HardwareState::default(),
             risk: RiskState::default(),

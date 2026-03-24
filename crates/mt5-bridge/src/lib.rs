@@ -109,6 +109,18 @@ pub struct DealInfo {
     pub executed_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoricalBarInfo {
+    pub timestamp_ms: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub tick_volume: f64,
+    pub spread: i64,
+    pub real_volume: f64,
+}
+
 impl MT5Engine {
     pub fn new() -> Result<Self> {
         // Python::initialize() is the new way in 0.26+
@@ -224,6 +236,37 @@ impl MT5Engine {
         .map_err(|e| anyhow::anyhow!("PyError: {}", e))
     }
 
+    pub fn historical_bars(
+        &self,
+        symbol: &str,
+        timeframe: &str,
+        from_timestamp_s: i64,
+        to_timestamp_s: i64,
+    ) -> Result<Vec<HistoricalBarInfo>> {
+        if !self.connected {
+            bail!("MT5 is not connected.");
+        }
+
+        Python::attach(|py| -> PyResult<Vec<HistoricalBarInfo>> {
+            let mt5 = py.import("MetaTrader5")?;
+            let timeframe_value = mt5_timeframe_value(&mt5, timeframe)?;
+            let rates = mt5
+                .getattr("copy_rates_range")?
+                .call1((symbol, timeframe_value, from_timestamp_s, to_timestamp_s))?;
+            let rates = ensure_mt5_collection(&mt5, "copy_rates_range", rates)?;
+            let rows = if rates.hasattr("tolist")? {
+                rates.getattr("tolist")?.call0()?
+            } else {
+                rates
+            };
+
+            rows.try_iter()?
+                .map(|item| parse_historical_bar_info(&item?))
+                .collect()
+        })
+        .map_err(|e| anyhow::anyhow!("PyError: {}", e))
+    }
+
     pub fn shutdown(&mut self) {
         if self.connected {
             let _ = Python::attach(|py| -> PyResult<()> {
@@ -321,6 +364,52 @@ fn parse_deal_info(item: &Bound<'_, PyAny>) -> PyResult<DealInfo> {
         comment: attr_string(item, "comment")?,
         executed_at: attr_i64(item, "time")?,
     })
+}
+
+fn parse_historical_bar_info(item: &Bound<'_, PyAny>) -> PyResult<HistoricalBarInfo> {
+    if let Ok((time_s, open, high, low, close, tick_volume, spread, real_volume)) =
+        item.extract::<(i64, f64, f64, f64, f64, f64, i64, f64)>()
+    {
+        return Ok(HistoricalBarInfo {
+            timestamp_ms: time_s.saturating_mul(1000),
+            open,
+            high,
+            low,
+            close,
+            tick_volume,
+            spread,
+            real_volume,
+        });
+    }
+
+    Ok(HistoricalBarInfo {
+        timestamp_ms: attr_i64(item, "time")?.saturating_mul(1000),
+        open: attr_f64(item, "open")?,
+        high: attr_f64(item, "high")?,
+        low: attr_f64(item, "low")?,
+        close: attr_f64(item, "close")?,
+        tick_volume: attr_f64(item, "tick_volume")?,
+        spread: attr_i64(item, "spread")?,
+        real_volume: attr_f64(item, "real_volume")?,
+    })
+}
+
+fn mt5_timeframe_value(mt5: &Bound<'_, PyModule>, timeframe: &str) -> PyResult<Py<PyAny>> {
+    let attr = match timeframe.trim().to_ascii_uppercase().as_str() {
+        "M1" => "TIMEFRAME_M1",
+        "M5" => "TIMEFRAME_M5",
+        "M15" => "TIMEFRAME_M15",
+        "H1" => "TIMEFRAME_H1",
+        "H4" => "TIMEFRAME_H4",
+        "D1" => "TIMEFRAME_D1",
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unsupported MT5 timeframe: {other}"
+            )))
+        }
+    };
+
+    Ok(mt5.getattr(attr)?.unbind())
 }
 
 fn attr_i64(item: &Bound<'_, PyAny>, attr: &str) -> PyResult<i64> {
@@ -481,5 +570,54 @@ sys.modules["MetaTrader5"] = mt5
 
             Ok(())
         })
+    }
+
+    #[test]
+    fn test_historical_bars_parse_copy_rates_range_payload() -> Result<()> {
+        Python::attach(|py| {
+            let locals = PyDict::new(py);
+            run_py(
+                py,
+                r#"
+import sys
+import types
+
+class RatesResult(list):
+    def tolist(self):
+        return list(self)
+
+mt5 = types.ModuleType("MetaTrader5")
+mt5.TIMEFRAME_M15 = 15
+mt5.copy_rates_range = lambda symbol, timeframe, date_from, date_to: RatesResult([
+    (1710000000, 1.1000, 1.1010, 1.0990, 1.1005, 100.0, 2, 50.0),
+    (1710000900, 1.1005, 1.1020, 1.1000, 1.1015, 120.0, 3, 55.0),
+])
+sys.modules["MetaTrader5"] = mt5
+"#,
+                &locals,
+            )?;
+
+            let engine = MT5Engine { connected: true };
+            let bars = engine.historical_bars("EURUSD", "M15", 1710000000, 1710001800)?;
+
+            assert_eq!(bars.len(), 2);
+            assert_eq!(bars[0].timestamp_ms, 1_710_000_000_000);
+            assert_eq!(bars[0].spread, 2);
+            assert_eq!(bars[1].tick_volume, 120.0);
+            assert_eq!(bars[1].real_volume, 55.0);
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_historical_bars_require_connected_engine() {
+        let engine = MT5Engine { connected: false };
+
+        let err = engine
+            .historical_bars("EURUSD", "M1", 1710000000, 1710000600)
+            .expect_err("disconnected MT5 engine must fail");
+
+        assert!(err.to_string().contains("not connected"));
     }
 }
