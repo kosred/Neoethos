@@ -2,8 +2,10 @@ use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::{
     build_account_auth_request, build_application_auth_request, build_get_trendbars_request,
     build_get_tick_data_request, build_symbol_by_id_request, build_symbols_list_request,
+    build_subscribe_live_trendbar_request, build_subscribe_spots_request,
+    build_unsubscribe_live_trendbar_request, build_unsubscribe_spots_request,
     parse_ctrader_error_payload, parse_open_api_envelope, trendbar_period_value,
-    CTraderOpenApiTransport, ProductionCTraderOpenApiTransport, CTRADER_QUOTE_TYPE_ASK,
+    CTraderOpenApiJsonMessage, CTraderOpenApiTransport, ProductionCTraderOpenApiTransport, CTRADER_QUOTE_TYPE_ASK,
     CTRADER_QUOTE_TYPE_BID,
     CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
@@ -93,6 +95,15 @@ pub struct CTraderChartHistoryResult {
     pub has_more: bool,
     pub bid_ticks: Vec<HistoricalTick>,
     pub ask_ticks: Vec<HistoricalTick>,
+    pub live_subscription_plan: CTraderLiveSubscriptionPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CTraderLiveSubscriptionPlan {
+    pub subscribe_spots: CTraderOpenApiJsonMessage,
+    pub subscribe_trendbars: CTraderOpenApiJsonMessage,
+    pub unsubscribe_spots: CTraderOpenApiJsonMessage,
+    pub unsubscribe_trendbars: CTraderOpenApiJsonMessage,
 }
 
 #[derive(Debug, Deserialize)]
@@ -383,13 +394,40 @@ pub fn load_chart_history_with_transport<T: CTraderOpenApiTransport>(
         .find(|symbol| normalize_symbol_key(&symbol.symbol_name) == requested_key)
         .ok_or_else(|| anyhow!("cTrader symbol '{}' was not found for this account", request.symbol_name))?;
 
+    let trendbar_period = trendbar_period_value(&request.timeframe)?;
+    let live_subscription_plan = CTraderLiveSubscriptionPlan {
+        subscribe_spots: build_subscribe_spots_request(
+            account_id,
+            &[light_symbol.symbol_id],
+            true,
+            "subscribe-spots-1",
+        ),
+        subscribe_trendbars: build_subscribe_live_trendbar_request(
+            account_id,
+            light_symbol.symbol_id,
+            trendbar_period,
+            "subscribe-live-trendbar-1",
+        ),
+        unsubscribe_spots: build_unsubscribe_spots_request(
+            account_id,
+            &[light_symbol.symbol_id],
+            "unsubscribe-spots-1",
+        ),
+        unsubscribe_trendbars: build_unsubscribe_live_trendbar_request(
+            account_id,
+            light_symbol.symbol_id,
+            trendbar_period,
+            "unsubscribe-live-trendbar-1",
+        ),
+    };
+
     let detail_responses = transport.send_sequence(&[
         build_symbol_by_id_request(account_id, &[light_symbol.symbol_id], "symbol-by-id-1"),
         // cTrader documents trendbar periods as enum values, so convert the UI label first.
         build_get_trendbars_request(
             account_id,
             light_symbol.symbol_id,
-            trendbar_period_value(&request.timeframe)?,
+            trendbar_period,
             request.from_timestamp_ms,
             request.to_timestamp_ms,
             request.count,
@@ -440,6 +478,7 @@ pub fn load_chart_history_with_transport<T: CTraderOpenApiTransport>(
         has_more: trendbars.has_more,
         bid_ticks: bid_ticks.ticks,
         ask_ticks: ask_ticks.ticks,
+        live_subscription_plan,
     })
 }
 
@@ -741,6 +780,22 @@ mod tests {
         assert_eq!(result.bars[0].close, 1.10075);
         assert_eq!(result.bid_ticks.len(), 2);
         assert_eq!(result.ask_ticks.len(), 2);
+        assert_eq!(
+            result.live_subscription_plan.subscribe_spots.payload_type,
+            crate::app_services::ctrader_messages::CTRADER_OA_SUBSCRIBE_SPOTS_REQUEST_PAYLOAD_TYPE
+        );
+        assert_eq!(
+            result.live_subscription_plan.subscribe_trendbars.payload_type,
+            crate::app_services::ctrader_messages::CTRADER_OA_SUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE
+        );
+        assert_eq!(
+            result.live_subscription_plan.unsubscribe_spots.payload_type,
+            crate::app_services::ctrader_messages::CTRADER_OA_UNSUBSCRIBE_SPOTS_REQUEST_PAYLOAD_TYPE
+        );
+        assert_eq!(
+            result.live_subscription_plan.unsubscribe_trendbars.payload_type,
+            crate::app_services::ctrader_messages::CTRADER_OA_UNSUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE
+        );
         assert_eq!(transport.sent_len(), 7);
     }
 

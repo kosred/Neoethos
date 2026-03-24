@@ -7,6 +7,17 @@ pub const CTRADER_OA_APPLICATION_AUTH_REQUEST_PAYLOAD_TYPE: u32 = 2100;
 pub const CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE: u32 = 2101;
 pub const CTRADER_OA_ACCOUNT_AUTH_REQUEST_PAYLOAD_TYPE: u32 = 2102;
 pub const CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE: u32 = 2103;
+pub const CTRADER_OA_TRADER_REQUEST_PAYLOAD_TYPE: u32 = 2121;
+pub const CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE: u32 = 2122;
+pub const CTRADER_OA_RECONCILE_REQUEST_PAYLOAD_TYPE: u32 = 2124;
+pub const CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE: u32 = 2125;
+pub const CTRADER_OA_SUBSCRIBE_SPOTS_REQUEST_PAYLOAD_TYPE: u32 = 2127;
+pub const CTRADER_OA_SUBSCRIBE_SPOTS_RESPONSE_PAYLOAD_TYPE: u32 = 2128;
+pub const CTRADER_OA_UNSUBSCRIBE_SPOTS_REQUEST_PAYLOAD_TYPE: u32 = 2129;
+pub const CTRADER_OA_UNSUBSCRIBE_SPOTS_RESPONSE_PAYLOAD_TYPE: u32 = 2130;
+pub const CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE: u32 = 2131;
+pub const CTRADER_OA_SUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE: u32 = 2135;
+pub const CTRADER_OA_UNSUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE: u32 = 2136;
 pub const CTRADER_OA_SYMBOLS_LIST_REQUEST_PAYLOAD_TYPE: u32 = 2114;
 pub const CTRADER_OA_SYMBOLS_LIST_RESPONSE_PAYLOAD_TYPE: u32 = 2115;
 pub const CTRADER_OA_SYMBOL_BY_ID_REQUEST_PAYLOAD_TYPE: u32 = 2116;
@@ -18,6 +29,8 @@ pub const CTRADER_OA_GET_TICK_DATA_REQUEST_PAYLOAD_TYPE: u32 = 2145;
 pub const CTRADER_OA_GET_TICK_DATA_RESPONSE_PAYLOAD_TYPE: u32 = 2146;
 pub const CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQUEST_PAYLOAD_TYPE: u32 = 2149;
 pub const CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RESPONSE_PAYLOAD_TYPE: u32 = 2150;
+pub const CTRADER_OA_SUBSCRIBE_LIVE_TRENDBAR_RESPONSE_PAYLOAD_TYPE: u32 = 2165;
+pub const CTRADER_OA_UNSUBSCRIBE_LIVE_TRENDBAR_RESPONSE_PAYLOAD_TYPE: u32 = 2166;
 pub const CTRADER_QUOTE_TYPE_BID: i32 = 1;
 pub const CTRADER_QUOTE_TYPE_ASK: i32 = 2;
 
@@ -93,6 +106,100 @@ pub fn build_account_list_by_access_token_request(
         payload_type: CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQUEST_PAYLOAD_TYPE,
         payload: serde_json::json!({
             "accessToken": access_token,
+        }),
+    }
+}
+
+pub fn build_trader_request(
+    ctid_trader_account_id: i64,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_TRADER_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+        }),
+    }
+}
+
+pub fn build_reconcile_request(
+    ctid_trader_account_id: i64,
+    return_protection_orders: bool,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_RECONCILE_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+            "returnProtectionOrders": return_protection_orders,
+        }),
+    }
+}
+
+pub fn build_subscribe_spots_request(
+    ctid_trader_account_id: i64,
+    symbol_ids: &[i64],
+    subscribe_to_spot_timestamp: bool,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_SUBSCRIBE_SPOTS_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+            "symbolId": symbol_ids,
+            "subscribeToSpotTimestamp": subscribe_to_spot_timestamp,
+        }),
+    }
+}
+
+pub fn build_unsubscribe_spots_request(
+    ctid_trader_account_id: i64,
+    symbol_ids: &[i64],
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_UNSUBSCRIBE_SPOTS_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+            "symbolId": symbol_ids,
+        }),
+    }
+}
+
+pub fn build_subscribe_live_trendbar_request(
+    ctid_trader_account_id: i64,
+    symbol_id: i64,
+    period: i32,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_SUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+            "symbolId": symbol_id,
+            "period": period,
+        }),
+    }
+}
+
+pub fn build_unsubscribe_live_trendbar_request(
+    ctid_trader_account_id: i64,
+    symbol_id: i64,
+    period: i32,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_UNSUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+            "symbolId": symbol_id,
+            "period": period,
         }),
     }
 }
@@ -204,6 +311,20 @@ pub fn expected_response_payload_type(request_payload_type: u32) -> Result<u32> 
             Ok(CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)
         }
         CTRADER_OA_ACCOUNT_AUTH_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE),
+        CTRADER_OA_TRADER_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE),
+        CTRADER_OA_RECONCILE_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE),
+        CTRADER_OA_SUBSCRIBE_SPOTS_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_SUBSCRIBE_SPOTS_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_UNSUBSCRIBE_SPOTS_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_UNSUBSCRIBE_SPOTS_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_SUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_SUBSCRIBE_LIVE_TRENDBAR_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_UNSUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_UNSUBSCRIBE_LIVE_TRENDBAR_RESPONSE_PAYLOAD_TYPE)
+        }
         CTRADER_OA_SYMBOLS_LIST_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_SYMBOLS_LIST_RESPONSE_PAYLOAD_TYPE),
         CTRADER_OA_SYMBOL_BY_ID_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_SYMBOL_BY_ID_RESPONSE_PAYLOAD_TYPE),
         CTRADER_OA_GET_TRENDBARS_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_GET_TRENDBARS_RESPONSE_PAYLOAD_TYPE),
@@ -211,6 +332,9 @@ pub fn expected_response_payload_type(request_payload_type: u32) -> Result<u32> 
         CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RESPONSE_PAYLOAD_TYPE)
         }
+        CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE => Err(anyhow!(
+            "cTrader spot events are push-only payloads and are not valid request messages"
+        )),
         payload_type => Err(anyhow!(
             "unsupported cTrader request payload type: {}",
             payload_type
@@ -223,6 +347,9 @@ pub fn is_matching_open_api_response(
     request: &CTraderOpenApiJsonMessage,
     expected_payload_type: u32,
 ) -> bool {
+    if envelope.payload_type == CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE {
+        return false;
+    }
     envelope.payload_type == expected_payload_type && envelope.client_msg_id == request.client_msg_id
 }
 
@@ -360,6 +487,103 @@ mod tests {
             message.payload.get("accessToken").and_then(serde_json::Value::as_str),
             Some("access-token-123")
         );
+    }
+
+    #[test]
+    fn trader_request_uses_documented_payload_type_and_account_id() {
+        let message = build_trader_request(7001, "trader-1");
+
+        assert_eq!(message.client_msg_id, "trader-1");
+        assert_eq!(message.payload_type, CTRADER_OA_TRADER_REQUEST_PAYLOAD_TYPE);
+        assert_eq!(
+            message.payload.get("ctidTraderAccountId").and_then(serde_json::Value::as_i64),
+            Some(7001)
+        );
+    }
+
+    #[test]
+    fn reconcile_request_uses_documented_payload_type_and_optional_protection_flag() {
+        let message = build_reconcile_request(7001, true, "reconcile-1");
+
+        assert_eq!(message.client_msg_id, "reconcile-1");
+        assert_eq!(message.payload_type, CTRADER_OA_RECONCILE_REQUEST_PAYLOAD_TYPE);
+        assert_eq!(
+            message.payload.get("ctidTraderAccountId").and_then(serde_json::Value::as_i64),
+            Some(7001)
+        );
+        assert_eq!(
+            message
+                .payload
+                .get("returnProtectionOrders")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn subscribe_spots_request_uses_documented_symbol_ids_and_timestamp_flag() {
+        let message = build_subscribe_spots_request(7001, &[14, 15], true, "spots-1");
+
+        assert_eq!(message.client_msg_id, "spots-1");
+        assert_eq!(message.payload_type, CTRADER_OA_SUBSCRIBE_SPOTS_REQUEST_PAYLOAD_TYPE);
+        assert_eq!(
+            message.payload.get("ctidTraderAccountId").and_then(serde_json::Value::as_i64),
+            Some(7001)
+        );
+        assert_eq!(
+            message.payload.get("symbolId").and_then(serde_json::Value::as_array).map(|items| items.len()),
+            Some(2)
+        );
+        assert_eq!(
+            message
+                .payload
+                .get("subscribeToSpotTimestamp")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn subscribe_live_trendbar_request_uses_documented_period_and_symbol_id() {
+        let message = build_subscribe_live_trendbar_request(7001, 14, 7, "live-bars-1");
+
+        assert_eq!(message.client_msg_id, "live-bars-1");
+        assert_eq!(
+            message.payload_type,
+            CTRADER_OA_SUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE
+        );
+        assert_eq!(
+            message.payload.get("ctidTraderAccountId").and_then(serde_json::Value::as_i64),
+            Some(7001)
+        );
+        assert_eq!(
+            message.payload.get("symbolId").and_then(serde_json::Value::as_i64),
+            Some(14)
+        );
+        assert_eq!(
+            message.payload.get("period").and_then(serde_json::Value::as_i64),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn unsubscribe_requests_use_documented_payload_types() {
+        let spots = build_unsubscribe_spots_request(7001, &[14], "spots-off-1");
+        let bars = build_unsubscribe_live_trendbar_request(7001, 14, 7, "bars-off-1");
+
+        assert_eq!(
+            spots.payload_type,
+            CTRADER_OA_UNSUBSCRIBE_SPOTS_REQUEST_PAYLOAD_TYPE
+        );
+        assert_eq!(
+            bars.payload_type,
+            CTRADER_OA_UNSUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE
+        );
+    }
+
+    #[test]
+    fn documented_spot_event_payload_type_constant_matches_official_message_id() {
+        assert_eq!(CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE, 2131);
     }
 
     #[test]
