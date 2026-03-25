@@ -400,7 +400,7 @@ fn cancelled_snapshot_from(mut snapshot: JobSnapshot, message: impl Into<String>
 
 pub fn start_training_job(
     request: TrainingRequest,
-    tx: mpsc::UnboundedSender<ServiceEvent>,
+    tx: mpsc::Sender<ServiceEvent>,
 ) -> Result<TrainingJobHandle> {
     request.validate()?;
 
@@ -625,8 +625,8 @@ pub fn start_training_job(
     Ok(handle)
 }
 
-fn send_event(tx: &mpsc::UnboundedSender<ServiceEvent>, event: ServiceEvent) {
-    if let Err(err) = tx.send(event) {
+fn send_event(tx: &mpsc::Sender<ServiceEvent>, event: ServiceEvent) {
+    if let Err(err) = tx.try_send(event) {
         tracing::error!("Failed to send training service event: {}", err);
     }
 }
@@ -767,7 +767,7 @@ mod tests {
     #[tokio::test]
     async fn start_training_job_emits_initial_snapshot_with_runtime_context() {
         let request = sample_request();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(10000);
 
         let _handle = start_training_job(request.clone(), tx).expect("job should start");
         let event = rx.recv().await.expect("expected initial training event");

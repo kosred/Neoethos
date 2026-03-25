@@ -37,9 +37,22 @@ pub struct AppState {
     pub training_job: Option<JobSnapshot>,
     pub bootstrap_form: BootstrapFormState,
     pub bootstrap_job: Option<JobSnapshot>,
+    pub order_ticket: OrderTicketState,
     pub canonical_log_path: PathBuf,
     pub hardware: HardwareState,
-    pub risk: RiskState,
+    pub risk: forex_core::config::RiskConfig,
+    pub dashboard_panel: crate::ui::dashboard::DashboardPanel,
+    pub ai_insights_panel: crate::ui::ai_insights::AiInsightsPanel,
+    pub llm_news_filter: forex_core::domain::news_filter::NewsFilter,
+    pub discovery_form: DiscoveryFormState,
+    pub ctrader_manual_auth_code: String,
+    pub auto_trade_enabled: bool,
+    
+    // Account Real-time Data
+    pub account_balance: f64,
+    pub account_equity: f64,
+    pub day_start_equity: f64,
+    pub initial_equity: f64,
 }
 
 impl AppState {
@@ -69,8 +82,48 @@ impl AppState {
             training_job: None,
             bootstrap_form: BootstrapFormState::default_for_symbol(&selected_pair),
             bootstrap_job: None,
+            order_ticket: OrderTicketState::default(),
             hardware: HardwareState::default(),
-            risk: RiskState::default(),
+            risk: forex_core::config::RiskConfig::default(),
+            dashboard_panel: crate::ui::dashboard::DashboardPanel::new(),
+            ai_insights_panel: crate::ui::ai_insights::AiInsightsPanel::new(),
+            llm_news_filter: forex_core::domain::news_filter::NewsFilter::new(false, 3, 3),
+            discovery_form: DiscoveryFormState::default(),
+            ctrader_manual_auth_code: String::new(),
+            auto_trade_enabled: false,
+            account_balance: 0.0,
+            account_equity: 0.0,
+            day_start_equity: 0.0,
+            initial_equity: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscoveryFormState {
+    pub base_tf: String,
+    pub higher_tfs: String,
+    pub max_indicators: u32,
+    pub population: u32,
+    pub generations: u32,
+    pub target_candidates: u32,
+    pub portfolio_size: u32,
+    pub correlation_threshold: f32,
+    pub min_trades_per_day: f32,
+}
+
+impl Default for DiscoveryFormState {
+    fn default() -> Self {
+        Self {
+            base_tf: "M1".to_string(),
+            higher_tfs: "M5, M15, H1".to_string(),
+            max_indicators: 12,
+            population: 100,
+            generations: 5,
+            target_candidates: 200,
+            portfolio_size: 100,
+            correlation_threshold: 0.7,
+            min_trades_per_day: 0.5, // Relaxed default
         }
     }
 }
@@ -92,6 +145,53 @@ impl BootstrapFormState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderType {
+    Market,
+    Limit,
+    Stop,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderTicketState {
+    pub order_type: OrderType,
+    pub target_price: f64,
+    pub auto_lot_sizing: bool,
+    pub auto_risk_pct: f64,
+    pub stop_loss_pips: f64,
+    pub lot_size: f64,
+    pub slippage_in_points: i32,
+    pub smart_sl_enabled: bool,
+    pub smart_rr_ratio: f64,
+    pub trailing_stop: bool,
+    pub comment: String,
+    pub label: String,
+    pub selected_position_id: Option<i64>,
+    pub selected_order_id: Option<i64>,
+}
+
+impl Default for OrderTicketState {
+    fn default() -> Self {
+        Self {
+            order_type: OrderType::Market,
+            target_price: 0.0,
+            auto_lot_sizing: false,
+            auto_risk_pct: 1.0,
+            stop_loss_pips: 20.0,
+            lot_size: 0.10,
+            slippage_in_points: 10,
+            smart_sl_enabled: true,
+            smart_rr_ratio: 2.0,
+            trailing_stop: false,
+            comment: String::new(),
+            label: "manual".to_string(),
+            selected_position_id: None,
+            selected_order_id: None,
+        }
+    }
+}
+
+
 #[derive(Debug, Clone)]
 pub struct HardwareState {
     pub cpu_cores: i32,
@@ -103,21 +203,6 @@ impl Default for HardwareState {
         Self {
             cpu_cores: num_cpus::get() as i32,
             gpu_enabled: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct RiskState {
-    pub daily_drawdown_limit: f32,
-    pub max_lot_size: f32,
-}
-
-impl Default for RiskState {
-    fn default() -> Self {
-        Self {
-            daily_drawdown_limit: 4.5,
-            max_lot_size: 10.0,
         }
     }
 }
@@ -156,11 +241,21 @@ mod tests {
         assert_eq!(state.bootstrap_form.pairs_input, "GBPUSD");
         assert_eq!(state.bootstrap_form.timeframes_input, "M1,M5,M15,H1");
         assert_eq!(state.bootstrap_form.years, 1);
+        assert_eq!(state.order_ticket.order_type, OrderType::Market);
+        assert_eq!(state.order_ticket.lot_size, 0.10);
+        assert!(!state.auto_trade_enabled);
+        assert_eq!(state.order_ticket.slippage_in_points, 10);
+        assert_eq!(state.order_ticket.label, "manual");
+        assert!(state.order_ticket.selected_position_id.is_none());
+        assert!(state.order_ticket.selected_order_id.is_none());
         assert_eq!(state.canonical_log_path, PathBuf::from("logs").join("forex-ai.log"));
         assert_eq!(state.hardware.cpu_cores, num_cpus::get() as i32);
         assert!(state.hardware.gpu_enabled);
-        assert_eq!(state.risk.daily_drawdown_limit, 4.5);
+        assert_eq!(state.risk.daily_drawdown_limit, 0.04);
+        assert_eq!(state.risk.total_drawdown_limit, 0.07);
         assert_eq!(state.risk.max_lot_size, 10.0);
+        assert_eq!(state.risk.risk_per_trade, 0.03);
+        assert!(state.risk.require_stop_loss);
     }
 
     #[test]
@@ -188,19 +283,24 @@ mod tests {
     }
 
     #[test]
-    fn risk_state_defaults_match_existing_guard_values() {
-        let state = RiskState::default();
-
-        assert_eq!(state.daily_drawdown_limit, 4.5);
-        assert_eq!(state.max_lot_size, 10.0);
-    }
-
-    #[test]
     fn bootstrap_form_defaults_can_be_built_for_a_symbol() {
         let state = BootstrapFormState::default_for_symbol("AUDUSD");
 
         assert_eq!(state.pairs_input, "AUDUSD");
         assert_eq!(state.timeframes_input, "M1,M5,M15,H1");
         assert_eq!(state.years, 1);
+    }
+
+    #[test]
+    fn order_ticket_defaults_are_operator_friendly() {
+        let state = OrderTicketState::default();
+
+        assert_eq!(state.order_type, OrderType::Market);
+        assert_eq!(state.lot_size, 0.10);
+        assert_eq!(state.slippage_in_points, 10);
+        assert_eq!(state.label, "manual");
+        assert!(state.comment.is_empty());
+        assert!(state.selected_position_id.is_none());
+        assert!(state.selected_order_id.is_none());
     }
 }

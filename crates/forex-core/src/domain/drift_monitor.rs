@@ -94,7 +94,7 @@ impl ConceptDriftMonitor {
                 let diff = x - self.mean_error;
                 diff * diff
             }).sum();
-            self.variance = var_sum / n; // population variance
+            self.variance = var_sum / (n - 1.0); // sample variance
         } else {
             self.variance = 0.0;
         }
@@ -250,7 +250,7 @@ impl ConceptDriftMonitor {
 fn variance(data: &[f64]) -> f64 {
     if data.len() < 2 { return 0.0; }
     let mean = data.iter().sum::<f64>() / data.len() as f64;
-    data.iter().map(|&x| (x - mean) * (x - mean)).sum::<f64>() / data.len() as f64
+    data.iter().map(|&x| (x - mean) * (x - mean)).sum::<f64>() / (data.len() as f64 - 1.0)
 }
 
 fn smirnov_p(x: f64) -> f64 {
@@ -261,9 +261,10 @@ fn smirnov_p(x: f64) -> f64 {
     let mut sum = 0.0;
     for k in 1..=5 {
         let f = k as f64;
-        sum += (if k % 2 == 1 { -1.0 } else { 1.0 }) * f64::exp(-2.0 * f * f * x * x);
+        let sign = if k % 2 == 1 { 1.0 } else { -1.0 };
+        sum += sign * f64::exp(-2.0 * f * f * x * x);
     }
     
-    let prob = 2.0 * (sum + f64::exp(-2.0 * x * x));
+    let prob = 2.0 * sum;
     prob.clamp(0.0, 1.0)
 }

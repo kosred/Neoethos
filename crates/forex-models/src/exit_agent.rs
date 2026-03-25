@@ -92,9 +92,9 @@ pub struct ExitAgent {
 }
 
 impl ExitAgent {
-    pub fn new() -> Self {
+    pub fn new(input_dim: usize) -> Self {
         let device = <TrainBackend as Backend>::Device::default();
-        let model = ExitAgentNetConfig::new().init(&device);
+        let model = ExitAgentNetConfig::new(input_dim).init(&device);
         let optim = AdamWConfig::new().with_weight_decay(1e-4).init();
         
         Self {

@@ -103,6 +103,25 @@ mod tests {
             positions: vec!["Open Position · EURUSD long · +24.5 pips".to_string()],
             pending_orders: vec!["EURUSD buy stop @ 1.10250".to_string()],
             bot_timeline: vec!["Bot entry approved · confidence 0.74".to_string()],
+            history_rows: vec!["History row".to_string()],
+            journal_rows: vec!["Journal row".to_string()],
+            selected_position_id: Some(1),
+            selected_order_id: Some(2),
+            position_choices: vec![crate::app_services::trading::ExecutionSelectionOption {
+                id: 1,
+                label: "Position #1".to_string(),
+            }],
+            pending_order_choices: vec![crate::app_services::trading::ExecutionSelectionOption {
+                id: 2,
+                label: "Order #2".to_string(),
+            }],
+            ticket: crate::app_services::trading::ExecutionTicketSnapshot {
+                lot_size: 0.10,
+                slippage_in_points: 10,
+                comment: String::new(),
+                label: "manual".to_string(),
+                max_lot_size: 10.0,
+            },
         };
 
         let panel = build_bottom_strip(&snapshot);

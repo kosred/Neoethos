@@ -24,7 +24,7 @@ type TrainingEntryGroups = (SectionRows, SectionRows, SectionRows);
 pub fn render(
     ui: &mut egui::Ui,
     state: &mut AppState,
-    tx: &mpsc::UnboundedSender<ServiceEvent>,
+    tx: &mpsc::Sender<ServiceEvent>,
     handle: &mut Option<TrainingJobHandle>,
 ) {
     render_view_header(

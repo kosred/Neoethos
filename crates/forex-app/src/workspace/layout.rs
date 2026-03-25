@@ -13,7 +13,7 @@ impl WorkspaceState {
         let [chart_node, _watchlist_node] = surface.split_left(
             NodeIndex::root(),
             0.18,
-            vec![WorkspaceTab::Watchlist, WorkspaceTab::System],
+            vec![WorkspaceTab::Dashboard, WorkspaceTab::Watchlist, WorkspaceTab::SystemStatus, WorkspaceTab::Hardware, WorkspaceTab::Risk],
         );
 
         let [chart_node, _right_node] = surface.split_right(
@@ -85,7 +85,9 @@ mod tests {
         assert!(tabs.contains(&"Bottom Strip".to_string()));
         assert!(tabs.contains(&"Discovery".to_string()));
         assert!(tabs.contains(&"Training".to_string()));
-        assert!(tabs.contains(&"System".to_string()));
+        assert!(tabs.contains(&"System Status".to_string()));
+        assert!(tabs.contains(&"Hardware".to_string()));
+        assert!(tabs.contains(&"Risk Settings".to_string()));
     }
 
     #[test]

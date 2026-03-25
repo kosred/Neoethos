@@ -58,9 +58,9 @@ pub fn simple_backtest(df: &DataFrame, signals: &Array1<i32>) -> Result<HashMap<
         } else {
             n_trades += 1;
             if sig == 1 {
-                pnl.push(if ret > 0.0 { 1.0 } else { -1.0 });
+                pnl.push(ret);
             } else if sig == -1 {
-                pnl.push(if ret < 0.0 { 1.0 } else { -1.0 });
+                pnl.push(-ret);
             }
         }
     }

@@ -6,3 +6,5 @@ pub mod system_status;
 pub mod theme;
 pub mod trading;
 pub mod training;
+pub mod ai_insights;
+pub mod dashboard;

@@ -53,29 +53,18 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &TradingSession)
 mod tests {
     use super::*;
     use crate::app_services::trading::TradingSession;
-    use crate::app_state::{AppRuntimeConfig, AppState, DataSource, HardwareState, RiskState};
+    use crate::app_state::{AppRuntimeConfig, AppState};
     use std::path::PathBuf;
 
     fn sample_state() -> AppState {
-        AppState {
-            runtime: AppRuntimeConfig {
-                config_path: "config.yaml".to_string(),
-                data_dir: PathBuf::from("data"),
-                start_local: false,
-            },
-            data_source: DataSource::MT5,
-            status_msg: "Offline".to_string(),
-            selected_pair: "EURUSD".to_string(),
-            chart_timeframe: "M1".to_string(),
-            available_symbols: vec!["EURUSD".to_string(), "GBPUSD".to_string(), "XAUUSD".to_string()],
-            discovery_job: None,
-            training_job: None,
-            bootstrap_form: crate::app_state::BootstrapFormState::default_for_symbol("EURUSD"),
-            bootstrap_job: None,
-            canonical_log_path: PathBuf::from("logs").join("forex-ai.log"),
-            hardware: HardwareState::default(),
-            risk: RiskState::default(),
-        }
+        let runtime = AppRuntimeConfig {
+            config_path: "config.yaml".to_string(),
+            data_dir: PathBuf::from("data"),
+            start_local: false,
+        };
+        let mut state = AppState::new(runtime, vec!["EURUSD".to_string(), "GBPUSD".to_string(), "XAUUSD".to_string()]);
+        state.selected_pair = "EURUSD".to_string();
+        state
     }
 
     #[test]

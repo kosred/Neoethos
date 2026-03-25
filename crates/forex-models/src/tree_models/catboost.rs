@@ -28,7 +28,7 @@ impl ExpertModel for CatBoostExpert {
     }
 
     fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
-        Ok(Array2::zeros((x.height(), 3)))
+        Ok(Array2::from_elem((x.height(), 3), 1.0 / 3.0))
     }
 
     fn save(&self, _path: &std::path::Path) -> Result<()> { Ok(()) }

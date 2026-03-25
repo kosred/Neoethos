@@ -446,7 +446,7 @@ fn cancelled_snapshot_from(mut snapshot: JobSnapshot, message: impl Into<String>
 
 pub fn start_discovery_job(
     request: DiscoveryRequest,
-    tx: mpsc::UnboundedSender<ServiceEvent>,
+    tx: mpsc::Sender<ServiceEvent>,
 ) -> Result<DiscoveryJobHandle> {
     request.validate()?;
 
@@ -669,9 +669,32 @@ pub fn start_discovery_job(
         let tx_progress = tx.clone();
         let live_snapshot_for_progress = Arc::clone(&live_snapshot);
         let search_result = tokio::task::spawn_blocking(move || {
+            // Apply Walk-Forward Validation (WFV) strict bounds
+            // Using 80% In-Sample for training, 20% Out-Of-Sample strictly withheld to eliminate look-ahead bias
+            let n_rows = base_ohlcv.close.len();
+            let wfv_bound = (n_rows as f64 * 0.8).floor() as usize;
+
+            let mut is_ohlcv = base_ohlcv.clone();
+            if let Some(ref mut ts) = is_ohlcv.timestamp {
+                ts.truncate(wfv_bound);
+            }
+            is_ohlcv.open.truncate(wfv_bound);
+            is_ohlcv.high.truncate(wfv_bound);
+            is_ohlcv.low.truncate(wfv_bound);
+            is_ohlcv.close.truncate(wfv_bound);
+            if let Some(ref mut vol) = is_ohlcv.volume {
+                vol.truncate(wfv_bound);
+            }
+
+            let wfv_feat_bound = wfv_bound.min(features.data.nrows());
+            let mut is_features = features.clone();
+            is_features.timestamps.truncate(wfv_feat_bound);
+            let rows = features.data.nrows().min(wfv_feat_bound);
+            is_features.data = features.data.slice(ndarray::s![..rows, ..]).to_owned();
+
             let result = run_discovery_cycle_with_progress(
-                &features,
-                &base_ohlcv,
+                &is_features,
+                &is_ohlcv,
                 &search_request.config,
                 move |event| {
                     if let Ok(mut snapshot) = live_snapshot_for_progress.lock() {
@@ -743,8 +766,8 @@ pub fn start_discovery_job(
     Ok(handle)
 }
 
-fn send_event(tx: &mpsc::UnboundedSender<ServiceEvent>, event: ServiceEvent) {
-    if let Err(err) = tx.send(event) {
+fn send_event(tx: &mpsc::Sender<ServiceEvent>, event: ServiceEvent) {
+    if let Err(err) = tx.try_send(event) {
         tracing::error!("Failed to send discovery service event: {}", err);
     }
 }
@@ -899,7 +922,7 @@ mod tests {
         request.config.generations = 7;
         request.config.candidate_count = 144;
         request.config.portfolio_size = 24;
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(10000);
 
         let _handle = start_discovery_job(request.clone(), tx).expect("job should start");
         let event = rx.recv().await.expect("expected initial discovery event");

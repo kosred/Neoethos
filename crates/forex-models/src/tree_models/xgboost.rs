@@ -60,12 +60,12 @@ impl ExpertModel for XGBoostExpert {
     }
 
     fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
-        if self.gpu_only_disabled { return Ok(Array2::zeros((x.height(), 3))); }
+        if self.gpu_only_disabled { return Ok(Array2::from_elem((x.height(), 3), 1.0 / 3.0)); }
         #[cfg(feature = "xgboost")]
         {
             let _model = self._model.as_ref().context("XGBoost not trained")?;
             // Prediction logic...
-            Ok(Array2::zeros((x.height(), 3)))
+            Ok(Array2::from_elem((x.height(), 3), 1.0 / 3.0))
         }
         #[cfg(not(feature = "xgboost"))]
         { anyhow::bail!("XGBoost not enabled"); }

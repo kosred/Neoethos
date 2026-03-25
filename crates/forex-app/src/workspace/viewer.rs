@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 pub struct WorkspaceViewer<'a> {
     pub state: &'a mut AppState,
     pub trading_session: &'a mut TradingSession,
-    pub tx: &'a mpsc::UnboundedSender<ServiceEvent>,
+    pub tx: &'a mpsc::Sender<ServiceEvent>,
     pub discovery_handle: &'a mut Option<DiscoveryJobHandle>,
     pub training_handle: &'a mut Option<TrainingJobHandle>,
     refresh_requested: bool,
@@ -24,7 +24,7 @@ impl<'a> WorkspaceViewer<'a> {
     pub fn new(
         state: &'a mut AppState,
         trading_session: &'a mut TradingSession,
-        tx: &'a mpsc::UnboundedSender<ServiceEvent>,
+        tx: &'a mpsc::Sender<ServiceEvent>,
         discovery_handle: &'a mut Option<DiscoveryJobHandle>,
         training_handle: &'a mut Option<TrainingJobHandle>,
     ) -> Self {
@@ -52,6 +52,11 @@ impl TabViewer for WorkspaceViewer<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         match tab {
+            WorkspaceTab::Dashboard => {
+                let auto_trade = &mut self.state.auto_trade_enabled;
+                let panel = &mut self.state.dashboard_panel;
+                panel.show(ui, auto_trade);
+            }
             WorkspaceTab::Chart => {
                 ui::trading::chart_panel::render(ui, self.state, self.trading_session)
             }
@@ -59,7 +64,7 @@ impl TabViewer for WorkspaceViewer<'_> {
                 ui::trading::watchlist_panel::render(ui, self.state, self.trading_session)
             }
             WorkspaceTab::Execution => {
-                ui::trading::execution_panel::render(ui, self.state, self.trading_session)
+                ui::trading::execution_panel::render(ui, self.state, self.trading_session, self.tx)
             }
             WorkspaceTab::News => ui::trading::news_panel::render(ui, self.state),
             WorkspaceTab::BottomStrip => {
@@ -71,15 +76,21 @@ impl TabViewer for WorkspaceViewer<'_> {
             WorkspaceTab::Training => {
                 ui::training::render(ui, self.state, self.tx, self.training_handle)
             }
-            WorkspaceTab::System => {
+            WorkspaceTab::SystemStatus => {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    let refresh = ui::system_status::render(ui, self.state, self.trading_session);
+                    let refresh = ui::system_status::render(ui, self.state, self.trading_session, self.tx);
                     if refresh {
                         self.refresh_requested = true;
                     }
-                    ui.separator();
+                });
+            }
+            WorkspaceTab::Hardware => {
+                egui::ScrollArea::vertical().show(ui, |ui| {
                     ui::hardware::render(ui, &mut self.state.hardware);
-                    ui.separator();
+                });
+            }
+            WorkspaceTab::Risk => {
+                egui::ScrollArea::vertical().show(ui, |ui| {
                     ui::risk::render(ui, &mut self.state.risk);
                 });
             }

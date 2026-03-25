@@ -136,7 +136,15 @@ pub fn load_parquet(path: impl AsRef<Path>) -> Result<Ohlcv> {
     let get_col = |names: &[&str]| -> Result<Vec<f64>> {
         for n in names {
             if let Ok(col) = df.column(n) {
-                return Ok(col.as_materialized_series().cast(&DataType::Float64)?.f64()?.into_iter().map(|v| v.unwrap_or(0.0)).collect());
+                let mut last_val = f64::NAN;
+                return Ok(col.as_materialized_series().cast(&DataType::Float64)?.f64()?.into_iter().map(|v| {
+                    if let Some(val) = v {
+                        last_val = val;
+                        val
+                    } else {
+                        last_val
+                    }
+                }).collect());
             }
         }
         bail!("missing column");

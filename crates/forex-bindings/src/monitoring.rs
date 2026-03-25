@@ -114,6 +114,7 @@ impl MetaController {
         
         let s = PropMetaState {
             daily_dd_pct: state.getattr("daily_dd_pct")?.extract()?,
+            daily_profit_pct: 0.0,
             volatility_regime: state.getattr("volatility_regime")?.extract()?,
             recent_win_rate: state.getattr("recent_win_rate")?.extract()?,
             consecutive_losses: state.getattr("consecutive_losses")?.extract()?,

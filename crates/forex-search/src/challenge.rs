@@ -80,11 +80,10 @@ impl ChallengeOptimizer {
         let safety_limit = daily_room.min(total_room).max(0.0);
 
         let mut optimal_risk = required_risk.min(kelly_limit).min(safety_limit);
-        optimal_risk = optimal_risk.clamp(0.0025, 0.02);
         if optimal_risk > safety_limit {
             optimal_risk = safety_limit;
         }
-        optimal_risk
+        optimal_risk.clamp(0.001, 0.02)
     }
 
     fn kelly_criterion(&self, win_rate: f64, rw_ratio: f64) -> f64 {

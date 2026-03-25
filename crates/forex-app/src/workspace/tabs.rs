@@ -1,5 +1,6 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WorkspaceTab {
+    Dashboard,
     Chart,
     Watchlist,
     Execution,
@@ -7,12 +8,15 @@ pub enum WorkspaceTab {
     BottomStrip,
     Discovery,
     Training,
-    System,
+    SystemStatus,
+    Hardware,
+    Risk,
 }
 
 impl WorkspaceTab {
     pub fn title(self) -> &'static str {
         match self {
+            Self::Dashboard => "Dashboard",
             Self::Chart => "Chart",
             Self::Watchlist => "Watchlist",
             Self::Execution => "Execution",
@@ -20,7 +24,9 @@ impl WorkspaceTab {
             Self::BottomStrip => "Bottom Strip",
             Self::Discovery => "Discovery",
             Self::Training => "Training",
-            Self::System => "System",
+            Self::SystemStatus => "System Status",
+            Self::Hardware => "Hardware",
+            Self::Risk => "Risk Settings",
         }
     }
 }
@@ -31,6 +37,7 @@ mod tests {
 
     #[test]
     fn workspace_tab_labels_are_stable() {
+        assert_eq!(WorkspaceTab::Dashboard.title(), "Dashboard");
         assert_eq!(WorkspaceTab::Chart.title(), "Chart");
         assert_eq!(WorkspaceTab::Watchlist.title(), "Watchlist");
         assert_eq!(WorkspaceTab::Execution.title(), "Execution");
@@ -38,6 +45,8 @@ mod tests {
         assert_eq!(WorkspaceTab::BottomStrip.title(), "Bottom Strip");
         assert_eq!(WorkspaceTab::Discovery.title(), "Discovery");
         assert_eq!(WorkspaceTab::Training.title(), "Training");
-        assert_eq!(WorkspaceTab::System.title(), "System");
+        assert_eq!(WorkspaceTab::SystemStatus.title(), "System Status");
+        assert_eq!(WorkspaceTab::Hardware.title(), "Hardware");
+        assert_eq!(WorkspaceTab::Risk.title(), "Risk Settings");
     }
 }

@@ -25,5 +25,21 @@ forex-data = { path = "../forex-data" }
 forex-search = { path = "../forex-search" }
 forex-models = { path = "../forex-models" }
 mt5-bridge = { path = "../mt5-bridge" }
+ndarray = "0.17.2"
 clap = { version = "4.6.0", features = ["derive"] }
 num_cpus = "1.17.0"
+
+[package.metadata.packager]
+product_name = "ForexAI"
+identifier = "com.forexai.app"
+authors = ["Forex AI Developers"]
+description = "Advanced Algorithmic Forex Terminal with ML and Live Execution"
+formats = ["nsis", "wix"]
+resources = ["config.yaml"]
+
+[[package.metadata.packager.binaries]]
+path = "forex-app"
+main = true
+
+[package.metadata.packager.windows]
+wix = { language = "en-US" }

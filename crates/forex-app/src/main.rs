@@ -11,6 +11,7 @@ use app_services::{
 };
 use app_state::{AppRuntimeConfig, AppState};
 use eframe::egui;
+use crate::ui::components::render_ribbon_item;
 use forex_core::logging::{setup_logging, write_subsystem_record};
 use forex_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
 use forex_core::Settings;
@@ -37,7 +38,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    setup_logging(false)?;
+    setup_logging(true)?;
     let settings = Settings::from_yaml(&args.config)?;
     let runtime = AppRuntimeConfig::from_settings(args.config.clone(), args.local, &settings);
     write_subsystem_record(
@@ -155,17 +156,17 @@ struct ForexApp {
     state: AppState,
     
     // Message Bus
-    tx: mpsc::UnboundedSender<ServiceEvent>,
-    rx: mpsc::UnboundedReceiver<ServiceEvent>,
+    tx: mpsc::Sender<ServiceEvent>,
+    rx: mpsc::Receiver<ServiceEvent>,
     discovery_handle: Option<DiscoveryJobHandle>,
     training_handle: Option<TrainingJobHandle>,
-    
+    heartbeat_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ForexApp {
     fn new(_cc: &eframe::CreationContext<'_>, runtime: AppRuntimeConfig) -> Self {
         ui::theme::apply_theme(&_cc.egui_ctx);
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(10000);
         let symbols = forex_data::discover_symbols(&runtime.data_dir).unwrap_or_default();
         let state = AppState::new(runtime.clone(), symbols);
         
@@ -173,10 +174,11 @@ impl ForexApp {
             trading_session: TradingSession::new(),
             workspace: WorkspaceState::default(),
             state,
-            tx,
+            tx: tx.clone(),
             rx,
             discovery_handle: None,
             training_handle: None,
+            heartbeat_handle: Some(spawn_account_heartbeat(tx.clone())),
         }
     }
 
@@ -185,7 +187,7 @@ impl ForexApp {
             forex_data::discover_symbols(&self.state.runtime.data_dir).unwrap_or_default();
     }
 
-    fn process_messages(&mut self) {
+    fn process_messages(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 ServiceEvent::DiscoveryUpdated(snapshot) => {
@@ -201,7 +203,7 @@ impl ForexApp {
                         self.discovery_handle = None;
                     }
                 }
-                ServiceEvent::TrainingUpdated(snapshot) => {
+                 ServiceEvent::TrainingUpdated(snapshot) => {
                     let terminal = matches!(
                         snapshot.state,
                         app_services::jobs::JobState::Succeeded
@@ -214,36 +216,83 @@ impl ForexApp {
                         self.training_handle = None;
                     }
                 }
+                ServiceEvent::LlmNewsUpdated(status) => {
+                    self.state.llm_news_filter.current_status = status;
+                }
+                ServiceEvent::CTraderAuthUpdated(_) => {
+                    // Update internal state or just repaint to poll
+                }
+                ServiceEvent::AccountSyncUpdated { balance, equity } => {
+                    self.state.account_balance = balance;
+                    self.state.account_equity = equity;
+                }
+                ServiceEvent::Heartbeat => {
+                    if self.trading_session.is_connected() {
+                        let _ = self.trading_session.refresh_runtime(&mut self.state);
+                    }
+                }
+                ServiceEvent::CTraderConnectUpdated(runtime) => {
+                    self.trading_session.handle_ctrader_connect_result(&mut self.state, runtime);
+                }
+                ServiceEvent::BootstrapUpdated(snapshot) => {
+                    self.state.bootstrap_job = Some(snapshot);
+                }
+                ServiceEvent::ConnectOutcome(result) => {
+                    match result {
+                        Ok(msg) => self.state.status_msg = msg,
+                        Err(err) => self.state.status_msg = format!("Connect Error: {}", err),
+                    }
+                }
             }
+            ctx.request_repaint();
         }
     }
 }
 
 impl eframe::App for ForexApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.process_messages();
+        self.process_messages(ctx);
 
         egui::TopBottomPanel::top("top_panel")
             .frame(ui::theme::top_panel_frame(ctx.style().as_ref()))
             .show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    let source = match self.state.data_source {
-                        app_state::DataSource::MT5 => "MT5",
-                        app_state::DataSource::Local => "Local",
-                    };
-                    ui.heading("Forex AI Terminal");
-                    ui.separator();
-                    ui.label(format!("Symbol: {}", self.state.selected_pair));
-                    ui.separator();
-                    ui.label(format!("Source: {source}"));
-                    ui.separator();
-                    ui.label(format!("Status: {}", self.state.status_msg));
-                    ui.separator();
-                    ui.label("Workspace: Dockable");
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    // Branding
+                    ui.heading(" FOREX AI"); // Using a chart icon placeholder or just text
+                    ui.add_space(20.0);
+                    
+                    // Ribbon Data
+                    ui.vertical_centered(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 24.0;
+                            
+                            render_ribbon_item(ui, "SYMBOL", &self.state.selected_pair, ui::theme::ACCENT);
+                            render_ribbon_item(ui, "SOURCE", match self.state.data_source {
+                                app_state::DataSource::MT5 => "MT5",
+                                app_state::DataSource::Local => "LOCAL",
+                            }, ui::theme::TEXT_MUTED);
+                            
+                            let status_color = if self.state.status_msg.contains("Connected") || self.state.status_msg.contains("Online") {
+                                ui::theme::SUCCESS
+                            } else {
+                                ui::theme::DANGER
+                            };
+                            render_ribbon_item(ui, "STATUS", &self.state.status_msg, status_color);
+                        });
+                    });
+                    
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(8.0);
+                        if ui.button("⚙").clicked() {
+                            // Toggle settings
+                        }
+                        ui.label(format!("CPU: {}%", self.state.hardware.cpu_cores)); // Placeholder for load
+                    });
                 });
+                ui.add_space(4.0);
             });
-        });
 
         egui::CentralPanel::default()
             .frame(ui::theme::central_panel_frame(ctx.style().as_ref()))
@@ -318,6 +367,18 @@ fn system_time_string() -> String {
         .expect("system time should be after unix epoch")
         .as_secs();
     format!("unix:{seconds}")
+}
+
+fn spawn_account_heartbeat(tx: mpsc::Sender<ServiceEvent>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            if tx.send(ServiceEvent::Heartbeat).await.is_err() {
+                break;
+            }
+        }
+    })
 }
 
 #[cfg(test)]

@@ -194,6 +194,14 @@ pub fn open_log(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn render_ribbon_item(ui: &mut egui::Ui, label: &str, value: &str, value_color: egui::Color32) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 1.0;
+        ui.label(egui::RichText::new(label).small().color(theme::TEXT_MUTED).strong());
+        ui.label(egui::RichText::new(value).color(value_color).strong());
+    });
+}
+
 fn event_color(level: JobEventLevel) -> egui::Color32 {
     match level {
         JobEventLevel::Info => egui::Color32::LIGHT_BLUE,

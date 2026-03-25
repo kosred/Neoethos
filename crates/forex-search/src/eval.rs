@@ -42,11 +42,11 @@ fn init_rayon() {
 }
 
 fn mean_std(values: &[f64]) -> (f64, f64) {
-    if values.is_empty() { return (0.0, 0.0); }
+    if values.len() < 2 { return (0.0, 0.0); }
     let n = values.len() as f64;
     let sum: f64 = values.iter().sum();
     let mean = sum / n;
-    let var = values.iter().map(|&v| { let d = v - mean; d * d }).sum::<f64>() / n;
+    let var = values.iter().map(|&v| { let d = v - mean; d * d }).sum::<f64>() / (n - 1.0);
     (mean, var.sqrt())
 }
 
@@ -95,6 +95,7 @@ pub fn fast_evaluate_strategy_core(
 
     let mut equity = 100000.0;
     let mut peak_equity = 100000.0;
+    let mut max_dd = 0.0;
     let mut trade_count = 0usize;
     let mut wins = 0usize;
     let mut gross_profit = 0.0;
@@ -142,8 +143,14 @@ pub fn fast_evaluate_strategy_core(
         if in_pos != 0 {
             let lo = low[i];
             let hi = high[i];
-            let float_pnl = if in_pos == 1 { (lo - entry_px) / pip * settings.pip_value_per_lot } else { (entry_px - hi) / pip * settings.pip_value_per_lot };
-            if (equity + float_pnl) < day_low { day_low = equity + float_pnl; }
+            let worst_float_pnl = if in_pos == 1 { (lo - entry_px) / pip * settings.pip_value_per_lot } else { (entry_px - hi) / pip * settings.pip_value_per_lot };
+            if (equity + worst_float_pnl) < day_low { day_low = equity + worst_float_pnl; }
+            
+            let best_float_pnl = if in_pos == 1 { (hi - entry_px) / pip * settings.pip_value_per_lot } else { (entry_px - lo) / pip * settings.pip_value_per_lot };
+            if (equity + best_float_pnl) > peak_equity { peak_equity = equity + best_float_pnl; }
+            
+            let current_dd = if peak_equity > 0.0 { (peak_equity - (equity + worst_float_pnl)) / peak_equity } else { 0.0 };
+            if current_dd > max_dd { max_dd = current_dd; }
 
             let mut pnl = 0.0;
             let mut exit = false;
@@ -190,6 +197,9 @@ pub fn fast_evaluate_strategy_core(
                 in_pos = 0;
                 if equity > peak_equity { peak_equity = equity; }
                 if equity < day_low { day_low = equity; }
+                
+                let current_dd = if peak_equity > 0.0 { (peak_equity - equity) / peak_equity } else { 0.0 };
+                if current_dd > max_dd { max_dd = current_dd; }
             }
         } else {
             let s = signals[i];
@@ -206,14 +216,16 @@ pub fn fast_evaluate_strategy_core(
     let win_rate = if trade_count > 0 { wins as f64 / trade_count as f64 } else { 0.0 };
     let pf = if gross_loss > 0.0 { gross_profit / gross_loss } else { if gross_profit > 0.0 { 10.0 } else { 0.0 } };
     let expectancy = if trade_count > 0 { net_profit / trade_count as f64 } else { 0.0 };
-    let max_dd = if peak_equity > 0.0 { (peak_equity - equity) / peak_equity } else { 0.0 };
 
     let mut month_returns = Vec::new();
     for i in 0..=month_ptr.min(239) { month_returns.push(monthly_pnls[i as usize]); }
     let (avg_m, std_m) = mean_std(&month_returns);
-    let consistency = if std_m > 0.0 { (avg_m / std_m).clamp(0.0, 1.0) } else { 0.0 };
+    
+    // Annualize Sharpe factor: sqrt(12) = 3.4641
+    let sharpe = if std_m > 0.0 { (avg_m / std_m) * 3.4641 } else { 0.0 };
+    let consistency = if std_m > 0.0 { (avg_m / std_m).clamp(0.0, 1.0) } else if avg_m > 0.0 && month_returns.len() < 2 { 1.0 } else { 0.0 };
 
-    [net_profit, 0.0, peak_equity, max_dd, win_rate, pf, expectancy, 0.0, trade_count as f64, consistency, max_daily_dd]
+    [net_profit, sharpe, peak_equity, max_dd, win_rate, pf, expectancy, 0.0, trade_count as f64, consistency, max_daily_dd]
 }
 
 pub fn evaluate_population_core(inputs: PopulationEvalInputs<'_>) -> Result<Vec<[f64; 11]>, String> {

@@ -18,7 +18,7 @@ struct SystemStatusDashboard {
     sections: Vec<DashboardSection>,
 }
 
-pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSession) -> bool {
+pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSession, tx: &tokio::sync::mpsc::Sender<crate::app_services::ServiceEvent>) -> bool {
     let _ = session.poll_ctrader_live_auth();
     let snapshot = session.snapshot(state);
     let readiness = session.adapter_readiness();
@@ -50,13 +50,26 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSess
     });
     ui.add_space(8.0);
 
-    render_adapter_configuration(ui, session);
-    ui.add_space(8.0);
-    render_bootstrap_controls(ui, state, session);
-    ui.add_space(8.0);
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        render_adapter_configuration(ui, session, tx);
+        ui.add_space(8.0);
+        render_intelligence_configuration(ui, state, tx);
+        ui.add_space(8.0);
+        render_bootstrap_controls(ui, state, session, tx);
+        ui.add_space(8.0);
 
-    render_summary_cards(ui, "Runtime Snapshot", &dashboard.summary_cards);
-    render_dashboard_sections(ui, "system_status_section", &dashboard.sections);
+        render_summary_cards(ui, "Runtime Snapshot", &dashboard.summary_cards);
+        render_dashboard_sections(ui, "system_status_section", &dashboard.sections);
+    });
+    
+    ui.add_space(12.0);
+    crate::ui::theme::section_frame(ui.style()).show(ui, |ui| {
+        state.dashboard_panel.show(ui, &mut state.auto_trade_enabled);
+    });
+    ui.add_space(8.0);
+    crate::ui::theme::section_frame(ui.style()).show(ui, |ui| {
+        state.ai_insights_panel.show(ui);
+    });
 
     if ui.button("🔄 Refresh Data").clicked() {
         refresh_requested = true;
@@ -65,7 +78,7 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSess
     refresh_requested
 }
 
-fn render_bootstrap_controls(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSession) {
+fn render_bootstrap_controls(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSession, tx: &tokio::sync::mpsc::Sender<crate::app_services::ServiceEvent>) {
     ui.separator();
     render_status_badge(ui, "Bootstrap", state.bootstrap_job.as_ref());
     ui.add_space(8.0);
@@ -95,15 +108,13 @@ fn render_bootstrap_controls(ui: &mut egui::Ui, state: &mut AppState, session: &
                 "bootstrap requires at least one symbol and one timeframe"
             )));
         } else {
-            match session.run_ctrader_bootstrap_batch(
-                &state.runtime.data_dir,
-                &symbols,
-                &timeframes,
+            let _ = session.start_ctrader_bootstrap_batch(
+                state.runtime.data_dir.clone(),
+                symbols,
+                timeframes,
                 state.bootstrap_form.years,
-            ) {
-                Ok(snapshot) => state.bootstrap_job = Some(snapshot),
-                Err(err) => state.bootstrap_job = Some(failed_bootstrap_snapshot(err)),
-            }
+                tx.clone(),
+            );
         }
     }
 
@@ -366,7 +377,10 @@ fn build_system_status_dashboard(
     }
 }
 
-fn render_adapter_configuration(ui: &mut egui::Ui, session: &mut TradingSession) {
+fn render_adapter_configuration(ui: &mut egui::Ui, session: &mut TradingSession, tx: &tokio::sync::mpsc::Sender<crate::app_services::ServiceEvent>) {
+    egui::CollapsingHeader::new("🔌 Broker Adapter Configuration")
+        .default_open(true)
+        .show(ui, |ui| {
     theme::section_frame(ui.style()).show(ui, |ui| {
         ui.strong("Adapter Configuration");
         ui.add_space(6.0);
@@ -409,16 +423,23 @@ fn render_adapter_configuration(ui: &mut egui::Ui, session: &mut TradingSession)
                         "Current cTrader environment: {}",
                         settings.environment.as_str()
                     ));
-                    labeled_text_edit(
-                        ui,
-                        "Authorization Code",
-                        &mut settings.authorization_code_input,
-                    );
-                    let code = settings.authorization_code_input.clone();
                     ui.horizontal(|ui| {
-                        if ui.button("Start cTrader Login").clicked() {
+                        if ui.button("Start cTrader Login (Automatic)").clicked() {
                             start_live_auth = true;
                         }
+                        ui.label("OR");
+                        if ui.button("Copy Code From Browser Manually").clicked() {
+                            accept_code = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label("If automatic transfer fails, copy the 'code' parameter from the browser URL and paste it below:");
+                    labeled_text_edit(
+                        ui,
+                        "Manual Code",
+                        &mut settings.authorization_code_input,
+                    );
+                    ui.horizontal(|ui| {
                         if ui.button("Discover Accounts").clicked() {
                             discover_accounts = true;
                         }
@@ -433,19 +454,29 @@ fn render_adapter_configuration(ui: &mut egui::Ui, session: &mut TradingSession)
                         if ui.button("Start cTrader Auth").clicked() {
                             start_auth = true;
                         }
-                        if ui.button("Accept Code").clicked() && !code.trim().is_empty() {
+                        if ui.button("Accept Code").clicked() && !settings.authorization_code_input.trim().is_empty() {
                             accept_code = true;
                         }
                         if ui.button("Prepare Token Request").clicked() {
                             prepare_token_request = true;
                         }
                     });
+                    ui.add_space(4.0);
+                    ui.label("Account Management");
+                    ui.horizontal(|ui| {
+                        if ui.button("🌐 Create Demo Account").clicked() {
+                            let _ = open::that("https://app.ctrader.com/accounts/create-demo");
+                        }
+                        if ui.button("🌐 Create Live Account").clicked() {
+                            let _ = open::that("https://app.ctrader.com/accounts/create-live");
+                        }
+                    });
                     render_account_targets(ui, &mut settings.accounts, "cTrader Account");
-                    code
+                    settings.authorization_code_input.clone()
                 };
 
                 if start_live_auth {
-                    let _ = session.start_ctrader_live_auth();
+                    let _ = session.start_ctrader_live_auth(tx.clone());
                 }
                 if discover_accounts {
                     let _ = session.discover_ctrader_accounts();
@@ -474,7 +505,8 @@ fn render_adapter_configuration(ui: &mut egui::Ui, session: &mut TradingSession)
                 render_account_targets(ui, &mut settings.accounts, "DXtrade Account");
             }
         }
-    });
+    }); // theme::section_frame
+    }); // egui::CollapsingHeader
 }
 
 fn labeled_text_edit(ui: &mut egui::Ui, label: &str, value: &mut String) {
@@ -512,33 +544,70 @@ fn render_account_targets(
     }
 }
 
+fn render_intelligence_configuration(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    tx: &tokio::sync::mpsc::Sender<crate::app_services::ServiceEvent>,
+) {
+    egui::CollapsingHeader::new("🧠 Intelligence & AI Settings")
+        .default_open(false)
+        .show(ui, |ui| {
+    ui.strong("Intelligence & AI Configuration");
+    ui.add_space(6.0);
+    
+    ui.horizontal(|ui| {
+        ui.label("LLM Provider");
+        ui.add_sized([ui.available_width().max(200.0), 24.0], egui::TextEdit::singleline(&mut state.llm_news_filter.llm_provider));
+    });
+    
+    let mut api_key = state.llm_news_filter.api_key.clone().unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label("API Key");
+        ui.add_sized([ui.available_width().max(200.0), 24.0], egui::TextEdit::singleline(&mut api_key).password(true));
+    });
+    if api_key.trim().is_empty() {
+        state.llm_news_filter.api_key = None;
+    } else {
+        state.llm_news_filter.api_key = Some(api_key);
+    }
+    
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut state.llm_news_filter.enabled, "Enable LLM News Blackout Kill-Switch");
+    });
+    
+    ui.horizontal(|ui| {
+        ui.label(format!("Current Status: {}", state.llm_news_filter.current_status));
+        if ui.button("Sync News Now").clicked() {
+            let pair = state.selected_pair.clone();
+            let mut filter_clone = state.llm_news_filter.clone();
+            let tx_clone = tx.clone();
+            std::thread::spawn(move || {
+                if let Ok(status) = filter_clone.poll_llm_news_sentiment(&pair) {
+                    let _ = tx_clone.blocking_send(crate::app_services::ServiceEvent::LlmNewsUpdated(status));
+                }
+            });
+        }
+    });
+    }); // egui::CollapsingHeader
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app_services::trading::{TradingAdapterKind, TradingSession};
-    use crate::app_state::{AppRuntimeConfig, HardwareState, RiskState};
+    use crate::app_state::AppRuntimeConfig;
     use std::path::PathBuf;
 
     fn sample_state(source: DataSource, status_msg: &str) -> AppState {
-        AppState {
-            runtime: AppRuntimeConfig {
-                config_path: "config.yaml".to_string(),
-                data_dir: PathBuf::from("data"),
-                start_local: matches!(source, DataSource::Local),
-            },
-            data_source: source,
-            status_msg: status_msg.to_string(),
-            selected_pair: "EURUSD".to_string(),
-            chart_timeframe: "M1".to_string(),
-            available_symbols: vec!["EURUSD".to_string(), "GBPUSD".to_string()],
-            discovery_job: None,
-            training_job: None,
-            bootstrap_form: crate::app_state::BootstrapFormState::default_for_symbol("EURUSD"),
-            bootstrap_job: None,
-            canonical_log_path: PathBuf::from("logs").join("forex-ai.log"),
-            hardware: HardwareState::default(),
-            risk: RiskState::default(),
-        }
+        let runtime = AppRuntimeConfig {
+            config_path: "config.yaml".to_string(),
+            data_dir: PathBuf::from("data"),
+            start_local: matches!(source, DataSource::Local),
+        };
+        let mut state = AppState::new(runtime, vec!["EURUSD".to_string(), "GBPUSD".to_string()]);
+        state.data_source = source;
+        state.status_msg = status_msg.to_string();
+        state
     }
 
     #[test]

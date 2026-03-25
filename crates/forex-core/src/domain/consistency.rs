@@ -85,7 +85,7 @@ impl ConsistencyTracker {
         if self.trade_outcomes.len() >= self.max_hist { self.trade_outcomes.pop_front(); }
         self.trade_outcomes.push_back(win_flag);
 
-        let cutoff_date = d - Duration::days(self.lookback_days * 2);
+        let cutoff_date = d - Duration::days(self.lookback_days);
 
         self.daily_pnl.retain(|&k, _| k >= cutoff_date);
         self.daily_trades.retain(|&k, _| k >= cutoff_date);
@@ -205,7 +205,7 @@ fn variance(data: &[f64]) -> f64 {
     data.iter().map(|&value| {
         let diff = mean - value;
         diff * diff
-    }).sum::<f64>() / data.len() as f64
+    }).sum::<f64>() / (data.len() as f64 - 1.0)
 }
 
 fn std_dev(data: &[f64]) -> f64 {

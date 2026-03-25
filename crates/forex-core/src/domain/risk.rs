@@ -321,6 +321,7 @@ pub struct RiskManager {
     pub night_min_volatility: f64,
 
     pub revenge_detector: RevengeTradeDetector,
+    pub min_confidence_threshold: f64,
 }
 
 impl RiskManager {
@@ -360,6 +361,7 @@ impl RiskManager {
             night_block_end_hour: 6,
             night_min_volatility: 0.0008,
             revenge_detector: RevengeTradeDetector::new(),
+            min_confidence_threshold: 0.55,
         }
     }
 
@@ -497,7 +499,7 @@ impl RiskManager {
             return (false, "Max trades per day reached".to_string());
         }
 
-        if input.confidence < 0.55 { // Simplified, should be dynamic
+        if input.confidence < self.min_confidence_threshold {
              return (false, format!("Confidence {:.2} too low", input.confidence));
         }
 

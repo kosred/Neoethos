@@ -140,7 +140,7 @@ pub fn new_random_gene(n_indicators: usize, max_indicators: usize, generation: u
     let weights: Vec<f32> = (0..count).map(|_| rng.random_range(0.1..1.0)).collect();
     let long_threshold = rng.random_range(0.15..0.55);
     let short_threshold = -rng.random_range(0.15..0.55);
-    let (sl_pips, tp_pips) = if rng.random_bool(0.2) { (0.0, 0.0) } else {
+    let (sl_pips, tp_pips) = if rng.random_bool(0.2) { (15.0, 30.0) } else {
         let sl: f64 = rng.random_range(5.0..=50.0);
         let rr: f64 = rng.random_range(1.5..=3.0);
         let tp = (sl * rr).clamp(10.0, 100.0);

@@ -380,14 +380,7 @@ pub struct RiskLedger {
     max_events: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RiskEvent {
-    pub timestamp: String, // ISO8601
-    pub type_: String,
-    pub message: String,
-    pub severity: String,
-    pub context: JsonValue,
-}
+use crate::domain::events::RiskEvent;
 
 impl RiskLedger {
     pub fn new(max_events: usize) -> Self {
@@ -404,13 +397,12 @@ impl RiskLedger {
         severity: &str,
         context: Option<JsonValue>,
     ) {
-        let event = RiskEvent {
-            timestamp: Utc::now().to_rfc3339(),
-            type_: event_type.to_string(),
-            message: message.to_string(),
-            severity: severity.to_string(),
-            context: context.unwrap_or(serde_json::json!({})),
-        };
+        let event = RiskEvent::new(
+            event_type,
+            message,
+            severity,
+            context,
+        );
 
         if let Ok(mut lock) = self.events.lock() {
             if lock.len() >= self.max_events {

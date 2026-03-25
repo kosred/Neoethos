@@ -211,12 +211,31 @@ pub fn validate_time_ordering(df: &DataFrame, context: &str) -> Result<bool> {
         return Ok(true);
     }
 
-    // Polars doesn't expose index like Pandas - check if we have a datetime column
-    // For now, assume data is already sorted or skip this check
-    // TODO: Implement proper datetime column check
+    let time_cols = ["timestamp", "time", "date", "datetime"];
+    for col_name in time_cols {
+        if let Ok(series) = df.column(col_name) {
+            if let Ok(ca) = series.cast(&polars::datatypes::DataType::Int64) {
+                if let Ok(ca_i64) = ca.i64() {
+                    let mut prev = i64::MIN;
+                    for opt_val in ca_i64.into_iter() {
+                        if let Some(val) = opt_val {
+                            if val < prev {
+                                return Err(anyhow::anyhow!(
+                                    "{}: Datetime column '{}' is NOT monotonically increasing. Look-ahead bias structural risk!", 
+                                    context, col_name
+                                ));
+                            }
+                            prev = val;
+                        }
+                    }
+                    return Ok(true);
+                }
+            }
+        }
+    }
 
     warn!(
-        "{}: Rust port skips strict monotonic check - assume data is pre-sorted",
+        "{}: No explicit time column found (timestamp/time/date). Assuming data is pre-sorted.",
         context
     );
     Ok(true)
@@ -458,7 +477,18 @@ pub fn detect_feature_drift(
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.20);
 
-    let vol_scale = 1.0; // Simplified - full implementation would check realized_vol
+    let mut vol_scale = 1.0;
+    if let Ok(vol_col) = val_df.column("realized_volatility") {
+        if let Ok(series) = vol_col.cast(&DataType::Float64) {
+            if let Ok(ca) = series.f64() {
+                let vol_sum: f64 = ca.into_iter().flatten().sum();
+                let count = ca.into_iter().flatten().count();
+                if count > 0 && vol_sum > 0.0 {
+                    vol_scale = ((vol_sum / count as f64) * 1000.0).max(0.2).min(5.0);
+                }
+            }
+        }
+    }
     let threshold = base_threshold * vol_scale;
 
     let mut drift_scores = HashMap::new();

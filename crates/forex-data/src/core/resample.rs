@@ -34,7 +34,7 @@ pub fn resample_ohlcv(src: &Ohlcv, target_tf: &str) -> Result<Ohlcv> {
     let mut resampled_close = Vec::new();
     let mut resampled_volume = if src.volume.is_some() { Some(Vec::new()) } else { None };
 
-    let mut current_bucket_start = (ts[0] / period_ns) * period_ns;
+    let mut current_bucket_start = ts[0].div_euclid(period_ns) * period_ns;
     let mut b_open = src.open[0];
     let mut b_high = src.high[0];
     let mut b_low = src.low[0];
@@ -42,7 +42,7 @@ pub fn resample_ohlcv(src: &Ohlcv, target_tf: &str) -> Result<Ohlcv> {
     let mut b_vol = src.volume.as_ref().map(|v| v[0]).unwrap_or(0.0);
 
     for i in 1..ts.len() {
-        let bucket = (ts[i] / period_ns) * period_ns;
+        let bucket = ts[i].div_euclid(period_ns) * period_ns;
         if bucket > current_bucket_start {
             resampled_ts.push(current_bucket_start);
             resampled_open.push(b_open);

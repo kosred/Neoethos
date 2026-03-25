@@ -40,6 +40,28 @@ pub struct CTraderSymbolInfo {
     pub pip_position: i32,
     pub is_archived: bool,
     pub is_trading_enabled: bool,
+    pub min_volume: Option<i64>,
+    pub max_volume: Option<i64>,
+    pub step_volume: Option<i64>,
+    pub lot_size: Option<i64>,
+    pub pnl_conversion_fee_rate: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CTraderSymbolLookupRequest {
+    pub client_id: String,
+    pub client_secret: String,
+    pub access_token: String,
+    pub environment: CTraderEnvironment,
+    pub account_id: String,
+    pub symbol_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CTraderResolvedSymbol {
+    pub account_id: i64,
+    pub light_symbol: CTraderLightSymbolInfo,
+    pub symbol: CTraderSymbolInfo,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -165,6 +187,16 @@ struct FullSymbolPayload {
     digits: i32,
     #[serde(rename = "pipPosition")]
     pip_position: i32,
+    #[serde(rename = "minVolume")]
+    min_volume: Option<i64>,
+    #[serde(rename = "maxVolume")]
+    max_volume: Option<i64>,
+    #[serde(rename = "stepVolume")]
+    step_volume: Option<i64>,
+    #[serde(rename = "lotSize")]
+    lot_size: Option<i64>,
+    #[serde(rename = "pnlConversionFeeRate")]
+    pnl_conversion_fee_rate: Option<i32>,
     #[serde(rename = "tradingMode")]
     trading_mode: Option<Value>,
 }
@@ -278,6 +310,11 @@ pub fn parse_symbol_by_id_response(response_json: &str) -> Result<Vec<CTraderSym
             pip_position: symbol.pip_position,
             is_archived: false,
             is_trading_enabled: trading_mode_enabled(symbol.trading_mode.as_ref()),
+            min_volume: symbol.min_volume,
+            max_volume: symbol.max_volume,
+            step_volume: symbol.step_volume,
+            lot_size: symbol.lot_size,
+            pnl_conversion_fee_rate: symbol.pnl_conversion_fee_rate,
         })
         .collect())
 }
@@ -366,12 +403,20 @@ pub fn load_chart_history_with_transport<T: CTraderOpenApiTransport>(
     transport: &T,
     request: &CTraderChartHistoryRequest,
 ) -> Result<CTraderChartHistoryResult> {
-    let (_account_id, light_symbol, symbol) =
-        resolve_ctrader_symbol_with_transport(transport, request)?;
-    let account_id = request
-        .account_id
-        .parse::<i64>()
-        .context("cTrader account id must be numeric")?;
+    let resolved = resolve_symbol_with_transport(
+        transport,
+        &CTraderSymbolLookupRequest {
+            client_id: request.client_id.clone(),
+            client_secret: request.client_secret.clone(),
+            access_token: request.access_token.clone(),
+            environment: request.environment,
+            account_id: request.account_id.clone(),
+            symbol_name: request.symbol_name.clone(),
+        },
+    )?;
+    let account_id = resolved.account_id;
+    let light_symbol = &resolved.light_symbol;
+    let symbol = &resolved.symbol;
 
     let trendbar_period = trendbar_period_value(&request.timeframe)?;
     let live_subscription_plan = CTraderLiveSubscriptionPlan {
@@ -434,11 +479,11 @@ pub fn load_chart_history_with_transport<T: CTraderOpenApiTransport>(
             detail_responses.len()
         ));
     }
-    let trendbars = parse_trendbars_response(&detail_responses[0], &symbol)?;
-    let bid_ticks = parse_tick_data_response(&detail_responses[1], &symbol)?;
-    let ask_ticks = parse_tick_data_response(&detail_responses[2], &symbol)?;
+    let trendbars = parse_trendbars_response(&detail_responses[0], symbol)?;
+    let bid_ticks = parse_tick_data_response(&detail_responses[1], symbol)?;
+    let ask_ticks = parse_tick_data_response(&detail_responses[2], symbol)?;
     Ok(CTraderChartHistoryResult {
-        symbol,
+        symbol: resolved.symbol.clone(),
         bars: trendbars.bars,
         has_more: trendbars.has_more,
         bid_ticks: bid_ticks.ticks,
@@ -456,13 +501,22 @@ pub fn load_historical_bars_only_with_transport<T: CTraderOpenApiTransport>(
     transport: &T,
     request: &CTraderChartHistoryRequest,
 ) -> Result<CTraderHistoricalBarsFetchResult> {
-    let (account_id, light_symbol, symbol) =
-        resolve_ctrader_symbol_with_transport(transport, request)?;
+    let resolved = resolve_symbol_with_transport(
+        transport,
+        &CTraderSymbolLookupRequest {
+            client_id: request.client_id.clone(),
+            client_secret: request.client_secret.clone(),
+            access_token: request.access_token.clone(),
+            environment: request.environment,
+            account_id: request.account_id.clone(),
+            symbol_name: request.symbol_name.clone(),
+        },
+    )?;
     let trendbar_period = trendbar_period_value(&request.timeframe)?;
     let responses = transport.send_sequence(&[
         build_get_trendbars_request(
-            account_id,
-            light_symbol.symbol_id,
+            resolved.account_id,
+            resolved.light_symbol.symbol_id,
             trendbar_period,
             request.from_timestamp_ms,
             request.to_timestamp_ms,
@@ -478,9 +532,9 @@ pub fn load_historical_bars_only_with_transport<T: CTraderOpenApiTransport>(
         ));
     }
 
-    let trendbars = parse_trendbars_response(&responses[0], &symbol)?;
+    let trendbars = parse_trendbars_response(&responses[0], &resolved.symbol)?;
     Ok(CTraderHistoricalBarsFetchResult {
-        symbol,
+        symbol: resolved.symbol.clone(),
         bars: trendbars.bars,
         has_more: trendbars.has_more,
     })
@@ -493,10 +547,10 @@ pub fn load_historical_bars_only(
     load_historical_bars_only_with_transport(&transport, request)
 }
 
-fn resolve_ctrader_symbol_with_transport<T: CTraderOpenApiTransport>(
+pub fn resolve_symbol_with_transport<T: CTraderOpenApiTransport>(
     transport: &T,
-    request: &CTraderChartHistoryRequest,
-) -> Result<(i64, CTraderLightSymbolInfo, CTraderSymbolInfo)> {
+    request: &CTraderSymbolLookupRequest,
+) -> Result<CTraderResolvedSymbol> {
     let account_id = request
         .account_id
         .parse::<i64>()
@@ -553,7 +607,16 @@ fn resolve_ctrader_symbol_with_transport<T: CTraderOpenApiTransport>(
         .filter(|description| !description.trim().is_empty())
         .unwrap_or_else(|| light_symbol.symbol_name.clone());
 
-    Ok((account_id, light_symbol, symbol))
+    Ok(CTraderResolvedSymbol {
+        account_id,
+        light_symbol,
+        symbol,
+    })
+}
+
+pub fn resolve_symbol(request: &CTraderSymbolLookupRequest) -> Result<CTraderResolvedSymbol> {
+    let transport = ProductionCTraderOpenApiTransport::new(request.environment.endpoint_host());
+    resolve_symbol_with_transport(&transport, request)
 }
 
 fn ensure_success_payload_type(response_json: &str, expected_payload_type: u32) -> Result<()> {
@@ -736,6 +799,11 @@ mod tests {
             pip_position: 4,
             is_archived: false,
             is_trading_enabled: true,
+            min_volume: None,
+            max_volume: None,
+            step_volume: None,
+            lot_size: None,
+            pnl_conversion_fee_rate: None,
         };
         let response = serde_json::json!({
             "clientMsgId": "trendbars-1",
@@ -782,6 +850,11 @@ mod tests {
             pip_position: 4,
             is_archived: false,
             is_trading_enabled: true,
+            min_volume: None,
+            max_volume: None,
+            step_volume: None,
+            lot_size: None,
+            pnl_conversion_fee_rate: None,
         };
         let response = serde_json::json!({
             "clientMsgId": "ticks-1",

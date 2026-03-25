@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone)]
 pub struct PropMetaState {
     pub daily_dd_pct: f64,
+    pub daily_profit_pct: f64,
     pub volatility_regime: String,
     pub recent_win_rate: f64,
     pub consecutive_losses: i32,
@@ -16,6 +17,7 @@ impl Default for PropMetaState {
     fn default() -> Self {
         Self {
             daily_dd_pct: 0.0,
+            daily_profit_pct: 0.0,
             volatility_regime: "normal".to_string(),
             recent_win_rate: 0.0,
             consecutive_losses: 0,
@@ -90,18 +92,27 @@ impl MetaController {
             regime_scale *= 1.0;
         }
 
-        let mut perf_multiplier = 1.0;
+        let mut perf_multiplier: f64 = 1.0;
         if state.recent_win_rate < 0.4 {
-            perf_multiplier *= 0.8;
+            perf_multiplier = perf_multiplier.min(0.8);
         }
         if state.consecutive_losses >= 2 {
-            perf_multiplier *= 0.8;
+            perf_multiplier = perf_multiplier.min(0.8);
         }
         if state.consecutive_losses >= 4 {
-            perf_multiplier *= 0.5;
+            perf_multiplier = perf_multiplier.min(0.5);
         }
 
+        
+        if state.daily_profit_pct >= 0.035 {
+            perf_multiplier = perf_multiplier.min(0.01);
+            let now_capper = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            if !self.silent && (now_capper - self.last_log_time > 10) {
+                warn!("Meta-Controller: Consistency Capper active. Daily Profit >= 3.5% ({:.2}%). Risk drastically scaled down.", state.daily_profit_pct * 100.0);
+            }
+        }
         let mut final_risk_multiplier = survival_multiplier * vol_multiplier * regime_scale * perf_multiplier;
+
 
         let confidence_adjustment = (1.0 - survival_multiplier) * 0.2;
         let mut final_confidence_threshold = self.base_confidence + confidence_adjustment;
@@ -113,7 +124,8 @@ impl MetaController {
         if state.daily_dd_pct >= (self.max_daily_dd - 0.002) {
             allow_trading = false;
             final_risk_multiplier = 0.0;
-            if !self.silent && (now - self.last_log_time > 10) {
+            let now_capper = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            if !self.silent && (now_capper - self.last_log_time > 10) {
                 warn!("Meta-Controller: Hard Stop Triggered! DD={:.2}% >= {:.2}%", 
                     state.daily_dd_pct * 100.0, 
                     (self.max_daily_dd - 0.002) * 100.0

@@ -49,6 +49,8 @@ pub struct CTraderPositionSnapshot {
     pub price: Option<f64>,
     pub stop_loss: Option<f64>,
     pub take_profit: Option<f64>,
+    pub swap: Option<f64>,
+    pub commission: Option<f64>,
     pub label: Option<String>,
     pub comment: Option<String>,
 }
@@ -81,8 +83,12 @@ pub struct CTraderDealSnapshot {
     pub filled_volume: f64,
     pub execution_timestamp_ms: i64,
     pub execution_price: Option<f64>,
+    pub entry_price: Option<f64>,
     pub gross_profit: Option<f64>,
     pub fee: Option<f64>,
+    pub swap: Option<f64>,
+    pub pnl_conversion_fee: Option<f64>,
+    pub net_profit: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -181,6 +187,10 @@ struct PositionPayload {
     stop_loss: Option<f64>,
     #[serde(rename = "takeProfit")]
     take_profit: Option<f64>,
+    swap: Option<i64>,
+    commission: Option<i64>,
+    #[serde(rename = "moneyDigits")]
+    money_digits: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,9 +254,14 @@ struct DealPayload {
 
 #[derive(Debug, Deserialize)]
 struct ClosePositionDetailPayload {
+    #[serde(rename = "entryPrice")]
+    entry_price: Option<f64>,
     #[serde(rename = "grossProfit")]
     gross_profit: i64,
+    swap: i64,
     commission: i64,
+    #[serde(rename = "pnlConversionFee")]
+    pnl_conversion_fee: Option<i64>,
     #[serde(rename = "moneyDigits")]
     money_digits: Option<u32>,
 }
@@ -293,6 +308,12 @@ pub fn parse_reconcile_response(response_json: &str) -> Result<CTraderReconcileS
             .positions
             .into_iter()
             .map(|position| CTraderPositionSnapshot {
+                swap: position
+                    .swap
+                    .map(|raw| scaled_money(raw, position.money_digits.unwrap_or(0))),
+                commission: position
+                    .commission
+                    .map(|raw| scaled_money(raw, position.money_digits.unwrap_or(0))),
                 position_id: position.position_id,
                 symbol_id: position.trade_data.symbol_id,
                 trade_side: trade_side_label(position.trade_data.trade_side),
@@ -353,6 +374,16 @@ pub fn parse_deal_list_response(response_json: &str) -> Result<Vec<CTraderDealSn
                     deal.commission
                         .map(|commission| scaled_money(commission, deal.money_digits.unwrap_or(0)))
                 });
+            let swap = deal.close_position_detail.as_ref().map(|detail| {
+                scaled_money(detail.swap, detail.money_digits.unwrap_or(0))
+            });
+            let pnl_conversion_fee = deal.close_position_detail.as_ref().and_then(|detail| {
+                detail
+                    .pnl_conversion_fee
+                    .map(|fee| scaled_money(fee, detail.money_digits.unwrap_or(0)))
+            });
+            let net_profit = gross_profit
+                .map(|gross| gross + fee.unwrap_or(0.0) + swap.unwrap_or(0.0) + pnl_conversion_fee.unwrap_or(0.0));
 
             CTraderDealSnapshot {
                 deal_id: deal.deal_id,
@@ -365,8 +396,15 @@ pub fn parse_deal_list_response(response_json: &str) -> Result<Vec<CTraderDealSn
                 filled_volume: volume_to_units(deal.filled_volume),
                 execution_timestamp_ms: deal.execution_timestamp,
                 execution_price: deal.execution_price,
+                entry_price: deal
+                    .close_position_detail
+                    .as_ref()
+                    .and_then(|detail| detail.entry_price),
                 gross_profit,
                 fee,
+                swap,
+                pnl_conversion_fee,
+                net_profit,
             }
         })
         .collect())

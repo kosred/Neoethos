@@ -20,7 +20,7 @@ struct DiscoveryDashboard {
 pub fn render(
     ui: &mut egui::Ui,
     state: &mut AppState,
-    tx: &mpsc::UnboundedSender<ServiceEvent>,
+    tx: &mpsc::Sender<ServiceEvent>,
     handle: &mut Option<DiscoveryJobHandle>,
 ) {
     render_view_header(
@@ -41,16 +41,40 @@ pub fn render(
             });
     });
 
+    egui::CollapsingHeader::new("🚀 Discovery Parameters")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Base Timeframe:");
+                    ui.text_edit_singleline(&mut state.discovery_form.base_tf);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Higher Timeframes (CSV):");
+                    ui.text_edit_singleline(&mut state.discovery_form.higher_tfs);
+                });
+                ui.add(egui::Slider::new(&mut state.discovery_form.max_indicators, 1..=30).text("Max Indicators"));
+                ui.add(egui::Slider::new(&mut state.discovery_form.population, 10..=500).text("Population"));
+                ui.add(egui::Slider::new(&mut state.discovery_form.generations, 1..=100).text("Generations"));
+                ui.add(egui::Slider::new(&mut state.discovery_form.target_candidates, 10..=1000).text("Target Candidates"));
+                ui.add(egui::Slider::new(&mut state.discovery_form.portfolio_size, 1..=500).text("Portfolio Size"));
+                ui.add(egui::Slider::new(&mut state.discovery_form.correlation_threshold, 0.0..=1.0).text("Correlation Threshold"));
+                ui.add(egui::Slider::new(&mut state.discovery_form.min_trades_per_day, 0.1..=10.0).text("Min Trades/Day"));
+            });
+        });
+
     render_status_badge(ui, "Discovery", state.discovery_job.as_ref());
 
-    if let Some(snapshot) = state.discovery_job.as_ref() {
-        render_discovery_dashboard(ui, snapshot);
-        egui::CollapsingHeader::new("Detailed Report & Events")
-            .default_open(true)
-            .show(ui, |ui| render_report(ui, snapshot));
-    } else {
-        ui.label("No active discovery job.");
-    }
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        if let Some(snapshot) = state.discovery_job.as_ref() {
+            render_discovery_dashboard(ui, snapshot);
+            egui::CollapsingHeader::new("Detailed Report & Events")
+                .default_open(true)
+                .show(ui, |ui| render_report(ui, snapshot));
+        } else {
+            ui.label("No active discovery job.");
+        }
+    });
 
     ui.separator();
     ui.horizontal(|ui| {
@@ -61,19 +85,25 @@ pub fn render(
             .unwrap_or(false);
 
         if !running && ui.button("🔥 Start Genetic Discovery").clicked() {
+            let higher_tfs: Vec<String> = state.discovery_form.higher_tfs
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+                
             let request = DiscoveryRequest {
                 data_root: state.runtime.data_dir.clone(),
                 symbol: state.selected_pair.clone(),
-                base_tf: "M1".to_string(),
-                higher_tfs: vec!["M5".to_string(), "M15".to_string(), "H1".to_string()],
+                base_tf: state.discovery_form.base_tf.clone(),
+                higher_tfs,
                 config: forex_search::DiscoveryConfig {
-                    population: 100,
-                    generations: 5,
-                    max_indicators: 12,
-                    candidate_count: 200,
-                    portfolio_size: 100,
-                    corr_threshold: 0.7,
-                    min_trades_per_day: 1.0,
+                    population: state.discovery_form.population as usize,
+                    generations: state.discovery_form.generations as usize,
+                    max_indicators: state.discovery_form.max_indicators as usize,
+                    candidate_count: state.discovery_form.target_candidates as usize,
+                    portfolio_size: state.discovery_form.portfolio_size as usize,
+                    corr_threshold: state.discovery_form.correlation_threshold as f64,
+                    min_trades_per_day: state.discovery_form.min_trades_per_day as f64,
                     filtering: Default::default(),
                 },
             };
