@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -47,8 +47,29 @@ pub struct FilteringConfig {
     pub min_sharpe: f64,
     pub min_win_rate: f64,
     pub min_profit_factor: f64,
+    pub min_positive_months: usize,
+    pub min_trades_per_month: f64,
+    pub min_monthly_return_pct: f64,
+    pub log_trades: bool,
+    pub trade_log_max: usize,
+    pub opportunistic_enabled: bool,
+    pub use_opportunistic_candidates: bool,
+    pub opportunistic_min_positive_months: usize,
+    pub opportunistic_min_trades_per_month: f64,
+    pub opportunistic_min_trade_return_pct: f64,
+    pub opportunistic_max_dd: f64,
     pub anomaly_guard: bool,
     pub elite_mode: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarketCostProfile {
+    pub symbol: String,
+    pub account_currency: String,
+    pub pip_value: f64,
+    pub pip_value_per_lot: f64,
+    pub spread_pips: f64,
+    pub commission_per_trade: f64,
 }
 
 impl Default for FilteringConfig {
@@ -60,9 +81,174 @@ impl Default for FilteringConfig {
             min_sharpe: 0.3,
             min_win_rate: 0.50,
             min_profit_factor: 1.05,
+            min_positive_months: 0,
+            min_trades_per_month: 0.0,
+            min_monthly_return_pct: 0.0,
+            log_trades: false,
+            trade_log_max: 20,
+            opportunistic_enabled: false,
+            use_opportunistic_candidates: false,
+            opportunistic_min_positive_months: 0,
+            opportunistic_min_trades_per_month: 0.0,
+            opportunistic_min_trade_return_pct: 0.0,
+            opportunistic_max_dd: 1.0,
             anomaly_guard: true,
             elite_mode: false,
         }
+    }
+}
+
+fn normalized_symbol(symbol: &str) -> String {
+    symbol
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+fn split_symbol_parts(symbol: &str) -> Option<(String, String)> {
+    let normalized = normalized_symbol(symbol);
+    if normalized.len() >= 6 {
+        Some((normalized[..3].to_string(), normalized[3..6].to_string()))
+    } else {
+        None
+    }
+}
+
+fn symbol_kind(symbol: &str) -> &'static str {
+    let normalized = normalized_symbol(symbol);
+    if normalized.starts_with("XAU") || normalized.starts_with("XAG") {
+        return "metal";
+    }
+    if normalized.contains("BTC") || normalized.contains("ETH") || normalized.contains("LTC") {
+        return "crypto";
+    }
+    if split_symbol_parts(&normalized).is_some() {
+        return "fx";
+    }
+    "other"
+}
+
+fn default_pip_size(symbol: &str) -> f64 {
+    match symbol_kind(symbol) {
+        "metal" => 0.01,
+        "crypto" => 1.0,
+        "fx" => match split_symbol_parts(symbol) {
+            Some((_base, quote)) if quote == "JPY" => 0.01,
+            _ => 0.0001,
+        },
+        _ => 0.0001,
+    }
+}
+
+fn default_contract_size(symbol: &str) -> f64 {
+    match symbol_kind(symbol) {
+        "metal" => match split_symbol_parts(symbol) {
+            Some((base, _quote)) if base == "XAG" => 5_000.0,
+            Some((base, _quote)) if base == "XAU" => 100.0,
+            _ => 100.0,
+        },
+        "crypto" => 1.0,
+        "fx" => 100_000.0,
+        _ => 1.0,
+    }
+}
+
+fn estimate_pip_value_per_lot(
+    symbol: &str,
+    account_currency: &str,
+    price_hint: Option<f64>,
+) -> f64 {
+    let pip_size = default_pip_size(symbol);
+    let contract_size = default_contract_size(symbol);
+    let pip_value_quote = pip_size * contract_size;
+    let account_currency = account_currency.trim().to_ascii_uppercase();
+    let normalized = normalized_symbol(symbol);
+    let price = price_hint.filter(|value| value.is_finite() && *value > 0.0);
+
+    if let Some((base, quote)) = split_symbol_parts(&normalized) {
+        if quote == account_currency {
+            return pip_value_quote.max(1e-6);
+        }
+        if base == account_currency {
+            return price
+                .map(|value| pip_value_quote / value.max(1e-9))
+                .unwrap_or_else(|| pip_value_quote.max(1e-6));
+        }
+        return price
+            .map(|value| pip_value_quote / value.max(1e-9))
+            .unwrap_or_else(|| pip_value_quote.max(1e-6));
+    }
+
+    pip_value_quote.max(1e-6)
+}
+
+pub fn infer_market_cost_profile(
+    symbol: &str,
+    account_currency: &str,
+    price_hint: Option<f64>,
+    spread_pips_override: Option<f64>,
+    commission_override: Option<f64>,
+) -> MarketCostProfile {
+    let symbol = if symbol.trim().is_empty() {
+        std::env::var("FOREX_BOT_PROP_SYMBOL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "EURUSD".to_string())
+    } else {
+        symbol.trim().to_string()
+    };
+    let account_currency = if account_currency.trim().is_empty() {
+        std::env::var("FOREX_BOT_PROP_ACCOUNT_CURRENCY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "USD".to_string())
+    } else {
+        account_currency.trim().to_string()
+    };
+
+    let pip_value = std::env::var("FOREX_BOT_PROP_PIP_VALUE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or_else(|| default_pip_size(&symbol));
+    let pip_value_per_lot = std::env::var("FOREX_BOT_PROP_PIP_VALUE_PER_LOT")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or_else(|| estimate_pip_value_per_lot(&symbol, &account_currency, price_hint));
+
+    let spread_pips = spread_pips_override
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .or_else(|| {
+            std::env::var("FOREX_BOT_PROP_SPREAD_PIPS")
+                .ok()
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| value.is_finite() && *value >= 0.0)
+        })
+        .unwrap_or_else(|| match symbol_kind(&symbol) {
+            "metal" => 2.5,
+            "crypto" => 8.0,
+            "fx" => 1.5,
+            _ => 1.0,
+        });
+    let commission_per_trade = commission_override
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .or_else(|| {
+            std::env::var("FOREX_BOT_PROP_COMMISSION")
+                .ok()
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| value.is_finite() && *value >= 0.0)
+        })
+        .unwrap_or(0.0);
+
+    MarketCostProfile {
+        symbol,
+        account_currency,
+        pip_value,
+        pip_value_per_lot,
+        spread_pips,
+        commission_per_trade,
     }
 }
 
@@ -91,7 +277,8 @@ impl Gene {
 
         let suspicious_ppt = trades >= 40.0 && dd <= 0.01 && ppt >= max_ppt;
 
-        let suspicious_ultra = trades >= 50.0 && dd <= 0.001 && profit >= 150_000.0 && ppt >= 1_000.0;
+        let suspicious_ultra =
+            trades >= 50.0 && dd <= 0.001 && profit >= 150_000.0 && ppt >= 1_000.0;
 
         let suspicious_low_dd = trades >= 80.0 && dd <= 0.001 && profit >= 50_000.0;
 
@@ -121,6 +308,14 @@ impl Gene {
             return false;
         }
         true
+    }
+
+    pub fn requires_quality_screen(cfg: &FilteringConfig) -> bool {
+        cfg.min_positive_months > 0
+            || cfg.min_trades_per_month > 0.0
+            || cfg.min_monthly_return_pct > 0.0
+            || cfg.log_trades
+            || (cfg.opportunistic_enabled && cfg.use_opportunistic_candidates)
     }
 
     pub fn normalize(&mut self, n_indicators: usize, min_indicators: usize) {
@@ -162,6 +357,8 @@ pub struct SearchResult {
 
 #[derive(Debug, Clone)]
 pub struct EvaluationConfig {
+    pub symbol: String,
+    pub account_currency: String,
     pub max_hold_bars: usize,
     pub trailing_enabled: bool,
     pub trailing_atr_multiplier: f64,
@@ -198,16 +395,25 @@ impl Default for EvaluationConfig {
                 .and_then(|v| v.parse::<f32>().ok())
                 .unwrap_or(default)
         }
+        let profile = infer_market_cost_profile("", "", None, None, None);
 
         Self {
+            symbol: profile.symbol,
+            account_currency: profile.account_currency,
             max_hold_bars: 0,
             trailing_enabled: false,
             trailing_atr_multiplier: 1.0,
             trailing_be_trigger_r: 1.0,
-            pip_value: env_f64("FOREX_BOT_PROP_PIP_VALUE", 0.0001),
-            spread_pips: env_f64("FOREX_BOT_PROP_SPREAD_PIPS", 1.5),
-            commission_per_trade: env_f64("FOREX_BOT_PROP_COMMISSION", 0.0),
-            pip_value_per_lot: env_f64("FOREX_BOT_PROP_PIP_VALUE_PER_LOT", 10.0),
+            pip_value: env_f64("FOREX_BOT_PROP_PIP_VALUE", profile.pip_value),
+            spread_pips: env_f64("FOREX_BOT_PROP_SPREAD_PIPS", profile.spread_pips),
+            commission_per_trade: env_f64(
+                "FOREX_BOT_PROP_COMMISSION",
+                profile.commission_per_trade,
+            ),
+            pip_value_per_lot: env_f64(
+                "FOREX_BOT_PROP_PIP_VALUE_PER_LOT",
+                profile.pip_value_per_lot,
+            ),
             smc_gate_threshold: env_f32("FOREX_BOT_PROP_SMC_GATE", 0.75),
             smc_weight_ob: env_f32("FOREX_BOT_PROP_SMC_W_OB", 1.0),
             smc_weight_fvg: env_f32("FOREX_BOT_PROP_SMC_W_FVG", 1.0),
@@ -220,6 +426,33 @@ impl Default for EvaluationConfig {
             smc_weight_eqh: env_f32("FOREX_BOT_PROP_SMC_W_EQH", 1.0),
             smc_weight_eql: env_f32("FOREX_BOT_PROP_SMC_W_EQL", 1.0),
             smc_weight_displacement: env_f32("FOREX_BOT_PROP_SMC_W_DISPLACEMENT", 1.0),
+        }
+    }
+}
+
+impl EvaluationConfig {
+    pub fn for_symbol(
+        symbol: &str,
+        account_currency: &str,
+        price_hint: Option<f64>,
+        spread_pips_override: Option<f64>,
+        commission_override: Option<f64>,
+    ) -> Self {
+        let profile = infer_market_cost_profile(
+            symbol,
+            account_currency,
+            price_hint,
+            spread_pips_override,
+            commission_override,
+        );
+        Self {
+            symbol: profile.symbol,
+            account_currency: profile.account_currency,
+            pip_value: profile.pip_value,
+            pip_value_per_lot: profile.pip_value_per_lot,
+            spread_pips: profile.spread_pips,
+            commission_per_trade: profile.commission_per_trade,
+            ..Self::default()
         }
     }
 }

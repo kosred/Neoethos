@@ -90,7 +90,11 @@ pub fn detect_hyperstack_n3() -> bool {
 
     info!(
         "🚀 Hyperstack N3 HPC Mode ACTIVATED: {} GPUs @ {:.1}GB+ VRAM, {} logical threads ({} physical cores), {:.1}GB RAM",
-        gpu_count, min_vram_gb, cpu_threads, cpu_threads / 2, total_ram_gb
+        gpu_count,
+        min_vram_gb,
+        cpu_threads,
+        cpu_threads / 2,
+        total_ram_gb
     );
 
     true
@@ -208,7 +212,7 @@ pub fn set_thread_affinity(cores: &[usize]) -> Result<()> {
         return Ok(());
     }
 
-    use libc::{cpu_set_t, sched_setaffinity, CPU_SET, CPU_ZERO};
+    use libc::{CPU_SET, CPU_ZERO, cpu_set_t, sched_setaffinity};
     use std::mem;
 
     unsafe {

@@ -7,7 +7,7 @@ edition = "2021"
 eframe = "0.31.0" # UI framework (egui)
 egui = "0.31.0"
 egui_dock = "0.16.0"
-tokio = { version = "1.43.0", features = ["full", "rt-multi-thread"] }
+tokio = { version = "1.49.0", features = ["full", "rt-multi-thread"] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 anyhow = "1.0.100"
@@ -17,13 +17,13 @@ reqwest = { version = "0.12.24", default-features = false, features = ["blocking
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
-polars = { version = "0.52.0", features = ["lazy", "parquet", "dtype-full", "temporal", "timezones"] }
+polars = { version = "0.52.0", features = ["lazy", "dtype-full", "temporal", "timezones"] }
 
 # Our internal core engines
 forex-core = { path = "../forex-core" }
 forex-data = { path = "../forex-data" }
 forex-search = { path = "../forex-search" }
-forex-models = { path = "../forex-models" }
+forex-models = { path = "../forex-models", features = ["tree-models", "pure-rust-ml"] }
 mt5-bridge = { path = "../mt5-bridge" }
 ndarray = "0.17.2"
 clap = { version = "4.6.0", features = ["derive"] }

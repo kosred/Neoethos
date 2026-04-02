@@ -1,15 +1,14 @@
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::{
-    build_account_auth_request, build_application_auth_request, build_deal_list_request,
-    build_reconcile_request, build_trader_request, parse_ctrader_error_payload,
-    parse_open_api_envelope, CTraderDealListRequest, CTraderOpenApiTransport,
-    ProductionCTraderOpenApiTransport,
     CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE, CTraderDealListRequest, CTraderOpenApiTransport,
+    ProductionCTraderOpenApiTransport, build_account_auth_request, build_application_auth_request,
+    build_deal_list_request, build_reconcile_request, build_trader_request,
+    parse_ctrader_error_payload, parse_open_api_envelope,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
@@ -349,8 +348,8 @@ pub fn parse_reconcile_response(response_json: &str) -> Result<CTraderReconcileS
 }
 
 pub fn parse_deal_list_response(response_json: &str) -> Result<Vec<CTraderDealSnapshot>> {
-    let envelope: DealListEnvelope =
-        serde_json::from_str(response_json).context("failed to parse cTrader deal list response")?;
+    let envelope: DealListEnvelope = serde_json::from_str(response_json)
+        .context("failed to parse cTrader deal list response")?;
     if envelope.payload_type != CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE {
         return Err(anyhow!(
             "unexpected cTrader deal list payload type: {}",
@@ -363,9 +362,10 @@ pub fn parse_deal_list_response(response_json: &str) -> Result<Vec<CTraderDealSn
         .deals
         .into_iter()
         .map(|deal| {
-            let gross_profit = deal.close_position_detail.as_ref().map(|detail| {
-                scaled_money(detail.gross_profit, detail.money_digits.unwrap_or(0))
-            });
+            let gross_profit = deal
+                .close_position_detail
+                .as_ref()
+                .map(|detail| scaled_money(detail.gross_profit, detail.money_digits.unwrap_or(0)));
             let fee = deal
                 .close_position_detail
                 .as_ref()
@@ -374,16 +374,18 @@ pub fn parse_deal_list_response(response_json: &str) -> Result<Vec<CTraderDealSn
                     deal.commission
                         .map(|commission| scaled_money(commission, deal.money_digits.unwrap_or(0)))
                 });
-            let swap = deal.close_position_detail.as_ref().map(|detail| {
-                scaled_money(detail.swap, detail.money_digits.unwrap_or(0))
-            });
+            let swap = deal
+                .close_position_detail
+                .as_ref()
+                .map(|detail| scaled_money(detail.swap, detail.money_digits.unwrap_or(0)));
             let pnl_conversion_fee = deal.close_position_detail.as_ref().and_then(|detail| {
                 detail
                     .pnl_conversion_fee
                     .map(|fee| scaled_money(fee, detail.money_digits.unwrap_or(0)))
             });
-            let net_profit = gross_profit
-                .map(|gross| gross + fee.unwrap_or(0.0) + swap.unwrap_or(0.0) + pnl_conversion_fee.unwrap_or(0.0));
+            let net_profit = gross_profit.map(|gross| {
+                gross + fee.unwrap_or(0.0) + swap.unwrap_or(0.0) + pnl_conversion_fee.unwrap_or(0.0)
+            });
 
             CTraderDealSnapshot {
                 deal_id: deal.deal_id,
@@ -426,7 +428,9 @@ pub fn load_account_runtime_with_transport<T: CTraderOpenApiTransport>(
         build_deal_list_request(
             &CTraderDealListRequest {
                 account_id,
-                from_timestamp_ms: Some(current_unix_millis()? - DEFAULT_CTRADER_DEAL_LOOKBACK_HOURS * 60 * 60 * 1000),
+                from_timestamp_ms: Some(
+                    current_unix_millis()? - DEFAULT_CTRADER_DEAL_LOOKBACK_HOURS * 60 * 60 * 1000,
+                ),
                 to_timestamp_ms: Some(current_unix_millis()?),
                 max_rows: Some(DEFAULT_CTRADER_DEAL_MAX_ROWS),
             },
@@ -444,10 +448,7 @@ pub fn load_account_runtime_with_transport<T: CTraderOpenApiTransport>(
         &responses[0],
         CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
     )?;
-    ensure_success_payload_type(
-        &responses[1],
-        CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
-    )?;
+    ensure_success_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
     ensure_success_payload_type(&responses[2], CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE)?;
     ensure_success_payload_type(&responses[3], CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE)?;
     ensure_success_payload_type(&responses[4], CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE)?;

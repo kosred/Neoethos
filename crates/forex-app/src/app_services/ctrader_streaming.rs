@@ -1,14 +1,18 @@
 use crate::app_services::ctrader_data::HistoricalBar;
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::{
+    CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE,
     build_account_auth_request, build_application_auth_request,
     build_subscribe_live_trendbar_request, build_subscribe_spots_request,
-    expected_response_payload_type, parse_ctrader_error_payload, parse_open_api_envelope,
-    trendbar_period_value, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE,
+    expected_response_payload_type, is_matching_open_api_response, parse_ctrader_error_payload,
+    parse_open_api_envelope, trendbar_period_value,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
-use tungstenite::{connect, Message};
+use std::net::TcpStream;
+use std::sync::{Mutex, OnceLock};
+use tungstenite::{Message, connect};
+type CTraderSocket = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CTraderLiveChartUpdateRequest {
@@ -71,6 +75,50 @@ impl ProductionCTraderLiveStreamingTransport {
             endpoint_host: endpoint_host.into(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CTraderStreamingSessionKey {
+    endpoint_host: String,
+    client_id: String,
+    client_secret: String,
+    access_token: String,
+    account_id: i64,
+    symbol_id: i64,
+    timeframe: String,
+    subscribe_to_spot_timestamp: bool,
+}
+
+impl CTraderStreamingSessionKey {
+    fn from_request(
+        endpoint_host: &str,
+        request: &CTraderLiveChartUpdateRequest,
+        account_id: i64,
+    ) -> Self {
+        Self {
+            endpoint_host: endpoint_host.to_string(),
+            client_id: request.client_id.clone(),
+            client_secret: request.client_secret.clone(),
+            access_token: request.access_token.clone(),
+            account_id,
+            symbol_id: request.symbol_id,
+            timeframe: request.timeframe.clone(),
+            subscribe_to_spot_timestamp: request.subscribe_to_spot_timestamp,
+        }
+    }
+}
+
+struct CTraderStreamingSession {
+    key: CTraderStreamingSessionKey,
+    responses: Vec<String>,
+    socket: CTraderSocket,
+}
+
+static CTRADER_STREAMING_SESSION: OnceLock<Mutex<Option<CTraderStreamingSession>>> =
+    OnceLock::new();
+
+fn streaming_session_cache() -> &'static Mutex<Option<CTraderStreamingSession>> {
+    CTRADER_STREAMING_SESSION.get_or_init(|| Mutex::new(None))
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,8 +184,14 @@ pub fn parse_spot_event(
 
     Ok(CTraderLiveChartUpdate {
         symbol_id: envelope.payload.symbol_id,
-        bid: envelope.payload.bid.map(|value| scaled_price(value as i64, digits)),
-        ask: envelope.payload.ask.map(|value| scaled_price(value as i64, digits)),
+        bid: envelope
+            .payload
+            .bid
+            .map(|value| scaled_price(value as i64, digits)),
+        ask: envelope
+            .payload
+            .ask
+            .map(|value| scaled_price(value as i64, digits)),
         timestamp_ms: envelope.payload.timestamp,
         latest_trendbar: envelope
             .payload
@@ -222,13 +276,19 @@ pub fn load_live_chart_update_with_transport<T: CTraderLiveStreamingTransport>(
 
     ensure_success_payload_type(
         &responses[0],
+        "app-auth-1",
         expected_response_payload_type(
-            build_application_auth_request(&request.client_id, &request.client_secret, "app-auth-1")
-                .payload_type,
+            build_application_auth_request(
+                &request.client_id,
+                &request.client_secret,
+                "app-auth-1",
+            )
+            .payload_type,
         )?,
     )?;
     ensure_success_payload_type(
         &responses[1],
+        "account-auth-1",
         expected_response_payload_type(
             build_account_auth_request(account_id, &request.access_token, "account-auth-1")
                 .payload_type,
@@ -236,6 +296,7 @@ pub fn load_live_chart_update_with_transport<T: CTraderLiveStreamingTransport>(
     )?;
     ensure_success_payload_type(
         &responses[2],
+        "subscribe-spots-1",
         expected_response_payload_type(
             build_subscribe_spots_request(
                 account_id,
@@ -248,6 +309,7 @@ pub fn load_live_chart_update_with_transport<T: CTraderLiveStreamingTransport>(
     )?;
     ensure_success_payload_type(
         &responses[3],
+        "subscribe-trendbar-1",
         expected_response_payload_type(
             build_subscribe_live_trendbar_request(
                 account_id,
@@ -259,13 +321,19 @@ pub fn load_live_chart_update_with_transport<T: CTraderLiveStreamingTransport>(
         )?,
     )?;
 
-    parse_spot_event(&spot_event_json, account_id, request.symbol_id, request.digits)
+    parse_spot_event(
+        &spot_event_json,
+        account_id,
+        request.symbol_id,
+        request.digits,
+    )
 }
 
 pub fn load_live_chart_update(
     request: &CTraderLiveChartUpdateRequest,
 ) -> Result<CTraderLiveChartUpdate> {
-    let transport = ProductionCTraderLiveStreamingTransport::new(request.environment.endpoint_host());
+    let transport =
+        ProductionCTraderLiveStreamingTransport::new(request.environment.endpoint_host());
     load_live_chart_update_with_transport(&transport, request)
 }
 
@@ -287,9 +355,56 @@ impl CTraderLiveStreamingTransport for ProductionCTraderLiveStreamingTransport {
             .account_id
             .parse::<i64>()
             .context("cTrader account id must be numeric")?;
+        let key =
+            CTraderStreamingSessionKey::from_request(&self.endpoint_host, request, account_id);
+        let mut session = {
+            let mut cache = streaming_session_cache()
+                .lock()
+                .expect("cTrader streaming session cache lock");
+            match cache.take() {
+                Some(session) if session.key == key => session,
+                Some(session) => {
+                    let mut socket = session.socket;
+                    let _ = socket.close(None);
+                    drop(cache);
+                    self.open_streaming_session(request, account_id, key.clone())?
+                }
+                None => {
+                    drop(cache);
+                    self.open_streaming_session(request, account_id, key.clone())?
+                }
+            }
+        };
+
+        let spot_event = self.read_next_spot_event(
+            &mut session.socket,
+            account_id,
+            request.symbol_id,
+            request.digits,
+        )?;
+        let responses = session.responses.clone();
+        let mut cache = streaming_session_cache()
+            .lock()
+            .expect("cTrader streaming session cache lock");
+        *cache = Some(session);
+        Ok((responses, spot_event))
+    }
+}
+
+impl ProductionCTraderLiveStreamingTransport {
+    fn open_streaming_session(
+        &self,
+        request: &CTraderLiveChartUpdateRequest,
+        account_id: i64,
+        key: CTraderStreamingSessionKey,
+    ) -> Result<CTraderStreamingSession> {
         let period = trendbar_period_value(&request.timeframe)?;
         let messages = vec![
-            build_application_auth_request(&request.client_id, &request.client_secret, "app-auth-1"),
+            build_application_auth_request(
+                &request.client_id,
+                &request.client_secret,
+                "app-auth-1",
+            ),
             build_account_auth_request(account_id, &request.access_token, "account-auth-1"),
             build_subscribe_spots_request(
                 account_id,
@@ -306,8 +421,8 @@ impl CTraderLiveStreamingTransport for ProductionCTraderLiveStreamingTransport {
         ];
 
         let url = format!("wss://{}:5036", self.endpoint_host);
-        let (mut socket, _) =
-            connect(url.as_str()).with_context(|| format!("failed to connect to cTrader endpoint {url}"))?;
+        let (mut socket, _) = connect(url.as_str())
+            .with_context(|| format!("failed to connect to cTrader endpoint {url}"))?;
         let mut responses = Vec::with_capacity(messages.len());
 
         for message in &messages {
@@ -319,7 +434,10 @@ impl CTraderLiveStreamingTransport for ProductionCTraderLiveStreamingTransport {
                 .context("failed to send cTrader streaming message")?;
 
             loop {
-                match socket.read().context("failed to read cTrader streaming response")? {
+                match socket
+                    .read()
+                    .context("failed to read cTrader streaming response")?
+                {
                     Message::Text(text) => {
                         let envelope = parse_open_api_envelope(text.as_ref())?;
                         if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
@@ -329,8 +447,7 @@ impl CTraderLiveStreamingTransport for ProductionCTraderLiveStreamingTransport {
                                 parse_ctrader_error_payload(&envelope.payload)?
                             ));
                         }
-                        if envelope.payload_type == expected_payload_type
-                            && envelope.client_msg_id == message.client_msg_id
+                        if is_matching_open_api_response(&envelope, message, expected_payload_type)
                         {
                             responses.push(text.to_string());
                             break;
@@ -347,8 +464,7 @@ impl CTraderLiveStreamingTransport for ProductionCTraderLiveStreamingTransport {
                                 parse_ctrader_error_payload(&envelope.payload)?
                             ));
                         }
-                        if envelope.payload_type == expected_payload_type
-                            && envelope.client_msg_id == message.client_msg_id
+                        if is_matching_open_api_response(&envelope, message, expected_payload_type)
                         {
                             responses.push(text);
                             break;
@@ -368,9 +484,26 @@ impl CTraderLiveStreamingTransport for ProductionCTraderLiveStreamingTransport {
             }
         }
 
+        Ok(CTraderStreamingSession {
+            key,
+            responses,
+            socket,
+        })
+    }
+
+    fn read_next_spot_event(
+        &self,
+        socket: &mut CTraderSocket,
+        account_id: i64,
+        symbol_id: i64,
+        digits: i32,
+    ) -> Result<String> {
         loop {
             match socket.read().context("failed to read cTrader spot event")? {
                 Message::Text(text) => {
+                    if text.trim().is_empty() {
+                        return Err(anyhow!("empty cTrader spot event"));
+                    }
                     let envelope = parse_open_api_envelope(text.as_ref())?;
                     if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
                         let _ = socket.close(None);
@@ -380,8 +513,10 @@ impl CTraderLiveStreamingTransport for ProductionCTraderLiveStreamingTransport {
                         ));
                     }
                     if envelope.payload_type == CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE {
-                        let _ = socket.close(None);
-                        return Ok((responses, text.to_string()));
+                        let parsed =
+                            parse_spot_event(text.as_ref(), account_id, symbol_id, digits)?;
+                        let _ = parsed; // keep parsing path honest without changing return contract
+                        return Ok(text.to_string());
                     }
                 }
                 Message::Binary(bytes) => {
@@ -396,8 +531,9 @@ impl CTraderLiveStreamingTransport for ProductionCTraderLiveStreamingTransport {
                         ));
                     }
                     if envelope.payload_type == CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE {
-                        let _ = socket.close(None);
-                        return Ok((responses, text));
+                        let parsed = parse_spot_event(&text, account_id, symbol_id, digits)?;
+                        let _ = parsed;
+                        return Ok(text);
                     }
                 }
                 Message::Ping(payload) => {
@@ -407,7 +543,9 @@ impl CTraderLiveStreamingTransport for ProductionCTraderLiveStreamingTransport {
                 }
                 Message::Pong(_) => {}
                 Message::Close(_) => {
-                    return Err(anyhow!("cTrader spot stream closed before first spot event"));
+                    return Err(anyhow!(
+                        "cTrader spot stream closed before first spot event"
+                    ));
                 }
                 Message::Frame(_) => {}
             }
@@ -415,12 +553,23 @@ impl CTraderLiveStreamingTransport for ProductionCTraderLiveStreamingTransport {
     }
 }
 
-fn ensure_success_payload_type(response_json: &str, expected_payload_type: u32) -> Result<()> {
+fn ensure_success_payload_type(
+    response_json: &str,
+    expected_client_msg_id: &str,
+    expected_payload_type: u32,
+) -> Result<()> {
     let envelope = parse_open_api_envelope(response_json)?;
     if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
         return Err(anyhow!(
             "cTrader response failed: {}",
             parse_ctrader_error_payload(&envelope.payload)?
+        ));
+    }
+    if envelope.client_msg_id != expected_client_msg_id {
+        return Err(anyhow!(
+            "unexpected cTrader client message id: expected {}, got {}",
+            expected_client_msg_id,
+            envelope.client_msg_id
         ));
     }
     if envelope.payload_type != expected_payload_type {
@@ -436,9 +585,18 @@ fn ensure_success_payload_type(response_json: &str, expected_payload_type: u32) 
 fn normalize_spot_trendbar(payload: SpotTrendbarPayload, digits: i32) -> Option<HistoricalBar> {
     let timestamp_ms = i64::from(payload.utc_timestamp_in_minutes?) * 60_000;
     let low = scaled_price(payload.low, digits);
-    let open = scaled_price(payload.low + payload.delta_open.unwrap_or_default() as i64, digits);
-    let close = scaled_price(payload.low + payload.delta_close.unwrap_or_default() as i64, digits);
-    let high = scaled_price(payload.low + payload.delta_high.unwrap_or_default() as i64, digits);
+    let open = scaled_price(
+        payload.low + payload.delta_open.unwrap_or_default() as i64,
+        digits,
+    );
+    let close = scaled_price(
+        payload.low + payload.delta_close.unwrap_or_default() as i64,
+        digits,
+    );
+    let high = scaled_price(
+        payload.low + payload.delta_high.unwrap_or_default() as i64,
+        digits,
+    );
     Some(HistoricalBar {
         timestamp_ms,
         open,
@@ -537,6 +695,25 @@ mod tests {
     }
 
     #[test]
+    fn spot_event_parser_honors_symbol_digits() {
+        let event = serde_json::json!({
+            "payloadType": 2131,
+            "payload": {
+                "ctidTraderAccountId": 712345,
+                "symbolId": 14,
+                "bid": 109900,
+                "ask": 110100,
+                "timestamp": 1710000200000i64
+            }
+        });
+
+        let parsed = parse_spot_event(&event.to_string(), 712345, 14, 3).expect("spot event");
+
+        assert_eq!(parsed.bid, Some(1.099));
+        assert_eq!(parsed.ask, Some(1.101));
+    }
+
+    #[test]
     fn live_chart_update_loader_authenticates_and_subscribes_before_consuming_spot_event() {
         let transport = StubStreamingTransport::success(
             vec![
@@ -570,6 +747,22 @@ mod tests {
         assert_eq!(
             transport.last_sent_payload_types(),
             vec![2100, 2102, 2127, 2135]
+        );
+    }
+
+    #[test]
+    fn response_validator_rejects_unexpected_client_message_id() {
+        let response = serde_json::json!({
+            "clientMsgId": "wrong-id",
+            "payloadType": 2101,
+            "payload": {}
+        });
+
+        let err = ensure_success_payload_type(&response.to_string(), "expected-id", 2101)
+            .expect_err("client id mismatch should fail");
+        assert!(
+            err.to_string()
+                .contains("unexpected cTrader client message id")
         );
     }
 
@@ -688,7 +881,11 @@ mod tests {
                 .context("cTrader account id must be numeric")?;
             let period = trendbar_period_value(&request.timeframe)?;
             self.sent.lock().expect("sent lock").extend([
-                build_application_auth_request(&request.client_id, &request.client_secret, "app-auth-1"),
+                build_application_auth_request(
+                    &request.client_id,
+                    &request.client_secret,
+                    "app-auth-1",
+                ),
                 build_account_auth_request(account_id, &request.access_token, "account-auth-1"),
                 build_subscribe_spots_request(
                     account_id,

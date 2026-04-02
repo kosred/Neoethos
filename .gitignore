@@ -9,6 +9,7 @@
 /.ruff_cache/
 /catboost_info/
 /target/
+/target-codex-*/
 /.worktrees/
 /rust_core/
 /vendor/talib-sys/dependencies/
@@ -28,6 +29,7 @@
 *.log
 *.tfevents*
 *.parquet
+*.vortex
 *.pyd
 *.dll
 *.so
@@ -37,6 +39,7 @@ claude-gpu-on-hyperstack.txt
 2025-12-21-what-mcp-tools-you-have.txt
 eval*.md
 audit_log*.md
+Antigravity_Audit_*.md
 launch_multi_gpu.sh
 nul
 __pycache__/
@@ -45,3 +48,8 @@ __pycache__/
 keys.txt
 *.whl
 *.tgz
+crates/audit_summary.txt
+crates/file_list.txt
+crates/*/err.txt
+rust_out.exe
+rust_out.pdb

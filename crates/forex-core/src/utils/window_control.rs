@@ -47,7 +47,7 @@ pub fn focus_mt5_window() -> bool {
     unsafe {
         let mut found_hwnd: Option<HWND> = None;
 
-        unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL { unsafe {
             let found_ptr = lparam.0 as *mut Option<HWND>;
 
             let length = GetWindowTextLengthW(hwnd);
@@ -64,7 +64,7 @@ pub fn focus_mt5_window() -> bool {
                 }
             }
             BOOL(1) // Continue enumeration
-        }
+        }}
 
         let lparam = LPARAM(&mut found_hwnd as *mut _ as isize);
         let _ = EnumWindows(Some(enum_window_proc), lparam);

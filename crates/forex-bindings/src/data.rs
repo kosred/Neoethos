@@ -34,8 +34,10 @@ pub fn load_symbol_features(
     let options = FeatureBuildOptions {
         profile: base_prof,
         include_smc: true,
-        include_talib: true,
+        include_hpc_ta: true,
         include_regime: true,
+        include_quant: true,
+        prefix_base_features: false,
         higher_tfs: higher.clone(),
     };
 

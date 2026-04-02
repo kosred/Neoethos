@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
   "crates/forex-search",
   "crates/forex-cli",
@@ -10,4 +10,5 @@ members = [
 ]
 
 [patch.crates-io]
-talib-sys = { path = "vendor/talib-sys" }
+lightgbm3-sys = { path = "vendor/lightgbm3-sys" }
+sklears-core = { path = "vendor/sklears-core" }

@@ -1,5 +1,5 @@
-use ndarray::Array2;
 use anyhow::Result;
+use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
@@ -29,8 +29,10 @@ impl FromStr for FeatureProfile {
 pub struct FeatureBuildOptions {
     pub profile: FeatureProfile,
     pub include_smc: bool,
-    pub include_talib: bool,
+    pub include_hpc_ta: bool,
     pub include_regime: bool,
+    pub include_quant: bool,
+    pub prefix_base_features: bool,
     pub higher_tfs: Vec<String>,
 }
 
@@ -39,8 +41,10 @@ impl Default for FeatureBuildOptions {
         Self {
             profile: FeatureProfile::Standard,
             include_smc: true,
-            include_talib: true,
+            include_hpc_ta: true,
             include_regime: true,
+            include_quant: true,
+            prefix_base_features: false,
             higher_tfs: Vec::new(),
         }
     }
@@ -53,13 +57,20 @@ pub struct FeatureFrame {
     pub data: Array2<f32>,
 }
 
-pub fn align_features_by_ns(base_ns: &[i64], feature_ns: &[i64], feature_data: &Array2<f32>, ffill: bool) -> Array2<f32> {
+pub fn align_features_by_ns(
+    base_ns: &[i64],
+    feature_ns: &[i64],
+    feature_data: &Array2<f32>,
+    ffill: bool,
+) -> Array2<f32> {
     let n_base = base_ns.len();
     let n_feat = feature_ns.len();
     let n_cols = feature_data.ncols();
     let mut out = Array2::from_elem((n_base, n_cols), f32::NAN);
-    
-    if n_feat == 0 { return out; }
+
+    if n_feat == 0 {
+        return out;
+    }
 
     let mut feat_idx = 0usize;
     for i in 0..n_base {
@@ -67,14 +78,22 @@ pub fn align_features_by_ns(base_ns: &[i64], feature_ns: &[i64], feature_data: &
         while feat_idx < n_feat && feature_ns[feat_idx] <= ts {
             feat_idx += 1;
         }
-        
+
         let best_idx = if feat_idx > 0 {
             let prev = feat_idx - 1;
-            if feature_ns[prev] == ts || ffill { Some(prev) } else { None }
-        } else { None };
+            if feature_ns[prev] == ts || ffill {
+                Some(prev)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         if let Some(idx) = best_idx {
-            for j in 0..n_cols { out[(i, j)] = feature_data[(idx, j)]; }
+            for j in 0..n_cols {
+                out[(i, j)] = feature_data[(idx, j)];
+            }
         }
     }
     out

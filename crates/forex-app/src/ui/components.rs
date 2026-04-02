@@ -36,7 +36,10 @@ pub fn render_view_header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
 
 pub fn render_status_badge(ui: &mut egui::Ui, label: &str, snapshot: Option<&JobSnapshot>) {
     let (text, color) = match snapshot {
-        Some(snapshot) => (format!("{label}: {:?}", snapshot.state), status_color(snapshot.state)),
+        Some(snapshot) => (
+            format!("{label}: {:?}", snapshot.state),
+            status_color(snapshot.state),
+        ),
         None => (format!("{label}: Idle"), theme::TEXT_MUTED),
     };
     let mut frame = theme::card_frame(ui.style());
@@ -58,7 +61,11 @@ pub fn render_summary_cards(ui: &mut egui::Ui, title: &str, cards: &[DashboardCa
         for card in cards {
             theme::card_frame(ui.style()).show(ui, |ui| {
                 ui.set_min_size(egui::vec2(165.0, 68.0));
-                ui.label(egui::RichText::new(&card.label).small().color(theme::TEXT_MUTED));
+                ui.label(
+                    egui::RichText::new(&card.label)
+                        .small()
+                        .color(theme::TEXT_MUTED),
+                );
                 ui.strong(egui::RichText::new(&card.value).color(theme::TEXT_PRIMARY));
             });
         }
@@ -156,10 +163,7 @@ pub fn render_report(ui: &mut egui::Ui, snapshot: &JobSnapshot) {
         ui.separator();
         ui.strong("Live Events");
         for event in snapshot.report.events.iter().rev() {
-            ui.colored_label(
-                event_color(event.level),
-                format!("• {}", event.message),
-            );
+            ui.colored_label(event_color(event.level), format!("• {}", event.message));
         }
     }
 
@@ -197,7 +201,12 @@ pub fn open_log(path: &Path) -> anyhow::Result<()> {
 pub fn render_ribbon_item(ui: &mut egui::Ui, label: &str, value: &str, value_color: egui::Color32) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 1.0;
-        ui.label(egui::RichText::new(label).small().color(theme::TEXT_MUTED).strong());
+        ui.label(
+            egui::RichText::new(label)
+                .small()
+                .color(theme::TEXT_MUTED)
+                .strong(),
+        );
         ui.label(egui::RichText::new(value).color(value_color).strong());
     });
 }
@@ -270,7 +279,10 @@ mod tests {
         assert_eq!(card.label, "Adapter");
         assert_eq!(card.value, "cTrader");
         assert_eq!(section.title, "Runtime");
-        assert_eq!(section.rows[0], ("Mode".to_string(), "Remote Open API".to_string()));
+        assert_eq!(
+            section.rows[0],
+            ("Mode".to_string(), "Remote Open API".to_string())
+        );
     }
 
     #[test]

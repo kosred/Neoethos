@@ -20,19 +20,8 @@ ${SUDO} apt-get install -y build-essential wget curl git \
     libsqlite3-dev pkg-config libatlas-base-dev gfortran \
     libgomp1 htop btop iotop sysstat
 
-# 1. TA-Lib Binary install (Standard dependency for FX bots)
-if ! command -v ta-lib-config >/dev/null 2>&1; then
-    echo "[*] Installing TA-Lib core binary (C++ source)..."
-    cd /tmp
-    wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz
-    tar -xzf ta-lib-0.4.0-src.tar.gz
-    cd ta-lib/ 
-    ./configure --prefix=/usr
-    make
-    ${SUDO} make install
-    cd ..
-    rm -rf ta-lib*
-fi
+# 1. Rust-native indicator stack
+echo "[*] Using Rust-native Vector-TA indicators; no external TA-Lib binary install required."
 
 # 2. Python 3.13 Defaulting
 echo "[*] Configuring Python 3.13 as the default interpreter..."

@@ -3,7 +3,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
 use std::collections::HashMap;
 use ndarray::{Array2};
-use forex_data::{compute_talib_feature_frame, FeatureProfile};
+use forex_data::{compute_hpc_feature_frame, FeatureProfile};
 use forex_search::{
     evaluate_genes,
     Gene, EvaluationConfig,
@@ -107,7 +107,7 @@ pub fn fast_evaluate_strategy(
     .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
 
     let prof = if include_raw { FeatureProfile::Full } else { FeatureProfile::Standard };
-    let features = compute_talib_feature_frame(&ohlcv, prof)
+    let features = compute_hpc_feature_frame(&ohlcv, prof)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Feature computation failed: {}", e)))?;
     let mut indices = Vec::new();
     let mut w_vec = Vec::new();
@@ -186,7 +186,7 @@ pub fn batch_evaluate_strategies(
     }
 
     let prof = if include_raw { FeatureProfile::Full } else { FeatureProfile::Standard };
-    let features = compute_talib_feature_frame(&ohlcv, prof)
+    let features = compute_hpc_feature_frame(&ohlcv, prof)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Feature computation failed: {}", e)))?;
     
     let config = EvaluationConfig::default();
@@ -221,7 +221,7 @@ pub fn batch_evaluate_strategies(
     include_raw=true
 ))]
 #[allow(clippy::too_many_arguments)]
-pub fn evaluate_population_talib_ohlcv(
+pub fn evaluate_population_vector_ta_ohlcv(
     py: Python,
     open: PyReadonlyArray1<f64>,
     high: PyReadonlyArray1<f64>,
@@ -246,7 +246,7 @@ pub fn evaluate_population_talib_ohlcv(
     .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
 
     let prof = if include_raw { FeatureProfile::Full } else { FeatureProfile::Standard };
-    let features = compute_talib_feature_frame(&ohlcv, prof)
+    let features = compute_hpc_feature_frame(&ohlcv, prof)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Feature computation failed: {}", e)))?;
     let mut genes = Vec::new();
     for (i, indicators) in indicator_sets.iter().enumerate() {
@@ -410,7 +410,7 @@ pub fn aggregate_prop_score_metrics<'py>(
     causal_min_bars=30
 ))]
 #[allow(clippy::too_many_arguments)]
-pub fn talib_bulk_signals_ohlcv(
+pub fn vector_ta_bulk_signals_ohlcv(
     py: Python,
     open: PyReadonlyArray1<f64>,
     high: PyReadonlyArray1<f64>,
@@ -436,7 +436,7 @@ pub fn talib_bulk_signals_ohlcv(
     .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
 
     let prof = if include_raw { FeatureProfile::Full } else { FeatureProfile::Standard };
-    let frame = compute_talib_feature_frame(&ohlcv, prof)
+    let frame = compute_hpc_feature_frame(&ohlcv, prof)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Feature computation failed: {}", e)))?;
     let n_rows = frame.data.nrows();
     let n_genes = indicator_sets.len();

@@ -1,11 +1,46 @@
+use crate::utils::build_ohlcv;
+use forex_data::{FeatureProfile, compute_hpc_feature_frame};
+use forex_search::genetic::{ParentSelectionPolicy, SurvivorSelectionPolicy};
+use forex_search::{GpuDiscoveryConfig, evolve_search, run_gpu_discovery};
 use numpy::PyReadonlyArray1;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
-use std::collections::HashSet;
 use pythonize::pythonize;
-use forex_data::{compute_talib_feature_frame, FeatureProfile};
-use forex_search::{evolve_search, run_gpu_discovery, GpuDiscoveryConfig};
-use crate::utils::{build_ohlcv};
+use std::collections::HashSet;
+
+fn fmt_f64(v: f64) -> String {
+    format!("{v:.10}")
+}
+
+fn fmt_f32(v: f32) -> String {
+    format!("{v:.8}")
+}
+
+fn parse_parent_selection(raw: &str) -> PyResult<ParentSelectionPolicy> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "uniform" => Ok(ParentSelectionPolicy::Uniform),
+        "rank" | "rank_weighted" | "rank-weighted" => Ok(ParentSelectionPolicy::RankWeighted),
+        "softmax" | "boltzmann" => Ok(ParentSelectionPolicy::Softmax),
+        "tournament" => Ok(ParentSelectionPolicy::Tournament),
+        other => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "unsupported parent_selection `{other}`; expected one of uniform, rank, softmax, tournament"
+        ))),
+    }
+}
+
+fn parse_survivor_selection(raw: &str) -> PyResult<SurvivorSelectionPolicy> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "elitist" | "elite" => Ok(SurvivorSelectionPolicy::Elitist),
+        "rank" | "rank_weighted" | "rank-weighted" => Ok(SurvivorSelectionPolicy::RankWeighted),
+        "tournament" => Ok(SurvivorSelectionPolicy::Tournament),
+        "generational" | "none" | "non_elitist" | "non-elitist" => {
+            Ok(SurvivorSelectionPolicy::Generational)
+        }
+        other => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "unsupported survivor_selection `{other}`; expected one of elitist, rank, tournament, generational"
+        ))),
+    }
+}
 
 #[pyfunction]
 #[pyo3(signature = (open, high, low, close, timestamps=None, volume=None, population=64, generations=20, max_indicators=12, include_raw=true))]
@@ -35,8 +70,12 @@ pub fn search_evolve_ohlcv(
 
     let (features, result) = py
         .detach(|| {
-            let prof = if include_raw { FeatureProfile::Full } else { FeatureProfile::Standard };
-            let features = compute_talib_feature_frame(&ohlcv, prof)
+            let prof = if include_raw {
+                FeatureProfile::Full
+            } else {
+                FeatureProfile::Standard
+            };
+            let features = compute_hpc_feature_frame(&ohlcv, prof)
                 .map_err(|e| format!("Feature computation failed: {}", e))?;
             let result = evolve_search(&features, &ohlcv, population, generations, max_indicators)
                 .map_err(|e| format!("Search failed: {}", e))?;
@@ -44,7 +83,11 @@ pub fn search_evolve_ohlcv(
         })
         .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
 
-    let metrics: Vec<Vec<f64>> = result.metrics.iter().map(|m: &[f64; 11]| m.to_vec()).collect();
+    let metrics: Vec<Vec<f64>> = result
+        .metrics
+        .iter()
+        .map(|m: &[f64; 11]| m.to_vec())
+        .collect();
     let genes_py: Vec<Py<PyAny>> = result
         .genes
         .iter()
@@ -74,6 +117,12 @@ pub fn search_evolve_ohlcv(
     generations=200,
     include_raw=true,
     elite_fraction=0.05,
+    survivor_fraction=0.10,
+    immigrant_fraction=0.20,
+    parent_selection="rank",
+    survivor_selection="rank",
+    selection_temperature=0.75,
+    tournament_size=4,
     sigma=0.5,
     crossover_rate=0.35,
     threshold_scale=0.10,
@@ -104,6 +153,12 @@ pub fn search_evolve_gpu_ohlcv(
     generations: usize,
     include_raw: bool,
     elite_fraction: f64,
+    survivor_fraction: f64,
+    immigrant_fraction: f64,
+    parent_selection: &str,
+    survivor_selection: &str,
+    selection_temperature: f64,
+    tournament_size: usize,
     sigma: f64,
     crossover_rate: f64,
     threshold_scale: f64,
@@ -130,11 +185,18 @@ pub fn search_evolve_gpu_ohlcv(
         volume.as_ref(),
     )
     .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
+    let defaults = GpuDiscoveryConfig::default();
 
     let config = GpuDiscoveryConfig {
         population: population.max(16),
         generations: generations.max(1),
         elite_fraction: elite_fraction.clamp(0.01, 0.50),
+        survivor_fraction: survivor_fraction.clamp(0.0, 0.95),
+        immigrant_fraction: immigrant_fraction.clamp(0.0, 0.95),
+        parent_selection: parse_parent_selection(parent_selection)?,
+        survivor_selection: parse_survivor_selection(survivor_selection)?,
+        selection_temperature: selection_temperature.max(1e-3),
+        tournament_size: tournament_size.max(2),
         sigma: sigma.max(0.01),
         crossover_rate: crossover_rate.clamp(0.0, 1.0),
         threshold_scale: threshold_scale.max(0.001),
@@ -150,13 +212,17 @@ pub fn search_evolve_gpu_ohlcv(
         pos_window_fraction: pos_window_fraction.clamp(0.0, 1.0),
         pos_penalty: pos_penalty.max(0.0),
         chunk_size: chunk_size.max(64),
-        devices: devices.unwrap_or_default(),
+        devices: devices.unwrap_or(defaults.devices),
     };
 
     let (features, result) = py
         .detach(|| {
-            let prof = if include_raw { FeatureProfile::Full } else { FeatureProfile::Standard };
-            let features = compute_talib_feature_frame(&ohlcv, prof)
+            let prof = if include_raw {
+                FeatureProfile::Full
+            } else {
+                FeatureProfile::Standard
+            };
+            let features = compute_hpc_feature_frame(&ohlcv, prof)
                 .map_err(|e| format!("Feature computation failed: {}", e))?;
             let result = {
                 #[cfg(feature = "gpu")]
@@ -181,7 +247,7 @@ pub fn search_evolve_gpu_ohlcv(
     dict.set_item("fitness", result.fitness)?;
     dict.set_item("feature_names", features.names)?;
     dict.set_item("timeframes", result.timeframes)?;
-    dict.set_item("gpu", true)?;
+    dict.set_item("gpu", result.used_gpu)?;
     Ok(dict.into_any().unbind())
 }
 
@@ -219,7 +285,7 @@ pub fn search_discovery_ohlcv(
 
     let (features, result) = py
         .detach(|| {
-            let features = compute_talib_feature_frame(&ohlcv, FeatureProfile::Standard)
+            let features = compute_hpc_feature_frame(&ohlcv, FeatureProfile::Standard)
                 .map_err(|e| format!("Feature computation failed: {}", e))?;
             let result = forex_search::run_discovery_cycle(&features, &ohlcv, &config)
                 .map_err(|e| format!("Discovery failed: {}", e))?;
@@ -245,14 +311,23 @@ pub fn search_discovery_ohlcv(
 
 pub fn discovery_gene_key(gene: &forex_search::Gene) -> String {
     let sid = gene.strategy_id.trim();
-    if !sid.is_empty() {
-        return format!("id:{sid}");
-    }
+    let strategy_prefix = if sid.is_empty() {
+        "id:".to_string()
+    } else {
+        format!("id:{sid}|")
+    };
+    let weights = gene
+        .weights
+        .iter()
+        .map(|weight| fmt_f32(*weight))
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "sig:{:?}|{:.6}|{:.6}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:.2}|{:.2}",
+        "{strategy_prefix}sig:idx={:?}|w=[{}]|lt={}|st={}|ob={}|fvg={}|liq={}|mtf={}|premium={}|inducement={}|bos={}|choch={}|eqh={}|eql={}|disp={}|tp={}|sl={}",
         gene.indices,
-        gene.long_threshold,
-        gene.short_threshold,
+        weights,
+        fmt_f32(gene.long_threshold),
+        fmt_f32(gene.short_threshold),
         gene.use_ob as u8,
         gene.use_fvg as u8,
         gene.use_liq_sweep as u8,
@@ -264,8 +339,8 @@ pub fn discovery_gene_key(gene: &forex_search::Gene) -> String {
         gene.use_eqh as u8,
         gene.use_eql as u8,
         gene.use_displacement as u8,
-        gene.tp_pips,
-        gene.sl_pips
+        fmt_f64(gene.tp_pips),
+        fmt_f64(gene.sl_pips)
     )
 }
 
@@ -338,4 +413,44 @@ pub fn select_ranked_discovery_genes(
     }
 
     (selected, ranked_filtered.len(), ranked_all.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::discovery_gene_key;
+    use forex_search::Gene;
+
+    #[test]
+    fn discovery_gene_key_distinguishes_weight_changes() {
+        let a = Gene {
+            indices: vec![1, 2, 3],
+            weights: vec![0.2, 0.3, 0.5],
+            long_threshold: 0.12345678,
+            short_threshold: -0.12345678,
+            tp_pips: 12.5,
+            sl_pips: 8.0,
+            ..Gene::default()
+        };
+
+        let mut b = a.clone();
+        b.weights = vec![0.5, 0.3, 0.2];
+
+        assert_ne!(discovery_gene_key(&a), discovery_gene_key(&b));
+    }
+
+    #[test]
+    fn discovery_gene_key_includes_strategy_id_without_collapsing_structure() {
+        let a = Gene {
+            strategy_id: "alpha".to_string(),
+            indices: vec![1, 2],
+            weights: vec![0.4, 0.6],
+            ..Gene::default()
+        };
+
+        let mut b = a.clone();
+        b.weights = vec![0.6, 0.4];
+
+        assert_ne!(discovery_gene_key(&a), discovery_gene_key(&b));
+        assert!(discovery_gene_key(&a).starts_with("id:alpha|"));
+    }
 }

@@ -1,7 +1,13 @@
-use anyhow::{Result, Context};
+use crate::discovery::{
+    DiscoveryConfig, ensure_non_empty_portfolio, run_discovery_cycle, save_discovery_profile_json,
+    save_portfolio_json, save_quality_report_json, save_trade_log_json,
+};
+use anyhow::{Context, Result};
+use forex_data::{
+    MANDATORY_TFS, ensure_timeframes_with_resample, load_symbol_dataset,
+    prepare_multitimeframe_features,
+};
 use std::path::Path;
-use forex_data::{load_symbol_dataset, ensure_timeframes_with_resample, prepare_multitimeframe_features, MANDATORY_TFS};
-use crate::discovery::{ensure_non_empty_portfolio, run_discovery_cycle, DiscoveryConfig, save_portfolio_json};
 use tracing::info;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -47,10 +53,14 @@ impl DiscoveryOrchestrator {
         }
     }
 
-    pub fn run_batch(&self, symbols: &[String], timeframes: &[String]) -> Result<BatchDiscoverySummary> {
+    pub fn run_batch(
+        &self,
+        symbols: &[String],
+        timeframes: &[String],
+    ) -> Result<BatchDiscoverySummary> {
         std::fs::create_dir_all(&self.output_dir)?;
         let mut summary = BatchDiscoverySummary::default();
-        
+
         for symbol in symbols {
             summary.symbols_seen += 1;
             info!("Processing symbol: {}", symbol);
@@ -85,17 +95,33 @@ impl DiscoveryOrchestrator {
                 };
 
                 let base_ohlcv = ds_ready.frames.get(tf).context("base tf missing")?;
-                let result = run_discovery_cycle(&features, base_ohlcv, &self.config)?;
-                if let Err(err) = ensure_non_empty_portfolio(&result, &format!("{} {}", symbol, tf)) {
+                let mut runtime_config = self.config.clone();
+                runtime_config.timeframe_label = tf.clone();
+                let result = run_discovery_cycle(&features, base_ohlcv, &runtime_config)?;
+                if let Err(err) = ensure_non_empty_portfolio(&result, &format!("{} {}", symbol, tf))
+                {
                     summary.empty_portfolios += 1;
                     info!("    {}", err);
                     continue;
                 }
-                
+
                 info!("    Found {} strategies", result.portfolio.len());
-                
+
                 let out_path = Path::new(&self.output_dir).join(format!("{}_{}.json", symbol, tf));
-                save_portfolio_json(out_path, &result.portfolio, &features.names)?;
+                save_portfolio_json(&out_path, &result.portfolio, &features.names)?;
+                let profile_path =
+                    Path::new(&self.output_dir).join(format!("{}_{}_profile.json", symbol, tf));
+                save_discovery_profile_json(profile_path, &runtime_config, &result)?;
+                if !result.quality_metrics.is_empty() {
+                    let quality_path =
+                        Path::new(&self.output_dir).join(format!("{}_{}_quality.json", symbol, tf));
+                    save_quality_report_json(quality_path, &result)?;
+                }
+                if !result.logged_trades.is_empty() {
+                    let trade_log_path = Path::new(&self.output_dir)
+                        .join(format!("{}_{}_trade_logs.json", symbol, tf));
+                    save_trade_log_json(trade_log_path, &result)?;
+                }
                 summary.portfolios_saved += 1;
             }
         }
@@ -119,9 +145,14 @@ mod tests {
             portfolios_saved: 0,
         };
 
-        let err = summary.finalize().expect_err("expected zero-save batch to fail");
+        let err = summary
+            .finalize()
+            .expect_err("expected zero-save batch to fail");
         let msg = err.to_string();
-        assert!(msg.contains("no usable portfolios"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("no usable portfolios"),
+            "unexpected error: {msg}"
+        );
         assert!(msg.contains("work_units=2"), "unexpected error: {msg}");
     }
 
@@ -133,7 +164,9 @@ mod tests {
             ..Default::default()
         };
 
-        let finalized = summary.finalize().expect("expected non-empty batch success");
+        let finalized = summary
+            .finalize()
+            .expect("expected non-empty batch success");
         assert_eq!(finalized.portfolios_saved, 1);
     }
 }

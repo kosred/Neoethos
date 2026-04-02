@@ -11,7 +11,7 @@ bottlenecks and ensure sub-millisecond execution safety.
 ---------------------------
 - forex-app: Central binary. Desktop GUI (egui) & Headless Server mode.
 - forex-core: Hardcoded Prop-Firm Risk Guard, Portfolio Math, & Configuration.
-- forex-data: High-speed OHLCV engine, Parquet loading, & TA-Lib integration.
+- forex-data: High-speed OHLCV engine, Vortex loading, & Vector-TA integration.
 - forex-models: Pure Rust Machine Learning (XGBoost, Neural Nets via Burn).
 - forex-search: Genetic algorithms for strategy discovery & SMC tracking.
 - forex-news: Async news aggregator (Perplexity) & sentiment analyzer (OpenAI).

@@ -122,7 +122,7 @@ mod tests {
         let style = ctx.style();
         assert_ne!(style.visuals.panel_fill, default_fill);
         assert_eq!(style.visuals.panel_fill, PANEL_BG);
-        assert_eq!(ACCENT, egui::Color32::from_rgb(72, 170, 255));
+        assert_eq!(ACCENT, egui::Color32::from_rgb(0, 140, 255));
     }
 
     #[test]

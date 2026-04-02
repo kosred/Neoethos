@@ -1,5 +1,5 @@
-use anyhow::{bail, Result};
-use forex_data::{compute_talib_feature_frame, FeatureCache, FeatureFrame, Ohlcv, SymbolDataset};
+use anyhow::{Result, bail};
+use forex_data::{FeatureCache, FeatureFrame, Ohlcv, SymbolDataset, compute_hpc_feature_frame};
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
 use serde::Serialize;
@@ -7,11 +7,21 @@ use std::collections::HashMap;
 use std::path::Path;
 use tch::{Device, Kind, Tensor};
 
+use crate::genetic::{
+    ParentSelectionPolicy, SurvivorSelectionPolicy, select_parent_index, select_survivor_indices,
+};
+
 #[derive(Debug, Clone)]
 pub struct GpuDiscoveryConfig {
     pub population: usize,
     pub generations: usize,
     pub elite_fraction: f64,
+    pub survivor_fraction: f64,
+    pub immigrant_fraction: f64,
+    pub parent_selection: ParentSelectionPolicy,
+    pub survivor_selection: SurvivorSelectionPolicy,
+    pub selection_temperature: f64,
+    pub tournament_size: usize,
     pub sigma: f64,
     pub crossover_rate: f64,
     pub threshold_scale: f64,
@@ -36,6 +46,12 @@ impl Default for GpuDiscoveryConfig {
             population: 24000,
             generations: 200,
             elite_fraction: 0.05,
+            survivor_fraction: 0.10,
+            immigrant_fraction: 0.20,
+            parent_selection: ParentSelectionPolicy::RankWeighted,
+            survivor_selection: SurvivorSelectionPolicy::RankWeighted,
+            selection_temperature: 0.75,
+            tournament_size: 4,
             sigma: 0.5,
             crossover_rate: 0.35,
             threshold_scale: 0.10,
@@ -62,6 +78,7 @@ pub struct GpuDiscoveryResult {
     pub fitness: Vec<f32>,
     pub feature_names: Vec<String>,
     pub timeframes: Vec<String>,
+    pub used_gpu: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -114,12 +131,12 @@ pub fn build_feature_cube(
         if let Some(frame) = cache.load(&base_key)? {
             frame
         } else {
-            let frame = compute_talib_feature_frame(base_ohlcv, true)?;
+            let frame = compute_hpc_feature_frame(base_ohlcv, true)?;
             cache.store(&base_key, &frame)?;
             frame
         }
     } else {
-        compute_talib_feature_frame(base_ohlcv, true)?
+        compute_hpc_feature_frame(base_ohlcv, true)?
     };
 
     let base_ts = base_frame.timestamps.clone();
@@ -158,12 +175,12 @@ pub fn build_feature_cube(
             if let Some(frame) = cache.load(&key)? {
                 frame
             } else {
-                let frame = compute_talib_feature_frame(htf, true)?;
+                let frame = compute_hpc_feature_frame(htf, true)?;
                 cache.store(&key, &frame)?;
                 frame
             }
         } else {
-            compute_talib_feature_frame(htf, true)?
+            compute_hpc_feature_frame(htf, true)?
         };
 
         let aligned = align_features(&base_ts, &htf_frame.timestamps, &htf_frame.data);
@@ -203,20 +220,14 @@ pub fn run_gpu_discovery(
     } else {
         config.devices.clone()
     };
-    if device_ids.is_empty() {
-        bail!("no CUDA devices available for GPU discovery");
-    }
+    let used_gpu = !device_ids.is_empty();
 
     let dim = tf_count + n_features + 2;
     let mut rng = rand::rng();
     let normal = Normal::new(0.0, 1.0).unwrap();
 
     let mut genomes: Vec<Vec<f32>> = (0..config.population)
-        .map(|_| {
-            (0..dim)
-                .map(|_| rng.random_range(-1.0..1.0))
-                .collect::<Vec<f32>>()
-        })
+        .map(|_| random_genome(dim, &mut rng))
         .collect();
 
     let mut best_genomes = Vec::new();
@@ -233,33 +244,105 @@ pub fn run_gpu_discovery(
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        let elite_count = ((config.population as f64) * config.elite_fraction)
-            .round()
-            .max(2.0) as usize;
-        let elite_count = elite_count.min(scored.len());
-        let elites: Vec<Vec<f32>> = scored
+        let effective_survivor_fraction = if config.survivor_fraction > 0.0 {
+            config.survivor_fraction
+        } else {
+            config.elite_fraction
+        };
+        let return_count = ((config.population as f64)
+            * effective_survivor_fraction
+                .max(config.elite_fraction)
+                .max(0.05))
+        .round()
+        .max(2.0) as usize;
+        let return_count = return_count.min(scored.len());
+        let best_candidates: Vec<Vec<f32>> = scored
             .iter()
-            .take(elite_count)
+            .take(return_count)
             .map(|(_, g)| g.clone())
             .collect();
-        let elite_scores: Vec<f32> = scored.iter().take(elite_count).map(|(f, _)| *f).collect();
+        let best_candidate_scores: Vec<f32> =
+            scored.iter().take(return_count).map(|(f, _)| *f).collect();
 
         if gen + 1 == config.generations {
-            best_genomes = elites.clone();
-            best_scores = elite_scores.clone();
+            best_genomes = best_candidates.clone();
+            best_scores = best_candidate_scores.clone();
             break;
         }
 
-        let mu = mean_vector(&elites);
-        let std = std_vector(&elites, &mu);
+        let score_vector: Vec<f64> = scored.iter().map(|(fitness, _)| *fitness as f64).collect();
+        let survivor_count = match config.survivor_selection {
+            SurvivorSelectionPolicy::Generational => 0,
+            _ => ((config.population as f64) * effective_survivor_fraction)
+                .round()
+                .max(2.0) as usize,
+        }
+        .min(scored.len());
+        let survivor_indices = select_survivor_indices(
+            &score_vector,
+            survivor_count,
+            config.survivor_selection,
+            config.selection_temperature,
+            config.tournament_size,
+            &mut rng,
+        );
+        let survivors: Vec<Vec<f32>> = survivor_indices
+            .iter()
+            .map(|idx| scored[*idx].1.clone())
+            .collect();
 
-        let mut next = elites.clone();
+        let parent_indices: Vec<usize> = (0..scored.len()).collect();
+        let reference_pool: Vec<Vec<f32>> = if survivors.is_empty() {
+            best_candidates.clone()
+        } else {
+            survivors.clone()
+        };
+        let mu = mean_vector(&reference_pool);
+        let std = std_vector(&reference_pool, &mu);
+
+        let mut next = survivors;
+        let immigrant_count =
+            ((config.population as f64) * config.immigrant_fraction).round() as usize;
+        let immigrant_count = immigrant_count.min(config.population.saturating_sub(next.len()));
+        for _ in 0..immigrant_count {
+            next.push(random_genome(dim, &mut rng));
+        }
         while next.len() < config.population {
             let use_cross = rng.random_bool(config.crossover_rate);
             let mut child = vec![0.0_f32; dim];
-            if use_cross && elites.len() >= 2 {
-                let a = &elites[rng.random_range(0..elites.len())];
-                let b = &elites[rng.random_range(0..elites.len())];
+            if use_cross && parent_indices.len() >= 2 {
+                let a_idx = select_parent_index(
+                    &score_vector,
+                    &parent_indices,
+                    config.parent_selection,
+                    config.tournament_size,
+                    config.selection_temperature,
+                    &mut rng,
+                );
+                let mut b_idx = select_parent_index(
+                    &score_vector,
+                    &parent_indices,
+                    config.parent_selection,
+                    config.tournament_size,
+                    config.selection_temperature,
+                    &mut rng,
+                );
+                if parent_indices.len() > 1 {
+                    let mut retries = 0usize;
+                    while b_idx == a_idx && retries < 4 {
+                        b_idx = select_parent_index(
+                            &score_vector,
+                            &parent_indices,
+                            config.parent_selection,
+                            config.tournament_size,
+                            config.selection_temperature,
+                            &mut rng,
+                        );
+                        retries += 1;
+                    }
+                }
+                let a = &scored[a_idx].1;
+                let b = &scored[b_idx].1;
                 for i in 0..dim {
                     let base = 0.5 * (a[i] + b[i]);
                     let noise = std[i] as f64 * normal.sample(&mut rng) * config.sigma;
@@ -281,7 +364,14 @@ pub fn run_gpu_discovery(
         fitness: best_scores,
         feature_names: frames[0].names.clone(),
         timeframes: (0..tf_count).map(|idx| format!("tf_{idx}")).collect(),
+        used_gpu,
     })
+}
+
+fn random_genome(dim: usize, rng: &mut impl Rng) -> Vec<f32> {
+    (0..dim)
+        .map(|_| rng.random_range(-1.0..1.0))
+        .collect::<Vec<f32>>()
 }
 
 fn build_data_cube(frames: &[FeatureFrame]) -> Result<Tensor> {
@@ -292,7 +382,7 @@ fn build_data_cube(frames: &[FeatureFrame]) -> Result<Tensor> {
 
     for (t, frame) in frames.iter().enumerate() {
         let shifted = shift_down(&frame.data);
-        let standardized = zscore(&shifted);
+        let standardized = causal_zscore(&shifted);
         for i in 0..n_samples {
             for j in 0..n_features {
                 let idx = (t * n_samples * n_features) + (i * n_features) + j;
@@ -327,6 +417,27 @@ fn evaluate_population_multi_gpu(
     device_ids: &[i64],
 ) -> Result<Vec<f32>> {
     let mut results = vec![0.0_f32; genomes.len()];
+
+    if device_ids.is_empty() {
+        let mut offset = 0usize;
+        while offset < genomes.len() {
+            let end = (offset + config.chunk_size).min(genomes.len());
+            let chunk = &genomes[offset..end];
+            let mut chunk_buf = Vec::with_capacity(chunk.len() * chunk[0].len());
+            for genome in chunk {
+                chunk_buf.extend_from_slice(genome);
+            }
+            let chunk_tensor = Tensor::from_slice(&chunk_buf)
+                .reshape(&[chunk.len() as i64, chunk[0].len() as i64]);
+            let fitness =
+                evaluate_population_gpu(data_cube, ohlc_cube, &chunk_tensor, config, Device::Cpu)?;
+            for (idx, value) in Vec::<f32>::from(&fitness).into_iter().enumerate() {
+                results[offset + idx] = value;
+            }
+            offset = end;
+        }
+        return Ok(results);
+    }
 
     // Keep static cubes resident per GPU to avoid repeated host->device copies per chunk.
     let mut per_device_cubes: Vec<(Device, Tensor, Tensor)> = Vec::with_capacity(device_ids.len());
@@ -591,22 +702,35 @@ fn shift_down(data: &ndarray::Array2<f32>) -> ndarray::Array2<f32> {
     out
 }
 
-fn zscore(data: &ndarray::Array2<f32>) -> ndarray::Array2<f32> {
+fn causal_zscore(data: &ndarray::Array2<f32>) -> ndarray::Array2<f32> {
     let (rows, cols) = data.dim();
     let mut out = ndarray::Array2::<f32>::zeros((rows, cols));
-    for c in 0..cols {
-        let mut sum = 0.0_f64;
-        let mut sumsq = 0.0_f64;
-        for r in 0..rows {
-            let v = data[(r, c)] as f64;
-            sum += v;
-            sumsq += v * v;
+    if rows == 0 || cols == 0 {
+        return out;
+    }
+
+    let mut running_sum = vec![0.0_f64; cols];
+    let mut running_sumsq = vec![0.0_f64; cols];
+    for r in 0..rows {
+        if r == 0 {
+            for c in 0..cols {
+                out[(r, c)] = 0.0;
+            }
+        } else {
+            let count = r as f64;
+            for c in 0..cols {
+                let mean = running_sum[c] / count;
+                let var = (running_sumsq[c] / count) - mean * mean;
+                let std = var.max(1e-12).sqrt();
+                out[(r, c)] = ((data[(r, c)] as f64 - mean) / std) as f32;
+            }
         }
-        let mean = sum / rows.max(1) as f64;
-        let var = (sumsq / rows.max(1) as f64) - mean * mean;
-        let std = var.max(1e-12).sqrt();
-        for r in 0..rows {
-            out[(r, c)] = ((data[(r, c)] as f64 - mean) / std) as f32;
+
+        for c in 0..cols {
+            let value = data[(r, c)] as f64;
+            let value = if value.is_finite() { value } else { 0.0 };
+            running_sum[c] += value;
+            running_sumsq[c] += value * value;
         }
     }
     out
@@ -644,4 +768,33 @@ fn std_vector(elites: &[Vec<f32>], mean: &[f32]) -> Vec<f32> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{causal_zscore, shift_down};
+    use ndarray::array;
+
+    #[test]
+    fn causal_zscore_ignores_future_rows() {
+        let future_spike = array![[1.0_f32], [2.0], [100.0]];
+        let alternate_future = array![[1.0_f32], [2.0], [3.0]];
+
+        let normalized_spike = causal_zscore(&shift_down(&future_spike));
+        let normalized_alt = causal_zscore(&shift_down(&alternate_future));
+
+        assert!((normalized_spike[(0, 0)] - normalized_alt[(0, 0)]).abs() < 1e-6);
+        assert!((normalized_spike[(1, 0)] - normalized_alt[(1, 0)]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn causal_zscore_is_past_only_and_finite() {
+        let data = array![[10.0_f32, 2.0], [12.0, 4.0], [50.0, 100.0]];
+        let normalized = causal_zscore(&data);
+
+        assert_eq!(normalized[(0, 0)], 0.0);
+        assert_eq!(normalized[(0, 1)], 0.0);
+        assert!(normalized[(1, 0)].is_finite());
+        assert!(normalized[(1, 1)].is_finite());
+    }
 }

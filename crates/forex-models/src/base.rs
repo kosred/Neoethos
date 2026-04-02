@@ -14,6 +14,13 @@ use std::collections::HashMap;
 use std::path::Path;
 use tracing::*;
 
+use crate::runtime::artifacts::{
+    LabelMapping, RuntimeArtifactMetadata, TrainingSummaryMetadata,
+    default_three_class_label_mapping,
+};
+use crate::runtime::capabilities::{CapabilityState, ModelFamily};
+use crate::runtime::prediction::{PredictionMetadata, RuntimePrediction, RuntimePredictionError};
+
 type ModelSaveFn = Box<dyn FnOnce(&Path) -> Result<()>>;
 
 // ============================================================================
@@ -124,11 +131,7 @@ pub trait ExpertModel {
     /// Keeps 'model.pt' (current) and 'model.pt.bak' (previous).
     ///
     /// Ported from Python _atomic_save method (lines 101-126)
-    fn atomic_save(
-        &self,
-        save_func: ModelSaveFn,
-        target_path: &Path,
-    ) -> Result<()> {
+    fn atomic_save(&self, save_func: ModelSaveFn, target_path: &Path) -> Result<()> {
         let temp_path = target_path.with_extension("tmp");
         let backup_path = target_path.with_extension("bak");
 
@@ -197,6 +200,55 @@ pub fn dataframe_to_float32_array(df: &DataFrame) -> Result<Array2<f32>> {
         .context("Failed to create Array2 from DataFrame")
 }
 
+/// Extract ordered feature column names from a dataframe.
+pub fn feature_columns_from_dataframe(df: &DataFrame) -> Vec<String> {
+    df.get_column_names()
+        .iter()
+        .map(|name| name.to_string())
+        .collect()
+}
+
+/// Return the canonical three-class label mapping used by the runtime contract.
+pub fn canonical_three_class_label_mapping() -> Vec<LabelMapping> {
+    default_three_class_label_mapping()
+}
+
+/// Build runtime artifact metadata from the shared model contract.
+pub fn build_runtime_artifact_metadata(
+    model_name: impl Into<String>,
+    family: ModelFamily,
+    state: CapabilityState,
+    feature_columns: Vec<String>,
+    label_mapping: Vec<LabelMapping>,
+    training_summary: TrainingSummaryMetadata,
+) -> RuntimeArtifactMetadata {
+    RuntimeArtifactMetadata::new(
+        model_name,
+        family,
+        state,
+        feature_columns,
+        label_mapping,
+        training_summary,
+    )
+}
+
+/// Build runtime prediction output from the shared model contract.
+pub fn build_runtime_prediction(
+    model_name: impl Into<String>,
+    family: ModelFamily,
+    state: CapabilityState,
+    class_probabilities: [f32; 3],
+    confidence: Option<f32>,
+    abstain_recommended: Option<bool>,
+) -> Result<RuntimePrediction, RuntimePredictionError> {
+    RuntimePrediction::try_new(
+        class_probabilities,
+        confidence,
+        abstain_recommended,
+        PredictionMetadata::new(model_name, family, state),
+    )
+}
+
 // ============================================================================
 // TIME-SERIES VALIDATION
 // ============================================================================
@@ -217,16 +269,15 @@ pub fn validate_time_ordering(df: &DataFrame, context: &str) -> Result<bool> {
             if let Ok(ca) = series.cast(&polars::datatypes::DataType::Int64) {
                 if let Ok(ca_i64) = ca.i64() {
                     let mut prev = i64::MIN;
-                    for opt_val in ca_i64.into_iter() {
-                        if let Some(val) = opt_val {
-                            if val < prev {
-                                return Err(anyhow::anyhow!(
-                                    "{}: Datetime column '{}' is NOT monotonically increasing. Look-ahead bias structural risk!", 
-                                    context, col_name
-                                ));
-                            }
-                            prev = val;
+                    for val in ca_i64.into_iter().flatten() {
+                        if val < prev {
+                            return Err(anyhow::anyhow!(
+                                "{}: Datetime column '{}' is NOT monotonically increasing. Look-ahead bias structural risk!",
+                                context,
+                                col_name
+                            ));
                         }
+                        prev = val;
                     }
                     return Ok(true);
                 }
@@ -294,8 +345,8 @@ pub fn stratified_downsample(
         return Ok((x.clone(), y.clone()));
     }
 
-    use rand::prelude::*;
     use rand::SeedableRng;
+    use rand::prelude::*;
     let mut rng = StdRng::seed_from_u64(random_state);
 
     // Group by class
@@ -484,7 +535,7 @@ pub fn detect_feature_drift(
                 let vol_sum: f64 = ca.into_iter().flatten().sum();
                 let count = ca.into_iter().flatten().count();
                 if count > 0 && vol_sum > 0.0 {
-                    vol_scale = ((vol_sum / count as f64) * 1000.0).max(0.2).min(5.0);
+                    vol_scale = ((vol_sum / count as f64) * 1000.0).clamp(0.2, 5.0);
                 }
             }
         }
@@ -839,5 +890,103 @@ impl RobustScaler {
         }
 
         Ok(transformed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn feature_columns_from_dataframe_preserves_column_order() -> Result<()> {
+        let df = DataFrame::new(vec![
+            Series::new("open".into(), vec![1.0_f64, 2.0]).into(),
+            Series::new("high".into(), vec![1.5_f64, 2.5]).into(),
+            Series::new("close".into(), vec![1.25_f64, 2.25]).into(),
+        ])?;
+
+        let columns = feature_columns_from_dataframe(&df);
+        assert_eq!(
+            columns,
+            vec!["open".to_string(), "high".to_string(), "close".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_runtime_artifact_metadata_populates_feature_and_label_contracts() {
+        let metadata = build_runtime_artifact_metadata(
+            "lightgbm",
+            ModelFamily::Tree,
+            CapabilityState::Implemented,
+            vec!["rsi".to_string(), "atr".to_string()],
+            canonical_three_class_label_mapping(),
+            TrainingSummaryMetadata::new(12_345, 10_000, 2_345),
+        );
+
+        assert_eq!(metadata.model_name, "lightgbm");
+        assert_eq!(metadata.family, ModelFamily::Tree);
+        assert_eq!(metadata.state, CapabilityState::Implemented);
+        assert_eq!(metadata.feature_columns, vec!["rsi", "atr"]);
+        assert_eq!(
+            metadata.label_mapping,
+            vec![
+                LabelMapping::new(-1, 2),
+                LabelMapping::new(0, 0),
+                LabelMapping::new(1, 1),
+            ]
+        );
+        assert_eq!(metadata.training_summary.dataset_rows, 12_345);
+        assert_eq!(metadata.training_summary.train_rows, 10_000);
+        assert_eq!(metadata.training_summary.val_rows, 2_345);
+    }
+
+    #[test]
+    fn build_runtime_prediction_attaches_metadata_and_validates_probability_shape() -> Result<()> {
+        let prediction = build_runtime_prediction(
+            "lightgbm",
+            ModelFamily::Tree,
+            CapabilityState::Implemented,
+            [0.1, 0.7, 0.2],
+            Some(0.7),
+            Some(false),
+        )?;
+
+        let (probs, confidence, abstain, metadata) = prediction.parts();
+        assert_eq!(probs, [0.1, 0.7, 0.2]);
+        assert_eq!(confidence, Some(0.7));
+        assert_eq!(abstain, Some(false));
+        assert_eq!(metadata.model_name, "lightgbm");
+        assert_eq!(metadata.family, ModelFamily::Tree);
+        assert_eq!(metadata.state, CapabilityState::Implemented);
+        Ok(())
+    }
+
+    #[test]
+    fn build_runtime_prediction_rejects_invalid_confidence() {
+        let err = build_runtime_prediction(
+            "lightgbm",
+            ModelFamily::Tree,
+            CapabilityState::Implemented,
+            [0.1, 0.7, 0.2],
+            Some(1.5),
+            Some(false),
+        )
+        .expect_err("invalid confidence should fail");
+
+        assert!(err.to_string().contains("invalid confidence"));
+    }
+
+    #[test]
+    fn dataframe_to_float32_array_still_builds_row_major_contract() -> Result<()> {
+        let df = DataFrame::new(vec![
+            Series::new("a".into(), vec![1.0_f64, 2.0]).into(),
+            Series::new("b".into(), vec![3.0_f64, 4.0]).into(),
+        ])?;
+
+        let array = dataframe_to_float32_array(&df)?;
+        assert_eq!(array, array![[1.0_f32, 3.0_f32], [2.0_f32, 4.0_f32]]);
+        Ok(())
     }
 }

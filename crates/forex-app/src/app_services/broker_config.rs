@@ -6,6 +6,7 @@ pub enum BrokerSessionState {
     Configured,
     ReadyForAuth,
     Authenticated,
+    #[cfg_attr(not(test), allow(dead_code))]
     Failed,
 }
 
@@ -163,7 +164,10 @@ fn required_missing_fields(fields: &[(&str, &str)]) -> Vec<String> {
 }
 
 fn count_enabled_targets(accounts: &[BrokerAccountTarget]) -> usize {
-    accounts.iter().filter(|account| account.enabled_for_execution).count()
+    accounts
+        .iter()
+        .filter(|account| account.enabled_for_execution)
+        .count()
 }
 
 #[cfg(test)]

@@ -127,7 +127,7 @@ risk:
   hurst_range: 0.45
 
 models:
-  ml_models: [lightgbm, xgboost, xgboost_rf, xgboost_dart, catboost, catboost_alt, mlp, elasticnet, bayes_logit, online_pa, online_hoeffding]
+  ml_models: [lightgbm, xgboost, xgboost_rf, xgboost_dart, catboost, catboost_alt, sklears_tree, mlp, neat, elasticnet, bayes_logit, online_pa, online_hoeffding, swarm_forecaster, isolation_forest]
   use_rl_agent: true
   use_sac_agent: true
   use_neuroevolution: true
@@ -136,11 +136,32 @@ models:
   rl_eval_episodes: 15
   rl_network_arch: [256, 256]
   rl_parallel_envs: 1
+  rl_state_bins: 255
+  rl_state_encoding: normalized
+  rl_update_interval: 0
+  rl_update_freq: 0
+  rl_learning_rate: 0.001
+  rl_gamma: 0.99
+  rl_epsilon_start: 1.0
+  rl_epsilon_end: 0.02
+  rl_epsilon_decay: 0.995
+  rl_buffer_capacity: 0
+  rl_reward_horizon: 0
+  rl_episode_len: 0
   rl_train_seconds: 3600
+  exit_agent_hidden_dim: 128
+  exit_agent_gamma: 0.99
+  exit_agent_epsilon: 0.20
+  exit_agent_epsilon_min: 0.05
+  exit_agent_epsilon_decay: 0.999
+  exit_agent_memory_capacity: 10000
+  exit_agent_reward_horizon: 0
+  exit_agent_warmup_steps: 0
   evo_train_seconds: 3600
   evo_hidden_size: 64
   evo_population: 32
   evo_islands: 8  # MORE ISLANDS = MORE DIVERSITY (was 4, now 8)
+  evo_sigma: 0.25
   prop_search_enabled: true  # CRITICAL: Enable strategy discovery!
   prop_search_population: 100  # Per-island population (100 × 8 islands = 800 total)
   prop_search_generations: 20  # Evolution iterations (budget-safe default)
@@ -152,6 +173,12 @@ models:
   prop_search_async: true
   prop_search_async_wait: false
   tree_device_preference: gpu
+  prop_search_parent_selection: rank
+  prop_search_survivor_selection: rank
+  prop_search_survivor_fraction: 0.10
+  prop_search_immigrant_fraction: 0.18
+  prop_search_selection_temperature: 0.75
+  prop_search_tournament_size: 10
   prop_search_checkpoint: models/strategy_evo_checkpoint.json
   prop_search_device: cpu
   prop_search_train_years: 8
@@ -183,6 +210,13 @@ models:
   kan_train_seconds: 3600
   mlp_train_seconds: 3600
   num_transformers: 2
+  swarm_memory_limit_mb: 256.0
+  swarm_horizon: 0
+  swarm_frequency: H
+  swarm_strategy: bayesian
+  swarm_online_learning: true
+  swarm_interpretability_needed: true
+  swarm_latency_ms: 0
   hpo_backend: ax
   hpo_trials: 8
   hpo_trials_by_model:
@@ -209,6 +243,7 @@ models:
   calibration_enabled: true
   calibration_method: platt
   calibration_min_rows: 300
+  model_param_overrides: {}
   regime_router_enabled: true
   regime_router_min_models: 2
   regime_trend_models: [transformer, patchtst, timesnet, nbeats, nbeatsx_nf, tide, tide_nf]
@@ -225,6 +260,13 @@ models:
   # Global pooling caps (0 = no cap)
   global_max_rows: 0
   global_max_rows_per_symbol: 0
+  label_use_triple_barrier: true
+  # 0 = derive from risk.triple_barrier_max_bars / risk.vol_horizon_bars
+  label_horizon_bars: 0
+  label_neutral_band_atr_fraction: 0.25
+  # 0 = derive from risk.atr_stop_multiplier / risk.min_risk_reward
+  label_stop_atr_multiplier: 0.0
+  label_take_profit_rr: 0.0
   prop_metric_weight: 1.0
   prop_accuracy_weight: 0.1
   prop_min_trades: 0

@@ -128,28 +128,36 @@ mod tests {
 
         assert_eq!(panel.sections.len(), 4);
         assert_eq!(panel.sections[0].title, "Positions / Orders / PnL");
-        assert!(panel.sections[0]
-            .lines
-            .iter()
-            .any(|line| line.contains("Open Position")));
-        assert!(panel.sections[0]
-            .lines
-            .iter()
-            .any(|line| line.contains("Pending")));
+        assert!(
+            panel.sections[0]
+                .lines
+                .iter()
+                .any(|line| line.contains("Open Position"))
+        );
+        assert!(
+            panel.sections[0]
+                .lines
+                .iter()
+                .any(|line| line.contains("Pending"))
+        );
         assert_eq!(panel.sections[1].title, "Bot Decisions Timeline");
         assert_eq!(
             panel.sections[1].lines,
             vec!["Bot entry approved · confidence 0.74".to_string()]
         );
         assert_eq!(panel.sections[2].title, "Execution Diagnostics");
-        assert!(panel.sections[2]
-            .lines
-            .iter()
-            .any(|line| line.contains("Market data capability")));
+        assert!(
+            panel.sections[2]
+                .lines
+                .iter()
+                .any(|line| line.contains("Market data capability"))
+        );
         assert_eq!(panel.sections[3].title, "Manual Notes");
-        assert!(panel.sections[3]
-            .lines
-            .iter()
-            .any(|line| line.contains("Symbol focus: EURUSD")));
+        assert!(
+            panel.sections[3]
+                .lines
+                .iter()
+                .any(|line| line.contains("Symbol focus: EURUSD"))
+        );
     }
 }

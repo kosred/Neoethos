@@ -1,5 +1,5 @@
 use crate::app_services::jobs::JobSnapshot;
-use forex_core::{logging::canonical_log_path, Settings};
+use forex_core::{Settings, logging::canonical_log_path};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -45,22 +45,33 @@ pub struct AppState {
     pub ai_insights_panel: crate::ui::ai_insights::AiInsightsPanel,
     pub llm_news_filter: forex_core::domain::news_filter::NewsFilter,
     pub discovery_form: DiscoveryFormState,
-    pub ctrader_manual_auth_code: String,
     pub auto_trade_enabled: bool,
-    
+
     // Account Real-time Data
     pub account_balance: f64,
     pub account_equity: f64,
-    pub day_start_equity: f64,
-    pub initial_equity: f64,
 }
 
 impl AppState {
-    pub fn new(runtime: AppRuntimeConfig, available_symbols: Vec<String>) -> Self {
+    pub fn new(
+        runtime: AppRuntimeConfig,
+        settings: &Settings,
+        available_symbols: Vec<String>,
+    ) -> Self {
         let selected_pair = available_symbols
             .first()
             .cloned()
             .unwrap_or_else(|| "EURUSD".to_string());
+        let mut llm_news_filter = forex_core::domain::news_filter::NewsFilter::new(
+            settings.news.openai_news_enabled,
+            settings.news.news_lookahead_minutes as i64,
+            settings.news.news_kill_window_min as i64,
+        );
+        llm_news_filter.llm_provider = if settings.news.openai_news_enabled {
+            "openai".to_string()
+        } else {
+            "perplexity".to_string()
+        };
 
         Self {
             data_source: if runtime.start_local {
@@ -84,17 +95,14 @@ impl AppState {
             bootstrap_job: None,
             order_ticket: OrderTicketState::default(),
             hardware: HardwareState::default(),
-            risk: forex_core::config::RiskConfig::default(),
+            risk: settings.risk.clone(),
             dashboard_panel: crate::ui::dashboard::DashboardPanel::new(),
             ai_insights_panel: crate::ui::ai_insights::AiInsightsPanel::new(),
-            llm_news_filter: forex_core::domain::news_filter::NewsFilter::new(false, 3, 3),
-            discovery_form: DiscoveryFormState::default(),
-            ctrader_manual_auth_code: String::new(),
+            llm_news_filter,
+            discovery_form: DiscoveryFormState::from_settings(settings),
             auto_trade_enabled: false,
             account_balance: 0.0,
             account_equity: 0.0,
-            day_start_equity: 0.0,
-            initial_equity: 0.0,
         }
     }
 }
@@ -124,6 +132,29 @@ impl Default for DiscoveryFormState {
             portfolio_size: 100,
             correlation_threshold: 0.7,
             min_trades_per_day: 0.5, // Relaxed default
+        }
+    }
+}
+
+impl DiscoveryFormState {
+    pub fn from_settings(settings: &Settings) -> Self {
+        let discovery = forex_search::DiscoveryConfig::from_settings(settings);
+        let higher_tfs = settings.system.higher_timeframes.join(", ");
+
+        Self {
+            base_tf: settings.system.base_timeframe.clone(),
+            higher_tfs: if higher_tfs.trim().is_empty() {
+                "M5, M15, H1".to_string()
+            } else {
+                higher_tfs
+            },
+            max_indicators: discovery.max_indicators as u32,
+            population: discovery.population as u32,
+            generations: discovery.generations as u32,
+            target_candidates: discovery.candidate_count as u32,
+            portfolio_size: discovery.portfolio_size as u32,
+            correlation_threshold: discovery.corr_threshold as f32,
+            min_trades_per_day: discovery.min_trades_per_day as f32,
         }
     }
 }
@@ -191,7 +222,6 @@ impl Default for OrderTicketState {
     }
 }
 
-
 #[derive(Debug, Clone)]
 pub struct HardwareState {
     pub cpu_cores: i32,
@@ -231,7 +261,11 @@ mod tests {
             start_local: true,
         };
 
-        let state = AppState::new(runtime, vec!["GBPUSD".to_string(), "EURUSD".to_string()]);
+        let state = AppState::new(
+            runtime,
+            &forex_core::Settings::default(),
+            vec!["GBPUSD".to_string(), "EURUSD".to_string()],
+        );
 
         assert_eq!(state.selected_pair, "GBPUSD");
         assert_eq!(state.chart_timeframe, "M1");
@@ -248,7 +282,10 @@ mod tests {
         assert_eq!(state.order_ticket.label, "manual");
         assert!(state.order_ticket.selected_position_id.is_none());
         assert!(state.order_ticket.selected_order_id.is_none());
-        assert_eq!(state.canonical_log_path, PathBuf::from("logs").join("forex-ai.log"));
+        assert_eq!(
+            state.canonical_log_path,
+            PathBuf::from("logs").join("forex-ai.log")
+        );
         assert_eq!(state.hardware.cpu_cores, num_cpus::get() as i32);
         assert!(state.hardware.gpu_enabled);
         assert_eq!(state.risk.daily_drawdown_limit, 0.04);
@@ -266,7 +303,7 @@ mod tests {
             start_local: false,
         };
 
-        let state = AppState::new(runtime, Vec::new());
+        let state = AppState::new(runtime, &forex_core::Settings::default(), Vec::new());
 
         assert_eq!(state.selected_pair, "EURUSD");
         assert_eq!(state.chart_timeframe, "M1");

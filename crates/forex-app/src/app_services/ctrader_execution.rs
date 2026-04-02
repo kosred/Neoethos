@@ -1,17 +1,25 @@
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::{
-    build_account_auth_request, build_application_auth_request, build_cancel_order_request,
-    build_close_position_request, build_new_order_request,
-    CTraderCancelOrderRequest, CTraderNewOrderRequest, CTraderOpenApiJsonMessage,
-    CTraderOpenApiTransport, ProductionCTraderOpenApiTransport,
-    CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_EXECUTION_EVENT_PAYLOAD_TYPE, CTRADER_OA_ORDER_ERROR_EVENT_PAYLOAD_TYPE,
+    CTraderCancelOrderRequest, CTraderNewOrderRequest, CTraderOpenApiJsonMessage,
+    CTraderOpenApiTransport, build_account_auth_request, build_application_auth_request,
+    build_cancel_order_request, build_close_position_request, build_new_order_request,
+    expected_response_payload_type, is_matching_open_api_response, parse_ctrader_error_payload,
+    parse_open_api_envelope,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::net::TcpStream;
 #[cfg(test)]
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{Message, connect};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CTraderExecutionRequest {
@@ -62,14 +70,26 @@ pub struct CTraderExecutionOutcome {
 }
 
 pub trait CTraderExecutionBackend: Send + Sync {
-    fn execute(
-        &self,
-        request: &CTraderExecutionRuntimeRequest,
-    ) -> Result<CTraderExecutionOutcome>;
+    fn execute(&self, request: &CTraderExecutionRuntimeRequest) -> Result<CTraderExecutionOutcome>;
 }
 
 #[derive(Clone, Default)]
 pub struct ProductionCTraderExecutionBackend;
+
+#[derive(Debug, Default)]
+struct CTraderExecutionSession {
+    socket: Option<tungstenite::WebSocket<MaybeTlsStream<TcpStream>>>,
+    auth_key: Option<String>,
+    recent_submissions: HashMap<String, CachedExecutionOutcome>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedExecutionOutcome {
+    created_at: Instant,
+    outcome: CTraderExecutionOutcome,
+}
+
+static EXECUTION_SESSION: OnceLock<Mutex<CTraderExecutionSession>> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
 struct ExecutionEnvelope {
@@ -203,6 +223,44 @@ impl CTraderExecutionRequest {
             Self::ClosePosition(request) => build_close_position_request(request, client_msg_id),
         }
     }
+
+    fn idempotency_fingerprint(&self) -> String {
+        match self {
+            Self::NewOrder(request) => format!(
+                "new|acct={}|sym={}|side={}|otype={}|vol={}|limit={:?}|stop={:?}|tif={:?}|exp={:?}|sl={:?}|tp={:?}|comment={:?}|base_slippage={:?}|slip_pts={:?}|label={:?}|position_id={:?}|client_order_id={:?}|rsl={:?}|rtp={:?}|gsl={:?}|tsl={:?}|trigger={:?}",
+                request.account_id,
+                request.symbol_id,
+                request.trade_side.label(),
+                request.order_type.label(),
+                request.volume,
+                request.limit_price,
+                request.stop_price,
+                request.time_in_force.map(|v| v.label()),
+                request.expiration_timestamp_ms,
+                request.stop_loss,
+                request.take_profit,
+                request.comment,
+                request.base_slippage_price,
+                request.slippage_in_points,
+                request.label,
+                request.position_id,
+                request.client_order_id,
+                request.relative_stop_loss,
+                request.relative_take_profit,
+                request.guaranteed_stop_loss,
+                request.trailing_stop_loss,
+                request.stop_trigger_method.map(|v| v.label())
+            ),
+            Self::CancelOrder(request) => format!(
+                "cancel|acct={}|order_id={}",
+                request.account_id, request.order_id
+            ),
+            Self::ClosePosition(request) => format!(
+                "close|acct={}|position_id={}|volume={}",
+                request.account_id, request.position_id, request.volume
+            ),
+        }
+    }
 }
 
 impl CTraderExecutionStatus {
@@ -220,6 +278,241 @@ impl CTraderExecutionStatus {
 }
 
 impl ProductionCTraderExecutionBackend {
+    fn session() -> &'static Mutex<CTraderExecutionSession> {
+        EXECUTION_SESSION.get_or_init(|| Mutex::new(CTraderExecutionSession::default()))
+    }
+
+    fn auth_key(request: &CTraderExecutionRuntimeRequest) -> String {
+        format!(
+            "{}|{}|{}|{}",
+            request.environment.endpoint_host(),
+            request.client_id,
+            request.account_id,
+            request.access_token
+        )
+    }
+
+    fn client_msg_id_for(phase: &str, fingerprint: &str, attempt: u32) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        phase.hash(&mut hasher);
+        fingerprint.hash(&mut hasher);
+        attempt.hash(&mut hasher);
+        format!("{phase}-{:016x}", hasher.finish())
+    }
+
+    fn maybe_cached_outcome(
+        session: &CTraderExecutionSession,
+        fingerprint: &str,
+    ) -> Option<CTraderExecutionOutcome> {
+        let ttl = Duration::from_secs(30);
+        session
+            .recent_submissions
+            .get(fingerprint)
+            .and_then(|cached| {
+                if cached.created_at.elapsed() <= ttl {
+                    Some(cached.outcome.clone())
+                } else {
+                    None
+                }
+            })
+    }
+
+    fn store_cached_outcome(
+        session: &mut CTraderExecutionSession,
+        fingerprint: String,
+        outcome: CTraderExecutionOutcome,
+    ) {
+        if outcome.status == CTraderExecutionStatus::Failed {
+            return;
+        }
+        session.recent_submissions.insert(
+            fingerprint,
+            CachedExecutionOutcome {
+                created_at: Instant::now(),
+                outcome,
+            },
+        );
+        if session.recent_submissions.len() > 256 {
+            let mut entries = session
+                .recent_submissions
+                .iter()
+                .map(|(key, value)| (key.clone(), value.created_at))
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|(_, created_at)| *created_at);
+            for (key, _) in entries
+                .into_iter()
+                .take(session.recent_submissions.len() - 256)
+            {
+                session.recent_submissions.remove(&key);
+            }
+        }
+    }
+
+    fn read_matching_response(
+        socket: &mut tungstenite::WebSocket<MaybeTlsStream<TcpStream>>,
+        request: &CTraderOpenApiJsonMessage,
+        expected_payload_type: u32,
+    ) -> Result<String> {
+        loop {
+            match socket
+                .read()
+                .context("failed to read cTrader open api response")?
+            {
+                Message::Text(text) => {
+                    if text.trim().is_empty() {
+                        return Err(anyhow!("empty cTrader open api response"));
+                    }
+                    let envelope = parse_open_api_envelope(text.as_ref())?;
+                    if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+                        return Ok(text.to_string());
+                    }
+                    if is_matching_open_api_response(&envelope, request, expected_payload_type) {
+                        return Ok(text.to_string());
+                    }
+                }
+                Message::Binary(bytes) => {
+                    let text = String::from_utf8(bytes.to_vec())
+                        .context("failed to decode cTrader binary response")?;
+                    if text.trim().is_empty() {
+                        return Err(anyhow!("empty cTrader open api response"));
+                    }
+                    let envelope = parse_open_api_envelope(&text)?;
+                    if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+                        return Ok(text);
+                    }
+                    if is_matching_open_api_response(&envelope, request, expected_payload_type) {
+                        return Ok(text);
+                    }
+                }
+                Message::Ping(payload) => {
+                    socket
+                        .send(Message::Pong(payload))
+                        .context("failed to reply to cTrader ping")?;
+                }
+                Message::Pong(_) => {}
+                Message::Close(_) => {
+                    return Err(anyhow!("cTrader open api socket closed unexpectedly"));
+                }
+                Message::Frame(_) => {}
+            }
+        }
+    }
+
+    fn send_message_and_wait(
+        socket: &mut tungstenite::WebSocket<MaybeTlsStream<TcpStream>>,
+        message: &CTraderOpenApiJsonMessage,
+    ) -> Result<String> {
+        let expected_payload_type = expected_response_payload_type(message.payload_type)?;
+        let serialized = serde_json::to_string(message)
+            .context("failed to serialize cTrader open api message")?;
+        socket
+            .send(Message::Text(serialized.into()))
+            .context("failed to send cTrader open api message")?;
+        Self::read_matching_response(socket, message, expected_payload_type)
+    }
+
+    fn ensure_authenticated(
+        session: &mut CTraderExecutionSession,
+        request: &CTraderExecutionRuntimeRequest,
+    ) -> Result<()> {
+        let auth_key = Self::auth_key(request);
+        if session.socket.is_some() && session.auth_key.as_deref() == Some(auth_key.as_str()) {
+            return Ok(());
+        }
+
+        session.socket = None;
+        let url = format!("wss://{}:5036", request.environment.endpoint_host());
+        let (socket, _) = connect(url.as_str())
+            .with_context(|| format!("failed to connect to cTrader endpoint {url}"))?;
+        session.socket = Some(socket);
+        session.auth_key = Some(auth_key);
+
+        let fingerprint = request.request.idempotency_fingerprint();
+        let app_auth = build_application_auth_request(
+            &request.client_id,
+            &request.client_secret,
+            Self::client_msg_id_for("app-auth", &fingerprint, 0),
+        );
+        let account_auth = build_account_auth_request(
+            request
+                .account_id
+                .parse::<i64>()
+                .context("cTrader execution account id must be numeric")?,
+            &request.access_token,
+            Self::client_msg_id_for("account-auth", &fingerprint, 0),
+        );
+
+        let socket = session
+            .socket
+            .as_mut()
+            .context("cTrader execution socket missing after connect")?;
+        let response = Self::send_message_and_wait(socket, &app_auth)?;
+        ensure_payload_type(&response, CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+        let response = Self::send_message_and_wait(socket, &account_auth)?;
+        ensure_payload_type(&response, CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+        Ok(())
+    }
+
+    fn execute_via_session(
+        request: &CTraderExecutionRuntimeRequest,
+    ) -> Result<CTraderExecutionOutcome> {
+        let mut session = Self::session()
+            .lock()
+            .map_err(|_| anyhow!("cTrader execution session lock poisoned"))?;
+        let fingerprint = request.request.idempotency_fingerprint();
+        if let Some(cached) = Self::maybe_cached_outcome(&session, &fingerprint) {
+            return Ok(cached);
+        }
+
+        let mut last_error = None;
+        for attempt in 0..2 {
+            if let Err(err) = Self::ensure_authenticated(&mut session, request) {
+                session.socket = None;
+                session.auth_key = None;
+                last_error = Some(err);
+                continue;
+            }
+
+            let order_message = request.request.to_message(&Self::client_msg_id_for(
+                "execute",
+                &fingerprint,
+                attempt,
+            ));
+            let socket = session
+                .socket
+                .as_mut()
+                .context("cTrader execution socket missing after auth")?;
+            match Self::send_message_and_wait(socket, &order_message) {
+                Ok(response) => {
+                    let response_envelope = parse_open_api_envelope(&response)
+                        .context("failed to inspect cTrader execution response")?;
+                    if response_envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+                        let error_message =
+                            parse_ctrader_error_payload(&response_envelope.payload)?;
+                        session.socket = None;
+                        session.auth_key = None;
+                        return Err(anyhow!(error_message));
+                    }
+                    let outcome = parse_execution_outcome(&response)?;
+                    validate_execution_outcome(request, &outcome)?;
+                    Self::store_cached_outcome(&mut session, fingerprint.clone(), outcome.clone());
+                    return Ok(outcome);
+                }
+                Err(err) => {
+                    session.socket = None;
+                    session.auth_key = None;
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("cTrader execution failed")))
+    }
+
+    #[allow(dead_code)]
     fn execute_with_transport<T: CTraderOpenApiTransport>(
         transport: &T,
         request: &CTraderExecutionRuntimeRequest,
@@ -230,7 +523,11 @@ impl ProductionCTraderExecutionBackend {
             .context("cTrader execution account id must be numeric")?;
         let order_message = request.request.to_message("execute-1");
         let responses = transport.send_sequence(&[
-            build_application_auth_request(&request.client_id, &request.client_secret, "app-auth-1"),
+            build_application_auth_request(
+                &request.client_id,
+                &request.client_secret,
+                "app-auth-1",
+            ),
             build_account_auth_request(account_id, &request.access_token, "account-auth-1"),
             order_message,
         ])?;
@@ -250,12 +547,8 @@ impl ProductionCTraderExecutionBackend {
 }
 
 impl CTraderExecutionBackend for ProductionCTraderExecutionBackend {
-    fn execute(
-        &self,
-        request: &CTraderExecutionRuntimeRequest,
-    ) -> Result<CTraderExecutionOutcome> {
-        let transport = ProductionCTraderOpenApiTransport::new(request.environment.endpoint_host());
-        Self::execute_with_transport(&transport, request)
+    fn execute(&self, request: &CTraderExecutionRuntimeRequest) -> Result<CTraderExecutionOutcome> {
+        Self::execute_via_session(request)
     }
 }
 
@@ -295,9 +588,12 @@ fn ensure_payload_type(response_json: &str, expected_payload_type: u32) -> Resul
     let payload_type = envelope
         .get("payloadType")
         .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("missing payloadType in cTrader envelope"))? as u32;
+        .ok_or_else(|| anyhow!("missing payloadType in cTrader envelope"))?
+        as u32;
     if payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
-        return Err(anyhow!("cTrader execution transport returned error payload"));
+        return Err(anyhow!(
+            "cTrader execution transport returned error payload"
+        ));
     }
     if payload_type != expected_payload_type {
         return Err(anyhow!(
@@ -315,7 +611,8 @@ fn parse_execution_outcome(response_json: &str) -> Result<CTraderExecutionOutcom
     let payload_type = envelope
         .get("payloadType")
         .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("missing payloadType in cTrader envelope"))? as u32;
+        .ok_or_else(|| anyhow!("missing payloadType in cTrader envelope"))?
+        as u32;
     match payload_type {
         CTRADER_OA_EXECUTION_EVENT_PAYLOAD_TYPE => parse_execution_event(response_json),
         CTRADER_OA_ORDER_ERROR_EVENT_PAYLOAD_TYPE => parse_order_error_event(response_json),
@@ -326,8 +623,8 @@ fn parse_execution_outcome(response_json: &str) -> Result<CTraderExecutionOutcom
 }
 
 fn parse_execution_event(response_json: &str) -> Result<CTraderExecutionOutcome> {
-    let envelope: ExecutionEnvelope = serde_json::from_str(response_json)
-        .context("failed to parse cTrader execution event")?;
+    let envelope: ExecutionEnvelope =
+        serde_json::from_str(response_json).context("failed to parse cTrader execution event")?;
     if envelope.payload_type != CTRADER_OA_EXECUTION_EVENT_PAYLOAD_TYPE {
         return Err(anyhow!(
             "unexpected cTrader execution event payload type: {}",
@@ -355,7 +652,10 @@ fn parse_execution_event(response_json: &str) -> Result<CTraderExecutionOutcome>
         item.close_position_detail
             .as_ref()
             .map(|detail| scaled_money(detail.commission, money_digits))
-            .or_else(|| item.commission.map(|commission| scaled_money(commission, money_digits)))
+            .or_else(|| {
+                item.commission
+                    .map(|commission| scaled_money(commission, money_digits))
+            })
     });
     let swap = deal.as_ref().and_then(|item| {
         item.close_position_detail
@@ -369,7 +669,9 @@ fn parse_execution_event(response_json: &str) -> Result<CTraderExecutionOutcome>
             .map(|fee| scaled_money(fee, money_digits))
     });
     let net_profit = match (gross_profit, fee, swap, pnl_conversion_fee) {
-        (Some(gross), fee, swap, pnl_fee) => Some(gross + fee.unwrap_or(0.0) + swap.unwrap_or(0.0) + pnl_fee.unwrap_or(0.0)),
+        (Some(gross), fee, swap, pnl_fee) => {
+            Some(gross + fee.unwrap_or(0.0) + swap.unwrap_or(0.0) + pnl_fee.unwrap_or(0.0))
+        }
         _ => None,
     };
 
@@ -381,7 +683,10 @@ fn parse_execution_event(response_json: &str) -> Result<CTraderExecutionOutcome>
             .map(|item| item.trade_data.symbol_id)
             .or_else(|| position.as_ref().map(|item| item.trade_data.symbol_id))
             .or_else(|| deal.as_ref().map(|item| item.symbol_id)),
-        order_id: order.as_ref().map(|item| item.order_id).or_else(|| deal.as_ref().map(|item| item.order_id)),
+        order_id: order
+            .as_ref()
+            .map(|item| item.order_id)
+            .or_else(|| deal.as_ref().map(|item| item.order_id)),
         position_id: position
             .as_ref()
             .map(|item| item.position_id)
@@ -390,14 +695,25 @@ fn parse_execution_event(response_json: &str) -> Result<CTraderExecutionOutcome>
         trade_side: order
             .as_ref()
             .map(|item| trade_side_label(item.trade_data.trade_side))
-            .or_else(|| position.as_ref().map(|item| trade_side_label(item.trade_data.trade_side)))
+            .or_else(|| {
+                position
+                    .as_ref()
+                    .map(|item| trade_side_label(item.trade_data.trade_side))
+            })
             .or_else(|| deal.as_ref().map(|item| trade_side_label(item.trade_side))),
         order_type: order.as_ref().map(|item| order_type_label(item.order_type)),
         lot_size: order
             .as_ref()
             .map(|item| volume_to_units(item.trade_data.volume))
-            .or_else(|| position.as_ref().map(|item| volume_to_units(item.trade_data.volume)))
-            .or_else(|| deal.as_ref().map(|item| volume_to_units(item.filled_volume))),
+            .or_else(|| {
+                position
+                    .as_ref()
+                    .map(|item| volume_to_units(item.trade_data.volume))
+            })
+            .or_else(|| {
+                deal.as_ref()
+                    .map(|item| volume_to_units(item.filled_volume))
+            }),
         execution_price: deal
             .as_ref()
             .and_then(|item| item.execution_price)
@@ -410,16 +726,24 @@ fn parse_execution_event(response_json: &str) -> Result<CTraderExecutionOutcome>
         timestamp_ms: deal
             .as_ref()
             .map(|item| item.execution_timestamp)
-            .or_else(|| order.as_ref().and_then(|item| item.trade_data.open_timestamp))
-            .or_else(|| position.as_ref().and_then(|item| item.trade_data.open_timestamp)),
+            .or_else(|| {
+                order
+                    .as_ref()
+                    .and_then(|item| item.trade_data.open_timestamp)
+            })
+            .or_else(|| {
+                position
+                    .as_ref()
+                    .and_then(|item| item.trade_data.open_timestamp)
+            }),
         error_code: envelope.payload.error_code,
         description: None,
     })
 }
 
 fn parse_order_error_event(response_json: &str) -> Result<CTraderExecutionOutcome> {
-    let envelope: OrderErrorEnvelope = serde_json::from_str(response_json)
-        .context("failed to parse cTrader order error event")?;
+    let envelope: OrderErrorEnvelope =
+        serde_json::from_str(response_json).context("failed to parse cTrader order error event")?;
     if envelope.payload_type != CTRADER_OA_ORDER_ERROR_EVENT_PAYLOAD_TYPE {
         return Err(anyhow!(
             "unexpected cTrader order error payload type: {}",
@@ -475,6 +799,63 @@ fn order_type_label(value: i32) -> String {
         6 => "STOP_LIMIT".to_string(),
         other => format!("ORDER_{other}"),
     }
+}
+
+fn validate_execution_outcome(
+    request: &CTraderExecutionRuntimeRequest,
+    outcome: &CTraderExecutionOutcome,
+) -> Result<()> {
+    let requested_account_id = request
+        .account_id
+        .parse::<i64>()
+        .context("cTrader execution account id must be numeric")?;
+    if outcome.account_id != requested_account_id {
+        anyhow::bail!(
+            "cTrader execution response account mismatch: expected {}, got {}",
+            requested_account_id,
+            outcome.account_id
+        );
+    }
+
+    match &request.request {
+        CTraderExecutionRequest::NewOrder(inner) => {
+            if outcome.symbol_id != Some(inner.symbol_id) {
+                anyhow::bail!(
+                    "cTrader new-order response symbol mismatch: expected {}, got {:?}",
+                    inner.symbol_id,
+                    outcome.symbol_id
+                );
+            }
+            if outcome.order_id.is_none()
+                && outcome.position_id.is_none()
+                && outcome.deal_id.is_none()
+            {
+                anyhow::bail!(
+                    "cTrader new-order response did not include an order, position, or deal id"
+                );
+            }
+        }
+        CTraderExecutionRequest::CancelOrder(inner) => {
+            if outcome.order_id != Some(inner.order_id) {
+                anyhow::bail!(
+                    "cTrader cancel-order response order mismatch: expected {}, got {:?}",
+                    inner.order_id,
+                    outcome.order_id
+                );
+            }
+        }
+        CTraderExecutionRequest::ClosePosition(inner) => {
+            if outcome.position_id != Some(inner.position_id) {
+                anyhow::bail!(
+                    "cTrader close-position response position mismatch: expected {}, got {:?}",
+                    inner.position_id,
+                    outcome.position_id
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -693,5 +1074,91 @@ mod tests {
         assert_eq!(outcome.status, CTraderExecutionStatus::Cancelled);
         assert_eq!(outcome.position_id, Some(9001));
         assert_eq!(outcome.lot_size, Some(50000.0));
+    }
+
+    #[test]
+    fn identical_execution_requests_have_identical_fingerprints_and_variants_do_not() {
+        let mut base = CTraderNewOrderRequest {
+            account_id: 712345,
+            symbol_id: 14,
+            order_type: CTraderOrderType::Market,
+            trade_side: crate::app_services::ctrader_messages::CTraderTradeSide::Buy,
+            volume: 100000,
+            limit_price: None,
+            stop_price: None,
+            time_in_force: Some(CTraderTimeInForce::ImmediateOrCancel),
+            expiration_timestamp_ms: None,
+            stop_loss: None,
+            take_profit: None,
+            comment: Some("alpha".to_string()),
+            base_slippage_price: None,
+            slippage_in_points: Some(10),
+            label: Some("entry".to_string()),
+            position_id: None,
+            client_order_id: Some("id-1".to_string()),
+            relative_stop_loss: None,
+            relative_take_profit: None,
+            guaranteed_stop_loss: None,
+            trailing_stop_loss: None,
+            stop_trigger_method: None,
+        };
+        let a = CTraderExecutionRequest::NewOrder(Box::new(base.clone()));
+        let b = CTraderExecutionRequest::NewOrder(Box::new(base.clone()));
+        base.client_order_id = Some("id-2".to_string());
+        let c = CTraderExecutionRequest::NewOrder(Box::new(base));
+
+        assert_eq!(a.idempotency_fingerprint(), b.idempotency_fingerprint());
+        assert_ne!(a.idempotency_fingerprint(), c.idempotency_fingerprint());
+    }
+
+    #[test]
+    fn validate_execution_outcome_rejects_symbol_mismatch_for_new_order() {
+        let request = sample_runtime_request(CTraderExecutionRequest::NewOrder(Box::new(
+            CTraderNewOrderRequest {
+                account_id: 712345,
+                symbol_id: 14,
+                order_type: CTraderOrderType::Market,
+                trade_side: crate::app_services::ctrader_messages::CTraderTradeSide::Buy,
+                volume: 100000,
+                limit_price: None,
+                stop_price: None,
+                time_in_force: None,
+                expiration_timestamp_ms: None,
+                stop_loss: None,
+                take_profit: None,
+                comment: None,
+                base_slippage_price: None,
+                slippage_in_points: None,
+                label: None,
+                position_id: None,
+                client_order_id: None,
+                relative_stop_loss: None,
+                relative_take_profit: None,
+                guaranteed_stop_loss: None,
+                trailing_stop_loss: None,
+                stop_trigger_method: None,
+            },
+        )));
+        let outcome = CTraderExecutionOutcome {
+            status: CTraderExecutionStatus::Accepted,
+            account_id: 712345,
+            symbol_id: Some(99),
+            order_id: Some(1),
+            position_id: None,
+            deal_id: None,
+            trade_side: Some("BUY".to_string()),
+            order_type: Some("MARKET".to_string()),
+            lot_size: Some(1000.0),
+            execution_price: None,
+            gross_profit: None,
+            fee: None,
+            swap: None,
+            net_profit: None,
+            timestamp_ms: None,
+            error_code: None,
+            description: None,
+        };
+
+        assert!(validate_execution_outcome(&request, &outcome).is_err());
     }
 }

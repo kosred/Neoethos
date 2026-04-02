@@ -1,5 +1,5 @@
-use forex_core::config::RiskConfig;
 use eframe::egui;
+use forex_core::config::RiskConfig;
 use std::ops::RangeInclusive;
 
 pub fn drawdown_slider_bounds() -> RangeInclusive<f64> {
@@ -26,17 +26,18 @@ pub fn render(ui: &mut egui::Ui, risk: &mut RiskConfig) {
             .text("Daily Drawdown Limit (%)"),
     );
     ui.add(
-        egui::Slider::new(&mut risk.total_drawdown_limit, total_drawdown_slider_bounds())
-            .text("Total Drawdown Limit (%)"),
+        egui::Slider::new(
+            &mut risk.total_drawdown_limit,
+            total_drawdown_slider_bounds(),
+        )
+        .text("Total Drawdown Limit (%)"),
     );
     ui.add(
         egui::Slider::new(&mut risk.risk_per_trade, risk_per_trade_slider_bounds())
             .text("Risk Per Trade (Ratio)"),
     );
     ui.add(
-        egui::Slider::new(&mut risk.max_lot_size, lot_size_slider_bounds())
-            .text("Max Lot Size"),
+        egui::Slider::new(&mut risk.max_lot_size, lot_size_slider_bounds()).text("Max Lot Size"),
     );
     ui.checkbox(&mut risk.require_stop_loss, "Require Stop-Loss (Prop Firm)");
 }
-

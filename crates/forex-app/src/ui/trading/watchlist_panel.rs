@@ -26,8 +26,12 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &TradingSession)
 
     ui.strong("Watchlist");
     ui.add_space(8.0);
-    ui.label(egui::RichText::new(format!("Adapter: {}", panel.adapter_name)).color(theme::TEXT_MUTED));
-    ui.label(egui::RichText::new(format!("Runtime: {}", panel.runtime_status)).color(theme::TEXT_MUTED));
+    ui.label(
+        egui::RichText::new(format!("Adapter: {}", panel.adapter_name)).color(theme::TEXT_MUTED),
+    );
+    ui.label(
+        egui::RichText::new(format!("Runtime: {}", panel.runtime_status)).color(theme::TEXT_MUTED),
+    );
     ui.add_space(8.0);
 
     for symbol in &panel.symbols {
@@ -62,7 +66,15 @@ mod tests {
             data_dir: PathBuf::from("data"),
             start_local: false,
         };
-        let mut state = AppState::new(runtime, vec!["EURUSD".to_string(), "GBPUSD".to_string(), "XAUUSD".to_string()]);
+        let mut state = AppState::new(
+            runtime,
+            &forex_core::Settings::default(),
+            vec![
+                "EURUSD".to_string(),
+                "GBPUSD".to_string(),
+                "XAUUSD".to_string(),
+            ],
+        );
         state.selected_pair = "EURUSD".to_string();
         state
     }

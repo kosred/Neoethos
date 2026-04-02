@@ -133,8 +133,12 @@ impl PortfolioOptimizer {
             for i in 0..n_assets {
                 let s = &names[i];
                 let sharpe = *sharpe_map.get(s).unwrap_or(&0.0);
-                let div_score = 1.0 / (1.0 + avg_corr[i].abs());
-                raw[i] = (1.0 / vols[i]) * sharpe.max(0.01) * div_score;
+                let div_score = if avg_corr[i] >= 0.0 {
+                    1.0 / (1.0 + avg_corr[i])
+                } else {
+                    1.0 + (-avg_corr[i]).min(1.0) * 0.5
+                };
+                raw[i] = (1.0 / vols[i]) * sharpe.max(0.0) * div_score;
             }
 
             if raw.iter().all(|v| *v <= 0.0) {

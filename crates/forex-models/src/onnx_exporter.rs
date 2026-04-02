@@ -9,12 +9,20 @@
 
 use anyhow::{Context, Result};
 use ndarray::Array2;
+#[cfg(feature = "python-onnx-export")]
 use pyo3::prelude::*;
+#[cfg(feature = "python-onnx-export")]
 use pyo3::types::{PyDict, PyModule};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "python-onnx-export")]
 use tracing::{info, warn};
+
+#[cfg(feature = "python-onnx-export")]
+use crate::registry::get_model_capability;
+#[cfg(feature = "python-onnx-export")]
+use crate::runtime::capabilities::ModelFamily;
 
 // ============================================================================
 // ONNX EXPORT METADATA
@@ -38,12 +46,79 @@ pub struct ExportManifest {
 /// ONNXExporter - Wraps Python onnx_exporter.py for PyTorch model export
 /// Tree models (LightGBM, XGBoost, CatBoost) export directly via Rust
 pub struct ONNXExporter {
+    #[cfg(feature = "python-onnx-export")]
     py_exporter: Option<Py<PyAny>>,
+    #[cfg_attr(not(feature = "python-onnx-export"), allow(dead_code))]
     models_dir: PathBuf,
+    #[cfg_attr(not(feature = "python-onnx-export"), allow(dead_code))]
     onnx_dir: PathBuf,
 }
 
 impl ONNXExporter {
+    #[cfg(feature = "python-onnx-export")]
+    fn resolve_export_route(&self, name: &str, model: &Bound<'_, PyAny>) -> Result<ExportRoute> {
+        if let Some(capability) = get_model_capability(name) {
+            return match capability.family {
+                ModelFamily::Tree => {
+                    if capability.name.contains("lightgbm") || capability.name.contains("lgbm") {
+                        Ok(ExportRoute::LightGbm)
+                    } else if capability.name.contains("xgboost") || capability.name.contains("xgb")
+                    {
+                        Ok(ExportRoute::XgBoost)
+                    } else if capability.name.contains("catboost")
+                        || capability.name.contains("cat")
+                    {
+                        Ok(ExportRoute::CatBoost)
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "tree model `{}` has no ONNX export route",
+                            capability.name
+                        ))
+                    }
+                }
+                ModelFamily::Deep
+                | ModelFamily::Forecasting
+                | ModelFamily::Exit
+                | ModelFamily::Evolutionary
+                | ModelFamily::Rl => Ok(ExportRoute::PyTorch),
+                ModelFamily::Meta | ModelFamily::Adaptive | ModelFamily::Anomaly => {
+                    Err(anyhow::anyhow!(
+                        "model `{}` ({:?}) does not currently expose a supported ONNX export path",
+                        capability.name,
+                        capability.family
+                    ))
+                }
+            };
+        }
+
+        let model_type_str = model.get_type().name()?.to_string();
+        let normalized_type = model_type_str.to_ascii_lowercase();
+        let normalized_name = name.to_ascii_lowercase();
+        if model.hasattr("state_dict")?
+            || normalized_type.contains("mlp")
+            || normalized_type.contains("nbeats")
+            || normalized_type.contains("tide")
+            || normalized_type.contains("tabnet")
+            || normalized_type.contains("kan")
+            || normalized_type.contains("transformer")
+            || normalized_type.contains("patch")
+            || normalized_type.contains("timesnet")
+        {
+            Ok(ExportRoute::PyTorch)
+        } else if normalized_name.contains("lightgbm") || normalized_name.contains("lgbm") {
+            Ok(ExportRoute::LightGbm)
+        } else if normalized_name.contains("xgboost") || normalized_name.contains("xgb") {
+            Ok(ExportRoute::XgBoost)
+        } else if normalized_name.contains("catboost") || normalized_name.contains("cat") {
+            Ok(ExportRoute::CatBoost)
+        } else {
+            Err(anyhow::anyhow!(
+                "unable to resolve ONNX export route for model `{name}` of runtime type `{model_type_str}`"
+            ))
+        }
+    }
+
+    #[cfg(feature = "python-onnx-export")]
     fn array2_to_numpy(py: Python<'_>, sample_input: &Array2<f32>) -> PyResult<Py<PyAny>> {
         let numpy = PyModule::import(py, "numpy")?;
         let shape = (sample_input.nrows(), sample_input.ncols());
@@ -62,7 +137,7 @@ impl ONNXExporter {
         // Create ONNX directory
         std::fs::create_dir_all(&onnx_dir).context("Failed to create ONNX directory")?;
 
-        // Initialize Python exporter
+        #[cfg(feature = "python-onnx-export")]
         let py_exporter = Python::attach(|py| {
             let exporter_module = PyModule::import(py, "forex_bot.models.onnx_exporter")
                 .context("Failed to import forex_bot.models.onnx_exporter")?;
@@ -79,7 +154,9 @@ impl ONNXExporter {
             Ok::<Py<PyAny>, anyhow::Error>(py_exporter.into())
         })?;
 
+        // Initialize Python exporter
         Ok(Self {
+            #[cfg(feature = "python-onnx-export")]
             py_exporter: Some(py_exporter),
             models_dir,
             onnx_dir,
@@ -88,6 +165,7 @@ impl ONNXExporter {
 
     /// Export PyTorch neural network model to ONNX
     /// Delegates to Python torch.onnx.export via PyO3
+    #[cfg(feature = "python-onnx-export")]
     pub fn export_pytorch_model(
         &self,
         name: &str,
@@ -112,6 +190,7 @@ impl ONNXExporter {
 
     /// Export LightGBM model to ONNX using onnxmltools
     /// Python lines 209-233
+    #[cfg(feature = "python-onnx-export")]
     pub fn export_lightgbm_model(&self, name: &str, sample_input: &Array2<f32>) -> Result<PathBuf> {
         Python::attach(|py| {
             let exporter = self
@@ -127,7 +206,8 @@ impl ONNXExporter {
             let model = joblib.call_method1("load", (model_path.to_string_lossy().as_ref(),))?;
 
             // Export via Python
-            let result = exporter.call_method1("_export_lightgbm_model", (name, model, np_array))?;
+            let result =
+                exporter.call_method1("_export_lightgbm_model", (name, model, np_array))?;
 
             if result.is_none() {
                 return Err(anyhow::anyhow!("LightGBM ONNX export returned None"));
@@ -140,6 +220,7 @@ impl ONNXExporter {
 
     /// Export XGBoost model to ONNX using onnxmltools
     /// Python lines 235-259
+    #[cfg(feature = "python-onnx-export")]
     pub fn export_xgboost_model(&self, name: &str, sample_input: &Array2<f32>) -> Result<PathBuf> {
         Python::attach(|py| {
             let exporter = self
@@ -166,6 +247,7 @@ impl ONNXExporter {
 
     /// Export CatBoost model to ONNX using CatBoost's native exporter
     /// Python lines 193-207
+    #[cfg(feature = "python-onnx-export")]
     pub fn export_catboost_model(&self, name: &str, sample_input: &Array2<f32>) -> Result<PathBuf> {
         Python::attach(|py| {
             let exporter = self
@@ -179,7 +261,8 @@ impl ONNXExporter {
             let joblib = PyModule::import(py, "joblib")?;
             let model = joblib.call_method1("load", (model_path.to_string_lossy().as_ref(),))?;
 
-            let result = exporter.call_method1("_export_catboost_model", (name, model, np_array))?;
+            let result =
+                exporter.call_method1("_export_catboost_model", (name, model, np_array))?;
 
             if result.is_none() {
                 return Err(anyhow::anyhow!("CatBoost ONNX export returned None"));
@@ -192,6 +275,7 @@ impl ONNXExporter {
 
     /// Export all models to ONNX format
     /// Python lines 61-131
+    #[cfg(feature = "python-onnx-export")]
     pub fn export_all(
         &self,
         models: HashMap<String, Py<PyAny>>,
@@ -223,6 +307,7 @@ impl ONNXExporter {
     }
 
     /// Export a single model (auto-detects type)
+    #[cfg(feature = "python-onnx-export")]
     fn export_model(
         &self,
         name: &str,
@@ -232,26 +317,15 @@ impl ONNXExporter {
         Python::attach(|py| {
             let model_bound = model.bind(py);
             let model_type_str = model_bound.get_type().name()?.to_string();
+            let route = self.resolve_export_route(name, model_bound)?;
 
             info!("Exporting {} (type: {})", name, model_type_str);
 
-            // Detect model type and route to appropriate exporter
-            let path = if model_type_str.contains("MLP")
-                || model_type_str.contains("NBeats")
-                || model_type_str.contains("TiDE")
-                || model_type_str.contains("TabNet")
-                || model_type_str.contains("KAN")
-            {
-                // PyTorch neural network
-                self.export_pytorch_model(name, model, sample_input)?
-            } else if name.contains("lightgbm") || name.contains("lgbm") {
-                self.export_lightgbm_model(name, sample_input)?
-            } else if name.contains("xgboost") || name.contains("xgb") {
-                self.export_xgboost_model(name, sample_input)?
-            } else if name.contains("catboost") || name.contains("cat") {
-                self.export_catboost_model(name, sample_input)?
-            } else {
-                return Err(anyhow::anyhow!("Unknown model type: {}", model_type_str));
+            let path = match route {
+                ExportRoute::PyTorch => self.export_pytorch_model(name, model, sample_input)?,
+                ExportRoute::LightGbm => self.export_lightgbm_model(name, sample_input)?,
+                ExportRoute::XgBoost => self.export_xgboost_model(name, sample_input)?,
+                ExportRoute::CatBoost => self.export_catboost_model(name, sample_input)?,
             };
 
             // Extract classes if available
@@ -262,6 +336,7 @@ impl ONNXExporter {
     }
 
     /// Extract class labels from model
+    #[cfg(feature = "python-onnx-export")]
     fn extract_classes(model: &Bound<'_, PyAny>) -> Result<Option<Vec<i32>>> {
         Python::attach(|_py| {
             // Try to get classes_ attribute
@@ -283,6 +358,15 @@ impl ONNXExporter {
             Ok(None)
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "python-onnx-export")]
+enum ExportRoute {
+    PyTorch,
+    LightGbm,
+    XgBoost,
+    CatBoost,
 }
 
 // ============================================================================
@@ -330,16 +414,22 @@ pub trait ONNXExportable {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "python-onnx-export")]
     use super::*;
+    #[cfg(feature = "python-onnx-export")]
     use ndarray::array;
+    #[cfg(feature = "python-onnx-export")]
     use pyo3::types::PyDict;
+    #[cfg(feature = "python-onnx-export")]
     use std::ffi::CString;
 
+    #[cfg(feature = "python-onnx-export")]
     fn run_py(py: Python<'_>, code: &str, locals: &Bound<'_, PyDict>) -> PyResult<()> {
         let code = CString::new(code).expect("python code should not contain embedded nulls");
         py.run(code.as_c_str(), Some(locals), Some(locals))
     }
 
+    #[cfg(feature = "python-onnx-export")]
     #[test]
     fn test_export_pytorch_model_avoids_pandas_bridge() -> Result<()> {
         Python::attach(|py| {

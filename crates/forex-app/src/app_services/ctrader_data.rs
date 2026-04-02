@@ -1,18 +1,18 @@
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::{
-    build_account_auth_request, build_application_auth_request, build_get_trendbars_request,
-    build_get_tick_data_request, build_symbol_by_id_request, build_symbols_list_request,
-    build_subscribe_live_trendbar_request, build_subscribe_spots_request,
-    build_unsubscribe_live_trendbar_request, build_unsubscribe_spots_request,
-    parse_ctrader_error_payload, parse_open_api_envelope, trendbar_period_value,
-    CTraderOpenApiJsonMessage, CTraderOpenApiTransport, ProductionCTraderOpenApiTransport, CTRADER_QUOTE_TYPE_ASK,
-    CTRADER_QUOTE_TYPE_BID,
-    CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_GET_TICK_DATA_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_GET_TRENDBARS_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_SYMBOL_BY_ID_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_SYMBOLS_LIST_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_QUOTE_TYPE_ASK, CTRADER_QUOTE_TYPE_BID, CTraderOpenApiJsonMessage,
+    CTraderOpenApiTransport, ProductionCTraderOpenApiTransport, build_account_auth_request,
+    build_application_auth_request, build_get_tick_data_request, build_get_trendbars_request,
+    build_subscribe_live_trendbar_request, build_subscribe_spots_request,
+    build_symbol_by_id_request, build_symbols_list_request,
+    build_unsubscribe_live_trendbar_request, build_unsubscribe_spots_request,
+    parse_ctrader_error_payload, parse_open_api_envelope, trendbar_period_value,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -391,9 +391,19 @@ pub fn parse_tick_data_response(
             price: relative_price_to_absolute(tick.tick, symbol.digits),
         });
     }
+    ticks.sort_by_key(|tick| tick.timestamp_ms);
 
     Ok(HistoricalTicksResult {
-        symbol_id: envelope.payload.symbol_id.unwrap_or(symbol.symbol_id),
+        symbol_id: match envelope.payload.symbol_id {
+            Some(symbol_id) if symbol_id != symbol.symbol_id => {
+                return Err(anyhow!(
+                    "unexpected cTrader tick-data symbol id: {}",
+                    symbol_id
+                ));
+            }
+            Some(symbol_id) => symbol_id,
+            None => symbol.symbol_id,
+        },
         ticks,
         has_more: envelope.payload.has_more,
     })
@@ -492,7 +502,9 @@ pub fn load_chart_history_with_transport<T: CTraderOpenApiTransport>(
     })
 }
 
-pub fn load_chart_history(request: &CTraderChartHistoryRequest) -> Result<CTraderChartHistoryResult> {
+pub fn load_chart_history(
+    request: &CTraderChartHistoryRequest,
+) -> Result<CTraderChartHistoryResult> {
     let transport = ProductionCTraderOpenApiTransport::new(request.environment.endpoint_host());
     load_chart_history_with_transport(&transport, request)
 }
@@ -513,17 +525,15 @@ pub fn load_historical_bars_only_with_transport<T: CTraderOpenApiTransport>(
         },
     )?;
     let trendbar_period = trendbar_period_value(&request.timeframe)?;
-    let responses = transport.send_sequence(&[
-        build_get_trendbars_request(
-            resolved.account_id,
-            resolved.light_symbol.symbol_id,
-            trendbar_period,
-            request.from_timestamp_ms,
-            request.to_timestamp_ms,
-            request.count,
-            "trendbars-1",
-        ),
-    ])?;
+    let responses = transport.send_sequence(&[build_get_trendbars_request(
+        resolved.account_id,
+        resolved.light_symbol.symbol_id,
+        trendbar_period,
+        request.from_timestamp_ms,
+        request.to_timestamp_ms,
+        request.count,
+        "trendbars-1",
+    )])?;
 
     if responses.len() != 1 {
         return Err(anyhow!(
@@ -540,6 +550,7 @@ pub fn load_historical_bars_only_with_transport<T: CTraderOpenApiTransport>(
     })
 }
 
+#[allow(dead_code)]
 pub fn load_historical_bars_only(
     request: &CTraderChartHistoryRequest,
 ) -> Result<CTraderHistoricalBarsFetchResult> {
@@ -584,11 +595,18 @@ pub fn resolve_symbol_with_transport<T: CTraderOpenApiTransport>(
         .symbols
         .into_iter()
         .find(|symbol| normalize_symbol_key(&symbol.symbol_name) == requested_key)
-        .ok_or_else(|| anyhow!("cTrader symbol '{}' was not found for this account", request.symbol_name))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "cTrader symbol '{}' was not found for this account",
+                request.symbol_name
+            )
+        })?;
 
-    let detail_responses = transport.send_sequence(&[
-        build_symbol_by_id_request(account_id, &[light_symbol.symbol_id], "symbol-by-id-1"),
-    ])?;
+    let detail_responses = transport.send_sequence(&[build_symbol_by_id_request(
+        account_id,
+        &[light_symbol.symbol_id],
+        "symbol-by-id-1",
+    )])?;
     if detail_responses.len() != 1 {
         return Err(anyhow!(
             "expected 1 cTrader symbol-by-id response, received {}",
@@ -599,7 +617,12 @@ pub fn resolve_symbol_with_transport<T: CTraderOpenApiTransport>(
     let mut symbol = parse_symbol_by_id_response(&detail_responses[0])?
         .into_iter()
         .find(|symbol| symbol.symbol_id == light_symbol.symbol_id)
-        .ok_or_else(|| anyhow!("cTrader full symbol metadata missing for symbol {}", light_symbol.symbol_id))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "cTrader full symbol metadata missing for symbol {}",
+                light_symbol.symbol_id
+            )
+        })?;
     symbol.symbol_name = light_symbol.symbol_name.clone();
     symbol.display_name = light_symbol
         .description
@@ -714,8 +737,14 @@ mod tests {
     }
 
     impl CTraderOpenApiTransport for StubTransport {
-        fn send_sequence(&self, messages: &[CTraderOpenApiJsonMessage]) -> anyhow::Result<Vec<String>> {
-            self.sent.lock().expect("sent lock").extend(messages.iter().cloned());
+        fn send_sequence(
+            &self,
+            messages: &[CTraderOpenApiJsonMessage],
+        ) -> anyhow::Result<Vec<String>> {
+            self.sent
+                .lock()
+                .expect("sent lock")
+                .extend(messages.iter().cloned());
             let mut responses = self.responses.lock().expect("responses lock");
             let mut output = Vec::with_capacity(messages.len());
             for _ in messages {
@@ -878,11 +907,52 @@ mod tests {
 
         assert_eq!(result.symbol_id, 1);
         assert_eq!(result.ticks.len(), 2);
-        assert_eq!(result.ticks[0].timestamp_ms, 1_700_000_000_000);
-        assert_eq!(result.ticks[1].timestamp_ms, 1_699_999_999_750);
-        assert!((result.ticks[0].price - 1.10120).abs() < 1e-9);
-        assert!((result.ticks[1].price - 1.10100).abs() < 1e-9);
+        assert!(result.ticks[0].timestamp_ms < result.ticks[1].timestamp_ms);
+        assert_eq!(result.ticks[0].timestamp_ms, 1_699_999_999_750);
+        assert_eq!(result.ticks[1].timestamp_ms, 1_700_000_000_000);
+        assert!((result.ticks[0].price - 1.10100).abs() < 1e-9);
+        assert!((result.ticks[1].price - 1.10120).abs() < 1e-9);
         assert!(result.has_more);
+    }
+
+    #[test]
+    fn tick_data_response_rejects_mismatched_symbol_id() {
+        let symbol = CTraderSymbolInfo {
+            symbol_id: 1,
+            symbol_name: "EUR/USD".to_string(),
+            display_name: "EUR/USD".to_string(),
+            digits: 5,
+            pip_position: 4,
+            is_archived: false,
+            is_trading_enabled: true,
+            min_volume: None,
+            max_volume: None,
+            step_volume: None,
+            lot_size: None,
+            pnl_conversion_fee_rate: None,
+        };
+        let response = serde_json::json!({
+            "clientMsgId": "ticks-1",
+            "payloadType": 2146,
+            "payload": {
+                "symbolId": 2,
+                "hasMore": false,
+                "tickData": [
+                    {
+                        "timestamp": 1_700_000_000_000i64,
+                        "tick": 110120
+                    }
+                ]
+            }
+        });
+
+        let err = parse_tick_data_response(&response.to_string(), &symbol)
+            .expect_err("mismatched symbol id should fail");
+        assert!(
+            err.to_string()
+                .contains("unexpected cTrader tick-data symbol id"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

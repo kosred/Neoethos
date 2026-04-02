@@ -13,7 +13,16 @@ impl WorkspaceState {
         let [chart_node, _watchlist_node] = surface.split_left(
             NodeIndex::root(),
             0.18,
-            vec![WorkspaceTab::Dashboard, WorkspaceTab::Watchlist, WorkspaceTab::SystemStatus, WorkspaceTab::Hardware, WorkspaceTab::Risk],
+            vec![
+                WorkspaceTab::Dashboard,
+                WorkspaceTab::Watchlist,
+                WorkspaceTab::Runtime,
+                WorkspaceTab::BrokerSetup,
+                WorkspaceTab::Intelligence,
+                WorkspaceTab::DataBootstrap,
+                WorkspaceTab::Hardware,
+                WorkspaceTab::Risk,
+            ],
         );
 
         let [chart_node, _right_node] = surface.split_right(
@@ -32,9 +41,7 @@ impl WorkspaceState {
             ],
         );
 
-        Self {
-            dock_state,
-        }
+        Self { dock_state }
     }
 
     pub fn dock_state_mut(&mut self) -> &mut DockState<WorkspaceTab> {
@@ -85,7 +92,10 @@ mod tests {
         assert!(tabs.contains(&"Bottom Strip".to_string()));
         assert!(tabs.contains(&"Discovery".to_string()));
         assert!(tabs.contains(&"Training".to_string()));
-        assert!(tabs.contains(&"System Status".to_string()));
+        assert!(tabs.contains(&"Runtime".to_string()));
+        assert!(tabs.contains(&"Broker Setup".to_string()));
+        assert!(tabs.contains(&"Intelligence".to_string()));
+        assert!(tabs.contains(&"Data Bootstrap".to_string()));
         assert!(tabs.contains(&"Hardware".to_string()));
         assert!(tabs.contains(&"Risk Settings".to_string()));
     }

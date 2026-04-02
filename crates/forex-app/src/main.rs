@@ -3,24 +3,22 @@ mod app_state;
 mod ui;
 mod workspace;
 
+use crate::ui::components::render_ribbon_item;
 use app_services::{
-    discovery::DiscoveryJobHandle,
-    trading::TradingSession,
+    ServiceEvent, discovery::DiscoveryJobHandle, trading::TradingSession,
     training::TrainingJobHandle,
-    ServiceEvent,
 };
 use app_state::{AppRuntimeConfig, AppState};
+use clap::Parser;
 use eframe::egui;
-use crate::ui::components::render_ribbon_item;
+use forex_core::Settings;
 use forex_core::logging::{setup_logging, write_subsystem_record};
 use forex_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
-use forex_core::Settings;
 use mt5_bridge::MT5Engine;
-use clap::Parser;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
-use std::time::{SystemTime, UNIX_EPOCH};
-use workspace::{render_workspace, WorkspaceState, WorkspaceViewer};
+use workspace::{WorkspaceState, WorkspaceViewer, render_workspace};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -67,7 +65,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eframe::run_native(
             "Forex AI - Pure Rust Terminal",
             options,
-            Box::new(|cc| Ok(Box::new(ForexApp::new(cc, runtime.clone())))),
+            Box::new(|cc| {
+                Ok(Box::new(ForexApp::new(
+                    cc,
+                    runtime.clone(),
+                    settings.clone(),
+                )))
+            }),
         )?;
         Ok(())
     }
@@ -75,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_headless_loop(runtime: AppRuntimeConfig) {
     info!("Loading configuration from: {}", runtime.config_path);
-    
+
     if runtime.start_local {
         info!("Running in Pure Local Mode (Linux Server Discovery/Training).");
         let symbols = forex_data::discover_symbols(&runtime.data_dir).unwrap_or_default();
@@ -101,12 +105,15 @@ async fn run_headless_loop(runtime: AppRuntimeConfig) {
         for sym in &symbols {
             info!("  - Symbol available: {}", sym);
         }
-        
+
         info!("Headless engine is now active and monitoring background tasks.");
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
         loop {
             interval.tick().await;
-            info!("Headless keep-alive tick: System Health OK | Cores: {} | Mode: LOCAL", num_cpus::get());
+            info!(
+                "Headless keep-alive tick: System Health OK | Cores: {} | Mode: LOCAL",
+                num_cpus::get()
+            );
         }
     } else {
         match MT5Engine::new() {
@@ -115,16 +122,30 @@ async fn run_headless_loop(runtime: AppRuntimeConfig) {
                     info!("MT5 successfully connected. Ready for Live Trading.");
                     if let Err(err) = write_subsystem_record(
                         SubsystemSection::App,
-                        app_record("headless_mt5_start", "SUCCESS", "MT5 connected for headless mode"),
+                        app_record(
+                            "headless_mt5_start",
+                            "SUCCESS",
+                            "MT5 connected for headless mode",
+                        ),
                     ) {
                         error!("Failed to write APP section log: {}", err);
                     }
-                    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+                    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
                     loop {
                         interval.tick().await;
+                        match engine.terminal_info() {
+                            Ok(info_text) => {
+                                info!("Headless MT5 heartbeat: connected | {}", info_text);
+                            }
+                            Err(err) => {
+                                warn!("Headless MT5 heartbeat degraded: {}", err);
+                            }
+                        }
                     }
                 } else {
-                    warn!("MT5 Connection failed or MetaTrader5 module missing. Headless trading disabled.");
+                    warn!(
+                        "MT5 Connection failed or MetaTrader5 module missing. Headless trading disabled."
+                    );
                     if let Err(err) = write_subsystem_record(
                         SubsystemSection::App,
                         app_record(
@@ -141,7 +162,11 @@ async fn run_headless_loop(runtime: AppRuntimeConfig) {
                 error!("Fatal Bridge Error: {:?}", e);
                 if let Err(log_err) = write_subsystem_record(
                     SubsystemSection::App,
-                    app_record("headless_mt5_start", "FAILED", format!("fatal bridge error: {e}")),
+                    app_record(
+                        "headless_mt5_start",
+                        "FAILED",
+                        format!("fatal bridge error: {e}"),
+                    ),
                 ) {
                     error!("Failed to write APP section log: {}", log_err);
                 }
@@ -154,22 +179,26 @@ struct ForexApp {
     trading_session: TradingSession,
     workspace: WorkspaceState,
     state: AppState,
-    
+
     // Message Bus
     tx: mpsc::Sender<ServiceEvent>,
     rx: mpsc::Receiver<ServiceEvent>,
     discovery_handle: Option<DiscoveryJobHandle>,
     training_handle: Option<TrainingJobHandle>,
-    heartbeat_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ForexApp {
-    fn new(_cc: &eframe::CreationContext<'_>, runtime: AppRuntimeConfig) -> Self {
+    fn new(
+        _cc: &eframe::CreationContext<'_>,
+        runtime: AppRuntimeConfig,
+        settings: Settings,
+    ) -> Self {
         ui::theme::apply_theme(&_cc.egui_ctx);
         let (tx, rx) = mpsc::channel(10000);
         let symbols = forex_data::discover_symbols(&runtime.data_dir).unwrap_or_default();
-        let state = AppState::new(runtime.clone(), symbols);
-        
+        let state = AppState::new(runtime.clone(), &settings, symbols);
+        let _heartbeat_handle = spawn_account_heartbeat(tx.clone());
+
         Self {
             trading_session: TradingSession::new(),
             workspace: WorkspaceState::default(),
@@ -178,7 +207,6 @@ impl ForexApp {
             rx,
             discovery_handle: None,
             training_handle: None,
-            heartbeat_handle: Some(spawn_account_heartbeat(tx.clone())),
         }
     }
 
@@ -203,7 +231,7 @@ impl ForexApp {
                         self.discovery_handle = None;
                     }
                 }
-                 ServiceEvent::TrainingUpdated(snapshot) => {
+                ServiceEvent::TrainingUpdated(snapshot) => {
                     let terminal = matches!(
                         snapshot.state,
                         app_services::jobs::JobState::Succeeded
@@ -219,30 +247,22 @@ impl ForexApp {
                 ServiceEvent::LlmNewsUpdated(status) => {
                     self.state.llm_news_filter.current_status = status;
                 }
-                ServiceEvent::CTraderAuthUpdated(_) => {
-                    // Update internal state or just repaint to poll
-                }
-                ServiceEvent::AccountSyncUpdated { balance, equity } => {
-                    self.state.account_balance = balance;
-                    self.state.account_equity = equity;
-                }
                 ServiceEvent::Heartbeat => {
                     if self.trading_session.is_connected() {
                         let _ = self.trading_session.refresh_runtime(&mut self.state);
                     }
                 }
                 ServiceEvent::CTraderConnectUpdated(runtime) => {
-                    self.trading_session.handle_ctrader_connect_result(&mut self.state, runtime);
+                    self.trading_session
+                        .handle_ctrader_connect_result(&mut self.state, runtime);
                 }
                 ServiceEvent::BootstrapUpdated(snapshot) => {
                     self.state.bootstrap_job = Some(snapshot);
                 }
-                ServiceEvent::ConnectOutcome(result) => {
-                    match result {
-                        Ok(msg) => self.state.status_msg = msg,
-                        Err(err) => self.state.status_msg = format!("Connect Error: {}", err),
-                    }
-                }
+                ServiceEvent::ConnectOutcome(result) => match result {
+                    Ok(msg) => self.state.status_msg = msg,
+                    Err(err) => self.state.status_msg = format!("Connect Error: {}", err),
+                },
             }
             ctx.request_repaint();
         }
@@ -262,19 +282,31 @@ impl eframe::App for ForexApp {
                     // Branding
                     ui.heading(" FOREX AI"); // Using a chart icon placeholder or just text
                     ui.add_space(20.0);
-                    
+
                     // Ribbon Data
                     ui.vertical_centered(|ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 24.0;
-                            
-                            render_ribbon_item(ui, "SYMBOL", &self.state.selected_pair, ui::theme::ACCENT);
-                            render_ribbon_item(ui, "SOURCE", match self.state.data_source {
-                                app_state::DataSource::MT5 => "MT5",
-                                app_state::DataSource::Local => "LOCAL",
-                            }, ui::theme::TEXT_MUTED);
-                            
-                            let status_color = if self.state.status_msg.contains("Connected") || self.state.status_msg.contains("Online") {
+
+                            render_ribbon_item(
+                                ui,
+                                "SYMBOL",
+                                &self.state.selected_pair,
+                                ui::theme::ACCENT,
+                            );
+                            render_ribbon_item(
+                                ui,
+                                "SOURCE",
+                                match self.state.data_source {
+                                    app_state::DataSource::MT5 => "MT5",
+                                    app_state::DataSource::Local => "LOCAL",
+                                },
+                                ui::theme::TEXT_MUTED,
+                            );
+
+                            let status_color = if self.state.status_msg.contains("Connected")
+                                || self.state.status_msg.contains("Online")
+                            {
                                 ui::theme::SUCCESS
                             } else {
                                 ui::theme::DANGER
@@ -282,13 +314,13 @@ impl eframe::App for ForexApp {
                             render_ribbon_item(ui, "STATUS", &self.state.status_msg, status_color);
                         });
                     });
-                    
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(8.0);
                         if ui.button("⚙").clicked() {
                             // Toggle settings
                         }
-                        ui.label(format!("CPU: {}%", self.state.hardware.cpu_cores)); // Placeholder for load
+                        ui.label(format!("CPU Cores: {}", self.state.hardware.cpu_cores));
                     });
                 });
                 ui.add_space(4.0);
@@ -297,18 +329,18 @@ impl eframe::App for ForexApp {
         egui::CentralPanel::default()
             .frame(ui::theme::central_panel_frame(ctx.style().as_ref()))
             .show(ctx, |ui| {
-            let mut viewer = WorkspaceViewer::new(
-                &mut self.state,
-                &mut self.trading_session,
-                &self.tx,
-                &mut self.discovery_handle,
-                &mut self.training_handle,
-            );
-            render_workspace(ui, &mut self.workspace, &mut viewer);
-            if viewer.refresh_requested() {
-                self.refresh_symbols();
-            }
-        });
+                let mut viewer = WorkspaceViewer::new(
+                    &mut self.state,
+                    &mut self.trading_session,
+                    &self.tx,
+                    &mut self.discovery_handle,
+                    &mut self.training_handle,
+                );
+                render_workspace(ui, &mut self.workspace, &mut viewer);
+                if viewer.refresh_requested() {
+                    self.refresh_symbols();
+                }
+            });
 
         let discovery_active = self
             .state
@@ -383,9 +415,9 @@ fn spawn_account_heartbeat(tx: mpsc::Sender<ServiceEvent>) -> tokio::task::JoinH
 
 #[cfg(test)]
 mod tests {
+    use super::{AppRuntimeConfig, app_record};
     use crate::app_state::DataSource;
     use forex_core::Settings;
-    use super::{app_record, AppRuntimeConfig};
     use std::path::PathBuf;
 
     #[test]
@@ -403,7 +435,10 @@ mod tests {
     fn app_record_targets_app_section() {
         let record = app_record("headless_start", "STARTED", "headless startup");
 
-        assert_eq!(record.subsystem, forex_core::sectioned_log::SubsystemSection::App);
+        assert_eq!(
+            record.subsystem,
+            forex_core::sectioned_log::SubsystemSection::App
+        );
         assert_eq!(record.operation, "headless_start");
         assert_eq!(record.status, "STARTED");
         assert_eq!(record.message, "headless startup");
@@ -413,14 +448,20 @@ mod tests {
     fn trading_panel_mode_disables_live_controls_in_local_mode() {
         let mode = crate::app_services::trading::panel_mode(DataSource::Local, false);
 
-        assert_eq!(mode, crate::app_services::trading::TradingPanelMode::LocalOnly);
+        assert_eq!(
+            mode,
+            crate::app_services::trading::TradingPanelMode::LocalOnly
+        );
     }
 
     #[test]
     fn trading_panel_mode_switches_to_disconnect_when_mt5_is_connected() {
         let mode = crate::app_services::trading::panel_mode(DataSource::MT5, true);
 
-        assert_eq!(mode, crate::app_services::trading::TradingPanelMode::Connected);
+        assert_eq!(
+            mode,
+            crate::app_services::trading::TradingPanelMode::Connected
+        );
     }
 
     #[test]
@@ -436,8 +477,8 @@ mod tests {
         let drawdown = crate::ui::risk::drawdown_slider_bounds();
         let lot_size = crate::ui::risk::lot_size_slider_bounds();
 
-        assert_eq!(drawdown.start(), &0.1);
-        assert_eq!(drawdown.end(), &10.0);
+        assert_eq!(drawdown.start(), &0.01);
+        assert_eq!(drawdown.end(), &0.20);
         assert_eq!(lot_size.start(), &0.01);
         assert_eq!(lot_size.end(), &50.0);
     }

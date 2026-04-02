@@ -6,6 +6,6 @@ edition = "2021"
 [dependencies]
 forex-core = { path = "../forex-core" }
 forex-data = { path = "../forex-data" }
-forex-models = { path = "../forex-models" }
+forex-models = { path = "../forex-models", features = ["tree-models", "pure-rust-ml"] }
 forex-search = { path = "../forex-search" }
 anyhow = "1.0"

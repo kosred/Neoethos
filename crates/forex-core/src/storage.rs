@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 
 // use rusqlite::{params, Connection}; // will use fully qualified or add imports as needed
 
-/// Represents a stored strategy gene (DTO for TALibStrategyGene)
+/// Represents a stored strategy gene (DTO for vector_taStrategyGene)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedStrategy {
     pub strategy_id: String,
@@ -187,7 +187,7 @@ impl StrategyLedger {
         Ok(())
     }
 
-    pub fn get_all_live_metrics(&self) -> Result<impl Iterator<Item = JsonValue>> {
+    pub fn get_all_live_metrics(&self) -> Result<impl Iterator<Item = JsonValue> + use<>> {
         // Implementation note: In Rust we might return a dedicated Struct or HashMap.
         // Python returns dict[str, dict]. Let's keep it simple for now or return a Vec.
         // For efficiency, we just return a stub or Result<Vec<...>>.

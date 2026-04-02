@@ -1,8 +1,13 @@
+use super::super::FeatureFrame;
+use super::vortex_io::{read_vortex_array, write_vortex_array};
+use anyhow::{Context, Result, bail};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use anyhow::Result;
-use polars::prelude::*;
-use super::super::FeatureFrame;
+use vortex_array::IntoArray;
+use vortex_array::ToCanonical;
+use vortex_array::arrays::{PrimitiveArray, StructArray};
+use vortex_array::dtype::{FieldName, NativePType};
 
 pub struct FeatureCache {
     pub dir: PathBuf,
@@ -12,65 +17,140 @@ pub struct FeatureCache {
 
 impl FeatureCache {
     pub fn new(dir: &str, ttl_minutes: u64, enabled: bool) -> Self {
-        Self { dir: PathBuf::from(dir), ttl_minutes, enabled }
+        Self {
+            dir: PathBuf::from(dir),
+            ttl_minutes,
+            enabled,
+        }
     }
 
     fn is_fresh(&self, path: &Path) -> bool {
-        let Ok(meta) = std::fs::metadata(path) else { return false; };
-        let Ok(mod_time) = meta.modified() else { return false; };
-        let Ok(elapsed) = SystemTime::now().duration_since(mod_time) else { return false; };
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        let Ok(mod_time) = meta.modified() else {
+            return false;
+        };
+        let Ok(elapsed) = SystemTime::now().duration_since(mod_time) else {
+            return false;
+        };
         elapsed.as_secs() <= self.ttl_minutes * 60
     }
 
     pub fn load(&self, key: &str) -> Result<Option<FeatureFrame>> {
-        if !self.enabled { return Ok(None); }
-        let mut path = self.dir.clone();
-        path.push(format!("{key}.parquet"));
-        if !path.exists() || !self.is_fresh(&path) { return Ok(None); }
-        
-        let file = std::fs::File::open(&path)?;
-        let df = ParquetReader::new(file).finish()?;
-        Ok(Some(df_to_feature_frame(&df)?))
+        if !self.enabled {
+            return Ok(None);
+        }
+        let path = self.dir.join(format!("{key}.vortex"));
+        if !path.exists() || !self.is_fresh(&path) {
+            return Ok(None);
+        }
+
+        match read_vortex_array(&path).and_then(vortex_to_feature_frame) {
+            Ok(frame) => Ok(Some(frame)),
+            Err(_) => {
+                let _ = fs::remove_file(&path);
+                Ok(None)
+            }
+        }
     }
 
     pub fn store(&self, key: &str, frame: &FeatureFrame) -> Result<()> {
-        if !self.enabled { return Ok(()); }
+        if !self.enabled {
+            return Ok(());
+        }
         std::fs::create_dir_all(&self.dir)?;
-        let mut path = self.dir.clone();
-        path.push(format!("{key}.parquet"));
-        let mut df = feature_frame_to_df(frame)?;
-        let file = std::fs::File::create(&path)?;
-        ParquetWriter::new(file).finish(&mut df)?;
+        let path = self.dir.join(format!("{key}.vortex"));
+        let array = feature_frame_to_vortex(frame)?;
+        write_vortex_array(&path, array)?;
         Ok(())
     }
 }
 
-pub fn feature_frame_to_df(frame: &FeatureFrame) -> Result<DataFrame> {
-    let mut cols: Vec<Column> = Vec::with_capacity(frame.names.len() + 1);
-    cols.push(Series::new("timestamp".into(), frame.timestamps.clone()).into());
-    for (idx, name) in frame.names.iter().enumerate() {
-        let mut col = Vec::with_capacity(frame.data.nrows());
-        for row in 0..frame.data.nrows() { col.push(frame.data[(row, idx)]); }
-        cols.push(Series::new(name.as_str().into(), col).into());
+pub fn feature_frame_to_vortex(frame: &FeatureFrame) -> Result<vortex_array::ArrayRef> {
+    let n_rows = frame.data.nrows();
+    if frame.timestamps.len() != n_rows {
+        bail!("feature frame timestamp/data row mismatch");
     }
-    Ok(DataFrame::new(cols)?)
+    if frame.names.len() != frame.data.ncols() {
+        bail!("feature frame name/data column mismatch");
+    }
+
+    let mut names: Vec<FieldName> = Vec::with_capacity(frame.names.len() + 1);
+    let mut arrays = Vec::with_capacity(frame.names.len() + 1);
+
+    names.push("timestamp".into());
+    arrays.push(PrimitiveArray::from_iter(frame.timestamps.iter().copied()).into_array());
+
+    for (idx, name) in frame.names.iter().enumerate() {
+        let column = frame.data.column(idx).iter().copied().collect::<Vec<_>>();
+        names.push(name.clone().into());
+        arrays.push(PrimitiveArray::from_iter(column).into_array());
+    }
+
+    Ok(StructArray::try_new(
+        names.into(),
+        arrays,
+        n_rows,
+        vortex_array::validity::Validity::NonNullable,
+    )
+    .context("failed to build feature vortex struct array")?
+    .into_array())
 }
 
-pub fn df_to_feature_frame(df: &DataFrame) -> Result<FeatureFrame> {
-    let ts_series = df.column("timestamp")?.as_materialized_series();
-    let timestamps: Vec<i64> = ts_series.cast(&DataType::Int64)?.i64()?.into_iter().map(|v| v.unwrap_or(0)).collect();
+pub fn vortex_to_feature_frame(array: vortex_array::ArrayRef) -> Result<FeatureFrame> {
+    let struct_array = array.to_struct();
+
+    let timestamp_field = struct_array
+        .unmasked_field_by_name("timestamp")
+        .context("missing timestamp field")?;
+    let timestamps = extract_non_null_primitive_vec::<i64>(timestamp_field, "timestamp")?;
     let n_rows = timestamps.len();
-    let n_cols = df.width() - 1;
-    let mut names = Vec::with_capacity(n_cols);
-    let mut data = ndarray::Array2::<f32>::zeros((n_rows, n_cols));
-    let mut col_idx = 0usize;
-    for col in df.get_columns() {
-        let s = col.as_materialized_series();
-        if s.name() == "timestamp" { continue; }
-        names.push(s.name().to_string());
-        let vals: Vec<f32> = s.cast(&DataType::Float32)?.f32()?.into_iter().map(|v| v.unwrap_or(0.0)).collect();
-        for i in 0..n_rows { data[(i, col_idx)] = vals[i]; }
-        col_idx += 1;
+
+    let mut names = Vec::with_capacity(struct_array.names().len().saturating_sub(1));
+    let mut columns = Vec::with_capacity(struct_array.names().len().saturating_sub(1));
+
+    for name in struct_array.names().iter() {
+        let field_name = name.to_string();
+        if field_name == "timestamp" {
+            continue;
+        }
+        let field = struct_array
+            .unmasked_field_by_name(&field_name)
+            .with_context(|| format!("missing feature field {field_name}"))?;
+        let values = extract_non_null_primitive_vec::<f32>(field, &field_name)?;
+        if values.len() != n_rows {
+            bail!("feature field {field_name} row mismatch");
+        }
+        names.push(field_name);
+        columns.push(values);
     }
-    Ok(FeatureFrame { timestamps, names, data })
+
+    let n_cols = names.len();
+    let mut data = ndarray::Array2::<f32>::zeros((n_rows, n_cols));
+    for (col_idx, values) in columns.iter().enumerate() {
+        for (row_idx, value) in values.iter().copied().enumerate() {
+            data[(row_idx, col_idx)] = value;
+        }
+    }
+
+    Ok(FeatureFrame {
+        timestamps,
+        names,
+        data,
+    })
+}
+
+fn extract_non_null_primitive_vec<T: NativePType>(
+    array: &vortex_array::ArrayRef,
+    label: &str,
+) -> Result<Vec<T>> {
+    if !array
+        .all_valid()
+        .with_context(|| format!("failed to inspect {label} validity"))?
+    {
+        bail!("{label} contains nulls");
+    }
+
+    Ok(array.to_primitive().as_slice::<T>().to_vec())
 }

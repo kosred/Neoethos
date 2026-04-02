@@ -1,6 +1,6 @@
-use crate::app_services::bootstrap_writer::write_bootstrap_parquet;
-use crate::app_services::ctrader_data::{load_historical_bars_only, CTraderChartHistoryRequest};
-use anyhow::{bail, Context, Result};
+use crate::app_services::bootstrap_writer::write_bootstrap_vortex;
+use crate::app_services::ctrader_data::{CTraderChartHistoryRequest, load_historical_bars_only};
+use anyhow::{Context, Result, bail};
 use forex_data::load_symbol_timeframe;
 use std::path::{Path, PathBuf};
 
@@ -97,7 +97,12 @@ pub fn clean_normalized_bars(bars: &[NormalizedBar]) -> Result<Vec<NormalizedBar
             bail!("negative volume detected");
         }
 
-        if bar.high < bar.low || bar.open < bar.low || bar.open > bar.high || bar.close < bar.low || bar.close > bar.high {
+        if bar.high < bar.low
+            || bar.open < bar.low
+            || bar.open > bar.high
+            || bar.close < bar.low
+            || bar.close > bar.high
+        {
             bail!("invalid OHLC row detected");
         }
     }
@@ -141,6 +146,7 @@ pub fn inspect_local_bar_coverage(
         requested_from_timestamp_ns,
         requested_to_timestamp_ns,
         &covered_segments,
+        step_ns,
     );
     let fully_covered = !covered_segments.is_empty() && missing_segments.is_empty();
 
@@ -182,6 +188,7 @@ pub fn inspect_local_bar_coverage_or_empty(
     }
 }
 
+#[allow(dead_code)]
 pub fn bootstrap_with_fetcher<F>(
     data_root: impl AsRef<Path>,
     symbol: &str,
@@ -245,8 +252,9 @@ where
             }
         }
         if !fetched_bars.is_empty() {
-            let merged = merge_existing_and_fetched_bars(data_root, symbol, timeframe, &fetched_bars)?;
-            let output_path = write_bootstrap_parquet(data_root, symbol, timeframe, &merged)?;
+            let merged =
+                merge_existing_and_fetched_bars(data_root, symbol, timeframe, &fetched_bars)?;
+            let output_path = write_bootstrap_vortex(data_root, symbol, timeframe, &merged)?;
             coverage = inspect_local_bar_coverage_or_empty(
                 data_root,
                 symbol,
@@ -265,11 +273,8 @@ where
         }
     }
 
-    let output_path = crate::app_services::bootstrap_writer::bootstrap_parquet_path(
-        data_root,
-        symbol,
-        timeframe,
-    );
+    let output_path =
+        crate::app_services::bootstrap_writer::bootstrap_vortex_path(data_root, symbol, timeframe);
     Ok(BootstrapOutcome {
         output_path,
         coverage,
@@ -279,6 +284,7 @@ where
     })
 }
 
+#[allow(dead_code)]
 pub fn bootstrap_from_ctrader_history(
     data_root: impl AsRef<Path>,
     request: &CTraderChartHistoryRequest,
@@ -351,28 +357,76 @@ fn missing_segments(
     requested_from_timestamp_ns: i64,
     requested_to_timestamp_ns: i64,
     covered_segments: &[CoverageSegment],
+    step_ns: i64,
 ) -> Vec<CoverageSegment> {
     let mut missing = Vec::new();
     let mut cursor = requested_from_timestamp_ns;
 
     for segment in covered_segments {
         if segment.from_timestamp_ns > cursor {
-            missing.push(CoverageSegment {
-                from_timestamp_ns: cursor,
-                to_timestamp_ns: segment.from_timestamp_ns,
-            });
+            push_missing_segment_if_trading(
+                &mut missing,
+                cursor,
+                segment.from_timestamp_ns,
+                step_ns,
+            );
         }
         cursor = cursor.max(segment.to_timestamp_ns);
     }
 
     if cursor < requested_to_timestamp_ns {
-        missing.push(CoverageSegment {
-            from_timestamp_ns: cursor,
-            to_timestamp_ns: requested_to_timestamp_ns,
-        });
+        push_missing_segment_if_trading(&mut missing, cursor, requested_to_timestamp_ns, step_ns);
     }
 
     missing
+}
+
+fn push_missing_segment_if_trading(
+    missing: &mut Vec<CoverageSegment>,
+    from_timestamp_ns: i64,
+    to_timestamp_ns: i64,
+    step_ns: i64,
+) {
+    if from_timestamp_ns >= to_timestamp_ns
+        || is_fx_weekend_gap_only(from_timestamp_ns, to_timestamp_ns, step_ns)
+    {
+        return;
+    }
+
+    missing.push(CoverageSegment {
+        from_timestamp_ns,
+        to_timestamp_ns,
+    });
+}
+
+fn is_fx_weekend_gap_only(from_timestamp_ns: i64, to_timestamp_ns: i64, step_ns: i64) -> bool {
+    if from_timestamp_ns >= to_timestamp_ns || step_ns <= 0 {
+        return false;
+    }
+
+    let mut cursor = from_timestamp_ns;
+    while cursor < to_timestamp_ns {
+        if is_fx_trading_timestamp(cursor) {
+            return false;
+        }
+        cursor = cursor.saturating_add(step_ns);
+    }
+
+    true
+}
+
+fn is_fx_trading_timestamp(timestamp_ns: i64) -> bool {
+    let minutes_of_day = timestamp_ns
+        .rem_euclid(DAY_NS)
+        .div_euclid(60 * 1_000_000_000);
+    let weekday = (timestamp_ns.div_euclid(DAY_NS) + 3).rem_euclid(7);
+
+    match weekday {
+        0..=4 => {
+            (TRADING_SESSION_START_MINUTES..=TRADING_SESSION_END_MINUTES).contains(&minutes_of_day)
+        }
+        _ => false,
+    }
 }
 
 fn timeframe_step_ns(timeframe: &str) -> Result<i64> {
@@ -453,15 +507,20 @@ fn load_existing_normalized_bars(
 
 fn looks_like_missing_local_dataset(err: &anyhow::Error) -> bool {
     let text = err.to_string();
-    text.contains("path not found") || text.contains("no parquet files found")
+    text.contains("path not found")
+        || text.contains("no vortex files found")
+        || text.contains("vortex dataset not found")
 }
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 const DAY_NS: i64 = DAY_MS * 1_000_000;
+const TRADING_SESSION_START_MINUTES: i64 = 5;
+const TRADING_SESSION_END_MINUTES: i64 = 23 * 60 + 55;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_services::bootstrap_writer::bootstrap_vortex_path;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -487,8 +546,14 @@ mod tests {
 
         let chunks = plan_bootstrap_chunks(now_ms, "M1", 2).expect("m1 chunks");
 
-        assert!(chunks.len() > 4, "expected multiple chunks for long M1 request");
-        assert_eq!(chunks.last().map(|chunk| chunk.to_timestamp_ms), Some(now_ms));
+        assert!(
+            chunks.len() > 4,
+            "expected multiple chunks for long M1 request"
+        );
+        assert_eq!(
+            chunks.last().map(|chunk| chunk.to_timestamp_ms),
+            Some(now_ms)
+        );
         for pair in chunks.windows(2) {
             assert_eq!(pair[0].to_timestamp_ms, pair[1].from_timestamp_ms);
         }
@@ -505,7 +570,10 @@ mod tests {
             h1_chunks.len() < m15_chunks.len(),
             "higher timeframe should need fewer chunks"
         );
-        assert_eq!(h1_chunks.last().map(|chunk| chunk.to_timestamp_ms), Some(now_ms));
+        assert_eq!(
+            h1_chunks.last().map(|chunk| chunk.to_timestamp_ms),
+            Some(now_ms)
+        );
     }
 
     #[test]
@@ -547,7 +615,10 @@ mod tests {
         .expect("cleaned bars");
 
         assert_eq!(
-            cleaned.iter().map(|bar| bar.timestamp_ns).collect::<Vec<_>>(),
+            cleaned
+                .iter()
+                .map(|bar| bar.timestamp_ns)
+                .collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
         assert!((cleaned[0].open - 1.1).abs() < f64::EPSILON);
@@ -601,7 +672,7 @@ mod tests {
                 volume: 1.0,
             })
             .collect::<Vec<_>>();
-        write_bootstrap_parquet(&root, "EURUSD", "M1", &bars).expect("write local parquet");
+        write_bootstrap_vortex(&root, "EURUSD", "M1", &bars).expect("write local vortex");
 
         let report = inspect_local_bar_coverage(
             &root,
@@ -616,27 +687,25 @@ mod tests {
         assert_eq!(report.covered_segments.len(), 1);
         assert!(report.missing_segments.is_empty());
 
-        std::fs::remove_dir_all(root).ok();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn local_coverage_reports_gap_between_contiguous_runs() {
         let root = unique_temp_root("gap_coverage");
         let start_ns = 1_700_000_000_000_000_000;
-        let bars = vec![
-            0_i64, 1, 2, 5, 6,
-        ]
-        .into_iter()
-        .map(|idx| NormalizedBar {
-            timestamp_ns: start_ns + idx * ONE_MINUTE_NS,
-            open: 1.1,
-            high: 1.2,
-            low: 1.0,
-            close: 1.15,
-            volume: 1.0,
-        })
-        .collect::<Vec<_>>();
-        write_bootstrap_parquet(&root, "EURUSD", "M1", &bars).expect("write local parquet");
+        let bars = vec![0_i64, 1, 2, 5, 6]
+            .into_iter()
+            .map(|idx| NormalizedBar {
+                timestamp_ns: start_ns + idx * ONE_MINUTE_NS,
+                open: 1.1,
+                high: 1.2,
+                low: 1.0,
+                close: 1.15,
+                volume: 1.0,
+            })
+            .collect::<Vec<_>>();
+        write_bootstrap_vortex(&root, "EURUSD", "M1", &bars).expect("write local vortex");
 
         let report = inspect_local_bar_coverage(
             &root,
@@ -658,7 +727,60 @@ mod tests {
             }
         );
 
-        std::fs::remove_dir_all(root).ok();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_coverage_ignores_weekend_only_gap() {
+        let root = unique_temp_root("weekend_gap");
+        let friday_close_ns = 1_774_655_700_000_i64 * 1_000_000;
+        let monday_open_ns = 1_774_829_100_000_i64 * 1_000_000;
+        let bars = vec![
+            NormalizedBar {
+                timestamp_ns: friday_close_ns,
+                open: 1.1,
+                high: 1.2,
+                low: 1.0,
+                close: 1.15,
+                volume: 1.0,
+            },
+            NormalizedBar {
+                timestamp_ns: monday_open_ns,
+                open: 1.2,
+                high: 1.3,
+                low: 1.1,
+                close: 1.25,
+                volume: 1.0,
+            },
+        ];
+        write_bootstrap_vortex(&root, "EURUSD", "M1", &bars).expect("write local vortex");
+
+        let report = inspect_local_bar_coverage(
+            &root,
+            "EURUSD",
+            "M1",
+            friday_close_ns,
+            monday_open_ns + ONE_MINUTE_NS,
+        )
+        .expect("coverage report");
+
+        assert!(report.fully_covered);
+        assert!(report.missing_segments.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn target_path_uses_expected_layout() {
+        let path = bootstrap_vortex_path(Path::new("data"), "eurusd", "m15");
+
+        assert_eq!(
+            path,
+            PathBuf::from("data")
+                .join("symbol=EURUSD")
+                .join("timeframe=M15")
+                .join("data.vortex")
+        );
     }
 
     #[test]
@@ -685,7 +807,7 @@ mod tests {
                 volume: 1.0,
             })
             .collect::<Vec<_>>();
-        write_bootstrap_parquet(&root, "EURUSD", "M1", &bars).expect("write local parquet");
+        write_bootstrap_vortex(&root, "EURUSD", "M1", &bars).expect("write local vortex");
 
         let mut called = false;
         let outcome = bootstrap_with_fetcher_for_range(
@@ -704,7 +826,7 @@ mod tests {
         assert!(!called);
         assert!(outcome.coverage.fully_covered);
 
-        std::fs::remove_dir_all(root).ok();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -722,7 +844,7 @@ mod tests {
                 volume: 1.0,
             })
             .collect::<Vec<_>>();
-        write_bootstrap_parquet(&root, "EURUSD", "M1", &local_bars).expect("write local parquet");
+        write_bootstrap_vortex(&root, "EURUSD", "M1", &local_bars).expect("write local vortex");
 
         let outcome = bootstrap_with_fetcher_for_range(
             &root,
@@ -757,6 +879,6 @@ mod tests {
         assert_eq!(outcome.bars_written, 5);
         assert_eq!(outcome.sources_used, vec!["RemoteBootstrap".to_string()]);
 
-        std::fs::remove_dir_all(root).ok();
+        let _ = std::fs::remove_dir_all(root);
     }
 }

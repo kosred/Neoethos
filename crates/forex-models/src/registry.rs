@@ -1,15 +1,77 @@
 // Model Registry
-// Ported from src/forex_bot/models/registry.py
 //
-// Python version uses threading.Lock for thread-safe lazy loading.
-// Rust version: No locks needed - static types are thread-safe by design
-// NO lazy loading needed - Rust compiles everything ahead of time
+// The registry now resolves model names to capability records first and only
+// derives compatibility metadata from those records.
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
-/// Model names supported by the registry
-/// Python lines 21-41
+use crate::runtime::capabilities::{ModelCapability, ModelFamily, model_capability};
+
+fn dynamic_registry() -> &'static Mutex<HashMap<String, ModelCapability>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, ModelCapability>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn infer_dynamic_family(name: &str, module_path: &str, class_name: &str) -> ModelFamily {
+    let haystack = format!(
+        "{} {} {}",
+        name.to_ascii_lowercase(),
+        module_path.to_ascii_lowercase(),
+        class_name.to_ascii_lowercase()
+    );
+    if haystack.contains("lightgbm")
+        || haystack.contains("xgboost")
+        || haystack.contains("catboost")
+        || haystack.contains("tree")
+    {
+        ModelFamily::Tree
+    } else if haystack.contains("swarm") || haystack.contains("forecast") {
+        ModelFamily::Forecasting
+    } else if haystack.contains("mlp")
+        || haystack.contains("nbeats")
+        || haystack.contains("tide")
+        || haystack.contains("tabnet")
+        || haystack.contains("transformer")
+        || haystack.contains("patch")
+        || haystack.contains("timesnet")
+        || haystack.contains("kan")
+    {
+        ModelFamily::Deep
+    } else if haystack.contains("meta")
+        || haystack.contains("calibr")
+        || haystack.contains("conformal")
+        || haystack.contains("bayes")
+        || haystack.contains("logit")
+        || haystack.contains("elastic")
+    {
+        ModelFamily::Meta
+    } else if haystack.contains("genetic")
+        || haystack.contains("evo")
+        || haystack.contains("crfmnes")
+        || haystack.contains("neat")
+    {
+        ModelFamily::Evolutionary
+    } else if haystack.contains("exit") {
+        ModelFamily::Exit
+    } else if haystack.contains("adaptive")
+        || haystack.contains("online")
+        || haystack.contains("hoeffding")
+        || haystack.contains("passive")
+    {
+        ModelFamily::Adaptive
+    } else if haystack.contains("anomaly")
+        || haystack.contains("forest")
+        || haystack.contains("isolation")
+    {
+        ModelFamily::Anomaly
+    } else {
+        ModelFamily::Rl
+    }
+}
+
+/// Current known model names supported by the registry.
 pub const AVAILABLE_MODELS: &[&str] = &[
     // Tree models
     "lightgbm",
@@ -18,124 +80,173 @@ pub const AVAILABLE_MODELS: &[&str] = &[
     "xgboost_dart",
     "catboost",
     "catboost_alt",
-    // Neural networks (PyO3 wrappers)
+    "sklears_tree",
+    // Deep models
     "mlp",
     "nbeats",
     "tide",
     "tabnet",
     "kan",
-    // Disabled (not yet ported)
-    // "transformer",
-    // "rl_ppo",
-    // "rl_sac",
-    // "rllib_ppo",
-    // "rllib_sac",
-    // "evolution",
-    // "genetic",
-    // "unsupervised",
+    "transformer",
+    "patchtst",
+    "timesnet",
+    "nbeatsx_nf",
+    "tide_nf",
+    "swarm_forecaster",
+    // Meta / online models
+    "elasticnet",
+    "bayes_logit",
+    "meta_blender",
+    "probability_calibrator",
+    "conformal_gate",
+    "meta_stack",
+    "genetic",
+    "neuro_evo",
+    "neat",
+    "exit_agent",
+    "online_pa",
+    "online_hoeffding",
+    "isolation_forest",
+    "dqn",
 ];
 
-/// Model metadata
-#[derive(Debug, Clone)]
-pub struct ModelInfo {
-    pub name: String,
-    pub category: ModelCategory,
-    pub requires_gpu: bool,
-    pub description: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Capability-aware categories used by legacy helpers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModelCategory {
-    TreeModel,
-    NeuralNetwork,
-    ReinforcementLearning,
+    Tree,
+    Deep,
+    Forecasting,
+    Meta,
     Evolutionary,
-    Unsupervised,
+    Exit,
+    Adaptive,
+    Anomaly,
+    Rl,
 }
 
-/// Get model information
-pub fn get_model_info(name: &str) -> Option<ModelInfo> {
-    match name {
-        // Tree models
-        "lightgbm" => Some(ModelInfo {
-            name: name.to_string(),
-            category: ModelCategory::TreeModel,
-            requires_gpu: false,
-            description: "LightGBM gradient boosting (GPU optional)".to_string(),
-        }),
-        "xgboost" => Some(ModelInfo {
-            name: name.to_string(),
-            category: ModelCategory::TreeModel,
-            requires_gpu: false,
-            description: "XGBoost gradient boosting (GPU optional)".to_string(),
-        }),
-        "xgboost_rf" => Some(ModelInfo {
-            name: name.to_string(),
-            category: ModelCategory::TreeModel,
-            requires_gpu: false,
-            description: "XGBoost Random Forest (GPU optional)".to_string(),
-        }),
-        "xgboost_dart" => Some(ModelInfo {
-            name: name.to_string(),
-            category: ModelCategory::TreeModel,
-            requires_gpu: false,
-            description: "XGBoost DART (GPU optional)".to_string(),
-        }),
-        "catboost" => Some(ModelInfo {
-            name: name.to_string(),
-            category: ModelCategory::TreeModel,
-            requires_gpu: false,
-            description: "CatBoost gradient boosting (GPU optional)".to_string(),
-        }),
-        "catboost_alt" => Some(ModelInfo {
-            name: name.to_string(),
-            category: ModelCategory::TreeModel,
-            requires_gpu: false,
-            description: "CatBoost alternative config (GPU optional)".to_string(),
-        }),
-
-        // Neural networks (PyO3 wrappers)
-        "mlp" => Some(ModelInfo {
-            name: name.to_string(),
-            category: ModelCategory::NeuralNetwork,
-            requires_gpu: true,
-            description: "Multi-Layer Perceptron (PyTorch via PyO3)".to_string(),
-        }),
-        "nbeats" => Some(ModelInfo {
-            name: name.to_string(),
-            category: ModelCategory::NeuralNetwork,
-            requires_gpu: true,
-            description: "N-BEATS time series architecture (PyTorch via PyO3)".to_string(),
-        }),
-        "tide" => Some(ModelInfo {
-            name: name.to_string(),
-            category: ModelCategory::NeuralNetwork,
-            requires_gpu: true,
-            description: "TiDE time series dense encoder (PyTorch via PyO3)".to_string(),
-        }),
-        "tabnet" => Some(ModelInfo {
-            name: name.to_string(),
-            category: ModelCategory::NeuralNetwork,
-            requires_gpu: true,
-            description: "TabNet attention-based tabular learning (PyTorch via PyO3)".to_string(),
-        }),
-        "kan" => Some(ModelInfo {
-            name: name.to_string(),
-            category: ModelCategory::NeuralNetwork,
-            requires_gpu: true,
-            description: "Kolmogorov-Arnold Network (PyTorch via PyO3)".to_string(),
-        }),
-
-        _ => None,
+impl From<ModelFamily> for ModelCategory {
+    fn from(family: ModelFamily) -> Self {
+        match family {
+            ModelFamily::Tree => Self::Tree,
+            ModelFamily::Deep => Self::Deep,
+            ModelFamily::Forecasting => Self::Forecasting,
+            ModelFamily::Meta => Self::Meta,
+            ModelFamily::Evolutionary => Self::Evolutionary,
+            ModelFamily::Exit => Self::Exit,
+            ModelFamily::Adaptive => Self::Adaptive,
+            ModelFamily::Anomaly => Self::Anomaly,
+            ModelFamily::Rl => Self::Rl,
+        }
     }
 }
 
-/// List all available models by category
+/// Model metadata resolved from the capability layer.
+#[derive(Debug, Clone)]
+pub struct ModelInfo {
+    pub name: String,
+    pub capability: ModelCapability,
+    pub category: ModelCategory,
+    pub supports_gpu: bool,
+    pub prefers_gpu: bool,
+    pub description: String,
+}
+
+fn description_for_capability(capability: &ModelCapability) -> String {
+    let kind = match capability.family {
+        ModelFamily::Tree => "tree ensemble",
+        ModelFamily::Deep => "deep sequence model",
+        ModelFamily::Forecasting => "forecasting ensemble",
+        ModelFamily::Meta => "meta/statistical model",
+        ModelFamily::Evolutionary => "evolutionary search model",
+        ModelFamily::Exit => "exit policy model",
+        ModelFamily::Adaptive => "adaptive online model",
+        ModelFamily::Anomaly => "anomaly detector",
+        ModelFamily::Rl => "reinforcement learning policy",
+    };
+
+    format!(
+        "{} capability for {} ({})",
+        capability.name, kind, capability.state
+    )
+}
+
+fn supports_gpu_for_model(name: &str, family: ModelFamily) -> bool {
+    match name {
+        "lightgbm" => cfg!(feature = "lightgbm-gpu"),
+        "xgboost" | "xgboost_rf" | "xgboost_dart" => cfg!(feature = "xgboost"),
+        "catboost" | "catboost_alt" => cfg!(feature = "catboost"),
+        _ => {
+            let _ = family;
+            false
+        }
+    }
+}
+
+fn prefers_gpu_for_model(name: &str, family: ModelFamily) -> bool {
+    match name {
+        "lightgbm" => cfg!(feature = "lightgbm-gpu"),
+        "xgboost" | "xgboost_rf" | "xgboost_dart" => cfg!(feature = "xgboost"),
+        "catboost" | "catboost_alt" => cfg!(feature = "catboost"),
+        _ => {
+            let _ = family;
+            false
+        }
+    }
+}
+
+/// Resolve capability-backed model information.
+pub fn get_model_info(name: &str) -> Option<ModelInfo> {
+    let capability = get_model_capability(name)?;
+    let category = capability.family.into();
+    let supports_gpu = supports_gpu_for_model(&capability.name, capability.family);
+    let prefers_gpu = prefers_gpu_for_model(&capability.name, capability.family);
+    let description = description_for_capability(&capability);
+
+    Some(ModelInfo {
+        name: capability.name.clone(),
+        capability,
+        category,
+        supports_gpu,
+        prefers_gpu,
+        description,
+    })
+}
+
+/// Resolve the capability record for a known model name.
+pub fn get_model_capability(name: &str) -> Option<ModelCapability> {
+    model_capability(name).or_else(|| {
+        dynamic_registry()
+            .lock()
+            .ok()
+            .and_then(|registry| registry.get(name).cloned())
+    })
+}
+
+fn default_inventory_names() -> Vec<String> {
+    let mut names = AVAILABLE_MODELS
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+
+    let num_transformers = forex_core::Settings::default()
+        .models
+        .num_transformers
+        .max(1);
+    if num_transformers > 1 {
+        for replica_idx in 1..=num_transformers {
+            names.push(format!("transformer_{replica_idx:02}"));
+        }
+    }
+
+    names
+}
+
+/// List all available models by capability family.
 pub fn list_models_by_category() -> HashMap<ModelCategory, Vec<String>> {
     let mut result = HashMap::new();
 
-    for &model_name in AVAILABLE_MODELS {
-        if let Some(info) = get_model_info(model_name) {
+    for model_name in default_inventory_names() {
+        if let Some(info) = get_model_info(&model_name) {
             result
                 .entry(info.category)
                 .or_insert_with(Vec::new)
@@ -143,45 +254,75 @@ pub fn list_models_by_category() -> HashMap<ModelCategory, Vec<String>> {
         }
     }
 
+    if let Ok(registry) = dynamic_registry().lock() {
+        for capability in registry.values() {
+            result
+                .entry(capability.family.into())
+                .or_insert_with(Vec::new)
+                .push(capability.name.clone());
+        }
+    }
+
     result
 }
 
-/// Check if a model name is valid
+/// Check if a model name is valid.
 pub fn is_valid_model(name: &str) -> bool {
-    AVAILABLE_MODELS.contains(&name)
+    get_model_capability(name).is_some()
 }
 
-/// Get recommended device for a model
+/// Get recommended device for a model.
 pub fn get_recommended_device(model_name: &str) -> Result<String> {
-    let info = get_model_info(model_name)
+    let capability = get_model_capability(model_name)
         .context(format!("Model '{}' not found in registry", model_name))?;
+    let settings = forex_core::Settings::load_with_env().unwrap_or_default();
 
-    // Neural networks benefit most from GPU
-    if info.category == ModelCategory::NeuralNetwork {
-        #[cfg(feature = "tch")]
-        {
-            use tch::Cuda;
-            if Cuda::is_available() && Cuda::device_count() > 0 {
-                return Ok("cuda:0".to_string());
-            }
-        }
-        Ok("cpu".to_string())
-    } else {
-        // Tree models work fine on CPU (GPU is optional)
-        Ok("cpu".to_string())
+    if !settings.system.enable_gpu {
+        return Ok("cpu".to_string());
     }
+
+    let configured_device = settings.system.device.trim();
+    if configured_device.eq_ignore_ascii_case("cpu") {
+        return Ok("cpu".to_string());
+    }
+
+    if prefers_gpu_for_model(&capability.name, capability.family)
+        && crate::tree_models::config::gpu_count() > 0
+    {
+        if !configured_device.is_empty() && !configured_device.eq_ignore_ascii_case("auto") {
+            return Ok(configured_device.to_string());
+        }
+        return Ok("cuda:0".to_string());
+    }
+
+    Ok("cpu".to_string())
 }
 
 // ============================================================================
 // PYTHON COMPATIBILITY
 // ============================================================================
 
-/// Python lines 43-50: register_model()
-/// In Rust: Not needed - models are statically registered at compile time
-/// Left as stub for API compatibility
-pub fn register_model(_name: &str, _module_path: &str, _class_name: &str) -> Result<()> {
-    // NO-OP in Rust - models are statically compiled
-    // Python needs this for dynamic imports; Rust doesn't
+/// Compatibility hook for dynamic model registration.
+/// Built-in models stay statically registered; custom models are appended here.
+pub fn register_model(name: &str, module_path: &str, class_name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        anyhow::bail!("model registration requires a non-empty name");
+    }
+
+    if get_model_capability(name).is_some() {
+        return Ok(());
+    }
+
+    let family = infer_dynamic_family(name, module_path, class_name);
+    let capability = ModelCapability::new(
+        name.trim(),
+        family,
+        crate::runtime::capabilities::CapabilityState::Implemented,
+    );
+    let mut registry = dynamic_registry()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("dynamic model registry mutex poisoned"))?;
+    registry.insert(name.trim().to_string(), capability);
     Ok(())
 }
 
@@ -189,16 +330,177 @@ pub fn register_model(_name: &str, _module_path: &str, _class_name: &str) -> Res
 // SUMMARY
 // ============================================================================
 //
-// Python registry.py uses:
-// - threading.Lock for thread-safe lazy loading
-// - importlib for dynamic imports
-// - Global _CLASS_CACHE dictionary
+// The registry now resolves every known configured model name to a
+// capability-backed record. Legacy helpers remain available, but they are
+// derived from the runtime capability layer instead of being a loose string
+// table.
 //
-// Rust registry.rs:
-// ✅ NO locks needed - Rust types are thread-safe by design
-// ✅ NO lazy loading - everything compiles ahead of time
-// ✅ NO caching - direct function calls (zero overhead)
-// ✅ Compile-time guarantees via static types
-//
-// This is SIMPLER and FASTER than Python while providing same functionality!
-//
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::capabilities::{CapabilityState, ModelFamily};
+    use forex_core::Settings;
+
+    #[test]
+    fn known_configured_models_resolve_to_capabilities() {
+        let expectations = [
+            ("lightgbm", ModelFamily::Tree, CapabilityState::Implemented),
+            ("xgboost", ModelFamily::Tree, CapabilityState::Implemented),
+            (
+                "xgboost_rf",
+                ModelFamily::Tree,
+                CapabilityState::Implemented,
+            ),
+            (
+                "xgboost_dart",
+                ModelFamily::Tree,
+                CapabilityState::Implemented,
+            ),
+            ("catboost", ModelFamily::Tree, CapabilityState::Implemented),
+            (
+                "catboost_alt",
+                ModelFamily::Tree,
+                CapabilityState::Implemented,
+            ),
+            (
+                "sklears_tree",
+                ModelFamily::Tree,
+                CapabilityState::Implemented,
+            ),
+            ("mlp", ModelFamily::Deep, CapabilityState::Implemented),
+            (
+                "elasticnet",
+                ModelFamily::Meta,
+                CapabilityState::Implemented,
+            ),
+            (
+                "bayes_logit",
+                ModelFamily::Meta,
+                CapabilityState::Implemented,
+            ),
+            (
+                "meta_blender",
+                ModelFamily::Meta,
+                CapabilityState::Implemented,
+            ),
+            (
+                "probability_calibrator",
+                ModelFamily::Meta,
+                CapabilityState::Implemented,
+            ),
+            (
+                "conformal_gate",
+                ModelFamily::Meta,
+                CapabilityState::Implemented,
+            ),
+            (
+                "meta_stack",
+                ModelFamily::Meta,
+                CapabilityState::Implemented,
+            ),
+            (
+                "genetic",
+                ModelFamily::Evolutionary,
+                CapabilityState::Implemented,
+            ),
+            (
+                "exit_agent",
+                ModelFamily::Exit,
+                CapabilityState::Implemented,
+            ),
+            (
+                "online_pa",
+                ModelFamily::Adaptive,
+                CapabilityState::Implemented,
+            ),
+            (
+                "online_hoeffding",
+                ModelFamily::Adaptive,
+                CapabilityState::Implemented,
+            ),
+            (
+                "isolation_forest",
+                ModelFamily::Anomaly,
+                CapabilityState::Implemented,
+            ),
+            ("dqn", ModelFamily::Rl, CapabilityState::Implemented),
+            (
+                "transformer",
+                ModelFamily::Deep,
+                CapabilityState::Implemented,
+            ),
+            ("nbeats", ModelFamily::Deep, CapabilityState::Implemented),
+            ("tide", ModelFamily::Deep, CapabilityState::Implemented),
+            ("tabnet", ModelFamily::Deep, CapabilityState::Implemented),
+            ("kan", ModelFamily::Deep, CapabilityState::Implemented),
+            ("patchtst", ModelFamily::Deep, CapabilityState::Implemented),
+            ("timesnet", ModelFamily::Deep, CapabilityState::Implemented),
+            (
+                "nbeatsx_nf",
+                ModelFamily::Deep,
+                CapabilityState::Implemented,
+            ),
+            ("tide_nf", ModelFamily::Deep, CapabilityState::Implemented),
+            (
+                "swarm_forecaster",
+                ModelFamily::Forecasting,
+                CapabilityState::Implemented,
+            ),
+            (
+                "neuro_evo",
+                ModelFamily::Evolutionary,
+                CapabilityState::Implemented,
+            ),
+            (
+                "neat",
+                ModelFamily::Evolutionary,
+                CapabilityState::Implemented,
+            ),
+        ];
+
+        for (name, family, state) in expectations {
+            let capability = get_model_capability(name)
+                .unwrap_or_else(|| panic!("missing capability for {name}"));
+
+            assert_eq!(capability.name, name);
+            assert_eq!(capability.family, family);
+            assert_eq!(capability.state, state);
+        }
+    }
+
+    #[test]
+    fn all_default_configured_model_names_have_capabilities() {
+        let settings = Settings::default();
+
+        for name in &settings.models.ml_models {
+            assert!(
+                get_model_capability(name).is_some(),
+                "configured model {name} should resolve to a capability"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_registration_adds_capability_entry() {
+        register_model("custom_patch_router", "custom.models.patch", "PatchRouter")
+            .expect("dynamic model registration should succeed");
+
+        let capability = get_model_capability("custom_patch_router")
+            .expect("dynamic capability should be discoverable");
+        assert_eq!(capability.family, ModelFamily::Deep);
+        assert_eq!(capability.state, CapabilityState::Implemented);
+    }
+
+    #[test]
+    fn default_inventory_lists_transformer_replicas() {
+        let listed = list_models_by_category();
+        let deep = listed
+            .get(&ModelCategory::Deep)
+            .expect("deep category should exist");
+        assert!(
+            deep.iter().any(|name| name == "transformer_01"),
+            "default inventory should expose transformer_01"
+        );
+    }
+}

@@ -81,7 +81,13 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSess
             );
         } else {
             paint_grid(ui, &painter, rect);
-            paint_candles(&painter, rect, &snapshot.candles, snapshot.price_min, snapshot.price_max);
+            paint_candles(
+                &painter,
+                rect,
+                &snapshot.candles,
+                snapshot.price_min,
+                snapshot.price_max,
+            );
             paint_overlays(ui, &painter, rect, &snapshot);
         }
 
@@ -217,8 +223,8 @@ mod tests {
             price_min: 1.0,
             price_max: 1.2,
             headline: "1 candles · latest close 1.15000 · range 1.00000-1.20000".to_string(),
-            overlay_status:
-                "Trade overlays will appear here once execution events are available.".to_string(),
+            overlay_status: "Trade overlays will appear here once execution events are available."
+                .to_string(),
             warnings: vec!["Execution timeline unavailable".to_string()],
         };
 

@@ -1,7 +1,7 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tungstenite::{connect, Message};
+use tungstenite::{Message, connect};
 
 pub const CTRADER_OA_APPLICATION_AUTH_REQUEST_PAYLOAD_TYPE: u32 = 2100;
 pub const CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE: u32 = 2101;
@@ -680,7 +680,10 @@ pub fn trendbar_period_value(label: &str) -> Result<i32> {
         "D1" => Ok(12),
         "W1" => Ok(13),
         "MN1" => Ok(14),
-        other => Err(anyhow!("unsupported cTrader trendbar period label {}", other)),
+        other => Err(anyhow!(
+            "unsupported cTrader trendbar period label {}",
+            other
+        )),
     }
 }
 
@@ -714,7 +717,9 @@ pub fn expected_response_payload_type(request_payload_type: u32) -> Result<u32> 
         CTRADER_OA_APPLICATION_AUTH_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)
         }
-        CTRADER_OA_ACCOUNT_AUTH_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE),
+        CTRADER_OA_ACCOUNT_AUTH_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)
+        }
         CTRADER_OA_NEW_ORDER_REQUEST_PAYLOAD_TYPE
         | CTRADER_OA_CANCEL_ORDER_REQUEST_PAYLOAD_TYPE
         | CTRADER_OA_AMEND_ORDER_REQUEST_PAYLOAD_TYPE
@@ -735,10 +740,18 @@ pub fn expected_response_payload_type(request_payload_type: u32) -> Result<u32> 
         CTRADER_OA_UNSUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_UNSUBSCRIBE_LIVE_TRENDBAR_RESPONSE_PAYLOAD_TYPE)
         }
-        CTRADER_OA_SYMBOLS_LIST_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_SYMBOLS_LIST_RESPONSE_PAYLOAD_TYPE),
-        CTRADER_OA_SYMBOL_BY_ID_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_SYMBOL_BY_ID_RESPONSE_PAYLOAD_TYPE),
-        CTRADER_OA_GET_TRENDBARS_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_GET_TRENDBARS_RESPONSE_PAYLOAD_TYPE),
-        CTRADER_OA_GET_TICK_DATA_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_GET_TICK_DATA_RESPONSE_PAYLOAD_TYPE),
+        CTRADER_OA_SYMBOLS_LIST_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_SYMBOLS_LIST_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_SYMBOL_BY_ID_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_SYMBOL_BY_ID_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_GET_TRENDBARS_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_GET_TRENDBARS_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_GET_TICK_DATA_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_GET_TICK_DATA_RESPONSE_PAYLOAD_TYPE)
+        }
         CTRADER_OA_DEAL_LIST_REQUEST_PAYLOAD_TYPE => Ok(CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE),
         CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RESPONSE_PAYLOAD_TYPE)
@@ -774,7 +787,8 @@ pub fn is_matching_open_api_response(
                 CTRADER_OA_EXECUTION_EVENT_PAYLOAD_TYPE | CTRADER_OA_ORDER_ERROR_EVENT_PAYLOAD_TYPE
             );
     }
-    envelope.payload_type == expected_payload_type && envelope.client_msg_id == request.client_msg_id
+    envelope.payload_type == expected_payload_type
+        && envelope.client_msg_id == request.client_msg_id
 }
 
 pub fn parse_ctrader_error_payload(payload: &Value) -> Result<String> {
@@ -785,8 +799,8 @@ pub fn parse_ctrader_error_payload(payload: &Value) -> Result<String> {
         description: Option<String>,
     }
 
-    let error: CTraderErrorPayload = serde_json::from_value(payload.clone())
-        .context("failed to parse cTrader error payload")?;
+    let error: CTraderErrorPayload =
+        serde_json::from_value(payload.clone()).context("failed to parse cTrader error payload")?;
     Ok(match error.description {
         Some(description) if !description.trim().is_empty() => {
             format!("{}: {}", error.error_code, description)
@@ -798,8 +812,8 @@ pub fn parse_ctrader_error_payload(payload: &Value) -> Result<String> {
 impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
     fn send_sequence(&self, messages: &[CTraderOpenApiJsonMessage]) -> Result<Vec<String>> {
         let url = format!("wss://{}:5036", self.endpoint_host);
-        let (mut socket, _) =
-            connect(url.as_str()).with_context(|| format!("failed to connect to cTrader endpoint {url}"))?;
+        let (mut socket, _) = connect(url.as_str())
+            .with_context(|| format!("failed to connect to cTrader endpoint {url}"))?;
         let mut responses = Vec::with_capacity(messages.len());
 
         for message in messages {
@@ -811,7 +825,10 @@ impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
                 .context("failed to send cTrader open api message")?;
 
             loop {
-                match socket.read().context("failed to read cTrader open api response")? {
+                match socket
+                    .read()
+                    .context("failed to read cTrader open api response")?
+                {
                     Message::Text(text) => {
                         if text.trim().is_empty() {
                             return Err(anyhow!("empty cTrader open api response"));
@@ -822,7 +839,8 @@ impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
                             let _ = socket.close(None);
                             return Ok(responses);
                         }
-                        if is_matching_open_api_response(&envelope, message, expected_payload_type) {
+                        if is_matching_open_api_response(&envelope, message, expected_payload_type)
+                        {
                             responses.push(text.to_string());
                             break;
                         }
@@ -839,7 +857,8 @@ impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
                             let _ = socket.close(None);
                             return Ok(responses);
                         }
-                        if is_matching_open_api_response(&envelope, message, expected_payload_type) {
+                        if is_matching_open_api_response(&envelope, message, expected_payload_type)
+                        {
                             responses.push(text);
                             break;
                         }
@@ -872,13 +891,22 @@ mod tests {
         let message = build_application_auth_request("client-id", "secret-456", "cm-id-2");
 
         assert_eq!(message.client_msg_id, "cm-id-2");
-        assert_eq!(message.payload_type, CTRADER_OA_APPLICATION_AUTH_REQUEST_PAYLOAD_TYPE);
         assert_eq!(
-            message.payload.get("clientId").and_then(serde_json::Value::as_str),
+            message.payload_type,
+            CTRADER_OA_APPLICATION_AUTH_REQUEST_PAYLOAD_TYPE
+        );
+        assert_eq!(
+            message
+                .payload
+                .get("clientId")
+                .and_then(serde_json::Value::as_str),
             Some("client-id")
         );
         assert_eq!(
-            message.payload.get("clientSecret").and_then(serde_json::Value::as_str),
+            message
+                .payload
+                .get("clientSecret")
+                .and_then(serde_json::Value::as_str),
             Some("secret-456")
         );
     }
@@ -887,13 +915,22 @@ mod tests {
     fn account_auth_request_uses_documented_payload_type_and_account_id() {
         let message = build_account_auth_request(7001, "token-123", "account-auth-1");
 
-        assert_eq!(message.payload_type, CTRADER_OA_ACCOUNT_AUTH_REQUEST_PAYLOAD_TYPE);
         assert_eq!(
-            message.payload.get("ctidTraderAccountId").and_then(serde_json::Value::as_i64),
+            message.payload_type,
+            CTRADER_OA_ACCOUNT_AUTH_REQUEST_PAYLOAD_TYPE
+        );
+        assert_eq!(
+            message
+                .payload
+                .get("ctidTraderAccountId")
+                .and_then(serde_json::Value::as_i64),
             Some(7001)
         );
         assert_eq!(
-            message.payload.get("accessToken").and_then(serde_json::Value::as_str),
+            message
+                .payload
+                .get("accessToken")
+                .and_then(serde_json::Value::as_str),
             Some("token-123")
         );
     }
@@ -908,7 +945,10 @@ mod tests {
             CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQUEST_PAYLOAD_TYPE
         );
         assert_eq!(
-            message.payload.get("accessToken").and_then(serde_json::Value::as_str),
+            message
+                .payload
+                .get("accessToken")
+                .and_then(serde_json::Value::as_str),
             Some("access-token-123")
         );
     }
@@ -920,7 +960,10 @@ mod tests {
         assert_eq!(message.client_msg_id, "trader-1");
         assert_eq!(message.payload_type, CTRADER_OA_TRADER_REQUEST_PAYLOAD_TYPE);
         assert_eq!(
-            message.payload.get("ctidTraderAccountId").and_then(serde_json::Value::as_i64),
+            message
+                .payload
+                .get("ctidTraderAccountId")
+                .and_then(serde_json::Value::as_i64),
             Some(7001)
         );
     }
@@ -930,9 +973,15 @@ mod tests {
         let message = build_reconcile_request(7001, true, "reconcile-1");
 
         assert_eq!(message.client_msg_id, "reconcile-1");
-        assert_eq!(message.payload_type, CTRADER_OA_RECONCILE_REQUEST_PAYLOAD_TYPE);
         assert_eq!(
-            message.payload.get("ctidTraderAccountId").and_then(serde_json::Value::as_i64),
+            message.payload_type,
+            CTRADER_OA_RECONCILE_REQUEST_PAYLOAD_TYPE
+        );
+        assert_eq!(
+            message
+                .payload
+                .get("ctidTraderAccountId")
+                .and_then(serde_json::Value::as_i64),
             Some(7001)
         );
         assert_eq!(
@@ -949,13 +998,23 @@ mod tests {
         let message = build_subscribe_spots_request(7001, &[14, 15], true, "spots-1");
 
         assert_eq!(message.client_msg_id, "spots-1");
-        assert_eq!(message.payload_type, CTRADER_OA_SUBSCRIBE_SPOTS_REQUEST_PAYLOAD_TYPE);
         assert_eq!(
-            message.payload.get("ctidTraderAccountId").and_then(serde_json::Value::as_i64),
+            message.payload_type,
+            CTRADER_OA_SUBSCRIBE_SPOTS_REQUEST_PAYLOAD_TYPE
+        );
+        assert_eq!(
+            message
+                .payload
+                .get("ctidTraderAccountId")
+                .and_then(serde_json::Value::as_i64),
             Some(7001)
         );
         assert_eq!(
-            message.payload.get("symbolId").and_then(serde_json::Value::as_array).map(|items| items.len()),
+            message
+                .payload
+                .get("symbolId")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| items.len()),
             Some(2)
         );
         assert_eq!(
@@ -977,15 +1036,24 @@ mod tests {
             CTRADER_OA_SUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE
         );
         assert_eq!(
-            message.payload.get("ctidTraderAccountId").and_then(serde_json::Value::as_i64),
+            message
+                .payload
+                .get("ctidTraderAccountId")
+                .and_then(serde_json::Value::as_i64),
             Some(7001)
         );
         assert_eq!(
-            message.payload.get("symbolId").and_then(serde_json::Value::as_i64),
+            message
+                .payload
+                .get("symbolId")
+                .and_then(serde_json::Value::as_i64),
             Some(14)
         );
         assert_eq!(
-            message.payload.get("period").and_then(serde_json::Value::as_i64),
+            message
+                .payload
+                .get("period")
+                .and_then(serde_json::Value::as_i64),
             Some(7)
         );
     }
@@ -1015,9 +1083,15 @@ mod tests {
         let message = build_symbols_list_request(7001, true, "symbols-list-1");
 
         assert_eq!(message.client_msg_id, "symbols-list-1");
-        assert_eq!(message.payload_type, CTRADER_OA_SYMBOLS_LIST_REQUEST_PAYLOAD_TYPE);
         assert_eq!(
-            message.payload.get("ctidTraderAccountId").and_then(serde_json::Value::as_i64),
+            message.payload_type,
+            CTRADER_OA_SYMBOLS_LIST_REQUEST_PAYLOAD_TYPE
+        );
+        assert_eq!(
+            message
+                .payload
+                .get("ctidTraderAccountId")
+                .and_then(serde_json::Value::as_i64),
             Some(7001)
         );
         assert_eq!(
@@ -1042,29 +1116,50 @@ mod tests {
         );
 
         assert_eq!(message.client_msg_id, "trendbars-1");
-        assert_eq!(message.payload_type, CTRADER_OA_GET_TRENDBARS_REQUEST_PAYLOAD_TYPE);
         assert_eq!(
-            message.payload.get("ctidTraderAccountId").and_then(serde_json::Value::as_i64),
+            message.payload_type,
+            CTRADER_OA_GET_TRENDBARS_REQUEST_PAYLOAD_TYPE
+        );
+        assert_eq!(
+            message
+                .payload
+                .get("ctidTraderAccountId")
+                .and_then(serde_json::Value::as_i64),
             Some(7001)
         );
         assert_eq!(
-            message.payload.get("symbolId").and_then(serde_json::Value::as_i64),
+            message
+                .payload
+                .get("symbolId")
+                .and_then(serde_json::Value::as_i64),
             Some(9001)
         );
         assert_eq!(
-            message.payload.get("period").and_then(serde_json::Value::as_i64),
+            message
+                .payload
+                .get("period")
+                .and_then(serde_json::Value::as_i64),
             Some(7)
         );
         assert_eq!(
-            message.payload.get("fromTimestamp").and_then(serde_json::Value::as_i64),
+            message
+                .payload
+                .get("fromTimestamp")
+                .and_then(serde_json::Value::as_i64),
             Some(1_700_000_000_000)
         );
         assert_eq!(
-            message.payload.get("toTimestamp").and_then(serde_json::Value::as_i64),
+            message
+                .payload
+                .get("toTimestamp")
+                .and_then(serde_json::Value::as_i64),
             Some(1_700_000_900_000)
         );
         assert_eq!(
-            message.payload.get("count").and_then(serde_json::Value::as_u64),
+            message
+                .payload
+                .get("count")
+                .and_then(serde_json::Value::as_u64),
             Some(400)
         );
     }
@@ -1089,17 +1184,29 @@ mod tests {
         );
 
         assert_eq!(message.client_msg_id, "ticks-1");
-        assert_eq!(message.payload_type, CTRADER_OA_GET_TICK_DATA_REQUEST_PAYLOAD_TYPE);
         assert_eq!(
-            message.payload.get("ctidTraderAccountId").and_then(serde_json::Value::as_i64),
+            message.payload_type,
+            CTRADER_OA_GET_TICK_DATA_REQUEST_PAYLOAD_TYPE
+        );
+        assert_eq!(
+            message
+                .payload
+                .get("ctidTraderAccountId")
+                .and_then(serde_json::Value::as_i64),
             Some(7001)
         );
         assert_eq!(
-            message.payload.get("symbolId").and_then(serde_json::Value::as_i64),
+            message
+                .payload
+                .get("symbolId")
+                .and_then(serde_json::Value::as_i64),
             Some(9001)
         );
         assert_eq!(
-            message.payload.get("type").and_then(serde_json::Value::as_i64),
+            message
+                .payload
+                .get("type")
+                .and_then(serde_json::Value::as_i64),
             Some(i64::from(CTRADER_QUOTE_TYPE_ASK))
         );
     }
@@ -1117,21 +1224,36 @@ mod tests {
         );
 
         assert_eq!(message.client_msg_id, "deals-1");
-        assert_eq!(message.payload_type, CTRADER_OA_DEAL_LIST_REQUEST_PAYLOAD_TYPE);
         assert_eq!(
-            message.payload.get("ctidTraderAccountId").and_then(serde_json::Value::as_i64),
+            message.payload_type,
+            CTRADER_OA_DEAL_LIST_REQUEST_PAYLOAD_TYPE
+        );
+        assert_eq!(
+            message
+                .payload
+                .get("ctidTraderAccountId")
+                .and_then(serde_json::Value::as_i64),
             Some(7001)
         );
         assert_eq!(
-            message.payload.get("fromTimestamp").and_then(serde_json::Value::as_i64),
+            message
+                .payload
+                .get("fromTimestamp")
+                .and_then(serde_json::Value::as_i64),
             Some(1_700_000_000_000)
         );
         assert_eq!(
-            message.payload.get("toTimestamp").and_then(serde_json::Value::as_i64),
+            message
+                .payload
+                .get("toTimestamp")
+                .and_then(serde_json::Value::as_i64),
             Some(1_700_000_100_000)
         );
         assert_eq!(
-            message.payload.get("maxRows").and_then(serde_json::Value::as_i64),
+            message
+                .payload
+                .get("maxRows")
+                .and_then(serde_json::Value::as_i64),
             Some(50)
         );
     }
@@ -1167,33 +1289,57 @@ mod tests {
         );
 
         assert_eq!(message.client_msg_id, "new-order-1");
-        assert_eq!(message.payload_type, CTRADER_OA_NEW_ORDER_REQUEST_PAYLOAD_TYPE);
         assert_eq!(
-            message.payload.get("ctidTraderAccountId").and_then(serde_json::Value::as_i64),
+            message.payload_type,
+            CTRADER_OA_NEW_ORDER_REQUEST_PAYLOAD_TYPE
+        );
+        assert_eq!(
+            message
+                .payload
+                .get("ctidTraderAccountId")
+                .and_then(serde_json::Value::as_i64),
             Some(7001)
         );
         assert_eq!(
-            message.payload.get("symbolId").and_then(serde_json::Value::as_i64),
+            message
+                .payload
+                .get("symbolId")
+                .and_then(serde_json::Value::as_i64),
             Some(14)
         );
         assert_eq!(
-            message.payload.get("orderType").and_then(serde_json::Value::as_i64),
+            message
+                .payload
+                .get("orderType")
+                .and_then(serde_json::Value::as_i64),
             Some(1)
         );
         assert_eq!(
-            message.payload.get("tradeSide").and_then(serde_json::Value::as_i64),
+            message
+                .payload
+                .get("tradeSide")
+                .and_then(serde_json::Value::as_i64),
             Some(1)
         );
         assert_eq!(
-            message.payload.get("volume").and_then(serde_json::Value::as_i64),
+            message
+                .payload
+                .get("volume")
+                .and_then(serde_json::Value::as_i64),
             Some(1500)
         );
         assert_eq!(
-            message.payload.get("timeInForce").and_then(serde_json::Value::as_i64),
+            message
+                .payload
+                .get("timeInForce")
+                .and_then(serde_json::Value::as_i64),
             Some(3)
         );
         assert_eq!(
-            message.payload.get("clientOrderId").and_then(serde_json::Value::as_str),
+            message
+                .payload
+                .get("clientOrderId")
+                .and_then(serde_json::Value::as_str),
             Some("client-order-1")
         );
     }
@@ -1221,17 +1367,29 @@ mod tests {
         );
 
         assert_eq!(message.client_msg_id, "amend-order-1");
-        assert_eq!(message.payload_type, CTRADER_OA_AMEND_ORDER_REQUEST_PAYLOAD_TYPE);
         assert_eq!(
-            message.payload.get("ctidTraderAccountId").and_then(serde_json::Value::as_i64),
+            message.payload_type,
+            CTRADER_OA_AMEND_ORDER_REQUEST_PAYLOAD_TYPE
+        );
+        assert_eq!(
+            message
+                .payload
+                .get("ctidTraderAccountId")
+                .and_then(serde_json::Value::as_i64),
             Some(7001)
         );
         assert_eq!(
-            message.payload.get("orderId").and_then(serde_json::Value::as_i64),
+            message
+                .payload
+                .get("orderId")
+                .and_then(serde_json::Value::as_i64),
             Some(8001)
         );
         assert_eq!(
-            message.payload.get("limitPrice").and_then(serde_json::Value::as_f64),
+            message
+                .payload
+                .get("limitPrice")
+                .and_then(serde_json::Value::as_f64),
             Some(1.0985)
         );
     }
@@ -1247,9 +1405,15 @@ mod tests {
         );
 
         assert_eq!(message.client_msg_id, "cancel-order-1");
-        assert_eq!(message.payload_type, CTRADER_OA_CANCEL_ORDER_REQUEST_PAYLOAD_TYPE);
         assert_eq!(
-            message.payload.get("orderId").and_then(serde_json::Value::as_i64),
+            message.payload_type,
+            CTRADER_OA_CANCEL_ORDER_REQUEST_PAYLOAD_TYPE
+        );
+        assert_eq!(
+            message
+                .payload
+                .get("orderId")
+                .and_then(serde_json::Value::as_i64),
             Some(8001)
         );
     }
@@ -1266,13 +1430,22 @@ mod tests {
         );
 
         assert_eq!(message.client_msg_id, "close-position-1");
-        assert_eq!(message.payload_type, CTRADER_OA_CLOSE_POSITION_REQUEST_PAYLOAD_TYPE);
         assert_eq!(
-            message.payload.get("positionId").and_then(serde_json::Value::as_i64),
+            message.payload_type,
+            CTRADER_OA_CLOSE_POSITION_REQUEST_PAYLOAD_TYPE
+        );
+        assert_eq!(
+            message
+                .payload
+                .get("positionId")
+                .and_then(serde_json::Value::as_i64),
             Some(9001)
         );
         assert_eq!(
-            message.payload.get("volume").and_then(serde_json::Value::as_i64),
+            message
+                .payload
+                .get("volume")
+                .and_then(serde_json::Value::as_i64),
             Some(500)
         );
     }

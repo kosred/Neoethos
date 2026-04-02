@@ -1,6 +1,6 @@
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,13 +161,10 @@ mod tests {
             .report
             .entries
             .push("alpha-7 | sharpe=1.92 | win_rate=0.61".to_string());
-        snapshot
-            .report
-            .events
-            .push(JobEvent {
-                level: JobEventLevel::Info,
-                message: "loaded dataset for EURUSD".to_string(),
-            });
+        snapshot.report.events.push(JobEvent {
+            level: JobEventLevel::Info,
+            message: "loaded dataset for EURUSD".to_string(),
+        });
         snapshot.report.summary = "7 accepted strategies".to_string();
 
         assert_eq!(snapshot.progress.percent, Some(0.42));
@@ -199,9 +196,19 @@ mod tests {
         }
 
         assert_eq!(events.len(), 8);
-        assert_eq!(events.first().map(|event| event.message.as_str()), Some("event-3"));
-        assert_eq!(events.last().map(|event| event.message.as_str()), Some("event-10"));
-        assert!(events.iter().all(|event| event.level == JobEventLevel::Info));
+        assert_eq!(
+            events.first().map(|event| event.message.as_str()),
+            Some("event-3")
+        );
+        assert_eq!(
+            events.last().map(|event| event.message.as_str()),
+            Some("event-10")
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.level == JobEventLevel::Info)
+        );
     }
 
     #[test]

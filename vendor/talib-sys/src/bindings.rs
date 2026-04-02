@@ -5693,7 +5693,7 @@ extern "C" {
 }
 extern "C" {
     pub fn TA_MINMAXINDEX_Lookback(optInTimePeriod: ::std::os::raw::c_int)
-        -> ::std::os::raw::c_int;
+    -> ::std::os::raw::c_int;
 }
 extern "C" {
     pub fn TA_MINUS_DI(

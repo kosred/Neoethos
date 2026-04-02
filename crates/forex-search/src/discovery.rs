@@ -1,36 +1,142 @@
-use crate::genetic::{evolve_search_with_progress, signals_for_gene, Gene};
+use crate::genetic::strategy_gene::EvaluationConfig;
+use crate::genetic::{Gene, evolve_search_with_progress_and_limits, signals_for_gene};
+use crate::quality::{StrategyMetrics, StrategyQualityAnalyzer, Trade};
 use anyhow::Result;
 use chrono::{Datelike, TimeZone, Utc};
 use forex_data::{FeatureFrame, Ohlcv};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct DiscoveryConfig {
+    pub timeframe_label: String,
+    pub evaluation_symbol: String,
+    pub evaluation_account_currency: String,
+    pub evaluation_spread_pips: f64,
+    pub evaluation_commission_per_trade: f64,
     pub population: usize,
     pub generations: usize,
     pub max_indicators: usize,
     pub candidate_count: usize,
     pub portfolio_size: usize,
+    pub max_rows: usize,
+    pub max_rows_by_timeframe: HashMap<String, usize>,
+    pub max_hours: f64,
     pub corr_threshold: f64,
     pub min_trades_per_day: f64,
+    pub walkforward_splits: usize,
+    pub embargo_minutes: usize,
+    pub enable_cpcv: bool,
+    pub cpcv_n_splits: usize,
+    pub cpcv_n_test_groups: usize,
+    pub cpcv_embargo_pct: f64,
+    pub cpcv_purge_pct: f64,
+    pub cpcv_min_phi: f64,
+    pub cpcv_max_rows: usize,
     pub filtering: crate::genetic::FilteringConfig,
 }
 
 impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
+            timeframe_label: "M1".to_string(),
+            evaluation_symbol: "EURUSD".to_string(),
+            evaluation_account_currency: "USD".to_string(),
+            evaluation_spread_pips: 1.5,
+            evaluation_commission_per_trade: 0.0,
             population: 1000,
             generations: 10,
             max_indicators: 12,
             candidate_count: 5000,
             portfolio_size: 2000,
+            max_rows: 0,
+            max_rows_by_timeframe: HashMap::new(),
+            max_hours: 0.0,
             corr_threshold: 0.85,
             min_trades_per_day: 0.2,
+            walkforward_splits: 20,
+            embargo_minutes: 120,
+            enable_cpcv: true,
+            cpcv_n_splits: 5,
+            cpcv_n_test_groups: 2,
+            cpcv_embargo_pct: 0.01,
+            cpcv_purge_pct: 0.02,
+            cpcv_min_phi: 0.80,
+            cpcv_max_rows: 0,
             filtering: crate::genetic::FilteringConfig::default(),
         }
+    }
+}
+
+impl DiscoveryConfig {
+    pub fn from_settings(settings: &forex_core::Settings) -> Self {
+        let model_settings = &settings.models;
+        let filtering = crate::genetic::FilteringConfig {
+            min_trades: model_settings.prop_min_trades.max(1) as f64,
+            anomaly_guard: true,
+            min_positive_months: model_settings.prop_search_val_min_positive_months,
+            min_trades_per_month: model_settings.prop_search_val_min_trades_per_month as f64,
+            min_monthly_return_pct: model_settings.prop_search_val_min_monthly_profit_pct / 100.0,
+            log_trades: model_settings.prop_search_val_log_trades,
+            trade_log_max: model_settings.prop_search_val_trade_log_max.max(1),
+            opportunistic_enabled: model_settings.prop_search_opportunistic_enabled,
+            use_opportunistic_candidates: model_settings.prop_search_use_opportunistic,
+            opportunistic_min_positive_months: model_settings
+                .prop_search_opportunistic_min_positive_months,
+            opportunistic_min_trades_per_month: model_settings
+                .prop_search_opportunistic_min_trades_per_month
+                as f64,
+            opportunistic_min_trade_return_pct: model_settings
+                .prop_search_opportunistic_min_trade_return_pct,
+            opportunistic_max_dd: model_settings.prop_search_opportunistic_max_dd.max(0.0),
+            ..Default::default()
+        };
+
+        Self {
+            timeframe_label: settings.system.base_timeframe.clone(),
+            evaluation_symbol: settings.system.symbol.clone(),
+            evaluation_account_currency: "USD".to_string(),
+            evaluation_spread_pips: settings.risk.backtest_spread_pips.max(0.0),
+            evaluation_commission_per_trade: settings.risk.commission_per_lot.max(0.0),
+            population: model_settings.prop_search_population.max(10),
+            generations: model_settings.prop_search_generations.max(1),
+            max_indicators: if model_settings.prop_search_max_indicators == 0 {
+                64
+            } else {
+                model_settings.prop_search_max_indicators.max(1)
+            },
+            candidate_count: model_settings
+                .prop_search_val_candidates
+                .max(model_settings.prop_search_population.max(50)),
+            portfolio_size: model_settings.prop_search_portfolio_size.max(1),
+            max_rows: model_settings.prop_search_max_rows,
+            max_rows_by_timeframe: model_settings.prop_search_max_rows_by_tf.clone(),
+            max_hours: model_settings.prop_search_max_hours.max(0.0),
+            corr_threshold: 0.85,
+            min_trades_per_day: model_settings.prop_search_val_min_trades_per_day.max(0.2),
+            walkforward_splits: model_settings.walkforward_splits.max(2),
+            embargo_minutes: model_settings.embargo_minutes,
+            enable_cpcv: model_settings.enable_cpcv,
+            cpcv_n_splits: model_settings.cpcv_n_splits.max(2),
+            cpcv_n_test_groups: model_settings.cpcv_n_test_groups.max(1),
+            cpcv_embargo_pct: model_settings.cpcv_embargo_pct.max(0.0),
+            cpcv_purge_pct: model_settings.cpcv_purge_pct.max(0.0),
+            cpcv_min_phi: model_settings.cpcv_min_phi.max(0.0),
+            cpcv_max_rows: model_settings.cpcv_max_rows,
+            filtering,
+        }
+    }
+
+    pub fn evaluation_config(&self, price_hint: Option<f64>) -> EvaluationConfig {
+        EvaluationConfig::for_symbol(
+            &self.evaluation_symbol,
+            &self.evaluation_account_currency,
+            price_hint,
+            Some(self.evaluation_spread_pips),
+            Some(self.evaluation_commission_per_trade),
+        )
     }
 }
 
@@ -38,6 +144,62 @@ impl Default for DiscoveryConfig {
 pub struct DiscoveryResult {
     pub portfolio: Vec<Gene>,
     pub candidates: Vec<Gene>,
+    pub quality_metrics: Vec<StrategyMetrics>,
+    pub logged_trades: Vec<LoggedStrategyTrades>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LoggedStrategyTrades {
+    pub strategy_id: String,
+    pub opportunistic: bool,
+    pub trades: Vec<Trade>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveryFilterProfile {
+    pub max_dd: f64,
+    pub min_profit: f64,
+    pub min_trades: f64,
+    pub min_sharpe: f64,
+    pub min_win_rate: f64,
+    pub min_profit_factor: f64,
+    pub min_positive_months: usize,
+    pub min_trades_per_month: f64,
+    pub min_monthly_return_pct: f64,
+    pub opportunistic_enabled: bool,
+    pub opportunistic_min_positive_months: usize,
+    pub opportunistic_min_trades_per_month: f64,
+    pub opportunistic_min_trade_return_pct: f64,
+    pub opportunistic_max_dd: f64,
+    pub log_trades: bool,
+    pub trade_log_max: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveryRunProfile {
+    pub timeframe_label: String,
+    pub population: usize,
+    pub generations: usize,
+    pub max_indicators: usize,
+    pub candidate_count_target: usize,
+    pub portfolio_size_target: usize,
+    pub max_rows: usize,
+    pub max_runtime_hours: f64,
+    pub corr_threshold: f64,
+    pub min_trades_per_day: f64,
+    pub walkforward_splits: usize,
+    pub embargo_minutes: usize,
+    pub enable_cpcv: bool,
+    pub cpcv_n_splits: usize,
+    pub cpcv_n_test_groups: usize,
+    pub cpcv_embargo_pct: f64,
+    pub cpcv_purge_pct: f64,
+    pub cpcv_min_phi: f64,
+    pub filters: DiscoveryFilterProfile,
+    pub candidates_observed: usize,
+    pub portfolio_observed: usize,
+    pub quality_metrics_observed: usize,
+    pub logged_trade_sets: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +225,12 @@ pub enum DiscoveryProgress {
         evaluated_candidates: usize,
         min_trades_required: usize,
     },
+    QualityScreened {
+        strict_passed: usize,
+        opportunistic_passed: usize,
+        evaluated_candidates: usize,
+        logged_trade_sets: usize,
+    },
     PortfolioSelected {
         portfolio_size: usize,
         rejected_by_correlation: usize,
@@ -84,6 +252,148 @@ pub fn ensure_non_empty_portfolio(result: &DiscoveryResult, context: &str) -> Re
         );
     }
     Ok(())
+}
+
+fn row_cap_for_config(config: &DiscoveryConfig) -> usize {
+    let tf_cap = config
+        .max_rows_by_timeframe
+        .get(&config.timeframe_label)
+        .copied()
+        .unwrap_or(0);
+    match (config.max_rows, tf_cap) {
+        (0, 0) => 0,
+        (0, tf) => tf,
+        (global, 0) => global,
+        (global, tf) => global.min(tf),
+    }
+}
+
+fn trim_recent_history(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    config: &DiscoveryConfig,
+) -> Result<(FeatureFrame, Ohlcv, Option<usize>)> {
+    let frame_rows = features.data.nrows();
+    let ohlcv_rows = ohlcv.close.len();
+    let available_rows = frame_rows.min(ohlcv_rows);
+    if available_rows == 0 {
+        anyhow::bail!("cannot run discovery on empty history");
+    }
+
+    let mut start_idx = 0usize;
+    let row_cap = row_cap_for_config(config);
+    if row_cap > 0 && row_cap < available_rows {
+        start_idx = available_rows - row_cap;
+    }
+
+    let trimmed_rows = available_rows.saturating_sub(start_idx);
+    let row_budget_applied = if start_idx > 0 {
+        Some(trimmed_rows)
+    } else {
+        None
+    };
+
+    let trimmed_features = FeatureFrame {
+        timestamps: features.timestamps[start_idx..available_rows].to_vec(),
+        names: features.names.clone(),
+        data: features
+            .data
+            .slice(ndarray::s![start_idx..available_rows, ..])
+            .to_owned(),
+    };
+    let trimmed_ohlcv = slice_ohlcv(ohlcv, start_idx, available_rows);
+    Ok((trimmed_features, trimmed_ohlcv, row_budget_applied))
+}
+
+fn slice_ohlcv(ohlcv: &Ohlcv, start_idx: usize, end_idx: usize) -> Ohlcv {
+    Ohlcv {
+        timestamp: ohlcv
+            .timestamp
+            .as_ref()
+            .map(|ts| ts[start_idx..end_idx].to_vec()),
+        open: ohlcv.open[start_idx..end_idx].to_vec(),
+        high: ohlcv.high[start_idx..end_idx].to_vec(),
+        low: ohlcv.low[start_idx..end_idx].to_vec(),
+        close: ohlcv.close[start_idx..end_idx].to_vec(),
+        volume: ohlcv
+            .volume
+            .as_ref()
+            .map(|vol| vol[start_idx..end_idx].to_vec()),
+    }
+}
+
+fn quality_analyzer_for_config(config: &DiscoveryConfig) -> StrategyQualityAnalyzer {
+    StrategyQualityAnalyzer {
+        min_sharpe: config.filtering.min_sharpe.max(0.0),
+        min_sortino: config.filtering.min_sharpe.max(0.0),
+        min_calmar: 0.0,
+        min_profit_factor: config.filtering.min_profit_factor.max(0.0),
+        min_win_rate: config.filtering.min_win_rate.clamp(0.0, 1.0),
+        min_trades: config.filtering.min_trades.max(0.0) as usize,
+        max_dd_acceptable: config.filtering.max_dd.max(0.0),
+        min_monthly_return_pct: config.filtering.min_monthly_return_pct.max(0.0),
+        edge_significance_pvalue: 0.05,
+    }
+}
+
+fn discovery_backtest_settings(gene: &Gene) -> crate::eval::BacktestSettings {
+    crate::eval::BacktestSettings {
+        sl_pips: if gene.sl_pips.is_finite() && gene.sl_pips > 0.0 {
+            gene.sl_pips
+        } else {
+            20.0
+        },
+        tp_pips: if gene.tp_pips.is_finite() && gene.tp_pips > 0.0 {
+            gene.tp_pips
+        } else {
+            40.0
+        },
+        ..crate::eval::BacktestSettings::default()
+    }
+}
+
+fn passes_strict_quality(metrics: &StrategyMetrics, cfg: &crate::genetic::FilteringConfig) -> bool {
+    if cfg.min_positive_months > 0 && metrics.positive_months < cfg.min_positive_months {
+        return false;
+    }
+    if cfg.min_trades_per_month > 0.0 && metrics.trades_per_month < cfg.min_trades_per_month {
+        return false;
+    }
+    if cfg.min_monthly_return_pct > 0.0
+        && metrics.avg_monthly_return_pct < cfg.min_monthly_return_pct
+    {
+        return false;
+    }
+    true
+}
+
+fn passes_opportunistic_quality(
+    metrics: &StrategyMetrics,
+    cfg: &crate::genetic::FilteringConfig,
+) -> bool {
+    if !cfg.opportunistic_enabled || !cfg.use_opportunistic_candidates {
+        return false;
+    }
+    if cfg.opportunistic_min_positive_months > 0
+        && metrics.positive_months < cfg.opportunistic_min_positive_months
+    {
+        return false;
+    }
+    if cfg.opportunistic_min_trades_per_month > 0.0
+        && metrics.trades_per_month < cfg.opportunistic_min_trades_per_month
+    {
+        return false;
+    }
+    let avg_trade_return_pct = metrics.avg_win_pct.abs() * 100.0;
+    if cfg.opportunistic_min_trade_return_pct > 0.0
+        && avg_trade_return_pct < cfg.opportunistic_min_trade_return_pct
+    {
+        return false;
+    }
+    if cfg.opportunistic_max_dd > 0.0 && metrics.max_drawdown_pct > cfg.opportunistic_max_dd {
+        return false;
+    }
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -118,17 +428,27 @@ pub fn run_discovery_cycle_with_progress<F>(
 where
     F: FnMut(DiscoveryProgress),
 {
+    let (features, ohlcv, _) = trim_recent_history(features, ohlcv, config)?;
     progress_fn(DiscoveryProgress::SearchStarted {
         population: config.population,
         generations: config.generations,
         max_indicators: config.max_indicators,
     });
-    let search = evolve_search_with_progress(
-        features,
-        ohlcv,
+    let max_runtime = if config.max_hours > 0.0 {
+        Some(std::time::Duration::from_secs_f64(
+            config.max_hours * 3600.0,
+        ))
+    } else {
+        None
+    };
+    let search = evolve_search_with_progress_and_limits(
+        &features,
+        &ohlcv,
         config.population,
         config.generations,
         config.max_indicators,
+        max_runtime,
+        Some(config.evaluation_config(ohlcv.close.last().copied())),
         |generation, total_generations, best_fitness, stagnant_generations, archived_profitable| {
             progress_fn(DiscoveryProgress::GenerationCompleted {
                 generation,
@@ -140,12 +460,13 @@ where
         },
     )?;
 
-    finalize_candidates_with_progress(search.genes, features, config, progress_fn)
+    finalize_candidates_with_progress(search.genes, &features, &ohlcv, config, progress_fn)
 }
 
 fn finalize_candidates_with_progress<F>(
     mut candidates: Vec<Gene>,
     features: &FeatureFrame,
+    ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
     mut progress_fn: F,
 ) -> Result<DiscoveryResult>
@@ -192,6 +513,84 @@ where
     });
 
     let filtered_count = filtered.len();
+    let mut quality_metrics = Vec::new();
+    let mut logged_trades = Vec::new();
+    if Gene::requires_quality_screen(&config.filtering) {
+        let analyzer = quality_analyzer_for_config(config);
+        let mut strict_passed = Vec::new();
+        let mut opportunistic_passed = 0usize;
+
+        for (gene, sig) in filtered.into_iter().zip(signals_map.into_iter()) {
+            let trades = crate::eval::simulate_trades_core(
+                &ohlcv.close,
+                &ohlcv.high,
+                &ohlcv.low,
+                &features.timestamps,
+                &sig,
+                &discovery_backtest_settings(&gene),
+            );
+            let metrics = analyzer.analyze_strategy(&gene.strategy_id, &trades, 100000.0);
+            let strict_quality = passes_strict_quality(&metrics, &config.filtering);
+            let opportunistic_quality =
+                !strict_quality && passes_opportunistic_quality(&metrics, &config.filtering);
+
+            if strict_quality || opportunistic_quality {
+                if opportunistic_quality {
+                    opportunistic_passed += 1;
+                }
+                quality_metrics.push(metrics.clone());
+                strict_passed.push((gene, sig, metrics, opportunistic_quality, trades));
+            }
+        }
+
+        strict_passed.sort_by(|a, b| {
+            let lane_a = if a.3 { 0_u8 } else { 1_u8 };
+            let lane_b = if b.3 { 0_u8 } else { 1_u8 };
+            lane_b
+                .cmp(&lane_a)
+                .then_with(|| {
+                    b.2.quality_score
+                        .partial_cmp(&a.2.quality_score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| {
+                    b.0.fitness
+                        .partial_cmp(&a.0.fitness)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+
+        if config.filtering.log_trades {
+            logged_trades = strict_passed
+                .iter()
+                .filter(|entry| !entry.4.is_empty())
+                .take(config.filtering.trade_log_max)
+                .map(|entry| LoggedStrategyTrades {
+                    strategy_id: entry.0.strategy_id.clone(),
+                    opportunistic: entry.3,
+                    trades: entry.4.clone(),
+                })
+                .collect();
+        }
+        let logged_trade_sets = logged_trades.len();
+
+        progress_fn(DiscoveryProgress::QualityScreened {
+            strict_passed: strict_passed.len().saturating_sub(opportunistic_passed),
+            opportunistic_passed,
+            evaluated_candidates: filtered_count,
+            logged_trade_sets,
+        });
+
+        let mut screened_genes = Vec::with_capacity(strict_passed.len());
+        let mut screened_signals = Vec::with_capacity(strict_passed.len());
+        for (gene, sig, _, _, _) in strict_passed {
+            screened_genes.push(gene);
+            screened_signals.push(sig);
+        }
+        filtered = screened_genes;
+        signals_map = screened_signals;
+    }
+
     let mut portfolio = Vec::new();
     let mut portfolio_signals: Vec<Vec<i8>> = Vec::new();
     let mut rejected_by_correlation = 0usize;
@@ -227,6 +626,8 @@ where
     Ok(DiscoveryResult {
         portfolio,
         candidates,
+        quality_metrics,
+        logged_trades,
     })
 }
 
@@ -309,6 +710,95 @@ pub fn save_portfolio_json(
     Ok(())
 }
 
+pub fn save_quality_report_json(path: impl AsRef<Path>, result: &DiscoveryResult) -> Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let payload = serde_json::to_string_pretty(&result.quality_metrics)?;
+    fs::write(path, payload)?;
+    Ok(())
+}
+
+pub fn save_trade_log_json(path: impl AsRef<Path>, result: &DiscoveryResult) -> Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let payload = serde_json::to_string_pretty(&result.logged_trades)?;
+    fs::write(path, payload)?;
+    Ok(())
+}
+
+pub fn build_discovery_profile(
+    config: &DiscoveryConfig,
+    result: &DiscoveryResult,
+) -> DiscoveryRunProfile {
+    DiscoveryRunProfile {
+        timeframe_label: config.timeframe_label.clone(),
+        population: config.population,
+        generations: config.generations,
+        max_indicators: config.max_indicators,
+        candidate_count_target: config.candidate_count,
+        portfolio_size_target: config.portfolio_size,
+        max_rows: row_cap_for_config(config),
+        max_runtime_hours: config.max_hours,
+        corr_threshold: config.corr_threshold,
+        min_trades_per_day: config.min_trades_per_day,
+        walkforward_splits: config.walkforward_splits,
+        embargo_minutes: config.embargo_minutes,
+        enable_cpcv: config.enable_cpcv,
+        cpcv_n_splits: config.cpcv_n_splits,
+        cpcv_n_test_groups: config.cpcv_n_test_groups,
+        cpcv_embargo_pct: config.cpcv_embargo_pct,
+        cpcv_purge_pct: config.cpcv_purge_pct,
+        cpcv_min_phi: config.cpcv_min_phi,
+        filters: DiscoveryFilterProfile {
+            max_dd: config.filtering.max_dd,
+            min_profit: config.filtering.min_profit,
+            min_trades: config.filtering.min_trades,
+            min_sharpe: config.filtering.min_sharpe,
+            min_win_rate: config.filtering.min_win_rate,
+            min_profit_factor: config.filtering.min_profit_factor,
+            min_positive_months: config.filtering.min_positive_months,
+            min_trades_per_month: config.filtering.min_trades_per_month,
+            min_monthly_return_pct: config.filtering.min_monthly_return_pct,
+            opportunistic_enabled: config.filtering.use_opportunistic_candidates
+                && config.filtering.opportunistic_enabled,
+            opportunistic_min_positive_months: config.filtering.opportunistic_min_positive_months,
+            opportunistic_min_trades_per_month: config.filtering.opportunistic_min_trades_per_month,
+            opportunistic_min_trade_return_pct: config.filtering.opportunistic_min_trade_return_pct,
+            opportunistic_max_dd: config.filtering.opportunistic_max_dd,
+            log_trades: config.filtering.log_trades,
+            trade_log_max: config.filtering.trade_log_max,
+        },
+        candidates_observed: result.candidates.len(),
+        portfolio_observed: result.portfolio.len(),
+        quality_metrics_observed: result.quality_metrics.len(),
+        logged_trade_sets: result.logged_trades.len(),
+    }
+}
+
+pub fn save_discovery_profile_json(
+    path: impl AsRef<Path>,
+    config: &DiscoveryConfig,
+    result: &DiscoveryResult,
+) -> Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let payload = serde_json::to_string_pretty(&build_discovery_profile(config, result))?;
+    fs::write(path, payload)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +815,44 @@ mod tests {
                 vec![1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0],
             )
             .expect("feature frame shape should be valid"),
+        }
+    }
+
+    fn sample_ohlcv() -> Ohlcv {
+        let start = 1_704_067_200_000_i64;
+        let close: Vec<f64> = vec![
+            1.1000, 1.1010, 1.1020, 1.1015, 1.1030, 1.1025, 1.1040, 1.1035, 1.1050, 1.1045,
+        ];
+        let open: Vec<f64> = close
+            .iter()
+            .enumerate()
+            .map(|(idx, value)| {
+                if idx == 0 {
+                    *value - 0.0005
+                } else {
+                    close[idx - 1]
+                }
+            })
+            .collect();
+        let high: Vec<f64> = open
+            .iter()
+            .zip(close.iter())
+            .map(|(open, close)| open.max(*close) + 0.0004)
+            .collect();
+        let low: Vec<f64> = open
+            .iter()
+            .zip(close.iter())
+            .map(|(open, close)| open.min(*close) - 0.0004)
+            .collect();
+        let volume: Vec<f64> = (0..10).map(|idx| 1000.0 + (idx as f64 * 25.0)).collect();
+
+        Ohlcv {
+            timestamp: Some((0..10).map(|idx| start + idx * 60_000).collect()),
+            open,
+            high,
+            low,
+            close,
+            volume: Some(volume),
         }
     }
 
@@ -351,6 +879,8 @@ mod tests {
         let result = DiscoveryResult {
             portfolio: Vec::new(),
             candidates: vec![Gene::default()],
+            quality_metrics: Vec::new(),
+            logged_trades: Vec::new(),
         };
 
         let err = ensure_non_empty_portfolio(&result, "EURUSD M1")
@@ -365,6 +895,8 @@ mod tests {
         let result = DiscoveryResult {
             portfolio: vec![Gene::default()],
             candidates: vec![Gene::default()],
+            quality_metrics: Vec::new(),
+            logged_trades: Vec::new(),
         };
 
         ensure_non_empty_portfolio(&result, "EURUSD M1")
@@ -374,6 +906,7 @@ mod tests {
     #[test]
     fn finalize_candidates_with_progress_emits_filter_and_portfolio_milestones() {
         let features = sample_feature_frame();
+        let ohlcv = sample_ohlcv();
         let config = DiscoveryConfig {
             candidate_count: 2,
             portfolio_size: 2,
@@ -388,16 +921,18 @@ mod tests {
                 max_dd: 0.2,
                 anomaly_guard: false,
                 elite_mode: false,
+                ..FilteringConfig::default()
             },
             ..DiscoveryConfig::default()
         };
         let candidates = vec![profitable_gene("alpha-1"), profitable_gene("alpha-2")];
         let mut progress_events = Vec::new();
 
-        let result = finalize_candidates_with_progress(candidates, &features, &config, |event| {
-            progress_events.push(event)
-        })
-        .expect("candidate finalization should succeed");
+        let result =
+            finalize_candidates_with_progress(candidates, &features, &ohlcv, &config, |event| {
+                progress_events.push(event)
+            })
+            .expect("candidate finalization should succeed");
 
         assert_eq!(result.candidates.len(), 2);
         assert_eq!(result.portfolio.len(), 1);

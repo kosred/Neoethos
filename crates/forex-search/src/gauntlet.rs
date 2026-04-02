@@ -1,5 +1,5 @@
-use crate::genetic::{month_day_indices, signals_for_gene, Gene};
 use crate::eval::BacktestSettings;
+use crate::genetic::{Gene, month_day_indices, signals_for_gene};
 use forex_data::{FeatureFrame, Ohlcv};
 
 #[derive(Debug, Clone)]
@@ -38,10 +38,17 @@ impl StrategyGauntlet {
     }
 
     pub fn run(&self, features: &FeatureFrame, ohlcv: &Ohlcv, gene: &Gene) -> bool {
-        if features.data.nrows() == 0 { return true; }
-        if ohlcv.close.len() != features.data.nrows() { return false; }
+        if features.data.nrows() == 0 {
+            return false;
+        }
+        if ohlcv.close.len() != features.data.nrows() {
+            return false;
+        }
 
         let signals = signals_for_gene(features, gene);
+        if signals.is_empty() || signals.len() != ohlcv.close.len() {
+            return false;
+        }
         let (months, days) = month_day_indices(&features.timestamps);
 
         let mut settings = self.config.backtest.clone();
@@ -64,11 +71,21 @@ impl StrategyGauntlet {
         let profit_factor = metrics[5];
         let max_daily_dd = metrics[10];
 
-        if win_rate < self.config.min_win_rate { return self.config.warn_only; }
-        if max_dd > self.config.max_drawdown_pct { return self.config.warn_only; }
-        if max_daily_dd > self.config.max_daily_dd { return self.config.warn_only; }
-        if profit_factor <= self.config.min_profit_factor { return self.config.warn_only; }
-        if net_profit <= 0.0 { return self.config.warn_only; }
+        if win_rate < self.config.min_win_rate {
+            return self.config.warn_only;
+        }
+        if max_dd > self.config.max_drawdown_pct {
+            return self.config.warn_only;
+        }
+        if max_daily_dd > self.config.max_daily_dd {
+            return self.config.warn_only;
+        }
+        if profit_factor <= self.config.min_profit_factor {
+            return self.config.warn_only;
+        }
+        if net_profit <= 0.0 {
+            return self.config.warn_only;
+        }
         true
     }
 }

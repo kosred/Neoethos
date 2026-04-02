@@ -1,10 +1,10 @@
+pub mod ai_insights;
 pub mod components;
+pub mod dashboard;
 pub mod discovery;
 pub mod hardware;
 pub mod risk;
-pub mod system_status;
+pub mod system;
 pub mod theme;
 pub mod trading;
 pub mod training;
-pub mod ai_insights;
-pub mod dashboard;

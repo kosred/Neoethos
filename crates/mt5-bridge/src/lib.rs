@@ -1,10 +1,18 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use forex_core::logging::write_subsystem_record;
 use forex_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MT5CapabilityReport {
+    pub connected: bool,
+    pub read_only: bool,
+    pub supported_queries: &'static [&'static str],
+    pub unsupported_actions: &'static [&'static str],
+}
 
 fn format_last_error(err: &Bound<'_, PyAny>) -> PyResult<String> {
     if let Ok((code, description)) = err.extract::<(i32, String)>() {
@@ -128,6 +136,26 @@ impl MT5Engine {
         Ok(Self { connected: false })
     }
 
+    pub fn capability_report(&self) -> MT5CapabilityReport {
+        MT5CapabilityReport {
+            connected: self.connected,
+            read_only: true,
+            supported_queries: &[
+                "terminal_info",
+                "positions",
+                "orders",
+                "recent_deals",
+                "historical_bars",
+            ],
+            unsupported_actions: &[
+                "execute_order",
+                "modify_order",
+                "cancel_order",
+                "close_position",
+            ],
+        }
+    }
+
     pub fn initialize(&mut self) -> Result<bool> {
         record_mt5_event("initialize", "STARTED", "starting MT5 initialization");
         let res = Python::attach(|py| -> PyResult<bool> {
@@ -143,37 +171,51 @@ impl MT5Engine {
                     return Ok(false);
                 }
             };
-            
+
             let init_result: bool = mt5.getattr("initialize")?.call0()?.extract()?;
-            
+
             if !init_result {
                 let err_obj = mt5.getattr("last_error")?.call0()?;
                 let err = format_last_error(err_obj.as_any())?;
                 error!("MT5 Initialization failed. Last error: {}", err);
-                record_mt5_event("initialize", "FAILED", format!("MT5 initialize returned false: {err}"));
+                record_mt5_event(
+                    "initialize",
+                    "FAILED",
+                    format!("MT5 initialize returned false: {err}"),
+                );
                 return Ok(false);
             }
 
             info!("MT5 successfully initialized from Pure Rust.");
-            record_mt5_event("initialize", "SUCCESS", "MT5 successfully initialized from Pure Rust");
+            record_mt5_event(
+                "initialize",
+                "SUCCESS",
+                "MT5 successfully initialized from Pure Rust",
+            );
             Ok(true)
-        }).map_err(|e| anyhow::anyhow!("PyError: {}", e))?;
-        
+        })
+        .map_err(|e| anyhow::anyhow!("PyError: {}", e))?;
+
         self.connected = res;
         Ok(res)
     }
 
     pub fn terminal_info(&self) -> Result<String> {
-        if !self.connected { anyhow::bail!("MT5 is not connected."); }
+        if !self.connected {
+            anyhow::bail!("MT5 is not connected.");
+        }
 
         Python::attach(|py| -> PyResult<String> {
             let mt5 = py.import("MetaTrader5")?;
             let info = mt5.getattr("terminal_info")?.call0()?;
             if info.is_none() {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err("Failed to get terminal info."));
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "Failed to get terminal info.",
+                ));
             }
             Ok(info.to_string())
-        }).map_err(|e| anyhow::anyhow!("PyError: {}", e))
+        })
+        .map_err(|e| anyhow::anyhow!("PyError: {}", e))
     }
 
     pub fn positions(&self, symbol: Option<&str>) -> Result<Vec<PositionInfo>> {
@@ -250,9 +292,12 @@ impl MT5Engine {
         Python::attach(|py| -> PyResult<Vec<HistoricalBarInfo>> {
             let mt5 = py.import("MetaTrader5")?;
             let timeframe_value = mt5_timeframe_value(&mt5, timeframe)?;
-            let rates = mt5
-                .getattr("copy_rates_range")?
-                .call1((symbol, timeframe_value, from_timestamp_s, to_timestamp_s))?;
+            let rates = mt5.getattr("copy_rates_range")?.call1((
+                symbol,
+                timeframe_value,
+                from_timestamp_s,
+                to_timestamp_s,
+            ))?;
             let rates = ensure_mt5_collection(&mt5, "copy_rates_range", rates)?;
             let rows = if rates.hasattr("tolist")? {
                 rates.getattr("tolist")?.call0()?
@@ -280,10 +325,18 @@ impl MT5Engine {
             record_mt5_event("shutdown", "SUCCESS", "MT5 connection shutdown completed");
         }
     }
+
+    pub fn execute_order(&self) -> Result<()> {
+        bail!(
+            "MT5 Rust bridge is read-only in this repository; trade execution is not implemented here"
+        );
+    }
 }
 
 impl Drop for MT5Engine {
-    fn drop(&mut self) { self.shutdown(); }
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 fn call_mt5_collection<'py>(
@@ -405,7 +458,7 @@ fn mt5_timeframe_value(mt5: &Bound<'_, PyModule>, timeframe: &str) -> PyResult<P
         other => {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "unsupported MT5 timeframe: {other}"
-            )))
+            )));
         }
     };
 
@@ -472,10 +525,12 @@ mod tests {
     fn test_format_last_error_handles_mt5_tuple_payload() -> Result<()> {
         Python::attach(|py| {
             let locals = PyDict::new(py);
-            run_py(py, r#"err = (-6, "Terminal: Authorization failed")"#, &locals)?;
-            let err = locals
-                .get_item("err")?
-                .expect("err should be defined");
+            run_py(
+                py,
+                r#"err = (-6, "Terminal: Authorization failed")"#,
+                &locals,
+            )?;
+            let err = locals.get_item("err")?.expect("err should be defined");
 
             let formatted = format_last_error(err.as_any())?;
 
@@ -492,9 +547,7 @@ mod tests {
         Python::attach(|py| {
             let locals = PyDict::new(py);
             run_py(py, r#"err = "module unavailable""#, &locals)?;
-            let err = locals
-                .get_item("err")?
-                .expect("err should be defined");
+            let err = locals.get_item("err")?.expect("err should be defined");
 
             let formatted = format_last_error(err.as_any())?;
 
@@ -507,7 +560,10 @@ mod tests {
     fn test_mt5_record_targets_mt5_section() {
         let record = mt5_record("initialize", "FAILED", "authorization failed");
 
-        assert_eq!(record.subsystem, forex_core::sectioned_log::SubsystemSection::Mt5);
+        assert_eq!(
+            record.subsystem,
+            forex_core::sectioned_log::SubsystemSection::Mt5
+        );
         assert_eq!(record.operation, "initialize");
         assert_eq!(record.status, "FAILED");
         assert_eq!(record.message, "authorization failed");
@@ -619,5 +675,30 @@ sys.modules["MetaTrader5"] = mt5
             .expect_err("disconnected MT5 engine must fail");
 
         assert!(err.to_string().contains("not connected"));
+    }
+
+    #[test]
+    fn test_capability_report_is_truthful_and_read_only() {
+        let engine = MT5Engine { connected: true };
+        let report = engine.capability_report();
+
+        assert!(report.connected);
+        assert!(report.read_only);
+        assert!(report.supported_queries.contains(&"positions"));
+        assert!(report.unsupported_actions.contains(&"execute_order"));
+    }
+
+    #[test]
+    fn test_execute_order_is_explicitly_unsupported() {
+        let engine = MT5Engine { connected: true };
+
+        let err = engine
+            .execute_order()
+            .expect_err("MT5 Rust bridge should be read-only");
+
+        assert!(
+            err.to_string().contains("read-only"),
+            "unexpected error message: {err}"
+        );
     }
 }

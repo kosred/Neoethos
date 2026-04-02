@@ -15,8 +15,6 @@ pub mod search;
 pub mod evaluation;
 pub mod validation;
 pub mod training;
-
-#[cfg(feature = "burn-backend")]
 pub mod burn_bindings;
 
 #[pymodule]
@@ -57,12 +55,12 @@ fn forex_bindings(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(evaluation::infer_stop_target_pips_ohlcv, m)?)?;
     m.add_function(wrap_pyfunction!(evaluation::fast_evaluate_strategy, m)?)?;
     m.add_function(wrap_pyfunction!(evaluation::batch_evaluate_strategies, m)?)?;
-    m.add_function(wrap_pyfunction!(evaluation::evaluate_population_talib_ohlcv, m)?)?;
+    m.add_function(wrap_pyfunction!(evaluation::evaluate_population_vector_ta_ohlcv, m)?)?;
     m.add_function(wrap_pyfunction!(evaluation::evaluate_population_core_py, m)?)?;
     m.add_function(wrap_pyfunction!(evaluation::trade_journal_metrics, m)?)?;
     m.add_function(wrap_pyfunction!(evaluation::triple_barrier_labels, m)?)?;
     m.add_function(wrap_pyfunction!(evaluation::quick_backtest_metrics, m)?)?;
-    m.add_function(wrap_pyfunction!(evaluation::talib_bulk_signals_ohlcv, m)?)?;
+    m.add_function(wrap_pyfunction!(evaluation::vector_ta_bulk_signals_ohlcv, m)?)?;
 
     // Validation
     m.add_function(wrap_pyfunction!(validation::embargoed_walkforward_backtest_py, m)?)?;
@@ -106,7 +104,6 @@ fn forex_bindings(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     models::register_models(m)?;
 
     // Burn deep learning models (pure Rust)
-    #[cfg(feature = "burn-backend")]
     burn_bindings::register_burn_models(m)?;
 
     Ok(())

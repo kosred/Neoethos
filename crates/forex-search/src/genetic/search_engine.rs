@@ -1,17 +1,18 @@
 use super::evolution_math::{
-    apply_metrics, crossover, generate_random_genes, mutate, new_random_gene,
-    unique_candidate_or_retry, SeenSignatureMemory,
+    EvolutionSearchPolicy, ParentSelectionPolicy, SeenSignatureMemory, SurvivorSelectionPolicy,
+    apply_metrics, crossover, generate_random_genes, mutate, new_random_gene, select_parent_index,
+    select_survivor_indices, unique_candidate_or_retry,
 };
-use super::smc_indicators::{build_smc_arrays, enforce_population_smc_ratio, SmcSearchConfig};
+use super::smc_indicators::{SmcSearchConfig, build_smc_arrays, enforce_population_smc_ratio};
 use super::strategy_gene::{EvaluationConfig, Gene, SearchResult};
 use crate::eval::BacktestSettings;
-use crate::stop_target::{infer_stop_target_pips, StopTargetSettings};
-use anyhow::{anyhow, bail, Result};
+use crate::stop_target::{StopTargetSettings, infer_stop_target_pips};
+use anyhow::{Result, anyhow, bail};
 use chrono::{Datelike, TimeZone, Utc};
 use forex_data::{FeatureFrame, Ohlcv};
 use ndarray::Array2;
-use rand::Rng;
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 type GeneArrays = (Vec<i32>, Vec<i32>, Vec<f32>, Vec<f32>, Vec<f32>);
 
@@ -244,7 +245,34 @@ pub fn evolve_search(
         population,
         generations,
         max_indicators,
+        None,
         |_, _, _, _, _| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn evolve_search_with_progress_and_limits<F>(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    population: usize,
+    generations: usize,
+    max_indicators: usize,
+    max_runtime: Option<Duration>,
+    eval_config: Option<EvaluationConfig>,
+    progress_fn: F,
+) -> Result<SearchResult>
+where
+    F: FnMut(usize, usize, f64, usize, usize),
+{
+    evolve_search_with_progress_impl(
+        features,
+        ohlcv,
+        population,
+        generations,
+        max_indicators,
+        max_runtime,
+        eval_config,
+        progress_fn,
     )
 }
 
@@ -254,6 +282,33 @@ pub fn evolve_search_with_progress<F>(
     population: usize,
     generations: usize,
     max_indicators: usize,
+    eval_config: Option<EvaluationConfig>,
+    progress_fn: F,
+) -> Result<SearchResult>
+where
+    F: FnMut(usize, usize, f64, usize, usize),
+{
+    evolve_search_with_progress_impl(
+        features,
+        ohlcv,
+        population,
+        generations,
+        max_indicators,
+        None,
+        eval_config,
+        progress_fn,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evolve_search_with_progress_impl<F>(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    population: usize,
+    generations: usize,
+    max_indicators: usize,
+    max_runtime: Option<Duration>,
+    eval_config: Option<EvaluationConfig>,
     mut progress_fn: F,
 ) -> Result<SearchResult>
 where
@@ -280,10 +335,8 @@ where
     let gate_stagnation_step = env_f32("FOREX_BOT_PROP_SMC_GATE_STAGNATION_STEP", 0.03).max(0.0);
     let (gate_lo, gate_hi) = (gate_start.min(gate_end), gate_start.max(gate_end));
 
-    let mut eval_cfg = EvaluationConfig {
-        smc_gate_threshold: gate_start.clamp(gate_lo, gate_hi),
-        ..EvaluationConfig::default()
-    };
+    let mut eval_cfg = eval_config.unwrap_or_default();
+    eval_cfg.smc_gate_threshold = gate_start.clamp(gate_lo, gate_hi);
 
     let seen_retry_attempts = std::env::var("FOREX_BOT_PROP_SEEN_RETRY")
         .ok()
@@ -336,12 +389,36 @@ where
         .unwrap_or(population * generations.max(1))
         .max(population);
     let base_immigrant_ratio = env_f64("FOREX_BOT_PROP_RANDOM_IMMIGRANTS", 0.25).clamp(0.0, 0.95);
+    let base_survivor_fraction = env_f64(
+        "FOREX_BOT_PROP_SURVIVOR_FRACTION",
+        env_f64("FOREX_BOT_PROP_ELITE_FRACTION", 0.10),
+    )
+    .clamp(0.0, 0.95);
+    let parent_selection =
+        ParentSelectionPolicy::parse(&env_str("FOREX_BOT_PROP_PARENT_SELECTION", "rank"));
+    let survivor_selection =
+        SurvivorSelectionPolicy::parse(&env_str("FOREX_BOT_PROP_SURVIVOR_SELECTION", "rank"));
+    let selection_temperature = env_f64("FOREX_BOT_PROP_SELECTION_TEMPERATURE", 0.75).max(1e-3);
+    let tournament_size = std::env::var("FOREX_BOT_PROP_TOURNAMENT_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or((population / 12).max(3))
+        .max(2);
+    let search_policy = EvolutionSearchPolicy::new(
+        base_survivor_fraction,
+        base_immigrant_ratio,
+        parent_selection,
+        survivor_selection,
+        selection_temperature,
+        tournament_size,
+    );
     let stagnation_patience = std::env::var("FOREX_BOT_PROP_STAGNATION_GENS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(2)
         .max(1);
 
+    let started_at = Instant::now();
     let mut best_score_seen = f64::NEG_INFINITY;
     let mut stagnant_gens = 0usize;
 
@@ -369,6 +446,65 @@ where
             .zip(metrics.into_iter())
             .map(|(g, m)| (g.fitness, g, m))
             .collect();
+
+        // --- Novelty Search: Behavioral Diversity ---
+        let novelty_weight: f64 = std::env::var("FOREX_BOT_NOVELTY_WEIGHT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.15);
+        if novelty_weight > 0.0 && scored.len() > 1 {
+            let n_pop = scored.len();
+            let mut novelty_scores = vec![0.0; n_pop];
+            for i in 0..n_pop {
+                let sig_i: HashSet<_> = scored[i].1.indices.iter().copied().collect();
+                let mut dist_sum = 0.0;
+                for (j, (_, gene_j, _)) in scored.iter().enumerate().take(n_pop) {
+                    if i == j {
+                        continue;
+                    }
+                    let sig_j: HashSet<_> = gene_j.indices.iter().copied().collect();
+                    let intersection = sig_i.intersection(&sig_j).count() as f64;
+                    let union = sig_i.union(&sig_j).count() as f64;
+                    let jaccard_dist = if union > 0.0 {
+                        1.0 - (intersection / union)
+                    } else {
+                        0.0
+                    };
+                    dist_sum += jaccard_dist;
+                }
+                novelty_scores[i] = dist_sum / (n_pop as f64 - 1.0);
+            }
+
+            // Normalize and blend
+            let min_fit = scored
+                .iter()
+                .map(|(f, _, _)| *f)
+                .filter(|f| f.is_finite())
+                .fold(f64::INFINITY, f64::min);
+            let max_fit = scored
+                .iter()
+                .map(|(f, _, _)| *f)
+                .filter(|f| f.is_finite())
+                .fold(f64::NEG_INFINITY, f64::max);
+            let fit_range = (max_fit - min_fit).max(1e-9);
+            let max_nov = novelty_scores
+                .iter()
+                .copied()
+                .fold(0.0_f64, f64::max)
+                .max(1e-9);
+
+            for i in 0..n_pop {
+                if !scored[i].0.is_finite() {
+                    continue;
+                }
+                let norm_fit = (scored[i].0 - min_fit) / fit_range;
+                let norm_nov = novelty_scores[i] / max_nov;
+                // Modify the sorting score purely for the tournament survival/elites
+                scored[i].0 = (1.0 - novelty_weight) * norm_fit + novelty_weight * norm_nov;
+            }
+        }
+        // ------------------------------------------
+
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
         let top_score = scored.first().map(|x| x.0).unwrap_or(f64::NEG_INFINITY);
@@ -418,16 +554,47 @@ where
             profitable_archive.len(),
         );
 
-        let elite_count = ((population as f32) * 0.2) as usize;
-        let elite_count = elite_count.clamp(2, scored.len());
-        let elites: Vec<Gene> = scored
+        if let Some(max_runtime) = max_runtime {
+            if started_at.elapsed() >= max_runtime {
+                let best_return_count = population.clamp(2, 24).min(scored.len());
+                let top_candidates: Vec<Gene> = scored
+                    .iter()
+                    .take(best_return_count)
+                    .map(|(_, g, _)| g.clone())
+                    .collect();
+                let top_metrics: Vec<[f64; 11]> = scored
+                    .iter()
+                    .take(best_return_count)
+                    .map(|(_, _, m)| *m)
+                    .collect();
+                seen_memory.flush();
+                if !profitable_archive.is_empty() {
+                    profitable_archive.sort_by(|a, b| {
+                        b.1[0]
+                            .partial_cmp(&a.1[0])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    return Ok(SearchResult {
+                        genes: profitable_archive.iter().map(|(g, _)| g.clone()).collect(),
+                        metrics: profitable_archive.iter().map(|(_, m)| *m).collect(),
+                    });
+                }
+                return Ok(SearchResult {
+                    genes: top_candidates,
+                    metrics: top_metrics,
+                });
+            }
+        }
+
+        let best_return_count = population.clamp(2, 24).min(scored.len());
+        let top_candidates: Vec<Gene> = scored
             .iter()
-            .take(elite_count)
+            .take(best_return_count)
             .map(|(_, g, _)| g.clone())
             .collect();
         best_metrics = scored
             .iter()
-            .take(elite_count)
+            .take(best_return_count)
             .map(|(_, _, m)| *m)
             .collect();
 
@@ -445,17 +612,42 @@ where
                 });
             }
             return Ok(SearchResult {
-                genes: elites,
+                genes: top_candidates,
                 metrics: best_metrics,
             });
         }
 
-        let mut next = Vec::with_capacity(population);
-        next.extend(elites.clone());
-        let immigrant_ratio = if stagnant_gens >= stagnation_patience {
-            base_immigrant_ratio.max(0.5)
+        let mut rng = rand::rng();
+        let score_vector: Vec<f64> = scored.iter().map(|(score, _, _)| *score).collect();
+        let survivor_fraction = if stagnant_gens >= stagnation_patience {
+            (search_policy.survivor_fraction * 0.75).clamp(0.0, 0.5)
         } else {
-            base_immigrant_ratio
+            search_policy.survivor_fraction
+        };
+        let survivor_count = ((population as f64) * survivor_fraction).round() as usize;
+        let survivor_count = match search_policy.survivor_selection {
+            SurvivorSelectionPolicy::Generational => 0,
+            _ => survivor_count.clamp(2, scored.len()),
+        };
+        let survivor_indices = select_survivor_indices(
+            &score_vector,
+            survivor_count,
+            search_policy.survivor_selection,
+            search_policy.selection_temperature,
+            search_policy.tournament_size,
+            &mut rng,
+        );
+        let survivors: Vec<Gene> = survivor_indices
+            .iter()
+            .map(|idx| scored[*idx].1.clone())
+            .collect();
+
+        let mut next = Vec::with_capacity(population);
+        next.extend(survivors);
+        let immigrant_ratio = if stagnant_gens >= stagnation_patience {
+            search_policy.immigrant_fraction.max(0.5)
+        } else {
+            search_policy.immigrant_fraction
         };
         let immigrant_count = ((population as f64) * immigrant_ratio).round() as usize;
         let immigrant_count = immigrant_count.min(population - next.len());
@@ -471,11 +663,40 @@ where
             ));
         }
 
-        let mut rng = rand::rng();
-        let parent_pool_len = (elite_count * 3).min(scored.len()).max(elite_count);
+        let parent_indices: Vec<usize> = (0..scored.len()).collect();
         while next.len() < population {
-            let a = &scored[rng.random_range(0..parent_pool_len)].1;
-            let b = &scored[rng.random_range(0..parent_pool_len)].1;
+            let a_idx = select_parent_index(
+                &score_vector,
+                &parent_indices,
+                search_policy.parent_selection,
+                search_policy.tournament_size,
+                search_policy.selection_temperature,
+                &mut rng,
+            );
+            let mut b_idx = select_parent_index(
+                &score_vector,
+                &parent_indices,
+                search_policy.parent_selection,
+                search_policy.tournament_size,
+                search_policy.selection_temperature,
+                &mut rng,
+            );
+            if parent_indices.len() > 1 {
+                let mut retries = 0usize;
+                while b_idx == a_idx && retries < 4 {
+                    b_idx = select_parent_index(
+                        &score_vector,
+                        &parent_indices,
+                        search_policy.parent_selection,
+                        search_policy.tournament_size,
+                        search_policy.selection_temperature,
+                        &mut rng,
+                    );
+                    retries += 1;
+                }
+            }
+            let a = &scored[a_idx].1;
+            let b = &scored[b_idx].1;
             next.push(unique_candidate_or_retry(
                 mutate(
                     &crossover(a, b, gen + 1),

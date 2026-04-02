@@ -1,7 +1,7 @@
-use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2, IntoPyArray};
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyModule};
 use forex_models::burn_models::*;
+use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+use pyo3::prelude::*;
+use pyo3::types::PyModule;
 
 /// Helper macro to create PyO3 wrappers for each Burn model
 macro_rules! burn_model_wrapper {
@@ -28,14 +28,14 @@ macro_rules! burn_model_wrapper {
         impl $py_name {
             #[new]
             #[pyo3(signature = (
-                input_dim=96,
-                hidden_dim=$default_hidden,
-                n_classes=3,
-                lr=1e-3,
-                batch_size=64,
-                max_epochs=100,
-                patience=8,
-            ))]
+                        input_dim=96,
+                        hidden_dim=$default_hidden,
+                        n_classes=3,
+                        lr=1e-3,
+                        batch_size=64,
+                        max_epochs=100,
+                        patience=8,
+                    ))]
             fn new(
                 input_dim: usize,
                 hidden_dim: usize,
@@ -81,11 +81,13 @@ macro_rules! burn_model_wrapper {
                     max_epochs: self.max_epochs,
                     patience: self.patience,
                     n_classes: self.n_classes,
+                    ..TrainConfig::default()
                 };
 
-                let (trained, best_loss) = train_model::<TrainBackend, _>(
-                    model, &x, &y, &train_config,
-                );
+                let (trained, best_loss) =
+                    train_model::<TrainBackend, _>(model, &x, &y, &train_config).map_err(
+                        |err| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(err.to_string()),
+                    )?;
                 self.model = Some(trained);
                 Ok(best_loss as f64)
             }
@@ -101,7 +103,9 @@ macro_rules! burn_model_wrapper {
                         "Model not trained yet. Call fit() first.",
                     )
                 })?;
-                let probs = predict_proba::<TrainBackend, _>(model, &x, self.batch_size);
+                let probs = predict_proba::<TrainBackend, _>(model, &x, self.batch_size).map_err(
+                    |err| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(err.to_string()),
+                )?;
                 Ok(probs.into_pyarray(py))
             }
         }
@@ -112,7 +116,13 @@ burn_model_wrapper!(BurnMLPModel, BurnMLPConfig, BurnMLP, 256, 3);
 burn_model_wrapper!(BurnNBeatsModel, BurnNBeatsConfig, BurnNBeats, 64, 3);
 burn_model_wrapper!(BurnTiDEModel, BurnTiDEConfig, BurnTiDE, 128, 2);
 burn_model_wrapper!(BurnKANModel, BurnKANConfig, BurnKAN, 32, 2);
-burn_model_wrapper!(BurnTransformerModel, BurnTransformerConfig, BurnTransformer, 128, 4);
+burn_model_wrapper!(
+    BurnTransformerModel,
+    BurnTransformerConfig,
+    BurnTransformer,
+    128,
+    4
+);
 
 // TabNet needs special handling
 #[pyclass(unsendable, name = "BurnTabNetModel", module = "forex_bindings")]
@@ -132,14 +142,29 @@ impl BurnTabNetModel {
     #[new]
     #[pyo3(signature = (input_dim=96, hidden_dim=64, n_classes=3, lr=2e-3, batch_size=64, max_epochs=100, patience=8))]
     fn new(
-        input_dim: usize, hidden_dim: usize, n_classes: usize,
-        lr: f64, batch_size: usize, max_epochs: usize, patience: usize,
+        input_dim: usize,
+        hidden_dim: usize,
+        n_classes: usize,
+        lr: f64,
+        batch_size: usize,
+        max_epochs: usize,
+        patience: usize,
     ) -> Self {
-        Self { model: None, input_dim, hidden_dim, n_classes, lr, batch_size, max_epochs, patience }
+        Self {
+            model: None,
+            input_dim,
+            hidden_dim,
+            n_classes,
+            lr,
+            batch_size,
+            max_epochs,
+            patience,
+        }
     }
 
     fn fit<'py>(
-        &mut self, _py: Python<'py>,
+        &mut self,
+        _py: Python<'py>,
         features: PyReadonlyArray2<'py, f32>,
         labels: PyReadonlyArray1<'py, i32>,
     ) -> PyResult<f64> {
@@ -154,23 +179,32 @@ impl BurnTabNetModel {
         let model = config.init::<TrainBackend>(&device);
 
         let train_config = TrainConfig {
-            lr: self.lr, batch_size: self.batch_size,
-            max_epochs: self.max_epochs, patience: self.patience, n_classes: self.n_classes,
+            lr: self.lr,
+            batch_size: self.batch_size,
+            max_epochs: self.max_epochs,
+            patience: self.patience,
+            n_classes: self.n_classes,
+            ..TrainConfig::default()
         };
-        let (trained, best_loss) = train_model::<TrainBackend, _>(model, &x, &y, &train_config);
+        let (trained, best_loss) = train_model::<TrainBackend, _>(model, &x, &y, &train_config)
+            .map_err(|err| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(err.to_string()))?;
         self.model = Some(trained);
         Ok(best_loss as f64)
     }
 
     fn predict_proba<'py>(
-        &self, py: Python<'py>,
+        &self,
+        py: Python<'py>,
         features: PyReadonlyArray2<'py, f32>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let x = features.as_array().to_owned();
         let model = self.model.as_ref().ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Model not trained. Call fit() first.")
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Model not trained. Call fit() first.",
+            )
         })?;
-        let probs = predict_proba::<TrainBackend, _>(model, &x, self.batch_size);
+        let probs = predict_proba::<TrainBackend, _>(model, &x, self.batch_size)
+            .map_err(|err| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(err.to_string()))?;
         Ok(probs.into_pyarray(py))
     }
 }

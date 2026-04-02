@@ -73,17 +73,50 @@ impl ChallengeOptimizer {
         };
 
         let kelly = self.kelly_criterion(input.win_rate, input.avg_risk_reward);
-        let kelly_limit = kelly * 0.5;
+        let kelly_limit = kelly * 0.25;
 
         let daily_room = (self.target.max_daily_dd - input.daily_loss_pct).max(0.0);
         let total_room = (self.target.max_total_dd - input.current_drawdown).max(0.0);
         let safety_limit = daily_room.min(total_room).max(0.0);
-
-        let mut optimal_risk = required_risk.min(kelly_limit).min(safety_limit);
-        if optimal_risk > safety_limit {
-            optimal_risk = safety_limit;
+        let daily_utilization = if self.target.max_daily_dd > 0.0 {
+            (input.daily_loss_pct / self.target.max_daily_dd).clamp(0.0, 1.5)
+        } else {
+            1.0
+        };
+        let total_utilization = if self.target.max_total_dd > 0.0 {
+            (input.current_drawdown / self.target.max_total_dd).clamp(0.0, 1.5)
+        } else {
+            1.0
+        };
+        let time_pressure = if self.target.max_trading_days > 0 {
+            1.0 - (input.days_left.max(0) as f64 / self.target.max_trading_days as f64)
+        } else {
+            0.0
         }
-        optimal_risk.clamp(0.001, 0.02)
+        .clamp(0.0, 1.0);
+        let pace_factor = (1.0 - 0.45 * time_pressure).clamp(0.40, 1.0);
+        let drawdown_factor =
+            (1.0 - 0.55 * daily_utilization.max(total_utilization)).clamp(0.20, 1.0);
+        let quality_factor = if expectancy <= 0.0 {
+            0.25
+        } else {
+            ((input.win_rate.clamp(0.0, 1.0) + (input.avg_risk_reward / 3.0).clamp(0.0, 1.0)) * 0.5)
+                .clamp(0.35, 1.0)
+        };
+        let safety_cap = (safety_limit * 0.5).max(0.0);
+
+        let mut optimal_risk = required_risk.min(kelly_limit).min(safety_cap)
+            * pace_factor
+            * drawdown_factor
+            * quality_factor;
+
+        if input.daily_loss_pct >= self.target.max_daily_dd * 0.9
+            || input.current_drawdown >= self.target.max_total_dd * 0.9
+        {
+            optimal_risk = optimal_risk.min(0.0025);
+        }
+
+        optimal_risk.clamp(0.001, 0.015)
     }
 
     fn kelly_criterion(&self, win_rate: f64, rw_ratio: f64) -> f64 {

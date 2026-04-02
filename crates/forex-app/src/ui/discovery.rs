@@ -1,12 +1,12 @@
 use crate::app_services::{
-    discovery::{failed_snapshot, start_discovery_job, DiscoveryJobHandle, DiscoveryRequest},
-    jobs::{JobSnapshot, JobState},
     ServiceEvent,
+    discovery::{DiscoveryJobHandle, DiscoveryRequest, failed_snapshot, start_discovery_job},
+    jobs::{JobSnapshot, JobState},
 };
 use crate::app_state::AppState;
 use crate::ui::components::{
-    open_log, render_dashboard_sections, render_report, render_status_badge, render_summary_cards,
-    render_view_header, DashboardCard, DashboardSection,
+    DashboardCard, DashboardSection, open_log, render_dashboard_sections, render_report,
+    render_status_badge, render_summary_cards, render_view_header,
 };
 use eframe::egui;
 use tokio::sync::mpsc;
@@ -53,13 +53,34 @@ pub fn render(
                     ui.label("Higher Timeframes (CSV):");
                     ui.text_edit_singleline(&mut state.discovery_form.higher_tfs);
                 });
-                ui.add(egui::Slider::new(&mut state.discovery_form.max_indicators, 1..=30).text("Max Indicators"));
-                ui.add(egui::Slider::new(&mut state.discovery_form.population, 10..=500).text("Population"));
-                ui.add(egui::Slider::new(&mut state.discovery_form.generations, 1..=100).text("Generations"));
-                ui.add(egui::Slider::new(&mut state.discovery_form.target_candidates, 10..=1000).text("Target Candidates"));
-                ui.add(egui::Slider::new(&mut state.discovery_form.portfolio_size, 1..=500).text("Portfolio Size"));
-                ui.add(egui::Slider::new(&mut state.discovery_form.correlation_threshold, 0.0..=1.0).text("Correlation Threshold"));
-                ui.add(egui::Slider::new(&mut state.discovery_form.min_trades_per_day, 0.1..=10.0).text("Min Trades/Day"));
+                ui.add(
+                    egui::Slider::new(&mut state.discovery_form.max_indicators, 1..=30)
+                        .text("Max Indicators"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut state.discovery_form.population, 10..=500)
+                        .text("Population"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut state.discovery_form.generations, 1..=100)
+                        .text("Generations"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut state.discovery_form.target_candidates, 10..=1000)
+                        .text("Target Candidates"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut state.discovery_form.portfolio_size, 1..=500)
+                        .text("Portfolio Size"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut state.discovery_form.correlation_threshold, 0.0..=1.0)
+                        .text("Correlation Threshold"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut state.discovery_form.min_trades_per_day, 0.1..=10.0)
+                        .text("Min Trades/Day"),
+                );
             });
         });
 
@@ -85,18 +106,21 @@ pub fn render(
             .unwrap_or(false);
 
         if !running && ui.button("🔥 Start Genetic Discovery").clicked() {
-            let higher_tfs: Vec<String> = state.discovery_form.higher_tfs
+            let higher_tfs: Vec<String> = state
+                .discovery_form
+                .higher_tfs
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
-                
+
             let request = DiscoveryRequest {
                 data_root: state.runtime.data_dir.clone(),
                 symbol: state.selected_pair.clone(),
                 base_tf: state.discovery_form.base_tf.clone(),
                 higher_tfs,
                 config: forex_search::DiscoveryConfig {
+                    timeframe_label: state.discovery_form.base_tf.clone(),
                     population: state.discovery_form.population as usize,
                     generations: state.discovery_form.generations as usize,
                     max_indicators: state.discovery_form.max_indicators as usize,
@@ -104,7 +128,7 @@ pub fn render(
                     portfolio_size: state.discovery_form.portfolio_size as usize,
                     corr_threshold: state.discovery_form.correlation_threshold as f64,
                     min_trades_per_day: state.discovery_form.min_trades_per_day as f64,
-                    filtering: Default::default(),
+                    ..forex_search::DiscoveryConfig::default()
                 },
             };
 
@@ -132,7 +156,11 @@ pub fn render(
             if let Err(err) = open_log(&state.canonical_log_path) {
                 state.discovery_job = Some(failed_snapshot(
                     crate::app_services::jobs::JobKind::Discovery,
-                    anyhow::anyhow!("failed to open log {}: {}", state.canonical_log_path.display(), err),
+                    anyhow::anyhow!(
+                        "failed to open log {}: {}",
+                        state.canonical_log_path.display(),
+                        err
+                    ),
                 ));
             }
         }
@@ -180,8 +208,18 @@ fn build_discovery_dashboard(snapshot: &JobSnapshot) -> DiscoveryDashboard {
     let mut sections = Vec::new();
 
     let mut plan_rows = Vec::new();
-    push_counter_row(snapshot, &mut plan_rows, "target_candidates", "Target Candidates");
-    push_counter_row(snapshot, &mut plan_rows, "target_portfolio", "Target Portfolio");
+    push_counter_row(
+        snapshot,
+        &mut plan_rows,
+        "target_candidates",
+        "Target Candidates",
+    );
+    push_counter_row(
+        snapshot,
+        &mut plan_rows,
+        "target_portfolio",
+        "Target Portfolio",
+    );
     push_counter_row(snapshot, &mut plan_rows, "population", "Population");
     push_counter_row(snapshot, &mut plan_rows, "generations", "Generations");
     push_highlight_row(snapshot, &mut plan_rows, "base_tf", "Base TF");
@@ -219,7 +257,12 @@ fn build_discovery_dashboard(snapshot: &JobSnapshot) -> DiscoveryDashboard {
     push_section(&mut sections, "Search Runtime", search_rows);
 
     let mut selection_rows = Vec::new();
-    push_counter_row(snapshot, &mut selection_rows, "candidates", "Ranked Candidates");
+    push_counter_row(
+        snapshot,
+        &mut selection_rows,
+        "candidates",
+        "Ranked Candidates",
+    );
     push_counter_row(
         snapshot,
         &mut selection_rows,
@@ -399,13 +442,17 @@ mod tests {
         let dashboard = build_discovery_dashboard(&snapshot);
 
         assert_eq!(dashboard.summary_cards.len(), 3);
-        assert!(dashboard
-            .sections
-            .iter()
-            .all(|section| !section.rows.is_empty()));
-        assert!(dashboard
-            .sections
-            .iter()
-            .all(|section| section.title != "Best Candidate"));
+        assert!(
+            dashboard
+                .sections
+                .iter()
+                .all(|section| !section.rows.is_empty())
+        );
+        assert!(
+            dashboard
+                .sections
+                .iter()
+                .all(|section| section.title != "Best Candidate")
+        );
     }
 }

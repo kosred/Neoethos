@@ -1,12 +1,11 @@
 use crate::app_services::ctrader_auth::CTraderTokenBundle;
 use crate::app_services::ctrader_messages::{
+    CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RESPONSE_PAYLOAD_TYPE, CTraderOpenApiJsonMessage,
+    CTraderOpenApiTransport, ProductionCTraderOpenApiTransport,
     build_account_list_by_access_token_request, build_application_auth_request,
-    CTraderOpenApiJsonMessage, CTraderOpenApiTransport, ProductionCTraderOpenApiTransport,
-    CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RESPONSE_PAYLOAD_TYPE,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 use std::io::{Read, Write};
@@ -14,11 +13,11 @@ use std::net::TcpListener;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
-use std::sync::{Arc, Mutex};
-#[cfg(test)]
 use crate::app_services::ctrader_messages::{
     expected_response_payload_type, is_matching_open_api_response, parse_open_api_envelope,
 };
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
 
 pub const CTRADER_DEFAULT_SCOPE: &str = "trading";
 pub const CTRADER_TOKEN_ENDPOINT_BASE: &str = "https://openapi.ctrader.com";
@@ -96,7 +95,10 @@ pub struct CTraderTokenRefreshRequest {
 
 pub trait CTraderLiveAuthBackend: Send + Sync {
     fn run(&self, request: CTraderLiveAuthRequest) -> Result<CTraderLiveAuthResult>;
-    fn refresh_token_bundle(&self, request: &CTraderTokenRefreshRequest) -> Result<CTraderTokenBundle>;
+    fn refresh_token_bundle(
+        &self,
+        request: &CTraderTokenRefreshRequest,
+    ) -> Result<CTraderTokenBundle>;
 }
 
 pub trait CTraderAccountDiscoveryBackend: Send + Sync {
@@ -140,7 +142,11 @@ struct CTraderTokenExchangeResponse {
 }
 
 impl CTraderLoopbackConfig {
-    pub fn new(primary_port: u16, fallback_ports: Vec<u16>, callback_path: impl Into<String>) -> Self {
+    pub fn new(
+        primary_port: u16,
+        fallback_ports: Vec<u16>,
+        callback_path: impl Into<String>,
+    ) -> Self {
         let mut allowed_ports = vec![primary_port];
         allowed_ports.extend(fallback_ports);
         Self {
@@ -174,7 +180,9 @@ impl ProductionCTraderLiveAuthBackend {
         listener: TcpListener,
         expected_path: &str,
     ) -> Result<String> {
-        let (mut stream, _) = listener.accept().context("failed to accept cTrader callback")?;
+        let (mut stream, _) = listener
+            .accept()
+            .context("failed to accept cTrader callback")?;
         let mut buffer = [0_u8; 4096];
         let bytes_read = stream
             .read(&mut buffer)
@@ -201,7 +209,9 @@ impl ProductionCTraderLiveAuthBackend {
         stream
             .write_all(response.as_bytes())
             .context("failed to write cTrader callback response")?;
-        stream.flush().context("failed to flush cTrader callback response")?;
+        stream
+            .flush()
+            .context("failed to flush cTrader callback response")?;
         Ok(payload.authorization_code)
     }
 
@@ -251,7 +261,10 @@ impl CTraderLiveAuthBackend for ProductionCTraderLiveAuthBackend {
         })
     }
 
-    fn refresh_token_bundle(&self, request: &CTraderTokenRefreshRequest) -> Result<CTraderTokenBundle> {
+    fn refresh_token_bundle(
+        &self,
+        request: &CTraderTokenRefreshRequest,
+    ) -> Result<CTraderTokenBundle> {
         let url = build_refresh_token_exchange_url(
             CTRADER_TOKEN_ENDPOINT_BASE,
             &request.refresh_token,
@@ -267,7 +280,6 @@ impl CTraderLiveAuthBackend for ProductionCTraderLiveAuthBackend {
             .context("failed to read cTrader refresh token response body")?;
         parse_token_bundle_response(&body, &request.scope, current_unix_seconds()?)
     }
-
 }
 
 #[cfg(test)]
@@ -350,8 +362,9 @@ impl CTraderAccountDiscoveryBackend for StubCTraderAccountDiscoveryBackend {
             .lock()
             .expect("stub cTrader account discovery lock poisoned")
             .take()
-            .unwrap_or_else(|| Err("stub cTrader account discovery backend was already consumed".to_string()))
-        {
+            .unwrap_or_else(|| {
+                Err("stub cTrader account discovery backend was already consumed".to_string())
+            }) {
             Ok(result) => Ok(result),
             Err(message) => Err(anyhow!(message)),
         }
@@ -373,14 +386,18 @@ impl CTraderLiveAuthBackend for StubCTraderLiveAuthBackend {
             .lock()
             .expect("stub cTrader live auth backend lock poisoned")
             .take()
-            .unwrap_or_else(|| Err("stub cTrader live auth backend was already consumed".to_string()))
-        {
+            .unwrap_or_else(|| {
+                Err("stub cTrader live auth backend was already consumed".to_string())
+            }) {
             Ok(result) => Ok(result),
             Err(message) => Err(anyhow!(message)),
         }
     }
 
-    fn refresh_token_bundle(&self, _request: &CTraderTokenRefreshRequest) -> Result<CTraderTokenBundle> {
+    fn refresh_token_bundle(
+        &self,
+        _request: &CTraderTokenRefreshRequest,
+    ) -> Result<CTraderTokenBundle> {
         match self
             .refresh_outcome
             .lock()
@@ -430,7 +447,10 @@ pub fn build_authorize_url(
     ))
 }
 
-pub fn parse_callback_request(request_target: &str, expected_path: &str) -> Result<CTraderCallbackPayload> {
+pub fn parse_callback_request(
+    request_target: &str,
+    expected_path: &str,
+) -> Result<CTraderCallbackPayload> {
     let (path, query) = request_target
         .split_once('?')
         .map_or((request_target, ""), |(path, query)| (path, query));
@@ -624,8 +644,8 @@ pub fn perform_account_discovery_with_transport<T: CTraderOpenApiTransport>(
         ));
     }
 
-    let app_auth_envelope: CTraderOpenApiJsonMessage = serde_json::from_str(&responses[0])
-        .context("failed to parse cTrader app auth response")?;
+    let app_auth_envelope: CTraderOpenApiJsonMessage =
+        serde_json::from_str(&responses[0]).context("failed to parse cTrader app auth response")?;
     if app_auth_envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
         let error = parse_ctrader_error_payload(&app_auth_envelope.payload)?;
         return Err(anyhow!("cTrader app auth failed: {}", error));
@@ -659,15 +679,17 @@ pub fn parse_token_bundle_response(
     fallback_scope: &str,
     created_at_unix: i64,
 ) -> Result<CTraderTokenBundle> {
-    let payload: CTraderTokenExchangeResponse = serde_json::from_str(response_json)
-        .context("failed to parse cTrader token response")?;
+    let payload: CTraderTokenExchangeResponse =
+        serde_json::from_str(response_json).context("failed to parse cTrader token response")?;
     if let Some(error_code) = payload.error_code.filter(|value| !value.trim().is_empty()) {
         let description = payload
             .description
             .filter(|value| !value.trim().is_empty())
             .map(|value| format!(": {value}"))
             .unwrap_or_default();
-        return Err(anyhow!("cTrader token exchange failed: {error_code}{description}"));
+        return Err(anyhow!(
+            "cTrader token exchange failed: {error_code}{description}"
+        ));
     }
 
     Ok(CTraderTokenBundle {
@@ -702,8 +724,8 @@ fn parse_ctrader_error_payload(payload: &Value) -> Result<String> {
         description: Option<String>,
     }
 
-    let error: CTraderErrorPayload = serde_json::from_value(payload.clone())
-        .context("failed to parse cTrader error payload")?;
+    let error: CTraderErrorPayload =
+        serde_json::from_value(payload.clone()).context("failed to parse cTrader error payload")?;
     Ok(match error.description {
         Some(description) if !description.trim().is_empty() => {
             format!("{}: {}", error.error_code, description)
@@ -736,7 +758,10 @@ impl StubCTraderOpenApiTransport {
     }
 
     fn sent_messages(&self) -> Vec<CTraderOpenApiJsonMessage> {
-        self.sent_messages.lock().expect("sent_messages lock").clone()
+        self.sent_messages
+            .lock()
+            .expect("sent_messages lock")
+            .clone()
     }
 }
 
@@ -851,9 +876,7 @@ mod tests {
         .expect("authorize url should build");
 
         assert!(authorize_url.contains("client_id=client-id"));
-        assert!(authorize_url.contains(
-            "redirect_uri=http%3A%2F%2F127.0.0.1%3A43002%2Fcallback"
-        ));
+        assert!(authorize_url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A43002%2Fcallback"));
         assert_eq!(config.allowed_ports(), &[43001, 43002, 43003]);
     }
 
@@ -889,7 +912,10 @@ mod tests {
         )
         .expect_err("denied callback should fail");
 
-        assert!(err.to_string().contains("cTrader authorization denied: access_denied"));
+        assert!(
+            err.to_string()
+                .contains("cTrader authorization denied: access_denied")
+        );
         assert!(err.to_string().contains("operator cancelled"));
     }
 
@@ -954,11 +980,17 @@ mod tests {
         assert_eq!(message.client_msg_id, "cm-id-2");
         assert_eq!(message.payload_type, 2100);
         assert_eq!(
-            message.payload.get("clientId").and_then(|value| value.as_str()),
+            message
+                .payload
+                .get("clientId")
+                .and_then(|value| value.as_str()),
             Some("client-id")
         );
         assert_eq!(
-            message.payload.get("clientSecret").and_then(|value| value.as_str()),
+            message
+                .payload
+                .get("clientSecret")
+                .and_then(|value| value.as_str()),
             Some("secret-456")
         );
     }
@@ -977,7 +1009,10 @@ mod tests {
         assert_eq!(message.client_msg_id, "cm-id-1");
         assert_eq!(message.payload_type, 2149);
         assert_eq!(
-            message.payload.get("accessToken").and_then(|value| value.as_str()),
+            message
+                .payload
+                .get("accessToken")
+                .and_then(|value| value.as_str()),
             Some("access-token-123")
         );
     }
@@ -1087,17 +1122,15 @@ mod tests {
 
     #[test]
     fn account_discovery_exchange_surfaces_ctrader_error_payload() {
-        let transport = StubCTraderOpenApiTransport::with_responses(vec![Ok(
-            serde_json::json!({
-                "clientMsgId": "app-auth-1",
-                "payloadType": 2142,
-                "payload": {
-                    "errorCode": "INVALID_ACCESS_TOKEN",
-                    "description": "Access token is expired"
-                }
-            })
-            .to_string(),
-        )]);
+        let transport = StubCTraderOpenApiTransport::with_responses(vec![Ok(serde_json::json!({
+            "clientMsgId": "app-auth-1",
+            "payloadType": 2142,
+            "payload": {
+                "errorCode": "INVALID_ACCESS_TOKEN",
+                "description": "Access token is expired"
+            }
+        })
+        .to_string())]);
         let request = CTraderAccountDiscoveryRequest {
             client_id: "client-id".to_string(),
             client_secret: "secret-456".to_string(),

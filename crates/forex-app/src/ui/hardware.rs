@@ -12,4 +12,3 @@ pub fn render(ui: &mut egui::Ui, hardware: &mut HardwareState) {
     ui.add(egui::Slider::new(&mut hardware.cpu_cores, cpu_slider_bounds()).text("CPU Cores"));
     ui.checkbox(&mut hardware.gpu_enabled, "Enable GPU Acceleration (CUDA)");
 }
-

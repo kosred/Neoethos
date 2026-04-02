@@ -1,33 +1,2153 @@
+use anyhow::{Context, Result, bail};
+use polars::prelude::{DataFrame, DataType, Series};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 #[cfg(feature = "swarm-forecasting")]
-use ruv_swarm_ml::agent_forecasting::AgentForecastingManager;
-use anyhow::Result;
+use ruv_swarm_ml::agent_forecasting::{AgentForecastingManager, ForecastRequirements};
+#[cfg(feature = "swarm-forecasting")]
+use ruv_swarm_ml::ensemble::{
+    EnsembleConfig, EnsembleForecaster, EnsembleModel, EnsembleStrategy, ModelPerformanceMetrics,
+    OptimizationMetric,
+};
+#[cfg(feature = "swarm-forecasting")]
+use ruv_swarm_ml::models::ModelType;
+#[cfg(feature = "swarm-forecasting")]
+use ruv_swarm_ml::time_series::{SeasonalityInfo, TimeSeriesData, TimeSeriesProcessor};
+
+const SWARM_ARTIFACT_FILE_NAME: &str = "swarm_forecaster.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SwarmEnsembleStrategy {
+    SimpleAverage,
+    WeightedAverage,
+    Median,
+    TrimmedMean,
+    BayesianModelAveraging,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmForecastConfig {
+    pub memory_limit_mb: f32,
+    pub agent_id: String,
+    pub agent_type: String,
+    pub frequency: String,
+    pub horizon: usize,
+    pub accuracy_target: f32,
+    pub latency_requirement_ms: f32,
+    pub interpretability_needed: bool,
+    pub online_learning: bool,
+    pub strategy: SwarmEnsembleStrategy,
+}
+
+impl Default for SwarmForecastConfig {
+    fn default() -> Self {
+        Self {
+            memory_limit_mb: 256.0,
+            agent_id: "swarm_forecaster".to_string(),
+            agent_type: "analyst".to_string(),
+            frequency: "H".to_string(),
+            horizon: 24,
+            accuracy_target: 0.90,
+            latency_requirement_ms: 200.0,
+            interpretability_needed: false,
+            online_learning: true,
+            strategy: SwarmEnsembleStrategy::BayesianModelAveraging,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmForecastSnapshot {
+    pub last_value: f32,
+    pub rolling_mean: f32,
+    pub drift_slope: f32,
+    pub volatility: f32,
+    pub has_trend: bool,
+    pub has_seasonality: bool,
+    pub seasonal_periods: Vec<usize>,
+    #[serde(default)]
+    pub short_mean: f32,
+    #[serde(default)]
+    pub medium_mean: f32,
+    #[serde(default)]
+    pub long_mean: f32,
+    #[serde(default)]
+    pub recent_return: f32,
+    #[serde(default)]
+    pub trend_strength: f32,
+    #[serde(default)]
+    pub mean_reversion_strength: f32,
+    #[serde(default)]
+    pub volatility_ratio: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmForecastResult {
+    pub point_forecast: Vec<f32>,
+    pub level_80_lower: Vec<f32>,
+    pub level_80_upper: Vec<f32>,
+    pub diversity_score: f32,
+    pub effective_models: f32,
+    pub prediction_variance: f32,
+    pub models_used: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SwarmForecasterArtifact {
+    config: SwarmForecastConfig,
+    runtime_mode: SwarmRuntimeMode,
+    fitted: bool,
+    values: Vec<f32>,
+    timestamps: Vec<f64>,
+    unique_id: String,
+    snapshot: Option<SwarmForecastSnapshot>,
+    last_result: Option<SwarmForecastResult>,
+    last_horizon: Option<usize>,
+    candidate_reports: Vec<SwarmCandidateReport>,
+    updated_at_unix_ms: Option<u64>,
+    training_report: Option<SwarmTrainingReport>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum SwarmRuntimeMode {
+    LocalFallback,
+    ExternalSwarm,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SwarmCandidateReport {
+    name: String,
+    model_type: String,
+    source: String,
+    weight: f32,
+    prediction_length: usize,
+    prediction_mean: f32,
+    prediction_std: f32,
+    mae: f32,
+    mse: f32,
+    mape: f32,
+    smape: f32,
+    coverage: f32,
+    #[serde(default)]
+    bias: f32,
+    #[serde(default)]
+    directional_accuracy: f32,
+    #[serde(default)]
+    regime_fit: f32,
+    #[serde(default)]
+    stability_score: f32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SwarmTrainingReport {
+    training_rows: usize,
+    validation_windows: usize,
+    fitted_horizon: usize,
+    best_candidate: Option<String>,
+    aggregate_mae: f32,
+    aggregate_smape: f32,
+    aggregate_directional_accuracy: f32,
+    aggregate_coverage: f32,
+    diversity_score: f32,
+    regime_bias: f32,
+    updated_at_unix_ms: Option<u64>,
+}
+
+#[cfg(feature = "swarm-forecasting")]
+fn map_strategy(strategy: SwarmEnsembleStrategy) -> EnsembleStrategy {
+    match strategy {
+        SwarmEnsembleStrategy::SimpleAverage => EnsembleStrategy::SimpleAverage,
+        SwarmEnsembleStrategy::WeightedAverage => EnsembleStrategy::WeightedAverage,
+        SwarmEnsembleStrategy::Median => EnsembleStrategy::Median,
+        SwarmEnsembleStrategy::TrimmedMean => EnsembleStrategy::TrimmedMean(0.1),
+        SwarmEnsembleStrategy::BayesianModelAveraging => EnsembleStrategy::BayesianModelAveraging,
+    }
+}
+
+fn mae(prediction: &[f32], actuals: &[f32]) -> f32 {
+    if prediction.is_empty() || actuals.is_empty() {
+        return 1.0;
+    }
+
+    prediction
+        .iter()
+        .zip(actuals.iter())
+        .map(|(predicted, actual)| (*predicted - *actual).abs())
+        .sum::<f32>()
+        / prediction.len().min(actuals.len()) as f32
+}
+
+fn mse(prediction: &[f32], actuals: &[f32]) -> f32 {
+    if prediction.is_empty() || actuals.is_empty() {
+        return 1.0;
+    }
+
+    prediction
+        .iter()
+        .zip(actuals.iter())
+        .map(|(predicted, actual)| (*predicted - *actual).powi(2))
+        .sum::<f32>()
+        / prediction.len().min(actuals.len()) as f32
+}
+
+fn mape(prediction: &[f32], actuals: &[f32]) -> f32 {
+    if prediction.is_empty() || actuals.is_empty() {
+        return 100.0;
+    }
+
+    let mut total = 0.0_f32;
+    let mut count = 0usize;
+
+    for (predicted, actual) in prediction.iter().zip(actuals.iter()) {
+        if actual.abs() > 1e-6 {
+            total += ((*predicted - *actual) / *actual).abs();
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        0.0
+    } else {
+        total / count as f32 * 100.0
+    }
+}
+
+fn smape(prediction: &[f32], actuals: &[f32]) -> f32 {
+    if prediction.is_empty() || actuals.is_empty() {
+        return 100.0;
+    }
+
+    let mut total = 0.0_f32;
+    let mut count = 0usize;
+
+    for (predicted, actual) in prediction.iter().zip(actuals.iter()) {
+        let denominator = (predicted.abs() + actual.abs()) * 0.5;
+        if denominator > 1e-6 {
+            total += (*predicted - *actual).abs() / denominator;
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        0.0
+    } else {
+        total / count as f32 * 100.0
+    }
+}
+
+fn volatility(values: &[f32]) -> f32 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+
+    let mean = values.iter().copied().sum::<f32>() / values.len() as f32;
+    let variance = values
+        .iter()
+        .map(|value| (*value - mean).powi(2))
+        .sum::<f32>()
+        / values.len() as f32;
+    variance.sqrt()
+}
+
+fn trend_slope(values: &[f32]) -> f32 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+
+    let n = values.len() as f32;
+    let mean_x = (n - 1.0) * 0.5;
+    let mean_y = values.iter().copied().sum::<f32>() / n;
+    let mut numerator = 0.0_f32;
+    let mut denominator = 0.0_f32;
+
+    for (idx, value) in values.iter().copied().enumerate() {
+        let x = idx as f32;
+        numerator += (x - mean_x) * (value - mean_y);
+        denominator += (x - mean_x).powi(2);
+    }
+
+    if denominator <= 1e-6 {
+        0.0
+    } else {
+        numerator / denominator
+    }
+}
+
+fn persistence_forecast(last_value: f32, horizon: usize) -> Vec<f32> {
+    vec![last_value; horizon]
+}
+
+fn moving_average_forecast(values: &[f32], horizon: usize, window: usize) -> Vec<f32> {
+    let effective_window = window.min(values.len()).max(1);
+    let mean = values[values.len() - effective_window..]
+        .iter()
+        .copied()
+        .sum::<f32>()
+        / effective_window as f32;
+    vec![mean; horizon]
+}
+
+fn drift_forecast(last_value: f32, slope: f32, horizon: usize) -> Vec<f32> {
+    (0..horizon)
+        .map(|step| last_value + slope * (step as f32 + 1.0))
+        .collect()
+}
+
+fn seasonal_forecast(
+    values: &[f32],
+    seasonal_periods: &[usize],
+    horizon: usize,
+) -> Option<Vec<f32>> {
+    let period = seasonal_periods
+        .iter()
+        .copied()
+        .find(|period| *period > 0 && values.len() >= *period)?;
+
+    Some(
+        (0..horizon)
+            .map(|step| {
+                let source_idx = values.len() - period + (step % period);
+                values[source_idx]
+            })
+            .collect(),
+    )
+}
+
+#[cfg(feature = "swarm-forecasting")]
+fn build_training_series(
+    values: &[f32],
+    timestamps: &[f64],
+    frequency: &str,
+    unique_id: &str,
+) -> Result<TimeSeriesData> {
+    if values.len() != timestamps.len() {
+        bail!(
+            "swarm forecaster value/timestamp mismatch: {} values vs {} timestamps",
+            values.len(),
+            timestamps.len()
+        );
+    }
+    if values.len() < 32 {
+        bail!(
+            "swarm forecaster requires at least 32 observations, received {}",
+            values.len()
+        );
+    }
+
+    Ok(TimeSeriesData {
+        values: values.to_vec(),
+        timestamps: timestamps.to_vec(),
+        frequency: frequency.to_string(),
+        unique_id: unique_id.to_string(),
+    })
+}
+
+#[cfg(feature = "swarm-forecasting")]
+fn infer_snapshot(
+    series: &TimeSeriesData,
+    processor: &TimeSeriesProcessor,
+) -> SwarmForecastSnapshot {
+    let seasonality: SeasonalityInfo = processor.detect_seasonality(series);
+    let last_window = series.values.len().min(32);
+    let short_window = series.values.len().min(8);
+    let medium_window = series.values.len().min(16);
+    let long_window = series.values.len().min(48);
+    let rolling_mean = series.values[series.values.len() - last_window..]
+        .iter()
+        .copied()
+        .sum::<f32>()
+        / last_window as f32;
+    let short_mean = series.values[series.values.len() - short_window..]
+        .iter()
+        .copied()
+        .sum::<f32>()
+        / short_window as f32;
+    let medium_mean = series.values[series.values.len() - medium_window..]
+        .iter()
+        .copied()
+        .sum::<f32>()
+        / medium_window as f32;
+    let long_mean = series.values[series.values.len() - long_window..]
+        .iter()
+        .copied()
+        .sum::<f32>()
+        / long_window as f32;
+    let slope = trend_slope(&series.values[series.values.len() - last_window..]);
+    let window_volatility = volatility(&series.values[series.values.len() - last_window..]);
+    let baseline_volatility = volatility(&series.values).max(1e-6);
+
+    SwarmForecastSnapshot {
+        last_value: *series.values.last().unwrap_or(&0.0),
+        rolling_mean,
+        drift_slope: slope,
+        volatility: window_volatility,
+        has_trend: seasonality.has_trend || slope.abs() > 1e-3,
+        has_seasonality: seasonality.has_seasonality,
+        seasonal_periods: seasonality.seasonal_periods,
+        short_mean,
+        medium_mean,
+        long_mean,
+        recent_return: series
+            .values
+            .last()
+            .zip(series.values.get(series.values.len().saturating_sub(2)))
+            .map(|(last, prev)| last - prev)
+            .unwrap_or_default(),
+        trend_strength: clamp_unit(
+            ((short_mean - long_mean).abs() + slope.abs()) / (window_volatility + 1e-6),
+        ),
+        mean_reversion_strength: clamp_unit(
+            (1.0 - ((short_mean - rolling_mean).abs() / (window_volatility + 1e-6))).max(0.0),
+        ),
+        volatility_ratio: (window_volatility / baseline_volatility).max(0.0),
+    }
+}
+
+#[cfg(feature = "swarm-forecasting")]
+fn candidate_predictions(
+    values: &[f32],
+    snapshot: &SwarmForecastSnapshot,
+    horizon: usize,
+) -> Vec<(String, ModelType, Vec<f32>)> {
+    let trend_weight = snapshot.trend_strength.clamp(0.1, 0.9);
+    let mean_reversion = snapshot.mean_reversion_strength.clamp(0.05, 0.9);
+    let mut predictions = vec![
+        (
+            "persistence".to_string(),
+            ModelType::MLP,
+            persistence_forecast(snapshot.last_value, horizon),
+        ),
+        (
+            "moving_average_short".to_string(),
+            ModelType::DLinear,
+            moving_average_forecast(values, horizon, 4),
+        ),
+        (
+            "moving_average_medium".to_string(),
+            ModelType::DLinear,
+            moving_average_forecast(values, horizon, 8),
+        ),
+        (
+            "moving_average_long".to_string(),
+            ModelType::DLinear,
+            moving_average_forecast(values, horizon, 16),
+        ),
+        (
+            "ewma_fast".to_string(),
+            ModelType::MLP,
+            ewma_forecast(values, horizon, 0.45),
+        ),
+        (
+            "ewma_slow".to_string(),
+            ModelType::MLP,
+            ewma_forecast(values, horizon, 0.22),
+        ),
+        (
+            "damped_drift".to_string(),
+            ModelType::TiDE,
+            damped_drift_forecast(snapshot.last_value, snapshot.drift_slope, horizon, 0.82),
+        ),
+        (
+            "mean_reversion".to_string(),
+            ModelType::TiDE,
+            mean_reversion_forecast(
+                snapshot.last_value,
+                snapshot.rolling_mean,
+                mean_reversion,
+                horizon,
+            ),
+        ),
+        (
+            "momentum_blend".to_string(),
+            ModelType::TiDE,
+            blend_forecasts(
+                &damped_drift_forecast(snapshot.last_value, snapshot.drift_slope, horizon, 0.90),
+                &ewma_forecast(values, horizon, 0.35),
+                trend_weight,
+            ),
+        ),
+        (
+            "regime_anchor".to_string(),
+            ModelType::NHITS,
+            blend_forecasts(
+                &moving_average_forecast(values, horizon, 12),
+                &mean_reversion_forecast(
+                    snapshot.last_value,
+                    snapshot.medium_mean.max(snapshot.rolling_mean),
+                    mean_reversion,
+                    horizon,
+                ),
+                0.5 + 0.3 * snapshot.trend_strength,
+            ),
+        ),
+        (
+            "drift".to_string(),
+            ModelType::TiDE,
+            drift_forecast(snapshot.last_value, snapshot.drift_slope, horizon),
+        ),
+    ];
+
+    if snapshot.has_seasonality {
+        if let Some(seasonal) = seasonal_forecast(values, &snapshot.seasonal_periods, horizon) {
+            predictions.push(("seasonal".to_string(), ModelType::NHITS, seasonal));
+            if let Some((_, _, drift)) = predictions.iter().find(|(name, _, _)| name == "drift") {
+                let seasonal_drift = blend_forecasts(
+                    drift,
+                    predictions
+                        .iter()
+                        .find(|(name, _, _)| name == "seasonal")
+                        .map(|(_, _, forecast)| forecast.as_slice())
+                        .unwrap_or(&[]),
+                    0.55 + 0.25 * snapshot.trend_strength,
+                );
+                predictions.push((
+                    "seasonal_drift".to_string(),
+                    ModelType::NHITS,
+                    seasonal_drift,
+                ));
+            }
+        }
+    }
+
+    predictions
+}
+
+fn current_unix_ms() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as u64)
+}
+
+fn prediction_stats(values: &[f32]) -> (f32, f32) {
+    if values.is_empty() {
+        return (0.0, 0.0);
+    }
+
+    let mean = values.iter().copied().sum::<f32>() / values.len() as f32;
+    let variance = values
+        .iter()
+        .map(|value| (*value - mean).powi(2))
+        .sum::<f32>()
+        / values.len() as f32;
+    (mean, variance.sqrt())
+}
+
+fn clamp_unit(value: f32) -> f32 {
+    value.clamp(0.0, 1.0)
+}
+
+fn is_numeric_dtype(dtype: &DataType) -> bool {
+    matches!(
+        dtype,
+        DataType::Float32
+            | DataType::Float64
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+    )
+}
+
+fn signed_direction(value: f32) -> f32 {
+    if value > 1e-6 {
+        1.0
+    } else if value < -1e-6 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
+fn ewma_forecast(values: &[f32], horizon: usize, alpha: f32) -> Vec<f32> {
+    let alpha = alpha.clamp(0.05, 0.95);
+    let mut smoothed = *values.last().unwrap_or(&0.0);
+    for value in values.iter().copied() {
+        smoothed = alpha * value + (1.0 - alpha) * smoothed;
+    }
+    vec![smoothed; horizon]
+}
+
+fn damped_drift_forecast(last_value: f32, slope: f32, horizon: usize, damping: f32) -> Vec<f32> {
+    let damping = damping.clamp(0.2, 0.995);
+    (0..horizon)
+        .scan((last_value, slope), |state, _| {
+            state.0 += state.1;
+            state.1 *= damping;
+            Some(state.0)
+        })
+        .collect()
+}
+
+fn mean_reversion_forecast(
+    last_value: f32,
+    anchor: f32,
+    strength: f32,
+    horizon: usize,
+) -> Vec<f32> {
+    let strength = strength.clamp(0.0, 1.0);
+    let mut state = last_value;
+    (0..horizon)
+        .map(|_| {
+            state += (anchor - state) * strength.max(0.05);
+            state
+        })
+        .collect()
+}
+
+fn blend_forecasts(primary: &[f32], secondary: &[f32], primary_weight: f32) -> Vec<f32> {
+    let primary_weight = primary_weight.clamp(0.0, 1.0);
+    let secondary_weight = 1.0 - primary_weight;
+    primary
+        .iter()
+        .zip(secondary.iter())
+        .map(|(left, right)| *left * primary_weight + *right * secondary_weight)
+        .collect()
+}
+
+fn interval_coverage(prediction: &[f32], reference: &[f32], band: f32) -> f32 {
+    if prediction.is_empty() || reference.is_empty() {
+        return 0.0;
+    }
+
+    let band = band.max(1e-6);
+    let mut inside = 0usize;
+    let mut count = 0usize;
+    for (predicted, actual) in prediction.iter().zip(reference.iter()) {
+        if predicted.is_finite() && actual.is_finite() {
+            count += 1;
+            if (*predicted - *actual).abs() <= band {
+                inside += 1;
+            }
+        }
+    }
+
+    if count == 0 {
+        0.0
+    } else {
+        inside as f32 / count as f32
+    }
+}
+
+fn aggregate_average(predictions: &[Vec<f32>], horizon: usize, baseline: f32) -> Vec<f32> {
+    if predictions.is_empty() {
+        return vec![baseline; horizon];
+    }
+
+    (0..horizon)
+        .map(|step| {
+            let mut sum = 0.0_f32;
+            let mut count = 0usize;
+            for forecast in predictions {
+                if let Some(value) = forecast.get(step) {
+                    if value.is_finite() {
+                        sum += *value;
+                        count += 1;
+                    }
+                }
+            }
+            if count == 0 {
+                baseline
+            } else {
+                sum / count as f32
+            }
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn fallback_forecast_from_forecasts(
+    snapshot: &SwarmForecastSnapshot,
+    candidates: &[(String, Vec<f32>)],
+    horizon: usize,
+) -> SwarmForecastResult {
+    let weights = build_candidate_weight_map_from_consensus(snapshot, candidates);
+    fallback_forecast_with_weights(snapshot, candidates, &weights, horizon)
+}
+
+fn fallback_forecast_with_weights(
+    snapshot: &SwarmForecastSnapshot,
+    candidates: &[(String, Vec<f32>)],
+    weights: &HashMap<String, f32>,
+    horizon: usize,
+) -> SwarmForecastResult {
+    let forecasts = candidates
+        .iter()
+        .map(|(_, forecast)| forecast.clone())
+        .collect::<Vec<_>>();
+    let point_forecast = aggregate_weighted(candidates, weights, horizon, snapshot.last_value);
+    let mut lower = Vec::with_capacity(horizon);
+    let mut upper = Vec::with_capacity(horizon);
+    let mut variance_sum = 0.0_f32;
+
+    for step in 0..horizon {
+        let step_values = forecasts
+            .iter()
+            .filter_map(|forecast| forecast.get(step).copied())
+            .filter(|value| value.is_finite())
+            .collect::<Vec<_>>();
+        let (mean, std_dev) = prediction_stats(&step_values);
+        let center = point_forecast.get(step).copied().unwrap_or(mean);
+        let spread = std_dev.max(snapshot.volatility.max(1e-6));
+        lower.push(center - 1.2816 * spread);
+        upper.push(center + 1.2816 * spread);
+        variance_sum += spread * spread;
+    }
+
+    let diversity_score = if forecasts.len() <= 1 {
+        0.0
+    } else {
+        (variance_sum / horizon.max(1) as f32).sqrt()
+    };
+    let effective_models = candidate_effective_models(weights, candidates.len());
+
+    SwarmForecastResult {
+        point_forecast,
+        level_80_lower: lower,
+        level_80_upper: upper,
+        diversity_score,
+        effective_models,
+        prediction_variance: if horizon == 0 {
+            0.0
+        } else {
+            variance_sum / horizon as f32
+        },
+        models_used: forecasts.len(),
+    }
+}
+
+fn result_is_valid(result: &SwarmForecastResult, horizon: usize) -> bool {
+    let valid_len = result.point_forecast.len() == horizon
+        && result.level_80_lower.len() == horizon
+        && result.level_80_upper.len() == horizon;
+    let valid_values = result
+        .point_forecast
+        .iter()
+        .zip(result.level_80_lower.iter())
+        .zip(result.level_80_upper.iter())
+        .all(|((point, lower), upper)| {
+            let point = *point;
+            let lower = *lower;
+            let upper = *upper;
+            point.is_finite()
+                && lower.is_finite()
+                && upper.is_finite()
+                && lower <= upper
+                && point >= lower.min(upper)
+                && point <= lower.max(upper)
+        });
+    valid_len && valid_values
+}
+
+fn candidate_report(
+    name: &str,
+    model_type: &str,
+    forecast: &[f32],
+    source: &str,
+    reference: &[f32],
+    weight: f32,
+    snapshot: Option<&SwarmForecastSnapshot>,
+) -> SwarmCandidateReport {
+    let (mean, std_dev) = prediction_stats(forecast);
+    let band = std_dev.max(1e-6);
+    let mae = mae(forecast, reference);
+    let mse = mse(forecast, reference);
+    let mape = mape(forecast, reference);
+    let smape = smape(forecast, reference);
+    let bias = if forecast.is_empty() || reference.is_empty() {
+        0.0
+    } else {
+        forecast
+            .iter()
+            .zip(reference.iter())
+            .map(|(predicted, actual)| *predicted - *actual)
+            .sum::<f32>()
+            / forecast.len().min(reference.len()) as f32
+    };
+    let coverage = {
+        let mut inside = 0usize;
+        let mut count = 0usize;
+        for (predicted, actual) in forecast.iter().zip(reference.iter()) {
+            if predicted.is_finite() && actual.is_finite() {
+                count += 1;
+                if (*predicted - *actual).abs() <= band {
+                    inside += 1;
+                }
+            }
+        }
+        if count == 0 {
+            0.0
+        } else {
+            inside as f32 / count as f32
+        }
+    };
+    let directional_accuracy = directional_accuracy(forecast, reference);
+    let regime_fit = snapshot
+        .map(|snapshot| candidate_regime_fit(snapshot, forecast))
+        .unwrap_or(0.5);
+    let stability_score = clamp_unit(
+        1.0 - std_dev / (snapshot.map(|s| s.volatility.max(1e-6)).unwrap_or(1.0) * 2.0).min(1.0),
+    );
+
+    SwarmCandidateReport {
+        name: name.to_string(),
+        model_type: model_type.to_string(),
+        source: source.to_string(),
+        weight,
+        prediction_length: forecast.len(),
+        prediction_mean: mean,
+        prediction_std: std_dev,
+        mae,
+        mse,
+        mape,
+        smape,
+        coverage,
+        bias,
+        directional_accuracy,
+        regime_fit,
+        stability_score,
+    }
+}
+
+fn directional_accuracy(forecast: &[f32], reference: &[f32]) -> f32 {
+    if forecast.len() < 2 || reference.len() < 2 {
+        return 0.5;
+    }
+
+    let comparisons = forecast
+        .windows(2)
+        .zip(reference.windows(2))
+        .map(|(predicted, actual)| {
+            let predicted_direction = signed_direction(predicted[1] - predicted[0]);
+            let actual_direction = signed_direction(actual[1] - actual[0]);
+            if predicted_direction == 0.0 && actual_direction == 0.0 {
+                1.0
+            } else if predicted_direction == 0.0 || actual_direction == 0.0 {
+                0.5
+            } else if predicted_direction == actual_direction {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if comparisons.is_empty() {
+        0.5
+    } else {
+        comparisons.iter().copied().sum::<f32>() / comparisons.len() as f32
+    }
+}
+
+fn candidate_regime_fit(snapshot: &SwarmForecastSnapshot, forecast: &[f32]) -> f32 {
+    if forecast.len() < 2 {
+        return 0.5;
+    }
+
+    let forecast_slope = trend_slope(forecast);
+    let direction_alignment = 1.0
+        - ((forecast_slope - snapshot.drift_slope).abs() / (snapshot.volatility + 1e-6)).min(1.0);
+    let anchor = if snapshot.trend_strength >= snapshot.mean_reversion_strength {
+        snapshot.short_mean.max(snapshot.medium_mean)
+    } else {
+        snapshot.rolling_mean
+    };
+    let terminal = *forecast.last().unwrap_or(&snapshot.last_value);
+    let anchor_fit = 1.0 - ((terminal - anchor).abs() / (snapshot.volatility + 1e-6)).min(1.0);
+    clamp_unit(direction_alignment * 0.6 + anchor_fit * 0.4)
+}
+
+fn report_weight(report: &SwarmCandidateReport) -> f32 {
+    let mae_term = 1.0 / (1.0 + report.mae.max(0.0));
+    let mse_term = 1.0 / (1.0 + report.mse.max(0.0).sqrt());
+    let percentage_term = 1.0 / (1.0 + 0.01 * (report.mape.max(0.0) + report.smape.max(0.0)));
+    let bias_penalty = 1.0 / (1.0 + report.bias.abs());
+    let quality = mae_term * mse_term * percentage_term * bias_penalty;
+    let calibration = 0.35 + 0.65 * clamp_unit(report.coverage);
+    let direction = 0.35 + 0.65 * clamp_unit(report.directional_accuracy);
+    let regime = 0.35 + 0.65 * clamp_unit(report.regime_fit);
+    let stability = 0.35 + 0.65 * clamp_unit(report.stability_score);
+    (quality * calibration * direction * regime * stability).max(1e-6)
+}
+
+fn apply_candidate_weights(reports: &mut [SwarmCandidateReport]) {
+    let total = reports
+        .iter()
+        .map(report_weight)
+        .fold(0.0_f32, |acc, weight| acc + weight);
+    if total <= f32::EPSILON {
+        let uniform = if reports.is_empty() {
+            1.0
+        } else {
+            1.0 / reports.len() as f32
+        };
+        for report in reports {
+            report.weight = uniform;
+        }
+        return;
+    }
+
+    for report in reports {
+        report.weight = report_weight(report) / total;
+    }
+}
+
+fn build_candidate_weight_map(reports: &[SwarmCandidateReport]) -> HashMap<String, f32> {
+    reports
+        .iter()
+        .map(|report| (report.name.clone(), report.weight))
+        .collect()
+}
+
+#[allow(dead_code)]
+fn build_candidate_weight_map_from_consensus(
+    snapshot: &SwarmForecastSnapshot,
+    candidates: &[(String, Vec<f32>)],
+) -> HashMap<String, f32> {
+    let reference = aggregate_average(
+        &candidates
+            .iter()
+            .map(|(_, forecast)| forecast.clone())
+            .collect::<Vec<_>>(),
+        candidates
+            .first()
+            .map(|(_, forecast)| forecast.len())
+            .unwrap_or_default(),
+        snapshot.last_value,
+    );
+    let mut reports = candidates
+        .iter()
+        .map(|(name, forecast)| {
+            candidate_report(
+                name,
+                "local_ensemble",
+                forecast,
+                "consensus",
+                &reference,
+                1.0,
+                Some(snapshot),
+            )
+        })
+        .collect::<Vec<_>>();
+    apply_candidate_weights(&mut reports);
+    build_candidate_weight_map(&reports)
+}
+
+fn aggregate_weighted(
+    candidates: &[(String, Vec<f32>)],
+    weights: &HashMap<String, f32>,
+    horizon: usize,
+    baseline: f32,
+) -> Vec<f32> {
+    (0..horizon)
+        .map(|step| {
+            let mut weighted_sum = 0.0_f32;
+            let mut total_weight = 0.0_f32;
+            for (name, forecast) in candidates {
+                if let Some(value) = forecast.get(step).copied() {
+                    if value.is_finite() {
+                        let weight = weights
+                            .get(name)
+                            .copied()
+                            .unwrap_or_else(|| 1.0 / candidates.len().max(1) as f32);
+                        weighted_sum += value * weight;
+                        total_weight += weight;
+                    }
+                }
+            }
+            if total_weight <= f32::EPSILON {
+                baseline
+            } else {
+                weighted_sum / total_weight
+            }
+        })
+        .collect()
+}
+
+fn candidate_effective_models(weights: &HashMap<String, f32>, candidate_count: usize) -> f32 {
+    if weights.is_empty() {
+        return candidate_count as f32;
+    }
+    let sum_sq = weights.values().map(|weight| weight * weight).sum::<f32>();
+    if sum_sq <= f32::EPSILON {
+        candidate_count as f32
+    } else {
+        (1.0 / sum_sq).min(candidate_count.max(1) as f32)
+    }
+}
+
+#[cfg(feature = "swarm-forecasting")]
+fn build_weighted_reports_external(
+    windows: &[(Vec<f32>, Vec<f64>, Vec<f32>)],
+    frequency: &str,
+    unique_id: &str,
+) -> Result<Vec<SwarmCandidateReport>> {
+    let mut accumulators: HashMap<String, SwarmCandidateReport> = HashMap::new();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+
+    for (window_idx, (train_values, train_timestamps, actuals)) in windows.iter().enumerate() {
+        let series = build_training_series(train_values, train_timestamps, frequency, unique_id)?;
+        let snapshot = infer_snapshot(&series, &TimeSeriesProcessor::new());
+        let candidates = candidate_predictions(train_values, &snapshot, actuals.len().max(1));
+        let reports = build_candidate_reports(
+            &candidates,
+            actuals,
+            &format!("validation_window_{window_idx}"),
+            Some(&snapshot),
+        );
+        for report in reports {
+            let entry = accumulators
+                .entry(report.name.clone())
+                .or_insert_with(|| report.clone());
+            if counts.contains_key(&report.name) {
+                entry.prediction_mean += report.prediction_mean;
+                entry.prediction_std += report.prediction_std;
+                entry.mae += report.mae;
+                entry.mse += report.mse;
+                entry.mape += report.mape;
+                entry.smape += report.smape;
+                entry.coverage += report.coverage;
+                entry.bias += report.bias;
+                entry.directional_accuracy += report.directional_accuracy;
+                entry.regime_fit += report.regime_fit;
+                entry.stability_score += report.stability_score;
+                entry.prediction_length = entry.prediction_length.max(report.prediction_length);
+            }
+            *counts.entry(report.name).or_insert(0) += 1;
+        }
+    }
+
+    let mut reports = accumulators
+        .into_iter()
+        .map(|(name, mut report)| {
+            let count = counts.get(&name).copied().unwrap_or(1) as f32;
+            report.source = "rolling_validation".to_string();
+            report.prediction_mean /= count;
+            report.prediction_std /= count;
+            report.mae /= count;
+            report.mse /= count;
+            report.mape /= count;
+            report.smape /= count;
+            report.coverage /= count;
+            report.bias /= count;
+            report.directional_accuracy /= count;
+            report.regime_fit /= count;
+            report.stability_score /= count;
+            report
+        })
+        .collect::<Vec<_>>();
+    apply_candidate_weights(&mut reports);
+    Ok(reports)
+}
+
+fn build_training_report(
+    reports: &[SwarmCandidateReport],
+    validation_windows: usize,
+    training_rows: usize,
+    horizon: usize,
+    diversity_score: f32,
+    regime_bias: f32,
+) -> SwarmTrainingReport {
+    let count = reports.len().max(1) as f32;
+    let best_candidate = reports
+        .iter()
+        .max_by(|left, right| left.weight.total_cmp(&right.weight))
+        .map(|report| report.name.clone());
+    SwarmTrainingReport {
+        training_rows,
+        validation_windows,
+        fitted_horizon: horizon,
+        best_candidate,
+        aggregate_mae: reports.iter().map(|report| report.mae).sum::<f32>() / count,
+        aggregate_smape: reports.iter().map(|report| report.smape).sum::<f32>() / count,
+        aggregate_directional_accuracy: reports
+            .iter()
+            .map(|report| report.directional_accuracy)
+            .sum::<f32>()
+            / count,
+        aggregate_coverage: reports.iter().map(|report| report.coverage).sum::<f32>() / count,
+        diversity_score,
+        regime_bias,
+        updated_at_unix_ms: current_unix_ms(),
+    }
+}
+
+#[cfg(feature = "swarm-forecasting")]
+fn build_candidate_reports(
+    candidates: &[(String, ModelType, Vec<f32>)],
+    reference: &[f32],
+    source: &str,
+    snapshot: Option<&SwarmForecastSnapshot>,
+) -> Vec<SwarmCandidateReport> {
+    let weight = if candidates.is_empty() {
+        1.0
+    } else {
+        1.0 / candidates.len() as f32
+    };
+    candidates
+        .iter()
+        .map(|(name, model_type, forecast)| {
+            let model_type_label = format!("{model_type:?}");
+            candidate_report(
+                name,
+                &model_type_label,
+                forecast,
+                source,
+                reference,
+                weight,
+                snapshot,
+            )
+        })
+        .collect::<Vec<_>>()
+}
+
+#[cfg(feature = "swarm-forecasting")]
+fn model_performance_metrics(prediction: &[f32], reference: &[f32]) -> ModelPerformanceMetrics {
+    let band = prediction_stats(prediction).1.max(1e-6);
+    ModelPerformanceMetrics {
+        mae: mae(prediction, reference),
+        mse: mse(prediction, reference),
+        mape: mape(prediction, reference),
+        smape: smape(prediction, reference),
+        coverage: interval_coverage(prediction, reference, band),
+    }
+}
+
+#[cfg(feature = "swarm-forecasting")]
+fn normalize_prediction_intervals(lower: Vec<f32>, upper: Vec<f32>) -> (Vec<f32>, Vec<f32>) {
+    let mut lower = lower;
+    let mut upper = upper;
+    for (lower_value, upper_value) in lower.iter_mut().zip(upper.iter_mut()) {
+        if *lower_value > *upper_value {
+            std::mem::swap(lower_value, upper_value);
+        }
+    }
+    (lower, upper)
+}
+
+#[allow(dead_code)]
+fn candidate_forecasts_local(
+    values: &[f32],
+    snapshot: &SwarmForecastSnapshot,
+    horizon: usize,
+) -> Vec<(String, Vec<f32>)> {
+    let trend_weight = snapshot.trend_strength.clamp(0.1, 0.9);
+    let mean_reversion = snapshot.mean_reversion_strength.clamp(0.05, 0.9);
+    let mut predictions = vec![
+        (
+            "persistence".to_string(),
+            persistence_forecast(snapshot.last_value, horizon),
+        ),
+        (
+            "moving_average_short".to_string(),
+            moving_average_forecast(values, horizon, 4),
+        ),
+        (
+            "moving_average_medium".to_string(),
+            moving_average_forecast(values, horizon, 8),
+        ),
+        (
+            "moving_average_long".to_string(),
+            moving_average_forecast(values, horizon, 16),
+        ),
+        (
+            "ewma_fast".to_string(),
+            ewma_forecast(values, horizon, 0.45),
+        ),
+        (
+            "ewma_slow".to_string(),
+            ewma_forecast(values, horizon, 0.22),
+        ),
+        (
+            "damped_drift".to_string(),
+            damped_drift_forecast(snapshot.last_value, snapshot.drift_slope, horizon, 0.82),
+        ),
+        (
+            "mean_reversion".to_string(),
+            mean_reversion_forecast(
+                snapshot.last_value,
+                snapshot.rolling_mean,
+                mean_reversion,
+                horizon,
+            ),
+        ),
+        (
+            "momentum_blend".to_string(),
+            blend_forecasts(
+                &damped_drift_forecast(snapshot.last_value, snapshot.drift_slope, horizon, 0.90),
+                &ewma_forecast(values, horizon, 0.35),
+                trend_weight,
+            ),
+        ),
+        (
+            "regime_anchor".to_string(),
+            blend_forecasts(
+                &moving_average_forecast(values, horizon, 12),
+                &mean_reversion_forecast(
+                    snapshot.last_value,
+                    snapshot.medium_mean.max(snapshot.rolling_mean),
+                    mean_reversion,
+                    horizon,
+                ),
+                0.5 + 0.3 * snapshot.trend_strength,
+            ),
+        ),
+        (
+            "drift".to_string(),
+            drift_forecast(snapshot.last_value, snapshot.drift_slope, horizon),
+        ),
+    ];
+
+    if snapshot.has_seasonality {
+        if let Some(seasonal) = seasonal_forecast(values, &snapshot.seasonal_periods, horizon) {
+            predictions.push(("seasonal".to_string(), seasonal));
+            predictions.push((
+                "seasonal_drift".to_string(),
+                blend_forecasts(
+                    predictions
+                        .iter()
+                        .find(|(name, _)| name == "drift")
+                        .map(|(_, forecast)| forecast.as_slice())
+                        .unwrap_or(&[]),
+                    predictions
+                        .iter()
+                        .find(|(name, _)| name == "seasonal")
+                        .map(|(_, forecast)| forecast.as_slice())
+                        .unwrap_or(&[]),
+                    0.55 + 0.25 * snapshot.trend_strength,
+                ),
+            ));
+        }
+    }
+
+    predictions
+}
+
+#[allow(dead_code)]
+fn build_local_snapshot(values: &[f32], timestamps: &[f64]) -> Result<SwarmForecastSnapshot> {
+    build_local_snapshot_with_min(values, timestamps, 32)
+}
+
+fn snapshot_rebuild_min_observations(observations: usize) -> usize {
+    observations.clamp(8, 32)
+}
+
+fn build_local_snapshot_with_min(
+    values: &[f32],
+    timestamps: &[f64],
+    min_observations: usize,
+) -> Result<SwarmForecastSnapshot> {
+    if values.len() != timestamps.len() {
+        bail!(
+            "swarm forecaster value/timestamp mismatch: {} values vs {} timestamps",
+            values.len(),
+            timestamps.len()
+        );
+    }
+    if values.len() < min_observations {
+        bail!(
+            "swarm forecaster requires at least {} observations, received {}",
+            min_observations,
+            values.len()
+        );
+    }
+
+    let last_window = values.len().min(32);
+    let window = &values[values.len() - last_window..];
+    let short_window = values.len().min(8);
+    let medium_window = values.len().min(16);
+    let long_window = values.len().min(32);
+    let rolling_mean = window.iter().copied().sum::<f32>() / window.len() as f32;
+    let short_mean = values[values.len() - short_window..]
+        .iter()
+        .copied()
+        .sum::<f32>()
+        / short_window as f32;
+    let medium_mean = values[values.len() - medium_window..]
+        .iter()
+        .copied()
+        .sum::<f32>()
+        / medium_window as f32;
+    let long_mean = values[values.len() - long_window..]
+        .iter()
+        .copied()
+        .sum::<f32>()
+        / long_window as f32;
+    let slope = trend_slope(window);
+    let window_volatility = volatility(window);
+    let baseline_volatility = volatility(values).max(1e-6);
+    let mut seasonal_periods = Vec::new();
+
+    for period in [4_usize, 6, 8, 12, 24, 48] {
+        if values.len() >= period * 2 {
+            let recent = &values[values.len() - period..];
+            let prior = &values[values.len() - 2 * period..values.len() - period];
+            let recent_mean = recent.iter().copied().sum::<f32>() / recent.len() as f32;
+            let prior_mean = prior.iter().copied().sum::<f32>() / prior.len() as f32;
+            let covariance = recent
+                .iter()
+                .zip(prior.iter())
+                .map(|(a, b)| (*a - recent_mean) * (*b - prior_mean))
+                .sum::<f32>();
+            let recent_var = recent
+                .iter()
+                .map(|value| (*value - recent_mean).powi(2))
+                .sum::<f32>();
+            let prior_var = prior
+                .iter()
+                .map(|value| (*value - prior_mean).powi(2))
+                .sum::<f32>();
+            let denominator = (recent_var * prior_var).sqrt();
+            let correlation = if denominator <= 1e-6 {
+                0.0
+            } else {
+                covariance / denominator
+            };
+            if correlation.is_finite() && correlation > 0.35 {
+                seasonal_periods.push(period);
+            }
+        }
+    }
+
+    Ok(SwarmForecastSnapshot {
+        last_value: *values.last().unwrap_or(&0.0),
+        rolling_mean,
+        drift_slope: slope,
+        volatility: window_volatility,
+        has_trend: slope.abs() > 1e-3,
+        has_seasonality: !seasonal_periods.is_empty(),
+        seasonal_periods,
+        short_mean,
+        medium_mean,
+        long_mean,
+        recent_return: values
+            .last()
+            .zip(values.get(values.len().saturating_sub(2)))
+            .map(|(last, prev)| last - prev)
+            .unwrap_or_default(),
+        trend_strength: clamp_unit(
+            ((short_mean - long_mean).abs() + slope.abs()) / (window_volatility + 1e-6),
+        ),
+        mean_reversion_strength: clamp_unit(
+            (1.0 - ((short_mean - rolling_mean).abs() / (window_volatility + 1e-6))).max(0.0),
+        ),
+        volatility_ratio: (window_volatility / baseline_volatility).max(0.0),
+    })
+}
+
+#[cfg(feature = "swarm-forecasting")]
+fn build_validation_windows(
+    values: &[f32],
+    timestamps: &[f64],
+    horizon: usize,
+) -> Vec<(Vec<f32>, Vec<f64>, Vec<f32>)> {
+    let window = horizon.max(8).min(values.len() / 5).max(4);
+    if values.len() <= window + 8 {
+        return Vec::new();
+    }
+
+    let mut windows = Vec::new();
+    let mut window_end = values.len();
+    while windows.len() < 3 && window_end > window + 8 {
+        let train_end = window_end - window;
+        windows.push((
+            values[..train_end].to_vec(),
+            timestamps[..train_end].to_vec(),
+            values[train_end..window_end].to_vec(),
+        ));
+        window_end = train_end;
+    }
+    windows.reverse();
+    windows
+}
+
+fn extract_series_from_frame(frame: &DataFrame, _labels: &Series) -> Result<Vec<f32>> {
+    let preferred_columns = [
+        "close",
+        "base_close",
+        "mid",
+        "price",
+        "target",
+        "close_M1",
+        "close_m1",
+    ];
+
+    for column_name in preferred_columns {
+        if let Ok(column) = frame.column(column_name) {
+            let series = column
+                .cast(&DataType::Float64)
+                .with_context(|| format!("cast swarm source column {column_name} to Float64"))?;
+            let values = series
+                .f64()
+                .context("access swarm source column as Float64")?
+                .into_iter()
+                .map(|value| value.unwrap_or(0.0) as f32)
+                .collect::<Vec<_>>();
+            if values.len() >= 32 {
+                return Ok(values);
+            }
+        }
+    }
+
+    for column in frame.get_columns() {
+        if preferred_columns.contains(&column.name().as_str()) {
+            continue;
+        }
+        let name = column.name().as_str().to_ascii_lowercase();
+        if name.contains("label") || name.contains("target") || name.contains("signal") {
+            continue;
+        }
+        if !is_numeric_dtype(column.dtype()) {
+            continue;
+        }
+        let series = column.cast(&DataType::Float64).with_context(|| {
+            format!(
+                "cast fallback swarm source column {} to Float64",
+                column.name().as_str()
+            )
+        })?;
+        let values = series
+            .f64()
+            .context("access fallback swarm source column as Float64")?
+            .into_iter()
+            .map(|value| value.unwrap_or(0.0) as f32)
+            .collect::<Vec<_>>();
+        if values.len() >= 32 {
+            return Ok(values);
+        }
+    }
+
+    let numeric_columns = frame
+        .get_columns()
+        .iter()
+        .filter(|column| {
+            let name = column.name().as_str().to_ascii_lowercase();
+            !name.contains("label")
+                && !name.contains("target")
+                && !name.contains("signal")
+                && is_numeric_dtype(column.dtype())
+        })
+        .map(|column| {
+            column.cast(&DataType::Float64).with_context(|| {
+                format!(
+                    "cast row-mean fallback column {} to Float64",
+                    column.name().as_str()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if numeric_columns.is_empty() {
+        bail!("swarm forecaster could not derive a price-like series from the training frame");
+    }
+
+    let height = frame.height();
+    let mut values = Vec::with_capacity(height);
+    for row_idx in 0..height {
+        let mut sum = 0.0_f64;
+        let mut count = 0usize;
+        for column in &numeric_columns {
+            if let Some(value) = column.f64().ok().and_then(|column| column.get(row_idx)) {
+                if value.is_finite() {
+                    sum += value;
+                    count += 1;
+                }
+            }
+        }
+        values.push(if count == 0 {
+            0.0
+        } else {
+            (sum / count as f64) as f32
+        });
+    }
+    if values.len() < 32 {
+        bail!("swarm forecaster requires at least 32 usable observations");
+    }
+    Ok(values)
+}
 
 pub struct SwarmForecaster {
     #[cfg(feature = "swarm-forecasting")]
     pub manager: Option<AgentForecastingManager>,
     #[cfg(not(feature = "swarm-forecasting"))]
     pub manager: Option<()>,
+    pub config: SwarmForecastConfig,
+    runtime_mode: SwarmRuntimeMode,
+    pub fitted: bool,
+    pub values: Vec<f32>,
+    pub timestamps: Vec<f64>,
+    pub unique_id: String,
+    pub snapshot: Option<SwarmForecastSnapshot>,
+    pub last_result: Option<SwarmForecastResult>,
+    pub last_horizon: Option<usize>,
+    candidate_reports: Vec<SwarmCandidateReport>,
+    pub updated_at_unix_ms: Option<u64>,
+    training_report: Option<SwarmTrainingReport>,
 }
 
 impl SwarmForecaster {
     pub fn new(memory_limit_mb: f64) -> Self {
+        let config = SwarmForecastConfig {
+            memory_limit_mb: memory_limit_mb as f32,
+            ..SwarmForecastConfig::default()
+        };
+
         #[cfg(feature = "swarm-forecasting")]
         {
             Self {
-                manager: Some(AgentForecastingManager::new(memory_limit_mb)),
+                manager: Some(AgentForecastingManager::new(config.memory_limit_mb)),
+                config,
+                runtime_mode: SwarmRuntimeMode::ExternalSwarm,
+                fitted: false,
+                values: Vec::new(),
+                timestamps: Vec::new(),
+                unique_id: "swarm_series".to_string(),
+                snapshot: None,
+                last_result: None,
+                last_horizon: None,
+                candidate_reports: Vec::new(),
+                updated_at_unix_ms: None,
+                training_report: None,
             }
         }
         #[cfg(not(feature = "swarm-forecasting"))]
         {
-            let _ = memory_limit_mb;
-            Self { manager: None }
+            Self {
+                manager: None,
+                config,
+                runtime_mode: SwarmRuntimeMode::LocalFallback,
+                fitted: false,
+                values: Vec::new(),
+                timestamps: Vec::new(),
+                unique_id: "swarm_series".to_string(),
+                snapshot: None,
+                last_result: None,
+                last_horizon: None,
+                candidate_reports: Vec::new(),
+                updated_at_unix_ms: None,
+                training_report: None,
+            }
         }
     }
 
+    pub fn with_agent(
+        mut self,
+        agent_id: impl Into<String>,
+        agent_type: impl Into<String>,
+    ) -> Self {
+        self.config.agent_id = agent_id.into();
+        self.config.agent_type = agent_type.into();
+        self
+    }
+
+    pub fn with_strategy(mut self, strategy: SwarmEnsembleStrategy) -> Self {
+        self.config.strategy = strategy;
+        self
+    }
+
+    pub fn with_frequency(mut self, frequency: impl Into<String>) -> Self {
+        self.config.frequency = frequency.into();
+        self
+    }
+
+    pub fn fit_from_frame(
+        &mut self,
+        frame: &DataFrame,
+        labels: &Series,
+        unique_id: impl Into<String>,
+    ) -> Result<()> {
+        let values = extract_series_from_frame(frame, labels)?;
+        let timestamps = (0..values.len()).map(|idx| idx as f64).collect::<Vec<_>>();
+        self.fit_series(&values, &timestamps, unique_id)
+    }
+
+    #[cfg(feature = "swarm-forecasting")]
+    pub fn fit_series(
+        &mut self,
+        values: &[f32],
+        timestamps: &[f64],
+        unique_id: impl Into<String>,
+    ) -> Result<()> {
+        let unique_id = unique_id.into();
+        let series = build_training_series(values, timestamps, &self.config.frequency, &unique_id)?;
+        let processor = TimeSeriesProcessor::new();
+        let snapshot = infer_snapshot(&series, &processor);
+
+        let requirements = ForecastRequirements {
+            horizon: self.config.horizon,
+            frequency: self.config.frequency.clone(),
+            accuracy_target: self.config.accuracy_target,
+            latency_requirement_ms: self.config.latency_requirement_ms,
+            interpretability_needed: self.config.interpretability_needed,
+            online_learning: self.config.online_learning,
+        };
+
+        let manager = self
+            .manager
+            .as_mut()
+            .context("swarm forecasting manager missing")?;
+        manager
+            .assign_model(
+                self.config.agent_id.clone(),
+                self.config.agent_type.clone(),
+                requirements,
+            )
+            .map_err(|err| anyhow::anyhow!("assign swarm forecasting model: {err}"))?;
+
+        self.values = values.to_vec();
+        self.timestamps = timestamps.to_vec();
+        self.unique_id = unique_id;
+        self.snapshot = Some(snapshot);
+        self.last_result = None;
+        self.last_horizon = None;
+        self.candidate_reports.clear();
+        self.updated_at_unix_ms = None;
+        self.training_report = None;
+        self.runtime_mode = SwarmRuntimeMode::ExternalSwarm;
+        self.fitted = true;
+        Ok(())
+    }
+
+    #[cfg(not(feature = "swarm-forecasting"))]
+    pub fn fit_series(
+        &mut self,
+        values: &[f32],
+        timestamps: &[f64],
+        unique_id: impl Into<String>,
+    ) -> Result<()> {
+        let unique_id = unique_id.into();
+        let snapshot = build_local_snapshot_with_min(values, timestamps, 8)?;
+
+        self.values = values.to_vec();
+        self.timestamps = timestamps.to_vec();
+        self.unique_id = unique_id;
+        self.snapshot = Some(snapshot);
+        self.last_result = None;
+        self.last_horizon = None;
+        self.candidate_reports.clear();
+        self.updated_at_unix_ms = None;
+        self.training_report = None;
+        self.runtime_mode = SwarmRuntimeMode::LocalFallback;
+        self.fitted = true;
+        Ok(())
+    }
+
+    #[cfg(feature = "swarm-forecasting")]
+    pub fn forecast(&mut self, horizon: usize) -> Result<SwarmForecastResult> {
+        if !self.fitted {
+            bail!("swarm forecaster has not been fitted");
+        }
+
+        let snapshot = self
+            .snapshot
+            .clone()
+            .context("swarm forecaster snapshot missing")?;
+        let horizon = horizon.max(1);
+        let candidates = candidate_predictions(&self.values, &snapshot, horizon);
+        if candidates.len() < 2 {
+            bail!("swarm forecaster requires at least two candidate forecasts");
+        }
+
+        let point_candidates = candidates
+            .iter()
+            .map(|(_, _, forecast)| forecast.clone())
+            .collect::<Vec<_>>();
+
+        let validation_windows = build_validation_windows(&self.values, &self.timestamps, horizon);
+        let weighted_reports = if !validation_windows.is_empty() {
+            build_weighted_reports_external(
+                &validation_windows,
+                &self.config.frequency,
+                &self.unique_id,
+            )?
+        } else {
+            let report_reference =
+                aggregate_average(&point_candidates, horizon, snapshot.last_value);
+            build_candidate_reports(&candidates, &report_reference, "consensus", Some(&snapshot))
+        };
+        let weight_map = build_candidate_weight_map(&weighted_reports);
+        let ordered_weights = candidates
+            .iter()
+            .map(|(name, _, _)| {
+                weight_map
+                    .get(name)
+                    .copied()
+                    .unwrap_or_else(|| 1.0 / candidates.len().max(1) as f32)
+            })
+            .collect::<Vec<_>>();
+        let config = EnsembleConfig {
+            strategy: map_strategy(self.config.strategy),
+            models: candidates.iter().map(|(name, _, _)| name.clone()).collect(),
+            weights: Some(ordered_weights),
+            meta_learner: Some("meta_stack".to_string()),
+            optimization_metric: OptimizationMetric::CombinedScore,
+        };
+        let mut ensemble = EnsembleForecaster::new(config).map_err(|err| anyhow::anyhow!(err))?;
+        for (name, model_type, forecast) in &candidates {
+            ensemble.add_model(EnsembleModel {
+                name: name.clone(),
+                model_type: *model_type,
+                weight: weight_map
+                    .get(name)
+                    .copied()
+                    .unwrap_or_else(|| 1.0 / candidates.len().max(1) as f32),
+                performance_metrics: model_performance_metrics(
+                    forecast,
+                    &aggregate_average(&point_candidates, horizon, snapshot.last_value),
+                ),
+            });
+        }
+        self.candidate_reports = weighted_reports.clone();
+        let ensemble_result = ensemble
+            .ensemble_predict(&point_candidates)
+            .map_err(|err| anyhow::anyhow!("swarm ensemble forecast: {err}"))?;
+        let ensemble_swarm_result = {
+            let (level_80_lower, level_80_upper) = normalize_prediction_intervals(
+                ensemble_result.prediction_intervals.level_80.0,
+                ensemble_result.prediction_intervals.level_80.1,
+            );
+            SwarmForecastResult {
+                point_forecast: ensemble_result.point_forecast,
+                level_80_lower,
+                level_80_upper,
+                diversity_score: ensemble_result.ensemble_metrics.diversity_score,
+                effective_models: ensemble_result.ensemble_metrics.effective_models,
+                prediction_variance: ensemble_result.ensemble_metrics.prediction_variance,
+                models_used: ensemble_result.models_used,
+            }
+        };
+        let final_result = if result_is_valid(&ensemble_swarm_result, horizon) {
+            ensemble_swarm_result
+        } else {
+            let fallback_candidates = candidates
+                .iter()
+                .map(|(name, _, forecast)| (name.clone(), forecast.clone()))
+                .collect::<Vec<_>>();
+            fallback_forecast_with_weights(&snapshot, &fallback_candidates, &weight_map, horizon)
+        };
+
+        if let Some(manager) = self.manager.as_mut() {
+            let confidence = (1.0 - final_result.prediction_variance).clamp(0.0, 1.0);
+            let accuracy_proxy = (1.0 - snapshot.volatility.abs()).clamp(0.0, 1.0);
+            let _update_result = manager.update_performance(
+                &self.config.agent_id,
+                self.config.latency_requirement_ms.min(50.0),
+                accuracy_proxy,
+                confidence,
+            );
+        }
+
+        self.last_result = Some(final_result.clone());
+        self.last_horizon = Some(horizon);
+        self.updated_at_unix_ms = current_unix_ms();
+        self.training_report = Some(build_training_report(
+            &self.candidate_reports,
+            validation_windows.len(),
+            self.values.len(),
+            horizon,
+            final_result.diversity_score,
+            snapshot.trend_strength - snapshot.mean_reversion_strength,
+        ));
+
+        Ok(final_result)
+    }
+
+    #[cfg(not(feature = "swarm-forecasting"))]
+    pub fn forecast(&mut self, horizon: usize) -> Result<SwarmForecastResult> {
+        if !self.fitted {
+            bail!("swarm forecaster has not been fitted");
+        }
+
+        let horizon = horizon.max(1);
+        let snapshot = self
+            .snapshot
+            .clone()
+            .context("swarm forecaster snapshot missing")?;
+        let candidates = candidate_forecasts_local(&self.values, &snapshot, horizon);
+        if candidates.len() < 2 {
+            bail!("swarm forecaster requires at least two candidate forecasts");
+        }
+
+        let report_reference = aggregate_average(
+            &candidates
+                .iter()
+                .map(|(_, forecast)| forecast.clone())
+                .collect::<Vec<_>>(),
+            horizon,
+            snapshot.last_value,
+        );
+        self.candidate_reports = candidates
+            .iter()
+            .map(|(name, forecast)| {
+                candidate_report(
+                    name,
+                    "local_ensemble",
+                    forecast,
+                    "consensus",
+                    &report_reference,
+                    1.0 / candidates.len() as f32,
+                    Some(&snapshot),
+                )
+            })
+            .collect::<Vec<_>>();
+        apply_candidate_weights(&mut self.candidate_reports);
+        let weight_map = build_candidate_weight_map(&self.candidate_reports);
+        let final_result =
+            fallback_forecast_with_weights(&snapshot, &candidates, &weight_map, horizon);
+        self.last_result = Some(final_result.clone());
+        self.last_horizon = Some(horizon);
+        self.updated_at_unix_ms = current_unix_ms();
+        self.runtime_mode = SwarmRuntimeMode::LocalFallback;
+        self.training_report = Some(build_training_report(
+            &self.candidate_reports,
+            0,
+            self.values.len(),
+            horizon,
+            final_result.diversity_score,
+            snapshot.trend_strength - snapshot.mean_reversion_strength,
+        ));
+
+        Ok(final_result)
+    }
+
     pub fn train(&mut self) -> Result<()> {
-        #[cfg(not(feature = "swarm-forecasting"))]
-        { anyhow::bail!("Swarm forecasting feature not enabled") }
+        if self.values.is_empty() || self.timestamps.is_empty() {
+            bail!("swarm forecaster cannot train without historical values");
+        }
+        self.fit_series(
+            &self.values.clone(),
+            &self.timestamps.clone(),
+            self.unique_id.clone(),
+        )
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if self.values.len() != self.timestamps.len() {
+            bail!(
+                "swarm forecaster cannot save mismatched values/timestamps: {} values vs {} timestamps",
+                self.values.len(),
+                self.timestamps.len()
+            );
+        }
+        if self.fitted && self.snapshot.is_none() {
+            bail!("swarm forecaster cannot save a fitted model without a snapshot");
+        }
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("create swarm forecaster directory {}", path.display()))?;
+        let artifact = SwarmForecasterArtifact {
+            config: self.config.clone(),
+            runtime_mode: self.runtime_mode,
+            fitted: self.fitted,
+            values: self.values.clone(),
+            timestamps: self.timestamps.clone(),
+            unique_id: self.unique_id.clone(),
+            snapshot: self.snapshot.clone(),
+            last_result: self.last_result.clone(),
+            last_horizon: self.last_horizon,
+            candidate_reports: self.candidate_reports.clone(),
+            updated_at_unix_ms: self.updated_at_unix_ms,
+            training_report: self.training_report.clone(),
+        };
+        let payload =
+            serde_json::to_vec_pretty(&artifact).context("serialize swarm forecaster artifact")?;
+        std::fs::write(path.join(SWARM_ARTIFACT_FILE_NAME), payload)
+            .with_context(|| format!("write swarm forecaster artifact {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn load(&mut self, path: &Path) -> Result<()> {
+        let payload = std::fs::read(path.join(SWARM_ARTIFACT_FILE_NAME))
+            .with_context(|| format!("read swarm forecaster artifact {}", path.display()))?;
+        let artifact: SwarmForecasterArtifact =
+            serde_json::from_slice(&payload).context("deserialize swarm forecaster artifact")?;
+
+        let SwarmForecasterArtifact {
+            config,
+            runtime_mode,
+            fitted,
+            values,
+            timestamps,
+            unique_id,
+            snapshot,
+            last_result,
+            last_horizon,
+            candidate_reports,
+            updated_at_unix_ms,
+            training_report,
+        } = artifact;
+
+        self.config = config;
+        self.runtime_mode = runtime_mode;
+        self.fitted = fitted;
+        self.values = values;
+        self.timestamps = timestamps;
+        self.unique_id = unique_id;
+        self.snapshot = snapshot;
+        self.last_result = last_result.clone();
+        self.last_horizon = last_horizon;
+        self.candidate_reports = candidate_reports.clone();
+        self.updated_at_unix_ms = updated_at_unix_ms;
+        self.training_report = training_report;
+
         #[cfg(feature = "swarm-forecasting")]
-        { Ok(()) }
+        {
+            self.manager = Some(AgentForecastingManager::new(self.config.memory_limit_mb));
+            if self.fitted {
+                let manager = self
+                    .manager
+                    .as_mut()
+                    .context("swarm forecasting manager missing after load")?;
+                let requirements = ForecastRequirements {
+                    horizon: self.config.horizon,
+                    frequency: self.config.frequency.clone(),
+                    accuracy_target: self.config.accuracy_target,
+                    latency_requirement_ms: self.config.latency_requirement_ms,
+                    interpretability_needed: self.config.interpretability_needed,
+                    online_learning: self.config.online_learning,
+                };
+                manager
+                    .assign_model(
+                        self.config.agent_id.clone(),
+                        self.config.agent_type.clone(),
+                        requirements,
+                    )
+                    .map_err(|err| anyhow::anyhow!("assign swarm forecasting model: {err}"))?;
+                if self.snapshot.is_none() {
+                    self.snapshot = Some(build_local_snapshot_with_min(
+                        &self.values,
+                        &self.timestamps,
+                        snapshot_rebuild_min_observations(self.values.len()),
+                    )?);
+                }
+            }
+        }
+
+        #[cfg(not(feature = "swarm-forecasting"))]
+        {
+            if self.fitted && self.snapshot.is_none() {
+                self.snapshot = Some(build_local_snapshot_with_min(
+                    &self.values,
+                    &self.timestamps,
+                    snapshot_rebuild_min_observations(self.values.len()),
+                )?);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_artifact_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock moved backwards")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "forex-ai-swarm-forecasting-{name}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn load_preserves_saved_local_fallback_artifacts_without_refitting() {
+        let dir = test_artifact_dir("load-preserves-local-artifact");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let values = vec![1.0, 1.2, 1.1, 1.4, 1.6, 1.5, 1.7, 1.8];
+        let timestamps = (0..values.len()).map(|idx| idx as f64).collect::<Vec<_>>();
+        let snapshot = build_local_snapshot_with_min(&values, &timestamps, 8).expect("snapshot");
+        let last_result = SwarmForecastResult {
+            point_forecast: vec![1.9, 2.0, 2.1],
+            level_80_lower: vec![1.7, 1.8, 1.9],
+            level_80_upper: vec![2.1, 2.2, 2.3],
+            diversity_score: 0.12,
+            effective_models: 3.0,
+            prediction_variance: 0.04,
+            models_used: 3,
+        };
+        let candidate_reports = vec![SwarmCandidateReport {
+            name: "persistence".to_string(),
+            model_type: "MLP".to_string(),
+            source: "local".to_string(),
+            weight: 1.0,
+            prediction_length: 3,
+            prediction_mean: 2.0,
+            prediction_std: 0.2,
+            mae: 0.1,
+            mse: 0.01,
+            mape: 5.0,
+            smape: 4.0,
+            coverage: 0.8,
+            bias: 0.0,
+            directional_accuracy: 0.75,
+            regime_fit: 0.65,
+            stability_score: 0.90,
+        }];
+        let training_report = SwarmTrainingReport {
+            training_rows: values.len(),
+            validation_windows: 1,
+            fitted_horizon: 3,
+            best_candidate: Some("persistence".to_string()),
+            aggregate_mae: 0.1,
+            aggregate_smape: 4.0,
+            aggregate_directional_accuracy: 0.75,
+            aggregate_coverage: 0.8,
+            diversity_score: 0.12,
+            regime_bias: 0.2,
+            updated_at_unix_ms: Some(456),
+        };
+
+        let artifact = SwarmForecasterArtifact {
+            config: SwarmForecastConfig::default(),
+            runtime_mode: SwarmRuntimeMode::LocalFallback,
+            fitted: true,
+            values: values.clone(),
+            timestamps: timestamps.clone(),
+            unique_id: "test-series".to_string(),
+            snapshot: Some(snapshot.clone()),
+            last_result: Some(last_result.clone()),
+            last_horizon: Some(3),
+            candidate_reports: candidate_reports.clone(),
+            updated_at_unix_ms: Some(123),
+            training_report: Some(training_report.clone()),
+        };
+        let payload = serde_json::to_vec_pretty(&artifact).expect("serialize artifact");
+        fs::write(dir.join(SWARM_ARTIFACT_FILE_NAME), payload).expect("write artifact");
+
+        let mut forecaster = SwarmForecaster::new(256.0);
+        forecaster.load(&dir).expect("load local fallback artifact");
+
+        assert_eq!(forecaster.runtime_mode, SwarmRuntimeMode::LocalFallback);
+        assert!(forecaster.fitted);
+        assert_eq!(forecaster.values, values);
+        assert_eq!(forecaster.timestamps, timestamps);
+        assert_eq!(forecaster.unique_id, "test-series");
+        assert_eq!(forecaster.last_horizon, Some(3));
+        assert_eq!(forecaster.updated_at_unix_ms, Some(123));
+        let loaded_result = forecaster.last_result.expect("last result after load");
+        assert_eq!(loaded_result.point_forecast, last_result.point_forecast);
+        assert_eq!(loaded_result.level_80_lower, last_result.level_80_lower);
+        assert_eq!(loaded_result.level_80_upper, last_result.level_80_upper);
+        assert_eq!(loaded_result.diversity_score, last_result.diversity_score);
+        assert_eq!(loaded_result.effective_models, last_result.effective_models);
+        assert_eq!(
+            loaded_result.prediction_variance,
+            last_result.prediction_variance
+        );
+        assert_eq!(loaded_result.models_used, last_result.models_used);
+
+        assert_eq!(forecaster.candidate_reports.len(), candidate_reports.len());
+        let loaded_report = &forecaster.candidate_reports[0];
+        let expected_report = &candidate_reports[0];
+        assert_eq!(loaded_report.name, expected_report.name);
+        assert_eq!(loaded_report.model_type, expected_report.model_type);
+        assert_eq!(loaded_report.source, expected_report.source);
+        assert_eq!(loaded_report.weight, expected_report.weight);
+        assert_eq!(
+            loaded_report.prediction_length,
+            expected_report.prediction_length
+        );
+        assert_eq!(
+            loaded_report.prediction_mean,
+            expected_report.prediction_mean
+        );
+        assert_eq!(loaded_report.prediction_std, expected_report.prediction_std);
+        assert_eq!(loaded_report.mae, expected_report.mae);
+        assert_eq!(loaded_report.mse, expected_report.mse);
+        assert_eq!(loaded_report.mape, expected_report.mape);
+        assert_eq!(loaded_report.smape, expected_report.smape);
+        assert_eq!(loaded_report.coverage, expected_report.coverage);
+        assert_eq!(loaded_report.bias, expected_report.bias);
+        assert_eq!(
+            loaded_report.directional_accuracy,
+            expected_report.directional_accuracy
+        );
+        assert_eq!(loaded_report.regime_fit, expected_report.regime_fit);
+        assert_eq!(
+            loaded_report.stability_score,
+            expected_report.stability_score
+        );
+
+        let loaded_snapshot = forecaster.snapshot.expect("snapshot after load");
+        assert_eq!(loaded_snapshot.last_value, snapshot.last_value);
+        assert_eq!(loaded_snapshot.rolling_mean, snapshot.rolling_mean);
+        assert_eq!(loaded_snapshot.drift_slope, snapshot.drift_slope);
+        assert_eq!(loaded_snapshot.volatility, snapshot.volatility);
+        assert_eq!(loaded_snapshot.has_trend, snapshot.has_trend);
+        assert_eq!(loaded_snapshot.has_seasonality, snapshot.has_seasonality);
+        assert_eq!(loaded_snapshot.seasonal_periods, snapshot.seasonal_periods);
+        assert_eq!(loaded_snapshot.short_mean, snapshot.short_mean);
+        assert_eq!(loaded_snapshot.medium_mean, snapshot.medium_mean);
+        assert_eq!(loaded_snapshot.long_mean, snapshot.long_mean);
+        assert_eq!(loaded_snapshot.recent_return, snapshot.recent_return);
+        assert_eq!(loaded_snapshot.trend_strength, snapshot.trend_strength);
+        assert_eq!(
+            loaded_snapshot.mean_reversion_strength,
+            snapshot.mean_reversion_strength
+        );
+        assert_eq!(loaded_snapshot.volatility_ratio, snapshot.volatility_ratio);
+
+        let loaded_training_report = forecaster
+            .training_report
+            .expect("training report after load");
+        assert_eq!(
+            loaded_training_report.training_rows,
+            training_report.training_rows
+        );
+        assert_eq!(
+            loaded_training_report.validation_windows,
+            training_report.validation_windows
+        );
+        assert_eq!(
+            loaded_training_report.fitted_horizon,
+            training_report.fitted_horizon
+        );
+        assert_eq!(
+            loaded_training_report.best_candidate,
+            training_report.best_candidate
+        );
+        assert_eq!(
+            loaded_training_report.aggregate_mae,
+            training_report.aggregate_mae
+        );
+        assert_eq!(
+            loaded_training_report.aggregate_smape,
+            training_report.aggregate_smape
+        );
+        assert_eq!(
+            loaded_training_report.aggregate_directional_accuracy,
+            training_report.aggregate_directional_accuracy
+        );
+        assert_eq!(
+            loaded_training_report.aggregate_coverage,
+            training_report.aggregate_coverage
+        );
+        assert_eq!(
+            loaded_training_report.diversity_score,
+            training_report.diversity_score
+        );
+        assert_eq!(
+            loaded_training_report.regime_bias,
+            training_report.regime_bias
+        );
+        assert_eq!(
+            loaded_training_report.updated_at_unix_ms,
+            training_report.updated_at_unix_ms
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

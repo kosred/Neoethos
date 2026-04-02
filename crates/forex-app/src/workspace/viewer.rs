@@ -1,8 +1,6 @@
 use crate::app_services::{
-    discovery::DiscoveryJobHandle,
-    trading::TradingSession,
+    ServiceEvent, discovery::DiscoveryJobHandle, trading::TradingSession,
     training::TrainingJobHandle,
-    ServiceEvent,
 };
 use crate::app_state::AppState;
 use crate::ui;
@@ -53,9 +51,13 @@ impl TabViewer for WorkspaceViewer<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         match tab {
             WorkspaceTab::Dashboard => {
-                let auto_trade = &mut self.state.auto_trade_enabled;
                 let panel = &mut self.state.dashboard_panel;
-                panel.show(ui, auto_trade);
+                panel.show(
+                    ui,
+                    self.state.auto_trade_enabled,
+                    self.state.account_balance,
+                    self.state.account_equity,
+                );
             }
             WorkspaceTab::Chart => {
                 ui::trading::chart_panel::render(ui, self.state, self.trading_session)
@@ -76,13 +78,20 @@ impl TabViewer for WorkspaceViewer<'_> {
             WorkspaceTab::Training => {
                 ui::training::render(ui, self.state, self.tx, self.training_handle)
             }
-            WorkspaceTab::SystemStatus => {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let refresh = ui::system_status::render(ui, self.state, self.trading_session, self.tx);
-                    if refresh {
-                        self.refresh_requested = true;
-                    }
-                });
+            WorkspaceTab::Runtime => {
+                let refresh = ui::system::runtime::render(ui, self.state, self.trading_session);
+                if refresh {
+                    self.refresh_requested = true;
+                }
+            }
+            WorkspaceTab::BrokerSetup => {
+                ui::system::brokers::render(ui, self.state, self.trading_session, self.tx);
+            }
+            WorkspaceTab::Intelligence => {
+                ui::system::intelligence::render(ui, self.state, self.tx);
+            }
+            WorkspaceTab::DataBootstrap => {
+                ui::system::bootstrap::render(ui, self.state, self.trading_session, self.tx);
             }
             WorkspaceTab::Hardware => {
                 egui::ScrollArea::vertical().show(ui, |ui| {

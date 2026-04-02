@@ -1,13 +1,22 @@
 // Base classes and utilities (ported from models/base.py)
 pub mod base;
+pub mod runtime;
 
 // Machine learning models
+pub mod deep_models;
 pub mod ensemble;
 pub mod parallel_trainer;
 pub mod training_orchestrator;
 pub mod tree_models;
 
-pub use ensemble::MetaBlender;
+pub use deep_models::{
+    BurnDeepExpert, KANExpert, MLPExpert, NBeatsExpert, NBeatsxNfExpert, PatchTSTExpert,
+    TabNetExpert, TiDEExpert, TiDENfExpert, TimesNetExpert, TransformerExpert,
+};
+pub use ensemble::{
+    CalibrationMethod, ConformalGate, ConformalPredictionExpert, MetaBlender, MetaDecisionStack,
+    ProbabilityCalibrationExpert, ProbabilityCalibrator,
+};
 pub use parallel_trainer::{ModelTrainingFailure, ModelTrainingProgress, ParallelTrainingSummary};
 pub use training_orchestrator::{TrainingOrchestrator, TrainingRunSummary};
 
@@ -23,7 +32,7 @@ pub mod evaluation_helpers;
 // Model registry (model discovery and validation)
 pub mod registry;
 
-// Genetic strategy expert (evolutionary algorithms for TA-Lib)
+// Genetic strategy expert (evolutionary algorithms over the feature stack)
 pub mod genetic;
 
 // Exit agent (RL-based trade exit decisions)
@@ -38,14 +47,21 @@ pub mod statistical;
 pub mod streaming;
 
 pub use anomaly::IsolationForestExpert;
-pub use evolution::NeuroEvoOptimizer;
-pub use forecasting::SwarmForecaster;
-pub use rl::TradingReinforcementLearner;
+pub use evolution::{NeatExpert, NeuroEvoExpert, NeuroEvoOptimizer};
+pub use forecasting::{
+    SwarmEnsembleStrategy, SwarmForecastConfig, SwarmForecastResult, SwarmForecaster,
+};
+pub use genetic::GeneticStrategyExpert;
+pub use rl::{
+    TradingAction, TradingEpisode, TradingReinforcementLearner, TradingStateEncoding,
+    TradingTransition,
+};
 pub use statistical::{BayesianLogitExpert, ElasticNetExpert, LogisticExpert};
-pub use streaming::AdaptiveGradientBooster;
+pub use streaming::{
+    AdaptiveGradientBooster, OnlineHoeffdingExpert, OnlinePassiveAggressiveExpert,
+};
 
 // Pure-Rust neural networks via Burn framework (no Python, no GIL)
-#[cfg(feature = "burn-backend")]
 pub mod burn_models;
 
 #[cfg(feature = "onnx")]
@@ -53,7 +69,7 @@ use anyhow::{Context, Result};
 #[cfg(feature = "onnx")]
 use ndarray::Array2;
 #[cfg(feature = "onnx")]
-use ort::{inputs, Session, Value};
+use ort::{Session, Value, inputs};
 #[cfg(feature = "onnx")]
 use std::collections::HashMap;
 #[cfg(feature = "onnx")]

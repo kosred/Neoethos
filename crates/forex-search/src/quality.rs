@@ -1,4 +1,5 @@
 use chrono::{Datelike, TimeZone, Utc};
+use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use statrs::distribution::{ContinuousCDF, StudentsT};
 use std::collections::HashMap;
@@ -45,6 +46,8 @@ pub struct StrategyMetrics {
     pub quality_score: f64,
     pub has_edge: bool,
     pub recommendation: String,
+    pub mc_worst_drawdown_95_pct: Option<f64>,
+    pub mc_risk_of_ruin_pct: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +195,45 @@ impl StrategyQualityAnalyzer {
         };
         let trades_per_month = calculate_trade_frequency(trades);
 
+        // --- Monte Carlo Simulation for Stress Testing ---
+        let mut rng = rand::rng();
+        let mc_iterations = 1000;
+        let mut worst_dds = Vec::with_capacity(mc_iterations);
+        let mut ruined_count = 0;
+        let ruin_threshold = initial_balance * 0.50; // Define ruin as 50% drawdown
+
+        for _ in 0..mc_iterations {
+            let mut mc_pnls = pnls.clone();
+            mc_pnls.shuffle(&mut rng);
+            let mut eq = initial_balance;
+            let mut pk = initial_balance;
+            let mut max_mc_dd = 0.0_f64;
+            let mut ruined = false;
+
+            for p in mc_pnls {
+                eq += p;
+                if eq < ruin_threshold {
+                    ruined = true;
+                }
+                if eq > pk {
+                    pk = eq;
+                }
+                let dd = if pk > 0.0 { (pk - eq) / pk } else { 0.0 };
+                if dd > max_mc_dd {
+                    max_mc_dd = dd;
+                }
+            }
+            worst_dds.push(max_mc_dd);
+            if ruined {
+                ruined_count += 1;
+            }
+        }
+        worst_dds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p95_idx = ((mc_iterations as f64 * 0.95) as usize).min(mc_iterations - 1);
+        let mc_worst_dd_95 = worst_dds.get(p95_idx).cloned().unwrap_or(max_dd);
+        let mc_risk_of_ruin = (ruined_count as f64) / (mc_iterations as f64);
+        // -------------------------------------------------
+
         let mut metrics = StrategyMetrics {
             strategy_id: strategy_id.to_string(),
             total_trades,
@@ -222,6 +264,8 @@ impl StrategyQualityAnalyzer {
             quality_score: 0.0,
             has_edge: false,
             recommendation: String::new(),
+            mc_worst_drawdown_95_pct: Some(mc_worst_dd_95),
+            mc_risk_of_ruin_pct: Some(mc_risk_of_ruin),
         };
 
         score_strategy(self, &mut metrics);
@@ -551,6 +595,8 @@ fn empty_metrics(strategy_id: &str) -> StrategyMetrics {
         quality_score: 0.0,
         has_edge: false,
         recommendation: String::new(),
+        mc_worst_drawdown_95_pct: None,
+        mc_risk_of_ruin_pct: None,
     }
 }
 

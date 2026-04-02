@@ -8,13 +8,24 @@ pub struct NewsPanel {
 }
 
 pub fn build_news_panel(state: &AppState) -> NewsPanel {
-    NewsPanel {
-        items: vec![
-            format!("ECB speaker in 12m · {}", state.selected_pair),
-            "US yields rising into open".to_string(),
-            "LLM summary · risk-on fading, stay selective".to_string(),
-        ],
+    let mut items = vec![format!(
+        "News filter status · {} · provider={}",
+        state.llm_news_filter.current_status, state.llm_news_filter.llm_provider
+    )];
+    if state.llm_news_filter.recent_events.is_empty() {
+        items.push(format!(
+            "No live news events connected for {} yet.",
+            state.selected_pair
+        ));
+    } else {
+        for event in state.llm_news_filter.recent_events.iter().take(6) {
+            items.push(format!(
+                "{} {} @ {}",
+                event.currency, event.impact, event.timestamp_ms
+            ));
+        }
     }
+    NewsPanel { items }
 }
 
 pub fn render(ui: &mut egui::Ui, state: &AppState) {
@@ -41,14 +52,28 @@ mod tests {
             data_dir: PathBuf::from("data"),
             start_local: false,
         };
-        AppState::new(runtime, vec!["EURUSD".to_string()])
+        AppState::new(
+            runtime,
+            &forex_core::Settings::default(),
+            vec!["EURUSD".to_string()],
+        )
     }
 
     #[test]
     fn news_panel_groups_market_brief_and_upcoming_events() {
         let panel = build_news_panel(&sample_state());
 
-        assert!(panel.items.iter().any(|item: &String| item.contains("ECB")));
-        assert!(panel.items.iter().any(|item: &String| item.contains("LLM summary")));
+        assert!(
+            panel
+                .items
+                .iter()
+                .any(|item: &String| item.contains("News filter status"))
+        );
+        assert!(
+            panel
+                .items
+                .iter()
+                .any(|item: &String| item.contains("No live news events connected"))
+        );
     }
 }

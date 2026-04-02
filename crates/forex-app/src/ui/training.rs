@@ -1,12 +1,12 @@
 use crate::app_services::{
-    jobs::{JobSnapshot, JobState},
-    training::{failed_snapshot, start_training_job, TrainingJobHandle, TrainingRequest},
     ServiceEvent,
+    jobs::{JobSnapshot, JobState},
+    training::{TrainingJobHandle, TrainingRequest, failed_snapshot, start_training_job},
 };
 use crate::app_state::AppState;
 use crate::ui::components::{
-    open_log, render_dashboard_sections, render_report, render_status_badge, render_summary_cards,
-    render_view_header, DashboardCard, DashboardSection,
+    DashboardCard, DashboardSection, open_log, render_dashboard_sections, render_report,
+    render_status_badge, render_summary_cards, render_view_header,
 };
 use eframe::egui;
 use std::path::PathBuf;
@@ -144,10 +144,30 @@ fn build_training_dashboard(snapshot: &JobSnapshot) -> TrainingDashboard {
     push_section(&mut sections, "Training Target", target_rows);
 
     let mut runtime_rows = Vec::new();
-    push_counter_row(snapshot, &mut runtime_rows, "requested_models", "Requested Models");
-    push_counter_row(snapshot, &mut runtime_rows, "planned_models", "Planned Models");
-    push_counter_row(snapshot, &mut runtime_rows, "completed_models", "Completed Models");
-    push_counter_row(snapshot, &mut runtime_rows, "failed_models", "Failed Models");
+    push_counter_row(
+        snapshot,
+        &mut runtime_rows,
+        "requested_models",
+        "Requested Models",
+    );
+    push_counter_row(
+        snapshot,
+        &mut runtime_rows,
+        "planned_models",
+        "Planned Models",
+    );
+    push_counter_row(
+        snapshot,
+        &mut runtime_rows,
+        "completed_models",
+        "Completed Models",
+    );
+    push_counter_row(
+        snapshot,
+        &mut runtime_rows,
+        "failed_models",
+        "Failed Models",
+    );
     push_section(&mut sections, "Execution Summary", runtime_rows);
 
     let (planned_models, completed_entries, failed_entries) = parse_training_entries(snapshot);
@@ -170,9 +190,7 @@ fn parse_training_entries(snapshot: &JobSnapshot) -> TrainingEntryGroups {
         let parts: Vec<&str> = entry.split(" | ").collect();
         match parts.as_slice() {
             ["planned", model] => planned.push(((*model).to_string(), "planned".to_string())),
-            ["completed", model] => {
-                completed.push(((*model).to_string(), "completed".to_string()))
-            }
+            ["completed", model] => completed.push(((*model).to_string(), "completed".to_string())),
             ["failed", model, error] => failed.push(((*model).to_string(), (*error).to_string())),
             _ => {}
         }

@@ -3,9 +3,18 @@
 
 #[cfg(all(test, feature = "lightgbm"))]
 mod lightgbm_tests {
+    use forex_models::tree_models::config::ParamValue;
     use forex_models::tree_models::{LightGBMExpert, TreeModel};
-    use ndarray::Array2;
+    use polars::prelude::Column;
     use polars::prelude::*;
+    use std::collections::HashMap;
+
+    fn cpu_lightgbm_params() -> HashMap<String, ParamValue> {
+        HashMap::from([
+            ("device".to_string(), ParamValue::String("cpu".to_string())),
+            ("gpu_only".to_string(), ParamValue::Bool(false)),
+        ])
+    }
 
     fn create_sample_data() -> (DataFrame, Series) {
         // Create synthetic classification data
@@ -21,7 +30,7 @@ mod lightgbm_tests {
             features.push(Series::new(format!("feature_{}", i).into(), data));
         }
 
-        let df = DataFrame::new(features).unwrap();
+        let df = DataFrame::new(features.into_iter().map(Column::from).collect()).unwrap();
 
         // Generate labels {-1, 0, 1} based on features
         let labels: Vec<i64> = (0..n_samples)
@@ -51,10 +60,7 @@ mod lightgbm_tests {
         let train_labels = labels.slice(0, n_train);
 
         // Create and train model
-        let mut model = LightGBMExpert::new(1, None);
-
-        // Set environment variable to force CPU (avoid GPU errors in CI)
-        std::env::set_var("FOREX_BOT_TREE_DEVICE", "cpu");
+        let mut model = LightGBMExpert::new(1, Some(cpu_lightgbm_params()));
 
         let result = model.fit(&train_df, &train_labels);
         assert!(
@@ -87,7 +93,7 @@ mod lightgbm_tests {
         // Check probabilities are in [0, 1]
         for &prob in probs.iter() {
             assert!(
-                prob >= 0.0 && prob <= 1.0,
+                (0.0..=1.0).contains(&prob),
                 "Probability should be in [0, 1], got {}",
                 prob
             );
@@ -104,12 +110,11 @@ mod lightgbm_tests {
         let train_labels = labels.slice(0, 800);
 
         // Train model
-        let mut model = LightGBMExpert::new(1, None);
-        std::env::set_var("FOREX_BOT_TREE_DEVICE", "cpu");
+        let mut model = LightGBMExpert::new(1, Some(cpu_lightgbm_params()));
         model.fit(&train_df, &train_labels).unwrap();
 
         // Save model
-        let model_path = Path::new("test_lightgbm_model.txt");
+        let model_path = Path::new("test_lightgbm_model_artifact");
         let result = model.save(model_path);
         assert!(result.is_ok(), "Save should succeed: {:?}", result.err());
 
@@ -127,7 +132,7 @@ mod lightgbm_tests {
         );
 
         // Cleanup
-        let _ = fs::remove_file(model_path);
+        let _ = fs::remove_dir_all(model_path);
     }
 
     #[test]
@@ -184,8 +189,8 @@ mod lightgbm_tests {
         ];
 
         let df = DataFrame::new(vec![
-            Series::new("close".into(), close_prices),
-            Series::new("volume".into(), volume),
+            Series::new("close".into(), close_prices).into(),
+            Series::new("volume".into(), volume).into(),
         ])
         .unwrap();
 
@@ -225,36 +230,36 @@ mod lightgbm_tests {
 
     #[test]
     fn test_gpu_only_mode() {
-        // Test GPU-only mode behavior
-        std::env::set_var("FOREX_BOT_GPU_ONLY", "1");
-        std::env::set_var("CUDA_VISIBLE_DEVICES", ""); // Simulate no GPU
-
         let (df, labels) = create_sample_data();
         let train_df = df.slice(0, 800);
         let train_labels = labels.slice(0, 800);
 
-        let mut model = LightGBMExpert::new(1, None);
+        let mut model = LightGBMExpert::new(
+            1,
+            Some(HashMap::from([
+                ("device".to_string(), ParamValue::String("gpu".to_string())),
+                ("gpu_only".to_string(), ParamValue::Bool(true)),
+            ])),
+        );
 
-        // Training should succeed but skip (GPU-only mode with no GPU)
         let result = model.fit(&train_df, &train_labels);
-        assert!(result.is_ok(), "Training should complete (skip if no GPU)");
-
-        // Prediction should fail (model disabled)
-        let test_df = df.slice(800, 200);
-        let result = model.predict_proba(&test_df);
-        // This might succeed or fail depending on whether GPU was available
-        // Just check it doesn't panic
-
-        // Cleanup
-        std::env::remove_var("FOREX_BOT_GPU_ONLY");
-        std::env::remove_var("CUDA_VISIBLE_DEVICES");
+        if let Err(err) = result {
+            assert!(
+                err.to_string()
+                    .contains("gpu-only mode requested but no GPU is available"),
+                "unexpected gpu-only error: {err}"
+            );
+        }
     }
 }
 
 #[cfg(all(test, feature = "xgboost"))]
 mod xgboost_tests {
+    use forex_models::tree_models::config::ParamValue;
     use forex_models::tree_models::{TreeModel, XGBoostExpert};
+    use polars::prelude::Column;
     use polars::prelude::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_xgboost_basic() {
@@ -270,16 +275,27 @@ mod xgboost_tests {
             features.push(Series::new(format!("feature_{}", i).into(), data));
         }
 
-        let df = DataFrame::new(features).unwrap();
-        let labels: Vec<i64> = (0..n_samples).map(|i| (i % 3 - 1) as i64).collect();
+        let df = DataFrame::new(features.into_iter().map(Column::from).collect()).unwrap();
+        let labels: Vec<i64> = (0..n_samples)
+            .map(|i| match i % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            })
+            .collect();
         let labels_series = Series::new("label".into(), labels);
 
         let train_df = df.slice(0, 400);
         let test_df = df.slice(400, 100);
         let train_labels = labels_series.slice(0, 400);
 
-        let mut model = XGBoostExpert::new(1, None);
-        std::env::set_var("FOREX_BOT_TREE_DEVICE", "cpu");
+        let mut model = XGBoostExpert::new(
+            1,
+            Some(HashMap::from([
+                ("device".to_string(), ParamValue::String("cpu".to_string())),
+                ("gpu_only".to_string(), ParamValue::Bool(false)),
+            ])),
+        );
 
         let result = model.fit(&train_df, &train_labels);
         assert!(
@@ -303,24 +319,58 @@ mod xgboost_tests {
 #[cfg(all(test, feature = "catboost"))]
 mod catboost_tests {
     use forex_models::tree_models::{CatBoostExpert, TreeModel};
+    use polars::prelude::Column;
     use polars::prelude::*;
+    use std::process::Command;
+
+    fn catboost_cli_available() -> bool {
+        for candidate in ["catboost", "catboost.exe"] {
+            if Command::new(candidate)
+                .arg("--version")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+        false
+    }
 
     #[test]
-    fn test_catboost_training_error() {
-        // CatBoost should error on training (not supported in Rust)
+    fn test_catboost_training_contract() {
         let features = vec![Series::new("f1".into(), vec![1.0, 2.0, 3.0])];
-        let df = DataFrame::new(features).unwrap();
+        let df = DataFrame::new(features.into_iter().map(Column::from).collect()).unwrap();
         let labels = Series::new("label".into(), vec![-1i64, 0, 1]);
 
-        let mut model = CatBoostExpert::new(1, None);
+        let mut model = CatBoostExpert::new(1);
         let result = model.fit(&df, &labels);
 
-        // Should fail with informative error
-        assert!(result.is_err(), "CatBoost training should fail in Rust");
-        let err_msg = result.err().unwrap().to_string();
-        assert!(
-            err_msg.contains("not supported"),
-            "Error should mention not supported"
-        );
+        if catboost_cli_available() {
+            assert!(
+                result.is_ok(),
+                "CatBoost training should succeed when CLI is available: {:?}",
+                result.err()
+            );
+            let predictions = model.predict_proba(&df);
+            assert!(
+                predictions.is_ok(),
+                "CatBoost prediction should succeed after training: {:?}",
+                predictions.err()
+            );
+            assert_eq!(predictions.unwrap().shape(), &[3, 3]);
+        } else {
+            assert!(
+                result.is_err(),
+                "CatBoost training should fail cleanly when CLI is unavailable"
+            );
+            let err_msg = result.err().unwrap().to_string();
+            assert!(
+                err_msg.contains("CatBoost CLI")
+                    || err_msg.contains("FOREX_BOT_CATBOOST_EXECUTABLE")
+                    || err_msg.contains("CATBOOST_EXECUTABLE"),
+                "Error should mention missing CatBoost CLI, got: {err_msg}"
+            );
+        }
     }
 }

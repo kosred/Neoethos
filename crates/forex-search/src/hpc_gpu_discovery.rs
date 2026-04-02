@@ -15,6 +15,7 @@ use std::thread;
 use tch::{Device, Kind, Tensor};
 
 use crate::discovery_gpu::{GpuDiscoveryConfig, GpuDiscoveryResult};
+use crate::genetic::{SurvivorSelectionPolicy, select_parent_index, select_survivor_indices};
 use crate::hpc::{get_gpu_cpu_affinity, is_hpc_mode, is_nvlink_pair, set_thread_affinity};
 
 /// Island-based GPU evolution configuration
@@ -83,7 +84,7 @@ pub fn run_island_model_discovery(
 
         // Select elites on each island
         for island in &mut islands {
-            island.select_elites(config.base_config.elite_fraction);
+            island.select_elites(&config.base_config);
         }
 
         // Migration via NVLink
@@ -125,6 +126,7 @@ pub fn run_island_model_discovery(
         fitness: final_fitness,
         feature_names: frames[0].names.clone(),
         timeframes: (0..tf_count).map(|idx| format!("tf_{idx}")).collect(),
+        used_gpu: true,
     })
 }
 
@@ -170,8 +172,12 @@ impl Island {
         Ok(())
     }
 
-    fn select_elites(&mut self, fraction: f64) {
-        let elite_count = ((self.population.len() as f64) * fraction).round().max(2.0) as usize;
+    fn select_elites(&mut self, config: &GpuDiscoveryConfig) {
+        let survivor_fraction = if config.survivor_fraction > 0.0 {
+            config.survivor_fraction
+        } else {
+            config.elite_fraction
+        };
 
         let mut scored: Vec<(f32, Vec<f32>)> = self
             .population
@@ -182,12 +188,29 @@ impl Island {
 
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        self.elites = scored
+        let score_vector: Vec<f64> = scored.iter().map(|(fitness, _)| *fitness as f64).collect();
+        let survivor_count = match config.survivor_selection {
+            SurvivorSelectionPolicy::Generational => 0,
+            _ => ((self.population.len() as f64) * survivor_fraction)
+                .round()
+                .max(2.0) as usize,
+        }
+        .min(scored.len());
+        let mut rng = rand::rng();
+        let survivor_indices = select_survivor_indices(
+            &score_vector,
+            survivor_count,
+            config.survivor_selection,
+            config.selection_temperature,
+            config.tournament_size,
+            &mut rng,
+        );
+
+        self.elites = survivor_indices
             .iter()
-            .take(elite_count)
-            .map(|(_, g)| g.clone())
+            .map(|idx| scored[*idx].1.clone())
             .collect();
-        self.elite_fitness = scored.iter().take(elite_count).map(|(f, _)| *f).collect();
+        self.elite_fitness = survivor_indices.iter().map(|idx| scored[*idx].0).collect();
     }
 
     fn evolve_generation(&mut self, config: &GpuDiscoveryConfig, _generation: usize) {
@@ -195,18 +218,62 @@ impl Island {
         let mut rng = rand::rng();
         let normal = Normal::new(0.0, 1.0).unwrap();
 
-        let mu = mean_vector(&self.elites);
-        let std = std_vector(&self.elites, &mu);
+        let reference_pool = if self.elites.is_empty() {
+            self.population.clone()
+        } else {
+            self.elites.clone()
+        };
+        let mu = mean_vector(&reference_pool);
+        let std = std_vector(&reference_pool, &mu);
 
         let mut next = self.elites.clone();
+        let immigrant_count =
+            ((self.population.len() as f64) * config.immigrant_fraction).round() as usize;
+        let immigrant_count = immigrant_count.min(self.population.len().saturating_sub(next.len()));
+        for _ in 0..immigrant_count {
+            next.push(random_genome(dim, &mut rng));
+        }
+
+        let score_vector: Vec<f64> = self.fitness.iter().map(|fitness| *fitness as f64).collect();
+        let parent_indices: Vec<usize> = (0..self.population.len()).collect();
 
         while next.len() < self.population.len() {
             let use_cross = rng.random_bool(config.crossover_rate);
             let mut child = vec![0.0_f32; dim];
 
-            if use_cross && self.elites.len() >= 2 {
-                let a = &self.elites[rng.random_range(0..self.elites.len())];
-                let b = &self.elites[rng.random_range(0..self.elites.len())];
+            if use_cross && parent_indices.len() >= 2 {
+                let a_idx = select_parent_index(
+                    &score_vector,
+                    &parent_indices,
+                    config.parent_selection,
+                    config.tournament_size,
+                    config.selection_temperature,
+                    &mut rng,
+                );
+                let mut b_idx = select_parent_index(
+                    &score_vector,
+                    &parent_indices,
+                    config.parent_selection,
+                    config.tournament_size,
+                    config.selection_temperature,
+                    &mut rng,
+                );
+                if parent_indices.len() > 1 {
+                    let mut retries = 0usize;
+                    while b_idx == a_idx && retries < 4 {
+                        b_idx = select_parent_index(
+                            &score_vector,
+                            &parent_indices,
+                            config.parent_selection,
+                            config.tournament_size,
+                            config.selection_temperature,
+                            &mut rng,
+                        );
+                        retries += 1;
+                    }
+                }
+                let a = &self.population[a_idx];
+                let b = &self.population[b_idx];
                 for i in 0..dim {
                     let base = 0.5 * (a[i] + b[i]);
                     let noise = std[i] as f64 * normal.sample(&mut rng) * config.sigma;
@@ -223,6 +290,12 @@ impl Island {
 
         self.population = next;
     }
+}
+
+fn random_genome(dim: usize, rng: &mut impl Rng) -> Vec<f32> {
+    (0..dim)
+        .map(|_| rng.random_range(-1.0..1.0))
+        .collect::<Vec<f32>>()
 }
 
 fn evaluate_islands_parallel(

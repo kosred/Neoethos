@@ -8,7 +8,10 @@ pub enum WorkspaceTab {
     BottomStrip,
     Discovery,
     Training,
-    SystemStatus,
+    Runtime,
+    BrokerSetup,
+    Intelligence,
+    DataBootstrap,
     Hardware,
     Risk,
 }
@@ -24,7 +27,10 @@ impl WorkspaceTab {
             Self::BottomStrip => "Bottom Strip",
             Self::Discovery => "Discovery",
             Self::Training => "Training",
-            Self::SystemStatus => "System Status",
+            Self::Runtime => "Runtime",
+            Self::BrokerSetup => "Broker Setup",
+            Self::Intelligence => "Intelligence",
+            Self::DataBootstrap => "Data Bootstrap",
             Self::Hardware => "Hardware",
             Self::Risk => "Risk Settings",
         }
@@ -45,7 +51,10 @@ mod tests {
         assert_eq!(WorkspaceTab::BottomStrip.title(), "Bottom Strip");
         assert_eq!(WorkspaceTab::Discovery.title(), "Discovery");
         assert_eq!(WorkspaceTab::Training.title(), "Training");
-        assert_eq!(WorkspaceTab::SystemStatus.title(), "System Status");
+        assert_eq!(WorkspaceTab::Runtime.title(), "Runtime");
+        assert_eq!(WorkspaceTab::BrokerSetup.title(), "Broker Setup");
+        assert_eq!(WorkspaceTab::Intelligence.title(), "Intelligence");
+        assert_eq!(WorkspaceTab::DataBootstrap.title(), "Data Bootstrap");
         assert_eq!(WorkspaceTab::Hardware.title(), "Hardware");
         assert_eq!(WorkspaceTab::Risk.title(), "Risk Settings");
     }

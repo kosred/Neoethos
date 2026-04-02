@@ -1,5 +1,5 @@
-use anyhow::{Result, bail};
 use crate::eval::{BacktestSettings, fast_evaluate_strategy_core};
+use anyhow::{Result, bail};
 use itertools::Itertools;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -54,7 +54,9 @@ pub struct WalkforwardBacktestInput<'a> {
     pub max_trades_per_day: usize,
 }
 
-pub fn embargoed_walkforward_backtest(input: WalkforwardBacktestInput<'_>) -> Result<WalkforwardSummary> {
+pub fn embargoed_walkforward_backtest(
+    input: WalkforwardBacktestInput<'_>,
+) -> Result<WalkforwardSummary> {
     let WalkforwardBacktestInput {
         close,
         high,
@@ -82,11 +84,13 @@ pub fn embargoed_walkforward_backtest(input: WalkforwardBacktestInput<'_>) -> Re
     for i in 0..n_splits {
         let start = i * window;
         let end = ((i + 1) * window).min(n);
-        if end - start < 80 { break; }
+        if end - start < 80 {
+            break;
+        }
 
         let train_end = start + ((window as f64) * train_ratio) as usize;
         let test_start = train_end + embargo_bars;
-        
+
         if test_start >= end || (train_end - start) < 40 || (end - test_start) < 40 {
             continue;
         }
@@ -99,7 +103,13 @@ pub fn embargoed_walkforward_backtest(input: WalkforwardBacktestInput<'_>) -> Re
         let slice_days = &days[test_start..end];
 
         let metrics = fast_evaluate_strategy_core(
-            slice_close, slice_high, slice_low, slice_sig, slice_months, slice_days, settings
+            slice_close,
+            slice_high,
+            slice_low,
+            slice_sig,
+            slice_months,
+            slice_days,
+            settings,
         );
 
         // Map metrics [net_profit, 0.0, peak_equity, max_dd, win_rate, pf, expectancy, 0.0, trade_count, consistency, max_daily_dd]
@@ -121,7 +131,7 @@ pub fn embargoed_walkforward_backtest(input: WalkforwardBacktestInput<'_>) -> Re
             daily_loss_breach: max_daily_dd >= max_daily_loss_pct,
             consistency_violation: false, // Simplified
             trade_limit_violation: false, // Simplified
-            min_trading_days_ok: true, // Simplified
+            min_trading_days_ok: true,    // Simplified
             daily_returns: Vec::new(),
             max_daily_dd_pct: max_daily_dd,
             prop_compliant: max_daily_dd < 0.05,
@@ -132,10 +142,17 @@ pub fn embargoed_walkforward_backtest(input: WalkforwardBacktestInput<'_>) -> Re
     if split_results.is_empty() {
         return Ok(WalkforwardSummary {
             walk_forward_splits: 0,
-            avg_pnl: 0.0, avg_win_rate: 0.0, avg_max_dd: 0.0, avg_max_consec_losses: 0.0,
-            avg_daily_min_dd: 0.0, avg_max_daily_loss: 0.0, any_daily_loss_breach: false,
-            any_consistency_violation: false, any_trade_limit_violation: false,
-            all_min_trading_days_ok: false, splits: Vec::new(),
+            avg_pnl: 0.0,
+            avg_win_rate: 0.0,
+            avg_max_dd: 0.0,
+            avg_max_consec_losses: 0.0,
+            avg_daily_min_dd: 0.0,
+            avg_max_daily_loss: 0.0,
+            any_daily_loss_breach: false,
+            any_consistency_violation: false,
+            any_trade_limit_violation: false,
+            all_min_trading_days_ok: false,
+            splits: Vec::new(),
         });
     }
 
@@ -169,67 +186,97 @@ pub struct CombinatorialPurgedCV {
 
 impl CombinatorialPurgedCV {
     pub fn new(n_splits: usize, n_test_groups: usize, embargo_pct: f64, purge_pct: f64) -> Self {
-        Self { n_splits, n_test_groups, embargo_pct, purge_pct }
+        Self {
+            n_splits,
+            n_test_groups,
+            embargo_pct,
+            purge_pct,
+        }
     }
 
     pub fn split(&self, n_samples: usize) -> Vec<(Vec<usize>, Vec<usize>)> {
-        if n_samples == 0 { return Vec::new(); }
+        if n_samples == 0 || self.n_splits < 2 {
+            return Vec::new();
+        }
+
+        // Divide n_samples into S groups
+        let group_size = n_samples / self.n_splits;
+        if group_size == 0 {
+            return Vec::new();
+        }
+
+        let mut groups = Vec::with_capacity(self.n_splits);
+        for i in 0..self.n_splits {
+            let start = i * group_size;
+            let end = if i == self.n_splits - 1 {
+                n_samples
+            } else {
+                (i + 1) * group_size
+            };
+            groups.push(start..end);
+        }
 
         let purge_size = (n_samples as f64 * self.purge_pct).ceil() as usize;
         let embargo_size = (n_samples as f64 * self.embargo_pct).ceil() as usize;
 
-        let warmup_size = (n_samples / self.n_splits).max(purge_size + embargo_size).max(self.n_splits);
-        let warmup_size = if warmup_size + self.n_splits >= n_samples {
-            (n_samples / (self.n_splits + 1)).max(1)
-        } else { warmup_size };
+        let mut results = Vec::new();
 
-        let cv_start = (warmup_size + embargo_size).min(n_samples);
-        let cv_len = n_samples - cv_start;
-        if cv_len < self.n_splits { return Vec::new(); }
-
-        let group_size = cv_len / self.n_splits;
-        let mut groups = Vec::new();
-        for i in 0..self.n_splits {
-            let start = cv_start + i * group_size;
-            let end = if i == self.n_splits - 1 { n_samples } else { cv_start + (i + 1) * group_size };
-            groups.push((start..end).collect::<Vec<usize>>());
-        }
-
-        let mut splits = Vec::new();
+        // Form all combinations of k test groups
         for combination in (0..self.n_splits).combinations(self.n_test_groups) {
             let mut test_idx = Vec::new();
-            for &i in &combination {
-                test_idx.extend(&groups[i]);
-            }
-            test_idx.sort_unstable();
+            let mut candidate_train_groups = Vec::new();
 
-            let earliest_group: usize = *combination.iter().min().unwrap();
-            let mut train_idx: Vec<usize> = (0..warmup_size).collect();
-            if earliest_group > 0 {
-                for (i, group) in groups.iter().enumerate().take(earliest_group) {
-                    if !combination.contains(&i) {
-                        train_idx.extend(group);
+            for (i, group) in groups.iter().enumerate().take(self.n_splits) {
+                if combination.contains(&i) {
+                    test_idx.extend(group.clone());
+                } else {
+                    candidate_train_groups.push(i);
+                }
+            }
+
+            let mut train_idx = Vec::new();
+
+            // For each training group, apply purging and embargoing relative to ALL test groups
+            for &g_idx in &candidate_train_groups {
+                let group_range = groups[g_idx].clone();
+                let group_start = group_range.start;
+                let group_end = group_range.end;
+
+                let mut group_valid_start = group_start;
+                let mut group_valid_end = group_end;
+
+                for &t_idx in &combination {
+                    let test_range = groups[t_idx].clone();
+
+                    // 1. Purge: if training group is BEFORE a test group,
+                    // remove samples at the end of training group that look into the test group.
+                    if group_end <= test_range.start {
+                        let potential_end = test_range.start.saturating_sub(purge_size);
+                        if potential_end < group_valid_end && potential_end >= group_start {
+                            group_valid_end = potential_end;
+                        }
+                    }
+
+                    // 2. Embargo: if training group is AFTER a test group,
+                    // remove samples at the beginning of training group that are serially correlated.
+                    if group_start >= test_range.end {
+                        let potential_start = test_range.end + embargo_size;
+                        if potential_start > group_valid_start && potential_start <= group_end {
+                            group_valid_start = potential_start;
+                        }
                     }
                 }
-            }
-            train_idx.sort_unstable();
 
-            // Purge and Embargo
-            if !test_idx.is_empty() && !train_idx.is_empty() {
-                let test_start: usize = test_idx[0];
-                let purge_threshold = test_start.saturating_sub(purge_size);
-                train_idx.retain(|&i| i < purge_threshold);
-
-                if !train_idx.is_empty() {
-                    let train_end = *train_idx.last().unwrap();
-                    let embargo_threshold = (train_end + embargo_size).min(n_samples);
-                    test_idx.retain(|&i| i >= embargo_threshold);
+                if group_valid_start < group_valid_end {
+                    train_idx.extend(group_valid_start..group_valid_end);
                 }
             }
 
-            splits.push((train_idx, test_idx));
+            if !test_idx.is_empty() && !train_idx.is_empty() {
+                results.push((train_idx, test_idx));
+            }
         }
 
-        splits
+        results
     }
 }

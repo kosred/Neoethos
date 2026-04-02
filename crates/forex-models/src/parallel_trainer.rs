@@ -1,14 +1,17 @@
-// Parallel Model Trainer - multi-core training for Rust-native workloads
-// Note: Python-backed training still obeys the GIL unless it releases it or runs in separate processes.
+// Parallel Model Trainer - multi-core training for Rust-native workloads.
+// The runtime now treats every active family as a native or self-contained path.
 use anyhow::{Context, Result};
 use ndarray::Array2;
+use polars::prelude::{Column, DataFrame, NamedFrom, Series};
 use rayon::prelude::*;
 use std::env;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 use tracing::info;
+
+use crate::base::dataframe_to_float32_array;
 
 fn read_threads_env(keys: &[&str]) -> Option<usize> {
     for key in keys {
@@ -67,18 +70,95 @@ pub struct ParallelTrainingSummary {
     pub failed_models: Vec<ModelTrainingFailure>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TrainingPayload {
+    pub frame: Arc<DataFrame>,
+    pub dense_features: Arc<Array2<f32>>,
+    pub labels: Arc<Vec<i32>>,
+}
+
+impl TrainingPayload {
+    pub fn from_frame(frame: DataFrame, labels: Vec<i32>) -> Result<Self> {
+        if frame.height() != labels.len() {
+            anyhow::bail!(
+                "training payload row/label mismatch: {} rows vs {} labels",
+                frame.height(),
+                labels.len()
+            );
+        }
+
+        let dense_features = dataframe_to_float32_array(&frame)
+            .context("build dense feature matrix from training dataframe")?;
+
+        Ok(Self {
+            frame: Arc::new(frame),
+            dense_features: Arc::new(dense_features),
+            labels: Arc::new(labels),
+        })
+    }
+
+    pub fn from_dense(dense_features: Array2<f32>, labels: Vec<i32>) -> Result<Self> {
+        let feature_names = (0..dense_features.ncols())
+            .map(|column_idx| format!("feature_{column_idx}"))
+            .collect::<Vec<_>>();
+
+        Self::from_named_dense(dense_features, labels, feature_names)
+    }
+
+    pub fn from_named_dense(
+        dense_features: Array2<f32>,
+        labels: Vec<i32>,
+        feature_names: Vec<String>,
+    ) -> Result<Self> {
+        if dense_features.nrows() != labels.len() {
+            anyhow::bail!(
+                "training payload row/label mismatch: {} rows vs {} labels",
+                dense_features.nrows(),
+                labels.len()
+            );
+        }
+
+        if dense_features.ncols() != feature_names.len() {
+            anyhow::bail!(
+                "training payload feature-name mismatch: {} cols vs {} names",
+                dense_features.ncols(),
+                feature_names.len()
+            );
+        }
+
+        let columns = feature_names
+            .into_iter()
+            .enumerate()
+            .map(|(column_idx, column_name)| {
+                let values = dense_features
+                    .column(column_idx)
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>();
+                Column::from(Series::new(column_name.into(), values))
+            })
+            .collect::<Vec<_>>();
+
+        let frame = DataFrame::new(columns).context("build dataframe from dense features")?;
+
+        Ok(Self {
+            frame: Arc::new(frame),
+            dense_features: Arc::new(dense_features),
+            labels: Arc::new(labels),
+        })
+    }
+}
+
 /// Train multiple models in parallel using a bounded Rayon thread pool.
-/// Rust-native training will run in parallel; Python-backed training may still serialize under GIL.
 pub fn train_models_parallel<F>(
     model_configs: Vec<ModelConfig>,
-    x: Arc<Array2<f32>>,
-    y: Arc<Vec<i32>>,
+    payload: Arc<TrainingPayload>,
     train_fn: F,
 ) -> Result<Vec<String>>
 where
-    F: Fn(&str, &Array2<f32>, &[i32]) -> Result<()> + Send + Sync + Clone + 'static,
+    F: Fn(&ModelConfig, &TrainingPayload) -> Result<()> + Send + Sync + Clone + 'static,
 {
-    let summary = train_models_parallel_with_progress(model_configs, x, y, |_| {}, train_fn)?;
+    let summary = train_models_parallel_with_progress(model_configs, payload, |_| {}, train_fn)?;
 
     if !summary.failed_models.is_empty() {
         anyhow::bail!(
@@ -98,13 +178,12 @@ where
 
 pub fn train_models_parallel_with_progress<F, R>(
     model_configs: Vec<ModelConfig>,
-    x: Arc<Array2<f32>>,
-    y: Arc<Vec<i32>>,
+    payload: Arc<TrainingPayload>,
     progress_fn: R,
     train_fn: F,
 ) -> Result<ParallelTrainingSummary>
 where
-    F: Fn(&str, &Array2<f32>, &[i32]) -> Result<()> + Send + Sync + Clone + 'static,
+    F: Fn(&ModelConfig, &TrainingPayload) -> Result<()> + Send + Sync + Clone + 'static,
     R: Fn(ModelTrainingProgress) + Send + Sync + Clone + 'static,
 {
     if model_configs.is_empty() {
@@ -130,8 +209,7 @@ where
         model_configs
             .into_par_iter()
             .map(|config| {
-                let x = Arc::clone(&x);
-                let y = Arc::clone(&y);
+                let payload = Arc::clone(&payload);
                 let train_fn = train_fn.clone();
                 let progress_fn = progress_fn.clone();
                 let completed_counter = Arc::clone(&completed_counter);
@@ -147,7 +225,7 @@ where
                     config.name
                 );
 
-                let result = train_fn(&config.name, &x, &y);
+                let result = train_fn(&config, &payload);
 
                 match result {
                     Ok(_) => {
@@ -219,24 +297,44 @@ where
 }
 
 /// Model configuration for parallel training
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub name: String,
     pub model_type: ModelType,
     pub params: std::collections::HashMap<String, String>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelType {
     LightGBM,
     XGBoost,
     CatBoost,
+    SklearsTree,
     MLP,
     NBeats,
+    NBeatsxNf,
     TiDE,
+    TiDENf,
     TabNet,
     KAN,
+    Transformer,
+    PatchTST,
+    TimesNet,
+    ElasticNet,
+    BayesianLogit,
+    MetaBlender,
+    ProbabilityCalibrator,
+    ConformalGate,
+    MetaStack,
+    ExitAgent,
+    OnlinePassiveAggressive,
+    OnlineHoeffding,
+    IsolationForest,
+    Dqn,
+    SwarmForecaster,
     Genetic,
+    NeuroEvo,
+    Neat,
 }
 
 // ============================================================================
@@ -254,8 +352,13 @@ mod tests {
         let n_samples = 1000;
         let n_features = 20;
 
-        let x = Arc::new(Array2::<f32>::zeros((n_samples, n_features)));
-        let y = Arc::new(vec![0i32; n_samples]);
+        let payload = Arc::new(
+            TrainingPayload::from_dense(
+                Array2::<f32>::zeros((n_samples, n_features)),
+                vec![0i32; n_samples],
+            )
+            .expect("build dense payload"),
+        );
 
         // Create model configs
         let configs = vec![
@@ -277,14 +380,14 @@ mod tests {
         ];
 
         // Training function (mock)
-        let train_fn = |name: &str, _x: &Array2<f32>, _y: &[i32]| {
-            println!("Training {}", name);
+        let train_fn = |config: &ModelConfig, _payload: &TrainingPayload| {
+            println!("Training {}", config.name);
             std::thread::sleep(std::time::Duration::from_millis(100));
             Ok(())
         };
 
         // Train in parallel
-        let results = train_models_parallel(configs, x, y, train_fn).unwrap();
+        let results = train_models_parallel(configs, payload, train_fn).unwrap();
 
         assert_eq!(results.len(), 3);
         println!("Successfully trained: {:?}", results);
@@ -292,8 +395,10 @@ mod tests {
 
     #[test]
     fn test_parallel_training_returns_error_when_any_model_fails() {
-        let x = Arc::new(Array2::<f32>::zeros((16, 4)));
-        let y = Arc::new(vec![0i32; 16]);
+        let payload = Arc::new(
+            TrainingPayload::from_dense(Array2::<f32>::zeros((16, 4)), vec![0i32; 16])
+                .expect("build dense payload"),
+        );
         let configs = vec![
             ModelConfig {
                 name: "ok_model".to_string(),
@@ -307,14 +412,14 @@ mod tests {
             },
         ];
 
-        let train_fn = |name: &str, _x: &Array2<f32>, _y: &[i32]| -> Result<()> {
-            if name == "bad_model" {
+        let train_fn = |config: &ModelConfig, _payload: &TrainingPayload| -> Result<()> {
+            if config.name == "bad_model" {
                 anyhow::bail!("synthetic failure");
             }
             Ok(())
         };
 
-        let err = train_models_parallel(configs, x, y, train_fn)
+        let err = train_models_parallel(configs, payload, train_fn)
             .expect_err("expected aggregated failure");
         let msg = err.to_string();
         assert!(msg.contains("bad_model"), "unexpected error: {msg}");
@@ -323,21 +428,25 @@ mod tests {
 
     #[test]
     fn test_parallel_training_rejects_empty_model_set() {
-        let x = Arc::new(Array2::<f32>::zeros((8, 2)));
-        let y = Arc::new(vec![0i32; 8]);
+        let payload = Arc::new(
+            TrainingPayload::from_dense(Array2::<f32>::zeros((8, 2)), vec![0i32; 8])
+                .expect("build dense payload"),
+        );
         let configs: Vec<ModelConfig> = Vec::new();
 
-        let train_fn = |_name: &str, _x: &Array2<f32>, _y: &[i32]| -> Result<()> { Ok(()) };
+        let train_fn = |_config: &ModelConfig, _payload: &TrainingPayload| -> Result<()> { Ok(()) };
 
-        let err = train_models_parallel(configs, x, y, train_fn)
+        let err = train_models_parallel(configs, payload, train_fn)
             .expect_err("expected empty-config error");
         assert!(err.to_string().contains("No model configs"));
     }
 
     #[test]
     fn test_parallel_training_summary_reports_live_model_events() {
-        let x = Arc::new(Array2::<f32>::zeros((12, 3)));
-        let y = Arc::new(vec![0i32; 12]);
+        let payload = Arc::new(
+            TrainingPayload::from_dense(Array2::<f32>::zeros((12, 3)), vec![0i32; 12])
+                .expect("build dense payload"),
+        );
         let configs = vec![
             ModelConfig {
                 name: "ok_model".to_string(),
@@ -353,8 +462,8 @@ mod tests {
         let seen_events = Arc::new(Mutex::new(Vec::new()));
         let event_sink = Arc::clone(&seen_events);
 
-        let train_fn = |name: &str, _x: &Array2<f32>, _y: &[i32]| -> Result<()> {
-            if name == "bad_model" {
+        let train_fn = |config: &ModelConfig, _payload: &TrainingPayload| -> Result<()> {
+            if config.name == "bad_model" {
                 anyhow::bail!("synthetic failure");
             }
             Ok(())
@@ -362,8 +471,7 @@ mod tests {
 
         let summary = train_models_parallel_with_progress(
             configs,
-            x,
-            y,
+            payload,
             move |event| {
                 event_sink
                     .lock()

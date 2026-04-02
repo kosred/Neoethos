@@ -1,9 +1,9 @@
 use crate::app_services::{
-    jobs::{
-        push_recent_event, CancellationFlag, JobEventLevel, JobKind, JobProgress, JobReport,
-        JobSnapshot, JobState,
-    },
     ServiceEvent,
+    jobs::{
+        CancellationFlag, JobEventLevel, JobKind, JobProgress, JobReport, JobSnapshot, JobState,
+        push_recent_event,
+    },
 };
 use anyhow::Result;
 use forex_core::{
@@ -11,12 +11,13 @@ use forex_core::{
     sectioned_log::{SectionedRunRecord, SubsystemSection},
 };
 use forex_data::{
-    ensure_timeframes_with_resample, load_symbol_dataset, prepare_multitimeframe_features,
-    FeatureCache, MANDATORY_TFS,
+    FeatureCache, MANDATORY_TFS, ensure_timeframes_with_resample, load_symbol_dataset,
+    prepare_multitimeframe_features,
 };
 use forex_search::{
-    ensure_non_empty_portfolio, run_discovery_cycle_with_progress, save_portfolio_json,
-    DiscoveryConfig, DiscoveryProgress, DiscoveryResult,
+    DiscoveryConfig, DiscoveryProgress, DiscoveryResult, ensure_non_empty_portfolio,
+    run_discovery_cycle_with_progress, save_discovery_profile_json, save_portfolio_json,
+    save_quality_report_json, save_trade_log_json,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -63,7 +64,7 @@ impl DiscoveryJobHandle {
 }
 
 fn requested_discovery_counters(request: &DiscoveryRequest) -> Vec<(String, u64)> {
-    vec![
+    let mut counters = vec![
         (
             "target_candidates".to_string(),
             request.config.candidate_count as u64,
@@ -74,11 +75,15 @@ fn requested_discovery_counters(request: &DiscoveryRequest) -> Vec<(String, u64)
         ),
         ("generations".to_string(), request.config.generations as u64),
         ("population".to_string(), request.config.population as u64),
-    ]
+    ];
+    if request.config.max_rows > 0 {
+        counters.push(("max_rows".to_string(), request.config.max_rows as u64));
+    }
+    counters
 }
 
 fn requested_discovery_highlights(request: &DiscoveryRequest) -> Vec<(String, String)> {
-    vec![
+    let mut highlights = vec![
         ("symbol".to_string(), request.symbol.clone()),
         ("base_tf".to_string(), request.base_tf.clone()),
         (
@@ -89,7 +94,20 @@ fn requested_discovery_highlights(request: &DiscoveryRequest) -> Vec<(String, St
                 request.higher_tfs.join(", ")
             },
         ),
-    ]
+    ];
+    if request.config.max_hours > 0.0 {
+        highlights.push((
+            "time_budget".to_string(),
+            format!("{:.2}h", request.config.max_hours),
+        ));
+    }
+    if request.config.filtering.use_opportunistic_candidates {
+        highlights.push((
+            "quality_lane".to_string(),
+            "strict+opportunistic".to_string(),
+        ));
+    }
+    highlights
 }
 
 fn upsert_counter(counters: &mut Vec<(String, u64)>, name: &str, value: u64) {
@@ -262,6 +280,44 @@ fn apply_backend_discovery_event(snapshot: &mut JobSnapshot, event: &DiscoveryPr
                 ),
             );
         }
+        DiscoveryProgress::QualityScreened {
+            strict_passed,
+            opportunistic_passed,
+            evaluated_candidates,
+            logged_trade_sets,
+        } => {
+            snapshot.progress = JobProgress {
+                percent: Some(0.955),
+                stage: "quality_screen".to_string(),
+                message: format!(
+                    "quality screen kept {} strict and {} opportunistic candidates",
+                    strict_passed, opportunistic_passed
+                ),
+            };
+            upsert_counter(
+                &mut snapshot.report.counters,
+                "quality_screened",
+                (*strict_passed + *opportunistic_passed) as u64,
+            );
+            upsert_counter(
+                &mut snapshot.report.counters,
+                "opportunistic_candidates",
+                *opportunistic_passed as u64,
+            );
+            upsert_counter(
+                &mut snapshot.report.counters,
+                "trade_logs",
+                *logged_trade_sets as u64,
+            );
+            snapshot.report.events = push_recent_event(
+                &snapshot.report.events,
+                JobEventLevel::Info,
+                format!(
+                    "quality screen kept {} strict + {} opportunistic out of {} candidates",
+                    strict_passed, opportunistic_passed, evaluated_candidates
+                ),
+            );
+        }
         DiscoveryProgress::PortfolioSelected {
             portfolio_size,
             rejected_by_correlation,
@@ -347,6 +403,11 @@ pub fn completed_snapshot(mut snapshot: JobSnapshot, result: &DiscoveryResult) -
     let candidates = result.candidates.len() as u64;
     let portfolio = result.portfolio.len() as u64;
     let rejected = candidates.saturating_sub(portfolio);
+    let quality_by_strategy = result
+        .quality_metrics
+        .iter()
+        .map(|metrics| (metrics.strategy_id.as_str(), metrics))
+        .collect::<std::collections::HashMap<_, _>>();
     let best_gene = result.portfolio.iter().max_by(|left, right| {
         left.fitness
             .partial_cmp(&right.fitness)
@@ -356,6 +417,38 @@ pub fn completed_snapshot(mut snapshot: JobSnapshot, result: &DiscoveryResult) -
         ("accepted".to_string(), portfolio.to_string()),
         ("rejected".to_string(), rejected.to_string()),
     ];
+    if !result.quality_metrics.is_empty() {
+        let strict_count = result
+            .quality_metrics
+            .iter()
+            .filter(|metrics| metrics.has_edge)
+            .count();
+        highlights.push((
+            "quality_scored".to_string(),
+            result.quality_metrics.len().to_string(),
+        ));
+        highlights.push(("quality_edge".to_string(), strict_count.to_string()));
+    }
+    if !result.logged_trades.is_empty() {
+        highlights.push((
+            "trade_logs".to_string(),
+            result.logged_trades.len().to_string(),
+        ));
+    }
+    if let Some(best_quality) = result.quality_metrics.iter().max_by(|left, right| {
+        left.quality_score
+            .partial_cmp(&right.quality_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }) {
+        highlights.push((
+            "best_quality".to_string(),
+            format!("{:.1}", best_quality.quality_score),
+        ));
+        highlights.push((
+            "best_quality_strategy".to_string(),
+            best_quality.strategy_id.clone(),
+        ));
+    }
     if let Some(best) = best_gene {
         highlights.push(("best_strategy".to_string(), best.strategy_id.clone()));
         highlights.push((
@@ -369,10 +462,26 @@ pub fn completed_snapshot(mut snapshot: JobSnapshot, result: &DiscoveryResult) -
         .iter()
         .take(3)
         .map(|gene| {
-            format!(
-                "{} | fitness={:.2} | sharpe={:.2} | win_rate={:.2} | trades={}",
-                gene.strategy_id, gene.fitness, gene.sharpe_ratio, gene.win_rate, gene.trades_count
-            )
+            if let Some(metrics) = quality_by_strategy.get(gene.strategy_id.as_str()) {
+                format!(
+                    "{} | fitness={:.2} | quality={:.1} | monthly_win={:.2} | trades/mo={:.1} | edge={}",
+                    gene.strategy_id,
+                    gene.fitness,
+                    metrics.quality_score,
+                    metrics.monthly_win_rate,
+                    metrics.trades_per_month,
+                    metrics.has_edge
+                )
+            } else {
+                format!(
+                    "{} | fitness={:.2} | sharpe={:.2} | win_rate={:.2} | trades={}",
+                    gene.strategy_id,
+                    gene.fitness,
+                    gene.sharpe_ratio,
+                    gene.win_rate,
+                    gene.trades_count
+                )
+            }
         })
         .collect();
 
@@ -382,6 +491,11 @@ pub fn completed_snapshot(mut snapshot: JobSnapshot, result: &DiscoveryResult) -
             ("candidates".to_string(), candidates),
             ("portfolio".to_string(), portfolio),
             ("rejected".to_string(), rejected),
+            (
+                "quality_scored".to_string(),
+                result.quality_metrics.len() as u64,
+            ),
+            ("trade_logs".to_string(), result.logged_trades.len() as u64),
         ],
         highlights,
         entries,
@@ -445,9 +559,10 @@ fn cancelled_snapshot_from(mut snapshot: JobSnapshot, message: impl Into<String>
 }
 
 pub fn start_discovery_job(
-    request: DiscoveryRequest,
+    mut request: DiscoveryRequest,
     tx: mpsc::Sender<ServiceEvent>,
 ) -> Result<DiscoveryJobHandle> {
+    request.config.timeframe_label = request.base_tf.clone();
     request.validate()?;
 
     let handle = DiscoveryJobHandle::new();
@@ -719,6 +834,17 @@ pub fn start_discovery_job(
                 std::fs::create_dir_all(parent)?;
             }
             save_portfolio_json(&out_path, &result.portfolio, &features.names)?;
+            save_discovery_profile_json(
+                out_path.with_extension("profile.json"),
+                &search_request.config,
+                &result,
+            )?;
+            if !result.quality_metrics.is_empty() {
+                save_quality_report_json(out_path.with_extension("quality.json"), &result)?;
+            }
+            if !result.logged_trades.is_empty() {
+                save_trade_log_json(out_path.with_extension("trades.json"), &result)?;
+            }
             Ok::<_, anyhow::Error>(result)
         })
         .await;
@@ -810,8 +936,8 @@ fn system_time_string() -> String {
 mod tests {
     use super::*;
     use crate::app_services::{
-        jobs::{JobKind, JobSnapshot, JobState},
         ServiceEvent,
+        jobs::{JobKind, JobSnapshot, JobState},
     };
     use forex_search::Gene;
     use std::path::PathBuf;
@@ -879,6 +1005,8 @@ mod tests {
         let result = DiscoveryResult {
             portfolio: vec![best.clone(), second],
             candidates: vec![best, Gene::default(), Gene::default()],
+            quality_metrics: Vec::new(),
+            logged_trades: Vec::new(),
         };
 
         let snapshot = completed_snapshot(JobSnapshot::new(JobKind::Discovery), &result);
@@ -890,28 +1018,38 @@ mod tests {
                 ("candidates".to_string(), 3),
                 ("portfolio".to_string(), 2),
                 ("rejected".to_string(), 1),
+                ("quality_scored".to_string(), 0),
+                ("trade_logs".to_string(), 0),
             ]
         );
-        assert!(snapshot
-            .report
-            .highlights
-            .iter()
-            .any(|(name, value)| { name == "best_strategy" && value == "alpha-1" }));
-        assert!(snapshot
-            .report
-            .highlights
-            .iter()
-            .any(|(name, value)| { name == "best_sharpe" && value == "1.82" }));
-        assert!(snapshot
-            .report
-            .entries
-            .iter()
-            .any(|entry| entry.contains("alpha-1") && entry.contains("win_rate=0.64")));
-        assert!(snapshot
-            .report
-            .events
-            .iter()
-            .any(|event| event.message.contains("completed discovery")));
+        assert!(
+            snapshot
+                .report
+                .highlights
+                .iter()
+                .any(|(name, value)| { name == "best_strategy" && value == "alpha-1" })
+        );
+        assert!(
+            snapshot
+                .report
+                .highlights
+                .iter()
+                .any(|(name, value)| { name == "best_sharpe" && value == "1.82" })
+        );
+        assert!(
+            snapshot
+                .report
+                .entries
+                .iter()
+                .any(|entry| entry.contains("alpha-1") && entry.contains("win_rate=0.64"))
+        );
+        assert!(
+            snapshot
+                .report
+                .events
+                .iter()
+                .any(|event| event.message.contains("completed discovery"))
+        );
     }
 
     #[tokio::test]
@@ -941,16 +1079,20 @@ mod tests {
                 ("population".to_string(), 96),
             ]
         );
-        assert!(snapshot
-            .report
-            .highlights
-            .iter()
-            .any(|(name, value)| name == "symbol" && value == "EURUSD"));
-        assert!(snapshot
-            .report
-            .highlights
-            .iter()
-            .any(|(name, value)| name == "higher_tfs" && value == "M5, M15, H1"));
+        assert!(
+            snapshot
+                .report
+                .highlights
+                .iter()
+                .any(|(name, value)| name == "symbol" && value == "EURUSD")
+        );
+        assert!(
+            snapshot
+                .report
+                .highlights
+                .iter()
+                .any(|(name, value)| name == "higher_tfs" && value == "M5, M15, H1")
+        );
         assert!(snapshot.report.events.iter().any(|event| {
             event.message.contains("planned discovery")
                 && event.message.contains("candidate_count=144")
@@ -991,25 +1133,33 @@ mod tests {
         assert_eq!(snapshot.state, JobState::Running);
         assert_eq!(snapshot.progress.stage, "portfolio_construction");
         assert!(snapshot.progress.percent.expect("percent should exist") >= 0.9);
-        assert!(snapshot
-            .report
-            .counters
-            .iter()
-            .any(|(name, value)| name == "portfolio" && *value == 12));
-        assert!(snapshot
-            .report
-            .counters
-            .iter()
-            .any(|(name, value)| name == "rejected_by_correlation" && *value == 5));
-        assert!(snapshot
-            .report
-            .events
-            .iter()
-            .any(|event| event.message.contains("portfolio selection")));
-        assert!(snapshot
-            .report
-            .entries
-            .iter()
-            .any(|entry| entry.contains("portfolio | accepted=12")));
+        assert!(
+            snapshot
+                .report
+                .counters
+                .iter()
+                .any(|(name, value)| name == "portfolio" && *value == 12)
+        );
+        assert!(
+            snapshot
+                .report
+                .counters
+                .iter()
+                .any(|(name, value)| name == "rejected_by_correlation" && *value == 5)
+        );
+        assert!(
+            snapshot
+                .report
+                .events
+                .iter()
+                .any(|event| event.message.contains("portfolio selection"))
+        );
+        assert!(
+            snapshot
+                .report
+                .entries
+                .iter()
+                .any(|entry| entry.contains("portfolio | accepted=12"))
+        );
     }
 }

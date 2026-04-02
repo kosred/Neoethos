@@ -26,7 +26,12 @@ pub fn detect_divergence(price: &[f64], indicator: &[f64], window: usize) -> Vec
     out
 }
 
-pub fn vortex_indicator(high: &[f64], low: &[f64], close: &[f64], period: usize) -> (Vec<f64>, Vec<f64>) {
+pub fn vortex_indicator(
+    high: &[f64],
+    low: &[f64],
+    close: &[f64],
+    period: usize,
+) -> (Vec<f64>, Vec<f64>) {
     let n = close.len();
     let mut vi_plus = vec![1.0; n];
     let mut vi_minus = vec![1.0; n];
@@ -39,7 +44,9 @@ pub fn vortex_indicator(high: &[f64], low: &[f64], close: &[f64], period: usize)
     for i in 1..n {
         vm_plus[i] = (high[i] - low[i - 1]).abs();
         vm_minus[i] = (low[i] - high[i - 1]).abs();
-        tr[i] = (high[i] - low[i]).max((high[i] - close[i - 1]).abs()).max((low[i] - close[i - 1]).abs());
+        tr[i] = (high[i] - low[i])
+            .max((high[i] - close[i - 1]).abs())
+            .max((low[i] - close[i - 1]).abs());
     }
     let mut s_vmp = 0.0;
     let mut s_vmm = 0.0;

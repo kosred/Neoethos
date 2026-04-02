@@ -52,8 +52,7 @@ pub struct CTraderTokenBundle {
 
 impl CTraderTokenBundle {
     pub fn expires_at_unix(&self) -> i64 {
-        self.created_at_unix
-            .saturating_add(self.expires_in.max(0))
+        self.created_at_unix.saturating_add(self.expires_in.max(0))
     }
 
     pub fn is_expired_at(&self, now_unix: i64) -> bool {
@@ -222,7 +221,10 @@ impl CTraderAuthSession {
                     "cTrader session restored from secure storage.".to_string()
                 }
                 CTraderAuthState::AccountsAvailable => {
-                    format!("{} cTrader accounts are available.", self.discovered_accounts.len())
+                    format!(
+                        "{} cTrader accounts are available.",
+                        self.discovered_accounts.len()
+                    )
                 }
                 CTraderAuthState::Failed => "cTrader auth failed.".to_string(),
             },
@@ -231,7 +233,9 @@ impl CTraderAuthSession {
             authorization_code_present: self.authorization_code.is_some(),
             token_request_ready: matches!(
                 self.state,
-                CTraderAuthState::AccessTokenReady | CTraderAuthState::RestoredFromStorage | CTraderAuthState::AccountsAvailable
+                CTraderAuthState::AccessTokenReady
+                    | CTraderAuthState::RestoredFromStorage
+                    | CTraderAuthState::AccountsAvailable
             ),
             token_persisted: self.token_bundle.is_some(),
             persistence_status: if self.token_bundle.is_some() {
@@ -276,7 +280,10 @@ mod tests {
         assert!(url.contains("client_id=client-id"));
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback"));
         assert!(url.contains("scope=trading"));
-        assert_eq!(auth.snapshot().state, CTraderAuthState::AwaitingAuthorizationCode);
+        assert_eq!(
+            auth.snapshot().state,
+            CTraderAuthState::AwaitingAuthorizationCode
+        );
     }
 
     #[test]

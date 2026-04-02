@@ -285,11 +285,7 @@ pub unsafe fn sharpe_ratio_simd(returns: &[f64]) -> f64 {
     let variance = (total_sumsq / n as f64) - mean * mean;
     let std_dev = variance.max(0.0).sqrt();
 
-    if std_dev > 1e-12 {
-        mean / std_dev
-    } else {
-        0.0
-    }
+    if std_dev > 1e-12 { mean / std_dev } else { 0.0 }
 }
 
 /// Public wrapper for Sharpe ratio computation
@@ -314,11 +310,7 @@ fn compute_sharpe_scalar(returns: &[f64]) -> f64 {
     let variance = (sumsq / n) - mean * mean;
     let std_dev = variance.max(0.0).sqrt();
 
-    if std_dev > 1e-12 {
-        mean / std_dev
-    } else {
-        0.0
-    }
+    if std_dev > 1e-12 { mean / std_dev } else { 0.0 }
 }
 
 #[cfg(test)]

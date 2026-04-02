@@ -1,5 +1,5 @@
 use crate::app_services::ctrader_auth::CTraderTokenBundle;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use keyring::Entry;
 
 #[cfg(test)]
@@ -110,7 +110,8 @@ impl<B: SecretStoreBackend> CTraderSecureStore<B> {
     }
 
     pub fn save_token_bundle(&self, bundle: &CTraderTokenBundle) -> Result<()> {
-        let secret = serde_json::to_string(bundle).context("failed to serialize cTrader token bundle")?;
+        let secret =
+            serde_json::to_string(bundle).context("failed to serialize cTrader token bundle")?;
         self.backend
             .set_secret(&self.service, &self.user, &secret)
             .context("failed to persist cTrader token bundle")
@@ -134,12 +135,11 @@ impl<B: SecretStoreBackend> CTraderSecureStore<B> {
                 .and_then(serde_json::Value::as_str)
                 .map(|value| value.trim().is_empty())
                 .unwrap_or(true)
-        })
-        {
+        }) {
             return Err(anyhow!("incomplete cTrader token bundle in secure storage"));
         }
-        let bundle: CTraderTokenBundle =
-            serde_json::from_value(value).context("failed to decode stored cTrader token bundle")?;
+        let bundle: CTraderTokenBundle = serde_json::from_value(value)
+            .context("failed to decode stored cTrader token bundle")?;
 
         Ok(Some(bundle))
     }
@@ -175,11 +175,7 @@ mod tests {
     #[test]
     fn secure_store_round_trip_saves_loads_and_clears_bundle() {
         let backend = MemorySecretStoreBackend::default();
-        let store = CTraderSecureStore::new(
-            "forex-ai.test",
-            "ctrader.account",
-            backend.clone(),
-        );
+        let store = CTraderSecureStore::new("forex-ai.test", "ctrader.account", backend.clone());
         let bundle = CTraderTokenBundle {
             access_token: "access".to_string(),
             refresh_token: "refresh".to_string(),
@@ -189,12 +185,17 @@ mod tests {
             created_at_unix: 1_774_147_200,
         };
 
-        store.save_token_bundle(&bundle).expect("save should succeed");
+        store
+            .save_token_bundle(&bundle)
+            .expect("save should succeed");
         let restored = store.load_token_bundle().expect("load should succeed");
         assert_eq!(restored, Some(bundle));
 
         store.clear_token_bundle().expect("clear should succeed");
-        assert_eq!(store.load_token_bundle().expect("load should succeed"), None);
+        assert_eq!(
+            store.load_token_bundle().expect("load should succeed"),
+            None
+        );
     }
 
     #[test]
@@ -205,13 +206,11 @@ mod tests {
             "ctrader.account",
             "{\"access_token\":\"access\"}".to_string(),
         );
-        let store = CTraderSecureStore::new(
-            "forex-ai.test",
-            "ctrader.account",
-            backend,
-        );
+        let store = CTraderSecureStore::new("forex-ai.test", "ctrader.account", backend);
 
-        let error = store.load_token_bundle().expect_err("incomplete payload must fail");
+        let error = store
+            .load_token_bundle()
+            .expect_err("incomplete payload must fail");
         assert!(error.to_string().contains("incomplete"));
     }
 }

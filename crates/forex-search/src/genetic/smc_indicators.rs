@@ -85,22 +85,48 @@ pub fn randomize_smc_flags(gene: &mut Gene, cfg: &SmcSearchConfig, rng: &mut imp
 
 pub fn smc_structural_flag_count(gene: &Gene) -> usize {
     let mut n = 0usize;
-    if gene.use_ob { n += 1; }
-    if gene.use_fvg { n += 1; }
-    if gene.use_liq_sweep { n += 1; }
-    if gene.use_premium_discount { n += 1; }
-    if gene.use_inducement { n += 1; }
-    if gene.use_bos { n += 1; }
-    if gene.use_choch { n += 1; }
-    if gene.use_eqh { n += 1; }
-    if gene.use_eql { n += 1; }
-    if gene.use_displacement { n += 1; }
+    if gene.use_ob {
+        n += 1;
+    }
+    if gene.use_fvg {
+        n += 1;
+    }
+    if gene.use_liq_sweep {
+        n += 1;
+    }
+    if gene.use_premium_discount {
+        n += 1;
+    }
+    if gene.use_inducement {
+        n += 1;
+    }
+    if gene.use_bos {
+        n += 1;
+    }
+    if gene.use_choch {
+        n += 1;
+    }
+    if gene.use_eqh {
+        n += 1;
+    }
+    if gene.use_eql {
+        n += 1;
+    }
+    if gene.use_displacement {
+        n += 1;
+    }
     n
 }
 
-pub fn enforce_min_structural_smc_flags(gene: &mut Gene, cfg: &SmcSearchConfig, rng: &mut impl Rng) {
+pub fn enforce_min_structural_smc_flags(
+    gene: &mut Gene,
+    cfg: &SmcSearchConfig,
+    rng: &mut impl Rng,
+) {
     let need = cfg.min_flags.min(10);
-    if need == 0 { return; }
+    if need == 0 {
+        return;
+    }
     while smc_structural_flag_count(gene) < need {
         match rng.random_range(0..10) {
             0 => gene.use_ob = true,
@@ -121,15 +147,28 @@ pub fn enforce_min_structural_smc_flags(gene: &mut Gene, cfg: &SmcSearchConfig, 
 }
 
 pub fn enforce_population_smc_ratio(genes: &mut [Gene], cfg: &SmcSearchConfig) {
-    if genes.is_empty() { return; }
+    if genes.is_empty() {
+        return;
+    }
     let target = ((genes.len() as f64) * cfg.force_ratio).ceil() as usize;
-    if target == 0 { return; }
-    let mut active = genes.iter().filter(|g| smc_structural_flag_count(g) > 0).count();
-    if active >= target { return; }
+    if target == 0 {
+        return;
+    }
+    let mut active = genes
+        .iter()
+        .filter(|g| smc_structural_flag_count(g) > 0)
+        .count();
+    if active >= target {
+        return;
+    }
     let mut rng = rand::rng();
     for gene in genes.iter_mut() {
-        if active >= target { break; }
-        if smc_structural_flag_count(gene) > 0 { continue; }
+        if active >= target {
+            break;
+        }
+        if smc_structural_flag_count(gene) > 0 {
+            continue;
+        }
         enforce_min_structural_smc_flags(gene, cfg, &mut rng);
         active += 1;
     }
@@ -169,10 +208,14 @@ fn normalize_feature_name(name: &str) -> String {
 }
 
 fn find_feature_column(names: &[String], aliases: &[&str]) -> Option<usize> {
-    let normalized_aliases: Vec<String> = aliases.iter().map(|a| normalize_feature_name(a)).collect();
+    let normalized_aliases: Vec<String> =
+        aliases.iter().map(|a| normalize_feature_name(a)).collect();
     for (idx, raw) in names.iter().enumerate() {
         let norm = normalize_feature_name(raw);
-        if normalized_aliases.iter().any(|a| norm == *a || norm.contains(a)) {
+        if normalized_aliases
+            .iter()
+            .any(|a| norm == *a || norm.contains(a))
+        {
             return Some(idx);
         }
     }
@@ -180,7 +223,13 @@ fn find_feature_column(names: &[String], aliases: &[&str]) -> Option<usize> {
 }
 
 fn quantize_dir(value: f32) -> i8 {
-    if value > 1e-9 { 1 } else if value < -1e-9 { -1 } else { 0 }
+    if value > 1e-9 {
+        1
+    } else if value < -1e-9 {
+        -1
+    } else {
+        0
+    }
 }
 
 fn quantize_binary(value: f32) -> i8 {
@@ -199,7 +248,10 @@ fn detect_smc_columns(names: &[String]) -> SmcColumns {
         choch: find_feature_column(names, &["smc_choch", "choch", "change_of_character"]),
         eqh: find_feature_column(names, &["smc_eqh", "eqh", "equal_highs"]),
         eql: find_feature_column(names, &["smc_eql", "eql", "equal_lows"]),
-        displacement: find_feature_column(names, &["smc_displacement", "displacement", "impulse_displacement"]),
+        displacement: find_feature_column(
+            names,
+            &["smc_displacement", "displacement", "impulse_displacement"],
+        ),
     }
 }
 
@@ -216,29 +268,65 @@ pub fn derive_smc_arrays(ohlcv: &Ohlcv) -> SmcSignalTuple {
     let mut eqh = vec![0_i8; n];
     let mut eql = vec![0_i8; n];
     let mut displacement = vec![0_i8; n];
-    
-    if n == 0 { return (ob, fvg, liq, trend, premium, inducement, bos, choch, eqh, eql, displacement); }
+
+    if n == 0 {
+        return (
+            ob,
+            fvg,
+            liq,
+            trend,
+            premium,
+            inducement,
+            bos,
+            choch,
+            eqh,
+            eql,
+            displacement,
+        );
+    }
 
     let lookback = 12usize;
     let eq_lookback = 20usize;
     let displacement_lookback = 20usize;
-    
+
     for i in 0..n {
         if i >= lookback {
             let d = ohlcv.close[i] - ohlcv.close[i - lookback];
-            trend[i] = if d > 0.0 { 1 } else if d < 0.0 { -1 } else { 0 };
+            trend[i] = if d > 0.0 {
+                1
+            } else if d < 0.0 {
+                -1
+            } else {
+                0
+            };
         } else if i > 0 {
             let d = ohlcv.close[i] - ohlcv.close[i - 1];
-            trend[i] = if d > 0.0 { 1 } else if d < 0.0 { -1 } else { 0 };
+            trend[i] = if d > 0.0 {
+                1
+            } else if d < 0.0 {
+                -1
+            } else {
+                0
+            };
         }
 
         let mid = (ohlcv.high[i] + ohlcv.low[i]) * 0.5;
         premium[i] = if ohlcv.close[i] <= mid { 1 } else { -1 };
 
         if i >= 1 {
-            let bull = ohlcv.close[i] > ohlcv.open[i] && ohlcv.close[i-1] < ohlcv.open[i-1] && ohlcv.close[i] >= ohlcv.high[i-1];
-            let bear = ohlcv.close[i] < ohlcv.open[i] && ohlcv.close[i-1] > ohlcv.open[i-1] && ohlcv.close[i] <= ohlcv.low[i-1];
-            ob[i] = if bull { 1 } else if bear { -1 } else { 0 };
+            let bull = ohlcv.close[i] > ohlcv.open[i]
+                && ohlcv.close[i - 1] < ohlcv.open[i - 1]
+                && ohlcv.close[i] >= ohlcv.high[i - 1];
+            let bear = ohlcv.close[i] < ohlcv.open[i]
+                && ohlcv.close[i - 1] > ohlcv.open[i - 1]
+                && ohlcv.close[i] <= ohlcv.low[i - 1];
+            ob[i] = if bull {
+                1
+            } else if bear {
+                -1
+            } else {
+                0
+            };
 
             let body = (ohlcv.close[i] - ohlcv.open[i]).abs();
             let upper = ohlcv.high[i] - ohlcv.open[i].max(ohlcv.close[i]);
@@ -249,22 +337,39 @@ pub fn derive_smc_arrays(ohlcv: &Ohlcv) -> SmcSignalTuple {
         }
 
         if i >= 2 {
-            if ohlcv.low[i] > ohlcv.high[i - 2] { fvg[i] = 1; }
-            else if ohlcv.high[i] < ohlcv.low[i - 2] { fvg[i] = -1; }
+            if ohlcv.low[i] > ohlcv.high[i - 2] {
+                fvg[i] = 1;
+            } else if ohlcv.high[i] < ohlcv.low[i - 2] {
+                fvg[i] = -1;
+            }
         }
 
         if i >= 3 {
-            let prev_low = ohlcv.low[(i-3)..i].iter().fold(f64::INFINITY, |a, &b| a.min(b));
-            let prev_high = ohlcv.high[(i-3)..i].iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-            if ohlcv.low[i] < prev_low && ohlcv.close[i] > prev_low { liq[i] = 1; }
-            else if ohlcv.high[i] > prev_high && ohlcv.close[i] < prev_high { liq[i] = -1; }
+            let prev_low = ohlcv.low[(i - 3)..i]
+                .iter()
+                .fold(f64::INFINITY, |a, &b| a.min(b));
+            let prev_high = ohlcv.high[(i - 3)..i]
+                .iter()
+                .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+            if ohlcv.low[i] < prev_low && ohlcv.close[i] > prev_low {
+                liq[i] = 1;
+            } else if ohlcv.high[i] > prev_high && ohlcv.close[i] < prev_high {
+                liq[i] = -1;
+            }
         }
 
         if i >= lookback {
-            let prev_low = ohlcv.low[(i-lookback)..i].iter().fold(f64::INFINITY, |a, &b| a.min(b));
-            let prev_high = ohlcv.high[(i-lookback)..i].iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-            if ohlcv.close[i] > prev_high { bos[i] = 1; }
-            else if ohlcv.close[i] < prev_low { bos[i] = -1; }
+            let prev_low = ohlcv.low[(i - lookback)..i]
+                .iter()
+                .fold(f64::INFINITY, |a, &b| a.min(b));
+            let prev_high = ohlcv.high[(i - lookback)..i]
+                .iter()
+                .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+            if ohlcv.close[i] > prev_high {
+                bos[i] = 1;
+            } else if ohlcv.close[i] < prev_low {
+                bos[i] = -1;
+            }
         }
 
         if i >= 1 && trend[i] != 0 && trend[i - 1] != 0 && trend[i] != trend[i - 1] {
@@ -280,10 +385,16 @@ pub fn derive_smc_arrays(ohlcv: &Ohlcv) -> SmcSignalTuple {
             let avg_range = range_sum / ((eq_lookback as f64) + 1.0);
             let tol = (avg_range * 0.1).max(1e-9);
             for j in lb..i {
-                if (ohlcv.high[i] - ohlcv.high[j]).abs() <= tol { eqh[i] = -1; break; }
+                if (ohlcv.high[i] - ohlcv.high[j]).abs() <= tol {
+                    eqh[i] = -1;
+                    break;
+                }
             }
             for j in lb..i {
-                if (ohlcv.low[i] - ohlcv.low[j]).abs() <= tol { eql[i] = 1; break; }
+                if (ohlcv.low[i] - ohlcv.low[j]).abs() <= tol {
+                    eql[i] = 1;
+                    break;
+                }
             }
         }
 
@@ -295,18 +406,48 @@ pub fn derive_smc_arrays(ohlcv: &Ohlcv) -> SmcSignalTuple {
             }
             avg_body /= displacement_lookback as f64;
             if avg_body > 1e-12 && body >= (1.8 * avg_body) {
-                displacement[i] = if ohlcv.close[i] > ohlcv.open[i] { 1 } else if ohlcv.close[i] < ohlcv.open[i] { -1 } else { 0 };
+                displacement[i] = if ohlcv.close[i] > ohlcv.open[i] {
+                    1
+                } else if ohlcv.close[i] < ohlcv.open[i] {
+                    -1
+                } else {
+                    0
+                };
             }
         }
     }
 
-    (ob, fvg, liq, trend, premium, inducement, bos, choch, eqh, eql, displacement)
+    (
+        ob,
+        fvg,
+        liq,
+        trend,
+        premium,
+        inducement,
+        bos,
+        choch,
+        eqh,
+        eql,
+        displacement,
+    )
 }
 
 pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> SmcSignalTuple {
     let n = frame.data.nrows();
     let cols = detect_smc_columns(&frame.names);
-    let (mut ob, mut fvg, mut liq, mut trend, mut premium, mut inducement, mut bos, mut choch, mut eqh, mut eql, mut displacement) = derive_smc_arrays(ohlcv);
+    let (
+        mut ob,
+        mut fvg,
+        mut liq,
+        mut trend,
+        mut premium,
+        mut inducement,
+        mut bos,
+        mut choch,
+        mut eqh,
+        mut eql,
+        mut displacement,
+    ) = derive_smc_arrays(ohlcv);
 
     let apply_dir_col = |target: &mut Vec<i8>, col_opt: Option<usize>| {
         if let Some(col) = col_opt {
@@ -332,7 +473,13 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> SmcSignalTuple {
                 for (i, slot) in target.iter_mut().enumerate().take(n) {
                     let v = frame.data[(i, col)];
                     let q = quantize_dir(v);
-                    *slot = if q != 0 { q } else if quantize_binary(v) != 0 { -1 } else { 0 };
+                    *slot = if q != 0 {
+                        q
+                    } else if quantize_binary(v) != 0 {
+                        -1
+                    } else {
+                        0
+                    };
                 }
             }
         }
@@ -343,7 +490,13 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> SmcSignalTuple {
                 for (i, slot) in target.iter_mut().enumerate().take(n) {
                     let v = frame.data[(i, col)];
                     let q = quantize_dir(v);
-                    *slot = if q != 0 { q } else if quantize_binary(v) != 0 { 1 } else { 0 };
+                    *slot = if q != 0 {
+                        q
+                    } else if quantize_binary(v) != 0 {
+                        1
+                    } else {
+                        0
+                    };
                 }
             }
         }
@@ -397,7 +550,7 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> SmcSignalTuple {
     apply_dir_fill_zeros(&mut trend, cols.bos);
     apply_dir_fill_zeros(&mut trend, cols.choch);
     apply_dir_fill_zeros(&mut trend, cols.displacement);
-    
+
     if let Some(col) = cols.displacement {
         if col < frame.data.ncols() {
             for (i, slot) in inducement.iter_mut().enumerate().take(n) {
@@ -413,5 +566,17 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> SmcSignalTuple {
         }
     }
 
-    (ob, fvg, liq, trend, premium, inducement, bos, choch, eqh, eql, displacement)
+    (
+        ob,
+        fvg,
+        liq,
+        trend,
+        premium,
+        inducement,
+        bos,
+        choch,
+        eqh,
+        eql,
+        displacement,
+    )
 }

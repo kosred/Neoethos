@@ -1,15 +1,15 @@
 use crate::app_services::{
-    jobs::{
-        push_recent_event, CancellationFlag, JobEventLevel, JobKind, JobProgress, JobReport,
-        JobSnapshot, JobState,
-    },
     ServiceEvent,
+    jobs::{
+        CancellationFlag, JobEventLevel, JobKind, JobProgress, JobReport, JobSnapshot, JobState,
+        push_recent_event,
+    },
 };
 use anyhow::Result;
 use forex_core::{
+    Settings,
     logging::{canonical_log_path, write_subsystem_record},
     sectioned_log::{SectionedRunRecord, SubsystemSection},
-    Settings,
 };
 use forex_models::{ModelTrainingProgress, TrainingOrchestrator, TrainingRunSummary};
 use std::path::PathBuf;
@@ -669,8 +669,8 @@ fn system_time_string() -> String {
 mod tests {
     use super::*;
     use crate::app_services::{
-        jobs::{JobEventLevel, JobState},
         ServiceEvent,
+        jobs::{JobEventLevel, JobState},
     };
     use forex_models::ModelTrainingProgress;
     use std::path::PathBuf;
@@ -731,31 +731,41 @@ mod tests {
                 ("failed_models".to_string(), 1),
             ]
         );
-        assert!(snapshot
-            .report
-            .highlights
-            .iter()
-            .any(|(name, value)| { name == "completed_models" && value == "2" }));
-        assert!(snapshot
-            .report
-            .highlights
-            .iter()
-            .any(|(name, value)| { name == "failed_models" && value == "1" }));
-        assert!(snapshot
-            .report
-            .entries
-            .iter()
-            .any(|entry| entry == "completed | xgboost"));
-        assert!(snapshot
-            .report
-            .entries
-            .iter()
-            .any(|entry| entry == "failed | mlp"));
-        assert!(snapshot
-            .report
-            .events
-            .iter()
-            .any(|event| event.message.contains("training finished")));
+        assert!(
+            snapshot
+                .report
+                .highlights
+                .iter()
+                .any(|(name, value)| { name == "completed_models" && value == "2" })
+        );
+        assert!(
+            snapshot
+                .report
+                .highlights
+                .iter()
+                .any(|(name, value)| { name == "failed_models" && value == "1" })
+        );
+        assert!(
+            snapshot
+                .report
+                .entries
+                .iter()
+                .any(|entry| entry == "completed | xgboost")
+        );
+        assert!(
+            snapshot
+                .report
+                .entries
+                .iter()
+                .any(|entry| entry == "failed | mlp")
+        );
+        assert!(
+            snapshot
+                .report
+                .events
+                .iter()
+                .any(|event| event.message.contains("training finished"))
+        );
         assert_eq!(
             snapshot.report.events.last().map(|event| event.level),
             Some(JobEventLevel::Warning)
@@ -777,16 +787,20 @@ mod tests {
 
         assert_eq!(snapshot.state, JobState::Running);
         assert_eq!(snapshot.progress.stage, "loading_settings");
-        assert!(snapshot
-            .report
-            .highlights
-            .iter()
-            .any(|(name, value)| name == "symbol" && value == "EURUSD"));
-        assert!(snapshot
-            .report
-            .highlights
-            .iter()
-            .any(|(name, value)| name == "config_path" && value == "config.yaml"));
+        assert!(
+            snapshot
+                .report
+                .highlights
+                .iter()
+                .any(|(name, value)| name == "symbol" && value == "EURUSD")
+        );
+        assert!(
+            snapshot
+                .report
+                .highlights
+                .iter()
+                .any(|(name, value)| name == "config_path" && value == "config.yaml")
+        );
         assert!(snapshot.report.events.iter().any(|event| {
             event.message.contains("loading training settings") && event.message.contains("EURUSD")
         }));
@@ -828,35 +842,45 @@ mod tests {
         assert_eq!(snapshot.state, JobState::Running);
         assert_eq!(snapshot.progress.stage, "backend_running");
         assert_eq!(snapshot.progress.percent, Some(0.8));
-        assert!(snapshot
-            .report
-            .counters
-            .iter()
-            .any(|(name, value)| name == "completed_models" && *value == 1));
-        assert!(snapshot
-            .report
-            .counters
-            .iter()
-            .any(|(name, value)| name == "failed_models" && *value == 1));
-        assert!(snapshot
-            .report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("mlp")));
-        assert!(snapshot
-            .report
-            .errors
-            .iter()
-            .any(|error| error.contains("synthetic backend failure")));
+        assert!(
+            snapshot
+                .report
+                .counters
+                .iter()
+                .any(|(name, value)| name == "completed_models" && *value == 1)
+        );
+        assert!(
+            snapshot
+                .report
+                .counters
+                .iter()
+                .any(|(name, value)| name == "failed_models" && *value == 1)
+        );
+        assert!(
+            snapshot
+                .report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("mlp"))
+        );
+        assert!(
+            snapshot
+                .report
+                .errors
+                .iter()
+                .any(|error| error.contains("synthetic backend failure"))
+        );
         assert!(snapshot
             .report
             .events
             .iter()
             .any(|event| event.level == JobEventLevel::Warning && event.message.contains("mlp")));
-        assert!(snapshot
-            .report
-            .entries
-            .iter()
-            .any(|entry| entry.contains("failed | mlp")));
+        assert!(
+            snapshot
+                .report
+                .entries
+                .iter()
+                .any(|entry| entry.contains("failed | mlp"))
+        );
     }
 }

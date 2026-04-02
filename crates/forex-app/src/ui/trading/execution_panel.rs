@@ -45,7 +45,12 @@ pub fn build_execution_panel(
     }
 }
 
-pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSession, tx: &tokio::sync::mpsc::Sender<crate::app_services::ServiceEvent>) {
+pub fn render(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    session: &mut TradingSession,
+    tx: &tokio::sync::mpsc::Sender<crate::app_services::ServiceEvent>,
+) {
     let snapshot = session.execution_surface_snapshot(state);
     let readiness = session.adapter_readiness();
     let connect_reason = (!session.is_connected()).then(|| readiness.status_line.clone());
@@ -53,16 +58,23 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSess
 
     ui.strong(format!("Execution · {}", panel.symbol));
     ui.add_space(8.0);
-    ui.label(egui::RichText::new(format!("Adapter: {}", panel.adapter_name)).color(theme::TEXT_MUTED));
     ui.label(
-        egui::RichText::new(format!("Integration: {}", panel.integration_mode)).color(theme::TEXT_MUTED),
+        egui::RichText::new(format!("Adapter: {}", panel.adapter_name)).color(theme::TEXT_MUTED),
     );
     ui.label(
-        egui::RichText::new(format!("Status: {}", panel.connection_status)).color(theme::TEXT_MUTED),
-    );
-    ui.label(
-        egui::RichText::new(format!("Supported: {}", panel.supported_adapters.join(", ")))
+        egui::RichText::new(format!("Integration: {}", panel.integration_mode))
             .color(theme::TEXT_MUTED),
+    );
+    ui.label(
+        egui::RichText::new(format!("Status: {}", panel.connection_status))
+            .color(theme::TEXT_MUTED),
+    );
+    ui.label(
+        egui::RichText::new(format!(
+            "Supported: {}",
+            panel.supported_adapters.join(", ")
+        ))
+        .color(theme::TEXT_MUTED),
     );
     ui.add_space(8.0);
 
@@ -70,8 +82,16 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSess
         ui.strong("Order Ticket");
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut state.order_ticket.order_type, OrderType::Market, "Market");
-            ui.selectable_value(&mut state.order_ticket.order_type, OrderType::Limit, "Limit");
+            ui.selectable_value(
+                &mut state.order_ticket.order_type,
+                OrderType::Market,
+                "Market",
+            );
+            ui.selectable_value(
+                &mut state.order_ticket.order_type,
+                OrderType::Limit,
+                "Limit",
+            );
             ui.selectable_value(&mut state.order_ticket.order_type, OrderType::Stop, "Stop");
         });
         ui.add_space(4.0);
@@ -82,32 +102,51 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSess
                 ui.add(egui::DragValue::new(&mut state.order_ticket.target_price).speed(0.0001));
             });
         }
-        
+
         ui.horizontal(|ui| {
-            ui.checkbox(&mut state.order_ticket.auto_lot_sizing, "Auto Sizing (Risk %)");
+            ui.checkbox(
+                &mut state.order_ticket.auto_lot_sizing,
+                "Auto Sizing (Risk %)",
+            );
         });
         if state.order_ticket.auto_lot_sizing {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Risk %").color(theme::TEXT_MUTED));
-                ui.add(egui::DragValue::new(&mut state.order_ticket.auto_risk_pct).speed(0.1).range(0.1..=10.0));
+                ui.add(
+                    egui::DragValue::new(&mut state.order_ticket.auto_risk_pct)
+                        .speed(0.1)
+                        .range(0.1..=10.0),
+                );
                 ui.label(egui::RichText::new("SL Pips").color(theme::TEXT_MUTED));
-                ui.add(egui::DragValue::new(&mut state.order_ticket.stop_loss_pips).speed(1.0).range(1.0..=500.0));
+                ui.add(
+                    egui::DragValue::new(&mut state.order_ticket.stop_loss_pips)
+                        .speed(1.0)
+                        .range(1.0..=500.0),
+                );
             });
-            let equity = if state.account_equity > 0.0 { state.account_equity } else { state.account_balance };
+            let equity = if state.account_equity > 0.0 {
+                state.account_equity
+            } else {
+                state.account_balance
+            };
             let calculated_lots = if equity > 0.0 && state.order_ticket.stop_loss_pips > 0.0 {
                 let risk_amount = equity * (state.order_ticket.auto_risk_pct / 100.0);
-                (risk_amount / (state.order_ticket.stop_loss_pips * 10.0)).clamp(0.01, state.risk.max_lot_size as f64)
+                (risk_amount / (state.order_ticket.stop_loss_pips * 10.0))
+                    .clamp(0.01, state.risk.max_lot_size)
             } else {
                 0.01
             };
-            ui.label(egui::RichText::new(format!("Calculated Size: {:.2} Lots", calculated_lots)).color(theme::WARNING));
+            ui.label(
+                egui::RichText::new(format!("Calculated Size: {:.2} Lots", calculated_lots))
+                    .color(theme::WARNING),
+            );
             state.order_ticket.lot_size = calculated_lots;
         } else {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Lot Size").color(theme::TEXT_MUTED));
                 ui.add(
                     egui::DragValue::new(&mut state.order_ticket.lot_size)
-                        .range(0.01..=state.risk.max_lot_size as f64)
+                        .range(0.01..=state.risk.max_lot_size)
                         .speed(0.01),
                 );
                 ui.label(
@@ -130,12 +169,17 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSess
             ui.text_edit_singleline(&mut state.order_ticket.comment);
         });
         ui.horizontal(|ui| {
-            ui.checkbox(&mut state.order_ticket.smart_sl_enabled, 
-                egui::RichText::new("Smart SL/TP (ATR)").color(theme::TEXT_MUTED)
+            ui.checkbox(
+                &mut state.order_ticket.smart_sl_enabled,
+                egui::RichText::new("Smart SL/TP (ATR)").color(theme::TEXT_MUTED),
             );
             if state.order_ticket.smart_sl_enabled {
                 ui.label(egui::RichText::new("RR:").color(theme::TEXT_MUTED));
-                ui.add(egui::DragValue::new(&mut state.order_ticket.smart_rr_ratio).speed(0.1).range(0.5..=10.0));
+                ui.add(
+                    egui::DragValue::new(&mut state.order_ticket.smart_rr_ratio)
+                        .speed(0.1)
+                        .range(0.5..=10.0),
+                );
             }
         });
         ui.horizontal(|ui| {
@@ -203,10 +247,21 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSess
             .and_then(|action| (!action.enabled).then(|| action.reason.clone()))
             .flatten();
         let buy = ui.add_enabled(
-            snapshot.primary_actions.first().map(|action| action.enabled).unwrap_or(false),
-            egui::Button::new(egui::RichText::new(if state.order_ticket.order_type == OrderType::Market { "Buy Market" } else { "Place Buy Order" }).color(theme::TEXT_PRIMARY))
-                .fill(theme::SUCCESS.linear_multiply(0.45))
-                .min_size(egui::vec2(ui.available_width() / 2.0 - 4.0, 34.0)),
+            snapshot
+                .primary_actions
+                .first()
+                .map(|action| action.enabled)
+                .unwrap_or(false),
+            egui::Button::new(
+                egui::RichText::new(if state.order_ticket.order_type == OrderType::Market {
+                    "Buy Market"
+                } else {
+                    "Place Buy Order"
+                })
+                .color(theme::TEXT_PRIMARY),
+            )
+            .fill(theme::SUCCESS.linear_multiply(0.45))
+            .min_size(egui::vec2(ui.available_width() / 2.0 - 4.0, 34.0)),
         );
         if let Some(reason) = &action_reason {
             if buy.hovered() {
@@ -223,9 +278,16 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSess
                 .get(1)
                 .map(|action| action.enabled)
                 .unwrap_or(false),
-            egui::Button::new(egui::RichText::new(if state.order_ticket.order_type == OrderType::Market { "Sell Market" } else { "Place Sell Order" }).color(theme::TEXT_PRIMARY))
-                .fill(theme::DANGER.linear_multiply(0.45))
-                .min_size(egui::vec2(ui.available_width(), 34.0)),
+            egui::Button::new(
+                egui::RichText::new(if state.order_ticket.order_type == OrderType::Market {
+                    "Sell Market"
+                } else {
+                    "Place Sell Order"
+                })
+                .color(theme::TEXT_PRIMARY),
+            )
+            .fill(theme::DANGER.linear_multiply(0.45))
+            .min_size(egui::vec2(ui.available_width(), 34.0)),
         );
         if let Some(reason) = &action_reason {
             if sell.hovered() {
@@ -238,16 +300,18 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSess
     });
 
     ui.horizontal(|ui| {
-        let cancel_enabled =
-            session.is_connected() && !snapshot.pending_order_choices.is_empty() && snapshot.adapter_name == "cTrader";
+        let cancel_enabled = session.is_connected()
+            && !snapshot.pending_order_choices.is_empty()
+            && snapshot.adapter_name == "cTrader";
         if ui
             .add_enabled(cancel_enabled, egui::Button::new("Cancel Selected"))
             .clicked()
         {
             session.cancel_selected_order(state);
         }
-        let close_enabled =
-            session.is_connected() && !snapshot.position_choices.is_empty() && snapshot.adapter_name == "cTrader";
+        let close_enabled = session.is_connected()
+            && !snapshot.position_choices.is_empty()
+            && snapshot.adapter_name == "cTrader";
         if ui
             .add_enabled(close_enabled, egui::Button::new("Close Selected"))
             .clicked()
@@ -273,7 +337,9 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSess
 
     ui.add_space(8.0);
     if snapshot.connection_status == "Local Mode" {
-        ui.label(egui::RichText::new("Execution remains disabled in Local mode.").color(theme::WARNING));
+        ui.label(
+            egui::RichText::new("Execution remains disabled in Local mode.").color(theme::WARNING),
+        );
     }
     if snapshot.connection_status != "Local Mode" {
         if session.is_connected() {
@@ -289,7 +355,14 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSess
                 }
             }
             if response.clicked() {
-                let _ = session.start_connect(tx.clone());
+                match session.configured_adapter() {
+                    crate::app_services::trading::TradingAdapterKind::Mt5 => {
+                        session.connect(state);
+                    }
+                    _ => {
+                        let _ = session.start_connect(tx.clone());
+                    }
+                }
             }
         }
     }
@@ -358,7 +431,11 @@ mod tests {
             data_dir: PathBuf::from("data"),
             start_local: false,
         };
-        AppState::new(runtime, vec!["EURUSD".to_string()])
+        AppState::new(
+            runtime,
+            &forex_core::Settings::default(),
+            vec!["EURUSD".to_string()],
+        )
     }
 
     #[test]
@@ -372,10 +449,12 @@ mod tests {
         assert!(panel.primary_actions.contains(&"Sell".to_string()));
         assert!(panel.supported_adapters.contains(&"cTrader".to_string()));
         assert_eq!(panel.connection_status, "Offline");
-        assert!(panel
-            .diagnostics
-            .iter()
-            .any(|line| line.contains("positions/orders feed is not wired yet")));
+        assert!(
+            panel
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("central broker background loop"))
+        );
         assert!(panel.history_rows.is_empty());
         assert!(panel.journal_rows.is_empty());
     }
@@ -398,7 +477,9 @@ mod tests {
         assert!(!panel.connect_enabled);
         assert_eq!(
             panel.connect_reason.as_deref(),
-            Some("cTrader configuration incomplete: missing client_id, client_secret, redirect_uri")
+            Some(
+                "cTrader configuration incomplete: missing client_id, client_secret, redirect_uri"
+            )
         );
     }
 }

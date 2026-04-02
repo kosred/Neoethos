@@ -1,60 +1,58 @@
 use crate::app_record;
-use anyhow::Context;
+use crate::app_services::ServiceEvent;
 use crate::app_services::broker_config::{
     AdapterReadinessSnapshot, BrokerAccountTarget, BrokerSessionState, BrokerSettingsState,
     CTraderBrokerEnvironment,
-};
-use crate::app_services::ctrader_bootstrap::{
-    bootstrap_from_ctrader_history, plan_bootstrap_chunks,
 };
 use crate::app_services::ctrader_account::{
     CTraderAccountRuntimeBackend, CTraderAccountRuntimeRequest, CTraderAccountRuntimeSnapshot,
     CTraderDealSnapshot, CTraderPendingOrderSnapshot, CTraderPositionSnapshot,
     ProductionCTraderAccountRuntimeBackend,
 };
-use crate::app_services::jobs::{JobEventLevel, JobKind, JobSnapshot, JobState, push_recent_event};
+use crate::app_services::ctrader_auth::{
+    CTraderAccountSummary, CTraderAuthSession, CTraderAuthSnapshot, CTraderDiscoveredAccount,
+    CTraderTokenBundle, CTraderTokenExchangeRequest,
+};
+use crate::app_services::ctrader_bootstrap::{
+    bootstrap_from_ctrader_history, plan_bootstrap_chunks,
+};
 use crate::app_services::ctrader_data::{
-    load_chart_history, resolve_symbol, CTraderChartHistoryRequest, CTraderSymbolInfo,
-    CTraderSymbolLookupRequest, HistoricalBar,
+    CTraderChartHistoryRequest, CTraderSymbolInfo, CTraderSymbolLookupRequest, HistoricalBar,
+    load_chart_history, resolve_symbol,
 };
 use crate::app_services::ctrader_execution::{
     CTraderExecutionBackend, CTraderExecutionOutcome, CTraderExecutionRequest,
     CTraderExecutionRuntimeRequest, CTraderExecutionStatus, ProductionCTraderExecutionBackend,
 };
-use crate::app_services::ctrader_auth::{
-    CTraderAccountSummary, CTraderAuthSession, CTraderAuthSnapshot, CTraderDiscoveredAccount,
-    CTraderTokenBundle, CTraderTokenExchangeRequest,
-};
 use crate::app_services::ctrader_live_auth::{
-    build_default_loopback_config, CTraderAccountDiscoveryBackend,
-    CTraderAccountDiscoveryRequest, CTraderEnvironment, CTraderLiveAuthBackend,
-    CTraderLiveAuthRequest, CTraderLiveAuthResult, CTraderTokenRefreshRequest,
-    ProductionCTraderLiveAuthBackend, CTRADER_DEFAULT_SCOPE,
+    CTRADER_DEFAULT_SCOPE, CTraderAccountDiscoveryBackend, CTraderAccountDiscoveryRequest,
+    CTraderEnvironment, CTraderLiveAuthBackend, CTraderLiveAuthRequest, CTraderLiveAuthResult,
+    CTraderTokenRefreshRequest, ProductionCTraderLiveAuthBackend, build_default_loopback_config,
 };
 use crate::app_services::ctrader_messages::{
-    build_amend_order_request, build_cancel_order_request, build_close_position_request,
-    build_new_order_request, CTraderAmendOrderRequest, CTraderCancelOrderRequest,
-    CTraderClosePositionRequest, CTraderNewOrderRequest, CTraderOrderTriggerMethod,
-    CTraderOrderType, CTraderTimeInForce, CTraderTradeSide,
-    SUPPORTED_CTRADER_ORDER_TRIGGER_METHODS, SUPPORTED_CTRADER_ORDER_TYPES,
-    SUPPORTED_CTRADER_TIME_IN_FORCE, SUPPORTED_CTRADER_TRADE_SIDES,
+    CTraderAmendOrderRequest, CTraderCancelOrderRequest, CTraderClosePositionRequest,
+    CTraderNewOrderRequest, CTraderOrderTriggerMethod, CTraderOrderType, CTraderTimeInForce,
+    CTraderTradeSide, SUPPORTED_CTRADER_ORDER_TRIGGER_METHODS, SUPPORTED_CTRADER_ORDER_TYPES,
+    SUPPORTED_CTRADER_TIME_IN_FORCE, SUPPORTED_CTRADER_TRADE_SIDES, build_amend_order_request,
+    build_cancel_order_request, build_close_position_request, build_new_order_request,
 };
-use crate::app_services::ServiceEvent;
 use crate::app_services::ctrader_streaming::{
-    merge_live_spot_update_into_bars, CTraderLiveChartUpdate, CTraderLiveChartUpdateRequest,
-    CTraderLiveStreamingBackend, ProductionCTraderLiveStreamingBackend,
+    CTraderLiveChartUpdate, CTraderLiveChartUpdateRequest, CTraderLiveStreamingBackend,
+    ProductionCTraderLiveStreamingBackend, merge_live_spot_update_into_bars,
 };
+use crate::app_services::jobs::{JobEventLevel, JobKind, JobSnapshot, JobState, push_recent_event};
 use crate::app_services::secure_store::{
     CTraderSecureStore, CTraderTokenStore, KeyringSecretStoreBackend,
 };
 use crate::app_state::{AppState, DataSource, OrderTicketState};
-use forex_data::{discover_timeframes, load_symbol_timeframe, Ohlcv};
+use anyhow::Context;
 use forex_core::logging::write_subsystem_record;
 use forex_core::sectioned_log::SubsystemSection;
+use forex_data::{Ohlcv, discover_timeframes, load_symbol_timeframe};
 use mt5_bridge::{DealInfo, MT5Engine, PendingOrderInfo, PositionInfo};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::error;
 
@@ -224,11 +222,13 @@ pub struct TradingSession {
     trade_journal: Vec<String>,
     initial_equity: Option<f64>,
     day_start_equity: Option<f64>,
+    ctrader_runtime_refreshed_at: Option<Instant>,
     connect_handle: Option<std::thread::JoinHandle<()>>,
     bootstrap_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 enum TradingAdapter {
+    #[cfg_attr(not(test), allow(dead_code))]
     Mt5(MT5Engine),
     CTrader(CTraderAccountRuntimeSnapshot),
 }
@@ -281,6 +281,15 @@ struct CachedCTraderLiveSpotUpdate {
     update: CTraderLiveChartUpdate,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CTraderBootstrapContext {
+    client_id: String,
+    client_secret: String,
+    access_token: String,
+    environment: CTraderEnvironment,
+    account_id: String,
+}
+
 enum ExecutionFeedHandle<'a> {
     Mt5(&'a MT5Engine),
     CTrader(&'a CTraderAccountRuntimeSnapshot),
@@ -324,6 +333,9 @@ impl TradingSession {
             trade_journal: Vec::new(),
             initial_equity: None,
             day_start_equity: None,
+            ctrader_runtime_refreshed_at: None,
+            connect_handle: None,
+            bootstrap_handle: None,
         }
     }
 
@@ -351,8 +363,11 @@ impl TradingSession {
             execution_surface_cache: None,
             ctrader_live_spot_cache: None,
             trade_journal: Vec::new(),
-            initial_balance: None,
-            day_start_balance: None,
+            initial_equity: None,
+            day_start_equity: None,
+            ctrader_runtime_refreshed_at: None,
+            connect_handle: None,
+            bootstrap_handle: None,
         }
     }
 
@@ -470,31 +485,55 @@ impl TradingSession {
         years: u32,
         tx: tokio::sync::mpsc::Sender<ServiceEvent>,
     ) -> anyhow::Result<()> {
+        self.reap_finished_background_tasks();
         if symbols.is_empty() || timeframes.is_empty() {
             return Err(anyhow::anyhow!(
                 "bootstrap requires at least one symbol and one timeframe"
             ));
         }
-
-        // We need to clone state for the thread
+        if self.background_task_running(TaskKind::Bootstrap) {
+            return Err(anyhow::anyhow!("cTrader data bootstrap is already running"));
+        }
+        let context = self.resolve_ctrader_bootstrap_context()?;
         let mut snapshot = JobSnapshot::new(JobKind::Bootstrap);
         snapshot.state = JobState::Running;
-        
+        snapshot.progress.stage = "bootstrap_queued".to_string();
+        snapshot.progress.message = format!(
+            "Queued {} symbols across {} timeframes",
+            symbols.len(),
+            timeframes.len()
+        );
+
         let tx_clone = tx.clone();
         let _ = tx.blocking_send(ServiceEvent::BootstrapUpdated(snapshot.clone()));
 
         let handle = std::thread::spawn(move || {
-            let mut final_snapshot = snapshot;
-            final_snapshot.state = JobState::Running;
-            final_snapshot.progress.stage = "bootstrap_background".to_string();
-            final_snapshot.progress.message = "Running background fetch...".to_string();
-            let _ = tx_clone.blocking_send(ServiceEvent::BootstrapUpdated(final_snapshot.clone()));
-            
-            // Background thread execution of the original logic (simplified)
-            
-            final_snapshot.state = JobState::Succeeded;
-            final_snapshot.progress.stage = "bootstrap_succeeded".to_string();
-            final_snapshot.progress.message = "Done".to_string();
+            let mut running_snapshot = snapshot;
+            running_snapshot.state = JobState::Running;
+            running_snapshot.progress.stage = "bootstrap_running".to_string();
+            running_snapshot.progress.message =
+                "Fetching and normalizing historical data".to_string();
+            let _ =
+                tx_clone.blocking_send(ServiceEvent::BootstrapUpdated(running_snapshot.clone()));
+
+            let final_snapshot = match run_ctrader_bootstrap_batch_with_context(
+                &context,
+                &data_root,
+                &symbols,
+                &timeframes,
+                years,
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    let mut failed = running_snapshot;
+                    failed.state = JobState::Failed;
+                    failed.progress.stage = "bootstrap_failed".to_string();
+                    failed.progress.message = err.to_string();
+                    failed.report.summary = format!("Bootstrap failed: {err}");
+                    failed.report.errors.push(err.to_string());
+                    failed
+                }
+            };
             let _ = tx_clone.blocking_send(ServiceEvent::BootstrapUpdated(final_snapshot));
         });
         self.bootstrap_handle = Some(handle);
@@ -502,6 +541,7 @@ impl TradingSession {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn run_ctrader_bootstrap_batch_legacy(
         &mut self,
         data_root: &std::path::Path,
@@ -523,9 +563,18 @@ impl TradingSession {
             symbols.len(),
             timeframes.len()
         );
-        snapshot.report.counters.push(("requested_symbols".to_string(), symbols.len() as u64));
-        snapshot.report.counters.push(("requested_timeframes".to_string(), timeframes.len() as u64));
-        snapshot.report.counters.push(("requested_years".to_string(), years as u64));
+        snapshot
+            .report
+            .counters
+            .push(("requested_symbols".to_string(), symbols.len() as u64));
+        snapshot
+            .report
+            .counters
+            .push(("requested_timeframes".to_string(), timeframes.len() as u64));
+        snapshot
+            .report
+            .counters
+            .push(("requested_years".to_string(), years as u64));
 
         let total_requests = (symbols.len() * timeframes.len()) as u64;
         let mut completed = 0_u64;
@@ -539,12 +588,13 @@ impl TradingSession {
 
         for symbol in symbols {
             for timeframe in timeframes {
-                let planned_chunks = plan_bootstrap_chunks(now_ms, timeframe, years).with_context(|| {
-                    format!(
-                        "failed to plan cTrader bootstrap chunks for {} {} over {} years",
-                        symbol, timeframe, years
-                    )
-                })?;
+                let planned_chunks =
+                    plan_bootstrap_chunks(now_ms, timeframe, years).with_context(|| {
+                        format!(
+                            "failed to plan cTrader bootstrap chunks for {} {} over {} years",
+                            symbol, timeframe, years
+                        )
+                    })?;
                 snapshot.progress.stage = "bootstrap_fetch".to_string();
                 snapshot.progress.message = format!("Bootstrapping {symbol} {timeframe}");
                 snapshot.report.events = push_recent_event(
@@ -612,10 +662,22 @@ impl TradingSession {
             }
         }
 
-        snapshot.report.counters.push(("completed_requests".to_string(), completed));
-        snapshot.report.counters.push(("succeeded_requests".to_string(), successes));
-        snapshot.report.counters.push(("degraded_requests".to_string(), degraded));
-        snapshot.report.counters.push(("failed_requests".to_string(), failures));
+        snapshot
+            .report
+            .counters
+            .push(("completed_requests".to_string(), completed));
+        snapshot
+            .report
+            .counters
+            .push(("succeeded_requests".to_string(), successes));
+        snapshot
+            .report
+            .counters
+            .push(("degraded_requests".to_string(), degraded));
+        snapshot
+            .report
+            .counters
+            .push(("failed_requests".to_string(), failures));
         snapshot.report.highlights.push((
             "requests".to_string(),
             format!("{}/{} completed", completed, total_requests),
@@ -656,14 +718,12 @@ impl TradingSession {
         &mut self,
         code: impl Into<String>,
     ) -> CTraderAuthSnapshot {
-        let session = self
-            .ctrader_auth
-            .get_or_insert_with(|| {
-                CTraderAuthSession::new(
-                    self.broker_settings.ctrader.client_id.clone(),
-                    self.broker_settings.ctrader.redirect_uri.clone(),
-                )
-            });
+        let session = self.ctrader_auth.get_or_insert_with(|| {
+            CTraderAuthSession::new(
+                self.broker_settings.ctrader.client_id.clone(),
+                self.broker_settings.ctrader.redirect_uri.clone(),
+            )
+        });
         session.receive_authorization_code(code);
         session.snapshot()
     }
@@ -671,7 +731,12 @@ impl TradingSession {
     pub fn build_ctrader_token_exchange_request(
         &mut self,
     ) -> anyhow::Result<CTraderTokenExchangeRequest> {
-        let client_secret = self.broker_settings.ctrader.client_secret.trim().to_string();
+        let client_secret = self
+            .broker_settings
+            .ctrader
+            .client_secret
+            .trim()
+            .to_string();
         if client_secret.is_empty() {
             if let Some(session) = self.ctrader_auth.as_mut() {
                 session.mark_failed();
@@ -704,10 +769,19 @@ impl TradingSession {
 
     pub fn start_ctrader_live_auth(
         &mut self,
-        tx: tokio::sync::mpsc::Sender<crate::app_services::ServiceEvent>,
+        _tx: tokio::sync::mpsc::Sender<crate::app_services::ServiceEvent>,
     ) -> anyhow::Result<CTraderAuthSnapshot> {
+        self.reap_finished_background_tasks();
+        if self.ctrader_live_auth_rx.is_some() {
+            return Err(anyhow::anyhow!("cTrader live auth is already in progress"));
+        }
         let client_id = self.broker_settings.ctrader.client_id.trim().to_string();
-        let client_secret = self.broker_settings.ctrader.client_secret.trim().to_string();
+        let client_secret = self
+            .broker_settings
+            .ctrader
+            .client_secret
+            .trim()
+            .to_string();
         let redirect_uri = self.broker_settings.ctrader.redirect_uri.trim().to_string();
         if client_id.is_empty() || client_secret.is_empty() || redirect_uri.is_empty() {
             return Err(anyhow::anyhow!(
@@ -821,10 +895,9 @@ impl TradingSession {
     }
 
     pub fn discover_ctrader_accounts(&mut self) -> anyhow::Result<Option<CTraderAuthSnapshot>> {
-        let auth_state = self
-            .ctrader_auth
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("cTrader account discovery requires a restored token session"))?;
+        let auth_state = self.ctrader_auth.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("cTrader account discovery requires a restored token session")
+        })?;
         if !matches!(
             auth_state.snapshot().state,
             crate::app_services::ctrader_auth::CTraderAuthState::RestoredFromStorage
@@ -858,10 +931,9 @@ impl TradingSession {
             &result.accounts,
         );
         self.broker_settings.ctrader.accounts = synced_accounts.clone();
-        let session = self
-            .ctrader_auth
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("cTrader account discovery requires a restored token session"))?;
+        let session = self.ctrader_auth.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("cTrader account discovery requires a restored token session")
+        })?;
         session.set_discovered_accounts(sync_discovered_accounts_with_targets(
             &result.accounts,
             &self.broker_settings.ctrader.accounts,
@@ -936,8 +1008,7 @@ impl TradingSession {
                 && matches!(adapter_kind, TradingAdapterKind::CTrader)
                 && self.connected;
             if cache.key == cache_key
-                && (!is_live_ctrader_chart
-                    || cache.refreshed_at.elapsed() < Duration::from_secs(1))
+                && (!is_live_ctrader_chart || cache.refreshed_at.elapsed() < Duration::from_secs(1))
             {
                 return cache.snapshot.clone();
             }
@@ -957,7 +1028,11 @@ impl TradingSession {
                     resolved_timeframes,
                     overlay_status,
                 ),
-            _ => match load_symbol_timeframe(&state.runtime.data_dir, &state.selected_pair, &timeframe) {
+            _ => match load_symbol_timeframe(
+                &state.runtime.data_dir,
+                &state.selected_pair,
+                &timeframe,
+            ) {
                 Ok(ohlcv) => build_market_chart_snapshot_from_ohlcv(
                     &state.selected_pair,
                     &timeframe,
@@ -979,7 +1054,10 @@ impl TradingSession {
                     overlays: Vec::new(),
                     price_min: 0.0,
                     price_max: 0.0,
-                    headline: format!("No market data loaded for {} {}", state.selected_pair, timeframe),
+                    headline: format!(
+                        "No market data loaded for {} {}",
+                        state.selected_pair, timeframe
+                    ),
                     overlay_status,
                     warnings: vec![format!(
                         "Failed to load {} market data for {}: {}",
@@ -1014,7 +1092,10 @@ impl TradingSession {
         }
 
         let mut runtime_warnings = Vec::new();
-        let runtime = match self.execution_feed_handle(state).load_runtime_snapshot(&state.selected_pair, 24) {
+        let runtime = match self
+            .execution_feed_handle(state)
+            .load_runtime_snapshot(&state.selected_pair, 24)
+        {
             Ok(snapshot) => Some(snapshot),
             Err(err) => {
                 runtime_warnings.push(err.to_string());
@@ -1037,54 +1118,72 @@ impl TradingSession {
         snapshot
     }
 
-    pub fn start_connect(&mut self, tx: tokio::sync::mpsc::Sender<ServiceEvent>) -> anyhow::Result<()> {
+    pub fn start_connect(
+        &mut self,
+        tx: tokio::sync::mpsc::Sender<ServiceEvent>,
+    ) -> anyhow::Result<()> {
+        self.reap_finished_background_tasks();
+        if self.background_task_running(TaskKind::Connect) {
+            return Err(anyhow::anyhow!("connection attempt already in progress"));
+        }
         match self.configured_adapter {
             TradingAdapterKind::Mt5 => {
                 let mut engine = MT5Engine::new()?;
                 if engine.initialize()? {
-                    let _ = tx.blocking_send(ServiceEvent::ConnectOutcome(Ok("MT5 Connected".to_string())));
+                    let _ = tx.blocking_send(ServiceEvent::ConnectOutcome(Ok(
+                        "MT5 Connected".to_string()
+                    )));
                 } else {
-                    let _ = tx.blocking_send(ServiceEvent::ConnectOutcome(Err("MT5 Initialization failed".to_string())));
+                    let _ = tx.blocking_send(ServiceEvent::ConnectOutcome(Err(
+                        "MT5 Initialization failed".to_string(),
+                    )));
                 }
             }
             TradingAdapterKind::CTrader => {
                 let request = self.build_ctrader_account_runtime_request()?;
                 let backend = Arc::clone(&self.ctrader_account_runtime_backend);
-                let handle = std::thread::spawn(move || {
-                    match backend.load_account_runtime(&request) {
+                let handle =
+                    std::thread::spawn(move || match backend.load_account_runtime(&request) {
                         Ok(runtime) => {
                             let _ = tx.blocking_send(ServiceEvent::CTraderConnectUpdated(runtime));
                         }
                         Err(err) => {
-                            let _ = tx.blocking_send(ServiceEvent::ConnectOutcome(Err(err.to_string())));
+                            let _ = tx
+                                .blocking_send(ServiceEvent::ConnectOutcome(Err(err.to_string())));
                         }
-                    }
-                });
+                    });
                 self.connect_handle = Some(handle);
             }
             _ => {
-                 let _ = tx.blocking_send(ServiceEvent::ConnectOutcome(Err(format!("Adapter {:?} not implemented", self.configured_adapter))));
+                let _ = tx.blocking_send(ServiceEvent::ConnectOutcome(Err(format!(
+                    "Adapter {:?} not implemented",
+                    self.configured_adapter
+                ))));
             }
         }
         Ok(())
     }
 
-    pub fn handle_ctrader_connect_result(&mut self, state: &mut AppState, runtime: CTraderAccountRuntimeSnapshot) {
+    pub fn handle_ctrader_connect_result(
+        &mut self,
+        state: &mut AppState,
+        runtime: CTraderAccountRuntimeSnapshot,
+    ) {
         self.connected = true;
+        self.ctrader_runtime_refreshed_at = Some(Instant::now());
         self.terminal_info =
             format_ctrader_terminal_info(&runtime.trader, self.selected_ctrader_environment());
         if self.initial_equity.is_none() {
             self.initial_equity = Some(runtime.trader.balance);
         }
-        self.day_start_equity = Some(
-            self.day_start_equity.unwrap_or(runtime.trader.balance),
-        );
+        self.day_start_equity = Some(self.day_start_equity.unwrap_or(runtime.trader.balance));
         self.adapter = Some(TradingAdapter::CTrader(runtime));
         self.market_chart_cache = None;
         self.execution_surface_cache = None;
         state.status_msg = "cTrader connected".to_string();
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn connect(&mut self, state: &mut AppState) {
         let readiness = self.adapter_readiness();
         match self.configured_adapter {
@@ -1101,7 +1200,11 @@ impl TradingSession {
                             .unwrap_or_default();
                         self.market_chart_cache = None;
                         self.execution_surface_cache = None;
-                        record_app_event("ui_mt5_connect", "SUCCESS", "UI MT5 connection succeeded");
+                        record_app_event(
+                            "ui_mt5_connect",
+                            "SUCCESS",
+                            "UI MT5 connection succeeded",
+                        );
                     }
                     _ => {
                         self.reset_connection_state();
@@ -1145,14 +1248,15 @@ impl TradingSession {
                 match self.load_ctrader_account_runtime() {
                     Ok(runtime) => {
                         self.connected = true;
-                        self.terminal_info =
-                            format_ctrader_terminal_info(&runtime.trader, self.selected_ctrader_environment());
+                        self.terminal_info = format_ctrader_terminal_info(
+                            &runtime.trader,
+                            self.selected_ctrader_environment(),
+                        );
                         if self.initial_equity.is_none() {
                             self.initial_equity = Some(runtime.trader.balance); // Fixed: Initial eq is balance + 0
                         }
-                        self.day_start_equity = Some(
-                            self.day_start_equity.unwrap_or(runtime.trader.balance),
-                        );
+                        self.day_start_equity =
+                            Some(self.day_start_equity.unwrap_or(runtime.trader.balance));
                         self.adapter = Some(TradingAdapter::CTrader(runtime));
                         self.market_chart_cache = None;
                         self.execution_surface_cache = None;
@@ -1223,8 +1327,13 @@ impl TradingSession {
 
     pub fn cancel_selected_order(&mut self, state: &mut AppState) {
         let Some(order_id) = state.order_ticket.selected_order_id.or_else(|| {
-            self.connected_ctrader_runtime()
-                .and_then(|runtime| runtime.reconcile.pending_orders.first().map(|order| order.order_id))
+            self.connected_ctrader_runtime().and_then(|runtime| {
+                runtime
+                    .reconcile
+                    .pending_orders
+                    .first()
+                    .map(|order| order.order_id)
+            })
         }) else {
             let message = "No pending cTrader order is selected for cancellation.".to_string();
             state.status_msg = message.clone();
@@ -1236,7 +1345,8 @@ impl TradingSession {
         match self.execute_ctrader_request(
             state,
             CTraderExecutionRequest::CancelOrder(CTraderCancelOrderRequest {
-                account_id: self.selected_ctrader_execution_account_id()
+                account_id: self
+                    .selected_ctrader_execution_account_id()
                     .and_then(|id| id.parse::<i64>().ok())
                     .unwrap_or_default(),
                 order_id,
@@ -1258,8 +1368,13 @@ impl TradingSession {
 
     pub fn close_selected_position(&mut self, state: &mut AppState) {
         let Some(position_id) = state.order_ticket.selected_position_id.or_else(|| {
-            self.connected_ctrader_runtime()
-                .and_then(|runtime| runtime.reconcile.positions.first().map(|position| position.position_id))
+            self.connected_ctrader_runtime().and_then(|runtime| {
+                runtime
+                    .reconcile
+                    .positions
+                    .first()
+                    .map(|position| position.position_id)
+            })
         }) else {
             let message = "No open cTrader position is selected for closing.".to_string();
             state.status_msg = message.clone();
@@ -1270,10 +1385,17 @@ impl TradingSession {
 
         let Some(volume) = self
             .connected_ctrader_runtime()
-            .and_then(|runtime| runtime.reconcile.positions.iter().find(|position| position.position_id == position_id))
+            .and_then(|runtime| {
+                runtime
+                    .reconcile
+                    .positions
+                    .iter()
+                    .find(|position| position.position_id == position_id)
+            })
             .map(|position| position.volume)
         else {
-            let message = format!("Selected cTrader position #{position_id} is no longer available.");
+            let message =
+                format!("Selected cTrader position #{position_id} is no longer available.");
             state.status_msg = message.clone();
             self.append_trade_journal(message.clone());
             record_app_event("ctrader_close_position", "FAILED", message);
@@ -1283,7 +1405,8 @@ impl TradingSession {
         match self.execute_ctrader_request(
             state,
             CTraderExecutionRequest::ClosePosition(CTraderClosePositionRequest {
-                account_id: self.selected_ctrader_execution_account_id()
+                account_id: self
+                    .selected_ctrader_execution_account_id()
                     .and_then(|id| id.parse::<i64>().ok())
                     .unwrap_or_default(),
                 position_id,
@@ -1363,12 +1486,16 @@ impl TradingSession {
                 reason: "Execution feed is unavailable in Local mode.".to_string(),
             },
             DataSource::MT5 => match &self.adapter {
-                Some(TradingAdapter::Mt5(engine)) if self.connected => ExecutionFeedHandle::Mt5(engine),
+                Some(TradingAdapter::Mt5(engine)) if self.connected => {
+                    ExecutionFeedHandle::Mt5(engine)
+                }
                 Some(TradingAdapter::CTrader(runtime)) if self.connected => {
                     ExecutionFeedHandle::CTrader(runtime)
                 }
                 _ => ExecutionFeedHandle::Unavailable {
-                    reason: self.active_adapter_kind().execution_feed_unavailable_reason(self.connected),
+                    reason: self
+                        .active_adapter_kind()
+                        .execution_feed_unavailable_reason(self.connected),
                 },
             },
         }
@@ -1381,13 +1508,16 @@ impl TradingSession {
         self.market_chart_cache = None;
         self.execution_surface_cache = None;
         self.ctrader_live_spot_cache = None;
+        self.ctrader_runtime_refreshed_at = None;
     }
 
     fn execute_ctrader_order(&mut self, state: &mut AppState, side: CTraderTradeSide) {
         match self.build_ctrader_order_request(state, side) {
             Ok(order_request) => {
                 let account_equity = self.ctrader_account_equity();
-                let pip_position = self.ctrader_symbol_pip_position(&state.selected_pair).unwrap_or(4);
+                let pip_position = self
+                    .ctrader_symbol_pip_position(&state.selected_pair)
+                    .unwrap_or(4);
                 if let Err(err) = prop_firm_pre_trade_check(
                     &state.risk,
                     &order_request,
@@ -1442,9 +1572,7 @@ impl TradingSession {
             ));
         }
         if !self.connected {
-            return Err(anyhow::anyhow!(
-                "cTrader runtime is not connected"
-            ));
+            return Err(anyhow::anyhow!("cTrader runtime is not connected"));
         }
 
         let runtime_request = self.build_ctrader_execution_runtime_request(request.clone())?;
@@ -1464,7 +1592,8 @@ impl TradingSession {
             journal_line,
         );
         if let Err(err) = self.refresh_ctrader_runtime_after_execution() {
-            let message = format!("cTrader execution succeeded but runtime refresh degraded: {err}");
+            let message =
+                format!("cTrader execution succeeded but runtime refresh degraded: {err}");
             self.append_trade_journal(message.clone());
             state.status_msg = message.clone();
             record_app_event("ctrader_order_execution_refresh", "DEGRADED", message);
@@ -1479,7 +1608,12 @@ impl TradingSession {
         request: CTraderExecutionRequest,
     ) -> anyhow::Result<CTraderExecutionRuntimeRequest> {
         let client_id = self.broker_settings.ctrader.client_id.trim().to_string();
-        let client_secret = self.broker_settings.ctrader.client_secret.trim().to_string();
+        let client_secret = self
+            .broker_settings
+            .ctrader
+            .client_secret
+            .trim()
+            .to_string();
         if client_id.is_empty() || client_secret.is_empty() {
             return Err(anyhow::anyhow!(
                 "cTrader execution requires configured client_id and client_secret"
@@ -1490,7 +1624,9 @@ impl TradingSession {
             .access_token;
         let account_id = self
             .selected_ctrader_execution_account_id()
-            .ok_or_else(|| anyhow::anyhow!("cTrader execution requires a selected discovered account"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("cTrader execution requires a selected discovered account")
+            })?;
         Ok(CTraderExecutionRuntimeRequest {
             client_id,
             client_secret,
@@ -1501,7 +1637,7 @@ impl TradingSession {
         })
     }
 
-    fn calculate_smart_atr_in_points(&self, state: &AppState, symbol_name: &str) -> Option<i64> {
+    fn calculate_smart_atr_in_points(&self, _state: &AppState, symbol_name: &str) -> Option<i64> {
         let cache_entry = self.market_chart_cache.as_ref()?;
         let chart = &cache_entry.snapshot;
         if chart.candles.len() < 14 {
@@ -1519,11 +1655,11 @@ impl TradingSession {
             tr_sum += tr;
         }
         let atr = tr_sum / 13.0; // simple average of the 13 computed TRs
-        
+
         // Convert ATR price delta into points (pipettes)
         let pip_position = self.ctrader_symbol_pip_position(symbol_name).unwrap_or(4);
         let point_multiplier = 10f64.powi(pip_position + 1);
-        
+
         let atr_points = atr * point_multiplier;
         Some(atr_points as i64)
     }
@@ -1534,27 +1670,37 @@ impl TradingSession {
         side: CTraderTradeSide,
     ) -> anyhow::Result<CTraderNewOrderRequest> {
         let resolved = self.resolve_selected_ctrader_symbol(&state.selected_pair)?;
-        let protocol_volume =
-            validate_and_convert_lot_size_to_ctrader_volume(&state.order_ticket, state.risk.max_lot_size as f64, &resolved.symbol)?;
-            
+        let protocol_volume = validate_and_convert_lot_size_to_ctrader_volume(
+            &state.order_ticket,
+            state.risk.max_lot_size,
+            &resolved.symbol,
+        )?;
+
         let mut relative_stop_loss = None;
         let mut relative_take_profit = None;
 
         if state.order_ticket.smart_sl_enabled {
-            if let Some(atr_points) = self.calculate_smart_atr_in_points(state, &state.selected_pair) {
+            if let Some(atr_points) =
+                self.calculate_smart_atr_in_points(state, &state.selected_pair)
+            {
                 // Calculate based on dynamic volatility
                 let sl_mult = 1.5;
                 let tp_mult = sl_mult * state.order_ticket.smart_rr_ratio; // standard RR 2.0 -> SL=1.5x, TP=3.0x
-                
+
                 relative_stop_loss = Some((atr_points as f64 * sl_mult) as i64);
                 relative_take_profit = Some((atr_points as f64 * tp_mult) as i64);
-                
+
                 tracing::info!(
-                    "Smart SL applied: ATR={}pts, SL={:?}, TP={:?} (RR={})", 
-                    atr_points, relative_stop_loss, relative_take_profit, state.order_ticket.smart_rr_ratio
+                    "Smart SL applied: ATR={}pts, SL={:?}, TP={:?} (RR={})",
+                    atr_points,
+                    relative_stop_loss,
+                    relative_take_profit,
+                    state.order_ticket.smart_rr_ratio
                 );
             } else {
-                tracing::warn!("Smart SL requested but not enough trailing candles for ATR. Sending order without SL/TP bounds or falling back to defaults.");
+                tracing::warn!(
+                    "Smart SL requested but not enough trailing candles for ATR. Sending order without SL/TP bounds or falling back to defaults."
+                );
             }
         }
 
@@ -1597,7 +1743,7 @@ impl TradingSession {
             relative_stop_loss,
             relative_take_profit,
             guaranteed_stop_loss: None,
-            trailing_stop_loss: state.order_ticket.trailing_stop.then(|| true),
+            trailing_stop_loss: state.order_ticket.trailing_stop.then_some(true),
             stop_trigger_method: None,
         })
     }
@@ -1607,18 +1753,27 @@ impl TradingSession {
         symbol_name: &str,
     ) -> anyhow::Result<crate::app_services::ctrader_data::CTraderResolvedSymbol> {
         let client_id = self.broker_settings.ctrader.client_id.trim().to_string();
-        let client_secret = self.broker_settings.ctrader.client_secret.trim().to_string();
+        let client_secret = self
+            .broker_settings
+            .ctrader
+            .client_secret
+            .trim()
+            .to_string();
         if client_id.is_empty() || client_secret.is_empty() {
             return Err(anyhow::anyhow!(
                 "cTrader symbol resolution requires configured client_id and client_secret"
             ));
         }
         let access_token = self
-            .ensure_fresh_ctrader_token_bundle("cTrader symbol resolution requires a stored token bundle")?
+            .ensure_fresh_ctrader_token_bundle(
+                "cTrader symbol resolution requires a stored token bundle",
+            )?
             .access_token;
         let account_id = self
             .selected_ctrader_execution_account_id()
-            .ok_or_else(|| anyhow::anyhow!("cTrader symbol resolution requires a selected discovered account"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("cTrader symbol resolution requires a selected discovered account")
+            })?;
         resolve_symbol(&CTraderSymbolLookupRequest {
             client_id,
             client_secret,
@@ -1630,10 +1785,11 @@ impl TradingSession {
     }
 
     fn ctrader_account_equity(&self) -> f64 {
-        let balance = self.connected_ctrader_runtime()
+        let balance = self
+            .connected_ctrader_runtime()
             .map(|r| r.trader.balance)
             .unwrap_or(0.0);
-        
+
         // Simple approximation for now: balance + sum(positions.profit)
         // A more complex implementation would look up live spots for each symbol.
         // For a desktop terminal, this is usually updated by the live spot stream.
@@ -1643,41 +1799,50 @@ impl TradingSession {
     fn ctrader_symbol_pip_position(&self, _symbol: &str) -> Option<i32> {
         // In a real implementation, this would lookup symbol metadata.
         // For common Forex pairs, it's 4. JPY is 2.
-        if _symbol.contains("JPY") {
-            Some(2)
-        } else if _symbol.contains("XAU") {
+        if _symbol.contains("JPY") || _symbol.contains("XAU") {
             Some(2)
         } else {
             Some(4)
         }
     }
 
-
-
     pub fn refresh_runtime(&mut self, state: &mut AppState) -> anyhow::Result<()> {
         if !self.connected {
             return Ok(());
         }
-        
-        // Use the existing logic but update AppState too
-        let runtime = self.load_ctrader_account_runtime()?;
-        self.terminal_info =
-            format_ctrader_terminal_info(&runtime.trader, self.selected_ctrader_environment());
-        
-        // Update AppState equity/balance
-        state.account_balance = runtime.trader.balance;
-        state.account_equity = self.calculate_equity_from_runtime(&runtime);
-        
-        self.adapter = Some(TradingAdapter::CTrader(runtime));
-        self.execution_surface_cache = None;
-        Ok(())
+        match &self.adapter {
+            Some(TradingAdapter::Mt5(engine)) => {
+                self.terminal_info = engine.terminal_info().unwrap_or_default();
+                Ok(())
+            }
+            Some(TradingAdapter::CTrader(_)) => {
+                if self
+                    .ctrader_runtime_refreshed_at
+                    .is_some_and(|refreshed_at| refreshed_at.elapsed() < Duration::from_secs(30))
+                {
+                    return Ok(());
+                }
+
+                let runtime = self.load_ctrader_account_runtime()?;
+                self.terminal_info = format_ctrader_terminal_info(
+                    &runtime.trader,
+                    self.selected_ctrader_environment(),
+                );
+                state.account_balance = runtime.trader.balance;
+                state.account_equity = self.calculate_equity_from_runtime(&runtime);
+                self.adapter = Some(TradingAdapter::CTrader(runtime));
+                self.ctrader_runtime_refreshed_at = Some(Instant::now());
+                self.execution_surface_cache = None;
+                Ok(())
+            }
+            None => Ok(()),
+        }
     }
 
     fn calculate_equity_from_runtime(&self, runtime: &CTraderAccountRuntimeSnapshot) -> f64 {
-        let equity = runtime.trader.balance;
         // In a real implementation, we'd sum up floating P&L from reconcile.positions.
         // For now, we use balance as the floor.
-        equity
+        runtime.trader.balance
     }
 
     fn refresh_ctrader_runtime_after_execution(&mut self) -> anyhow::Result<()> {
@@ -1686,6 +1851,7 @@ impl TradingSession {
             format_ctrader_terminal_info(&runtime.trader, self.selected_ctrader_environment());
         self.adapter = Some(TradingAdapter::CTrader(runtime));
         self.connected = true;
+        self.ctrader_runtime_refreshed_at = Some(Instant::now());
         self.execution_surface_cache = None;
         Ok(())
     }
@@ -1723,18 +1889,18 @@ impl TradingSession {
                             history.symbol.symbol_id,
                             history.symbol.digits,
                         ) {
-                            Ok(live_request) => match self
-                                .load_ctrader_live_chart_update_cached(&live_request)
-                            {
-                                Ok(update) => Some(update),
-                                Err(err) => {
-                                    warnings.push(format!(
-                                        "Failed to load cTrader live {} update for {}: {}",
-                                        timeframe, symbol, err
-                                    ));
-                                    None
+                            Ok(live_request) => {
+                                match self.load_ctrader_live_chart_update_cached(&live_request) {
+                                    Ok(update) => Some(update),
+                                    Err(err) => {
+                                        warnings.push(format!(
+                                            "Failed to load cTrader live {} update for {}: {}",
+                                            timeframe, symbol, err
+                                        ));
+                                        None
+                                    }
                                 }
-                            },
+                            }
                             Err(err) => {
                                 warnings.push(format!(
                                     "cTrader live {} update is unavailable for {}: {}",
@@ -1747,7 +1913,8 @@ impl TradingSession {
                         None
                     };
 
-                    let bars = merge_live_spot_update_into_bars(&history.bars, live_update.as_ref());
+                    let bars =
+                        merge_live_spot_update_into_bars(&history.bars, live_update.as_ref());
 
                     let mut snapshot = build_market_chart_snapshot_from_historical_bars(
                         &history.symbol.symbol_name,
@@ -1760,7 +1927,9 @@ impl TradingSession {
                     .with_overlay_status(overlay_status);
                     if let Some(update) = live_update {
                         let quote_line = match (update.bid, update.ask) {
-                            (Some(bid), Some(ask)) => format!(" · live tick bid {:.5} · ask {:.5}", bid, ask),
+                            (Some(bid), Some(ask)) => {
+                                format!(" · live tick bid {:.5} · ask {:.5}", bid, ask)
+                            }
                             (Some(bid), None) => format!(" · live tick bid {:.5}", bid),
                             (None, Some(ask)) => format!(" · live tick ask {:.5}", ask),
                             (None, None) => String::new(),
@@ -1839,7 +2008,12 @@ impl TradingSession {
         timeframe: &str,
     ) -> anyhow::Result<CTraderChartHistoryRequest> {
         let client_id = self.broker_settings.ctrader.client_id.trim().to_string();
-        let client_secret = self.broker_settings.ctrader.client_secret.trim().to_string();
+        let client_secret = self
+            .broker_settings
+            .ctrader
+            .client_secret
+            .trim()
+            .to_string();
         if client_id.is_empty() || client_secret.is_empty() {
             return Err(anyhow::anyhow!(
                 "cTrader chart history requires configured client_id and client_secret"
@@ -1847,12 +2021,14 @@ impl TradingSession {
         }
 
         let access_token = self
-            .ensure_fresh_ctrader_token_bundle("cTrader chart history requires a stored token bundle")?
+            .ensure_fresh_ctrader_token_bundle(
+                "cTrader chart history requires a stored token bundle",
+            )?
             .access_token;
 
-        let account_id = self
-            .selected_ctrader_chart_account_id()
-            .ok_or_else(|| anyhow::anyhow!("cTrader chart history requires at least one discovered account"))?;
+        let account_id = self.selected_ctrader_chart_account_id().ok_or_else(|| {
+            anyhow::anyhow!("cTrader chart history requires at least one discovered account")
+        })?;
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1919,14 +2095,20 @@ impl TradingSession {
 
     fn load_ctrader_account_runtime(&mut self) -> anyhow::Result<CTraderAccountRuntimeSnapshot> {
         let request = self.build_ctrader_account_runtime_request()?;
-        self.ctrader_account_runtime_backend.load_account_runtime(&request)
+        self.ctrader_account_runtime_backend
+            .load_account_runtime(&request)
     }
 
     fn build_ctrader_account_runtime_request(
         &mut self,
     ) -> anyhow::Result<CTraderAccountRuntimeRequest> {
         let client_id = self.broker_settings.ctrader.client_id.trim().to_string();
-        let client_secret = self.broker_settings.ctrader.client_secret.trim().to_string();
+        let client_secret = self
+            .broker_settings
+            .ctrader
+            .client_secret
+            .trim()
+            .to_string();
         if client_id.is_empty() || client_secret.is_empty() {
             return Err(anyhow::anyhow!(
                 "cTrader account runtime requires configured client_id and client_secret"
@@ -1955,9 +2137,11 @@ impl TradingSession {
             .ensure_fresh_ctrader_token_bundle("cTrader connect requires a stored token bundle")?
             .access_token;
 
-        let account_id = self.selected_ctrader_execution_account_id().ok_or_else(|| {
-            anyhow::anyhow!("cTrader account runtime requires at least one discovered account")
-        })?;
+        let account_id = self
+            .selected_ctrader_execution_account_id()
+            .ok_or_else(|| {
+                anyhow::anyhow!("cTrader account runtime requires at least one discovered account")
+            })?;
 
         Ok(CTraderAccountRuntimeRequest {
             client_id,
@@ -1967,6 +2151,51 @@ impl TradingSession {
             account_id,
             return_protection_orders: true,
         })
+    }
+
+    fn resolve_ctrader_bootstrap_context(&mut self) -> anyhow::Result<CTraderBootstrapContext> {
+        let request = self.build_ctrader_account_runtime_request()?;
+        Ok(CTraderBootstrapContext {
+            client_id: request.client_id,
+            client_secret: request.client_secret,
+            access_token: request.access_token,
+            environment: request.environment,
+            account_id: request.account_id,
+        })
+    }
+
+    fn background_task_running(&self, kind: TaskKind) -> bool {
+        match kind {
+            TaskKind::Connect => self
+                .connect_handle
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished()),
+            TaskKind::Bootstrap => self
+                .bootstrap_handle
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished()),
+        }
+    }
+
+    fn reap_finished_background_tasks(&mut self) {
+        if self
+            .connect_handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+        {
+            if let Some(handle) = self.connect_handle.take() {
+                let _ = handle.join();
+            }
+        }
+        if self
+            .bootstrap_handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+        {
+            if let Some(handle) = self.bootstrap_handle.take() {
+                let _ = handle.join();
+            }
+        }
     }
 
     fn selected_ctrader_execution_account_id(&self) -> Option<String> {
@@ -1984,7 +2213,12 @@ impl TradingSession {
         missing_bundle_message: &str,
     ) -> anyhow::Result<CTraderTokenBundle> {
         let client_id = self.broker_settings.ctrader.client_id.trim().to_string();
-        let client_secret = self.broker_settings.ctrader.client_secret.trim().to_string();
+        let client_secret = self
+            .broker_settings
+            .ctrader
+            .client_secret
+            .trim()
+            .to_string();
         if client_id.is_empty() || client_secret.is_empty() {
             return Err(anyhow::anyhow!(
                 "cTrader token refresh requires configured client_id and client_secret"
@@ -2000,17 +2234,19 @@ impl TradingSession {
             return Ok(bundle);
         }
 
-        let refreshed_bundle = self
-            .ctrader_live_auth_backend
-            .refresh_token_bundle(&CTraderTokenRefreshRequest {
-                client_id,
-                client_secret,
-                refresh_token: bundle.refresh_token.clone(),
-                scope: bundle.scope.clone(),
-            })?;
+        let refreshed_bundle =
+            self.ctrader_live_auth_backend
+                .refresh_token_bundle(&CTraderTokenRefreshRequest {
+                    client_id,
+                    client_secret,
+                    refresh_token: bundle.refresh_token.clone(),
+                    scope: bundle.scope.clone(),
+                })?;
         self.ctrader_token_store
             .save_token_bundle(&refreshed_bundle)
-            .map_err(|err| anyhow::anyhow!("failed to persist refreshed cTrader token bundle: {err}"))?;
+            .map_err(|err| {
+                anyhow::anyhow!("failed to persist refreshed cTrader token bundle: {err}")
+            })?;
         if let Some(session) = self.ctrader_auth.as_mut() {
             session.replace_persisted_token_bundle(refreshed_bundle.clone());
         }
@@ -2044,10 +2280,184 @@ impl Default for TradingSession {
             trade_journal: Vec::new(),
             initial_equity: None,
             day_start_equity: None,
+            ctrader_runtime_refreshed_at: None,
             connect_handle: None,
             bootstrap_handle: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskKind {
+    Connect,
+    Bootstrap,
+}
+
+fn run_ctrader_bootstrap_batch_with_context(
+    context: &CTraderBootstrapContext,
+    data_root: &std::path::Path,
+    symbols: &[String],
+    timeframes: &[String],
+    years: u32,
+) -> anyhow::Result<JobSnapshot> {
+    if symbols.is_empty() || timeframes.is_empty() {
+        return Err(anyhow::anyhow!(
+            "bootstrap requires at least one symbol and one timeframe"
+        ));
+    }
+
+    let mut snapshot = JobSnapshot::new(JobKind::Bootstrap);
+    snapshot.state = JobState::Running;
+    snapshot.progress.stage = "bootstrap_planning".to_string();
+    snapshot.progress.message = format!(
+        "Preparing {} symbols across {} timeframes",
+        symbols.len(),
+        timeframes.len()
+    );
+    snapshot
+        .report
+        .counters
+        .push(("requested_symbols".to_string(), symbols.len() as u64));
+    snapshot
+        .report
+        .counters
+        .push(("requested_timeframes".to_string(), timeframes.len() as u64));
+    snapshot
+        .report
+        .counters
+        .push(("requested_years".to_string(), years as u64));
+
+    let total_requests = (symbols.len() * timeframes.len()) as u64;
+    let mut completed = 0_u64;
+    let mut successes = 0_u64;
+    let mut degraded = 0_u64;
+    let mut failures = 0_u64;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| anyhow::anyhow!("system clock is before unix epoch"))?
+        .as_millis() as i64;
+
+    for symbol in symbols {
+        for timeframe in timeframes {
+            let planned_chunks =
+                plan_bootstrap_chunks(now_ms, timeframe, years).with_context(|| {
+                    format!(
+                        "failed to plan cTrader bootstrap chunks for {} {} over {} years",
+                        symbol, timeframe, years
+                    )
+                })?;
+            snapshot.progress.stage = "bootstrap_fetch".to_string();
+            snapshot.progress.message = format!("Bootstrapping {symbol} {timeframe}");
+            snapshot.report.events = push_recent_event(
+                &snapshot.report.events,
+                JobEventLevel::Info,
+                format!(
+                    "bootstrap started for {symbol} {timeframe} with {} planned chunks",
+                    planned_chunks.len()
+                ),
+            );
+
+            let request = CTraderChartHistoryRequest {
+                client_id: context.client_id.clone(),
+                client_secret: context.client_secret.clone(),
+                access_token: context.access_token.clone(),
+                environment: context.environment,
+                account_id: context.account_id.clone(),
+                symbol_name: symbol.clone(),
+                timeframe: timeframe.clone(),
+                from_timestamp_ms: now_ms,
+                to_timestamp_ms: now_ms,
+                count: None,
+            };
+            let outcome = bootstrap_from_ctrader_history(data_root, &request, now_ms, years);
+            completed += 1;
+            snapshot.progress.percent = Some(completed as f32 / total_requests as f32);
+
+            match outcome {
+                Ok(outcome) => {
+                    let missing_segments = outcome.coverage.missing_segments.len();
+                    if outcome.coverage.fully_covered {
+                        successes += 1;
+                    } else {
+                        degraded += 1;
+                        snapshot.report.warnings.push(format!(
+                            "{} {} has {} uncovered segments after bootstrap",
+                            symbol, timeframe, missing_segments
+                        ));
+                    }
+                    snapshot.report.entries.push(format!(
+                        "{} {} | planned_chunks={} | bars_written={} | covered_segments={} | missing_segments={}",
+                        symbol,
+                        timeframe,
+                        planned_chunks.len(),
+                        outcome.bars_written,
+                        outcome.coverage.covered_segments.len(),
+                        missing_segments
+                    ));
+                    snapshot.report.events = push_recent_event(
+                        &snapshot.report.events,
+                        if outcome.coverage.fully_covered {
+                            JobEventLevel::Info
+                        } else {
+                            JobEventLevel::Warning
+                        },
+                        format!(
+                            "bootstrap finished for {symbol} {timeframe} with {} covered segments",
+                            outcome.coverage.covered_segments.len()
+                        ),
+                    );
+                }
+                Err(err) => {
+                    failures += 1;
+                    snapshot
+                        .report
+                        .errors
+                        .push(format!("{symbol} {timeframe}: {err}"));
+                    snapshot.report.events = push_recent_event(
+                        &snapshot.report.events,
+                        JobEventLevel::Error,
+                        format!("bootstrap failed for {symbol} {timeframe}: {err}"),
+                    );
+                }
+            }
+        }
+    }
+
+    snapshot
+        .report
+        .counters
+        .push(("completed_requests".to_string(), completed));
+    snapshot
+        .report
+        .counters
+        .push(("succeeded_requests".to_string(), successes));
+    snapshot
+        .report
+        .counters
+        .push(("degraded_requests".to_string(), degraded));
+    snapshot
+        .report
+        .counters
+        .push(("failed_requests".to_string(), failures));
+    snapshot.report.highlights.push((
+        "requests".to_string(),
+        format!("{}/{} completed", completed, total_requests),
+    ));
+    snapshot.report.summary = format!(
+        "Bootstrap finished: {} succeeded, {} degraded, {} failed",
+        successes, degraded, failures
+    );
+    snapshot.report.log_path = Some("logs/forex-ai.log".to_string());
+    snapshot.state = if failures == total_requests {
+        JobState::Failed
+    } else if failures > 0 || degraded > 0 {
+        JobState::Degraded
+    } else {
+        JobState::Succeeded
+    };
+    snapshot.progress.stage = "bootstrap_complete".to_string();
+    snapshot.progress.message = snapshot.report.summary.clone();
+    Ok(snapshot)
 }
 
 impl TradingAdapter {
@@ -2058,6 +2468,7 @@ impl TradingAdapter {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn terminal_info(&self) -> String {
         match self {
             Self::Mt5(engine) => engine.terminal_info().unwrap_or_default(),
@@ -2162,10 +2573,12 @@ pub fn panel_mode(data_source: DataSource, connected: bool) -> TradingPanelMode 
 const MAX_CHART_CANDLES: usize = 96;
 
 fn supported_ctrader_chart_timeframes() -> Vec<String> {
-    ["M1", "M2", "M3", "M4", "M5", "M10", "M15", "M30", "H1", "H4", "H12", "D1", "W1", "MN1"]
-        .into_iter()
-        .map(str::to_string)
-        .collect()
+    [
+        "M1", "M2", "M3", "M4", "M5", "M10", "M15", "M30", "H1", "H4", "H12", "D1", "W1", "MN1",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 fn chart_history_window_ms(timeframe: &str) -> Option<i64> {
@@ -2246,12 +2659,17 @@ pub fn build_market_chart_snapshot_from_ohlcv(
     let (price_min, price_max) = if candles.is_empty() {
         (0.0, 0.0)
     } else {
-        candles.iter().fold((f64::MAX, f64::MIN), |(min_v, max_v), candle| {
-            (min_v.min(candle.low), max_v.max(candle.high))
-        })
+        candles
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(min_v, max_v), candle| {
+                (min_v.min(candle.low), max_v.max(candle.high))
+            })
     };
 
-    let latest_close = candles.last().map(|candle| candle.close).unwrap_or_default();
+    let latest_close = candles
+        .last()
+        .map(|candle| candle.close)
+        .unwrap_or_default();
     let headline = if candles.is_empty() {
         format!("No candles loaded for {symbol} {timeframe}")
     } else {
@@ -2273,8 +2691,8 @@ pub fn build_market_chart_snapshot_from_ohlcv(
         price_min,
         price_max,
         headline,
-        overlay_status:
-            "Trade overlays will appear here once execution events are available.".to_string(),
+        overlay_status: "Trade overlays will appear here once execution events are available."
+            .to_string(),
         warnings,
     }
 }
@@ -2286,7 +2704,9 @@ pub fn build_execution_surface_snapshot_with_runtime(
     mut runtime_warnings: Vec<String>,
 ) -> ExecutionSurfaceSnapshot {
     let action_reason = match connection.mode {
-        TradingPanelMode::LocalOnly => Some("Local mode disables live order submission.".to_string()),
+        TradingPanelMode::LocalOnly => {
+            Some("Local mode disables live order submission.".to_string())
+        }
         TradingPanelMode::Disconnected => {
             Some("Connect a broker adapter before sending live orders.".to_string())
         }
@@ -2359,8 +2779,14 @@ pub fn build_execution_surface_snapshot_with_runtime(
         ));
     }
 
-    let (positions, pending_orders, bot_timeline, history_rows, position_choices, pending_order_choices) =
-        if let Some(runtime) = runtime {
+    let (
+        positions,
+        pending_orders,
+        bot_timeline,
+        history_rows,
+        position_choices,
+        pending_order_choices,
+    ) = if let Some(runtime) = runtime {
         match runtime {
             AppExecutionRuntimeSnapshot::Mt5(runtime) => {
                 diagnostics.push(format!("Open positions: {}", runtime.positions.len()));
@@ -2428,7 +2854,11 @@ pub fn build_execution_surface_snapshot_with_runtime(
                         .iter()
                         .map(format_ctrader_pending_order_line)
                         .collect(),
-                    runtime.recent_deals.iter().map(format_ctrader_deal_line).collect(),
+                    runtime
+                        .recent_deals
+                        .iter()
+                        .map(format_ctrader_deal_line)
+                        .collect(),
                     runtime
                         .recent_deals
                         .iter()
@@ -2504,7 +2934,7 @@ pub fn build_execution_surface_snapshot_with_runtime(
             slippage_in_points: state.order_ticket.slippage_in_points,
             comment: state.order_ticket.comment.clone(),
             label: state.order_ticket.label.clone(),
-            max_lot_size: state.risk.max_lot_size as f64,
+            max_lot_size: state.risk.max_lot_size,
         },
     }
 }
@@ -2604,10 +3034,7 @@ fn format_ctrader_terminal_info(
     trader: &crate::app_services::ctrader_account::CTraderTraderSnapshot,
     environment: CTraderEnvironment,
 ) -> String {
-    let broker = trader
-        .broker_name
-        .as_deref()
-        .unwrap_or("cTrader Open API");
+    let broker = trader.broker_name.as_deref().unwrap_or("cTrader Open API");
     format!(
         "{} · {} · account {} · balance {:.2}",
         broker,
@@ -2620,6 +3047,7 @@ fn format_ctrader_terminal_info(
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn format_ctrader_connect_error(err: &anyhow::Error) -> String {
     let message = err.to_string();
     if message.contains("restored token session") || message.contains("stored token bundle") {
@@ -2738,7 +3166,13 @@ fn append_ctrader_order_builder_diagnostics(
         .positions
         .first()
         .map(|position| position.symbol_id)
-        .or_else(|| runtime.reconcile.pending_orders.first().map(|order| order.symbol_id));
+        .or_else(|| {
+            runtime
+                .reconcile
+                .pending_orders
+                .first()
+                .map(|order| order.symbol_id)
+        });
 
     if let Some(symbol_id) = symbol_id {
         let seed_volume = runtime
@@ -2746,7 +3180,13 @@ fn append_ctrader_order_builder_diagnostics(
             .positions
             .first()
             .map(|position| position.volume)
-            .or_else(|| runtime.reconcile.pending_orders.first().map(|order| order.volume))
+            .or_else(|| {
+                runtime
+                    .reconcile
+                    .pending_orders
+                    .first()
+                    .map(|order| order.volume)
+            })
             .unwrap_or(1.0);
         let request = build_new_order_request(
             &CTraderNewOrderRequest {
@@ -2775,7 +3215,10 @@ fn append_ctrader_order_builder_diagnostics(
             },
             "preview-new-order",
         );
-        diagnostics.push(format!("New order builder ready: payload {}", request.payload_type));
+        diagnostics.push(format!(
+            "New order builder ready: payload {}",
+            request.payload_type
+        ));
     }
 
     if let Some(order) = runtime.reconcile.pending_orders.first() {
@@ -2977,45 +3420,53 @@ fn prop_firm_pre_trade_check(
     pip_position: i32,
 ) -> anyhow::Result<()> {
     if risk.require_stop_loss && order.stop_loss.is_none() {
-        return Err(anyhow::anyhow!("Mandatory stop-loss rule violated: order missing stop_loss"));
+        return Err(anyhow::anyhow!(
+            "Mandatory stop-loss rule violated: order missing stop_loss"
+        ));
     }
 
     if day_start_equity > 0.0 {
-        let daily_drawdown_pct = ((day_start_equity - account_equity) / day_start_equity) * 100.0;
-        if daily_drawdown_pct >= risk.daily_drawdown_limit as f64 {
+        let daily_drawdown_ratio =
+            ((day_start_equity - account_equity) / day_start_equity).max(0.0);
+        if daily_drawdown_ratio >= risk.daily_drawdown_limit {
             return Err(anyhow::anyhow!(
                 "Daily drawdown limit reached: current {:.2}% >= max {:.2}% (measured via Equity)",
-                daily_drawdown_pct,
-                risk.daily_drawdown_limit
+                daily_drawdown_ratio * 100.0,
+                risk.daily_drawdown_limit * 100.0
             ));
         }
     }
 
     if initial_equity > 0.0 {
-        let total_drawdown_pct = ((initial_equity - account_equity) / initial_equity) * 100.0;
-        if total_drawdown_pct >= risk.total_drawdown_limit as f64 {
+        let total_drawdown_ratio = ((initial_equity - account_equity) / initial_equity).max(0.0);
+        if total_drawdown_ratio >= risk.total_drawdown_limit {
             return Err(anyhow::anyhow!(
                 "Total drawdown limit reached: current {:.2}% >= max {:.2}% (measured via Equity)",
-                total_drawdown_pct,
-                risk.total_drawdown_limit
+                total_drawdown_ratio * 100.0,
+                risk.total_drawdown_limit * 100.0
             ));
         }
     }
-    
+
     // Soft check on risk per trade based on distance to stop loss.
-    if let (Some(sl), Some(entry_estimate)) = (order.stop_loss, order.limit_price.or(order.stop_price)) {
+    if let (Some(sl), Some(entry_estimate)) =
+        (order.stop_loss, order.limit_price.or(order.stop_price))
+    {
         let pip_multiplier = 10.0_f64.powi(pip_position);
         let pip_distance = (entry_estimate - sl).abs() * pip_multiplier;
-        
+
         // Volume-based loss: (Lot size * Pips * Pip Value)
         // For standard 100k lots, 1 pip is usually $10.
-        let estimated_loss = pip_distance * (order.volume as f64 / 100.0) * 10.0; 
-        let max_loss = (risk.risk_per_trade as f64 / 100.0) * account_equity;
-        
+        let estimated_loss = pip_distance * (order.volume as f64 / 100.0) * 10.0;
+        let max_loss = risk.risk_per_trade * account_equity;
+
         if estimated_loss > max_loss {
             tracing::warn!(
                 "Trade may exceed risk-per-trade limit: estimated loss {:.2} > max allowed {:.2} ({}%) based on {} pips",
-                estimated_loss, max_loss, risk.risk_per_trade, pip_distance
+                estimated_loss,
+                max_loss,
+                risk.risk_per_trade * 100.0,
+                pip_distance
             );
         }
     }
@@ -3051,7 +3502,11 @@ mod tests {
             data_dir: PathBuf::from("data"),
             start_local: matches!(source, DataSource::Local),
         };
-        let mut state = AppState::new(runtime, vec!["EURUSD".to_string()]);
+        let mut state = AppState::new(
+            runtime,
+            &forex_core::Settings::default(),
+            vec!["EURUSD".to_string()],
+        );
         state.data_source = source;
         state.status_msg = status_msg.to_string();
         state
@@ -3097,16 +3552,27 @@ mod tests {
         assert_eq!(snapshot.mode, TradingPanelMode::Connected);
         assert!(snapshot.connected);
         assert_eq!(snapshot.status_text, "Connected");
-        assert!(snapshot
-            .terminal_info
-            .contains("TerminalInfo(community_account=False"));
+        assert!(
+            snapshot
+                .terminal_info
+                .contains("TerminalInfo(community_account=False")
+        );
     }
 
     #[test]
     fn panel_mode_uses_data_source_and_connection_state() {
-        assert_eq!(panel_mode(DataSource::Local, false), TradingPanelMode::LocalOnly);
-        assert_eq!(panel_mode(DataSource::MT5, false), TradingPanelMode::Disconnected);
-        assert_eq!(panel_mode(DataSource::MT5, true), TradingPanelMode::Connected);
+        assert_eq!(
+            panel_mode(DataSource::Local, false),
+            TradingPanelMode::LocalOnly
+        );
+        assert_eq!(
+            panel_mode(DataSource::MT5, false),
+            TradingPanelMode::Disconnected
+        );
+        assert_eq!(
+            panel_mode(DataSource::MT5, true),
+            TradingPanelMode::Connected
+        );
     }
 
     #[test]
@@ -3214,7 +3680,8 @@ mod tests {
 
     #[test]
     fn ctrader_chart_history_request_uses_enabled_target_and_selected_environment() {
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
         session.broker_settings_mut().ctrader.redirect_uri =
@@ -3254,7 +3721,8 @@ mod tests {
     #[test]
     fn market_chart_snapshot_reports_ctrader_requirements_instead_of_fake_fallback() {
         let state = sample_state(DataSource::MT5, "Offline");
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
 
@@ -3262,44 +3730,56 @@ mod tests {
 
         assert!(snapshot.candles.is_empty());
         assert_eq!(snapshot.timeframe, "M1");
-        assert_eq!(snapshot.available_timeframes.first().map(String::as_str), Some("M1"));
-        assert!(snapshot
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("stored token bundle")));
-        assert!(snapshot
-            .headline
-            .contains("No cTrader market data loaded"));
+        assert_eq!(
+            snapshot.available_timeframes.first().map(String::as_str),
+            Some("M1")
+        );
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("stored token bundle"))
+        );
+        assert!(snapshot.headline.contains("No cTrader market data loaded"));
     }
 
     #[test]
     fn execution_surface_snapshot_disables_live_actions_and_surfaces_unwired_gaps() {
         let state = sample_state(DataSource::Local, "Local Mode");
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
 
         let snapshot = session.execution_surface_snapshot(&state);
 
         assert_eq!(snapshot.symbol, "EURUSD");
         assert_eq!(snapshot.adapter_name, "cTrader");
         assert_eq!(snapshot.primary_actions.len(), 2);
-        assert!(snapshot.primary_actions.iter().all(|action| !action.enabled));
-        assert!(snapshot
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("Local mode")));
-        assert!(snapshot
-            .diagnostics
-            .iter()
-            .any(|line| line.contains("positions/orders feed is not wired yet")));
+        assert!(
+            snapshot
+                .primary_actions
+                .iter()
+                .all(|action| !action.enabled)
+        );
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Local mode"))
+        );
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("central broker background loop"))
+        );
     }
 
     #[test]
     fn execution_surface_snapshot_formats_positions_orders_and_recent_fills() {
         let state = sample_state(DataSource::MT5, "Connected");
-        let connection = TradingSession::from_connected_terminal_for_test(
-            "TerminalInfo(connected=True)",
-        )
-        .snapshot(&state);
+        let connection =
+            TradingSession::from_connected_terminal_for_test("TerminalInfo(connected=True)")
+                .snapshot(&state);
         let runtime = BrokerExecutionSnapshot {
             positions: vec![PositionInfo {
                 ticket: 1001,
@@ -3342,32 +3822,45 @@ mod tests {
         };
 
         let runtime = AppExecutionRuntimeSnapshot::Mt5(runtime);
-        let snapshot =
-            build_execution_surface_snapshot_with_runtime(&state, &connection, Some(&runtime), Vec::new());
+        let snapshot = build_execution_surface_snapshot_with_runtime(
+            &state,
+            &connection,
+            Some(&runtime),
+            Vec::new(),
+        );
 
-        assert!(snapshot.positions.iter().any(|line| line.contains("BUY 0.20")));
-        assert!(snapshot
-            .pending_orders
-            .iter()
-            .any(|line| line.contains("BUY_LIMIT 0.15")));
-        assert!(snapshot
-            .bot_timeline
-            .iter()
-            .any(|line| line.contains("IN BUY 0.15")));
+        assert!(
+            snapshot
+                .positions
+                .iter()
+                .any(|line| line.contains("BUY 0.20"))
+        );
+        assert!(
+            snapshot
+                .pending_orders
+                .iter()
+                .any(|line| line.contains("BUY_LIMIT 0.15"))
+        );
+        assert!(
+            snapshot
+                .bot_timeline
+                .iter()
+                .any(|line| line.contains("IN BUY 0.15"))
+        );
         assert!(snapshot.warnings.is_empty());
     }
 
     #[test]
     fn execution_surface_snapshot_surfaces_adapter_specific_unwired_feed_reason() {
         let state = sample_state(DataSource::MT5, "Offline");
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
 
         let snapshot = session.execution_surface_snapshot(&state);
 
-        assert!(snapshot
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("cTrader execution feed is unavailable until the remote account session connects")));
+        assert!(snapshot.warnings.iter().any(|warning| warning.contains(
+            "cTrader execution feed is unavailable until the remote account session connects"
+        )));
     }
 
     #[test]
@@ -3387,7 +3880,8 @@ mod tests {
     #[test]
     fn connect_sets_missing_credentials_status_for_unready_remote_adapter() {
         let mut state = sample_state(DataSource::MT5, "Offline");
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
 
         session.connect(&mut state);
 
@@ -3401,7 +3895,8 @@ mod tests {
     #[test]
     fn connect_requires_restored_ctrader_session_before_runtime_probe() {
         let mut state = sample_state(DataSource::MT5, "Offline");
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
         session.broker_settings_mut().ctrader.redirect_uri =
@@ -3419,7 +3914,8 @@ mod tests {
     #[test]
     fn connect_uses_ctrader_account_runtime_probe_when_session_is_restored() {
         let mut state = sample_state(DataSource::MT5, "Offline");
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
         session.broker_settings_mut().ctrader.redirect_uri =
@@ -3465,16 +3961,18 @@ mod tests {
 
     #[test]
     fn ctrader_live_spot_cache_reuses_backend_update_within_ttl() {
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
-        let backend = crate::app_services::ctrader_streaming::StubCTraderLiveStreamingBackend::success(
-            crate::app_services::ctrader_streaming::CTraderLiveChartUpdate {
-                symbol_id: 14,
-                bid: Some(1.09995),
-                ask: Some(1.10015),
-                timestamp_ms: Some(1_710_000_200_000),
-                latest_trendbar: None,
-            },
-        );
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let backend =
+            crate::app_services::ctrader_streaming::StubCTraderLiveStreamingBackend::success(
+                crate::app_services::ctrader_streaming::CTraderLiveChartUpdate {
+                    symbol_id: 14,
+                    bid: Some(1.09995),
+                    ask: Some(1.10015),
+                    timestamp_ms: Some(1_710_000_200_000),
+                    latest_trendbar: None,
+                },
+            );
         session.set_ctrader_live_streaming_backend_for_test(backend.clone());
 
         let request = crate::app_services::ctrader_streaming::CTraderLiveChartUpdateRequest {
@@ -3503,7 +4001,8 @@ mod tests {
     #[test]
     fn execution_surface_snapshot_uses_ctrader_reconcile_runtime_when_connected() {
         let mut state = sample_state(DataSource::MT5, "Connected");
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
         session.broker_settings_mut().ctrader.redirect_uri =
@@ -3533,34 +4032,38 @@ mod tests {
                     },
                     reconcile: crate::app_services::ctrader_account::CTraderReconcileSnapshot {
                         account_id: 712345,
-                        positions: vec![crate::app_services::ctrader_account::CTraderPositionSnapshot {
-                            position_id: 9001,
-                            symbol_id: 14,
-                            trade_side: "BUY".to_string(),
-                            volume: 25.0,
-                            open_timestamp_ms: Some(1710000000000),
-                            price: Some(1.10123),
-                            stop_loss: Some(1.095),
-                            take_profit: Some(1.11),
-                            swap: None,
-                            commission: None,
-                            label: Some("trend".to_string()),
-                            comment: Some("bot".to_string()),
-                        }],
-                        pending_orders: vec![crate::app_services::ctrader_account::CTraderPendingOrderSnapshot {
-                            order_id: 8001,
-                            symbol_id: 14,
-                            trade_side: "SELL".to_string(),
-                            order_type: "LIMIT".to_string(),
-                            volume: 15.0,
-                            open_timestamp_ms: Some(1710000100000),
-                            limit_price: Some(1.099),
-                            stop_price: None,
-                            stop_loss: Some(1.105),
-                            take_profit: Some(1.09),
-                            label: Some("breakout".to_string()),
-                            comment: Some("pending".to_string()),
-                        }],
+                        positions: vec![
+                            crate::app_services::ctrader_account::CTraderPositionSnapshot {
+                                position_id: 9001,
+                                symbol_id: 14,
+                                trade_side: "BUY".to_string(),
+                                volume: 25.0,
+                                open_timestamp_ms: Some(1710000000000),
+                                price: Some(1.10123),
+                                stop_loss: Some(1.095),
+                                take_profit: Some(1.11),
+                                swap: None,
+                                commission: None,
+                                label: Some("trend".to_string()),
+                                comment: Some("bot".to_string()),
+                            },
+                        ],
+                        pending_orders: vec![
+                            crate::app_services::ctrader_account::CTraderPendingOrderSnapshot {
+                                order_id: 8001,
+                                symbol_id: 14,
+                                trade_side: "SELL".to_string(),
+                                order_type: "LIMIT".to_string(),
+                                volume: 15.0,
+                                open_timestamp_ms: Some(1710000100000),
+                                limit_price: Some(1.099),
+                                stop_price: None,
+                                stop_loss: Some(1.105),
+                                take_profit: Some(1.09),
+                                label: Some("breakout".to_string()),
+                                comment: Some("pending".to_string()),
+                            },
+                        ],
                     },
                     recent_deals: vec![crate::app_services::ctrader_account::CTraderDealSnapshot {
                         deal_id: 3001,
@@ -3588,20 +4091,38 @@ mod tests {
         let snapshot = session.execution_surface_snapshot(&state);
 
         assert!(snapshot.positions.iter().any(|line| line.contains("#9001")));
-        assert!(snapshot.pending_orders.iter().any(|line| line.contains("#8001")));
-        assert!(snapshot.bot_timeline.iter().any(|line| line.contains("#3001")));
-        assert!(snapshot
-            .diagnostics
-            .iter()
-            .any(|line| line.contains("Recent fills: 1")));
-        assert!(snapshot.diagnostics.iter().any(|line| line.contains("Trader balance")));
+        assert!(
+            snapshot
+                .pending_orders
+                .iter()
+                .any(|line| line.contains("#8001"))
+        );
+        assert!(
+            snapshot
+                .bot_timeline
+                .iter()
+                .any(|line| line.contains("#3001"))
+        );
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("Recent fills: 1"))
+        );
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("Trader balance"))
+        );
         assert!(snapshot.warnings.is_empty());
     }
 
     #[test]
     fn cancel_selected_order_records_ctrader_journal_and_updates_status() {
         let mut state = sample_state(DataSource::MT5, "Connected");
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
         session.broker_settings_mut().ctrader.redirect_uri =
@@ -3631,34 +4152,38 @@ mod tests {
                     },
                     reconcile: crate::app_services::ctrader_account::CTraderReconcileSnapshot {
                         account_id: 712345,
-                        positions: vec![crate::app_services::ctrader_account::CTraderPositionSnapshot {
-                            position_id: 9001,
-                            symbol_id: 14,
-                            trade_side: "BUY".to_string(),
-                            volume: 25.0,
-                            open_timestamp_ms: Some(1710000000000),
-                            price: Some(1.10123),
-                            stop_loss: Some(1.095),
-                            take_profit: Some(1.11),
-                            swap: None,
-                            commission: None,
-                            label: Some("trend".to_string()),
-                            comment: Some("bot".to_string()),
-                        }],
-                        pending_orders: vec![crate::app_services::ctrader_account::CTraderPendingOrderSnapshot {
-                            order_id: 8001,
-                            symbol_id: 14,
-                            trade_side: "SELL".to_string(),
-                            order_type: "LIMIT".to_string(),
-                            volume: 15.0,
-                            open_timestamp_ms: Some(1710000100000),
-                            limit_price: Some(1.099),
-                            stop_price: None,
-                            stop_loss: Some(1.105),
-                            take_profit: Some(1.09),
-                            label: Some("breakout".to_string()),
-                            comment: Some("pending".to_string()),
-                        }],
+                        positions: vec![
+                            crate::app_services::ctrader_account::CTraderPositionSnapshot {
+                                position_id: 9001,
+                                symbol_id: 14,
+                                trade_side: "BUY".to_string(),
+                                volume: 25.0,
+                                open_timestamp_ms: Some(1710000000000),
+                                price: Some(1.10123),
+                                stop_loss: Some(1.095),
+                                take_profit: Some(1.11),
+                                swap: None,
+                                commission: None,
+                                label: Some("trend".to_string()),
+                                comment: Some("bot".to_string()),
+                            },
+                        ],
+                        pending_orders: vec![
+                            crate::app_services::ctrader_account::CTraderPendingOrderSnapshot {
+                                order_id: 8001,
+                                symbol_id: 14,
+                                trade_side: "SELL".to_string(),
+                                order_type: "LIMIT".to_string(),
+                                volume: 15.0,
+                                open_timestamp_ms: Some(1710000100000),
+                                limit_price: Some(1.099),
+                                stop_price: None,
+                                stop_loss: Some(1.105),
+                                take_profit: Some(1.09),
+                                label: Some("breakout".to_string()),
+                                comment: Some("pending".to_string()),
+                            },
+                        ],
                     },
                     recent_deals: Vec::new(),
                 },
@@ -3669,7 +4194,8 @@ mod tests {
         session.set_ctrader_execution_backend_for_test(
             crate::app_services::ctrader_execution::StubCTraderExecutionBackend::succeed(
                 crate::app_services::ctrader_execution::CTraderExecutionOutcome {
-                    status: crate::app_services::ctrader_execution::CTraderExecutionStatus::Cancelled,
+                    status:
+                        crate::app_services::ctrader_execution::CTraderExecutionStatus::Cancelled,
                     account_id: 712345,
                     symbol_id: Some(14),
                     order_id: Some(8001),
@@ -3694,13 +4220,19 @@ mod tests {
         let snapshot = session.execution_surface_snapshot(&state);
 
         assert!(state.status_msg.contains("Cancelled order"));
-        assert!(snapshot.journal_rows.iter().any(|line| line.contains("Cancel order #8001")));
+        assert!(
+            snapshot
+                .journal_rows
+                .iter()
+                .any(|line| line.contains("Cancel order #8001"))
+        );
     }
 
     #[test]
     fn close_selected_position_surfaces_ctrader_execution_failure() {
         let mut state = sample_state(DataSource::MT5, "Connected");
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
         session.broker_settings_mut().ctrader.redirect_uri =
@@ -3730,20 +4262,22 @@ mod tests {
                     },
                     reconcile: crate::app_services::ctrader_account::CTraderReconcileSnapshot {
                         account_id: 712345,
-                        positions: vec![crate::app_services::ctrader_account::CTraderPositionSnapshot {
-                            position_id: 9001,
-                            symbol_id: 14,
-                            trade_side: "BUY".to_string(),
-                            volume: 25.0,
-                            open_timestamp_ms: Some(1710000000000),
-                            price: Some(1.10123),
-                            stop_loss: Some(1.095),
-                            take_profit: Some(1.11),
-                            swap: None,
-                            commission: None,
-                            label: Some("trend".to_string()),
-                            comment: Some("bot".to_string()),
-                        }],
+                        positions: vec![
+                            crate::app_services::ctrader_account::CTraderPositionSnapshot {
+                                position_id: 9001,
+                                symbol_id: 14,
+                                trade_side: "BUY".to_string(),
+                                volume: 25.0,
+                                open_timestamp_ms: Some(1710000000000),
+                                price: Some(1.10123),
+                                stop_loss: Some(1.095),
+                                take_profit: Some(1.11),
+                                swap: None,
+                                commission: None,
+                                label: Some("trend".to_string()),
+                                comment: Some("bot".to_string()),
+                            },
+                        ],
                         pending_orders: Vec::new(),
                     },
                     recent_deals: Vec::new(),
@@ -3761,12 +4295,18 @@ mod tests {
         session.close_selected_position(&mut state);
 
         assert!(state.status_msg.contains("failed"));
-        assert!(session.trade_journal.iter().any(|line| line.contains("BROKER_REJECTED")));
+        assert!(
+            session
+                .trade_journal
+                .iter()
+                .any(|line| line.contains("BROKER_REJECTED"))
+        );
     }
 
     #[test]
     fn start_ctrader_auth_exposes_authorize_url_when_ready() {
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.redirect_uri =
             "http://localhost:3000/callback".to_string();
@@ -3777,16 +4317,19 @@ mod tests {
             snapshot.state,
             crate::app_services::ctrader_auth::CTraderAuthState::AwaitingAuthorizationCode
         );
-        assert!(snapshot
-            .authorize_url
-            .as_deref()
-            .unwrap_or_default()
-            .contains("client_id=client"));
+        assert!(
+            snapshot
+                .authorize_url
+                .as_deref()
+                .unwrap_or_default()
+                .contains("client_id=client")
+        );
     }
 
     #[test]
     fn receive_ctrader_authorization_code_updates_auth_snapshot() {
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.redirect_uri =
             "http://localhost:3000/callback".to_string();
@@ -3803,7 +4346,8 @@ mod tests {
 
     #[test]
     fn build_ctrader_token_exchange_request_uses_configured_secret() {
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
         session.broker_settings_mut().ctrader.redirect_uri =
@@ -3822,20 +4366,19 @@ mod tests {
 
     #[test]
     fn build_ctrader_token_exchange_request_keeps_staged_targets_pending_until_discovery() {
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
         session.broker_settings_mut().ctrader.redirect_uri =
             "http://localhost:3000/callback".to_string();
-        session
-            .broker_settings_mut()
-            .ctrader
-            .accounts
-            .push(crate::app_services::broker_config::BrokerAccountTarget {
+        session.broker_settings_mut().ctrader.accounts.push(
+            crate::app_services::broker_config::BrokerAccountTarget {
                 account_id: "acct-1".to_string(),
                 label: "Primary".to_string(),
                 enabled_for_execution: true,
-            });
+            },
+        );
         session.start_ctrader_auth().expect("auth snapshot");
         session.receive_ctrader_authorization_code("code-123");
 
@@ -3854,7 +4397,8 @@ mod tests {
 
     #[test]
     fn restore_ctrader_session_loads_saved_bundle_into_auth_snapshot() {
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
         session.broker_settings_mut().ctrader.redirect_uri =
@@ -3880,7 +4424,8 @@ mod tests {
 
     #[test]
     fn start_ctrader_live_auth_persists_tokens_and_updates_snapshot() {
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
         session.broker_settings_mut().ctrader.redirect_uri =
@@ -3905,7 +4450,10 @@ mod tests {
             ),
         );
 
-        let snapshot = session.start_ctrader_live_auth().expect("live auth should start");
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let snapshot = session
+            .start_ctrader_live_auth(tx)
+            .expect("live auth should start");
         assert_eq!(
             snapshot.state,
             crate::app_services::ctrader_auth::CTraderAuthState::ListeningForCallback
@@ -3930,7 +4478,8 @@ mod tests {
 
     #[test]
     fn clear_ctrader_saved_session_clears_restored_state() {
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
         session.broker_settings_mut().ctrader.redirect_uri =
@@ -3949,26 +4498,27 @@ mod tests {
             .clear_ctrader_saved_session()
             .expect("clear should succeed");
 
-        let restored = session.restore_ctrader_session().expect("restore should succeed");
+        let restored = session
+            .restore_ctrader_session()
+            .expect("restore should succeed");
         assert!(restored.is_none());
     }
 
     #[test]
     fn discover_ctrader_accounts_syncs_discovered_catalog_into_targets() {
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
         session.broker_settings_mut().ctrader.redirect_uri =
             "http://127.0.0.1:43001/callback".to_string();
-        session
-            .broker_settings_mut()
-            .ctrader
-            .accounts
-            .push(crate::app_services::broker_config::BrokerAccountTarget {
+        session.broker_settings_mut().ctrader.accounts.push(
+            crate::app_services::broker_config::BrokerAccountTarget {
                 account_id: "101".to_string(),
                 label: "Operator Primary".to_string(),
                 enabled_for_execution: true,
-            });
+            },
+        );
         session.set_ctrader_store_for_test(
             crate::app_services::secure_store::MemorySecretStoreBackend::default(),
         );
@@ -4018,25 +4568,30 @@ mod tests {
         assert_eq!(snapshot.account_count, 2);
         assert_eq!(snapshot.enabled_target_count, 1);
         assert_eq!(session.broker_settings_mut().ctrader.accounts.len(), 2);
-        assert!(session
-            .broker_settings_mut()
-            .ctrader
-            .accounts
-            .iter()
-            .any(|account| account.account_id == "101"
-                && account.label == "Operator Primary"
-                && account.enabled_for_execution));
-        assert!(session
-            .broker_settings_mut()
-            .ctrader
-            .accounts
-            .iter()
-            .any(|account| account.account_id == "202" && !account.enabled_for_execution));
+        assert!(
+            session
+                .broker_settings_mut()
+                .ctrader
+                .accounts
+                .iter()
+                .any(|account| account.account_id == "101"
+                    && account.label == "Operator Primary"
+                    && account.enabled_for_execution)
+        );
+        assert!(
+            session
+                .broker_settings_mut()
+                .ctrader
+                .accounts
+                .iter()
+                .any(|account| account.account_id == "202" && !account.enabled_for_execution)
+        );
     }
 
     #[test]
     fn discover_ctrader_accounts_uses_configured_demo_environment() {
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
         session.broker_settings_mut().ctrader.redirect_uri =
@@ -4075,7 +4630,8 @@ mod tests {
 
     #[test]
     fn discover_ctrader_accounts_requires_restored_token_session() {
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
         session.broker_settings_mut().ctrader.redirect_uri =
@@ -4085,14 +4641,16 @@ mod tests {
             .discover_ctrader_accounts()
             .expect_err("discovery should fail without a restored token");
 
-        assert!(err
-            .to_string()
-            .contains("cTrader account discovery requires a restored token session"));
+        assert!(
+            err.to_string()
+                .contains("cTrader account discovery requires a restored token session")
+        );
     }
 
     #[test]
     fn discover_ctrader_accounts_requires_persisted_token_bundle() {
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
         session.broker_settings_mut().ctrader.redirect_uri =
@@ -4127,14 +4685,16 @@ mod tests {
             .discover_ctrader_accounts()
             .expect_err("discovery should fail without persisted token bundle");
 
-        assert!(err
-            .to_string()
-            .contains("cTrader account discovery requires a stored token bundle"));
+        assert!(
+            err.to_string()
+                .contains("cTrader account discovery requires a stored token bundle")
+        );
     }
 
     #[test]
     fn discover_ctrader_accounts_uses_selected_demo_environment() {
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
         session.broker_settings_mut().ctrader.redirect_uri =
@@ -4174,31 +4734,32 @@ mod tests {
 
     #[test]
     fn ctrader_runtime_request_refreshes_expired_token_bundle_before_use() {
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
         session.broker_settings_mut().ctrader.redirect_uri =
             "http://127.0.0.1:43001/callback".to_string();
-        session
-            .broker_settings_mut()
-            .ctrader
-            .accounts
-            .push(crate::app_services::broker_config::BrokerAccountTarget {
+        session.broker_settings_mut().ctrader.accounts.push(
+            crate::app_services::broker_config::BrokerAccountTarget {
                 account_id: "101".to_string(),
                 label: "Primary".to_string(),
                 enabled_for_execution: true,
-            });
+            },
+        );
         let store = crate::app_services::secure_store::MemorySecretStoreBackend::default();
         session.set_ctrader_store_for_test(store.clone());
         session
-            .seed_ctrader_token_bundle_for_test(crate::app_services::ctrader_auth::CTraderTokenBundle {
-                access_token: "expired-access".to_string(),
-                refresh_token: "expired-refresh".to_string(),
-                token_type: "bearer".to_string(),
-                expires_in: 60,
-                scope: "trading".to_string(),
-                created_at_unix: 1,
-            })
+            .seed_ctrader_token_bundle_for_test(
+                crate::app_services::ctrader_auth::CTraderTokenBundle {
+                    access_token: "expired-access".to_string(),
+                    refresh_token: "expired-refresh".to_string(),
+                    token_type: "bearer".to_string(),
+                    expires_in: 60,
+                    scope: "trading".to_string(),
+                    created_at_unix: 1,
+                },
+            )
             .expect("seed should succeed");
         session
             .restore_ctrader_session()
@@ -4233,32 +4794,33 @@ mod tests {
 
     #[test]
     fn ctrader_runtime_request_fails_closed_when_refresh_fails() {
-        let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
         session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
         session.broker_settings_mut().ctrader.redirect_uri =
             "http://127.0.0.1:43001/callback".to_string();
-        session
-            .broker_settings_mut()
-            .ctrader
-            .accounts
-            .push(crate::app_services::broker_config::BrokerAccountTarget {
+        session.broker_settings_mut().ctrader.accounts.push(
+            crate::app_services::broker_config::BrokerAccountTarget {
                 account_id: "101".to_string(),
                 label: "Primary".to_string(),
                 enabled_for_execution: true,
-            });
+            },
+        );
         session.set_ctrader_store_for_test(
             crate::app_services::secure_store::MemorySecretStoreBackend::default(),
         );
         session
-            .seed_ctrader_token_bundle_for_test(crate::app_services::ctrader_auth::CTraderTokenBundle {
-                access_token: "expired-access".to_string(),
-                refresh_token: "expired-refresh".to_string(),
-                token_type: "bearer".to_string(),
-                expires_in: 60,
-                scope: "trading".to_string(),
-                created_at_unix: 1,
-            })
+            .seed_ctrader_token_bundle_for_test(
+                crate::app_services::ctrader_auth::CTraderTokenBundle {
+                    access_token: "expired-access".to_string(),
+                    refresh_token: "expired-refresh".to_string(),
+                    token_type: "bearer".to_string(),
+                    expires_in: 60,
+                    scope: "trading".to_string(),
+                    created_at_unix: 1,
+                },
+            )
             .expect("seed should succeed");
         session
             .restore_ctrader_session()
@@ -4275,6 +4837,85 @@ mod tests {
             .expect_err("runtime request should fail when refresh fails");
 
         assert!(err.to_string().contains("token refresh failed"));
+    }
+
+    #[test]
+    fn refresh_runtime_skips_ctrader_probe_within_refresh_window() {
+        let mut state = sample_state(DataSource::MT5, "Connected");
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        let backend =
+            crate::app_services::ctrader_account::StubCTraderAccountRuntimeBackend::success(
+                crate::app_services::ctrader_account::CTraderAccountRuntimeSnapshot {
+                    trader: crate::app_services::ctrader_account::CTraderTraderSnapshot {
+                        account_id: 712345,
+                        balance: 1000.0,
+                        leverage: Some(50.0),
+                        trader_login: Some(998877),
+                        account_type: Some("NETTED".to_string()),
+                        broker_name: Some("Demo Broker".to_string()),
+                        money_digits: 2,
+                    },
+                    reconcile: crate::app_services::ctrader_account::CTraderReconcileSnapshot {
+                        account_id: 712345,
+                        positions: Vec::new(),
+                        pending_orders: Vec::new(),
+                    },
+                    recent_deals: Vec::new(),
+                },
+            );
+        session.set_ctrader_account_runtime_backend_for_test(backend.clone());
+        session.handle_ctrader_connect_result(
+            &mut state,
+            crate::app_services::ctrader_account::CTraderAccountRuntimeSnapshot {
+                trader: crate::app_services::ctrader_account::CTraderTraderSnapshot {
+                    account_id: 712345,
+                    balance: 1000.0,
+                    leverage: Some(50.0),
+                    trader_login: Some(998877),
+                    account_type: Some("NETTED".to_string()),
+                    broker_name: Some("Demo Broker".to_string()),
+                    money_digits: 2,
+                },
+                reconcile: crate::app_services::ctrader_account::CTraderReconcileSnapshot {
+                    account_id: 712345,
+                    positions: Vec::new(),
+                    pending_orders: Vec::new(),
+                },
+                recent_deals: Vec::new(),
+            },
+        );
+
+        session
+            .refresh_runtime(&mut state)
+            .expect("refresh within throttle window should succeed");
+
+        assert!(backend.last_request().is_none());
+    }
+
+    #[test]
+    fn start_ctrader_bootstrap_batch_rejects_concurrent_request() {
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        session.bootstrap_handle = Some(std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }));
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        let err = session
+            .start_ctrader_bootstrap_batch(
+                std::path::PathBuf::from("data"),
+                vec!["EURUSD".to_string()],
+                vec!["M15".to_string()],
+                1,
+                tx,
+            )
+            .expect_err("concurrent bootstrap should be rejected");
+
+        assert!(err.to_string().contains("already running"));
+        if let Some(handle) = session.bootstrap_handle.take() {
+            let _ = handle.join();
+        }
     }
 
     fn sample_prop_firm_order() -> CTraderNewOrderRequest {
@@ -4309,7 +4950,8 @@ mod tests {
         let mut order = sample_prop_firm_order();
         order.stop_loss = None;
         let risk = RiskConfig::default();
-        let err = prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4).unwrap_err();
+        let err =
+            prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4).unwrap_err();
         assert!(err.to_string().contains("missing stop_loss"));
     }
 
@@ -4317,10 +4959,10 @@ mod tests {
     fn prop_firm_gate_blocks_when_daily_drawdown_breached() {
         let order = sample_prop_firm_order();
         let risk = RiskConfig::default();
-        let err = prop_firm_pre_trade_check(&risk, &order, 9500.0, 10000.0, 10000.0, 4).unwrap_err();
+        let err =
+            prop_firm_pre_trade_check(&risk, &order, 9500.0, 10000.0, 10000.0, 4).unwrap_err();
         assert!(err.to_string().contains("Daily drawdown limit reached"));
-        assert!(err.to_string().contains("9500.00")); // Check message includes context
-        assert!(err.to_string().contains("current 5.00% >= max 4.50%"));
+        assert!(err.to_string().contains("current 5.00% >= max 4.00%"));
     }
 
     #[test]
@@ -4341,7 +4983,7 @@ mod tests {
         // Set day_start_equity equal to account_equity so daily DD is 0%, forcing it to hit total DD rule
         let err = prop_firm_pre_trade_check(&risk, &order, 8900.0, 10000.0, 8900.0, 4).unwrap_err();
         assert!(err.to_string().contains("Total drawdown limit reached"));
-        assert!(err.to_string().contains("current 11.00% >= max 10.00%"));
+        assert!(err.to_string().contains("current 11.00% >= max 7.00%"));
     }
 
     #[test]
@@ -4355,8 +4997,10 @@ mod tests {
     fn prop_firm_gate_respects_disabled_stop_loss_requirement() {
         let mut order = sample_prop_firm_order();
         order.stop_loss = None;
-        let mut risk = RiskConfig::default();
-        risk.require_stop_loss = false;
+        let risk = RiskConfig {
+            require_stop_loss: false,
+            ..RiskConfig::default()
+        };
         assert!(prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4).is_ok());
     }
 }
