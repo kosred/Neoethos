@@ -240,7 +240,7 @@ pub fn infer_market_cost_profile(
                 .and_then(|value| value.parse::<f64>().ok())
                 .filter(|value| value.is_finite() && *value >= 0.0)
         })
-        .unwrap_or(0.0);
+        .unwrap_or(7.0);
 
     MarketCostProfile {
         symbol,

@@ -1,20 +1,21 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use ndarray::{Array1, Array2, Axis};
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::base::{
-    ExpertModel, build_runtime_artifact_metadata, build_runtime_prediction,
-    canonical_three_class_label_mapping,
+    build_runtime_artifact_metadata, build_runtime_prediction, canonical_three_class_label_mapping,
+    three_class_runtime_confidence, ExpertModel,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 use crate::runtime::prediction::RuntimePrediction;
 
 use super::common::{
-    FeatureScaler, METADATA_FILE_NAME, MODEL_FILE_NAME, ensure_feature_columns_match,
-    feature_matrix_from_dataframe, read_json, remap_three_class_labels, softmax_rows, write_json,
+    ensure_feature_columns_match, feature_matrix_from_dataframe, read_json,
+    remap_three_class_labels, softmax_rows, write_json, FeatureScaler, METADATA_FILE_NAME,
+    MODEL_FILE_NAME,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,15 +133,14 @@ fn runtime_predictions(
     let mut predictions = Vec::with_capacity(probabilities.nrows());
     for row in probabilities.outer_iter() {
         let row_values = [row[0], row[1], row[2]];
-        let confidence = row_values.iter().copied().fold(0.0_f32, f32::max);
-        let abstain_recommended = Some(confidence < 0.5);
+        let (confidence, abstain_recommended) = three_class_runtime_confidence(row_values)?;
         predictions.push(build_runtime_prediction(
             model_name.to_string(),
             ModelFamily::Meta,
             CapabilityState::Implemented,
             row_values,
             Some(confidence),
-            abstain_recommended,
+            Some(abstain_recommended),
         )?);
     }
 
@@ -161,6 +161,23 @@ fn validate_runtime_metadata(
             "runtime metadata mismatch for {expected_model_name}: expected model name {expected_model_name}, got {}",
             metadata.model_name
         );
+    }
+    if metadata.family != ModelFamily::Meta {
+        bail!(
+            "runtime metadata mismatch for {expected_model_name}: expected family {:?}, got {:?}",
+            ModelFamily::Meta,
+            metadata.family
+        );
+    }
+    if metadata.state != CapabilityState::Implemented {
+        bail!(
+            "runtime metadata mismatch for {expected_model_name}: expected state {:?}, got {:?}",
+            CapabilityState::Implemented,
+            metadata.state
+        );
+    }
+    if metadata.label_mapping != canonical_three_class_label_mapping() {
+        bail!("runtime metadata mismatch for {expected_model_name}: unexpected label mapping");
     }
     if metadata.feature_columns != expected_feature_columns {
         bail!(
@@ -185,6 +202,54 @@ fn validate_runtime_metadata(
             metadata.training_summary.val_rows,
             metadata.training_summary.dataset_rows
         );
+    }
+
+    Ok(())
+}
+
+fn validate_linear_artifact(artifact: &LinearSoftmaxArtifact) -> Result<()> {
+    if artifact.model_name != "elasticnet" && artifact.model_name != "logistic" {
+        bail!(
+            "unexpected linear artifact model name {}",
+            artifact.model_name
+        );
+    }
+    if artifact.feature_columns.is_empty() {
+        bail!("linear artifact must contain at least one feature column");
+    }
+    if artifact.weights.nrows() != artifact.feature_columns.len() {
+        bail!(
+            "linear artifact feature-column mismatch: {} weights rows vs {} feature columns",
+            artifact.weights.nrows(),
+            artifact.feature_columns.len()
+        );
+    }
+    if artifact.weights.ncols() != 3 || artifact.bias.len() != 3 {
+        bail!(
+            "linear artifact must persist exactly three classes, found {} weight columns and {} bias terms",
+            artifact.weights.ncols(),
+            artifact.bias.len()
+        );
+    }
+    if artifact.scaler.means.len() != artifact.feature_columns.len()
+        || artifact.scaler.stds.len() != artifact.feature_columns.len()
+    {
+        bail!(
+            "linear artifact scaler dimension mismatch: means {}, stds {}, features {}",
+            artifact.scaler.means.len(),
+            artifact.scaler.stds.len(),
+            artifact.feature_columns.len()
+        );
+    }
+    if artifact.weights.iter().any(|value| !value.is_finite())
+        || artifact.bias.iter().any(|value| !value.is_finite())
+        || artifact.scaler.means.iter().any(|value| !value.is_finite())
+        || artifact.scaler.stds.iter().any(|value| !value.is_finite())
+    {
+        bail!("linear artifact contains non-finite parameters");
+    }
+    if artifact.dataset_rows == 0 {
+        bail!("linear artifact must persist a non-zero dataset row count");
     }
 
     Ok(())
@@ -421,6 +486,7 @@ impl ExpertModel for ElasticNetExpert {
             .model
             .as_ref()
             .context("ElasticNetExpert not trained")?;
+        validate_linear_artifact(model)?;
         let runtime_metadata = model
             .runtime_metadata
             .as_ref()
@@ -440,6 +506,7 @@ impl ExpertModel for ElasticNetExpert {
         if model.model_name != "elasticnet" {
             bail!("expected elasticnet artifact, got {}", model.model_name);
         }
+        validate_linear_artifact(&model)?;
         let runtime_metadata: RuntimeArtifactMetadata = read_json(&path.join(METADATA_FILE_NAME))?;
         validate_runtime_metadata(
             &runtime_metadata,
@@ -505,6 +572,7 @@ impl ExpertModel for LogisticExpert {
 
     fn save(&self, path: &Path) -> Result<()> {
         let model = self.model.as_ref().context("LogisticExpert not trained")?;
+        validate_linear_artifact(model)?;
         let runtime_metadata = model
             .runtime_metadata
             .as_ref()
@@ -524,6 +592,7 @@ impl ExpertModel for LogisticExpert {
         if model.model_name != "logistic" {
             bail!("expected logistic artifact, got {}", model.model_name);
         }
+        validate_linear_artifact(&model)?;
         let runtime_metadata: RuntimeArtifactMetadata = read_json(&path.join(METADATA_FILE_NAME))?;
         validate_runtime_metadata(
             &runtime_metadata,
@@ -554,6 +623,7 @@ impl LogisticExpert {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::base::three_class_runtime_confidence;
 
     fn sample_dataframe() -> DataFrame {
         DataFrame::new(vec![
@@ -621,6 +691,23 @@ mod tests {
 
         let runtime_predictions = model.predict_runtime(&df)?;
         assert_eq!(runtime_predictions.len(), 6);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_predictions_use_shared_three_class_confidence_gate() -> Result<()> {
+        let probabilities = Array2::from_shape_vec((1, 3), vec![0.58_f32, 0.20, 0.22])?;
+        let predictions = runtime_predictions("logistic", &probabilities)?;
+        let prediction = predictions
+            .first()
+            .expect("one runtime prediction should be produced");
+        let (expected_confidence, expected_abstain) =
+            three_class_runtime_confidence([0.58, 0.20, 0.22])?;
+
+        assert!(
+            (prediction.confidence().expect("confidence") - expected_confidence).abs() < 1e-6
+        );
+        assert_eq!(prediction.abstain_recommended(), Some(expected_abstain));
         Ok(())
     }
 

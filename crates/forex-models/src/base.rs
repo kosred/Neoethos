@@ -7,7 +7,7 @@
 // - ExpertModel: Abstract trait for all expert models
 // - Training utilities for time-series aware data handling
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use ndarray::Array2;
 use polars::prelude::*;
 use std::collections::HashMap;
@@ -15,8 +15,8 @@ use std::path::Path;
 use tracing::*;
 
 use crate::runtime::artifacts::{
-    LabelMapping, RuntimeArtifactMetadata, TrainingSummaryMetadata,
-    default_three_class_label_mapping,
+    default_three_class_label_mapping, LabelMapping, RuntimeArtifactMetadata,
+    TrainingSummaryMetadata,
 };
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 use crate::runtime::prediction::{PredictionMetadata, RuntimePrediction, RuntimePredictionError};
@@ -151,6 +151,14 @@ pub trait ExpertModel {
             })?;
         }
 
+        if target_path.exists() {
+            std::fs::remove_file(target_path).with_context(|| {
+                format!(
+                    "Failed to remove previous target: {}",
+                    target_path.display()
+                )
+            })?;
+        }
         std::fs::rename(&temp_path, target_path)
             .with_context(|| format!("Failed to move temp to target: {}", target_path.display()))?;
 
@@ -169,11 +177,8 @@ pub fn dataframe_to_float32_array(df: &DataFrame) -> Result<Array2<f32>> {
     let n_rows = df.height();
     let n_cols = df.width();
 
-    let mut data = Vec::with_capacity(n_rows * n_cols);
-
-    // Iterate through columns
-    for col in df.get_columns() {
-        // Try to convert to f64 series first
+    let mut array_data = vec![0.0_f32; n_rows * n_cols];
+    for (col_idx, col) in df.get_columns().iter().enumerate() {
         let series_f64 = col
             .cast(&DataType::Float64)
             .with_context(|| format!("Failed to cast column {} to f64", col.name()))?;
@@ -182,22 +187,61 @@ pub fn dataframe_to_float32_array(df: &DataFrame) -> Result<Array2<f32>> {
             .f64()
             .with_context(|| format!("Failed to get f64 chunked array for {}", col.name()))?;
 
-        // Extract values
-        for val in ca.into_iter() {
-            data.push(val.unwrap_or(0.0) as f32);
-        }
-    }
+        for (row_idx, val) in ca.into_iter().enumerate() {
+            let value = val.with_context(|| {
+                format!(
+                    "Column {} contains null at row {}; model features must be fully materialized",
+                    col.name(),
+                    row_idx
+                )
+            })?;
+            if !value.is_finite() {
+                return Err(anyhow::anyhow!(
+                    "Column {} contains non-finite value {} at row {}",
+                    col.name(),
+                    value,
+                    row_idx
+                ));
+            }
 
-    // Reshape to (n_rows, n_cols) - column-major to row-major
-    let mut array_data = Vec::with_capacity(n_rows * n_cols);
-    for row_idx in 0..n_rows {
-        for col_idx in 0..n_cols {
-            array_data.push(data[col_idx * n_rows + row_idx]);
+            array_data[row_idx * n_cols + col_idx] = value as f32;
         }
     }
 
     Array2::from_shape_vec((n_rows, n_cols), array_data)
         .context("Failed to create Array2 from DataFrame")
+}
+
+/// Extract a numeric column as strict finite Float64 values.
+/// Nulls or non-finite values are treated as structural data errors.
+pub fn strict_numeric_column_values(df: &DataFrame, column_name: &str) -> Result<Vec<f64>> {
+    let series = df
+        .column(column_name)
+        .with_context(|| format!("Missing required numeric column {column_name}"))?
+        .cast(&DataType::Float64)
+        .with_context(|| format!("Failed to cast column {column_name} to Float64"))?;
+
+    series
+        .f64()
+        .with_context(|| format!("Failed to access column {column_name} as Float64"))?
+        .into_iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            let value = value.with_context(|| {
+                format!(
+                    "Column {column_name} contains null at row {idx}; downstream models require strict numeric input"
+                )
+            })?;
+            if !value.is_finite() {
+                return Err(anyhow::anyhow!(
+                    "Column {column_name} contains non-finite value {} at row {}",
+                    value,
+                    idx
+                ));
+            }
+            Ok(value)
+        })
+        .collect()
 }
 
 /// Extract ordered feature column names from a dataframe.
@@ -247,6 +291,50 @@ pub fn build_runtime_prediction(
         abstain_recommended,
         PredictionMetadata::new(model_name, family, state),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_runtime_prediction_with_details(
+    model_name: impl Into<String>,
+    family: ModelFamily,
+    state: CapabilityState,
+    class_probabilities: [f32; 3],
+    confidence: Option<f32>,
+    abstain_recommended: Option<bool>,
+    execution_backend: Option<String>,
+    degraded_reason: Option<String>,
+) -> Result<RuntimePrediction, RuntimePredictionError> {
+    RuntimePrediction::try_new(
+        class_probabilities,
+        confidence,
+        abstain_recommended,
+        PredictionMetadata::new(model_name, family, state)
+            .with_runtime_details(execution_backend, degraded_reason),
+    )
+}
+
+pub fn three_class_runtime_confidence(row_values: [f32; 3]) -> Result<(f32, bool)> {
+    let mut sorted = row_values;
+    for value in &sorted {
+        if !value.is_finite() || *value < 0.0 {
+            bail!("runtime predictions require finite non-negative probabilities");
+        }
+    }
+
+    sorted.sort_by(|left, right| right.total_cmp(left));
+    let top = sorted[0];
+    let runner_up = sorted[1];
+    let margin = (top - runner_up).max(0.0);
+    let entropy = row_values
+        .iter()
+        .copied()
+        .filter(|value| *value > 1e-8)
+        .map(|value| -value * value.ln())
+        .sum::<f32>()
+        / (3.0_f32.ln());
+    let sharpness = (1.0 - entropy).clamp(0.0, 1.0);
+    let confidence = (0.6 * top + 0.25 * margin + 0.15 * sharpness).clamp(0.0, 1.0);
+    Ok((confidence, top < 0.5 || confidence < 0.56))
 }
 
 // ============================================================================
@@ -345,8 +433,8 @@ pub fn stratified_downsample(
         return Ok((x.clone(), y.clone()));
     }
 
-    use rand::SeedableRng;
     use rand::prelude::*;
+    use rand::SeedableRng;
     let mut rng = StdRng::seed_from_u64(random_state);
 
     // Group by class
@@ -621,11 +709,9 @@ pub fn detect_feature_drift(
     if !drifted_features.is_empty() {
         let mut sorted_drifted = drifted_features.clone();
         sorted_drifted.sort_by(|a, b| {
-            let score_a = drift_scores.get(a).copied().unwrap_or(0.0);
-            let score_b = drift_scores.get(b).copied().unwrap_or(0.0);
-            score_b
-                .partial_cmp(&score_a)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let score_a = drift_scores.get(a).copied().unwrap_or(f64::NEG_INFINITY);
+            let score_b = drift_scores.get(b).copied().unwrap_or(f64::NEG_INFINITY);
+            score_b.total_cmp(&score_a).then_with(|| a.cmp(b))
         });
 
         let top_5: Vec<_> = sorted_drifted.iter().take(5).map(|s| s.as_str()).collect();
@@ -660,7 +746,11 @@ pub struct FeatureDriftReport {
 fn extract_numeric_values(series: &Series) -> Result<Vec<f64>> {
     let series_f64 = series.cast(&DataType::Float64)?;
     let ca = series_f64.f64()?;
-    let values: Vec<f64> = ca.into_iter().flatten().collect();
+    let values: Vec<f64> = ca
+        .into_iter()
+        .flatten()
+        .filter(|value| value.is_finite())
+        .collect();
     Ok(values)
 }
 
@@ -746,8 +836,15 @@ fn compute_psi_from_counts(
 }
 
 fn compute_percentiles(data: &[f64], n: usize) -> Vec<f64> {
-    let mut sorted = data.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut sorted: Vec<f64> = data
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
+    if sorted.is_empty() || n == 0 {
+        return Vec::new();
+    }
+    sorted.sort_by(|a, b| a.total_cmp(b));
 
     (0..=n)
         .map(|i| {
@@ -979,6 +1076,47 @@ mod tests {
     }
 
     #[test]
+    fn build_runtime_prediction_with_details_attaches_backend_and_degraded_reason() -> Result<()> {
+        let prediction = build_runtime_prediction_with_details(
+            "lightgbm",
+            ModelFamily::Tree,
+            CapabilityState::Implemented,
+            [0.1, 0.7, 0.2],
+            Some(0.7),
+            Some(false),
+            Some("tree_surrogate".to_string()),
+            Some("native_lightgbm_unavailable".to_string()),
+        )?;
+
+        let (_, _, _, metadata) = prediction.parts();
+        assert_eq!(
+            metadata.execution_backend.as_deref(),
+            Some("tree_surrogate")
+        );
+        assert_eq!(
+            metadata.degraded_reason.as_deref(),
+            Some("native_lightgbm_unavailable")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn three_class_runtime_confidence_abstains_on_tight_top_two_margin() -> Result<()> {
+        let (confidence, abstain) = three_class_runtime_confidence([0.51, 0.49, 0.0])?;
+        assert!(confidence < 0.56, "tight top-two split should stay low-confidence");
+        assert!(abstain, "tight top-two split should recommend abstain");
+        Ok(())
+    }
+
+    #[test]
+    fn three_class_runtime_confidence_accepts_clear_decisive_rows() -> Result<()> {
+        let (confidence, abstain) = three_class_runtime_confidence([0.8, 0.1, 0.1])?;
+        assert!(confidence > 0.56, "clear winner should produce strong confidence");
+        assert!(!abstain, "clear winner should not recommend abstain");
+        Ok(())
+    }
+
+    #[test]
     fn dataframe_to_float32_array_still_builds_row_major_contract() -> Result<()> {
         let df = DataFrame::new(vec![
             Series::new("a".into(), vec![1.0_f64, 2.0]).into(),
@@ -987,6 +1125,30 @@ mod tests {
 
         let array = dataframe_to_float32_array(&df)?;
         assert_eq!(array, array![[1.0_f32, 3.0_f32], [2.0_f32, 4.0_f32]]);
+        Ok(())
+    }
+
+    #[test]
+    fn dataframe_to_float32_array_rejects_nulls() -> Result<()> {
+        let df = DataFrame::new(vec![
+            Series::new("a".into(), vec![Some(1.0_f64), None]).into(),
+            Series::new("b".into(), vec![Some(3.0_f64), Some(4.0)]).into(),
+        ])?;
+
+        let err = dataframe_to_float32_array(&df).expect_err("null feature row should fail");
+        assert!(err.to_string().contains("contains null"));
+        Ok(())
+    }
+
+    #[test]
+    fn strict_numeric_column_values_rejects_non_finite_values() -> Result<()> {
+        let df = DataFrame::new(vec![
+            Series::new("close".into(), vec![1.0_f64, f64::NAN]).into()
+        ])?;
+
+        let err = strict_numeric_column_values(&df, "close")
+            .expect_err("non-finite numeric values should fail");
+        assert!(err.to_string().contains("non-finite"));
         Ok(())
     }
 }

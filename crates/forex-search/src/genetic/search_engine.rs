@@ -1,13 +1,13 @@
 use super::evolution_math::{
-    EvolutionSearchPolicy, ParentSelectionPolicy, SeenSignatureMemory, SurvivorSelectionPolicy,
     apply_metrics, crossover, generate_random_genes, mutate, new_random_gene, select_parent_index,
-    select_survivor_indices, unique_candidate_or_retry,
+    select_survivor_indices, unique_candidate_or_retry, EvolutionSearchPolicy,
+    ParentSelectionPolicy, SeenSignatureMemory, SurvivorSelectionPolicy,
 };
-use super::smc_indicators::{SmcSearchConfig, build_smc_arrays, enforce_population_smc_ratio};
+use super::smc_indicators::{build_smc_arrays, enforce_population_smc_ratio, SmcSearchConfig};
 use super::strategy_gene::{EvaluationConfig, Gene, SearchResult};
 use crate::eval::BacktestSettings;
-use crate::stop_target::{StopTargetSettings, infer_stop_target_pips};
-use anyhow::{Result, anyhow, bail};
+use crate::stop_target::{infer_stop_target_pips, StopTargetSettings};
+use anyhow::{anyhow, bail, Result};
 use chrono::{Datelike, TimeZone, Utc};
 use forex_data::{FeatureFrame, Ohlcv};
 use ndarray::Array2;
@@ -363,7 +363,8 @@ where
         .collect();
 
     let mut best_metrics = Vec::new();
-    let mut profitable_archive: Vec<(Gene, [f64; 11])> = Vec::new();
+    let mut profitable_archive: Vec<(Gene, [f64; 11], usize)> = Vec::new();
+    let mut archive_seq = 0usize;
     let mut seen_strategy_ids: HashSet<String> = HashSet::new();
 
     let env_str = |n, d: &str| {
@@ -440,11 +441,12 @@ where
         let metrics = evaluate_genes(features, ohlcv, &genes, &eval_cfg)?;
         apply_metrics(&mut genes, &metrics);
 
-        let mut scored: Vec<(f64, Gene, [f64; 11])> = genes
+        let mut scored: Vec<(f64, usize, Gene, [f64; 11])> = genes
             .iter()
             .cloned()
             .zip(metrics.into_iter())
-            .map(|(g, m)| (g.fitness, g, m))
+            .enumerate()
+            .map(|(idx, (g, m))| (g.fitness, idx, g, m))
             .collect();
 
         // --- Novelty Search: Behavioral Diversity ---
@@ -456,9 +458,9 @@ where
             let n_pop = scored.len();
             let mut novelty_scores = vec![0.0; n_pop];
             for i in 0..n_pop {
-                let sig_i: HashSet<_> = scored[i].1.indices.iter().copied().collect();
+                let sig_i: HashSet<_> = scored[i].2.indices.iter().copied().collect();
                 let mut dist_sum = 0.0;
-                for (j, (_, gene_j, _)) in scored.iter().enumerate().take(n_pop) {
+                for (j, (_, _, gene_j, _)) in scored.iter().enumerate().take(n_pop) {
                     if i == j {
                         continue;
                     }
@@ -478,12 +480,12 @@ where
             // Normalize and blend
             let min_fit = scored
                 .iter()
-                .map(|(f, _, _)| *f)
+                .map(|(f, _, _, _)| *f)
                 .filter(|f| f.is_finite())
                 .fold(f64::INFINITY, f64::min);
             let max_fit = scored
                 .iter()
-                .map(|(f, _, _)| *f)
+                .map(|(f, _, _, _)| *f)
                 .filter(|f| f.is_finite())
                 .fold(f64::NEG_INFINITY, f64::max);
             let fit_range = (max_fit - min_fit).max(1e-9);
@@ -505,7 +507,11 @@ where
         }
         // ------------------------------------------
 
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
 
         let top_score = scored.first().map(|x| x.0).unwrap_or(f64::NEG_INFINITY);
         if top_score > best_score_seen + 1e-12 {
@@ -515,7 +521,7 @@ where
             stagnant_gens += 1;
         }
 
-        for (_score, gene, m) in scored.iter() {
+        for (_score, _, gene, m) in scored.iter() {
             if profitable_archive.len() >= archive_cap {
                 break;
             }
@@ -543,7 +549,8 @@ where
             if !seen_strategy_ids.insert(sid) {
                 continue;
             }
-            profitable_archive.push((gene.clone(), *m));
+            profitable_archive.push((gene.clone(), *m, archive_seq));
+            archive_seq += 1;
         }
 
         progress_fn(
@@ -560,12 +567,12 @@ where
                 let top_candidates: Vec<Gene> = scored
                     .iter()
                     .take(best_return_count)
-                    .map(|(_, g, _)| g.clone())
+                    .map(|(_, _, g, _)| g.clone())
                     .collect();
                 let top_metrics: Vec<[f64; 11]> = scored
                     .iter()
                     .take(best_return_count)
-                    .map(|(_, _, m)| *m)
+                    .map(|(_, _, _, m)| *m)
                     .collect();
                 seen_memory.flush();
                 if !profitable_archive.is_empty() {
@@ -573,10 +580,14 @@ where
                         b.1[0]
                             .partial_cmp(&a.1[0])
                             .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.2.cmp(&b.2))
                     });
                     return Ok(SearchResult {
-                        genes: profitable_archive.iter().map(|(g, _)| g.clone()).collect(),
-                        metrics: profitable_archive.iter().map(|(_, m)| *m).collect(),
+                        genes: profitable_archive
+                            .iter()
+                            .map(|(g, _, _)| g.clone())
+                            .collect(),
+                        metrics: profitable_archive.iter().map(|(_, m, _)| *m).collect(),
                     });
                 }
                 return Ok(SearchResult {
@@ -590,12 +601,12 @@ where
         let top_candidates: Vec<Gene> = scored
             .iter()
             .take(best_return_count)
-            .map(|(_, g, _)| g.clone())
+            .map(|(_, _, g, _)| g.clone())
             .collect();
         best_metrics = scored
             .iter()
             .take(best_return_count)
-            .map(|(_, _, m)| *m)
+            .map(|(_, _, _, m)| *m)
             .collect();
 
         if gen + 1 == generations {
@@ -605,10 +616,14 @@ where
                     b.1[0]
                         .partial_cmp(&a.1[0])
                         .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.2.cmp(&b.2))
                 });
                 return Ok(SearchResult {
-                    genes: profitable_archive.iter().map(|(g, _)| g.clone()).collect(),
-                    metrics: profitable_archive.iter().map(|(_, m)| *m).collect(),
+                    genes: profitable_archive
+                        .iter()
+                        .map(|(g, _, _)| g.clone())
+                        .collect(),
+                    metrics: profitable_archive.iter().map(|(_, m, _)| *m).collect(),
                 });
             }
             return Ok(SearchResult {
@@ -618,7 +633,7 @@ where
         }
 
         let mut rng = rand::rng();
-        let score_vector: Vec<f64> = scored.iter().map(|(score, _, _)| *score).collect();
+        let score_vector: Vec<f64> = scored.iter().map(|(score, _, _, _)| *score).collect();
         let survivor_fraction = if stagnant_gens >= stagnation_patience {
             (search_policy.survivor_fraction * 0.75).clamp(0.0, 0.5)
         } else {
@@ -639,7 +654,7 @@ where
         );
         let survivors: Vec<Gene> = survivor_indices
             .iter()
-            .map(|idx| scored[*idx].1.clone())
+            .map(|idx| scored[*idx].2.clone())
             .collect();
 
         let mut next = Vec::with_capacity(population);
@@ -695,8 +710,8 @@ where
                     retries += 1;
                 }
             }
-            let a = &scored[a_idx].1;
-            let b = &scored[b_idx].1;
+            let a = &scored[a_idx].2;
+            let b = &scored[b_idx].2;
             next.push(unique_candidate_or_retry(
                 mutate(
                     &crossover(a, b, gen + 1),

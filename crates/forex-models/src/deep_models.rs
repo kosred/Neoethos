@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use burn::module::{AutodiffModule, Module};
 use burn::record::{DefaultFileRecorder, FullPrecisionSettings};
 use ndarray::Array2;
@@ -8,16 +8,17 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::base::{
-    ExpertModel, build_runtime_artifact_metadata, canonical_three_class_label_mapping,
-    dataframe_to_float32_array, feature_columns_from_dataframe,
+    build_runtime_artifact_metadata, canonical_three_class_label_mapping,
+    dataframe_to_float32_array, feature_columns_from_dataframe, ExpertModel,
 };
 use crate::burn_models::{
-    BurnKAN, BurnKANConfig, BurnMLP, BurnMLPConfig, BurnNBeats, BurnNBeatsConfig, BurnNBeatsx,
-    BurnNBeatsxConfig, BurnPatchTST, BurnPatchTSTConfig, BurnTabNet, BurnTabNetConfig, BurnTiDE,
-    BurnTiDEConfig, BurnTiDENf, BurnTiDENfConfig, BurnTimesNet, BurnTimesNetConfig,
-    BurnTrainingReport, BurnTransformer, BurnTransformerConfig, InferBackend, TrainBackend,
-    TrainConfig, predict_proba as burn_predict_proba,
-    train_model_with_report as burn_train_model_with_report,
+    predict_proba_on_device as burn_predict_proba_on_device, resolve_infer_device,
+    resolve_train_device, train_model_with_report as burn_train_model_with_report,
+    BurnDeviceSelection, BurnKAN, BurnKANConfig, BurnMLP, BurnMLPConfig, BurnNBeats,
+    BurnNBeatsConfig, BurnNBeatsx, BurnNBeatsxConfig, BurnPatchTST, BurnPatchTSTConfig, BurnTabNet,
+    BurnTabNetConfig, BurnTiDE, BurnTiDEConfig, BurnTiDENf, BurnTiDENfConfig, BurnTimesNet,
+    BurnTimesNetConfig, BurnTrainingReport, BurnTransformer, BurnTransformerConfig, InferBackend,
+    TrainBackend, TrainConfig,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
@@ -81,50 +82,81 @@ enum RuntimeDeepModel {
 impl RuntimeDeepModel {
     fn save_to(&self, base_path: &Path) -> Result<()> {
         let recorder = DefaultFileRecorder::<FullPrecisionSettings>::new();
+        let base_name = base_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("deep-model record base path is missing a file name")?;
+        let temp_base_path = base_path.with_file_name(format!("{base_name}_tmp"));
+        let target_record_path = base_path.with_extension("mpk");
+        let temp_record_path = temp_base_path.with_extension("mpk");
+
         match self {
-            Self::Mlp(model) => model.clone().save_file(base_path.to_path_buf(), &recorder),
-            Self::NBeats(model) => model.clone().save_file(base_path.to_path_buf(), &recorder),
-            Self::NBeatsxNf(model) => model.clone().save_file(base_path.to_path_buf(), &recorder),
-            Self::TiDE(model) => model.clone().save_file(base_path.to_path_buf(), &recorder),
-            Self::TiDENf(model) => model.clone().save_file(base_path.to_path_buf(), &recorder),
-            Self::TabNet(model) => model.clone().save_file(base_path.to_path_buf(), &recorder),
-            Self::Kan(model) => model.clone().save_file(base_path.to_path_buf(), &recorder),
-            Self::Transformer(model) => model.clone().save_file(base_path.to_path_buf(), &recorder),
-            Self::PatchTst(model) => model.clone().save_file(base_path.to_path_buf(), &recorder),
-            Self::TimesNet(model) => model.clone().save_file(base_path.to_path_buf(), &recorder),
+            Self::Mlp(model) => model.clone().save_file(temp_base_path.clone(), &recorder),
+            Self::NBeats(model) => model.clone().save_file(temp_base_path.clone(), &recorder),
+            Self::NBeatsxNf(model) => model.clone().save_file(temp_base_path.clone(), &recorder),
+            Self::TiDE(model) => model.clone().save_file(temp_base_path.clone(), &recorder),
+            Self::TiDENf(model) => model.clone().save_file(temp_base_path.clone(), &recorder),
+            Self::TabNet(model) => model.clone().save_file(temp_base_path.clone(), &recorder),
+            Self::Kan(model) => model.clone().save_file(temp_base_path.clone(), &recorder),
+            Self::Transformer(model) => model.clone().save_file(temp_base_path.clone(), &recorder),
+            Self::PatchTst(model) => model.clone().save_file(temp_base_path.clone(), &recorder),
+            Self::TimesNet(model) => model.clone().save_file(temp_base_path.clone(), &recorder),
         }
-        .with_context(|| format!("persist Burn model record to {}", base_path.display()))
+        .with_context(|| format!("persist Burn model record to {}", temp_base_path.display()))?;
+
+        if target_record_path.exists() {
+            std::fs::remove_file(&target_record_path).with_context(|| {
+                format!(
+                    "remove previous deep-model record before rotation {}",
+                    target_record_path.display()
+                )
+            })?;
+        }
+        std::fs::rename(&temp_record_path, &target_record_path).with_context(|| {
+            format!(
+                "rename deep-model record into {}",
+                target_record_path.display()
+            )
+        })?;
+        Ok(())
     }
 
     fn predict_probabilities(
         &self,
         features: &Array2<f32>,
         batch_size: usize,
+        device: &<InferBackend as burn::tensor::backend::Backend>::Device,
     ) -> Result<Array2<f32>> {
         match self {
-            Self::Mlp(model) => burn_predict_proba::<InferBackend, _>(model, features, batch_size),
+            Self::Mlp(model) => {
+                burn_predict_proba_on_device::<InferBackend, _>(model, features, batch_size, device)
+            }
             Self::NBeats(model) => {
-                burn_predict_proba::<InferBackend, _>(model, features, batch_size)
+                burn_predict_proba_on_device::<InferBackend, _>(model, features, batch_size, device)
             }
             Self::NBeatsxNf(model) => {
-                burn_predict_proba::<InferBackend, _>(model, features, batch_size)
+                burn_predict_proba_on_device::<InferBackend, _>(model, features, batch_size, device)
             }
-            Self::TiDE(model) => burn_predict_proba::<InferBackend, _>(model, features, batch_size),
+            Self::TiDE(model) => {
+                burn_predict_proba_on_device::<InferBackend, _>(model, features, batch_size, device)
+            }
             Self::TiDENf(model) => {
-                burn_predict_proba::<InferBackend, _>(model, features, batch_size)
+                burn_predict_proba_on_device::<InferBackend, _>(model, features, batch_size, device)
             }
             Self::TabNet(model) => {
-                burn_predict_proba::<InferBackend, _>(model, features, batch_size)
+                burn_predict_proba_on_device::<InferBackend, _>(model, features, batch_size, device)
             }
-            Self::Kan(model) => burn_predict_proba::<InferBackend, _>(model, features, batch_size),
+            Self::Kan(model) => {
+                burn_predict_proba_on_device::<InferBackend, _>(model, features, batch_size, device)
+            }
             Self::Transformer(model) => {
-                burn_predict_proba::<InferBackend, _>(model, features, batch_size)
+                burn_predict_proba_on_device::<InferBackend, _>(model, features, batch_size, device)
             }
             Self::PatchTst(model) => {
-                burn_predict_proba::<InferBackend, _>(model, features, batch_size)
+                burn_predict_proba_on_device::<InferBackend, _>(model, features, batch_size, device)
             }
             Self::TimesNet(model) => {
-                burn_predict_proba::<InferBackend, _>(model, features, batch_size)
+                burn_predict_proba_on_device::<InferBackend, _>(model, features, batch_size, device)
             }
         }
     }
@@ -203,6 +235,15 @@ impl BurnDeepExpert {
 
     fn batch_size(&self) -> usize {
         self.usize_param("batch_size", 64)
+    }
+
+    fn string_param(&self, key: &str, default: &str) -> String {
+        self.params
+            .get(key)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(default)
+            .to_string()
     }
 
     fn usize_param(&self, key: &str, default: usize) -> usize {
@@ -321,7 +362,8 @@ impl BurnDeepExpert {
     }
 
     fn init_runtime_model(&self, input_dim: usize) -> RuntimeDeepModel {
-        let device = Default::default();
+        let requested_device = self.string_param("device", "auto");
+        let (device, _) = resolve_infer_device(&requested_device);
         match self.kind {
             DeepModelKind::Mlp => {
                 RuntimeDeepModel::Mlp(self.mlp_config(input_dim).init::<InferBackend>(&device))
@@ -369,9 +411,14 @@ impl BurnDeepExpert {
         input_dim: usize,
         features: &Array2<f32>,
         labels: &[i32],
-    ) -> Result<(RuntimeDeepModel, TrainingSummaryMetadata)> {
+    ) -> Result<(
+        RuntimeDeepModel,
+        TrainingSummaryMetadata,
+        BurnDeviceSelection,
+    )> {
         let train_config = self.train_config();
-        let device = Default::default();
+        let requested_device = self.string_param("device", "auto");
+        let (device, device_selection) = resolve_train_device(&requested_device);
         match self.kind {
             DeepModelKind::Mlp => {
                 let model = self.mlp_config(input_dim).init::<TrainBackend>(&device);
@@ -384,6 +431,7 @@ impl BurnDeepExpert {
                 Ok((
                     RuntimeDeepModel::Mlp(trained.valid()),
                     Self::training_summary_from_report(&report),
+                    device_selection.clone(),
                 ))
             }
             DeepModelKind::NBeats => {
@@ -397,6 +445,7 @@ impl BurnDeepExpert {
                 Ok((
                     RuntimeDeepModel::NBeats(trained.valid()),
                     Self::training_summary_from_report(&report),
+                    device_selection.clone(),
                 ))
             }
             DeepModelKind::NBeatsxNf => {
@@ -412,6 +461,7 @@ impl BurnDeepExpert {
                 Ok((
                     RuntimeDeepModel::NBeatsxNf(trained.valid()),
                     Self::training_summary_from_report(&report),
+                    device_selection.clone(),
                 ))
             }
             DeepModelKind::TiDE => {
@@ -425,6 +475,7 @@ impl BurnDeepExpert {
                 Ok((
                     RuntimeDeepModel::TiDE(trained.valid()),
                     Self::training_summary_from_report(&report),
+                    device_selection.clone(),
                 ))
             }
             DeepModelKind::TiDENf => {
@@ -438,6 +489,7 @@ impl BurnDeepExpert {
                 Ok((
                     RuntimeDeepModel::TiDENf(trained.valid()),
                     Self::training_summary_from_report(&report),
+                    device_selection.clone(),
                 ))
             }
             DeepModelKind::TabNet => {
@@ -451,6 +503,7 @@ impl BurnDeepExpert {
                 Ok((
                     RuntimeDeepModel::TabNet(trained.valid()),
                     Self::training_summary_from_report(&report),
+                    device_selection.clone(),
                 ))
             }
             DeepModelKind::Kan => {
@@ -464,6 +517,7 @@ impl BurnDeepExpert {
                 Ok((
                     RuntimeDeepModel::Kan(trained.valid()),
                     Self::training_summary_from_report(&report),
+                    device_selection.clone(),
                 ))
             }
             DeepModelKind::Transformer => {
@@ -479,6 +533,7 @@ impl BurnDeepExpert {
                 Ok((
                     RuntimeDeepModel::Transformer(trained.valid()),
                     Self::training_summary_from_report(&report),
+                    device_selection.clone(),
                 ))
             }
             DeepModelKind::PatchTst => {
@@ -494,6 +549,7 @@ impl BurnDeepExpert {
                 Ok((
                     RuntimeDeepModel::PatchTst(trained.valid()),
                     Self::training_summary_from_report(&report),
+                    device_selection.clone(),
                 ))
             }
             DeepModelKind::TimesNet => {
@@ -509,6 +565,7 @@ impl BurnDeepExpert {
                 Ok((
                     RuntimeDeepModel::TimesNet(trained.valid()),
                     Self::training_summary_from_report(&report),
+                    device_selection.clone(),
                 ))
             }
         }
@@ -555,6 +612,10 @@ impl BurnDeepExpert {
             .with_context(|| format!("serialize {}", path.display()))?;
         std::fs::write(&temp_path, payload)
             .with_context(|| format!("write temporary artifact {}", temp_path.display()))?;
+        if path.exists() {
+            std::fs::remove_file(path)
+                .with_context(|| format!("remove previous artifact {}", path.display()))?;
+        }
         std::fs::rename(&temp_path, path)
             .with_context(|| format!("rename artifact into {}", path.display()))?;
         Ok(())
@@ -635,8 +696,21 @@ impl ExpertModel for BurnDeepExpert {
         let input_dim = features.ncols();
 
         self.feature_columns = feature_columns_from_dataframe(x);
-        let (model, summary) = self.train_runtime_model(input_dim, &features, &labels)?;
+        let (model, summary, device_selection) =
+            self.train_runtime_model(input_dim, &features, &labels)?;
         self.training_summary = Some(summary);
+        self.params.insert(
+            "requested_device_policy".to_string(),
+            device_selection.requested_policy,
+        );
+        self.params.insert(
+            "effective_device_policy".to_string(),
+            device_selection.effective_policy,
+        );
+        self.params.insert(
+            "execution_backend".to_string(),
+            device_selection.execution_backend,
+        );
         self.model = Some(model);
         Ok(())
     }
@@ -658,7 +732,9 @@ impl ExpertModel for BurnDeepExpert {
 
         let features = dataframe_to_float32_array(x)
             .with_context(|| format!("build {} inference matrix", self.model_name()))?;
-        let probabilities = model.predict_probabilities(&features, self.batch_size())?;
+        let requested_device = self.string_param("device", "auto");
+        let (device, _) = resolve_infer_device(&requested_device);
+        let probabilities = model.predict_probabilities(&features, self.batch_size(), &device)?;
         if probabilities.ncols() != 3 {
             bail!(
                 "{} should output 3 probability columns, got {}",
@@ -699,11 +775,14 @@ impl ExpertModel for BurnDeepExpert {
         let next_params = config.params;
         let next_feature_columns = metadata.feature_columns;
         let next_training_summary = Some(metadata.training_summary);
-        let next_model = self.init_runtime_model(next_feature_columns.len());
+        let mut next_state = self.clone();
+        next_state.params = next_params.clone();
+        let next_model = next_state.init_runtime_model(next_feature_columns.len());
 
         let recorder = DefaultFileRecorder::<FullPrecisionSettings>::new();
         let base_path = Self::model_record_path(path);
-        let device = Default::default();
+        let requested_device = next_state.string_param("device", "auto");
+        let (device, device_selection) = resolve_infer_device(&requested_device);
         let loaded = match next_model {
             RuntimeDeepModel::Mlp(model) => RuntimeDeepModel::Mlp(
                 model
@@ -756,10 +835,23 @@ impl ExpertModel for BurnDeepExpert {
                     .with_context(|| format!("load {} Burn record", self.model_name()))?,
             ),
         };
-        self.params = next_params;
-        self.feature_columns = next_feature_columns;
-        self.training_summary = next_training_summary;
-        self.model = Some(loaded);
+        next_state.params = next_params;
+        next_state.params.insert(
+            "requested_device_policy".to_string(),
+            device_selection.requested_policy,
+        );
+        next_state.params.insert(
+            "effective_device_policy".to_string(),
+            device_selection.effective_policy,
+        );
+        next_state.params.insert(
+            "execution_backend".to_string(),
+            device_selection.execution_backend,
+        );
+        next_state.feature_columns = next_feature_columns;
+        next_state.training_summary = next_training_summary;
+        next_state.model = Some(loaded);
+        *self = next_state;
         Ok(())
     }
 }
@@ -827,10 +919,9 @@ mod tests {
         let err = expert
             .metadata()
             .expect_err("missing training summary must fail");
-        assert!(
-            err.to_string()
-                .contains("missing training summary metadata")
-        );
+        assert!(err
+            .to_string()
+            .contains("missing training summary metadata"));
     }
 
     #[test]
@@ -862,5 +953,48 @@ mod tests {
         let err = BurnDeepExpert::validate_loaded_metadata(&metadata, "mlp")
             .expect_err("inconsistent training summary must fail");
         assert!(err.to_string().contains("training summary is inconsistent"));
+    }
+
+    #[test]
+    fn fit_persists_effective_burn_device_metadata() -> Result<()> {
+        let rsi = (0..140)
+            .map(|idx| 0.1_f32 + idx as f32 * 0.01)
+            .collect::<Vec<_>>();
+        let atr = (0..140)
+            .map(|idx| 1.0_f32 + idx as f32 * 0.01)
+            .collect::<Vec<_>>();
+        let labels = (0..140)
+            .map(|idx| match idx % 3 {
+                0 => 0_i32,
+                1 => 1_i32,
+                _ => -1_i32,
+            })
+            .collect::<Vec<_>>();
+        let df = DataFrame::new(vec![
+            Series::new("rsi".into(), rsi).into(),
+            Series::new("atr".into(), atr).into(),
+        ])?;
+        let labels = Series::new("label".into(), labels);
+        let mut expert = BurnDeepExpert::new(
+            DeepModelKind::Mlp,
+            7,
+            Some(HashMap::from([
+                ("device".to_string(), "cpu".to_string()),
+                ("max_epochs".to_string(), "2".to_string()),
+                ("batch_size".to_string(), "4".to_string()),
+            ])),
+        );
+        expert.fit(&df, &labels)?;
+
+        assert_eq!(
+            expert
+                .params
+                .get("requested_device_policy")
+                .map(String::as_str),
+            Some("cpu")
+        );
+        assert!(expert.params.contains_key("effective_device_policy"));
+        assert!(expert.params.contains_key("execution_backend"));
+        Ok(())
     }
 }

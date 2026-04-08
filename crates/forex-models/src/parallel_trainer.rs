@@ -6,12 +6,13 @@ use polars::prelude::{Column, DataFrame, NamedFrom, Series};
 use rayon::prelude::*;
 use std::env;
 use std::sync::{
-    Arc,
     atomic::{AtomicUsize, Ordering},
+    Arc,
 };
 use tracing::info;
 
 use crate::base::dataframe_to_float32_array;
+use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 
 fn read_threads_env(keys: &[&str]) -> Option<usize> {
     for key in keys {
@@ -301,6 +302,8 @@ where
 pub struct ModelConfig {
     pub name: String,
     pub model_type: ModelType,
+    pub capability_family: ModelFamily,
+    pub capability_state: CapabilityState,
     pub params: std::collections::HashMap<String, String>,
 }
 
@@ -365,21 +368,27 @@ mod tests {
             ModelConfig {
                 name: "model_1".to_string(),
                 model_type: ModelType::LightGBM,
+                capability_family: ModelFamily::Tree,
+                capability_state: CapabilityState::Implemented,
                 params: Default::default(),
             },
             ModelConfig {
                 name: "model_2".to_string(),
                 model_type: ModelType::XGBoost,
+                capability_family: ModelFamily::Tree,
+                capability_state: CapabilityState::Implemented,
                 params: Default::default(),
             },
             ModelConfig {
                 name: "model_3".to_string(),
                 model_type: ModelType::MLP,
+                capability_family: ModelFamily::Deep,
+                capability_state: CapabilityState::Implemented,
                 params: Default::default(),
             },
         ];
 
-        // Training function (mock)
+        // Test helper training function
         let train_fn = |config: &ModelConfig, _payload: &TrainingPayload| {
             println!("Training {}", config.name);
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -403,11 +412,15 @@ mod tests {
             ModelConfig {
                 name: "ok_model".to_string(),
                 model_type: ModelType::LightGBM,
+                capability_family: ModelFamily::Tree,
+                capability_state: CapabilityState::Implemented,
                 params: Default::default(),
             },
             ModelConfig {
                 name: "bad_model".to_string(),
                 model_type: ModelType::XGBoost,
+                capability_family: ModelFamily::Tree,
+                capability_state: CapabilityState::Implemented,
                 params: Default::default(),
             },
         ];
@@ -451,11 +464,15 @@ mod tests {
             ModelConfig {
                 name: "ok_model".to_string(),
                 model_type: ModelType::LightGBM,
+                capability_family: ModelFamily::Tree,
+                capability_state: CapabilityState::Implemented,
                 params: Default::default(),
             },
             ModelConfig {
                 name: "bad_model".to_string(),
                 model_type: ModelType::XGBoost,
+                capability_family: ModelFamily::Tree,
+                capability_state: CapabilityState::Implemented,
                 params: Default::default(),
             },
         ];

@@ -1,35 +1,32 @@
 #[cfg(feature = "catboost")]
 use catboost_rust as catboost;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use ndarray::Array2;
 use polars::prelude::*;
-#[cfg(feature = "catboost")]
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
-#[cfg(feature = "catboost")]
 use std::path::PathBuf;
 
-use crate::base::ExpertModel;
-use crate::base::feature_columns_from_dataframe;
+use crate::base::{feature_columns_from_dataframe, ExpertModel};
 use crate::runtime::artifacts::TrainingSummaryMetadata;
+use crate::runtime::prediction::RuntimePrediction;
 
 use super::common::{
-    CATBOOST_MODEL_FILE_NAME, TreeLocalFallbackArtifact, atomic_write,
-    build_tree_local_fallback_artifact, dataframe_to_row_major_vec, default_training_summary,
-    ensure_feature_columns_match, predict_tree_local_fallback, read_runtime_metadata,
-    remap_labels_to_tree_targets, reshape_three_class_probabilities, tree_artifact_paths,
-    tree_runtime_metadata, write_runtime_metadata,
+    atomic_write, build_tree_local_fallback_artifact, build_tree_runtime_predictions,
+    calibrate_three_class_probabilities, dataframe_to_row_major_vec, default_training_summary,
+    ensure_feature_columns_match, normalize_three_class_probabilities, predict_tree_local_fallback,
+    read_runtime_metadata, remap_labels_to_tree_targets, reshape_three_class_probabilities,
+    tree_artifact_paths, tree_runtime_metadata, validate_tree_local_fallback_artifact,
+    write_runtime_metadata, TreeLocalFallbackArtifact, CATBOOST_MODEL_FILE_NAME,
 };
 use super::config::*;
 
-#[cfg(feature = "catboost")]
 const CATBOOST_RUNTIME_FILE_NAME: &str = "runtime.json";
 const CATBOOST_LOCAL_FALLBACK_FILE_NAME: &str = "catboost_local_fallback.json";
 
-#[cfg(feature = "catboost")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CatBoostRuntimeArtifact {
     executable: String,
@@ -44,16 +41,13 @@ struct CatBoostRuntimeArtifact {
     depth: i32,
     learning_rate: f64,
     l2_leaf_reg: f64,
+    probability_temperature: f64,
     use_best_model: bool,
     thread_count: usize,
     random_seed: usize,
     loss_function: String,
 }
 
-#[cfg(not(feature = "catboost"))]
-type CatBoostRuntimeArtifact = ();
-
-#[cfg(feature = "catboost")]
 impl CatBoostRuntimeArtifact {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -68,6 +62,7 @@ impl CatBoostRuntimeArtifact {
         depth: i32,
         learning_rate: f64,
         l2_leaf_reg: f64,
+        probability_temperature: f64,
         use_best_model: bool,
         thread_count: usize,
         random_seed: usize,
@@ -92,6 +87,7 @@ impl CatBoostRuntimeArtifact {
             depth,
             learning_rate,
             l2_leaf_reg,
+            probability_temperature,
             use_best_model,
             thread_count,
             random_seed,
@@ -100,7 +96,6 @@ impl CatBoostRuntimeArtifact {
     }
 }
 
-#[cfg(feature = "catboost")]
 fn validate_runtime_artifact(
     artifact: &CatBoostRuntimeArtifact,
     expected_feature_count: usize,
@@ -141,6 +136,12 @@ fn validate_runtime_artifact(
         bail!(
             "CatBoost runtime artifact has invalid l2_leaf_reg {}",
             artifact.l2_leaf_reg
+        );
+    }
+    if !artifact.probability_temperature.is_finite() || artifact.probability_temperature <= 0.0 {
+        bail!(
+            "CatBoost runtime artifact has invalid probability_temperature {}",
+            artifact.probability_temperature
         );
     }
     if artifact.thread_count == 0 {
@@ -236,6 +237,7 @@ impl CatBoostExpert {
         params.insert("depth".into(), ParamValue::Int(8));
         params.insert("learning_rate".into(), ParamValue::Float(0.05));
         params.insert("l2_leaf_reg".into(), ParamValue::Float(3.0));
+        params.insert("probability_temperature".into(), ParamValue::Float(1.0));
         params.insert(
             "loss_function".into(),
             ParamValue::String("MultiClass".into()),
@@ -244,13 +246,21 @@ impl CatBoostExpert {
         params
     }
 
+    fn probability_temperature(&self) -> f32 {
+        let configured = param_float(&self.config.params, "probability_temperature", 1.0) as f32;
+        if configured.is_finite() && configured > 0.0 {
+            configured
+        } else {
+            1.0
+        }
+    }
+
     fn stored_training_summary(&self) -> TrainingSummaryMetadata {
         self.training_summary
             .clone()
             .unwrap_or_else(|| TrainingSummaryMetadata::new(0, 0, 0))
     }
 
-    #[cfg(feature = "catboost")]
     fn runtime_artifact_path(path: &Path) -> PathBuf {
         path.join(CATBOOST_RUNTIME_FILE_NAME)
     }
@@ -261,6 +271,7 @@ impl CatBoostExpert {
 
     fn persist_local_fallback(&self, path: &Path) -> Result<()> {
         if let Some(artifact) = self.local_fallback.as_ref() {
+            validate_tree_local_fallback_artifact(artifact, &self.feature_columns)?;
             let payload =
                 serde_json::to_vec_pretty(artifact).context("serialize CatBoost local fallback")?;
             atomic_write(&Self::local_fallback_path(path), &payload)?;
@@ -281,7 +292,6 @@ impl CatBoostExpert {
         Ok(Some(artifact))
     }
 
-    #[cfg(feature = "catboost")]
     fn read_runtime_artifact(path: &Path) -> Result<Option<CatBoostRuntimeArtifact>> {
         let runtime_path = Self::runtime_artifact_path(path);
         if !runtime_path.exists() {
@@ -302,7 +312,6 @@ impl CatBoostExpert {
         Ok(Some(artifact))
     }
 
-    #[cfg(feature = "catboost")]
     fn effective_task_type(&self) -> &'static str {
         let wants_gpu = matches!(self.config.device_pref, DevicePreference::Gpu)
             || (matches!(self.config.device_pref, DevicePreference::Auto) && gpu_count() > 0);
@@ -313,7 +322,6 @@ impl CatBoostExpert {
         }
     }
 
-    #[cfg(feature = "catboost")]
     fn build_runtime_artifact(
         &self,
         executable: Option<&Path>,
@@ -325,6 +333,8 @@ impl CatBoostExpert {
         let depth = param_int(&self.config.params, "depth", 8).max(1);
         let learning_rate = param_float(&self.config.params, "learning_rate", 0.05);
         let l2_leaf_reg = param_float(&self.config.params, "l2_leaf_reg", 3.0);
+        let probability_temperature =
+            param_float(&self.config.params, "probability_temperature", 1.0);
         let use_best_model = param_bool(&self.config.params, "use_best_model", false);
         let thread_count = self
             .config
@@ -346,11 +356,49 @@ impl CatBoostExpert {
             depth,
             learning_rate,
             l2_leaf_reg,
+            probability_temperature,
             use_best_model,
             thread_count,
             self.idx,
             &loss_function,
         )
+    }
+
+    fn apply_runtime_artifact(&mut self, artifact: &CatBoostRuntimeArtifact) {
+        self.config.gpu_only = artifact.gpu_only;
+        self.config.cpu_threads = Some(artifact.thread_count.max(1));
+        self.config.device_pref = match artifact.device_preference.as_str() {
+            "gpu" => DevicePreference::Gpu,
+            "cpu" => DevicePreference::Cpu,
+            _ => DevicePreference::Auto,
+        };
+        self.config.params.insert(
+            "iterations".into(),
+            ParamValue::Int(artifact.iterations.max(1)),
+        );
+        self.config
+            .params
+            .insert("depth".into(), ParamValue::Int(artifact.depth.max(1)));
+        self.config.params.insert(
+            "learning_rate".into(),
+            ParamValue::Float(artifact.learning_rate),
+        );
+        self.config.params.insert(
+            "l2_leaf_reg".into(),
+            ParamValue::Float(artifact.l2_leaf_reg),
+        );
+        self.config.params.insert(
+            "probability_temperature".into(),
+            ParamValue::Float(artifact.probability_temperature),
+        );
+        self.config.params.insert(
+            "use_best_model".into(),
+            ParamValue::Bool(artifact.use_best_model),
+        );
+        self.config.params.insert(
+            "loss_function".into(),
+            ParamValue::String(artifact.loss_function.clone()),
+        );
     }
 
     #[cfg(feature = "catboost")]
@@ -573,6 +621,9 @@ impl CatBoostExpert {
 
         let mut probabilities = Vec::with_capacity(raw_scores.len());
         for row in raw_scores.chunks(cols) {
+            if row.iter().any(|value| !value.is_finite()) {
+                bail!("CatBoost produced non-finite raw logits");
+            }
             let max_logit = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             let exp_values = row
                 .iter()
@@ -688,7 +739,19 @@ impl ExpertModel for CatBoostExpert {
             }
             if self.model.is_none() {
                 if let Some(fallback) = self.local_fallback.as_ref() {
-                    return predict_tree_local_fallback(fallback, x);
+                    tracing::warn!(
+                        model = "catboost",
+                        surrogate_kind = %fallback.surrogate_kind,
+                        surrogate_rows = fallback.training_summary.dataset_rows,
+                        "CatBoost native model unavailable during predict_proba; using local surrogate fallback"
+                    );
+                    let probabilities = predict_tree_local_fallback(fallback, x)?;
+                    let probabilities = calibrate_three_class_probabilities(
+                        probabilities,
+                        self.probability_temperature(),
+                        "CatBoost",
+                    )?;
+                    return normalize_three_class_probabilities(probabilities, "CatBoost");
                 }
                 bail!("CatBoost not trained");
             }
@@ -713,7 +776,13 @@ impl ExpertModel for CatBoostExpert {
                 .context("run CatBoost prediction on float features")?;
             let raw_cols = raw_scores.len() / rows.max(1);
             let probabilities = Self::softmax_probabilities(raw_scores, rows, raw_cols)?;
-            reshape_three_class_probabilities(probabilities, rows, raw_cols)
+            let probabilities = reshape_three_class_probabilities(probabilities, rows, raw_cols)?;
+            let probabilities = calibrate_three_class_probabilities(
+                probabilities,
+                self.probability_temperature(),
+                "CatBoost",
+            )?;
+            normalize_three_class_probabilities(probabilities, "CatBoost")
         }
         #[cfg(not(feature = "catboost"))]
         {
@@ -721,7 +790,13 @@ impl ExpertModel for CatBoostExpert {
                 .local_fallback
                 .as_ref()
                 .context("CatBoost local fallback not trained")?;
-            predict_tree_local_fallback(fallback, x)
+            let probabilities = predict_tree_local_fallback(fallback, x)?;
+            let probabilities = calibrate_three_class_probabilities(
+                probabilities,
+                self.probability_temperature(),
+                "CatBoost",
+            )?;
+            normalize_three_class_probabilities(probabilities, "CatBoost")
         }
     }
 
@@ -738,26 +813,21 @@ impl ExpertModel for CatBoostExpert {
             );
             let (model_path, metadata_path) = tree_artifact_paths(path, CATBOOST_MODEL_FILE_NAME);
             write_runtime_metadata(&metadata_path, &metadata)?;
+            let runtime_artifact = self.runtime_artifact.clone().unwrap_or_else(|| {
+                self.build_runtime_artifact(
+                    self.resolve_executable().ok().as_deref(),
+                    Some(self.effective_task_type()),
+                    3,
+                    self.feature_columns.len(),
+                )
+            });
+            validate_runtime_artifact(&runtime_artifact, self.feature_columns.len())?;
+            let runtime_path = Self::runtime_artifact_path(path);
+            let runtime_bytes = serde_json::to_vec_pretty(&runtime_artifact)
+                .context("serialize CatBoost runtime artifact")?;
+            atomic_write(&runtime_path, &runtime_bytes)?;
             if let Some(model_bytes) = self.model_bytes.as_ref() {
                 atomic_write(&model_path, model_bytes)?;
-                let executable = self.resolve_executable().ok();
-                let runtime_artifact = self.runtime_artifact.clone().unwrap_or_else(|| {
-                    let model = self
-                        .model
-                        .as_ref()
-                        .expect("CatBoost model should exist when saving");
-                    self.build_runtime_artifact(
-                        executable.as_deref(),
-                        Some(self.effective_task_type()),
-                        model.get_dimensions_count(),
-                        self.feature_columns.len(),
-                    )
-                });
-                validate_runtime_artifact(&runtime_artifact, self.feature_columns.len())?;
-                let runtime_path = Self::runtime_artifact_path(path);
-                let runtime_bytes = serde_json::to_vec_pretty(&runtime_artifact)
-                    .context("serialize CatBoost runtime artifact")?;
-                atomic_write(&runtime_path, &runtime_bytes)?;
             } else if self.local_fallback.is_none() {
                 bail!("CatBoost model bytes unavailable; train or load before saving");
             }
@@ -779,6 +849,19 @@ impl ExpertModel for CatBoostExpert {
             );
             let (_, metadata_path) = tree_artifact_paths(path, CATBOOST_MODEL_FILE_NAME);
             write_runtime_metadata(&metadata_path, &metadata)?;
+            let runtime_artifact = self.runtime_artifact.clone().unwrap_or_else(|| {
+                self.build_runtime_artifact(
+                    None,
+                    Some(self.effective_task_type()),
+                    3,
+                    self.feature_columns.len(),
+                )
+            });
+            validate_runtime_artifact(&runtime_artifact, self.feature_columns.len())?;
+            let runtime_path = Self::runtime_artifact_path(path);
+            let runtime_bytes = serde_json::to_vec_pretty(&runtime_artifact)
+                .context("serialize CatBoost runtime artifact")?;
+            atomic_write(&runtime_path, &runtime_bytes)?;
             self.persist_local_fallback(path)?;
             Ok(())
         }
@@ -800,6 +883,11 @@ impl ExpertModel for CatBoostExpert {
             }
             self.feature_columns = metadata.feature_columns;
             self.training_summary = Some(metadata.training_summary);
+            let persisted_runtime_artifact = Self::read_runtime_artifact(path)?;
+            if let Some(runtime_artifact) = persisted_runtime_artifact.as_ref() {
+                validate_runtime_artifact(runtime_artifact, self.feature_columns.len())?;
+                self.apply_runtime_artifact(runtime_artifact);
+            }
             let native_model_result = if model_path.exists() {
                 Some((|| -> Result<(Vec<u8>, catboost::Model)> {
                     let model_bytes = std::fs::read(&model_path).with_context(|| {
@@ -829,31 +917,20 @@ impl ExpertModel for CatBoostExpert {
 
             match native_model_result {
                 Some(Ok((model_bytes, model))) => {
-                    let runtime_artifact = match Self::read_runtime_artifact(path) {
-                        Ok(Some(artifact)) => artifact,
-                        Ok(None) => self.build_runtime_artifact(
+                    let runtime_artifact = persisted_runtime_artifact.unwrap_or_else(|| {
+                        self.build_runtime_artifact(
                             None,
                             Some(self.effective_task_type()),
                             model.get_dimensions_count(),
                             self.feature_columns.len(),
-                        ),
-                        Err(err) => {
-                            tracing::warn!(
-                                model = "catboost",
-                                path = %path.display(),
-                                error = %err,
-                                "failed to load CatBoost runtime artifact, rebuilding runtime metadata from the restored model"
-                            );
-                            self.build_runtime_artifact(
-                                None,
-                                Some(self.effective_task_type()),
-                                model.get_dimensions_count(),
-                                self.feature_columns.len(),
-                            )
-                        }
-                    };
+                        )
+                    });
                     validate_runtime_artifact(&runtime_artifact, self.feature_columns.len())?;
+                    self.apply_runtime_artifact(&runtime_artifact);
                     self.local_fallback = Self::read_local_fallback(path)?;
+                    if let Some(fallback) = self.local_fallback.as_ref() {
+                        validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
+                    }
                     self.model_bytes = Some(model_bytes);
                     self.runtime_artifact = Some(runtime_artifact);
                     self.model = Some(model);
@@ -863,7 +940,17 @@ impl ExpertModel for CatBoostExpert {
                     self.runtime_artifact = None;
                     self.model = None;
                     self.local_fallback = Self::read_local_fallback(path)?;
-                    if self.local_fallback.is_none() {
+                    if let Some(fallback) = self.local_fallback.as_ref() {
+                        validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
+                        tracing::warn!(
+                            model = "catboost",
+                            path = %path.display(),
+                            surrogate_kind = %fallback.surrogate_kind,
+                            surrogate_rows = fallback.training_summary.dataset_rows,
+                            error = %native_err,
+                            "failed to restore native CatBoost model; using local surrogate fallback"
+                        );
+                    } else {
                         return Err(native_err);
                     }
                 }
@@ -872,7 +959,16 @@ impl ExpertModel for CatBoostExpert {
                     self.runtime_artifact = None;
                     self.model = None;
                     self.local_fallback = Self::read_local_fallback(path)?;
-                    if self.local_fallback.is_none() {
+                    if let Some(fallback) = self.local_fallback.as_ref() {
+                        validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
+                        tracing::warn!(
+                            model = "catboost",
+                            path = %path.display(),
+                            surrogate_kind = %fallback.surrogate_kind,
+                            surrogate_rows = fallback.training_summary.dataset_rows,
+                            "CatBoost artifact missing native model; using local surrogate fallback"
+                        );
+                    } else {
                         bail!(
                             "CatBoost artifact {} is missing both native model and local fallback payload",
                             path.display()
@@ -889,13 +985,36 @@ impl ExpertModel for CatBoostExpert {
             let metadata = read_runtime_metadata(&metadata_path)?;
             self.feature_columns = metadata.feature_columns;
             self.training_summary = Some(metadata.training_summary);
+            let persisted_runtime_artifact = Self::read_runtime_artifact(path)?;
+            if let Some(runtime_artifact) = persisted_runtime_artifact.as_ref() {
+                validate_runtime_artifact(runtime_artifact, self.feature_columns.len())?;
+                self.apply_runtime_artifact(runtime_artifact);
+            }
             self.local_fallback = Self::read_local_fallback(path)?;
+            if let Some(fallback) = self.local_fallback.as_ref() {
+                validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
+            }
             self.model_bytes = None;
-            self.runtime_artifact = None;
+            self.runtime_artifact = persisted_runtime_artifact;
             self.model = None;
             self.gpu_only_disabled = false;
             Ok(())
         }
+    }
+}
+
+impl CatBoostExpert {
+    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
+        let probabilities = self.predict_proba(x)?;
+        build_tree_runtime_predictions(
+            "catboost",
+            &probabilities,
+            self.model.is_some(),
+            "catboost_native",
+            self.local_fallback.as_ref(),
+            "native_catboost_unavailable",
+            "catboost_unknown",
+        )
     }
 }
 

@@ -4,6 +4,8 @@
 // REMOVES: Python multiprocessing, GIL-related threading workarounds
 
 use std::env;
+#[cfg(feature = "tch")]
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
 #[cfg(feature = "tch")]
@@ -364,7 +366,13 @@ mod tests {
     fn test_hardware_detection() {
         let hw = HardwareInfo::detect();
         assert!(hw.cpu_cores > 0);
-        assert!(hw.cpu_cores_usable < hw.cpu_cores);
+        assert!(hw.cpu_cores_usable >= 1);
+        assert!(hw.cpu_cores_usable <= hw.cpu_cores);
+        if hw.cpu_cores > 1 {
+            assert!(hw.cpu_cores_usable < hw.cpu_cores);
+        } else {
+            assert_eq!(hw.cpu_cores_usable, 1);
+        }
     }
 
     #[test]

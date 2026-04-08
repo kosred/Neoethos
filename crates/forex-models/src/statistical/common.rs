@@ -1,19 +1,26 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use ndarray::Array2;
 use polars::prelude::*;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::path::Path;
 
 use crate::base::{
     build_runtime_artifact_metadata, dataframe_to_float32_array, feature_columns_from_dataframe,
 };
 use crate::runtime::artifacts::{
-    RuntimeArtifactMetadata, TrainingSummaryMetadata, default_three_class_label_mapping,
+    default_three_class_label_mapping, RuntimeArtifactMetadata, TrainingSummaryMetadata,
 };
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 
 pub const METADATA_FILE_NAME: &str = "metadata.json";
 pub const MODEL_FILE_NAME: &str = "model.json";
+
+fn ensure_finite_matrix(values: &Array2<f32>, context: &str) -> Result<()> {
+    if values.iter().any(|value| !value.is_finite()) {
+        bail!("{context} contains non-finite values");
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeatureScaler {
@@ -26,6 +33,7 @@ impl FeatureScaler {
         if features.nrows() == 0 || features.ncols() == 0 {
             bail!("feature scaler requires a non-empty feature matrix");
         }
+        ensure_finite_matrix(features, "feature scaler input")?;
 
         let rows = features.nrows();
         let cols = features.ncols();
@@ -65,6 +73,7 @@ impl FeatureScaler {
                 self.stds.len()
             );
         }
+        ensure_finite_matrix(features, "feature scaler transform input")?;
 
         let mut scaled = features.clone();
         for row in 0..scaled.nrows() {
@@ -72,6 +81,7 @@ impl FeatureScaler {
                 scaled[(row, col)] = (scaled[(row, col)] - self.means[col]) / self.stds[col];
             }
         }
+        ensure_finite_matrix(&scaled, "feature scaler output")?;
         Ok(scaled)
     }
 }
@@ -123,18 +133,38 @@ pub fn softmax_rows(logits: &Array2<f32>) -> Array2<f32> {
     let mut probabilities = logits.clone();
     for row in 0..probabilities.nrows() {
         let mut max_logit = f32::NEG_INFINITY;
+        let mut row_is_valid = true;
         for col in 0..probabilities.ncols() {
-            max_logit = max_logit.max(probabilities[(row, col)]);
+            let value = probabilities[(row, col)];
+            if !value.is_finite() {
+                row_is_valid = false;
+                break;
+            }
+            max_logit = max_logit.max(value);
+        }
+
+        if !row_is_valid || !max_logit.is_finite() {
+            for col in 0..probabilities.ncols() {
+                probabilities[(row, col)] = 0.0;
+            }
+            if probabilities.ncols() > 0 {
+                probabilities[(row, 0)] = 1.0;
+            }
+            continue;
         }
 
         let mut normalizer = 0.0_f32;
         for col in 0..probabilities.ncols() {
             let value = (probabilities[(row, col)] - max_logit).exp();
+            if !value.is_finite() {
+                row_is_valid = false;
+                break;
+            }
             probabilities[(row, col)] = value;
             normalizer += value;
         }
 
-        if normalizer <= f32::EPSILON {
+        if !row_is_valid || !normalizer.is_finite() || normalizer <= f32::EPSILON {
             for col in 0..probabilities.ncols() {
                 probabilities[(row, col)] = 0.0;
             }
@@ -178,6 +208,10 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .with_context(|| format!("serialize {}", path.display()))?;
     std::fs::write(&temp_path, payload)
         .with_context(|| format!("write temporary artifact {}", temp_path.display()))?;
+    if path.exists() {
+        std::fs::remove_file(path)
+            .with_context(|| format!("remove previous artifact {}", path.display()))?;
+    }
     std::fs::rename(&temp_path, path)
         .with_context(|| format!("rename artifact into {}", path.display()))?;
     Ok(())

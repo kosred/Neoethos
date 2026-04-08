@@ -1,16 +1,18 @@
 use super::common::{
-    TreeLocalFallbackArtifact, XGBOOST_MODEL_FILE_NAME, atomic_write,
-    build_tree_local_fallback_artifact, dataframe_to_row_major_vec, default_training_summary,
-    ensure_feature_columns_match, predict_tree_local_fallback, read_runtime_metadata,
-    remap_labels_to_tree_targets, tree_artifact_paths, tree_runtime_metadata,
-    write_runtime_metadata,
+    atomic_write, build_tree_local_fallback_artifact, build_tree_runtime_predictions,
+    calibrate_three_class_probabilities, dataframe_to_row_major_vec, default_training_summary,
+    ensure_feature_columns_match, normalize_three_class_probabilities, predict_tree_local_fallback,
+    read_runtime_metadata, remap_labels_to_tree_targets, tree_artifact_paths,
+    tree_runtime_metadata, validate_tree_local_fallback_artifact, write_runtime_metadata,
+    TreeLocalFallbackArtifact, XGBOOST_MODEL_FILE_NAME,
 };
 use super::config::*;
 use crate::base::ExpertModel;
 use crate::base::{compute_sample_weights, feature_columns_from_dataframe};
 use crate::runtime::artifacts::TrainingSummaryMetadata;
 use crate::runtime::capabilities::ModelFamily;
-use anyhow::{Context, Result, bail};
+use crate::runtime::prediction::RuntimePrediction;
+use anyhow::{bail, Context, Result};
 use ndarray::Array2;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -207,7 +209,6 @@ impl XGBoostExpert {
         }
     }
 
-    #[cfg(feature = "xgboost")]
     fn probability_temperature(&self) -> f64 {
         let configured = param_float(&self.config.params, "probability_temperature", 1.0);
         if configured.is_finite() && configured > 0.0 {
@@ -296,6 +297,7 @@ impl XGBoostExpert {
 
     fn persist_local_runtime_artifact(&self, path: &Path) -> Result<()> {
         if let Some(artifact) = self.local_runtime_artifact() {
+            validate_tree_local_fallback_artifact(&artifact, &self.feature_columns)?;
             let payload = serde_json::to_vec_pretty(&artifact)
                 .context("serialize XGBoost local fallback artifact")?;
             atomic_write(&path.join(XGBOOST_LOCAL_RUNTIME_FILE_NAME), &payload)?;
@@ -464,75 +466,16 @@ impl XGBoostExpert {
         predict_tree_local_fallback(artifact, x)
     }
 
-    #[cfg(feature = "xgboost")]
-    fn calibrate_probabilities(&self, probabilities: Array2<f32>) -> Array2<f32> {
-        let temperature = self.probability_temperature();
-        if !temperature.is_finite() || (temperature - 1.0).abs() < f64::EPSILON {
-            return probabilities;
-        }
-
-        let mut calibrated = probabilities;
-        let temperature = temperature.max(1e-6);
-        for row_idx in 0..calibrated.nrows() {
-            let mut max_logit = f32::NEG_INFINITY;
-            let mut logits = Vec::with_capacity(calibrated.ncols());
-            for col_idx in 0..calibrated.ncols() {
-                let probability = calibrated[(row_idx, col_idx)].clamp(1e-12, 1.0);
-                let logit = probability.ln() / (temperature as f32);
-                max_logit = max_logit.max(logit);
-                logits.push(logit);
-            }
-
-            let mut sum = 0.0_f32;
-            for (col_idx, logit) in logits.into_iter().enumerate() {
-                let value = (logit - max_logit).exp();
-                calibrated[(row_idx, col_idx)] = value;
-                sum += value;
-            }
-
-            if sum > f32::EPSILON {
-                for col_idx in 0..calibrated.ncols() {
-                    calibrated[(row_idx, col_idx)] /= sum;
-                }
-            }
-        }
-
-        calibrated
+    fn calibrate_probabilities(&self, probabilities: Array2<f32>) -> Result<Array2<f32>> {
+        calibrate_three_class_probabilities(
+            probabilities,
+            self.probability_temperature() as f32,
+            "XGBoost",
+        )
     }
 
-    #[cfg(feature = "xgboost")]
-    fn normalize_probabilities(probabilities: Array2<f32>) -> Array2<f32> {
-        let mut normalized = probabilities;
-        for row_idx in 0..normalized.nrows() {
-            let mut sum = 0.0_f32;
-            for col_idx in 0..normalized.ncols() {
-                let value = normalized[(row_idx, col_idx)];
-                let clamped = if value.is_finite() {
-                    value.max(0.0)
-                } else {
-                    0.0
-                };
-                normalized[(row_idx, col_idx)] = clamped;
-                sum += clamped;
-            }
-
-            if sum <= f32::EPSILON {
-                for col_idx in 0..normalized.ncols() {
-                    normalized[(row_idx, col_idx)] = 0.0;
-                }
-                if normalized.ncols() >= 2 {
-                    normalized[(row_idx, 1)] = 1.0;
-                } else if normalized.ncols() == 1 {
-                    normalized[(row_idx, 0)] = 1.0;
-                }
-                continue;
-            }
-
-            for col_idx in 0..normalized.ncols() {
-                normalized[(row_idx, col_idx)] /= sum;
-            }
-        }
-        normalized
+    fn normalize_probabilities(probabilities: Array2<f32>) -> Result<Array2<f32>> {
+        normalize_three_class_probabilities(probabilities, "XGBoost")
     }
 }
 
@@ -666,7 +609,15 @@ impl ExpertModel for XGBoostExpert {
             ensure_feature_columns_match(&self.feature_columns, x)?;
             if self._model.is_none() {
                 if let Some(fallback) = self.local_fallback.as_ref() {
-                    return Self::local_predict_proba_from_artifact(fallback, x);
+                    tracing::warn!(
+                        model = "xgboost",
+                        surrogate_kind = %fallback.surrogate_kind,
+                        surrogate_rows = fallback.training_summary.dataset_rows,
+                        "XGBoost native booster unavailable during predict_proba; using local surrogate fallback"
+                    );
+                    let probabilities = Self::local_predict_proba_from_artifact(fallback, x)?;
+                    let probabilities = self.calibrate_probabilities(probabilities)?;
+                    return Self::normalize_probabilities(probabilities);
                 }
                 anyhow::bail!("XGBoost not trained");
             }
@@ -702,8 +653,8 @@ impl ExpertModel for XGBoostExpert {
                 }
             };
             let probabilities = reshape_three_class_probabilities(probabilities, n_rows, cols)?;
-            let probabilities = self.calibrate_probabilities(probabilities);
-            Ok(Self::normalize_probabilities(probabilities))
+            let probabilities = self.calibrate_probabilities(probabilities)?;
+            Self::normalize_probabilities(probabilities)
         }
         #[cfg(not(feature = "xgboost"))]
         {
@@ -711,7 +662,9 @@ impl ExpertModel for XGBoostExpert {
                 .local_fallback
                 .as_ref()
                 .context("XGBoost local fallback not trained")?;
-            Self::local_predict_proba_from_artifact(fallback, x)
+            let probabilities = Self::local_predict_proba_from_artifact(fallback, x)?;
+            let probabilities = self.calibrate_probabilities(probabilities)?;
+            Self::normalize_probabilities(probabilities)
         }
     }
 
@@ -773,6 +726,9 @@ impl ExpertModel for XGBoostExpert {
             self.feature_columns = metadata.feature_columns;
             self.training_summary = Some(metadata.training_summary);
             self.local_fallback = Self::read_local_runtime_artifact(path)?;
+            if let Some(fallback) = self.local_fallback.as_ref() {
+                validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
+            }
             if let Some(artifact) = Self::read_runtime_artifact(path)? {
                 let XGBoostRuntimeArtifact {
                     configured_params,
@@ -862,13 +818,37 @@ impl ExpertModel for XGBoostExpert {
                 {
                     Ok(model) => {
                         self._model = Some(model);
+                        if let Some(fallback) = self.local_fallback.as_ref() {
+                            validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
+                        }
                     }
                     Err(err) => {
-                        return Err(err);
+                        self._model = None;
+                        if let Some(fallback) = self.local_fallback.as_ref() {
+                            tracing::warn!(
+                                model = "xgboost",
+                                path = %path.display(),
+                                surrogate_kind = %fallback.surrogate_kind,
+                                surrogate_rows = fallback.training_summary.dataset_rows,
+                                error = %err,
+                                "failed to restore native XGBoost booster; using local surrogate fallback"
+                            );
+                        } else {
+                            return Err(err);
+                        }
                     }
                 }
             } else {
                 self._model = None;
+                if let Some(fallback) = self.local_fallback.as_ref() {
+                    tracing::warn!(
+                        model = "xgboost",
+                        path = %path.display(),
+                        surrogate_kind = %fallback.surrogate_kind,
+                        surrogate_rows = fallback.training_summary.dataset_rows,
+                        "XGBoost artifact missing native booster; using local surrogate fallback"
+                    );
+                }
             }
             self.gpu_only_disabled = false;
             if self._model.is_none() && self.local_fallback.is_none() {
@@ -895,6 +875,9 @@ impl ExpertModel for XGBoostExpert {
             self.feature_columns = metadata.feature_columns;
             self.training_summary = Some(metadata.training_summary);
             self.local_fallback = Self::read_local_runtime_artifact(path)?;
+            if let Some(fallback) = self.local_fallback.as_ref() {
+                validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
+            }
             if self.local_fallback.is_none() {
                 anyhow::bail!(
                     "XGBoost local fallback artifact missing at {}",
@@ -905,6 +888,21 @@ impl ExpertModel for XGBoostExpert {
             self.gpu_only_disabled = false;
         }
         Ok(())
+    }
+}
+
+impl XGBoostExpert {
+    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
+        let probabilities = self.predict_proba(x)?;
+        build_tree_runtime_predictions(
+            "xgboost",
+            &probabilities,
+            self._model.is_some(),
+            "xgboost_native",
+            self.local_fallback.as_ref(),
+            "native_xgboost_unavailable",
+            "xgboost_unknown",
+        )
     }
 }
 
@@ -991,7 +989,7 @@ mod tests {
         let probabilities = Array2::from_shape_vec((2, 3), vec![2.0_f32, 1.0, 1.0, 0.0, 0.0, 0.0])
             .expect("build probability matrix");
 
-        let normalized = XGBoostExpert::normalize_probabilities(probabilities);
+        let normalized = XGBoostExpert::normalize_probabilities(probabilities).expect("normalize");
         for row in normalized.outer_iter() {
             let sum = row.iter().copied().sum::<f32>();
             assert!((sum - 1.0).abs() < 1e-6_f32);
@@ -1006,7 +1004,9 @@ mod tests {
         let expert = XGBoostExpert::new(11, Some(params));
         let probabilities = Array2::from_shape_vec((1, 3), vec![0.6_f32, 0.3, 0.1])
             .expect("build probability matrix");
-        let calibrated = expert.calibrate_probabilities(probabilities);
+        let calibrated = expert
+            .calibrate_probabilities(probabilities)
+            .expect("calibrate");
 
         let row = calibrated.row(0);
         let sum = row.iter().copied().sum::<f32>();

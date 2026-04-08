@@ -9,6 +9,10 @@ pub struct PredictionMetadata {
     pub model_name: String,
     pub family: ModelFamily,
     pub state: CapabilityState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
 }
 
 impl PredictionMetadata {
@@ -17,13 +21,26 @@ impl PredictionMetadata {
             model_name: model_name.into(),
             family,
             state,
+            execution_backend: None,
+            degraded_reason: None,
         }
+    }
+
+    pub fn with_runtime_details(
+        mut self,
+        execution_backend: Option<String>,
+        degraded_reason: Option<String>,
+    ) -> Self {
+        self.execution_backend = execution_backend.filter(|value| !value.trim().is_empty());
+        self.degraded_reason = degraded_reason.filter(|value| !value.trim().is_empty());
+        self
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RuntimePredictionError {
     InvalidClassProbability { index: usize, value: f32 },
+    InvalidProbabilitySum { sum: f32 },
     InvalidConfidence { value: f32 },
 }
 
@@ -32,6 +49,9 @@ impl fmt::Display for RuntimePredictionError {
         match self {
             Self::InvalidClassProbability { index, value } => {
                 write!(f, "invalid class probability at index {index}: {value}")
+            }
+            Self::InvalidProbabilitySum { sum } => {
+                write!(f, "invalid class probability sum: expected ~1.0, got {sum}")
             }
             Self::InvalidConfidence { value } => {
                 write!(f, "invalid confidence: {value}")
@@ -96,10 +116,16 @@ impl RuntimePrediction {
     fn validate_probabilities(
         class_probabilities: &[f32; 3],
     ) -> Result<(), RuntimePredictionError> {
+        let mut sum = 0.0_f32;
         for (index, value) in class_probabilities.iter().copied().enumerate() {
             if !value.is_finite() || !(0.0..=1.0).contains(&value) {
                 return Err(RuntimePredictionError::InvalidClassProbability { index, value });
             }
+            sum += value;
+        }
+
+        if !sum.is_finite() || (sum - 1.0).abs() > 1e-3 {
+            return Err(RuntimePredictionError::InvalidProbabilitySum { sum });
         }
 
         Ok(())
@@ -174,6 +200,24 @@ mod tests {
     }
 
     #[test]
+    fn runtime_prediction_try_new_rejects_rows_that_do_not_sum_to_one() {
+        let error = RuntimePrediction::try_new(
+            [0.1, 0.7, 0.1],
+            Some(0.7),
+            Some(false),
+            PredictionMetadata::new("lightgbm", ModelFamily::Tree, CapabilityState::Implemented),
+        )
+        .expect_err("probability rows must sum to one");
+
+        match error {
+            RuntimePredictionError::InvalidProbabilitySum { sum } => {
+                assert!((sum - 0.9).abs() < 1e-6);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn runtime_prediction_serde_round_trips_with_valid_three_class_shape() {
         let prediction = RuntimePrediction::try_new(
             [0.1, 0.7, 0.2],
@@ -207,5 +251,24 @@ mod tests {
         assert_eq!(metadata.model_name, "lightgbm");
         assert_eq!(metadata.family, ModelFamily::Tree);
         assert_eq!(metadata.state, CapabilityState::Implemented);
+    }
+
+    #[test]
+    fn prediction_metadata_can_carry_runtime_details() {
+        let metadata =
+            PredictionMetadata::new("lightgbm", ModelFamily::Tree, CapabilityState::Implemented)
+                .with_runtime_details(
+                    Some("lightgbm_native".to_string()),
+                    Some("native booster unavailable".to_string()),
+                );
+
+        assert_eq!(
+            metadata.execution_backend.as_deref(),
+            Some("lightgbm_native")
+        );
+        assert_eq!(
+            metadata.degraded_reason.as_deref(),
+            Some("native booster unavailable")
+        );
     }
 }

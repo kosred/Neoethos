@@ -1,47 +1,42 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 #[cfg(feature = "lightgbm")]
 use lightgbm3;
 use ndarray::Array2;
 use polars::prelude::*;
-#[cfg(feature = "lightgbm")]
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-#[cfg(feature = "lightgbm")]
 use std::path::PathBuf;
 
-use crate::base::ExpertModel;
-use crate::base::build_runtime_prediction;
-use crate::base::feature_columns_from_dataframe;
+use crate::base::{feature_columns_from_dataframe, ExpertModel};
 use crate::runtime::artifacts::TrainingSummaryMetadata;
-use crate::runtime::capabilities::{CapabilityState, ModelFamily};
+use crate::runtime::capabilities::ModelFamily;
 use crate::runtime::prediction::RuntimePrediction;
 
 use super::common::{
-    LIGHTGBM_MODEL_FILE_NAME, TreeLocalFallbackArtifact, atomic_write,
-    build_tree_local_fallback_artifact, dataframe_to_row_major_vec, default_training_summary,
-    ensure_feature_columns_match, predict_tree_local_fallback, read_runtime_metadata,
-    remap_labels_to_tree_targets, reshape_three_class_probabilities, tree_artifact_paths,
-    tree_runtime_metadata, write_runtime_metadata,
+    atomic_write, build_tree_local_fallback_artifact, build_tree_runtime_predictions,
+    calibrate_three_class_probabilities, dataframe_to_row_major_vec, default_training_summary,
+    ensure_feature_columns_match, normalize_three_class_probabilities, predict_tree_local_fallback,
+    read_runtime_metadata, remap_labels_to_tree_targets, reshape_three_class_probabilities,
+    tree_artifact_paths, tree_runtime_metadata, validate_tree_local_fallback_artifact,
+    write_runtime_metadata, TreeLocalFallbackArtifact, LIGHTGBM_MODEL_FILE_NAME,
 };
 #[cfg(feature = "lightgbm")]
 use super::config::{
-    DevicePreference, ParamValue, TreeModelConfig, cpu_threads_from_params, cpu_threads_hint_for,
-    device_preference_from_params, gpu_count, gpu_only_from_params, gpu_only_mode_for, param_bool,
-    param_float, param_int, param_string, tree_device_preference_for,
+    cpu_threads_from_params, cpu_threads_hint_for, device_preference_from_params, gpu_count,
+    gpu_only_from_params, gpu_only_mode_for, param_bool, param_float, param_int, param_string,
+    tree_device_preference_for, DevicePreference, ParamValue, TreeModelConfig,
 };
 #[cfg(not(feature = "lightgbm"))]
 use super::config::{
-    ParamValue, TreeModelConfig, cpu_threads_from_params, cpu_threads_hint_for,
-    device_preference_from_params, gpu_only_from_params, gpu_only_mode_for,
-    tree_device_preference_for,
+    cpu_threads_from_params, cpu_threads_hint_for, device_preference_from_params,
+    gpu_only_from_params, gpu_only_mode_for, tree_device_preference_for, ParamValue,
+    TreeModelConfig,
 };
 use std::collections::HashMap;
 
-#[cfg(feature = "lightgbm")]
 const LIGHTGBM_RUNTIME_FILE_NAME: &str = "runtime.json";
 const LIGHTGBM_LOCAL_FALLBACK_FILE_NAME: &str = "lightgbm_local_fallback.json";
 
-#[cfg(feature = "lightgbm")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LightGBMRuntimeProfile {
     device_pref: DevicePreference,
@@ -108,6 +103,7 @@ impl LightGBMExpert {
         params.insert("lambda_l2".into(), ParamValue::Float(0.0));
         params.insert("max_bin".into(), ParamValue::Int(255));
         params.insert("verbosity".into(), ParamValue::Int(-1));
+        params.insert("probability_temperature".into(), ParamValue::Float(1.0));
         params.insert("drop_rate".into(), ParamValue::Float(0.1));
         params.insert("skip_drop".into(), ParamValue::Float(0.5));
         params.insert("max_drop".into(), ParamValue::Int(50));
@@ -121,7 +117,6 @@ impl LightGBMExpert {
             .unwrap_or_else(|| TrainingSummaryMetadata::new(0, 0, 0))
     }
 
-    #[cfg(feature = "lightgbm")]
     fn runtime_profile(&self) -> LightGBMRuntimeProfile {
         LightGBMRuntimeProfile {
             device_pref: self.config.device_pref,
@@ -131,7 +126,6 @@ impl LightGBMExpert {
         }
     }
 
-    #[cfg(feature = "lightgbm")]
     fn apply_runtime_profile(&mut self, profile: LightGBMRuntimeProfile) {
         self.config.device_pref = profile.device_pref;
         self.config.gpu_only = profile.gpu_only;
@@ -139,7 +133,6 @@ impl LightGBMExpert {
         self.config.params = profile.params;
     }
 
-    #[cfg(feature = "lightgbm")]
     fn runtime_profile_path(root: &Path) -> PathBuf {
         root.join(LIGHTGBM_RUNTIME_FILE_NAME)
     }
@@ -150,6 +143,7 @@ impl LightGBMExpert {
 
     fn persist_local_fallback(&self, root: &Path) -> Result<()> {
         if let Some(artifact) = self.local_fallback.as_ref() {
+            validate_tree_local_fallback_artifact(artifact, &self.feature_columns)?;
             let payload =
                 serde_json::to_vec_pretty(artifact).context("serialize LightGBM local fallback")?;
             atomic_write(&Self::local_fallback_path(root), &payload)?;
@@ -169,7 +163,6 @@ impl LightGBMExpert {
         Ok(Some(artifact))
     }
 
-    #[cfg(feature = "lightgbm")]
     fn read_runtime_profile(root: &Path) -> Result<Option<LightGBMRuntimeProfile>> {
         let path = Self::runtime_profile_path(root);
         if !path.exists() {
@@ -234,6 +227,16 @@ impl LightGBMExpert {
     }
 
     #[cfg(feature = "lightgbm")]
+    fn probability_temperature(&self) -> f32 {
+        let configured = param_float(&self.config.params, "probability_temperature", 1.0) as f32;
+        if configured.is_finite() && configured > 0.0 {
+            configured
+        } else {
+            1.0
+        }
+    }
+
+    #[cfg(feature = "lightgbm")]
     fn normalize_probabilities(
         probabilities: Vec<f32>,
         rows: usize,
@@ -273,26 +276,20 @@ impl LightGBMExpert {
         Ok(normalized)
     }
 
-    #[cfg(feature = "lightgbm")]
     fn runtime_predictions(
+        &self,
         model_name: &str,
         probabilities: &Array2<f32>,
     ) -> Result<Vec<RuntimePrediction>> {
-        let mut predictions = Vec::with_capacity(probabilities.nrows());
-        for row in probabilities.outer_iter() {
-            let row_values = [row[0], row[1], row[2]];
-            let confidence = row_values.iter().copied().fold(0.0_f32, f32::max);
-            predictions.push(build_runtime_prediction(
-                model_name.to_string(),
-                ModelFamily::Tree,
-                CapabilityState::Implemented,
-                row_values,
-                Some(confidence),
-                Some(confidence < 0.5),
-            )?);
-        }
-
-        Ok(predictions)
+        build_tree_runtime_predictions(
+            model_name,
+            probabilities,
+            self.model.is_some(),
+            "lightgbm_native",
+            self.local_fallback.as_ref(),
+            "native_lightgbm_unavailable",
+            "lightgbm_unknown",
+        )
     }
 }
 
@@ -382,7 +379,19 @@ impl ExpertModel for LightGBMExpert {
             ensure_feature_columns_match(&self.feature_columns, x)?;
             if self.model.is_none() {
                 if let Some(fallback) = self.local_fallback.as_ref() {
-                    return predict_tree_local_fallback(fallback, x);
+                    tracing::warn!(
+                        model = "lightgbm",
+                        surrogate_kind = %fallback.surrogate_kind,
+                        surrogate_rows = fallback.training_summary.dataset_rows,
+                        "LightGBM native booster unavailable during predict_proba; using local surrogate fallback"
+                    );
+                    let probabilities = predict_tree_local_fallback(fallback, x)?;
+                    let probabilities = calibrate_three_class_probabilities(
+                        probabilities,
+                        self.probability_temperature(),
+                        "LightGBM",
+                    )?;
+                    return normalize_three_class_probabilities(probabilities, "LightGBM");
                 }
                 bail!("LightGBM not trained");
             }
@@ -395,7 +404,13 @@ impl ExpertModel for LightGBMExpert {
                 .map(|value| value as f32)
                 .collect::<Vec<_>>();
             let normalized = Self::normalize_probabilities(probabilities, rows, 3)?;
-            reshape_three_class_probabilities(normalized, rows, 3)
+            let probabilities = reshape_three_class_probabilities(normalized, rows, 3)?;
+            let probabilities = calibrate_three_class_probabilities(
+                probabilities,
+                self.probability_temperature(),
+                "LightGBM",
+            )?;
+            normalize_three_class_probabilities(probabilities, "LightGBM")
         }
         #[cfg(not(feature = "lightgbm"))]
         {
@@ -403,7 +418,13 @@ impl ExpertModel for LightGBMExpert {
                 .local_fallback
                 .as_ref()
                 .context("LightGBM local fallback not trained")?;
-            predict_tree_local_fallback(fallback, x)
+            let probabilities = predict_tree_local_fallback(fallback, x)?;
+            let probabilities = calibrate_three_class_probabilities(
+                probabilities,
+                param_float(&self.config.params, "probability_temperature", 1.0) as f32,
+                "LightGBM",
+            )?;
+            normalize_three_class_probabilities(probabilities, "LightGBM")
         }
     }
 
@@ -423,6 +444,12 @@ impl ExpertModel for LightGBMExpert {
             );
             let (_, metadata_path) = tree_artifact_paths(path, LIGHTGBM_MODEL_FILE_NAME);
             write_runtime_metadata(&metadata_path, &metadata)?;
+            let runtime_profile = self.runtime_profile();
+            atomic_write(
+                &Self::runtime_profile_path(path),
+                &serde_json::to_vec_pretty(&runtime_profile)
+                    .context("serialize LightGBM runtime profile")?,
+            )?;
             self.persist_local_fallback(path)?;
             Ok(())
         }
@@ -438,6 +465,12 @@ impl ExpertModel for LightGBMExpert {
             );
             let (model_path, metadata_path) = tree_artifact_paths(path, LIGHTGBM_MODEL_FILE_NAME);
             write_runtime_metadata(&metadata_path, &metadata)?;
+            let runtime_profile = self.runtime_profile();
+            atomic_write(
+                &Self::runtime_profile_path(path),
+                &serde_json::to_vec_pretty(&runtime_profile)
+                    .context("serialize LightGBM runtime profile")?,
+            )?;
             if let Some(model) = self.model.as_ref() {
                 model
                     .save_file(
@@ -446,12 +479,6 @@ impl ExpertModel for LightGBMExpert {
                             .context("LightGBM artifact path must be valid unicode")?,
                     )
                     .with_context(|| format!("save LightGBM artifact {}", model_path.display()))?;
-                let runtime_profile = self.runtime_profile();
-                atomic_write(
-                    &Self::runtime_profile_path(path),
-                    &serde_json::to_vec_pretty(&runtime_profile)
-                        .context("serialize LightGBM runtime profile")?,
-                )?;
             } else if self.local_fallback.is_none() {
                 bail!("LightGBM not trained");
             }
@@ -477,7 +504,13 @@ impl ExpertModel for LightGBMExpert {
             }
             self.feature_columns = metadata.feature_columns;
             self.training_summary = Some(metadata.training_summary);
+            if let Some(profile) = Self::read_runtime_profile(path)? {
+                self.apply_runtime_profile(profile);
+            }
             self.local_fallback = Self::read_local_fallback(path)?;
+            if let Some(fallback) = self.local_fallback.as_ref() {
+                validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
+            }
             self.model = None;
             self.gpu_only_disabled = false;
             Ok(())
@@ -498,6 +531,9 @@ impl ExpertModel for LightGBMExpert {
             }
             self.feature_columns = metadata.feature_columns;
             self.training_summary = Some(metadata.training_summary);
+            if let Some(profile) = Self::read_runtime_profile(path)? {
+                self.apply_runtime_profile(profile);
+            }
             let native_model_result = if model_path.exists() {
                 Some(
                     lightgbm3::Booster::from_file(
@@ -514,22 +550,41 @@ impl ExpertModel for LightGBMExpert {
             match native_model_result {
                 Some(Ok(model)) => {
                     self.model = Some(model);
-                    if let Some(profile) = Self::read_runtime_profile(path)? {
-                        self.apply_runtime_profile(profile);
-                    }
                     self.local_fallback = Self::read_local_fallback(path)?;
+                    if let Some(fallback) = self.local_fallback.as_ref() {
+                        validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
+                    }
                 }
                 Some(Err(native_err)) => {
                     self.model = None;
                     self.local_fallback = Self::read_local_fallback(path)?;
-                    if self.local_fallback.is_none() {
+                    if let Some(fallback) = self.local_fallback.as_ref() {
+                        validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
+                        tracing::warn!(
+                            model = "lightgbm",
+                            path = %path.display(),
+                            surrogate_kind = %fallback.surrogate_kind,
+                            surrogate_rows = fallback.training_summary.dataset_rows,
+                            error = %native_err,
+                            "failed to restore native LightGBM booster; using local surrogate fallback"
+                        );
+                    } else {
                         return Err(native_err);
                     }
                 }
                 None => {
                     self.model = None;
                     self.local_fallback = Self::read_local_fallback(path)?;
-                    if self.local_fallback.is_none() {
+                    if let Some(fallback) = self.local_fallback.as_ref() {
+                        validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
+                        tracing::warn!(
+                            model = "lightgbm",
+                            path = %path.display(),
+                            surrogate_kind = %fallback.surrogate_kind,
+                            surrogate_rows = fallback.training_summary.dataset_rows,
+                            "LightGBM artifact missing native booster; using local surrogate fallback"
+                        );
+                    } else {
                         bail!(
                             "LightGBM artifact {} is missing both native model and local fallback payload",
                             path.display()
@@ -543,11 +598,10 @@ impl ExpertModel for LightGBMExpert {
     }
 }
 
-#[cfg(feature = "lightgbm")]
 impl LightGBMExpert {
     pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
         let probabilities = self.predict_proba(x)?;
-        Self::runtime_predictions("lightgbm", &probabilities)
+        self.runtime_predictions("lightgbm", &probabilities)
     }
 }
 

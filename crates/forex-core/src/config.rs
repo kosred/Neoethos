@@ -872,44 +872,188 @@ impl Settings {
         Self::from_yaml(&config_file)
     }
 
-    /// Load settings with environment variable overrides
-    pub fn load_with_env() -> anyhow::Result<Self> {
-        let mut settings = Self::load()?;
+    fn parse_csv_list(value: &str) -> Vec<String> {
+        value
+            .split(',')
+            .map(|entry| entry.trim().to_string())
+            .filter(|entry| !entry.is_empty())
+            .collect()
+    }
 
-        // Apply environment variable overrides
-        if let Ok(symbol) = std::env::var("FOREX_BOT_SYMBOL") {
-            settings.system.symbol = symbol;
+    fn apply_overrides_from_lookup<F>(&mut self, mut lookup: F)
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        if let Some(symbol) = lookup("FOREX_BOT_SYMBOL") {
+            self.system.symbol = symbol;
         }
 
-        if let Ok(data_root) =
-            std::env::var("FOREX_BOT_DATA_ROOT").or_else(|_| std::env::var("FOREX_BOT_DATA_DIR"))
-        {
-            settings.system.data_dir = PathBuf::from(data_root);
+        let data_root = lookup("FOREX_BOT_DATA_ROOT").or_else(|| lookup("FOREX_BOT_DATA_DIR"));
+        if let Some(data_root) = data_root {
+            self.system.data_dir = PathBuf::from(data_root);
         }
 
-        if let Ok(base_tf) = std::env::var("FOREX_BOT_BASE_TIMEFRAME") {
-            settings.system.base_timeframe = base_tf;
+        if let Some(base_tf) = lookup("FOREX_BOT_BASE_TIMEFRAME") {
+            self.system.base_timeframe = base_tf;
         }
 
-        if let Ok(higher_tfs) = std::env::var("FOREX_BOT_HIGHER_TFS") {
-            let parsed = higher_tfs
-                .split(',')
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .collect::<Vec<_>>();
+        if let Some(higher_tfs) = lookup("FOREX_BOT_HIGHER_TFS") {
+            let parsed = Self::parse_csv_list(&higher_tfs);
             if !parsed.is_empty() {
-                settings.system.higher_timeframes = parsed;
+                self.system.higher_timeframes = parsed;
             }
         }
 
-        if let Ok(device) = std::env::var("FOREX_BOT_DEVICE") {
-            settings.system.device = device;
+        if let Some(device) = lookup("FOREX_BOT_DEVICE") {
+            self.system.device = device;
         }
 
-        if let Ok(tree_device) = std::env::var("FOREX_BOT_TREE_DEVICE") {
-            settings.models.tree_device_preference = tree_device;
+        if let Some(preference) = lookup("FOREX_BOT_ENABLE_GPU_PREFERENCE") {
+            self.system.enable_gpu_preference = preference;
         }
 
+        if let Some(tree_device) = lookup("FOREX_BOT_TREE_DEVICE") {
+            self.models.tree_device_preference = tree_device;
+        }
+
+        if let Some(model_names) = lookup("FOREX_BOT_ML_MODELS") {
+            let parsed = Self::parse_csv_list(&model_names);
+            if !parsed.is_empty() {
+                self.models.ml_models = parsed;
+            }
+        }
+
+        if let Some(num_transformers) =
+            lookup("FOREX_BOT_NUM_TRANSFORMERS").and_then(|value| value.parse::<usize>().ok())
+        {
+            self.models.num_transformers = num_transformers.max(1);
+        }
+
+        if let Some(model_names) = lookup("FOREX_BOT_PHASE5_CORE_MODELS") {
+            let parsed = Self::parse_csv_list(&model_names);
+            if !parsed.is_empty() {
+                self.models.phase5_core_models = parsed;
+            }
+        }
+
+        if let Some(model_names) = lookup("FOREX_BOT_REGIME_TREND_MODELS") {
+            let parsed = Self::parse_csv_list(&model_names);
+            if !parsed.is_empty() {
+                self.models.regime_trend_models = parsed;
+            }
+        }
+
+        if let Some(model_names) = lookup("FOREX_BOT_REGIME_RANGE_MODELS") {
+            let parsed = Self::parse_csv_list(&model_names);
+            if !parsed.is_empty() {
+                self.models.regime_range_models = parsed;
+            }
+        }
+
+        if let Some(model_names) = lookup("FOREX_BOT_REGIME_NEUTRAL_MODELS") {
+            let parsed = Self::parse_csv_list(&model_names);
+            if !parsed.is_empty() {
+                self.models.regime_neutral_models = parsed;
+            }
+        }
+
+        if let Some(enabled) = lookup("FOREX_BOT_PHASE5_FILTER_META_BLENDER") {
+            self.models.phase5_filter_meta_blender = matches!(
+                enabled.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+
+        if let Some(enabled) = lookup("FOREX_BOT_REGIME_ROUTER_ENABLED") {
+            self.models.regime_router_enabled = matches!(
+                enabled.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+
+        if let Some(min_models) = lookup("FOREX_BOT_REGIME_ROUTER_MIN_MODELS")
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            self.models.regime_router_min_models = min_models.max(1);
+        }
+
+        if let Some(method) = lookup("FOREX_BOT_CALIBRATION_METHOD") {
+            self.models.calibration_method = method;
+        }
+
+        if let Some(min_rows) =
+            lookup("FOREX_BOT_CALIBRATION_MIN_ROWS").and_then(|value| value.parse::<usize>().ok())
+        {
+            self.models.calibration_min_rows = min_rows.max(1);
+        }
+
+        if let Some(holdout_pct) =
+            lookup("FOREX_BOT_TRAIN_HOLDOUT_PCT").and_then(|value| value.parse::<f64>().ok())
+        {
+            self.models.train_holdout_pct = holdout_pct;
+        }
+
+        if let Some(label_horizon) =
+            lookup("FOREX_BOT_LABEL_HORIZON_BARS").and_then(|value| value.parse::<usize>().ok())
+        {
+            self.models.label_horizon_bars = label_horizon;
+        }
+
+        if let Some(meta_hold) = lookup("FOREX_BOT_META_LABEL_MAX_HOLD_BARS")
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            self.risk.meta_label_max_hold_bars = meta_hold.max(1);
+        }
+
+        if let Some(conf_threshold) =
+            lookup("FOREX_BOT_PROP_CONF_THRESHOLD").and_then(|value| value.parse::<f64>().ok())
+        {
+            self.models.prop_conf_threshold = conf_threshold;
+        }
+
+        if let Some(use_rllib_agent) = lookup("FOREX_BOT_USE_RLLIB_AGENT") {
+            self.models.use_rllib_agent = matches!(
+                use_rllib_agent.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+
+        if let Some(rllib_workers) =
+            lookup("FOREX_BOT_RLLIB_NUM_WORKERS").and_then(|value| value.parse::<usize>().ok())
+        {
+            self.models.rllib_num_workers = rllib_workers;
+        }
+
+        if let Some(auto_enable_rllib) = lookup("FOREX_BOT_AUTO_ENABLE_RLLIB") {
+            self.models.auto_enable_rllib = matches!(
+                auto_enable_rllib.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+
+        if let Some(prop_search_device) = lookup("FOREX_BOT_PROP_SEARCH_DEVICE") {
+            self.models.prop_search_device = prop_search_device;
+        }
+
+        if let Some(prop_search_async) = lookup("FOREX_BOT_PROP_SEARCH_ASYNC") {
+            self.models.prop_search_async = matches!(
+                prop_search_async.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+
+        if let Some(prop_search_async_wait) = lookup("FOREX_BOT_PROP_SEARCH_ASYNC_WAIT") {
+            self.models.prop_search_async_wait = matches!(
+                prop_search_async_wait.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
+    }
+
+    /// Load settings with environment variable overrides
+    pub fn load_with_env() -> anyhow::Result<Self> {
+        let mut settings = Self::load()?;
+        settings.apply_overrides_from_lookup(|key| std::env::var(key).ok());
         Ok(settings)
     }
 
@@ -924,6 +1068,7 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_default_settings() {
@@ -939,5 +1084,104 @@ mod tests {
         let yaml = serde_yaml_ng::to_string(&settings).unwrap();
         let deserialized: Settings = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(deserialized.system.symbol, settings.system.symbol);
+    }
+
+    #[test]
+    fn runtime_overrides_apply_to_dispatch_and_label_settings() {
+        let mut settings = Settings::default();
+        let overrides = HashMap::from([
+            (
+                "FOREX_BOT_ENABLE_GPU_PREFERENCE".to_string(),
+                "gpu".to_string(),
+            ),
+            ("FOREX_BOT_TREE_DEVICE".to_string(), "cuda".to_string()),
+            ("FOREX_BOT_NUM_TRANSFORMERS".to_string(), "4".to_string()),
+            (
+                "FOREX_BOT_ML_MODELS".to_string(),
+                "lightgbm, xgboost , neat".to_string(),
+            ),
+            (
+                "FOREX_BOT_PHASE5_CORE_MODELS".to_string(),
+                "transformer, tabnet".to_string(),
+            ),
+            (
+                "FOREX_BOT_PHASE5_FILTER_META_BLENDER".to_string(),
+                "false".to_string(),
+            ),
+            (
+                "FOREX_BOT_REGIME_ROUTER_ENABLED".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "FOREX_BOT_REGIME_ROUTER_MIN_MODELS".to_string(),
+                "3".to_string(),
+            ),
+            (
+                "FOREX_BOT_CALIBRATION_METHOD".to_string(),
+                "temperature".to_string(),
+            ),
+            (
+                "FOREX_BOT_CALIBRATION_MIN_ROWS".to_string(),
+                "512".to_string(),
+            ),
+            ("FOREX_BOT_TRAIN_HOLDOUT_PCT".to_string(), "0.3".to_string()),
+            ("FOREX_BOT_LABEL_HORIZON_BARS".to_string(), "24".to_string()),
+            (
+                "FOREX_BOT_META_LABEL_MAX_HOLD_BARS".to_string(),
+                "144".to_string(),
+            ),
+            (
+                "FOREX_BOT_PROP_CONF_THRESHOLD".to_string(),
+                "0.72".to_string(),
+            ),
+            ("FOREX_BOT_USE_RLLIB_AGENT".to_string(), "1".to_string()),
+            ("FOREX_BOT_RLLIB_NUM_WORKERS".to_string(), "6".to_string()),
+            ("FOREX_BOT_AUTO_ENABLE_RLLIB".to_string(), "off".to_string()),
+            (
+                "FOREX_BOT_PROP_SEARCH_DEVICE".to_string(),
+                "cuda:0".to_string(),
+            ),
+            (
+                "FOREX_BOT_PROP_SEARCH_ASYNC".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "FOREX_BOT_PROP_SEARCH_ASYNC_WAIT".to_string(),
+                "true".to_string(),
+            ),
+        ]);
+
+        settings.apply_overrides_from_lookup(|key| overrides.get(key).cloned());
+
+        assert_eq!(settings.system.enable_gpu_preference, "gpu");
+        assert_eq!(settings.models.tree_device_preference, "cuda");
+        assert_eq!(settings.models.num_transformers, 4);
+        assert_eq!(
+            settings.models.ml_models,
+            vec![
+                "lightgbm".to_string(),
+                "xgboost".to_string(),
+                "neat".to_string(),
+            ]
+        );
+        assert_eq!(
+            settings.models.phase5_core_models,
+            vec!["transformer".to_string(), "tabnet".to_string()]
+        );
+        assert!(!settings.models.phase5_filter_meta_blender);
+        assert!(settings.models.regime_router_enabled);
+        assert_eq!(settings.models.regime_router_min_models, 3);
+        assert_eq!(settings.models.calibration_method, "temperature");
+        assert_eq!(settings.models.calibration_min_rows, 512);
+        assert_eq!(settings.models.train_holdout_pct, 0.3);
+        assert_eq!(settings.models.label_horizon_bars, 24);
+        assert_eq!(settings.risk.meta_label_max_hold_bars, 144);
+        assert_eq!(settings.models.prop_conf_threshold, 0.72);
+        assert!(settings.models.use_rllib_agent);
+        assert_eq!(settings.models.rllib_num_workers, 6);
+        assert!(!settings.models.auto_enable_rllib);
+        assert_eq!(settings.models.prop_search_device, "cuda:0");
+        assert!(settings.models.prop_search_async);
+        assert!(settings.models.prop_search_async_wait);
     }
 }

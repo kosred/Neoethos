@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use ndarray::Array2;
 use polars::prelude::{DataFrame, Series};
 use rand::{Rng, SeedableRng};
@@ -7,12 +7,14 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::{cmp::Ordering, f64::consts::PI};
 
-use crate::base::{ExpertModel, build_runtime_artifact_metadata};
-use crate::runtime::artifacts::{TrainingSummaryMetadata, default_three_class_label_mapping};
+use crate::base::{build_runtime_artifact_metadata, ExpertModel};
+use crate::runtime::artifacts::{
+    default_three_class_label_mapping, RuntimeArtifactMetadata, TrainingSummaryMetadata,
+};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 use crate::statistical::common::{
-    FeatureScaler, METADATA_FILE_NAME, ensure_feature_columns_match, feature_matrix_from_dataframe,
-    read_json, remap_three_class_labels, softmax_rows, write_json,
+    ensure_feature_columns_match, feature_matrix_from_dataframe, read_json,
+    remap_three_class_labels, softmax_rows, write_json, FeatureScaler, METADATA_FILE_NAME,
 };
 
 const NEURO_EVO_ARTIFACT_FILE_NAME: &str = "neuro_evo.json";
@@ -278,6 +280,111 @@ impl NeuroEvoExpert {
         Ok((w1, b1, w2, b2))
     }
 
+    fn validate_loaded_metadata(metadata: &RuntimeArtifactMetadata) -> Result<()> {
+        if metadata.model_name != "neuro_evo" {
+            bail!(
+                "neuro-evo artifact model mismatch: expected neuro_evo, got {}",
+                metadata.model_name
+            );
+        }
+
+        if metadata.family != ModelFamily::Evolutionary {
+            bail!(
+                "neuro-evo artifact family mismatch: expected {:?}, got {:?}",
+                ModelFamily::Evolutionary,
+                metadata.family
+            );
+        }
+
+        if metadata.state != CapabilityState::Implemented {
+            bail!(
+                "neuro-evo artifact state mismatch: expected {:?}, got {:?}",
+                CapabilityState::Implemented,
+                metadata.state
+            );
+        }
+
+        if metadata.feature_columns.is_empty() {
+            bail!("neuro-evo artifact metadata must contain at least one feature column");
+        }
+
+        if metadata.label_mapping != default_three_class_label_mapping() {
+            bail!("neuro-evo artifact label mapping mismatch");
+        }
+
+        if metadata.training_summary.dataset_rows
+            != metadata.training_summary.train_rows + metadata.training_summary.val_rows
+        {
+            bail!("neuro-evo artifact training summary is inconsistent");
+        }
+
+        Ok(())
+    }
+
+    fn validate_loaded_artifact(
+        metadata: &RuntimeArtifactMetadata,
+        artifact: &NeuroEvoArtifact,
+    ) -> Result<()> {
+        if !artifact.fitted {
+            bail!("neuro-evo artifact must be marked fitted before loading");
+        }
+
+        if artifact.input_dim == 0 || artifact.hidden_dim == 0 {
+            bail!("neuro-evo artifact has invalid network dimensions");
+        }
+
+        if !artifact.sigma.is_finite() || artifact.sigma <= 0.0 {
+            bail!("neuro-evo artifact sigma is invalid");
+        }
+
+        let expected_params = Self::parameter_dim(artifact.input_dim, artifact.hidden_dim);
+        if artifact.params.len() != expected_params {
+            bail!(
+                "neuro-evo artifact parameter mismatch: expected {}, got {}",
+                expected_params,
+                artifact.params.len()
+            );
+        }
+
+        if artifact.feature_columns.is_empty() {
+            bail!("neuro-evo artifact must contain feature columns");
+        }
+
+        if artifact.feature_columns.len() != artifact.scaler.means.len()
+            || artifact.feature_columns.len() != artifact.scaler.stds.len()
+        {
+            bail!(
+                "neuro-evo artifact scaler mismatch: feature columns {}, means {}, stds {}",
+                artifact.feature_columns.len(),
+                artifact.scaler.means.len(),
+                artifact.scaler.stds.len()
+            );
+        }
+
+        if artifact.population < 4 || artifact.islands == 0 || artifact.generations < 4 {
+            bail!(
+                "neuro-evo artifact search topology is invalid: generations={}, population={}, islands={}",
+                artifact.generations,
+                artifact.population,
+                artifact.islands
+            );
+        }
+
+        if artifact.dataset_rows == 0 {
+            bail!("neuro-evo artifact dataset rows must be greater than zero");
+        }
+
+        if metadata.feature_columns != artifact.feature_columns {
+            bail!("neuro-evo artifact feature columns do not match runtime metadata");
+        }
+
+        if metadata.training_summary.dataset_rows != artifact.dataset_rows {
+            bail!("neuro-evo artifact dataset row count does not match metadata");
+        }
+
+        Ok(())
+    }
+
     fn hidden_activations(features: &Array2<f32>, w1: &Array2<f32>, b1: &[f32]) -> Array2<f32> {
         let mut hidden = Array2::<f32>::zeros((features.nrows(), b1.len()));
         for row in 0..features.nrows() {
@@ -439,20 +546,34 @@ impl ExpertModel for NeuroEvoExpert {
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
-        let _: crate::runtime::artifacts::RuntimeArtifactMetadata =
-            read_json(&path.join(METADATA_FILE_NAME))?;
+        let metadata: RuntimeArtifactMetadata = read_json(&path.join(METADATA_FILE_NAME))?;
         let artifact: NeuroEvoArtifact = read_json(&path.join(NEURO_EVO_ARTIFACT_FILE_NAME))?;
-        self.input_dim = artifact.input_dim;
-        self.hidden_dim = artifact.hidden_dim;
-        self.sigma = artifact.sigma;
-        self.generations = artifact.generations;
-        self.population = artifact.population.max(4);
-        self.islands = artifact.islands.max(1);
-        self.dataset_rows = artifact.dataset_rows;
-        self.feature_columns = artifact.feature_columns;
-        self.scaler = Some(artifact.scaler);
-        self.params = artifact.params;
-        self.fitted = artifact.fitted;
+        Self::validate_loaded_metadata(&metadata)?;
+        Self::validate_loaded_artifact(&metadata, &artifact)?;
+
+        let next_input_dim = artifact.input_dim;
+        let next_hidden_dim = artifact.hidden_dim;
+        let next_sigma = artifact.sigma;
+        let next_generations = artifact.generations.max(4);
+        let next_population = artifact.population.max(4);
+        let next_islands = artifact.islands.max(1);
+        let next_dataset_rows = artifact.dataset_rows;
+        let next_feature_columns = artifact.feature_columns;
+        let next_scaler = Some(artifact.scaler);
+        let next_params = artifact.params;
+        let next_fitted = artifact.fitted;
+
+        self.input_dim = next_input_dim;
+        self.hidden_dim = next_hidden_dim;
+        self.sigma = next_sigma;
+        self.generations = next_generations;
+        self.population = next_population;
+        self.islands = next_islands;
+        self.dataset_rows = next_dataset_rows;
+        self.feature_columns = next_feature_columns;
+        self.scaler = next_scaler;
+        self.params = next_params;
+        self.fitted = next_fitted;
         Ok(())
     }
 }

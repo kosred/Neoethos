@@ -1,3 +1,4 @@
+use crate::base::strict_numeric_column_values;
 use anyhow::Result;
 use ndarray::{Array1, Array2};
 use polars::prelude::*;
@@ -36,15 +37,10 @@ pub fn simple_backtest(df: &DataFrame, signals: &Array1<i32>) -> Result<HashMap<
         return Ok(HashMap::new());
     }
 
-    let close_col = df.column("close")?.as_materialized_series();
-    let close: Vec<f64> = close_col
-        .cast(&DataType::Float64)?
-        .f64()?
-        .into_iter()
-        .map(|v| v.unwrap_or(0.0))
-        .collect();
+    let close = strict_numeric_column_values(df, "close")?;
 
     let mut pnl = Vec::new();
+    let mut realized_trade_pnl = Vec::new();
     let mut n_trades = 0;
 
     for i in 0..close.len() - 1 {
@@ -57,17 +53,22 @@ pub fn simple_backtest(df: &DataFrame, signals: &Array1<i32>) -> Result<HashMap<
             pnl.push(0.0);
         } else {
             n_trades += 1;
-            if sig == 1 {
-                pnl.push(ret);
+            let trade_pnl = if sig == 1 {
+                ret
             } else if sig == -1 {
-                pnl.push(-ret);
-            }
+                -ret
+            } else {
+                0.0
+            };
+            pnl.push(trade_pnl);
+            realized_trade_pnl.push(trade_pnl);
         }
     }
 
     let pnl_score: f64 = pnl.iter().sum();
-    let win_rate = if !pnl.is_empty() {
-        pnl.iter().filter(|&&v| v > 0.0).count() as f64 / pnl.len() as f64
+    let win_rate = if !realized_trade_pnl.is_empty() {
+        realized_trade_pnl.iter().filter(|&&v| v > 0.0).count() as f64
+            / realized_trade_pnl.len() as f64
     } else {
         0.0
     };

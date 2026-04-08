@@ -1,9 +1,9 @@
 use super::smc_indicators::{
-    SmcSearchConfig, enforce_min_structural_smc_flags, randomize_smc_flags,
+    enforce_min_structural_smc_flags, randomize_smc_flags, SmcSearchConfig,
 };
 use super::strategy_gene::Gene;
-use rand::Rng;
 use rand::seq::index::sample;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
@@ -112,11 +112,12 @@ fn quantize_f64(value: f64, scale: f64) -> i64 {
     (value * scale).round() as i64
 }
 
-fn rank_weights(scores: &[f64], candidate_indices: &[usize]) -> Vec<f64> {
-    let total = scores.len().max(1) as f64;
+fn rank_weights(candidate_indices: &[usize]) -> Vec<f64> {
+    let total = candidate_indices.len().max(1) as f64;
     candidate_indices
         .iter()
-        .map(|idx| (total - (*idx as f64)).max(1.0))
+        .enumerate()
+        .map(|(rank, _)| (total - rank as f64).max(1.0))
         .collect()
 }
 
@@ -155,7 +156,7 @@ fn draw_weighted_offset(weights: &[f64], rng: &mut impl Rng) -> usize {
         .filter(|value| value.is_finite() && *value > 0.0)
         .sum::<f64>();
     if total <= 0.0 {
-        return rng.random_range(0..weights.len().max(1));
+        return 0;
     }
 
     let mut target = rng.random_range(0.0..total);
@@ -204,7 +205,7 @@ pub fn select_parent_index(
             winner
         }
         ParentSelectionPolicy::RankWeighted => {
-            let weights = rank_weights(scores, candidate_indices);
+            let weights = rank_weights(candidate_indices);
             candidate_indices[draw_weighted_offset(&weights, rng)]
         }
         ParentSelectionPolicy::Softmax => {
@@ -696,5 +697,23 @@ pub fn apply_metrics(genes: &mut [Gene], metrics: &[[f64; 11]]) {
         gene.trades_count = m[8].max(0.0) as usize;
         gene.slice_pass_rate = 1.0;
         gene.consistency = m[9];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::mock::StepRng;
+
+    #[test]
+    fn rank_weights_follow_candidate_order() {
+        let weights = rank_weights(&[10, 20, 30, 40]);
+        assert_eq!(weights, vec![4.0, 3.0, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn zero_weight_fallback_is_deterministic() {
+        let mut rng = StepRng::new(0, 1);
+        assert_eq!(draw_weighted_offset(&[0.0, f64::NAN, -1.0], &mut rng), 0);
     }
 }

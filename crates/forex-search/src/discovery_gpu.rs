@@ -1,5 +1,5 @@
-use anyhow::{Result, bail};
-use forex_data::{FeatureCache, FeatureFrame, Ohlcv, SymbolDataset, compute_hpc_feature_frame};
+use anyhow::{bail, Result};
+use forex_data::{compute_hpc_feature_frame, FeatureCache, FeatureFrame, Ohlcv, SymbolDataset};
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
 use serde::Serialize;
@@ -8,7 +8,7 @@ use std::path::Path;
 use tch::{Device, Kind, Tensor};
 
 use crate::genetic::{
-    ParentSelectionPolicy, SurvivorSelectionPolicy, select_parent_index, select_survivor_indices,
+    select_parent_index, select_survivor_indices, ParentSelectionPolicy, SurvivorSelectionPolicy,
 };
 
 #[derive(Debug, Clone)]
@@ -237,12 +237,17 @@ pub fn run_gpu_discovery(
         let fitness =
             evaluate_population_multi_gpu(&data_cube, &ohlc_cube, &genomes, config, &device_ids)?;
 
-        let mut scored: Vec<(f32, Vec<f32>)> = genomes
+        let mut scored: Vec<(f32, usize, Vec<f32>)> = genomes
             .into_iter()
+            .enumerate()
             .zip(fitness.into_iter())
-            .map(|(g, f)| (f, g))
+            .map(|((idx, g), f)| (f, idx, g))
             .collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
 
         let effective_survivor_fraction = if config.survivor_fraction > 0.0 {
             config.survivor_fraction
@@ -259,10 +264,13 @@ pub fn run_gpu_discovery(
         let best_candidates: Vec<Vec<f32>> = scored
             .iter()
             .take(return_count)
-            .map(|(_, g)| g.clone())
+            .map(|(_, _, g)| g.clone())
             .collect();
-        let best_candidate_scores: Vec<f32> =
-            scored.iter().take(return_count).map(|(f, _)| *f).collect();
+        let best_candidate_scores: Vec<f32> = scored
+            .iter()
+            .take(return_count)
+            .map(|(f, _, _)| *f)
+            .collect();
 
         if gen + 1 == config.generations {
             best_genomes = best_candidates.clone();
@@ -270,7 +278,10 @@ pub fn run_gpu_discovery(
             break;
         }
 
-        let score_vector: Vec<f64> = scored.iter().map(|(fitness, _)| *fitness as f64).collect();
+        let score_vector: Vec<f64> = scored
+            .iter()
+            .map(|(fitness, _, _)| *fitness as f64)
+            .collect();
         let survivor_count = match config.survivor_selection {
             SurvivorSelectionPolicy::Generational => 0,
             _ => ((config.population as f64) * effective_survivor_fraction)
@@ -288,7 +299,7 @@ pub fn run_gpu_discovery(
         );
         let survivors: Vec<Vec<f32>> = survivor_indices
             .iter()
-            .map(|idx| scored[*idx].1.clone())
+            .map(|idx| scored[*idx].2.clone())
             .collect();
 
         let parent_indices: Vec<usize> = (0..scored.len()).collect();
@@ -341,8 +352,8 @@ pub fn run_gpu_discovery(
                         retries += 1;
                     }
                 }
-                let a = &scored[a_idx].1;
-                let b = &scored[b_idx].1;
+                let a = &scored[a_idx].2;
+                let b = &scored[b_idx].2;
                 for i in 0..dim {
                     let base = 0.5 * (a[i] + b[i]);
                     let noise = std[i] as f64 * normal.sample(&mut rng) * config.sigma;

@@ -918,10 +918,9 @@ pub fn infer_stop_target_pips(
         weights,
         ewma_lambda: settings.ewma_lambda,
     });
-    let sigma_last = *sigma.last().unwrap_or(&0.0);
-    let es = estimate_expected_shortfall(close, settings.tail_window, settings.tail_alpha)
-        .unwrap_or(0.0);
-    let price = *close.last().unwrap_or(&0.0);
+    let &sigma_last = sigma.last()?;
+    let es = estimate_expected_shortfall(close, settings.tail_window, settings.tail_alpha)?;
+    let &price = close.last()?;
     let scale = (settings.vol_horizon_bars.max(1) as f64).sqrt();
     let vol_dist = price * sigma_last * scale;
     let tail_dist = price * es * scale;

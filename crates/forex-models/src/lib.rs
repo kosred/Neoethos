@@ -24,6 +24,7 @@ pub use training_orchestrator::{TrainingOrchestrator, TrainingRunSummary};
 pub mod hardware;
 
 // ONNX export for ultra-fast inference
+#[cfg(feature = "python-onnx-export")]
 pub mod onnx_exporter;
 
 // Evaluation helpers (simple backtest, signal conversion)
@@ -69,7 +70,7 @@ use anyhow::{Context, Result};
 #[cfg(feature = "onnx")]
 use ndarray::Array2;
 #[cfg(feature = "onnx")]
-use ort::{Session, Value, inputs};
+use ort::{inputs, Session, Value};
 #[cfg(feature = "onnx")]
 use std::collections::HashMap;
 #[cfg(feature = "onnx")]

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use ndarray::Array2;
 use polars::prelude::{DataFrame, Series};
 use rand::{Rng, SeedableRng};
@@ -9,12 +9,12 @@ use std::path::Path;
 use symbios_genetics::Genotype;
 use symbios_neat::{Activation, CppnEvaluator, NeatConfig, NeatGenome};
 
-use crate::base::{ExpertModel, build_runtime_artifact_metadata};
-use crate::runtime::artifacts::{TrainingSummaryMetadata, default_three_class_label_mapping};
+use crate::base::{build_runtime_artifact_metadata, ExpertModel};
+use crate::runtime::artifacts::{default_three_class_label_mapping, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 use crate::statistical::common::{
-    FeatureScaler, METADATA_FILE_NAME, ensure_feature_columns_match, feature_matrix_from_dataframe,
-    read_json, remap_three_class_labels, softmax_rows, write_json,
+    ensure_feature_columns_match, feature_matrix_from_dataframe, read_json,
+    remap_three_class_labels, softmax_rows, write_json, FeatureScaler, METADATA_FILE_NAME,
 };
 
 const NEAT_ARTIFACT_FILE_NAME: &str = "neat.json";
@@ -541,6 +541,128 @@ impl NeatExpert {
 
         Ok(best)
     }
+
+    fn validate_loaded_metadata(
+        metadata: &crate::runtime::artifacts::RuntimeArtifactMetadata,
+    ) -> Result<()> {
+        if metadata.model_name != "neat" {
+            bail!(
+                "NEAT artifact model mismatch: expected neat, got {}",
+                metadata.model_name
+            );
+        }
+
+        if metadata.family != ModelFamily::Evolutionary {
+            bail!(
+                "NEAT artifact family mismatch: expected {:?}, got {:?}",
+                ModelFamily::Evolutionary,
+                metadata.family
+            );
+        }
+
+        if metadata.state != CapabilityState::Implemented {
+            bail!(
+                "NEAT artifact state mismatch: expected {:?}, got {:?}",
+                CapabilityState::Implemented,
+                metadata.state
+            );
+        }
+
+        if metadata.feature_columns.is_empty() {
+            bail!("NEAT artifact metadata must contain at least one feature column");
+        }
+
+        if metadata.label_mapping != default_three_class_label_mapping() {
+            bail!("NEAT artifact label mapping mismatch");
+        }
+
+        if metadata.training_summary.dataset_rows
+            != metadata.training_summary.train_rows + metadata.training_summary.val_rows
+        {
+            bail!("NEAT artifact training summary is inconsistent");
+        }
+
+        Ok(())
+    }
+
+    fn validate_loaded_artifact(
+        metadata: &crate::runtime::artifacts::RuntimeArtifactMetadata,
+        artifact: &NeatArtifact,
+    ) -> Result<()> {
+        if artifact.feature_columns.is_empty() {
+            bail!("NEAT artifact must contain feature columns");
+        }
+
+        if artifact.feature_columns.len() != artifact.scaler.means.len()
+            || artifact.feature_columns.len() != artifact.scaler.stds.len()
+        {
+            bail!(
+                "NEAT artifact scaler mismatch: feature columns {}, means {}, stds {}",
+                artifact.feature_columns.len(),
+                artifact.scaler.means.len(),
+                artifact.scaler.stds.len()
+            );
+        }
+
+        if artifact.population_size < 24 || artifact.generations < 8 {
+            bail!(
+                "NEAT artifact search topology is invalid: generations={}, population_size={}",
+                artifact.generations,
+                artifact.population_size
+            );
+        }
+
+        if artifact.dataset_rows == 0 {
+            bail!("NEAT artifact dataset rows must be greater than zero");
+        }
+
+        if artifact.mutation_rate.is_nan() || !artifact.mutation_rate.is_finite() {
+            bail!("NEAT artifact mutation rate is invalid");
+        }
+
+        if artifact.config.num_inputs != artifact.feature_columns.len() {
+            bail!(
+                "NEAT artifact input dimension mismatch: config expects {}, feature columns {}",
+                artifact.config.num_inputs,
+                artifact.feature_columns.len()
+            );
+        }
+
+        if artifact.config.num_outputs != 3 {
+            bail!(
+                "NEAT artifact output dimension mismatch: expected 3, got {}",
+                artifact.config.num_outputs
+            );
+        }
+
+        if metadata.feature_columns != artifact.feature_columns {
+            bail!("NEAT artifact feature columns do not match runtime metadata");
+        }
+
+        if metadata.training_summary.dataset_rows != artifact.dataset_rows {
+            bail!("NEAT artifact dataset row count does not match metadata");
+        }
+
+        if !artifact.best_fitness.is_finite()
+            || !artifact.best_loss.is_finite()
+            || !artifact.best_accuracy.is_finite()
+        {
+            bail!("NEAT artifact metrics are not finite");
+        }
+
+        if !(0.0..=1.0).contains(&artifact.best_accuracy) {
+            bail!(
+                "NEAT artifact accuracy is out of range: {}",
+                artifact.best_accuracy
+            );
+        }
+
+        if !artifact.fitted {
+            bail!("NEAT artifact must be marked fitted before loading");
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for NeatExpert {
@@ -630,25 +752,45 @@ impl ExpertModel for NeatExpert {
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
-        let _: crate::runtime::artifacts::RuntimeArtifactMetadata =
+        let metadata: crate::runtime::artifacts::RuntimeArtifactMetadata =
             read_json(&path.join(METADATA_FILE_NAME))?;
         let artifact: NeatArtifact = read_json(&path.join(NEAT_ARTIFACT_FILE_NAME))?;
-        self.config = artifact.config;
-        self.generations = artifact.generations.max(8);
-        self.population_size = artifact.population_size.max(24);
-        self.mutation_rate = artifact.mutation_rate.clamp(0.05, 1.5);
-        self.species_elitism = artifact.species_elitism.max(1);
-        self.compatibility_threshold = artifact.compatibility_threshold.max(0.25);
-        self.immigrant_fraction = artifact.immigrant_fraction.clamp(0.0, 0.4);
-        self.seed = artifact.seed;
-        self.feature_columns = artifact.feature_columns;
-        self.scaler = Some(artifact.scaler);
-        self.best_genome = Some(artifact.best_genome);
-        self.fitted = artifact.fitted;
-        self.dataset_rows = artifact.dataset_rows;
-        self.best_fitness = artifact.best_fitness;
-        self.best_loss = artifact.best_loss;
-        self.best_accuracy = artifact.best_accuracy;
+        Self::validate_loaded_metadata(&metadata)?;
+        Self::validate_loaded_artifact(&metadata, &artifact)?;
+
+        let next_config = artifact.config;
+        let next_generations = artifact.generations.max(8);
+        let next_population_size = artifact.population_size.max(24);
+        let next_mutation_rate = artifact.mutation_rate.clamp(0.05, 1.5);
+        let next_species_elitism = artifact.species_elitism.max(1);
+        let next_compatibility_threshold = artifact.compatibility_threshold.max(0.25);
+        let next_immigrant_fraction = artifact.immigrant_fraction.clamp(0.0, 0.4);
+        let next_seed = artifact.seed;
+        let next_feature_columns = artifact.feature_columns;
+        let next_scaler = Some(artifact.scaler);
+        let next_best_genome = Some(artifact.best_genome);
+        let next_fitted = artifact.fitted;
+        let next_dataset_rows = artifact.dataset_rows;
+        let next_best_fitness = artifact.best_fitness;
+        let next_best_loss = artifact.best_loss;
+        let next_best_accuracy = artifact.best_accuracy;
+
+        self.config = next_config;
+        self.generations = next_generations;
+        self.population_size = next_population_size;
+        self.mutation_rate = next_mutation_rate;
+        self.species_elitism = next_species_elitism;
+        self.compatibility_threshold = next_compatibility_threshold;
+        self.immigrant_fraction = next_immigrant_fraction;
+        self.seed = next_seed;
+        self.feature_columns = next_feature_columns;
+        self.scaler = next_scaler;
+        self.best_genome = next_best_genome;
+        self.fitted = next_fitted;
+        self.dataset_rows = next_dataset_rows;
+        self.best_fitness = next_best_fitness;
+        self.best_loss = next_best_loss;
+        self.best_accuracy = next_best_accuracy;
         Ok(())
     }
 }

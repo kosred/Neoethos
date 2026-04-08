@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use super::capabilities::{CapabilityState, ModelFamily};
+
 pub const ONNX_EXPORT_STATUS_FILE_NAME: &str = "onnx_export_status.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,6 +16,8 @@ pub enum OnnxExportDisposition {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OnnxExportStatus {
     pub model_name: String,
+    pub capability_family: ModelFamily,
+    pub capability_state: CapabilityState,
     pub requested: bool,
     pub disposition: OnnxExportDisposition,
     pub exporter: String,
@@ -25,8 +29,11 @@ pub struct OnnxExportStatus {
 }
 
 impl OnnxExportStatus {
+    #[allow(clippy::too_many_arguments)]
     pub fn skipped(
         model_name: impl Into<String>,
+        capability_family: ModelFamily,
+        capability_state: CapabilityState,
         exporter: impl Into<String>,
         artifact_dir: PathBuf,
         feature_count: usize,
@@ -35,6 +42,8 @@ impl OnnxExportStatus {
     ) -> Self {
         Self {
             model_name: model_name.into(),
+            capability_family,
+            capability_state,
             requested: true,
             disposition: OnnxExportDisposition::Skipped,
             exporter: exporter.into(),
@@ -46,8 +55,11 @@ impl OnnxExportStatus {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn exported(
         model_name: impl Into<String>,
+        capability_family: ModelFamily,
+        capability_state: CapabilityState,
         exporter: impl Into<String>,
         artifact_dir: PathBuf,
         output_path: PathBuf,
@@ -56,6 +68,8 @@ impl OnnxExportStatus {
     ) -> Self {
         Self {
             model_name: model_name.into(),
+            capability_family,
+            capability_state,
             requested: true,
             disposition: OnnxExportDisposition::Exported,
             exporter: exporter.into(),

@@ -1,9 +1,11 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use ndarray::Array2;
 use polars::prelude::DataFrame;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+
+use super::capabilities::{CapabilityState, ModelFamily};
 
 pub const OPTIMIZATION_REPORT_FILE_NAME: &str = "optimization.json";
 
@@ -32,6 +34,8 @@ pub struct OptimizationTrialRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OptimizationReport {
     pub model_name: String,
+    pub capability_family: ModelFamily,
+    pub capability_state: CapabilityState,
     pub backend: String,
     pub trials_requested: usize,
     pub trials_completed: usize,

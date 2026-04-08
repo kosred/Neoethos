@@ -2,16 +2,24 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use super::capabilities::{CapabilityState, ModelFamily};
+
 pub const TRAINING_RUNTIME_PROFILE_FILE_NAME: &str = "training_profile.json";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrainingRuntimeProfile {
     pub model_name: String,
+    pub capability_family: ModelFamily,
+    pub capability_state: CapabilityState,
     pub symbol: String,
     pub base_timeframe: String,
     pub feature_count: usize,
     pub dataset_rows: usize,
     pub row_budget_applied: Option<usize>,
+    pub label_horizon_bars: usize,
+    pub effective_label_horizon_bars: usize,
+    pub meta_label_max_hold_bars: usize,
+    pub label_use_triple_barrier: bool,
     pub higher_timeframes: Vec<String>,
     pub multi_resolution_enabled: bool,
     pub base_features_prefixed: bool,

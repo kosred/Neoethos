@@ -6,12 +6,25 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use tracing::warn;
 
-use crate::runtime::capabilities::{ModelCapability, ModelFamily, model_capability};
+use crate::runtime::capabilities::{model_capability, ModelCapability, ModelFamily};
 
 fn dynamic_registry() -> &'static Mutex<HashMap<String, ModelCapability>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, ModelCapability>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn load_registry_settings() -> forex_core::Settings {
+    match forex_core::Settings::load_with_env() {
+        Ok(settings) => settings,
+        Err(err) => {
+            warn!(
+                "failed to load settings for model registry/runtime device selection: {err}; falling back to defaults"
+            );
+            forex_core::Settings::default()
+        }
+    }
 }
 
 fn infer_dynamic_family(name: &str, module_path: &str, class_name: &str) -> ModelFamily {
@@ -175,10 +188,11 @@ fn supports_gpu_for_model(name: &str, family: ModelFamily) -> bool {
         "lightgbm" => cfg!(feature = "lightgbm-gpu"),
         "xgboost" | "xgboost_rf" | "xgboost_dart" => cfg!(feature = "xgboost"),
         "catboost" | "catboost_alt" => cfg!(feature = "catboost"),
-        _ => {
-            let _ = family;
-            false
-        }
+        "dqn" => cfg!(feature = "reinforcement-learning-cuda"),
+        _ => match family {
+            ModelFamily::Deep | ModelFamily::Exit => cfg!(feature = "burn-wgpu-backend"),
+            _ => false,
+        },
     }
 }
 
@@ -187,10 +201,32 @@ fn prefers_gpu_for_model(name: &str, family: ModelFamily) -> bool {
         "lightgbm" => cfg!(feature = "lightgbm-gpu"),
         "xgboost" | "xgboost_rf" | "xgboost_dart" => cfg!(feature = "xgboost"),
         "catboost" | "catboost_alt" => cfg!(feature = "catboost"),
-        _ => {
-            let _ = family;
-            false
+        "dqn" => cfg!(feature = "reinforcement-learning-cuda"),
+        _ => match family {
+            ModelFamily::Deep | ModelFamily::Exit => cfg!(feature = "burn-wgpu-backend"),
+            _ => false,
+        },
+    }
+}
+
+fn default_gpu_device_for_capability(capability: &ModelCapability) -> &'static str {
+    match capability.family {
+        ModelFamily::Tree | ModelFamily::Rl => "cuda:0",
+        ModelFamily::Deep | ModelFamily::Exit => {
+            if cfg!(feature = "burn-wgpu-backend") {
+                "wgpu"
+            } else {
+                "cpu"
+            }
         }
+        _ => "cpu",
+    }
+}
+
+fn gpu_runtime_available_for_capability(capability: &ModelCapability) -> bool {
+    match capability.family {
+        ModelFamily::Deep | ModelFamily::Exit => cfg!(feature = "burn-wgpu-backend"),
+        _ => crate::tree_models::config::gpu_count() > 0,
     }
 }
 
@@ -222,16 +258,13 @@ pub fn get_model_capability(name: &str) -> Option<ModelCapability> {
     })
 }
 
-fn default_inventory_names() -> Vec<String> {
+fn default_inventory_names(settings: &forex_core::Settings) -> Vec<String> {
     let mut names = AVAILABLE_MODELS
         .iter()
         .map(|name| (*name).to_string())
         .collect::<Vec<_>>();
 
-    let num_transformers = forex_core::Settings::default()
-        .models
-        .num_transformers
-        .max(1);
+    let num_transformers = settings.models.num_transformers.max(1);
     if num_transformers > 1 {
         for replica_idx in 1..=num_transformers {
             names.push(format!("transformer_{replica_idx:02}"));
@@ -244,8 +277,9 @@ fn default_inventory_names() -> Vec<String> {
 /// List all available models by capability family.
 pub fn list_models_by_category() -> HashMap<ModelCategory, Vec<String>> {
     let mut result = HashMap::new();
+    let settings = load_registry_settings();
 
-    for model_name in default_inventory_names() {
+    for model_name in default_inventory_names(&settings) {
         if let Some(info) = get_model_info(&model_name) {
             result
                 .entry(info.category)
@@ -275,7 +309,7 @@ pub fn is_valid_model(name: &str) -> bool {
 pub fn get_recommended_device(model_name: &str) -> Result<String> {
     let capability = get_model_capability(model_name)
         .context(format!("Model '{}' not found in registry", model_name))?;
-    let settings = forex_core::Settings::load_with_env().unwrap_or_default();
+    let settings = load_registry_settings();
 
     if !settings.system.enable_gpu {
         return Ok("cpu".to_string());
@@ -286,13 +320,28 @@ pub fn get_recommended_device(model_name: &str) -> Result<String> {
         return Ok("cpu".to_string());
     }
 
+    if !supports_gpu_for_model(&capability.name, capability.family) {
+        return Ok("cpu".to_string());
+    }
+
     if prefers_gpu_for_model(&capability.name, capability.family)
-        && crate::tree_models::config::gpu_count() > 0
+        && gpu_runtime_available_for_capability(&capability)
     {
         if !configured_device.is_empty() && !configured_device.eq_ignore_ascii_case("auto") {
-            return Ok(configured_device.to_string());
+            match capability.family {
+                ModelFamily::Deep | ModelFamily::Exit => {
+                    if configured_device.eq_ignore_ascii_case("gpu")
+                        || configured_device.eq_ignore_ascii_case("wgpu")
+                        || configured_device.eq_ignore_ascii_case("wgpu_vulkan")
+                    {
+                        return Ok("wgpu".to_string());
+                    }
+                    return Ok(default_gpu_device_for_capability(&capability).to_string());
+                }
+                _ => return Ok(configured_device.to_string()),
+            }
         }
-        return Ok("cuda:0".to_string());
+        return Ok(default_gpu_device_for_capability(&capability).to_string());
     }
 
     Ok("cpu".to_string())
@@ -490,6 +539,17 @@ mod tests {
             .expect("dynamic capability should be discoverable");
         assert_eq!(capability.family, ModelFamily::Deep);
         assert_eq!(capability.state, CapabilityState::Implemented);
+    }
+
+    #[test]
+    fn default_inventory_names_follow_runtime_transformer_replica_settings() {
+        let mut settings = Settings::default();
+        settings.models.num_transformers = 3;
+
+        let names = default_inventory_names(&settings);
+        assert!(names.contains(&"transformer_01".to_string()));
+        assert!(names.contains(&"transformer_02".to_string()));
+        assert!(names.contains(&"transformer_03".to_string()));
     }
 
     #[test]

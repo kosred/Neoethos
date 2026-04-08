@@ -5,26 +5,27 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::base::ExpertModel;
+use crate::burn_models::active_burn_backend_name;
 use crate::ensemble::{
     CalibrationMethod, ConformalPredictionExpert, MetaBlender, MetaDecisionStack,
     ProbabilityCalibrationExpert,
 };
 use crate::exit_agent::ExitAgent;
 use crate::parallel_trainer::{
-    ModelConfig, ModelTrainingFailure, ModelTrainingProgress, ModelType, TrainingPayload,
-    train_models_parallel_with_progress,
+    train_models_parallel_with_progress, ModelConfig, ModelTrainingFailure, ModelTrainingProgress,
+    ModelType, TrainingPayload,
 };
 use crate::runtime::capabilities::CapabilityState;
-use crate::runtime::dispatch::{DispatchPlan, build_dispatch_plan};
+use crate::runtime::dispatch::{build_dispatch_plan, DispatchPlan};
 use crate::runtime::exports::{
-    ONNX_EXPORT_STATUS_FILE_NAME, OnnxExportStatus, write_onnx_export_status,
+    write_onnx_export_status, OnnxExportStatus, ONNX_EXPORT_STATUS_FILE_NAME,
 };
 use crate::runtime::hpo::{
-    OPTIMIZATION_REPORT_FILE_NAME, OptimizationReport, OptimizationTrialRecord,
     evaluate_prediction_quality, time_series_holdout_split, write_optimization_report,
+    OptimizationReport, OptimizationTrialRecord, OPTIMIZATION_REPORT_FILE_NAME,
 };
 use crate::runtime::profile::{
-    TRAINING_RUNTIME_PROFILE_FILE_NAME, TrainingRuntimeProfile, write_training_runtime_profile,
+    write_training_runtime_profile, TrainingRuntimeProfile, TRAINING_RUNTIME_PROFILE_FILE_NAME,
 };
 use crate::tree_models::config::ParamValue;
 use crate::tree_models::{CatBoostExpert, LightGBMExpert, SklearsTreeExpert, XGBoostExpert};
@@ -35,7 +36,7 @@ use crate::{
     TiDENfExpert, TimesNetExpert, TradingReinforcementLearner, TransformerExpert,
 };
 use forex_data::{
-    FeatureBuildOptions, Ohlcv, load_symbol_dataset, prepare_multitimeframe_features_with_options,
+    load_symbol_dataset, prepare_multitimeframe_features_with_options, FeatureBuildOptions, Ohlcv,
 };
 use forex_search::genetic::{ParentSelectionPolicy, SurvivorSelectionPolicy};
 use polars::prelude::{BooleanChunked, DataFrame, NamedFrom, NewChunkedArray, Series};
@@ -57,6 +58,37 @@ impl TrainingOrchestrator {
         Self {
             settings,
             models_dir,
+        }
+    }
+
+    fn preferred_burn_device_policy(&self) -> String {
+        let gpu_pref = self
+            .settings
+            .system
+            .enable_gpu_preference
+            .trim()
+            .to_ascii_lowercase();
+        let system_device = self.settings.system.device.trim().to_ascii_lowercase();
+        match gpu_pref.as_str() {
+            "false" | "cpu" => "cpu".to_string(),
+            "true" | "gpu" => {
+                if system_device.is_empty() || system_device == "cpu" {
+                    "gpu".to_string()
+                } else {
+                    system_device
+                }
+            }
+            _ => {
+                if system_device.starts_with("cuda:")
+                    || system_device.starts_with("gpu:")
+                    || system_device.starts_with("wgpu:")
+                    || matches!(system_device.as_str(), "gpu" | "cuda" | "wgpu")
+                {
+                    system_device
+                } else {
+                    "auto".to_string()
+                }
+            }
         }
     }
 
@@ -280,7 +312,7 @@ impl TrainingOrchestrator {
 
         if !blocked.is_empty() {
             anyhow::bail!(
-                "model capability dispatch is not yet wired for the configured models: {}",
+                "configured models resolve to planned capabilities and cannot enter the training dispatch: {}",
                 blocked.join(", ")
             );
         }
@@ -299,6 +331,8 @@ impl TrainingOrchestrator {
                 Ok(ModelConfig {
                     name: entry.name.clone(),
                     model_type: self.map_model_type(&entry.name)?,
+                    capability_family: entry.family,
+                    capability_state: entry.state,
                     params,
                 })
             })
@@ -334,6 +368,14 @@ impl TrainingOrchestrator {
 
     fn min_calibration_rows(&self) -> usize {
         self.settings.models.calibration_min_rows.max(32)
+    }
+
+    fn effective_label_horizon_bars(&self) -> usize {
+        if self.settings.models.label_horizon_bars > 0 {
+            self.settings.models.label_horizon_bars
+        } else {
+            self.settings.risk.meta_label_max_hold_bars.max(1)
+        }
     }
 
     fn holdout_pct(&self) -> f64 {
@@ -820,6 +862,7 @@ impl TrainingOrchestrator {
                 ("learning_rate".to_string(), "0.05".to_string()),
             ]),
             "mlp" => HashMap::from([
+                ("device".to_string(), self.preferred_burn_device_policy()),
                 (
                     "hidden_dim".to_string(),
                     self.settings.models.nf_hidden_dim.to_string(),
@@ -863,9 +906,11 @@ impl TrainingOrchestrator {
                         (42_u64 + replica_offset as u64 * 97).to_string(),
                     ),
                     ("ensemble_member".to_string(), replica_idx.to_string()),
+                    ("device".to_string(), self.preferred_burn_device_policy()),
                 ])
             }
             "nbeats" => HashMap::from([
+                ("device".to_string(), self.preferred_burn_device_policy()),
                 (
                     "hidden_dim".to_string(),
                     self.settings.models.nbeats_hidden_dim.to_string(),
@@ -882,6 +927,7 @@ impl TrainingOrchestrator {
                 ),
             ]),
             "tide" => HashMap::from([
+                ("device".to_string(), self.preferred_burn_device_policy()),
                 (
                     "hidden_dim".to_string(),
                     self.settings.models.tide_hidden_dim.to_string(),
@@ -897,6 +943,7 @@ impl TrainingOrchestrator {
                 ),
             ]),
             "tabnet" => HashMap::from([
+                ("device".to_string(), self.preferred_burn_device_policy()),
                 (
                     "hidden_dim".to_string(),
                     self.settings.models.tabnet_hidden_dim.to_string(),
@@ -913,6 +960,7 @@ impl TrainingOrchestrator {
                 ),
             ]),
             "kan" => HashMap::from([
+                ("device".to_string(), self.preferred_burn_device_policy()),
                 (
                     "hidden_dim".to_string(),
                     self.settings.models.kan_hidden_dim.to_string(),
@@ -929,6 +977,7 @@ impl TrainingOrchestrator {
                 ),
             ]),
             "patchtst" => HashMap::from([
+                ("device".to_string(), self.preferred_burn_device_policy()),
                 (
                     "hidden_dim".to_string(),
                     self.transformer_hidden_dim().to_string(),
@@ -953,6 +1002,7 @@ impl TrainingOrchestrator {
                 ),
             ]),
             "timesnet" => HashMap::from([
+                ("device".to_string(), self.preferred_burn_device_policy()),
                 (
                     "hidden_dim".to_string(),
                     self.settings.models.nf_hidden_dim.to_string(),
@@ -968,6 +1018,7 @@ impl TrainingOrchestrator {
                 ),
             ]),
             "nbeatsx_nf" => HashMap::from([
+                ("device".to_string(), self.preferred_burn_device_policy()),
                 (
                     "hidden_dim".to_string(),
                     self.settings.models.nbeats_hidden_dim.to_string(),
@@ -983,6 +1034,7 @@ impl TrainingOrchestrator {
                 ),
             ]),
             "tide_nf" => HashMap::from([
+                ("device".to_string(), self.preferred_burn_device_policy()),
                 (
                     "hidden_dim".to_string(),
                     self.settings.models.tide_hidden_dim.to_string(),
@@ -1045,6 +1097,7 @@ impl TrainingOrchestrator {
                 ),
             ]),
             "exit_agent" => HashMap::from([
+                ("device".to_string(), self.preferred_burn_device_policy()),
                 (
                     "hidden_dim".to_string(),
                     self.settings.models.exit_agent_hidden_dim.to_string(),
@@ -1531,19 +1584,30 @@ impl TrainingOrchestrator {
         if n == 0 {
             return Vec::new();
         }
+        assert_eq!(
+            ohlcv.open.len(),
+            n,
+            "derive_labels requires aligned OHLCV series: open={} close={}",
+            ohlcv.open.len(),
+            n
+        );
+        assert_eq!(
+            ohlcv.high.len(),
+            n,
+            "derive_labels requires aligned OHLCV series: high={} close={}",
+            ohlcv.high.len(),
+            n
+        );
+        assert_eq!(
+            ohlcv.low.len(),
+            n,
+            "derive_labels requires aligned OHLCV series: low={} close={}",
+            ohlcv.low.len(),
+            n
+        );
 
         let mut labels = vec![0; n];
-        let hold_bars = self
-            .settings
-            .models
-            .label_horizon_bars
-            .max(
-                self.settings
-                    .risk
-                    .triple_barrier_max_bars
-                    .max(self.settings.risk.vol_horizon_bars.max(1)),
-            )
-            .max(1);
+        let hold_bars = self.effective_label_horizon_bars();
         let atr_period = self.settings.risk.atr_period.max(2);
         let min_distance = self.settings.risk.meta_label_min_dist.max(1e-6);
         let atr_stop_multiplier = self
@@ -1569,7 +1633,7 @@ impl TrainingOrchestrator {
             .clamp(0.05, 1.0);
 
         for (i, slot) in labels.iter_mut().enumerate() {
-            let entry = ohlcv.close.get(i).copied().unwrap_or_default();
+            let entry = ohlcv.close[i];
             if !entry.is_finite() || entry.abs() <= f64::EPSILON || i + 1 >= n {
                 continue;
             }
@@ -1583,9 +1647,9 @@ impl TrainingOrchestrator {
                 let lower_barrier = entry - stop_distance;
 
                 for forward_idx in (i + 1)..=horizon_end {
-                    let high = ohlcv.high.get(forward_idx).copied().unwrap_or(entry);
-                    let low = ohlcv.low.get(forward_idx).copied().unwrap_or(entry);
-                    let close = ohlcv.close.get(forward_idx).copied().unwrap_or(entry);
+                    let high = ohlcv.high[forward_idx];
+                    let low = ohlcv.low[forward_idx];
+                    let close = ohlcv.close[forward_idx];
                     let tp_hit = high.is_finite() && high >= upper_barrier;
                     let sl_hit = low.is_finite() && low <= lower_barrier;
 
@@ -1620,7 +1684,7 @@ impl TrainingOrchestrator {
                 continue;
             }
 
-            let terminal_close = ohlcv.close.get(horizon_end).copied().unwrap_or(entry);
+            let terminal_close = ohlcv.close[horizon_end];
             let terminal_move = terminal_close - entry;
             let neutral_band = min_distance.max(atr * neutral_band_fraction);
             if terminal_move >= neutral_band {
@@ -1853,6 +1917,11 @@ fn training_runtime_profile(
     row_budget_applied: Option<usize>,
     higher_timeframes: Vec<String>,
 ) -> TrainingRuntimeProfile {
+    let effective_label_horizon_bars = if settings.models.label_horizon_bars > 0 {
+        settings.models.label_horizon_bars
+    } else {
+        settings.risk.meta_label_max_hold_bars.max(1)
+    };
     let requested_backend = parse_string_param(&config.params, "backend");
     let requested_device = parse_string_param(&config.params, "device");
     let rllib_requested = requested_backend
@@ -1871,7 +1940,10 @@ fn training_runtime_profile(
     }
     if settings.models.enable_ddp || settings.models.enable_fsdp {
         notes.push(
-            "distributed deep-learning flags are recorded for runtime traceability; active burn backend is still single-process ndarray".to_string(),
+            format!(
+                "distributed deep-learning flags are recorded for runtime traceability; active burn backend in this build is `{}` and training still executes as a single-process local run",
+                active_burn_backend_name()
+            ),
         );
     }
     if parse_bool_param(&config.params, "async", false) {
@@ -1887,11 +1959,17 @@ fn training_runtime_profile(
 
     TrainingRuntimeProfile {
         model_name: config.name.clone(),
+        capability_family: config.capability_family,
+        capability_state: config.capability_state,
         symbol: symbol.to_string(),
         base_timeframe: base_tf.to_string(),
         feature_count: payload.frame.width(),
         dataset_rows: payload.frame.height(),
         row_budget_applied,
+        label_horizon_bars: settings.models.label_horizon_bars,
+        effective_label_horizon_bars,
+        meta_label_max_hold_bars: settings.risk.meta_label_max_hold_bars.max(1),
+        label_use_triple_barrier: settings.models.label_use_triple_barrier,
         higher_timeframes,
         multi_resolution_enabled: settings.system.multi_resolution_enabled,
         base_features_prefixed: settings.system.multi_resolution_prefix_base,
@@ -2707,6 +2785,8 @@ fn optimize_model_config(
     else {
         let report = OptimizationReport {
             model_name: config.name.clone(),
+            capability_family: config.capability_family,
+            capability_state: config.capability_state,
             backend,
             trials_requested,
             trials_completed: 0,
@@ -2816,6 +2896,8 @@ fn optimize_model_config(
 
     let report = OptimizationReport {
         model_name: config.name.clone(),
+        capability_family: config.capability_family,
+        capability_state: config.capability_state,
         backend,
         trials_requested,
         trials_completed,
@@ -2855,6 +2937,8 @@ fn write_onnx_status_sidecar(
     };
     let status = OnnxExportStatus::skipped(
         config.name.clone(),
+        config.capability_family,
+        config.capability_state,
         exporter,
         artifact_dir.to_path_buf(),
         payload.frame.width(),
@@ -2975,9 +3059,9 @@ fn train_model_dispatch(
                 .with_buffer_capacity(parse_usize_param(&config.params, "buffer_capacity", 50_000))
                 .with_runtime_hints(
                     parse_string_param(&config.params, "backend")
-                        .unwrap_or_else(|| "native".to_string()),
+                        .unwrap_or_else(|| "rlkit".to_string()),
                     parse_string_param(&config.params, "device")
-                        .unwrap_or_else(|| "cpu".to_string()),
+                        .unwrap_or_else(|| "auto".to_string()),
                     parse_usize_param(&config.params, "parallel_envs", 1),
                     parse_usize_param(&config.params, "eval_episodes", 8),
                     parse_usize_param(&config.params, "rllib_num_workers", 0),
@@ -3273,5 +3357,67 @@ mod tests {
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].name, "neat");
         assert_eq!(configs[0].model_type, ModelType::Neat);
+    }
+
+    #[test]
+    fn derive_labels_uses_meta_label_max_hold_bars_when_model_horizon_is_zero() {
+        let mut orchestrator = orchestrator_with_models(&["lightgbm"]);
+        orchestrator.settings.models.label_use_triple_barrier = false;
+        orchestrator.settings.models.label_horizon_bars = 0;
+        orchestrator.settings.risk.meta_label_max_hold_bars = 3;
+        orchestrator.settings.risk.triple_barrier_max_bars = 1;
+        orchestrator.settings.risk.vol_horizon_bars = 1;
+        orchestrator.settings.risk.meta_label_min_dist = 0.2;
+
+        let ohlcv = Ohlcv {
+            timestamp: Some(vec![0, 1, 2, 3]),
+            open: vec![100.0, 100.1, 100.2, 100.3],
+            high: vec![100.0, 100.1, 100.2, 100.3],
+            low: vec![100.0, 100.1, 100.2, 100.3],
+            close: vec![100.0, 100.1, 100.2, 100.3],
+            volume: None,
+        };
+
+        let labels = orchestrator.derive_labels(&ohlcv);
+        assert_eq!(labels[0], 1);
+    }
+
+    #[test]
+    fn training_runtime_profile_records_capability_metadata_and_effective_label_horizon() {
+        let mut orchestrator = orchestrator_with_models(&["lightgbm"]);
+        orchestrator.settings.models.label_horizon_bars = 0;
+        orchestrator.settings.risk.meta_label_max_hold_bars = 3;
+        orchestrator.settings.models.label_use_triple_barrier = false;
+
+        let plan = orchestrator
+            .create_dispatch_plan()
+            .expect("dispatch plan should build");
+        let configs = orchestrator
+            .build_training_configs(&plan)
+            .expect("training configs should build");
+        let config = &configs[0];
+        let payload =
+            TrainingPayload::from_dense(ndarray::Array2::<f32>::zeros((4, 1)), vec![0, 0, 0, 0])
+                .expect("build payload");
+
+        let profile = training_runtime_profile(
+            &orchestrator.settings,
+            config,
+            "EURUSD",
+            "M1",
+            &payload,
+            Some(4),
+            vec!["H1".to_string()],
+        );
+
+        assert_eq!(
+            profile.capability_family,
+            crate::runtime::capabilities::ModelFamily::Tree
+        );
+        assert_eq!(profile.capability_state, CapabilityState::Implemented);
+        assert_eq!(profile.label_horizon_bars, 0);
+        assert_eq!(profile.effective_label_horizon_bars, 3);
+        assert_eq!(profile.meta_label_max_hold_bars, 3);
+        assert!(!profile.label_use_triple_barrier);
     }
 }

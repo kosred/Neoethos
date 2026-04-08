@@ -169,7 +169,7 @@ pub fn model_capability(name: &str) -> Option<ModelCapability> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CapabilityState, ModelCapability, ModelFamily, model_capability};
+    use super::{model_capability, CapabilityState, ModelCapability, ModelFamily};
 
     #[test]
     fn model_family_has_expected_variants() {

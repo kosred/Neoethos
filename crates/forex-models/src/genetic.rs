@@ -1,13 +1,13 @@
 use crate::base::{dataframe_to_float32_array, feature_columns_from_dataframe};
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::{Duration, TimeZone, Utc};
 use forex_data::{FeatureFrame, Ohlcv};
 use forex_search::genetic::{
-    Gene, ParentSelectionPolicy, SeenSignatureMemory, SmcSearchConfig, SurvivorSelectionPolicy,
     crossover, generate_random_genes, mutate, select_parent_index, select_survivor_indices,
-    signals_for_gene, unique_candidate_or_retry,
+    signals_for_gene, unique_candidate_or_retry, Gene, ParentSelectionPolicy, SeenSignatureMemory,
+    SmcSearchConfig, SurvivorSelectionPolicy,
 };
-use forex_search::{DiscoveryConfig, FilteringConfig, run_discovery_cycle};
+use forex_search::{run_discovery_cycle, DiscoveryConfig, FilteringConfig};
 use ndarray::Array2;
 use polars::prelude::*;
 use rand::Rng;
@@ -202,49 +202,69 @@ impl GeneticStrategyExpert {
         })
     }
 
-    fn numeric_column(df: &DataFrame, names: &[&str]) -> Option<Vec<f64>> {
+    fn numeric_column(df: &DataFrame, names: &[&str]) -> Result<Option<Vec<f64>>> {
         for name in names {
             if let Ok(column) = df.column(name) {
-                if let Ok(series) = column.as_materialized_series().cast(&DataType::Float64) {
-                    if let Ok(values) = series.f64() {
-                        let mut last = 0.0_f64;
-                        return Some(
-                            values
-                                .into_iter()
-                                .map(|value| {
-                                    if let Some(value) = value {
-                                        last = value;
-                                        value
-                                    } else {
-                                        last
-                                    }
-                                })
-                                .collect(),
-                        );
-                    }
-                }
+                let series = column
+                    .as_materialized_series()
+                    .cast(&DataType::Float64)
+                    .with_context(|| format!("cast genetic OHLCV column {name} to Float64"))?;
+                let values = series
+                    .f64()
+                    .with_context(|| format!("access genetic OHLCV column {name} as Float64"))?
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, value)| {
+                        let value = value.with_context(|| {
+                            format!(
+                                "genetic OHLCV column {name} contains null at row {idx}; discovery-backed training requires fully materialized market data"
+                            )
+                        })?;
+                        if !value.is_finite() {
+                            bail!(
+                                "genetic OHLCV column {name} contains non-finite value {} at row {}",
+                                value,
+                                idx
+                            );
+                        }
+                        Ok(value)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                return Ok(Some(values));
             }
         }
-        None
+        Ok(None)
     }
 
-    fn extract_ohlcv(df: &DataFrame) -> Option<Ohlcv> {
+    fn extract_ohlcv(df: &DataFrame) -> Result<Option<Ohlcv>> {
         let open = Self::numeric_column(df, &["open", "o"])?;
         let high = Self::numeric_column(df, &["high", "h"])?;
         let low = Self::numeric_column(df, &["low", "l"])?;
         let close = Self::numeric_column(df, &["close", "c"])?;
+        if open.is_none() && high.is_none() && low.is_none() && close.is_none() {
+            return Ok(None);
+        }
+
+        let open =
+            open.context("genetic OHLCV extraction found close-like data but no open column")?;
+        let high =
+            high.context("genetic OHLCV extraction found close-like data but no high column")?;
+        let low =
+            low.context("genetic OHLCV extraction found close-like data but no low column")?;
+        let close =
+            close.context("genetic OHLCV extraction found incomplete OHLCV market columns")?;
         let len = close.len();
         if open.len() != len || high.len() != len || low.len() != len {
-            return None;
+            bail!("genetic OHLCV columns have inconsistent lengths");
         }
-        Some(Ohlcv {
+        Ok(Some(Ohlcv {
             timestamp: Some(Self::timestamps_from_frame(df)),
             open,
             high,
             low,
             close,
-            volume: Self::numeric_column(df, &["volume", "vol", "v"]),
-        })
+            volume: Self::numeric_column(df, &["volume", "vol", "v"])?,
+        }))
     }
 
     fn discovery_config(&self) -> DiscoveryConfig {
@@ -773,10 +793,17 @@ impl GeneticStrategyExpert {
         self.feature_columns = features.names.clone();
         self.symbol = symbol.map(|value| value.to_string());
 
-        let portfolio = if let Some(ohlcv) = metadata
-            .and_then(Self::extract_ohlcv)
-            .or_else(|| Self::extract_ohlcv(x))
-        {
+        let metadata_ohlcv = match metadata {
+            Some(frame) => Self::extract_ohlcv(frame)?,
+            None => None,
+        };
+        let feature_ohlcv = if metadata_ohlcv.is_none() {
+            Self::extract_ohlcv(x)?
+        } else {
+            None
+        };
+
+        let portfolio = if let Some(ohlcv) = metadata_ohlcv.or(feature_ohlcv) {
             self.backend_mode = GeneticBackendMode::DiscoveryBacked;
             self.train_with_discovery(&features, &ohlcv)?
         } else {
@@ -788,7 +815,7 @@ impl GeneticStrategyExpert {
             .iter()
             .map(|gene| gene.fitness)
             .reduce(f64::max)
-            .unwrap_or(0.0);
+            .ok_or_else(|| anyhow::anyhow!("genetic training produced an empty portfolio"))?;
         self.portfolio = portfolio;
 
         info!(
@@ -945,6 +972,21 @@ mod tests {
         assert!(err.to_string().contains("no portfolio"));
 
         let _ = std::fs::remove_dir_all(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn genetic_extract_ohlcv_rejects_null_market_rows() -> Result<()> {
+        let df = DataFrame::new(vec![
+            Series::new("open".into(), vec![Some(1.0_f64), None]).into(),
+            Series::new("high".into(), vec![Some(1.1_f64), Some(1.2)]).into(),
+            Series::new("low".into(), vec![Some(0.9_f64), Some(1.0)]).into(),
+            Series::new("close".into(), vec![Some(1.05_f64), Some(1.1)]).into(),
+        ])?;
+
+        let err = GeneticStrategyExpert::extract_ohlcv(&df)
+            .expect_err("null OHLCV rows should fail strict extraction");
+        assert!(err.to_string().contains("contains null"));
         Ok(())
     }
 }

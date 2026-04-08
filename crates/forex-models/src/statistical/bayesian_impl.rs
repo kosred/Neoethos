@@ -1,20 +1,21 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use ndarray::{Array1, Array2, Axis};
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::base::{
-    ExpertModel, build_runtime_artifact_metadata, build_runtime_prediction,
-    canonical_three_class_label_mapping,
+    build_runtime_artifact_metadata, build_runtime_prediction, canonical_three_class_label_mapping,
+    three_class_runtime_confidence, ExpertModel,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 use crate::runtime::prediction::RuntimePrediction;
 
 use super::common::{
-    FeatureScaler, METADATA_FILE_NAME, MODEL_FILE_NAME, ensure_feature_columns_match,
-    feature_matrix_from_dataframe, read_json, remap_three_class_labels, softmax_rows, write_json,
+    ensure_feature_columns_match, feature_matrix_from_dataframe, read_json,
+    remap_three_class_labels, softmax_rows, write_json, FeatureScaler, METADATA_FILE_NAME,
+    MODEL_FILE_NAME,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,14 +250,14 @@ fn runtime_predictions(
     let mut predictions = Vec::with_capacity(probabilities.nrows());
     for row in probabilities.outer_iter() {
         let row_values = [row[0], row[1], row[2]];
-        let confidence = row_values.iter().copied().fold(0.0_f32, f32::max);
+        let (confidence, abstain_recommended) = three_class_runtime_confidence(row_values)?;
         predictions.push(build_runtime_prediction(
             model_name.to_string(),
             ModelFamily::Meta,
             CapabilityState::Implemented,
             row_values,
             Some(confidence),
-            Some(confidence < 0.5),
+            Some(abstain_recommended),
         )?);
     }
 
@@ -277,6 +278,23 @@ fn validate_runtime_metadata(
             "runtime metadata mismatch for {expected_model_name}: expected model name {expected_model_name}, got {}",
             metadata.model_name
         );
+    }
+    if metadata.family != ModelFamily::Meta {
+        bail!(
+            "runtime metadata mismatch for {expected_model_name}: expected family {:?}, got {:?}",
+            ModelFamily::Meta,
+            metadata.family
+        );
+    }
+    if metadata.state != CapabilityState::Implemented {
+        bail!(
+            "runtime metadata mismatch for {expected_model_name}: expected state {:?}, got {:?}",
+            CapabilityState::Implemented,
+            metadata.state
+        );
+    }
+    if metadata.label_mapping != canonical_three_class_label_mapping() {
+        bail!("runtime metadata mismatch for {expected_model_name}: unexpected label mapping");
     }
     if metadata.feature_columns != expected_feature_columns {
         bail!(
@@ -301,6 +319,56 @@ fn validate_runtime_metadata(
             metadata.training_summary.val_rows,
             metadata.training_summary.dataset_rows
         );
+    }
+
+    Ok(())
+}
+
+fn validate_bayesian_artifact(artifact: &BayesianOneVsRestArtifact) -> Result<()> {
+    if artifact.model_name != "bayes_logit" {
+        bail!(
+            "unexpected bayesian artifact model name {}",
+            artifact.model_name
+        );
+    }
+    if artifact.feature_columns.is_empty() {
+        bail!("bayesian artifact must contain at least one feature column");
+    }
+    if artifact.dataset_rows == 0 {
+        bail!("bayesian artifact must persist a non-zero dataset row count");
+    }
+    if artifact.classes.len() != 3 {
+        bail!(
+            "bayesian artifact must persist exactly three class models, found {}",
+            artifact.classes.len()
+        );
+    }
+    if artifact.scaler.means.len() != artifact.feature_columns.len()
+        || artifact.scaler.stds.len() != artifact.feature_columns.len()
+    {
+        bail!(
+            "bayesian artifact scaler dimension mismatch: means {}, stds {}, features {}",
+            artifact.scaler.means.len(),
+            artifact.scaler.stds.len(),
+            artifact.feature_columns.len()
+        );
+    }
+    if artifact.scaler.means.iter().any(|value| !value.is_finite())
+        || artifact.scaler.stds.iter().any(|value| !value.is_finite())
+        || artifact.classes.iter().any(|class_model| {
+            class_model.weights.len() != artifact.feature_columns.len()
+                || class_model.variance_diag.len() != artifact.feature_columns.len()
+                || class_model.weights.iter().any(|value| !value.is_finite())
+                || !class_model.bias.is_finite()
+                || class_model
+                    .variance_diag
+                    .iter()
+                    .any(|value| !value.is_finite() || *value <= 0.0)
+                || !class_model.bias_variance.is_finite()
+                || class_model.bias_variance <= 0.0
+        })
+    {
+        bail!("bayesian artifact contains invalid posterior parameters");
     }
 
     Ok(())
@@ -447,6 +515,7 @@ impl ExpertModel for BayesianLogitExpert {
             .model
             .as_ref()
             .context("BayesianLogitExpert not trained")?;
+        validate_bayesian_artifact(artifact)?;
         let runtime_metadata = artifact
             .runtime_metadata
             .as_ref()
@@ -463,9 +532,7 @@ impl ExpertModel for BayesianLogitExpert {
 
     fn load(&mut self, path: &Path) -> Result<()> {
         let mut artifact: BayesianOneVsRestArtifact = read_json(&path.join(MODEL_FILE_NAME))?;
-        if artifact.model_name != "bayes_logit" {
-            bail!("expected bayes_logit artifact, got {}", artifact.model_name);
-        }
+        validate_bayesian_artifact(&artifact)?;
         let runtime_metadata: RuntimeArtifactMetadata = read_json(&path.join(METADATA_FILE_NAME))?;
         validate_runtime_metadata(
             &runtime_metadata,
@@ -499,6 +566,7 @@ impl BayesianLogitExpert {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::base::three_class_runtime_confidence;
 
     fn sample_dataframe() -> DataFrame {
         DataFrame::new(vec![
@@ -520,5 +588,22 @@ mod tests {
             .fit(&df, &y)
             .expect_err("mismatched labels should fail");
         assert!(err.to_string().contains("matching feature and label rows"));
+    }
+
+    #[test]
+    fn runtime_predictions_use_shared_three_class_confidence_gate() -> Result<()> {
+        let probabilities = Array2::from_shape_vec((1, 3), vec![0.58_f32, 0.20, 0.22])?;
+        let predictions = runtime_predictions("bayes_logit", &probabilities)?;
+        let prediction = predictions
+            .first()
+            .expect("one runtime prediction should be produced");
+        let (expected_confidence, expected_abstain) =
+            three_class_runtime_confidence([0.58, 0.20, 0.22])?;
+
+        assert!(
+            (prediction.confidence().expect("confidence") - expected_confidence).abs() < 1e-6
+        );
+        assert_eq!(prediction.abstain_recommended(), Some(expected_abstain));
+        Ok(())
     }
 }

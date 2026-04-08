@@ -1,5 +1,5 @@
 use crate::genetic::strategy_gene::EvaluationConfig;
-use crate::genetic::{Gene, evolve_search_with_progress_and_limits, signals_for_gene};
+use crate::genetic::{evolve_search_with_progress_and_limits, signals_for_gene, Gene};
 use crate::quality::{StrategyMetrics, StrategyQualityAnalyzer, Trade};
 use anyhow::Result;
 use chrono::{Datelike, TimeZone, Utc};
@@ -464,7 +464,7 @@ where
 }
 
 fn finalize_candidates_with_progress<F>(
-    mut candidates: Vec<Gene>,
+    candidates: Vec<Gene>,
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
@@ -474,17 +474,34 @@ where
     F: FnMut(DiscoveryProgress),
 {
     // Sort by a weighted combo of fitness and consistency to find reliably profitable ones
-    candidates.sort_by(|a, b| {
+    let mut ranked_candidates: Vec<(usize, Gene)> = candidates.into_iter().enumerate().collect();
+    ranked_candidates.sort_by(|(idx_a, a), (idx_b, b)| {
         let score_a = a.fitness + (a.consistency * 0.5);
         let score_b = b.fitness + (b.consistency * 0.5);
         score_b
             .partial_cmp(&score_a)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.consistency
+                    .partial_cmp(&a.consistency)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                b.fitness
+                    .partial_cmp(&a.fitness)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.strategy_id.cmp(&b.strategy_id))
+            .then_with(|| idx_a.cmp(idx_b))
     });
-    let max_candidates = config.candidate_count.max(100).min(candidates.len());
-    candidates.truncate(max_candidates);
+    let max_candidates = config.candidate_count.max(100).min(ranked_candidates.len());
+    ranked_candidates.truncate(max_candidates);
+    let ranked_candidate_genes: Vec<Gene> = ranked_candidates
+        .iter()
+        .map(|(_, gene)| gene.clone())
+        .collect();
     progress_fn(DiscoveryProgress::CandidatesRanked {
-        candidate_count: candidates.len(),
+        candidate_count: ranked_candidates.len(),
         truncated_to: max_candidates,
     });
 
@@ -493,22 +510,22 @@ where
         config.min_trades_per_day,
         features.data.nrows(),
     );
-    let mut filtered = Vec::new();
+    let mut filtered: Vec<(usize, Gene)> = Vec::new();
     let mut signals_map = Vec::new();
-    for gene in &candidates {
+    for (candidate_idx, gene) in &ranked_candidates {
         if !gene.passes_filter(&config.filtering) {
             continue;
         }
         let sig = signals_for_gene(features, gene);
         let trade_count = sig.iter().filter(|v| **v != 0).count() as f64;
         if trade_count >= min_trades as f64 {
-            filtered.push(gene.clone());
+            filtered.push((*candidate_idx, gene.clone()));
             signals_map.push(sig);
         }
     }
     progress_fn(DiscoveryProgress::CandidatesFiltered {
         passed_filters: filtered.len(),
-        evaluated_candidates: candidates.len(),
+        evaluated_candidates: ranked_candidates.len(),
         min_trades_required: min_trades,
     });
 
@@ -516,11 +533,12 @@ where
     let mut quality_metrics = Vec::new();
     let mut logged_trades = Vec::new();
     if Gene::requires_quality_screen(&config.filtering) {
+        type QualityCandidate = (usize, Gene, Vec<i8>, StrategyMetrics, bool, Vec<Trade>);
         let analyzer = quality_analyzer_for_config(config);
-        let mut strict_passed = Vec::new();
+        let mut strict_passed: Vec<QualityCandidate> = Vec::new();
         let mut opportunistic_passed = 0usize;
 
-        for (gene, sig) in filtered.into_iter().zip(signals_map.into_iter()) {
+        for ((candidate_idx, gene), sig) in filtered.into_iter().zip(signals_map.into_iter()) {
             let trades = crate::eval::simulate_trades_core(
                 &ohlcv.close,
                 &ohlcv.high,
@@ -539,36 +557,45 @@ where
                     opportunistic_passed += 1;
                 }
                 quality_metrics.push(metrics.clone());
-                strict_passed.push((gene, sig, metrics, opportunistic_quality, trades));
+                strict_passed.push((
+                    candidate_idx,
+                    gene,
+                    sig,
+                    metrics,
+                    opportunistic_quality,
+                    trades,
+                ));
             }
         }
 
         strict_passed.sort_by(|a, b| {
-            let lane_a = if a.3 { 0_u8 } else { 1_u8 };
-            let lane_b = if b.3 { 0_u8 } else { 1_u8 };
+            let lane_a = if a.4 { 0_u8 } else { 1_u8 };
+            let lane_b = if b.4 { 0_u8 } else { 1_u8 };
             lane_b
                 .cmp(&lane_a)
                 .then_with(|| {
-                    b.2.quality_score
-                        .partial_cmp(&a.2.quality_score)
+                    b.3.quality_score
+                        .partial_cmp(&a.3.quality_score)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .then_with(|| {
-                    b.0.fitness
-                        .partial_cmp(&a.0.fitness)
+                    b.1.fitness
+                        .partial_cmp(&a.1.fitness)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
+                .then_with(|| a.1.strategy_id.cmp(&b.1.strategy_id))
+                .then_with(|| a.0.cmp(&b.0))
         });
 
         if config.filtering.log_trades {
             logged_trades = strict_passed
                 .iter()
-                .filter(|entry| !entry.4.is_empty())
+                .filter(|entry| !entry.5.is_empty())
                 .take(config.filtering.trade_log_max)
                 .map(|entry| LoggedStrategyTrades {
-                    strategy_id: entry.0.strategy_id.clone(),
-                    opportunistic: entry.3,
-                    trades: entry.4.clone(),
+                    strategy_id: entry.1.strategy_id.clone(),
+                    opportunistic: entry.4,
+                    trades: entry.5.clone(),
                 })
                 .collect();
         }
@@ -583,8 +610,8 @@ where
 
         let mut screened_genes = Vec::with_capacity(strict_passed.len());
         let mut screened_signals = Vec::with_capacity(strict_passed.len());
-        for (gene, sig, _, _, _) in strict_passed {
-            screened_genes.push(gene);
+        for (candidate_idx, gene, sig, _, _, _) in strict_passed {
+            screened_genes.push((candidate_idx, gene));
             screened_signals.push(sig);
         }
         filtered = screened_genes;
@@ -594,7 +621,7 @@ where
     let mut portfolio = Vec::new();
     let mut portfolio_signals: Vec<Vec<i8>> = Vec::new();
     let mut rejected_by_correlation = 0usize;
-    for (gene, sig) in filtered.into_iter().zip(signals_map.into_iter()) {
+    for ((_, gene), sig) in filtered.into_iter().zip(signals_map.into_iter()) {
         if portfolio.len() >= config.portfolio_size {
             break;
         }
@@ -618,14 +645,14 @@ where
         target_portfolio: config.portfolio_size,
     });
     progress_fn(DiscoveryProgress::Completed {
-        candidate_count: candidates.len(),
+        candidate_count: ranked_candidate_genes.len(),
         filtered_count,
         portfolio_size: portfolio.len(),
     });
 
     Ok(DiscoveryResult {
         portfolio,
-        candidates,
+        candidates: ranked_candidate_genes,
         quality_metrics,
         logged_trades,
     })

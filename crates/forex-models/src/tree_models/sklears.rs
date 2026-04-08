@@ -1,11 +1,11 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use ndarray::Array2;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::path::Path;
 
-use crate::base::{ExpertModel, dataframe_to_float32_array, feature_columns_from_dataframe};
+use crate::base::{dataframe_to_float32_array, feature_columns_from_dataframe, ExpertModel};
 use crate::runtime::artifacts::TrainingSummaryMetadata;
 use crate::runtime::capabilities::ModelFamily;
 use crate::tree_models::common::{
@@ -37,6 +37,69 @@ struct DecisionTreeArtifact {
     min_samples_leaf: usize,
     max_thresholds_per_feature: usize,
     root: TreeNode,
+}
+
+fn validate_probability_vector(probabilities: &[f32; 3]) -> Result<()> {
+    let mut sum = 0.0_f32;
+    for value in probabilities {
+        if !value.is_finite() || *value < 0.0 {
+            bail!("sklears-tree probabilities must be finite and non-negative");
+        }
+        sum += *value;
+    }
+    if sum <= f32::EPSILON {
+        bail!("sklears-tree probabilities must have positive mass");
+    }
+    Ok(())
+}
+
+fn validate_tree_node(node: &TreeNode, feature_count: usize) -> Result<()> {
+    match node {
+        TreeNode::Leaf {
+            class_counts,
+            probabilities,
+        } => {
+            if class_counts.iter().sum::<usize>() == 0 {
+                bail!("sklears-tree leaf must contain at least one observed class");
+            }
+            validate_probability_vector(probabilities)?;
+        }
+        TreeNode::Split {
+            feature_index,
+            threshold,
+            probabilities,
+            left,
+            right,
+        } => {
+            if *feature_index >= feature_count {
+                bail!(
+                    "sklears-tree split feature index {} is out of bounds for {} features",
+                    feature_index,
+                    feature_count
+                );
+            }
+            if !threshold.is_finite() {
+                bail!("sklears-tree split threshold must be finite");
+            }
+            validate_probability_vector(probabilities)?;
+            validate_tree_node(left, feature_count)?;
+            validate_tree_node(right, feature_count)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_tree_artifact(artifact: &DecisionTreeArtifact, feature_count: usize) -> Result<()> {
+    if artifact.max_depth == 0 {
+        bail!("sklears-tree artifact must have positive max_depth");
+    }
+    if artifact.min_samples_split == 0 || artifact.min_samples_leaf == 0 {
+        bail!("sklears-tree artifact must have positive sample thresholds");
+    }
+    if artifact.max_thresholds_per_feature == 0 {
+        bail!("sklears-tree artifact must have positive threshold budget");
+    }
+    validate_tree_node(&artifact.root, feature_count)
 }
 
 #[derive(Debug, Clone)]
@@ -210,7 +273,11 @@ impl SklearsTreeExpert {
             }
         }
 
-        if best_gain > 1e-6 { best_split } else { None }
+        if best_gain > 1e-6 {
+            best_split
+        } else {
+            None
+        }
     }
 
     fn build_node(
@@ -323,6 +390,10 @@ impl ExpertModel for SklearsTreeExpert {
             .root
             .as_ref()
             .context("sklears-tree model not fitted")?;
+        if self.feature_columns.is_empty() {
+            bail!("sklears-tree model is missing feature columns");
+        }
+        validate_tree_node(root, self.feature_columns.len())?;
         let artifact = DecisionTreeArtifact {
             max_depth: self.max_depth,
             min_samples_split: self.min_samples_split,
@@ -364,6 +435,7 @@ impl ExpertModel for SklearsTreeExpert {
         if metadata.feature_columns.is_empty() {
             bail!("sklears-tree runtime metadata must contain at least one feature column");
         }
+        validate_tree_artifact(&artifact, metadata.feature_columns.len())?;
         self.max_depth = artifact.max_depth;
         self.min_samples_split = artifact.min_samples_split;
         self.min_samples_leaf = artifact.min_samples_leaf;

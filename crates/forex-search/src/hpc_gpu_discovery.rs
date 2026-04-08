@@ -15,7 +15,7 @@ use std::thread;
 use tch::{Device, Kind, Tensor};
 
 use crate::discovery_gpu::{GpuDiscoveryConfig, GpuDiscoveryResult};
-use crate::genetic::{SurvivorSelectionPolicy, select_parent_index, select_survivor_indices};
+use crate::genetic::{select_parent_index, select_survivor_indices, SurvivorSelectionPolicy};
 use crate::hpc::{get_gpu_cpu_affinity, is_hpc_mode, is_nvlink_pair, set_thread_affinity};
 
 /// Island-based GPU evolution configuration
@@ -55,7 +55,6 @@ pub fn run_island_model_discovery(
     }
 
     let tf_count = frames.len();
-    let n_samples = frames[0].data.nrows();
     let n_features = frames[0].data.ncols();
     let genome_dim = tf_count + n_features + 2;
 
@@ -111,15 +110,25 @@ pub fn run_island_model_discovery(
     }
 
     // Sort all elites by fitness
-    let mut scored: Vec<(f32, Vec<f32>)> = all_elites
+    let mut scored: Vec<(f32, usize, Vec<f32>)> = all_elites
         .into_iter()
+        .enumerate()
         .zip(all_fitness.into_iter())
+        .map(|((idx, genome), fitness)| (fitness, idx, genome))
         .collect();
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+    });
 
     // Return top elites
-    let final_elites: Vec<Vec<f32>> = scored.iter().take(1000).map(|(_, g)| g.clone()).collect();
-    let final_fitness: Vec<f32> = scored.iter().take(1000).map(|(f, _)| *f).collect();
+    let final_elites: Vec<Vec<f32>> = scored
+        .iter()
+        .take(1000)
+        .map(|(_, _, g)| g.clone())
+        .collect();
+    let final_fitness: Vec<f32> = scored.iter().take(1000).map(|(f, _, _)| *f).collect();
 
     Ok(GpuDiscoveryResult {
         genomes: final_elites,
@@ -179,16 +188,25 @@ impl Island {
             config.elite_fraction
         };
 
-        let mut scored: Vec<(f32, Vec<f32>)> = self
+        let mut scored: Vec<(f32, usize, Vec<f32>)> = self
             .population
             .clone()
             .into_iter()
+            .enumerate()
             .zip(self.fitness.iter().cloned())
+            .map(|((idx, genome), fitness)| (fitness, idx, genome))
             .collect();
 
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
 
-        let score_vector: Vec<f64> = scored.iter().map(|(fitness, _)| *fitness as f64).collect();
+        let score_vector: Vec<f64> = scored
+            .iter()
+            .map(|(fitness, _, _)| *fitness as f64)
+            .collect();
         let survivor_count = match config.survivor_selection {
             SurvivorSelectionPolicy::Generational => 0,
             _ => ((self.population.len() as f64) * survivor_fraction)
@@ -208,7 +226,7 @@ impl Island {
 
         self.elites = survivor_indices
             .iter()
-            .map(|idx| scored[*idx].1.clone())
+            .map(|idx| scored[*idx].2.clone())
             .collect();
         self.elite_fitness = survivor_indices.iter().map(|idx| scored[*idx].0).collect();
     }
@@ -539,8 +557,6 @@ fn evaluate_chunk_hpc(
 
 /// Build data cube for HPC mode
 fn build_data_cube_hpc(frames: &[FeatureFrame]) -> Result<Tensor> {
-    use ndarray::Axis;
-
     let tf_count = frames.len();
     let n_samples = frames[0].data.nrows();
     let n_features = frames[0].data.ncols();
@@ -549,7 +565,7 @@ fn build_data_cube_hpc(frames: &[FeatureFrame]) -> Result<Tensor> {
 
     for (t, frame) in frames.iter().enumerate() {
         let shifted = shift_down_hpc(&frame.data);
-        let standardized = zscore_hpc(&shifted);
+        let standardized = causal_zscore_hpc(&shifted);
 
         for i in 0..n_samples {
             for j in 0..n_features {
@@ -615,27 +631,36 @@ fn shift_down_hpc(data: &ndarray::Array2<f32>) -> ndarray::Array2<f32> {
     out
 }
 
-/// Z-score normalization
-fn zscore_hpc(data: &ndarray::Array2<f32>) -> ndarray::Array2<f32> {
+/// Causal z-score normalization using only past rows.
+fn causal_zscore_hpc(data: &ndarray::Array2<f32>) -> ndarray::Array2<f32> {
     let (rows, cols) = data.dim();
     let mut out = ndarray::Array2::<f32>::zeros((rows, cols));
+    if rows == 0 || cols == 0 {
+        return out;
+    }
 
-    for c in 0..cols {
-        let mut sum = 0.0_f64;
-        let mut sumsq = 0.0_f64;
-
-        for r in 0..rows {
-            let v = data[(r, c)] as f64;
-            sum += v;
-            sumsq += v * v;
+    let mut running_sum = vec![0.0_f64; cols];
+    let mut running_sumsq = vec![0.0_f64; cols];
+    for r in 0..rows {
+        if r == 0 {
+            for c in 0..cols {
+                out[(r, c)] = 0.0;
+            }
+        } else {
+            let count = r as f64;
+            for c in 0..cols {
+                let mean = running_sum[c] / count;
+                let var = (running_sumsq[c] / count) - mean * mean;
+                let std = var.max(1e-12).sqrt();
+                out[(r, c)] = ((data[(r, c)] as f64 - mean) / std) as f32;
+            }
         }
 
-        let mean = sum / rows.max(1) as f64;
-        let var = (sumsq / rows.max(1) as f64) - mean * mean;
-        let std = var.max(1e-12).sqrt();
-
-        for r in 0..rows {
-            out[(r, c)] = ((data[(r, c)] as f64 - mean) / std) as f32;
+        for c in 0..cols {
+            let value = data[(r, c)] as f64;
+            let value = if value.is_finite() { value } else { 0.0 };
+            running_sum[c] += value;
+            running_sumsq[c] += value * value;
         }
     }
 
@@ -687,4 +712,22 @@ fn std_vector(elites: &[Vec<f32>], mean: &[f32]) -> Vec<f32> {
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{causal_zscore_hpc, shift_down_hpc};
+    use ndarray::array;
+
+    #[test]
+    fn causal_zscore_hpc_ignores_future_rows() {
+        let future_spike = array![[1.0_f32], [2.0], [100.0]];
+        let alternate_future = array![[1.0_f32], [2.0], [3.0]];
+
+        let normalized_spike = causal_zscore_hpc(&shift_down_hpc(&future_spike));
+        let normalized_alt = causal_zscore_hpc(&shift_down_hpc(&alternate_future));
+
+        assert!((normalized_spike[(0, 0)] - normalized_alt[(0, 0)]).abs() < 1e-6);
+        assert!((normalized_spike[(1, 0)] - normalized_alt[(1, 0)]).abs() < 1e-6);
+    }
 }

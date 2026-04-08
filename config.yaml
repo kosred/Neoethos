@@ -130,6 +130,9 @@ models:
   ml_models: [lightgbm, xgboost, xgboost_rf, xgboost_dart, catboost, catboost_alt, sklears_tree, mlp, neat, elasticnet, bayes_logit, online_pa, online_hoeffding, swarm_forecaster, isolation_forest]
   use_rl_agent: true
   use_sac_agent: true
+  use_rllib_agent: false
+  rllib_num_workers: 0
+  auto_enable_rllib: true
   use_neuroevolution: true
   rl_population_size: 5
   rl_timesteps: 100000
@@ -257,11 +260,12 @@ models:
   l1_feature_selection_c: 0.20
   # Train using base-signal filter for meta-labeling (set false to use all rows)
   filter_to_base_signal: true
+  train_holdout_pct: 0.2
   # Global pooling caps (0 = no cap)
   global_max_rows: 0
   global_max_rows_per_symbol: 0
   label_use_triple_barrier: true
-  # 0 = derive from risk.triple_barrier_max_bars / risk.vol_horizon_bars
+  # 0 = fall back to risk.meta_label_max_hold_bars
   label_horizon_bars: 0
   label_neutral_band_atr_fraction: 0.25
   # 0 = derive from risk.atr_stop_multiplier / risk.min_risk_reward

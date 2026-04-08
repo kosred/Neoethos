@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 
 use super::capabilities::{CapabilityState, ModelFamily};
 use crate::registry::get_model_capability;

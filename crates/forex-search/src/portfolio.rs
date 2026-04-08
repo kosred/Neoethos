@@ -132,7 +132,9 @@ impl PortfolioOptimizer {
             let mut raw = vec![0.0; n_assets];
             for i in 0..n_assets {
                 let s = &names[i];
-                let sharpe = *sharpe_map.get(s).unwrap_or(&0.0);
+                let sharpe = *sharpe_map
+                    .get(s)
+                    .expect("ranked allocation names should always resolve to sharpe metrics");
                 let div_score = if avg_corr[i] >= 0.0 {
                     1.0 / (1.0 + avg_corr[i])
                 } else {
@@ -158,11 +160,15 @@ impl PortfolioOptimizer {
             };
 
             for (i, s) in names.iter().enumerate() {
-                let win_rate = *win_map.get(s).unwrap_or(&0.5);
+                let win_rate = *win_map
+                    .get(s)
+                    .expect("ranked allocation names should always resolve to win-rate metrics");
                 // Proper Kelly criterion: f* = p - (1-p)/b where b = avg_win / avg_loss
-                let m = metrics_map.get(s);
-                let avg_win = m.map(|x| x.avg_win_pct).unwrap_or(0.0);
-                let avg_loss_mag = m.map(|x| x.avg_loss_pct.abs()).unwrap_or(1.0).max(1e-9);
+                let metrics = metrics_map
+                    .get(s)
+                    .expect("allocation names should always resolve to source metrics");
+                let avg_win = metrics.avg_win_pct.max(0.0);
+                let avg_loss_mag = metrics.avg_loss_pct.abs().max(1e-9);
                 let b = avg_win / avg_loss_mag;
                 let kelly_raw = win_rate - (1.0 - win_rate) / b.max(1e-9);
                 let kelly_val = self.kelly_fraction * kelly_raw.clamp(0.0, 0.5);
@@ -174,14 +180,18 @@ impl PortfolioOptimizer {
                         kelly_size: kelly_val,
                         risk_budget: norm[i],
                         correlation_score: avg_corr[i],
-                        sharpe: *sharpe_map.get(s).unwrap_or(&0.0),
+                        sharpe: metrics.sharpe,
                     },
                 );
             }
         } else {
             let w = 1.0 / symbols.len().max(1) as f64;
             for s in symbols {
-                let sharpe = metrics_map.get(s).map(|m| m.sharpe).unwrap_or(0.0);
+                let sharpe = metrics_map
+                    .get(s)
+                    .map(|m| m.sharpe)
+                    .filter(|value| value.is_finite())
+                    .unwrap_or_default();
                 weights.insert(
                     s.clone(),
                     AllocationResult {

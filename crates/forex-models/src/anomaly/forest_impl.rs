@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 #[cfg(feature = "anomaly-detection")]
 use extended_isolation_forest::{Forest, ForestOptions};
 use ndarray::Array2;
@@ -8,13 +8,15 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::base::{
-    ExpertModel, build_runtime_artifact_metadata, canonical_three_class_label_mapping,
+    build_runtime_artifact_metadata, build_runtime_prediction_with_details,
+    canonical_three_class_label_mapping, ExpertModel,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
+use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
-    METADATA_FILE_NAME, MODEL_FILE_NAME, ensure_feature_columns_match,
-    feature_matrix_from_dataframe, read_json, write_json,
+    ensure_feature_columns_match, feature_matrix_from_dataframe, read_json, write_json,
+    METADATA_FILE_NAME, MODEL_FILE_NAME,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,11 +35,19 @@ struct IsolationForestArtifact {
     anomaly_threshold: f32,
     score_mean: f32,
     score_std: f32,
+    #[serde(default)]
+    score_median: f32,
+    #[serde(default = "default_score_mad")]
+    score_mad: f32,
     model_json: String,
     #[serde(default)]
     fallback_means: Vec<f32>,
     #[serde(default)]
     fallback_stds: Vec<f32>,
+}
+
+fn default_score_mad() -> f32 {
+    1.0
 }
 
 #[cfg(feature = "anomaly-detection")]
@@ -152,6 +162,23 @@ fn validate_runtime_metadata(
     expected_feature_columns: &[String],
     expected_dataset_rows: usize,
 ) -> Result<()> {
+    if metadata.family != ModelFamily::Anomaly {
+        bail!(
+            "runtime metadata mismatch for isolation_forest: expected family {:?}, got {:?}",
+            ModelFamily::Anomaly,
+            metadata.family
+        );
+    }
+    if metadata.state != CapabilityState::Implemented {
+        bail!(
+            "runtime metadata mismatch for isolation_forest: expected state {:?}, got {:?}",
+            CapabilityState::Implemented,
+            metadata.state
+        );
+    }
+    if metadata.label_mapping != canonical_three_class_label_mapping() {
+        bail!("runtime metadata mismatch for isolation_forest: label mapping mismatch");
+    }
     if expected_feature_columns.is_empty() {
         bail!("persisted isolation_forest artifact is missing feature columns");
     }
@@ -189,12 +216,78 @@ fn validate_runtime_metadata(
     Ok(())
 }
 
-fn clamp_probability(value: f32) -> f32 {
-    if value.is_finite() {
-        value.clamp(0.0, 1.0)
-    } else {
-        0.5
+fn validate_isolation_forest_artifact(artifact: &IsolationForestArtifact) -> Result<()> {
+    if artifact.feature_columns.is_empty() {
+        bail!("isolation_forest artifact must contain feature columns");
     }
+    if artifact.backend_kind.trim().is_empty() {
+        bail!("isolation_forest artifact must declare a backend kind");
+    }
+    if artifact.dataset_rows == 0 {
+        bail!("isolation_forest artifact must contain at least one training row");
+    }
+    if !artifact.anomaly_threshold.is_finite() || artifact.anomaly_threshold < 0.0 {
+        bail!("isolation_forest anomaly_threshold must be finite and non-negative");
+    }
+    if !artifact.score_mean.is_finite()
+        || !artifact.score_std.is_finite()
+        || artifact.score_std <= 0.0
+        || !artifact.score_median.is_finite()
+        || !artifact.score_mad.is_finite()
+        || artifact.score_mad <= 0.0
+    {
+        bail!(
+            "isolation_forest score statistics must be finite and score_std/score_mad must be positive"
+        );
+    }
+    if artifact
+        .fallback_means
+        .iter()
+        .chain(artifact.fallback_stds.iter())
+        .any(|value| !value.is_finite())
+    {
+        bail!("isolation_forest fallback statistics must be finite");
+    }
+    if artifact.fallback_stds.iter().any(|value| *value <= 0.0) {
+        bail!("isolation_forest fallback scales must be positive");
+    }
+    if artifact.fallback_means.len() != artifact.feature_columns.len()
+        || artifact.fallback_stds.len() != artifact.feature_columns.len()
+    {
+        bail!(
+            "isolation_forest fallback statistics mismatch: expected {} features, received means {} and stds {}",
+            artifact.feature_columns.len(),
+            artifact.fallback_means.len(),
+            artifact.fallback_stds.len()
+        );
+    }
+    match artifact.backend_kind.as_str() {
+        "extended_isolation_forest" => {
+            if artifact.model_json.trim().is_empty() {
+                bail!("extended_isolation_forest artifact must contain serialized backend payload");
+            }
+        }
+        "diagonal_profile" => {
+            if !artifact.model_json.trim().is_empty() {
+                bail!("diagonal_profile artifact must not carry serialized backend payload");
+            }
+        }
+        other => bail!("unsupported isolation forest backend kind: {other}"),
+    }
+    Ok(())
+}
+
+fn validate_probability(value: f32) -> Result<f32> {
+    if !value.is_finite() {
+        bail!("isolation_forest probability projection produced a non-finite value");
+    }
+    if !(0.0..=1.0).contains(&value) {
+        bail!(
+            "isolation_forest probability projection produced an out-of-range value {}",
+            value
+        );
+    }
+    Ok(value)
 }
 
 fn quantile(values: &[f32], fraction: f32) -> f32 {
@@ -207,9 +300,9 @@ fn quantile(values: &[f32], fraction: f32) -> f32 {
     values[index.min(values.len().saturating_sub(1))]
 }
 
-fn score_statistics(values: &[f32]) -> (f32, f32) {
+fn score_statistics(values: &[f32]) -> (f32, f32, f32, f32) {
     if values.is_empty() {
-        return (0.0, 1.0);
+        return (0.0, 1.0, 0.0, 1.0);
     }
 
     let mean = values.iter().copied().sum::<f32>() / values.len() as f32;
@@ -222,24 +315,47 @@ fn score_statistics(values: &[f32]) -> (f32, f32) {
         .sum::<f32>()
         / values.len() as f32;
     let std = variance.sqrt();
-    (
-        mean,
-        if std.is_finite() && std > 1e-6 {
-            std
-        } else {
-            1.0
-        },
-    )
+    let median_value = median(values.to_vec());
+    let mad = median(
+        values
+            .iter()
+            .map(|value| (*value - median_value).abs())
+            .collect(),
+    );
+    let std = if std.is_finite() && std > 1e-6 {
+        std
+    } else {
+        1.0
+    };
+    let mad = if mad.is_finite() && mad > 1e-6 {
+        mad
+    } else {
+        1.0
+    };
+    (mean, std, median_value, mad)
 }
 
-fn anomaly_probabilities(scores: &[f32], threshold: f32, score_std: f32) -> Result<Array2<f32>> {
+fn anomaly_probabilities(
+    scores: &[f32],
+    threshold: f32,
+    score_std: f32,
+    score_median: f32,
+    score_mad: f32,
+) -> Result<Array2<f32>> {
     let mut probabilities = Vec::with_capacity(scores.len() * 3);
-    let normalizer = score_std.max(1e-4);
+    let robust_scale = (score_mad * 1.4826).max(1e-4);
+    let normalizer = robust_scale.max(score_std * 0.1).max(1e-4);
 
     for score in scores {
-        let anomaly_logit = (*score - threshold) / normalizer;
-        let anomaly_probability = clamp_probability(1.0 / (1.0 + (-anomaly_logit).exp()));
+        if !score.is_finite() {
+            bail!("isolation_forest produced a non-finite anomaly score");
+        }
+        let centered_score = *score - score_median;
+        let adjusted_threshold = threshold - score_median;
+        let anomaly_logit = (centered_score - adjusted_threshold) / normalizer;
+        let anomaly_probability = validate_probability(1.0 / (1.0 + (-anomaly_logit).exp()))?;
         let directional_probability = (1.0 - anomaly_probability) * 0.5;
+        let directional_probability = validate_probability(directional_probability)?;
         probabilities.push(anomaly_probability);
         probabilities.push(directional_probability);
         probabilities.push(directional_probability);
@@ -334,6 +450,8 @@ pub struct IsolationForestExpert {
     pub anomaly_threshold: f32,
     pub score_mean: f32,
     pub score_std: f32,
+    pub score_median: f32,
+    pub score_mad: f32,
     pub fallback_means: Vec<f32>,
     pub fallback_stds: Vec<f32>,
 }
@@ -352,6 +470,8 @@ impl IsolationForestExpert {
             anomaly_threshold: 0.5,
             score_mean: 0.0,
             score_std: 1.0,
+            score_median: 0.0,
+            score_mad: 1.0,
             fallback_means: Vec::new(),
             fallback_stds: Vec::new(),
         }
@@ -377,6 +497,8 @@ impl IsolationForestExpert {
                 anomaly_threshold: self.anomaly_threshold,
                 score_mean: self.score_mean,
                 score_std: self.score_std,
+                score_median: self.score_median,
+                score_mad: self.score_mad,
                 model_json: self
                     .backend
                     .as_ref()
@@ -406,6 +528,8 @@ impl IsolationForestExpert {
                 anomaly_threshold: self.anomaly_threshold,
                 score_mean: self.score_mean,
                 score_std: self.score_std,
+                score_median: self.score_median,
+                score_mad: self.score_mad,
                 model_json: String::new(),
                 fallback_means: self.fallback_means.clone(),
                 fallback_stds: self.fallback_stds.clone(),
@@ -441,7 +565,7 @@ impl ExpertModel for IsolationForestExpert {
                 .collect::<Result<Vec<_>>>()?;
             scores.sort_by(|left, right| left.total_cmp(right));
 
-            let (score_mean, score_std) = score_statistics(&scores);
+            let (score_mean, score_std, score_median, score_mad) = score_statistics(&scores);
             self.feature_columns = feature_columns;
             self.dataset_rows = features.nrows();
             self.fallback_means = means;
@@ -450,6 +574,8 @@ impl ExpertModel for IsolationForestExpert {
             self.anomaly_threshold = quantile(&scores, 0.95).max(0.5);
             self.score_mean = score_mean;
             self.score_std = score_std;
+            self.score_median = score_median;
+            self.score_mad = score_mad;
             Ok(())
         }
 
@@ -489,7 +615,8 @@ impl ExpertModel for IsolationForestExpert {
                 .collect::<Result<Vec<_>>>()?;
             training_scores.sort_by(|left, right| left.total_cmp(right));
 
-            let (score_mean, score_std) = score_statistics(&training_scores);
+            let (score_mean, score_std, score_median, score_mad) =
+                score_statistics(&training_scores);
             self.backend = Some(backend);
             self.n_trees = options.n_trees;
             self.sample_size = options.sample_size;
@@ -500,6 +627,8 @@ impl ExpertModel for IsolationForestExpert {
             self.anomaly_threshold = quantile(&training_scores, 0.95).max(0.5);
             self.score_mean = score_mean;
             self.score_std = score_std;
+            self.score_median = score_median;
+            self.score_mad = score_mad;
             self.fallback_means = means;
             self.fallback_stds = stds;
             Ok(())
@@ -521,7 +650,13 @@ impl ExpertModel for IsolationForestExpert {
                     )
                 })
                 .collect::<Result<Vec<_>>>()?;
-            anomaly_probabilities(&scores, self.anomaly_threshold, self.score_std)
+            anomaly_probabilities(
+                &scores,
+                self.anomaly_threshold,
+                self.score_std,
+                self.score_median,
+                self.score_mad,
+            )
         }
 
         #[cfg(feature = "anomaly-detection")]
@@ -562,7 +697,13 @@ impl ExpertModel for IsolationForestExpert {
                 other => bail!("unsupported isolation forest backend kind: {other}"),
             };
 
-            anomaly_probabilities(&scores, self.anomaly_threshold, self.score_std)
+            anomaly_probabilities(
+                &scores,
+                self.anomaly_threshold,
+                self.score_std,
+                self.score_median,
+                self.score_mad,
+            )
         }
     }
 
@@ -597,6 +738,7 @@ impl ExpertModel for IsolationForestExpert {
         validate_runtime_metadata(&runtime_metadata, &self.feature_columns, self.dataset_rows)?;
         write_json(&path.join(METADATA_FILE_NAME), &runtime_metadata)?;
         let artifact = self.artifact()?;
+        validate_isolation_forest_artifact(&artifact)?;
         if artifact.runtime_metadata.as_ref() != Some(&runtime_metadata) {
             bail!("runtime metadata file does not match isolation_forest artifact");
         }
@@ -607,6 +749,7 @@ impl ExpertModel for IsolationForestExpert {
     fn load(&mut self, path: &Path) -> Result<()> {
         let runtime_metadata: RuntimeArtifactMetadata = read_json(&path.join(METADATA_FILE_NAME))?;
         let artifact: IsolationForestArtifact = read_json(&path.join(MODEL_FILE_NAME))?;
+        validate_isolation_forest_artifact(&artifact)?;
         if artifact.model_name != "isolation_forest" {
             bail!(
                 "expected isolation_forest artifact, got {}",
@@ -622,55 +765,56 @@ impl ExpertModel for IsolationForestExpert {
             bail!("runtime metadata file does not match isolation_forest artifact");
         }
 
-        self.n_trees = artifact.n_trees;
-        self.sample_size = artifact.sample_size;
-        self.extension_level = artifact.extension_level;
-        self.max_tree_depth = artifact.max_tree_depth;
-        self.backend_kind = artifact.backend_kind;
-        self.feature_columns = artifact.feature_columns;
-        self.dataset_rows = artifact.dataset_rows;
-        self.anomaly_threshold = artifact.anomaly_threshold;
-        self.score_mean = artifact.score_mean;
-        self.score_std = artifact.score_std;
-        self.fallback_means = artifact.fallback_means;
-        self.fallback_stds = artifact.fallback_stds;
+        let mut next_state = Self::new(artifact.n_trees, artifact.sample_size);
+        next_state.extension_level = artifact.extension_level;
+        next_state.max_tree_depth = artifact.max_tree_depth;
+        next_state.backend_kind = artifact.backend_kind;
+        next_state.feature_columns = artifact.feature_columns;
+        next_state.dataset_rows = artifact.dataset_rows;
+        next_state.anomaly_threshold = artifact.anomaly_threshold;
+        next_state.score_mean = artifact.score_mean;
+        next_state.score_std = artifact.score_std;
+        next_state.score_median = artifact.score_median;
+        next_state.score_mad = artifact.score_mad;
+        next_state.fallback_means = artifact.fallback_means;
+        next_state.fallback_stds = artifact.fallback_stds;
 
         #[cfg(not(feature = "anomaly-detection"))]
         {
-            if self.backend_kind != "diagonal_profile" {
+            if next_state.backend_kind != "diagonal_profile" {
                 bail!(
                     "isolation_forest artifact requires backend `{}` but this build only supports `diagonal_profile`",
-                    self.backend_kind
+                    next_state.backend_kind
                 );
             }
-            if self.fallback_means.len() != self.feature_columns.len()
-                || self.fallback_stds.len() != self.feature_columns.len()
+            if next_state.fallback_means.len() != next_state.feature_columns.len()
+                || next_state.fallback_stds.len() != next_state.feature_columns.len()
             {
                 bail!(
                     "diagonal-profile anomaly artifact is missing feature statistics: expected {} columns, got means {} and stds {}",
-                    self.feature_columns.len(),
-                    self.fallback_means.len(),
-                    self.fallback_stds.len()
+                    next_state.feature_columns.len(),
+                    next_state.fallback_means.len(),
+                    next_state.fallback_stds.len()
                 );
             }
         }
 
         #[cfg(feature = "anomaly-detection")]
         {
-            self.backend = match self.backend_kind.as_str() {
+            next_state.backend = match next_state.backend_kind.as_str() {
                 "extended_isolation_forest" => Some(dispatch_forest_loader(
-                    self.feature_columns.len(),
+                    next_state.feature_columns.len(),
                     &artifact.model_json,
                 )?),
                 "diagonal_profile" => {
-                    if self.fallback_means.len() != self.feature_columns.len()
-                        || self.fallback_stds.len() != self.feature_columns.len()
+                    if next_state.fallback_means.len() != next_state.feature_columns.len()
+                        || next_state.fallback_stds.len() != next_state.feature_columns.len()
                     {
                         bail!(
                             "diagonal-profile anomaly artifact is missing feature statistics: expected {} columns, got means {} and stds {}",
-                            self.feature_columns.len(),
-                            self.fallback_means.len(),
-                            self.fallback_stds.len()
+                            next_state.feature_columns.len(),
+                            next_state.fallback_means.len(),
+                            next_state.fallback_stds.len()
                         );
                     }
                     None
@@ -679,7 +823,45 @@ impl ExpertModel for IsolationForestExpert {
             };
         }
 
+        *self = next_state;
         Ok(())
+    }
+}
+
+impl IsolationForestExpert {
+    fn runtime_details(&self) -> (Option<String>, Option<String>) {
+        match self.backend_kind.as_str() {
+            "extended_isolation_forest" => (Some("extended_isolation_forest".to_string()), None),
+            "diagonal_profile" => (
+                Some("diagonal_profile".to_string()),
+                Some("native_anomaly_backend_unavailable".to_string()),
+            ),
+            _ => (
+                Some("isolation_forest_unknown".to_string()),
+                Some("anomaly_backend_unknown".to_string()),
+            ),
+        }
+    }
+
+    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
+        let probabilities = self.predict_proba(x)?;
+        let (execution_backend, degraded_reason) = self.runtime_details();
+        let mut predictions = Vec::with_capacity(probabilities.nrows());
+        for row in probabilities.outer_iter() {
+            let row_values = [row[0], row[1], row[2]];
+            let confidence = row_values.iter().copied().fold(0.0_f32, f32::max);
+            predictions.push(build_runtime_prediction_with_details(
+                "isolation_forest",
+                ModelFamily::Anomaly,
+                CapabilityState::Implemented,
+                row_values,
+                Some(confidence),
+                Some(row_values[0] > 0.5),
+                execution_backend.clone(),
+                degraded_reason.clone(),
+            )?);
+        }
+        Ok(predictions)
     }
 }
 
@@ -749,5 +931,55 @@ mod tests {
 
         std::fs::remove_dir_all(&artifact_dir).expect("cleanup artifact dir");
         Ok(())
+    }
+
+    #[test]
+    fn isolation_forest_rejects_diagonal_profile_with_backend_payload() -> Result<()> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let df = sample_dataframe();
+        let mut model = IsolationForestExpert::default();
+        model.fit(&df, &Series::new("label".into(), vec![0_i32; 8]))?;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        let artifact_dir =
+            std::env::temp_dir().join(format!("forex-models-forest-payload-{unique}"));
+        std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+
+        model.save(&artifact_dir)?;
+
+        let model_path = artifact_dir.join(MODEL_FILE_NAME);
+        let mut artifact: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&model_path).expect("read model"))
+                .expect("parse model");
+        artifact["backend_kind"] = serde_json::Value::String("diagonal_profile".to_string());
+        artifact["model_json"] = serde_json::Value::String("{\"tampered\":true}".to_string());
+        std::fs::write(
+            &model_path,
+            serde_json::to_vec_pretty(&artifact).expect("serialize tampered model"),
+        )
+        .expect("write tampered model");
+
+        let mut reloaded = IsolationForestExpert::default();
+        let err = reloaded
+            .load(&artifact_dir)
+            .expect_err("diagonal profile with backend payload should fail");
+        assert!(err
+            .to_string()
+            .contains("must not carry serialized backend payload"));
+
+        std::fs::remove_dir_all(&artifact_dir).expect("cleanup artifact dir");
+        Ok(())
+    }
+
+    #[test]
+    fn robust_score_profile_stays_centered_under_single_large_outlier() {
+        let (mean, std, median, mad) = score_statistics(&[0.9, 1.0, 1.1, 8.0]);
+        assert!(mean > median, "mean should be pulled by the outlier");
+        assert!((median - 1.05).abs() < 0.1, "median should stay near the dense cluster");
+        assert!(mad < std, "robust dispersion should stay tighter than std under outliers");
     }
 }

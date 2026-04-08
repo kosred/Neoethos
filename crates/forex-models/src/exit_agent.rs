@@ -8,27 +8,28 @@ use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use burn::backend::Autodiff;
 use burn::module::AutodiffModule;
 use burn::nn;
 use burn::optim::adaptor::OptimizerAdaptor;
 use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
-use burn::record::{DefaultFileRecorder, FullPrecisionSettings};
-use burn_ndarray::NdArray;
+use burn::record::{DefaultFileRecorder, FullPrecisionSettings, Recorder};
 
 use polars::prelude::{DataFrame, DataType, Series};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::base::{
-    build_runtime_prediction, dataframe_to_float32_array, feature_columns_from_dataframe,
+    build_runtime_artifact_metadata, build_runtime_prediction_with_details,
+    canonical_three_class_label_mapping, dataframe_to_float32_array,
+    feature_columns_from_dataframe, three_class_runtime_confidence,
 };
+use crate::burn_models::{resolve_train_device, TrainBackend};
+use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 use crate::runtime::prediction::RuntimePrediction;
-
-pub type TrainBackend = Autodiff<NdArray>;
+use crate::statistical::common::{read_json, write_json, METADATA_FILE_NAME};
 // ============================================================================
 // BURN Q-NETWORK
 // ============================================================================
@@ -108,6 +109,14 @@ pub struct ExitAgentArtifact {
     pub replay_memory: Vec<Experience>,
     #[serde(default)]
     pub pending_regret: HashMap<i32, PendingRegret>,
+    #[serde(default)]
+    pub training_report: Option<ExitAgentTrainingReport>,
+    #[serde(default)]
+    pub requested_device_policy: Option<String>,
+    #[serde(default)]
+    pub effective_device_policy: Option<String>,
+    #[serde(default)]
+    pub execution_backend: Option<String>,
 }
 
 impl Default for ExitAgentArtifact {
@@ -128,11 +137,159 @@ impl Default for ExitAgentArtifact {
             average_reward: 0.0,
             replay_memory: Vec::new(),
             pending_regret: HashMap::new(),
+            training_report: None,
+            requested_device_policy: None,
+            effective_device_policy: None,
+            execution_backend: None,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+fn exit_runtime_metadata(
+    feature_columns: Vec<String>,
+    dataset_rows: usize,
+) -> RuntimeArtifactMetadata {
+    build_runtime_artifact_metadata(
+        "exit_agent",
+        ModelFamily::Exit,
+        CapabilityState::Implemented,
+        feature_columns,
+        canonical_three_class_label_mapping(),
+        TrainingSummaryMetadata::new(dataset_rows, dataset_rows, 0),
+    )
+}
+
+fn validate_exit_metadata(
+    metadata: &RuntimeArtifactMetadata,
+    expected_feature_columns: &[String],
+    expected_dataset_rows: usize,
+) -> Result<()> {
+    if metadata.model_name != "exit_agent" {
+        anyhow::bail!(
+            "exit-agent metadata model mismatch: expected exit_agent, got {}",
+            metadata.model_name
+        );
+    }
+    if metadata.family != ModelFamily::Exit {
+        anyhow::bail!(
+            "exit-agent metadata family mismatch: expected {:?}, got {:?}",
+            ModelFamily::Exit,
+            metadata.family
+        );
+    }
+    if metadata.state != CapabilityState::Implemented {
+        anyhow::bail!(
+            "exit-agent metadata state mismatch: expected {:?}, got {:?}",
+            CapabilityState::Implemented,
+            metadata.state
+        );
+    }
+    if metadata.label_mapping != canonical_three_class_label_mapping() {
+        anyhow::bail!("exit-agent metadata label mapping mismatch");
+    }
+    if expected_feature_columns.is_empty() {
+        anyhow::bail!("exit-agent metadata validation requires non-empty feature columns");
+    }
+    if metadata.feature_columns != expected_feature_columns {
+        anyhow::bail!(
+            "exit-agent metadata feature-column mismatch: expected {:?}, got {:?}",
+            expected_feature_columns,
+            metadata.feature_columns
+        );
+    }
+    if metadata.training_summary.dataset_rows != expected_dataset_rows {
+        anyhow::bail!(
+            "exit-agent metadata dataset-row mismatch: expected {}, got {}",
+            expected_dataset_rows,
+            metadata.training_summary.dataset_rows
+        );
+    }
+    if metadata.training_summary.train_rows + metadata.training_summary.val_rows
+        != metadata.training_summary.dataset_rows
+    {
+        anyhow::bail!(
+            "exit-agent metadata rows are inconsistent: train_rows {} + val_rows {} != dataset_rows {}",
+            metadata.training_summary.train_rows,
+            metadata.training_summary.val_rows,
+            metadata.training_summary.dataset_rows
+        );
+    }
+    Ok(())
+}
+
+fn validate_exit_artifact(artifact: &ExitAgentArtifact) -> Result<()> {
+    if artifact.input_dim == 0 {
+        anyhow::bail!("exit-agent artifact input_dim must be positive");
+    }
+    if artifact.hidden_dim == 0 {
+        anyhow::bail!("exit-agent artifact hidden_dim must be positive");
+    }
+    if artifact.feature_columns.is_empty() {
+        anyhow::bail!("exit-agent artifact must contain feature columns");
+    }
+    if artifact.feature_columns.len() != artifact.input_dim {
+        anyhow::bail!(
+            "exit-agent artifact feature-column mismatch: input_dim {} vs {} feature columns",
+            artifact.input_dim,
+            artifact.feature_columns.len()
+        );
+    }
+    if artifact.train_rows == 0 {
+        anyhow::bail!("exit-agent artifact must record at least one training row");
+    }
+    if !artifact.gamma.is_finite() || !(0.0..1.0).contains(&artifact.gamma) {
+        anyhow::bail!("exit-agent artifact gamma must be finite and inside (0, 1)");
+    }
+    if !artifact.epsilon.is_finite() || !(0.0..=1.0).contains(&artifact.epsilon) {
+        anyhow::bail!("exit-agent artifact epsilon must be finite and inside [0, 1]");
+    }
+    if !artifact.epsilon_min.is_finite() || !(0.0..=1.0).contains(&artifact.epsilon_min) {
+        anyhow::bail!("exit-agent artifact epsilon_min must be finite and inside [0, 1]");
+    }
+    if artifact.epsilon < artifact.epsilon_min {
+        anyhow::bail!(
+            "exit-agent artifact epsilon {} must be >= epsilon_min {}",
+            artifact.epsilon,
+            artifact.epsilon_min
+        );
+    }
+    if !artifact.epsilon_decay.is_finite() || !(0.90..=0.99999).contains(&artifact.epsilon_decay) {
+        anyhow::bail!(
+            "exit-agent artifact epsilon_decay must be finite and inside [0.90, 0.99999]"
+        );
+    }
+    if artifact.memory_capacity < 1_024 {
+        anyhow::bail!(
+            "exit-agent artifact memory_capacity {} is below the supported minimum 1024",
+            artifact.memory_capacity
+        );
+    }
+    if !artifact.average_reward.is_finite() {
+        anyhow::bail!("exit-agent artifact average_reward must be finite");
+    }
+    if let Some(report) = artifact.training_report.as_ref() {
+        if report.train_rows != artifact.train_rows {
+            anyhow::bail!(
+                "exit-agent training report rows {} do not match artifact train_rows {}",
+                report.train_rows,
+                artifact.train_rows
+            );
+        }
+        if report.memory_size != artifact.trained_memory_size {
+            anyhow::bail!(
+                "exit-agent training report memory_size {} does not match trained_memory_size {}",
+                report.memory_size,
+                artifact.trained_memory_size
+            );
+        }
+        if !report.average_reward.is_finite() {
+            anyhow::bail!("exit-agent training report average_reward must be finite");
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExitAgentTrainingReport {
     pub train_rows: usize,
     pub memory_size: usize,
@@ -159,7 +316,11 @@ pub struct ExitAgent {
     train_rows: usize,
     trained_memory_size: usize,
     average_reward: f32,
+    training_report: Option<ExitAgentTrainingReport>,
     device: <TrainBackend as Backend>::Device,
+    requested_device_policy: String,
+    effective_device_policy: String,
+    execution_backend: String,
 }
 
 impl ExitAgent {
@@ -168,7 +329,7 @@ impl ExitAgent {
     }
 
     pub fn with_hidden_dim(input_dim: usize, hidden_dim: usize) -> Self {
-        let device = <TrainBackend as Backend>::Device::default();
+        let (device, selection) = resolve_train_device("auto");
         let model = ExitAgentNetConfig::new()
             .with_input_dim(input_dim)
             .with_hidden_dim(hidden_dim)
@@ -193,8 +354,27 @@ impl ExitAgent {
             train_rows: 0,
             trained_memory_size: 0,
             average_reward: 0.0,
+            training_report: None,
             device,
+            requested_device_policy: selection.requested_policy,
+            effective_device_policy: selection.effective_policy,
+            execution_backend: selection.execution_backend,
         }
+    }
+
+    pub fn with_device_policy(mut self, policy: impl Into<String>) -> Self {
+        let requested = policy.into();
+        let (device, selection) = resolve_train_device(&requested);
+        self.device = device;
+        self.model = ExitAgentNetConfig::new()
+            .with_input_dim(self.input_dim)
+            .with_hidden_dim(self.hidden_dim)
+            .init(&device);
+        self.optim = AdamWConfig::new().with_weight_decay(1e-4).init();
+        self.requested_device_policy = selection.requested_policy;
+        self.effective_device_policy = selection.effective_policy;
+        self.execution_backend = selection.execution_backend;
+        self
     }
 
     pub fn with_gamma(mut self, gamma: f32) -> Self {
@@ -241,7 +421,11 @@ impl ExitAgent {
     }
 
     fn normalize_direction(direction: i32) -> i32 {
-        if direction < 0 { -1 } else { 1 }
+        if direction < 0 {
+            -1
+        } else {
+            1
+        }
     }
 
     fn reward_from_trace(
@@ -453,11 +637,62 @@ impl ExitAgent {
             average_reward: self.average_reward,
             replay_memory: self.memory.iter().cloned().collect(),
             pending_regret: self.pending_regret.clone(),
+            training_report: self.training_report.clone(),
+            requested_device_policy: Some(self.requested_device_policy.clone()),
+            effective_device_policy: Some(self.effective_device_policy.clone()),
+            execution_backend: Some(self.execution_backend.clone()),
+        }
+    }
+
+    fn runtime_degraded_reason(&self) -> Option<String> {
+        if self.requested_device_policy == self.effective_device_policy {
+            None
+        } else {
+            Some(format!(
+                "requested Burn device `{}` resolved to `{}` on the current build/runtime",
+                self.requested_device_policy, self.effective_device_policy
+            ))
         }
     }
 
     fn runtime_probabilities(hold_probability: f32, close_probability: f32) -> [f32; 3] {
-        [hold_probability, 0.0, close_probability]
+        let total = (hold_probability + close_probability).max(f32::EPSILON);
+        let hold_probability = (hold_probability / total).clamp(0.0, 1.0);
+        let close_probability = (close_probability / total).clamp(0.0, 1.0);
+        let disagreement = 1.0 - (hold_probability - close_probability).abs();
+        let directional_confidence = hold_probability.max(close_probability);
+        let neutral_probability = (disagreement * (1.0 - directional_confidence)).clamp(0.0, 0.35);
+        let action_mass = 1.0 - neutral_probability;
+        [
+            hold_probability * action_mass,
+            neutral_probability,
+            close_probability * action_mass,
+        ]
+    }
+
+    fn validated_runtime_probabilities(probabilities: &[f32]) -> Result<[f32; 2]> {
+        if probabilities.len() != 2 {
+            anyhow::bail!(
+                "exit-agent runtime prediction expected 2 probabilities, received {}",
+                probabilities.len()
+            );
+        }
+
+        let hold_probability = probabilities[0];
+        let close_probability = probabilities[1];
+        if !hold_probability.is_finite() || !close_probability.is_finite() {
+            anyhow::bail!("exit-agent runtime prediction returned non-finite probabilities");
+        }
+        if hold_probability < 0.0 || close_probability < 0.0 {
+            anyhow::bail!("exit-agent runtime prediction returned negative probabilities");
+        }
+
+        let total = hold_probability + close_probability;
+        if !total.is_finite() || total <= 0.0 {
+            anyhow::bail!("exit-agent runtime prediction returned degenerate probability mass");
+        }
+
+        Ok([hold_probability / total, close_probability / total])
     }
 
     fn push_experience(&mut self, experience: Experience) {
@@ -602,18 +837,20 @@ impl ExitAgent {
         self.trained_memory_size = self.memory.len();
         self.average_reward = average_reward;
         self.feature_columns = feature_columns;
+        let training_report = ExitAgentTrainingReport {
+            train_rows: self.train_rows,
+            memory_size: self.trained_memory_size,
+            warmup_steps,
+            average_reward,
+        };
+        self.training_report = Some(training_report.clone());
 
         info!(
             "trained exit agent from offline sequence dataset (rows={}, memory={})",
             features.nrows(),
             self.memory.len()
         );
-        Ok(ExitAgentTrainingReport {
-            train_rows: self.train_rows,
-            memory_size: self.trained_memory_size,
-            warmup_steps,
-            average_reward,
-        })
+        Ok(training_report)
     }
 
     pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
@@ -648,23 +885,21 @@ impl ExitAgent {
                     .to_vec::<f32>()
                     .context("extract exit-agent runtime probabilities")?;
 
-            if probabilities.len() != 2 {
-                anyhow::bail!(
-                    "exit-agent runtime prediction expected 2 probabilities, received {}",
-                    probabilities.len()
-                );
-            }
-
-            let hold_probability = probabilities[0].clamp(0.0, 1.0);
-            let close_probability = probabilities[1].clamp(0.0, 1.0);
-            let confidence = hold_probability.max(close_probability);
-            predictions.push(build_runtime_prediction(
+            let [hold_probability, close_probability] =
+                Self::validated_runtime_probabilities(&probabilities)?;
+            let runtime_probabilities =
+                Self::runtime_probabilities(hold_probability, close_probability);
+            let (confidence, abstain_recommended) =
+                three_class_runtime_confidence(runtime_probabilities)?;
+            predictions.push(build_runtime_prediction_with_details(
                 "exit_agent",
                 ModelFamily::Exit,
                 CapabilityState::Implemented,
-                Self::runtime_probabilities(hold_probability, close_probability),
+                runtime_probabilities,
                 Some(confidence),
-                Some(confidence < 0.55),
+                Some(abstain_recommended),
+                Some(self.execution_backend.clone()),
+                self.runtime_degraded_reason(),
             )?);
         }
 
@@ -679,9 +914,21 @@ impl ExitAgent {
         path.join("config.json")
     }
 
+    fn optimizer_record_base_path(path: &Path) -> std::path::PathBuf {
+        path.join("optimizer")
+    }
+
+    fn optimizer_record_file_path(path: &Path) -> std::path::PathBuf {
+        let mut record_path = Self::optimizer_record_base_path(path);
+        record_path.set_extension("mpk");
+        record_path
+    }
+
     pub fn save(&self, path: &Path) -> Result<()> {
         std::fs::create_dir_all(path)
             .with_context(|| format!("create exit-agent directory {}", path.display()))?;
+        let artifact = self.artifact();
+        validate_exit_artifact(&artifact)?;
 
         let recorder = DefaultFileRecorder::<FullPrecisionSettings>::new();
         self.model
@@ -689,33 +936,44 @@ impl ExitAgent {
             .valid()
             .save_file(Self::record_base_path(path), &recorder)
             .with_context(|| format!("persist exit-agent record to {}", path.display()))?;
+        recorder
+            .record(
+                self.optim.to_record(),
+                Self::optimizer_record_base_path(path),
+            )
+            .with_context(|| format!("persist exit-agent optimizer to {}", path.display()))?;
 
-        let payload =
-            serde_json::to_vec_pretty(&self.artifact()).context("serialize exit-agent artifact")?;
-        std::fs::write(Self::artifact_path(path), payload)
+        let runtime_metadata =
+            exit_runtime_metadata(artifact.feature_columns.clone(), artifact.train_rows);
+        validate_exit_metadata(
+            &runtime_metadata,
+            &artifact.feature_columns,
+            artifact.train_rows,
+        )?;
+        write_json(&path.join(METADATA_FILE_NAME), &runtime_metadata)?;
+        write_json(&Self::artifact_path(path), &artifact)
             .with_context(|| format!("write exit-agent config to {}", path.display()))?;
         Ok(())
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        let payload = std::fs::read(Self::artifact_path(path))
+        let metadata: RuntimeArtifactMetadata = read_json(&path.join(METADATA_FILE_NAME))?;
+        let artifact: ExitAgentArtifact = read_json(&Self::artifact_path(path))
             .with_context(|| format!("read exit-agent config from {}", path.display()))?;
-        let artifact: ExitAgentArtifact =
-            serde_json::from_slice(&payload).context("deserialize exit-agent artifact")?;
-        if !artifact.feature_columns.is_empty()
-            && artifact.feature_columns.len() != artifact.input_dim
-        {
-            anyhow::bail!(
-                "exit-agent artifact feature-column mismatch: input_dim {} vs {} feature columns",
-                artifact.input_dim,
-                artifact.feature_columns.len()
-            );
-        }
+        validate_exit_artifact(&artifact)?;
+        validate_exit_metadata(&metadata, &artifact.feature_columns, artifact.train_rows)?;
         if artifact.replay_memory.len() > artifact.memory_capacity.max(1_024) {
             anyhow::bail!(
                 "exit-agent artifact replay memory {} exceeds configured capacity {}",
                 artifact.replay_memory.len(),
                 artifact.memory_capacity.max(1_024)
+            );
+        }
+        if artifact.train_rows != 0 && artifact.train_rows < artifact.replay_memory.len() {
+            anyhow::bail!(
+                "exit-agent artifact train_rows {} is smaller than persisted replay memory {}",
+                artifact.train_rows,
+                artifact.replay_memory.len()
             );
         }
         if artifact.trained_memory_size != 0
@@ -728,7 +986,11 @@ impl ExitAgent {
             );
         }
 
-        let device = <TrainBackend as Backend>::Device::default();
+        let requested_device_policy = artifact
+            .requested_device_policy
+            .clone()
+            .unwrap_or_else(|| "auto".to_string());
+        let (device, selection) = resolve_train_device(&requested_device_policy);
         let recorder = DefaultFileRecorder::<FullPrecisionSettings>::new();
         let model = ExitAgentNetConfig::new()
             .with_input_dim(artifact.input_dim)
@@ -738,6 +1000,18 @@ impl ExitAgent {
             .with_context(|| format!("load exit-agent record from {}", path.display()))?;
 
         let optim = AdamWConfig::new().with_weight_decay(1e-4).init();
+        let optim = if Self::optimizer_record_file_path(path).exists() {
+            let optimizer_record = recorder
+                .load(Self::optimizer_record_base_path(path), &device)
+                .with_context(|| format!("load exit-agent optimizer from {}", path.display()))?;
+            optim.load_record(optimizer_record)
+        } else {
+            warn!(
+                "exit-agent optimizer checkpoint missing at {}; continuing with a fresh optimizer state",
+                Self::optimizer_record_file_path(path).display()
+            );
+            optim
+        };
         let replay_memory_len = artifact.replay_memory.len();
 
         Ok(Self {
@@ -768,14 +1042,24 @@ impl ExitAgent {
             train_rows: artifact.train_rows,
             trained_memory_size: artifact.trained_memory_size.max(replay_memory_len),
             average_reward: artifact.average_reward,
+            training_report: artifact.training_report,
             device,
+            requested_device_policy: selection.requested_policy,
+            effective_device_policy: selection.effective_policy,
+            execution_backend: selection.execution_backend,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ExitAgent;
+    use super::{exit_runtime_metadata, ExitAgent, ExitAgentArtifact, Experience};
+    use crate::base::three_class_runtime_confidence;
+    use crate::statistical::common::{write_json, METADATA_FILE_NAME};
+    use anyhow::Result;
+    use burn::module::Param;
+    use burn::tensor::Tensor;
+    use polars::prelude::{DataFrame, NamedFrom, Series};
     use std::path::PathBuf;
 
     #[test]
@@ -824,7 +1108,96 @@ mod tests {
     #[test]
     fn runtime_probabilities_keep_exit_agent_mapping_truthful() {
         let mapped = ExitAgent::runtime_probabilities(0.7, 0.2);
-        assert_eq!(mapped, [0.7, 0.0, 0.2]);
+        assert!(mapped[0] > mapped[2]);
+        assert!(mapped[1] > 0.0);
+        let total = mapped.iter().sum::<f32>();
+        assert!((total - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn runtime_probabilities_assign_more_neutral_mass_when_indecisive() {
+        let decisive = ExitAgent::runtime_probabilities(0.8, 0.2);
+        let indecisive = ExitAgent::runtime_probabilities(0.51, 0.49);
+        assert!(
+            indecisive[1] > decisive[1],
+            "neutral mass should grow when hold and close are nearly tied"
+        );
+    }
+
+    #[test]
+    fn validated_runtime_probabilities_rejects_degenerate_rows() {
+        let err = ExitAgent::validated_runtime_probabilities(&[0.0, 0.0])
+            .expect_err("zero-mass probabilities should be rejected");
+        assert!(
+            err.to_string().contains("degenerate probability mass"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_replay_memory_longer_than_recorded_training_rows() {
+        let path = unique_temp_dir("exit-agent-train-rows");
+        let artifact = ExitAgentArtifact {
+            input_dim: 6,
+            hidden_dim: 16,
+            feature_columns: vec![
+                "f1".to_string(),
+                "f2".to_string(),
+                "f3".to_string(),
+                "f4".to_string(),
+                "f5".to_string(),
+                "f6".to_string(),
+            ],
+            gamma: 0.99,
+            epsilon: 0.2,
+            epsilon_min: 0.05,
+            epsilon_decay: 0.999,
+            memory_capacity: 1_024,
+            reward_horizon: 0,
+            warmup_steps: 0,
+            train_rows: 1,
+            trained_memory_size: 2,
+            average_reward: 0.0,
+            training_report: None,
+            requested_device_policy: None,
+            effective_device_policy: None,
+            execution_backend: None,
+            replay_memory: vec![
+                Experience {
+                    state: vec![0.0; 6],
+                    action: 0,
+                    reward: 0.0,
+                    done: true,
+                },
+                Experience {
+                    state: vec![0.0; 6],
+                    action: 1,
+                    reward: 1.0,
+                    done: true,
+                },
+            ],
+            pending_regret: Default::default(),
+        };
+        std::fs::write(
+            ExitAgent::artifact_path(&path),
+            serde_json::to_vec_pretty(&artifact).expect("serialize artifact"),
+        )
+        .expect("write config");
+        write_json(
+            &path.join(METADATA_FILE_NAME),
+            &exit_runtime_metadata(artifact.feature_columns.clone(), artifact.train_rows),
+        )
+        .expect("write metadata");
+
+        let err = ExitAgent::load(&path)
+            .err()
+            .expect("inconsistent train rows should fail");
+        assert!(
+            err.to_string().contains("train_rows"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -859,18 +1232,104 @@ mod tests {
 
     #[test]
     fn save_and_load_preserve_memory_capacity() {
-        let agent = ExitAgent::with_hidden_dim(6, 16).with_memory_capacity(1_024);
+        let mut agent = ExitAgent::with_hidden_dim(6, 16).with_memory_capacity(1_024);
+        agent.feature_columns = vec![
+            "f1".to_string(),
+            "f2".to_string(),
+            "f3".to_string(),
+            "f4".to_string(),
+            "f5".to_string(),
+            "f6".to_string(),
+        ];
+        agent.train_rows = 64;
+        agent.training_report = Some(super::ExitAgentTrainingReport {
+            train_rows: 64,
+            memory_size: 0,
+            warmup_steps: 0,
+            average_reward: 0.0,
+        });
         let path = unique_temp_dir("exit-agent-capacity");
 
         agent.save(&path).expect("save should succeed");
         let loaded = ExitAgent::load(&path).expect("load should succeed");
 
         assert_eq!(loaded.artifact().memory_capacity, 1_024);
+        assert!(path.join("optimizer.mpk").exists());
         assert!(
             loaded.memory.capacity() >= 1_024,
             "loaded memory should honor the configured minimum capacity"
         );
+        assert_eq!(
+            loaded
+                .training_report
+                .as_ref()
+                .expect("training report should round-trip")
+                .train_rows,
+            64
+        );
 
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn predict_runtime_uses_shared_three_class_confidence_gate() -> Result<()> {
+        let mut agent = ExitAgent::with_hidden_dim(6, 16);
+        let device = agent.device;
+        agent.feature_columns = vec![
+            "f1".to_string(),
+            "f2".to_string(),
+            "f3".to_string(),
+            "f4".to_string(),
+            "f5".to_string(),
+            "f6".to_string(),
+        ];
+
+        agent.model.fc1.weight = Param::from_tensor(Tensor::from_data([[0.0_f32; 16]; 6], &device));
+        agent.model.fc1.bias = Some(Param::from_tensor(Tensor::from_data(
+            [0.0_f32; 16],
+            &device,
+        )));
+        agent.model.fc2.weight =
+            Param::from_tensor(Tensor::from_data([[0.0_f32; 16]; 16], &device));
+        agent.model.fc2.bias = Some(Param::from_tensor(Tensor::from_data(
+            [0.0_f32; 16],
+            &device,
+        )));
+        agent.model.output.weight =
+            Param::from_tensor(Tensor::from_data([[0.0_f32; 2]; 16], &device));
+        agent.model.output.bias = Some(Param::from_tensor(Tensor::from_data(
+            [0.84729785_f32, 0.0],
+            &device,
+        )));
+
+        let df = DataFrame::new(vec![
+            Series::new("f1".into(), vec![0.0_f64]).into(),
+            Series::new("f2".into(), vec![0.0_f64]).into(),
+            Series::new("f3".into(), vec![0.0_f64]).into(),
+            Series::new("f4".into(), vec![0.0_f64]).into(),
+            Series::new("f5".into(), vec![0.0_f64]).into(),
+            Series::new("f6".into(), vec![0.0_f64]).into(),
+        ])?;
+
+        let predictions = agent.predict_runtime(&df)?;
+        let prediction = predictions
+            .first()
+            .expect("one runtime prediction should be produced");
+        let expected_row = ExitAgent::runtime_probabilities(0.7, 0.3);
+        let (expected_confidence, expected_abstain) = three_class_runtime_confidence(expected_row)?;
+
+        assert!((prediction.confidence().expect("confidence") - expected_confidence).abs() < 1e-6);
+        assert_eq!(prediction.abstain_recommended(), Some(expected_abstain));
+        assert!(prediction.metadata().execution_backend.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_carries_device_policy_fields() {
+        let agent = ExitAgent::with_hidden_dim(6, 16).with_device_policy("cpu");
+        let artifact = agent.artifact();
+        assert_eq!(artifact.requested_device_policy.as_deref(), Some("cpu"));
+        assert_eq!(artifact.effective_device_policy.as_deref(), Some("cpu"));
+        assert!(artifact.execution_backend.is_some());
     }
 }
