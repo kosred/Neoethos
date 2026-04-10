@@ -151,6 +151,12 @@ pub fn validate_tree_local_fallback_artifact(
     if priors_sum <= f32::EPSILON {
         bail!("tree local fallback class priors must have positive mass");
     }
+    if (priors_sum - 1.0).abs() > 1e-3 {
+        bail!(
+            "tree local fallback class priors must sum to 1.0 within tolerance, got {}",
+            priors_sum
+        );
+    }
 
     for value in artifact
         .feature_means
@@ -298,11 +304,26 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::write(&temp_path, bytes)
         .with_context(|| format!("write temporary artifact {}", temp_path.display()))?;
     if path.exists() {
-        std::fs::remove_file(path)
-            .with_context(|| format!("remove previous artifact {}", path.display()))?;
+        let backup_path = path.with_extension("bak");
+        if backup_path.exists() {
+            std::fs::remove_file(&backup_path)
+                .with_context(|| format!("remove stale backup {}", backup_path.display()))?;
+        }
+        std::fs::rename(path, &backup_path)
+            .with_context(|| format!("move existing artifact to {}", backup_path.display()))?;
+        if let Err(rename_err) = std::fs::rename(&temp_path, path) {
+            let _ = std::fs::rename(&backup_path, path);
+            return Err(rename_err)
+                .with_context(|| format!("rename artifact into {}", path.display()));
+        }
+        if backup_path.exists() {
+            std::fs::remove_file(&backup_path)
+                .with_context(|| format!("remove backup artifact {}", backup_path.display()))?;
+        }
+    } else {
+        std::fs::rename(&temp_path, path)
+            .with_context(|| format!("rename artifact into {}", path.display()))?;
     }
-    std::fs::rename(&temp_path, path)
-        .with_context(|| format!("rename artifact into {}", path.display()))?;
     Ok(())
 }
 
@@ -315,15 +336,15 @@ pub fn set_neutral_probability_row(row: &mut [f32]) {
     }
 }
 
-fn neutral_prior_for_class(class_idx: usize) -> f32 {
-    if class_idx == 0 {
-        0.998
-    } else {
-        0.001
-    }
-}
-
 fn fallback_anchor_distribution(artifact: &TreeLocalFallbackArtifact) -> [f32; 3] {
+    let mut support_distribution = [1.0_f32 / 3.0; 3];
+    let support_sum = artifact.class_support.iter().copied().sum::<f32>();
+    if support_sum > f32::EPSILON && artifact.class_support.len() == 3 {
+        for (class_idx, slot) in support_distribution.iter_mut().enumerate() {
+            *slot = artifact.class_support[class_idx].max(0.0) / support_sum;
+        }
+    }
+
     let mut anchor = [0.0_f32; 3];
     let mut sum = 0.0_f32;
     for (class_idx, slot) in anchor.iter_mut().enumerate() {
@@ -331,9 +352,10 @@ fn fallback_anchor_distribution(artifact: &TreeLocalFallbackArtifact) -> [f32; 3
             .class_priors
             .get(class_idx)
             .copied()
-            .unwrap_or_else(|| neutral_prior_for_class(class_idx))
+            .unwrap_or(1.0_f32 / 3.0)
             .max(1e-6);
-        *slot = 0.55 * prior + 0.45 * neutral_prior_for_class(class_idx);
+        let support = support_distribution[class_idx].max(1e-6);
+        *slot = 0.7 * prior + 0.2 * support + 0.1 * (1.0 / 3.0);
         sum += *slot;
     }
     if sum <= f32::EPSILON {
@@ -365,7 +387,10 @@ pub fn tree_runtime_backend_details(
             Some(fallback_reason.to_string()),
         )
     } else {
-        (Some(unknown_backend.to_string()), None)
+        (
+            Some(unknown_backend.to_string()),
+            Some("tree_runtime_backend_unavailable".to_string()),
+        )
     }
 }
 
@@ -478,11 +503,15 @@ pub fn normalize_three_class_probabilities(
         let mut sum = 0.0_f32;
         for col_idx in 0..normalized.ncols() {
             let value = normalized[(row_idx, col_idx)];
-            let clamped = if value.is_finite() {
-                value.max(0.0)
-            } else {
-                0.0
-            };
+            if !value.is_finite() {
+                bail!(
+                    "{} probability normalization encountered non-finite value at row {} col {}",
+                    context_name,
+                    row_idx,
+                    col_idx
+                );
+            }
+            let clamped = value.max(0.0);
             normalized[(row_idx, col_idx)] = clamped;
             sum += clamped;
         }
@@ -931,11 +960,84 @@ pub fn reorder_to_neutral_buy_sell(
         }
         2 => {
             let mut reordered = Array2::zeros((probabilities.nrows(), 3));
-            reordered.column_mut(0).assign(&probabilities.column(0));
-            reordered.column_mut(1).assign(&probabilities.column(1));
+            for row_idx in 0..probabilities.nrows() {
+                reordered[(row_idx, 0)] = 1.0;
+            }
             reordered
         }
         _ => probabilities,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_fallback_artifact() -> TreeLocalFallbackArtifact {
+        TreeLocalFallbackArtifact {
+            surrogate_kind: TREE_LOCAL_SURROGATE_KIND.to_string(),
+            feature_columns: vec!["momentum".into(), "trend".into()],
+            training_summary: TrainingSummaryMetadata::new(12, 12, 0),
+            class_priors: vec![0.2, 0.5, 0.3],
+            class_support: vec![2.0, 5.0, 3.0],
+            feature_means: vec![0.0, 0.0],
+            feature_scales: vec![1.0, 1.0],
+            feature_salience: vec![1.0, 1.0],
+            class_centroids: vec![vec![0.0, 0.0], vec![1.0, 1.0], vec![-1.0, -1.0]],
+            class_variances: vec![vec![1.0, 1.0], vec![1.0, 1.0], vec![1.0, 1.0]],
+            distance_location: vec![1.0, 1.0, 1.0],
+            distance_scale: vec![1.0, 1.0, 1.0],
+        }
+    }
+
+    #[test]
+    fn validate_tree_local_fallback_artifact_rejects_unnormalized_class_priors() {
+        let mut artifact = sample_fallback_artifact();
+        artifact.class_priors = vec![0.2, 0.5, 0.5];
+
+        let err =
+            validate_tree_local_fallback_artifact(&artifact, &["momentum".into(), "trend".into()])
+                .expect_err("unnormalized priors should fail");
+        assert!(err.to_string().contains("sum to 1.0"));
+    }
+
+    #[test]
+    fn normalize_three_class_probabilities_rejects_non_finite_values() {
+        let probabilities =
+            Array2::from_shape_vec((1, 3), vec![0.2, f32::NAN, 0.8]).expect("array");
+        let err = normalize_three_class_probabilities(probabilities, "tree-test")
+            .expect_err("non-finite row should fail");
+        assert!(err.to_string().contains("non-finite"));
+    }
+
+    #[test]
+    fn tree_runtime_backend_details_marks_missing_backend_as_degraded() {
+        let (backend, degraded_reason) = tree_runtime_backend_details(
+            false,
+            "lightgbm_native",
+            None,
+            "native_lightgbm_unavailable",
+            "lightgbm_unknown",
+        );
+        assert_eq!(backend.as_deref(), Some("lightgbm_unknown"));
+        assert_eq!(
+            degraded_reason.as_deref(),
+            Some("tree_runtime_backend_unavailable")
+        );
+    }
+
+    #[test]
+    fn reorder_to_neutral_buy_sell_two_columns_returns_neutral_rows() {
+        let probabilities =
+            Array2::from_shape_vec((2, 2), vec![0.3, 0.7, 0.4, 0.6]).expect("array");
+        let reordered = reorder_to_neutral_buy_sell(probabilities, None);
+        assert_eq!(reordered.ncols(), 3);
+        assert_eq!(reordered[(0, 0)], 1.0);
+        assert_eq!(reordered[(0, 1)], 0.0);
+        assert_eq!(reordered[(0, 2)], 0.0);
+        assert_eq!(reordered[(1, 0)], 1.0);
+        assert_eq!(reordered[(1, 1)], 0.0);
+        assert_eq!(reordered[(1, 2)], 0.0);
     }
 }
 

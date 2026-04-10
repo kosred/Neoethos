@@ -2,11 +2,11 @@ use anyhow::{bail, Context, Result};
 use ndarray::{Array1, Array2, Axis};
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::base::{
-    build_runtime_artifact_metadata, build_runtime_prediction, canonical_three_class_label_mapping,
-    three_class_runtime_confidence, ExpertModel,
+    build_runtime_artifact_metadata, build_runtime_prediction_with_details,
+    canonical_three_class_label_mapping, three_class_runtime_confidence, ExpertModel,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
@@ -51,17 +51,87 @@ fn sigmoid(value: f32) -> f32 {
 }
 
 fn split_train_val_indices(rows: usize) -> (Vec<usize>, Vec<usize>) {
-    if rows <= 4 {
+    if rows <= 6 {
         return ((0..rows).collect(), Vec::new());
     }
 
     let val_rows = ((rows as f32) * 0.2).round() as usize;
-    let val_rows = val_rows.clamp(1, rows.saturating_sub(1));
-    let train_rows = rows - val_rows;
+    let val_rows = val_rows.clamp(1, rows.saturating_sub(2));
+    let embargo_rows = if rows >= 20 {
+        ((rows as f32) * 0.02).round() as usize
+    } else {
+        0
+    };
+    let embargo_rows = embargo_rows.clamp(0, rows.saturating_sub(val_rows + 1));
+    let train_rows = rows.saturating_sub(val_rows + embargo_rows);
+
+    if train_rows == 0 {
+        return ((0..rows).collect(), Vec::new());
+    }
 
     let train = (0..train_rows).collect::<Vec<_>>();
-    let val = (train_rows..rows).collect::<Vec<_>>();
+    let val = (train_rows + embargo_rows..rows).collect::<Vec<_>>();
     (train, val)
+}
+
+fn staged_bayesian_artifact_dir(path: &Path) -> PathBuf {
+    path.with_extension("tmp_bayesian_artifact")
+}
+
+fn backup_bayesian_artifact_dir(path: &Path) -> PathBuf {
+    path.with_extension("bak_bayesian_artifact")
+}
+
+fn cleanup_bayesian_artifact_dir(path: &Path) -> Result<()> {
+    if path.exists() {
+        std::fs::remove_dir_all(path)
+            .with_context(|| format!("remove bayesian artifact directory {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn replace_bayesian_artifact_dir(staged_path: &Path, target_path: &Path) -> Result<()> {
+    let backup_path = backup_bayesian_artifact_dir(target_path);
+    cleanup_bayesian_artifact_dir(&backup_path)?;
+    if target_path.exists() {
+        std::fs::rename(target_path, &backup_path).with_context(|| {
+            format!(
+                "move previous bayesian artifact into backup {}",
+                backup_path.display()
+            )
+        })?;
+    }
+    if let Err(error) = std::fs::rename(staged_path, target_path) {
+        if backup_path.exists() {
+            let _ = std::fs::rename(&backup_path, target_path);
+        }
+        bail!(
+            "rename staged bayesian artifact into {} failed: {}",
+            target_path.display(),
+            error
+        );
+    }
+    cleanup_bayesian_artifact_dir(&backup_path)?;
+    Ok(())
+}
+
+fn with_staged_bayesian_artifact_dir<F>(path: &Path, writer: F) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    let staged_path = staged_bayesian_artifact_dir(path);
+    cleanup_bayesian_artifact_dir(&staged_path)?;
+    std::fs::create_dir_all(&staged_path).with_context(|| {
+        format!(
+            "create staged bayesian artifact directory {}",
+            staged_path.display()
+        )
+    })?;
+    if let Err(error) = writer(&staged_path) {
+        let _ = cleanup_bayesian_artifact_dir(&staged_path);
+        return Err(error);
+    }
+    replace_bayesian_artifact_dir(&staged_path, path)
 }
 
 fn runtime_metadata(
@@ -251,13 +321,16 @@ fn runtime_predictions(
     for row in probabilities.outer_iter() {
         let row_values = [row[0], row[1], row[2]];
         let (confidence, abstain_recommended) = three_class_runtime_confidence(row_values)?;
-        predictions.push(build_runtime_prediction(
-            model_name.to_string(),
+        predictions.push(build_runtime_prediction_with_details(
+            model_name,
             ModelFamily::Meta,
             CapabilityState::Implemented,
             row_values,
             Some(confidence),
             Some(abstain_recommended),
+            Some(format!("{model_name}_bayesian_ovr_cpu")),
+            abstain_recommended
+                .then(|| "shared three-class confidence gate recommended abstain".to_string()),
         )?);
     }
 
@@ -310,6 +383,11 @@ fn validate_runtime_metadata(
             metadata.training_summary.dataset_rows
         );
     }
+    if metadata.training_summary.train_rows == 0 {
+        bail!(
+            "runtime metadata mismatch for {expected_model_name}: training rows must be non-zero"
+        );
+    }
     if metadata.training_summary.train_rows + metadata.training_summary.val_rows
         != metadata.training_summary.dataset_rows
     {
@@ -353,8 +431,30 @@ fn validate_bayesian_artifact(artifact: &BayesianOneVsRestArtifact) -> Result<()
             artifact.feature_columns.len()
         );
     }
+    if artifact.runtime_metadata.is_none() {
+        bail!("bayesian artifact must persist runtime metadata");
+    }
+    validate_runtime_metadata(
+        artifact
+            .runtime_metadata
+            .as_ref()
+            .expect("checked runtime metadata presence"),
+        "bayes_logit",
+        &artifact.feature_columns,
+        artifact.dataset_rows,
+    )?;
+    if !artifact.prior_precision.is_finite() || artifact.prior_precision <= 0.0 {
+        bail!("bayesian artifact prior_precision must be finite and positive");
+    }
+    if !artifact.learning_rate.is_finite() || artifact.learning_rate <= 0.0 {
+        bail!("bayesian artifact learning_rate must be finite and positive");
+    }
+    if artifact.epochs == 0 {
+        bail!("bayesian artifact epochs must be positive");
+    }
     if artifact.scaler.means.iter().any(|value| !value.is_finite())
         || artifact.scaler.stds.iter().any(|value| !value.is_finite())
+        || artifact.scaler.stds.iter().any(|value| *value <= 0.0)
         || artifact.classes.iter().any(|class_model| {
             class_model.weights.len() != artifact.feature_columns.len()
                 || class_model.variance_diag.len() != artifact.feature_columns.len()
@@ -526,8 +626,10 @@ impl ExpertModel for BayesianLogitExpert {
             &artifact.feature_columns,
             artifact.dataset_rows,
         )?;
-        write_json(&path.join(MODEL_FILE_NAME), artifact)?;
-        write_json(&path.join(METADATA_FILE_NAME), &runtime_metadata)
+        with_staged_bayesian_artifact_dir(path, |staged_path| {
+            write_json(&staged_path.join(MODEL_FILE_NAME), artifact)?;
+            write_json(&staged_path.join(METADATA_FILE_NAME), &runtime_metadata)
+        })
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
@@ -558,6 +660,16 @@ impl BayesianLogitExpert {
             .model
             .as_ref()
             .context("BayesianLogitExpert not trained")?;
+        let runtime_metadata = artifact
+            .runtime_metadata
+            .as_ref()
+            .context("BayesianLogitExpert runtime metadata missing")?;
+        validate_runtime_metadata(
+            runtime_metadata,
+            &artifact.model_name,
+            &artifact.feature_columns,
+            artifact.dataset_rows,
+        )?;
         let probabilities = self.predict_proba(x)?;
         runtime_predictions(&artifact.model_name, &probabilities)
     }
@@ -600,10 +712,121 @@ mod tests {
         let (expected_confidence, expected_abstain) =
             three_class_runtime_confidence([0.58, 0.20, 0.22])?;
 
-        assert!(
-            (prediction.confidence().expect("confidence") - expected_confidence).abs() < 1e-6
-        );
+        assert!((prediction.confidence().expect("confidence") - expected_confidence).abs() < 1e-6);
         assert_eq!(prediction.abstain_recommended(), Some(expected_abstain));
         Ok(())
+    }
+
+    #[test]
+    fn runtime_predictions_persist_bayesian_backend_details() -> Result<()> {
+        let probabilities = Array2::from_shape_vec((1, 3), vec![0.58_f32, 0.20, 0.22])?;
+        let prediction = runtime_predictions("bayes_logit", &probabilities)?
+            .into_iter()
+            .next()
+            .expect("one runtime prediction");
+
+        assert_eq!(
+            prediction.metadata().execution_backend.as_deref(),
+            Some("bayes_logit_bayesian_ovr_cpu")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn split_train_val_indices_leaves_temporal_embargo_gap() {
+        let (train, val) = split_train_val_indices(50);
+        assert!(!val.is_empty(), "validation split should be present");
+        let last_train = *train.last().expect("train rows");
+        let first_val = *val.first().expect("val rows");
+        assert!(
+            first_val > last_train + 1,
+            "expected embargo gap between train and val"
+        );
+    }
+
+    #[test]
+    fn validate_bayesian_artifact_rejects_missing_runtime_metadata() {
+        let artifact = BayesianOneVsRestArtifact {
+            model_name: "bayes_logit".to_string(),
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            dataset_rows: 8,
+            scaler: FeatureScaler {
+                means: vec![0.0, 0.0],
+                stds: vec![1.0, 1.0],
+            },
+            runtime_metadata: None,
+            prior_precision: 0.05,
+            learning_rate: 0.05,
+            epochs: 32,
+            classes: vec![
+                BayesianClassPosterior {
+                    weights: Array1::zeros(2),
+                    bias: 0.0,
+                    variance_diag: Array1::ones(2),
+                    bias_variance: 1.0,
+                };
+                3
+            ],
+        };
+
+        let err = validate_bayesian_artifact(&artifact)
+            .expect_err("artifact without runtime metadata should fail");
+        assert!(err.to_string().contains("runtime metadata"));
+    }
+
+    #[test]
+    fn validate_bayesian_artifact_rejects_non_positive_scaler_stds() {
+        let artifact = BayesianOneVsRestArtifact {
+            model_name: "bayes_logit".to_string(),
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            dataset_rows: 8,
+            scaler: FeatureScaler {
+                means: vec![0.0, 0.0],
+                stds: vec![1.0, 0.0],
+            },
+            runtime_metadata: Some(runtime_metadata(
+                "bayes_logit",
+                vec!["f1".to_string(), "f2".to_string()],
+                8,
+                6,
+                2,
+            )),
+            prior_precision: 0.05,
+            learning_rate: 0.05,
+            epochs: 32,
+            classes: vec![
+                BayesianClassPosterior {
+                    weights: Array1::zeros(2),
+                    bias: 0.0,
+                    variance_diag: Array1::ones(2),
+                    bias_variance: 1.0,
+                };
+                3
+            ],
+        };
+
+        let err = validate_bayesian_artifact(&artifact)
+            .expect_err("artifact with non-positive scaler std should fail");
+        assert!(err.to_string().contains("invalid posterior parameters"));
+    }
+
+    #[test]
+    fn validate_runtime_metadata_rejects_zero_train_rows() {
+        let metadata = runtime_metadata(
+            "bayes_logit",
+            vec!["f1".to_string(), "f2".to_string()],
+            8,
+            0,
+            8,
+        );
+
+        let err = validate_runtime_metadata(
+            &metadata,
+            "bayes_logit",
+            &["f1".to_string(), "f2".to_string()],
+            8,
+        )
+        .expect_err("zero train rows must fail");
+        assert!(err.to_string().contains("training rows must be non-zero"));
     }
 }

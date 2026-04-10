@@ -11,7 +11,7 @@ use ndarray::{Array1, Array2};
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::base::{
     build_runtime_artifact_metadata, build_runtime_prediction_with_details,
@@ -69,6 +69,21 @@ fn hoeffding_fallback_basis(params: &HashMap<String, String>) -> HoeffdingFallba
     }
 }
 
+fn validate_hoeffding_fallback_basis_param(params: &HashMap<String, String>) -> Result<()> {
+    if let Some(value) = params.get("fallback_basis") {
+        let normalized = value.trim().to_ascii_lowercase();
+        if !normalized.is_empty()
+            && !matches!(normalized.as_str(), "linear" | "quadratic" | "poly2")
+        {
+            bail!(
+                "online_hoeffding fallback_basis `{}` is not supported; expected linear or quadratic",
+                value.trim()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn expand_hoeffding_fallback_features(values: &[f32], basis: HoeffdingFallbackBasis) -> Vec<f32> {
     match basis {
         HoeffdingFallbackBasis::Linear => values.to_vec(),
@@ -115,6 +130,55 @@ fn adaptive_runtime_metadata(
     )
 }
 
+fn staged_adaptive_file(path: &Path, file_name: &str) -> PathBuf {
+    path.join(format!("{file_name}.tmp"))
+}
+
+fn backup_adaptive_file(path: &Path, file_name: &str) -> PathBuf {
+    path.join(format!("{file_name}.bak"))
+}
+
+fn cleanup_adaptive_temp_file(path: &Path) {
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn stage_adaptive_target(target: &Path, backup: &Path, staged: Option<&Path>) -> Result<()> {
+    if backup.exists() {
+        std::fs::remove_file(backup)
+            .with_context(|| format!("remove adaptive backup {}", backup.display()))?;
+    }
+    if target.exists() {
+        std::fs::rename(target, backup).with_context(|| {
+            format!(
+                "rotate adaptive artifact target {} to backup {}",
+                target.display(),
+                backup.display()
+            )
+        })?;
+    }
+    if let Some(staged_path) = staged {
+        std::fs::rename(staged_path, target).with_context(|| {
+            format!(
+                "promote adaptive staged file {} to {}",
+                staged_path.display(),
+                target.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn restore_adaptive_backup(target: &Path, backup: &Path) {
+    if target.exists() {
+        let _ = std::fs::remove_file(target);
+    }
+    if backup.exists() {
+        let _ = std::fs::rename(backup, target);
+    }
+}
+
 fn validate_adaptive_metadata(
     metadata: &RuntimeArtifactMetadata,
     expected_model_name: &str,
@@ -146,10 +210,25 @@ fn validate_adaptive_metadata(
     if metadata.feature_columns.is_empty() {
         bail!("adaptive artifact metadata must contain at least one feature column");
     }
+    if metadata.training_summary.dataset_rows == 0 {
+        bail!("adaptive artifact metadata must record non-zero training rows");
+    }
+    if metadata.training_summary.dataset_rows
+        != metadata.training_summary.train_rows + metadata.training_summary.val_rows
+    {
+        bail!("adaptive artifact metadata training summary is inconsistent");
+    }
     Ok(())
 }
 
 fn validate_passive_aggressive_artifact(artifact: &PassiveAggressiveArtifact) -> Result<()> {
+    if artifact.model_name != AdaptiveModelKind::PassiveAggressive.model_name() {
+        bail!(
+            "online_pa artifact model mismatch: expected {}, got {}",
+            AdaptiveModelKind::PassiveAggressive.model_name(),
+            artifact.model_name
+        );
+    }
     if artifact.feature_columns.is_empty() {
         bail!("online_pa artifact must contain at least one feature column");
     }
@@ -190,6 +269,9 @@ fn validate_passive_aggressive_artifact(artifact: &PassiveAggressiveArtifact) ->
     {
         bail!("online_pa scaler contains non-finite values");
     }
+    if artifact.scaler.stds.iter().any(|value| *value <= 0.0) {
+        bail!("online_pa scaler stds must stay strictly positive");
+    }
     if artifact.weights.iter().any(|value| !value.is_finite()) {
         bail!("online_pa weights contain non-finite values");
     }
@@ -199,17 +281,27 @@ fn validate_passive_aggressive_artifact(artifact: &PassiveAggressiveArtifact) ->
     if !artifact.aggressiveness.is_finite() || artifact.aggressiveness <= 0.0 {
         bail!("online_pa aggressiveness must be finite and positive");
     }
-
+    if artifact.epochs == 0 {
+        bail!("online_pa epochs must stay positive");
+    }
     Ok(())
 }
 
 fn validate_hoeffding_artifact(artifact: &HoeffdingArtifact) -> Result<()> {
+    if artifact.model_name != AdaptiveModelKind::Hoeffding.model_name() {
+        bail!(
+            "online_hoeffding artifact model mismatch: expected {}, got {}",
+            AdaptiveModelKind::Hoeffding.model_name(),
+            artifact.model_name
+        );
+    }
     if artifact.feature_columns.is_empty() {
         bail!("online_hoeffding artifact must contain at least one feature column");
     }
     if artifact.dataset_rows == 0 {
         bail!("online_hoeffding artifact must contain at least one training row");
     }
+    validate_hoeffding_fallback_basis_param(&artifact.params)?;
 
     match (
         artifact.fallback_scaler.as_ref(),
@@ -265,6 +357,13 @@ fn validate_hoeffding_artifact(artifact: &HoeffdingArtifact) -> Result<()> {
     }
 
     let has_fallback = artifact.fallback_scaler.is_some();
+    if artifact
+        .committee_json
+        .iter()
+        .any(|payload| payload.trim().is_empty())
+    {
+        bail!("online_hoeffding committee payloads must not be blank");
+    }
     if artifact.committee_json.is_empty() && !has_fallback {
         bail!("online_hoeffding artifact has neither committees nor a fallback model");
     }
@@ -280,7 +379,11 @@ fn validate_hoeffding_artifact(artifact: &HoeffdingArtifact) -> Result<()> {
         }
     }
 
-    let _ = hoeffding_fallback_blend_weight(&artifact.params)?;
+    let fallback_blend_weight = hoeffding_fallback_blend_weight(&artifact.params)?;
+    if artifact.committee_json.is_empty() && fallback_blend_weight <= f32::EPSILON && !has_fallback
+    {
+        bail!("online_hoeffding artifact cannot be empty and blend-less at the same time");
+    }
 
     Ok(())
 }
@@ -575,8 +678,29 @@ impl ExpertModel for OnlinePassiveAggressiveExpert {
             artifact.feature_columns.clone(),
             artifact.dataset_rows,
         );
-        write_json(&path.join(METADATA_FILE_NAME), &runtime_metadata)?;
-        write_json(&path.join(MODEL_FILE_NAME), &artifact)?;
+        let metadata_path = path.join(METADATA_FILE_NAME);
+        let model_path = path.join(MODEL_FILE_NAME);
+        let metadata_tmp = staged_adaptive_file(path, METADATA_FILE_NAME);
+        let model_tmp = staged_adaptive_file(path, MODEL_FILE_NAME);
+        write_json(&metadata_tmp, &runtime_metadata)?;
+        if let Err(err) = write_json(&model_tmp, &artifact) {
+            cleanup_adaptive_temp_file(&metadata_tmp);
+            cleanup_adaptive_temp_file(&model_tmp);
+            return Err(err)
+                .with_context(|| format!("write online_pa artifact to {}", path.display()));
+        }
+        let metadata_backup = backup_adaptive_file(path, METADATA_FILE_NAME);
+        let model_backup = backup_adaptive_file(path, MODEL_FILE_NAME);
+        if let Err(err) =
+            stage_adaptive_target(&metadata_path, &metadata_backup, Some(&metadata_tmp))
+        {
+            cleanup_adaptive_temp_file(&model_tmp);
+            return Err(err);
+        }
+        if let Err(err) = stage_adaptive_target(&model_path, &model_backup, Some(&model_tmp)) {
+            restore_adaptive_backup(&metadata_path, &metadata_backup);
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -614,8 +738,34 @@ impl ExpertModel for OnlinePassiveAggressiveExpert {
 }
 
 impl OnlinePassiveAggressiveExpert {
+    fn runtime_details(&self) -> (Option<String>, Option<String>) {
+        let has_runtime_state =
+            self.scaler.is_some() && self.weights.is_some() && self.bias.is_some();
+        if self.dataset_rows == 0 {
+            return (
+                Some("online_pa_unknown".to_string()),
+                Some("adaptive_policy_unavailable".to_string()),
+            );
+        }
+        if self.feature_columns.is_empty() {
+            return (
+                Some("online_pa_unknown".to_string()),
+                Some("pa_feature_schema_missing".to_string()),
+            );
+        }
+        if !has_runtime_state {
+            return (
+                Some("online_pa_unknown".to_string()),
+                Some("pa_runtime_state_incomplete".to_string()),
+            );
+        }
+
+        (Some("online_pa_cpu".to_string()), None)
+    }
+
     pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
         let probabilities = self.predict_proba(x)?;
+        let (execution_backend, degraded_reason) = self.runtime_details();
         let mut predictions = Vec::with_capacity(probabilities.nrows());
         for row in probabilities.outer_iter() {
             let row_values = [row[0], row[1], row[2]];
@@ -627,8 +777,8 @@ impl OnlinePassiveAggressiveExpert {
                 row_values,
                 Some(confidence),
                 Some(abstain),
-                Some("online_pa".to_string()),
-                None,
+                execution_backend.clone(),
+                degraded_reason.clone(),
             )?);
         }
         Ok(predictions)
@@ -707,6 +857,8 @@ pub struct OnlineHoeffdingExpert {
     feature_columns: Vec<String>,
     dataset_rows: usize,
     committee_json: Vec<String>,
+    committee_runtime_ready: bool,
+    load_degraded_reason: Option<String>,
     fallback_scaler: Option<FeatureScaler>,
     fallback_weights: Option<Array2<f32>>,
     fallback_bias: Option<Array1<f32>>,
@@ -721,6 +873,8 @@ impl OnlineHoeffdingExpert {
             feature_columns: Vec::new(),
             dataset_rows: 0,
             committee_json: Vec::new(),
+            committee_runtime_ready: false,
+            load_degraded_reason: None,
             fallback_scaler: None,
             fallback_weights: None,
             fallback_bias: None,
@@ -796,8 +950,23 @@ impl OnlineHoeffdingExpert {
             && self.fallback_bias.is_some()
     }
 
+    fn has_live_runtime_committees(&self) -> bool {
+        #[cfg(feature = "adaptive-models")]
+        {
+            self.committee_runtime_ready
+                && !self.committees.is_empty()
+                && self.committees.len() == self.committee_json.len()
+        }
+
+        #[cfg(not(feature = "adaptive-models"))]
+        {
+            false
+        }
+    }
+
     #[cfg(feature = "adaptive-models")]
     fn restore_committees(&mut self) -> Result<()> {
+        self.committee_runtime_ready = false;
         self.committees.clear();
         let mut failures = 0usize;
         for payload in &self.committee_json {
@@ -824,6 +993,7 @@ impl OnlineHoeffdingExpert {
                 "online_hoeffding restore reported committee failures with no committee payloads"
             );
         }
+        self.committee_runtime_ready = !self.committee_json.is_empty();
         Ok(())
     }
 }
@@ -856,6 +1026,7 @@ impl ExpertModel for OnlineHoeffdingExpert {
             self.feature_columns = feature_columns;
             self.dataset_rows = features.nrows();
             self.committee_json.clear();
+            self.committee_runtime_ready = false;
             self.fallback_scaler = Some(scaler);
             self.fallback_weights = Some(weights);
             self.fallback_bias = Some(bias);
@@ -912,6 +1083,7 @@ impl ExpertModel for OnlineHoeffdingExpert {
             self.feature_columns = feature_columns;
             self.dataset_rows = features.nrows();
             self.committee_json = committee_json;
+            self.committee_runtime_ready = true;
             self.fallback_scaler = Some(fallback_scaler);
             self.fallback_weights = Some(fallback_weights);
             self.fallback_bias = Some(fallback_bias);
@@ -1035,15 +1207,34 @@ impl ExpertModel for OnlineHoeffdingExpert {
             .with_context(|| format!("create online_hoeffding directory {}", path.display()))?;
         let artifact = self.artifact();
         validate_hoeffding_artifact(&artifact)?;
-        write_json(
-            &path.join(METADATA_FILE_NAME),
-            &adaptive_runtime_metadata(
-                AdaptiveModelKind::Hoeffding.model_name(),
-                artifact.feature_columns.clone(),
-                artifact.dataset_rows,
-            ),
-        )?;
-        write_json(&path.join(MODEL_FILE_NAME), &artifact)?;
+        let metadata = adaptive_runtime_metadata(
+            AdaptiveModelKind::Hoeffding.model_name(),
+            artifact.feature_columns.clone(),
+            artifact.dataset_rows,
+        );
+        let metadata_path = path.join(METADATA_FILE_NAME);
+        let model_path = path.join(MODEL_FILE_NAME);
+        let metadata_tmp = staged_adaptive_file(path, METADATA_FILE_NAME);
+        let model_tmp = staged_adaptive_file(path, MODEL_FILE_NAME);
+        write_json(&metadata_tmp, &metadata)?;
+        if let Err(err) = write_json(&model_tmp, &artifact) {
+            cleanup_adaptive_temp_file(&metadata_tmp);
+            cleanup_adaptive_temp_file(&model_tmp);
+            return Err(err)
+                .with_context(|| format!("write online_hoeffding artifact to {}", path.display()));
+        }
+        let metadata_backup = backup_adaptive_file(path, METADATA_FILE_NAME);
+        let model_backup = backup_adaptive_file(path, MODEL_FILE_NAME);
+        if let Err(err) =
+            stage_adaptive_target(&metadata_path, &metadata_backup, Some(&metadata_tmp))
+        {
+            cleanup_adaptive_temp_file(&model_tmp);
+            return Err(err);
+        }
+        if let Err(err) = stage_adaptive_target(&model_path, &model_backup, Some(&model_tmp)) {
+            restore_adaptive_backup(&metadata_path, &metadata_backup);
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -1088,11 +1279,25 @@ impl ExpertModel for OnlineHoeffdingExpert {
         next_state.feature_columns = artifact.feature_columns;
         next_state.dataset_rows = artifact.dataset_rows;
         next_state.committee_json = artifact.committee_json;
+        next_state.committee_runtime_ready = false;
+        next_state.load_degraded_reason = None;
         next_state.fallback_scaler = artifact.fallback_scaler;
         next_state.fallback_weights = artifact.fallback_weights;
         next_state.fallback_bias = artifact.fallback_bias;
         if next_state.committee_json.is_empty() && !next_state.has_persistable_fallback() {
             bail!("online_hoeffding artifact has neither committees nor a fallback model");
+        }
+        #[cfg(not(feature = "adaptive-models"))]
+        {
+            if !next_state.has_persistable_fallback() {
+                bail!(
+                    "online_hoeffding artifacts require a persisted fallback model when adaptive-models support is disabled"
+                );
+            }
+            if !next_state.committee_json.is_empty() {
+                next_state.committee_runtime_ready = false;
+                next_state.load_degraded_reason = Some("committee_backend_unavailable".to_string());
+            }
         }
         #[cfg(feature = "adaptive-models")]
         {
@@ -1103,10 +1308,8 @@ impl ExpertModel for OnlineHoeffdingExpert {
                         err
                     );
                     next_state.committees.clear();
-                    next_state.committee_json.clear();
-                    next_state
-                        .params
-                        .insert("artifact_mode".to_string(), "fallback_only".to_string());
+                    next_state.committee_runtime_ready = false;
+                    next_state.load_degraded_reason = Some("committee_restore_failed".to_string());
                 } else {
                     return Err(err);
                 }
@@ -1119,10 +1322,20 @@ impl ExpertModel for OnlineHoeffdingExpert {
 
 impl OnlineHoeffdingExpert {
     fn runtime_details(&self) -> (Option<String>, Option<String>) {
-        let has_committees = !self.committee_json.is_empty();
+        let has_runtime_committees = self.has_live_runtime_committees();
+        let has_persisted_committees = !self.committee_json.is_empty();
         let has_fallback = self.has_persistable_fallback();
         let fallback_blend_weight = hoeffding_fallback_blend_weight(&self.params).unwrap_or(0.3);
-        match (has_committees, has_fallback) {
+        let persisted_committee_reason = if has_persisted_committees && !has_runtime_committees {
+            Some(
+                self.load_degraded_reason
+                    .clone()
+                    .unwrap_or_else(|| "committee_backend_unavailable".to_string()),
+            )
+        } else {
+            None
+        };
+        match (has_runtime_committees, has_fallback) {
             (true, true) if fallback_blend_weight >= 1.0 - f32::EPSILON => (
                 Some("online_hoeffding_fallback".to_string()),
                 Some("committee_blend_disabled_by_weight".to_string()),
@@ -1130,15 +1343,22 @@ impl OnlineHoeffdingExpert {
             (true, true) if fallback_blend_weight <= f32::EPSILON => {
                 (Some("online_hoeffding_committee".to_string()), None)
             }
-            (true, true) => (Some("online_hoeffding_committee_hybrid".to_string()), None),
+            (true, true) => (
+                Some("online_hoeffding_committee_hybrid".to_string()),
+                Some("committee_predictions_blended_with_fallback".to_string()),
+            ),
             (true, false) => (Some("online_hoeffding_committee".to_string()), None),
             (false, true) => (
                 Some("online_hoeffding_fallback".to_string()),
-                Some("committee_backend_unavailable".to_string()),
+                persisted_committee_reason,
             ),
             (false, false) => (
                 Some("online_hoeffding_unknown".to_string()),
-                Some("adaptive_policy_unavailable".to_string()),
+                Some(if let Some(reason) = persisted_committee_reason {
+                    reason
+                } else {
+                    "adaptive_policy_unavailable".to_string()
+                }),
             ),
         }
     }
@@ -1329,6 +1549,7 @@ impl Default for AdaptiveGradientBooster {
 #[cfg(all(test, feature = "adaptive-models"))]
 mod tests {
     use super::*;
+    use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
     use polars::prelude::{DataFrame, Series};
     use std::collections::HashMap;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1379,6 +1600,13 @@ mod tests {
 
         let mut expert = OnlineHoeffdingExpert::new(None);
         expert.load(&path)?;
+        assert_eq!(expert.committee_json.len(), 1);
+        let (backend, degraded_reason) = expert.runtime_details();
+        assert_eq!(backend.as_deref(), Some("online_hoeffding_fallback"));
+        assert!(
+            degraded_reason.is_some(),
+            "degraded load should preserve committee provenance"
+        );
 
         let frame = DataFrame::new(vec![
             Series::new("f1".into(), vec![1.0_f64, -1.0]).into(),
@@ -1392,6 +1620,79 @@ mod tests {
             let sum = probabilities.row(row).iter().sum::<f32>();
             assert!((sum - 1.0).abs() < 1e-5);
         }
+
+        let _ = std::fs::remove_dir_all(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn validate_hoeffding_artifact_rejects_unknown_fallback_basis() {
+        let artifact = HoeffdingArtifact {
+            model_name: AdaptiveModelKind::Hoeffding.model_name().to_string(),
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            dataset_rows: 2,
+            params: HashMap::from([("fallback_basis".to_string(), "cubic".to_string())]),
+            committee_json: Vec::new(),
+            fallback_scaler: Some(FeatureScaler {
+                means: vec![0.0, 0.0],
+                stds: vec![1.0, 1.0],
+            }),
+            fallback_weights: Some(Array2::zeros((3, 2))),
+            fallback_bias: Some(Array1::zeros(3)),
+        };
+
+        let err =
+            validate_hoeffding_artifact(&artifact).expect_err("unknown fallback basis must fail");
+        assert!(err.to_string().contains("fallback_basis"));
+    }
+
+    #[cfg(not(feature = "adaptive-models"))]
+    #[test]
+    fn online_hoeffding_load_preserves_committee_provenance_without_backend() -> Result<()> {
+        let path = temp_model_dir("online_hoeffding_no_backend_mode");
+        std::fs::create_dir_all(&path)?;
+
+        write_json(
+            &path.join(METADATA_FILE_NAME),
+            &adaptive_runtime_metadata(
+                AdaptiveModelKind::Hoeffding.model_name(),
+                vec!["f1".to_string(), "f2".to_string()],
+                2,
+            ),
+        )?;
+
+        let artifact = HoeffdingArtifact {
+            model_name: AdaptiveModelKind::Hoeffding.model_name().to_string(),
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            dataset_rows: 2,
+            params: HashMap::from([
+                ("artifact_mode".to_string(), "committee_hybrid".to_string()),
+                ("fallback_blend_weight".to_string(), "0.3".to_string()),
+            ]),
+            committee_json: vec!["{}".to_string()],
+            fallback_scaler: Some(FeatureScaler {
+                means: vec![0.0, 0.0],
+                stds: vec![1.0, 1.0],
+            }),
+            fallback_weights: Some(Array2::zeros((3, 2))),
+            fallback_bias: Some(Array1::zeros(3)),
+        };
+        write_json(&path.join(MODEL_FILE_NAME), &artifact)?;
+
+        let mut expert = OnlineHoeffdingExpert::new(None);
+        expert.load(&path)?;
+
+        assert_eq!(expert.committee_json.len(), 1);
+        assert_eq!(
+            expert.params.get("artifact_mode").map(String::as_str),
+            Some("committee_hybrid")
+        );
+        let (backend, degraded_reason) = expert.runtime_details();
+        assert_eq!(backend.as_deref(), Some("online_hoeffding_fallback"));
+        assert_eq!(
+            degraded_reason.as_deref(),
+            Some("committee_backend_unavailable")
+        );
 
         let _ = std::fs::remove_dir_all(&path);
         Ok(())
@@ -1431,12 +1732,116 @@ mod tests {
     }
 
     #[test]
+    fn online_pa_runtime_details_mark_missing_schema_as_degraded() {
+        let mut expert = OnlinePassiveAggressiveExpert::new(1.0, 4);
+        expert.dataset_rows = 8;
+        expert.scaler = Some(FeatureScaler {
+            means: vec![0.0, 0.0],
+            stds: vec![1.0, 1.0],
+        });
+        expert.weights = Some(Array2::zeros((3, 2)));
+        expert.bias = Some(Array1::zeros(3));
+
+        let (backend, degraded_reason) = expert.runtime_details();
+        assert_eq!(backend.as_deref(), Some("online_pa_unknown"));
+        assert_eq!(
+            degraded_reason.as_deref(),
+            Some("pa_feature_schema_missing")
+        );
+    }
+
+    #[test]
+    fn online_pa_runtime_details_mark_partial_runtime_state_as_degraded() {
+        let mut expert = OnlinePassiveAggressiveExpert::new(1.0, 4);
+        expert.dataset_rows = 8;
+        expert.feature_columns = vec!["f1".to_string(), "f2".to_string()];
+        expert.scaler = Some(FeatureScaler {
+            means: vec![0.0, 0.0],
+            stds: vec![1.0, 1.0],
+        });
+        expert.weights = Some(Array2::zeros((3, 2)));
+
+        let (backend, degraded_reason) = expert.runtime_details();
+        assert_eq!(backend.as_deref(), Some("online_pa_unknown"));
+        assert_eq!(
+            degraded_reason.as_deref(),
+            Some("pa_runtime_state_incomplete")
+        );
+    }
+
+    #[test]
+    fn validate_passive_aggressive_artifact_rejects_zero_epochs() {
+        let artifact = PassiveAggressiveArtifact {
+            model_name: AdaptiveModelKind::PassiveAggressive
+                .model_name()
+                .to_string(),
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            dataset_rows: 8,
+            scaler: FeatureScaler {
+                means: vec![0.0, 0.0],
+                stds: vec![1.0, 1.0],
+            },
+            weights: Array2::zeros((3, 2)),
+            bias: Array1::zeros(3),
+            aggressiveness: 1.0,
+            epochs: 0,
+        };
+
+        let err = validate_passive_aggressive_artifact(&artifact)
+            .expect_err("zero epochs should be rejected");
+        assert!(err.to_string().contains("epochs"));
+    }
+
+    #[test]
+    fn validate_passive_aggressive_artifact_rejects_wrong_model_name() {
+        let artifact = PassiveAggressiveArtifact {
+            model_name: "not_online_pa".to_string(),
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            dataset_rows: 8,
+            scaler: FeatureScaler {
+                means: vec![0.0, 0.0],
+                stds: vec![1.0, 1.0],
+            },
+            weights: Array2::zeros((3, 2)),
+            bias: Array1::zeros(3),
+            aggressiveness: 1.0,
+            epochs: 4,
+        };
+
+        let err = validate_passive_aggressive_artifact(&artifact)
+            .expect_err("wrong model name should be rejected");
+        assert!(err.to_string().contains("model mismatch"));
+    }
+
+    #[test]
+    fn validate_adaptive_metadata_rejects_inconsistent_training_summary() {
+        let metadata = RuntimeArtifactMetadata {
+            model_name: AdaptiveModelKind::PassiveAggressive
+                .model_name()
+                .to_string(),
+            family: ModelFamily::Adaptive,
+            state: CapabilityState::Implemented,
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            label_mapping: canonical_three_class_label_mapping(),
+            training_summary: TrainingSummaryMetadata::new(8, 7, 0),
+        };
+
+        let err = validate_adaptive_metadata(
+            &metadata,
+            AdaptiveModelKind::PassiveAggressive.model_name(),
+        )
+        .expect_err("inconsistent training summary should be rejected");
+        assert!(err.to_string().contains("inconsistent"));
+    }
+
+    #[test]
     fn online_hoeffding_runtime_details_follow_effective_blend_weight() {
         let mut fallback_only = OnlineHoeffdingExpert::new(Some(HashMap::from([(
             "fallback_blend_weight".to_string(),
             "1.0".to_string(),
         )])));
         fallback_only.committee_json = vec!["committee-a".to_string()];
+        fallback_only.committee_runtime_ready = true;
         fallback_only.fallback_scaler = Some(FeatureScaler {
             means: vec![0.0, 0.0],
             stds: vec![1.0, 1.0],
@@ -1456,6 +1861,7 @@ mod tests {
             "0.0".to_string(),
         )])));
         committee_only.committee_json = vec!["committee-a".to_string()];
+        committee_only.committee_runtime_ready = true;
         committee_only.fallback_scaler = Some(FeatureScaler {
             means: vec![0.0, 0.0],
             stds: vec![1.0, 1.0],
@@ -1466,5 +1872,118 @@ mod tests {
         let (backend, degraded_reason) = committee_only.runtime_details();
         assert_eq!(backend.as_deref(), Some("online_hoeffding_committee"));
         assert_eq!(degraded_reason, None);
+    }
+
+    #[test]
+    fn online_hoeffding_runtime_details_mark_hybrid_blend_as_degraded() {
+        let mut hybrid = OnlineHoeffdingExpert::new(Some(HashMap::from([(
+            "fallback_blend_weight".to_string(),
+            "0.35".to_string(),
+        )])));
+        hybrid.committee_json = vec!["committee-a".to_string()];
+        hybrid.committee_runtime_ready = true;
+        hybrid.fallback_scaler = Some(FeatureScaler {
+            means: vec![0.0, 0.0],
+            stds: vec![1.0, 1.0],
+        });
+        hybrid.fallback_weights = Some(Array2::zeros((3, 2)));
+        hybrid.fallback_bias = Some(Array1::zeros(3));
+
+        let (backend, degraded_reason) = hybrid.runtime_details();
+        assert_eq!(
+            backend.as_deref(),
+            Some("online_hoeffding_committee_hybrid")
+        );
+        assert_eq!(
+            degraded_reason.as_deref(),
+            Some("committee_predictions_blended_with_fallback")
+        );
+    }
+
+    #[test]
+    fn online_hoeffding_runtime_details_mark_persisted_committees_without_runtime_backend_as_degraded(
+    ) {
+        let mut expert = OnlineHoeffdingExpert::new(Some(HashMap::from([(
+            "fallback_blend_weight".to_string(),
+            "0.35".to_string(),
+        )])));
+        expert.committee_json = vec!["committee-a".to_string()];
+        expert.committee_runtime_ready = false;
+        expert.fallback_scaler = Some(FeatureScaler {
+            means: vec![0.0, 0.0],
+            stds: vec![1.0, 1.0],
+        });
+        expert.fallback_weights = Some(Array2::zeros((3, 2)));
+        expert.fallback_bias = Some(Array1::zeros(3));
+
+        let (backend, degraded_reason) = expert.runtime_details();
+        assert_eq!(backend.as_deref(), Some("online_hoeffding_fallback"));
+        assert_eq!(
+            degraded_reason.as_deref(),
+            Some("committee_backend_unavailable")
+        );
+    }
+
+    #[test]
+    fn online_hoeffding_runtime_details_mark_committee_only_artifact_without_runtime_backend_as_unavailable(
+    ) {
+        let mut expert = OnlineHoeffdingExpert::new(Some(HashMap::from([(
+            "artifact_mode".to_string(),
+            "committee_only".to_string(),
+        )])));
+        expert.committee_json = vec!["committee-a".to_string()];
+        expert.committee_runtime_ready = false;
+
+        let (backend, degraded_reason) = expert.runtime_details();
+        assert_eq!(backend.as_deref(), Some("online_hoeffding_unknown"));
+        assert_eq!(
+            degraded_reason.as_deref(),
+            Some("committee_backend_unavailable")
+        );
+    }
+
+    #[test]
+    fn validate_hoeffding_artifact_rejects_blank_committee_payload() {
+        let artifact = HoeffdingArtifact {
+            model_name: AdaptiveModelKind::Hoeffding.model_name().to_string(),
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            dataset_rows: 2,
+            params: HashMap::from([("fallback_blend_weight".to_string(), "0.3".to_string())]),
+            committee_json: vec!["  ".to_string()],
+            fallback_scaler: Some(FeatureScaler {
+                means: vec![0.0, 0.0],
+                stds: vec![1.0, 1.0],
+            }),
+            fallback_weights: Some(Array2::zeros((3, 2))),
+            fallback_bias: Some(Array1::zeros(3)),
+        };
+
+        let err = validate_hoeffding_artifact(&artifact).expect_err("blank committee should fail");
+        assert!(err.to_string().contains("committee payloads"));
+    }
+
+    #[cfg(feature = "adaptive-models")]
+    #[test]
+    fn online_hoeffding_runtime_details_use_live_committees_not_just_runtime_flag() {
+        let mut expert = OnlineHoeffdingExpert::new(Some(HashMap::from([(
+            "fallback_blend_weight".to_string(),
+            "0.0".to_string(),
+        )])));
+        expert.committee_json = vec!["committee-a".to_string()];
+        expert.committee_runtime_ready = true;
+        expert.committees.clear();
+        expert.fallback_scaler = Some(FeatureScaler {
+            means: vec![0.0, 0.0],
+            stds: vec![1.0, 1.0],
+        });
+        expert.fallback_weights = Some(Array2::zeros((3, 2)));
+        expert.fallback_bias = Some(Array1::zeros(3));
+
+        let (backend, degraded_reason) = expert.runtime_details();
+        assert_eq!(backend.as_deref(), Some("online_hoeffding_fallback"));
+        assert_eq!(
+            degraded_reason.as_deref(),
+            Some("committee_backend_unavailable")
+        );
     }
 }

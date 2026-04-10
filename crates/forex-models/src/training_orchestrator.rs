@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
 
 use crate::base::ExpertModel;
-use crate::burn_models::active_burn_backend_name;
+use crate::burn_models::{active_burn_backend_name, normalize_burn_device_policy};
 use crate::ensemble::{
     CalibrationMethod, ConformalPredictionExpert, MetaBlender, MetaDecisionStack,
     ProbabilityCalibrationExpert,
@@ -53,6 +53,10 @@ pub struct TrainingOrchestrator {
     pub models_dir: PathBuf,
 }
 
+fn is_supported_orchestrator_burn_device_policy(policy: &str) -> bool {
+    matches!(policy, "auto" | "cpu" | "gpu") || policy.starts_with("gpu:")
+}
+
 impl TrainingOrchestrator {
     pub fn new(settings: forex_core::Settings, models_dir: PathBuf) -> Self {
         Self {
@@ -69,22 +73,21 @@ impl TrainingOrchestrator {
             .trim()
             .to_ascii_lowercase();
         let system_device = self.settings.system.device.trim().to_ascii_lowercase();
+        let normalized_system_device = normalize_burn_device_policy(&system_device);
         match gpu_pref.as_str() {
             "false" | "cpu" => "cpu".to_string(),
             "true" | "gpu" => {
                 if system_device.is_empty() || system_device == "cpu" {
                     "gpu".to_string()
+                } else if is_supported_orchestrator_burn_device_policy(&normalized_system_device) {
+                    normalized_system_device
                 } else {
-                    system_device
+                    "gpu".to_string()
                 }
             }
             _ => {
-                if system_device.starts_with("cuda:")
-                    || system_device.starts_with("gpu:")
-                    || system_device.starts_with("wgpu:")
-                    || matches!(system_device.as_str(), "gpu" | "cuda" | "wgpu")
-                {
-                    system_device
+                if is_supported_orchestrator_burn_device_policy(&normalized_system_device) {
+                    normalized_system_device
                 } else {
                     "auto".to_string()
                 }
@@ -138,7 +141,7 @@ impl TrainingOrchestrator {
         };
         let frame = prepare_multitimeframe_features_with_options(&dataset, base_tf, &opts, None)?;
         let base_ohlcv = dataset.frames.get(base_tf).context("base tf missing")?;
-        let labels = self.derive_labels(base_ohlcv);
+        let labels = self.derive_labels(base_ohlcv)?;
         let raw_payload = TrainingPayload::from_named_dense(frame.data, labels, frame.names)?;
         let filtered_payload = if self.settings.models.filter_to_base_signal {
             let (filtered_frame, filtered_labels) = self.apply_base_signal_filter(
@@ -1579,32 +1582,32 @@ impl TrainingOrchestrator {
         }
     }
 
-    fn derive_labels(&self, ohlcv: &Ohlcv) -> Vec<i32> {
+    fn derive_labels(&self, ohlcv: &Ohlcv) -> Result<Vec<i32>> {
         let n = ohlcv.close.len();
         if n == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        assert_eq!(
-            ohlcv.open.len(),
-            n,
-            "derive_labels requires aligned OHLCV series: open={} close={}",
-            ohlcv.open.len(),
-            n
-        );
-        assert_eq!(
-            ohlcv.high.len(),
-            n,
-            "derive_labels requires aligned OHLCV series: high={} close={}",
-            ohlcv.high.len(),
-            n
-        );
-        assert_eq!(
-            ohlcv.low.len(),
-            n,
-            "derive_labels requires aligned OHLCV series: low={} close={}",
-            ohlcv.low.len(),
-            n
-        );
+        if ohlcv.open.len() != n {
+            anyhow::bail!(
+                "derive_labels requires aligned OHLCV series: open={} close={}",
+                ohlcv.open.len(),
+                n
+            );
+        }
+        if ohlcv.high.len() != n {
+            anyhow::bail!(
+                "derive_labels requires aligned OHLCV series: high={} close={}",
+                ohlcv.high.len(),
+                n
+            );
+        }
+        if ohlcv.low.len() != n {
+            anyhow::bail!(
+                "derive_labels requires aligned OHLCV series: low={} close={}",
+                ohlcv.low.len(),
+                n
+            );
+        }
 
         let mut labels = vec![0; n];
         let hold_bars = self.effective_label_horizon_bars();
@@ -1694,7 +1697,7 @@ impl TrainingOrchestrator {
             }
         }
 
-        labels
+        Ok(labels)
     }
 }
 
@@ -2194,6 +2197,106 @@ fn model_artifact_dir(
     model_name: &str,
 ) -> PathBuf {
     models_dir.join(symbol).join(base_tf).join(model_name)
+}
+
+fn staged_training_artifact_dir(path: &Path) -> PathBuf {
+    path.with_extension("tmp_training_dispatch")
+}
+
+fn backup_training_artifact_dir(path: &Path) -> PathBuf {
+    path.with_extension("bak_training_dispatch")
+}
+
+fn cleanup_training_artifact_dir(path: &Path) -> Result<()> {
+    if path.exists() {
+        std::fs::remove_dir_all(path)
+            .with_context(|| format!("remove staged training artifact dir {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn replace_training_artifact_dir(staged_path: &Path, target_path: &Path) -> Result<()> {
+    let backup_path = backup_training_artifact_dir(target_path);
+    cleanup_training_artifact_dir(&backup_path)?;
+
+    if target_path.exists() {
+        std::fs::rename(target_path, &backup_path).with_context(|| {
+            format!(
+                "backup training artifact dir {} to {}",
+                target_path.display(),
+                backup_path.display()
+            )
+        })?;
+    }
+
+    if let Err(error) = std::fs::rename(staged_path, target_path) {
+        if backup_path.exists() {
+            let _ = std::fs::rename(&backup_path, target_path);
+        } else if staged_path.exists() {
+            let _ = std::fs::remove_dir_all(staged_path);
+        }
+        anyhow::bail!(
+            "promote staged training artifact dir {} to {} failed: {}",
+            staged_path.display(),
+            target_path.display(),
+            error
+        );
+    }
+
+    cleanup_training_artifact_dir(&backup_path)?;
+    Ok(())
+}
+
+fn with_staged_training_artifact_dir<F>(path: &Path, writer: F) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    let staged_path = staged_training_artifact_dir(path);
+    cleanup_training_artifact_dir(&staged_path)?;
+    std::fs::create_dir_all(&staged_path).with_context(|| {
+        format!(
+            "create staged training artifact dir {}",
+            staged_path.display()
+        )
+    })?;
+    if let Err(error) = writer(&staged_path) {
+        let _ = cleanup_training_artifact_dir(&staged_path);
+        return Err(error);
+    }
+    replace_training_artifact_dir(&staged_path, path)
+}
+
+fn persist_training_artifacts<F>(
+    artifact_dir: &Path,
+    settings: &forex_core::Settings,
+    config: &ModelConfig,
+    symbol: &str,
+    base_tf: &str,
+    payload: &TrainingPayload,
+    row_budget_applied: Option<usize>,
+    optimization_report: Option<&OptimizationReport>,
+    save_model: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    with_staged_training_artifact_dir(artifact_dir, |staged_dir| {
+        save_model(staged_dir)?;
+        if let Some(report) = optimization_report {
+            write_optimization_report(&staged_dir.join(OPTIMIZATION_REPORT_FILE_NAME), report)?;
+        }
+        write_onnx_status_sidecar(staged_dir, config, payload)?;
+        write_training_profile_sidecar(
+            staged_dir,
+            settings,
+            config,
+            symbol,
+            base_tf,
+            payload,
+            row_budget_applied,
+        )?;
+        Ok(())
+    })
 }
 
 fn supports_hpo(model_type: ModelType) -> bool {
@@ -2924,6 +3027,12 @@ fn write_onnx_status_sidecar(
     if !export_onnx_requested(&config.params) {
         return Ok(());
     }
+    if !artifact_dir.is_dir() {
+        anyhow::bail!(
+            "cannot write ONNX export status without saved artifact directory {}",
+            artifact_dir.display()
+        );
+    }
 
     let exporter = if cfg!(feature = "python-onnx-export") {
         "python-onnx-export"
@@ -2931,9 +3040,9 @@ fn write_onnx_status_sidecar(
         "none"
     };
     let reason = if cfg!(feature = "python-onnx-export") {
-        "runtime artifact to ONNX export has not been wired for the current Rust training path yet"
+        "trained runtime artifact saved; ONNX export was requested but not attempted because the current Rust training path does not wire the exporter yet"
     } else {
-        "python-onnx-export feature is not enabled for this build"
+        "trained runtime artifact saved; ONNX export was requested but python-onnx-export is not enabled for this build"
     };
     let status = OnnxExportStatus::skipped(
         config.name.clone(),
@@ -2962,23 +3071,27 @@ fn train_model_dispatch(
     if uses_shared_expert_dispatch(config.model_type) {
         let (selected_params, optimization_report) =
             optimize_model_config(config, payload, base_tf, row_budget_applied)?;
+        let effective_config = ModelConfig {
+            name: config.name.clone(),
+            model_type: config.model_type,
+            capability_family: config.capability_family,
+            capability_state: config.capability_state,
+            params: selected_params.clone(),
+        };
         let labels = labels_to_series(payload.labels.as_ref());
-        let mut model = build_expert_model(config, payload.frame.width(), &selected_params)?;
+        let mut model =
+            build_expert_model(&effective_config, payload.frame.width(), &selected_params)?;
         model.fit(payload.frame.as_ref(), &labels)?;
-        model.save(&artifact_dir)?;
-        write_optimization_report(
-            &artifact_dir.join(OPTIMIZATION_REPORT_FILE_NAME),
-            &optimization_report,
-        )?;
-        write_onnx_status_sidecar(&artifact_dir, config, payload)?;
-        write_training_profile_sidecar(
+        persist_training_artifacts(
             &artifact_dir,
             settings,
-            config,
+            &effective_config,
             symbol,
             base_tf,
             payload,
             row_budget_applied,
+            Some(&optimization_report),
+            |staged_dir| model.save(staged_dir),
         )?;
         return Ok(());
     }
@@ -2989,9 +3102,7 @@ fn train_model_dispatch(
         ModelType::SklearsTree => {
             let mut model = SklearsTreeExpert::new();
             model.fit(payload.frame.as_ref(), &labels)?;
-            model.save(&artifact_dir)?;
-            write_onnx_status_sidecar(&artifact_dir, config, payload)?;
-            write_training_profile_sidecar(
+            persist_training_artifacts(
                 &artifact_dir,
                 settings,
                 config,
@@ -2999,6 +3110,8 @@ fn train_model_dispatch(
                 base_tf,
                 payload,
                 row_budget_applied,
+                None,
+                |staged_dir| model.save(staged_dir),
             )?;
             Ok(())
         }
@@ -3017,9 +3130,7 @@ fn train_model_dispatch(
             .with_reward_horizon(parse_usize_param(&config.params, "reward_horizon", 0))
             .with_warmup_steps(parse_usize_param(&config.params, "warmup_steps", 0));
             model.fit_from_frame(payload.frame.as_ref(), &labels)?;
-            model.save(&artifact_dir)?;
-            write_onnx_status_sidecar(&artifact_dir, config, payload)?;
-            write_training_profile_sidecar(
+            persist_training_artifacts(
                 &artifact_dir,
                 settings,
                 config,
@@ -3027,6 +3138,8 @@ fn train_model_dispatch(
                 base_tf,
                 payload,
                 row_budget_applied,
+                None,
+                |staged_dir| model.save(staged_dir),
             )?;
             Ok(())
         }
@@ -3082,9 +3195,7 @@ fn train_model_dispatch(
                 }
             }
             model.train_on_frame(payload.frame.as_ref(), &labels)?;
-            model.save(&artifact_dir)?;
-            write_onnx_status_sidecar(&artifact_dir, config, payload)?;
-            write_training_profile_sidecar(
+            persist_training_artifacts(
                 &artifact_dir,
                 settings,
                 config,
@@ -3092,6 +3203,8 @@ fn train_model_dispatch(
                 base_tf,
                 payload,
                 row_budget_applied,
+                None,
+                |staged_dir| model.save(staged_dir),
             )?;
             Ok(())
         }
@@ -3146,9 +3259,7 @@ fn train_model_dispatch(
                 model.config.interpretability_needed,
             );
             model.fit_from_frame(payload.frame.as_ref(), &labels, symbol)?;
-            model.save(&artifact_dir)?;
-            write_onnx_status_sidecar(&artifact_dir, config, payload)?;
-            write_training_profile_sidecar(
+            persist_training_artifacts(
                 &artifact_dir,
                 settings,
                 config,
@@ -3156,6 +3267,8 @@ fn train_model_dispatch(
                 base_tf,
                 payload,
                 row_budget_applied,
+                None,
+                |staged_dir| model.save(staged_dir),
             )?;
             Ok(())
         }
@@ -3179,9 +3292,7 @@ fn train_model_dispatch(
                 parse_usize_param(&config.params, "tournament_size", 3),
             );
             model.fit(payload.frame.as_ref(), &labels, None, Some(symbol))?;
-            model.save(&artifact_dir)?;
-            write_onnx_status_sidecar(&artifact_dir, config, payload)?;
-            write_training_profile_sidecar(
+            persist_training_artifacts(
                 &artifact_dir,
                 settings,
                 config,
@@ -3189,6 +3300,8 @@ fn train_model_dispatch(
                 base_tf,
                 payload,
                 row_budget_applied,
+                None,
+                |staged_dir| model.save(staged_dir),
             )?;
             Ok(())
         }
@@ -3204,6 +3317,7 @@ fn train_model_dispatch(
 mod tests {
     use super::*;
     use crate::registry::get_model_capability;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn orchestrator_with_models(models: &[&str]) -> TrainingOrchestrator {
         let mut settings = forex_core::Settings::default();
@@ -3217,6 +3331,18 @@ mod tests {
         settings.models.use_neuroevolution = false;
         settings.risk.conformal_enabled = false;
         TrainingOrchestrator::new(settings, PathBuf::from("models"))
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("current time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "forex_ai_training_orchestrator_{name}_{}_{}",
+            std::process::id(),
+            nanos
+        ))
     }
 
     #[test]
@@ -3378,8 +3504,37 @@ mod tests {
             volume: None,
         };
 
-        let labels = orchestrator.derive_labels(&ohlcv);
+        let labels = orchestrator
+            .derive_labels(&ohlcv)
+            .expect("aligned OHLCV should derive labels");
         assert_eq!(labels[0], 1);
+    }
+
+    #[test]
+    fn preferred_burn_device_policy_rejects_unknown_gpu_token() {
+        let mut orchestrator = orchestrator_with_models(&["mlp"]);
+        orchestrator.settings.system.enable_gpu_preference = "gpu".to_string();
+        orchestrator.settings.system.device = "mystery_gpu".to_string();
+
+        assert_eq!(orchestrator.preferred_burn_device_policy(), "gpu");
+    }
+
+    #[test]
+    fn derive_labels_returns_error_on_ohlcv_mismatch() {
+        let orchestrator = orchestrator_with_models(&["lightgbm"]);
+        let ohlcv = Ohlcv {
+            timestamp: None,
+            open: vec![1.0, 2.0],
+            high: vec![1.0],
+            low: vec![1.0, 2.0],
+            close: vec![1.0, 2.0],
+            volume: None,
+        };
+
+        let err = orchestrator
+            .derive_labels(&ohlcv)
+            .expect_err("misaligned OHLCV should fail");
+        assert!(err.to_string().contains("aligned OHLCV series"));
     }
 
     #[test]
@@ -3419,5 +3574,63 @@ mod tests {
         assert_eq!(profile.effective_label_horizon_bars, 3);
         assert_eq!(profile.meta_label_max_hold_bars, 3);
         assert!(!profile.label_use_triple_barrier);
+    }
+
+    #[test]
+    fn write_onnx_status_sidecar_requires_saved_artifact_dir() {
+        let config = ModelConfig {
+            name: "mlp".to_string(),
+            model_type: ModelType::MLP,
+            capability_family: crate::runtime::capabilities::ModelFamily::Deep,
+            capability_state: CapabilityState::Implemented,
+            params: HashMap::from([("export_onnx".to_string(), "true".to_string())]),
+        };
+        let payload =
+            TrainingPayload::from_dense(ndarray::Array2::<f32>::zeros((4, 2)), vec![0, 1, 2, 1])
+                .expect("build payload");
+        let artifact_dir = unique_test_dir("onnx_missing_dir");
+
+        let err = write_onnx_status_sidecar(&artifact_dir, &config, &payload)
+            .expect_err("missing artifact dir must fail");
+        assert!(err.to_string().contains("without saved artifact directory"));
+    }
+
+    #[test]
+    fn with_staged_training_artifact_dir_promotes_complete_directory() {
+        let target_dir = unique_test_dir("staged_promote");
+        let marker_name = "marker.txt";
+        with_staged_training_artifact_dir(&target_dir, |staged_dir| {
+            std::fs::write(staged_dir.join(marker_name), b"ok")
+                .context("write staged training marker")?;
+            Ok(())
+        })
+        .expect("staged training artifact directory should promote");
+
+        assert!(target_dir.join(marker_name).is_file());
+        assert!(!staged_training_artifact_dir(&target_dir).exists());
+
+        if target_dir.exists() {
+            std::fs::remove_dir_all(&target_dir).expect("cleanup promoted target dir");
+        }
+    }
+
+    #[test]
+    fn with_staged_training_artifact_dir_cleans_up_failed_stage() {
+        let target_dir = unique_test_dir("staged_cleanup");
+        let staged_dir = staged_training_artifact_dir(&target_dir);
+
+        let err = with_staged_training_artifact_dir(&target_dir, |_staged_dir| {
+            anyhow::bail!("synthetic staging failure")
+        })
+        .expect_err("failing staged write must bubble up");
+        assert!(err.to_string().contains("synthetic staging failure"));
+        assert!(
+            !staged_dir.exists(),
+            "failed staged dir should be cleaned up"
+        );
+        assert!(
+            !target_dir.exists(),
+            "target dir should not be created on failure"
+        );
     }
 }

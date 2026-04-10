@@ -28,9 +28,9 @@ use super::config::{
 };
 #[cfg(not(feature = "lightgbm"))]
 use super::config::{
-    cpu_threads_from_params, cpu_threads_hint_for, device_preference_from_params,
-    gpu_only_from_params, gpu_only_mode_for, tree_device_preference_for, ParamValue,
-    TreeModelConfig,
+    cpu_threads_from_params, cpu_threads_hint_for, device_preference_from_params, gpu_count,
+    gpu_only_from_params, gpu_only_mode_for, param_float, param_string, tree_device_preference_for,
+    DevicePreference, ParamValue, TreeModelConfig,
 };
 use std::collections::HashMap;
 
@@ -38,11 +38,17 @@ const LIGHTGBM_RUNTIME_FILE_NAME: &str = "runtime.json";
 const LIGHTGBM_LOCAL_FALLBACK_FILE_NAME: &str = "lightgbm_local_fallback.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct LightGBMRuntimeProfile {
+struct LightGBMRuntimeArtifact {
+    configured_params: HashMap<String, ParamValue>,
+    resolved_params: HashMap<String, ParamValue>,
+    feature_columns: Vec<String>,
+    training_summary: TrainingSummaryMetadata,
     device_pref: DevicePreference,
+    effective_device_type: String,
+    boosting_type: String,
+    probability_temperature: f64,
     gpu_only: bool,
     cpu_threads: usize,
-    params: HashMap<String, ParamValue>,
 }
 
 pub struct LightGBMExpert {
@@ -117,20 +123,72 @@ impl LightGBMExpert {
             .unwrap_or_else(|| TrainingSummaryMetadata::new(0, 0, 0))
     }
 
-    fn runtime_profile(&self) -> LightGBMRuntimeProfile {
-        LightGBMRuntimeProfile {
-            device_pref: self.config.device_pref,
-            gpu_only: self.config.gpu_only,
-            cpu_threads: self.config.cpu_threads.unwrap_or(1).max(1),
-            params: self.config.params.clone(),
+    fn boosting_type(&self) -> String {
+        param_string(&self.config.params, "boosting_type", "gbdt").to_lowercase()
+    }
+
+    fn probability_temperature(&self) -> f64 {
+        let configured = param_float(&self.config.params, "probability_temperature", 1.0);
+        if configured.is_finite() && configured > 0.0 {
+            configured
+        } else {
+            1.0
         }
     }
 
-    fn apply_runtime_profile(&mut self, profile: LightGBMRuntimeProfile) {
-        self.config.device_pref = profile.device_pref;
-        self.config.gpu_only = profile.gpu_only;
-        self.config.cpu_threads = Some(profile.cpu_threads.max(1));
-        self.config.params = profile.params;
+    fn effective_device_type(&self) -> String {
+        let gpu_available = gpu_count() > 0 && !self.gpu_only_disabled;
+        match self.config.device_pref {
+            DevicePreference::Gpu if gpu_available => "gpu".to_string(),
+            DevicePreference::Auto if gpu_available => "gpu".to_string(),
+            _ => "cpu".to_string(),
+        }
+    }
+
+    fn resolved_params(&self) -> HashMap<String, ParamValue> {
+        let mut params = self.config.params.clone();
+        params.insert(
+            "boosting_type".into(),
+            ParamValue::String(self.boosting_type()),
+        );
+        params.insert(
+            "device_type".into(),
+            ParamValue::String(self.effective_device_type()),
+        );
+        params.insert(
+            "probability_temperature".into(),
+            ParamValue::Float(self.probability_temperature()),
+        );
+        params.insert("gpu_only".into(), ParamValue::Bool(self.config.gpu_only));
+        params.insert(
+            "cpu_threads".into(),
+            ParamValue::Int(self.config.cpu_threads.unwrap_or(1).max(1) as i32),
+        );
+        params
+    }
+
+    fn runtime_artifact(&self) -> LightGBMRuntimeArtifact {
+        LightGBMRuntimeArtifact {
+            configured_params: self.config.params.clone(),
+            resolved_params: self.resolved_params(),
+            feature_columns: self.feature_columns.clone(),
+            training_summary: self.stored_training_summary(),
+            device_pref: self.config.device_pref,
+            effective_device_type: self.effective_device_type(),
+            boosting_type: self.boosting_type(),
+            probability_temperature: self.probability_temperature(),
+            gpu_only: self.config.gpu_only,
+            cpu_threads: self.config.cpu_threads.unwrap_or(1).max(1),
+        }
+    }
+
+    fn apply_runtime_artifact(&mut self, artifact: LightGBMRuntimeArtifact) {
+        self.config.device_pref = artifact.device_pref;
+        self.config.gpu_only = artifact.gpu_only;
+        self.config.cpu_threads = Some(artifact.cpu_threads.max(1));
+        self.config.params = artifact.configured_params;
+        self.feature_columns = artifact.feature_columns;
+        self.training_summary = Some(artifact.training_summary);
     }
 
     fn runtime_profile_path(root: &Path) -> PathBuf {
@@ -163,16 +221,16 @@ impl LightGBMExpert {
         Ok(Some(artifact))
     }
 
-    fn read_runtime_profile(root: &Path) -> Result<Option<LightGBMRuntimeProfile>> {
+    fn read_runtime_artifact(root: &Path) -> Result<Option<LightGBMRuntimeArtifact>> {
         let path = Self::runtime_profile_path(root);
         if !path.exists() {
             return Ok(None);
         }
         let payload = std::fs::read(&path)
-            .with_context(|| format!("read LightGBM runtime profile from {}", path.display()))?;
+            .with_context(|| format!("read LightGBM runtime artifact from {}", path.display()))?;
         let profile = serde_json::from_slice(&payload).with_context(|| {
             format!(
-                "deserialize LightGBM runtime profile from {}",
+                "deserialize LightGBM runtime artifact from {}",
                 path.display()
             )
         })?;
@@ -224,16 +282,6 @@ impl LightGBMExpert {
         }
 
         params
-    }
-
-    #[cfg(feature = "lightgbm")]
-    fn probability_temperature(&self) -> f32 {
-        let configured = param_float(&self.config.params, "probability_temperature", 1.0) as f32;
-        if configured.is_finite() && configured > 0.0 {
-            configured
-        } else {
-            1.0
-        }
     }
 
     #[cfg(feature = "lightgbm")]
@@ -290,6 +338,92 @@ impl LightGBMExpert {
             "native_lightgbm_unavailable",
             "lightgbm_unknown",
         )
+    }
+
+    fn ensure_runtime_state_ready(&self) -> Result<()> {
+        if self.feature_columns.is_empty() {
+            bail!("LightGBM runtime state is missing persisted feature columns");
+        }
+        let summary = self
+            .training_summary
+            .as_ref()
+            .context("LightGBM runtime state is missing training summary metadata")?;
+        if summary.dataset_rows == 0 {
+            bail!("LightGBM runtime state has zero dataset_rows in training summary");
+        }
+        if summary.dataset_rows != summary.train_rows + summary.val_rows {
+            bail!(
+                "LightGBM runtime state has inconsistent training summary: dataset_rows={} train_rows={} val_rows={}",
+                summary.dataset_rows,
+                summary.train_rows,
+                summary.val_rows
+            );
+        }
+        if self.model.is_none() && self.local_fallback.is_none() {
+            bail!("LightGBM runtime state has neither a native booster nor a local surrogate");
+        }
+        if let Some(fallback) = self.local_fallback.as_ref() {
+            validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
+        }
+        Ok(())
+    }
+
+    fn validate_runtime_artifact(
+        artifact: &LightGBMRuntimeArtifact,
+        expected_feature_columns: &[String],
+        expected_training_summary: &TrainingSummaryMetadata,
+    ) -> Result<()> {
+        if artifact.feature_columns.is_empty() {
+            bail!("LightGBM runtime artifact must contain feature columns");
+        }
+        if artifact.feature_columns != expected_feature_columns {
+            bail!(
+                "LightGBM runtime artifact feature-columns mismatch: expected {:?}, got {:?}",
+                expected_feature_columns,
+                artifact.feature_columns
+            );
+        }
+        if artifact.training_summary.dataset_rows != expected_training_summary.dataset_rows
+            || artifact.training_summary.train_rows != expected_training_summary.train_rows
+            || artifact.training_summary.val_rows != expected_training_summary.val_rows
+        {
+            bail!(
+                "LightGBM runtime artifact training-summary mismatch: expected {:?}, got {:?}",
+                expected_training_summary,
+                artifact.training_summary
+            );
+        }
+        if artifact.training_summary.dataset_rows == 0 {
+            bail!("LightGBM runtime artifact must record non-zero dataset_rows");
+        }
+        if artifact.training_summary.dataset_rows
+            != artifact.training_summary.train_rows + artifact.training_summary.val_rows
+        {
+            bail!("LightGBM runtime artifact training summary is inconsistent");
+        }
+        if artifact.configured_params.is_empty() {
+            bail!("LightGBM runtime artifact must contain configured params");
+        }
+        if artifact.resolved_params.is_empty() {
+            bail!("LightGBM runtime artifact must contain resolved params");
+        }
+        if !artifact.probability_temperature.is_finite() || artifact.probability_temperature <= 0.0
+        {
+            bail!("LightGBM runtime artifact probability_temperature must be finite and positive");
+        }
+        if artifact.cpu_threads == 0 {
+            bail!("LightGBM runtime artifact cpu_threads must be greater than zero");
+        }
+        if artifact.boosting_type.trim().is_empty() {
+            bail!("LightGBM runtime artifact boosting_type must not be blank");
+        }
+        if !matches!(artifact.effective_device_type.as_str(), "cpu" | "gpu") {
+            bail!(
+                "LightGBM runtime artifact effective_device_type must be 'cpu' or 'gpu', got {}",
+                artifact.effective_device_type
+            );
+        }
+        Ok(())
     }
 }
 
@@ -388,7 +522,7 @@ impl ExpertModel for LightGBMExpert {
                     let probabilities = predict_tree_local_fallback(fallback, x)?;
                     let probabilities = calibrate_three_class_probabilities(
                         probabilities,
-                        self.probability_temperature(),
+                        self.probability_temperature() as f32,
                         "LightGBM",
                     )?;
                     return normalize_three_class_probabilities(probabilities, "LightGBM");
@@ -407,7 +541,7 @@ impl ExpertModel for LightGBMExpert {
             let probabilities = reshape_three_class_probabilities(normalized, rows, 3)?;
             let probabilities = calibrate_three_class_probabilities(
                 probabilities,
-                self.probability_temperature(),
+                self.probability_temperature() as f32,
                 "LightGBM",
             )?;
             normalize_three_class_probabilities(probabilities, "LightGBM")
@@ -421,7 +555,7 @@ impl ExpertModel for LightGBMExpert {
             let probabilities = predict_tree_local_fallback(fallback, x)?;
             let probabilities = calibrate_three_class_probabilities(
                 probabilities,
-                param_float(&self.config.params, "probability_temperature", 1.0) as f32,
+                self.probability_temperature() as f32,
                 "LightGBM",
             )?;
             normalize_three_class_probabilities(probabilities, "LightGBM")
@@ -429,6 +563,7 @@ impl ExpertModel for LightGBMExpert {
     }
 
     fn save(&self, path: &Path) -> Result<()> {
+        self.ensure_runtime_state_ready()?;
         #[cfg(not(feature = "lightgbm"))]
         {
             std::fs::create_dir_all(path).with_context(|| {
@@ -444,11 +579,16 @@ impl ExpertModel for LightGBMExpert {
             );
             let (_, metadata_path) = tree_artifact_paths(path, LIGHTGBM_MODEL_FILE_NAME);
             write_runtime_metadata(&metadata_path, &metadata)?;
-            let runtime_profile = self.runtime_profile();
+            let runtime_profile = self.runtime_artifact();
+            Self::validate_runtime_artifact(
+                &runtime_profile,
+                &self.feature_columns,
+                &self.stored_training_summary(),
+            )?;
             atomic_write(
                 &Self::runtime_profile_path(path),
                 &serde_json::to_vec_pretty(&runtime_profile)
-                    .context("serialize LightGBM runtime profile")?,
+                    .context("serialize LightGBM runtime artifact")?,
             )?;
             self.persist_local_fallback(path)?;
             Ok(())
@@ -465,11 +605,16 @@ impl ExpertModel for LightGBMExpert {
             );
             let (model_path, metadata_path) = tree_artifact_paths(path, LIGHTGBM_MODEL_FILE_NAME);
             write_runtime_metadata(&metadata_path, &metadata)?;
-            let runtime_profile = self.runtime_profile();
+            let runtime_profile = self.runtime_artifact();
+            Self::validate_runtime_artifact(
+                &runtime_profile,
+                &self.feature_columns,
+                &self.stored_training_summary(),
+            )?;
             atomic_write(
                 &Self::runtime_profile_path(path),
                 &serde_json::to_vec_pretty(&runtime_profile)
-                    .context("serialize LightGBM runtime profile")?,
+                    .context("serialize LightGBM runtime artifact")?,
             )?;
             if let Some(model) = self.model.as_ref() {
                 model
@@ -502,11 +647,16 @@ impl ExpertModel for LightGBMExpert {
             if metadata.feature_columns.is_empty() {
                 bail!("LightGBM runtime metadata must contain at least one feature column");
             }
-            self.feature_columns = metadata.feature_columns;
-            self.training_summary = Some(metadata.training_summary);
-            if let Some(profile) = Self::read_runtime_profile(path)? {
-                self.apply_runtime_profile(profile);
-            }
+            let metadata_feature_columns = metadata.feature_columns.clone();
+            let metadata_training_summary = metadata.training_summary.clone();
+            let runtime_profile = Self::read_runtime_artifact(path)?
+                .context("LightGBM artifact is missing runtime.json sidecar")?;
+            Self::validate_runtime_artifact(
+                &runtime_profile,
+                &metadata_feature_columns,
+                &metadata_training_summary,
+            )?;
+            self.apply_runtime_artifact(runtime_profile);
             self.local_fallback = Self::read_local_fallback(path)?;
             if let Some(fallback) = self.local_fallback.as_ref() {
                 validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
@@ -529,11 +679,16 @@ impl ExpertModel for LightGBMExpert {
             if metadata.feature_columns.is_empty() {
                 bail!("LightGBM runtime metadata must contain at least one feature column");
             }
-            self.feature_columns = metadata.feature_columns;
-            self.training_summary = Some(metadata.training_summary);
-            if let Some(profile) = Self::read_runtime_profile(path)? {
-                self.apply_runtime_profile(profile);
-            }
+            let metadata_feature_columns = metadata.feature_columns.clone();
+            let metadata_training_summary = metadata.training_summary.clone();
+            let runtime_profile = Self::read_runtime_artifact(path)?
+                .context("LightGBM artifact is missing runtime.json sidecar")?;
+            Self::validate_runtime_artifact(
+                &runtime_profile,
+                &metadata_feature_columns,
+                &metadata_training_summary,
+            )?;
+            self.apply_runtime_artifact(runtime_profile);
             let native_model_result = if model_path.exists() {
                 Some(
                     lightgbm3::Booster::from_file(
@@ -607,10 +762,13 @@ impl LightGBMExpert {
 
 #[cfg(all(test, feature = "lightgbm"))]
 mod tests {
-    use super::{ExpertModel, LightGBMExpert};
+    use super::{build_tree_local_fallback_artifact, ExpertModel, LightGBMExpert};
+    use crate::runtime::artifacts::TrainingSummaryMetadata;
+    use crate::tree_models::config::{DevicePreference, ParamValue};
     use ndarray::Array2;
     use polars::df;
     use polars::prelude::*;
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -743,5 +901,58 @@ mod tests {
             let sum = row.iter().copied().sum::<f32>();
             assert!((sum - 1.0).abs() < 1e-3_f32);
         }
+    }
+
+    #[test]
+    fn lightgbm_validate_runtime_artifact_rejects_invalid_probability_temperature() {
+        let artifact = super::LightGBMRuntimeArtifact {
+            configured_params: HashMap::from([
+                ("boosting_type".into(), ParamValue::String("gbdt".into())),
+                ("probability_temperature".into(), ParamValue::Float(1.0)),
+            ]),
+            resolved_params: HashMap::from([
+                ("device_type".into(), ParamValue::String("cpu".into())),
+                ("cpu_threads".into(), ParamValue::Int(4)),
+            ]),
+            feature_columns: vec!["momentum".into(), "trend".into()],
+            training_summary: TrainingSummaryMetadata::new(9, 9, 0),
+            device_pref: DevicePreference::Cpu,
+            effective_device_type: "cpu".into(),
+            boosting_type: "gbdt".into(),
+            probability_temperature: 0.0,
+            gpu_only: false,
+            cpu_threads: 4,
+        };
+
+        let err = LightGBMExpert::validate_runtime_artifact(
+            &artifact,
+            &["momentum".into(), "trend".into()],
+            &TrainingSummaryMetadata::new(9, 9, 0),
+        )
+        .expect_err("non-positive probability_temperature should fail");
+        assert!(err.to_string().contains("probability_temperature"));
+    }
+
+    #[test]
+    fn lightgbm_save_rejects_missing_training_summary() {
+        let (x, y) = sample_three_class_dataset();
+        let artifact_dir = unique_temp_dir("lightgbm-missing-summary");
+
+        let mut expert = LightGBMExpert::new(7, None);
+        expert.feature_columns = vec!["momentum".into(), "trend".into(), "volatility".into()];
+        expert.local_fallback = Some(
+            build_tree_local_fallback_artifact(
+                &x,
+                &y,
+                TrainingSummaryMetadata::new(x.height(), x.height(), 0),
+            )
+            .expect("fallback artifact"),
+        );
+        expert.training_summary = None;
+
+        let err = expert
+            .save(&artifact_dir)
+            .expect_err("save should fail without training summary");
+        assert!(err.to_string().contains("training summary"));
     }
 }

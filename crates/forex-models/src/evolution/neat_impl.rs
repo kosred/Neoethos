@@ -9,15 +9,21 @@ use std::path::Path;
 use symbios_genetics::Genotype;
 use symbios_neat::{Activation, CppnEvaluator, NeatConfig, NeatGenome};
 
-use crate::base::{build_runtime_artifact_metadata, ExpertModel};
+use crate::base::{
+    build_runtime_artifact_metadata, build_runtime_prediction_with_details,
+    three_class_runtime_confidence, ExpertModel,
+};
 use crate::runtime::artifacts::{default_three_class_label_mapping, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
+use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
     ensure_feature_columns_match, feature_matrix_from_dataframe, read_json,
     remap_three_class_labels, softmax_rows, write_json, FeatureScaler, METADATA_FILE_NAME,
 };
 
 const NEAT_ARTIFACT_FILE_NAME: &str = "neat.json";
+const NEAT_MODEL_NAME: &str = "neat";
+const NEAT_RUNTIME_BACKEND: &str = "symbios_neat_cpu";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -35,6 +41,9 @@ struct NeatArtifact {
     best_genome: NeatGenome,
     fitted: bool,
     dataset_rows: usize,
+    train_rows: usize,
+    val_rows: usize,
+    runtime_backend: String,
     best_fitness: f32,
     best_loss: f32,
     best_accuracy: f32,
@@ -61,6 +70,9 @@ impl Default for NeatArtifact {
             best_genome: NeatGenome::fully_connected(config, &mut rng),
             fitted: false,
             dataset_rows: 0,
+            train_rows: 0,
+            val_rows: 0,
+            runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
             best_fitness: f32::NEG_INFINITY,
             best_loss: f32::INFINITY,
             best_accuracy: 0.0,
@@ -384,6 +396,9 @@ pub struct NeatExpert {
     best_genome: Option<NeatGenome>,
     fitted: bool,
     dataset_rows: usize,
+    train_rows: usize,
+    val_rows: usize,
+    runtime_backend: String,
     best_fitness: f32,
     best_loss: f32,
     best_accuracy: f32,
@@ -409,6 +424,9 @@ impl NeatExpert {
             best_genome: None,
             fitted: false,
             dataset_rows: 0,
+            train_rows: 0,
+            val_rows: 0,
+            runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
             best_fitness: f32::NEG_INFINITY,
             best_loss: f32::INFINITY,
             best_accuracy: 0.0,
@@ -431,14 +449,54 @@ impl NeatExpert {
         self
     }
 
+    fn split_train_val_indices(rows: usize) -> (Vec<usize>, Vec<usize>) {
+        if rows <= 4 {
+            return ((0..rows).collect(), Vec::new());
+        }
+
+        let val_rows = ((rows as f32) * 0.2).round() as usize;
+        let val_rows = val_rows.clamp(1, rows.saturating_sub(1));
+        let train_rows = rows - val_rows;
+
+        let train = (0..train_rows).collect::<Vec<_>>();
+        let val = (train_rows..rows).collect::<Vec<_>>();
+        (train, val)
+    }
+
+    fn slice_rows(features: &Array2<f32>, indices: &[usize]) -> Array2<f32> {
+        let mut sliced = Array2::<f32>::zeros((indices.len(), features.ncols()));
+        for (out_row, src_row) in indices.iter().copied().enumerate() {
+            for col in 0..features.ncols() {
+                sliced[(out_row, col)] = features[(src_row, col)];
+            }
+        }
+        sliced
+    }
+
+    fn slice_labels(labels: &[usize], indices: &[usize]) -> Vec<usize> {
+        indices
+            .iter()
+            .filter_map(|idx| labels.get(*idx).copied())
+            .collect::<Vec<_>>()
+    }
+
     fn evolve_population(
         &mut self,
-        features: &Array2<f32>,
-        labels: &[usize],
+        train_features: &Array2<f32>,
+        train_labels: &[usize],
+        val_features: &Array2<f32>,
+        val_labels: &[usize],
     ) -> Result<GenomeScore> {
         let mut rng = Xoroshiro128PlusPlus::seed_from_u64(self.seed);
         let mut population = build_seed_population(&self.config, self.population_size, &mut rng);
-        let evaluator = NeatDatasetEvaluator { features, labels };
+        let train_evaluator = NeatDatasetEvaluator {
+            features: train_features,
+            labels: train_labels,
+        };
+        let val_evaluator = (!val_labels.is_empty()).then_some(NeatDatasetEvaluator {
+            features: val_features,
+            labels: val_labels,
+        });
         let mut best = GenomeScore {
             genome: population
                 .first()
@@ -453,7 +511,17 @@ impl NeatExpert {
         for _generation in 0..self.generations {
             let mut scores = population
                 .iter()
-                .map(|genome| evaluator.evaluate(genome))
+                .map(|genome| {
+                    let mut score = train_evaluator.evaluate(genome);
+                    if let Some(evaluator) = val_evaluator.as_ref() {
+                        let val_score = evaluator.evaluate(genome);
+                        score.fitness = 0.65 * score.fitness + 0.35 * val_score.fitness;
+                        score.loss = 0.65 * score.loss + 0.35 * val_score.loss;
+                        score.accuracy = 0.65 * score.accuracy + 0.35 * val_score.accuracy;
+                        score.adjusted_fitness = score.fitness;
+                    }
+                    score
+                })
                 .collect::<Vec<_>>();
             sort_scores_desc(&mut scores);
             if scores
@@ -542,12 +610,112 @@ impl NeatExpert {
         Ok(best)
     }
 
+    fn runtime_details(&self) -> (Option<String>, Option<String>) {
+        if !self.fitted {
+            return (
+                Some("neat_unknown".to_string()),
+                Some("neat_not_fitted".to_string()),
+            );
+        }
+        if self.feature_columns.is_empty() {
+            return (
+                Some("neat_unknown".to_string()),
+                Some("neat_feature_schema_missing".to_string()),
+            );
+        }
+        if self.scaler.is_none() || self.best_genome.is_none() {
+            return (
+                Some("neat_unknown".to_string()),
+                Some("neat_runtime_state_incomplete".to_string()),
+            );
+        }
+        if self.train_rows == 0 || self.train_rows + self.val_rows != self.dataset_rows {
+            return (
+                Some("neat_unknown".to_string()),
+                Some("neat_training_summary_incomplete".to_string()),
+            );
+        }
+        let backend = if self.runtime_backend.trim().is_empty() {
+            "neat_unknown".to_string()
+        } else {
+            self.runtime_backend.clone()
+        };
+        let degraded_reason = if backend == "neat_unknown" {
+            Some("neat_runtime_backend_missing".to_string())
+        } else {
+            None
+        };
+        (Some(backend), degraded_reason)
+    }
+
+    fn ensure_runtime_state_ready(&self) -> Result<()> {
+        if !self.fitted {
+            bail!("NEAT expert has not been fitted");
+        }
+        if self.feature_columns.is_empty() {
+            bail!("NEAT feature schema missing");
+        }
+        if self.best_genome.is_none() {
+            bail!("NEAT genome missing");
+        }
+        if self.scaler.is_none() {
+            bail!("NEAT scaler missing");
+        }
+        if self.dataset_rows == 0 || self.train_rows == 0 {
+            bail!("NEAT training summary is incomplete");
+        }
+        if self.train_rows + self.val_rows != self.dataset_rows {
+            bail!("NEAT training summary is inconsistent");
+        }
+        if self.runtime_backend.trim().is_empty() {
+            bail!("NEAT runtime backend missing");
+        }
+        let scaler = self.scaler.as_ref().context("NEAT scaler missing")?;
+        if scaler.means.len() != self.feature_columns.len()
+            || scaler.stds.len() != self.feature_columns.len()
+        {
+            bail!("NEAT scaler does not match feature schema");
+        }
+        if scaler.means.iter().any(|value| !value.is_finite()) {
+            bail!("NEAT scaler contains non-finite means");
+        }
+        if scaler
+            .stds
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+        {
+            bail!("NEAT scaler contains non-finite or non-positive stds");
+        }
+        Ok(())
+    }
+
+    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
+        let probabilities = self.predict_proba(x)?;
+        let (execution_backend, degraded_reason) = self.runtime_details();
+        let mut predictions = Vec::with_capacity(probabilities.nrows());
+        for row in probabilities.outer_iter() {
+            let row_values = [row[0], row[1], row[2]];
+            let (confidence, abstain_recommended) = three_class_runtime_confidence(row_values)?;
+            predictions.push(build_runtime_prediction_with_details(
+                NEAT_MODEL_NAME.to_string(),
+                ModelFamily::Evolutionary,
+                CapabilityState::Implemented,
+                row_values,
+                Some(confidence),
+                Some(abstain_recommended),
+                execution_backend.clone(),
+                degraded_reason.clone(),
+            )?);
+        }
+        Ok(predictions)
+    }
+
     fn validate_loaded_metadata(
         metadata: &crate::runtime::artifacts::RuntimeArtifactMetadata,
     ) -> Result<()> {
-        if metadata.model_name != "neat" {
+        if metadata.model_name != NEAT_MODEL_NAME {
             bail!(
-                "NEAT artifact model mismatch: expected neat, got {}",
+                "NEAT artifact model mismatch: expected {NEAT_MODEL_NAME}, got {}",
                 metadata.model_name
             );
         }
@@ -581,6 +749,9 @@ impl NeatExpert {
         {
             bail!("NEAT artifact training summary is inconsistent");
         }
+        if metadata.training_summary.train_rows == 0 {
+            bail!("NEAT artifact training summary must contain positive train_rows");
+        }
 
         Ok(())
     }
@@ -603,6 +774,17 @@ impl NeatExpert {
                 artifact.scaler.stds.len()
             );
         }
+        if artifact.scaler.means.iter().any(|value| !value.is_finite()) {
+            bail!("NEAT artifact scaler contains non-finite means");
+        }
+        if artifact
+            .scaler
+            .stds
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+        {
+            bail!("NEAT artifact scaler contains non-finite or non-positive stds");
+        }
 
         if artifact.population_size < 24 || artifact.generations < 8 {
             bail!(
@@ -615,9 +797,21 @@ impl NeatExpert {
         if artifact.dataset_rows == 0 {
             bail!("NEAT artifact dataset rows must be greater than zero");
         }
+        if artifact.train_rows == 0 {
+            bail!("NEAT artifact train_rows must be greater than zero");
+        }
+        if artifact.train_rows + artifact.val_rows != artifact.dataset_rows {
+            bail!("NEAT artifact train_rows + val_rows must equal dataset_rows");
+        }
+        if artifact.runtime_backend.trim().is_empty() {
+            bail!("NEAT artifact must persist a runtime backend label");
+        }
 
-        if artifact.mutation_rate.is_nan() || !artifact.mutation_rate.is_finite() {
-            bail!("NEAT artifact mutation rate is invalid");
+        if artifact.mutation_rate.is_nan()
+            || !artifact.mutation_rate.is_finite()
+            || !(0.05..=1.5).contains(&artifact.mutation_rate)
+        {
+            bail!("NEAT artifact mutation rate is out of contract range");
         }
 
         if artifact.config.num_inputs != artifact.feature_columns.len() {
@@ -641,6 +835,11 @@ impl NeatExpert {
 
         if metadata.training_summary.dataset_rows != artifact.dataset_rows {
             bail!("NEAT artifact dataset row count does not match metadata");
+        }
+        if metadata.training_summary.train_rows != artifact.train_rows
+            || metadata.training_summary.val_rows != artifact.val_rows
+        {
+            bail!("NEAT artifact training summary does not match metadata");
         }
 
         if !artifact.best_fitness.is_finite()
@@ -688,8 +887,17 @@ impl ExpertModel for NeatExpert {
         self.feature_columns = feature_columns;
         self.scaler = Some(scaler);
         self.dataset_rows = scaled.nrows();
+        let (train_indices, val_indices) = Self::split_train_val_indices(scaled.nrows());
+        let train_features = Self::slice_rows(&scaled, &train_indices);
+        let val_features = Self::slice_rows(&scaled, &val_indices);
+        let train_labels = Self::slice_labels(&labels, &train_indices);
+        let val_labels = Self::slice_labels(&labels, &val_indices);
+        self.train_rows = train_features.nrows();
+        self.val_rows = val_features.nrows();
+        self.runtime_backend = NEAT_RUNTIME_BACKEND.to_string();
 
-        let best = self.evolve_population(&scaled, &labels)?;
+        let best =
+            self.evolve_population(&train_features, &train_labels, &val_features, &val_labels)?;
         self.best_fitness = best.fitness;
         self.best_loss = best.loss;
         self.best_accuracy = best.accuracy;
@@ -699,9 +907,7 @@ impl ExpertModel for NeatExpert {
     }
 
     fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
-        if !self.fitted {
-            bail!("NEAT expert has not been fitted");
-        }
+        self.ensure_runtime_state_ready()?;
         ensure_feature_columns_match(&self.feature_columns, x)?;
         let (features, _) = feature_matrix_from_dataframe(x)?;
         let scaler = self.scaler.as_ref().context("NEAT scaler missing")?;
@@ -711,21 +917,19 @@ impl ExpertModel for NeatExpert {
     }
 
     fn save(&self, path: &Path) -> Result<()> {
-        if !self.fitted {
-            bail!("NEAT expert cannot be saved before fitting");
-        }
+        self.ensure_runtime_state_ready()?;
 
         std::fs::create_dir_all(path)
             .with_context(|| format!("create NEAT model directory {}", path.display()))?;
         write_json(
             &path.join(METADATA_FILE_NAME),
             &build_runtime_artifact_metadata(
-                "neat",
+                NEAT_MODEL_NAME,
                 ModelFamily::Evolutionary,
                 CapabilityState::Implemented,
                 self.feature_columns.clone(),
                 default_three_class_label_mapping(),
-                TrainingSummaryMetadata::new(self.dataset_rows, self.dataset_rows, 0),
+                TrainingSummaryMetadata::new(self.dataset_rows, self.train_rows, self.val_rows),
             ),
         )?;
         write_json(
@@ -744,6 +948,9 @@ impl ExpertModel for NeatExpert {
                 best_genome: self.best_genome.clone().context("NEAT genome missing")?,
                 fitted: self.fitted,
                 dataset_rows: self.dataset_rows,
+                train_rows: self.train_rows,
+                val_rows: self.val_rows,
+                runtime_backend: self.runtime_backend.clone(),
                 best_fitness: self.best_fitness,
                 best_loss: self.best_loss,
                 best_accuracy: self.best_accuracy,
@@ -761,7 +968,7 @@ impl ExpertModel for NeatExpert {
         let next_config = artifact.config;
         let next_generations = artifact.generations.max(8);
         let next_population_size = artifact.population_size.max(24);
-        let next_mutation_rate = artifact.mutation_rate.clamp(0.05, 1.5);
+        let next_mutation_rate = artifact.mutation_rate;
         let next_species_elitism = artifact.species_elitism.max(1);
         let next_compatibility_threshold = artifact.compatibility_threshold.max(0.25);
         let next_immigrant_fraction = artifact.immigrant_fraction.clamp(0.0, 0.4);
@@ -771,6 +978,9 @@ impl ExpertModel for NeatExpert {
         let next_best_genome = Some(artifact.best_genome);
         let next_fitted = artifact.fitted;
         let next_dataset_rows = artifact.dataset_rows;
+        let next_train_rows = artifact.train_rows;
+        let next_val_rows = artifact.val_rows;
+        let next_runtime_backend = artifact.runtime_backend;
         let next_best_fitness = artifact.best_fitness;
         let next_best_loss = artifact.best_loss;
         let next_best_accuracy = artifact.best_accuracy;
@@ -788,9 +998,246 @@ impl ExpertModel for NeatExpert {
         self.best_genome = next_best_genome;
         self.fitted = next_fitted;
         self.dataset_rows = next_dataset_rows;
+        self.train_rows = next_train_rows;
+        self.val_rows = next_val_rows;
+        self.runtime_backend = next_runtime_backend;
         self.best_fitness = next_best_fitness;
         self.best_loss = next_best_loss;
         self.best_accuracy = next_best_accuracy;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::statistical::common::read_json;
+    use polars::prelude::{DataFrame, NamedFrom, Series};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_model_dir(name: &str) -> std::path::PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be monotonic")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "forex_models_{name}_{}_{}",
+            std::process::id(),
+            stamp
+        ))
+    }
+
+    fn training_frame() -> Result<(DataFrame, Series)> {
+        let features = DataFrame::new(vec![
+            Series::new(
+                "f1".into(),
+                (0..32).map(|idx| idx as f64).collect::<Vec<_>>(),
+            )
+            .into(),
+            Series::new(
+                "f2".into(),
+                (0..32).map(|idx| (idx as f64) * 0.5).collect::<Vec<_>>(),
+            )
+            .into(),
+        ])?;
+        let labels = Series::new(
+            "target".into(),
+            (0..32)
+                .map(|idx| match idx % 3 {
+                    0 => -1,
+                    1 => 0,
+                    _ => 1,
+                })
+                .collect::<Vec<_>>(),
+        );
+        Ok((features, labels))
+    }
+
+    #[test]
+    fn neat_save_records_train_val_rows_and_runtime_backend() -> Result<()> {
+        let (features, labels) = training_frame()?;
+        let mut expert = NeatExpert::with_config(2, 24, 8);
+        expert.fit(&features, &labels)?;
+
+        let path = temp_model_dir("neat");
+        expert.save(&path)?;
+
+        let metadata: crate::runtime::artifacts::RuntimeArtifactMetadata =
+            read_json(&path.join(METADATA_FILE_NAME))?;
+        assert_eq!(metadata.training_summary.dataset_rows, 32);
+        assert_eq!(metadata.training_summary.train_rows, 26);
+        assert_eq!(metadata.training_summary.val_rows, 6);
+
+        let artifact: NeatArtifact = read_json(&path.join(NEAT_ARTIFACT_FILE_NAME))?;
+        assert_eq!(artifact.train_rows, 26);
+        assert_eq!(artifact.val_rows, 6);
+        assert_eq!(artifact.runtime_backend, NEAT_RUNTIME_BACKEND);
+
+        let _ = std::fs::remove_dir_all(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn neat_predict_runtime_reports_backend_details() -> Result<()> {
+        let (features, labels) = training_frame()?;
+        let mut expert = NeatExpert::with_config(2, 24, 8);
+        expert.fit(&features, &labels)?;
+
+        let predictions = expert.predict_runtime(&features)?;
+        assert_eq!(predictions.len(), 32);
+        assert_eq!(
+            predictions[0].metadata().execution_backend.as_deref(),
+            Some(NEAT_RUNTIME_BACKEND)
+        );
+        assert_eq!(predictions[0].metadata().degraded_reason, None);
+        Ok(())
+    }
+
+    #[test]
+    fn validate_loaded_artifact_rejects_inconsistent_train_val_rows() -> Result<()> {
+        let metadata = build_runtime_artifact_metadata(
+            NEAT_MODEL_NAME,
+            ModelFamily::Evolutionary,
+            CapabilityState::Implemented,
+            vec!["f1".to_string()],
+            default_three_class_label_mapping(),
+            TrainingSummaryMetadata::new(32, 26, 6),
+        );
+        let artifact = NeatArtifact {
+            config: build_neat_config(1),
+            generations: 8,
+            population_size: 24,
+            mutation_rate: 0.85,
+            species_elitism: 1,
+            compatibility_threshold: 2.5,
+            immigrant_fraction: 0.1,
+            seed: 42,
+            feature_columns: vec!["f1".to_string()],
+            scaler: FeatureScaler {
+                means: vec![0.0],
+                stds: vec![1.0],
+            },
+            best_genome: {
+                let mut rng = Xoroshiro128PlusPlus::seed_from_u64(42);
+                NeatGenome::fully_connected(build_neat_config(1), &mut rng)
+            },
+            fitted: true,
+            dataset_rows: 32,
+            train_rows: 32,
+            val_rows: 1,
+            runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
+            best_fitness: 0.5,
+            best_loss: 1.0,
+            best_accuracy: 0.5,
+        };
+
+        let err = NeatExpert::validate_loaded_artifact(&metadata, &artifact)
+            .expect_err("inconsistent train/val rows should be rejected");
+        assert!(err.to_string().contains("train_rows + val_rows"));
+        Ok(())
+    }
+
+    #[test]
+    fn validate_loaded_artifact_rejects_non_positive_scaler_stds() -> Result<()> {
+        let metadata = build_runtime_artifact_metadata(
+            NEAT_MODEL_NAME,
+            ModelFamily::Evolutionary,
+            CapabilityState::Implemented,
+            vec!["f1".to_string()],
+            default_three_class_label_mapping(),
+            TrainingSummaryMetadata::new(32, 26, 6),
+        );
+        let artifact = NeatArtifact {
+            config: build_neat_config(1),
+            generations: 8,
+            population_size: 24,
+            mutation_rate: 0.85,
+            species_elitism: 1,
+            compatibility_threshold: 2.5,
+            immigrant_fraction: 0.1,
+            seed: 42,
+            feature_columns: vec!["f1".to_string()],
+            scaler: FeatureScaler {
+                means: vec![0.0],
+                stds: vec![0.0],
+            },
+            best_genome: {
+                let mut rng = Xoroshiro128PlusPlus::seed_from_u64(42);
+                NeatGenome::fully_connected(build_neat_config(1), &mut rng)
+            },
+            fitted: true,
+            dataset_rows: 32,
+            train_rows: 26,
+            val_rows: 6,
+            runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
+            best_fitness: 0.5,
+            best_loss: 1.0,
+            best_accuracy: 0.5,
+        };
+
+        let err = NeatExpert::validate_loaded_artifact(&metadata, &artifact)
+            .expect_err("non-positive scaler stds should be rejected");
+        assert!(err.to_string().contains("non-positive stds"));
+        Ok(())
+    }
+
+    #[test]
+    fn validate_loaded_artifact_rejects_out_of_range_mutation_rate() -> Result<()> {
+        let metadata = build_runtime_artifact_metadata(
+            NEAT_MODEL_NAME,
+            ModelFamily::Evolutionary,
+            CapabilityState::Implemented,
+            vec!["f1".to_string()],
+            default_three_class_label_mapping(),
+            TrainingSummaryMetadata::new(32, 26, 6),
+        );
+        let artifact = NeatArtifact {
+            config: build_neat_config(1),
+            generations: 8,
+            population_size: 24,
+            mutation_rate: 1.75,
+            species_elitism: 1,
+            compatibility_threshold: 2.5,
+            immigrant_fraction: 0.1,
+            seed: 42,
+            feature_columns: vec!["f1".to_string()],
+            scaler: FeatureScaler {
+                means: vec![0.0],
+                stds: vec![1.0],
+            },
+            best_genome: {
+                let mut rng = Xoroshiro128PlusPlus::seed_from_u64(42);
+                NeatGenome::fully_connected(build_neat_config(1), &mut rng)
+            },
+            fitted: true,
+            dataset_rows: 32,
+            train_rows: 26,
+            val_rows: 6,
+            runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
+            best_fitness: 0.5,
+            best_loss: 1.0,
+            best_accuracy: 0.5,
+        };
+
+        let err = NeatExpert::validate_loaded_artifact(&metadata, &artifact)
+            .expect_err("out-of-range mutation rate should be rejected");
+        assert!(err
+            .to_string()
+            .contains("mutation rate is out of contract range"));
+        Ok(())
+    }
+
+    #[test]
+    fn predict_proba_rejects_missing_runtime_backend() -> Result<()> {
+        let (features, labels) = training_frame()?;
+        let mut expert = NeatExpert::with_config(2, 24, 8);
+        expert.fit(&features, &labels)?;
+        expert.runtime_backend.clear();
+
+        let err = expert
+            .predict_proba(&features)
+            .expect_err("missing runtime backend should fail early");
+        assert!(err.to_string().contains("runtime backend"));
         Ok(())
     }
 }

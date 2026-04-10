@@ -58,13 +58,53 @@ pub struct ModelCapability {
 
 impl ModelCapability {
     pub fn new(name: impl Into<String>, family: ModelFamily, state: CapabilityState) -> Self {
+        let name = name.into();
+        assert!(
+            !name.trim().is_empty(),
+            "model capability requires a non-empty name"
+        );
         Self {
-            name: name.into(),
+            name,
             family,
             state,
         }
     }
 }
+
+pub const KNOWN_MODEL_NAMES: &[&str] = &[
+    "lightgbm",
+    "xgboost",
+    "xgboost_rf",
+    "xgboost_dart",
+    "catboost",
+    "catboost_alt",
+    "sklears_tree",
+    "mlp",
+    "nbeats",
+    "tide",
+    "tabnet",
+    "kan",
+    "transformer",
+    "patchtst",
+    "timesnet",
+    "nbeatsx_nf",
+    "tide_nf",
+    "swarm_forecaster",
+    "elasticnet",
+    "bayes_logit",
+    "meta_blender",
+    "probability_calibrator",
+    "conformal_gate",
+    "meta_stack",
+    "genetic",
+    "neuro_evo",
+    "neat",
+    "exit_agent",
+    "online_pa",
+    "online_hoeffding",
+    "isolation_forest",
+    "dqn",
+];
 
 pub fn model_capability(name: &str) -> Option<ModelCapability> {
     let is_transformer_replica = name
@@ -170,6 +210,7 @@ pub fn model_capability(name: &str) -> Option<ModelCapability> {
 #[cfg(test)]
 mod tests {
     use super::{model_capability, CapabilityState, ModelCapability, ModelFamily};
+    use std::collections::HashSet;
 
     #[test]
     fn model_family_has_expected_variants() {
@@ -269,5 +310,23 @@ mod tests {
         let capability = model_capability("dqn").expect("dqn should resolve");
         assert_eq!(capability.family, ModelFamily::Rl);
         assert_eq!(capability.state, CapabilityState::Implemented);
+    }
+
+    #[test]
+    fn known_model_names_are_unique_and_resolve() {
+        let mut seen = HashSet::new();
+        for name in KNOWN_MODEL_NAMES {
+            assert!(seen.insert(*name), "duplicate known model name {name}");
+            assert!(
+                model_capability(name).is_some(),
+                "known model name {name} should resolve"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty name")]
+    fn model_capability_new_rejects_blank_name() {
+        let _ = ModelCapability::new("   ", ModelFamily::Tree, CapabilityState::Implemented);
     }
 }

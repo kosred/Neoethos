@@ -17,8 +17,13 @@ pub struct PredictionMetadata {
 
 impl PredictionMetadata {
     pub fn new(model_name: impl Into<String>, family: ModelFamily, state: CapabilityState) -> Self {
+        let model_name = model_name.into();
+        assert!(
+            !model_name.trim().is_empty(),
+            "runtime prediction metadata requires a non-empty model_name"
+        );
         Self {
-            model_name: model_name.into(),
+            model_name,
             family,
             state,
             execution_backend: None,
@@ -270,5 +275,11 @@ mod tests {
             metadata.degraded_reason.as_deref(),
             Some("native booster unavailable")
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "runtime prediction metadata requires a non-empty model_name")]
+    fn prediction_metadata_rejects_blank_model_name() {
+        let _ = PredictionMetadata::new("   ", ModelFamily::Tree, CapabilityState::Implemented);
     }
 }

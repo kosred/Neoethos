@@ -7,17 +7,24 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::{cmp::Ordering, f64::consts::PI};
 
-use crate::base::{build_runtime_artifact_metadata, ExpertModel};
+use crate::base::{
+    build_runtime_artifact_metadata, build_runtime_prediction_with_details,
+    three_class_runtime_confidence, ExpertModel,
+};
 use crate::runtime::artifacts::{
     default_three_class_label_mapping, RuntimeArtifactMetadata, TrainingSummaryMetadata,
 };
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
+use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
     ensure_feature_columns_match, feature_matrix_from_dataframe, read_json,
     remap_three_class_labels, softmax_rows, write_json, FeatureScaler, METADATA_FILE_NAME,
 };
 
 const NEURO_EVO_ARTIFACT_FILE_NAME: &str = "neuro_evo.json";
+const NEURO_EVO_MODEL_NAME: &str = "neuro_evo";
+const FALLBACK_BACKEND_NAME: &str = "simple_es_restart_cpu";
+const FALLBACK_DEGRADED_REASON: &str = "crfmnes_backend_degraded_to_simple_es";
 
 type NeuroEvoParams = (Array2<f32>, Vec<f32>, Array2<f32>, Vec<f32>);
 
@@ -166,9 +173,14 @@ struct NeuroEvoArtifact {
     population: usize,
     islands: usize,
     dataset_rows: usize,
+    train_rows: usize,
+    val_rows: usize,
     feature_columns: Vec<String>,
     scaler: FeatureScaler,
     params: Vec<f32>,
+    search_backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_degraded_reason: Option<String>,
     fitted: bool,
 }
 
@@ -182,12 +194,16 @@ impl Default for NeuroEvoArtifact {
             population: 16,
             islands: 1,
             dataset_rows: 0,
+            train_rows: 0,
+            val_rows: 0,
             feature_columns: Vec::new(),
             scaler: FeatureScaler {
                 means: Vec::new(),
                 stds: Vec::new(),
             },
             params: Vec::new(),
+            search_backend: FALLBACK_BACKEND_NAME.to_string(),
+            runtime_degraded_reason: Some(FALLBACK_DEGRADED_REASON.to_string()),
             fitted: false,
         }
     }
@@ -201,9 +217,13 @@ pub struct NeuroEvoExpert {
     population: usize,
     islands: usize,
     dataset_rows: usize,
+    train_rows: usize,
+    val_rows: usize,
     feature_columns: Vec<String>,
     scaler: Option<FeatureScaler>,
     params: Vec<f32>,
+    search_backend: String,
+    runtime_degraded_reason: Option<String>,
     fitted: bool,
 }
 
@@ -229,9 +249,13 @@ impl NeuroEvoExpert {
             population: 16,
             islands: 1,
             dataset_rows: 0,
+            train_rows: 0,
+            val_rows: 0,
             feature_columns: Vec::new(),
             scaler: None,
             params: vec![0.0; param_dim],
+            search_backend: FALLBACK_BACKEND_NAME.to_string(),
+            runtime_degraded_reason: Some(FALLBACK_DEGRADED_REASON.to_string()),
             fitted: false,
         }
     }
@@ -240,6 +264,37 @@ impl NeuroEvoExpert {
         self.population = population.max(4);
         self.islands = islands.max(1);
         self
+    }
+
+    fn split_train_val_indices(rows: usize) -> (Vec<usize>, Vec<usize>) {
+        if rows <= 4 {
+            return ((0..rows).collect(), Vec::new());
+        }
+
+        let val_rows = ((rows as f32) * 0.2).round() as usize;
+        let val_rows = val_rows.clamp(1, rows.saturating_sub(1));
+        let train_rows = rows - val_rows;
+
+        let train = (0..train_rows).collect::<Vec<_>>();
+        let val = (train_rows..rows).collect::<Vec<_>>();
+        (train, val)
+    }
+
+    fn slice_rows(features: &Array2<f32>, indices: &[usize]) -> Array2<f32> {
+        let mut sliced = Array2::<f32>::zeros((indices.len(), features.ncols()));
+        for (out_row, src_row) in indices.iter().copied().enumerate() {
+            for col in 0..features.ncols() {
+                sliced[(out_row, col)] = features[(src_row, col)];
+            }
+        }
+        sliced
+    }
+
+    fn slice_labels(labels: &[usize], indices: &[usize]) -> Vec<usize> {
+        indices
+            .iter()
+            .filter_map(|idx| labels.get(*idx).copied())
+            .collect::<Vec<_>>()
     }
 
     fn parameter_dim(input_dim: usize, hidden_dim: usize) -> usize {
@@ -281,9 +336,9 @@ impl NeuroEvoExpert {
     }
 
     fn validate_loaded_metadata(metadata: &RuntimeArtifactMetadata) -> Result<()> {
-        if metadata.model_name != "neuro_evo" {
+        if metadata.model_name != NEURO_EVO_MODEL_NAME {
             bail!(
-                "neuro-evo artifact model mismatch: expected neuro_evo, got {}",
+                "neuro-evo artifact model mismatch: expected {NEURO_EVO_MODEL_NAME}, got {}",
                 metadata.model_name
             );
         }
@@ -317,6 +372,9 @@ impl NeuroEvoExpert {
         {
             bail!("neuro-evo artifact training summary is inconsistent");
         }
+        if metadata.training_summary.train_rows == 0 {
+            bail!("neuro-evo artifact training summary must contain positive train_rows");
+        }
 
         Ok(())
     }
@@ -345,6 +403,9 @@ impl NeuroEvoExpert {
                 artifact.params.len()
             );
         }
+        if artifact.params.iter().any(|value| !value.is_finite()) {
+            bail!("neuro-evo artifact parameters contain non-finite values");
+        }
 
         if artifact.feature_columns.is_empty() {
             bail!("neuro-evo artifact must contain feature columns");
@@ -360,6 +421,17 @@ impl NeuroEvoExpert {
                 artifact.scaler.stds.len()
             );
         }
+        if artifact.scaler.means.iter().any(|value| !value.is_finite()) {
+            bail!("neuro-evo artifact scaler contains non-finite means");
+        }
+        if artifact
+            .scaler
+            .stds
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+        {
+            bail!("neuro-evo artifact scaler contains non-finite or non-positive stds");
+        }
 
         if artifact.population < 4 || artifact.islands == 0 || artifact.generations < 4 {
             bail!(
@@ -373,6 +445,15 @@ impl NeuroEvoExpert {
         if artifact.dataset_rows == 0 {
             bail!("neuro-evo artifact dataset rows must be greater than zero");
         }
+        if artifact.train_rows == 0 {
+            bail!("neuro-evo artifact train_rows must be greater than zero");
+        }
+        if artifact.train_rows + artifact.val_rows != artifact.dataset_rows {
+            bail!("neuro-evo artifact train_rows + val_rows must equal dataset_rows");
+        }
+        if artifact.search_backend.trim().is_empty() {
+            bail!("neuro-evo artifact must persist a runtime backend label");
+        }
 
         if metadata.feature_columns != artifact.feature_columns {
             bail!("neuro-evo artifact feature columns do not match runtime metadata");
@@ -380,6 +461,21 @@ impl NeuroEvoExpert {
 
         if metadata.training_summary.dataset_rows != artifact.dataset_rows {
             bail!("neuro-evo artifact dataset row count does not match metadata");
+        }
+        if metadata.training_summary.train_rows != artifact.train_rows
+            || metadata.training_summary.val_rows != artifact.val_rows
+        {
+            bail!("neuro-evo artifact training summary does not match metadata");
+        }
+        if artifact.search_backend == FALLBACK_BACKEND_NAME
+            && artifact.runtime_degraded_reason.as_deref() != Some(FALLBACK_DEGRADED_REASON)
+        {
+            bail!("neuro-evo artifact fallback backend must persist the fallback degraded reason");
+        }
+        if artifact.search_backend != FALLBACK_BACKEND_NAME
+            && artifact.runtime_degraded_reason.is_some()
+        {
+            bail!("neuro-evo artifact non-fallback backend may not persist a degraded reason");
         }
 
         Ok(())
@@ -437,6 +533,123 @@ impl NeuroEvoExpert {
             / params.len().max(1) as f64;
         Ok(loss + 1e-4 * l2)
     }
+
+    fn selection_loss_for_params(
+        &self,
+        params: &[f32],
+        train_features: &Array2<f32>,
+        train_labels: &[usize],
+        val_features: &Array2<f32>,
+        val_labels: &[usize],
+    ) -> Result<(f64, f64, f64)> {
+        let train_loss = self.loss_for_params(params, train_features, train_labels)?;
+        let val_loss = if val_labels.is_empty() {
+            train_loss
+        } else {
+            self.loss_for_params(params, val_features, val_labels)?
+        };
+        let selection_loss = if val_labels.is_empty() {
+            train_loss
+        } else {
+            0.65 * train_loss + 0.35 * val_loss
+        };
+        Ok((selection_loss, train_loss, val_loss))
+    }
+
+    fn runtime_details(&self) -> (Option<String>, Option<String>) {
+        if !self.fitted {
+            return (
+                Some("neuro_evo_unknown".to_string()),
+                Some("neuro_evo_not_fitted".to_string()),
+            );
+        }
+        if self.feature_columns.is_empty() {
+            return (
+                Some("neuro_evo_unknown".to_string()),
+                Some("neuro_evo_feature_schema_missing".to_string()),
+            );
+        }
+        if self.scaler.is_none() || self.params.is_empty() {
+            return (
+                Some("neuro_evo_unknown".to_string()),
+                Some("neuro_evo_runtime_state_incomplete".to_string()),
+            );
+        }
+        let backend = if self.search_backend.trim().is_empty() {
+            "neuro_evo_unknown".to_string()
+        } else {
+            self.search_backend.clone()
+        };
+        let degraded_reason = if backend == FALLBACK_BACKEND_NAME {
+            Some(FALLBACK_DEGRADED_REASON.to_string())
+        } else {
+            self.runtime_degraded_reason.clone()
+        };
+        (Some(backend), degraded_reason)
+    }
+
+    fn ensure_runtime_state_ready(&self) -> Result<()> {
+        if !self.fitted {
+            bail!("neuro-evo expert has not been fitted");
+        }
+        if self.feature_columns.is_empty() {
+            bail!("neuro-evo feature schema missing");
+        }
+        if self.scaler.is_none() {
+            bail!("neuro-evo scaler missing");
+        }
+        if self.params.is_empty() {
+            bail!("neuro-evo parameters missing");
+        }
+        if self.dataset_rows == 0 || self.train_rows == 0 {
+            bail!("neuro-evo training summary is incomplete");
+        }
+        if self.train_rows + self.val_rows != self.dataset_rows {
+            bail!("neuro-evo training summary is inconsistent");
+        }
+        let scaler = self.scaler.as_ref().context("neuro-evo scaler missing")?;
+        if scaler.means.len() != self.feature_columns.len()
+            || scaler.stds.len() != self.feature_columns.len()
+        {
+            bail!("neuro-evo scaler does not match feature schema");
+        }
+        if scaler.means.iter().any(|value| !value.is_finite()) {
+            bail!("neuro-evo scaler contains non-finite means");
+        }
+        if scaler
+            .stds
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+        {
+            bail!("neuro-evo scaler contains non-finite or non-positive stds");
+        }
+        if self.params.iter().any(|value| !value.is_finite()) {
+            bail!("neuro-evo parameters contain non-finite values");
+        }
+        Ok(())
+    }
+
+    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
+        self.ensure_runtime_state_ready()?;
+        let probabilities = self.predict_proba(x)?;
+        let (execution_backend, degraded_reason) = self.runtime_details();
+        let mut predictions = Vec::with_capacity(probabilities.nrows());
+        for row in probabilities.outer_iter() {
+            let row_values = [row[0], row[1], row[2]];
+            let (confidence, abstain_recommended) = three_class_runtime_confidence(row_values)?;
+            predictions.push(build_runtime_prediction_with_details(
+                NEURO_EVO_MODEL_NAME.to_string(),
+                ModelFamily::Evolutionary,
+                CapabilityState::Implemented,
+                row_values,
+                Some(confidence),
+                Some(abstain_recommended),
+                execution_backend.clone(),
+                degraded_reason.clone(),
+            )?);
+        }
+        Ok(predictions)
+    }
 }
 
 impl Default for NeuroEvoExpert {
@@ -462,9 +675,18 @@ impl ExpertModel for NeuroEvoExpert {
         self.feature_columns = feature_columns;
         self.scaler = Some(scaler.clone());
         self.dataset_rows = scaled.nrows();
+        let (train_indices, val_indices) = Self::split_train_val_indices(scaled.nrows());
+        let train_features = Self::slice_rows(&scaled, &train_indices);
+        let val_features = Self::slice_rows(&scaled, &val_indices);
+        let train_labels = Self::slice_labels(&labels, &train_indices);
+        let val_labels = Self::slice_labels(&labels, &val_indices);
+        self.train_rows = train_features.nrows();
+        self.val_rows = val_features.nrows();
+        self.search_backend = FALLBACK_BACKEND_NAME.to_string();
+        self.runtime_degraded_reason = Some(FALLBACK_DEGRADED_REASON.to_string());
         let param_dim = Self::parameter_dim(self.input_dim, self.hidden_dim);
         let mut best_params = vec![0.0_f32; param_dim];
-        let mut best_loss = f64::INFINITY;
+        let mut best_selection_loss = f64::INFINITY;
 
         for _ in 0..self.islands.max(1) {
             let mut optimizer = NeuroEvoOptimizer::new(param_dim, self.sigma, self.population);
@@ -476,17 +698,23 @@ impl ExpertModel for NeuroEvoExpert {
                         .iter()
                         .map(|value| *value as f32)
                         .collect::<Vec<_>>();
-                    let loss = self.loss_for_params(&candidate_f32, &scaled, &labels)?;
-                    if loss < best_loss {
-                        best_loss = loss;
+                    let (selection_loss, _train_loss, _val_loss) = self.selection_loss_for_params(
+                        &candidate_f32,
+                        &train_features,
+                        &train_labels,
+                        &val_features,
+                        &val_labels,
+                    )?;
+                    if selection_loss < best_selection_loss {
+                        best_selection_loss = selection_loss;
                         best_params = candidate_f32;
                     }
-                    fitness.push(-loss);
+                    fitness.push(-selection_loss);
                 }
                 optimizer.tell(fitness)?;
             }
 
-            if best_loss.is_infinite() {
+            if best_selection_loss.is_infinite() {
                 let best = optimizer.best_weights()?;
                 best_params = best.iter().map(|value| *value as f32).collect();
             }
@@ -498,9 +726,7 @@ impl ExpertModel for NeuroEvoExpert {
     }
 
     fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
-        if !self.fitted {
-            bail!("neuro-evo expert has not been fitted");
-        }
+        self.ensure_runtime_state_ready()?;
         ensure_feature_columns_match(&self.feature_columns, x)?;
         let (features, _) = feature_matrix_from_dataframe(x)?;
         let scaler = self.scaler.as_ref().context("neuro-evo scaler missing")?;
@@ -511,20 +737,18 @@ impl ExpertModel for NeuroEvoExpert {
     }
 
     fn save(&self, path: &Path) -> Result<()> {
-        if !self.fitted {
-            bail!("neuro-evo expert cannot be saved before fitting");
-        }
+        self.ensure_runtime_state_ready()?;
         std::fs::create_dir_all(path)
             .with_context(|| format!("create neuro-evo directory {}", path.display()))?;
         write_json(
             &path.join(METADATA_FILE_NAME),
             &build_runtime_artifact_metadata(
-                "neuro_evo",
+                NEURO_EVO_MODEL_NAME,
                 ModelFamily::Evolutionary,
                 CapabilityState::Implemented,
                 self.feature_columns.clone(),
                 default_three_class_label_mapping(),
-                TrainingSummaryMetadata::new(self.dataset_rows, self.dataset_rows, 0),
+                TrainingSummaryMetadata::new(self.dataset_rows, self.train_rows, self.val_rows),
             ),
         )?;
         write_json(
@@ -537,9 +761,13 @@ impl ExpertModel for NeuroEvoExpert {
                 population: self.population,
                 islands: self.islands,
                 dataset_rows: self.dataset_rows,
+                train_rows: self.train_rows,
+                val_rows: self.val_rows,
                 feature_columns: self.feature_columns.clone(),
                 scaler: self.scaler.clone().context("neuro-evo scaler missing")?,
                 params: self.params.clone(),
+                search_backend: self.search_backend.clone(),
+                runtime_degraded_reason: self.runtime_degraded_reason.clone(),
                 fitted: self.fitted,
             },
         )
@@ -558,9 +786,13 @@ impl ExpertModel for NeuroEvoExpert {
         let next_population = artifact.population.max(4);
         let next_islands = artifact.islands.max(1);
         let next_dataset_rows = artifact.dataset_rows;
+        let next_train_rows = artifact.train_rows;
+        let next_val_rows = artifact.val_rows;
         let next_feature_columns = artifact.feature_columns;
         let next_scaler = Some(artifact.scaler);
         let next_params = artifact.params;
+        let next_search_backend = artifact.search_backend;
+        let next_runtime_degraded_reason = artifact.runtime_degraded_reason;
         let next_fitted = artifact.fitted;
 
         self.input_dim = next_input_dim;
@@ -570,9 +802,13 @@ impl ExpertModel for NeuroEvoExpert {
         self.population = next_population;
         self.islands = next_islands;
         self.dataset_rows = next_dataset_rows;
+        self.train_rows = next_train_rows;
+        self.val_rows = next_val_rows;
         self.feature_columns = next_feature_columns;
         self.scaler = next_scaler;
         self.params = next_params;
+        self.search_backend = next_search_backend;
+        self.runtime_degraded_reason = next_runtime_degraded_reason;
         self.fitted = next_fitted;
         Ok(())
     }
@@ -630,7 +866,17 @@ mod tests {
         let metadata: crate::runtime::artifacts::RuntimeArtifactMetadata =
             read_json(&path.join(METADATA_FILE_NAME))?;
         assert_eq!(metadata.training_summary.dataset_rows, 32);
-        assert_eq!(metadata.training_summary.train_rows, 32);
+        assert_eq!(metadata.training_summary.train_rows, 26);
+        assert_eq!(metadata.training_summary.val_rows, 6);
+
+        let artifact: NeuroEvoArtifact = read_json(&path.join(NEURO_EVO_ARTIFACT_FILE_NAME))?;
+        assert_eq!(artifact.train_rows, 26);
+        assert_eq!(artifact.val_rows, 6);
+        assert_eq!(artifact.search_backend, FALLBACK_BACKEND_NAME);
+        assert_eq!(
+            artifact.runtime_degraded_reason.as_deref(),
+            Some(FALLBACK_DEGRADED_REASON)
+        );
 
         let _ = std::fs::remove_dir_all(&path);
         Ok(())
@@ -657,5 +903,168 @@ mod tests {
         assert_eq!(proba.nrows(), 2);
         assert_eq!(proba.ncols(), 3);
         Ok(())
+    }
+
+    #[test]
+    fn neuro_evo_predict_runtime_reports_truthful_fallback_backend() -> Result<()> {
+        let scaler = FeatureScaler {
+            means: vec![0.0, 0.0],
+            stds: vec![1.0, 1.0],
+        };
+        let mut expert = NeuroEvoExpert::with_config(2, 8, 0.25, 4);
+        expert.feature_columns = vec!["f1".to_string(), "f2".to_string()];
+        expert.scaler = Some(scaler);
+        expert.params = vec![0.0; NeuroEvoExpert::parameter_dim(2, 8)];
+        expert.dataset_rows = 32;
+        expert.train_rows = 26;
+        expert.val_rows = 6;
+        expert.search_backend = FALLBACK_BACKEND_NAME.to_string();
+        expert.runtime_degraded_reason = Some(FALLBACK_DEGRADED_REASON.to_string());
+        expert.fitted = true;
+
+        let df = DataFrame::new(vec![
+            Series::new("f1".into(), vec![1.0_f64, 2.0]).into(),
+            Series::new("f2".into(), vec![0.5_f64, 1.5]).into(),
+        ])?;
+
+        let predictions = expert.predict_runtime(&df)?;
+        assert_eq!(predictions.len(), 2);
+        assert_eq!(
+            predictions[0].metadata().execution_backend.as_deref(),
+            Some(FALLBACK_BACKEND_NAME)
+        );
+        assert_eq!(
+            predictions[0].metadata().degraded_reason.as_deref(),
+            Some(FALLBACK_DEGRADED_REASON)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validate_loaded_artifact_rejects_inconsistent_train_val_rows() -> Result<()> {
+        let metadata = build_runtime_artifact_metadata(
+            NEURO_EVO_MODEL_NAME,
+            ModelFamily::Evolutionary,
+            CapabilityState::Implemented,
+            vec!["f1".to_string()],
+            default_three_class_label_mapping(),
+            TrainingSummaryMetadata::new(32, 26, 6),
+        );
+        let artifact = NeuroEvoArtifact {
+            input_dim: 1,
+            hidden_dim: 8,
+            sigma: 0.25,
+            generations: 4,
+            population: 4,
+            islands: 1,
+            dataset_rows: 32,
+            train_rows: 32,
+            val_rows: 1,
+            feature_columns: vec!["f1".to_string()],
+            scaler: FeatureScaler {
+                means: vec![0.0],
+                stds: vec![1.0],
+            },
+            params: vec![0.0; NeuroEvoExpert::parameter_dim(1, 8)],
+            search_backend: FALLBACK_BACKEND_NAME.to_string(),
+            runtime_degraded_reason: Some(FALLBACK_DEGRADED_REASON.to_string()),
+            fitted: true,
+        };
+
+        let err = NeuroEvoExpert::validate_loaded_artifact(&metadata, &artifact)
+            .expect_err("inconsistent train/val rows should be rejected");
+        assert!(err.to_string().contains("train_rows + val_rows"));
+        Ok(())
+    }
+
+    #[test]
+    fn validate_loaded_artifact_rejects_fallback_backend_without_reason() -> Result<()> {
+        let metadata = build_runtime_artifact_metadata(
+            NEURO_EVO_MODEL_NAME,
+            ModelFamily::Evolutionary,
+            CapabilityState::Implemented,
+            vec!["f1".to_string()],
+            default_three_class_label_mapping(),
+            TrainingSummaryMetadata::new(32, 26, 6),
+        );
+        let artifact = NeuroEvoArtifact {
+            input_dim: 1,
+            hidden_dim: 8,
+            sigma: 0.25,
+            generations: 4,
+            population: 4,
+            islands: 1,
+            dataset_rows: 32,
+            train_rows: 26,
+            val_rows: 6,
+            feature_columns: vec!["f1".to_string()],
+            scaler: FeatureScaler {
+                means: vec![0.0],
+                stds: vec![1.0],
+            },
+            params: vec![0.0; NeuroEvoExpert::parameter_dim(1, 8)],
+            search_backend: FALLBACK_BACKEND_NAME.to_string(),
+            runtime_degraded_reason: None,
+            fitted: true,
+        };
+
+        let err = NeuroEvoExpert::validate_loaded_artifact(&metadata, &artifact)
+            .expect_err("fallback backend without degraded reason should be rejected");
+        assert!(err.to_string().contains("fallback degraded reason"));
+        Ok(())
+    }
+
+    #[test]
+    fn validate_loaded_artifact_rejects_non_fallback_backend_with_degraded_reason() -> Result<()> {
+        let metadata = build_runtime_artifact_metadata(
+            NEURO_EVO_MODEL_NAME,
+            ModelFamily::Evolutionary,
+            CapabilityState::Implemented,
+            vec!["f1".to_string()],
+            default_three_class_label_mapping(),
+            TrainingSummaryMetadata::new(32, 26, 6),
+        );
+        let artifact = NeuroEvoArtifact {
+            input_dim: 1,
+            hidden_dim: 8,
+            sigma: 0.25,
+            generations: 4,
+            population: 4,
+            islands: 1,
+            dataset_rows: 32,
+            train_rows: 26,
+            val_rows: 6,
+            feature_columns: vec!["f1".to_string()],
+            scaler: FeatureScaler {
+                means: vec![0.0],
+                stds: vec![1.0],
+            },
+            params: vec![0.0; NeuroEvoExpert::parameter_dim(1, 8)],
+            search_backend: "crfmnes_cpu".to_string(),
+            runtime_degraded_reason: Some("stale_degraded_reason".to_string()),
+            fitted: true,
+        };
+
+        let err = NeuroEvoExpert::validate_loaded_artifact(&metadata, &artifact)
+            .expect_err("non-fallback backend with degraded reason should be rejected");
+        assert!(err
+            .to_string()
+            .contains("non-fallback backend may not persist a degraded reason"));
+        Ok(())
+    }
+
+    #[test]
+    fn predict_proba_rejects_incomplete_runtime_state() {
+        let expert = NeuroEvoExpert::with_config(2, 8, 0.25, 4);
+        let df = DataFrame::new(vec![
+            Series::new("f1".into(), vec![1.0_f64, 2.0]).into(),
+            Series::new("f2".into(), vec![0.5_f64, 1.5]).into(),
+        ])
+        .expect("valid dataframe");
+
+        let err = expert
+            .predict_proba(&df)
+            .expect_err("incomplete runtime state should fail early");
+        assert!(err.to_string().contains("not been fitted"));
     }
 }

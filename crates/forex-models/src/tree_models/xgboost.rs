@@ -451,6 +451,97 @@ impl XGBoostExpert {
             .unwrap_or_else(|| TrainingSummaryMetadata::new(0, 0, 0))
     }
 
+    fn ensure_runtime_state_ready(&self) -> Result<()> {
+        if self.feature_columns.is_empty() {
+            bail!("XGBoost runtime state is missing persisted feature columns");
+        }
+        let summary = self
+            .training_summary
+            .as_ref()
+            .context("XGBoost runtime state is missing training summary metadata")?;
+        if summary.dataset_rows == 0 {
+            bail!("XGBoost runtime state has zero dataset_rows in training summary");
+        }
+        if summary.dataset_rows != summary.train_rows + summary.val_rows {
+            bail!(
+                "XGBoost runtime state has inconsistent training summary: dataset_rows={} train_rows={} val_rows={}",
+                summary.dataset_rows,
+                summary.train_rows,
+                summary.val_rows
+            );
+        }
+        if self._model.is_none() && self.local_fallback.is_none() {
+            bail!("XGBoost runtime state has neither a native booster nor a local surrogate");
+        }
+        if let Some(fallback) = self.local_fallback.as_ref() {
+            validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
+        }
+        Ok(())
+    }
+
+    fn validate_runtime_artifact(
+        artifact: &XGBoostRuntimeArtifact,
+        expected_feature_columns: &[String],
+        expected_training_summary: &TrainingSummaryMetadata,
+    ) -> Result<()> {
+        if artifact.feature_columns.is_empty() {
+            bail!("XGBoost runtime artifact must contain feature columns");
+        }
+        if artifact.feature_columns != expected_feature_columns {
+            bail!(
+                "XGBoost runtime artifact feature-columns mismatch: expected {:?}, got {:?}",
+                expected_feature_columns,
+                artifact.feature_columns
+            );
+        }
+        if artifact.training_summary.dataset_rows != expected_training_summary.dataset_rows
+            || artifact.training_summary.train_rows != expected_training_summary.train_rows
+            || artifact.training_summary.val_rows != expected_training_summary.val_rows
+        {
+            bail!(
+                "XGBoost runtime artifact training-summary mismatch: expected {:?}, got {:?}",
+                expected_training_summary,
+                artifact.training_summary
+            );
+        }
+        if artifact.training_summary.dataset_rows == 0 {
+            bail!("XGBoost runtime artifact must record non-zero dataset_rows");
+        }
+        if artifact.training_summary.dataset_rows
+            != artifact.training_summary.train_rows + artifact.training_summary.val_rows
+        {
+            bail!("XGBoost runtime artifact training summary is inconsistent");
+        }
+        if !artifact.probability_temperature.is_finite() || artifact.probability_temperature <= 0.0
+        {
+            bail!("XGBoost runtime artifact probability_temperature must be finite and positive");
+        }
+        if artifact.num_parallel_tree == 0 {
+            bail!("XGBoost runtime artifact num_parallel_tree must be greater than zero");
+        }
+        for (field, value) in [
+            ("booster_variant", artifact.booster_variant.as_str()),
+            (
+                "configured_tree_method",
+                artifact.configured_tree_method.as_str(),
+            ),
+            (
+                "effective_tree_method",
+                artifact.effective_tree_method.as_str(),
+            ),
+            ("objective", artifact.objective.as_str()),
+            ("predictor", artifact.predictor.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("XGBoost runtime artifact `{field}` may not be blank");
+            }
+        }
+        if artifact.resolved_params.is_empty() {
+            bail!("XGBoost runtime artifact must persist resolved runtime params");
+        }
+        Ok(())
+    }
+
     fn build_local_fallback_artifact(
         &self,
         x: &DataFrame,
@@ -669,6 +760,7 @@ impl ExpertModel for XGBoostExpert {
     }
 
     fn save(&self, path: &Path) -> Result<()> {
+        self.ensure_runtime_state_ready()?;
         #[cfg(feature = "xgboost")]
         {
             std::fs::create_dir_all(path)
@@ -681,6 +773,11 @@ impl ExpertModel for XGBoostExpert {
             let (model_path, metadata_path) = tree_artifact_paths(path, XGBOOST_MODEL_FILE_NAME);
             write_runtime_metadata(&metadata_path, &metadata)?;
             if let Some(model) = self._model.as_ref() {
+                Self::validate_runtime_artifact(
+                    &self.runtime_artifact(),
+                    &self.feature_columns,
+                    &self.stored_training_summary(),
+                )?;
                 model
                     .save(&model_path)
                     .with_context(|| format!("save XGBoost artifact {}", model_path.display()))?;
@@ -730,6 +827,11 @@ impl ExpertModel for XGBoostExpert {
                 validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
             }
             if let Some(artifact) = Self::read_runtime_artifact(path)? {
+                Self::validate_runtime_artifact(
+                    &artifact,
+                    &metadata_feature_columns,
+                    &metadata_training_summary,
+                )?;
                 let XGBoostRuntimeArtifact {
                     configured_params,
                     resolved_params,
@@ -1015,6 +1117,61 @@ mod tests {
             row[0] > 0.6_f32,
             "expected lower temperature to sharpen the dominant class, got {row:?}"
         );
+    }
+
+    #[test]
+    fn xgboost_validate_runtime_artifact_rejects_invalid_probability_temperature() {
+        let artifact = super::XGBoostRuntimeArtifact {
+            configured_params: HashMap::new(),
+            resolved_params: HashMap::from([(
+                "tree_method".to_string(),
+                ParamValue::String("hist".to_string()),
+            )]),
+            feature_columns: vec!["momentum".to_string()],
+            training_summary: TrainingSummaryMetadata::new(9, 9, 0),
+            device_pref: super::DevicePreference::Cpu,
+            booster_variant: "gbtree".to_string(),
+            configured_tree_method: "hist".to_string(),
+            effective_tree_method: "hist".to_string(),
+            objective: "multi:softprob".to_string(),
+            predictor: "cpu_predictor".to_string(),
+            num_parallel_tree: 1,
+            probability_temperature: 0.0,
+            gpu_only: false,
+            cpu_threads: Some(4),
+        };
+
+        let err = XGBoostExpert::validate_runtime_artifact(
+            &artifact,
+            &["momentum".to_string()],
+            &TrainingSummaryMetadata::new(9, 9, 0),
+        )
+        .expect_err("non-positive probability_temperature should fail");
+        assert!(err.to_string().contains("probability_temperature"));
+    }
+
+    #[test]
+    fn xgboost_save_rejects_missing_training_summary() {
+        let mut expert = XGBoostExpert::new(11, None);
+        expert.feature_columns = vec!["momentum".to_string()];
+        expert.local_fallback = Some(super::TreeLocalFallbackArtifact {
+            feature_columns: vec!["momentum".to_string()],
+            class_centroids: vec![vec![0.1], vec![0.2], vec![0.3]],
+            class_variances: vec![vec![1.0], vec![1.0], vec![1.0]],
+            class_support: vec![1, 1, 1],
+            training_summary: TrainingSummaryMetadata::new(9, 9, 0),
+            distance_location: 0.0,
+            distance_scale: 1.0,
+            surrogate_kind: "gaussian_centroid".to_string(),
+        });
+        let artifact_dir = unique_temp_dir("xgboost-missing-summary");
+
+        let err = expert
+            .save(&artifact_dir)
+            .expect_err("missing training summary should fail");
+        assert!(err.to_string().contains("training summary"));
+
+        let _ = std::fs::remove_dir_all(&artifact_dir);
     }
 
     #[test]

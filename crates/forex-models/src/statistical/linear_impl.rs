@@ -2,11 +2,11 @@ use anyhow::{bail, Context, Result};
 use ndarray::{Array1, Array2, Axis};
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::base::{
-    build_runtime_artifact_metadata, build_runtime_prediction, canonical_three_class_label_mapping,
-    three_class_runtime_confidence, ExpertModel,
+    build_runtime_artifact_metadata, build_runtime_prediction_with_details,
+    canonical_three_class_label_mapping, three_class_runtime_confidence, ExpertModel,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
@@ -45,17 +45,87 @@ fn sign(value: f32) -> f32 {
 }
 
 fn split_train_val_indices(rows: usize) -> (Vec<usize>, Vec<usize>) {
-    if rows <= 4 {
+    if rows <= 6 {
         return ((0..rows).collect(), Vec::new());
     }
 
     let val_rows = ((rows as f32) * 0.2).round() as usize;
-    let val_rows = val_rows.clamp(1, rows.saturating_sub(1));
-    let train_rows = rows - val_rows;
+    let val_rows = val_rows.clamp(1, rows.saturating_sub(2));
+    let embargo_rows = if rows >= 20 {
+        ((rows as f32) * 0.02).round() as usize
+    } else {
+        0
+    };
+    let embargo_rows = embargo_rows.clamp(0, rows.saturating_sub(val_rows + 1));
+    let train_rows = rows.saturating_sub(val_rows + embargo_rows);
+
+    if train_rows == 0 {
+        return ((0..rows).collect(), Vec::new());
+    }
 
     let train = (0..train_rows).collect::<Vec<_>>();
-    let val = (train_rows..rows).collect::<Vec<_>>();
+    let val = (train_rows + embargo_rows..rows).collect::<Vec<_>>();
     (train, val)
+}
+
+fn staged_linear_artifact_dir(path: &Path) -> PathBuf {
+    path.with_extension("tmp_linear_artifact")
+}
+
+fn backup_linear_artifact_dir(path: &Path) -> PathBuf {
+    path.with_extension("bak_linear_artifact")
+}
+
+fn cleanup_linear_artifact_dir(path: &Path) -> Result<()> {
+    if path.exists() {
+        std::fs::remove_dir_all(path)
+            .with_context(|| format!("remove linear artifact directory {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn replace_linear_artifact_dir(staged_path: &Path, target_path: &Path) -> Result<()> {
+    let backup_path = backup_linear_artifact_dir(target_path);
+    cleanup_linear_artifact_dir(&backup_path)?;
+    if target_path.exists() {
+        std::fs::rename(target_path, &backup_path).with_context(|| {
+            format!(
+                "move previous linear artifact into backup {}",
+                backup_path.display()
+            )
+        })?;
+    }
+    if let Err(error) = std::fs::rename(staged_path, target_path) {
+        if backup_path.exists() {
+            let _ = std::fs::rename(&backup_path, target_path);
+        }
+        bail!(
+            "rename staged linear artifact into {} failed: {}",
+            target_path.display(),
+            error
+        );
+    }
+    cleanup_linear_artifact_dir(&backup_path)?;
+    Ok(())
+}
+
+fn with_staged_linear_artifact_dir<F>(path: &Path, writer: F) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    let staged_path = staged_linear_artifact_dir(path);
+    cleanup_linear_artifact_dir(&staged_path)?;
+    std::fs::create_dir_all(&staged_path).with_context(|| {
+        format!(
+            "create staged linear artifact dir {}",
+            staged_path.display()
+        )
+    })?;
+    if let Err(error) = writer(&staged_path) {
+        let _ = cleanup_linear_artifact_dir(&staged_path);
+        return Err(error);
+    }
+    replace_linear_artifact_dir(&staged_path, path)
 }
 
 fn logits_from_features(
@@ -134,13 +204,16 @@ fn runtime_predictions(
     for row in probabilities.outer_iter() {
         let row_values = [row[0], row[1], row[2]];
         let (confidence, abstain_recommended) = three_class_runtime_confidence(row_values)?;
-        predictions.push(build_runtime_prediction(
-            model_name.to_string(),
+        predictions.push(build_runtime_prediction_with_details(
+            model_name,
             ModelFamily::Meta,
             CapabilityState::Implemented,
             row_values,
             Some(confidence),
             Some(abstain_recommended),
+            Some(format!("{model_name}_softmax_cpu")),
+            abstain_recommended
+                .then(|| "shared three-class confidence gate recommended abstain".to_string()),
         )?);
     }
 
@@ -193,6 +266,11 @@ fn validate_runtime_metadata(
             metadata.training_summary.dataset_rows
         );
     }
+    if metadata.training_summary.train_rows == 0 {
+        bail!(
+            "runtime metadata mismatch for {expected_model_name}: training rows must be non-zero"
+        );
+    }
     if metadata.training_summary.train_rows + metadata.training_summary.val_rows
         != metadata.training_summary.dataset_rows
     {
@@ -241,10 +319,35 @@ fn validate_linear_artifact(artifact: &LinearSoftmaxArtifact) -> Result<()> {
             artifact.feature_columns.len()
         );
     }
+    if artifact.runtime_metadata.is_none() {
+        bail!("linear artifact must persist runtime metadata");
+    }
+    validate_runtime_metadata(
+        artifact
+            .runtime_metadata
+            .as_ref()
+            .expect("checked runtime metadata presence"),
+        &artifact.model_name,
+        &artifact.feature_columns,
+        artifact.dataset_rows,
+    )?;
+    if !artifact.alpha.is_finite() || artifact.alpha < 0.0 {
+        bail!("linear artifact alpha must be finite and non-negative");
+    }
+    if !artifact.l1_ratio.is_finite() || !(0.0..=1.0).contains(&artifact.l1_ratio) {
+        bail!("linear artifact l1_ratio must be finite and inside [0, 1]");
+    }
+    if !artifact.learning_rate.is_finite() || artifact.learning_rate <= 0.0 {
+        bail!("linear artifact learning_rate must be finite and positive");
+    }
+    if artifact.epochs == 0 {
+        bail!("linear artifact epochs must be positive");
+    }
     if artifact.weights.iter().any(|value| !value.is_finite())
         || artifact.bias.iter().any(|value| !value.is_finite())
         || artifact.scaler.means.iter().any(|value| !value.is_finite())
         || artifact.scaler.stds.iter().any(|value| !value.is_finite())
+        || artifact.scaler.stds.iter().any(|value| *value <= 0.0)
     {
         bail!("linear artifact contains non-finite parameters");
     }
@@ -454,6 +557,16 @@ impl ElasticNetExpert {
             .model
             .as_ref()
             .context("ElasticNetExpert not trained")?;
+        let runtime_metadata = model
+            .runtime_metadata
+            .as_ref()
+            .context("ElasticNetExpert runtime metadata missing")?;
+        validate_runtime_metadata(
+            runtime_metadata,
+            &model.model_name,
+            &model.feature_columns,
+            model.dataset_rows,
+        )?;
         let probabilities = predict_linear_softmax(model, x)?;
         runtime_predictions(&model.model_name, &probabilities)
     }
@@ -497,8 +610,10 @@ impl ExpertModel for ElasticNetExpert {
             &model.feature_columns,
             model.dataset_rows,
         )?;
-        write_json(&path.join(MODEL_FILE_NAME), model)?;
-        write_json(&path.join(METADATA_FILE_NAME), &runtime_metadata)
+        with_staged_linear_artifact_dir(path, |staged_path| {
+            write_json(&staged_path.join(MODEL_FILE_NAME), model)?;
+            write_json(&staged_path.join(METADATA_FILE_NAME), &runtime_metadata)
+        })
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
@@ -583,8 +698,10 @@ impl ExpertModel for LogisticExpert {
             &model.feature_columns,
             model.dataset_rows,
         )?;
-        write_json(&path.join(MODEL_FILE_NAME), model)?;
-        write_json(&path.join(METADATA_FILE_NAME), &runtime_metadata)
+        with_staged_linear_artifact_dir(path, |staged_path| {
+            write_json(&staged_path.join(MODEL_FILE_NAME), model)?;
+            write_json(&staged_path.join(METADATA_FILE_NAME), &runtime_metadata)
+        })
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
@@ -615,6 +732,16 @@ impl ExpertModel for LogisticExpert {
 impl LogisticExpert {
     pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
         let model = self.model.as_ref().context("LogisticExpert not trained")?;
+        let runtime_metadata = model
+            .runtime_metadata
+            .as_ref()
+            .context("LogisticExpert runtime metadata missing")?;
+        validate_runtime_metadata(
+            runtime_metadata,
+            &model.model_name,
+            &model.feature_columns,
+            model.dataset_rows,
+        )?;
         let probabilities = predict_linear_softmax(model, x)?;
         runtime_predictions(&model.model_name, &probabilities)
     }
@@ -704,11 +831,110 @@ mod tests {
         let (expected_confidence, expected_abstain) =
             three_class_runtime_confidence([0.58, 0.20, 0.22])?;
 
-        assert!(
-            (prediction.confidence().expect("confidence") - expected_confidence).abs() < 1e-6
-        );
+        assert!((prediction.confidence().expect("confidence") - expected_confidence).abs() < 1e-6);
         assert_eq!(prediction.abstain_recommended(), Some(expected_abstain));
         Ok(())
+    }
+
+    #[test]
+    fn runtime_predictions_persist_linear_backend_details() -> Result<()> {
+        let probabilities = Array2::from_shape_vec((1, 3), vec![0.58_f32, 0.20, 0.22])?;
+        let prediction = runtime_predictions("logistic", &probabilities)?
+            .into_iter()
+            .next()
+            .expect("one runtime prediction");
+
+        assert_eq!(
+            prediction.metadata().execution_backend.as_deref(),
+            Some("logistic_softmax_cpu")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn split_train_val_indices_leaves_temporal_embargo_gap() {
+        let (train, val) = split_train_val_indices(50);
+        assert!(!val.is_empty(), "validation split should be present");
+        let last_train = *train.last().expect("train rows");
+        let first_val = *val.first().expect("val rows");
+        assert!(
+            first_val > last_train + 1,
+            "expected embargo gap between train and val"
+        );
+    }
+
+    #[test]
+    fn validate_linear_artifact_rejects_missing_runtime_metadata() {
+        let artifact = LinearSoftmaxArtifact {
+            weights: Array2::zeros((2, 3)),
+            bias: Array1::zeros(3),
+            scaler: FeatureScaler {
+                means: vec![0.0, 0.0],
+                stds: vec![1.0, 1.0],
+            },
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            dataset_rows: 8,
+            runtime_metadata: None,
+            alpha: 0.01,
+            l1_ratio: 0.0,
+            learning_rate: 0.05,
+            epochs: 64,
+            model_name: "logistic".to_string(),
+        };
+
+        let err = validate_linear_artifact(&artifact)
+            .expect_err("artifact without runtime metadata should fail");
+        assert!(err.to_string().contains("runtime metadata"));
+    }
+
+    #[test]
+    fn validate_linear_artifact_rejects_non_positive_scaler_stds() {
+        let artifact = LinearSoftmaxArtifact {
+            weights: Array2::zeros((2, 3)),
+            bias: Array1::zeros(3),
+            scaler: FeatureScaler {
+                means: vec![0.0, 0.0],
+                stds: vec![1.0, 0.0],
+            },
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            dataset_rows: 8,
+            runtime_metadata: Some(runtime_metadata(
+                "logistic",
+                vec!["f1".to_string(), "f2".to_string()],
+                8,
+                6,
+                2,
+            )),
+            alpha: 0.01,
+            l1_ratio: 0.0,
+            learning_rate: 0.05,
+            epochs: 64,
+            model_name: "logistic".to_string(),
+        };
+
+        let err = validate_linear_artifact(&artifact)
+            .expect_err("artifact with non-positive scaler std should fail");
+        assert!(err.to_string().contains("non-finite parameters"));
+    }
+
+    #[test]
+    fn validate_runtime_metadata_rejects_zero_train_rows() {
+        let metadata = runtime_metadata(
+            "logistic",
+            vec!["f1".to_string(), "f2".to_string()],
+            8,
+            0,
+            8,
+        );
+
+        let err = validate_runtime_metadata(
+            &metadata,
+            "logistic",
+            &["f1".to_string(), "f2".to_string()],
+            8,
+        )
+        .expect_err("zero train rows must fail");
+        assert!(err.to_string().contains("training rows must be non-zero"));
     }
 
     #[test]

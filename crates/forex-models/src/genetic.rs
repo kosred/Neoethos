@@ -1,4 +1,11 @@
-use crate::base::{dataframe_to_float32_array, feature_columns_from_dataframe};
+use crate::base::{
+    build_runtime_artifact_metadata, build_runtime_prediction_with_details,
+    canonical_three_class_label_mapping, dataframe_to_float32_array,
+    feature_columns_from_dataframe, three_class_runtime_confidence, ExpertModel,
+};
+use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
+use crate::runtime::capabilities::{CapabilityState, ModelFamily};
+use crate::runtime::prediction::RuntimePrediction;
 use anyhow::{bail, Context, Result};
 use chrono::{Duration, TimeZone, Utc};
 use forex_data::{FeatureFrame, Ohlcv};
@@ -17,6 +24,8 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 
 const ARTIFACT_FILE_NAME: &str = "genetic_portfolio.json";
+const METADATA_FILE_NAME: &str = "metadata.json";
+const MODEL_NAME: &str = "genetic";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum GeneticBackendMode {
@@ -44,6 +53,8 @@ struct GeneticArtifact {
     tournament_size: usize,
     best_fitness: f64,
     portfolio: Vec<Gene>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_metadata: Option<RuntimeArtifactMetadata>,
 }
 
 impl Default for GeneticArtifact {
@@ -66,6 +77,7 @@ impl Default for GeneticArtifact {
             tournament_size: 5,
             best_fitness: 0.0,
             portfolio: Vec::new(),
+            runtime_metadata: None,
         }
     }
 }
@@ -89,6 +101,7 @@ pub struct GeneticStrategyExpert {
     tournament_size: usize,
     portfolio: Vec<Gene>,
     best_fitness: f64,
+    runtime_metadata: Option<RuntimeArtifactMetadata>,
 }
 
 impl GeneticStrategyExpert {
@@ -111,6 +124,7 @@ impl GeneticStrategyExpert {
             tournament_size: (population_size / 10).max(3),
             portfolio: Vec::new(),
             best_fitness: 0.0,
+            runtime_metadata: None,
         })
     }
 
@@ -341,6 +355,20 @@ impl GeneticStrategyExpert {
         }
     }
 
+    fn split_label_train_val_indices(row_count: usize) -> (Vec<usize>, Vec<usize>) {
+        if row_count <= 4 {
+            return ((0..row_count).collect(), Vec::new());
+        }
+
+        let val_rows = ((row_count as f32) * 0.2).round() as usize;
+        let val_rows = val_rows.clamp(1, row_count.saturating_sub(1));
+        let train_rows = row_count - val_rows;
+
+        let train = (0..train_rows).collect::<Vec<_>>();
+        let val = (train_rows..row_count).collect::<Vec<_>>();
+        (train, val)
+    }
+
     fn slice_feature_frame(features: &FeatureFrame, indices: &[usize]) -> FeatureFrame {
         let timestamps = indices
             .iter()
@@ -387,6 +415,13 @@ impl GeneticStrategyExpert {
                     .collect::<Vec<_>>()
             }),
         }
+    }
+
+    fn slice_labels(labels: &[i32], indices: &[usize]) -> Vec<i32> {
+        indices
+            .iter()
+            .filter_map(|idx| labels.get(*idx).copied())
+            .collect::<Vec<_>>()
     }
 
     fn train_with_discovery(&self, features: &FeatureFrame, ohlcv: &Ohlcv) -> Result<Vec<Gene>> {
@@ -494,6 +529,13 @@ impl GeneticStrategyExpert {
         if n_indicators == 0 {
             bail!("genetic label-search requires at least one feature column");
         }
+        let (train_indices, val_indices) = Self::split_label_train_val_indices(labels.len());
+        let train_features = Self::slice_feature_frame(features, &train_indices);
+        let train_labels = Self::slice_labels(&labels, &train_indices);
+        let val_features =
+            (!val_indices.is_empty()).then(|| Self::slice_feature_frame(features, &val_indices));
+        let val_labels =
+            (!val_indices.is_empty()).then(|| Self::slice_labels(&labels, &val_indices));
 
         let smc_cfg = SmcSearchConfig::from_env();
         let population_size = self.population_size.max(16);
@@ -536,9 +578,37 @@ impl GeneticStrategyExpert {
             let mut scored = population
                 .into_iter()
                 .map(|mut gene| {
-                    let score = Self::evaluate_gene_against_labels(
-                        features, &labels, &mut gene, generation,
+                    let train_score = Self::evaluate_gene_against_labels(
+                        &train_features,
+                        &train_labels,
+                        &mut gene,
+                        generation,
                     );
+                    let score = if let (Some(val_features), Some(val_labels)) =
+                        (val_features.as_ref(), val_labels.as_ref())
+                    {
+                        let mut val_gene = gene.clone();
+                        let val_score = Self::evaluate_gene_against_labels(
+                            val_features,
+                            val_labels,
+                            &mut val_gene,
+                            generation,
+                        );
+                        gene.fitness = 0.65 * train_score + 0.35 * val_score;
+                        gene.sharpe_ratio = 0.65 * gene.sharpe_ratio + 0.35 * val_gene.sharpe_ratio;
+                        gene.win_rate = 0.65 * gene.win_rate + 0.35 * val_gene.win_rate;
+                        gene.max_drawdown = 0.65 * gene.max_drawdown + 0.35 * val_gene.max_drawdown;
+                        gene.profit_factor =
+                            0.65 * gene.profit_factor + 0.35 * val_gene.profit_factor;
+                        gene.expectancy = 0.65 * gene.expectancy + 0.35 * val_gene.expectancy;
+                        gene.consistency = 0.65 * gene.consistency + 0.35 * val_gene.consistency;
+                        gene.trades_count = ((gene.trades_count as f64 * 0.65)
+                            + (val_gene.trades_count as f64 * 0.35))
+                            .round() as usize;
+                        gene.fitness
+                    } else {
+                        train_score
+                    };
                     (score, gene)
                 })
                 .collect::<Vec<_>>();
@@ -666,12 +736,36 @@ impl GeneticStrategyExpert {
         let mut final_scored = population
             .into_iter()
             .map(|mut gene| {
-                let score = Self::evaluate_gene_against_labels(
-                    features,
-                    &labels,
+                let train_score = Self::evaluate_gene_against_labels(
+                    &train_features,
+                    &train_labels,
                     &mut gene,
                     self.generations,
                 );
+                let score = if let (Some(val_features), Some(val_labels)) =
+                    (val_features.as_ref(), val_labels.as_ref())
+                {
+                    let mut val_gene = gene.clone();
+                    let val_score = Self::evaluate_gene_against_labels(
+                        val_features,
+                        val_labels,
+                        &mut val_gene,
+                        self.generations,
+                    );
+                    gene.fitness = 0.65 * train_score + 0.35 * val_score;
+                    gene.sharpe_ratio = 0.65 * gene.sharpe_ratio + 0.35 * val_gene.sharpe_ratio;
+                    gene.win_rate = 0.65 * gene.win_rate + 0.35 * val_gene.win_rate;
+                    gene.max_drawdown = 0.65 * gene.max_drawdown + 0.35 * val_gene.max_drawdown;
+                    gene.profit_factor = 0.65 * gene.profit_factor + 0.35 * val_gene.profit_factor;
+                    gene.expectancy = 0.65 * gene.expectancy + 0.35 * val_gene.expectancy;
+                    gene.consistency = 0.65 * gene.consistency + 0.35 * val_gene.consistency;
+                    gene.trades_count = ((gene.trades_count as f64 * 0.65)
+                        + (val_gene.trades_count as f64 * 0.35))
+                        .round() as usize;
+                    gene.fitness
+                } else {
+                    train_score
+                };
                 (score, gene)
             })
             .collect::<Vec<_>>();
@@ -712,6 +806,320 @@ impl GeneticStrategyExpert {
         path.join(ARTIFACT_FILE_NAME)
     }
 
+    fn runtime_metadata_path(path: &Path) -> PathBuf {
+        path.join(METADATA_FILE_NAME)
+    }
+
+    fn staged_artifact_dir(path: &Path) -> PathBuf {
+        path.with_extension("tmp_artifact")
+    }
+
+    fn backup_artifact_dir(path: &Path) -> PathBuf {
+        path.with_extension("bak_artifact")
+    }
+
+    fn cleanup_artifact_dir(path: &Path) -> Result<()> {
+        if path.exists() {
+            std::fs::remove_dir_all(path)
+                .with_context(|| format!("remove staged genetic artifact {}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    fn replace_artifact_dir(staged_path: &Path, target_path: &Path) -> Result<()> {
+        let backup_path = Self::backup_artifact_dir(target_path);
+        Self::cleanup_artifact_dir(&backup_path)?;
+        if target_path.exists() {
+            std::fs::rename(target_path, &backup_path).with_context(|| {
+                format!(
+                    "move previous genetic artifact into backup {}",
+                    backup_path.display()
+                )
+            })?;
+        }
+        if let Err(error) = std::fs::rename(staged_path, target_path) {
+            if backup_path.exists() {
+                let _ = std::fs::rename(&backup_path, target_path);
+            }
+            bail!(
+                "rename staged genetic artifact into {} failed: {}",
+                target_path.display(),
+                error
+            );
+        }
+        Self::cleanup_artifact_dir(&backup_path)?;
+        Ok(())
+    }
+
+    fn validate_gene(gene: &Gene, feature_count: usize, context: &str) -> Result<()> {
+        if gene.indices.is_empty() {
+            bail!("{context} contains a gene without feature indices");
+        }
+        if gene.indices.len() != gene.weights.len() {
+            bail!(
+                "{context} contains a gene with {} indices but {} weights",
+                gene.indices.len(),
+                gene.weights.len()
+            );
+        }
+        if gene.indices.iter().any(|idx| *idx >= feature_count.max(1)) {
+            bail!(
+                "{context} contains a gene that references indices beyond the persisted feature schema"
+            );
+        }
+        if gene
+            .weights
+            .iter()
+            .any(|weight| !weight.is_finite() || *weight <= 0.0)
+        {
+            bail!("{context} contains a gene with non-finite or non-positive weights");
+        }
+        if !gene.long_threshold.is_finite() || !gene.short_threshold.is_finite() {
+            bail!("{context} contains a gene with non-finite thresholds");
+        }
+        if gene.long_threshold <= gene.short_threshold {
+            bail!("{context} contains a gene with invalid threshold ordering");
+        }
+        if gene.strategy_id.trim().is_empty() {
+            bail!("{context} contains a gene with an empty strategy identifier");
+        }
+        for metric in [
+            gene.fitness,
+            gene.sharpe_ratio,
+            gene.win_rate,
+            gene.max_drawdown,
+            gene.profit_factor,
+            gene.expectancy,
+            gene.slice_pass_rate,
+            gene.consistency,
+            gene.tp_pips,
+            gene.sl_pips,
+        ] {
+            if !metric.is_finite() {
+                bail!("{context} contains a gene with non-finite metrics");
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_portfolio(
+        portfolio: &[Gene],
+        feature_columns: &[String],
+        context: &str,
+    ) -> Result<()> {
+        if feature_columns.is_empty() {
+            bail!("{context} is missing feature columns");
+        }
+        if portfolio.is_empty() {
+            bail!("{context} has no portfolio");
+        }
+        for gene in portfolio {
+            Self::validate_gene(gene, feature_columns.len(), context)?;
+        }
+        Ok(())
+    }
+
+    fn validate_best_fitness(best_fitness: f64, portfolio: &[Gene], context: &str) -> Result<()> {
+        let portfolio_best = portfolio
+            .iter()
+            .map(|gene| gene.fitness)
+            .reduce(f64::max)
+            .context("genetic portfolio unexpectedly empty while validating best fitness")?;
+        if (portfolio_best - best_fitness).abs() > 1e-6 {
+            bail!(
+                "{context} best_fitness {} does not match portfolio max fitness {}",
+                best_fitness,
+                portfolio_best
+            );
+        }
+        Ok(())
+    }
+
+    fn training_summary(&self, features: &FeatureFrame) -> TrainingSummaryMetadata {
+        let dataset_rows = features.data.nrows();
+        if matches!(self.backend_mode, GeneticBackendMode::DiscoveryBacked) {
+            let train_rows = self
+                .slice_rows_by_history_window(&features.timestamps, dataset_rows)
+                .map(|indices| indices.len())
+                .unwrap_or(dataset_rows);
+            let val_rows = dataset_rows.saturating_sub(train_rows);
+            TrainingSummaryMetadata::new(dataset_rows, train_rows, val_rows)
+        } else {
+            let (train_indices, val_indices) = Self::split_label_train_val_indices(dataset_rows);
+            TrainingSummaryMetadata::new(dataset_rows, train_indices.len(), val_indices.len())
+        }
+    }
+
+    fn build_runtime_metadata(
+        feature_columns: Vec<String>,
+        training_summary: TrainingSummaryMetadata,
+    ) -> RuntimeArtifactMetadata {
+        build_runtime_artifact_metadata(
+            MODEL_NAME,
+            ModelFamily::Evolutionary,
+            CapabilityState::Implemented,
+            feature_columns,
+            canonical_three_class_label_mapping(),
+            training_summary,
+        )
+    }
+
+    fn validate_runtime_metadata(
+        metadata: &RuntimeArtifactMetadata,
+        expected_feature_columns: &[String],
+    ) -> Result<()> {
+        if expected_feature_columns.is_empty() {
+            bail!("persisted genetic artifact is missing feature columns");
+        }
+        if metadata.model_name != MODEL_NAME {
+            bail!(
+                "runtime metadata mismatch for {MODEL_NAME}: expected model name {MODEL_NAME}, got {}",
+                metadata.model_name
+            );
+        }
+        if metadata.family != ModelFamily::Evolutionary {
+            bail!(
+                "runtime metadata mismatch for {MODEL_NAME}: expected family {:?}, got {:?}",
+                ModelFamily::Evolutionary,
+                metadata.family
+            );
+        }
+        if metadata.state != CapabilityState::Implemented {
+            bail!(
+                "runtime metadata mismatch for {MODEL_NAME}: expected state {:?}, got {:?}",
+                CapabilityState::Implemented,
+                metadata.state
+            );
+        }
+        if metadata.label_mapping != canonical_three_class_label_mapping() {
+            bail!("runtime metadata mismatch for {MODEL_NAME}: unexpected label mapping");
+        }
+        if metadata.feature_columns != expected_feature_columns {
+            bail!(
+                "runtime metadata mismatch for {MODEL_NAME}: expected feature columns {:?}, got {:?}",
+                expected_feature_columns,
+                metadata.feature_columns
+            );
+        }
+        if metadata.training_summary.dataset_rows == 0 {
+            bail!("runtime metadata mismatch for {MODEL_NAME}: dataset_rows must be positive");
+        }
+        if metadata.training_summary.train_rows == 0 {
+            bail!("runtime metadata mismatch for {MODEL_NAME}: train_rows must be positive");
+        }
+        if metadata.training_summary.train_rows + metadata.training_summary.val_rows
+            != metadata.training_summary.dataset_rows
+        {
+            bail!(
+                "runtime metadata mismatch for {MODEL_NAME}: training rows {} + validation rows {} must equal dataset rows {}",
+                metadata.training_summary.train_rows,
+                metadata.training_summary.val_rows,
+                metadata.training_summary.dataset_rows
+            );
+        }
+        Ok(())
+    }
+
+    fn write_runtime_metadata(path: &Path, metadata: &RuntimeArtifactMetadata) -> Result<()> {
+        let metadata_path = Self::runtime_metadata_path(path);
+        let temp_path = metadata_path.with_extension("tmp");
+        let payload = serde_json::to_vec_pretty(metadata).with_context(|| {
+            format!(
+                "serialize genetic runtime metadata {}",
+                metadata_path.display()
+            )
+        })?;
+        std::fs::write(&temp_path, payload).with_context(|| {
+            format!(
+                "write genetic temp runtime metadata {}",
+                temp_path.display()
+            )
+        })?;
+        std::fs::rename(&temp_path, &metadata_path).with_context(|| {
+            format!(
+                "rename genetic runtime metadata into {}",
+                metadata_path.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    fn read_runtime_metadata(path: &Path) -> Result<Option<RuntimeArtifactMetadata>> {
+        let metadata_path = Self::runtime_metadata_path(path);
+        if !metadata_path.exists() {
+            return Ok(None);
+        }
+        let payload = std::fs::read(&metadata_path).with_context(|| {
+            format!("read genetic runtime metadata {}", metadata_path.display())
+        })?;
+        let metadata = serde_json::from_slice(&payload).with_context(|| {
+            format!(
+                "deserialize genetic runtime metadata {}",
+                metadata_path.display()
+            )
+        })?;
+        Ok(Some(metadata))
+    }
+
+    fn runtime_backend(&self) -> String {
+        match self.backend_mode {
+            GeneticBackendMode::DiscoveryBacked => "genetic_discovery_backed_cpu".to_string(),
+            GeneticBackendMode::LabelSearch => "genetic_label_search_cpu".to_string(),
+        }
+    }
+
+    fn runtime_degraded_reason(&self) -> Option<String> {
+        if self.feature_columns.is_empty() {
+            return Some("genetic_feature_schema_missing".to_string());
+        }
+        if self.portfolio.is_empty() {
+            return Some("genetic_portfolio_missing".to_string());
+        }
+        if Self::validate_portfolio(
+            &self.portfolio,
+            &self.feature_columns,
+            "genetic runtime state",
+        )
+        .is_err()
+        {
+            return Some("genetic_portfolio_state_invalid".to_string());
+        }
+        let Some(metadata) = self.runtime_metadata.as_ref() else {
+            return Some("genetic_runtime_metadata_missing".to_string());
+        };
+        if Self::validate_runtime_metadata(metadata, &self.feature_columns).is_err() {
+            return Some("genetic_runtime_metadata_invalid".to_string());
+        }
+        None
+    }
+
+    fn ensure_runtime_state_ready(&self) -> Result<&RuntimeArtifactMetadata> {
+        if self.feature_columns.is_empty() {
+            bail!("genetic runtime is missing persisted feature columns");
+        }
+        Self::validate_portfolio(
+            &self.portfolio,
+            &self.feature_columns,
+            "genetic runtime state",
+        )?;
+        let metadata = self
+            .runtime_metadata
+            .as_ref()
+            .context("genetic runtime metadata missing")?;
+        Self::validate_runtime_metadata(metadata, &self.feature_columns)?;
+        Ok(metadata)
+    }
+
+    fn runtime_details(&self) -> (Option<String>, Option<String>) {
+        let degraded_reason = self.runtime_degraded_reason();
+        let backend = if degraded_reason.is_some() {
+            Some("genetic_unknown".to_string())
+        } else {
+            Some(self.runtime_backend())
+        };
+        (backend, degraded_reason)
+    }
+
     fn validate_artifact(artifact: &GeneticArtifact) -> Result<()> {
         if artifact.population_size == 0 {
             bail!("genetic artifact population_size must be greater than zero");
@@ -724,6 +1132,15 @@ impl GeneticStrategyExpert {
         }
         if artifact.portfolio_size == 0 {
             bail!("genetic artifact portfolio_size must be greater than zero");
+        }
+        if artifact.portfolio_size > artifact.population_size {
+            bail!("genetic artifact portfolio_size may not exceed population_size");
+        }
+        if artifact.tournament_size < 2 {
+            bail!("genetic artifact tournament_size must be at least two");
+        }
+        if artifact.tournament_size > artifact.population_size {
+            bail!("genetic artifact tournament_size may not exceed population_size");
         }
         if artifact.feature_columns.is_empty() {
             bail!("genetic artifact must persist feature columns");
@@ -746,13 +1163,21 @@ impl GeneticStrategyExpert {
         if artifact.portfolio.is_empty() {
             bail!("genetic artifact has no portfolio");
         }
-        if artifact
-            .portfolio
-            .iter()
-            .any(|gene| !gene.fitness.is_finite())
-        {
-            bail!("genetic artifact contains a portfolio gene with non-finite fitness");
-        }
+        Self::validate_portfolio(
+            &artifact.portfolio,
+            &artifact.feature_columns,
+            "genetic artifact",
+        )?;
+        Self::validate_best_fitness(
+            artifact.best_fitness,
+            &artifact.portfolio,
+            "genetic artifact",
+        )?;
+        let runtime_metadata = artifact
+            .runtime_metadata
+            .as_ref()
+            .context("genetic artifact is missing runtime metadata")?;
+        Self::validate_runtime_metadata(runtime_metadata, &artifact.feature_columns)?;
         Ok(())
     }
 
@@ -817,6 +1242,12 @@ impl GeneticStrategyExpert {
             .reduce(f64::max)
             .ok_or_else(|| anyhow::anyhow!("genetic training produced an empty portfolio"))?;
         self.portfolio = portfolio;
+        Self::validate_best_fitness(self.best_fitness, &self.portfolio, "genetic runtime state")?;
+        let training_summary = self.training_summary(&features);
+        self.runtime_metadata = Some(Self::build_runtime_metadata(
+            self.feature_columns.clone(),
+            training_summary,
+        ));
 
         info!(
             "Genetic expert fitted in {:?} mode (population={}, generations={}, portfolio={})",
@@ -868,11 +1299,30 @@ impl GeneticStrategyExpert {
         Ok(probabilities)
     }
 
-    pub fn save(&self, path: &Path) -> Result<()> {
-        if self.portfolio.is_empty() {
-            bail!("cannot save genetic model before training or loading")
+    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
+        self.ensure_runtime_state_ready()?;
+        let probabilities = self.predict_proba(x, None, None)?;
+        let (execution_backend, degraded_reason) = self.runtime_details();
+        let mut predictions = Vec::with_capacity(probabilities.nrows());
+        for row in probabilities.outer_iter() {
+            let row_values = [row[0], row[1], row[2]];
+            let (confidence, abstain_recommended) = three_class_runtime_confidence(row_values)?;
+            predictions.push(build_runtime_prediction_with_details(
+                MODEL_NAME.to_string(),
+                ModelFamily::Evolutionary,
+                CapabilityState::Implemented,
+                row_values,
+                Some(confidence),
+                Some(abstain_recommended),
+                execution_backend.clone(),
+                degraded_reason.clone(),
+            )?);
         }
+        Ok(predictions)
+    }
 
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let runtime_metadata = self.ensure_runtime_state_ready()?.clone();
         let artifact = GeneticArtifact {
             population_size: self.population_size,
             generations: self.generations,
@@ -891,14 +1341,40 @@ impl GeneticStrategyExpert {
             tournament_size: self.tournament_size,
             best_fitness: self.best_fitness,
             portfolio: self.portfolio.clone(),
+            runtime_metadata: Some(runtime_metadata.clone()),
         };
-        Self::write_artifact(path, &artifact)?;
+        let staged_path = Self::staged_artifact_dir(path);
+        Self::cleanup_artifact_dir(&staged_path)?;
+        std::fs::create_dir_all(&staged_path).with_context(|| {
+            format!(
+                "create staged genetic artifact directory {}",
+                staged_path.display()
+            )
+        })?;
+        if let Err(error) = (|| -> Result<()> {
+            Self::write_artifact(&staged_path, &artifact)?;
+            Self::write_runtime_metadata(&staged_path, &runtime_metadata)?;
+            Ok(())
+        })() {
+            let _ = Self::cleanup_artifact_dir(&staged_path);
+            return Err(error);
+        }
+        Self::replace_artifact_dir(&staged_path, path)?;
         info!("Saved genetic expert to: {:?}", path);
         Ok(())
     }
 
     pub fn load(&mut self, path: &Path) -> Result<()> {
         let artifact = Self::read_artifact(path)?;
+        let sidecar_metadata = Self::read_runtime_metadata(path)?
+            .context("genetic artifact is missing runtime metadata sidecar")?;
+        if let Some(embedded) = artifact.runtime_metadata.as_ref() {
+            if embedded != &sidecar_metadata {
+                bail!("runtime metadata file does not match genetic artifact");
+            }
+        }
+        let runtime_metadata = sidecar_metadata;
+        Self::validate_runtime_metadata(&runtime_metadata, &artifact.feature_columns)?;
         self.population_size = artifact.population_size;
         self.generations = artifact.generations;
         self.max_indicators = artifact.max_indicators;
@@ -916,6 +1392,7 @@ impl GeneticStrategyExpert {
         self.tournament_size = artifact.tournament_size;
         self.best_fitness = artifact.best_fitness;
         self.portfolio = artifact.portfolio;
+        self.runtime_metadata = Some(runtime_metadata);
         info!("Loaded genetic expert from: {:?}", path);
         Ok(())
     }
@@ -926,6 +1403,24 @@ impl GeneticStrategyExpert {
 
     pub fn best_fitness(&self) -> Result<f64> {
         Ok(self.best_fitness)
+    }
+}
+
+impl ExpertModel for GeneticStrategyExpert {
+    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
+        GeneticStrategyExpert::fit(self, x, y, None, None)
+    }
+
+    fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
+        GeneticStrategyExpert::predict_proba(self, x, None, None)
+    }
+
+    fn save(&self, path: &Path) -> Result<()> {
+        GeneticStrategyExpert::save(self, path)
+    }
+
+    fn load(&mut self, path: &Path) -> Result<()> {
+        GeneticStrategyExpert::load(self, path)
     }
 }
 
@@ -952,6 +1447,36 @@ mod tests {
         ))
     }
 
+    fn sample_gene() -> Gene {
+        Gene {
+            indices: vec![0],
+            weights: vec![1.0],
+            long_threshold: 0.5,
+            short_threshold: -0.5,
+            fitness: 12.0,
+            sharpe_ratio: 0.8,
+            win_rate: 0.6,
+            max_drawdown: 0.12,
+            profit_factor: 1.4,
+            expectancy: 0.25,
+            trades_count: 18,
+            generation: 1,
+            strategy_id: "genetic_gene_0".to_string(),
+            tp_pips: 15.0,
+            sl_pips: 8.0,
+            slice_pass_rate: 0.75,
+            consistency: 0.68,
+            ..Gene::default()
+        }
+    }
+
+    fn sample_runtime_metadata(feature_columns: Vec<String>) -> RuntimeArtifactMetadata {
+        GeneticStrategyExpert::build_runtime_metadata(
+            feature_columns,
+            TrainingSummaryMetadata::new(24, 24, 0),
+        )
+    }
+
     #[test]
     fn genetic_load_rejects_empty_portfolio_artifacts() -> Result<()> {
         let path = temp_model_dir("genetic_empty_portfolio");
@@ -960,6 +1485,7 @@ mod tests {
         let artifact = GeneticArtifact {
             portfolio: Vec::new(),
             feature_columns: vec!["f1".to_string()],
+            runtime_metadata: Some(sample_runtime_metadata(vec!["f1".to_string()])),
             ..GeneticArtifact::default()
         };
         let payload = serde_json::to_vec_pretty(&artifact)?;
@@ -972,6 +1498,175 @@ mod tests {
         assert!(err.to_string().contains("no portfolio"));
 
         let _ = std::fs::remove_dir_all(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn genetic_load_rejects_gene_indices_outside_feature_schema() -> Result<()> {
+        let path = temp_model_dir("genetic_invalid_gene_indices");
+        std::fs::create_dir_all(&path)?;
+
+        let mut gene = sample_gene();
+        gene.indices = vec![1];
+        let artifact = GeneticArtifact {
+            portfolio: vec![gene],
+            feature_columns: vec!["f1".to_string()],
+            runtime_metadata: Some(sample_runtime_metadata(vec!["f1".to_string()])),
+            ..GeneticArtifact::default()
+        };
+        let payload = serde_json::to_vec_pretty(&artifact)?;
+        std::fs::write(GeneticStrategyExpert::artifact_path(&path), payload)?;
+
+        let mut expert = GeneticStrategyExpert::default();
+        let err = expert
+            .load(&path)
+            .expect_err("out-of-range genetic gene indices should be rejected");
+        assert!(err.to_string().contains("references indices beyond"));
+
+        let _ = std::fs::remove_dir_all(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn genetic_load_rejects_mismatched_best_fitness() -> Result<()> {
+        let path = temp_model_dir("genetic_best_fitness_mismatch");
+        std::fs::create_dir_all(&path)?;
+
+        let mut gene = sample_gene();
+        gene.fitness = 8.0;
+        let artifact = GeneticArtifact {
+            best_fitness: 12.0,
+            portfolio: vec![gene],
+            feature_columns: vec!["f1".to_string()],
+            runtime_metadata: Some(sample_runtime_metadata(vec!["f1".to_string()])),
+            ..GeneticArtifact::default()
+        };
+        let payload = serde_json::to_vec_pretty(&artifact)?;
+        std::fs::write(GeneticStrategyExpert::artifact_path(&path), payload)?;
+
+        let mut expert = GeneticStrategyExpert::default();
+        let err = expert
+            .load(&path)
+            .expect_err("mismatched best fitness should be rejected");
+        assert!(err.to_string().contains("best_fitness"));
+
+        let _ = std::fs::remove_dir_all(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn genetic_load_requires_runtime_metadata_sidecar() -> Result<()> {
+        let path = temp_model_dir("genetic_missing_runtime_sidecar");
+        std::fs::create_dir_all(&path)?;
+
+        let artifact = GeneticArtifact {
+            feature_columns: vec!["f1".to_string()],
+            runtime_metadata: Some(sample_runtime_metadata(vec!["f1".to_string()])),
+            portfolio: vec![sample_gene()],
+            best_fitness: 12.0,
+            ..GeneticArtifact::default()
+        };
+        let payload = serde_json::to_vec_pretty(&artifact)?;
+        std::fs::write(GeneticStrategyExpert::artifact_path(&path), payload)?;
+
+        let mut expert = GeneticStrategyExpert::default();
+        let err = expert
+            .load(&path)
+            .expect_err("missing runtime metadata sidecar must fail");
+        assert!(err.to_string().contains("runtime metadata sidecar"));
+
+        let _ = std::fs::remove_dir_all(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn genetic_predict_runtime_rejects_missing_runtime_metadata() -> Result<()> {
+        let mut expert = GeneticStrategyExpert::default();
+        expert.feature_columns = vec!["f1".to_string()];
+        expert.portfolio = vec![sample_gene()];
+        expert.best_fitness = 12.0;
+
+        let df = DataFrame::new(vec![Series::new("f1".into(), vec![0.8_f64, -0.4]).into()])?;
+        let err = expert
+            .predict_runtime(&df)
+            .expect_err("missing runtime metadata should fail runtime predictions");
+        assert!(err.to_string().contains("runtime metadata"));
+        Ok(())
+    }
+
+    #[test]
+    fn genetic_predict_runtime_reports_backend_details() -> Result<()> {
+        let mut expert = GeneticStrategyExpert::default();
+        expert.feature_columns = vec!["f1".to_string()];
+        expert.backend_mode = GeneticBackendMode::LabelSearch;
+        expert.portfolio = vec![sample_gene()];
+        expert.best_fitness = 12.0;
+        expert.runtime_metadata = Some(sample_runtime_metadata(expert.feature_columns.clone()));
+
+        let df = DataFrame::new(vec![Series::new("f1".into(), vec![0.8_f64, -0.4]).into()])?;
+        let predictions = expert.predict_runtime(&df)?;
+        assert_eq!(predictions.len(), 2);
+        assert_eq!(
+            predictions[0].metadata().execution_backend.as_deref(),
+            Some("genetic_label_search_cpu")
+        );
+        assert_eq!(predictions[0].metadata().degraded_reason, None);
+        Ok(())
+    }
+
+    #[test]
+    fn genetic_trait_fit_and_predict_delegate_to_runtime_model() -> Result<()> {
+        let features = DataFrame::new(vec![
+            Series::new("f1".into(), vec![0.8_f64, -0.2, 1.1, -1.0, 0.3, -0.7]).into(),
+            Series::new("f2".into(), vec![0.1_f64, -0.4, 0.9, -0.8, 0.2, -0.5]).into(),
+        ])?;
+        let labels = Series::new("target".into(), vec![1_i32, -1, 1, -1, 0, 0]);
+        let mut expert = GeneticStrategyExpert::new(8, 2, 2)?;
+
+        ExpertModel::fit(&mut expert, &features, &labels)?;
+        let probabilities = ExpertModel::predict_proba(&expert, &features)?;
+
+        assert_eq!(probabilities.nrows(), features.height());
+        assert_eq!(probabilities.ncols(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn genetic_label_search_runtime_metadata_tracks_train_val_split() -> Result<()> {
+        let features = DataFrame::new(vec![
+            Series::new(
+                "f1".into(),
+                (0..20).map(|idx| idx as f64 * 0.1).collect::<Vec<_>>(),
+            )
+            .into(),
+            Series::new(
+                "f2".into(),
+                (0..20)
+                    .map(|idx| (idx as f64 * 0.1) - 0.5)
+                    .collect::<Vec<_>>(),
+            )
+            .into(),
+        ])?;
+        let labels = Series::new(
+            "target".into(),
+            (0..20)
+                .map(|idx| match idx % 3 {
+                    0 => -1,
+                    1 => 0,
+                    _ => 1,
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut expert = GeneticStrategyExpert::new(12, 2, 2)?;
+
+        expert.fit(&features, &labels, None, None)?;
+        let metadata = expert
+            .runtime_metadata
+            .as_ref()
+            .context("genetic runtime metadata should be present after fit")?;
+        assert_eq!(metadata.training_summary.dataset_rows, 20);
+        assert_eq!(metadata.training_summary.train_rows, 16);
+        assert_eq!(metadata.training_summary.val_rows, 4);
         Ok(())
     }
 

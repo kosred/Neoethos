@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use tracing::warn;
 
-use crate::runtime::capabilities::{model_capability, ModelCapability, ModelFamily};
+use crate::runtime::capabilities::{
+    model_capability, CapabilityState, ModelCapability, ModelFamily, KNOWN_MODEL_NAMES,
+};
 
 fn dynamic_registry() -> &'static Mutex<HashMap<String, ModelCapability>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, ModelCapability>>> = OnceLock::new();
@@ -27,7 +29,7 @@ fn load_registry_settings() -> forex_core::Settings {
     }
 }
 
-fn infer_dynamic_family(name: &str, module_path: &str, class_name: &str) -> ModelFamily {
+fn infer_dynamic_family(name: &str, module_path: &str, class_name: &str) -> Option<ModelFamily> {
     let haystack = format!(
         "{} {} {}",
         name.to_ascii_lowercase(),
@@ -39,9 +41,9 @@ fn infer_dynamic_family(name: &str, module_path: &str, class_name: &str) -> Mode
         || haystack.contains("catboost")
         || haystack.contains("tree")
     {
-        ModelFamily::Tree
+        Some(ModelFamily::Tree)
     } else if haystack.contains("swarm") || haystack.contains("forecast") {
-        ModelFamily::Forecasting
+        Some(ModelFamily::Forecasting)
     } else if haystack.contains("mlp")
         || haystack.contains("nbeats")
         || haystack.contains("tide")
@@ -51,7 +53,7 @@ fn infer_dynamic_family(name: &str, module_path: &str, class_name: &str) -> Mode
         || haystack.contains("timesnet")
         || haystack.contains("kan")
     {
-        ModelFamily::Deep
+        Some(ModelFamily::Deep)
     } else if haystack.contains("meta")
         || haystack.contains("calibr")
         || haystack.contains("conformal")
@@ -59,69 +61,30 @@ fn infer_dynamic_family(name: &str, module_path: &str, class_name: &str) -> Mode
         || haystack.contains("logit")
         || haystack.contains("elastic")
     {
-        ModelFamily::Meta
+        Some(ModelFamily::Meta)
     } else if haystack.contains("genetic")
         || haystack.contains("evo")
         || haystack.contains("crfmnes")
         || haystack.contains("neat")
     {
-        ModelFamily::Evolutionary
+        Some(ModelFamily::Evolutionary)
     } else if haystack.contains("exit") {
-        ModelFamily::Exit
+        Some(ModelFamily::Exit)
     } else if haystack.contains("adaptive")
         || haystack.contains("online")
         || haystack.contains("hoeffding")
         || haystack.contains("passive")
     {
-        ModelFamily::Adaptive
+        Some(ModelFamily::Adaptive)
     } else if haystack.contains("anomaly")
         || haystack.contains("forest")
         || haystack.contains("isolation")
     {
-        ModelFamily::Anomaly
+        Some(ModelFamily::Anomaly)
     } else {
-        ModelFamily::Rl
+        None
     }
 }
-
-/// Current known model names supported by the registry.
-pub const AVAILABLE_MODELS: &[&str] = &[
-    // Tree models
-    "lightgbm",
-    "xgboost",
-    "xgboost_rf",
-    "xgboost_dart",
-    "catboost",
-    "catboost_alt",
-    "sklears_tree",
-    // Deep models
-    "mlp",
-    "nbeats",
-    "tide",
-    "tabnet",
-    "kan",
-    "transformer",
-    "patchtst",
-    "timesnet",
-    "nbeatsx_nf",
-    "tide_nf",
-    "swarm_forecaster",
-    // Meta / online models
-    "elasticnet",
-    "bayes_logit",
-    "meta_blender",
-    "probability_calibrator",
-    "conformal_gate",
-    "meta_stack",
-    "genetic",
-    "neuro_evo",
-    "neat",
-    "exit_agent",
-    "online_pa",
-    "online_hoeffding",
-    "isolation_forest",
-    "dqn",
-];
 
 /// Capability-aware categories used by legacy helpers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -230,6 +193,41 @@ fn gpu_runtime_available_for_capability(capability: &ModelCapability) -> bool {
     }
 }
 
+fn normalize_recommended_gpu_device(
+    configured_device: &str,
+    capability: &ModelCapability,
+) -> Option<String> {
+    let normalized = configured_device.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized == "auto" {
+        return None;
+    }
+
+    match capability.family {
+        ModelFamily::Deep | ModelFamily::Exit => {
+            if normalized == "gpu"
+                || normalized == "wgpu"
+                || normalized == "wgpu_vulkan"
+                || normalized == "wgpu_dx12"
+                || normalized == "wgpu_metal"
+            {
+                Some("wgpu".to_string())
+            } else {
+                None
+            }
+        }
+        ModelFamily::Tree | ModelFamily::Rl => {
+            if normalized == "gpu" || normalized == "cuda" {
+                Some("cuda:0".to_string())
+            } else if normalized.starts_with("cuda:") {
+                Some(normalized)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Resolve capability-backed model information.
 pub fn get_model_info(name: &str) -> Option<ModelInfo> {
     let capability = get_model_capability(name)?;
@@ -259,7 +257,7 @@ pub fn get_model_capability(name: &str) -> Option<ModelCapability> {
 }
 
 fn default_inventory_names(settings: &forex_core::Settings) -> Vec<String> {
-    let mut names = AVAILABLE_MODELS
+    let mut names = KNOWN_MODEL_NAMES
         .iter()
         .map(|name| (*name).to_string())
         .collect::<Vec<_>>();
@@ -327,19 +325,11 @@ pub fn get_recommended_device(model_name: &str) -> Result<String> {
     if prefers_gpu_for_model(&capability.name, capability.family)
         && gpu_runtime_available_for_capability(&capability)
     {
+        if let Some(device) = normalize_recommended_gpu_device(configured_device, &capability) {
+            return Ok(device);
+        }
         if !configured_device.is_empty() && !configured_device.eq_ignore_ascii_case("auto") {
-            match capability.family {
-                ModelFamily::Deep | ModelFamily::Exit => {
-                    if configured_device.eq_ignore_ascii_case("gpu")
-                        || configured_device.eq_ignore_ascii_case("wgpu")
-                        || configured_device.eq_ignore_ascii_case("wgpu_vulkan")
-                    {
-                        return Ok("wgpu".to_string());
-                    }
-                    return Ok(default_gpu_device_for_capability(&capability).to_string());
-                }
-                _ => return Ok(configured_device.to_string()),
-            }
+            return Ok(default_gpu_device_for_capability(&capability).to_string());
         }
         return Ok(default_gpu_device_for_capability(&capability).to_string());
     }
@@ -362,12 +352,12 @@ pub fn register_model(name: &str, module_path: &str, class_name: &str) -> Result
         return Ok(());
     }
 
-    let family = infer_dynamic_family(name, module_path, class_name);
-    let capability = ModelCapability::new(
-        name.trim(),
-        family,
-        crate::runtime::capabilities::CapabilityState::Implemented,
-    );
+    let family = infer_dynamic_family(name, module_path, class_name).with_context(|| {
+        format!(
+            "dynamic model registration requires an inferable family for {name} ({module_path}::{class_name})"
+        )
+    })?;
+    let capability = ModelCapability::new(name.trim(), family, CapabilityState::Planned);
     let mut registry = dynamic_registry()
         .lock()
         .map_err(|_| anyhow::anyhow!("dynamic model registry mutex poisoned"))?;
@@ -538,7 +528,14 @@ mod tests {
         let capability = get_model_capability("custom_patch_router")
             .expect("dynamic capability should be discoverable");
         assert_eq!(capability.family, ModelFamily::Deep);
-        assert_eq!(capability.state, CapabilityState::Implemented);
+        assert_eq!(capability.state, CapabilityState::Planned);
+    }
+
+    #[test]
+    fn dynamic_registration_rejects_unknown_family_inference() {
+        let err = register_model("custom_unknown", "custom.models.misc", "Router")
+            .expect_err("unknown dynamic model family must fail");
+        assert!(err.to_string().contains("inferable family"));
     }
 
     #[test]
@@ -561,6 +558,47 @@ mod tests {
         assert!(
             deep.iter().any(|name| name == "transformer_01"),
             "default inventory should expose transformer_01"
+        );
+    }
+
+    #[test]
+    fn known_model_names_are_unique_and_resolve() {
+        let mut seen = std::collections::HashSet::new();
+        for name in KNOWN_MODEL_NAMES {
+            assert!(seen.insert(*name), "duplicate known model name {name}");
+            assert!(
+                get_model_capability(name).is_some(),
+                "known model name {name} should resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_recommended_gpu_device_maps_generic_tokens_per_family() {
+        let deep = ModelCapability::new("mlp", ModelFamily::Deep, CapabilityState::Implemented);
+        let tree =
+            ModelCapability::new("lightgbm", ModelFamily::Tree, CapabilityState::Implemented);
+        let rl = ModelCapability::new("dqn", ModelFamily::Rl, CapabilityState::Implemented);
+
+        assert_eq!(
+            normalize_recommended_gpu_device("gpu", &deep).as_deref(),
+            Some("wgpu")
+        );
+        assert_eq!(
+            normalize_recommended_gpu_device("wgpu_vulkan", &deep).as_deref(),
+            Some("wgpu")
+        );
+        assert_eq!(
+            normalize_recommended_gpu_device("gpu", &tree).as_deref(),
+            Some("cuda:0")
+        );
+        assert_eq!(
+            normalize_recommended_gpu_device("cuda:2", &rl).as_deref(),
+            Some("cuda:2")
+        );
+        assert!(
+            normalize_recommended_gpu_device("wgpu", &tree).is_none(),
+            "tree models should not claim wgpu devices"
         );
     }
 }

@@ -53,6 +53,43 @@ pub struct OptimizationReport {
 
 pub type HoldoutSplit = (DataFrame, Vec<i32>, DataFrame, Vec<i32>);
 
+fn validate_optimization_report(report: &OptimizationReport) -> Result<()> {
+    if report.model_name.trim().is_empty() {
+        bail!("optimization report model_name must not be empty");
+    }
+    if report.backend.trim().is_empty() {
+        bail!("optimization report backend must not be empty");
+    }
+    if report.trials_requested == 0 {
+        bail!("optimization report trials_requested must be non-zero");
+    }
+    if report.trials_completed > report.trials_requested {
+        bail!("optimization report trials_completed must not exceed trials_requested");
+    }
+    if !(0.0..1.0).contains(&report.holdout_pct) {
+        bail!("optimization report holdout_pct must be inside [0, 1)");
+    }
+    if report.train_rows == 0 {
+        bail!("optimization report train_rows must be non-zero");
+    }
+    if report.train_rows + report.val_rows == 0 {
+        bail!("optimization report total rows must be non-zero");
+    }
+    if report.selected_trial_index >= report.trials_requested {
+        bail!("optimization report selected_trial_index is out of range");
+    }
+    if report.trials.is_empty() {
+        bail!("optimization report must contain at least one trial record");
+    }
+    if report.trials.iter().all(|trial| !trial.selected) {
+        bail!("optimization report must mark one trial as selected");
+    }
+    if report.trials.iter().filter(|trial| trial.selected).count() != 1 {
+        bail!("optimization report must mark exactly one selected trial");
+    }
+    Ok(())
+}
+
 fn label_to_probability_index(label: i32) -> Result<usize> {
     match label {
         0 => Ok(0),
@@ -223,12 +260,123 @@ pub fn evaluate_prediction_quality(
 }
 
 pub fn write_optimization_report(path: &Path, report: &OptimizationReport) -> Result<()> {
+    validate_optimization_report(report)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create optimization artifact dir {}", parent.display()))?;
     }
 
+    let temp_path = path.with_extension("tmp_optimization");
+    let backup_path = path.with_extension("bak_optimization");
     let payload = serde_json::to_vec_pretty(report).context("serialize optimization report")?;
-    std::fs::write(path, payload)
-        .with_context(|| format!("write optimization report to {}", path.display()))
+    if temp_path.exists() {
+        std::fs::remove_file(&temp_path).with_context(|| {
+            format!(
+                "remove stale staged optimization report {}",
+                temp_path.display()
+            )
+        })?;
+    }
+    if backup_path.exists() {
+        std::fs::remove_file(&backup_path).with_context(|| {
+            format!(
+                "remove stale backup optimization report {}",
+                backup_path.display()
+            )
+        })?;
+    }
+    std::fs::write(&temp_path, payload).with_context(|| {
+        format!(
+            "write staged optimization report to {}",
+            temp_path.display()
+        )
+    })?;
+    if path.exists() {
+        std::fs::rename(path, &backup_path)
+            .with_context(|| format!("backup optimization report {}", path.display()))?;
+    }
+    if let Err(error) = std::fs::rename(&temp_path, path) {
+        if backup_path.exists() {
+            let _ = std::fs::rename(&backup_path, path);
+        } else if temp_path.exists() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        anyhow::bail!(
+            "write optimization report to {} failed: {}",
+            path.display(),
+            error
+        );
+    }
+    if backup_path.exists() {
+        std::fs::remove_file(&backup_path).with_context(|| {
+            format!(
+                "remove backup optimization report {}",
+                backup_path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_report() -> OptimizationReport {
+        OptimizationReport {
+            model_name: "lightgbm".to_string(),
+            capability_family: ModelFamily::Tree,
+            capability_state: CapabilityState::Implemented,
+            backend: "lightgbm".to_string(),
+            trials_requested: 4,
+            trials_completed: 4,
+            holdout_pct: 0.2,
+            train_rows: 800,
+            val_rows: 200,
+            selected_trial_index: 1,
+            selected_params: HashMap::from([("learning_rate".to_string(), "0.05".to_string())]),
+            selected_metrics: None,
+            row_budget_applied: Some(900),
+            hpo_rows_applied: Some(900),
+            notes: Vec::new(),
+            trials: vec![
+                OptimizationTrialRecord {
+                    index: 0,
+                    backend: "lightgbm".to_string(),
+                    params: HashMap::new(),
+                    metrics: None,
+                    error: None,
+                    selected: false,
+                },
+                OptimizationTrialRecord {
+                    index: 1,
+                    backend: "lightgbm".to_string(),
+                    params: HashMap::new(),
+                    metrics: None,
+                    error: None,
+                    selected: true,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn optimization_report_rejects_blank_backend() {
+        let mut report = sample_report();
+        report.backend = " ".to_string();
+        let err = validate_optimization_report(&report)
+            .expect_err("blank backend must fail")
+            .to_string();
+        assert!(err.contains("backend"));
+    }
+
+    #[test]
+    fn optimization_report_requires_single_selected_trial() {
+        let mut report = sample_report();
+        report.trials[0].selected = true;
+        let err = validate_optimization_report(&report)
+            .expect_err("multiple selected trials must fail")
+            .to_string();
+        assert!(err.contains("exactly one selected"));
+    }
 }

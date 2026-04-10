@@ -12,7 +12,7 @@ use rlkit::types::{Action, EnvTrait, Reward, Status};
 #[cfg(feature = "reinforcement-learning")]
 use rlkit::{Algorithm, DNQStateMode, TrainArgs, DQN};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::base::{
     build_runtime_artifact_metadata, build_runtime_prediction_with_details,
@@ -146,6 +146,8 @@ pub struct TradingRlArtifact {
     #[serde(default)]
     pub training_report: Option<TradingRlTrainingReport>,
     #[serde(default)]
+    pub feature_scaler: Option<FeatureScaler>,
+    #[serde(default)]
     pub fallback_basis: TradingFallbackBasis,
     #[serde(default)]
     pub fallback_weights: Option<Array2<f32>>,
@@ -188,6 +190,7 @@ impl Default for TradingRlArtifact {
             reward_horizon: 0,
             episode_len: 0,
             training_report: None,
+            feature_scaler: None,
             fallback_basis: TradingFallbackBasis::Linear,
             fallback_weights: None,
             fallback_bias: None,
@@ -195,7 +198,7 @@ impl Default for TradingRlArtifact {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TradingRlTrainingReport {
     pub train_rows: usize,
     pub episode_count: usize,
@@ -209,6 +212,8 @@ pub struct TradingRlTrainingReport {
     pub average_sell_reward: f32,
     pub used_network_snapshot: bool,
     pub used_fallback_q: bool,
+    #[serde(default)]
+    pub used_feature_scaler: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +294,31 @@ fn fallback_backend_name(basis: TradingFallbackBasis) -> &'static str {
     }
 }
 
+fn is_known_rl_requested_backend(value: &str) -> bool {
+    matches!(value, "native" | "rlkit" | "rlkit_cpu" | "rlkit_cuda")
+        || value.starts_with("linear_q_")
+        || value.starts_with("quadratic_q_")
+}
+
+fn is_known_rl_effective_backend(value: &str) -> bool {
+    matches!(value, "rlkit_cpu" | "rlkit_cuda")
+        || value.starts_with("linear_q_")
+        || value.starts_with("quadratic_q_")
+}
+
+fn is_known_rl_requested_device_policy(value: &str) -> bool {
+    let normalized = normalize_rl_device_policy(value);
+    matches!(
+        normalized.as_str(),
+        "cpu" | "auto" | "gpu" | "cuda" | "nvidia"
+    ) || normalized.starts_with("cuda:")
+}
+
+fn is_known_rl_effective_device_policy(value: &str) -> bool {
+    let normalized = normalize_rl_device_policy(value);
+    normalized == "cpu" || normalized.starts_with("cuda:")
+}
+
 fn artifact_requested_backend(artifact: &TradingRlArtifact) -> String {
     artifact
         .requested_backend
@@ -317,6 +347,14 @@ fn artifact_effective_device_policy(artifact: &TradingRlArtifact) -> String {
         .unwrap_or_else(|| artifact.device_policy.clone())
 }
 
+fn staged_rl_file(path: &Path, file_name: &str) -> PathBuf {
+    path.join(format!("{file_name}.tmp"))
+}
+
+fn backup_rl_file(path: &Path, file_name: &str) -> PathBuf {
+    path.join(format!("{file_name}.bak"))
+}
+
 fn rl_runtime_metadata(
     feature_columns: Vec<String>,
     dataset_rows: usize,
@@ -329,6 +367,11 @@ fn rl_runtime_metadata(
         canonical_three_class_label_mapping(),
         TrainingSummaryMetadata::new(dataset_rows, dataset_rows, 0),
     )
+}
+
+fn requested_gpu_device_policy(policy: &str) -> bool {
+    let normalized = policy.trim().to_ascii_lowercase();
+    matches!(normalized.as_str(), "gpu" | "cuda" | "nvidia") || normalized.starts_with("cuda:")
 }
 
 fn validate_rl_metadata(
@@ -387,6 +430,70 @@ fn validate_rl_metadata(
         );
     }
     Ok(())
+}
+
+fn cleanup_rl_temp_file(path: &Path) {
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn stage_rl_target(
+    final_path: &Path,
+    backup_path: &Path,
+    staged_path: Option<&Path>,
+) -> Result<bool> {
+    if backup_path.exists() {
+        std::fs::remove_file(backup_path).with_context(|| {
+            format!("remove stale RL backup artifact {}", backup_path.display())
+        })?;
+    }
+    let replaced_existing = final_path.exists();
+    if replaced_existing {
+        std::fs::rename(final_path, backup_path).with_context(|| {
+            format!(
+                "backup existing RL artifact {} to {}",
+                final_path.display(),
+                backup_path.display()
+            )
+        })?;
+    }
+    if let Some(staged_path) = staged_path {
+        if let Err(err) = std::fs::rename(staged_path, final_path) {
+            if replaced_existing && backup_path.exists() {
+                let _ = std::fs::rename(backup_path, final_path);
+            }
+            cleanup_rl_temp_file(staged_path);
+            return Err(err).with_context(|| {
+                format!(
+                    "promote staged RL artifact {} to {}",
+                    staged_path.display(),
+                    final_path.display()
+                )
+            });
+        }
+    }
+    if replaced_existing && backup_path.exists() {
+        let _ = std::fs::remove_file(backup_path);
+    }
+    Ok(replaced_existing)
+}
+
+fn restore_rl_backup(final_path: &Path, backup_path: &Path) {
+    if backup_path.exists() {
+        if final_path.exists() {
+            let _ = std::fs::remove_file(final_path);
+        }
+        let _ = std::fs::rename(backup_path, final_path);
+    }
+}
+
+fn rollback_rl_target(final_path: &Path, backup_path: &Path) {
+    if backup_path.exists() {
+        restore_rl_backup(final_path, backup_path);
+    } else if final_path.exists() {
+        let _ = std::fs::remove_file(final_path);
+    }
 }
 
 fn build_reward_triplet(labels: &[usize], idx: usize, horizon: usize) -> [f32; 3] {
@@ -801,8 +908,12 @@ pub struct TradingReinforcementLearner {
     bounds: Option<FeatureBounds>,
     fallback_weights: Option<Array2<f32>>,
     fallback_bias: Option<ndarray::Array1<f32>>,
+    feature_scaler: Option<FeatureScaler>,
     feature_columns: Vec<String>,
     training_report: Option<TradingRlTrainingReport>,
+    runtime_effective_backend: Option<String>,
+    runtime_effective_device_policy: Option<String>,
+    persisted_network_snapshot_present: bool,
 }
 
 impl TradingReinforcementLearner {
@@ -827,8 +938,12 @@ impl TradingReinforcementLearner {
             bounds: None,
             fallback_weights: None,
             fallback_bias: None,
+            feature_scaler: None,
             feature_columns: Vec::new(),
             training_report: None,
+            runtime_effective_backend: None,
+            runtime_effective_device_policy: None,
+            persisted_network_snapshot_present: false,
         }
     }
 
@@ -1063,6 +1178,9 @@ impl TradingReinforcementLearner {
         self.train_args.effective_device_policy = Some("cpu".to_string());
         self.train_args.backend = fallback_backend;
         self.train_args.device_policy = "cpu".to_string();
+        self.runtime_effective_backend = self.train_args.effective_backend.clone();
+        self.runtime_effective_device_policy = self.train_args.effective_device_policy.clone();
+        self.persisted_network_snapshot_present = false;
         self.fallback_weights = Some(weights);
         self.fallback_bias = Some(bias);
         Ok(())
@@ -1105,6 +1223,7 @@ impl TradingReinforcementLearner {
             average_sell_reward: sell_reward_sum / denom,
             used_network_snapshot: self.inference_network.is_some(),
             used_fallback_q: self.fallback_weights.is_some() && self.fallback_bias.is_some(),
+            used_feature_scaler: self.feature_scaler.is_some(),
         }
     }
 
@@ -1189,6 +1308,9 @@ impl TradingReinforcementLearner {
         self.train_args.effective_device_policy = Some(effective_policy.clone());
         self.train_args.backend = effective_backend;
         self.train_args.device_policy = effective_policy;
+        self.runtime_effective_backend = self.train_args.effective_backend.clone();
+        self.runtime_effective_device_policy = self.train_args.effective_device_policy.clone();
+        self.persisted_network_snapshot_present = true;
         let training_report = self.build_training_report(episodes);
         self.train_args.training_report = Some(training_report.clone());
         self.training_report = Some(training_report);
@@ -1235,6 +1357,8 @@ impl TradingReinforcementLearner {
         let episodes = build_training_episodes(&scaled, &labels, episode_len, horizon)?;
         self.train_args.feature_columns = feature_columns.clone();
         self.feature_columns = feature_columns;
+        self.feature_scaler = Some(scaler.clone());
+        self.train_args.feature_scaler = Some(scaler);
         self.train_args.train_rows = scaled.nrows();
         self.train_on_episodes(&episodes)
     }
@@ -1243,7 +1367,26 @@ impl TradingReinforcementLearner {
         if self.train_args.state_dim == 0 || self.bounds.is_none() {
             bail!("RL artifact is unavailable before the learner is trained");
         }
-        Ok(self.train_args.clone())
+        let mut artifact = self.train_args.clone();
+        if !self.feature_columns.is_empty() {
+            artifact.feature_columns = self.feature_columns.clone();
+        }
+        artifact.feature_scaler = self.feature_scaler.clone();
+        let persisted_report = self
+            .train_args
+            .training_report
+            .as_ref()
+            .context("RL artifact state is missing the persisted training_report")?;
+        let training_report = self
+            .training_report
+            .as_ref()
+            .context("RL artifact is missing a persisted training_report")?;
+        if persisted_report != training_report {
+            bail!("RL live training_report drifted from the persisted artifact report");
+        }
+        artifact.training_report = Some(persisted_report.clone());
+        Self::validate_artifact(&artifact)?;
+        Ok(artifact)
     }
 
     fn validate_artifact(artifact: &TradingRlArtifact) -> Result<()> {
@@ -1253,6 +1396,46 @@ impl TradingReinforcementLearner {
         if artifact.train_rows == 0 {
             bail!("RL artifact is missing training-row metadata");
         }
+        if artifact.hidden_dims.is_empty() || artifact.hidden_dims.iter().any(|dim| *dim == 0) {
+            bail!("RL artifact hidden_dims must contain only positive layer widths");
+        }
+        if artifact.state_bins < 2 {
+            bail!("RL artifact state_bins must be at least 2");
+        }
+        if artifact.batch_size == 0
+            || artifact.buffer_capacity == 0
+            || artifact.epochs == 0
+            || artifact.max_steps == 0
+            || artifact.update_interval == 0
+            || artifact.update_freq == 0
+            || artifact.parallel_envs == 0
+            || artifact.eval_episodes == 0
+            || artifact.ray_tune_max_concurrency == 0
+        {
+            bail!("RL artifact contains zero-valued training parameters that must stay positive");
+        }
+        if !artifact.learning_rate.is_finite() || artifact.learning_rate <= 0.0 {
+            bail!("RL artifact learning_rate must be finite and positive");
+        }
+        if !artifact.gamma.is_finite() || !(0.0..1.0).contains(&artifact.gamma) {
+            bail!("RL artifact gamma must be finite and inside (0, 1)");
+        }
+        if !artifact.epsilon_start.is_finite() || !(0.0..=1.0).contains(&artifact.epsilon_start) {
+            bail!("RL artifact epsilon_start must be finite and inside [0, 1]");
+        }
+        if !artifact.epsilon_end.is_finite() || !(0.0..=1.0).contains(&artifact.epsilon_end) {
+            bail!("RL artifact epsilon_end must be finite and inside [0, 1]");
+        }
+        if artifact.epsilon_start < artifact.epsilon_end {
+            bail!(
+                "RL artifact epsilon_start {} must be >= epsilon_end {}",
+                artifact.epsilon_start,
+                artifact.epsilon_end
+            );
+        }
+        if !artifact.epsilon_decay.is_finite() || !(0.0..=1.0).contains(&artifact.epsilon_decay) {
+            bail!("RL artifact epsilon_decay must be finite and inside [0, 1]");
+        }
         if !artifact.feature_columns.is_empty()
             && artifact.feature_columns.len() != artifact.state_dim
         {
@@ -1261,6 +1444,27 @@ impl TradingReinforcementLearner {
                 artifact.state_dim,
                 artifact.feature_columns.len()
             );
+        }
+        if let Some(scaler) = artifact.feature_scaler.as_ref() {
+            if scaler.means.len() != artifact.state_dim || scaler.stds.len() != artifact.state_dim {
+                bail!(
+                    "RL artifact feature_scaler mismatch: expected {} dimensions, received means {} / stds {}",
+                    artifact.state_dim,
+                    scaler.means.len(),
+                    scaler.stds.len()
+                );
+            }
+            if scaler
+                .means
+                .iter()
+                .chain(scaler.stds.iter())
+                .any(|value| !value.is_finite())
+            {
+                bail!("RL artifact feature_scaler contains non-finite values");
+            }
+            if scaler.stds.iter().any(|value| *value <= f32::EPSILON) {
+                bail!("RL artifact feature_scaler contains non-positive standard deviations");
+            }
         }
         if artifact.fallback_weights.is_some() != artifact.fallback_bias.is_some() {
             bail!("RL artifact fallback weights and bias must be persisted together");
@@ -1294,6 +1498,130 @@ impl TradingReinforcementLearner {
             if !value.is_empty() && value.trim().is_empty() {
                 bail!("RL artifact {} may not be blank", field);
             }
+        }
+        for (field, value) in [
+            ("backend", artifact.backend.as_str()),
+            (
+                "requested_backend",
+                artifact.requested_backend.as_deref().unwrap_or_default(),
+            ),
+        ] {
+            if !value.is_empty() && !is_known_rl_requested_backend(value) {
+                bail!(
+                    "RL artifact {} `{}` is not a supported backend",
+                    field,
+                    value
+                );
+            }
+        }
+        for (field, value) in [(
+            "effective_backend",
+            artifact.effective_backend.as_deref().unwrap_or_default(),
+        )] {
+            if !value.is_empty() && !is_known_rl_effective_backend(value) {
+                bail!(
+                    "RL artifact {} `{}` is not a supported runtime backend",
+                    field,
+                    value
+                );
+            }
+        }
+        for (field, value) in [
+            ("device_policy", artifact.device_policy.as_str()),
+            (
+                "requested_device_policy",
+                artifact
+                    .requested_device_policy
+                    .as_deref()
+                    .unwrap_or_default(),
+            ),
+        ] {
+            if !value.is_empty() && !is_known_rl_requested_device_policy(value) {
+                bail!(
+                    "RL artifact {} `{}` is not a supported device policy",
+                    field,
+                    value
+                );
+            }
+        }
+        for (field, value) in [(
+            "effective_device_policy",
+            artifact
+                .effective_device_policy
+                .as_deref()
+                .unwrap_or_default(),
+        )] {
+            if !value.is_empty() && !is_known_rl_effective_device_policy(value) {
+                bail!(
+                    "RL artifact {} `{}` is not a supported effective device policy",
+                    field,
+                    value
+                );
+            }
+        }
+        let runtime_identity_count = [
+            artifact.requested_backend.as_ref(),
+            artifact.requested_device_policy.as_ref(),
+            artifact.effective_backend.as_ref(),
+            artifact.effective_device_policy.as_ref(),
+        ]
+        .iter()
+        .filter(|value| value.is_some())
+        .count();
+        if runtime_identity_count != 4 {
+            bail!(
+                "RL artifact must persist requested/effective backend and device policy together"
+            );
+        }
+        if let Some(effective_backend) = artifact.effective_backend.as_ref() {
+            if artifact.backend != *effective_backend {
+                bail!(
+                    "RL artifact legacy backend {} conflicts with effective_backend {}",
+                    artifact.backend,
+                    effective_backend
+                );
+            }
+        }
+        if let Some(effective_device_policy) = artifact.effective_device_policy.as_ref() {
+            let normalized_legacy = normalize_rl_device_policy(&artifact.device_policy);
+            let normalized_effective = normalize_rl_device_policy(effective_device_policy);
+            if normalized_legacy != normalized_effective {
+                bail!(
+                    "RL artifact legacy device_policy {} conflicts with effective_device_policy {}",
+                    artifact.device_policy,
+                    effective_device_policy
+                );
+            }
+        }
+        let effective_backend = artifact_effective_backend(artifact);
+        let effective_device_policy = artifact_effective_device_policy(artifact);
+        if effective_backend == "rlkit_cpu"
+            && normalize_rl_device_policy(&effective_device_policy) != "cpu"
+        {
+            bail!(
+                "RL effective backend {} requires cpu device policy, got {}",
+                effective_backend,
+                effective_device_policy
+            );
+        }
+        if effective_backend == "rlkit_cuda"
+            && !normalize_rl_device_policy(&effective_device_policy).starts_with("cuda:")
+        {
+            bail!(
+                "RL effective backend {} requires cuda:<ordinal> device policy, got {}",
+                effective_backend,
+                effective_device_policy
+            );
+        }
+        if (effective_backend.starts_with("linear_q_")
+            || effective_backend.starts_with("quadratic_q_"))
+            && normalize_rl_device_policy(&effective_device_policy) != "cpu"
+        {
+            bail!(
+                "RL fallback backend {} requires cpu device policy, got {}",
+                effective_backend,
+                effective_device_policy
+            );
         }
         if artifact.state_mins.len() != artifact.state_dim {
             bail!(
@@ -1333,44 +1661,156 @@ impl TradingReinforcementLearner {
                 bail!("RL fallback bias contains non-finite values");
             }
         }
-        if let Some(report) = artifact.training_report.as_ref() {
-            if report.train_rows != artifact.train_rows {
-                bail!(
-                    "RL training report rows {} do not match artifact train_rows {}",
-                    report.train_rows,
-                    artifact.train_rows
-                );
+        let report = artifact
+            .training_report
+            .as_ref()
+            .context("RL artifact is missing training_report")?;
+        if report.train_rows != artifact.train_rows {
+            bail!(
+                "RL training report rows {} do not match artifact train_rows {}",
+                report.train_rows,
+                artifact.train_rows
+            );
+        }
+        if report.state_dim != artifact.state_dim {
+            bail!(
+                "RL training report state_dim {} does not match artifact state_dim {}",
+                report.state_dim,
+                artifact.state_dim
+            );
+        }
+        if report.reward_horizon != artifact.reward_horizon {
+            bail!(
+                "RL training report reward_horizon {} does not match artifact reward_horizon {}",
+                report.reward_horizon,
+                artifact.reward_horizon
+            );
+        }
+        if report.episode_len != artifact.episode_len {
+            bail!(
+                "RL training report episode_len {} does not match artifact episode_len {}",
+                report.episode_len,
+                artifact.episode_len
+            );
+        }
+        if report.backend.trim().is_empty() || report.device_policy.trim().is_empty() {
+            bail!("RL training report must persist non-empty backend and device_policy");
+        }
+        for value in [
+            report.average_hold_reward,
+            report.average_buy_reward,
+            report.average_sell_reward,
+        ] {
+            if !value.is_finite() {
+                bail!("RL training report contains non-finite reward statistics");
             }
-            if report.state_dim != artifact.state_dim {
-                bail!(
-                    "RL training report state_dim {} does not match artifact state_dim {}",
-                    report.state_dim,
-                    artifact.state_dim
-                );
-            }
-            if report.reward_horizon != artifact.reward_horizon {
-                bail!(
-                    "RL training report reward_horizon {} does not match artifact reward_horizon {}",
-                    report.reward_horizon,
-                    artifact.reward_horizon
-                );
-            }
-            if report.episode_len != artifact.episode_len {
-                bail!(
-                    "RL training report episode_len {} does not match artifact episode_len {}",
-                    report.episode_len,
-                    artifact.episode_len
-                );
-            }
-            for value in [
-                report.average_hold_reward,
-                report.average_buy_reward,
-                report.average_sell_reward,
-            ] {
-                if !value.is_finite() {
-                    bail!("RL training report contains non-finite reward statistics");
-                }
-            }
+        }
+        if report.backend.trim().is_empty() {
+            bail!("RL training report backend may not be blank");
+        }
+        if report.device_policy.trim().is_empty() {
+            bail!("RL training report device_policy may not be blank");
+        }
+        if report.backend != artifact_effective_backend(artifact) {
+            bail!(
+                "RL training report backend {} does not match effective artifact backend {}",
+                report.backend,
+                artifact_effective_backend(artifact)
+            );
+        }
+        if report.device_policy != artifact_effective_device_policy(artifact) {
+            bail!(
+                "RL training report device_policy {} does not match effective artifact device policy {}",
+                report.device_policy,
+                artifact_effective_device_policy(artifact)
+            );
+        }
+        if report.used_fallback_q
+            && (artifact.fallback_weights.is_none() || artifact.fallback_bias.is_none())
+        {
+            bail!(
+                "RL training report marks fallback Q as used but artifact does not contain fallback parameters"
+            );
+        }
+        if !report.used_fallback_q
+            && (artifact_effective_backend(artifact).starts_with("linear_q")
+                || artifact_effective_backend(artifact).starts_with("quadratic_q"))
+        {
+            bail!(
+                "RL training report marks fallback Q as unused but effective artifact backend {} is a fallback backend",
+                artifact_effective_backend(artifact)
+            );
+        }
+        if report.used_network_snapshot
+            && artifact_effective_backend(artifact).starts_with("linear_q")
+            || report.used_network_snapshot
+                && artifact_effective_backend(artifact).starts_with("quadratic_q")
+        {
+            bail!(
+                "RL training report marks network snapshot as used but effective artifact backend {} is a fallback backend",
+                artifact_effective_backend(artifact)
+            );
+        }
+        if report.used_feature_scaler != artifact.feature_scaler.is_some() {
+            bail!(
+                "RL training report feature_scaler flag {} does not match artifact scaler presence {}",
+                report.used_feature_scaler,
+                artifact.feature_scaler.is_some()
+            );
+        }
+        Ok(())
+    }
+
+    fn live_runtime_identity(&self) -> (String, String, bool, bool) {
+        let used_network_snapshot = self.inference_network.is_some();
+        let used_fallback_q = self.fallback_weights.is_some() && self.fallback_bias.is_some();
+        let persisted_effective_backend = self
+            .runtime_effective_backend
+            .clone()
+            .or_else(|| self.train_args.effective_backend.clone())
+            .unwrap_or_else(|| self.train_args.backend.clone());
+        let persisted_effective_device_policy = self
+            .runtime_effective_device_policy
+            .clone()
+            .or_else(|| self.train_args.effective_device_policy.clone())
+            .unwrap_or_else(|| self.train_args.device_policy.clone());
+        if used_network_snapshot {
+            (
+                persisted_effective_backend,
+                persisted_effective_device_policy,
+                true,
+                used_fallback_q,
+            )
+        } else if used_fallback_q {
+            (
+                fallback_backend_name(self.train_args.fallback_basis).to_string(),
+                "cpu".to_string(),
+                false,
+                true,
+            )
+        } else {
+            (
+                persisted_effective_backend,
+                persisted_effective_device_policy,
+                false,
+                false,
+            )
+        }
+    }
+
+    fn ensure_runtime_state_ready(&self) -> Result<()> {
+        let artifact = self.artifact()?;
+        Self::validate_artifact(&artifact)?;
+        if artifact.feature_columns.is_empty() {
+            bail!("RL runtime feature schema is unavailable");
+        }
+        if self.bounds.is_none() {
+            bail!("RL runtime feature bounds are unavailable; load or train the learner first");
+        }
+        if self.inference_network.is_none()
+            && (self.fallback_weights.is_none() || self.fallback_bias.is_none())
+        {
+            bail!("RL runtime policy is unavailable");
         }
         Ok(())
     }
@@ -1396,6 +1836,24 @@ impl TradingReinforcementLearner {
         Ok(bounds)
     }
 
+    fn preprocess_runtime_state(&self, state: &[f32]) -> Result<Vec<f32>> {
+        if let Some(scaler) = self.feature_scaler.as_ref() {
+            if state.len() != scaler.means.len() || state.len() != scaler.stds.len() {
+                bail!(
+                    "RL runtime scaler dimension mismatch: expected {}, got {}",
+                    scaler.means.len(),
+                    state.len()
+                );
+            }
+            let features = Array2::from_shape_vec((1, state.len()), state.to_vec())
+                .context("shape RL runtime state for scaling")?;
+            let scaled = scaler.transform(&features)?;
+            Ok(scaled.row(0).iter().copied().collect())
+        } else {
+            Ok(state.to_vec())
+        }
+    }
+
     #[cfg(feature = "reinforcement-learning")]
     fn discretize_state(&self, state: &[f32]) -> Result<Status<u16>> {
         let bounds = self.bounds.as_ref().context("RL feature bounds missing")?;
@@ -1408,8 +1866,10 @@ impl TradingReinforcementLearner {
 
     #[cfg(feature = "reinforcement-learning")]
     pub fn predict_q_values(&self, state: &[f32]) -> Result<Vec<f32>> {
+        self.ensure_runtime_state_ready()?;
         if let Some(network) = self.inference_network.as_ref() {
-            let status = self.discretize_state(state)?;
+            let scaled = self.preprocess_runtime_state(state)?;
+            let status = self.discretize_state(&scaled)?;
             let tensor = match self.state_encoding {
                 TradingStateEncoding::OneHot => status
                     .to_one_hot_flat(
@@ -1448,7 +1908,8 @@ impl TradingReinforcementLearner {
                 .as_ref()
                 .context("RL fallback bias missing")?;
             let bounds = self.bounds.as_ref().context("RL feature bounds missing")?;
-            let normalized = bounds.normalize(state)?;
+            let scaled = self.preprocess_runtime_state(state)?;
+            let normalized = bounds.normalize(&scaled)?;
             let fallback_state = expand_fallback_basis(&normalized, self.train_args.fallback_basis);
             validate_q_values(
                 (0..3)
@@ -1468,6 +1929,7 @@ impl TradingReinforcementLearner {
 
     #[cfg(not(feature = "reinforcement-learning"))]
     pub fn predict_q_values(&self, state: &[f32]) -> Result<Vec<f32>> {
+        self.ensure_runtime_state_ready()?;
         let weights = self
             .fallback_weights
             .as_ref()
@@ -1477,7 +1939,8 @@ impl TradingReinforcementLearner {
             .as_ref()
             .context("RL fallback bias missing")?;
         let bounds = self.bounds.as_ref().context("RL feature bounds missing")?;
-        let normalized = bounds.normalize(state)?;
+        let scaled = self.preprocess_runtime_state(state)?;
+        let normalized = bounds.normalize(&scaled)?;
         let fallback_state = expand_fallback_basis(&normalized, self.train_args.fallback_basis);
         validate_q_values(
             (0..3)
@@ -1506,44 +1969,120 @@ impl TradingReinforcementLearner {
     }
 
     fn runtime_backend_details(&self) -> (Option<String>, Option<String>) {
-        let effective_backend = self
+        let (effective_backend, effective_device_policy, used_network_snapshot, used_fallback_q) =
+            self.live_runtime_identity();
+        let mut reasons = Vec::new();
+        if let Some(persisted_backend) = self.train_args.effective_backend.as_ref() {
+            if persisted_backend != &effective_backend {
+                reasons.push("rl_persisted_runtime_backend_drift".to_string());
+            }
+        }
+        if let Some(persisted_policy) = self.train_args.effective_device_policy.as_ref() {
+            if persisted_policy != &effective_device_policy {
+                reasons.push("rl_persisted_runtime_device_drift".to_string());
+            }
+        }
+        if let Some(gap_reason) = self
             .train_args
-            .effective_backend
-            .clone()
-            .unwrap_or_else(|| self.train_args.backend.clone());
-        if self.inference_network.is_some() {
-            (
-                Some(effective_backend.clone()),
-                if effective_backend.starts_with("linear_q") {
-                    Some("rl_network_unavailable".to_string())
-                } else {
-                    None
-                },
-            )
-        } else if self.fallback_weights.is_some() && self.fallback_bias.is_some() {
-            let backend = if effective_backend.trim().is_empty()
-                || effective_backend.starts_with("linear_q")
+            .requested_device_policy
+            .as_ref()
+            .filter(|policy| requested_gpu_device_policy(policy))
+            .and_then(|_| {
+                (!effective_device_policy
+                    .trim()
+                    .to_ascii_lowercase()
+                    .starts_with("cuda"))
+                .then(|| "requested_rl_device_unavailable".to_string())
+            })
+            .or_else(|| {
+                self.train_args
+                    .requested_backend
+                    .as_ref()
+                    .filter(|backend| !backend.trim().is_empty())
+                    .and_then(|backend| {
+                        (!backend.eq_ignore_ascii_case(&effective_backend))
+                            .then(|| "requested_rl_backend_unavailable".to_string())
+                    })
+            })
+        {
+            reasons.push(gap_reason);
+        }
+        if self.persisted_network_snapshot_present && !used_network_snapshot {
+            reasons.push("persisted_rl_network_snapshot_unavailable".to_string());
+        }
+        if self.train_args.train_rows > 0 && self.training_report.is_none() {
+            reasons.push("rl_training_report_missing".to_string());
+        }
+        if self.train_args.train_rows > 0
+            && self.training_report.is_some()
+            && self.train_args.training_report.is_none()
+        {
+            reasons.push("rl_persisted_training_report_missing".to_string());
+        }
+        if let (Some(persisted_report), Some(runtime_report)) = (
+            self.train_args.training_report.as_ref(),
+            self.training_report.as_ref(),
+        ) {
+            if persisted_report != runtime_report {
+                reasons.push("rl_training_report_state_drift".to_string());
+            }
+        }
+        if let Some(report) = self.training_report.as_ref() {
+            if report.backend != effective_backend {
+                reasons.push("rl_training_report_backend_drift".to_string());
+            }
+            if report.device_policy != effective_device_policy {
+                reasons.push("rl_training_report_device_drift".to_string());
+            }
+            if report.used_network_snapshot != used_network_snapshot {
+                reasons.push("rl_training_report_network_drift".to_string());
+            }
+            if report.used_fallback_q != used_fallback_q {
+                reasons.push("rl_training_report_fallback_drift".to_string());
+            }
+            if report.used_feature_scaler != self.feature_scaler.is_some() {
+                reasons.push("rl_training_report_scaler_drift".to_string());
+            }
+            if report.used_feature_scaler && self.feature_scaler.is_none() {
+                reasons.push("rl_feature_scaler_missing".to_string());
+            }
+        }
+        if used_network_snapshot {
+            if effective_backend.starts_with("linear_q")
                 || effective_backend.starts_with("quadratic_q")
             {
-                fallback_backend_name(self.train_args.fallback_basis).to_string()
-            } else {
-                effective_backend
-            };
-            let degraded_reason = if backend.ends_with("_q_cpu") {
-                Some("rl_network_unavailable".to_string())
-            } else {
-                Some("rl_backend_degraded_to_fallback_q".to_string())
-            };
-            (Some(backend), degraded_reason)
+                reasons.push("rl_runtime_identity_inconsistent".to_string());
+            }
+            (
+                Some(effective_backend.clone()),
+                (!reasons.is_empty()).then(|| reasons.join("; ")),
+            )
+        } else if used_fallback_q {
+            reasons.push("rl_network_unavailable".to_string());
+            if !self
+                .train_args
+                .requested_backend
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+            {
+                reasons.push("rl_backend_degraded_to_fallback_q".to_string());
+            }
+            (Some(effective_backend), Some(reasons.join("; ")))
         } else {
             (
                 Some("rl_unknown".to_string()),
-                Some("rl_policy_unavailable".to_string()),
+                Some(if reasons.is_empty() {
+                    "rl_policy_unavailable".to_string()
+                } else {
+                    format!("{}; rl_policy_unavailable", reasons.join("; "))
+                }),
             )
         }
     }
 
     pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
+        self.ensure_runtime_state_ready()?;
         let (features, columns) = feature_matrix_from_dataframe(x)?;
         if !self.feature_columns.is_empty() && self.feature_columns != columns {
             bail!(
@@ -1578,6 +2117,7 @@ impl TradingReinforcementLearner {
     pub fn save(&self, path: &Path) -> Result<()> {
         #[cfg(not(feature = "reinforcement-learning"))]
         {
+            self.ensure_runtime_state_ready()?;
             std::fs::create_dir_all(path)
                 .with_context(|| format!("create RL model directory {}", path.display()))?;
             if self.fallback_weights.is_none() || self.fallback_bias.is_none() {
@@ -1594,37 +2134,61 @@ impl TradingReinforcementLearner {
                 &artifact.feature_columns,
                 artifact.train_rows,
             )?;
-            write_json(&path.join(METADATA_FILE_NAME), &runtime_metadata)?;
-            write_json(&path.join("rl_config.json"), &artifact)
-                .with_context(|| format!("write RL config to {}", path.display()))?;
+            let metadata_path = path.join(METADATA_FILE_NAME);
+            let config_path = path.join("rl_config.json");
             let network_path = path.join("q_network.safetensors");
-            if network_path.exists() {
-                std::fs::remove_file(&network_path).with_context(|| {
-                    format!("remove stale RL network snapshot from {}", path.display())
-                })?;
+            let metadata_tmp = staged_rl_file(path, METADATA_FILE_NAME);
+            let config_tmp = staged_rl_file(path, "rl_config.json");
+            write_json(&metadata_tmp, &runtime_metadata)?;
+            if let Err(err) = write_json(&config_tmp, &artifact) {
+                cleanup_rl_temp_file(&metadata_tmp);
+                cleanup_rl_temp_file(&config_tmp);
+                return Err(err).with_context(|| format!("write RL config to {}", path.display()));
+            }
+            let metadata_backup = backup_rl_file(path, METADATA_FILE_NAME);
+            let config_backup = backup_rl_file(path, "rl_config.json");
+            let network_backup = backup_rl_file(path, "q_network.safetensors");
+            if let Err(err) = stage_rl_target(&metadata_path, &metadata_backup, Some(&metadata_tmp))
+            {
+                cleanup_rl_temp_file(&config_tmp);
+                return Err(err);
+            }
+            if let Err(err) = stage_rl_target(&config_path, &config_backup, Some(&config_tmp)) {
+                rollback_rl_target(&metadata_path, &metadata_backup);
+                return Err(err);
+            }
+            if let Err(err) = stage_rl_target(&network_path, &network_backup, None) {
+                rollback_rl_target(&config_path, &config_backup);
+                rollback_rl_target(&metadata_path, &metadata_backup);
+                return Err(err);
             }
             Ok(())
         }
 
         #[cfg(feature = "reinforcement-learning")]
         {
+            self.ensure_runtime_state_ready()?;
             std::fs::create_dir_all(path)
                 .with_context(|| format!("create RL model directory {}", path.display()))?;
             let has_fallback = self.fallback_weights.is_some() && self.fallback_bias.is_some();
             let network_path = path.join("q_network.safetensors");
+            let metadata_path = path.join(METADATA_FILE_NAME);
+            let config_path = path.join("rl_config.json");
+            let metadata_tmp = staged_rl_file(path, METADATA_FILE_NAME);
+            let config_tmp = staged_rl_file(path, "rl_config.json");
+            let network_tmp = staged_rl_file(path, "q_network.safetensors");
             if let Some(network) = self.inference_network.as_ref() {
-                network
-                    .save(network_path.to_string_lossy().as_ref())
-                    .map_err(|err| anyhow::anyhow!("save RL network: {err}"))?;
+                if let Err(err) = network.save(network_tmp.to_string_lossy().as_ref()) {
+                    cleanup_rl_temp_file(&metadata_tmp);
+                    cleanup_rl_temp_file(&config_tmp);
+                    cleanup_rl_temp_file(&network_tmp);
+                    return Err(anyhow::anyhow!("save RL network: {err}"));
+                }
             } else {
                 if !has_fallback {
                     bail!("RL model has neither a trained network nor fallback Q-parameters");
                 }
-                if network_path.exists() {
-                    std::fs::remove_file(&network_path).with_context(|| {
-                        format!("remove stale RL network snapshot from {}", path.display())
-                    })?;
-                }
+                cleanup_rl_temp_file(&network_tmp);
             }
             let mut artifact = self.artifact()?;
             if artifact.feature_columns.is_empty() {
@@ -1637,9 +2201,36 @@ impl TradingReinforcementLearner {
                 &artifact.feature_columns,
                 artifact.train_rows,
             )?;
-            write_json(&path.join(METADATA_FILE_NAME), &runtime_metadata)?;
-            write_json(&path.join("rl_config.json"), &artifact)
-                .with_context(|| format!("write RL config to {}", path.display()))?;
+            write_json(&metadata_tmp, &runtime_metadata)?;
+            if let Err(err) = write_json(&config_tmp, &artifact) {
+                cleanup_rl_temp_file(&metadata_tmp);
+                cleanup_rl_temp_file(&config_tmp);
+                cleanup_rl_temp_file(&network_tmp);
+                return Err(err).with_context(|| format!("write RL config to {}", path.display()));
+            }
+            let metadata_backup = backup_rl_file(path, METADATA_FILE_NAME);
+            let config_backup = backup_rl_file(path, "rl_config.json");
+            let network_backup = backup_rl_file(path, "q_network.safetensors");
+            if let Err(err) = stage_rl_target(&metadata_path, &metadata_backup, Some(&metadata_tmp))
+            {
+                cleanup_rl_temp_file(&config_tmp);
+                cleanup_rl_temp_file(&network_tmp);
+                return Err(err);
+            }
+            if let Err(err) = stage_rl_target(&config_path, &config_backup, Some(&config_tmp)) {
+                cleanup_rl_temp_file(&network_tmp);
+                rollback_rl_target(&metadata_path, &metadata_backup);
+                return Err(err);
+            }
+            let staged_network = self
+                .inference_network
+                .as_ref()
+                .map(|_| network_tmp.as_path());
+            if let Err(err) = stage_rl_target(&network_path, &network_backup, staged_network) {
+                rollback_rl_target(&config_path, &config_backup);
+                rollback_rl_target(&metadata_path, &metadata_backup);
+                return Err(err);
+            }
             Ok(())
         }
     }
@@ -1653,41 +2244,19 @@ impl TradingReinforcementLearner {
             if artifact.feature_columns.is_empty() {
                 artifact.feature_columns = default_rl_feature_columns(artifact.state_dim);
             }
-            artifact
-                .requested_backend
-                .get_or_insert_with(|| artifact.backend.clone());
-            artifact
-                .requested_device_policy
-                .get_or_insert_with(|| artifact.device_policy.clone());
-            artifact
-                .effective_backend
-                .get_or_insert_with(|| artifact.backend.clone());
-            artifact
-                .effective_device_policy
-                .get_or_insert_with(|| artifact.device_policy.clone());
             validate_rl_metadata(&metadata, &artifact.feature_columns, artifact.train_rows)?;
             let bounds = Self::bounds_from_artifact(&artifact)?;
             if artifact.fallback_weights.is_none() || artifact.fallback_bias.is_none() {
                 bail!("RL artifact does not contain fallback Q-parameters");
             }
-            let training_report =
-                artifact
-                    .training_report
-                    .clone()
-                    .unwrap_or_else(|| TradingRlTrainingReport {
-                        train_rows: artifact.train_rows,
-                        episode_count: 0,
-                        state_dim: artifact.state_dim,
-                        reward_horizon: artifact.reward_horizon,
-                        episode_len: artifact.episode_len,
-                        backend: artifact_effective_backend(&artifact),
-                        device_policy: artifact_effective_device_policy(&artifact),
-                        average_hold_reward: 0.0,
-                        average_buy_reward: 0.0,
-                        average_sell_reward: 0.0,
-                        used_network_snapshot: false,
-                        used_fallback_q: true,
-                    });
+            let persisted_network_snapshot_present = path.join("q_network.safetensors").exists();
+            let runtime_effective_backend =
+                fallback_backend_name(artifact.fallback_basis).to_string();
+            let runtime_effective_device_policy = "cpu".to_string();
+            let training_report = artifact
+                .training_report
+                .clone()
+                .context("RL artifact is missing training_report")?;
             Ok(Self {
                 inference_network: None,
                 hidden_dims: artifact.hidden_dims.clone(),
@@ -1697,8 +2266,12 @@ impl TradingReinforcementLearner {
                 bounds: Some(bounds),
                 fallback_weights: artifact.fallback_weights.clone(),
                 fallback_bias: artifact.fallback_bias.clone(),
+                feature_scaler: artifact.feature_scaler.clone(),
                 feature_columns: artifact.feature_columns.clone(),
                 training_report: Some(training_report),
+                runtime_effective_backend: Some(runtime_effective_backend),
+                runtime_effective_device_policy: Some(runtime_effective_device_policy),
+                persisted_network_snapshot_present,
                 train_args: artifact,
             })
         }
@@ -1713,11 +2286,11 @@ impl TradingReinforcementLearner {
             }
             validate_rl_metadata(&metadata, &artifact.feature_columns, artifact.train_rows)?;
             let bounds = Self::bounds_from_artifact(&artifact)?;
-            let requested_backend = artifact_requested_backend(&artifact);
             let requested_device_policy = artifact_requested_device_policy(&artifact);
             let (device, effective_policy, effective_backend) =
                 resolve_rl_inference_device(&requested_device_policy);
             let network_path = path.join("q_network.safetensors");
+            let persisted_network_snapshot_present = network_path.exists();
             let inference_network = if network_path.exists() {
                 Some(
                     NeuralNetwork::load(
@@ -1737,32 +2310,26 @@ impl TradingReinforcementLearner {
             {
                 bail!("RL artifact does not contain a network snapshot or fallback Q-parameters");
             }
-            artifact.requested_backend = Some(requested_backend.clone());
-            artifact.requested_device_policy = Some(requested_device_policy.clone());
-            artifact.effective_backend = Some(effective_backend.clone());
-            artifact.effective_device_policy = Some(effective_policy.clone());
-            artifact.backend = requested_backend;
-            artifact.device_policy = requested_device_policy;
             let used_network_snapshot = inference_network.is_some();
-            let training_report =
-                artifact
-                    .training_report
-                    .clone()
-                    .unwrap_or_else(|| TradingRlTrainingReport {
-                        train_rows: artifact.train_rows,
-                        episode_count: 0,
-                        state_dim: artifact.state_dim,
-                        reward_horizon: artifact.reward_horizon,
-                        episode_len: artifact.episode_len,
-                        backend: artifact_effective_backend(&artifact),
-                        device_policy: artifact_effective_device_policy(&artifact),
-                        average_hold_reward: 0.0,
-                        average_buy_reward: 0.0,
-                        average_sell_reward: 0.0,
-                        used_network_snapshot,
-                        used_fallback_q: artifact.fallback_weights.is_some()
-                            && artifact.fallback_bias.is_some(),
-                    });
+            let runtime_effective_backend = if used_network_snapshot {
+                effective_backend
+            } else {
+                fallback_backend_name(artifact.fallback_basis).to_string()
+            };
+            let runtime_effective_device_policy = if used_network_snapshot {
+                effective_policy
+            } else {
+                "cpu".to_string()
+            };
+            let training_report = artifact
+                .training_report
+                .clone()
+                .context("RL artifact is missing training_report")?;
+            if training_report.used_network_snapshot && !persisted_network_snapshot_present {
+                bail!(
+                    "RL artifact training_report claims a network snapshot but q_network.safetensors is missing"
+                );
+            }
 
             Ok(Self {
                 inference_network,
@@ -1773,8 +2340,12 @@ impl TradingReinforcementLearner {
                 bounds: Some(bounds),
                 fallback_weights: artifact.fallback_weights.clone(),
                 fallback_bias: artifact.fallback_bias.clone(),
+                feature_scaler: artifact.feature_scaler.clone(),
                 feature_columns: artifact.feature_columns.clone(),
                 training_report: Some(training_report),
+                runtime_effective_backend: Some(runtime_effective_backend),
+                runtime_effective_device_policy: Some(runtime_effective_device_policy),
+                persisted_network_snapshot_present,
                 train_args: artifact,
             })
         }
@@ -1804,6 +2375,22 @@ mod tests {
     }
 
     #[test]
+    fn rollback_rl_target_removes_partial_file_without_backup() {
+        let path = unique_temp_dir("rl-rollback-target");
+        let final_path = path.join("partial.json");
+        let backup_path = path.join("partial.json.bak");
+        std::fs::write(&final_path, b"partial").expect("write partial artifact");
+
+        rollback_rl_target(&final_path, &backup_path);
+
+        assert!(
+            !final_path.exists(),
+            "rollback should remove partial final artifact when no backup exists"
+        );
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
     fn fallback_only_artifact_round_trips_without_network_file() {
         let mut learner = TradingReinforcementLearner::new();
         learner.train_args.state_dim = 2;
@@ -1817,6 +2404,12 @@ mod tests {
             maxs: vec![1.0, 1.0],
         });
         learner.feature_columns = learner.train_args.feature_columns.clone();
+        learner.train_args.backend = "linear_q_cpu".to_string();
+        learner.train_args.device_policy = "cpu".to_string();
+        learner.train_args.requested_backend = Some("linear_q_cpu".to_string());
+        learner.train_args.requested_device_policy = Some("cpu".to_string());
+        learner.train_args.effective_backend = Some("linear_q_cpu".to_string());
+        learner.train_args.effective_device_policy = Some("cpu".to_string());
 
         let weights = Array2::<f32>::from_shape_vec((3, 2), vec![1.0_f32, 0.0, 0.0, 1.0, 0.5, 0.5])
             .expect("shape fallback weights");
@@ -1836,6 +2429,7 @@ mod tests {
             average_sell_reward: -0.1,
             used_network_snapshot: false,
             used_fallback_q: true,
+            used_feature_scaler: false,
         });
         learner.fallback_weights = Some(weights);
         learner.fallback_bias = Some(bias);
@@ -1947,11 +2541,11 @@ mod tests {
             epsilon_start: 1.0,
             epsilon_end: 0.02,
             epsilon_decay: 0.995,
-            requested_backend: None,
-            requested_device_policy: None,
-            effective_backend: None,
-            effective_device_policy: None,
-            backend: "native".to_string(),
+            requested_backend: Some("linear_q_cpu".to_string()),
+            requested_device_policy: Some("cpu".to_string()),
+            effective_backend: Some("linear_q_cpu".to_string()),
+            effective_device_policy: Some("cpu".to_string()),
+            backend: "linear_q_cpu".to_string(),
             device_policy: "cpu".to_string(),
             parallel_envs: 1,
             eval_episodes: 8,
@@ -1959,7 +2553,22 @@ mod tests {
             ray_tune_max_concurrency: 1,
             reward_horizon: 0,
             episode_len: 0,
-            training_report: None,
+            training_report: Some(TradingRlTrainingReport {
+                train_rows: 32,
+                episode_count: 2,
+                state_dim: 2,
+                reward_horizon: 0,
+                episode_len: 0,
+                backend: "linear_q_cpu".to_string(),
+                device_policy: "cpu".to_string(),
+                average_hold_reward: 0.0,
+                average_buy_reward: 0.0,
+                average_sell_reward: 0.0,
+                used_network_snapshot: false,
+                used_fallback_q: true,
+                used_feature_scaler: false,
+            }),
+            feature_scaler: None,
             fallback_basis: TradingFallbackBasis::Linear,
             fallback_weights: Some(Array2::zeros((3, 2))),
             fallback_bias: None,
@@ -1999,9 +2608,910 @@ mod tests {
 
         let (backend, degraded_reason) = learner.runtime_backend_details();
         assert_eq!(backend.as_deref(), Some("quadratic_q_cpu"));
-        assert_eq!(
-            degraded_reason.as_deref(),
-            Some("rl_network_unavailable")
-        );
+        assert_eq!(degraded_reason.as_deref(), Some("rl_network_unavailable"));
+    }
+
+    #[test]
+    fn runtime_backend_details_explain_requested_gpu_fallback_to_cpu() {
+        let mut learner = TradingReinforcementLearner::new();
+        learner.train_args.requested_backend = Some("rlkit".to_string());
+        learner.train_args.requested_device_policy = Some("cuda:0".to_string());
+        learner.train_args.effective_backend = Some("quadratic_q_cpu".to_string());
+        learner.train_args.effective_device_policy = Some("cpu".to_string());
+        learner.train_args.fallback_basis = TradingFallbackBasis::Quadratic;
+        learner.fallback_weights = Some(Array2::zeros((3, 4)));
+        learner.fallback_bias = Some(Array1::zeros(3));
+
+        let (backend, degraded_reason) = learner.runtime_backend_details();
+        assert_eq!(backend.as_deref(), Some("quadratic_q_cpu"));
+        let degraded_reason = degraded_reason.expect("fallback should be degraded");
+        assert!(degraded_reason.contains("requested_rl_device_unavailable"));
+        assert!(degraded_reason.contains("rl_network_unavailable"));
+        assert!(degraded_reason.contains("rl_backend_degraded_to_fallback_q"));
+    }
+
+    #[test]
+    fn validate_artifact_rejects_training_report_claiming_missing_fallback() {
+        let artifact = TradingRlArtifact {
+            state_dim: 2,
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            train_rows: 32,
+            hidden_dims: vec![4, 4],
+            state_encoding: TradingStateEncoding::Normalized,
+            state_bins: 255,
+            state_mins: vec![0.0, 0.0],
+            state_maxs: vec![1.0, 1.0],
+            buffer_capacity: 50_000,
+            epochs: 64,
+            max_steps: 512,
+            update_interval: 32,
+            update_freq: 4,
+            batch_size: 64,
+            learning_rate: 1e-3,
+            gamma: 0.99,
+            epsilon_start: 1.0,
+            epsilon_end: 0.02,
+            epsilon_decay: 0.995,
+            requested_backend: Some("rlkit".to_string()),
+            requested_device_policy: Some("cpu".to_string()),
+            effective_backend: Some("rlkit_cpu".to_string()),
+            effective_device_policy: Some("cpu".to_string()),
+            backend: "rlkit_cpu".to_string(),
+            device_policy: "cpu".to_string(),
+            parallel_envs: 1,
+            eval_episodes: 8,
+            rllib_num_workers: 0,
+            ray_tune_max_concurrency: 1,
+            reward_horizon: 0,
+            episode_len: 0,
+            training_report: Some(TradingRlTrainingReport {
+                train_rows: 32,
+                episode_count: 2,
+                state_dim: 2,
+                reward_horizon: 0,
+                episode_len: 0,
+                backend: "rlkit_cpu".to_string(),
+                device_policy: "cpu".to_string(),
+                average_hold_reward: 0.1,
+                average_buy_reward: 0.2,
+                average_sell_reward: -0.1,
+                used_network_snapshot: false,
+                used_fallback_q: true,
+                used_feature_scaler: false,
+            }),
+            feature_scaler: None,
+            fallback_basis: TradingFallbackBasis::Quadratic,
+            fallback_weights: None,
+            fallback_bias: None,
+        };
+
+        let err = TradingReinforcementLearner::validate_artifact(&artifact)
+            .expect_err("training report should not claim fallback without fallback parameters");
+        assert!(err.to_string().contains("fallback"));
+    }
+
+    #[test]
+    fn validate_artifact_rejects_training_report_underreporting_fallback_backend() {
+        let artifact = TradingRlArtifact {
+            state_dim: 2,
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            train_rows: 32,
+            hidden_dims: vec![4, 4],
+            state_encoding: TradingStateEncoding::Normalized,
+            state_bins: 255,
+            state_mins: vec![0.0, 0.0],
+            state_maxs: vec![1.0, 1.0],
+            buffer_capacity: 50_000,
+            epochs: 64,
+            max_steps: 512,
+            update_interval: 32,
+            update_freq: 4,
+            batch_size: 64,
+            learning_rate: 1e-3,
+            gamma: 0.99,
+            epsilon_start: 1.0,
+            epsilon_end: 0.02,
+            epsilon_decay: 0.995,
+            requested_backend: Some("rlkit".to_string()),
+            requested_device_policy: Some("cpu".to_string()),
+            effective_backend: Some("quadratic_q_cpu".to_string()),
+            effective_device_policy: Some("cpu".to_string()),
+            backend: "quadratic_q_cpu".to_string(),
+            device_policy: "cpu".to_string(),
+            parallel_envs: 1,
+            eval_episodes: 8,
+            rllib_num_workers: 0,
+            ray_tune_max_concurrency: 1,
+            reward_horizon: 0,
+            episode_len: 0,
+            training_report: Some(TradingRlTrainingReport {
+                train_rows: 32,
+                episode_count: 2,
+                state_dim: 2,
+                reward_horizon: 0,
+                episode_len: 0,
+                backend: "quadratic_q_cpu".to_string(),
+                device_policy: "cpu".to_string(),
+                average_hold_reward: 0.1,
+                average_buy_reward: 0.2,
+                average_sell_reward: -0.1,
+                used_network_snapshot: false,
+                used_fallback_q: false,
+                used_feature_scaler: false,
+            }),
+            feature_scaler: None,
+            fallback_basis: TradingFallbackBasis::Quadratic,
+            fallback_weights: Some(Array2::zeros((3, 4))),
+            fallback_bias: Some(Array1::zeros(3)),
+        };
+
+        let err = TradingReinforcementLearner::validate_artifact(&artifact)
+            .expect_err("fallback backend must not under-report fallback usage");
+        assert!(err.to_string().contains("fallback Q as unused"));
+    }
+
+    #[test]
+    fn validate_artifact_rejects_training_report_claiming_network_on_fallback_backend() {
+        let artifact = TradingRlArtifact {
+            state_dim: 2,
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            train_rows: 32,
+            hidden_dims: vec![4, 4],
+            state_encoding: TradingStateEncoding::Normalized,
+            state_bins: 255,
+            state_mins: vec![0.0, 0.0],
+            state_maxs: vec![1.0, 1.0],
+            buffer_capacity: 50_000,
+            epochs: 64,
+            max_steps: 512,
+            update_interval: 32,
+            update_freq: 4,
+            batch_size: 64,
+            learning_rate: 1e-3,
+            gamma: 0.99,
+            epsilon_start: 1.0,
+            epsilon_end: 0.02,
+            epsilon_decay: 0.995,
+            requested_backend: Some("rlkit".to_string()),
+            requested_device_policy: Some("cuda:0".to_string()),
+            effective_backend: Some("quadratic_q_cpu".to_string()),
+            effective_device_policy: Some("cpu".to_string()),
+            backend: "rlkit".to_string(),
+            device_policy: "cuda:0".to_string(),
+            parallel_envs: 1,
+            eval_episodes: 8,
+            rllib_num_workers: 0,
+            ray_tune_max_concurrency: 1,
+            reward_horizon: 4,
+            episode_len: 16,
+            training_report: Some(TradingRlTrainingReport {
+                train_rows: 32,
+                episode_count: 4,
+                state_dim: 2,
+                reward_horizon: 4,
+                episode_len: 16,
+                backend: "quadratic_q_cpu".to_string(),
+                device_policy: "cpu".to_string(),
+                average_hold_reward: 0.1,
+                average_buy_reward: 0.2,
+                average_sell_reward: -0.1,
+                used_network_snapshot: true,
+                used_fallback_q: true,
+                used_feature_scaler: false,
+            }),
+            feature_scaler: None,
+            fallback_basis: TradingFallbackBasis::Quadratic,
+            fallback_weights: Some(Array2::zeros((3, 4))),
+            fallback_bias: Some(Array1::zeros(3)),
+        };
+
+        let err = TradingReinforcementLearner::validate_artifact(&artifact)
+            .expect_err("network-on-fallback report should be rejected");
+        assert!(err.to_string().contains("network snapshot"));
+    }
+
+    #[test]
+    fn validate_artifact_rejects_missing_training_report() {
+        let mut artifact = TradingRlArtifact {
+            state_dim: 2,
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            train_rows: 32,
+            hidden_dims: vec![4, 4],
+            state_encoding: TradingStateEncoding::Normalized,
+            state_bins: 255,
+            state_mins: vec![0.0, 0.0],
+            state_maxs: vec![1.0, 1.0],
+            buffer_capacity: 50_000,
+            epochs: 64,
+            max_steps: 512,
+            update_interval: 32,
+            update_freq: 4,
+            batch_size: 64,
+            learning_rate: 1e-3,
+            gamma: 0.99,
+            epsilon_start: 1.0,
+            epsilon_end: 0.02,
+            epsilon_decay: 0.995,
+            requested_backend: Some("linear_q_cpu".to_string()),
+            requested_device_policy: Some("cpu".to_string()),
+            effective_backend: Some("linear_q_cpu".to_string()),
+            effective_device_policy: Some("cpu".to_string()),
+            backend: "linear_q_cpu".to_string(),
+            device_policy: "cpu".to_string(),
+            parallel_envs: 1,
+            eval_episodes: 8,
+            rllib_num_workers: 0,
+            ray_tune_max_concurrency: 1,
+            reward_horizon: 4,
+            episode_len: 16,
+            training_report: None,
+            feature_scaler: None,
+            fallback_basis: TradingFallbackBasis::Quadratic,
+            fallback_weights: Some(Array2::zeros((3, 4))),
+            fallback_bias: Some(Array1::zeros(3)),
+        };
+        artifact.training_report = None;
+
+        let err = TradingReinforcementLearner::validate_artifact(&artifact)
+            .expect_err("missing training_report should be rejected");
+        assert!(err.to_string().contains("missing training_report"));
+    }
+
+    #[test]
+    fn validate_artifact_rejects_zero_training_parameters() {
+        let artifact = TradingRlArtifact {
+            state_dim: 2,
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            train_rows: 32,
+            hidden_dims: vec![4, 4],
+            state_encoding: TradingStateEncoding::Normalized,
+            state_bins: 255,
+            state_mins: vec![0.0, 0.0],
+            state_maxs: vec![1.0, 1.0],
+            buffer_capacity: 50_000,
+            epochs: 0,
+            max_steps: 512,
+            update_interval: 32,
+            update_freq: 4,
+            batch_size: 64,
+            learning_rate: 1e-3,
+            gamma: 0.99,
+            epsilon_start: 1.0,
+            epsilon_end: 0.02,
+            epsilon_decay: 0.995,
+            requested_backend: Some("rlkit".to_string()),
+            requested_device_policy: Some("auto".to_string()),
+            effective_backend: Some("quadratic_q_cpu".to_string()),
+            effective_device_policy: Some("cpu".to_string()),
+            backend: "rlkit".to_string(),
+            device_policy: "auto".to_string(),
+            parallel_envs: 1,
+            eval_episodes: 8,
+            rllib_num_workers: 0,
+            ray_tune_max_concurrency: 1,
+            reward_horizon: 4,
+            episode_len: 16,
+            training_report: Some(TradingRlTrainingReport {
+                train_rows: 32,
+                episode_count: 4,
+                state_dim: 2,
+                reward_horizon: 4,
+                episode_len: 16,
+                backend: "quadratic_q_cpu".to_string(),
+                device_policy: "cpu".to_string(),
+                average_hold_reward: 0.1,
+                average_buy_reward: 0.2,
+                average_sell_reward: -0.1,
+                used_network_snapshot: false,
+                used_fallback_q: true,
+                used_feature_scaler: false,
+            }),
+            feature_scaler: None,
+            fallback_basis: TradingFallbackBasis::Quadratic,
+            fallback_weights: Some(Array2::zeros((3, 4))),
+            fallback_bias: Some(Array1::zeros(3)),
+        };
+
+        let err = TradingReinforcementLearner::validate_artifact(&artifact)
+            .expect_err("zero epochs must be rejected");
+        assert!(err.to_string().contains("zero-valued training parameters"));
+    }
+
+    #[test]
+    fn runtime_backend_details_include_missing_training_report_for_trained_state() {
+        let mut learner = TradingReinforcementLearner::default();
+        learner.train_args.train_rows = 128;
+        learner.train_args.effective_backend = Some("quadratic_q_cpu".to_string());
+        learner.train_args.effective_device_policy = Some("cpu".to_string());
+        learner.fallback_weights = Some(Array2::zeros((3, 2)));
+        learner.fallback_bias = Some(Array1::zeros(3));
+        learner.training_report = None;
+
+        let (backend, degraded_reason) = learner.runtime_backend_details();
+
+        assert_eq!(backend.as_deref(), Some("quadratic_q_cpu"));
+        let degraded_reason = degraded_reason.expect("trained fallback state should be degraded");
+        assert!(degraded_reason.contains("rl_training_report_missing"));
+        assert!(degraded_reason.contains("rl_network_unavailable"));
+    }
+
+    #[test]
+    fn runtime_backend_details_flag_missing_persisted_training_report() {
+        let mut learner = TradingReinforcementLearner::default();
+        learner.train_args.train_rows = 128;
+        learner.train_args.effective_backend = Some("quadratic_q_cpu".to_string());
+        learner.train_args.effective_device_policy = Some("cpu".to_string());
+        learner.fallback_weights = Some(Array2::zeros((3, 2)));
+        learner.fallback_bias = Some(Array1::zeros(3));
+        learner.training_report = Some(TradingRlTrainingReport {
+            train_rows: 128,
+            episode_count: 4,
+            state_dim: 2,
+            reward_horizon: 4,
+            episode_len: 16,
+            backend: "quadratic_q_cpu".to_string(),
+            device_policy: "cpu".to_string(),
+            average_hold_reward: 0.1,
+            average_buy_reward: 0.2,
+            average_sell_reward: -0.1,
+            used_network_snapshot: false,
+            used_fallback_q: true,
+            used_feature_scaler: false,
+        });
+        learner.train_args.training_report = None;
+
+        let (_, degraded_reason) = learner.runtime_backend_details();
+        assert!(degraded_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("rl_persisted_training_report_missing"));
+    }
+
+    #[test]
+    fn validate_artifact_rejects_partial_runtime_identity_fields() {
+        let artifact = TradingRlArtifact {
+            state_dim: 2,
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            train_rows: 32,
+            hidden_dims: vec![4, 4],
+            state_encoding: TradingStateEncoding::Normalized,
+            state_bins: 255,
+            state_mins: vec![0.0, 0.0],
+            state_maxs: vec![1.0, 1.0],
+            buffer_capacity: 50_000,
+            epochs: 8,
+            max_steps: 128,
+            update_interval: 8,
+            update_freq: 2,
+            batch_size: 32,
+            learning_rate: 1e-3,
+            gamma: 0.99,
+            epsilon_start: 1.0,
+            epsilon_end: 0.02,
+            epsilon_decay: 0.995,
+            requested_backend: Some("rlkit".to_string()),
+            requested_device_policy: None,
+            effective_backend: Some("quadratic_q_cpu".to_string()),
+            effective_device_policy: Some("cpu".to_string()),
+            backend: "rlkit".to_string(),
+            device_policy: "auto".to_string(),
+            parallel_envs: 1,
+            eval_episodes: 8,
+            rllib_num_workers: 0,
+            ray_tune_max_concurrency: 1,
+            reward_horizon: 4,
+            episode_len: 16,
+            training_report: Some(TradingRlTrainingReport {
+                train_rows: 32,
+                episode_count: 4,
+                state_dim: 2,
+                reward_horizon: 4,
+                episode_len: 16,
+                backend: "quadratic_q_cpu".to_string(),
+                device_policy: "cpu".to_string(),
+                average_hold_reward: 0.1,
+                average_buy_reward: 0.2,
+                average_sell_reward: -0.1,
+                used_network_snapshot: false,
+                used_fallback_q: true,
+                used_feature_scaler: false,
+            }),
+            feature_scaler: None,
+            fallback_basis: TradingFallbackBasis::Quadratic,
+            fallback_weights: Some(Array2::zeros((3, 4))),
+            fallback_bias: Some(Array1::zeros(3)),
+        };
+
+        let err = TradingReinforcementLearner::validate_artifact(&artifact)
+            .expect_err("partial runtime identity should be rejected");
+        assert!(err.to_string().contains("requested/effective backend"));
+    }
+
+    #[test]
+    fn validate_artifact_rejects_unknown_effective_backend() {
+        let artifact = TradingRlArtifact {
+            state_dim: 2,
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            train_rows: 32,
+            hidden_dims: vec![4, 4],
+            state_encoding: TradingStateEncoding::Normalized,
+            state_bins: 255,
+            state_mins: vec![0.0, 0.0],
+            state_maxs: vec![1.0, 1.0],
+            buffer_capacity: 50_000,
+            epochs: 8,
+            max_steps: 128,
+            update_interval: 8,
+            update_freq: 2,
+            batch_size: 32,
+            learning_rate: 1e-3,
+            gamma: 0.99,
+            epsilon_start: 1.0,
+            epsilon_end: 0.02,
+            epsilon_decay: 0.995,
+            requested_backend: Some("rlkit".to_string()),
+            requested_device_policy: Some("auto".to_string()),
+            effective_backend: Some("mystery_backend".to_string()),
+            effective_device_policy: Some("cpu".to_string()),
+            backend: "rlkit".to_string(),
+            device_policy: "auto".to_string(),
+            parallel_envs: 1,
+            eval_episodes: 8,
+            rllib_num_workers: 0,
+            ray_tune_max_concurrency: 1,
+            reward_horizon: 4,
+            episode_len: 16,
+            training_report: Some(TradingRlTrainingReport {
+                train_rows: 32,
+                episode_count: 4,
+                state_dim: 2,
+                reward_horizon: 4,
+                episode_len: 16,
+                backend: "mystery_backend".to_string(),
+                device_policy: "cpu".to_string(),
+                average_hold_reward: 0.1,
+                average_buy_reward: 0.2,
+                average_sell_reward: -0.1,
+                used_network_snapshot: false,
+                used_fallback_q: true,
+                used_feature_scaler: false,
+            }),
+            feature_scaler: None,
+            fallback_basis: TradingFallbackBasis::Quadratic,
+            fallback_weights: Some(Array2::zeros((3, 4))),
+            fallback_bias: Some(Array1::zeros(3)),
+        };
+
+        let err = TradingReinforcementLearner::validate_artifact(&artifact)
+            .expect_err("unknown effective backend should be rejected");
+        assert!(err.to_string().contains("supported runtime backend"));
+    }
+
+    #[test]
+    fn validate_artifact_rejects_legacy_effective_runtime_drift() {
+        let artifact = TradingRlArtifact {
+            state_dim: 2,
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            train_rows: 32,
+            hidden_dims: vec![4, 4],
+            state_encoding: TradingStateEncoding::Normalized,
+            state_bins: 255,
+            state_mins: vec![0.0, 0.0],
+            state_maxs: vec![1.0, 1.0],
+            buffer_capacity: 50_000,
+            epochs: 8,
+            max_steps: 128,
+            update_interval: 8,
+            update_freq: 2,
+            batch_size: 32,
+            learning_rate: 1e-3,
+            gamma: 0.99,
+            epsilon_start: 1.0,
+            epsilon_end: 0.02,
+            epsilon_decay: 0.995,
+            requested_backend: Some("rlkit".to_string()),
+            requested_device_policy: Some("cuda:0".to_string()),
+            effective_backend: Some("quadratic_q_cpu".to_string()),
+            effective_device_policy: Some("cpu".to_string()),
+            backend: "rlkit_cuda".to_string(),
+            device_policy: "cuda:0".to_string(),
+            parallel_envs: 1,
+            eval_episodes: 8,
+            rllib_num_workers: 0,
+            ray_tune_max_concurrency: 1,
+            reward_horizon: 4,
+            episode_len: 16,
+            training_report: Some(TradingRlTrainingReport {
+                train_rows: 32,
+                episode_count: 4,
+                state_dim: 2,
+                reward_horizon: 4,
+                episode_len: 16,
+                backend: "quadratic_q_cpu".to_string(),
+                device_policy: "cpu".to_string(),
+                average_hold_reward: 0.1,
+                average_buy_reward: 0.2,
+                average_sell_reward: -0.1,
+                used_network_snapshot: false,
+                used_fallback_q: true,
+                used_feature_scaler: false,
+            }),
+            feature_scaler: None,
+            fallback_basis: TradingFallbackBasis::Quadratic,
+            fallback_weights: Some(Array2::zeros((3, 4))),
+            fallback_bias: Some(Array1::zeros(3)),
+        };
+
+        let err = TradingReinforcementLearner::validate_artifact(&artifact)
+            .expect_err("legacy effective runtime drift should be rejected");
+        assert!(err.to_string().contains("legacy backend"));
+    }
+
+    #[test]
+    fn runtime_backend_details_include_training_report_backend_drift() {
+        let mut learner = TradingReinforcementLearner::default();
+        learner.train_args.train_rows = 128;
+        learner.train_args.effective_backend = Some("quadratic_q_cpu".to_string());
+        learner.train_args.effective_device_policy = Some("cpu".to_string());
+        learner.fallback_weights = Some(Array2::zeros((3, 2)));
+        learner.fallback_bias = Some(Array1::zeros(3));
+        learner.training_report = Some(TradingRlTrainingReport {
+            backend: "rlkit_cuda".to_string(),
+            device_policy: "cpu".to_string(),
+            used_fallback_q: true,
+            used_feature_scaler: false,
+            ..TradingRlTrainingReport::default()
+        });
+
+        let (_, degraded_reason) = learner.runtime_backend_details();
+        assert!(degraded_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("rl_training_report_backend_drift"));
+    }
+
+    #[test]
+    fn runtime_backend_details_include_persisted_runtime_drift_and_missing_network_snapshot() {
+        let mut learner = TradingReinforcementLearner::default();
+        learner.train_args.train_rows = 128;
+        learner.train_args.requested_backend = Some("rlkit".to_string());
+        learner.train_args.requested_device_policy = Some("cuda:0".to_string());
+        learner.train_args.effective_backend = Some("rlkit_cuda".to_string());
+        learner.train_args.effective_device_policy = Some("cuda:0".to_string());
+        learner.runtime_effective_backend = Some("quadratic_q_cpu".to_string());
+        learner.runtime_effective_device_policy = Some("cpu".to_string());
+        learner.persisted_network_snapshot_present = true;
+        learner.fallback_weights = Some(Array2::zeros((3, 2)));
+        learner.fallback_bias = Some(Array1::zeros(3));
+
+        let (_, degraded_reason) = learner.runtime_backend_details();
+        let degraded_reason = degraded_reason.expect("runtime should be degraded");
+        assert!(degraded_reason.contains("rl_persisted_runtime_backend_drift"));
+        assert!(degraded_reason.contains("rl_persisted_runtime_device_drift"));
+        assert!(degraded_reason.contains("persisted_rl_network_snapshot_unavailable"));
+    }
+
+    #[test]
+    fn validate_artifact_rejects_misaligned_feature_scaler() {
+        let artifact = TradingRlArtifact {
+            state_dim: 2,
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            train_rows: 32,
+            hidden_dims: vec![4, 4],
+            state_encoding: TradingStateEncoding::Normalized,
+            state_bins: 255,
+            state_mins: vec![0.0, 0.0],
+            state_maxs: vec![1.0, 1.0],
+            buffer_capacity: 50_000,
+            epochs: 8,
+            max_steps: 128,
+            update_interval: 8,
+            update_freq: 2,
+            batch_size: 32,
+            learning_rate: 1e-3,
+            gamma: 0.99,
+            epsilon_start: 1.0,
+            epsilon_end: 0.02,
+            epsilon_decay: 0.995,
+            requested_backend: Some("rlkit".to_string()),
+            requested_device_policy: Some("cpu".to_string()),
+            effective_backend: Some("quadratic_q_cpu".to_string()),
+            effective_device_policy: Some("cpu".to_string()),
+            backend: "rlkit".to_string(),
+            device_policy: "cpu".to_string(),
+            parallel_envs: 1,
+            eval_episodes: 8,
+            rllib_num_workers: 0,
+            ray_tune_max_concurrency: 1,
+            reward_horizon: 4,
+            episode_len: 16,
+            training_report: Some(TradingRlTrainingReport {
+                train_rows: 32,
+                episode_count: 4,
+                state_dim: 2,
+                reward_horizon: 4,
+                episode_len: 16,
+                backend: "quadratic_q_cpu".to_string(),
+                device_policy: "cpu".to_string(),
+                average_hold_reward: 0.1,
+                average_buy_reward: 0.2,
+                average_sell_reward: -0.1,
+                used_network_snapshot: false,
+                used_fallback_q: true,
+                used_feature_scaler: true,
+            }),
+            feature_scaler: Some(FeatureScaler {
+                means: vec![0.0],
+                stds: vec![1.0, 1.0],
+            }),
+            fallback_basis: TradingFallbackBasis::Quadratic,
+            fallback_weights: Some(Array2::zeros((3, 4))),
+            fallback_bias: Some(Array1::zeros(3)),
+        };
+
+        let err = TradingReinforcementLearner::validate_artifact(&artifact)
+            .expect_err("misaligned feature scaler should be rejected");
+        assert!(err.to_string().contains("feature_scaler mismatch"));
+    }
+
+    #[test]
+    fn validate_artifact_rejects_training_report_scaler_drift() {
+        let artifact = TradingRlArtifact {
+            state_dim: 2,
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            train_rows: 32,
+            hidden_dims: vec![4, 4],
+            state_encoding: TradingStateEncoding::Normalized,
+            state_bins: 255,
+            state_mins: vec![0.0, 0.0],
+            state_maxs: vec![1.0, 1.0],
+            buffer_capacity: 50_000,
+            epochs: 8,
+            max_steps: 128,
+            update_interval: 8,
+            update_freq: 2,
+            batch_size: 32,
+            learning_rate: 1e-3,
+            gamma: 0.99,
+            epsilon_start: 1.0,
+            epsilon_end: 0.02,
+            epsilon_decay: 0.995,
+            requested_backend: Some("rlkit".to_string()),
+            requested_device_policy: Some("cpu".to_string()),
+            effective_backend: Some("quadratic_q_cpu".to_string()),
+            effective_device_policy: Some("cpu".to_string()),
+            backend: "rlkit".to_string(),
+            device_policy: "cpu".to_string(),
+            parallel_envs: 1,
+            eval_episodes: 8,
+            rllib_num_workers: 0,
+            ray_tune_max_concurrency: 1,
+            reward_horizon: 4,
+            episode_len: 16,
+            training_report: Some(TradingRlTrainingReport {
+                train_rows: 32,
+                episode_count: 4,
+                state_dim: 2,
+                reward_horizon: 4,
+                episode_len: 16,
+                backend: "quadratic_q_cpu".to_string(),
+                device_policy: "cpu".to_string(),
+                average_hold_reward: 0.1,
+                average_buy_reward: 0.2,
+                average_sell_reward: -0.1,
+                used_network_snapshot: false,
+                used_fallback_q: true,
+                used_feature_scaler: false,
+            }),
+            feature_scaler: Some(FeatureScaler {
+                means: vec![0.0, 0.0],
+                stds: vec![1.0, 1.0],
+            }),
+            fallback_basis: TradingFallbackBasis::Quadratic,
+            fallback_weights: Some(Array2::zeros((3, 4))),
+            fallback_bias: Some(Array1::zeros(3)),
+        };
+
+        let err = TradingReinforcementLearner::validate_artifact(&artifact)
+            .expect_err("training report scaler drift should be rejected");
+        assert!(err.to_string().contains("feature_scaler flag"));
+    }
+
+    #[test]
+    fn artifact_rejects_live_training_report_drift() {
+        let mut learner = TradingReinforcementLearner::new();
+        learner.train_args.state_dim = 2;
+        learner.train_args.train_rows = 16;
+        learner.train_args.feature_columns = vec!["f1".to_string(), "f2".to_string()];
+        learner.train_args.backend = "quadratic_q_cpu".to_string();
+        learner.train_args.device_policy = "cpu".to_string();
+        learner.train_args.requested_backend = Some("rlkit".to_string());
+        learner.train_args.requested_device_policy = Some("cuda:0".to_string());
+        learner.train_args.effective_backend = Some("quadratic_q_cpu".to_string());
+        learner.train_args.effective_device_policy = Some("cpu".to_string());
+        learner.train_args.fallback_basis = TradingFallbackBasis::Quadratic;
+        learner.train_args.training_report = Some(TradingRlTrainingReport {
+            train_rows: 16,
+            episode_count: 2,
+            state_dim: 2,
+            reward_horizon: 0,
+            episode_len: 0,
+            backend: "quadratic_q_cpu".to_string(),
+            device_policy: "cpu".to_string(),
+            average_hold_reward: 0.0,
+            average_buy_reward: 0.0,
+            average_sell_reward: 0.0,
+            used_network_snapshot: false,
+            used_fallback_q: true,
+            used_feature_scaler: true,
+        });
+        learner.bounds = Some(FeatureBounds {
+            mins: vec![0.0, 0.0],
+            maxs: vec![1.0, 1.0],
+        });
+        learner.feature_columns = vec!["f1".to_string(), "f2".to_string()];
+        learner.fallback_weights = Some(Array2::zeros((3, 4)));
+        learner.fallback_bias = Some(Array1::zeros(3));
+        learner.feature_scaler = Some(FeatureScaler {
+            means: vec![0.25, 0.75],
+            stds: vec![0.5, 0.25],
+        });
+        learner.training_report = Some(TradingRlTrainingReport {
+            train_rows: 16,
+            episode_count: 2,
+            state_dim: 2,
+            reward_horizon: 0,
+            episode_len: 0,
+            backend: "stale_backend".to_string(),
+            device_policy: "stale_device".to_string(),
+            average_hold_reward: 0.0,
+            average_buy_reward: 0.0,
+            average_sell_reward: 0.0,
+            used_network_snapshot: true,
+            used_fallback_q: false,
+            used_feature_scaler: true,
+        });
+
+        let err = learner
+            .artifact()
+            .expect_err("live/persisted training report drift should be rejected");
+        assert!(err.to_string().contains("training_report drifted"));
+    }
+
+    #[test]
+    fn artifact_rejects_missing_persisted_training_report() {
+        let mut learner = TradingReinforcementLearner::new();
+        learner.train_args.state_dim = 2;
+        learner.train_args.train_rows = 16;
+        learner.train_args.feature_columns = vec!["f1".to_string(), "f2".to_string()];
+        learner.train_args.backend = "quadratic_q_cpu".to_string();
+        learner.train_args.device_policy = "cpu".to_string();
+        learner.train_args.requested_backend = Some("rlkit".to_string());
+        learner.train_args.requested_device_policy = Some("cuda:0".to_string());
+        learner.train_args.effective_backend = Some("quadratic_q_cpu".to_string());
+        learner.train_args.effective_device_policy = Some("cpu".to_string());
+        learner.train_args.fallback_basis = TradingFallbackBasis::Quadratic;
+        learner.train_args.training_report = None;
+        learner.bounds = Some(FeatureBounds {
+            mins: vec![0.0, 0.0],
+            maxs: vec![1.0, 1.0],
+        });
+        learner.feature_columns = vec!["f1".to_string(), "f2".to_string()];
+        learner.fallback_weights = Some(Array2::zeros((3, 4)));
+        learner.fallback_bias = Some(Array1::zeros(3));
+        learner.training_report = Some(TradingRlTrainingReport {
+            train_rows: 16,
+            episode_count: 2,
+            state_dim: 2,
+            reward_horizon: 0,
+            episode_len: 0,
+            backend: "quadratic_q_cpu".to_string(),
+            device_policy: "cpu".to_string(),
+            average_hold_reward: 0.0,
+            average_buy_reward: 0.0,
+            average_sell_reward: 0.0,
+            used_network_snapshot: false,
+            used_fallback_q: true,
+            used_feature_scaler: false,
+        });
+
+        let err = learner
+            .artifact()
+            .expect_err("missing persisted training report should be rejected");
+        assert!(err
+            .to_string()
+            .contains("missing the persisted training_report"));
+    }
+
+    #[test]
+    fn load_rejects_missing_network_snapshot_when_report_claims_one() {
+        let path = unique_temp_dir("rl-missing-network-snapshot");
+        let artifact = TradingRlArtifact {
+            state_dim: 2,
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            train_rows: 32,
+            hidden_dims: vec![4, 4],
+            state_encoding: TradingStateEncoding::Normalized,
+            state_bins: 255,
+            state_mins: vec![0.0, 0.0],
+            state_maxs: vec![1.0, 1.0],
+            buffer_capacity: 50_000,
+            epochs: 64,
+            max_steps: 512,
+            update_interval: 32,
+            update_freq: 4,
+            batch_size: 64,
+            learning_rate: 1e-3,
+            gamma: 0.99,
+            epsilon_start: 1.0,
+            epsilon_end: 0.02,
+            epsilon_decay: 0.995,
+            requested_backend: Some("rlkit".to_string()),
+            requested_device_policy: Some("cpu".to_string()),
+            effective_backend: Some("rlkit_cpu".to_string()),
+            effective_device_policy: Some("cpu".to_string()),
+            backend: "rlkit_cpu".to_string(),
+            device_policy: "cpu".to_string(),
+            parallel_envs: 1,
+            eval_episodes: 8,
+            rllib_num_workers: 0,
+            ray_tune_max_concurrency: 1,
+            reward_horizon: 0,
+            episode_len: 0,
+            training_report: Some(TradingRlTrainingReport {
+                train_rows: 32,
+                episode_count: 2,
+                state_dim: 2,
+                reward_horizon: 0,
+                episode_len: 0,
+                backend: "rlkit_cpu".to_string(),
+                device_policy: "cpu".to_string(),
+                average_hold_reward: 0.1,
+                average_buy_reward: 0.2,
+                average_sell_reward: -0.1,
+                used_network_snapshot: true,
+                used_fallback_q: true,
+                used_feature_scaler: false,
+            }),
+            feature_scaler: None,
+            fallback_basis: TradingFallbackBasis::Quadratic,
+            fallback_weights: Some(Array2::zeros((3, 4))),
+            fallback_bias: Some(Array1::zeros(3)),
+        };
+        let metadata = rl_runtime_metadata(artifact.feature_columns.clone(), artifact.train_rows);
+        write_json(&path.join(METADATA_FILE_NAME), &metadata).expect("write metadata");
+        write_json(&path.join("rl_config.json"), &artifact).expect("write config");
+
+        let err = TradingReinforcementLearner::load(&path)
+            .expect_err("load should reject missing network snapshot");
+        assert!(err.to_string().contains("claims a network snapshot"));
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn preprocess_runtime_state_applies_persisted_feature_scaler() {
+        let mut learner = TradingReinforcementLearner::new();
+        learner.feature_scaler = Some(FeatureScaler {
+            means: vec![1.0, 2.0],
+            stds: vec![2.0, 4.0],
+        });
+
+        let scaled = learner
+            .preprocess_runtime_state(&[5.0, 10.0])
+            .expect("runtime preprocessing should use persisted scaler");
+        assert_eq!(scaled, vec![2.0, 2.0]);
+    }
+
+    #[test]
+    fn predict_runtime_rejects_missing_bounds_before_inference() -> Result<()> {
+        let learner = TradingReinforcementLearner::new();
+        let df = DataFrame::new(vec![Series::new("f1".into(), vec![0.0_f64]).into()])?;
+
+        let err = learner
+            .predict_runtime(&df)
+            .expect_err("missing bounds should fail early");
+        assert!(err.to_string().contains("feature bounds"));
+        Ok(())
     }
 }

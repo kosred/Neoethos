@@ -10,6 +10,10 @@ pub struct LabelMapping {
 
 impl LabelMapping {
     pub fn new(raw_label: i32, class_index: usize) -> Self {
+        assert!(
+            class_index < 3,
+            "runtime label mapping class_index must stay inside the three-class contract"
+        );
         Self {
             raw_label,
             class_index,
@@ -26,6 +30,18 @@ pub struct TrainingSummaryMetadata {
 
 impl TrainingSummaryMetadata {
     pub fn new(dataset_rows: usize, train_rows: usize, val_rows: usize) -> Self {
+        assert!(
+            dataset_rows > 0,
+            "runtime training summary requires a non-zero dataset row count"
+        );
+        assert!(
+            train_rows > 0,
+            "runtime training summary requires a non-zero train row count"
+        );
+        assert!(
+            train_rows + val_rows == dataset_rows,
+            "runtime training summary requires train_rows + val_rows == dataset_rows"
+        );
         Self {
             dataset_rows,
             train_rows,
@@ -53,8 +69,21 @@ impl RuntimeArtifactMetadata {
         label_mapping: Vec<LabelMapping>,
         training_summary: TrainingSummaryMetadata,
     ) -> Self {
+        let model_name = model_name.into();
+        assert!(
+            !model_name.trim().is_empty(),
+            "runtime artifact metadata requires a non-empty model_name"
+        );
+        assert!(
+            !feature_columns.is_empty(),
+            "runtime artifact metadata requires at least one feature column"
+        );
+        assert!(
+            !label_mapping.is_empty(),
+            "runtime artifact metadata requires a non-empty label mapping"
+        );
         Self {
-            model_name: model_name.into(),
+            model_name,
             family,
             state,
             feature_columns,
@@ -70,4 +99,28 @@ pub fn default_three_class_label_mapping() -> Vec<LabelMapping> {
         LabelMapping::new(0, 0),
         LabelMapping::new(1, 1),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "runtime training summary requires a non-zero train row count")]
+    fn training_summary_rejects_zero_train_rows() {
+        let _ = TrainingSummaryMetadata::new(10, 0, 10);
+    }
+
+    #[test]
+    #[should_panic(expected = "runtime artifact metadata requires at least one feature column")]
+    fn runtime_metadata_rejects_empty_feature_columns() {
+        let _ = RuntimeArtifactMetadata::new(
+            "mlp",
+            ModelFamily::Deep,
+            CapabilityState::Implemented,
+            Vec::new(),
+            default_three_class_label_mapping(),
+            TrainingSummaryMetadata::new(10, 8, 2),
+        );
+    }
 }

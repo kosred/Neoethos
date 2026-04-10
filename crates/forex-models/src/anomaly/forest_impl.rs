@@ -9,7 +9,7 @@ use std::path::Path;
 
 use crate::base::{
     build_runtime_artifact_metadata, build_runtime_prediction_with_details,
-    canonical_three_class_label_mapping, ExpertModel,
+    canonical_three_class_label_mapping, three_class_runtime_confidence, ExpertModel,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
@@ -220,6 +220,15 @@ fn validate_isolation_forest_artifact(artifact: &IsolationForestArtifact) -> Res
     if artifact.feature_columns.is_empty() {
         bail!("isolation_forest artifact must contain feature columns");
     }
+    let runtime_metadata = artifact
+        .runtime_metadata
+        .as_ref()
+        .context("isolation_forest artifact must persist runtime metadata")?;
+    validate_runtime_metadata(
+        runtime_metadata,
+        &artifact.feature_columns,
+        artifact.dataset_rows,
+    )?;
     if artifact.backend_kind.trim().is_empty() {
         bail!("isolation_forest artifact must declare a backend kind");
     }
@@ -829,13 +838,73 @@ impl ExpertModel for IsolationForestExpert {
 }
 
 impl IsolationForestExpert {
+    fn has_minimal_runtime_context(&self) -> bool {
+        self.dataset_rows > 0 && !self.feature_columns.is_empty()
+    }
+
+    fn has_diagonal_profile_runtime(&self) -> bool {
+        self.has_minimal_runtime_context()
+            && self.fallback_means.len() == self.feature_columns.len()
+            && self.fallback_stds.len() == self.feature_columns.len()
+            && self
+                .fallback_stds
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0)
+            && self.fallback_means.iter().all(|value| value.is_finite())
+    }
+
     fn runtime_details(&self) -> (Option<String>, Option<String>) {
+        if !self.has_minimal_runtime_context() {
+            return (
+                Some("isolation_forest_unknown".to_string()),
+                Some("anomaly_runtime_state_incomplete".to_string()),
+            );
+        }
+
         match self.backend_kind.as_str() {
-            "extended_isolation_forest" => (Some("extended_isolation_forest".to_string()), None),
-            "diagonal_profile" => (
-                Some("diagonal_profile".to_string()),
-                Some("native_anomaly_backend_unavailable".to_string()),
-            ),
+            "extended_isolation_forest" => {
+                #[cfg(feature = "anomaly-detection")]
+                {
+                    if self.backend.is_some() {
+                        (Some("extended_isolation_forest".to_string()), None)
+                    } else {
+                        let degraded_reason = if self.has_diagonal_profile_runtime() {
+                            "extended_anomaly_backend_missing"
+                        } else {
+                            "anomaly_runtime_state_incomplete"
+                        };
+                        (
+                            Some("extended_isolation_forest".to_string()),
+                            Some(degraded_reason.to_string()),
+                        )
+                    }
+                }
+                #[cfg(not(feature = "anomaly-detection"))]
+                {
+                    let degraded_reason = if self.has_diagonal_profile_runtime() {
+                        "extended_anomaly_backend_unavailable"
+                    } else {
+                        "anomaly_runtime_state_incomplete"
+                    };
+                    (
+                        Some("extended_isolation_forest".to_string()),
+                        Some(degraded_reason.to_string()),
+                    )
+                }
+            }
+            "diagonal_profile" => {
+                if self.has_diagonal_profile_runtime() {
+                    (
+                        Some("diagonal_profile".to_string()),
+                        Some("anomaly_backend_degraded_to_diagonal_profile".to_string()),
+                    )
+                } else {
+                    (
+                        Some("isolation_forest_unknown".to_string()),
+                        Some("anomaly_runtime_state_incomplete".to_string()),
+                    )
+                }
+            }
             _ => (
                 Some("isolation_forest_unknown".to_string()),
                 Some("anomaly_backend_unknown".to_string()),
@@ -849,14 +918,14 @@ impl IsolationForestExpert {
         let mut predictions = Vec::with_capacity(probabilities.nrows());
         for row in probabilities.outer_iter() {
             let row_values = [row[0], row[1], row[2]];
-            let confidence = row_values.iter().copied().fold(0.0_f32, f32::max);
+            let (confidence, abstain) = three_class_runtime_confidence(row_values)?;
             predictions.push(build_runtime_prediction_with_details(
                 "isolation_forest",
                 ModelFamily::Anomaly,
                 CapabilityState::Implemented,
                 row_values,
                 Some(confidence),
-                Some(row_values[0] > 0.5),
+                Some(abstain),
                 execution_backend.clone(),
                 degraded_reason.clone(),
             )?);
@@ -976,10 +1045,130 @@ mod tests {
     }
 
     #[test]
+    fn predict_runtime_uses_shared_three_class_confidence_gate() -> Result<()> {
+        let df = sample_dataframe();
+        let expert = IsolationForestExpert {
+            backend_kind: "diagonal_profile".to_string(),
+            feature_columns: vec![
+                "open".to_string(),
+                "high".to_string(),
+                "low".to_string(),
+                "close".to_string(),
+            ],
+            dataset_rows: df.height(),
+            anomaly_threshold: 0.5,
+            score_std: 1.0,
+            score_median: 0.0,
+            score_mad: 1.0,
+            fallback_means: vec![0.0; 4],
+            fallback_stds: vec![1.0; 4],
+            ..IsolationForestExpert::default()
+        };
+
+        let probabilities = expert.predict_proba(&df)?;
+        let predictions = expert.predict_runtime(&df)?;
+        let first_row = probabilities.row(0);
+        let row_values = [first_row[0], first_row[1], first_row[2]];
+        let (expected_confidence, expected_abstain) = three_class_runtime_confidence(row_values)?;
+
+        assert_eq!(predictions.len(), df.height());
+        assert_eq!(predictions[0].confidence(), Some(expected_confidence));
+        assert_eq!(predictions[0].abstain_recommended(), Some(expected_abstain));
+        Ok(())
+    }
+
+    #[test]
     fn robust_score_profile_stays_centered_under_single_large_outlier() {
         let (mean, std, median, mad) = score_statistics(&[0.9, 1.0, 1.1, 8.0]);
         assert!(mean > median, "mean should be pulled by the outlier");
-        assert!((median - 1.05).abs() < 0.1, "median should stay near the dense cluster");
-        assert!(mad < std, "robust dispersion should stay tighter than std under outliers");
+        assert!(
+            (median - 1.05).abs() < 0.1,
+            "median should stay near the dense cluster"
+        );
+        assert!(
+            mad < std,
+            "robust dispersion should stay tighter than std under outliers"
+        );
+    }
+
+    #[test]
+    fn isolation_forest_artifact_requires_runtime_metadata() {
+        let artifact = IsolationForestArtifact {
+            model_name: "isolation_forest".to_string(),
+            backend_kind: "diagonal_profile".to_string(),
+            runtime_metadata: None,
+            feature_columns: vec!["f1".to_string()],
+            dataset_rows: 8,
+            n_trees: 64,
+            sample_size: 8,
+            extension_level: 0,
+            max_tree_depth: None,
+            anomaly_threshold: 0.5,
+            score_mean: 0.0,
+            score_std: 1.0,
+            score_median: 0.0,
+            score_mad: 1.0,
+            model_json: String::new(),
+            fallback_means: vec![0.0],
+            fallback_stds: vec![1.0],
+        };
+
+        let err = validate_isolation_forest_artifact(&artifact)
+            .expect_err("artifact without runtime metadata should fail");
+        assert!(err.to_string().contains("runtime metadata"));
+    }
+
+    #[test]
+    fn isolation_forest_runtime_details_mark_diagonal_profile_as_degraded() {
+        let expert = IsolationForestExpert {
+            backend_kind: "diagonal_profile".to_string(),
+            feature_columns: vec!["open".to_string(), "high".to_string()],
+            dataset_rows: 8,
+            fallback_means: vec![0.0, 0.0],
+            fallback_stds: vec![1.0, 1.0],
+            ..IsolationForestExpert::default()
+        };
+
+        let (backend, degraded_reason) = expert.runtime_details();
+        assert_eq!(backend.as_deref(), Some("diagonal_profile"));
+        assert_eq!(
+            degraded_reason.as_deref(),
+            Some("anomaly_backend_degraded_to_diagonal_profile")
+        );
+    }
+
+    #[test]
+    fn isolation_forest_runtime_details_mark_incomplete_diagonal_profile_state_as_unknown() {
+        let expert = IsolationForestExpert {
+            backend_kind: "diagonal_profile".to_string(),
+            feature_columns: vec!["open".to_string(), "high".to_string()],
+            dataset_rows: 8,
+            fallback_means: vec![0.0],
+            fallback_stds: vec![1.0, 1.0],
+            ..IsolationForestExpert::default()
+        };
+
+        let (backend, degraded_reason) = expert.runtime_details();
+        assert_eq!(backend.as_deref(), Some("isolation_forest_unknown"));
+        assert_eq!(
+            degraded_reason.as_deref(),
+            Some("anomaly_runtime_state_incomplete")
+        );
+    }
+
+    #[test]
+    fn isolation_forest_runtime_details_mark_missing_feature_schema_as_incomplete() {
+        let expert = IsolationForestExpert {
+            backend_kind: "extended_isolation_forest".to_string(),
+            dataset_rows: 8,
+            ..IsolationForestExpert::default()
+        };
+
+        let (backend, degraded_reason) = expert.runtime_details();
+        assert_eq!(backend.as_deref(), Some("isolation_forest_unknown"));
+        assert_eq!(
+            degraded_reason.as_deref(),
+            Some("anomaly_runtime_state_incomplete")
+        );
     }
 }

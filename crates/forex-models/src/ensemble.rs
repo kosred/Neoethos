@@ -2,9 +2,11 @@ use anyhow::{bail, Context, Result};
 use ndarray::Array2;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::base::{build_runtime_prediction, ExpertModel};
+use crate::base::{
+    build_runtime_prediction_with_details, three_class_runtime_confidence, ExpertModel,
+};
 use crate::runtime::artifacts::{default_three_class_label_mapping, RuntimeArtifactMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 use crate::runtime::prediction::RuntimePrediction;
@@ -210,7 +212,142 @@ fn validate_meta_metadata(
     if metadata.feature_columns.is_empty() {
         bail!("meta artifact metadata must contain at least one feature column");
     }
+    if metadata.training_summary.dataset_rows == 0 {
+        bail!("meta artifact training summary must persist a non-zero dataset row count");
+    }
+    if metadata.training_summary.dataset_rows
+        != metadata.training_summary.train_rows + metadata.training_summary.val_rows
+    {
+        bail!("meta artifact training summary is inconsistent");
+    }
     Ok(())
+}
+
+fn staged_meta_artifact_dir(path: &Path) -> PathBuf {
+    path.with_extension("tmp_meta_artifact")
+}
+
+fn backup_meta_artifact_dir(path: &Path) -> PathBuf {
+    path.with_extension("bak_meta_artifact")
+}
+
+fn staged_meta_file(path: &Path) -> PathBuf {
+    path.with_extension("tmp_meta_file")
+}
+
+fn backup_meta_file(path: &Path) -> PathBuf {
+    path.with_extension("bak_meta_file")
+}
+
+fn cleanup_meta_artifact_dir(path: &Path) -> Result<()> {
+    if path.exists() {
+        std::fs::remove_dir_all(path)
+            .with_context(|| format!("remove staged meta artifact {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn replace_meta_artifact_dir(staged_path: &Path, target_path: &Path) -> Result<()> {
+    let backup_path = backup_meta_artifact_dir(target_path);
+    cleanup_meta_artifact_dir(&backup_path)?;
+    if target_path.exists() {
+        std::fs::rename(target_path, &backup_path).with_context(|| {
+            format!(
+                "move previous meta artifact into backup {}",
+                backup_path.display()
+            )
+        })?;
+    }
+    if let Err(error) = std::fs::rename(staged_path, target_path) {
+        if backup_path.exists() {
+            let _ = std::fs::rename(&backup_path, target_path);
+        }
+        bail!(
+            "rename staged meta artifact into {} failed: {}",
+            target_path.display(),
+            error
+        );
+    }
+    cleanup_meta_artifact_dir(&backup_path)?;
+    Ok(())
+}
+
+fn with_staged_meta_artifact_dir<F>(path: &Path, writer: F) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    let staged_path = staged_meta_artifact_dir(path);
+    cleanup_meta_artifact_dir(&staged_path)?;
+    std::fs::create_dir_all(&staged_path)
+        .with_context(|| format!("create staged meta artifact dir {}", staged_path.display()))?;
+    if let Err(error) = writer(&staged_path) {
+        let _ = cleanup_meta_artifact_dir(&staged_path);
+        return Err(error);
+    }
+    replace_meta_artifact_dir(&staged_path, path)
+}
+
+fn write_json_with_backup<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create artifact directory {}", parent.display()))?;
+    }
+
+    let staged_path = staged_meta_file(path);
+    let backup_path = backup_meta_file(path);
+    if staged_path.exists() {
+        std::fs::remove_file(&staged_path)
+            .with_context(|| format!("remove stale staged meta file {}", staged_path.display()))?;
+    }
+    if backup_path.exists() {
+        std::fs::remove_file(&backup_path)
+            .with_context(|| format!("remove stale backup meta file {}", backup_path.display()))?;
+    }
+
+    let payload = serde_json::to_vec_pretty(value)
+        .with_context(|| format!("serialize {}", path.display()))?;
+    std::fs::write(&staged_path, payload)
+        .with_context(|| format!("write staged meta file {}", staged_path.display()))?;
+
+    if path.exists() {
+        std::fs::rename(path, &backup_path)
+            .with_context(|| format!("backup current meta file {}", path.display()))?;
+    }
+
+    if let Err(error) = std::fs::rename(&staged_path, path) {
+        if backup_path.exists() {
+            let _ = std::fs::rename(&backup_path, path);
+        } else if staged_path.exists() {
+            let _ = std::fs::remove_file(&staged_path);
+        }
+        bail!(
+            "promote staged meta file into {} failed: {}",
+            path.display(),
+            error
+        );
+    }
+
+    if backup_path.exists() {
+        std::fs::remove_file(&backup_path)
+            .with_context(|| format!("remove backup meta file {}", backup_path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn join_degraded_reasons<I>(reasons: I) -> Option<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let reasons = reasons
+        .into_iter()
+        .filter(|reason| !reason.trim().is_empty())
+        .collect::<Vec<_>>();
+    if reasons.is_empty() {
+        None
+    } else {
+        Some(reasons.join("; "))
+    }
 }
 
 fn validate_calibrator_artifact(artifact: &ProbabilityCalibratorArtifact) -> Result<()> {
@@ -268,6 +405,111 @@ fn validate_calibrator_artifact(artifact: &ProbabilityCalibratorArtifact) -> Res
     Ok(())
 }
 
+fn validate_meta_blender_save_state(state: &MetaBlender) -> Result<()> {
+    let model = state.model.as_ref().context("MetaBlender not fitted")?;
+    if !state.fitted {
+        bail!("MetaBlender must be marked as fitted before save");
+    }
+    if state.feature_columns.is_empty() {
+        bail!("MetaBlender must persist at least one feature column before save");
+    }
+    if state.training_rows == 0 {
+        bail!("MetaBlender must persist a non-zero training row count before save");
+    }
+    if model.feature_columns.is_empty() {
+        bail!("MetaBlender backend is missing feature columns");
+    }
+    if model.feature_columns != state.feature_columns {
+        bail!(
+            "MetaBlender backend feature-column mismatch between state {:?} and backend {:?}",
+            state.feature_columns,
+            model.feature_columns
+        );
+    }
+    Ok(())
+}
+
+fn validate_probability_calibrator_live_state(state: &ProbabilityCalibrator) -> Result<()> {
+    if !state.fitted {
+        bail!("probability calibrator is not fitted");
+    }
+    validate_calibrator_artifact(&ProbabilityCalibratorArtifact {
+        method: state.method,
+        fitted: state.fitted,
+        models: state.models.clone(),
+    })
+}
+
+fn validate_conformal_gate_live_state(state: &ConformalGate) -> Result<()> {
+    if !state.fitted {
+        bail!("conformal gate is not fitted");
+    }
+    validate_conformal_artifact(&ConformalGateArtifact {
+        alpha: state.alpha,
+        qhat: state.qhat,
+        fitted: state.fitted,
+        n_calib: state.n_calib,
+    })
+}
+
+fn validate_probability_calibration_expert_artifact(
+    artifact: &ProbabilityCalibrationExpertArtifact,
+) -> Result<()> {
+    if artifact.feature_columns.is_empty() {
+        bail!("probability calibration artifact must contain at least one feature column");
+    }
+    if artifact.training_rows == 0 {
+        bail!("probability calibration artifact must persist a non-zero training row count");
+    }
+    if artifact.min_fit_rows < 32 {
+        bail!(
+            "probability calibration artifact min_fit_rows must be at least 32, got {}",
+            artifact.min_fit_rows
+        );
+    }
+    if !artifact.fitted {
+        bail!("probability calibration expert artifact is marked as unfitted");
+    }
+    Ok(())
+}
+
+fn validate_probability_calibration_expert_save_state(
+    state: &ProbabilityCalibrationExpert,
+) -> Result<()> {
+    validate_meta_blender_save_state(&state.backend)?;
+    validate_probability_calibrator_live_state(&state.calibrator)?;
+    if !state.fitted {
+        bail!("probability calibration expert is not fitted");
+    }
+    if state.feature_columns.is_empty() {
+        bail!("probability calibration expert must persist feature columns before save");
+    }
+    if state.training_rows == 0 {
+        bail!("probability calibration expert must persist training rows before save");
+    }
+    if state.feature_columns != state.backend.feature_columns {
+        bail!(
+            "probability calibration expert feature-column mismatch between state {:?} and backend {:?}",
+            state.feature_columns,
+            state.backend.feature_columns
+        );
+    }
+    if state.training_rows != state.backend.training_rows {
+        bail!(
+            "probability calibration expert training row mismatch between state {} and backend {}",
+            state.training_rows,
+            state.backend.training_rows
+        );
+    }
+    if state.min_fit_rows < 32 {
+        bail!(
+            "probability calibration expert min_fit_rows must be at least 32, got {}",
+            state.min_fit_rows
+        );
+    }
+    Ok(())
+}
+
 fn validate_conformal_artifact(artifact: &ConformalGateArtifact) -> Result<()> {
     if !artifact.alpha.is_finite() || !(0.0..1.0).contains(&artifact.alpha) {
         bail!("conformal gate alpha must be finite and strictly between 0 and 1");
@@ -283,6 +525,150 @@ fn validate_conformal_artifact(artifact: &ConformalGateArtifact) -> Result<()> {
     }
     if !artifact.fitted && artifact.n_calib != 0 {
         bail!("unfitted conformal gate should not persist calibration row count");
+    }
+    Ok(())
+}
+
+fn validate_conformal_prediction_expert_save_state(
+    state: &ConformalPredictionExpert,
+) -> Result<()> {
+    validate_meta_blender_save_state(&state.backend)?;
+    validate_probability_calibrator_live_state(&state.calibrator)?;
+    validate_conformal_gate_live_state(&state.conformal_gate)?;
+    if !state.fitted {
+        bail!("conformal prediction expert is not fitted");
+    }
+    if state.feature_columns.is_empty() {
+        bail!("conformal prediction expert must persist feature columns before save");
+    }
+    if state.training_rows == 0 {
+        bail!("conformal prediction expert must persist training rows before save");
+    }
+    if state.feature_columns != state.backend.feature_columns {
+        bail!(
+            "conformal prediction expert feature-column mismatch between state {:?} and backend {:?}",
+            state.feature_columns,
+            state.backend.feature_columns
+        );
+    }
+    if state.training_rows != state.backend.training_rows {
+        bail!(
+            "conformal prediction expert training row mismatch between state {} and backend {}",
+            state.training_rows,
+            state.backend.training_rows
+        );
+    }
+    if !(1..=3).contains(&state.min_prediction_set) {
+        bail!(
+            "conformal prediction expert min_prediction_set must be between 1 and 3, got {}",
+            state.min_prediction_set
+        );
+    }
+    if state.min_fit_rows < 32 {
+        bail!(
+            "conformal prediction expert min_fit_rows must be at least 32, got {}",
+            state.min_fit_rows
+        );
+    }
+    Ok(())
+}
+
+fn validate_conformal_prediction_expert_artifact(
+    artifact: &ConformalPredictionExpertArtifact,
+) -> Result<()> {
+    if artifact.feature_columns.is_empty() {
+        bail!("conformal prediction artifact must contain at least one feature column");
+    }
+    if artifact.training_rows == 0 {
+        bail!("conformal prediction artifact must persist a non-zero training row count");
+    }
+    if !artifact.alpha.is_finite() || !(0.0..1.0).contains(&artifact.alpha) {
+        bail!("conformal prediction artifact alpha must be finite and strictly between 0 and 1");
+    }
+    if !(1..=3).contains(&artifact.min_prediction_set) {
+        bail!(
+            "conformal prediction artifact min_prediction_set must be between 1 and 3, got {}",
+            artifact.min_prediction_set
+        );
+    }
+    if artifact.min_fit_rows < 32 {
+        bail!(
+            "conformal prediction artifact min_fit_rows must be at least 32, got {}",
+            artifact.min_fit_rows
+        );
+    }
+    if !artifact.fitted {
+        bail!("conformal prediction artifact is marked as unfitted");
+    }
+    Ok(())
+}
+
+fn validate_meta_stack_save_state(state: &MetaDecisionStack) -> Result<()> {
+    validate_meta_blender_save_state(&state.blender)?;
+    validate_probability_calibrator_live_state(&state.calibrator)?;
+    validate_conformal_gate_live_state(&state.conformal_gate)?;
+    if !state.fitted {
+        bail!("meta decision stack is not fitted");
+    }
+    if state.feature_columns.is_empty() {
+        bail!("meta decision stack must persist feature columns before save");
+    }
+    if state.training_rows == 0 {
+        bail!("meta decision stack must persist training rows before save");
+    }
+    if state.feature_columns != state.blender.feature_columns {
+        bail!(
+            "meta decision stack feature-column mismatch between state {:?} and blender {:?}",
+            state.feature_columns,
+            state.blender.feature_columns
+        );
+    }
+    if state.training_rows != state.blender.training_rows {
+        bail!(
+            "meta decision stack training row mismatch between state {} and blender {}",
+            state.training_rows,
+            state.blender.training_rows
+        );
+    }
+    if !(1..=3).contains(&state.min_prediction_set) {
+        bail!(
+            "meta decision stack min_prediction_set must be between 1 and 3, got {}",
+            state.min_prediction_set
+        );
+    }
+    if state.min_fit_rows < 32 {
+        bail!(
+            "meta decision stack min_fit_rows must be at least 32, got {}",
+            state.min_fit_rows
+        );
+    }
+    Ok(())
+}
+
+fn validate_meta_stack_artifact(artifact: &MetaDecisionStackArtifact) -> Result<()> {
+    if artifact.feature_columns.is_empty() {
+        bail!("meta stack artifact must contain at least one feature column");
+    }
+    if artifact.training_rows == 0 {
+        bail!("meta stack artifact must persist a non-zero training row count");
+    }
+    if !artifact.alpha.is_finite() || !(0.0..1.0).contains(&artifact.alpha) {
+        bail!("meta stack artifact alpha must be finite and strictly between 0 and 1");
+    }
+    if !(1..=3).contains(&artifact.min_prediction_set) {
+        bail!(
+            "meta stack artifact min_prediction_set must be between 1 and 3, got {}",
+            artifact.min_prediction_set
+        );
+    }
+    if artifact.min_fit_rows < 32 {
+        bail!(
+            "meta stack artifact min_fit_rows must be at least 32, got {}",
+            artifact.min_fit_rows
+        );
+    }
+    if !artifact.fitted {
+        bail!("meta decision stack artifact is marked as unfitted");
     }
     Ok(())
 }
@@ -376,8 +762,144 @@ fn select_temperature(probabilities: &Array2<f32>, labels: &[i32]) -> Result<f32
     Ok(best_temperature)
 }
 
-fn max_probability(row: &[f32; 3]) -> f32 {
-    row.iter().copied().fold(0.0_f32, f32::max)
+fn build_meta_runtime_prediction(
+    model_name: &str,
+    row: [f32; 3],
+    conformal_gate: &ConformalGate,
+    min_prediction_set: usize,
+) -> Result<RuntimePrediction> {
+    let (confidence, shared_abstain) = three_class_runtime_confidence(row)?;
+    let (conformal_abstain, _) = conformal_gate.should_abstain(&row, min_prediction_set);
+    let degraded_reason = join_degraded_reasons(
+        [
+            shared_abstain.then(|| "meta runtime confidence gate recommended abstain".to_string()),
+            conformal_abstain.then(|| "meta conformal gate recommended abstain".to_string()),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    build_runtime_prediction_with_details(
+        model_name,
+        ModelFamily::Meta,
+        CapabilityState::Implemented,
+        row,
+        Some(confidence),
+        Some(shared_abstain || conformal_abstain),
+        Some("xgboost_meta_blender+conformal_gate".to_string()),
+        degraded_reason,
+    )
+}
+
+fn calibration_method_name(method: CalibrationMethod) -> &'static str {
+    match method {
+        CalibrationMethod::Identity => "identity",
+        CalibrationMethod::Platt => "platt",
+        CalibrationMethod::Temperature => "temperature",
+    }
+}
+
+fn build_probability_calibration_runtime_prediction(
+    row: [f32; 3],
+    calibration_method: CalibrationMethod,
+) -> Result<RuntimePrediction> {
+    let (confidence, abstain) = three_class_runtime_confidence(row)?;
+    let degraded_reason = if abstain {
+        Some("shared three-class confidence gate recommended abstain".to_string())
+    } else {
+        None
+    };
+    build_runtime_prediction_with_details(
+        "probability_calibrator",
+        ModelFamily::Meta,
+        CapabilityState::Implemented,
+        row,
+        Some(confidence),
+        Some(abstain),
+        Some(format!(
+            "xgboost_meta_blender+{}_calibration",
+            calibration_method_name(calibration_method)
+        )),
+        degraded_reason,
+    )
+}
+
+fn build_conformal_runtime_prediction(
+    row: [f32; 3],
+    calibration_method: CalibrationMethod,
+    conformal_gate: &ConformalGate,
+    min_prediction_set: usize,
+) -> Result<RuntimePrediction> {
+    let (confidence, shared_abstain) = three_class_runtime_confidence(row)?;
+    let (conformal_abstain, prediction_set_size) =
+        conformal_gate.should_abstain(&row, min_prediction_set);
+    let degraded_reason = join_degraded_reasons(
+        [
+            shared_abstain
+                .then(|| "shared three-class confidence gate recommended abstain".to_string()),
+            conformal_abstain.then(|| {
+                format!(
+                    "conformal prediction set size {} reached abstain threshold {}",
+                    prediction_set_size,
+                    min_prediction_set.max(1)
+                )
+            }),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+
+    build_runtime_prediction_with_details(
+        "conformal_gate",
+        ModelFamily::Meta,
+        CapabilityState::Implemented,
+        row,
+        Some(confidence),
+        Some(shared_abstain || conformal_abstain),
+        Some(format!(
+            "xgboost_meta_blender+{}_calibration+conformal_gate",
+            calibration_method_name(calibration_method)
+        )),
+        degraded_reason,
+    )
+}
+
+fn build_meta_stack_runtime_prediction(
+    row: [f32; 3],
+    calibration_method: CalibrationMethod,
+    conformal_gate: &ConformalGate,
+    min_prediction_set: usize,
+) -> Result<RuntimePrediction> {
+    let (confidence, shared_abstain) = three_class_runtime_confidence(row)?;
+    let (conformal_abstain, prediction_set_size) =
+        conformal_gate.should_abstain(&row, min_prediction_set);
+    let mut degraded_reasons = Vec::new();
+    if shared_abstain {
+        degraded_reasons.push("shared three-class confidence gate recommended abstain".to_string());
+    }
+    if conformal_abstain {
+        degraded_reasons.push(format!(
+            "conformal prediction set size {} reached abstain threshold {}",
+            prediction_set_size,
+            min_prediction_set.max(1)
+        ));
+    }
+    build_runtime_prediction_with_details(
+        "meta_stack",
+        ModelFamily::Meta,
+        CapabilityState::Implemented,
+        row,
+        Some(confidence),
+        Some(shared_abstain || conformal_abstain),
+        Some(format!(
+            "xgboost_meta_blender+{}_calibration+conformal_gate",
+            calibration_method_name(calibration_method)
+        )),
+        if degraded_reasons.is_empty() {
+            None
+        } else {
+            Some(degraded_reasons.join("; "))
+        },
+    )
 }
 
 pub struct MetaBlender {
@@ -421,27 +943,25 @@ impl MetaBlender {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        std::fs::create_dir_all(path)
-            .with_context(|| format!("create meta blender directory {}", path.display()))?;
-        write_json(
-            &path.join(METADATA_FILE_NAME),
-            &meta_runtime_metadata(
-                "meta_blender",
-                self.feature_columns.clone(),
-                self.training_rows,
-            ),
-        )?;
-        write_json(
-            &path.join(META_BLENDER_FILE_NAME),
-            &MetaBlenderArtifact {
-                feature_columns: self.feature_columns.clone(),
-                fitted: self.fitted,
-                training_rows: self.training_rows,
-            },
-        )?;
+        validate_meta_blender_save_state(self)?;
         let model = self.model.as_ref().context("MetaBlender not fitted")?;
-        model.save(&path.join(BLENDER_BACKEND_DIR_NAME))?;
-        Ok(())
+        let artifact = MetaBlenderArtifact {
+            feature_columns: self.feature_columns.clone(),
+            fitted: self.fitted,
+            training_rows: self.training_rows,
+        };
+        with_staged_meta_artifact_dir(path, |staged_path| {
+            write_json(
+                &staged_path.join(METADATA_FILE_NAME),
+                &meta_runtime_metadata(
+                    "meta_blender",
+                    self.feature_columns.clone(),
+                    self.training_rows,
+                ),
+            )?;
+            write_json(&staged_path.join(META_BLENDER_FILE_NAME), &artifact)?;
+            model.save(&staged_path.join(BLENDER_BACKEND_DIR_NAME))
+        })
     }
 
     pub fn load(&mut self, path: &Path) -> Result<()> {
@@ -665,7 +1185,7 @@ impl ProbabilityCalibrator {
             models: self.models.clone(),
         };
         validate_calibrator_artifact(&artifact)?;
-        write_json(&path.join(CALIBRATOR_FILE_NAME), &artifact)
+        write_json_with_backup(&path.join(CALIBRATOR_FILE_NAME), &artifact)
     }
 
     pub fn load(&mut self, path: &Path) -> Result<()> {
@@ -707,6 +1227,25 @@ impl ProbabilityCalibrationExpert {
             training_rows: 0,
         }
     }
+
+    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
+        let probabilities = self.predict_proba(x)?;
+        let mut runtime_predictions = Vec::with_capacity(probabilities.nrows());
+
+        for row_idx in 0..probabilities.nrows() {
+            let row = [
+                clamp_probability(probabilities[(row_idx, 0)]),
+                clamp_probability(probabilities[(row_idx, 1)]),
+                clamp_probability(probabilities[(row_idx, 2)]),
+            ];
+            runtime_predictions.push(build_probability_calibration_runtime_prediction(
+                row,
+                self.calibrator.method,
+            )?);
+        }
+
+        Ok(runtime_predictions)
+    }
 }
 
 impl Default for ProbabilityCalibrationExpert {
@@ -745,34 +1284,29 @@ impl ExpertModel for ProbabilityCalibrationExpert {
     }
 
     fn save(&self, path: &Path) -> Result<()> {
-        if !self.fitted {
-            bail!("probability calibration expert is not fitted");
-        }
-        std::fs::create_dir_all(path).with_context(|| {
-            format!("create probability calibrator directory {}", path.display())
-        })?;
-        write_json(
-            &path.join(METADATA_FILE_NAME),
-            &meta_runtime_metadata(
-                "probability_calibrator",
-                self.feature_columns.clone(),
-                self.training_rows,
-            ),
-        )?;
-        write_json(
-            &path.join(CALIBRATION_EXPERT_FILE_NAME),
-            &ProbabilityCalibrationExpertArtifact {
-                fitted: self.fitted,
-                feature_columns: self.feature_columns.clone(),
-                training_rows: self.training_rows,
-                method: self.calibrator.method,
-                min_fit_rows: self.min_fit_rows,
-            },
-        )?;
-        self.backend
-            .save(&path.join(CALIBRATION_BACKEND_DIR_NAME))?;
-        self.calibrator.save(path)?;
-        Ok(())
+        validate_probability_calibration_expert_save_state(self)?;
+        let artifact = ProbabilityCalibrationExpertArtifact {
+            fitted: self.fitted,
+            feature_columns: self.feature_columns.clone(),
+            training_rows: self.training_rows,
+            method: self.calibrator.method,
+            min_fit_rows: self.min_fit_rows,
+        };
+        validate_probability_calibration_expert_artifact(&artifact)?;
+        with_staged_meta_artifact_dir(path, |staged_path| {
+            write_json(
+                &staged_path.join(METADATA_FILE_NAME),
+                &meta_runtime_metadata(
+                    "probability_calibrator",
+                    self.feature_columns.clone(),
+                    self.training_rows,
+                ),
+            )?;
+            write_json(&staged_path.join(CALIBRATION_EXPERT_FILE_NAME), &artifact)?;
+            self.backend
+                .save(&staged_path.join(CALIBRATION_BACKEND_DIR_NAME))?;
+            self.calibrator.save(staged_path)
+        })
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
@@ -780,12 +1314,7 @@ impl ExpertModel for ProbabilityCalibrationExpert {
         validate_meta_metadata(&metadata, "probability_calibrator")?;
         let artifact: ProbabilityCalibrationExpertArtifact =
             read_json(&path.join(CALIBRATION_EXPERT_FILE_NAME))?;
-        if !artifact.fitted {
-            bail!("probability calibration expert artifact is marked as unfitted");
-        }
-        if artifact.training_rows == 0 {
-            bail!("probability calibration artifact must persist a non-zero training row count");
-        }
+        validate_probability_calibration_expert_artifact(&artifact)?;
         if metadata.training_summary.dataset_rows != artifact.training_rows {
             bail!(
                 "probability calibration training row mismatch between metadata {} and artifact {}",
@@ -933,7 +1462,7 @@ impl ConformalGate {
             n_calib: self.n_calib,
         };
         validate_conformal_artifact(&artifact)?;
-        write_json(&path.join(CONFORMAL_FILE_NAME), &artifact)
+        write_json_with_backup(&path.join(CONFORMAL_FILE_NAME), &artifact)
     }
 
     pub fn load(&mut self, path: &Path) -> Result<()> {
@@ -991,17 +1520,11 @@ impl ConformalPredictionExpert {
                 clamp_probability(probabilities[(row_idx, 1)]),
                 clamp_probability(probabilities[(row_idx, 2)]),
             ];
-            let confidence = max_probability(&row);
-            let (abstain, _) = self
-                .conformal_gate
-                .should_abstain(&row, self.min_prediction_set);
-            runtime_predictions.push(build_runtime_prediction(
-                "conformal_gate",
-                crate::runtime::capabilities::ModelFamily::Meta,
-                crate::runtime::capabilities::CapabilityState::Implemented,
+            runtime_predictions.push(build_conformal_runtime_prediction(
                 row,
-                Some(confidence),
-                Some(abstain),
+                self.calibrator.method,
+                &self.conformal_gate,
+                self.min_prediction_set,
             )?);
         }
 
@@ -1048,35 +1571,32 @@ impl ExpertModel for ConformalPredictionExpert {
     }
 
     fn save(&self, path: &Path) -> Result<()> {
-        if !self.fitted {
-            bail!("conformal prediction expert is not fitted");
-        }
-        std::fs::create_dir_all(path)
-            .with_context(|| format!("create conformal expert directory {}", path.display()))?;
-        write_json(
-            &path.join(METADATA_FILE_NAME),
-            &meta_runtime_metadata(
-                "conformal_gate",
-                self.feature_columns.clone(),
-                self.training_rows,
-            ),
-        )?;
-        write_json(
-            &path.join(CONFORMAL_EXPERT_FILE_NAME),
-            &ConformalPredictionExpertArtifact {
-                fitted: self.fitted,
-                feature_columns: self.feature_columns.clone(),
-                training_rows: self.training_rows,
-                alpha: self.conformal_gate.alpha,
-                method: self.calibrator.method,
-                min_prediction_set: self.min_prediction_set,
-                min_fit_rows: self.min_fit_rows,
-            },
-        )?;
-        self.backend.save(&path.join(CONFORMAL_BACKEND_DIR_NAME))?;
-        self.calibrator.save(path)?;
-        self.conformal_gate.save(path)?;
-        Ok(())
+        validate_conformal_prediction_expert_save_state(self)?;
+        let artifact = ConformalPredictionExpertArtifact {
+            fitted: self.fitted,
+            feature_columns: self.feature_columns.clone(),
+            training_rows: self.training_rows,
+            alpha: self.conformal_gate.alpha,
+            method: self.calibrator.method,
+            min_prediction_set: self.min_prediction_set,
+            min_fit_rows: self.min_fit_rows,
+        };
+        validate_conformal_prediction_expert_artifact(&artifact)?;
+        with_staged_meta_artifact_dir(path, |staged_path| {
+            write_json(
+                &staged_path.join(METADATA_FILE_NAME),
+                &meta_runtime_metadata(
+                    "conformal_gate",
+                    self.feature_columns.clone(),
+                    self.training_rows,
+                ),
+            )?;
+            write_json(&staged_path.join(CONFORMAL_EXPERT_FILE_NAME), &artifact)?;
+            self.backend
+                .save(&staged_path.join(CONFORMAL_BACKEND_DIR_NAME))?;
+            self.calibrator.save(staged_path)?;
+            self.conformal_gate.save(staged_path)
+        })
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
@@ -1084,12 +1604,7 @@ impl ExpertModel for ConformalPredictionExpert {
         validate_meta_metadata(&metadata, "conformal_gate")?;
         let artifact: ConformalPredictionExpertArtifact =
             read_json(&path.join(CONFORMAL_EXPERT_FILE_NAME))?;
-        if !artifact.fitted {
-            bail!("conformal prediction expert artifact is marked as unfitted");
-        }
-        if artifact.training_rows == 0 {
-            bail!("conformal prediction artifact must persist a non-zero training row count");
-        }
+        validate_conformal_prediction_expert_artifact(&artifact)?;
         if metadata.training_summary.dataset_rows != artifact.training_rows {
             bail!(
                 "conformal prediction training row mismatch between metadata {} and artifact {}",
@@ -1176,17 +1691,11 @@ impl MetaDecisionStack {
                 clamp_probability(probabilities[(row_idx, 1)]),
                 clamp_probability(probabilities[(row_idx, 2)]),
             ];
-            let confidence = max_probability(&row);
-            let (abstain, _) = self
-                .conformal_gate
-                .should_abstain(&row, self.min_prediction_set);
-            runtime_predictions.push(build_runtime_prediction(
-                "meta_stack",
-                crate::runtime::capabilities::ModelFamily::Meta,
-                crate::runtime::capabilities::CapabilityState::Implemented,
+            runtime_predictions.push(build_meta_stack_runtime_prediction(
                 row,
-                Some(confidence),
-                Some(abstain),
+                self.calibrator.method,
+                &self.conformal_gate,
+                self.min_prediction_set,
             )?);
         }
 
@@ -1235,47 +1744,38 @@ impl ExpertModel for MetaDecisionStack {
     }
 
     fn save(&self, path: &Path) -> Result<()> {
-        if !self.fitted {
-            bail!("meta decision stack is not fitted");
-        }
-        std::fs::create_dir_all(path)
-            .with_context(|| format!("create meta stack directory {}", path.display()))?;
-        write_json(
-            &path.join(METADATA_FILE_NAME),
-            &meta_runtime_metadata(
-                "meta_stack",
-                self.feature_columns.clone(),
-                self.training_rows,
-            ),
-        )?;
-        write_json(
-            &path.join(META_STACK_FILE_NAME),
-            &MetaDecisionStackArtifact {
-                fitted: self.fitted,
-                feature_columns: self.feature_columns.clone(),
-                training_rows: self.training_rows,
-                method: self.calibrator.method,
-                alpha: self.conformal_gate.alpha,
-                min_prediction_set: self.min_prediction_set,
-                min_fit_rows: self.min_fit_rows,
-            },
-        )?;
-        self.blender.save(&path.join(BLENDER_DIR_NAME))?;
-        self.calibrator.save(path)?;
-        self.conformal_gate.save(path)?;
-        Ok(())
+        validate_meta_stack_save_state(self)?;
+        let artifact = MetaDecisionStackArtifact {
+            fitted: self.fitted,
+            feature_columns: self.feature_columns.clone(),
+            training_rows: self.training_rows,
+            method: self.calibrator.method,
+            alpha: self.conformal_gate.alpha,
+            min_prediction_set: self.min_prediction_set,
+            min_fit_rows: self.min_fit_rows,
+        };
+        validate_meta_stack_artifact(&artifact)?;
+        with_staged_meta_artifact_dir(path, |staged_path| {
+            write_json(
+                &staged_path.join(METADATA_FILE_NAME),
+                &meta_runtime_metadata(
+                    "meta_stack",
+                    self.feature_columns.clone(),
+                    self.training_rows,
+                ),
+            )?;
+            write_json(&staged_path.join(META_STACK_FILE_NAME), &artifact)?;
+            self.blender.save(&staged_path.join(BLENDER_DIR_NAME))?;
+            self.calibrator.save(staged_path)?;
+            self.conformal_gate.save(staged_path)
+        })
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
         let metadata: RuntimeArtifactMetadata = read_json(&path.join(METADATA_FILE_NAME))?;
         validate_meta_metadata(&metadata, "meta_stack")?;
         let artifact: MetaDecisionStackArtifact = read_json(&path.join(META_STACK_FILE_NAME))?;
-        if !artifact.fitted {
-            bail!("meta decision stack artifact is marked as unfitted");
-        }
-        if artifact.training_rows == 0 {
-            bail!("meta decision stack artifact must persist a non-zero training row count");
-        }
+        validate_meta_stack_artifact(&artifact)?;
         if metadata.training_summary.dataset_rows != artifact.training_rows {
             bail!(
                 "meta stack training row mismatch between metadata {} and artifact {}",
@@ -1323,5 +1823,307 @@ impl ExpertModel for MetaDecisionStack {
         next_state.min_fit_rows = artifact.min_fit_rows.max(32);
         *self = next_state;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tree_models::XGBoostExpert;
+
+    fn fitted_temperature_calibrator() -> ProbabilityCalibrator {
+        ProbabilityCalibrator {
+            method: CalibrationMethod::Temperature,
+            fitted: true,
+            models: vec![CalibrationModel::Temperature { temperature: 1.0 }],
+        }
+    }
+
+    fn fitted_conformal_gate(alpha: f32) -> ConformalGate {
+        ConformalGate {
+            alpha,
+            qhat: 0.55,
+            fitted: true,
+            n_calib: 128,
+        }
+    }
+
+    #[test]
+    fn validate_meta_metadata_rejects_inconsistent_training_summary() {
+        let metadata = RuntimeArtifactMetadata::new(
+            "meta_stack",
+            ModelFamily::Meta,
+            CapabilityState::Implemented,
+            vec!["feature".to_string()],
+            default_three_class_label_mapping(),
+            crate::runtime::artifacts::TrainingSummaryMetadata::new(12, 8, 1),
+        );
+
+        let err = validate_meta_metadata(&metadata, "meta_stack")
+            .expect_err("inconsistent meta training summary must fail");
+        assert!(err.to_string().contains("training summary is inconsistent"));
+    }
+
+    #[test]
+    fn meta_runtime_prediction_uses_shared_three_class_confidence_gate() -> Result<()> {
+        let gate = ConformalGate::new(0.10);
+        let row = [0.51_f32, 0.49, 0.0];
+
+        let prediction = build_meta_runtime_prediction("meta_stack", row, &gate, 2)?;
+        let (expected_confidence, expected_abstain) = three_class_runtime_confidence(row)?;
+
+        assert_eq!(prediction.confidence(), Some(expected_confidence));
+        assert_eq!(prediction.abstain_recommended(), Some(expected_abstain));
+        Ok(())
+    }
+
+    #[test]
+    fn conformal_prediction_artifact_rejects_invalid_prediction_set() {
+        let err =
+            validate_conformal_prediction_expert_artifact(&ConformalPredictionExpertArtifact {
+                fitted: true,
+                feature_columns: vec!["f1".to_string()],
+                training_rows: 128,
+                alpha: 0.10,
+                method: CalibrationMethod::Platt,
+                min_prediction_set: 4,
+                min_fit_rows: 300,
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("min_prediction_set"));
+    }
+
+    #[test]
+    fn conformal_prediction_runtime_uses_expert_metadata_and_backend_details() -> Result<()> {
+        let mut expert = ConformalPredictionExpert::new(CalibrationMethod::Temperature, 0.10);
+        expert.fitted = true;
+        expert.feature_columns = vec!["feature".to_string()];
+        expert.training_rows = 128;
+        expert.conformal_gate.fitted = true;
+        expert.conformal_gate.n_calib = 128;
+        expert.conformal_gate.qhat = 0.20;
+
+        let frame = DataFrame::new(vec![Series::new("feature".into(), &[1.0_f64]).into()])?;
+        expert.backend = MetaBlender {
+            model: None,
+            feature_columns: vec!["feature".to_string()],
+            fitted: true,
+            training_rows: 128,
+        };
+        expert.calibrator.fitted = true;
+        expert.calibrator.method = CalibrationMethod::Temperature;
+        expert.calibrator.models = vec![CalibrationModel::Temperature { temperature: 1.0 }];
+
+        let predictions = expert.predict_runtime(&frame);
+        assert!(
+            predictions.is_err(),
+            "cold backend should still fail prediction"
+        );
+
+        let backend = format!(
+            "xgboost_meta_blender+{}_calibration+conformal_gate",
+            calibration_method_name(CalibrationMethod::Temperature)
+        );
+        assert_eq!(
+            backend,
+            "xgboost_meta_blender+temperature_calibration+conformal_gate"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn probability_calibration_artifact_rejects_missing_feature_columns() {
+        let err = validate_probability_calibration_expert_artifact(
+            &ProbabilityCalibrationExpertArtifact {
+                fitted: true,
+                feature_columns: Vec::new(),
+                training_rows: 128,
+                method: CalibrationMethod::Platt,
+                min_fit_rows: 300,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("feature column"));
+    }
+
+    #[test]
+    fn probability_calibration_runtime_uses_shared_confidence_and_backend_details() -> Result<()> {
+        let row = [0.52_f32, 0.33, 0.15];
+        let prediction =
+            build_probability_calibration_runtime_prediction(row, CalibrationMethod::Temperature)?;
+        let (expected_confidence, expected_abstain) = three_class_runtime_confidence(row)?;
+
+        assert_eq!(prediction.confidence(), Some(expected_confidence));
+        assert_eq!(prediction.abstain_recommended(), Some(expected_abstain));
+        assert_eq!(
+            prediction.metadata().execution_backend.as_deref(),
+            Some("xgboost_meta_blender+temperature_calibration")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn probability_calibration_runtime_surfaces_shared_abstain_reason() -> Result<()> {
+        let row = [0.50_f32, 0.49, 0.01];
+        let prediction =
+            build_probability_calibration_runtime_prediction(row, CalibrationMethod::Temperature)?;
+
+        assert_eq!(prediction.abstain_recommended(), Some(true));
+        assert!(prediction
+            .metadata()
+            .degraded_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("shared three-class confidence gate recommended abstain"));
+        Ok(())
+    }
+
+    #[test]
+    fn meta_stack_artifact_rejects_invalid_prediction_set() {
+        let err = validate_meta_stack_artifact(&MetaDecisionStackArtifact {
+            fitted: true,
+            feature_columns: vec!["f1".to_string()],
+            training_rows: 128,
+            method: CalibrationMethod::Platt,
+            alpha: 0.10,
+            min_prediction_set: 5,
+            min_fit_rows: 300,
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("min_prediction_set"));
+    }
+
+    #[test]
+    fn meta_stack_runtime_uses_backend_details_and_shared_confidence() -> Result<()> {
+        let gate = ConformalGate {
+            alpha: 0.10,
+            qhat: 0.20,
+            fitted: true,
+            n_calib: 128,
+        };
+        let row = [0.52_f32, 0.33, 0.15];
+        let prediction =
+            build_meta_stack_runtime_prediction(row, CalibrationMethod::Temperature, &gate, 2)?;
+        let (expected_confidence, expected_abstain) = three_class_runtime_confidence(row)?;
+
+        assert_eq!(prediction.confidence(), Some(expected_confidence));
+        assert_eq!(
+            prediction.abstain_recommended(),
+            Some(expected_abstain || gate.should_abstain(&row, 2).0)
+        );
+        assert_eq!(
+            prediction.metadata().execution_backend.as_deref(),
+            Some("xgboost_meta_blender+temperature_calibration+conformal_gate")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn meta_stack_runtime_surfaces_combined_abstain_reasons() -> Result<()> {
+        let gate = fitted_conformal_gate(0.10);
+        let row = [0.50_f32, 0.49, 0.01];
+        let prediction =
+            build_meta_stack_runtime_prediction(row, CalibrationMethod::Temperature, &gate, 2)?;
+        let degraded_reason = prediction
+            .metadata()
+            .degraded_reason
+            .as_deref()
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(degraded_reason.contains("shared three-class confidence gate recommended abstain"));
+        assert!(degraded_reason.contains("conformal prediction set size"));
+        Ok(())
+    }
+
+    #[test]
+    fn conformal_runtime_surfaces_shared_and_conformal_abstain_reasons() -> Result<()> {
+        let gate = fitted_conformal_gate(0.10);
+        let row = [0.50_f32, 0.49, 0.01];
+        let prediction =
+            build_conformal_runtime_prediction(row, CalibrationMethod::Temperature, &gate, 2)?;
+        let degraded_reason = prediction
+            .metadata()
+            .degraded_reason
+            .as_deref()
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(degraded_reason.contains("shared three-class confidence gate recommended abstain"));
+        assert!(degraded_reason.contains("conformal prediction set size"));
+        Ok(())
+    }
+
+    #[test]
+    fn meta_blender_save_state_rejects_backend_feature_drift() {
+        let mut backend = XGBoostExpert::new(0, None);
+        backend.feature_columns = vec!["backend".to_string()];
+        let blender = MetaBlender {
+            model: Some(backend),
+            feature_columns: vec!["state".to_string()],
+            fitted: true,
+            training_rows: 128,
+        };
+
+        let err = validate_meta_blender_save_state(&blender)
+            .expect_err("feature-column drift must fail")
+            .to_string();
+        assert!(err.contains("feature-column mismatch"));
+    }
+
+    #[test]
+    fn probability_calibration_save_state_rejects_backend_training_row_drift() {
+        let mut backend = XGBoostExpert::new(0, None);
+        backend.feature_columns = vec!["feature".to_string()];
+        let expert = ProbabilityCalibrationExpert {
+            backend: MetaBlender {
+                model: Some(backend),
+                feature_columns: vec!["feature".to_string()],
+                fitted: true,
+                training_rows: 64,
+            },
+            calibrator: fitted_temperature_calibrator(),
+            min_fit_rows: 300,
+            fitted: true,
+            feature_columns: vec!["feature".to_string()],
+            training_rows: 128,
+        };
+
+        let err = validate_probability_calibration_expert_save_state(&expert)
+            .expect_err("backend/state training-row drift must fail")
+            .to_string();
+        assert!(err.contains("training row mismatch"));
+    }
+
+    #[test]
+    fn meta_stack_save_state_rejects_blender_feature_drift() {
+        let mut backend = XGBoostExpert::new(0, None);
+        backend.feature_columns = vec!["backend".to_string()];
+        let stack = MetaDecisionStack {
+            blender: MetaBlender {
+                model: Some(backend),
+                feature_columns: vec!["backend".to_string()],
+                fitted: true,
+                training_rows: 128,
+            },
+            calibrator: fitted_temperature_calibrator(),
+            conformal_gate: fitted_conformal_gate(0.10),
+            min_prediction_set: 2,
+            min_fit_rows: 300,
+            fitted: true,
+            feature_columns: vec!["state".to_string()],
+            training_rows: 128,
+        };
+
+        let err = validate_meta_stack_save_state(&stack)
+            .expect_err("feature-column drift must fail")
+            .to_string();
+        assert!(err.contains("feature-column mismatch"));
     }
 }

@@ -8,8 +8,10 @@ use std::path::Path;
 use crate::base::{dataframe_to_float32_array, feature_columns_from_dataframe, ExpertModel};
 use crate::runtime::artifacts::TrainingSummaryMetadata;
 use crate::runtime::capabilities::ModelFamily;
+use crate::runtime::prediction::RuntimePrediction;
 use crate::tree_models::common::{
-    atomic_write, ensure_feature_columns_match, read_runtime_metadata, tree_artifact_paths,
+    atomic_write, build_tree_runtime_predictions, default_training_summary,
+    ensure_feature_columns_match, read_runtime_metadata, tree_artifact_paths,
     tree_runtime_metadata, write_runtime_metadata,
 };
 
@@ -49,6 +51,12 @@ fn validate_probability_vector(probabilities: &[f32; 3]) -> Result<()> {
     }
     if sum <= f32::EPSILON {
         bail!("sklears-tree probabilities must have positive mass");
+    }
+    if (sum - 1.0).abs() > 1e-3 {
+        bail!(
+            "sklears-tree probabilities must sum to 1.0 within tolerance, got {}",
+            sum
+        );
     }
     Ok(())
 }
@@ -106,7 +114,7 @@ fn validate_tree_artifact(artifact: &DecisionTreeArtifact, feature_count: usize)
 pub struct SklearsTreeExpert {
     root: Option<TreeNode>,
     feature_columns: Vec<String>,
-    training_rows: usize,
+    training_summary: Option<TrainingSummaryMetadata>,
     max_depth: usize,
     min_samples_split: usize,
     min_samples_leaf: usize,
@@ -118,7 +126,7 @@ impl SklearsTreeExpert {
         Self {
             root: None,
             feature_columns: Vec::new(),
-            training_rows: 0,
+            training_summary: None,
             max_depth: 6,
             min_samples_split: 32,
             min_samples_leaf: 16,
@@ -336,6 +344,39 @@ impl SklearsTreeExpert {
             }
         }
     }
+
+    fn stored_training_summary(&self) -> TrainingSummaryMetadata {
+        self.training_summary
+            .clone()
+            .unwrap_or_else(|| TrainingSummaryMetadata::new(0, 0, 0))
+    }
+
+    fn ensure_runtime_state_ready(&self) -> Result<()> {
+        let root = self
+            .root
+            .as_ref()
+            .context("sklears-tree model not fitted")?;
+        if self.feature_columns.is_empty() {
+            bail!("sklears-tree model is missing feature columns");
+        }
+        let summary = self
+            .training_summary
+            .as_ref()
+            .context("sklears-tree model is missing training summary metadata")?;
+        if summary.dataset_rows == 0 {
+            bail!("sklears-tree training summary must record non-zero dataset_rows");
+        }
+        if summary.dataset_rows != summary.train_rows + summary.val_rows {
+            bail!(
+                "sklears-tree training summary is inconsistent: dataset_rows={} train_rows={} val_rows={}",
+                summary.dataset_rows,
+                summary.train_rows,
+                summary.val_rows
+            );
+        }
+        validate_tree_node(root, self.feature_columns.len())?;
+        Ok(())
+    }
 }
 
 impl Default for SklearsTreeExpert {
@@ -363,7 +404,7 @@ impl ExpertModel for SklearsTreeExpert {
         let rows = (0..features.nrows()).collect::<Vec<_>>();
         self.root = Some(self.build_node(&features, &labels, &rows, 0));
         self.feature_columns = feature_columns_from_dataframe(x);
-        self.training_rows = features.nrows();
+        self.training_summary = Some(default_training_summary(x));
         Ok(())
     }
 
@@ -386,14 +427,11 @@ impl ExpertModel for SklearsTreeExpert {
     }
 
     fn save(&self, path: &Path) -> Result<()> {
+        self.ensure_runtime_state_ready()?;
         let root = self
             .root
             .as_ref()
             .context("sklears-tree model not fitted")?;
-        if self.feature_columns.is_empty() {
-            bail!("sklears-tree model is missing feature columns");
-        }
-        validate_tree_node(root, self.feature_columns.len())?;
         let artifact = DecisionTreeArtifact {
             max_depth: self.max_depth,
             min_samples_split: self.min_samples_split,
@@ -410,7 +448,7 @@ impl ExpertModel for SklearsTreeExpert {
             &tree_runtime_metadata(
                 "sklears_tree",
                 self.feature_columns.clone(),
-                TrainingSummaryMetadata::new(self.training_rows, self.training_rows, 0),
+                self.stored_training_summary(),
             ),
         )?;
         Ok(())
@@ -435,14 +473,131 @@ impl ExpertModel for SklearsTreeExpert {
         if metadata.feature_columns.is_empty() {
             bail!("sklears-tree runtime metadata must contain at least one feature column");
         }
+        if metadata.training_summary.dataset_rows == 0 {
+            bail!("sklears-tree runtime metadata must record non-zero dataset_rows");
+        }
+        if metadata.training_summary.dataset_rows
+            != metadata.training_summary.train_rows + metadata.training_summary.val_rows
+        {
+            bail!("sklears-tree runtime metadata training summary is inconsistent");
+        }
         validate_tree_artifact(&artifact, metadata.feature_columns.len())?;
         self.max_depth = artifact.max_depth;
         self.min_samples_split = artifact.min_samples_split;
         self.min_samples_leaf = artifact.min_samples_leaf;
         self.max_thresholds_per_feature = artifact.max_thresholds_per_feature;
         self.root = Some(artifact.root);
-        self.training_rows = metadata.training_summary.dataset_rows;
+        self.training_summary = Some(metadata.training_summary);
         self.feature_columns = metadata.feature_columns;
         Ok(())
+    }
+}
+
+impl SklearsTreeExpert {
+    pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
+        self.ensure_runtime_state_ready()?;
+        let probabilities = self.predict_proba(x)?;
+        build_tree_runtime_predictions(
+            "sklears_tree",
+            &probabilities,
+            true,
+            "sklears_tree_native",
+            None,
+            "native_sklears_tree_unavailable",
+            "sklears_tree_unknown",
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExpertModel, SklearsTreeExpert};
+    use crate::runtime::artifacts::TrainingSummaryMetadata;
+    use polars::df;
+    use polars::prelude::*;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn sample_three_class_dataset() -> (DataFrame, Series) {
+        let x = df![
+            "momentum" => &[0.96, 0.93, 0.89, 0.07, 0.03, 0.11, -0.94, -0.91, -0.88],
+            "trend" => &[0.87, 0.91, 0.86, 0.01, -0.02, 0.04, -0.9, -0.86, -0.93],
+            "volatility" => &[0.62, 0.58, 0.6, 0.2, 0.18, 0.23, 0.69, 0.66, 0.64],
+        ]
+        .expect("build training dataframe");
+        let y = Series::new("label".into(), &[1_i32, 1, 1, 0, 0, 0, -1, -1, -1]);
+        (x, y)
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("{prefix}-{nonce}"));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    #[test]
+    fn sklears_save_rejects_missing_training_summary() {
+        let (x, y) = sample_three_class_dataset();
+        let artifact_dir = unique_temp_dir("sklears-missing-summary");
+
+        let mut expert = SklearsTreeExpert::new();
+        expert.fit(&x, &y).expect("fit should succeed");
+        expert.training_summary = None;
+
+        let err = expert
+            .save(&artifact_dir)
+            .expect_err("save should fail without training summary");
+        assert!(err.to_string().contains("training summary"));
+    }
+
+    #[test]
+    fn sklears_predict_runtime_returns_runtime_predictions() {
+        let (x, y) = sample_three_class_dataset();
+
+        let mut expert = SklearsTreeExpert::new();
+        expert.fit(&x, &y).expect("fit should succeed");
+
+        let predictions = expert
+            .predict_runtime(&x)
+            .expect("runtime prediction should succeed");
+        assert_eq!(predictions.len(), x.height());
+        assert!(predictions.iter().all(|prediction| {
+            prediction.class_probabilities().len() == 3
+                && prediction
+                    .class_probabilities()
+                    .iter()
+                    .all(|value| value.is_finite() && *value >= 0.0)
+        }));
+    }
+
+    #[test]
+    fn sklears_load_rejects_inconsistent_training_summary() {
+        let (x, y) = sample_three_class_dataset();
+        let artifact_dir = unique_temp_dir("sklears-bad-summary");
+
+        let mut expert = SklearsTreeExpert::new();
+        expert.fit(&x, &y).expect("fit should succeed");
+        expert.save(&artifact_dir).expect("save should succeed");
+
+        let metadata_path = artifact_dir.join("metadata.json");
+        let mut metadata: crate::runtime::artifacts::RuntimeArtifactMetadata =
+            serde_json::from_slice(&std::fs::read(&metadata_path).expect("read metadata"))
+                .expect("deserialize metadata");
+        metadata.training_summary = TrainingSummaryMetadata::new(9, 8, 0);
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_vec_pretty(&metadata).expect("serialize metadata"),
+        )
+        .expect("write metadata");
+
+        let mut loaded = SklearsTreeExpert::new();
+        let err = loaded
+            .load(&artifact_dir)
+            .expect_err("inconsistent training summary should fail");
+        assert!(err.to_string().contains("training summary"));
     }
 }

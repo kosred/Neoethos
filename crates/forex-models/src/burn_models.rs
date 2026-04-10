@@ -6,7 +6,8 @@
 //
 // Production features matching Python:
 // - Class-weighted loss for imbalanced data
-// - Time-series aware train/val split with embargo (no look-ahead bias)
+// - Index-order-aware train/val split with embargo
+//   The caller must pass rows already sorted chronologically.
 // - Early stopping with configurable patience
 // - Mini-batch training with shuffling
 // - Label protocol mapping (-1 → 2)
@@ -25,7 +26,9 @@ use anyhow::Context;
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "burn-wgpu-backend")]
-use std::sync::OnceLock;
+use std::collections::HashSet;
+#[cfg(feature = "burn-wgpu-backend")]
+use std::sync::{Mutex, OnceLock};
 use tracing::info;
 
 /// Backend types
@@ -39,11 +42,14 @@ pub type TrainBackend = Autodiff<NdArray>;
 pub type InferBackend = NdArray;
 
 #[cfg(feature = "burn-wgpu-backend")]
-fn initialize_wgpu_runtime(device: &<InferBackend as Backend>::Device) {
-    static INIT: OnceLock<()> = OnceLock::new();
-    let _ = INIT.get_or_init(|| {
+fn initialize_wgpu_runtime(device: &<InferBackend as Backend>::Device, policy_key: &str) {
+    static INIT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let initialized = INIT.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut initialized = initialized.lock().expect("wgpu init cache poisoned");
+    let init_key = format!("{policy_key}::{device:?}");
+    if initialized.insert(init_key) {
         init_setup::<graphics::Vulkan>(device, Default::default());
-    });
+    }
 }
 
 pub fn active_burn_backend_name() -> &'static str {
@@ -57,6 +63,25 @@ pub fn active_burn_backend_name() -> &'static str {
     }
 }
 
+pub fn selection_execution_backend(selection: &BurnDeviceSelection) -> &str {
+    selection.execution_backend.as_str()
+}
+
+fn backend_name_for_type<B: Backend>() -> String {
+    let backend_type = std::any::type_name::<B>().to_ascii_lowercase();
+    if backend_type.contains("wgpu") {
+        "wgpu".to_string()
+    } else if backend_type.contains("ndarray") {
+        "ndarray_cpu".to_string()
+    } else {
+        active_burn_backend_name().to_string()
+    }
+}
+
+fn external_execution_backend_for<B: Backend>() -> String {
+    format!("external:{}", backend_name_for_type::<B>())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BurnDeviceSelection {
     pub requested_policy: String,
@@ -68,9 +93,123 @@ pub fn normalize_burn_device_policy(policy: &str) -> String {
     let normalized = policy.trim().to_ascii_lowercase();
     if normalized.is_empty() {
         "auto".to_string()
+    } else if normalized == "cuda" || normalized == "wgpu" {
+        "gpu".to_string()
+    } else if normalized == "default" {
+        "auto".to_string()
+    } else if let Some(index) = normalized.strip_prefix("cuda:") {
+        format!("gpu:{index}")
+    } else if let Some(index) = normalized.strip_prefix("wgpu:") {
+        format!("gpu:{index}")
     } else {
         normalized
     }
+}
+
+fn is_supported_burn_device_policy(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "auto" | "cpu" | "gpu" | "cuda" | "wgpu" | "default"
+    ) || normalized.starts_with("cuda:")
+        || normalized.starts_with("gpu:")
+        || normalized.starts_with("wgpu:")
+}
+
+fn normalize_effective_burn_device_policy(policy: &str) -> String {
+    let normalized = policy.trim().to_ascii_lowercase();
+    if normalized == "external_device" {
+        normalized
+    } else {
+        normalize_burn_device_policy(&normalized)
+    }
+}
+
+pub(crate) fn validate_burn_device_selection(
+    selection: &BurnDeviceSelection,
+) -> anyhow::Result<()> {
+    let requested = normalize_burn_device_policy(&selection.requested_policy);
+    let effective = normalize_effective_burn_device_policy(&selection.effective_policy);
+    let execution_backend = selection.execution_backend.trim().to_ascii_lowercase();
+
+    if !is_supported_burn_device_policy(&requested) {
+        return Err(anyhow::anyhow!(
+            "Burn runtime requested device policy is unsupported: {}",
+            selection.requested_policy
+        ));
+    }
+
+    let effective_supported = effective == "external_device"
+        || effective == "cpu"
+        || effective == "default"
+        || effective == "gpu"
+        || effective.starts_with("gpu:");
+    if !effective_supported {
+        return Err(anyhow::anyhow!(
+            "Burn runtime effective device policy is unsupported: {}",
+            selection.effective_policy
+        ));
+    }
+
+    if execution_backend.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Burn runtime execution backend must not be empty"
+        ));
+    }
+
+    match execution_backend.as_str() {
+        "ndarray_cpu" => {
+            if effective != "cpu" && effective != "external_device" {
+                return Err(anyhow::anyhow!(
+                    "Burn runtime ndarray_cpu backend is incompatible with effective policy {effective}"
+                ));
+            }
+        }
+        "wgpu" => {
+            if effective != "external_device" {
+                return Err(anyhow::anyhow!(
+                    "Burn runtime generic wgpu backend requires external_device effective policy, got {effective}"
+                ));
+            }
+        }
+        "wgpu_cpu" => {
+            if effective != "cpu" && effective != "external_device" {
+                return Err(anyhow::anyhow!(
+                    "Burn runtime wgpu_cpu backend is incompatible with effective policy {effective}"
+                ));
+            }
+        }
+        "wgpu_default" => {
+            if effective != "default" && effective != "external_device" {
+                return Err(anyhow::anyhow!(
+                    "Burn runtime wgpu_default backend is incompatible with effective policy {effective}"
+                ));
+            }
+        }
+        "wgpu_discrete_gpu" | "wgpu_integrated_gpu" => {
+            if effective != "external_device"
+                && effective != "gpu"
+                && !effective.starts_with("gpu:")
+            {
+                return Err(anyhow::anyhow!(
+                    "Burn runtime GPU backend {execution_backend} is incompatible with effective policy {effective}"
+                ));
+            }
+        }
+        other if other.starts_with("external:") => {
+            if effective != "external_device" {
+                return Err(anyhow::anyhow!(
+                    "Burn runtime external backend {other} requires external_device effective policy, got {effective}"
+                ));
+            }
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "Burn runtime execution backend is unsupported: {other}"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(feature = "burn-wgpu-backend")]
@@ -89,20 +228,20 @@ fn resolve_wgpu_device_policy(normalized: &str) -> (WgpuDevice, String, String) 
         "auto" | "gpu" | "cuda" | "wgpu" | "default" => (
             WgpuDevice::DefaultDevice,
             "default".to_string(),
-            "wgpu".to_string(),
+            "wgpu_default".to_string(),
         ),
         other => {
             if let Some(index) = parse_wgpu_gpu_index(other) {
                 (
                     WgpuDevice::DiscreteGpu(index),
                     format!("gpu:{index}"),
-                    "wgpu".to_string(),
+                    "wgpu_discrete_gpu".to_string(),
                 )
             } else {
                 (
                     WgpuDevice::DefaultDevice,
                     "default".to_string(),
-                    "wgpu".to_string(),
+                    "wgpu_default".to_string(),
                 )
             }
         }
@@ -117,7 +256,7 @@ pub fn resolve_infer_device(
     {
         let (device, effective_policy, execution_backend) =
             resolve_wgpu_device_policy(&requested_policy);
-        initialize_wgpu_runtime(&device);
+        initialize_wgpu_runtime(&device, &effective_policy);
         return (
             device,
             BurnDeviceSelection {
@@ -148,7 +287,7 @@ pub fn resolve_train_device(
     {
         let (device, effective_policy, execution_backend) =
             resolve_wgpu_device_policy(&requested_policy);
-        initialize_wgpu_runtime(&device);
+        initialize_wgpu_runtime(&device, &effective_policy);
         return (
             device,
             BurnDeviceSelection {
@@ -180,18 +319,26 @@ pub fn default_train_device() -> <TrainBackend as Backend>::Device {
 }
 
 pub trait ManagedBurnBackend: Backend {
-    fn managed_device() -> Self::Device;
+    fn managed_device_and_selection() -> (Self::Device, BurnDeviceSelection);
+
+    fn managed_device() -> Self::Device {
+        Self::managed_device_and_selection().0
+    }
+
+    fn managed_selection() -> BurnDeviceSelection {
+        Self::managed_device_and_selection().1
+    }
 }
 
 impl ManagedBurnBackend for TrainBackend {
-    fn managed_device() -> Self::Device {
-        default_train_device()
+    fn managed_device_and_selection() -> (Self::Device, BurnDeviceSelection) {
+        resolve_train_device("auto")
     }
 }
 
 impl ManagedBurnBackend for InferBackend {
-    fn managed_device() -> Self::Device {
-        default_infer_device()
+    fn managed_device_and_selection() -> (Self::Device, BurnDeviceSelection) {
+        resolve_infer_device("auto")
     }
 }
 
@@ -252,7 +399,9 @@ fn scalar_loss_value(values: burn::tensor::TensorData, context: &str) -> anyhow:
     Ok(value)
 }
 
-/// Time-series train/val split with embargo gap. No shuffling, no look-ahead.
+/// Index-order-aware train/val split with embargo gap.
+/// The caller must provide rows in chronological order; this helper does not
+/// infer or validate timestamps.
 fn time_series_split(
     n_samples: usize,
     val_ratio: f32,
@@ -1221,12 +1370,44 @@ pub struct BurnTrainingReport {
     pub batch_size: usize,
     pub patience: usize,
     pub seed: u64,
+    pub requested_device_policy: String,
+    pub effective_device_policy: String,
+    pub execution_backend: String,
 }
 
 impl BurnTrainingReport {
     pub fn best_observed_loss(&self) -> f32 {
         self.best_loss
     }
+}
+
+fn validate_train_config(config: &TrainConfig) -> anyhow::Result<()> {
+    if !config.lr.is_finite() || config.lr <= 0.0 {
+        return Err(anyhow::anyhow!(
+            "Burn training learning rate must be finite and positive"
+        ));
+    }
+    if config.batch_size == 0 {
+        return Err(anyhow::anyhow!(
+            "Burn training batch_size must be greater than zero"
+        ));
+    }
+    if config.max_epochs == 0 {
+        return Err(anyhow::anyhow!(
+            "Burn training max_epochs must be greater than zero"
+        ));
+    }
+    if config.patience == 0 {
+        return Err(anyhow::anyhow!(
+            "Burn training patience must be greater than zero"
+        ));
+    }
+    if config.n_classes < 2 {
+        return Err(anyhow::anyhow!(
+            "Burn training requires at least two classes"
+        ));
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -1282,6 +1463,20 @@ fn normalize_probability_rows(
     Some(probabilities)
 }
 
+fn validate_feature_matrix(x_data: &Array2<f32>, context: &str) -> anyhow::Result<()> {
+    if x_data.ncols() == 0 {
+        return Err(anyhow::anyhow!(
+            "{context} requires at least one feature column"
+        ));
+    }
+    if x_data.iter().any(|value| !value.is_finite()) {
+        return Err(anyhow::anyhow!(
+            "{context} received non-finite feature values"
+        ));
+    }
+    Ok(())
+}
+
 // ============================================================================
 // TRAINING LOOP — generic over all Burn models
 // Matches Python deep.py: class weights, time-series split, early stopping
@@ -1303,7 +1498,7 @@ pub fn train_model<B, M>(
 ) -> anyhow::Result<(M, f32)>
 where
     B: AutodiffBackend + ManagedBurnBackend,
-    M: burn::module::AutodiffModule<B> + BurnForward<B>,
+    M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
 {
     let (model, report) = train_model_with_report::<B, M>(model, x_data, y_raw, config)?;
     Ok((model, report.best_observed_loss()))
@@ -1318,10 +1513,46 @@ pub fn train_model_with_report<B, M>(
 ) -> anyhow::Result<(M, BurnTrainingReport)>
 where
     B: AutodiffBackend + ManagedBurnBackend,
-    M: burn::module::AutodiffModule<B> + BurnForward<B>,
+    M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
 {
+    let (device, selection) = resolve_train_device("auto");
+    train_model_with_report_with_selection::<B, M>(
+        model, x_data, y_raw, config, &device, &selection,
+    )
+}
+
+pub fn train_model_with_report_on_device<B, M>(
+    model: M,
+    x_data: &Array2<f32>,
+    y_raw: &[i32],
+    config: &TrainConfig,
+    device: &B::Device,
+    selection: &BurnDeviceSelection,
+) -> anyhow::Result<(M, BurnTrainingReport)>
+where
+    B: AutodiffBackend,
+    M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
+{
+    train_model_with_report_with_selection::<B, M>(model, x_data, y_raw, config, device, selection)
+}
+
+pub fn train_model_with_report_with_selection<B, M>(
+    model: M,
+    x_data: &Array2<f32>,
+    y_raw: &[i32],
+    config: &TrainConfig,
+    device: &B::Device,
+    selection: &BurnDeviceSelection,
+) -> anyhow::Result<(M, BurnTrainingReport)>
+where
+    B: AutodiffBackend,
+    M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
+{
+    validate_train_config(config)?;
+    validate_burn_device_selection(selection)?;
     let n_samples = x_data.nrows();
-    let device = B::managed_device();
+
+    validate_feature_matrix(x_data, "Burn training")?;
 
     if n_samples != y_raw.len() {
         return Err(anyhow::anyhow!(
@@ -1334,7 +1565,9 @@ where
     // 1. Label mapping: -1 → 2
     let y_mapped = map_labels(y_raw)?;
 
-    // 2. Time-series split with embargo
+    // 2. Index-order-aware split with embargo.
+    // We intentionally rely on caller ordering here; shuffled inputs would
+    // invalidate the chronology assumptions of this holdout.
     let embargo = (n_samples as f32 * 0.005).ceil() as usize;
     let (train_range, val_range) = time_series_split(n_samples, 0.15, 100, embargo.max(10));
     let n_train = train_range.len();
@@ -1382,6 +1615,7 @@ where
     let mut best_epoch = None;
     let mut final_train_loss = f32::INFINITY;
     let mut model = model;
+    let mut best_model_snapshot: Option<M> = None;
     let mut rng = StdRng::seed_from_u64(config.seed);
     let mut indices: Vec<usize> = (0..n_train).collect();
     let mut epochs_ran = 0usize;
@@ -1430,6 +1664,7 @@ where
         if train_epoch_loss.is_finite() && val_range.is_empty() && train_epoch_loss < best_loss {
             best_loss = train_epoch_loss;
             best_epoch = Some(epoch);
+            best_model_snapshot = Some(model.clone());
         }
 
         // Validation on holdout (sequential, no shuffle)
@@ -1449,6 +1684,7 @@ where
             if vl < best_loss {
                 best_loss = vl;
                 best_epoch = Some(epoch);
+                best_model_snapshot = Some(model.clone());
             }
             if early_stop.check(vl) {
                 info!("Early stop at epoch {} (val_loss={:.6})", epoch, vl);
@@ -1474,6 +1710,9 @@ where
             best_epoch = Some(epochs_ran.saturating_sub(1));
         }
     }
+    if let Some(best_model) = best_model_snapshot {
+        model = best_model;
+    }
 
     Ok((
         model,
@@ -1491,6 +1730,9 @@ where
             batch_size: config.batch_size,
             patience: config.patience,
             seed: config.seed,
+            requested_device_policy: selection.requested_policy.clone(),
+            effective_device_policy: selection.effective_policy.clone(),
+            execution_backend: selection.execution_backend.clone(),
         },
     ))
 }
@@ -1514,7 +1756,19 @@ pub fn predict_proba_on_device<B: Backend, M: BurnForward<B>>(
     batch_size: usize,
     device: &B::Device,
 ) -> anyhow::Result<Array2<f32>> {
-    predict_proba_checked_on_device::<B, M>(model, x_data, batch_size, device)
+    Ok(predict_proba_checked_on_device::<B, M>(model, x_data, batch_size, device)?.0)
+}
+
+pub fn predict_proba_on_device_with_selection<B: Backend, M: BurnForward<B>>(
+    model: &M,
+    x_data: &Array2<f32>,
+    batch_size: usize,
+    device: &B::Device,
+    selection: &BurnDeviceSelection,
+) -> anyhow::Result<(Array2<f32>, BurnDeviceSelection)> {
+    predict_proba_checked_on_device_with_selection::<B, M>(
+        model, x_data, batch_size, device, selection,
+    )
 }
 
 /// Run inference and return validated probabilities as (n_samples, 3) array.
@@ -1523,8 +1777,18 @@ pub fn predict_proba_checked<B: ManagedBurnBackend, M: BurnForward<B>>(
     x_data: &Array2<f32>,
     batch_size: usize,
 ) -> anyhow::Result<Array2<f32>> {
-    let device = B::managed_device();
-    predict_proba_checked_on_device::<B, M>(model, x_data, batch_size, &device)
+    Ok(predict_proba_checked_with_selection::<B, M>(model, x_data, batch_size)?.0)
+}
+
+pub fn predict_proba_checked_with_selection<B: ManagedBurnBackend, M: BurnForward<B>>(
+    model: &M,
+    x_data: &Array2<f32>,
+    batch_size: usize,
+) -> anyhow::Result<(Array2<f32>, BurnDeviceSelection)> {
+    let (device, selection) = B::managed_device_and_selection();
+    predict_proba_checked_on_device_with_selection::<B, M>(
+        model, x_data, batch_size, &device, &selection,
+    )
 }
 
 pub fn predict_proba_checked_on_device<B: Backend, M: BurnForward<B>>(
@@ -1532,7 +1796,25 @@ pub fn predict_proba_checked_on_device<B: Backend, M: BurnForward<B>>(
     x_data: &Array2<f32>,
     batch_size: usize,
     device: &B::Device,
-) -> anyhow::Result<Array2<f32>> {
+) -> anyhow::Result<(Array2<f32>, BurnDeviceSelection)> {
+    let selection = BurnDeviceSelection {
+        requested_policy: "external_device".to_string(),
+        effective_policy: "external_device".to_string(),
+        execution_backend: external_execution_backend_for::<B>(),
+    };
+    predict_proba_checked_on_device_with_selection::<B, M>(
+        model, x_data, batch_size, device, &selection,
+    )
+}
+
+pub fn predict_proba_checked_on_device_with_selection<B: Backend, M: BurnForward<B>>(
+    model: &M,
+    x_data: &Array2<f32>,
+    batch_size: usize,
+    device: &B::Device,
+    selection: &BurnDeviceSelection,
+) -> anyhow::Result<(Array2<f32>, BurnDeviceSelection)> {
+    validate_burn_device_selection(selection)?;
     if batch_size == 0 {
         return Err(anyhow::anyhow!(
             "Burn prediction batch_size must be greater than zero"
@@ -1540,8 +1822,9 @@ pub fn predict_proba_checked_on_device<B: Backend, M: BurnForward<B>>(
     }
     let n_samples = x_data.nrows();
     if n_samples == 0 {
-        return Ok(Array2::zeros((0, 3)));
+        return Ok((Array2::zeros((0, 3)), selection.clone()));
     }
+    validate_feature_matrix(x_data, "Burn prediction")?;
 
     let mut all_probs: Vec<f32> = Vec::with_capacity(n_samples * 3);
 
@@ -1566,8 +1849,9 @@ pub fn predict_proba_checked_on_device<B: Backend, M: BurnForward<B>>(
 
     let normalized = normalize_probability_rows(all_probs, n_samples, 3)
         .ok_or_else(|| anyhow::anyhow!("Burn prediction probabilities failed validation"))?;
-    Array2::from_shape_vec((n_samples, 3), normalized)
-        .map_err(|_| anyhow::anyhow!("Burn prediction probabilities failed to reshape"))
+    let probabilities = Array2::from_shape_vec((n_samples, 3), normalized)
+        .map_err(|_| anyhow::anyhow!("Burn prediction probabilities failed to reshape"))?;
+    Ok((probabilities, selection.clone()))
 }
 
 #[cfg(test)]
@@ -1599,9 +1883,127 @@ mod tests {
     }
 
     #[test]
+    fn predict_proba_rejects_zero_feature_columns() {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<InferBackend>(&device);
+        let x = Array2::<f32>::zeros((1, 0));
+
+        let err = predict_proba::<InferBackend, _>(&model, &x, 16)
+            .expect_err("zero feature columns must fail early");
+        assert!(err.to_string().contains("at least one feature column"));
+    }
+
+    #[test]
+    fn predict_proba_rejects_non_finite_inputs() {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<InferBackend>(&device);
+        let x = Array2::from_shape_vec((1, 2), vec![0.0_f32, f32::NAN]).expect("shape input");
+
+        let err = predict_proba::<InferBackend, _>(&model, &x, 16)
+            .expect_err("non-finite inputs must fail early");
+        assert!(err.to_string().contains("non-finite feature values"));
+    }
+
+    #[test]
+    fn train_model_rejects_non_finite_inputs_before_tensorization() {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<TrainBackend>(&device);
+        let x = Array2::from_shape_vec(
+            (128, 2),
+            (0..256)
+                .map(|idx| {
+                    if idx == 17 {
+                        f32::INFINITY
+                    } else {
+                        idx as f32 * 0.01
+                    }
+                })
+                .collect(),
+        )
+        .expect("shape input");
+        let labels = (0..128)
+            .map(|idx| match idx % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            })
+            .collect::<Vec<_>>();
+
+        let err = train_model::<TrainBackend, _>(model, &x, &labels, &TrainConfig::default())
+            .expect_err("non-finite training inputs must fail early");
+        assert!(err.to_string().contains("non-finite feature values"));
+    }
+
+    #[test]
     fn normalize_burn_device_policy_defaults_to_auto() {
         assert_eq!(normalize_burn_device_policy(""), "auto");
-        assert_eq!(normalize_burn_device_policy("  CUDA:2 "), "cuda:2");
+        assert_eq!(normalize_burn_device_policy("  CUDA:2 "), "gpu:2");
+        assert_eq!(normalize_burn_device_policy("cuda"), "gpu");
+        assert_eq!(normalize_burn_device_policy("wgpu"), "gpu");
+    }
+
+    #[test]
+    fn supported_burn_device_policy_recognizes_expected_aliases() {
+        assert!(is_supported_burn_device_policy("auto"));
+        assert!(is_supported_burn_device_policy("cpu"));
+        assert!(is_supported_burn_device_policy("cuda:2"));
+        assert!(is_supported_burn_device_policy("gpu:1"));
+        assert!(!is_supported_burn_device_policy("metal"));
+    }
+
+    #[test]
+    fn train_model_rejects_invalid_train_config_before_tensor_work() {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<TrainBackend>(&device);
+        let x = Array2::from_shape_vec((128, 2), (0..256).map(|idx| idx as f32 * 0.01).collect())
+            .expect("shape input");
+        let labels = (0..128)
+            .map(|idx| match idx % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            })
+            .collect::<Vec<_>>();
+        let config = TrainConfig {
+            batch_size: 0,
+            ..TrainConfig::default()
+        };
+
+        let err = train_model::<TrainBackend, _>(model, &x, &labels, &config)
+            .expect_err("invalid train config must fail early");
+        assert!(err
+            .to_string()
+            .contains("batch_size must be greater than zero"));
+    }
+
+    #[test]
+    fn train_model_with_report_on_device_requires_explicit_selection() -> anyhow::Result<()> {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<TrainBackend>(&device);
+        let x = Array2::from_shape_vec((160, 2), (0..320).map(|idx| idx as f32 * 0.01).collect())
+            .expect("shape input");
+        let labels = (0..160)
+            .map(|idx| match idx % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            })
+            .collect::<Vec<_>>();
+        let selection = resolve_train_device("cpu").1;
+
+        let (_trained, report) = train_model_with_report_on_device::<TrainBackend, _>(
+            model,
+            &x,
+            &labels,
+            &TrainConfig::default(),
+            &device,
+            &selection,
+        )?;
+
+        assert_eq!(report.requested_device_policy, selection.requested_policy);
+        assert_eq!(report.effective_device_policy, selection.effective_policy);
+        assert_eq!(report.execution_backend, selection.execution_backend);
+        Ok(())
     }
 
     #[test]
@@ -1613,5 +2015,127 @@ mod tests {
         assert_eq!(selection.execution_backend, "wgpu_cpu");
         #[cfg(not(feature = "burn-wgpu-backend"))]
         assert_eq!(selection.execution_backend, "ndarray_cpu");
+    }
+
+    #[cfg(feature = "burn-wgpu-backend")]
+    #[test]
+    fn resolve_train_device_cuda_alias_reports_wgpu_runtime_truthfully() {
+        let (_device, selection) = resolve_train_device("cuda:2");
+        assert_eq!(selection.requested_policy, "gpu:2");
+        assert_eq!(selection.effective_policy, "gpu:2");
+        assert_eq!(selection.execution_backend, "wgpu_discrete_gpu");
+    }
+
+    #[cfg(feature = "burn-wgpu-backend")]
+    #[test]
+    fn resolve_infer_device_default_gpu_reports_wgpu_default_backend() {
+        let (_device, selection) = resolve_infer_device("gpu");
+        assert_eq!(selection.requested_policy, "gpu");
+        assert_eq!(selection.effective_policy, "default");
+        assert_eq!(selection.execution_backend, "wgpu_default");
+    }
+
+    #[test]
+    fn predict_proba_checked_with_selection_returns_runtime_provenance() -> anyhow::Result<()> {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<InferBackend>(&device);
+        let x = Array2::<f32>::zeros((2, 2));
+
+        let (_probabilities, selection) =
+            predict_proba_checked_with_selection::<InferBackend, _>(&model, &x, 16)?;
+        assert!(!selection.requested_policy.trim().is_empty());
+        assert!(!selection.effective_policy.trim().is_empty());
+        assert!(!selection.execution_backend.trim().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn predict_proba_on_device_with_selection_preserves_supplied_provenance() -> anyhow::Result<()>
+    {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<InferBackend>(&device);
+        let x = Array2::<f32>::zeros((2, 2));
+        let selection = BurnDeviceSelection {
+            requested_policy: "external_device".to_string(),
+            effective_policy: "external_device".to_string(),
+            execution_backend: active_burn_backend_name().to_string(),
+        };
+
+        let (_probabilities, returned_selection) = predict_proba_on_device_with_selection::<
+            InferBackend,
+            _,
+        >(&model, &x, 16, &device, &selection)?;
+        assert_eq!(returned_selection, selection);
+        Ok(())
+    }
+
+    #[test]
+    fn predict_proba_checked_on_device_reports_typed_external_provenance() -> anyhow::Result<()> {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<InferBackend>(&device);
+        let x = Array2::<f32>::zeros((2, 2));
+
+        let (_probabilities, selection) =
+            predict_proba_checked_on_device::<InferBackend, _>(&model, &x, 16, &device)?;
+        assert_eq!(selection.requested_policy, "external_device");
+        assert_eq!(selection.effective_policy, "external_device");
+        assert!(selection.execution_backend.starts_with("external:"));
+        Ok(())
+    }
+
+    #[test]
+    fn train_model_with_report_rejects_incoherent_runtime_selection() {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<TrainBackend>(&device);
+        let x = Array2::<f32>::zeros((12, 2));
+        let labels = (0..12)
+            .map(|idx| match idx % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            })
+            .collect::<Vec<_>>();
+        let selection = BurnDeviceSelection {
+            requested_policy: "cpu".to_string(),
+            effective_policy: "cpu".to_string(),
+            execution_backend: "wgpu_discrete_gpu".to_string(),
+        };
+
+        let err = train_model_with_report_on_device::<TrainBackend, _>(
+            model,
+            &x,
+            &labels,
+            &TrainConfig::default(),
+            &device,
+            &selection,
+        )
+        .expect_err("incoherent runtime provenance must fail");
+        assert!(
+            err.to_string()
+                .contains("incompatible with effective policy cpu"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn predict_proba_on_device_with_selection_rejects_incoherent_runtime_selection() {
+        let device = Default::default();
+        let model = BurnMLPConfig::new(2).init::<InferBackend>(&device);
+        let x = Array2::<f32>::zeros((2, 2));
+        let selection = BurnDeviceSelection {
+            requested_policy: "cpu".to_string(),
+            effective_policy: "cpu".to_string(),
+            execution_backend: "wgpu_discrete_gpu".to_string(),
+        };
+
+        let err = predict_proba_on_device_with_selection::<InferBackend, _>(
+            &model, &x, 16, &device, &selection,
+        )
+        .expect_err("incoherent runtime provenance must fail");
+        assert!(
+            err.to_string()
+                .contains("incompatible with effective policy cpu"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -266,6 +266,18 @@ pub fn build_runtime_artifact_metadata(
     label_mapping: Vec<LabelMapping>,
     training_summary: TrainingSummaryMetadata,
 ) -> RuntimeArtifactMetadata {
+    if feature_columns.is_empty() {
+        panic!("runtime artifact metadata requires at least one feature column");
+    }
+    if label_mapping.is_empty() {
+        panic!("runtime artifact metadata requires a non-empty label mapping");
+    }
+    if training_summary.dataset_rows == 0 {
+        panic!("runtime artifact metadata requires a non-zero dataset row count");
+    }
+    if training_summary.train_rows + training_summary.val_rows != training_summary.dataset_rows {
+        panic!("runtime artifact metadata requires train_rows + val_rows == dataset_rows");
+    }
     RuntimeArtifactMetadata::new(
         model_name,
         family,
@@ -314,18 +326,30 @@ pub fn build_runtime_prediction_with_details(
 }
 
 pub fn three_class_runtime_confidence(row_values: [f32; 3]) -> Result<(f32, bool)> {
-    let mut sorted = row_values;
-    for value in &sorted {
+    let mut normalized = row_values;
+    let mut sum = 0.0_f32;
+    for value in &normalized {
         if !value.is_finite() || *value < 0.0 {
             bail!("runtime predictions require finite non-negative probabilities");
         }
+        if *value > 1.0 + 1e-4 {
+            bail!("runtime predictions require probability rows bounded by 1.0");
+        }
+        sum += *value;
+    }
+    if !sum.is_finite() || sum <= f32::EPSILON {
+        bail!("runtime predictions require probability rows with positive mass");
+    }
+    for value in &mut normalized {
+        *value /= sum;
     }
 
+    let mut sorted = normalized;
     sorted.sort_by(|left, right| right.total_cmp(left));
     let top = sorted[0];
     let runner_up = sorted[1];
     let margin = (top - runner_up).max(0.0);
-    let entropy = row_values
+    let entropy = normalized
         .iter()
         .copied()
         .filter(|value| *value > 1e-8)
@@ -1040,6 +1064,19 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "runtime artifact metadata requires at least one feature column")]
+    fn build_runtime_artifact_metadata_rejects_empty_feature_columns() {
+        let _ = build_runtime_artifact_metadata(
+            "lightgbm",
+            ModelFamily::Tree,
+            CapabilityState::Implemented,
+            Vec::new(),
+            canonical_three_class_label_mapping(),
+            TrainingSummaryMetadata::new(10, 8, 2),
+        );
+    }
+
+    #[test]
     fn build_runtime_prediction_attaches_metadata_and_validates_probability_shape() -> Result<()> {
         let prediction = build_runtime_prediction(
             "lightgbm",
@@ -1103,7 +1140,10 @@ mod tests {
     #[test]
     fn three_class_runtime_confidence_abstains_on_tight_top_two_margin() -> Result<()> {
         let (confidence, abstain) = three_class_runtime_confidence([0.51, 0.49, 0.0])?;
-        assert!(confidence < 0.56, "tight top-two split should stay low-confidence");
+        assert!(
+            confidence < 0.56,
+            "tight top-two split should stay low-confidence"
+        );
         assert!(abstain, "tight top-two split should recommend abstain");
         Ok(())
     }
@@ -1111,9 +1151,28 @@ mod tests {
     #[test]
     fn three_class_runtime_confidence_accepts_clear_decisive_rows() -> Result<()> {
         let (confidence, abstain) = three_class_runtime_confidence([0.8, 0.1, 0.1])?;
-        assert!(confidence > 0.56, "clear winner should produce strong confidence");
+        assert!(
+            confidence > 0.56,
+            "clear winner should produce strong confidence"
+        );
         assert!(!abstain, "clear winner should not recommend abstain");
         Ok(())
+    }
+
+    #[test]
+    fn three_class_runtime_confidence_normalizes_probability_mass() -> Result<()> {
+        let (confidence_a, abstain_a) = three_class_runtime_confidence([0.6, 0.3, 0.1])?;
+        let (confidence_b, abstain_b) = three_class_runtime_confidence([0.3, 0.15, 0.05])?;
+        assert!((confidence_a - confidence_b).abs() < 1e-6);
+        assert_eq!(abstain_a, abstain_b);
+        Ok(())
+    }
+
+    #[test]
+    fn three_class_runtime_confidence_rejects_probabilities_above_one() {
+        let err = three_class_runtime_confidence([1.2, 0.1, 0.1])
+            .expect_err("probabilities above one must fail");
+        assert!(err.to_string().contains("bounded by 1.0"));
     }
 
     #[test]
