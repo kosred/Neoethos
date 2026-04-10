@@ -122,7 +122,13 @@ impl ONNXInferenceEngine {
             let entry = entry?;
             let path = entry.path();
             if path.extension().map_or(false, |ext| ext == "onnx") {
-                let name = path.file_stem().unwrap().to_string_lossy().to_string();
+                let name = match path.file_stem().and_then(|s| s.to_str()) {
+                    Some(stem) if !stem.is_empty() => stem.to_string(),
+                    _ => {
+                        warn!("Skipping ONNX file with non-utf8 or empty stem: {:?}", path);
+                        continue;
+                    }
+                };
                 if let Err(e) = self.load_model(&name, &path) {
                     warn!("Failed to load model {}: {}", name, e);
                 }
@@ -149,8 +155,12 @@ impl ONNXInferenceEngine {
                 break;
             }
         }
-        if proba_output_name.is_empty() && !outputs.is_empty() {
-            proba_output_name = outputs.last().unwrap().name.clone();
+        if proba_output_name.is_empty() {
+            if let Some(last) = outputs.last() {
+                proba_output_name = last.name.clone();
+            } else {
+                warn!("ONNX model '{}' has no outputs: {}", name, path.display());
+            }
         }
 
         self.sessions.insert(name.to_string(), session);
