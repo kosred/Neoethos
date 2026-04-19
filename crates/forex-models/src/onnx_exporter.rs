@@ -9,19 +9,19 @@
 
 use anyhow::{Context, Result};
 use ndarray::Array2;
-#[cfg(feature = "python-onnx-export")]
+#[cfg(feature = "onnx-export-bridge")]
 use pyo3::prelude::*;
-#[cfg(feature = "python-onnx-export")]
+#[cfg(feature = "onnx-export-bridge")]
 use pyo3::types::{PyDict, PyModule};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "python-onnx-export")]
+#[cfg(feature = "onnx-export-bridge")]
 use tracing::{info, warn};
 
-#[cfg(feature = "python-onnx-export")]
+#[cfg(feature = "onnx-export-bridge")]
 use crate::registry::get_model_capability;
-#[cfg(feature = "python-onnx-export")]
+#[cfg(feature = "onnx-export-bridge")]
 use crate::runtime::capabilities::ModelFamily;
 
 // ============================================================================
@@ -46,16 +46,16 @@ pub struct ExportManifest {
 /// ONNXExporter - Wraps Python onnx_exporter.py for PyTorch model export
 /// Tree models (LightGBM, XGBoost, CatBoost) export directly via Rust
 pub struct ONNXExporter {
-    #[cfg(feature = "python-onnx-export")]
+    #[cfg(feature = "onnx-export-bridge")]
     py_exporter: Option<Py<PyAny>>,
-    #[cfg_attr(not(feature = "python-onnx-export"), allow(dead_code))]
+    #[cfg_attr(not(feature = "onnx-export-bridge"), allow(dead_code))]
     models_dir: PathBuf,
-    #[cfg_attr(not(feature = "python-onnx-export"), allow(dead_code))]
+    #[cfg_attr(not(feature = "onnx-export-bridge"), allow(dead_code))]
     onnx_dir: PathBuf,
 }
 
 impl ONNXExporter {
-    #[cfg(feature = "python-onnx-export")]
+    #[cfg(feature = "onnx-export-bridge")]
     fn resolve_export_route(&self, name: &str, model: &Bound<'_, PyAny>) -> Result<ExportRoute> {
         if let Some(capability) = get_model_capability(name) {
             return match capability.family {
@@ -118,7 +118,7 @@ impl ONNXExporter {
         }
     }
 
-    #[cfg(feature = "python-onnx-export")]
+    #[cfg(feature = "onnx-export-bridge")]
     fn array2_to_numpy(py: Python<'_>, sample_input: &Array2<f32>) -> PyResult<Py<PyAny>> {
         let numpy = PyModule::import(py, "numpy")?;
         let shape = (sample_input.nrows(), sample_input.ncols());
@@ -137,7 +137,7 @@ impl ONNXExporter {
         // Create ONNX directory
         std::fs::create_dir_all(&onnx_dir).context("Failed to create ONNX directory")?;
 
-        #[cfg(feature = "python-onnx-export")]
+        #[cfg(feature = "onnx-export-bridge")]
         let py_exporter = Python::attach(|py| {
             let exporter_module = PyModule::import(py, "forex_bot.models.onnx_exporter")
                 .context("Failed to import forex_bot.models.onnx_exporter")?;
@@ -156,7 +156,7 @@ impl ONNXExporter {
 
         // Initialize Python exporter
         Ok(Self {
-            #[cfg(feature = "python-onnx-export")]
+            #[cfg(feature = "onnx-export-bridge")]
             py_exporter: Some(py_exporter),
             models_dir,
             onnx_dir,
@@ -165,7 +165,7 @@ impl ONNXExporter {
 
     /// Export PyTorch neural network model to ONNX
     /// Delegates to Python torch.onnx.export via PyO3
-    #[cfg(feature = "python-onnx-export")]
+    #[cfg(feature = "onnx-export-bridge")]
     pub fn export_pytorch_model(
         &self,
         name: &str,
@@ -190,7 +190,7 @@ impl ONNXExporter {
 
     /// Export LightGBM model to ONNX using onnxmltools
     /// Python lines 209-233
-    #[cfg(feature = "python-onnx-export")]
+    #[cfg(feature = "onnx-export-bridge")]
     pub fn export_lightgbm_model(&self, name: &str, sample_input: &Array2<f32>) -> Result<PathBuf> {
         Python::attach(|py| {
             let exporter = self
@@ -220,7 +220,7 @@ impl ONNXExporter {
 
     /// Export XGBoost model to ONNX using onnxmltools
     /// Python lines 235-259
-    #[cfg(feature = "python-onnx-export")]
+    #[cfg(feature = "onnx-export-bridge")]
     pub fn export_xgboost_model(&self, name: &str, sample_input: &Array2<f32>) -> Result<PathBuf> {
         Python::attach(|py| {
             let exporter = self
@@ -247,7 +247,7 @@ impl ONNXExporter {
 
     /// Export CatBoost model to ONNX using CatBoost's native exporter
     /// Python lines 193-207
-    #[cfg(feature = "python-onnx-export")]
+    #[cfg(feature = "onnx-export-bridge")]
     pub fn export_catboost_model(&self, name: &str, sample_input: &Array2<f32>) -> Result<PathBuf> {
         Python::attach(|py| {
             let exporter = self
@@ -275,7 +275,7 @@ impl ONNXExporter {
 
     /// Export all models to ONNX format
     /// Python lines 61-131
-    #[cfg(feature = "python-onnx-export")]
+    #[cfg(feature = "onnx-export-bridge")]
     pub fn export_all(
         &self,
         models: HashMap<String, Py<PyAny>>,
@@ -307,7 +307,7 @@ impl ONNXExporter {
     }
 
     /// Export a single model (auto-detects type)
-    #[cfg(feature = "python-onnx-export")]
+    #[cfg(feature = "onnx-export-bridge")]
     fn export_model(
         &self,
         name: &str,
@@ -336,7 +336,7 @@ impl ONNXExporter {
     }
 
     /// Extract class labels from model
-    #[cfg(feature = "python-onnx-export")]
+    #[cfg(feature = "onnx-export-bridge")]
     fn extract_classes(model: &Bound<'_, PyAny>) -> Result<Option<Vec<i32>>> {
         Python::attach(|_py| {
             // Try to get classes_ attribute
@@ -361,7 +361,7 @@ impl ONNXExporter {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(feature = "python-onnx-export")]
+#[cfg(feature = "onnx-export-bridge")]
 enum ExportRoute {
     PyTorch,
     LightGbm,
@@ -414,22 +414,22 @@ pub trait ONNXExportable {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "python-onnx-export")]
+    #[cfg(feature = "onnx-export-bridge")]
     use super::*;
-    #[cfg(feature = "python-onnx-export")]
+    #[cfg(feature = "onnx-export-bridge")]
     use ndarray::array;
-    #[cfg(feature = "python-onnx-export")]
+    #[cfg(feature = "onnx-export-bridge")]
     use pyo3::types::PyDict;
-    #[cfg(feature = "python-onnx-export")]
+    #[cfg(feature = "onnx-export-bridge")]
     use std::ffi::CString;
 
-    #[cfg(feature = "python-onnx-export")]
+    #[cfg(feature = "onnx-export-bridge")]
     fn run_py(py: Python<'_>, code: &str, locals: &Bound<'_, PyDict>) -> PyResult<()> {
         let code = CString::new(code).expect("python code should not contain embedded nulls");
         py.run(code.as_c_str(), Some(locals), Some(locals))
     }
 
-    #[cfg(feature = "python-onnx-export")]
+    #[cfg(feature = "onnx-export-bridge")]
     #[test]
     fn test_export_pytorch_model_avoids_pandas_bridge() -> Result<()> {
         Python::attach(|py| {

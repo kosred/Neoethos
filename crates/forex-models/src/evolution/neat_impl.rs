@@ -11,10 +11,14 @@ use symbios_neat::{Activation, CppnEvaluator, NeatConfig, NeatGenome};
 
 use crate::base::{
     build_runtime_artifact_metadata, build_runtime_prediction_with_details,
-    three_class_runtime_confidence, ExpertModel,
+    three_class_runtime_confidence, try_build_runtime_artifact_metadata, ExpertModel,
 };
-use crate::runtime::artifacts::{default_three_class_label_mapping, TrainingSummaryMetadata};
-use crate::runtime::capabilities::{CapabilityState, ModelFamily};
+use crate::runtime::artifacts::{
+    default_three_class_label_mapping, RuntimeArtifactMetadata, TrainingSummaryMetadata,
+};
+use crate::runtime::capabilities::{
+    append_runtime_degraded_reason, gpu_policy_cpu_fallback_reason, CapabilityState, ModelFamily,
+};
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
     ensure_feature_columns_match, feature_matrix_from_dataframe, read_json,
@@ -47,6 +51,8 @@ struct NeatArtifact {
     best_fitness: f32,
     best_loss: f32,
     best_accuracy: f32,
+    #[serde(default)]
+    runtime_metadata: Option<RuntimeArtifactMetadata>,
 }
 
 impl Default for NeatArtifact {
@@ -76,6 +82,7 @@ impl Default for NeatArtifact {
             best_fitness: f32::NEG_INFINITY,
             best_loss: f32::INFINITY,
             best_accuracy: 0.0,
+            runtime_metadata: None,
         }
     }
 }
@@ -611,28 +618,41 @@ impl NeatExpert {
     }
 
     fn runtime_details(&self) -> (Option<String>, Option<String>) {
+        let gpu_cpu_fallback = gpu_policy_cpu_fallback_reason("neat");
         if !self.fitted {
             return (
                 Some("neat_unknown".to_string()),
-                Some("neat_not_fitted".to_string()),
+                append_runtime_degraded_reason(
+                    Some("neat_not_fitted".to_string()),
+                    gpu_cpu_fallback,
+                ),
             );
         }
         if self.feature_columns.is_empty() {
             return (
                 Some("neat_unknown".to_string()),
-                Some("neat_feature_schema_missing".to_string()),
+                append_runtime_degraded_reason(
+                    Some("neat_feature_schema_missing".to_string()),
+                    gpu_cpu_fallback,
+                ),
             );
         }
         if self.scaler.is_none() || self.best_genome.is_none() {
             return (
                 Some("neat_unknown".to_string()),
-                Some("neat_runtime_state_incomplete".to_string()),
+                append_runtime_degraded_reason(
+                    Some("neat_runtime_state_incomplete".to_string()),
+                    gpu_cpu_fallback,
+                ),
             );
         }
         if self.train_rows == 0 || self.train_rows + self.val_rows != self.dataset_rows {
             return (
                 Some("neat_unknown".to_string()),
-                Some("neat_training_summary_incomplete".to_string()),
+                append_runtime_degraded_reason(
+                    Some("neat_training_summary_incomplete".to_string()),
+                    gpu_cpu_fallback,
+                ),
             );
         }
         let backend = if self.runtime_backend.trim().is_empty() {
@@ -645,7 +665,10 @@ impl NeatExpert {
         } else {
             None
         };
-        (Some(backend), degraded_reason)
+        (
+            Some(backend),
+            append_runtime_degraded_reason(degraded_reason, gpu_cpu_fallback),
+        )
     }
 
     fn ensure_runtime_state_ready(&self) -> Result<()> {
@@ -862,6 +885,82 @@ impl NeatExpert {
 
         Ok(())
     }
+
+    fn metadata_from_artifact(artifact: &NeatArtifact) -> Result<RuntimeArtifactMetadata> {
+        try_build_runtime_artifact_metadata(
+            NEAT_MODEL_NAME,
+            ModelFamily::Evolutionary,
+            CapabilityState::Implemented,
+            artifact.feature_columns.clone(),
+            default_three_class_label_mapping(),
+            TrainingSummaryMetadata::new(
+                artifact.dataset_rows,
+                artifact.train_rows,
+                artifact.val_rows,
+            ),
+        )
+    }
+
+    fn validate_metadata_consistency(
+        sidecar: &RuntimeArtifactMetadata,
+        embedded: &RuntimeArtifactMetadata,
+    ) -> Result<()> {
+        if sidecar.model_name != embedded.model_name
+            || sidecar.family != embedded.family
+            || sidecar.state != embedded.state
+        {
+            bail!("NEAT metadata identity mismatch between sidecar and embedded payload");
+        }
+        if sidecar.feature_columns != embedded.feature_columns {
+            bail!("NEAT metadata feature columns drift between sidecar and embedded");
+        }
+        if sidecar.label_mapping != embedded.label_mapping {
+            bail!("NEAT metadata label mapping drift between sidecar and embedded");
+        }
+        if sidecar.training_summary != embedded.training_summary {
+            bail!("NEAT metadata training summary drift between sidecar and embedded");
+        }
+        Ok(())
+    }
+
+    fn resolve_loaded_metadata(
+        path: &Path,
+        artifact: &NeatArtifact,
+    ) -> Result<RuntimeArtifactMetadata> {
+        let metadata_path = path.join(METADATA_FILE_NAME);
+        let reconstructed = Self::metadata_from_artifact(artifact)?;
+        Self::validate_loaded_metadata(&reconstructed)?;
+        match read_json::<RuntimeArtifactMetadata>(&metadata_path) {
+            Ok(sidecar) => {
+                Self::validate_loaded_metadata(&sidecar)?;
+                Self::validate_metadata_consistency(&sidecar, &reconstructed)?;
+                if let Some(embedded) = artifact.runtime_metadata.as_ref() {
+                    Self::validate_loaded_metadata(embedded)?;
+                    Self::validate_metadata_consistency(&sidecar, embedded)?;
+                }
+                Ok(sidecar)
+            }
+            Err(error) => {
+                if let Some(embedded) = artifact.runtime_metadata.as_ref() {
+                    Self::validate_loaded_metadata(embedded)?;
+                    Self::validate_metadata_consistency(embedded, &reconstructed)?;
+                    tracing::warn!(
+                        "NEAT metadata sidecar unavailable at {} ({}); falling back to embedded metadata",
+                        metadata_path.display(),
+                        error
+                    );
+                    Ok(embedded.clone())
+                } else {
+                    tracing::warn!(
+                        "NEAT metadata sidecar unavailable at {} ({}); reconstructing metadata from artifact",
+                        metadata_path.display(),
+                        error
+                    );
+                    Ok(reconstructed)
+                }
+            }
+        }
+    }
 }
 
 impl Default for NeatExpert {
@@ -921,17 +1020,15 @@ impl ExpertModel for NeatExpert {
 
         std::fs::create_dir_all(path)
             .with_context(|| format!("create NEAT model directory {}", path.display()))?;
-        write_json(
-            &path.join(METADATA_FILE_NAME),
-            &build_runtime_artifact_metadata(
-                NEAT_MODEL_NAME,
-                ModelFamily::Evolutionary,
-                CapabilityState::Implemented,
-                self.feature_columns.clone(),
-                default_three_class_label_mapping(),
-                TrainingSummaryMetadata::new(self.dataset_rows, self.train_rows, self.val_rows),
-            ),
+        let runtime_metadata = try_build_runtime_artifact_metadata(
+            NEAT_MODEL_NAME,
+            ModelFamily::Evolutionary,
+            CapabilityState::Implemented,
+            self.feature_columns.clone(),
+            default_three_class_label_mapping(),
+            TrainingSummaryMetadata::new(self.dataset_rows, self.train_rows, self.val_rows),
         )?;
+        write_json(&path.join(METADATA_FILE_NAME), &runtime_metadata)?;
         write_json(
             &path.join(NEAT_ARTIFACT_FILE_NAME),
             &NeatArtifact {
@@ -954,15 +1051,14 @@ impl ExpertModel for NeatExpert {
                 best_fitness: self.best_fitness,
                 best_loss: self.best_loss,
                 best_accuracy: self.best_accuracy,
+                runtime_metadata: Some(runtime_metadata),
             },
         )
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
-        let metadata: crate::runtime::artifacts::RuntimeArtifactMetadata =
-            read_json(&path.join(METADATA_FILE_NAME))?;
         let artifact: NeatArtifact = read_json(&path.join(NEAT_ARTIFACT_FILE_NAME))?;
-        Self::validate_loaded_metadata(&metadata)?;
+        let metadata = Self::resolve_loaded_metadata(path, &artifact)?;
         Self::validate_loaded_artifact(&metadata, &artifact)?;
 
         let next_config = artifact.config;
@@ -1094,6 +1190,44 @@ mod tests {
     }
 
     #[test]
+    fn neat_load_falls_back_to_embedded_metadata_when_sidecar_missing() -> Result<()> {
+        let (features, labels) = training_frame()?;
+        let mut expert = NeatExpert::with_config(2, 24, 8);
+        expert.fit(&features, &labels)?;
+        let path = temp_model_dir("neat_sidecar_missing");
+        expert.save(&path)?;
+        std::fs::remove_file(path.join(METADATA_FILE_NAME))?;
+
+        let mut loaded = NeatExpert::with_config(2, 24, 8);
+        loaded.load(&path)?;
+        assert_eq!(loaded.train_rows + loaded.val_rows, loaded.dataset_rows);
+        let _ = std::fs::remove_dir_all(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn neat_load_rejects_sidecar_drift_against_embedded() -> Result<()> {
+        let (features, labels) = training_frame()?;
+        let mut expert = NeatExpert::with_config(2, 24, 8);
+        expert.fit(&features, &labels)?;
+        let path = temp_model_dir("neat_sidecar_drift");
+        expert.save(&path)?;
+
+        let mut sidecar: RuntimeArtifactMetadata = read_json(&path.join(METADATA_FILE_NAME))?;
+        sidecar.training_summary.train_rows = sidecar.training_summary.train_rows.saturating_sub(1);
+        sidecar.training_summary.val_rows += 1;
+        write_json(&path.join(METADATA_FILE_NAME), &sidecar)?;
+
+        let mut loaded = NeatExpert::with_config(2, 24, 8);
+        let err = loaded
+            .load(&path)
+            .expect_err("drifted sidecar metadata should be rejected");
+        assert!(err.to_string().contains("drift"));
+        let _ = std::fs::remove_dir_all(&path);
+        Ok(())
+    }
+
+    #[test]
     fn validate_loaded_artifact_rejects_inconsistent_train_val_rows() -> Result<()> {
         let metadata = build_runtime_artifact_metadata(
             NEAT_MODEL_NAME,
@@ -1129,6 +1263,7 @@ mod tests {
             best_fitness: 0.5,
             best_loss: 1.0,
             best_accuracy: 0.5,
+            runtime_metadata: None,
         };
 
         let err = NeatExpert::validate_loaded_artifact(&metadata, &artifact)
@@ -1173,6 +1308,7 @@ mod tests {
             best_fitness: 0.5,
             best_loss: 1.0,
             best_accuracy: 0.5,
+            runtime_metadata: None,
         };
 
         let err = NeatExpert::validate_loaded_artifact(&metadata, &artifact)
@@ -1217,6 +1353,7 @@ mod tests {
             best_fitness: 0.5,
             best_loss: 1.0,
             best_accuracy: 0.5,
+            runtime_metadata: None,
         };
 
         let err = NeatExpert::validate_loaded_artifact(&metadata, &artifact)

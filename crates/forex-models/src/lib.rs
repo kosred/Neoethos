@@ -1,4 +1,4 @@
-// Base classes and utilities (ported from models/base.py)
+// Base classes and utilities (derived from models/base.py)
 pub mod base;
 pub mod runtime;
 
@@ -20,11 +20,11 @@ pub use ensemble::{
 pub use parallel_trainer::{ModelTrainingFailure, ModelTrainingProgress, ParallelTrainingSummary};
 pub use training_orchestrator::{TrainingOrchestrator, TrainingRunSummary};
 
-// Hardware detection (ported from models/device.py)
+// Hardware detection (derived from models/device.py)
 pub mod hardware;
 
 // ONNX export for ultra-fast inference
-#[cfg(feature = "python-onnx-export")]
+#[cfg(feature = "onnx-export-bridge")]
 pub mod onnx_exporter;
 
 // Evaluation helpers (simple backtest, signal conversion)
@@ -62,7 +62,7 @@ pub use streaming::{
     AdaptiveGradientBooster, OnlineHoeffdingExpert, OnlinePassiveAggressiveExpert,
 };
 
-// Pure-Rust neural networks via Burn framework (no Python, no GIL)
+// Pure-Rust neural networks via Burn framework (no legacy, no GIL)
 pub mod burn_models;
 
 #[cfg(feature = "onnx")]

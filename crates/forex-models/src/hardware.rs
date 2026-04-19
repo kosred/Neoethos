@@ -1,7 +1,7 @@
 // Hardware detection and device selection utilities
-// Ported from src/forex_bot/models/device.py
+// Derived from src/forex_bot/models/device.py
 // NO SIMPLIFICATION - Preserves all hardware profiling logic
-// REMOVES: Python multiprocessing, GIL-related threading workarounds
+// REMOVES: legacy multiprocessing, GIL-related threading workarounds
 
 use std::env;
 #[cfg(feature = "tch")]
@@ -30,7 +30,7 @@ pub struct HardwareInfo {
 
 impl HardwareInfo {
     /// Auto-detect all hardware: CPUs, GPUs, RAM, OS
-    /// This is what Python needed multiprocessing to emulate
+    /// This is what legacy needed multiprocessing to emulate
     pub fn detect() -> Self {
         let cpu_cores = num_cpus::get();
         let cpu_cores_usable = cpu_cores.saturating_sub(1).max(1); // Reserve 1 for OS
@@ -67,7 +67,7 @@ impl HardwareInfo {
     }
 
     /// Detect GPUs using tch (PyTorch bindings)
-    /// Python lines 61-73
+    /// legacy lines 61-73
     fn detect_gpus() -> GpuDetection {
         #[cfg(feature = "tch")]
         {
@@ -106,7 +106,7 @@ impl HardwareInfo {
     }
 
     /// Check if GPU supports bfloat16 (Ampere+ = SM 8.0+)
-    /// Python lines 76-84
+    /// legacy lines 76-84
     pub fn gpu_supports_bf16(&self, gpu_idx: usize) -> bool {
         if gpu_idx >= self.compute_capabilities.len() {
             return false;
@@ -116,7 +116,7 @@ impl HardwareInfo {
     }
 
     /// Check if GPU supports FP8 (Ada/Hopper/Blackwell = SM 8.9+)
-    /// Python lines 99-109
+    /// legacy lines 99-109
     pub fn gpu_supports_fp8(&self, gpu_idx: usize) -> bool {
         if gpu_idx >= self.compute_capabilities.len() {
             return false;
@@ -131,12 +131,12 @@ impl HardwareInfo {
 // ============================================================================
 
 /// Simple benchmarking to determine relative CPU vs GPU performance
-/// Python lines 18-58
+/// legacy lines 18-58
 pub struct DeviceBenchmark;
 
 impl DeviceBenchmark {
     /// Measure time for a matrix multiplication
-    /// Python lines 22-42
+    /// legacy lines 22-42
     #[cfg(feature = "tch")]
     pub fn benchmark_matmul(device: Device, size: i64) -> f64 {
         let result = std::panic::catch_unwind(|| {
@@ -167,7 +167,7 @@ impl DeviceBenchmark {
     }
 
     /// Estimate CPU->GPU transfer latency
-    /// Python lines 44-58
+    /// legacy lines 44-58
     #[cfg(feature = "tch")]
     pub fn estimate_transfer_overhead(device: Device, size_mb: usize) -> f64 {
         if !device.is_cuda() {
@@ -208,7 +208,7 @@ pub enum DevicePreference {
 }
 
 /// Select device based on request and availability
-/// Python lines 173-194
+/// legacy lines 173-194
 pub fn select_device(requested: DevicePreference) -> Vec<String> {
     match requested {
         DevicePreference::Cpu => vec!["cpu".to_string()],
@@ -244,7 +244,7 @@ pub fn select_device(requested: DevicePreference) -> Vec<String> {
 }
 
 /// Get list of available GPU device strings
-/// Python lines 70-73
+/// legacy lines 70-73
 pub fn get_available_gpus() -> Vec<String> {
     #[cfg(feature = "tch")]
     {
@@ -261,20 +261,20 @@ pub fn get_available_gpus() -> Vec<String> {
 // ============================================================================
 
 /// Enable fast math on supported GPUs (TF32 for Ampere/Hopper)
-/// Python lines 130-141
+/// legacy lines 130-141
 #[cfg(feature = "tch")]
 pub fn tune_torch_backend(device: Device) {
-    // Note: tch-rs doesn't expose all backend tuning options that Python PyTorch has
+    // Note: tch-rs doesn't expose all backend tuning options that legacy PyTorch has
     // These would need to be set via environment variables or C++ FFI
 
     if device.is_cuda() {
         // Enable TF32 for Ampere/Hopper
-        // In Python: torch.backends.cuda.matmul.allow_tf32 = True
+        // In legacy: torch.backends.cuda.matmul.allow_tf32 = True
         // In Rust: Set via env var before program start
         env::set_var("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1");
 
         // Enable cuDNN benchmark mode
-        // In Python: torch.backends.cudnn.benchmark = True
+        // In legacy: torch.backends.cudnn.benchmark = True
         // In Rust: Set via env var
         env::set_var("TORCH_CUDNN_BENCHMARK", "1");
 
@@ -288,7 +288,7 @@ pub fn tune_torch_backend(_device: &str) {
 }
 
 /// Enable flash attention / memory-efficient SDPA kernels
-/// Python lines 144-170
+/// legacy lines 144-170
 #[cfg(feature = "tch")]
 pub fn enable_flash_attention() {
     // These are PyTorch 2.0+ features
@@ -308,7 +308,7 @@ pub fn enable_flash_attention() {
 // ============================================================================
 
 /// Configure rayon thread pool to use all cores minus 1
-/// REPLACES Python's multiprocessing.cpu_count() - no GIL issues!
+/// REPLACES legacy's multiprocessing.cpu_count() - no GIL issues!
 pub fn configure_rayon_threads(hardware: &HardwareInfo) {
     let threads = hardware.cpu_cores_usable.max(1);
 
@@ -323,7 +323,7 @@ pub fn configure_rayon_threads(hardware: &HardwareInfo) {
 }
 
 /// Get number of parallel jobs for given hardware
-/// REPLACES Python's prefer_gpu_env_jobs (lines 197-204)
+/// REPLACES legacy's prefer_gpu_env_jobs (lines 197-204)
 /// NO multiprocessing import needed - Rust has no GIL!
 pub fn get_parallel_jobs(hardware: &HardwareInfo, requested: Option<usize>) -> usize {
     let max_jobs = hardware.cpu_cores_usable.max(1);

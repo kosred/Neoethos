@@ -131,25 +131,38 @@ pub fn gpu_count() -> usize {
         }
     }
 
+    fn parse_visible_devices(devices: &str) -> Option<usize> {
+        let trimmed = devices.trim();
+        if trimmed.is_empty() || trimmed == "-1" || trimmed.eq_ignore_ascii_case("void") {
+            return Some(0);
+        }
+        let count = trimmed
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "-1")
+            .count();
+        (count > 0).then_some(count)
+    }
+
     fn env_gpu_count(keys: &[&str]) -> Option<usize> {
         for key in keys {
             let Ok(devices) = env::var(key) else {
                 continue;
             };
-            let trimmed = devices.trim();
-            if trimmed.is_empty() || trimmed == "-1" || trimmed.eq_ignore_ascii_case("void") {
-                return Some(0);
-            }
-            let count = trimmed
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty() && *value != "-1")
-                .count();
-            if count > 0 {
+            if let Some(count) = parse_visible_devices(&devices) {
                 return Some(count);
             }
         }
         None
+    }
+
+    fn parse_nvidia_smi_output(stdout: &str) -> Option<usize> {
+        let count = stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .count();
+        Some(count)
     }
 
     fn nvidia_smi_gpu_count() -> Option<usize> {
@@ -161,19 +174,74 @@ pub fn gpu_count() -> usize {
             return None;
         }
         let stdout = String::from_utf8(output.stdout).ok()?;
-        let count = stdout
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .count();
-        Some(count)
+        parse_nvidia_smi_output(&stdout)
     }
 
-    if let Some(count) = env_gpu_count(&["CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES"]) {
+    fn parse_rocm_output(stdout: &str) -> Option<usize> {
+        let gfx_count = stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                let lower = line.to_ascii_lowercase();
+                lower.contains("gfx")
+                    || lower.starts_with("gpu[")
+                    || lower.starts_with("card series")
+            })
+            .count();
+        (gfx_count > 0).then_some(gfx_count)
+    }
+
+    fn rocm_gpu_count() -> Option<usize> {
+        let rocminfo = Command::new("rocminfo").output().ok();
+        if let Some(output) = rocminfo {
+            if output.status.success() {
+                if let Ok(stdout) = String::from_utf8(output.stdout) {
+                    if let Some(count) = parse_rocm_output(&stdout) {
+                        return Some(count);
+                    }
+                }
+            }
+        }
+
+        let rocm_smi = Command::new("rocm-smi")
+            .arg("--showproductname")
+            .output()
+            .ok();
+        if let Some(output) = rocm_smi {
+            if output.status.success() {
+                if let Ok(stdout) = String::from_utf8(output.stdout) {
+                    if let Some(count) = parse_rocm_output(&stdout) {
+                        return Some(count);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    if let Some(count) = env_gpu_count(&[
+        "FOREX_GPU_VISIBLE_DEVICES",
+        "GPU_VISIBLE_DEVICES",
+        "CUDA_VISIBLE_DEVICES",
+        "NVIDIA_VISIBLE_DEVICES",
+        "HIP_VISIBLE_DEVICES",
+        "ROCR_VISIBLE_DEVICES",
+        "ROCM_VISIBLE_DEVICES",
+    ]) {
         return count;
     }
 
+    if let Ok(value) = env::var("FOREX_GPU_COUNT") {
+        if let Ok(parsed) = value.trim().parse::<usize>() {
+            return parsed;
+        }
+    }
+
     if let Some(count) = nvidia_smi_gpu_count() {
+        return count;
+    }
+
+    if let Some(count) = rocm_gpu_count() {
         return count;
     }
 
@@ -265,4 +333,32 @@ pub fn cpu_threads_from_params(params: &HashMap<String, ParamValue>, default: us
         }
     }
     default
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{gpu_count, parse_device_preference};
+
+    #[test]
+    fn parse_device_preference_accepts_vendor_aliases() {
+        assert!(matches!(
+            parse_device_preference("cuda"),
+            super::DevicePreference::Gpu
+        ));
+        assert!(matches!(
+            parse_device_preference("gpu"),
+            super::DevicePreference::Gpu
+        ));
+        assert!(matches!(
+            parse_device_preference("cpu"),
+            super::DevicePreference::Cpu
+        ));
+    }
+
+    #[test]
+    fn gpu_count_reads_generic_override() {
+        std::env::set_var("FOREX_GPU_COUNT", "3");
+        assert_eq!(gpu_count(), 3);
+        std::env::remove_var("FOREX_GPU_COUNT");
+    }
 }

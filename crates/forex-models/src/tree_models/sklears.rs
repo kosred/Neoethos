@@ -16,6 +16,7 @@ use crate::tree_models::common::{
 };
 
 const MODEL_FILE_NAME: &str = "model.json";
+const SKLEARS_RUNTIME_FILE_NAME: &str = "runtime.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum TreeNode {
@@ -39,6 +40,12 @@ struct DecisionTreeArtifact {
     min_samples_leaf: usize,
     max_thresholds_per_feature: usize,
     root: TreeNode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SklearsRuntimeArtifact {
+    feature_columns: Vec<String>,
+    training_summary: TrainingSummaryMetadata,
 }
 
 fn validate_probability_vector(probabilities: &[f32; 3]) -> Result<()> {
@@ -122,6 +129,26 @@ pub struct SklearsTreeExpert {
 }
 
 impl SklearsTreeExpert {
+    fn read_runtime_artifact(path: &Path) -> Result<Option<SklearsRuntimeArtifact>> {
+        let runtime_path = path.join(SKLEARS_RUNTIME_FILE_NAME);
+        if !runtime_path.exists() {
+            return Ok(None);
+        }
+        let payload = std::fs::read(&runtime_path).with_context(|| {
+            format!(
+                "read sklears-tree runtime artifact {}",
+                runtime_path.display()
+            )
+        })?;
+        let artifact = serde_json::from_slice(&payload).with_context(|| {
+            format!(
+                "deserialize sklears-tree runtime artifact {}",
+                runtime_path.display()
+            )
+        })?;
+        Ok(Some(artifact))
+    }
+
     pub fn new() -> Self {
         Self {
             root: None,
@@ -443,13 +470,20 @@ impl ExpertModel for SklearsTreeExpert {
         let payload =
             serde_json::to_vec_pretty(&artifact).context("serialize sklears-tree artifact")?;
         atomic_write(&model_path, &payload)?;
+        let runtime_artifact = SklearsRuntimeArtifact {
+            feature_columns: self.feature_columns.clone(),
+            training_summary: self.stored_training_summary(),
+        };
+        let runtime_payload = serde_json::to_vec_pretty(&runtime_artifact)
+            .context("serialize sklears-tree runtime artifact")?;
+        atomic_write(&path.join(SKLEARS_RUNTIME_FILE_NAME), &runtime_payload)?;
         write_runtime_metadata(
             &metadata_path,
             &tree_runtime_metadata(
                 "sklears_tree",
                 self.feature_columns.clone(),
                 self.stored_training_summary(),
-            ),
+            )?,
         )?;
         Ok(())
     }
@@ -462,17 +496,37 @@ impl ExpertModel for SklearsTreeExpert {
             serde_json::from_slice(&payload).with_context(|| {
                 format!("deserialize sklears-tree artifact {}", model_path.display())
             })?;
-        let metadata = read_runtime_metadata(&metadata_path)?;
-        if metadata.model_name != "sklears_tree" || metadata.family != ModelFamily::Tree {
-            bail!(
-                "sklears-tree runtime metadata mismatch: expected tree/sklears_tree, got {}/{}",
-                metadata.family,
-                metadata.model_name
+        let runtime_artifact = Self::read_runtime_artifact(path)?;
+        let metadata = if metadata_path.exists() {
+            let metadata = read_runtime_metadata(&metadata_path)?;
+            if metadata.model_name != "sklears_tree" || metadata.family != ModelFamily::Tree {
+                bail!(
+                    "sklears-tree runtime metadata mismatch: expected tree/sklears_tree, got {}/{}",
+                    metadata.family,
+                    metadata.model_name
+                );
+            }
+            if metadata.feature_columns.is_empty() {
+                bail!("sklears-tree runtime metadata must contain at least one feature column");
+            }
+            metadata
+        } else if let Some(runtime_artifact) = runtime_artifact {
+            let metadata = tree_runtime_metadata(
+                "sklears_tree",
+                runtime_artifact.feature_columns,
+                runtime_artifact.training_summary,
+            )?;
+            tracing::warn!(
+                path = %path.display(),
+                "sklears-tree metadata sidecar missing; reconstructing from runtime artifact"
             );
-        }
-        if metadata.feature_columns.is_empty() {
-            bail!("sklears-tree runtime metadata must contain at least one feature column");
-        }
+            metadata
+        } else {
+            bail!(
+                "sklears-tree metadata sidecar missing and runtime artifact missing at {}",
+                path.display()
+            );
+        };
         if metadata.training_summary.dataset_rows == 0 {
             bail!("sklears-tree runtime metadata must record non-zero dataset_rows");
         }
@@ -599,5 +653,33 @@ mod tests {
             .load(&artifact_dir)
             .expect_err("inconsistent training summary should fail");
         assert!(err.to_string().contains("training summary"));
+    }
+
+    #[test]
+    fn sklears_load_uses_runtime_artifact_when_metadata_sidecar_missing() {
+        let (x, y) = sample_three_class_dataset();
+        let artifact_dir = unique_temp_dir("sklears-metadata-missing");
+
+        let mut expert = SklearsTreeExpert::new();
+        expert.fit(&x, &y).expect("fit should succeed");
+        expert.save(&artifact_dir).expect("save should succeed");
+
+        let metadata_path = artifact_dir.join("metadata.json");
+        assert!(
+            metadata_path.exists(),
+            "expected metadata sidecar at {}",
+            metadata_path.display()
+        );
+        std::fs::remove_file(&metadata_path)
+            .expect("remove metadata sidecar to trigger reconstruction");
+
+        let mut loaded = SklearsTreeExpert::new();
+        loaded
+            .load(&artifact_dir)
+            .expect("load should reconstruct metadata from runtime artifact");
+        let probabilities = loaded
+            .predict_proba(&x)
+            .expect("prediction should succeed after metadata reconstruction");
+        assert_eq!(probabilities.dim(), (x.height(), 3));
     }
 }

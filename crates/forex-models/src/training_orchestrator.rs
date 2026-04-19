@@ -3034,15 +3034,15 @@ fn write_onnx_status_sidecar(
         );
     }
 
-    let exporter = if cfg!(feature = "python-onnx-export") {
-        "python-onnx-export"
+    let exporter = if cfg!(feature = "onnx-export-bridge") {
+        "onnx-export-bridge"
     } else {
         "none"
     };
-    let reason = if cfg!(feature = "python-onnx-export") {
+    let reason = if cfg!(feature = "onnx-export-bridge") {
         "trained runtime artifact saved; ONNX export was requested but not attempted because the current Rust training path does not wire the exporter yet"
     } else {
-        "trained runtime artifact saved; ONNX export was requested but python-onnx-export is not enabled for this build"
+        "trained runtime artifact saved; ONNX export was requested but the optional export bridge feature is not enabled for this build"
     };
     let status = OnnxExportStatus::skipped(
         config.name.clone(),

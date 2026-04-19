@@ -5,7 +5,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::path::Path;
 
 use crate::base::{
-    build_runtime_artifact_metadata, dataframe_to_float32_array, feature_columns_from_dataframe,
+    dataframe_to_float32_array, feature_columns_from_dataframe, try_build_runtime_artifact_metadata,
 };
 use crate::runtime::artifacts::{
     default_three_class_label_mapping, RuntimeArtifactMetadata, TrainingSummaryMetadata,
@@ -14,6 +14,51 @@ use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 
 pub const METADATA_FILE_NAME: &str = "metadata.json";
 pub const MODEL_FILE_NAME: &str = "model.json";
+
+pub fn normalize_statistical_device_policy(policy: &str) -> String {
+    let normalized = policy.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return "auto".to_string();
+    }
+    if matches!(
+        normalized.as_str(),
+        "cuda" | "rocm" | "metal" | "vulkan" | "nvidia"
+    ) {
+        return "gpu".to_string();
+    }
+    if let Some(index) = normalized
+        .strip_prefix("cuda:")
+        .or_else(|| normalized.strip_prefix("rocm:"))
+        .or_else(|| normalized.strip_prefix("metal:"))
+        .or_else(|| normalized.strip_prefix("vulkan:"))
+        .or_else(|| normalized.strip_prefix("gpu:"))
+    {
+        return format!("gpu:{index}");
+    }
+    normalized
+}
+
+pub fn runtime_backend_with_gpu_fallback(
+    model_name: &str,
+    cpu_backend: &str,
+) -> (Option<String>, Option<String>) {
+    let model_key = format!(
+        "FOREX_BOT_{}_DEVICE",
+        model_name.trim().to_ascii_uppercase().replace('-', "_")
+    );
+    let requested = std::env::var(&model_key)
+        .or_else(|_| std::env::var("FOREX_BOT_META_DEVICE"))
+        .unwrap_or_else(|_| "auto".to_string());
+    let normalized = normalize_statistical_device_policy(&requested);
+    let degraded_reason = if normalized == "gpu" || normalized.starts_with("gpu:") {
+        Some(format!(
+            "requested device policy `{normalized}`; statistical backend currently executes on CPU"
+        ))
+    } else {
+        None
+    };
+    (Some(cpu_backend.to_string()), degraded_reason)
+}
 
 fn ensure_finite_matrix(values: &Array2<f32>, context: &str) -> Result<()> {
     if values.iter().any(|value| !value.is_finite()) {
@@ -186,8 +231,8 @@ pub fn meta_runtime_metadata(
     model_name: &str,
     feature_columns: Vec<String>,
     dataset_rows: usize,
-) -> RuntimeArtifactMetadata {
-    build_runtime_artifact_metadata(
+) -> Result<RuntimeArtifactMetadata> {
+    try_build_runtime_artifact_metadata(
         model_name,
         ModelFamily::Meta,
         CapabilityState::Implemented,
@@ -222,4 +267,29 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
         std::fs::read(path).with_context(|| format!("read model artifact {}", path.display()))?;
     serde_json::from_slice(&payload)
         .with_context(|| format!("deserialize model artifact {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_statistical_device_policy, runtime_backend_with_gpu_fallback};
+
+    #[test]
+    fn normalize_statistical_device_policy_accepts_vendor_aliases() {
+        assert_eq!(normalize_statistical_device_policy("cuda:1"), "gpu:1");
+        assert_eq!(normalize_statistical_device_policy("rocm:2"), "gpu:2");
+        assert_eq!(normalize_statistical_device_policy("metal"), "gpu");
+        assert_eq!(normalize_statistical_device_policy("vulkan:0"), "gpu:0");
+    }
+
+    #[test]
+    fn runtime_backend_marks_gpu_request_as_cpu_fallback() {
+        std::env::set_var("FOREX_BOT_META_DEVICE", "gpu:0");
+        let (backend, degraded_reason) =
+            runtime_backend_with_gpu_fallback("elasticnet", "cpu_backend");
+        assert_eq!(backend.as_deref(), Some("cpu_backend"));
+        assert!(degraded_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("currently executes on CPU")));
+        std::env::remove_var("FOREX_BOT_META_DEVICE");
+    }
 }

@@ -106,6 +106,89 @@ pub const KNOWN_MODEL_NAMES: &[&str] = &[
     "dqn",
 ];
 
+pub fn normalize_runtime_device_policy(policy: &str) -> String {
+    let normalized = policy.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return "auto".to_string();
+    }
+    if matches!(
+        normalized.as_str(),
+        "cuda" | "rocm" | "metal" | "vulkan" | "nvidia"
+    ) {
+        return "gpu".to_string();
+    }
+    if let Some(index) = normalized
+        .strip_prefix("cuda:")
+        .or_else(|| normalized.strip_prefix("rocm:"))
+        .or_else(|| normalized.strip_prefix("metal:"))
+        .or_else(|| normalized.strip_prefix("vulkan:"))
+        .or_else(|| normalized.strip_prefix("gpu:"))
+    {
+        return format!("gpu:{index}");
+    }
+    normalized
+}
+
+pub fn requested_runtime_device_policy(model_name: &str) -> String {
+    let model_key = format!(
+        "FOREX_BOT_{}_DEVICE",
+        model_name.trim().to_ascii_uppercase().replace('-', "_")
+    );
+    let requested = std::env::var(&model_key)
+        .or_else(|_| std::env::var("FOREX_BOT_META_DEVICE"))
+        .unwrap_or_else(|_| "auto".to_string());
+    normalize_runtime_device_policy(&requested)
+}
+
+pub fn append_runtime_degraded_reason(
+    degraded_reason: Option<String>,
+    appended_reason: Option<String>,
+) -> Option<String> {
+    match (degraded_reason, appended_reason) {
+        (Some(primary), Some(secondary)) => Some(format!("{primary}; {secondary}")),
+        (Some(primary), None) => Some(primary),
+        (None, Some(secondary)) => Some(secondary),
+        (None, None) => None,
+    }
+}
+
+pub fn gpu_policy_cpu_fallback_reason(model_name: &str) -> Option<String> {
+    let normalized = requested_runtime_device_policy(model_name);
+    if normalized == "gpu" || normalized.starts_with("gpu:") {
+        Some(format!(
+            "requested device policy `{normalized}`; runtime currently executes on CPU"
+        ))
+    } else {
+        None
+    }
+}
+
+pub fn normalize_training_precision_policy(policy: &str) -> String {
+    let normalized = policy.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return "auto".to_string();
+    }
+    match normalized.as_str() {
+        "auto" | "fp32" | "bf16" | "fp8" | "bf4" => normalized,
+        "float32" | "f32" => "fp32".to_string(),
+        "bfloat16" => "bf16".to_string(),
+        "float8" => "fp8".to_string(),
+        _ => "auto".to_string(),
+    }
+}
+
+pub fn requested_training_precision_policy(model_name: &str) -> String {
+    let model_key = format!(
+        "FOREX_BOT_{}_TRAIN_PRECISION",
+        model_name.trim().to_ascii_uppercase().replace('-', "_")
+    );
+    let requested = std::env::var(&model_key)
+        .or_else(|_| std::env::var("FOREX_BOT_TRAIN_PRECISION"))
+        .or_else(|_| std::env::var("FOREX_TRAIN_PRECISION"))
+        .unwrap_or_else(|_| "auto".to_string());
+    normalize_training_precision_policy(&requested)
+}
+
 pub fn model_capability(name: &str) -> Option<ModelCapability> {
     let is_transformer_replica = name
         .strip_prefix("transformer_")
@@ -113,57 +196,45 @@ pub fn model_capability(name: &str) -> Option<ModelCapability> {
 
     let capability = match name {
         // Tree models
-        "lightgbm" => ModelCapability::new(name, ModelFamily::Tree, CapabilityState::Implemented),
-        "xgboost" => ModelCapability::new(name, ModelFamily::Tree, CapabilityState::Implemented),
-        "xgboost_rf" => ModelCapability::new(name, ModelFamily::Tree, CapabilityState::Implemented),
-        "xgboost_dart" => {
-            ModelCapability::new(name, ModelFamily::Tree, CapabilityState::Implemented)
-        }
-        "catboost" => ModelCapability::new(name, ModelFamily::Tree, CapabilityState::Implemented),
-        "catboost_alt" => {
-            ModelCapability::new(name, ModelFamily::Tree, CapabilityState::Implemented)
-        }
-        "sklears_tree" => {
-            ModelCapability::new(name, ModelFamily::Tree, CapabilityState::Implemented)
-        }
+        "lightgbm" => ModelCapability::new(name, ModelFamily::Tree, CapabilityState::Verified),
+        "xgboost" => ModelCapability::new(name, ModelFamily::Tree, CapabilityState::Verified),
+        "xgboost_rf" => ModelCapability::new(name, ModelFamily::Tree, CapabilityState::Verified),
+        "xgboost_dart" => ModelCapability::new(name, ModelFamily::Tree, CapabilityState::Verified),
+        "catboost" => ModelCapability::new(name, ModelFamily::Tree, CapabilityState::Verified),
+        "catboost_alt" => ModelCapability::new(name, ModelFamily::Tree, CapabilityState::Verified),
+        "sklears_tree" => ModelCapability::new(name, ModelFamily::Tree, CapabilityState::Verified),
 
         // Deep models
-        "mlp" => ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Implemented),
-        "nbeats" => ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Implemented),
-        "tide" => ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Implemented),
-        "tabnet" => ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Implemented),
-        "kan" => ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Implemented),
-        "transformer" => {
-            ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Implemented)
-        }
+        "mlp" => ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Verified),
+        "nbeats" => ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Verified),
+        "tide" => ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Verified),
+        "tabnet" => ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Verified),
+        "kan" => ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Verified),
+        "transformer" => ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Verified),
         _ if is_transformer_replica => {
-            ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Implemented)
+            ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Verified)
         }
-        "patchtst" => ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Implemented),
-        "timesnet" => ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Implemented),
-        "nbeatsx_nf" => ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Implemented),
-        "tide_nf" => ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Implemented),
+        "patchtst" => ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Verified),
+        "timesnet" => ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Verified),
+        "nbeatsx_nf" => ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Verified),
+        "tide_nf" => ModelCapability::new(name, ModelFamily::Deep, CapabilityState::Verified),
 
         // Forecasting models
         "swarm_forecaster" => {
-            ModelCapability::new(name, ModelFamily::Forecasting, CapabilityState::Implemented)
+            ModelCapability::new(name, ModelFamily::Forecasting, CapabilityState::Verified)
         }
 
         // Meta models
-        "elasticnet" => ModelCapability::new(name, ModelFamily::Meta, CapabilityState::Implemented),
-        "bayes_logit" => {
-            ModelCapability::new(name, ModelFamily::Meta, CapabilityState::Implemented)
-        }
-        "meta_blender" => {
-            ModelCapability::new(name, ModelFamily::Meta, CapabilityState::Implemented)
-        }
+        "elasticnet" => ModelCapability::new(name, ModelFamily::Meta, CapabilityState::Verified),
+        "bayes_logit" => ModelCapability::new(name, ModelFamily::Meta, CapabilityState::Verified),
+        "meta_blender" => ModelCapability::new(name, ModelFamily::Meta, CapabilityState::Verified),
         "probability_calibrator" => {
-            ModelCapability::new(name, ModelFamily::Meta, CapabilityState::Implemented)
+            ModelCapability::new(name, ModelFamily::Meta, CapabilityState::Verified)
         }
         "conformal_gate" => {
-            ModelCapability::new(name, ModelFamily::Meta, CapabilityState::Implemented)
+            ModelCapability::new(name, ModelFamily::Meta, CapabilityState::Verified)
         }
-        "meta_stack" => ModelCapability::new(name, ModelFamily::Meta, CapabilityState::Implemented),
+        "meta_stack" => ModelCapability::new(name, ModelFamily::Meta, CapabilityState::Verified),
 
         // Evolutionary models
         "genetic" => ModelCapability::new(
@@ -176,30 +247,24 @@ pub fn model_capability(name: &str) -> Option<ModelCapability> {
             ModelFamily::Evolutionary,
             CapabilityState::Implemented,
         ),
-        "neat" => ModelCapability::new(
-            name,
-            ModelFamily::Evolutionary,
-            CapabilityState::Implemented,
-        ),
+        "neat" => ModelCapability::new(name, ModelFamily::Evolutionary, CapabilityState::Verified),
 
         // Exit models
-        "exit_agent" => ModelCapability::new(name, ModelFamily::Exit, CapabilityState::Implemented),
+        "exit_agent" => ModelCapability::new(name, ModelFamily::Exit, CapabilityState::Verified),
 
         // Adaptive models
-        "online_pa" => {
-            ModelCapability::new(name, ModelFamily::Adaptive, CapabilityState::Implemented)
-        }
+        "online_pa" => ModelCapability::new(name, ModelFamily::Adaptive, CapabilityState::Verified),
         "online_hoeffding" => {
-            ModelCapability::new(name, ModelFamily::Adaptive, CapabilityState::Implemented)
+            ModelCapability::new(name, ModelFamily::Adaptive, CapabilityState::Verified)
         }
 
         // Anomaly models
         "isolation_forest" => {
-            ModelCapability::new(name, ModelFamily::Anomaly, CapabilityState::Implemented)
+            ModelCapability::new(name, ModelFamily::Anomaly, CapabilityState::Verified)
         }
 
         // Reinforcement-learning models
-        "dqn" => ModelCapability::new(name, ModelFamily::Rl, CapabilityState::Implemented),
+        "dqn" => ModelCapability::new(name, ModelFamily::Rl, CapabilityState::Verified),
 
         _ => return None,
     };
@@ -209,7 +274,11 @@ pub fn model_capability(name: &str) -> Option<ModelCapability> {
 
 #[cfg(test)]
 mod tests {
-    use super::{model_capability, CapabilityState, ModelCapability, ModelFamily};
+    use super::{
+        append_runtime_degraded_reason, gpu_policy_cpu_fallback_reason, model_capability,
+        normalize_runtime_device_policy, normalize_training_precision_policy,
+        requested_training_precision_policy, CapabilityState, ModelCapability, ModelFamily,
+    };
     use std::collections::HashSet;
 
     #[test]
@@ -246,45 +315,49 @@ mod tests {
     fn known_configured_model_names_resolve_to_capabilities() {
         let capability = model_capability("transformer").expect("transformer should resolve");
         assert_eq!(capability.family, ModelFamily::Deep);
-        assert_eq!(capability.state, CapabilityState::Implemented);
+        assert_eq!(capability.state, CapabilityState::Verified);
 
         let capability = model_capability("sklears_tree").expect("sklears_tree should resolve");
         assert_eq!(capability.family, ModelFamily::Tree);
-        assert_eq!(capability.state, CapabilityState::Implemented);
+        assert_eq!(capability.state, CapabilityState::Verified);
 
         let capability = model_capability("patchtst").expect("patchtst should resolve");
         assert_eq!(capability.family, ModelFamily::Deep);
-        assert_eq!(capability.state, CapabilityState::Implemented);
+        assert_eq!(capability.state, CapabilityState::Verified);
 
         let capability =
             model_capability("swarm_forecaster").expect("swarm_forecaster should resolve");
         assert_eq!(capability.family, ModelFamily::Forecasting);
-        assert_eq!(capability.state, CapabilityState::Implemented);
+        assert_eq!(capability.state, CapabilityState::Verified);
 
         let capability = model_capability("online_pa").expect("online_pa should resolve");
         assert_eq!(capability.family, ModelFamily::Adaptive);
-        assert_eq!(capability.state, CapabilityState::Implemented);
+        assert_eq!(capability.state, CapabilityState::Verified);
 
         let capability = model_capability("elasticnet").expect("elasticnet should resolve");
         assert_eq!(capability.family, ModelFamily::Meta);
-        assert_eq!(capability.state, CapabilityState::Implemented);
+        assert_eq!(capability.state, CapabilityState::Verified);
+
+        let capability = model_capability("bayes_logit").expect("bayes_logit should resolve");
+        assert_eq!(capability.family, ModelFamily::Meta);
+        assert_eq!(capability.state, CapabilityState::Verified);
 
         let capability = model_capability("meta_blender").expect("meta_blender should resolve");
         assert_eq!(capability.family, ModelFamily::Meta);
-        assert_eq!(capability.state, CapabilityState::Implemented);
+        assert_eq!(capability.state, CapabilityState::Verified);
 
         let capability = model_capability("probability_calibrator")
             .expect("probability_calibrator should resolve");
         assert_eq!(capability.family, ModelFamily::Meta);
-        assert_eq!(capability.state, CapabilityState::Implemented);
+        assert_eq!(capability.state, CapabilityState::Verified);
 
         let capability = model_capability("conformal_gate").expect("conformal_gate should resolve");
         assert_eq!(capability.family, ModelFamily::Meta);
-        assert_eq!(capability.state, CapabilityState::Implemented);
+        assert_eq!(capability.state, CapabilityState::Verified);
 
         let capability = model_capability("meta_stack").expect("meta_stack should resolve");
         assert_eq!(capability.family, ModelFamily::Meta);
-        assert_eq!(capability.state, CapabilityState::Implemented);
+        assert_eq!(capability.state, CapabilityState::Verified);
 
         let capability = model_capability("genetic").expect("genetic should resolve");
         assert_eq!(capability.family, ModelFamily::Evolutionary);
@@ -296,20 +369,20 @@ mod tests {
 
         let capability = model_capability("neat").expect("neat should resolve");
         assert_eq!(capability.family, ModelFamily::Evolutionary);
-        assert_eq!(capability.state, CapabilityState::Implemented);
+        assert_eq!(capability.state, CapabilityState::Verified);
 
         let capability = model_capability("exit_agent").expect("exit_agent should resolve");
         assert_eq!(capability.family, ModelFamily::Exit);
-        assert_eq!(capability.state, CapabilityState::Implemented);
+        assert_eq!(capability.state, CapabilityState::Verified);
 
         let capability =
             model_capability("isolation_forest").expect("isolation_forest should resolve");
         assert_eq!(capability.family, ModelFamily::Anomaly);
-        assert_eq!(capability.state, CapabilityState::Implemented);
+        assert_eq!(capability.state, CapabilityState::Verified);
 
         let capability = model_capability("dqn").expect("dqn should resolve");
         assert_eq!(capability.family, ModelFamily::Rl);
-        assert_eq!(capability.state, CapabilityState::Implemented);
+        assert_eq!(capability.state, CapabilityState::Verified);
     }
 
     #[test]
@@ -325,8 +398,133 @@ mod tests {
     }
 
     #[test]
+    fn tree_model_names_resolve_to_verified_capabilities() {
+        let tree_models = [
+            "lightgbm",
+            "xgboost",
+            "xgboost_rf",
+            "xgboost_dart",
+            "catboost",
+            "catboost_alt",
+            "sklears_tree",
+        ];
+
+        for model in tree_models {
+            let capability = model_capability(model).expect("tree model should resolve");
+            assert_eq!(capability.family, ModelFamily::Tree);
+            assert_eq!(capability.state, CapabilityState::Verified);
+        }
+    }
+
+    #[test]
+    fn statistical_meta_model_names_resolve_to_verified_capabilities() {
+        let verified_models = [
+            "elasticnet",
+            "bayes_logit",
+            "meta_blender",
+            "probability_calibrator",
+            "conformal_gate",
+            "meta_stack",
+        ];
+        for model in verified_models {
+            let capability = model_capability(model).expect("meta model should resolve");
+            assert_eq!(capability.family, ModelFamily::Meta);
+            assert_eq!(capability.state, CapabilityState::Verified);
+        }
+    }
+
+    #[test]
+    fn deferred_evolutionary_search_models_remain_implemented() {
+        for model in ["genetic", "neuro_evo"] {
+            let capability = model_capability(model).expect("evolutionary model should resolve");
+            assert_eq!(capability.family, ModelFamily::Evolutionary);
+            assert_eq!(capability.state, CapabilityState::Implemented);
+        }
+    }
+
+    #[test]
+    fn non_search_models_promoted_to_verified() {
+        let verified_models = [
+            "mlp",
+            "nbeats",
+            "tide",
+            "tabnet",
+            "kan",
+            "transformer",
+            "patchtst",
+            "timesnet",
+            "nbeatsx_nf",
+            "tide_nf",
+            "swarm_forecaster",
+            "neat",
+            "exit_agent",
+            "online_pa",
+            "online_hoeffding",
+            "isolation_forest",
+            "dqn",
+        ];
+
+        for model in verified_models {
+            let capability = model_capability(model).expect("model should resolve");
+            assert_eq!(capability.state, CapabilityState::Verified);
+        }
+    }
+
+    #[test]
     #[should_panic(expected = "non-empty name")]
     fn model_capability_new_rejects_blank_name() {
         let _ = ModelCapability::new("   ", ModelFamily::Tree, CapabilityState::Implemented);
+    }
+
+    #[test]
+    fn normalize_runtime_device_policy_accepts_vendor_aliases() {
+        assert_eq!(normalize_runtime_device_policy(" CUDA:1 "), "gpu:1");
+        assert_eq!(normalize_runtime_device_policy("rocm:2"), "gpu:2");
+        assert_eq!(normalize_runtime_device_policy("metal"), "gpu");
+        assert_eq!(normalize_runtime_device_policy("vulkan:0"), "gpu:0");
+    }
+
+    #[test]
+    fn append_runtime_degraded_reason_preserves_primary_and_secondary() {
+        assert_eq!(
+            append_runtime_degraded_reason(
+                Some("primary".to_string()),
+                Some("secondary".to_string())
+            ),
+            Some("primary; secondary".to_string())
+        );
+        assert_eq!(
+            append_runtime_degraded_reason(None, Some("secondary".to_string())),
+            Some("secondary".to_string())
+        );
+    }
+
+    #[test]
+    fn gpu_policy_cpu_fallback_reason_detects_model_override() {
+        std::env::set_var("FOREX_BOT_NEAT_DEVICE", "cuda:3");
+        let reason = gpu_policy_cpu_fallback_reason("neat");
+        std::env::remove_var("FOREX_BOT_NEAT_DEVICE");
+        assert_eq!(
+            reason.as_deref(),
+            Some("requested device policy `gpu:3`; runtime currently executes on CPU")
+        );
+    }
+
+    #[test]
+    fn normalize_training_precision_policy_accepts_aliases() {
+        assert_eq!(normalize_training_precision_policy(" bfloat16 "), "bf16");
+        assert_eq!(normalize_training_precision_policy("f32"), "fp32");
+        assert_eq!(normalize_training_precision_policy("float8"), "fp8");
+        assert_eq!(normalize_training_precision_policy("unknown"), "auto");
+    }
+
+    #[test]
+    fn requested_training_precision_policy_prefers_model_scoped_env() {
+        std::env::set_var("FOREX_BOT_DQN_TRAIN_PRECISION", "bf16");
+        std::env::set_var("FOREX_BOT_TRAIN_PRECISION", "fp32");
+        let requested = requested_training_precision_policy("dqn");
+        std::env::remove_var("FOREX_BOT_DQN_TRAIN_PRECISION");
+        std::env::remove_var("FOREX_BOT_TRAIN_PRECISION");
+        assert_eq!(requested, "bf16");
     }
 }

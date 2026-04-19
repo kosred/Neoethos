@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::base::{
-    build_runtime_artifact_metadata, build_runtime_prediction_with_details,
-    canonical_three_class_label_mapping, dataframe_to_float32_array,
-    feature_columns_from_dataframe, three_class_runtime_confidence, ExpertModel,
+    build_runtime_prediction_with_details, canonical_three_class_label_mapping,
+    dataframe_to_float32_array, feature_columns_from_dataframe, three_class_runtime_confidence,
+    try_build_runtime_artifact_metadata, ExpertModel,
 };
 use crate::burn_models::{
     normalize_burn_device_policy, predict_proba_on_device as burn_predict_proba_on_device,
@@ -67,6 +67,8 @@ struct DeepArtifactConfig {
     params: HashMap<String, String>,
     #[serde(default)]
     burn_training_report: Option<BurnTrainingReport>,
+    #[serde(default)]
+    runtime_metadata: Option<RuntimeArtifactMetadata>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -227,14 +229,14 @@ impl BurnDeepExpert {
             );
         }
 
-        Ok(build_runtime_artifact_metadata(
+        try_build_runtime_artifact_metadata(
             self.model_name(),
             ModelFamily::Deep,
             CapabilityState::Implemented,
             self.feature_columns.clone(),
             canonical_three_class_label_mapping(),
             training_summary,
-        ))
+        )
     }
 
     fn validate_runtime_params(params: &HashMap<String, String>) -> Result<()> {
@@ -276,6 +278,20 @@ impl BurnDeepExpert {
                     "deep-model runtime param `execution_backend` uses unsupported backend `{}`",
                     value
                 );
+            }
+        }
+        if let Some(value) = params.get("training_precision") {
+            let normalized = value.trim().to_ascii_lowercase();
+            if !matches!(normalized.as_str(), "fp32" | "bf16" | "fp8" | "bf4") {
+                bail!(
+                    "deep-model runtime param `training_precision` uses unsupported precision `{}`",
+                    value
+                );
+            }
+        }
+        if let Some(value) = params.get("training_precision_reason") {
+            if value.trim().is_empty() {
+                bail!("deep-model runtime param `training_precision_reason` may not be blank");
             }
         }
         if let Some(device) = params.get("device") {
@@ -364,10 +380,19 @@ impl BurnDeepExpert {
                 report.effective_device_policy.as_str(),
             ),
             ("execution_backend", report.execution_backend.as_str()),
+            ("training_precision", report.training_precision.as_str()),
         ] {
             if value.trim().is_empty() {
                 bail!(
                     "{} Burn training report `{field_name}` may not be blank",
+                    self.model_name()
+                );
+            }
+        }
+        if let Some(reason) = report.training_precision_reason.as_ref() {
+            if reason.trim().is_empty() {
+                bail!(
+                    "{} Burn training report `training_precision_reason` may not be blank",
                     self.model_name()
                 );
             }
@@ -444,6 +469,7 @@ impl BurnDeepExpert {
     fn artifact_config(&self) -> Result<DeepArtifactConfig> {
         Self::validate_runtime_params(&self.params)?;
         self.validate_model_params()?;
+        let runtime_metadata = self.metadata()?;
         let summary = self.training_summary.as_ref().with_context(|| {
             format!(
                 "{} model is missing training summary metadata",
@@ -460,7 +486,49 @@ impl BurnDeepExpert {
             kind: self.kind,
             params: self.params.clone(),
             burn_training_report: self.burn_training_report.clone(),
+            runtime_metadata: Some(runtime_metadata),
         })
+    }
+
+    fn resolve_loaded_metadata(
+        path: &Path,
+        config: &DeepArtifactConfig,
+        expected_model_name: &str,
+    ) -> Result<RuntimeArtifactMetadata> {
+        let metadata_path = Self::metadata_path(path);
+        if metadata_path.exists() {
+            let sidecar: RuntimeArtifactMetadata = Self::read_json(&metadata_path)?;
+            if let Some(embedded) = config.runtime_metadata.as_ref() {
+                if sidecar.model_name != embedded.model_name
+                    || sidecar.family != embedded.family
+                    || sidecar.state != embedded.state
+                    || sidecar.feature_columns != embedded.feature_columns
+                    || sidecar.label_mapping != embedded.label_mapping
+                    || sidecar.training_summary.dataset_rows
+                        != embedded.training_summary.dataset_rows
+                    || sidecar.training_summary.train_rows != embedded.training_summary.train_rows
+                    || sidecar.training_summary.val_rows != embedded.training_summary.val_rows
+                {
+                    bail!(
+                        "deep artifact {} metadata sidecar mismatch with embedded runtime metadata",
+                        path.display()
+                    );
+                }
+            }
+            return Ok(sidecar);
+        }
+        if let Some(metadata) = config.runtime_metadata.clone() {
+            tracing::warn!(
+                model = %expected_model_name,
+                path = %path.display(),
+                "deep-model metadata sidecar missing; using runtime metadata embedded in config"
+            );
+            return Ok(metadata);
+        }
+        bail!(
+            "deep artifact {} is missing metadata sidecar and embedded runtime metadata",
+            path.display()
+        );
     }
 
     fn batch_size(&self) -> usize {
@@ -1200,6 +1268,18 @@ impl ExpertModel for BurnDeepExpert {
             "execution_backend".to_string(),
             device_selection.execution_backend,
         );
+        if let Some(report) = self.burn_training_report.as_ref() {
+            self.params.insert(
+                "training_precision".to_string(),
+                report.training_precision.clone(),
+            );
+            if let Some(reason) = report.training_precision_reason.as_ref() {
+                self.params
+                    .insert("training_precision_reason".to_string(), reason.clone());
+            } else {
+                self.params.remove("training_precision_reason");
+            }
+        }
         self.persisted_runtime_selection = Self::runtime_selection_from_params(&self.params)?;
         self.host_runtime_selection = self.persisted_runtime_selection.clone();
         self.model = Some(model);
@@ -1266,8 +1346,9 @@ impl ExpertModel for BurnDeepExpert {
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
-        let metadata: RuntimeArtifactMetadata = Self::read_json(&Self::metadata_path(path))?;
         let config: DeepArtifactConfig = Self::read_json(&Self::config_path(path))?;
+        let metadata: RuntimeArtifactMetadata =
+            Self::resolve_loaded_metadata(path, &config, self.model_name())?;
         if config.kind != self.kind {
             bail!(
                 "deep artifact kind mismatch: expected {}, got {}",
@@ -1759,10 +1840,102 @@ mod tests {
             requested_device_policy: "cpu".to_string(),
             effective_device_policy: "cpu".to_string(),
             execution_backend: "ndarray_cpu".to_string(),
+            training_precision: "fp32".to_string(),
+            training_precision_reason: None,
         });
 
         let artifact = expert.artifact_config()?;
         assert!(artifact.burn_training_report.is_some());
+        assert!(artifact.runtime_metadata.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_loaded_metadata_uses_config_runtime_metadata_when_sidecar_missing() -> Result<()> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let artifact_dir = std::env::temp_dir().join(format!("deep-metadata-fallback-{nonce}"));
+        std::fs::create_dir_all(&artifact_dir)?;
+
+        let runtime_metadata = RuntimeArtifactMetadata::new(
+            "mlp",
+            ModelFamily::Deep,
+            CapabilityState::Implemented,
+            vec!["rsi".to_string(), "atr".to_string()],
+            canonical_three_class_label_mapping(),
+            TrainingSummaryMetadata::new(100, 80, 20),
+        );
+        let config = DeepArtifactConfig {
+            kind: DeepModelKind::Mlp,
+            params: HashMap::new(),
+            burn_training_report: None,
+            runtime_metadata: Some(runtime_metadata.clone()),
+        };
+        BurnDeepExpert::write_json(&BurnDeepExpert::config_path(&artifact_dir), &config)?;
+        let loaded_config: DeepArtifactConfig =
+            BurnDeepExpert::read_json(&BurnDeepExpert::config_path(&artifact_dir))?;
+
+        let resolved =
+            BurnDeepExpert::resolve_loaded_metadata(&artifact_dir, &loaded_config, "mlp")?;
+        assert_eq!(resolved.feature_columns, runtime_metadata.feature_columns);
+        assert_eq!(
+            resolved.training_summary.dataset_rows,
+            runtime_metadata.training_summary.dataset_rows
+        );
+        assert_eq!(
+            resolved.training_summary.train_rows,
+            runtime_metadata.training_summary.train_rows
+        );
+        assert_eq!(
+            resolved.training_summary.val_rows,
+            runtime_metadata.training_summary.val_rows
+        );
+
+        std::fs::remove_dir_all(&artifact_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_loaded_metadata_rejects_sidecar_embedded_mismatch() -> Result<()> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let artifact_dir = std::env::temp_dir().join(format!("deep-metadata-mismatch-{nonce}"));
+        std::fs::create_dir_all(&artifact_dir)?;
+
+        let sidecar = RuntimeArtifactMetadata::new(
+            "mlp",
+            ModelFamily::Deep,
+            CapabilityState::Implemented,
+            vec!["rsi".to_string(), "atr".to_string()],
+            canonical_three_class_label_mapping(),
+            TrainingSummaryMetadata::new(100, 80, 20),
+        );
+        let embedded = RuntimeArtifactMetadata::new(
+            "mlp",
+            ModelFamily::Deep,
+            CapabilityState::Implemented,
+            vec!["rsi".to_string(), "atr".to_string()],
+            canonical_three_class_label_mapping(),
+            TrainingSummaryMetadata::new(100, 81, 19),
+        );
+        let config = DeepArtifactConfig {
+            kind: DeepModelKind::Mlp,
+            params: HashMap::new(),
+            burn_training_report: None,
+            runtime_metadata: Some(embedded),
+        };
+        BurnDeepExpert::write_json(&BurnDeepExpert::metadata_path(&artifact_dir), &sidecar)?;
+        BurnDeepExpert::write_json(&BurnDeepExpert::config_path(&artifact_dir), &config)?;
+        let loaded_config: DeepArtifactConfig =
+            BurnDeepExpert::read_json(&BurnDeepExpert::config_path(&artifact_dir))?;
+
+        let err = BurnDeepExpert::resolve_loaded_metadata(&artifact_dir, &loaded_config, "mlp")
+            .expect_err("mismatched sidecar/embedded metadata should fail");
+        assert!(err.to_string().contains("metadata sidecar mismatch"));
+
+        std::fs::remove_dir_all(&artifact_dir)?;
         Ok(())
     }
 
@@ -1788,6 +1961,8 @@ mod tests {
             requested_device_policy: "cpu".to_string(),
             effective_device_policy: "cpu".to_string(),
             execution_backend: "ndarray_cpu".to_string(),
+            training_precision: "fp32".to_string(),
+            training_precision_reason: None,
         });
 
         let err = expert
@@ -1818,6 +1993,8 @@ mod tests {
             requested_device_policy: "cpu".to_string(),
             effective_device_policy: "cpu".to_string(),
             execution_backend: "wgpu_discrete_gpu".to_string(),
+            training_precision: "fp32".to_string(),
+            training_precision_reason: None,
         });
 
         let err = expert

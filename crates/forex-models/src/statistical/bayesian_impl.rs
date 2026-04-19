@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::base::{
-    build_runtime_artifact_metadata, build_runtime_prediction_with_details,
-    canonical_three_class_label_mapping, three_class_runtime_confidence, ExpertModel,
+    build_runtime_prediction_with_details, canonical_three_class_label_mapping,
+    three_class_runtime_confidence, try_build_runtime_artifact_metadata, ExpertModel,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
@@ -14,8 +14,8 @@ use crate::runtime::prediction::RuntimePrediction;
 
 use super::common::{
     ensure_feature_columns_match, feature_matrix_from_dataframe, read_json,
-    remap_three_class_labels, softmax_rows, write_json, FeatureScaler, METADATA_FILE_NAME,
-    MODEL_FILE_NAME,
+    remap_three_class_labels, runtime_backend_with_gpu_fallback, softmax_rows, write_json,
+    FeatureScaler, METADATA_FILE_NAME, MODEL_FILE_NAME,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,8 +140,8 @@ fn runtime_metadata(
     dataset_rows: usize,
     train_rows: usize,
     val_rows: usize,
-) -> RuntimeArtifactMetadata {
-    build_runtime_artifact_metadata(
+) -> Result<RuntimeArtifactMetadata> {
+    try_build_runtime_artifact_metadata(
         model_name,
         ModelFamily::Meta,
         CapabilityState::Implemented,
@@ -317,10 +317,17 @@ fn runtime_predictions(
     model_name: &str,
     probabilities: &Array2<f32>,
 ) -> Result<Vec<RuntimePrediction>> {
+    let cpu_backend = format!("{model_name}_bayesian_ovr_cpu");
+    let (execution_backend, degraded_reason) =
+        runtime_backend_with_gpu_fallback(model_name, &cpu_backend);
     let mut predictions = Vec::with_capacity(probabilities.nrows());
     for row in probabilities.outer_iter() {
         let row_values = [row[0], row[1], row[2]];
         let (confidence, abstain_recommended) = three_class_runtime_confidence(row_values)?;
+        let reason = degraded_reason.clone().or_else(|| {
+            abstain_recommended
+                .then(|| "shared three-class confidence gate recommended abstain".to_string())
+        });
         predictions.push(build_runtime_prediction_with_details(
             model_name,
             ModelFamily::Meta,
@@ -328,9 +335,8 @@ fn runtime_predictions(
             row_values,
             Some(confidence),
             Some(abstain_recommended),
-            Some(format!("{model_name}_bayesian_ovr_cpu")),
-            abstain_recommended
-                .then(|| "shared three-class confidence gate recommended abstain".to_string()),
+            execution_backend.clone(),
+            reason,
         )?);
     }
 
@@ -400,6 +406,60 @@ fn validate_runtime_metadata(
     }
 
     Ok(())
+}
+
+fn resolve_runtime_metadata_from_artifact(
+    path: &Path,
+    artifact: &BayesianOneVsRestArtifact,
+) -> Result<RuntimeArtifactMetadata> {
+    let metadata_path = path.join(METADATA_FILE_NAME);
+    match read_json::<RuntimeArtifactMetadata>(&metadata_path) {
+        Ok(metadata) => {
+            validate_runtime_metadata(
+                &metadata,
+                "bayes_logit",
+                &artifact.feature_columns,
+                artifact.dataset_rows,
+            )?;
+            if let Some(embedded) = artifact.runtime_metadata.as_ref() {
+                if embedded.model_name != metadata.model_name
+                    || embedded.family != metadata.family
+                    || embedded.state != metadata.state
+                    || embedded.feature_columns != metadata.feature_columns
+                    || embedded.label_mapping != metadata.label_mapping
+                    || embedded.training_summary.dataset_rows
+                        != metadata.training_summary.dataset_rows
+                    || embedded.training_summary.train_rows != metadata.training_summary.train_rows
+                    || embedded.training_summary.val_rows != metadata.training_summary.val_rows
+                {
+                    bail!(
+                        "runtime metadata sidecar mismatch with embedded bayes_logit metadata at {}",
+                        metadata_path.display()
+                    );
+                }
+            }
+            Ok(metadata)
+        }
+        Err(file_err) => {
+            let fallback = artifact
+                .runtime_metadata
+                .clone()
+                .with_context(|| format!("missing runtime metadata file {} and artifact has no embedded metadata: {file_err}", metadata_path.display()))?;
+            validate_runtime_metadata(
+                &fallback,
+                "bayes_logit",
+                &artifact.feature_columns,
+                artifact.dataset_rows,
+            )?;
+            tracing::warn!(
+                path = %metadata_path.display(),
+                error = %file_err,
+                model = "bayes_logit",
+                "bayesian metadata sidecar missing/unreadable; using embedded runtime metadata"
+            );
+            Ok(fallback)
+        }
+    }
 }
 
 fn validate_bayesian_artifact(artifact: &BayesianOneVsRestArtifact) -> Result<()> {
@@ -572,7 +632,7 @@ impl ExpertModel for BayesianLogitExpert {
             rows,
             train_labels.len(),
             val_indices.len(),
-        );
+        )?;
         self.model = Some(BayesianOneVsRestArtifact {
             model_name: "bayes_logit".to_string(),
             feature_columns,
@@ -635,16 +695,7 @@ impl ExpertModel for BayesianLogitExpert {
     fn load(&mut self, path: &Path) -> Result<()> {
         let mut artifact: BayesianOneVsRestArtifact = read_json(&path.join(MODEL_FILE_NAME))?;
         validate_bayesian_artifact(&artifact)?;
-        let runtime_metadata: RuntimeArtifactMetadata = read_json(&path.join(METADATA_FILE_NAME))?;
-        validate_runtime_metadata(
-            &runtime_metadata,
-            "bayes_logit",
-            &artifact.feature_columns,
-            artifact.dataset_rows,
-        )?;
-        if artifact.runtime_metadata.as_ref() != Some(&runtime_metadata) {
-            bail!("runtime metadata file does not match bayes_logit artifact");
-        }
+        let runtime_metadata = resolve_runtime_metadata_from_artifact(path, &artifact)?;
         artifact.runtime_metadata = Some(runtime_metadata);
         self.prior_precision = artifact.prior_precision;
         self.learning_rate = artifact.learning_rate;
@@ -784,13 +835,16 @@ mod tests {
                 means: vec![0.0, 0.0],
                 stds: vec![1.0, 0.0],
             },
-            runtime_metadata: Some(runtime_metadata(
-                "bayes_logit",
-                vec!["f1".to_string(), "f2".to_string()],
-                8,
-                6,
-                2,
-            )),
+            runtime_metadata: Some(
+                runtime_metadata(
+                    "bayes_logit",
+                    vec!["f1".to_string(), "f2".to_string()],
+                    8,
+                    6,
+                    2,
+                )
+                .expect("build metadata"),
+            ),
             prior_precision: 0.05,
             learning_rate: 0.05,
             epochs: 32,
@@ -818,7 +872,8 @@ mod tests {
             8,
             0,
             8,
-        );
+        )
+        .expect("build metadata");
 
         let err = validate_runtime_metadata(
             &metadata,
@@ -828,5 +883,65 @@ mod tests {
         )
         .expect_err("zero train rows must fail");
         assert!(err.to_string().contains("training rows must be non-zero"));
+    }
+
+    #[test]
+    fn bayesian_load_uses_embedded_runtime_metadata_when_metadata_file_missing() -> Result<()> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let df = sample_dataframe();
+        let y = sample_labels();
+        let mut model = BayesianLogitExpert::new();
+        model.fit(&df, &y)?;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        let artifact_dir = std::env::temp_dir().join(format!("forex-models-bayes-embed-{unique}"));
+        std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+
+        model.save(&artifact_dir)?;
+        std::fs::remove_file(artifact_dir.join(METADATA_FILE_NAME)).expect("remove metadata file");
+
+        let mut reloaded = BayesianLogitExpert::new();
+        reloaded.load(&artifact_dir)?;
+        assert!(reloaded.model.is_some());
+
+        std::fs::remove_dir_all(&artifact_dir).expect("cleanup artifact dir");
+        Ok(())
+    }
+
+    #[test]
+    fn bayesian_load_rejects_sidecar_drift_against_embedded_metadata() -> Result<()> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let df = sample_dataframe();
+        let y = sample_labels();
+        let mut model = BayesianLogitExpert::new();
+        model.fit(&df, &y)?;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        let artifact_dir = std::env::temp_dir().join(format!("forex-models-bayes-drift-{unique}"));
+        std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+
+        model.save(&artifact_dir)?;
+        let metadata_path = artifact_dir.join(METADATA_FILE_NAME);
+        let mut drifted: RuntimeArtifactMetadata =
+            read_json(&metadata_path).expect("read saved metadata");
+        drifted.training_summary.dataset_rows += 1;
+        write_json(&metadata_path, &drifted).expect("write drifted metadata");
+
+        let mut reloaded = BayesianLogitExpert::new();
+        let err = reloaded
+            .load(&artifact_dir)
+            .expect_err("drifted sidecar metadata should fail load");
+        assert!(err.to_string().contains("sidecar mismatch"));
+
+        std::fs::remove_dir_all(&artifact_dir).expect("cleanup artifact dir");
+        Ok(())
     }
 }

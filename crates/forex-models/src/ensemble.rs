@@ -957,7 +957,7 @@ impl MetaBlender {
                     "meta_blender",
                     self.feature_columns.clone(),
                     self.training_rows,
-                ),
+                )?,
             )?;
             write_json(&staged_path.join(META_BLENDER_FILE_NAME), &artifact)?;
             model.save(&staged_path.join(BLENDER_BACKEND_DIR_NAME))
@@ -1300,7 +1300,7 @@ impl ExpertModel for ProbabilityCalibrationExpert {
                     "probability_calibrator",
                     self.feature_columns.clone(),
                     self.training_rows,
-                ),
+                )?,
             )?;
             write_json(&staged_path.join(CALIBRATION_EXPERT_FILE_NAME), &artifact)?;
             self.backend
@@ -1589,7 +1589,7 @@ impl ExpertModel for ConformalPredictionExpert {
                     "conformal_gate",
                     self.feature_columns.clone(),
                     self.training_rows,
-                ),
+                )?,
             )?;
             write_json(&staged_path.join(CONFORMAL_EXPERT_FILE_NAME), &artifact)?;
             self.backend
@@ -1762,7 +1762,7 @@ impl ExpertModel for MetaDecisionStack {
                     "meta_stack",
                     self.feature_columns.clone(),
                     self.training_rows,
-                ),
+                )?,
             )?;
             write_json(&staged_path.join(META_STACK_FILE_NAME), &artifact)?;
             self.blender.save(&staged_path.join(BLENDER_DIR_NAME))?;

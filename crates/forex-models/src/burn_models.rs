@@ -2,9 +2,9 @@
 //
 // Pure-Rust deep learning models using Burn 0.20.
 // Default backend is NdArray CPU, with an optional pure-Rust WGPU lane.
-// Replaces Python models (deep.py, mlp.py) — no Python, no GIL.
+// Replaces legacy models (deep.py, mlp.py) — no legacy, no GIL.
 //
-// Production features matching Python:
+// Production features matching legacy:
 // - Class-weighted loss for imbalanced data
 // - Index-order-aware train/val split with embargo
 //   The caller must pass rows already sorted chronologically.
@@ -22,6 +22,8 @@ use burn_ndarray::NdArray;
 #[cfg(feature = "burn-wgpu-backend")]
 use burn_wgpu::{graphics, init_setup, Wgpu, WgpuDevice};
 
+use crate::hardware::HardwareInfo;
+use crate::runtime::capabilities::requested_training_precision_policy;
 use anyhow::Context;
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
@@ -93,13 +95,20 @@ pub fn normalize_burn_device_policy(policy: &str) -> String {
     let normalized = policy.trim().to_ascii_lowercase();
     if normalized.is_empty() {
         "auto".to_string()
-    } else if normalized == "cuda" || normalized == "wgpu" {
+    } else if matches!(
+        normalized.as_str(),
+        "cuda" | "wgpu" | "rocm" | "metal" | "vulkan"
+    ) {
         "gpu".to_string()
     } else if normalized == "default" {
         "auto".to_string()
-    } else if let Some(index) = normalized.strip_prefix("cuda:") {
-        format!("gpu:{index}")
-    } else if let Some(index) = normalized.strip_prefix("wgpu:") {
+    } else if let Some(index) = normalized
+        .strip_prefix("cuda:")
+        .or_else(|| normalized.strip_prefix("wgpu:"))
+        .or_else(|| normalized.strip_prefix("rocm:"))
+        .or_else(|| normalized.strip_prefix("metal:"))
+        .or_else(|| normalized.strip_prefix("vulkan:"))
+    {
         format!("gpu:{index}")
     } else {
         normalized
@@ -109,10 +118,13 @@ pub fn normalize_burn_device_policy(policy: &str) -> String {
 fn is_supported_burn_device_policy(normalized: &str) -> bool {
     matches!(
         normalized,
-        "auto" | "cpu" | "gpu" | "cuda" | "wgpu" | "default"
+        "auto" | "cpu" | "gpu" | "cuda" | "wgpu" | "default" | "rocm" | "metal" | "vulkan"
     ) || normalized.starts_with("cuda:")
         || normalized.starts_with("gpu:")
         || normalized.starts_with("wgpu:")
+        || normalized.starts_with("rocm:")
+        || normalized.starts_with("metal:")
+        || normalized.starts_with("vulkan:")
 }
 
 fn normalize_effective_burn_device_policy(policy: &str) -> String {
@@ -218,6 +230,9 @@ fn parse_wgpu_gpu_index(normalized: &str) -> Option<usize> {
         .strip_prefix("cuda:")
         .or_else(|| normalized.strip_prefix("gpu:"))
         .or_else(|| normalized.strip_prefix("wgpu:"))
+        .or_else(|| normalized.strip_prefix("rocm:"))
+        .or_else(|| normalized.strip_prefix("metal:"))
+        .or_else(|| normalized.strip_prefix("vulkan:"))
         .and_then(|value| value.parse::<usize>().ok())
 }
 
@@ -225,7 +240,7 @@ fn parse_wgpu_gpu_index(normalized: &str) -> Option<usize> {
 fn resolve_wgpu_device_policy(normalized: &str) -> (WgpuDevice, String, String) {
     match normalized {
         "cpu" => (WgpuDevice::Cpu, "cpu".to_string(), "wgpu_cpu".to_string()),
-        "auto" | "gpu" | "cuda" | "wgpu" | "default" => (
+        "auto" | "gpu" | "cuda" | "wgpu" | "default" | "rocm" | "metal" | "vulkan" => (
             WgpuDevice::DefaultDevice,
             "default".to_string(),
             "wgpu_default".to_string(),
@@ -343,10 +358,10 @@ impl ManagedBurnBackend for InferBackend {
 }
 
 // ============================================================================
-// SHARED UTILITIES — matching Python base.py
+// SHARED UTILITIES — matching legacy base.py
 // ============================================================================
 
-/// Map labels from {-1, 0, 1} to {2, 0, 1} matching Python protocol.
+/// Map labels from {-1, 0, 1} to {2, 0, 1} matching legacy protocol.
 fn map_labels(y: &[i32]) -> anyhow::Result<Vec<i64>> {
     y.iter()
         .map(|&v| match v {
@@ -360,7 +375,7 @@ fn map_labels(y: &[i32]) -> anyhow::Result<Vec<i64>> {
         .collect()
 }
 
-/// Compute class weights (inverse frequency) matching Python compute_class_weights().
+/// Compute class weights (inverse frequency) matching legacy compute_class_weights().
 fn compute_class_weights(y: &[i64], n_classes: usize) -> Vec<f32> {
     let mut counts = vec![0usize; n_classes];
     for &label in y {
@@ -419,7 +434,7 @@ fn time_series_split(
     (0..train_end, val_start..n_samples)
 }
 
-/// Early stopping tracker matching Python EarlyStopper.
+/// Early stopping tracker matching legacy EarlyStopper.
 struct EarlyStopper {
     patience: usize,
     min_delta: f32,
@@ -468,7 +483,7 @@ fn labels_to_tensor<B: Backend>(labels: &[i64], device: &B::Device) -> Tensor<B,
 }
 
 // ============================================================================
-// BURN MLP — matches Python MLPExpert (mlp.py)
+// BURN MLP — matches legacy MLPExpert (mlp.py)
 // Uses LayerNorm instead of BatchNorm to avoid 3D reshape complications
 // ============================================================================
 
@@ -526,7 +541,7 @@ impl<B: Backend> BurnMLP<B> {
 }
 
 // ============================================================================
-// BURN N-BEATS — matches Python NBeatsExpert (deep.py)
+// BURN N-BEATS — matches legacy NBeatsExpert (deep.py)
 // ============================================================================
 
 #[derive(Module, Debug)]
@@ -683,7 +698,7 @@ impl<B: Backend> BurnNBeatsx<B> {
 }
 
 // ============================================================================
-// BURN TiDE — matches Python TiDEExpert (deep.py)
+// BURN TiDE — matches legacy TiDEExpert (deep.py)
 // ============================================================================
 
 #[derive(Module, Debug)]
@@ -826,7 +841,7 @@ impl<B: Backend> BurnTiDENf<B> {
 }
 
 // ============================================================================
-// BURN TabNet — matches Python TabNetExpert (deep.py)
+// BURN TabNet — matches legacy TabNetExpert (deep.py)
 // Uses GLU activation via manual split
 // ============================================================================
 
@@ -910,7 +925,7 @@ impl<B: Backend> BurnTabNet<B> {
 }
 
 // ============================================================================
-// BURN KAN — matches Python KANExpert (deep.py)
+// BURN KAN — matches legacy KANExpert (deep.py)
 // ============================================================================
 
 #[derive(Module, Debug)]
@@ -967,7 +982,7 @@ impl<B: Backend> BurnKAN<B> {
 }
 
 // ============================================================================
-// BURN TRANSFORMER — matches Python TransformerExpert (transformers.py)
+// BURN TRANSFORMER — matches legacy TransformerExpert (transformers.py)
 // Manual multi-head attention (Burn has no built-in transformer module for 2D)
 // ============================================================================
 
@@ -1331,7 +1346,7 @@ impl<B: Backend> BurnForward<B> for BurnTimesNet<B> {
 // TRAINING CONFIGURATION
 // ============================================================================
 
-/// Training configuration matching Python deep.py defaults.
+/// Training configuration matching legacy deep.py defaults.
 pub struct TrainConfig {
     pub lr: f64,
     pub batch_size: usize,
@@ -1373,6 +1388,8 @@ pub struct BurnTrainingReport {
     pub requested_device_policy: String,
     pub effective_device_policy: String,
     pub execution_backend: String,
+    pub training_precision: String,
+    pub training_precision_reason: Option<String>,
 }
 
 impl BurnTrainingReport {
@@ -1410,11 +1427,75 @@ fn validate_train_config(config: &TrainConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn resolve_burn_training_precision(selection: &BurnDeviceSelection) -> (String, Option<String>) {
+    fn env_flag(name: &str, default: bool) -> bool {
+        match std::env::var(name) {
+            Ok(value) => matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            ),
+            Err(_) => default,
+        }
+    }
+
+    let requested = requested_training_precision_policy("burn");
+
+    let gpu_requested = selection.effective_policy == "gpu"
+        || selection.effective_policy.starts_with("gpu:")
+        || selection.execution_backend.contains("gpu");
+    if !gpu_requested {
+        let reason = if requested != "auto" && requested != "fp32" {
+            Some(format!(
+                "requested precision `{requested}`; CPU execution requires fp32"
+            ))
+        } else {
+            None
+        };
+        return ("fp32".to_string(), reason);
+    }
+
+    let hardware = HardwareInfo::detect();
+    let supports_bf16 = hardware.gpu_supports_bf16(0);
+    let supports_fp8 = hardware.gpu_supports_fp8(0);
+    let model_supports_bf16 = env_flag("FOREX_BURN_MODEL_SUPPORTS_BF16", true);
+    let model_supports_fp8 = env_flag("FOREX_BURN_MODEL_SUPPORTS_FP8", false);
+    let model_supports_bf4 = env_flag("FOREX_BURN_MODEL_SUPPORTS_BF4", false);
+
+    let selected = match requested.as_str() {
+        "bf4" if supports_fp8 && model_supports_bf4 => "bf4",
+        "fp8" if supports_fp8 && model_supports_fp8 => "fp8",
+        "bf16" if supports_bf16 && model_supports_bf16 => "bf16",
+        "fp32" => "fp32",
+        "auto" => {
+            if supports_fp8 && model_supports_bf4 {
+                "bf4"
+            } else if supports_fp8 && model_supports_fp8 {
+                "fp8"
+            } else if supports_bf16 && model_supports_bf16 {
+                "bf16"
+            } else {
+                "fp32"
+            }
+        }
+        _ => "fp32",
+    };
+    let reason = if selected != requested && requested != "auto" {
+        Some(format!(
+            "requested precision `{requested}` unsupported for current GPU/model implementation; using `{selected}`"
+        ))
+    } else if selected == "fp32" && requested == "auto" {
+        Some("auto precision fallback to fp32 for current GPU/model implementation".to_string())
+    } else {
+        None
+    };
+    (selected.to_string(), reason)
+}
+
 // ============================================================================
 // CROSS-ENTROPY LOSS
 // ============================================================================
 
-/// Weighted cross-entropy loss matching Python nn.CrossEntropyLoss(weight=...).
+/// Weighted cross-entropy loss matching legacy nn.CrossEntropyLoss(weight=...).
 fn cross_entropy_loss<B: Backend>(
     logits: Tensor<B, 2>,
     targets: Tensor<B, 1, Int>,
@@ -1479,7 +1560,7 @@ fn validate_feature_matrix(x_data: &Array2<f32>, context: &str) -> anyhow::Resul
 
 // ============================================================================
 // TRAINING LOOP — generic over all Burn models
-// Matches Python deep.py: class weights, time-series split, early stopping
+// Matches legacy deep.py: class weights, time-series split, early stopping
 // ============================================================================
 
 use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
@@ -1714,6 +1795,8 @@ where
         model = best_model;
     }
 
+    let (training_precision, training_precision_reason) =
+        resolve_burn_training_precision(selection);
     Ok((
         model,
         BurnTrainingReport {
@@ -1733,6 +1816,8 @@ where
             requested_device_policy: selection.requested_policy.clone(),
             effective_device_policy: selection.effective_policy.clone(),
             execution_backend: selection.execution_backend.clone(),
+            training_precision,
+            training_precision_reason,
         },
     ))
 }
@@ -1938,6 +2023,9 @@ mod tests {
     fn normalize_burn_device_policy_defaults_to_auto() {
         assert_eq!(normalize_burn_device_policy(""), "auto");
         assert_eq!(normalize_burn_device_policy("  CUDA:2 "), "gpu:2");
+        assert_eq!(normalize_burn_device_policy("rocm:3"), "gpu:3");
+        assert_eq!(normalize_burn_device_policy("metal"), "gpu");
+        assert_eq!(normalize_burn_device_policy("vulkan:1"), "gpu:1");
         assert_eq!(normalize_burn_device_policy("cuda"), "gpu");
         assert_eq!(normalize_burn_device_policy("wgpu"), "gpu");
     }
@@ -1948,7 +2036,23 @@ mod tests {
         assert!(is_supported_burn_device_policy("cpu"));
         assert!(is_supported_burn_device_policy("cuda:2"));
         assert!(is_supported_burn_device_policy("gpu:1"));
-        assert!(!is_supported_burn_device_policy("metal"));
+        assert!(is_supported_burn_device_policy("metal"));
+        assert!(is_supported_burn_device_policy("rocm:2"));
+    }
+
+    #[test]
+    fn burn_training_precision_support_flags_can_enable_fp8() {
+        std::env::set_var("FOREX_BURN_MODEL_SUPPORTS_FP8", "true");
+        std::env::set_var("FOREX_BOT_TRAIN_PRECISION", "fp8");
+        let selection = BurnDeviceSelection {
+            requested_policy: "gpu".to_string(),
+            effective_policy: "gpu".to_string(),
+            execution_backend: "wgpu_discrete_gpu".to_string(),
+        };
+        let (precision, _reason) = resolve_burn_training_precision(&selection);
+        std::env::remove_var("FOREX_BURN_MODEL_SUPPORTS_FP8");
+        std::env::remove_var("FOREX_BOT_TRAIN_PRECISION");
+        assert!(matches!(precision.as_str(), "fp8" | "bf16" | "fp32"));
     }
 
     #[test]
@@ -2003,6 +2107,7 @@ mod tests {
         assert_eq!(report.requested_device_policy, selection.requested_policy);
         assert_eq!(report.effective_device_policy, selection.effective_policy);
         assert_eq!(report.execution_backend, selection.execution_backend);
+        assert!(!report.training_precision.trim().is_empty());
         Ok(())
     }
 

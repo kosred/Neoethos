@@ -1,10 +1,12 @@
 use crate::base::{
-    build_runtime_artifact_metadata, build_runtime_prediction_with_details,
-    canonical_three_class_label_mapping, dataframe_to_float32_array,
-    feature_columns_from_dataframe, three_class_runtime_confidence, ExpertModel,
+    build_runtime_prediction_with_details, canonical_three_class_label_mapping,
+    dataframe_to_float32_array, feature_columns_from_dataframe, three_class_runtime_confidence,
+    try_build_runtime_artifact_metadata, ExpertModel,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
-use crate::runtime::capabilities::{CapabilityState, ModelFamily};
+use crate::runtime::capabilities::{
+    append_runtime_degraded_reason, gpu_policy_cpu_fallback_reason, CapabilityState, ModelFamily,
+};
 use crate::runtime::prediction::RuntimePrediction;
 use anyhow::{bail, Context, Result};
 use chrono::{Duration, TimeZone, Utc};
@@ -26,6 +28,8 @@ use tracing::info;
 const ARTIFACT_FILE_NAME: &str = "genetic_portfolio.json";
 const METADATA_FILE_NAME: &str = "metadata.json";
 const MODEL_NAME: &str = "genetic";
+const DEFAULT_MAX_LABEL_EVALUATIONS: usize = 25_000;
+const DEFAULT_MAX_DISCOVERY_CANDIDATES: usize = 25_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum GeneticBackendMode {
@@ -105,6 +109,47 @@ pub struct GeneticStrategyExpert {
 }
 
 impl GeneticStrategyExpert {
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    }
+
+    fn max_label_evaluations() -> usize {
+        Self::env_usize(
+            "FOREX_GENETIC_MAX_LABEL_EVALS",
+            DEFAULT_MAX_LABEL_EVALUATIONS,
+        )
+    }
+
+    fn max_discovery_candidates() -> usize {
+        Self::env_usize(
+            "FOREX_GENETIC_MAX_DISCOVERY_CANDIDATES",
+            DEFAULT_MAX_DISCOVERY_CANDIDATES,
+        )
+    }
+
+    fn effective_generation_count_with_budget(
+        population_size: usize,
+        configured_generations: usize,
+        max_label_evaluations: usize,
+    ) -> usize {
+        let population_size = population_size.max(1);
+        let configured_generations = configured_generations.max(1);
+        let budget_limited_generations = max_label_evaluations.max(1) / population_size;
+        budget_limited_generations.clamp(1, configured_generations)
+    }
+
+    fn effective_generation_count(population_size: usize, configured_generations: usize) -> usize {
+        Self::effective_generation_count_with_budget(
+            population_size,
+            configured_generations,
+            Self::max_label_evaluations(),
+        )
+    }
+
     pub fn new(population_size: usize, generations: usize, max_indicators: usize) -> Result<Self> {
         Ok(Self {
             population_size: population_size.max(8),
@@ -282,11 +327,12 @@ impl GeneticStrategyExpert {
     }
 
     fn discovery_config(&self) -> DiscoveryConfig {
+        let max_candidates = Self::max_discovery_candidates();
         let candidate_count = self
             .population_size
             .saturating_mul(self.generations.max(1))
             .max(self.population_size)
-            .min(25_000);
+            .min(max_candidates);
         DiscoveryConfig {
             population: self.population_size,
             generations: self.generations,
@@ -539,6 +585,8 @@ impl GeneticStrategyExpert {
 
         let smc_cfg = SmcSearchConfig::from_env();
         let population_size = self.population_size.max(16);
+        let effective_generations =
+            Self::effective_generation_count(population_size, self.generations);
         let mut population = generate_random_genes(
             population_size,
             n_indicators,
@@ -574,7 +622,17 @@ impl GeneticStrategyExpert {
         let immigrant_fraction = self.immigrant_fraction.clamp(0.0, 0.95);
         let mut rng = rand::rng();
 
-        for generation in 0..self.generations {
+        if effective_generations < self.generations {
+            info!(
+                "genetic label-search budget capped generations from {} to {} (population={}, max_label_evals={})",
+                self.generations,
+                effective_generations,
+                population_size,
+                Self::max_label_evaluations()
+            );
+        }
+
+        for generation in 0..effective_generations {
             let mut scored = population
                 .into_iter()
                 .map(|mut gene| {
@@ -740,7 +798,7 @@ impl GeneticStrategyExpert {
                     &train_features,
                     &train_labels,
                     &mut gene,
-                    self.generations,
+                    effective_generations,
                 );
                 let score = if let (Some(val_features), Some(val_labels)) =
                     (val_features.as_ref(), val_labels.as_ref())
@@ -750,7 +808,7 @@ impl GeneticStrategyExpert {
                         val_features,
                         val_labels,
                         &mut val_gene,
-                        self.generations,
+                        effective_generations,
                     );
                     gene.fitness = 0.65 * train_score + 0.35 * val_score;
                     gene.sharpe_ratio = 0.65 * gene.sharpe_ratio + 0.35 * val_gene.sharpe_ratio;
@@ -953,8 +1011,8 @@ impl GeneticStrategyExpert {
     fn build_runtime_metadata(
         feature_columns: Vec<String>,
         training_summary: TrainingSummaryMetadata,
-    ) -> RuntimeArtifactMetadata {
-        build_runtime_artifact_metadata(
+    ) -> Result<RuntimeArtifactMetadata> {
+        try_build_runtime_artifact_metadata(
             MODEL_NAME,
             ModelFamily::Evolutionary,
             CapabilityState::Implemented,
@@ -1061,6 +1119,35 @@ impl GeneticStrategyExpert {
         Ok(Some(metadata))
     }
 
+    fn resolve_runtime_metadata_from_artifact(
+        path: &Path,
+        artifact: &GeneticArtifact,
+    ) -> Result<RuntimeArtifactMetadata> {
+        match Self::read_runtime_metadata(path)? {
+            Some(metadata) => {
+                if let Some(embedded) = artifact.runtime_metadata.as_ref() {
+                    if embedded != &metadata {
+                        bail!("runtime metadata file does not match genetic artifact");
+                    }
+                }
+                Self::validate_runtime_metadata(&metadata, &artifact.feature_columns)?;
+                Ok(metadata)
+            }
+            None => {
+                let fallback = artifact
+                    .runtime_metadata
+                    .clone()
+                    .context("genetic artifact is missing runtime metadata in both sidecar and artifact payload")?;
+                Self::validate_runtime_metadata(&fallback, &artifact.feature_columns)?;
+                tracing::warn!(
+                    path = %path.display(),
+                    "genetic runtime metadata sidecar missing; using embedded artifact runtime metadata"
+                );
+                Ok(fallback)
+            }
+        }
+    }
+
     fn runtime_backend(&self) -> String {
         match self.backend_mode {
             GeneticBackendMode::DiscoveryBacked => "genetic_discovery_backed_cpu".to_string(),
@@ -1111,13 +1198,17 @@ impl GeneticStrategyExpert {
     }
 
     fn runtime_details(&self) -> (Option<String>, Option<String>) {
+        let gpu_cpu_fallback = gpu_policy_cpu_fallback_reason("genetic");
         let degraded_reason = self.runtime_degraded_reason();
         let backend = if degraded_reason.is_some() {
             Some("genetic_unknown".to_string())
         } else {
             Some(self.runtime_backend())
         };
-        (backend, degraded_reason)
+        (
+            backend,
+            append_runtime_degraded_reason(degraded_reason, gpu_cpu_fallback),
+        )
     }
 
     fn validate_artifact(artifact: &GeneticArtifact) -> Result<()> {
@@ -1247,7 +1338,7 @@ impl GeneticStrategyExpert {
         self.runtime_metadata = Some(Self::build_runtime_metadata(
             self.feature_columns.clone(),
             training_summary,
-        ));
+        )?);
 
         info!(
             "Genetic expert fitted in {:?} mode (population={}, generations={}, portfolio={})",
@@ -1366,15 +1457,7 @@ impl GeneticStrategyExpert {
 
     pub fn load(&mut self, path: &Path) -> Result<()> {
         let artifact = Self::read_artifact(path)?;
-        let sidecar_metadata = Self::read_runtime_metadata(path)?
-            .context("genetic artifact is missing runtime metadata sidecar")?;
-        if let Some(embedded) = artifact.runtime_metadata.as_ref() {
-            if embedded != &sidecar_metadata {
-                bail!("runtime metadata file does not match genetic artifact");
-            }
-        }
-        let runtime_metadata = sidecar_metadata;
-        Self::validate_runtime_metadata(&runtime_metadata, &artifact.feature_columns)?;
+        let runtime_metadata = Self::resolve_runtime_metadata_from_artifact(path, &artifact)?;
         self.population_size = artifact.population_size;
         self.generations = artifact.generations;
         self.max_indicators = artifact.max_indicators;
@@ -1475,6 +1558,7 @@ mod tests {
             feature_columns,
             TrainingSummaryMetadata::new(24, 24, 0),
         )
+        .expect("build metadata")
     }
 
     #[test]
@@ -1555,7 +1639,7 @@ mod tests {
     }
 
     #[test]
-    fn genetic_load_requires_runtime_metadata_sidecar() -> Result<()> {
+    fn genetic_load_uses_embedded_runtime_metadata_when_sidecar_missing() -> Result<()> {
         let path = temp_model_dir("genetic_missing_runtime_sidecar");
         std::fs::create_dir_all(&path)?;
 
@@ -1570,10 +1654,9 @@ mod tests {
         std::fs::write(GeneticStrategyExpert::artifact_path(&path), payload)?;
 
         let mut expert = GeneticStrategyExpert::default();
-        let err = expert
-            .load(&path)
-            .expect_err("missing runtime metadata sidecar must fail");
-        assert!(err.to_string().contains("runtime metadata sidecar"));
+        expert.load(&path)?;
+        assert_eq!(expert.feature_columns, vec!["f1".to_string()]);
+        assert!(expert.runtime_metadata.is_some());
 
         let _ = std::fs::remove_dir_all(&path);
         Ok(())
@@ -1683,5 +1766,20 @@ mod tests {
             .expect_err("null OHLCV rows should fail strict extraction");
         assert!(err.to_string().contains("contains null"));
         Ok(())
+    }
+
+    #[test]
+    fn genetic_effective_generation_count_obeys_evaluation_budget() {
+        assert_eq!(
+            GeneticStrategyExpert::effective_generation_count_with_budget(16, 10, 40),
+            2
+        );
+    }
+
+    #[test]
+    fn genetic_discovery_candidate_budget_caps_at_default_limit() {
+        let expert = GeneticStrategyExpert::new(2_000, 400, 4).expect("construct expert");
+        let config = expert.discovery_config();
+        assert_eq!(config.candidate_count, DEFAULT_MAX_DISCOVERY_CANDIDATES);
     }
 }

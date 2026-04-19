@@ -6,9 +6,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::base::{
-    build_runtime_artifact_metadata, build_runtime_prediction_with_details,
-    canonical_three_class_label_mapping, compute_sample_weights, dataframe_to_float32_array,
-    feature_columns_from_dataframe, three_class_runtime_confidence,
+    build_runtime_prediction_with_details, canonical_three_class_label_mapping,
+    compute_sample_weights, dataframe_to_float32_array, feature_columns_from_dataframe,
+    three_class_runtime_confidence, try_build_runtime_artifact_metadata,
 };
 use crate::runtime::artifacts::{LabelMapping, RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
@@ -263,8 +263,8 @@ pub fn tree_runtime_metadata(
     model_name: &str,
     feature_columns: Vec<String>,
     training_summary: TrainingSummaryMetadata,
-) -> RuntimeArtifactMetadata {
-    build_runtime_artifact_metadata(
+) -> Result<RuntimeArtifactMetadata> {
+    try_build_runtime_artifact_metadata(
         model_name,
         ModelFamily::Tree,
         CapabilityState::Implemented,

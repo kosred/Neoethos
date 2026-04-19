@@ -8,11 +8,13 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::base::{
-    build_runtime_artifact_metadata, build_runtime_prediction_with_details,
-    canonical_three_class_label_mapping, three_class_runtime_confidence, ExpertModel,
+    build_runtime_prediction_with_details, canonical_three_class_label_mapping,
+    three_class_runtime_confidence, try_build_runtime_artifact_metadata, ExpertModel,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
-use crate::runtime::capabilities::{CapabilityState, ModelFamily};
+use crate::runtime::capabilities::{
+    append_runtime_degraded_reason, gpu_policy_cpu_fallback_reason, CapabilityState, ModelFamily,
+};
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
     ensure_feature_columns_match, feature_matrix_from_dataframe, read_json, write_json,
@@ -146,8 +148,8 @@ fn anomaly_runtime_metadata(
     model_name: &str,
     feature_columns: Vec<String>,
     dataset_rows: usize,
-) -> RuntimeArtifactMetadata {
-    build_runtime_artifact_metadata(
+) -> Result<RuntimeArtifactMetadata> {
+    try_build_runtime_artifact_metadata(
         model_name,
         ModelFamily::Anomaly,
         CapabilityState::Implemented,
@@ -214,6 +216,49 @@ fn validate_runtime_metadata(
     }
 
     Ok(())
+}
+
+fn resolve_runtime_metadata_from_artifact(
+    path: &Path,
+    artifact: &IsolationForestArtifact,
+) -> Result<RuntimeArtifactMetadata> {
+    let metadata_path = path.join(METADATA_FILE_NAME);
+    match read_json::<RuntimeArtifactMetadata>(&metadata_path) {
+        Ok(metadata) => {
+            validate_runtime_metadata(&metadata, &artifact.feature_columns, artifact.dataset_rows)?;
+            if let Some(embedded) = artifact.runtime_metadata.as_ref() {
+                if embedded.model_name != metadata.model_name
+                    || embedded.family != metadata.family
+                    || embedded.state != metadata.state
+                    || embedded.feature_columns != metadata.feature_columns
+                    || embedded.label_mapping != metadata.label_mapping
+                    || embedded.training_summary.dataset_rows
+                        != metadata.training_summary.dataset_rows
+                    || embedded.training_summary.train_rows != metadata.training_summary.train_rows
+                    || embedded.training_summary.val_rows != metadata.training_summary.val_rows
+                {
+                    bail!(
+                        "runtime metadata sidecar mismatch with embedded isolation_forest metadata at {}",
+                        metadata_path.display()
+                    );
+                }
+            }
+            Ok(metadata)
+        }
+        Err(file_err) => {
+            let fallback = artifact
+                .runtime_metadata
+                .clone()
+                .with_context(|| format!("missing runtime metadata file {} and isolation artifact has no embedded metadata: {file_err}", metadata_path.display()))?;
+            validate_runtime_metadata(&fallback, &artifact.feature_columns, artifact.dataset_rows)?;
+            tracing::warn!(
+                path = %metadata_path.display(),
+                error = %file_err,
+                "isolation_forest metadata sidecar missing/unreadable; using embedded runtime metadata"
+            );
+            Ok(fallback)
+        }
+    }
 }
 
 fn validate_isolation_forest_artifact(artifact: &IsolationForestArtifact) -> Result<()> {
@@ -496,7 +541,7 @@ impl IsolationForestExpert {
                     "isolation_forest",
                     self.feature_columns.clone(),
                     self.dataset_rows,
-                )),
+                )?),
                 feature_columns: self.feature_columns.clone(),
                 dataset_rows: self.dataset_rows,
                 n_trees: self.n_trees,
@@ -527,7 +572,7 @@ impl IsolationForestExpert {
                     "isolation_forest",
                     self.feature_columns.clone(),
                     self.dataset_rows,
-                )),
+                )?),
                 feature_columns: self.feature_columns.clone(),
                 dataset_rows: self.dataset_rows,
                 n_trees: self.n_trees,
@@ -743,7 +788,7 @@ impl ExpertModel for IsolationForestExpert {
             "isolation_forest",
             self.feature_columns.clone(),
             self.dataset_rows,
-        );
+        )?;
         validate_runtime_metadata(&runtime_metadata, &self.feature_columns, self.dataset_rows)?;
         write_json(&path.join(METADATA_FILE_NAME), &runtime_metadata)?;
         let artifact = self.artifact()?;
@@ -756,7 +801,6 @@ impl ExpertModel for IsolationForestExpert {
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
-        let runtime_metadata: RuntimeArtifactMetadata = read_json(&path.join(METADATA_FILE_NAME))?;
         let artifact: IsolationForestArtifact = read_json(&path.join(MODEL_FILE_NAME))?;
         validate_isolation_forest_artifact(&artifact)?;
         if artifact.model_name != "isolation_forest" {
@@ -765,14 +809,7 @@ impl ExpertModel for IsolationForestExpert {
                 artifact.model_name
             );
         }
-        validate_runtime_metadata(
-            &runtime_metadata,
-            &artifact.feature_columns,
-            artifact.dataset_rows,
-        )?;
-        if artifact.runtime_metadata.as_ref() != Some(&runtime_metadata) {
-            bail!("runtime metadata file does not match isolation_forest artifact");
-        }
+        resolve_runtime_metadata_from_artifact(path, &artifact)?;
 
         let mut next_state = Self::new(artifact.n_trees, artifact.sample_size);
         next_state.extension_level = artifact.extension_level;
@@ -854,10 +891,14 @@ impl IsolationForestExpert {
     }
 
     fn runtime_details(&self) -> (Option<String>, Option<String>) {
+        let gpu_cpu_fallback = gpu_policy_cpu_fallback_reason("isolation_forest");
         if !self.has_minimal_runtime_context() {
             return (
                 Some("isolation_forest_unknown".to_string()),
-                Some("anomaly_runtime_state_incomplete".to_string()),
+                append_runtime_degraded_reason(
+                    Some("anomaly_runtime_state_incomplete".to_string()),
+                    gpu_cpu_fallback,
+                ),
             );
         }
 
@@ -866,7 +907,10 @@ impl IsolationForestExpert {
                 #[cfg(feature = "anomaly-detection")]
                 {
                     if self.backend.is_some() {
-                        (Some("extended_isolation_forest".to_string()), None)
+                        (
+                            Some("extended_isolation_forest".to_string()),
+                            gpu_cpu_fallback.clone(),
+                        )
                     } else {
                         let degraded_reason = if self.has_diagonal_profile_runtime() {
                             "extended_anomaly_backend_missing"
@@ -875,7 +919,10 @@ impl IsolationForestExpert {
                         };
                         (
                             Some("extended_isolation_forest".to_string()),
-                            Some(degraded_reason.to_string()),
+                            append_runtime_degraded_reason(
+                                Some(degraded_reason.to_string()),
+                                gpu_cpu_fallback.clone(),
+                            ),
                         )
                     }
                 }
@@ -888,7 +935,10 @@ impl IsolationForestExpert {
                     };
                     (
                         Some("extended_isolation_forest".to_string()),
-                        Some(degraded_reason.to_string()),
+                        append_runtime_degraded_reason(
+                            Some(degraded_reason.to_string()),
+                            gpu_cpu_fallback.clone(),
+                        ),
                     )
                 }
             }
@@ -896,18 +946,27 @@ impl IsolationForestExpert {
                 if self.has_diagonal_profile_runtime() {
                     (
                         Some("diagonal_profile".to_string()),
-                        Some("anomaly_backend_degraded_to_diagonal_profile".to_string()),
+                        append_runtime_degraded_reason(
+                            Some("anomaly_backend_degraded_to_diagonal_profile".to_string()),
+                            gpu_cpu_fallback.clone(),
+                        ),
                     )
                 } else {
                     (
                         Some("isolation_forest_unknown".to_string()),
-                        Some("anomaly_runtime_state_incomplete".to_string()),
+                        append_runtime_degraded_reason(
+                            Some("anomaly_runtime_state_incomplete".to_string()),
+                            gpu_cpu_fallback.clone(),
+                        ),
                     )
                 }
             }
             _ => (
                 Some("isolation_forest_unknown".to_string()),
-                Some("anomaly_backend_unknown".to_string()),
+                append_runtime_degraded_reason(
+                    Some("anomaly_backend_unknown".to_string()),
+                    gpu_cpu_fallback,
+                ),
             ),
         }
     }
@@ -1116,6 +1175,69 @@ mod tests {
         let err = validate_isolation_forest_artifact(&artifact)
             .expect_err("artifact without runtime metadata should fail");
         assert!(err.to_string().contains("runtime metadata"));
+    }
+
+    #[test]
+    fn isolation_forest_load_uses_embedded_runtime_metadata_when_metadata_file_missing(
+    ) -> Result<()> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let df = sample_dataframe();
+        let labels = sample_labels();
+        let mut model = IsolationForestExpert::new(64, 16);
+        model.fit(&df, &labels)?;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        let artifact_dir =
+            std::env::temp_dir().join(format!("forex-models-isolation-embed-{unique}"));
+        std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+
+        model.save(&artifact_dir)?;
+        std::fs::remove_file(artifact_dir.join(METADATA_FILE_NAME)).expect("remove metadata file");
+
+        let mut reloaded = IsolationForestExpert::new(64, 16);
+        reloaded.load(&artifact_dir)?;
+        assert!(!reloaded.feature_columns.is_empty());
+
+        std::fs::remove_dir_all(&artifact_dir).expect("cleanup artifact dir");
+        Ok(())
+    }
+
+    #[test]
+    fn isolation_forest_load_rejects_sidecar_drift_against_embedded_metadata() -> Result<()> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let df = sample_dataframe();
+        let labels = sample_labels();
+        let mut model = IsolationForestExpert::new(64, 16);
+        model.fit(&df, &labels)?;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        let artifact_dir =
+            std::env::temp_dir().join(format!("forex-models-isolation-drift-{unique}"));
+        std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+
+        model.save(&artifact_dir)?;
+        let metadata_path = artifact_dir.join(METADATA_FILE_NAME);
+        let mut drifted: RuntimeArtifactMetadata =
+            read_json(&metadata_path).expect("read saved metadata");
+        drifted.training_summary.dataset_rows += 1;
+        write_json(&metadata_path, &drifted).expect("write drifted metadata");
+
+        let mut reloaded = IsolationForestExpert::new(64, 16);
+        let err = reloaded
+            .load(&artifact_dir)
+            .expect_err("drifted sidecar metadata should fail load");
+        assert!(err.to_string().contains("sidecar mismatch"));
+
+        std::fs::remove_dir_all(&artifact_dir).expect("cleanup artifact dir");
+        Ok(())
     }
 
     #[test]

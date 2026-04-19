@@ -8,7 +8,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::base::{feature_columns_from_dataframe, ExpertModel};
-use crate::runtime::artifacts::TrainingSummaryMetadata;
+use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::ModelFamily;
 use crate::runtime::prediction::RuntimePrediction;
 
@@ -425,6 +425,52 @@ impl LightGBMExpert {
         }
         Ok(())
     }
+
+    fn resolve_runtime_metadata(
+        path: &Path,
+        runtime_artifact: Option<&LightGBMRuntimeArtifact>,
+        local_fallback: Option<&TreeLocalFallbackArtifact>,
+    ) -> Result<RuntimeArtifactMetadata> {
+        let (_, metadata_path) = tree_artifact_paths(path, LIGHTGBM_MODEL_FILE_NAME);
+        if metadata_path.exists() {
+            let metadata = read_runtime_metadata(&metadata_path)?;
+            if metadata.model_name != "lightgbm" || metadata.family != ModelFamily::Tree {
+                bail!(
+                    "LightGBM runtime metadata mismatch: expected tree/lightgbm, got {}/{}",
+                    metadata.family,
+                    metadata.model_name
+                );
+            }
+            if metadata.feature_columns.is_empty() {
+                bail!("LightGBM runtime metadata must contain at least one feature column");
+            }
+            return Ok(metadata);
+        }
+
+        let (feature_columns, training_summary) = if let Some(runtime_artifact) = runtime_artifact {
+            (
+                runtime_artifact.feature_columns.clone(),
+                runtime_artifact.training_summary.clone(),
+            )
+        } else if let Some(local_fallback) = local_fallback {
+            (
+                local_fallback.feature_columns.clone(),
+                local_fallback.training_summary.clone(),
+            )
+        } else {
+            bail!(
+                "LightGBM metadata sidecar missing and no runtime/local artifact is available at {}",
+                path.display()
+            );
+        };
+
+        let metadata = tree_runtime_metadata("lightgbm", feature_columns, training_summary)?;
+        tracing::warn!(
+            path = %path.display(),
+            "LightGBM metadata sidecar missing; reconstructing runtime metadata from persisted runtime artifacts"
+        );
+        Ok(metadata)
+    }
 }
 
 impl ExpertModel for LightGBMExpert {
@@ -576,7 +622,7 @@ impl ExpertModel for LightGBMExpert {
                 "lightgbm",
                 self.feature_columns.clone(),
                 self.stored_training_summary(),
-            );
+            )?;
             let (_, metadata_path) = tree_artifact_paths(path, LIGHTGBM_MODEL_FILE_NAME);
             write_runtime_metadata(&metadata_path, &metadata)?;
             let runtime_profile = self.runtime_artifact();
@@ -602,7 +648,7 @@ impl ExpertModel for LightGBMExpert {
                 "lightgbm",
                 self.feature_columns.clone(),
                 self.stored_training_summary(),
-            );
+            )?;
             let (model_path, metadata_path) = tree_artifact_paths(path, LIGHTGBM_MODEL_FILE_NAME);
             write_runtime_metadata(&metadata_path, &metadata)?;
             let runtime_profile = self.runtime_artifact();
@@ -635,29 +681,30 @@ impl ExpertModel for LightGBMExpert {
     fn load(&mut self, path: &Path) -> Result<()> {
         #[cfg(not(feature = "lightgbm"))]
         {
-            let (_, metadata_path) = tree_artifact_paths(path, LIGHTGBM_MODEL_FILE_NAME);
-            let metadata = read_runtime_metadata(&metadata_path)?;
-            if metadata.model_name != "lightgbm" || metadata.family != ModelFamily::Tree {
-                bail!(
-                    "LightGBM runtime metadata mismatch: expected tree/lightgbm, got {}/{}",
-                    metadata.family,
-                    metadata.model_name
-                );
-            }
-            if metadata.feature_columns.is_empty() {
-                bail!("LightGBM runtime metadata must contain at least one feature column");
-            }
+            let runtime_profile = Self::read_runtime_artifact(path)?;
+            self.local_fallback = Self::read_local_fallback(path)?;
+            let metadata = Self::resolve_runtime_metadata(
+                path,
+                runtime_profile.as_ref(),
+                self.local_fallback.as_ref(),
+            )?;
             let metadata_feature_columns = metadata.feature_columns.clone();
             let metadata_training_summary = metadata.training_summary.clone();
-            let runtime_profile = Self::read_runtime_artifact(path)?
-                .context("LightGBM artifact is missing runtime.json sidecar")?;
-            Self::validate_runtime_artifact(
-                &runtime_profile,
-                &metadata_feature_columns,
-                &metadata_training_summary,
-            )?;
-            self.apply_runtime_artifact(runtime_profile);
-            self.local_fallback = Self::read_local_fallback(path)?;
+            if let Some(runtime_profile) = runtime_profile {
+                Self::validate_runtime_artifact(
+                    &runtime_profile,
+                    &metadata_feature_columns,
+                    &metadata_training_summary,
+                )?;
+                self.apply_runtime_artifact(runtime_profile);
+            } else {
+                self.feature_columns = metadata_feature_columns;
+                self.training_summary = Some(metadata_training_summary);
+                tracing::warn!(
+                    path = %path.display(),
+                    "LightGBM runtime.json missing; using metadata/local fallback to restore runtime state"
+                );
+            }
             if let Some(fallback) = self.local_fallback.as_ref() {
                 validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
             }
@@ -667,28 +714,31 @@ impl ExpertModel for LightGBMExpert {
         }
         #[cfg(feature = "lightgbm")]
         {
-            let (model_path, metadata_path) = tree_artifact_paths(path, LIGHTGBM_MODEL_FILE_NAME);
-            let metadata = read_runtime_metadata(&metadata_path)?;
-            if metadata.model_name != "lightgbm" || metadata.family != ModelFamily::Tree {
-                bail!(
-                    "LightGBM runtime metadata mismatch: expected tree/lightgbm, got {}/{}",
-                    metadata.family,
-                    metadata.model_name
-                );
-            }
-            if metadata.feature_columns.is_empty() {
-                bail!("LightGBM runtime metadata must contain at least one feature column");
-            }
+            let (model_path, _) = tree_artifact_paths(path, LIGHTGBM_MODEL_FILE_NAME);
+            let runtime_profile = Self::read_runtime_artifact(path)?;
+            self.local_fallback = Self::read_local_fallback(path)?;
+            let metadata = Self::resolve_runtime_metadata(
+                path,
+                runtime_profile.as_ref(),
+                self.local_fallback.as_ref(),
+            )?;
             let metadata_feature_columns = metadata.feature_columns.clone();
             let metadata_training_summary = metadata.training_summary.clone();
-            let runtime_profile = Self::read_runtime_artifact(path)?
-                .context("LightGBM artifact is missing runtime.json sidecar")?;
-            Self::validate_runtime_artifact(
-                &runtime_profile,
-                &metadata_feature_columns,
-                &metadata_training_summary,
-            )?;
-            self.apply_runtime_artifact(runtime_profile);
+            if let Some(runtime_profile) = runtime_profile {
+                Self::validate_runtime_artifact(
+                    &runtime_profile,
+                    &metadata_feature_columns,
+                    &metadata_training_summary,
+                )?;
+                self.apply_runtime_artifact(runtime_profile);
+            } else {
+                self.feature_columns = metadata_feature_columns;
+                self.training_summary = Some(metadata_training_summary);
+                tracing::warn!(
+                    path = %path.display(),
+                    "LightGBM runtime.json missing; using metadata/local fallback to restore runtime state"
+                );
+            }
             let native_model_result = if model_path.exists() {
                 Some(
                     lightgbm3::Booster::from_file(
@@ -705,14 +755,12 @@ impl ExpertModel for LightGBMExpert {
             match native_model_result {
                 Some(Ok(model)) => {
                     self.model = Some(model);
-                    self.local_fallback = Self::read_local_fallback(path)?;
                     if let Some(fallback) = self.local_fallback.as_ref() {
                         validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
                     }
                 }
                 Some(Err(native_err)) => {
                     self.model = None;
-                    self.local_fallback = Self::read_local_fallback(path)?;
                     if let Some(fallback) = self.local_fallback.as_ref() {
                         validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
                         tracing::warn!(
@@ -729,7 +777,6 @@ impl ExpertModel for LightGBMExpert {
                 }
                 None => {
                     self.model = None;
-                    self.local_fallback = Self::read_local_fallback(path)?;
                     if let Some(fallback) = self.local_fallback.as_ref() {
                         validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
                         tracing::warn!(
@@ -901,6 +948,50 @@ mod tests {
             let sum = row.iter().copied().sum::<f32>();
             assert!((sum - 1.0).abs() < 1e-3_f32);
         }
+    }
+
+    #[test]
+    fn lightgbm_load_uses_runtime_profile_when_metadata_sidecar_missing() {
+        let (x, y) = sample_three_class_dataset();
+        let artifact_dir = unique_temp_dir("lightgbm-missing-metadata-sidecar");
+
+        let mut expert = LightGBMExpert::new(7, None);
+        expert.fit(&x, &y).expect("fit should succeed");
+        expert.save(&artifact_dir).expect("save should succeed");
+        std::fs::remove_file(artifact_dir.join("metadata.json"))
+            .expect("remove metadata sidecar to force fallback path");
+
+        let mut loaded = LightGBMExpert::new(7, None);
+        loaded
+            .load(&artifact_dir)
+            .expect("load should reconstruct runtime metadata from runtime profile");
+
+        let probabilities = loaded
+            .predict_proba(&x)
+            .expect("prediction should succeed after metadata reconstruction");
+        assert_eq!(probabilities.dim(), (x.height(), 3));
+    }
+
+    #[test]
+    fn lightgbm_load_uses_metadata_when_runtime_sidecar_missing() {
+        let (x, y) = sample_three_class_dataset();
+        let artifact_dir = unique_temp_dir("lightgbm-missing-runtime-sidecar");
+
+        let mut expert = LightGBMExpert::new(11, None);
+        expert.fit(&x, &y).expect("fit should succeed");
+        expert.save(&artifact_dir).expect("save should succeed");
+        std::fs::remove_file(artifact_dir.join("runtime.json"))
+            .expect("remove runtime sidecar to force metadata/local fallback path");
+
+        let mut loaded = LightGBMExpert::new(11, None);
+        loaded
+            .load(&artifact_dir)
+            .expect("load should reconstruct runtime state from metadata/local fallback");
+
+        let probabilities = loaded
+            .predict_proba(&x)
+            .expect("prediction should succeed after runtime reconstruction");
+        assert_eq!(probabilities.dim(), (x.height(), 3));
     }
 
     #[test]

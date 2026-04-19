@@ -15,11 +15,13 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::base::{
-    build_runtime_artifact_metadata, build_runtime_prediction_with_details,
-    canonical_three_class_label_mapping, three_class_runtime_confidence,
+    build_runtime_prediction_with_details, canonical_three_class_label_mapping,
+    three_class_runtime_confidence, try_build_runtime_artifact_metadata,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
-use crate::runtime::capabilities::{CapabilityState, ModelFamily};
+use crate::runtime::capabilities::{
+    requested_training_precision_policy, CapabilityState, ModelFamily,
+};
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
     feature_matrix_from_dataframe, read_json, remap_three_class_labels, write_json, FeatureScaler,
@@ -308,15 +310,14 @@ fn is_known_rl_effective_backend(value: &str) -> bool {
 
 fn is_known_rl_requested_device_policy(value: &str) -> bool {
     let normalized = normalize_rl_device_policy(value);
-    matches!(
-        normalized.as_str(),
-        "cpu" | "auto" | "gpu" | "cuda" | "nvidia"
-    ) || normalized.starts_with("cuda:")
+    matches!(normalized.as_str(), "cpu" | "auto" | "gpu")
+        || normalized.starts_with("gpu:")
+        || normalized.starts_with("cuda:")
 }
 
 fn is_known_rl_effective_device_policy(value: &str) -> bool {
     let normalized = normalize_rl_device_policy(value);
-    normalized == "cpu" || normalized.starts_with("cuda:")
+    normalized == "cpu" || normalized.starts_with("cuda:") || normalized.starts_with("gpu:")
 }
 
 fn artifact_requested_backend(artifact: &TradingRlArtifact) -> String {
@@ -358,8 +359,8 @@ fn backup_rl_file(path: &Path, file_name: &str) -> PathBuf {
 fn rl_runtime_metadata(
     feature_columns: Vec<String>,
     dataset_rows: usize,
-) -> RuntimeArtifactMetadata {
-    build_runtime_artifact_metadata(
+) -> Result<RuntimeArtifactMetadata> {
+    try_build_runtime_artifact_metadata(
         "dqn",
         ModelFamily::Rl,
         CapabilityState::Implemented,
@@ -370,8 +371,8 @@ fn rl_runtime_metadata(
 }
 
 fn requested_gpu_device_policy(policy: &str) -> bool {
-    let normalized = policy.trim().to_ascii_lowercase();
-    matches!(normalized.as_str(), "gpu" | "cuda" | "nvidia") || normalized.starts_with("cuda:")
+    let normalized = normalize_rl_device_policy(policy);
+    normalized == "gpu" || normalized.starts_with("gpu:")
 }
 
 fn validate_rl_metadata(
@@ -430,6 +431,48 @@ fn validate_rl_metadata(
         );
     }
     Ok(())
+}
+
+fn resolve_rl_runtime_metadata(
+    path: &Path,
+    artifact: &TradingRlArtifact,
+) -> Result<RuntimeArtifactMetadata> {
+    let metadata_path = path.join(METADATA_FILE_NAME);
+    let reconstructed = rl_runtime_metadata(artifact.feature_columns.clone(), artifact.train_rows)?;
+    validate_rl_metadata(
+        &reconstructed,
+        &artifact.feature_columns,
+        artifact.train_rows,
+    )?;
+    match read_json::<RuntimeArtifactMetadata>(&metadata_path) {
+        Ok(metadata) => {
+            validate_rl_metadata(&metadata, &artifact.feature_columns, artifact.train_rows)?;
+            if metadata.model_name != reconstructed.model_name
+                || metadata.family != reconstructed.family
+                || metadata.state != reconstructed.state
+                || metadata.feature_columns != reconstructed.feature_columns
+                || metadata.label_mapping != reconstructed.label_mapping
+                || metadata.training_summary.dataset_rows
+                    != reconstructed.training_summary.dataset_rows
+                || metadata.training_summary.train_rows != reconstructed.training_summary.train_rows
+                || metadata.training_summary.val_rows != reconstructed.training_summary.val_rows
+            {
+                bail!(
+                    "RL metadata sidecar mismatch with reconstructed runtime metadata at {}",
+                    metadata_path.display()
+                );
+            }
+            Ok(metadata)
+        }
+        Err(file_err) => {
+            tracing::warn!(
+                path = %metadata_path.display(),
+                error = %file_err,
+                "RL metadata sidecar missing/unreadable; using reconstructed runtime metadata from artifact"
+            );
+            Ok(reconstructed)
+        }
+    }
 }
 
 fn cleanup_rl_temp_file(path: &Path) {
@@ -691,10 +734,27 @@ impl FeatureBounds {
 fn normalize_rl_device_policy(policy: &str) -> String {
     let normalized = policy.trim().to_ascii_lowercase();
     if normalized.is_empty() {
-        "auto".to_string()
-    } else {
-        normalized
+        return "auto".to_string();
     }
+    if matches!(
+        normalized.as_str(),
+        "nvidia" | "cuda" | "rocm" | "metal" | "vulkan"
+    ) {
+        return "gpu".to_string();
+    }
+    if let Some(index) = normalized
+        .strip_prefix("cuda:")
+        .or_else(|| normalized.strip_prefix("rocm:"))
+        .or_else(|| normalized.strip_prefix("metal:"))
+        .or_else(|| normalized.strip_prefix("vulkan:"))
+        .or_else(|| normalized.strip_prefix("wgpu:"))
+    {
+        return format!("gpu:{index}");
+    }
+    if matches!(normalized.as_str(), "cpu" | "auto" | "gpu") || normalized.starts_with("gpu:") {
+        return normalized;
+    }
+    "auto".to_string()
 }
 
 #[cfg(all(
@@ -703,15 +763,14 @@ fn normalize_rl_device_policy(policy: &str) -> String {
 ))]
 fn requested_cuda_ordinal(policy: &str) -> Option<usize> {
     normalize_rl_device_policy(policy)
-        .strip_prefix("cuda:")
+        .strip_prefix("gpu:")
         .and_then(|value| value.parse::<usize>().ok())
 }
 
 #[cfg(feature = "reinforcement-learning")]
 fn resolve_rl_training_device(policy: &str) -> Result<(Device, String, String)> {
     let normalized = normalize_rl_device_policy(policy);
-    let explicit_gpu =
-        matches!(normalized.as_str(), "gpu" | "cuda" | "nvidia") || normalized.starts_with("cuda:");
+    let explicit_gpu = requested_gpu_device_policy(&normalized);
 
     #[cfg(feature = "reinforcement-learning-cuda")]
     {
@@ -724,12 +783,12 @@ fn resolve_rl_training_device(policy: &str) -> Result<(Device, String, String)> 
                 }
                 Err(_) => return Ok((Device::Cpu, "cpu".to_string(), "rlkit_cpu".to_string())),
             },
-            "gpu" | "cuda" | "nvidia" => {
+            "gpu" => {
                 let device = Device::new_cuda(ordinal)
                     .map_err(|err| anyhow::anyhow!("initialize RL CUDA device {ordinal}: {err}"))?;
                 return Ok((device, format!("cuda:{ordinal}"), "rlkit_cuda".to_string()));
             }
-            value if value.starts_with("cuda:") => {
+            value if value.starts_with("gpu:") => {
                 let device = Device::new_cuda(ordinal)
                     .map_err(|err| anyhow::anyhow!("initialize RL CUDA device {ordinal}: {err}"))?;
                 return Ok((device, format!("cuda:{ordinal}"), "rlkit_cuda".to_string()));
@@ -739,9 +798,7 @@ fn resolve_rl_training_device(policy: &str) -> Result<(Device, String, String)> 
     }
 
     if explicit_gpu {
-        bail!(
-            "RL device policy `{normalized}` requested CUDA, but this build does not include reinforcement-learning-cuda support"
-        );
+        return Ok((Device::Cpu, "cpu".to_string(), "rlkit_cpu".to_string()));
     }
 
     Ok((Device::Cpu, "cpu".to_string(), "rlkit_cpu".to_string()))
@@ -749,14 +806,12 @@ fn resolve_rl_training_device(policy: &str) -> Result<(Device, String, String)> 
 
 #[cfg(feature = "reinforcement-learning")]
 fn resolve_rl_inference_device(policy: &str) -> (Device, String, String) {
-    let _normalized = normalize_rl_device_policy(policy);
+    let normalized = normalize_rl_device_policy(policy);
 
     #[cfg(feature = "reinforcement-learning-cuda")]
     {
         let ordinal = requested_cuda_ordinal(&normalized).unwrap_or(0);
-        if matches!(normalized.as_str(), "auto" | "gpu" | "cuda" | "nvidia")
-            || normalized.starts_with("cuda:")
-        {
+        if matches!(normalized.as_str(), "auto" | "gpu") || normalized.starts_with("gpu:") {
             if let Ok(device) = Device::new_cuda(ordinal) {
                 return (device, format!("cuda:{ordinal}"), "rlkit_cuda".to_string());
             }
@@ -1972,6 +2027,12 @@ impl TradingReinforcementLearner {
         let (effective_backend, effective_device_policy, used_network_snapshot, used_fallback_q) =
             self.live_runtime_identity();
         let mut reasons = Vec::new();
+        let requested_precision = requested_training_precision_policy("dqn");
+        if requested_precision != "auto" && requested_precision != "fp32" {
+            reasons.push(format!(
+                "requested_rl_precision_unavailable({requested_precision})"
+            ));
+        }
         if let Some(persisted_backend) = self.train_args.effective_backend.as_ref() {
             if persisted_backend != &effective_backend {
                 reasons.push("rl_persisted_runtime_backend_drift".to_string());
@@ -2128,7 +2189,7 @@ impl TradingReinforcementLearner {
                 artifact.feature_columns = default_rl_feature_columns(artifact.state_dim);
             }
             let runtime_metadata =
-                rl_runtime_metadata(artifact.feature_columns.clone(), artifact.train_rows);
+                rl_runtime_metadata(artifact.feature_columns.clone(), artifact.train_rows)?;
             validate_rl_metadata(
                 &runtime_metadata,
                 &artifact.feature_columns,
@@ -2195,7 +2256,7 @@ impl TradingReinforcementLearner {
                 artifact.feature_columns = default_rl_feature_columns(artifact.state_dim);
             }
             let runtime_metadata =
-                rl_runtime_metadata(artifact.feature_columns.clone(), artifact.train_rows);
+                rl_runtime_metadata(artifact.feature_columns.clone(), artifact.train_rows)?;
             validate_rl_metadata(
                 &runtime_metadata,
                 &artifact.feature_columns,
@@ -2238,12 +2299,12 @@ impl TradingReinforcementLearner {
     pub fn load(path: &Path) -> Result<Self> {
         #[cfg(not(feature = "reinforcement-learning"))]
         {
-            let metadata: RuntimeArtifactMetadata = read_json(&path.join(METADATA_FILE_NAME))?;
             let mut artifact: TradingRlArtifact = read_json(&path.join("rl_config.json"))?;
             Self::validate_artifact(&artifact)?;
             if artifact.feature_columns.is_empty() {
                 artifact.feature_columns = default_rl_feature_columns(artifact.state_dim);
             }
+            let metadata = resolve_rl_runtime_metadata(path, &artifact)?;
             validate_rl_metadata(&metadata, &artifact.feature_columns, artifact.train_rows)?;
             let bounds = Self::bounds_from_artifact(&artifact)?;
             if artifact.fallback_weights.is_none() || artifact.fallback_bias.is_none() {
@@ -2278,12 +2339,12 @@ impl TradingReinforcementLearner {
 
         #[cfg(feature = "reinforcement-learning")]
         {
-            let metadata: RuntimeArtifactMetadata = read_json(&path.join(METADATA_FILE_NAME))?;
             let mut artifact: TradingRlArtifact = read_json(&path.join("rl_config.json"))?;
             Self::validate_artifact(&artifact)?;
             if artifact.feature_columns.is_empty() {
                 artifact.feature_columns = default_rl_feature_columns(artifact.state_dim);
             }
+            let metadata = resolve_rl_runtime_metadata(path, &artifact)?;
             validate_rl_metadata(&metadata, &artifact.feature_columns, artifact.train_rows)?;
             let bounds = Self::bounds_from_artifact(&artifact)?;
             let requested_device_policy = artifact_requested_device_policy(&artifact);
@@ -2512,11 +2573,21 @@ mod tests {
         not(feature = "reinforcement-learning-cuda")
     ))]
     #[test]
-    fn explicit_gpu_policy_fails_without_cuda_support() {
-        let err =
-            resolve_rl_training_device("cuda:0").expect_err("gpu policy should fail without cuda");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("does not include reinforcement-learning-cuda support"));
+    fn explicit_gpu_policy_falls_back_to_cpu_without_cuda_support() {
+        let (device, policy, backend) =
+            resolve_rl_training_device("rocm:0").expect("gpu policy should degrade to cpu");
+        assert!(matches!(device, Device::Cpu));
+        assert_eq!(policy, "cpu");
+        assert_eq!(backend, "rlkit_cpu");
+    }
+
+    #[test]
+    fn normalize_rl_device_policy_accepts_vendor_neutral_gpu_tokens() {
+        assert_eq!(normalize_rl_device_policy("CUDA:1"), "gpu:1");
+        assert_eq!(normalize_rl_device_policy("rocm:2"), "gpu:2");
+        assert_eq!(normalize_rl_device_policy("metal:0"), "gpu:0");
+        assert_eq!(normalize_rl_device_policy("vulkan:3"), "gpu:3");
+        assert_eq!(normalize_rl_device_policy("nvidia"), "gpu");
     }
 
     #[test]
@@ -2628,6 +2699,18 @@ mod tests {
         assert!(degraded_reason.contains("requested_rl_device_unavailable"));
         assert!(degraded_reason.contains("rl_network_unavailable"));
         assert!(degraded_reason.contains("rl_backend_degraded_to_fallback_q"));
+    }
+
+    #[test]
+    fn runtime_backend_details_explain_requested_precision_when_unavailable() {
+        std::env::set_var("FOREX_BOT_DQN_TRAIN_PRECISION", "bf16");
+        let learner = TradingReinforcementLearner::new();
+        let (_backend, degraded_reason) = learner.runtime_backend_details();
+        std::env::remove_var("FOREX_BOT_DQN_TRAIN_PRECISION");
+
+        let degraded_reason =
+            degraded_reason.expect("precision request should appear in degraded reason");
+        assert!(degraded_reason.contains("requested_rl_precision_unavailable(bf16)"));
     }
 
     #[test]
@@ -3478,13 +3561,151 @@ mod tests {
             fallback_weights: Some(Array2::zeros((3, 4))),
             fallback_bias: Some(Array1::zeros(3)),
         };
-        let metadata = rl_runtime_metadata(artifact.feature_columns.clone(), artifact.train_rows);
+        let metadata = rl_runtime_metadata(artifact.feature_columns.clone(), artifact.train_rows)
+            .expect("build metadata");
         write_json(&path.join(METADATA_FILE_NAME), &metadata).expect("write metadata");
         write_json(&path.join("rl_config.json"), &artifact).expect("write config");
 
         let err = TradingReinforcementLearner::load(&path)
             .expect_err("load should reject missing network snapshot");
         assert!(err.to_string().contains("claims a network snapshot"));
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn load_reconstructs_runtime_metadata_when_sidecar_missing() {
+        let path = unique_temp_dir("rl-missing-metadata-sidecar");
+        let artifact = TradingRlArtifact {
+            state_dim: 2,
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            train_rows: 32,
+            hidden_dims: vec![4, 4],
+            state_encoding: TradingStateEncoding::Normalized,
+            state_bins: 255,
+            state_mins: vec![0.0, 0.0],
+            state_maxs: vec![1.0, 1.0],
+            buffer_capacity: 50_000,
+            epochs: 64,
+            max_steps: 512,
+            update_interval: 32,
+            update_freq: 4,
+            batch_size: 64,
+            learning_rate: 1e-3,
+            gamma: 0.99,
+            epsilon_start: 1.0,
+            epsilon_end: 0.02,
+            epsilon_decay: 0.995,
+            requested_backend: Some("rlkit".to_string()),
+            requested_device_policy: Some("cpu".to_string()),
+            effective_backend: Some("rlkit_cpu".to_string()),
+            effective_device_policy: Some("cpu".to_string()),
+            backend: "rlkit_cpu".to_string(),
+            device_policy: "cpu".to_string(),
+            parallel_envs: 1,
+            eval_episodes: 8,
+            rllib_num_workers: 0,
+            ray_tune_max_concurrency: 1,
+            reward_horizon: 0,
+            episode_len: 0,
+            training_report: Some(TradingRlTrainingReport {
+                train_rows: 32,
+                episode_count: 2,
+                state_dim: 2,
+                reward_horizon: 0,
+                episode_len: 0,
+                backend: "rlkit_cpu".to_string(),
+                device_policy: "cpu".to_string(),
+                average_hold_reward: 0.1,
+                average_buy_reward: 0.2,
+                average_sell_reward: -0.1,
+                used_network_snapshot: false,
+                used_fallback_q: true,
+                used_feature_scaler: false,
+            }),
+            feature_scaler: None,
+            fallback_basis: TradingFallbackBasis::Quadratic,
+            fallback_weights: Some(Array2::zeros((3, 4))),
+            fallback_bias: Some(Array1::zeros(3)),
+        };
+
+        write_json(&path.join("rl_config.json"), &artifact).expect("write config");
+
+        let loaded = TradingReinforcementLearner::load(&path)
+            .expect("load should reconstruct metadata from artifact fields");
+        assert_eq!(loaded.feature_columns, artifact.feature_columns);
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn load_rejects_metadata_sidecar_drift_against_reconstructed_runtime_metadata() {
+        let path = unique_temp_dir("rl-sidecar-drift");
+        let artifact = TradingRlArtifact {
+            state_dim: 2,
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            train_rows: 32,
+            hidden_dims: vec![4, 4],
+            state_encoding: TradingStateEncoding::Normalized,
+            state_bins: 255,
+            state_mins: vec![0.0, 0.0],
+            state_maxs: vec![1.0, 1.0],
+            buffer_capacity: 50_000,
+            epochs: 64,
+            max_steps: 512,
+            update_interval: 32,
+            update_freq: 4,
+            batch_size: 64,
+            learning_rate: 1e-3,
+            gamma: 0.99,
+            epsilon_start: 1.0,
+            epsilon_end: 0.02,
+            epsilon_decay: 0.995,
+            requested_backend: Some("rlkit".to_string()),
+            requested_device_policy: Some("cpu".to_string()),
+            effective_backend: Some("rlkit_cpu".to_string()),
+            effective_device_policy: Some("cpu".to_string()),
+            backend: "rlkit_cpu".to_string(),
+            device_policy: "cpu".to_string(),
+            parallel_envs: 1,
+            eval_episodes: 8,
+            rllib_num_workers: 0,
+            ray_tune_max_concurrency: 1,
+            reward_horizon: 0,
+            episode_len: 0,
+            training_report: Some(TradingRlTrainingReport {
+                train_rows: 32,
+                episode_count: 2,
+                state_dim: 2,
+                reward_horizon: 0,
+                episode_len: 0,
+                backend: "rlkit_cpu".to_string(),
+                device_policy: "cpu".to_string(),
+                average_hold_reward: 0.1,
+                average_buy_reward: 0.2,
+                average_sell_reward: -0.1,
+                used_network_snapshot: false,
+                used_fallback_q: true,
+                used_feature_scaler: false,
+            }),
+            feature_scaler: None,
+            fallback_basis: TradingFallbackBasis::Quadratic,
+            fallback_weights: Some(Array2::zeros((3, 4))),
+            fallback_bias: Some(Array1::zeros(3)),
+        };
+        let mut drifted_metadata =
+            rl_runtime_metadata(artifact.feature_columns.clone(), artifact.train_rows)
+                .expect("build metadata");
+        drifted_metadata.training_summary.train_rows = 31;
+        drifted_metadata.training_summary.val_rows = 1;
+        drifted_metadata.training_summary.dataset_rows = 33;
+
+        write_json(&path.join("rl_config.json"), &artifact).expect("write config");
+        write_json(&path.join(METADATA_FILE_NAME), &drifted_metadata).expect("write metadata");
+
+        let err =
+            TradingReinforcementLearner::load(&path).expect_err("drifted sidecar should fail load");
+        assert!(err.to_string().contains("metadata sidecar mismatch"));
 
         let _ = std::fs::remove_dir_all(&path);
     }

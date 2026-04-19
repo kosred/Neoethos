@@ -1,5 +1,5 @@
 // Exit Agent - Pure Rust Burn RL-Based Trade Exit Expert
-// Ported from src/forex_bot/models/exit_agent.py
+// Derived from src/forex_bot/models/exit_agent.py
 //
 // Lightweight RL Network for Trade Exit Decisions.
 // Learns to balance Greed (Holding for TP) vs Fear (Cutting Loss/Stall).
@@ -21,9 +21,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::base::{
-    build_runtime_artifact_metadata, build_runtime_prediction_with_details,
-    canonical_three_class_label_mapping, dataframe_to_float32_array,
-    feature_columns_from_dataframe, three_class_runtime_confidence,
+    build_runtime_prediction_with_details, canonical_three_class_label_mapping,
+    dataframe_to_float32_array, feature_columns_from_dataframe, three_class_runtime_confidence,
+    try_build_runtime_artifact_metadata,
 };
 use crate::burn_models::{resolve_train_device, TrainBackend};
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
@@ -117,6 +117,8 @@ pub struct ExitAgentArtifact {
     pub effective_device_policy: Option<String>,
     #[serde(default)]
     pub execution_backend: Option<String>,
+    #[serde(default)]
+    pub runtime_metadata: Option<RuntimeArtifactMetadata>,
 }
 
 impl Default for ExitAgentArtifact {
@@ -141,6 +143,7 @@ impl Default for ExitAgentArtifact {
             requested_device_policy: None,
             effective_device_policy: None,
             execution_backend: None,
+            runtime_metadata: None,
         }
     }
 }
@@ -148,8 +151,8 @@ impl Default for ExitAgentArtifact {
 fn exit_runtime_metadata(
     feature_columns: Vec<String>,
     dataset_rows: usize,
-) -> RuntimeArtifactMetadata {
-    build_runtime_artifact_metadata(
+) -> Result<RuntimeArtifactMetadata> {
+    try_build_runtime_artifact_metadata(
         "exit_agent",
         ModelFamily::Exit,
         CapabilityState::Implemented,
@@ -215,6 +218,61 @@ fn validate_exit_metadata(
         );
     }
     Ok(())
+}
+
+fn validate_exit_metadata_consistency(
+    sidecar: &RuntimeArtifactMetadata,
+    embedded: &RuntimeArtifactMetadata,
+) -> Result<()> {
+    if sidecar.model_name != embedded.model_name
+        || sidecar.family != embedded.family
+        || sidecar.state != embedded.state
+    {
+        anyhow::bail!("exit-agent metadata identity mismatch between sidecar and embedded payload");
+    }
+    if sidecar.feature_columns != embedded.feature_columns {
+        anyhow::bail!("exit-agent metadata feature columns drift between sidecar and embedded");
+    }
+    if sidecar.label_mapping != embedded.label_mapping {
+        anyhow::bail!("exit-agent metadata label mapping drift between sidecar and embedded");
+    }
+    if sidecar.training_summary != embedded.training_summary {
+        anyhow::bail!("exit-agent metadata training summary drift between sidecar and embedded");
+    }
+    Ok(())
+}
+
+fn resolve_exit_runtime_metadata(
+    path: &Path,
+    artifact: &ExitAgentArtifact,
+) -> Result<RuntimeArtifactMetadata> {
+    let metadata_path = path.join(METADATA_FILE_NAME);
+    match read_json::<RuntimeArtifactMetadata>(&metadata_path) {
+        Ok(metadata) => {
+            validate_exit_metadata(&metadata, &artifact.feature_columns, artifact.train_rows)?;
+            if let Some(embedded) = artifact.runtime_metadata.as_ref() {
+                validate_exit_metadata(embedded, &artifact.feature_columns, artifact.train_rows)?;
+                validate_exit_metadata_consistency(&metadata, embedded)?;
+            }
+            Ok(metadata)
+        }
+        Err(error) => {
+            let embedded = artifact.runtime_metadata.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "exit-agent metadata sidecar missing or unreadable at {} and no embedded runtime metadata in artifact: {}",
+                    metadata_path.display(),
+                    error
+                )
+            })?;
+            warn!(
+                "exit-agent metadata sidecar unavailable at {} ({}); falling back to embedded artifact metadata",
+                metadata_path.display(),
+                error
+            );
+            validate_exit_metadata(embedded, &artifact.feature_columns, artifact.train_rows)?;
+            Ok(embedded.clone())
+        }
+    }
 }
 
 fn validate_exit_artifact(artifact: &ExitAgentArtifact) -> Result<()> {
@@ -809,6 +867,7 @@ impl ExitAgent {
             requested_device_policy: Some(self.requested_device_policy.clone()),
             effective_device_policy: Some(self.effective_device_policy.clone()),
             execution_backend: Some(self.execution_backend.clone()),
+            runtime_metadata: None,
         }
     }
 
@@ -1288,14 +1347,16 @@ impl ExitAgent {
                 })?;
 
             let runtime_metadata =
-                exit_runtime_metadata(artifact.feature_columns.clone(), artifact.train_rows);
+                exit_runtime_metadata(artifact.feature_columns.clone(), artifact.train_rows)?;
             validate_exit_metadata(
                 &runtime_metadata,
                 &artifact.feature_columns,
                 artifact.train_rows,
             )?;
+            let mut artifact_to_write = artifact.clone();
+            artifact_to_write.runtime_metadata = Some(runtime_metadata.clone());
             write_json(&staged_path.join(METADATA_FILE_NAME), &runtime_metadata)?;
-            write_json(&Self::artifact_path(&staged_path), &artifact)
+            write_json(&Self::artifact_path(&staged_path), &artifact_to_write)
                 .with_context(|| format!("write exit-agent config to {}", staged_path.display()))?;
             Ok(())
         })() {
@@ -1307,11 +1368,10 @@ impl ExitAgent {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        let metadata: RuntimeArtifactMetadata = read_json(&path.join(METADATA_FILE_NAME))?;
         let artifact: ExitAgentArtifact = read_json(&Self::artifact_path(path))
             .with_context(|| format!("read exit-agent config from {}", path.display()))?;
         validate_exit_artifact(&artifact)?;
-        validate_exit_metadata(&metadata, &artifact.feature_columns, artifact.train_rows)?;
+        let _metadata = resolve_exit_runtime_metadata(path, &artifact)?;
         if artifact.replay_memory.len() > artifact.memory_capacity.max(1_024) {
             anyhow::bail!(
                 "exit-agent artifact replay memory {} exceeds configured capacity {}",
@@ -1527,6 +1587,7 @@ mod tests {
             requested_device_policy: None,
             effective_device_policy: None,
             execution_backend: None,
+            runtime_metadata: None,
             replay_memory: vec![
                 Experience {
                     state: vec![0.0; 6],
@@ -1550,7 +1611,8 @@ mod tests {
         .expect("write config");
         write_json(
             &path.join(METADATA_FILE_NAME),
-            &exit_runtime_metadata(artifact.feature_columns.clone(), artifact.train_rows),
+            &exit_runtime_metadata(artifact.feature_columns.clone(), artifact.train_rows)
+                .expect("build metadata"),
         )
         .expect("write metadata");
 
@@ -1561,6 +1623,72 @@ mod tests {
             err.to_string().contains("train_rows"),
             "unexpected error: {err}"
         );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn load_uses_embedded_runtime_metadata_when_sidecar_missing() {
+        let mut agent = ExitAgent::with_hidden_dim(6, 16).with_memory_capacity(1_024);
+        agent.feature_columns = vec![
+            "f1".to_string(),
+            "f2".to_string(),
+            "f3".to_string(),
+            "f4".to_string(),
+            "f5".to_string(),
+            "f6".to_string(),
+        ];
+        agent.train_rows = 64;
+        agent.trained_checkpoint_ready = true;
+        agent.push_experience(Experience {
+            state: vec![0.0; 6],
+            action: 1,
+            reward: 0.5,
+            done: true,
+        });
+        let path = unique_temp_dir("exit-agent-embedded-metadata");
+        agent.save(&path).expect("save should succeed");
+        std::fs::remove_file(path.join(METADATA_FILE_NAME)).expect("remove metadata sidecar");
+
+        let loaded = ExitAgent::load(&path).expect("load should fallback to embedded metadata");
+        assert_eq!(loaded.train_rows, 64);
+        assert_eq!(loaded.feature_columns.len(), 6);
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn load_rejects_sidecar_embedded_runtime_metadata_drift() {
+        let mut agent = ExitAgent::with_hidden_dim(6, 16).with_memory_capacity(1_024);
+        agent.feature_columns = vec![
+            "f1".to_string(),
+            "f2".to_string(),
+            "f3".to_string(),
+            "f4".to_string(),
+            "f5".to_string(),
+            "f6".to_string(),
+        ];
+        agent.train_rows = 64;
+        agent.trained_checkpoint_ready = true;
+        agent.push_experience(Experience {
+            state: vec![0.0; 6],
+            action: 1,
+            reward: 0.5,
+            done: true,
+        });
+        let path = unique_temp_dir("exit-agent-metadata-drift");
+        agent.save(&path).expect("save should succeed");
+
+        let mut drifted = exit_runtime_metadata(agent.feature_columns.clone(), agent.train_rows)
+            .expect("build metadata");
+        drifted.training_summary.train_rows = drifted.training_summary.train_rows.saturating_sub(1);
+        drifted.training_summary.val_rows = drifted.training_summary.val_rows.saturating_add(1);
+        write_json(&path.join(METADATA_FILE_NAME), &drifted).expect("overwrite drifted sidecar");
+
+        let err = ExitAgent::load(&path)
+            .err()
+            .expect("drifted sidecar metadata should be rejected");
+        assert!(err.to_string().contains("drift"), "unexpected error: {err}");
 
         let _ = std::fs::remove_dir_all(&path);
     }

@@ -14,11 +14,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::base::{
-    build_runtime_artifact_metadata, build_runtime_prediction_with_details,
-    canonical_three_class_label_mapping, three_class_runtime_confidence, ExpertModel,
+    build_runtime_prediction_with_details, canonical_three_class_label_mapping,
+    three_class_runtime_confidence, try_build_runtime_artifact_metadata, ExpertModel,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
-use crate::runtime::capabilities::{CapabilityState, ModelFamily};
+use crate::runtime::capabilities::{
+    append_runtime_degraded_reason, gpu_policy_cpu_fallback_reason, CapabilityState, ModelFamily,
+};
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
     ensure_feature_columns_match, feature_matrix_from_dataframe, read_json,
@@ -119,8 +121,8 @@ fn adaptive_runtime_metadata(
     model_name: &str,
     feature_columns: Vec<String>,
     dataset_rows: usize,
-) -> RuntimeArtifactMetadata {
-    build_runtime_artifact_metadata(
+) -> Result<RuntimeArtifactMetadata> {
+    try_build_runtime_artifact_metadata(
         model_name,
         ModelFamily::Adaptive,
         CapabilityState::Implemented,
@@ -128,6 +130,66 @@ fn adaptive_runtime_metadata(
         canonical_three_class_label_mapping(),
         TrainingSummaryMetadata::new(dataset_rows, dataset_rows, 0),
     )
+}
+
+fn resolve_adaptive_runtime_metadata(
+    path: &Path,
+    model_name: &str,
+    feature_columns: &[String],
+    dataset_rows: usize,
+) -> Result<RuntimeArtifactMetadata> {
+    let metadata_path = path.join(METADATA_FILE_NAME);
+    let reconstructed =
+        adaptive_runtime_metadata(model_name, feature_columns.to_vec(), dataset_rows)?;
+    validate_adaptive_metadata(&reconstructed, model_name)?;
+    if reconstructed.feature_columns != feature_columns {
+        bail!(
+            "{} reconstructed feature columns mismatch: expected {:?}, got {:?}",
+            model_name,
+            feature_columns,
+            reconstructed.feature_columns
+        );
+    }
+    if reconstructed.training_summary.dataset_rows != dataset_rows {
+        bail!(
+            "{} reconstructed dataset rows mismatch: expected {}, got {}",
+            model_name,
+            dataset_rows,
+            reconstructed.training_summary.dataset_rows
+        );
+    }
+
+    match read_json::<RuntimeArtifactMetadata>(&metadata_path) {
+        Ok(metadata) => {
+            validate_adaptive_metadata(&metadata, model_name)?;
+            if metadata.model_name != reconstructed.model_name
+                || metadata.family != reconstructed.family
+                || metadata.state != reconstructed.state
+                || metadata.feature_columns != reconstructed.feature_columns
+                || metadata.label_mapping != reconstructed.label_mapping
+                || metadata.training_summary.dataset_rows
+                    != reconstructed.training_summary.dataset_rows
+                || metadata.training_summary.train_rows != reconstructed.training_summary.train_rows
+                || metadata.training_summary.val_rows != reconstructed.training_summary.val_rows
+            {
+                bail!(
+                    "{} metadata sidecar mismatch with reconstructed metadata at {}",
+                    model_name,
+                    metadata_path.display()
+                );
+            }
+            Ok(metadata)
+        }
+        Err(file_err) => {
+            tracing::warn!(
+                model = %model_name,
+                path = %metadata_path.display(),
+                error = %file_err,
+                "adaptive metadata sidecar missing/unreadable; using reconstructed metadata"
+            );
+            Ok(reconstructed)
+        }
+    }
 }
 
 fn staged_adaptive_file(path: &Path, file_name: &str) -> PathBuf {
@@ -677,7 +739,7 @@ impl ExpertModel for OnlinePassiveAggressiveExpert {
             AdaptiveModelKind::PassiveAggressive.model_name(),
             artifact.feature_columns.clone(),
             artifact.dataset_rows,
-        );
+        )?;
         let metadata_path = path.join(METADATA_FILE_NAME);
         let model_path = path.join(MODEL_FILE_NAME);
         let metadata_tmp = staged_adaptive_file(path, METADATA_FILE_NAME);
@@ -705,13 +767,17 @@ impl ExpertModel for OnlinePassiveAggressiveExpert {
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
-        let metadata: RuntimeArtifactMetadata = read_json(&path.join(METADATA_FILE_NAME))?;
-        validate_adaptive_metadata(&metadata, AdaptiveModelKind::PassiveAggressive.model_name())?;
         let artifact: PassiveAggressiveArtifact = read_json(&path.join(MODEL_FILE_NAME))?;
         validate_passive_aggressive_artifact(&artifact)?;
         if artifact.model_name != AdaptiveModelKind::PassiveAggressive.model_name() {
             bail!("expected online_pa artifact, got {}", artifact.model_name);
         }
+        let metadata = resolve_adaptive_runtime_metadata(
+            path,
+            AdaptiveModelKind::PassiveAggressive.model_name(),
+            &artifact.feature_columns,
+            artifact.dataset_rows,
+        )?;
         if artifact.feature_columns != metadata.feature_columns {
             bail!(
                 "online_pa feature-column mismatch between metadata {:?} and artifact {:?}",
@@ -739,28 +805,38 @@ impl ExpertModel for OnlinePassiveAggressiveExpert {
 
 impl OnlinePassiveAggressiveExpert {
     fn runtime_details(&self) -> (Option<String>, Option<String>) {
+        let gpu_cpu_fallback = gpu_policy_cpu_fallback_reason("online_pa");
         let has_runtime_state =
             self.scaler.is_some() && self.weights.is_some() && self.bias.is_some();
         if self.dataset_rows == 0 {
             return (
                 Some("online_pa_unknown".to_string()),
-                Some("adaptive_policy_unavailable".to_string()),
+                append_runtime_degraded_reason(
+                    Some("adaptive_policy_unavailable".to_string()),
+                    gpu_cpu_fallback,
+                ),
             );
         }
         if self.feature_columns.is_empty() {
             return (
                 Some("online_pa_unknown".to_string()),
-                Some("pa_feature_schema_missing".to_string()),
+                append_runtime_degraded_reason(
+                    Some("pa_feature_schema_missing".to_string()),
+                    gpu_cpu_fallback,
+                ),
             );
         }
         if !has_runtime_state {
             return (
                 Some("online_pa_unknown".to_string()),
-                Some("pa_runtime_state_incomplete".to_string()),
+                append_runtime_degraded_reason(
+                    Some("pa_runtime_state_incomplete".to_string()),
+                    gpu_cpu_fallback,
+                ),
             );
         }
 
-        (Some("online_pa_cpu".to_string()), None)
+        (Some("online_pa_cpu".to_string()), gpu_cpu_fallback)
     }
 
     pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
@@ -1211,7 +1287,7 @@ impl ExpertModel for OnlineHoeffdingExpert {
             AdaptiveModelKind::Hoeffding.model_name(),
             artifact.feature_columns.clone(),
             artifact.dataset_rows,
-        );
+        )?;
         let metadata_path = path.join(METADATA_FILE_NAME);
         let model_path = path.join(MODEL_FILE_NAME);
         let metadata_tmp = staged_adaptive_file(path, METADATA_FILE_NAME);
@@ -1239,8 +1315,6 @@ impl ExpertModel for OnlineHoeffdingExpert {
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
-        let metadata: RuntimeArtifactMetadata = read_json(&path.join(METADATA_FILE_NAME))?;
-        validate_adaptive_metadata(&metadata, AdaptiveModelKind::Hoeffding.model_name())?;
         let artifact: HoeffdingArtifact = read_json(&path.join(MODEL_FILE_NAME))?;
         validate_hoeffding_artifact(&artifact)?;
         if artifact.model_name != AdaptiveModelKind::Hoeffding.model_name() {
@@ -1249,6 +1323,12 @@ impl ExpertModel for OnlineHoeffdingExpert {
                 artifact.model_name
             );
         }
+        let metadata = resolve_adaptive_runtime_metadata(
+            path,
+            AdaptiveModelKind::Hoeffding.model_name(),
+            &artifact.feature_columns,
+            artifact.dataset_rows,
+        )?;
         if artifact.feature_columns != metadata.feature_columns {
             bail!(
                 "online_hoeffding feature-column mismatch between metadata {:?} and artifact {:?}",
@@ -1322,6 +1402,7 @@ impl ExpertModel for OnlineHoeffdingExpert {
 
 impl OnlineHoeffdingExpert {
     fn runtime_details(&self) -> (Option<String>, Option<String>) {
+        let gpu_cpu_fallback = gpu_policy_cpu_fallback_reason("online_hoeffding");
         let has_runtime_committees = self.has_live_runtime_committees();
         let has_persisted_committees = !self.committee_json.is_empty();
         let has_fallback = self.has_persistable_fallback();
@@ -1338,27 +1419,43 @@ impl OnlineHoeffdingExpert {
         match (has_runtime_committees, has_fallback) {
             (true, true) if fallback_blend_weight >= 1.0 - f32::EPSILON => (
                 Some("online_hoeffding_fallback".to_string()),
-                Some("committee_blend_disabled_by_weight".to_string()),
+                append_runtime_degraded_reason(
+                    Some("committee_blend_disabled_by_weight".to_string()),
+                    gpu_cpu_fallback.clone(),
+                ),
             ),
-            (true, true) if fallback_blend_weight <= f32::EPSILON => {
-                (Some("online_hoeffding_committee".to_string()), None)
-            }
+            (true, true) if fallback_blend_weight <= f32::EPSILON => (
+                Some("online_hoeffding_committee".to_string()),
+                gpu_cpu_fallback.clone(),
+            ),
             (true, true) => (
                 Some("online_hoeffding_committee_hybrid".to_string()),
-                Some("committee_predictions_blended_with_fallback".to_string()),
+                append_runtime_degraded_reason(
+                    Some("committee_predictions_blended_with_fallback".to_string()),
+                    gpu_cpu_fallback.clone(),
+                ),
             ),
-            (true, false) => (Some("online_hoeffding_committee".to_string()), None),
+            (true, false) => (
+                Some("online_hoeffding_committee".to_string()),
+                gpu_cpu_fallback.clone(),
+            ),
             (false, true) => (
                 Some("online_hoeffding_fallback".to_string()),
-                persisted_committee_reason,
+                append_runtime_degraded_reason(
+                    persisted_committee_reason,
+                    gpu_cpu_fallback.clone(),
+                ),
             ),
             (false, false) => (
                 Some("online_hoeffding_unknown".to_string()),
-                Some(if let Some(reason) = persisted_committee_reason {
-                    reason
-                } else {
-                    "adaptive_policy_unavailable".to_string()
-                }),
+                append_runtime_degraded_reason(
+                    Some(if let Some(reason) = persisted_committee_reason {
+                        reason
+                    } else {
+                        "adaptive_policy_unavailable".to_string()
+                    }),
+                    gpu_cpu_fallback,
+                ),
             ),
         }
     }
@@ -1577,7 +1674,7 @@ mod tests {
                 AdaptiveModelKind::Hoeffding.model_name(),
                 vec!["f1".to_string(), "f2".to_string()],
                 2,
-            ),
+            )?,
         )?;
 
         let artifact = HoeffdingArtifact {
@@ -1626,6 +1723,73 @@ mod tests {
     }
 
     #[test]
+    fn online_hoeffding_load_reconstructs_metadata_when_sidecar_missing() -> Result<()> {
+        let path = temp_model_dir("online_hoeffding_missing_metadata");
+        std::fs::create_dir_all(&path)?;
+
+        let artifact = HoeffdingArtifact {
+            model_name: AdaptiveModelKind::Hoeffding.model_name().to_string(),
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            dataset_rows: 2,
+            params: HashMap::new(),
+            committee_json: vec!["not-json".to_string()],
+            fallback_scaler: Some(FeatureScaler {
+                means: vec![0.0, 0.0],
+                stds: vec![1.0, 1.0],
+            }),
+            fallback_weights: Some(Array2::zeros((3, 2))),
+            fallback_bias: Some(Array1::zeros(3)),
+        };
+        write_json(&path.join(MODEL_FILE_NAME), &artifact)?;
+
+        let mut expert = OnlineHoeffdingExpert::new(None);
+        expert.load(&path)?;
+        assert_eq!(expert.feature_columns, artifact.feature_columns);
+
+        let _ = std::fs::remove_dir_all(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn online_pa_load_rejects_metadata_sidecar_drift() -> Result<()> {
+        let path = temp_model_dir("online_pa_sidecar_drift");
+        std::fs::create_dir_all(&path)?;
+
+        let artifact = PassiveAggressiveArtifact {
+            model_name: AdaptiveModelKind::PassiveAggressive
+                .model_name()
+                .to_string(),
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            dataset_rows: 8,
+            scaler: FeatureScaler {
+                means: vec![0.0, 0.0],
+                stds: vec![1.0, 1.0],
+            },
+            weights: Array2::zeros((3, 2)),
+            bias: Array1::zeros(3),
+            aggressiveness: 1.0,
+            epochs: 4,
+        };
+        write_json(&path.join(MODEL_FILE_NAME), &artifact)?;
+        let mut drifted = adaptive_runtime_metadata(
+            AdaptiveModelKind::PassiveAggressive.model_name(),
+            artifact.feature_columns.clone(),
+            artifact.dataset_rows,
+        )?;
+        drifted.training_summary.dataset_rows += 1;
+        write_json(&path.join(METADATA_FILE_NAME), &drifted)?;
+
+        let mut expert = OnlinePassiveAggressiveExpert::new(1.0, 4);
+        let err = expert
+            .load(&path)
+            .expect_err("drifted metadata sidecar should fail");
+        assert!(err.to_string().contains("sidecar mismatch"));
+
+        let _ = std::fs::remove_dir_all(&path);
+        Ok(())
+    }
+
+    #[test]
     fn validate_hoeffding_artifact_rejects_unknown_fallback_basis() {
         let artifact = HoeffdingArtifact {
             model_name: AdaptiveModelKind::Hoeffding.model_name().to_string(),
@@ -1658,7 +1822,7 @@ mod tests {
                 AdaptiveModelKind::Hoeffding.model_name(),
                 vec!["f1".to_string(), "f2".to_string()],
                 2,
-            ),
+            )?,
         )?;
 
         let artifact = HoeffdingArtifact {

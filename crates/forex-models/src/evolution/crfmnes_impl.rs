@@ -9,12 +9,14 @@ use std::{cmp::Ordering, f64::consts::PI};
 
 use crate::base::{
     build_runtime_artifact_metadata, build_runtime_prediction_with_details,
-    three_class_runtime_confidence, ExpertModel,
+    three_class_runtime_confidence, try_build_runtime_artifact_metadata, ExpertModel,
 };
 use crate::runtime::artifacts::{
     default_three_class_label_mapping, RuntimeArtifactMetadata, TrainingSummaryMetadata,
 };
-use crate::runtime::capabilities::{CapabilityState, ModelFamily};
+use crate::runtime::capabilities::{
+    append_runtime_degraded_reason, gpu_policy_cpu_fallback_reason, CapabilityState, ModelFamily,
+};
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
     ensure_feature_columns_match, feature_matrix_from_dataframe, read_json,
@@ -25,6 +27,7 @@ const NEURO_EVO_ARTIFACT_FILE_NAME: &str = "neuro_evo.json";
 const NEURO_EVO_MODEL_NAME: &str = "neuro_evo";
 const FALLBACK_BACKEND_NAME: &str = "simple_es_restart_cpu";
 const FALLBACK_DEGRADED_REASON: &str = "crfmnes_backend_degraded_to_simple_es";
+const DEFAULT_MAX_NEURO_EVO_EVALUATIONS: usize = 30_000;
 
 type NeuroEvoParams = (Array2<f32>, Vec<f32>, Array2<f32>, Vec<f32>);
 
@@ -181,6 +184,8 @@ struct NeuroEvoArtifact {
     search_backend: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     runtime_degraded_reason: Option<String>,
+    #[serde(default)]
+    runtime_metadata: Option<RuntimeArtifactMetadata>,
     fitted: bool,
 }
 
@@ -204,6 +209,7 @@ impl Default for NeuroEvoArtifact {
             params: Vec::new(),
             search_backend: FALLBACK_BACKEND_NAME.to_string(),
             runtime_degraded_reason: Some(FALLBACK_DEGRADED_REASON.to_string()),
+            runtime_metadata: None,
             fitted: false,
         }
     }
@@ -228,6 +234,31 @@ pub struct NeuroEvoExpert {
 }
 
 impl NeuroEvoExpert {
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    }
+
+    fn max_evaluations_budget() -> usize {
+        Self::env_usize(
+            "FOREX_NEURO_EVO_MAX_EVALS",
+            DEFAULT_MAX_NEURO_EVO_EVALUATIONS,
+        )
+    }
+
+    fn effective_generation_count_with_budget(&self, max_evaluations_budget: usize) -> usize {
+        let per_generation = self.population.max(1).saturating_mul(self.islands.max(1));
+        let budget_limited = max_evaluations_budget.max(1) / per_generation.max(1);
+        budget_limited.clamp(1, self.generations.max(1))
+    }
+
+    fn effective_generation_count(&self) -> usize {
+        self.effective_generation_count_with_budget(Self::max_evaluations_budget())
+    }
+
     pub fn new(input_dim: usize) -> Self {
         Self::with_config(input_dim, 32, 0.25, 24)
     }
@@ -557,22 +588,32 @@ impl NeuroEvoExpert {
     }
 
     fn runtime_details(&self) -> (Option<String>, Option<String>) {
+        let gpu_cpu_fallback = gpu_policy_cpu_fallback_reason("neuro_evo");
         if !self.fitted {
             return (
                 Some("neuro_evo_unknown".to_string()),
-                Some("neuro_evo_not_fitted".to_string()),
+                append_runtime_degraded_reason(
+                    Some("neuro_evo_not_fitted".to_string()),
+                    gpu_cpu_fallback,
+                ),
             );
         }
         if self.feature_columns.is_empty() {
             return (
                 Some("neuro_evo_unknown".to_string()),
-                Some("neuro_evo_feature_schema_missing".to_string()),
+                append_runtime_degraded_reason(
+                    Some("neuro_evo_feature_schema_missing".to_string()),
+                    gpu_cpu_fallback,
+                ),
             );
         }
         if self.scaler.is_none() || self.params.is_empty() {
             return (
                 Some("neuro_evo_unknown".to_string()),
-                Some("neuro_evo_runtime_state_incomplete".to_string()),
+                append_runtime_degraded_reason(
+                    Some("neuro_evo_runtime_state_incomplete".to_string()),
+                    gpu_cpu_fallback,
+                ),
             );
         }
         let backend = if self.search_backend.trim().is_empty() {
@@ -585,7 +626,10 @@ impl NeuroEvoExpert {
         } else {
             self.runtime_degraded_reason.clone()
         };
-        (Some(backend), degraded_reason)
+        (
+            Some(backend),
+            append_runtime_degraded_reason(degraded_reason, gpu_cpu_fallback),
+        )
     }
 
     fn ensure_runtime_state_ready(&self) -> Result<()> {
@@ -687,10 +731,22 @@ impl ExpertModel for NeuroEvoExpert {
         let param_dim = Self::parameter_dim(self.input_dim, self.hidden_dim);
         let mut best_params = vec![0.0_f32; param_dim];
         let mut best_selection_loss = f64::INFINITY;
+        let effective_generations = self.effective_generation_count();
+
+        if effective_generations < self.generations {
+            tracing::info!(
+                "neuro-evo budget capped generations from {} to {} (population={}, islands={}, max_evals={})",
+                self.generations,
+                effective_generations,
+                self.population,
+                self.islands,
+                Self::max_evaluations_budget()
+            );
+        }
 
         for _ in 0..self.islands.max(1) {
             let mut optimizer = NeuroEvoOptimizer::new(param_dim, self.sigma, self.population);
-            for _ in 0..self.generations {
+            for _ in 0..effective_generations {
                 let candidates = optimizer.ask()?;
                 let mut fitness = Vec::with_capacity(candidates.len());
                 for candidate in &candidates {
@@ -740,17 +796,15 @@ impl ExpertModel for NeuroEvoExpert {
         self.ensure_runtime_state_ready()?;
         std::fs::create_dir_all(path)
             .with_context(|| format!("create neuro-evo directory {}", path.display()))?;
-        write_json(
-            &path.join(METADATA_FILE_NAME),
-            &build_runtime_artifact_metadata(
-                NEURO_EVO_MODEL_NAME,
-                ModelFamily::Evolutionary,
-                CapabilityState::Implemented,
-                self.feature_columns.clone(),
-                default_three_class_label_mapping(),
-                TrainingSummaryMetadata::new(self.dataset_rows, self.train_rows, self.val_rows),
-            ),
+        let runtime_metadata = try_build_runtime_artifact_metadata(
+            NEURO_EVO_MODEL_NAME,
+            ModelFamily::Evolutionary,
+            CapabilityState::Implemented,
+            self.feature_columns.clone(),
+            default_three_class_label_mapping(),
+            TrainingSummaryMetadata::new(self.dataset_rows, self.train_rows, self.val_rows),
         )?;
+        write_json(&path.join(METADATA_FILE_NAME), &runtime_metadata)?;
         write_json(
             &path.join(NEURO_EVO_ARTIFACT_FILE_NAME),
             &NeuroEvoArtifact {
@@ -768,15 +822,15 @@ impl ExpertModel for NeuroEvoExpert {
                 params: self.params.clone(),
                 search_backend: self.search_backend.clone(),
                 runtime_degraded_reason: self.runtime_degraded_reason.clone(),
+                runtime_metadata: Some(runtime_metadata),
                 fitted: self.fitted,
             },
         )
     }
 
     fn load(&mut self, path: &Path) -> Result<()> {
-        let metadata: RuntimeArtifactMetadata = read_json(&path.join(METADATA_FILE_NAME))?;
         let artifact: NeuroEvoArtifact = read_json(&path.join(NEURO_EVO_ARTIFACT_FILE_NAME))?;
-        Self::validate_loaded_metadata(&metadata)?;
+        let metadata = Self::resolve_loaded_metadata(path, &artifact)?;
         Self::validate_loaded_artifact(&metadata, &artifact)?;
 
         let next_input_dim = artifact.input_dim;
@@ -811,6 +865,82 @@ impl ExpertModel for NeuroEvoExpert {
         self.runtime_degraded_reason = next_runtime_degraded_reason;
         self.fitted = next_fitted;
         Ok(())
+    }
+
+    fn metadata_from_artifact(artifact: &NeuroEvoArtifact) -> Result<RuntimeArtifactMetadata> {
+        try_build_runtime_artifact_metadata(
+            NEURO_EVO_MODEL_NAME,
+            ModelFamily::Evolutionary,
+            CapabilityState::Implemented,
+            artifact.feature_columns.clone(),
+            default_three_class_label_mapping(),
+            TrainingSummaryMetadata::new(
+                artifact.dataset_rows,
+                artifact.train_rows,
+                artifact.val_rows,
+            ),
+        )
+    }
+
+    fn validate_metadata_consistency(
+        sidecar: &RuntimeArtifactMetadata,
+        embedded: &RuntimeArtifactMetadata,
+    ) -> Result<()> {
+        if sidecar.model_name != embedded.model_name
+            || sidecar.family != embedded.family
+            || sidecar.state != embedded.state
+        {
+            bail!("neuro-evo metadata identity mismatch between sidecar and embedded payload");
+        }
+        if sidecar.feature_columns != embedded.feature_columns {
+            bail!("neuro-evo metadata feature columns drift between sidecar and embedded");
+        }
+        if sidecar.label_mapping != embedded.label_mapping {
+            bail!("neuro-evo metadata label mapping drift between sidecar and embedded");
+        }
+        if sidecar.training_summary != embedded.training_summary {
+            bail!("neuro-evo metadata training summary drift between sidecar and embedded");
+        }
+        Ok(())
+    }
+
+    fn resolve_loaded_metadata(
+        path: &Path,
+        artifact: &NeuroEvoArtifact,
+    ) -> Result<RuntimeArtifactMetadata> {
+        let metadata_path = path.join(METADATA_FILE_NAME);
+        let reconstructed = Self::metadata_from_artifact(artifact)?;
+        Self::validate_loaded_metadata(&reconstructed)?;
+        match read_json::<RuntimeArtifactMetadata>(&metadata_path) {
+            Ok(sidecar) => {
+                Self::validate_loaded_metadata(&sidecar)?;
+                Self::validate_metadata_consistency(&sidecar, &reconstructed)?;
+                if let Some(embedded) = artifact.runtime_metadata.as_ref() {
+                    Self::validate_loaded_metadata(embedded)?;
+                    Self::validate_metadata_consistency(&sidecar, embedded)?;
+                }
+                Ok(sidecar)
+            }
+            Err(error) => {
+                if let Some(embedded) = artifact.runtime_metadata.as_ref() {
+                    Self::validate_loaded_metadata(embedded)?;
+                    Self::validate_metadata_consistency(embedded, &reconstructed)?;
+                    tracing::warn!(
+                        "neuro-evo metadata sidecar unavailable at {} ({}); falling back to embedded metadata",
+                        metadata_path.display(),
+                        error
+                    );
+                    Ok(embedded.clone())
+                } else {
+                    tracing::warn!(
+                        "neuro-evo metadata sidecar unavailable at {} ({}); reconstructing metadata from artifact",
+                        metadata_path.display(),
+                        error
+                    );
+                    Ok(reconstructed)
+                }
+            }
+        }
     }
 }
 
@@ -968,6 +1098,7 @@ mod tests {
             params: vec![0.0; NeuroEvoExpert::parameter_dim(1, 8)],
             search_backend: FALLBACK_BACKEND_NAME.to_string(),
             runtime_degraded_reason: Some(FALLBACK_DEGRADED_REASON.to_string()),
+            runtime_metadata: None,
             fitted: true,
         };
 
@@ -1005,6 +1136,7 @@ mod tests {
             params: vec![0.0; NeuroEvoExpert::parameter_dim(1, 8)],
             search_backend: FALLBACK_BACKEND_NAME.to_string(),
             runtime_degraded_reason: None,
+            runtime_metadata: None,
             fitted: true,
         };
 
@@ -1042,6 +1174,7 @@ mod tests {
             params: vec![0.0; NeuroEvoExpert::parameter_dim(1, 8)],
             search_backend: "crfmnes_cpu".to_string(),
             runtime_degraded_reason: Some("stale_degraded_reason".to_string()),
+            runtime_metadata: None,
             fitted: true,
         };
 
@@ -1051,6 +1184,98 @@ mod tests {
             .to_string()
             .contains("non-fallback backend may not persist a degraded reason"));
         Ok(())
+    }
+
+    #[test]
+    fn neuro_evo_load_falls_back_to_embedded_metadata_when_sidecar_missing() -> Result<()> {
+        let (features, labels) = {
+            let features = DataFrame::new(vec![
+                Series::new(
+                    "f1".into(),
+                    (0..32).map(|idx| idx as f64).collect::<Vec<_>>(),
+                )
+                .into(),
+                Series::new(
+                    "f2".into(),
+                    (0..32).map(|idx| (idx as f64) * 0.5).collect::<Vec<_>>(),
+                )
+                .into(),
+            ])?;
+            let labels = Series::new(
+                "target".into(),
+                (0..32)
+                    .map(|idx| match idx % 3 {
+                        0 => -1,
+                        1 => 0,
+                        _ => 1,
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            (features, labels)
+        };
+        let mut expert = NeuroEvoExpert::with_config(2, 8, 0.25, 4).with_search_topology(4, 1);
+        expert.fit(&features, &labels)?;
+        let path = temp_model_dir("neuro_evo_sidecar_missing");
+        expert.save(&path)?;
+        std::fs::remove_file(path.join(METADATA_FILE_NAME))?;
+
+        let mut loaded = NeuroEvoExpert::default();
+        loaded.load(&path)?;
+        assert_eq!(loaded.train_rows + loaded.val_rows, loaded.dataset_rows);
+        let _ = std::fs::remove_dir_all(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn neuro_evo_load_rejects_sidecar_drift_against_embedded() -> Result<()> {
+        let (features, labels) = {
+            let features = DataFrame::new(vec![
+                Series::new(
+                    "f1".into(),
+                    (0..32).map(|idx| idx as f64).collect::<Vec<_>>(),
+                )
+                .into(),
+                Series::new(
+                    "f2".into(),
+                    (0..32).map(|idx| (idx as f64) * 0.5).collect::<Vec<_>>(),
+                )
+                .into(),
+            ])?;
+            let labels = Series::new(
+                "target".into(),
+                (0..32)
+                    .map(|idx| match idx % 3 {
+                        0 => -1,
+                        1 => 0,
+                        _ => 1,
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            (features, labels)
+        };
+        let mut expert = NeuroEvoExpert::with_config(2, 8, 0.25, 4).with_search_topology(4, 1);
+        expert.fit(&features, &labels)?;
+        let path = temp_model_dir("neuro_evo_sidecar_drift");
+        expert.save(&path)?;
+
+        let mut sidecar: RuntimeArtifactMetadata = read_json(&path.join(METADATA_FILE_NAME))?;
+        sidecar.training_summary.train_rows = sidecar.training_summary.train_rows.saturating_sub(1);
+        sidecar.training_summary.val_rows += 1;
+        write_json(&path.join(METADATA_FILE_NAME), &sidecar)?;
+
+        let mut loaded = NeuroEvoExpert::default();
+        let err = loaded
+            .load(&path)
+            .expect_err("drifted sidecar metadata should be rejected");
+        assert!(err.to_string().contains("drift"));
+        let _ = std::fs::remove_dir_all(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn neuro_evo_effective_generations_honor_budget() {
+        let expert = NeuroEvoExpert::with_config(8, 16, 0.2, 20).with_search_topology(10, 2);
+        assert_eq!(expert.effective_generation_count_with_budget(120), 6);
     }
 
     #[test]

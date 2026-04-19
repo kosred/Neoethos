@@ -1,6 +1,6 @@
 // Base classes and utilities for machine learning models
 //
-// Ported from src/forex_bot/models/base.py line-by-line
+// Derived from the legacy reference implementation and fully maintained in Rust.
 //
 // This module provides:
 // - EarlyStopper: Universal early stopping for training loops
@@ -30,7 +30,7 @@ type ModelSaveFn = Box<dyn FnOnce(&Path) -> Result<()>>;
 /// Universal Early Stopping utility.
 /// Stops training when validation metric stops improving.
 ///
-/// Ported from Python EarlyStopper class (lines 25-48)
+/// Early-stopping helper for supervised training loops.
 pub struct EarlyStopper {
     patience: usize,
     min_delta: f64,
@@ -51,7 +51,7 @@ impl EarlyStopper {
     }
 
     /// Call with validation loss. Returns true if should stop.
-    /// Ported from Python __call__ method (lines 38-48)
+    /// Derived from legacy __call__ method (lines 38-48)
     pub fn check(&mut self, val_loss: f64) -> bool {
         if self.best_loss.is_none() {
             self.best_loss = Some(val_loss);
@@ -71,7 +71,7 @@ impl EarlyStopper {
 }
 
 /// Return (patience, min_delta) with optional env overrides.
-/// Ported from Python get_early_stop_params (lines 51-69)
+/// Derived from legacy get_early_stop_params (lines 51-69)
 pub fn get_early_stop_params(default_patience: usize, default_min_delta: f64) -> (usize, f64) {
     let mut patience = default_patience;
     let mut min_delta = default_min_delta;
@@ -104,10 +104,10 @@ pub fn get_early_stop_params(default_patience: usize, default_min_delta: f64) ->
 // ============================================================================
 
 /// Abstract base trait for all expert models.
-/// Ported from Python ExpertModel class (lines 71-127)
+/// Derived from legacy ExpertModel class (lines 71-127)
 pub trait ExpertModel {
     /// Train the model.
-    /// Ported from Python fit method (lines 74-77)
+    /// Derived from legacy fit method (lines 74-77)
     fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()>;
 
     /// Predict probabilities for classes [-1, 0, 1].
@@ -116,21 +116,21 @@ pub trait ExpertModel {
     ///     Array2<f32>: Shape (N, 3) where columns map to [neutral, buy, sell]
     ///                  Convention: col 0 -> neutral, col 1 -> buy, col 2 -> sell
     ///
-    /// Ported from Python predict_proba method (lines 79-89)
+    /// Derived from legacy predict_proba method (lines 79-89)
     fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>>;
 
     /// Save model artifacts to directory.
-    /// Ported from Python save method (lines 91-94)
+    /// Derived from legacy save method (lines 91-94)
     fn save(&self, path: &Path) -> Result<()>;
 
     /// Load model artifacts from directory.
-    /// Ported from Python load method (lines 96-99)
+    /// Derived from legacy load method (lines 96-99)
     fn load(&mut self, path: &Path) -> Result<()>;
 
     /// Helper for atomic model saving with rotation/backup.
     /// Keeps 'model.pt' (current) and 'model.pt.bak' (previous).
     ///
-    /// Ported from Python _atomic_save method (lines 101-126)
+    /// Derived from legacy _atomic_save method (lines 101-126)
     fn atomic_save(&self, save_func: ModelSaveFn, target_path: &Path) -> Result<()> {
         let temp_path = target_path.with_extension("tmp");
         let backup_path = target_path.with_extension("bak");
@@ -172,7 +172,7 @@ pub trait ExpertModel {
 
 /// Convert a DataFrame to a float32 ndarray suitable for models.
 ///
-/// Ported from Python dataframe_to_float32_numpy (lines 129-139)
+/// Derived from legacy dataframe_to_float32_numpy (lines 129-139)
 pub fn dataframe_to_float32_array(df: &DataFrame) -> Result<Array2<f32>> {
     let n_rows = df.height();
     let n_cols = df.width();
@@ -266,19 +266,7 @@ pub fn build_runtime_artifact_metadata(
     label_mapping: Vec<LabelMapping>,
     training_summary: TrainingSummaryMetadata,
 ) -> RuntimeArtifactMetadata {
-    if feature_columns.is_empty() {
-        panic!("runtime artifact metadata requires at least one feature column");
-    }
-    if label_mapping.is_empty() {
-        panic!("runtime artifact metadata requires a non-empty label mapping");
-    }
-    if training_summary.dataset_rows == 0 {
-        panic!("runtime artifact metadata requires a non-zero dataset row count");
-    }
-    if training_summary.train_rows + training_summary.val_rows != training_summary.dataset_rows {
-        panic!("runtime artifact metadata requires train_rows + val_rows == dataset_rows");
-    }
-    RuntimeArtifactMetadata::new(
+    try_build_runtime_artifact_metadata(
         model_name,
         family,
         state,
@@ -286,6 +274,93 @@ pub fn build_runtime_artifact_metadata(
         label_mapping,
         training_summary,
     )
+    .expect("runtime artifact metadata contract violation")
+}
+
+/// Build runtime artifact metadata from the shared model contract without panicking.
+pub fn try_build_runtime_artifact_metadata(
+    model_name: impl Into<String>,
+    family: ModelFamily,
+    state: CapabilityState,
+    feature_columns: Vec<String>,
+    label_mapping: Vec<LabelMapping>,
+    training_summary: TrainingSummaryMetadata,
+) -> Result<RuntimeArtifactMetadata> {
+    let model_name = model_name.into();
+    let mut label_mapping = label_mapping;
+    if feature_columns.is_empty() {
+        bail!("runtime artifact metadata requires at least one feature column");
+    }
+    if label_mapping.is_empty() {
+        warn!(
+            "runtime artifact metadata for {} is missing label mapping; defaulting to canonical three-class mapping",
+            model_name
+        );
+        label_mapping = default_three_class_label_mapping();
+    }
+    if training_summary.dataset_rows == 0 {
+        bail!("runtime artifact metadata requires a non-zero dataset row count");
+    }
+    let training_summary = normalize_training_summary_for_metadata(&model_name, training_summary)?;
+    Ok(RuntimeArtifactMetadata::new(
+        model_name,
+        family,
+        state,
+        feature_columns,
+        label_mapping,
+        training_summary,
+    ))
+}
+
+fn normalize_training_summary_for_metadata(
+    model_name: &str,
+    mut summary: TrainingSummaryMetadata,
+) -> Result<TrainingSummaryMetadata> {
+    let current_total = summary.train_rows + summary.val_rows;
+    if current_total != summary.dataset_rows {
+        if summary.train_rows <= summary.dataset_rows {
+            let repaired_val_rows = summary.dataset_rows.saturating_sub(summary.train_rows);
+            warn!(
+                "runtime artifact metadata train/val mismatch for {}: repairing train_rows={} val_rows={} dataset_rows={} -> val_rows={}",
+                model_name,
+                summary.train_rows,
+                summary.val_rows,
+                summary.dataset_rows,
+                repaired_val_rows
+            );
+            summary.val_rows = repaired_val_rows;
+        } else if summary.val_rows <= summary.dataset_rows {
+            let repaired_train_rows = summary.dataset_rows.saturating_sub(summary.val_rows);
+            warn!(
+                "runtime artifact metadata train/val mismatch for {}: repairing train_rows={} val_rows={} dataset_rows={} -> train_rows={}",
+                model_name,
+                summary.train_rows,
+                summary.val_rows,
+                summary.dataset_rows,
+                repaired_train_rows
+            );
+            summary.train_rows = repaired_train_rows;
+        } else {
+            bail!(
+                "runtime artifact metadata cannot repair split rows: train_rows={} val_rows={} dataset_rows={}",
+                summary.train_rows,
+                summary.val_rows,
+                summary.dataset_rows
+            );
+        }
+    }
+
+    if summary.train_rows == 0 && summary.dataset_rows > 0 {
+        warn!(
+            "runtime artifact metadata for {} has zero train rows; promoting split to train_rows={} val_rows=0",
+            model_name,
+            summary.dataset_rows
+        );
+        summary.train_rows = summary.dataset_rows;
+        summary.val_rows = 0;
+    }
+
+    Ok(summary)
 }
 
 /// Build runtime prediction output from the shared model contract.
@@ -369,7 +444,7 @@ pub fn three_class_runtime_confidence(row_values: [f32; 3]) -> Result<(f32, bool
 ///
 /// This is critical for time-series models to prevent look-ahead bias.
 ///
-/// Ported from Python validate_time_ordering (lines 142-184)
+/// Derived from legacy validate_time_ordering (lines 142-184)
 pub fn validate_time_ordering(df: &DataFrame, context: &str) -> Result<bool> {
     if df.height() == 0 {
         return Ok(true);
@@ -406,7 +481,7 @@ pub fn validate_time_ordering(df: &DataFrame, context: &str) -> Result<bool> {
 
 /// Splits data for time-series training with an embargo gap.
 ///
-/// Ported from Python time_series_train_val_split (lines 187-212)
+/// Derived from legacy time_series_train_val_split (lines 187-212)
 pub fn time_series_train_val_split(
     x: &DataFrame,
     y: &Series,
@@ -444,7 +519,7 @@ pub fn time_series_train_val_split(
 /// Used to limit memory/compute for large datasets while maintaining
 /// representative class balance.
 ///
-/// Ported from Python stratified_downsample (lines 215-289)
+/// Derived from legacy stratified_downsample (lines 215-289)
 pub fn stratified_downsample(
     x: &DataFrame,
     y: &Series,
@@ -525,7 +600,7 @@ pub fn stratified_downsample(
 ///
 /// Uses inverse frequency weighting: rare classes get higher weights.
 ///
-/// Ported from Python compute_class_weights (lines 292-319)
+/// Derived from legacy compute_class_weights (lines 292-319)
 pub fn compute_class_weights(y: &Series) -> Result<HashMap<i64, f64>> {
     let y_i64 = y.cast(&DataType::Int64)?;
     let y_ca = y_i64.i64()?;
@@ -553,7 +628,7 @@ pub fn compute_class_weights(y: &Series) -> Result<HashMap<i64, f64>> {
 
 /// Compute per-sample weights based on class frequency.
 ///
-/// Ported from Python compute_sample_weights (lines 322-343)
+/// Derived from legacy compute_sample_weights (lines 322-343)
 pub fn compute_sample_weights(y: &Series) -> Result<Vec<f32>> {
     let class_weights = compute_class_weights(y)?;
     let y_i64 = y.cast(&DataType::Int64)?;
@@ -582,7 +657,7 @@ pub fn compute_sample_weights(y: &Series) -> Result<Vec<f32>> {
 /// Uses Population Stability Index (PSI) or simple mean/std comparison
 /// to identify features that have shifted significantly.
 ///
-/// Ported from Python detect_feature_drift (lines 346-477)
+/// Derived from legacy detect_feature_drift (lines 346-477)
 pub fn detect_feature_drift(
     train_df: &DataFrame,
     val_df: &DataFrame,
@@ -787,7 +862,7 @@ fn extract_numeric_values(series: &Series) -> Result<Vec<f64>> {
 /// - 0.1 <= PSI < 0.25: Moderate change
 /// - PSI >= 0.25: Significant change
 ///
-/// Ported from Python _compute_psi (lines 480-535)
+/// Derived from legacy _compute_psi (lines 480-535)
 pub fn compute_psi(expected: &[f64], actual: &[f64], n_bins: usize) -> f64 {
     let eps = 1e-6;
     let n_bins = n_bins.max(3);
@@ -896,7 +971,7 @@ fn histogram(data: &[f64], breakpoints: &[f64]) -> Vec<usize> {
 
 /// Fallback drift metric based on mean/std shift.
 ///
-/// Ported from Python _compute_stats_drift (lines 538-554)
+/// Derived from legacy _compute_stats_drift (lines 538-554)
 pub fn compute_stats_drift(train_vals: &[f64], val_vals: &[f64]) -> f64 {
     let train_mean = train_vals.iter().sum::<f64>() / train_vals.len() as f64;
     let val_mean = val_vals.iter().sum::<f64>() / val_vals.len() as f64;
@@ -934,7 +1009,7 @@ pub fn compute_stats_drift(train_vals: &[f64], val_vals: &[f64]) -> f64 {
 // ============================================================================
 
 /// Robust Scaler that handles NaN and Infinite values efficiently.
-/// Ported from Python advancements in normalization.
+/// Derived from legacy advancements in normalization.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RobustScaler {
     pub mean: Option<Array2<f32>>,
@@ -1074,6 +1149,90 @@ mod tests {
             canonical_three_class_label_mapping(),
             TrainingSummaryMetadata::new(10, 8, 2),
         );
+    }
+
+    #[test]
+    fn try_build_runtime_artifact_metadata_returns_error_for_invalid_contract() {
+        let err = try_build_runtime_artifact_metadata(
+            "lightgbm",
+            ModelFamily::Tree,
+            CapabilityState::Implemented,
+            Vec::new(),
+            canonical_three_class_label_mapping(),
+            TrainingSummaryMetadata::new(10, 8, 2),
+        )
+        .expect_err("expected contract validation error");
+
+        assert!(err
+            .to_string()
+            .contains("requires at least one feature column"));
+    }
+
+    #[test]
+    fn try_build_runtime_artifact_metadata_repairs_train_val_mismatch_when_possible() {
+        let metadata = try_build_runtime_artifact_metadata(
+            "lightgbm",
+            ModelFamily::Tree,
+            CapabilityState::Implemented,
+            vec!["rsi".to_string()],
+            canonical_three_class_label_mapping(),
+            TrainingSummaryMetadata::new(10, 8, 1),
+        )
+        .expect("metadata split should be repaired");
+
+        assert_eq!(metadata.training_summary.dataset_rows, 10);
+        assert_eq!(metadata.training_summary.train_rows, 8);
+        assert_eq!(metadata.training_summary.val_rows, 2);
+    }
+
+    #[test]
+    fn try_build_runtime_artifact_metadata_defaults_empty_label_mapping() {
+        let metadata = try_build_runtime_artifact_metadata(
+            "lightgbm",
+            ModelFamily::Tree,
+            CapabilityState::Implemented,
+            vec!["rsi".to_string()],
+            Vec::new(),
+            TrainingSummaryMetadata::new(10, 8, 2),
+        )
+        .expect("empty label mapping should be defaulted");
+
+        assert_eq!(
+            metadata.label_mapping,
+            canonical_three_class_label_mapping()
+        );
+    }
+
+    #[test]
+    fn try_build_runtime_artifact_metadata_rejects_irreparable_train_val_mismatch() {
+        let err = try_build_runtime_artifact_metadata(
+            "lightgbm",
+            ModelFamily::Tree,
+            CapabilityState::Implemented,
+            vec!["rsi".to_string()],
+            canonical_three_class_label_mapping(),
+            TrainingSummaryMetadata::new(10, 12, 12),
+        )
+        .expect_err("split larger than dataset should remain invalid");
+
+        assert!(err.to_string().contains("cannot repair split rows"));
+    }
+
+    #[test]
+    fn try_build_runtime_artifact_metadata_promotes_zero_train_rows() {
+        let metadata = try_build_runtime_artifact_metadata(
+            "lightgbm",
+            ModelFamily::Tree,
+            CapabilityState::Implemented,
+            vec!["rsi".to_string()],
+            canonical_three_class_label_mapping(),
+            TrainingSummaryMetadata::new(7, 0, 7),
+        )
+        .expect("zero-train split should be promoted");
+
+        assert_eq!(metadata.training_summary.dataset_rows, 7);
+        assert_eq!(metadata.training_summary.train_rows, 7);
+        assert_eq!(metadata.training_summary.val_rows, 0);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use super::common::{
 use super::config::*;
 use crate::base::ExpertModel;
 use crate::base::{compute_sample_weights, feature_columns_from_dataframe};
-use crate::runtime::artifacts::TrainingSummaryMetadata;
+use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::ModelFamily;
 use crate::runtime::prediction::RuntimePrediction;
 use anyhow::{bail, Context, Result};
@@ -769,7 +769,7 @@ impl ExpertModel for XGBoostExpert {
                 "xgboost",
                 self.feature_columns.clone(),
                 self.stored_training_summary(),
-            );
+            )?;
             let (model_path, metadata_path) = tree_artifact_paths(path, XGBOOST_MODEL_FILE_NAME);
             write_runtime_metadata(&metadata_path, &metadata)?;
             if let Some(model) = self._model.as_ref() {
@@ -795,7 +795,7 @@ impl ExpertModel for XGBoostExpert {
                 "xgboost",
                 self.feature_columns.clone(),
                 self.stored_training_summary(),
-            );
+            )?;
             let (_, metadata_path) = tree_artifact_paths(path, XGBOOST_MODEL_FILE_NAME);
             write_runtime_metadata(&metadata_path, &metadata)?;
             self.persist_local_runtime_artifact(path)?;
@@ -807,26 +807,55 @@ impl ExpertModel for XGBoostExpert {
         #[cfg(feature = "xgboost")]
         {
             let (model_path, metadata_path) = tree_artifact_paths(path, XGBOOST_MODEL_FILE_NAME);
-            let metadata = read_runtime_metadata(&metadata_path)?;
-            if metadata.model_name != "xgboost" || metadata.family != ModelFamily::Tree {
-                bail!(
-                    "XGBoost runtime metadata mismatch: expected tree/xgboost, got {}/{}",
-                    metadata.family,
-                    metadata.model_name
+            let runtime_artifact = Self::read_runtime_artifact(path)?;
+            self.local_fallback = Self::read_local_runtime_artifact(path)?;
+            let metadata: RuntimeArtifactMetadata = if metadata_path.exists() {
+                let metadata = read_runtime_metadata(&metadata_path)?;
+                if metadata.model_name != "xgboost" || metadata.family != ModelFamily::Tree {
+                    bail!(
+                        "XGBoost runtime metadata mismatch: expected tree/xgboost, got {}/{}",
+                        metadata.family,
+                        metadata.model_name
+                    );
+                }
+                if metadata.feature_columns.is_empty() {
+                    bail!("XGBoost runtime metadata must contain at least one feature column");
+                }
+                metadata
+            } else {
+                let (feature_columns, training_summary) = if let Some(artifact) =
+                    runtime_artifact.as_ref()
+                {
+                    (
+                        artifact.feature_columns.clone(),
+                        artifact.training_summary.clone(),
+                    )
+                } else if let Some(fallback) = self.local_fallback.as_ref() {
+                    (
+                        fallback.feature_columns.clone(),
+                        fallback.training_summary.clone(),
+                    )
+                } else {
+                    bail!(
+                        "XGBoost metadata sidecar missing and no runtime/local artifact is available at {}",
+                        path.display()
+                    );
+                };
+                let metadata = tree_runtime_metadata("xgboost", feature_columns, training_summary)?;
+                tracing::warn!(
+                    path = %path.display(),
+                    "XGBoost metadata sidecar missing; reconstructing from persisted runtime artifacts"
                 );
-            }
-            if metadata.feature_columns.is_empty() {
-                bail!("XGBoost runtime metadata must contain at least one feature column");
-            }
+                metadata
+            };
             let metadata_feature_columns = metadata.feature_columns.clone();
             let metadata_training_summary = metadata.training_summary.clone();
             self.feature_columns = metadata.feature_columns;
             self.training_summary = Some(metadata.training_summary);
-            self.local_fallback = Self::read_local_runtime_artifact(path)?;
             if let Some(fallback) = self.local_fallback.as_ref() {
                 validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
             }
-            if let Some(artifact) = Self::read_runtime_artifact(path)? {
+            if let Some(artifact) = runtime_artifact {
                 Self::validate_runtime_artifact(
                     &artifact,
                     &metadata_feature_columns,
@@ -963,20 +992,41 @@ impl ExpertModel for XGBoostExpert {
         #[cfg(not(feature = "xgboost"))]
         {
             let (_, metadata_path) = tree_artifact_paths(path, XGBOOST_MODEL_FILE_NAME);
-            let metadata = read_runtime_metadata(&metadata_path)?;
-            if metadata.model_name != "xgboost" || metadata.family != ModelFamily::Tree {
-                anyhow::bail!(
-                    "XGBoost runtime metadata mismatch: expected tree/xgboost, got {}/{}",
-                    metadata.family,
-                    metadata.model_name
+            self.local_fallback = Self::read_local_runtime_artifact(path)?;
+            let metadata = if metadata_path.exists() {
+                let metadata = read_runtime_metadata(&metadata_path)?;
+                if metadata.model_name != "xgboost" || metadata.family != ModelFamily::Tree {
+                    anyhow::bail!(
+                        "XGBoost runtime metadata mismatch: expected tree/xgboost, got {}/{}",
+                        metadata.family,
+                        metadata.model_name
+                    );
+                }
+                if metadata.feature_columns.is_empty() {
+                    anyhow::bail!(
+                        "XGBoost runtime metadata must contain at least one feature column"
+                    );
+                }
+                metadata
+            } else if let Some(fallback) = self.local_fallback.as_ref() {
+                let metadata = tree_runtime_metadata(
+                    "xgboost",
+                    fallback.feature_columns.clone(),
+                    fallback.training_summary.clone(),
+                )?;
+                tracing::warn!(
+                    path = %path.display(),
+                    "XGBoost metadata sidecar missing; reconstructing from local fallback artifact"
                 );
-            }
-            if metadata.feature_columns.is_empty() {
-                anyhow::bail!("XGBoost runtime metadata must contain at least one feature column");
-            }
+                metadata
+            } else {
+                anyhow::bail!(
+                    "XGBoost metadata sidecar missing and local fallback artifact missing at {}",
+                    path.display()
+                );
+            };
             self.feature_columns = metadata.feature_columns;
             self.training_summary = Some(metadata.training_summary);
-            self.local_fallback = Self::read_local_runtime_artifact(path)?;
             if let Some(fallback) = self.local_fallback.as_ref() {
                 validate_tree_local_fallback_artifact(fallback, &self.feature_columns)?;
             }
@@ -1210,5 +1260,24 @@ mod tests {
                 "expected persisted probabilities to round-trip, left={lhs}, right={rhs}"
             );
         }
+    }
+
+    #[test]
+    fn xgboost_load_uses_runtime_artifacts_when_metadata_sidecar_missing() {
+        let (x, y) = sample_three_class_dataset();
+        let artifact_dir = unique_temp_dir("xgboost-missing-metadata-sidecar");
+
+        let mut expert = XGBoostExpert::new(11, None);
+        expert.fit(&x, &y).expect("fit should succeed");
+        expert.save(&artifact_dir).expect("save should succeed");
+        std::fs::remove_file(artifact_dir.join("metadata.json"))
+            .expect("remove metadata sidecar to trigger reconstruction");
+
+        let mut loaded = XGBoostExpert::new(11, None);
+        loaded
+            .load(&artifact_dir)
+            .expect("load should reconstruct metadata from persisted runtime artifacts");
+        let probabilities = loaded.predict_proba(&x).expect("prediction should succeed");
+        assert_eq!(probabilities.dim(), (x.height(), 3));
     }
 }
