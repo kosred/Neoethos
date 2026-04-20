@@ -1,5 +1,4 @@
 use crate::app_record;
-use crate::app_services::ServiceEvent;
 use crate::app_services::broker_config::{
     AdapterReadinessSnapshot, BrokerAccountTarget, BrokerSessionState, BrokerSettingsState,
     CTraderBrokerEnvironment,
@@ -17,46 +16,133 @@ use crate::app_services::ctrader_bootstrap::{
     bootstrap_from_ctrader_history, plan_bootstrap_chunks,
 };
 use crate::app_services::ctrader_data::{
-    CTraderChartHistoryRequest, CTraderSymbolInfo, CTraderSymbolLookupRequest, HistoricalBar,
-    load_chart_history, resolve_symbol,
+    load_chart_history, resolve_symbol, CTraderChartHistoryRequest, CTraderSymbolInfo,
+    CTraderSymbolLookupRequest, HistoricalBar,
 };
 use crate::app_services::ctrader_execution::{
     CTraderExecutionBackend, CTraderExecutionOutcome, CTraderExecutionRequest,
     CTraderExecutionRuntimeRequest, CTraderExecutionStatus, ProductionCTraderExecutionBackend,
 };
 use crate::app_services::ctrader_live_auth::{
-    CTRADER_DEFAULT_SCOPE, CTraderAccountDiscoveryBackend, CTraderAccountDiscoveryRequest,
+    build_default_loopback_config, CTraderAccountDiscoveryBackend, CTraderAccountDiscoveryRequest,
     CTraderEnvironment, CTraderLiveAuthBackend, CTraderLiveAuthRequest, CTraderLiveAuthResult,
-    CTraderTokenRefreshRequest, ProductionCTraderLiveAuthBackend, build_default_loopback_config,
+    CTraderTokenRefreshRequest, ProductionCTraderLiveAuthBackend, CTRADER_DEFAULT_SCOPE,
 };
 use crate::app_services::ctrader_messages::{
-    CTraderAmendOrderRequest, CTraderCancelOrderRequest, CTraderClosePositionRequest,
-    CTraderNewOrderRequest, CTraderOrderTriggerMethod, CTraderOrderType, CTraderTimeInForce,
-    CTraderTradeSide, SUPPORTED_CTRADER_ORDER_TRIGGER_METHODS, SUPPORTED_CTRADER_ORDER_TYPES,
-    SUPPORTED_CTRADER_TIME_IN_FORCE, SUPPORTED_CTRADER_TRADE_SIDES, build_amend_order_request,
-    build_cancel_order_request, build_close_position_request, build_new_order_request,
+    build_amend_order_request, build_cancel_order_request, build_close_position_request,
+    build_new_order_request, CTraderAmendOrderRequest, CTraderCancelOrderRequest,
+    CTraderClosePositionRequest, CTraderNewOrderRequest, CTraderOrderTriggerMethod,
+    CTraderOrderType, CTraderTimeInForce, CTraderTradeSide,
+    SUPPORTED_CTRADER_ORDER_TRIGGER_METHODS, SUPPORTED_CTRADER_ORDER_TYPES,
+    SUPPORTED_CTRADER_TIME_IN_FORCE, SUPPORTED_CTRADER_TRADE_SIDES,
 };
 use crate::app_services::ctrader_streaming::{
-    CTraderLiveChartUpdate, CTraderLiveChartUpdateRequest, CTraderLiveStreamingBackend,
-    ProductionCTraderLiveStreamingBackend, merge_live_spot_update_into_bars,
+    merge_live_spot_update_into_bars, CTraderLiveChartUpdate, CTraderLiveChartUpdateRequest,
+    CTraderLiveStreamingBackend, ProductionCTraderLiveStreamingBackend,
 };
-use crate::app_services::jobs::{JobEventLevel, JobKind, JobSnapshot, JobState, push_recent_event};
+use crate::app_services::jobs::{push_recent_event, JobEventLevel, JobKind, JobSnapshot, JobState};
 use crate::app_services::secure_store::{
     CTraderSecureStore, CTraderTokenStore, KeyringSecretStoreBackend,
 };
+use crate::app_services::ServiceEvent;
 use crate::app_state::{AppState, DataSource, OrderTicketState};
 use anyhow::Context;
 use forex_core::logging::write_subsystem_record;
 use forex_core::sectioned_log::SubsystemSection;
-use forex_data::{Ohlcv, discover_timeframes, load_symbol_timeframe};
+use forex_data::{discover_timeframes, load_symbol_timeframe, Ohlcv};
+#[cfg(not(feature = "legacy-mt5"))]
+use legacy_mt5_stub::{DealInfo, MT5Engine, PendingOrderInfo, PositionInfo};
+#[cfg(feature = "legacy-mt5")]
 use mt5_bridge::{DealInfo, MT5Engine, PendingOrderInfo, PositionInfo};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::error;
 
 const CTRADER_TOKEN_REFRESH_WINDOW_SECS: i64 = 300;
+
+#[cfg(not(feature = "legacy-mt5"))]
+mod legacy_mt5_stub {
+    #[derive(Debug)]
+    pub struct MT5Engine;
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct PositionInfo {
+        pub ticket: i64,
+        pub symbol: String,
+        pub order_side: String,
+        pub volume: f64,
+        pub price_open: f64,
+        pub price_current: f64,
+        pub profit: f64,
+        pub stop_loss: f64,
+        pub take_profit: f64,
+        pub comment: String,
+        pub opened_at: i64,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct PendingOrderInfo {
+        pub ticket: i64,
+        pub symbol: String,
+        pub order_kind: String,
+        pub volume_initial: f64,
+        pub price_open: f64,
+        pub stop_loss: f64,
+        pub take_profit: f64,
+        pub comment: String,
+        pub created_at: i64,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct DealInfo {
+        pub ticket: i64,
+        pub order_ticket: i64,
+        pub position_id: i64,
+        pub symbol: String,
+        pub entry_kind: String,
+        pub order_side: String,
+        pub volume: f64,
+        pub price: f64,
+        pub profit: f64,
+        pub fee: f64,
+        pub comment: String,
+        pub executed_at: i64,
+    }
+
+    impl MT5Engine {
+        pub fn new() -> anyhow::Result<Self> {
+            Err(anyhow::anyhow!(
+                "legacy MT5 bridge is disabled; rebuild forex-app with --features legacy-mt5"
+            ))
+        }
+
+        pub fn initialize(&mut self) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        pub fn terminal_info(&self) -> anyhow::Result<String> {
+            Err(anyhow::anyhow!("legacy MT5 bridge is disabled"))
+        }
+
+        pub fn positions(&self, _symbol: Option<&str>) -> anyhow::Result<Vec<PositionInfo>> {
+            Err(anyhow::anyhow!("legacy MT5 bridge is disabled"))
+        }
+
+        pub fn orders(&self, _symbol: Option<&str>) -> anyhow::Result<Vec<PendingOrderInfo>> {
+            Err(anyhow::anyhow!("legacy MT5 bridge is disabled"))
+        }
+
+        pub fn recent_deals(
+            &self,
+            _symbol: Option<&str>,
+            _lookback_hours: i64,
+        ) -> anyhow::Result<Vec<DealInfo>> {
+            Err(anyhow::anyhow!("legacy MT5 bridge is disabled"))
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradingAdapterKind {
@@ -95,11 +181,16 @@ impl TradingAdapterKind {
     }
 }
 
+#[cfg(feature = "legacy-mt5")]
 pub const SUPPORTED_TRADING_ADAPTERS: [TradingAdapterKind; 3] = [
     TradingAdapterKind::Mt5,
     TradingAdapterKind::CTrader,
     TradingAdapterKind::DxTrade,
 ];
+
+#[cfg(not(feature = "legacy-mt5"))]
+pub const SUPPORTED_TRADING_ADAPTERS: [TradingAdapterKind; 2] =
+    [TradingAdapterKind::CTrader, TradingAdapterKind::DxTrade];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradingPanelMode {
@@ -985,11 +1076,11 @@ impl TradingSession {
         };
         let timeframe =
             preferred_chart_timeframe(&available_timeframes, state.chart_timeframe.as_str());
-        let ctrader_environment = matches!(state.data_source, DataSource::MT5)
+        let ctrader_environment = matches!(state.data_source, DataSource::CTrader)
             .then_some(adapter_kind)
             .filter(|kind| matches!(kind, TradingAdapterKind::CTrader))
             .map(|_| self.selected_ctrader_environment());
-        let ctrader_account_id = matches!(state.data_source, DataSource::MT5)
+        let ctrader_account_id = matches!(state.data_source, DataSource::CTrader)
             .then_some(adapter_kind)
             .filter(|kind| matches!(kind, TradingAdapterKind::CTrader))
             .and_then(|_| self.selected_ctrader_chart_account_id());
@@ -1004,7 +1095,7 @@ impl TradingSession {
         };
 
         if let Some(cache) = &self.market_chart_cache {
-            let is_live_ctrader_chart = matches!(state.data_source, DataSource::MT5)
+            let is_live_ctrader_chart = matches!(state.data_source, DataSource::CTrader)
                 && matches!(adapter_kind, TradingAdapterKind::CTrader)
                 && self.connected;
             if cache.key == cache_key
@@ -1021,7 +1112,7 @@ impl TradingSession {
             available_timeframes.clone()
         };
         let snapshot = match (state.data_source, adapter_kind) {
-            (DataSource::MT5, TradingAdapterKind::CTrader) => self
+            (DataSource::CTrader, TradingAdapterKind::CTrader) => self
                 .load_ctrader_market_chart_snapshot(
                     &state.selected_pair,
                     &timeframe,
@@ -1433,6 +1524,7 @@ impl TradingSession {
         self.configured_adapter = kind;
         state.status_msg = match state.data_source {
             DataSource::Local => "Local Mode".to_string(),
+            DataSource::CTrader => format!("{} selected · disconnected", kind.as_str()),
             DataSource::MT5 => format!("{} selected · disconnected", kind.as_str()),
         };
         if matches!(kind, TradingAdapterKind::CTrader) {
@@ -1456,6 +1548,21 @@ impl TradingSession {
             DataSource::Local => {
                 "Trade overlays unavailable in Local mode until execution events are wired.".to_string()
             }
+            DataSource::CTrader => match self.active_adapter_kind() {
+                TradingAdapterKind::CTrader if !self.connected => {
+                    "Trade overlays unavailable while the cTrader runtime is disconnected."
+                        .to_string()
+                }
+                TradingAdapterKind::CTrader => {
+                    "Trade overlays will appear here once cTrader positions, fills, and bot execution events are wired.".to_string()
+                }
+                TradingAdapterKind::DxTrade => {
+                    "Trade overlays will appear here once DXtrade execution events are wired.".to_string()
+                }
+                TradingAdapterKind::Mt5 => {
+                    "MT5 is legacy-only; use cTrader for the canonical live runtime.".to_string()
+                }
+            },
             DataSource::MT5 => match self.active_adapter_kind() {
                 TradingAdapterKind::Mt5 if !self.connected => {
                     "Trade overlays unavailable while the trading runtime is disconnected.".to_string()
@@ -1484,6 +1591,19 @@ impl TradingSession {
         match state.data_source {
             DataSource::Local => ExecutionFeedHandle::Unavailable {
                 reason: "Execution feed is unavailable in Local mode.".to_string(),
+            },
+            DataSource::CTrader => match &self.adapter {
+                Some(TradingAdapter::CTrader(runtime)) if self.connected => {
+                    ExecutionFeedHandle::CTrader(runtime)
+                }
+                Some(TradingAdapter::Mt5(engine)) if self.connected => {
+                    ExecutionFeedHandle::Mt5(engine)
+                }
+                _ => ExecutionFeedHandle::Unavailable {
+                    reason: self
+                        .active_adapter_kind()
+                        .execution_feed_unavailable_reason(self.connected),
+                },
             },
             DataSource::MT5 => match &self.adapter {
                 Some(TradingAdapter::Mt5(engine)) if self.connected => {
@@ -2257,7 +2377,7 @@ impl TradingSession {
 impl Default for TradingSession {
     fn default() -> Self {
         Self {
-            configured_adapter: TradingAdapterKind::Mt5,
+            configured_adapter: TradingAdapterKind::CTrader,
             broker_settings: BrokerSettingsState::default(),
             ctrader_auth: None,
             ctrader_live_auth_backend: Arc::new(ProductionCTraderLiveAuthBackend),
@@ -2565,6 +2685,8 @@ fn current_unix_seconds() -> anyhow::Result<i64> {
 pub fn panel_mode(data_source: DataSource, connected: bool) -> TradingPanelMode {
     match (data_source, connected) {
         (DataSource::Local, _) => TradingPanelMode::LocalOnly,
+        (DataSource::CTrader, false) => TradingPanelMode::Disconnected,
+        (DataSource::CTrader, true) => TradingPanelMode::Connected,
         (DataSource::MT5, false) => TradingPanelMode::Disconnected,
         (DataSource::MT5, true) => TradingPanelMode::Connected,
     }
@@ -3493,7 +3615,6 @@ mod tests {
     use crate::app_state::AppRuntimeConfig;
     use forex_core::config::RiskConfig;
     use forex_data::Ohlcv;
-    use mt5_bridge::{DealInfo, PendingOrderInfo, PositionInfo};
     use std::path::PathBuf;
 
     fn sample_state(source: DataSource, status_msg: &str) -> AppState {
@@ -3552,11 +3673,9 @@ mod tests {
         assert_eq!(snapshot.mode, TradingPanelMode::Connected);
         assert!(snapshot.connected);
         assert_eq!(snapshot.status_text, "Connected");
-        assert!(
-            snapshot
-                .terminal_info
-                .contains("TerminalInfo(community_account=False")
-        );
+        assert!(snapshot
+            .terminal_info
+            .contains("TerminalInfo(community_account=False"));
     }
 
     #[test]
@@ -3564,6 +3683,14 @@ mod tests {
         assert_eq!(
             panel_mode(DataSource::Local, false),
             TradingPanelMode::LocalOnly
+        );
+        assert_eq!(
+            panel_mode(DataSource::CTrader, false),
+            TradingPanelMode::Disconnected
+        );
+        assert_eq!(
+            panel_mode(DataSource::CTrader, true),
+            TradingPanelMode::Connected
         );
         assert_eq!(
             panel_mode(DataSource::MT5, false),
@@ -3590,7 +3717,7 @@ mod tests {
 
     #[test]
     fn connection_snapshot_reports_remote_api_metadata_for_stubbed_ctrader() {
-        let state = sample_state(DataSource::MT5, "Offline");
+        let state = sample_state(DataSource::CTrader, "Offline");
         let session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
 
         let snapshot = session.snapshot(&state);
@@ -3605,7 +3732,7 @@ mod tests {
 
     #[test]
     fn connection_snapshot_reports_remote_api_metadata_for_stubbed_dxtrade() {
-        let state = sample_state(DataSource::MT5, "Offline");
+        let state = sample_state(DataSource::CTrader, "Offline");
         let session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::DxTrade);
 
         let snapshot = session.snapshot(&state);
@@ -3720,7 +3847,7 @@ mod tests {
 
     #[test]
     fn market_chart_snapshot_reports_ctrader_requirements_instead_of_fake_fallback() {
-        let state = sample_state(DataSource::MT5, "Offline");
+        let state = sample_state(DataSource::CTrader, "Offline");
         let mut session =
             TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
@@ -3734,12 +3861,10 @@ mod tests {
             snapshot.available_timeframes.first().map(String::as_str),
             Some("M1")
         );
-        assert!(
-            snapshot
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("stored token bundle"))
-        );
+        assert!(snapshot
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("stored token bundle")));
         assert!(snapshot.headline.contains("No cTrader market data loaded"));
     }
 
@@ -3754,24 +3879,18 @@ mod tests {
         assert_eq!(snapshot.symbol, "EURUSD");
         assert_eq!(snapshot.adapter_name, "cTrader");
         assert_eq!(snapshot.primary_actions.len(), 2);
-        assert!(
-            snapshot
-                .primary_actions
-                .iter()
-                .all(|action| !action.enabled)
-        );
-        assert!(
-            snapshot
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("Local mode"))
-        );
-        assert!(
-            snapshot
-                .diagnostics
-                .iter()
-                .any(|line| line.contains("central broker background loop"))
-        );
+        assert!(snapshot
+            .primary_actions
+            .iter()
+            .all(|action| !action.enabled));
+        assert!(snapshot
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Local mode")));
+        assert!(snapshot
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("central broker background loop")));
     }
 
     #[test]
@@ -3829,30 +3948,24 @@ mod tests {
             Vec::new(),
         );
 
-        assert!(
-            snapshot
-                .positions
-                .iter()
-                .any(|line| line.contains("BUY 0.20"))
-        );
-        assert!(
-            snapshot
-                .pending_orders
-                .iter()
-                .any(|line| line.contains("BUY_LIMIT 0.15"))
-        );
-        assert!(
-            snapshot
-                .bot_timeline
-                .iter()
-                .any(|line| line.contains("IN BUY 0.15"))
-        );
+        assert!(snapshot
+            .positions
+            .iter()
+            .any(|line| line.contains("BUY 0.20")));
+        assert!(snapshot
+            .pending_orders
+            .iter()
+            .any(|line| line.contains("BUY_LIMIT 0.15")));
+        assert!(snapshot
+            .bot_timeline
+            .iter()
+            .any(|line| line.contains("IN BUY 0.15")));
         assert!(snapshot.warnings.is_empty());
     }
 
     #[test]
     fn execution_surface_snapshot_surfaces_adapter_specific_unwired_feed_reason() {
-        let state = sample_state(DataSource::MT5, "Offline");
+        let state = sample_state(DataSource::CTrader, "Offline");
         let mut session =
             TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
 
@@ -3865,7 +3978,7 @@ mod tests {
 
     #[test]
     fn selecting_adapter_updates_configured_runtime_and_status_message() {
-        let mut state = sample_state(DataSource::MT5, "Offline");
+        let mut state = sample_state(DataSource::CTrader, "Offline");
         let mut session = TradingSession::new();
 
         session.select_adapter(&mut state, TradingAdapterKind::CTrader);
@@ -3879,7 +3992,7 @@ mod tests {
 
     #[test]
     fn connect_sets_missing_credentials_status_for_unready_remote_adapter() {
-        let mut state = sample_state(DataSource::MT5, "Offline");
+        let mut state = sample_state(DataSource::CTrader, "Offline");
         let mut session =
             TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
 
@@ -3894,7 +4007,7 @@ mod tests {
 
     #[test]
     fn connect_requires_restored_ctrader_session_before_runtime_probe() {
-        let mut state = sample_state(DataSource::MT5, "Offline");
+        let mut state = sample_state(DataSource::CTrader, "Offline");
         let mut session =
             TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
@@ -3913,7 +4026,7 @@ mod tests {
 
     #[test]
     fn connect_uses_ctrader_account_runtime_probe_when_session_is_restored() {
-        let mut state = sample_state(DataSource::MT5, "Offline");
+        let mut state = sample_state(DataSource::CTrader, "Offline");
         let mut session =
             TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
@@ -4000,7 +4113,7 @@ mod tests {
 
     #[test]
     fn execution_surface_snapshot_uses_ctrader_reconcile_runtime_when_connected() {
-        let mut state = sample_state(DataSource::MT5, "Connected");
+        let mut state = sample_state(DataSource::CTrader, "Connected");
         let mut session =
             TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
@@ -4091,36 +4204,28 @@ mod tests {
         let snapshot = session.execution_surface_snapshot(&state);
 
         assert!(snapshot.positions.iter().any(|line| line.contains("#9001")));
-        assert!(
-            snapshot
-                .pending_orders
-                .iter()
-                .any(|line| line.contains("#8001"))
-        );
-        assert!(
-            snapshot
-                .bot_timeline
-                .iter()
-                .any(|line| line.contains("#3001"))
-        );
-        assert!(
-            snapshot
-                .diagnostics
-                .iter()
-                .any(|line| line.contains("Recent fills: 1"))
-        );
-        assert!(
-            snapshot
-                .diagnostics
-                .iter()
-                .any(|line| line.contains("Trader balance"))
-        );
+        assert!(snapshot
+            .pending_orders
+            .iter()
+            .any(|line| line.contains("#8001")));
+        assert!(snapshot
+            .bot_timeline
+            .iter()
+            .any(|line| line.contains("#3001")));
+        assert!(snapshot
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("Recent fills: 1")));
+        assert!(snapshot
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("Trader balance")));
         assert!(snapshot.warnings.is_empty());
     }
 
     #[test]
     fn cancel_selected_order_records_ctrader_journal_and_updates_status() {
-        let mut state = sample_state(DataSource::MT5, "Connected");
+        let mut state = sample_state(DataSource::CTrader, "Connected");
         let mut session =
             TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
@@ -4220,17 +4325,15 @@ mod tests {
         let snapshot = session.execution_surface_snapshot(&state);
 
         assert!(state.status_msg.contains("Cancelled order"));
-        assert!(
-            snapshot
-                .journal_rows
-                .iter()
-                .any(|line| line.contains("Cancel order #8001"))
-        );
+        assert!(snapshot
+            .journal_rows
+            .iter()
+            .any(|line| line.contains("Cancel order #8001")));
     }
 
     #[test]
     fn close_selected_position_surfaces_ctrader_execution_failure() {
-        let mut state = sample_state(DataSource::MT5, "Connected");
+        let mut state = sample_state(DataSource::CTrader, "Connected");
         let mut session =
             TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         session.broker_settings_mut().ctrader.client_id = "client".to_string();
@@ -4295,12 +4398,10 @@ mod tests {
         session.close_selected_position(&mut state);
 
         assert!(state.status_msg.contains("failed"));
-        assert!(
-            session
-                .trade_journal
-                .iter()
-                .any(|line| line.contains("BROKER_REJECTED"))
-        );
+        assert!(session
+            .trade_journal
+            .iter()
+            .any(|line| line.contains("BROKER_REJECTED")));
     }
 
     #[test]
@@ -4317,13 +4418,11 @@ mod tests {
             snapshot.state,
             crate::app_services::ctrader_auth::CTraderAuthState::AwaitingAuthorizationCode
         );
-        assert!(
-            snapshot
-                .authorize_url
-                .as_deref()
-                .unwrap_or_default()
-                .contains("client_id=client")
-        );
+        assert!(snapshot
+            .authorize_url
+            .as_deref()
+            .unwrap_or_default()
+            .contains("client_id=client"));
     }
 
     #[test]
@@ -4568,24 +4667,20 @@ mod tests {
         assert_eq!(snapshot.account_count, 2);
         assert_eq!(snapshot.enabled_target_count, 1);
         assert_eq!(session.broker_settings_mut().ctrader.accounts.len(), 2);
-        assert!(
-            session
-                .broker_settings_mut()
-                .ctrader
-                .accounts
-                .iter()
-                .any(|account| account.account_id == "101"
-                    && account.label == "Operator Primary"
-                    && account.enabled_for_execution)
-        );
-        assert!(
-            session
-                .broker_settings_mut()
-                .ctrader
-                .accounts
-                .iter()
-                .any(|account| account.account_id == "202" && !account.enabled_for_execution)
-        );
+        assert!(session
+            .broker_settings_mut()
+            .ctrader
+            .accounts
+            .iter()
+            .any(|account| account.account_id == "101"
+                && account.label == "Operator Primary"
+                && account.enabled_for_execution));
+        assert!(session
+            .broker_settings_mut()
+            .ctrader
+            .accounts
+            .iter()
+            .any(|account| account.account_id == "202" && !account.enabled_for_execution));
     }
 
     #[test]
@@ -4641,10 +4736,9 @@ mod tests {
             .discover_ctrader_accounts()
             .expect_err("discovery should fail without a restored token");
 
-        assert!(
-            err.to_string()
-                .contains("cTrader account discovery requires a restored token session")
-        );
+        assert!(err
+            .to_string()
+            .contains("cTrader account discovery requires a restored token session"));
     }
 
     #[test]
@@ -4685,10 +4779,9 @@ mod tests {
             .discover_ctrader_accounts()
             .expect_err("discovery should fail without persisted token bundle");
 
-        assert!(
-            err.to_string()
-                .contains("cTrader account discovery requires a stored token bundle")
-        );
+        assert!(err
+            .to_string()
+            .contains("cTrader account discovery requires a stored token bundle"));
     }
 
     #[test]
@@ -4841,7 +4934,7 @@ mod tests {
 
     #[test]
     fn refresh_runtime_skips_ctrader_probe_within_refresh_window() {
-        let mut state = sample_state(DataSource::MT5, "Connected");
+        let mut state = sample_state(DataSource::CTrader, "Connected");
         let mut session =
             TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         let backend =

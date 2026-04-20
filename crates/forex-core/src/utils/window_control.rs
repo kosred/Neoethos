@@ -5,18 +5,18 @@ use std::ffi::OsString;
 #[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStringExt;
 #[cfg(target_os = "windows")]
-use windows::core::BOOL;
-#[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{HWND, LPARAM};
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_E,
+    INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY, VK_CONTROL, VK_E,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowTextLengthW, GetWindowTextW, IsIconic, SetForegroundWindow, ShowWindow,
-    SW_RESTORE,
+    EnumWindows, GetWindowTextLengthW, GetWindowTextW, IsIconic, SW_RESTORE, SetForegroundWindow,
+    ShowWindow,
 };
+#[cfg(target_os = "windows")]
+use windows::core::BOOL;
 
 pub fn ensure_autotrading_enabled() -> bool {
     // This function originally acted as a high-level check.
@@ -47,24 +47,26 @@ pub fn focus_mt5_window() -> bool {
     unsafe {
         let mut found_hwnd: Option<HWND> = None;
 
-        unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL { unsafe {
-            let found_ptr = lparam.0 as *mut Option<HWND>;
+        unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            unsafe {
+                let found_ptr = lparam.0 as *mut Option<HWND>;
 
-            let length = GetWindowTextLengthW(hwnd);
-            if length > 0 {
-                let mut buffer = vec![0u16; (length + 1) as usize];
-                GetWindowTextW(hwnd, &mut buffer);
-                let title = OsString::from_wide(&buffer[..length as usize]);
-                let title_lossy = title.to_string_lossy();
+                let length = GetWindowTextLengthW(hwnd);
+                if length > 0 {
+                    let mut buffer = vec![0u16; (length + 1) as usize];
+                    GetWindowTextW(hwnd, &mut buffer);
+                    let title = OsString::from_wide(&buffer[..length as usize]);
+                    let title_lossy = title.to_string_lossy();
 
-                if title_lossy.contains("MetaTrader 5") {
-                    // Found it
-                    *found_ptr = Some(hwnd);
-                    return BOOL(0); // Stop enumeration
+                    if title_lossy.contains("MetaTrader 5") {
+                        // Found it
+                        *found_ptr = Some(hwnd);
+                        return BOOL(0); // Stop enumeration
+                    }
                 }
+                BOOL(1) // Continue enumeration
             }
-            BOOL(1) // Continue enumeration
-        }}
+        }
 
         let lparam = LPARAM(&mut found_hwnd as *mut _ as isize);
         let _ = EnumWindows(Some(enum_window_proc), lparam);

@@ -15,7 +15,7 @@ use std::thread;
 use tch::{Device, Kind, Tensor};
 
 use crate::discovery_gpu::{GpuDiscoveryConfig, GpuDiscoveryResult};
-use crate::genetic::{select_parent_index, select_survivor_indices, SurvivorSelectionPolicy};
+use crate::genetic::{SurvivorSelectionPolicy, select_parent_index, select_survivor_indices};
 use crate::hpc::{get_gpu_cpu_affinity, is_hpc_mode, is_nvlink_pair, set_thread_affinity};
 
 /// Island-based GPU evolution configuration
@@ -77,7 +77,7 @@ pub fn run_island_model_discovery(
         .collect();
 
     // Evolution loop
-    for gen in 0..config.base_config.generations {
+    for generation in 0..config.base_config.generations {
         // Evaluate all islands
         evaluate_islands_parallel(&mut islands, &data_cube, &ohlc_cube, &config.base_config)?;
 
@@ -87,15 +87,18 @@ pub fn run_island_model_discovery(
         }
 
         // Migration via NVLink
-        if gen > 0 && gen % config.migration_interval == 0 {
-            info!("Generation {}: Performing NVLink elite migration", gen);
+        if generation > 0 && generation % config.migration_interval == 0 {
+            info!(
+                "Generation {}: Performing NVLink elite migration",
+                generation
+            );
             perform_nvlink_migration(&mut islands, config.migration_fraction);
         }
 
         // Evolve to next generation
-        if gen + 1 < config.base_config.generations {
+        if generation + 1 < config.base_config.generations {
             for island in &mut islands {
-                island.evolve_generation(&config.base_config, gen);
+                island.evolve_generation(&config.base_config, generation);
             }
         }
     }

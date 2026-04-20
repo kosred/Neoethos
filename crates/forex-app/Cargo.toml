@@ -1,7 +1,11 @@
 [package]
 name = "forex-app"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+
+[features]
+default = []
+legacy-mt5 = ["dep:mt5-bridge"]
 
 [dependencies]
 eframe = "0.31.0" # UI framework (egui)
@@ -24,7 +28,7 @@ forex-core = { path = "../forex-core" }
 forex-data = { path = "../forex-data" }
 forex-search = { path = "../forex-search" }
 forex-models = { path = "../forex-models", features = ["tree-models", "pure-rust-ml"] }
-mt5-bridge = { path = "../mt5-bridge" }
+mt5-bridge = { path = "../mt5-bridge", optional = true }
 ndarray = "0.17.2"
 clap = { version = "4.6.0", features = ["derive"] }
 num_cpus = "1.17.0"

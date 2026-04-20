@@ -1,13 +1,13 @@
 use super::evolution_math::{
+    EvolutionSearchPolicy, ParentSelectionPolicy, SeenSignatureMemory, SurvivorSelectionPolicy,
     apply_metrics, crossover, generate_random_genes, mutate, new_random_gene, select_parent_index,
-    select_survivor_indices, unique_candidate_or_retry, EvolutionSearchPolicy,
-    ParentSelectionPolicy, SeenSignatureMemory, SurvivorSelectionPolicy,
+    select_survivor_indices, unique_candidate_or_retry,
 };
-use super::smc_indicators::{build_smc_arrays, enforce_population_smc_ratio, SmcSearchConfig};
+use super::smc_indicators::{SmcSearchConfig, build_smc_arrays, enforce_population_smc_ratio};
 use super::strategy_gene::{EvaluationConfig, Gene, SearchResult};
 use crate::eval::BacktestSettings;
-use crate::stop_target::{infer_stop_target_pips, StopTargetSettings};
-use anyhow::{anyhow, bail, Result};
+use crate::stop_target::{StopTargetSettings, infer_stop_target_pips};
+use anyhow::{Result, anyhow, bail};
 use chrono::{Datelike, TimeZone, Utc};
 use forex_data::{FeatureFrame, Ohlcv};
 use ndarray::Array2;
@@ -430,8 +430,8 @@ where
         return Ok(SearchResult { genes, metrics });
     }
 
-    for gen in 0..generations {
-        let progress = (gen as f32) / ((generations - 1) as f32).max(1.0);
+    for generation in 0..generations {
+        let progress = (generation as f32) / ((generations - 1) as f32).max(1.0);
         let mut gate_now = gate_start + (gate_end - gate_start) * progress.powf(gate_curve);
         if stagnant_gens >= stagnation_patience {
             gate_now -= gate_stagnation_step * (stagnant_gens as f32);
@@ -554,7 +554,7 @@ where
         }
 
         progress_fn(
-            gen + 1,
+            generation + 1,
             generations,
             top_score,
             stagnant_gens,
@@ -609,7 +609,7 @@ where
             .map(|(_, _, _, m)| *m)
             .collect();
 
-        if gen + 1 == generations {
+        if generation + 1 == generations {
             seen_memory.flush();
             if !profitable_archive.is_empty() {
                 profitable_archive.sort_by(|a, b| {
@@ -668,11 +668,11 @@ where
         let immigrant_count = immigrant_count.min(population - next.len());
         for _ in 0..immigrant_count {
             next.push(unique_candidate_or_retry(
-                new_random_gene(n_indicators, max_indicators, gen + 1, &smc_cfg),
+                new_random_gene(n_indicators, max_indicators, generation + 1, &smc_cfg),
                 &mut seen_memory,
                 n_indicators,
                 max_indicators,
-                gen + 1,
+                generation + 1,
                 seen_retry_attempts,
                 &smc_cfg,
             ));
@@ -714,16 +714,16 @@ where
             let b = &scored[b_idx].2;
             next.push(unique_candidate_or_retry(
                 mutate(
-                    &crossover(a, b, gen + 1),
+                    &crossover(a, b, generation + 1),
                     n_indicators,
                     max_indicators,
-                    gen + 1,
+                    generation + 1,
                     &smc_cfg,
                 ),
                 &mut seen_memory,
                 n_indicators,
                 max_indicators,
-                gen + 1,
+                generation + 1,
                 seen_retry_attempts,
                 &smc_cfg,
             ));

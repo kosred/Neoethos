@@ -8,6 +8,18 @@ members = [
   "crates/forex-core",
   "crates/forex-bindings", "crates/forex-app", "crates/mt5-bridge", "crates/forex-news",
 ]
+default-members = [
+  "crates/forex-search",
+  "crates/forex-cli",
+  "crates/forex-data",
+  "crates/forex-models",
+  "crates/forex-core",
+  "crates/forex-app",
+  "crates/forex-news",
+]
+
+[workspace.package]
+edition = "2024"
 
 [patch.crates-io]
 lightgbm3-sys = { path = "vendor/lightgbm3-sys" }

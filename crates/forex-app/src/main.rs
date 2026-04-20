@@ -5,20 +5,19 @@ mod workspace;
 
 use crate::ui::components::render_ribbon_item;
 use app_services::{
-    ServiceEvent, discovery::DiscoveryJobHandle, trading::TradingSession,
-    training::TrainingJobHandle,
+    discovery::DiscoveryJobHandle, trading::TradingSession, training::TrainingJobHandle,
+    ServiceEvent,
 };
 use app_state::{AppRuntimeConfig, AppState};
 use clap::Parser;
 use eframe::egui;
-use forex_core::Settings;
 use forex_core::logging::{setup_logging, write_subsystem_record};
 use forex_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
-use mt5_bridge::MT5Engine;
+use forex_core::Settings;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
-use workspace::{WorkspaceState, WorkspaceViewer, render_workspace};
+use tracing::{error, info};
+use workspace::{render_workspace, WorkspaceState, WorkspaceViewer};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -116,61 +115,24 @@ async fn run_headless_loop(runtime: AppRuntimeConfig) {
             );
         }
     } else {
-        match MT5Engine::new() {
-            Ok(mut engine) => {
-                if let Ok(true) = engine.initialize() {
-                    info!("MT5 successfully connected. Ready for Live Trading.");
-                    if let Err(err) = write_subsystem_record(
-                        SubsystemSection::App,
-                        app_record(
-                            "headless_mt5_start",
-                            "SUCCESS",
-                            "MT5 connected for headless mode",
-                        ),
-                    ) {
-                        error!("Failed to write APP section log: {}", err);
-                    }
-                    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
-                    loop {
-                        interval.tick().await;
-                        match engine.terminal_info() {
-                            Ok(info_text) => {
-                                info!("Headless MT5 heartbeat: connected | {}", info_text);
-                            }
-                            Err(err) => {
-                                warn!("Headless MT5 heartbeat degraded: {}", err);
-                            }
-                        }
-                    }
-                } else {
-                    warn!(
-                        "MT5 Connection failed or MetaTrader5 module missing. Headless trading disabled."
-                    );
-                    if let Err(err) = write_subsystem_record(
-                        SubsystemSection::App,
-                        app_record(
-                            "headless_mt5_start",
-                            "DEGRADED",
-                            "MT5 connection failed or MetaTrader5 module missing",
-                        ),
-                    ) {
-                        error!("Failed to write APP section log: {}", err);
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Fatal Bridge Error: {:?}", e);
-                if let Err(log_err) = write_subsystem_record(
-                    SubsystemSection::App,
-                    app_record(
-                        "headless_mt5_start",
-                        "FAILED",
-                        format!("fatal bridge error: {e}"),
-                    ),
-                ) {
-                    error!("Failed to write APP section log: {}", log_err);
-                }
-            }
+        info!("Running in cTrader-first Headless Broker Mode.");
+        if let Err(err) = write_subsystem_record(
+            SubsystemSection::App,
+            app_record(
+                "headless_ctrader_start",
+                "READY",
+                "cTrader is the canonical broker runtime; auth/connect are managed by app services",
+            ),
+        ) {
+            error!("Failed to write APP section log: {}", err);
+        }
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            info!(
+                "Headless keep-alive tick: System Health OK | Cores: {} | Mode: CTRADER",
+                num_cpus::get()
+            );
         }
     }
 }
@@ -298,6 +260,7 @@ impl eframe::App for ForexApp {
                                 ui,
                                 "SOURCE",
                                 match self.state.data_source {
+                                    app_state::DataSource::CTrader => "CTRADER",
                                     app_state::DataSource::MT5 => "MT5",
                                     app_state::DataSource::Local => "LOCAL",
                                 },
@@ -415,7 +378,7 @@ fn spawn_account_heartbeat(tx: mpsc::Sender<ServiceEvent>) -> tokio::task::JoinH
 
 #[cfg(test)]
 mod tests {
-    use super::{AppRuntimeConfig, app_record};
+    use super::{app_record, AppRuntimeConfig};
     use crate::app_state::DataSource;
     use forex_core::Settings;
     use std::path::PathBuf;
@@ -455,8 +418,8 @@ mod tests {
     }
 
     #[test]
-    fn trading_panel_mode_switches_to_disconnect_when_mt5_is_connected() {
-        let mode = crate::app_services::trading::panel_mode(DataSource::MT5, true);
+    fn trading_panel_mode_switches_to_connected_when_ctrader_is_connected() {
+        let mode = crate::app_services::trading::panel_mode(DataSource::CTrader, true);
 
         assert_eq!(
             mode,

@@ -1,5 +1,5 @@
 use crate::app_services::jobs::JobSnapshot;
-use forex_core::{Settings, logging::canonical_log_path};
+use forex_core::{logging::canonical_log_path, Settings};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -21,6 +21,7 @@ impl AppRuntimeConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataSource {
+    CTrader,
     MT5,
     Local,
 }
@@ -77,12 +78,12 @@ impl AppState {
             data_source: if runtime.start_local {
                 DataSource::Local
             } else {
-                DataSource::MT5
+                DataSource::CTrader
             },
             status_msg: if runtime.start_local {
                 "Local Mode".to_string()
             } else {
-                "Offline".to_string()
+                "cTrader Ready".to_string()
             },
             canonical_log_path: canonical_log_path(),
             runtime,
@@ -307,7 +308,7 @@ mod tests {
 
         assert_eq!(state.selected_pair, "EURUSD");
         assert_eq!(state.chart_timeframe, "M1");
-        assert_eq!(state.status_msg, "Offline");
+        assert_eq!(state.status_msg, "cTrader Ready");
         assert_eq!(state.bootstrap_form.pairs_input, "EURUSD");
     }
 

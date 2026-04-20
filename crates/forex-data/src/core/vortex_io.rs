@@ -120,7 +120,7 @@ fn atomic_replace_file_windows(src: &Path, dst: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
     }
 

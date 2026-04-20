@@ -42,7 +42,7 @@ pub unsafe fn backtest_simd(signals: &[i8], returns: &[f64]) -> f64 {
         );
 
         // Load returns
-        let ret = _mm256_loadu_pd(returns.as_ptr().add(offset));
+        let ret = unsafe { _mm256_loadu_pd(returns.as_ptr().add(offset)) };
 
         // Compute trade P&L: signal * return
         let pnl = _mm256_mul_pd(sig, ret);
@@ -62,8 +62,8 @@ pub unsafe fn backtest_simd(signals: &[i8], returns: &[f64]) -> f64 {
     }
 
     // Horizontal sum of accumulators
-    let hsum_profit = hsum256_pd(sum_profit);
-    let hsum_loss = hsum256_pd(sum_loss);
+    let hsum_profit = unsafe { hsum256_pd(sum_profit) };
+    let hsum_loss = unsafe { hsum256_pd(sum_loss) };
 
     // Process remainder
     let mut rem_profit = 0.0;
@@ -94,7 +94,7 @@ pub unsafe fn backtest_simd(signals: &[i8], returns: &[f64]) -> f64 {
 #[target_feature(enable = "avx2")]
 unsafe fn hsum256_pd(v: __m256d) -> f64 {
     let lo = _mm256_castpd256_pd128(v);
-    let hi = _mm256_extractf128_pd(v, 1);
+    let hi = unsafe { _mm256_extractf128_pd(v, 1) };
     let sum128 = _mm_add_pd(lo, hi);
     let unpacked = _mm_unpackhi_pd(sum128, sum128);
     let sum64 = _mm_add_sd(sum128, unpacked);
@@ -116,13 +116,13 @@ pub unsafe fn compute_signals_simd(features: &[f32], weights: &[f32], threshold:
     // Process 8 floats at a time
     for i in 0..chunks {
         let offset = i * 8;
-        let f = _mm256_loadu_ps(features.as_ptr().add(offset));
-        let w = _mm256_loadu_ps(weights.as_ptr().add(offset));
+        let f = unsafe { _mm256_loadu_ps(features.as_ptr().add(offset)) };
+        let w = unsafe { _mm256_loadu_ps(weights.as_ptr().add(offset)) };
         sum = _mm256_fmadd_ps(f, w, sum);
     }
 
     // Horizontal sum
-    let mut total = hsum256_ps(sum);
+    let mut total = unsafe { hsum256_ps(sum) };
 
     // Process remainder
     for i in (n - remainder)..n {
@@ -150,7 +150,7 @@ unsafe fn hsum256_ps(v: __m256) -> f32 {
 
     // Extract low and high 128-bit halves
     let low = _mm256_castps256_ps128(sum2);
-    let high = _mm256_extractf128_ps(sum2, 1);
+    let high = unsafe { _mm256_extractf128_ps(sum2, 1) };
 
     // Add halves
     let sum128 = _mm_add_ss(low, high);
@@ -261,14 +261,14 @@ pub unsafe fn sharpe_ratio_simd(returns: &[f64]) -> f64 {
     // Process chunks
     for i in 0..chunks {
         let offset = i * 4;
-        let r = _mm256_loadu_pd(returns.as_ptr().add(offset));
+        let r = unsafe { _mm256_loadu_pd(returns.as_ptr().add(offset)) };
         sum = _mm256_add_pd(sum, r);
         sumsq = _mm256_fmadd_pd(r, r, sumsq);
     }
 
     // Horizontal sum
-    let hsum = hsum256_pd(sum);
-    let hsumsq = hsum256_pd(sumsq);
+    let hsum = unsafe { hsum256_pd(sum) };
+    let hsumsq = unsafe { hsum256_pd(sumsq) };
 
     // Process remainder
     let mut rem_sum = 0.0;

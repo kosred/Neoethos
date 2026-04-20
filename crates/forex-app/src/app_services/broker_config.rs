@@ -81,6 +81,20 @@ impl BrokerSettingsState {
         match adapter {
             TradingAdapterKind::Mt5 => {
                 let target_count = count_enabled_targets(&self.mt5.accounts);
+                #[cfg(not(feature = "legacy-mt5"))]
+                {
+                    return AdapterReadinessSnapshot {
+                        adapter_name: adapter.as_str().to_string(),
+                        session_state: BrokerSessionState::Disconnected,
+                        status_line:
+                            "Legacy MT5 bridge disabled; cTrader is the canonical runtime."
+                                .to_string(),
+                        missing_fields: Vec::new(),
+                        target_count,
+                        can_attempt_connect: false,
+                    };
+                }
+                #[cfg(feature = "legacy-mt5")]
                 AdapterReadinessSnapshot {
                     adapter_name: adapter.as_str().to_string(),
                     session_state: BrokerSessionState::Configured,

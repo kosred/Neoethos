@@ -1,7 +1,7 @@
 [package]
 name = "mt5-bridge"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 
 [dependencies]
 pyo3 = { version = "0.28.2", features = ["auto-initialize"] }

@@ -1,5 +1,5 @@
-use anyhow::{bail, Result};
-use forex_data::{compute_hpc_feature_frame, FeatureCache, FeatureFrame, Ohlcv, SymbolDataset};
+use anyhow::{Result, bail};
+use forex_data::{FeatureCache, FeatureFrame, Ohlcv, SymbolDataset, compute_hpc_feature_frame};
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
 use serde::Serialize;
@@ -8,7 +8,7 @@ use std::path::Path;
 use tch::{Device, Kind, Tensor};
 
 use crate::genetic::{
-    select_parent_index, select_survivor_indices, ParentSelectionPolicy, SurvivorSelectionPolicy,
+    ParentSelectionPolicy, SurvivorSelectionPolicy, select_parent_index, select_survivor_indices,
 };
 
 #[derive(Debug, Clone)]
@@ -233,7 +233,7 @@ pub fn run_gpu_discovery(
     let mut best_genomes = Vec::new();
     let mut best_scores = Vec::new();
 
-    for gen in 0..config.generations {
+    for generation in 0..config.generations {
         let fitness =
             evaluate_population_multi_gpu(&data_cube, &ohlc_cube, &genomes, config, &device_ids)?;
 
@@ -272,7 +272,7 @@ pub fn run_gpu_discovery(
             .map(|(f, _, _)| *f)
             .collect();
 
-        if gen + 1 == config.generations {
+        if generation + 1 == config.generations {
             best_genomes = best_candidates.clone();
             best_scores = best_candidate_scores.clone();
             break;

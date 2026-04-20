@@ -3,8 +3,8 @@ use crate::app_services::ctrader_auth::CTraderAuthSnapshot;
 use crate::app_services::trading::{ConnectionSnapshot, TradingSession};
 use crate::app_state::{AppState, DataSource};
 use crate::ui::components::{
-    DashboardCard, DashboardSection, render_dashboard_sections, render_summary_cards,
-    render_view_header,
+    render_dashboard_sections, render_summary_cards, render_view_header, DashboardCard,
+    DashboardSection,
 };
 use eframe::egui;
 
@@ -50,6 +50,7 @@ fn build_runtime_dashboard(
     ctrader_auth: Option<&CTraderAuthSnapshot>,
 ) -> RuntimeDashboard {
     let source = match state.data_source {
+        DataSource::CTrader => "cTrader",
         DataSource::MT5 => "MT5",
         DataSource::Local => "Local",
     };
@@ -156,6 +157,30 @@ fn build_runtime_dashboard(
                 (
                     "Armed Broker Adapter".to_string(),
                     connection.adapter_name.clone(),
+                ),
+            ],
+        },
+        DataSource::CTrader => DashboardSection {
+            title: "Broker Status".to_string(),
+            rows: vec![
+                (
+                    "Connection".to_string(),
+                    if connection.connected {
+                        "Online".to_string()
+                    } else {
+                        "Offline".to_string()
+                    },
+                ),
+                ("Adapter".to_string(), connection.adapter_name.clone()),
+                ("Bridge".to_string(), connection.integration_mode.clone()),
+                (
+                    "Guidance".to_string(),
+                    if connection.connected {
+                        "cTrader runtime is available".to_string()
+                    } else {
+                        "Use Broker Setup to restore cTrader auth and connect the selected account"
+                            .to_string()
+                    },
                 ),
             ],
         },

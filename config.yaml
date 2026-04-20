@@ -12,13 +12,8 @@ system:
   trading_session_start: "00:05"
   trading_session_end: "23:55"
   session_timezone: UTC
-  broker_backend: mt5_local
-  mt5_required: false  # Set true for live trading on Windows
-  mt5_terminal_path: 'C:/Program Files/MetaTrader 5/terminal64.exe'
-  mt5_login: 0
-  mt5_password: ""
-  mt5_server: ""
-  mt5_timeout_seconds: 30
+  broker_backend: ctrader
+  mt5_required: false  # Legacy MT5 bridge is optional and disabled by default
   poll_interval_seconds: 60
   metrics_logging_enabled: true
   metrics_db_path: metrics.sqlite
@@ -40,7 +35,7 @@ system:
   discovery_stream: true
 
 risk:
-  initial_balance: 10000  # Fallback used when MT5 balance unavailable
+  initial_balance: 10000  # Fallback used when broker balance is unavailable
   min_risk_per_trade: 0.0
   max_risk_per_trade: 0.030
   risk_per_trade: 0.030
