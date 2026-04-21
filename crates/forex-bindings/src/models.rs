@@ -1,14 +1,57 @@
-use crate::utils::params_from_py;
+use crate::utils::{dataframe_from_ndarray, params_from_py};
+use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+use polars::prelude::{NamedFrom, Series};
 use pyo3::prelude::*;
 use std::sync::Mutex;
 
 use forex_models::MLPExpert;
 use forex_models::NeatExpert;
 use forex_models::anomaly::IsolationForestExpert;
+use forex_models::base::ExpertModel;
 use forex_models::forecasting::SwarmForecaster;
 use forex_models::genetic::GeneticStrategyExpert;
 use forex_models::statistical::{BayesianLogitExpert, ElasticNetExpert};
 use forex_models::tree_models::XGBoostExpert;
+
+fn fit_expert_model<M: ExpertModel>(
+    inner: &Mutex<M>,
+    features: PyReadonlyArray2<'_, f64>,
+    labels: PyReadonlyArray1<'_, i32>,
+) -> PyResult<()> {
+    let x = features.as_array().to_owned();
+    let y = labels.as_array().iter().copied().collect::<Vec<_>>();
+    if x.nrows() != y.len() {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "feature rows ({}) must match label rows ({})",
+            x.nrows(),
+            y.len()
+        )));
+    }
+    let df = dataframe_from_ndarray(&x).map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
+    let labels = Series::new("label".into(), y);
+    let mut guard = inner
+        .lock()
+        .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("model mutex poisoned"))?;
+    guard
+        .fit(&df, &labels)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+}
+
+fn predict_expert_model<'py, M: ExpertModel>(
+    py: Python<'py>,
+    inner: &Mutex<M>,
+    features: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let x = features.as_array().to_owned();
+    let df = dataframe_from_ndarray(&x).map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
+    let guard = inner
+        .lock()
+        .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("model mutex poisoned"))?;
+    let probabilities = guard
+        .predict_proba(&df)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    Ok(probabilities.into_pyarray(py))
+}
 
 #[pyclass(unsendable, module = "forex_bindings")]
 pub struct XGBoostModel {
@@ -25,6 +68,22 @@ impl XGBoostModel {
             inner: Mutex::new(XGBoostExpert::new(0, rs_params)),
         })
     }
+
+    fn fit(
+        &self,
+        features: PyReadonlyArray2<'_, f64>,
+        labels: PyReadonlyArray1<'_, i32>,
+    ) -> PyResult<()> {
+        fit_expert_model(&self.inner, features, labels)
+    }
+
+    fn predict_proba<'py>(
+        &self,
+        py: Python<'py>,
+        features: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        predict_expert_model(py, &self.inner, features)
+    }
 }
 
 #[pyclass(unsendable, module = "forex_bindings")]
@@ -40,6 +99,22 @@ impl ElasticNetModel {
             inner: Mutex::new(ElasticNetExpert::new(alpha, l1_ratio)),
         }
     }
+
+    fn fit(
+        &self,
+        features: PyReadonlyArray2<'_, f64>,
+        labels: PyReadonlyArray1<'_, i32>,
+    ) -> PyResult<()> {
+        fit_expert_model(&self.inner, features, labels)
+    }
+
+    fn predict_proba<'py>(
+        &self,
+        py: Python<'py>,
+        features: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        predict_expert_model(py, &self.inner, features)
+    }
 }
 
 #[pyclass(unsendable, module = "forex_bindings")]
@@ -53,6 +128,22 @@ impl BayesianLogitModel {
         Self {
             inner: Mutex::new(BayesianLogitExpert::new()),
         }
+    }
+
+    fn fit(
+        &self,
+        features: PyReadonlyArray2<'_, f64>,
+        labels: PyReadonlyArray1<'_, i32>,
+    ) -> PyResult<()> {
+        fit_expert_model(&self.inner, features, labels)
+    }
+
+    fn predict_proba<'py>(
+        &self,
+        py: Python<'py>,
+        features: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        predict_expert_model(py, &self.inner, features)
     }
 }
 
@@ -69,6 +160,22 @@ impl IsolationForestModel {
             inner: Mutex::new(IsolationForestExpert::new(n_trees, sample_size)),
         }
     }
+
+    fn fit(
+        &self,
+        features: PyReadonlyArray2<'_, f64>,
+        labels: PyReadonlyArray1<'_, i32>,
+    ) -> PyResult<()> {
+        fit_expert_model(&self.inner, features, labels)
+    }
+
+    fn predict_proba<'py>(
+        &self,
+        py: Python<'py>,
+        features: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        predict_expert_model(py, &self.inner, features)
+    }
 }
 
 #[pyclass(unsendable, module = "forex_bindings")]
@@ -82,6 +189,22 @@ impl SwarmForecasterModel {
         Self {
             inner: Mutex::new(SwarmForecaster::new(mem_limit)),
         }
+    }
+
+    fn fit(
+        &self,
+        features: PyReadonlyArray2<'_, f64>,
+        labels: PyReadonlyArray1<'_, i32>,
+    ) -> PyResult<()> {
+        fit_expert_model(&self.inner, features, labels)
+    }
+
+    fn predict_proba<'py>(
+        &self,
+        py: Python<'py>,
+        features: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        predict_expert_model(py, &self.inner, features)
     }
 }
 
@@ -97,6 +220,22 @@ impl MLPModel {
             inner: Mutex::new(MLPExpert::default()),
         }
     }
+
+    fn fit(
+        &self,
+        features: PyReadonlyArray2<'_, f64>,
+        labels: PyReadonlyArray1<'_, i32>,
+    ) -> PyResult<()> {
+        fit_expert_model(&self.inner, features, labels)
+    }
+
+    fn predict_proba<'py>(
+        &self,
+        py: Python<'py>,
+        features: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        predict_expert_model(py, &self.inner, features)
+    }
 }
 
 #[pyclass(unsendable, module = "forex_bindings")]
@@ -107,10 +246,28 @@ pub struct GeneticModel {
 impl GeneticModel {
     #[new]
     #[pyo3(signature = (pop=50, gens=10, max_ind=8))]
-    fn new(pop: usize, gens: usize, max_ind: usize) -> Self {
-        Self {
-            inner: Mutex::new(GeneticStrategyExpert::new(pop, gens, max_ind).unwrap()),
-        }
+    fn new(pop: usize, gens: usize, max_ind: usize) -> PyResult<Self> {
+        let inner = GeneticStrategyExpert::new(pop, gens, max_ind)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+        Ok(Self {
+            inner: Mutex::new(inner),
+        })
+    }
+
+    fn fit(
+        &self,
+        features: PyReadonlyArray2<'_, f64>,
+        labels: PyReadonlyArray1<'_, i32>,
+    ) -> PyResult<()> {
+        fit_expert_model(&self.inner, features, labels)
+    }
+
+    fn predict_proba<'py>(
+        &self,
+        py: Python<'py>,
+        features: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        predict_expert_model(py, &self.inner, features)
     }
 }
 
@@ -126,6 +283,22 @@ impl NeatModel {
         Self {
             inner: Mutex::new(NeatExpert::with_config(input_dim, population, generations)),
         }
+    }
+
+    fn fit(
+        &self,
+        features: PyReadonlyArray2<'_, f64>,
+        labels: PyReadonlyArray1<'_, i32>,
+    ) -> PyResult<()> {
+        fit_expert_model(&self.inner, features, labels)
+    }
+
+    fn predict_proba<'py>(
+        &self,
+        py: Python<'py>,
+        features: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        predict_expert_model(py, &self.inner, features)
     }
 }
 

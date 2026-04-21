@@ -1,4 +1,6 @@
-use tracing::{info, warn};
+#[cfg(target_os = "windows")]
+use tracing::info;
+use tracing::warn;
 
 #[cfg(target_os = "windows")]
 use std::ffi::OsString;
@@ -19,26 +21,31 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::BOOL;
 
 pub fn ensure_autotrading_enabled() -> bool {
-    // This function originally acted as a high-level check.
-    // Since we don't have the full MT5 module here yet,
-    // we will implement the low-level window control parts that were the core complexity.
-    // The actual logic verifying MT5 state typically belongs in an execution/broker adapter.
-    // For now, we provide the ability to toggle it via the window control if needed.
-
-    // In Python this function did:
-    // 1. Check if linux -> return True
-    // 2. Check MT5 connection -> return False if fail
-    // 3. Check terminal_info.trade_allowed -> return True if allowed
-    // 4. If disabled -> focus window -> send Ctrl+E -> check again
-
-    // We will port the "focus window -> send Ctrl+E" primitives here.
-
-    if !cfg!(target_os = "windows") {
+    #[cfg(not(target_os = "windows"))]
+    {
         return true;
     }
 
-    // Stub implementation for now as we don't have MT5 connection in core yet.
-    // But we will expose the helper functions.
+    #[cfg(target_os = "windows")]
+    {
+        warn!(
+            "Cannot verify MT5 AutoTrading from forex-core without broker terminal state; use the MT5 adapter before live execution."
+        );
+        false
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn ensure_autotrading_window_shortcut() -> bool {
+    true
+}
+
+#[cfg(target_os = "windows")]
+pub fn ensure_autotrading_window_shortcut() -> bool {
+    if !focus_mt5_window() {
+        return false;
+    }
+    send_ctrl_e();
     true
 }
 

@@ -42,6 +42,17 @@ fn parse_survivor_selection(raw: &str) -> PyResult<SurvivorSelectionPolicy> {
     }
 }
 
+fn pythonize_genes(py: Python, genes: &[forex_search::Gene]) -> PyResult<Vec<Py<PyAny>>> {
+    genes
+        .iter()
+        .map(|gene| {
+            pythonize(py, gene)
+                .map(|obj| obj.unbind())
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+        })
+        .collect()
+}
+
 #[pyfunction]
 #[pyo3(signature = (open, high, low, close, timestamps=None, volume=None, population=64, generations=20, max_indicators=12, include_raw=true))]
 #[allow(clippy::too_many_arguments)]
@@ -88,15 +99,7 @@ pub fn search_evolve_ohlcv(
         .iter()
         .map(|m: &[f64; 11]| m.to_vec())
         .collect();
-    let genes_py: Vec<Py<PyAny>> = result
-        .genes
-        .iter()
-        .map(|g| {
-            pythonize(py, g)
-                .map(|obj| obj.into())
-                .unwrap_or_else(|_| py.None())
-        })
-        .collect();
+    let genes_py = pythonize_genes(py, &result.genes)?;
 
     let dict = PyDict::new(py);
     dict.set_item("genes", genes_py)?;
@@ -295,15 +298,7 @@ pub fn search_discovery_ohlcv(
         })
         .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
 
-    let genes_py: Vec<Py<PyAny>> = result
-        .portfolio
-        .iter()
-        .map(|g| {
-            pythonize(py, g)
-                .map(|obj| obj.into())
-                .unwrap_or_else(|_| py.None())
-        })
-        .collect();
+    let genes_py = pythonize_genes(py, &result.portfolio)?;
 
     let dict = PyDict::new(py);
     dict.set_item("genes", genes_py)?;

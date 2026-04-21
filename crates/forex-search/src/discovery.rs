@@ -1,5 +1,5 @@
 use crate::genetic::strategy_gene::EvaluationConfig;
-use crate::genetic::{evolve_search_with_progress_and_limits, signals_for_gene, Gene};
+use crate::genetic::{Gene, evolve_search_with_progress_and_limits, signals_for_gene};
 use crate::quality::{StrategyMetrics, StrategyQualityAnalyzer, Trade};
 use anyhow::Result;
 use chrono::{Datelike, TimeZone, Utc};
@@ -94,6 +94,12 @@ impl DiscoveryConfig {
             ..Default::default()
         };
 
+        let candidate_count = if model_settings.prop_search_val_candidates == 0 {
+            model_settings.prop_search_population.max(50)
+        } else {
+            model_settings.prop_search_val_candidates.max(1)
+        };
+
         Self {
             timeframe_label: settings.system.base_timeframe.clone(),
             evaluation_symbol: settings.system.symbol.clone(),
@@ -107,9 +113,7 @@ impl DiscoveryConfig {
             } else {
                 model_settings.prop_search_max_indicators.max(1)
             },
-            candidate_count: model_settings
-                .prop_search_val_candidates
-                .max(model_settings.prop_search_population.max(50)),
+            candidate_count,
             portfolio_size: model_settings.prop_search_portfolio_size.max(1),
             max_rows: model_settings.prop_search_max_rows,
             max_rows_by_timeframe: model_settings.prop_search_max_rows_by_tf.clone(),
@@ -494,7 +498,8 @@ where
             .then_with(|| a.strategy_id.cmp(&b.strategy_id))
             .then_with(|| idx_a.cmp(idx_b))
     });
-    let max_candidates = config.candidate_count.max(100).min(ranked_candidates.len());
+    let max_candidates =
+        candidate_truncation_limit(config.candidate_count, ranked_candidates.len());
     ranked_candidates.truncate(max_candidates);
     let ranked_candidate_genes: Vec<Gene> = ranked_candidates
         .iter()
@@ -656,6 +661,16 @@ where
         quality_metrics,
         logged_trades,
     })
+}
+
+fn candidate_truncation_limit(requested: usize, available: usize) -> usize {
+    if available == 0 {
+        0
+    } else if requested == 0 {
+        available
+    } else {
+        requested.min(available)
+    }
 }
 
 fn min_trades_required(timestamps: &[i64], min_trades_per_day: f64, n_rows: usize) -> usize {
@@ -928,6 +943,14 @@ mod tests {
 
         ensure_non_empty_portfolio(&result, "EURUSD M1")
             .expect("expected non-empty portfolio to pass");
+    }
+
+    #[test]
+    fn candidate_truncation_honors_small_explicit_limits() {
+        assert_eq!(candidate_truncation_limit(2, 500), 2);
+        assert_eq!(candidate_truncation_limit(0, 500), 500);
+        assert_eq!(candidate_truncation_limit(500, 2), 2);
+        assert_eq!(candidate_truncation_limit(5, 0), 0);
     }
 
     #[test]

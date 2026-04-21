@@ -58,15 +58,20 @@ impl PortfolioOptimizer {
         let mut names = Vec::new();
         for s in symbols {
             if let Some(metrics) = metrics_map.get(s) {
-                if metrics.returns.len() > 5 {
-                    rets.push(metrics.returns.clone());
+                let returns = bounded_lookback_returns(&metrics.returns, self.lookback_days);
+                if returns.len() > 5 {
+                    rets.push(returns);
                     names.push(s.clone());
                 }
             }
         }
 
         let mut weights = HashMap::new();
-        let min_corr_samples = 30usize;
+        let min_corr_samples = if self.lookback_days == 0 {
+            30
+        } else {
+            self.lookback_days.clamp(6, 30)
+        };
 
         if rets.len() >= 2 {
             let min_len = rets.iter().map(|r| r.len()).min().unwrap_or(0);
@@ -217,6 +222,18 @@ fn mean(values: &[f64]) -> f64 {
     values.iter().sum::<f64>() / values.len() as f64
 }
 
+fn bounded_lookback_returns(returns: &[f64], lookback_days: usize) -> Vec<f64> {
+    let finite_returns = returns
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    if lookback_days == 0 || finite_returns.len() <= lookback_days {
+        return finite_returns;
+    }
+    finite_returns[(finite_returns.len() - lookback_days)..].to_vec()
+}
+
 fn stddev(values: &[f64], mean: f64) -> f64 {
     if values.len() < 2 {
         return 0.0;
@@ -253,6 +270,30 @@ mod tests {
             avg_win_pct: 0.0,
             avg_loss_pct: 0.0,
         }
+    }
+
+    #[test]
+    fn lookback_days_limits_allocation_to_recent_returns() {
+        let optimizer = PortfolioOptimizer::new(6, 0.95, 0.25);
+        let symbols = vec!["EURUSD".to_string(), "GBPUSD".to_string()];
+        let mut eur_returns = (0..60)
+            .map(|i| if i % 2 == 0 { 0.10 } else { -0.10 })
+            .collect::<Vec<_>>();
+        eur_returns.extend([0.001; 6]);
+        let mut gbp_returns = vec![0.001; 60];
+        gbp_returns.extend([0.10, -0.10, 0.10, -0.10, 0.10, -0.10]);
+
+        let mut map = HashMap::new();
+        map.insert("EURUSD".to_string(), metrics(eur_returns, 1.0, 0.55));
+        map.insert("GBPUSD".to_string(), metrics(gbp_returns, 1.0, 0.55));
+
+        let alloc = optimizer.get_optimal_allocation(&symbols, &map);
+        let eur_weight = alloc.get("EURUSD").expect("missing EURUSD").weight;
+        let gbp_weight = alloc.get("GBPUSD").expect("missing GBPUSD").weight;
+        assert!(
+            eur_weight > gbp_weight,
+            "recent low-volatility EURUSD tail should receive higher weight"
+        );
     }
 
     #[test]

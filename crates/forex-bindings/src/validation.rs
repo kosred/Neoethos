@@ -1,8 +1,11 @@
+use crate::utils::{vec_from_py_f64, vec_from_py_i8, vec_from_py_i64};
+use forex_search::eval::BacktestSettings;
+use forex_search::validation::{
+    CombinatorialPurgedCV, WalkforwardBacktestInput, embargoed_walkforward_backtest,
+};
 use numpy::PyReadonlyArray1;
 use pyo3::prelude::*;
-use crate::utils::{vec_from_py_f64, vec_from_py_i8, vec_from_py_i64};
-use forex_search::validation::{embargoed_walkforward_backtest, CombinatorialPurgedCV, WalkforwardBacktestInput};
-use forex_search::eval::BacktestSettings;
+use pyo3::types::{PyAny, PyDict};
 
 #[pyfunction]
 #[pyo3(signature = (
@@ -33,13 +36,12 @@ pub fn embargoed_walkforward_backtest_py(
     train_ratio: f64,
     n_splits: usize,
     embargo_bars: usize,
-    settings: Option<Py<PyAny>>, // Changed from _settings to match macro
+    settings: Option<Py<PyAny>>,
     max_daily_loss_pct: f64,
     max_daily_profit_pct: f64,
     min_trading_days: usize,
     max_trades_per_day: usize,
 ) -> PyResult<Py<PyAny>> {
-    let _ = settings;
     let cl = vec_from_py_f64(&close);
     let hi = vec_from_py_f64(&high);
     let lo = vec_from_py_f64(&low);
@@ -47,7 +49,7 @@ pub fn embargoed_walkforward_backtest_py(
     let m = vec_from_py_i64(&months);
     let d = vec_from_py_i64(&days);
 
-    let b_settings = BacktestSettings::default();
+    let b_settings = backtest_settings_from_py(py, settings)?;
 
     let res = embargoed_walkforward_backtest(WalkforwardBacktestInput {
         close: &cl,
@@ -64,9 +66,81 @@ pub fn embargoed_walkforward_backtest_py(
         max_daily_profit_pct,
         min_trading_days,
         max_trades_per_day,
-    }).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    })
+    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-    pythonize::pythonize(py, &res).map(|b| b.unbind()).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    pythonize::pythonize(py, &res)
+        .map(|b| b.unbind())
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+}
+
+fn backtest_settings_from_py(
+    py: Python,
+    settings: Option<Py<PyAny>>,
+) -> PyResult<BacktestSettings> {
+    let mut out = BacktestSettings::default();
+    let Some(settings) = settings else {
+        return Ok(out);
+    };
+    let obj = settings.bind(py);
+    if obj.is_none() {
+        return Ok(out);
+    }
+
+    set_f64(obj, "sl_pips", &mut out.sl_pips)?;
+    set_f64(obj, "stop_loss_pips", &mut out.sl_pips)?;
+    set_f64(obj, "tp_pips", &mut out.tp_pips)?;
+    set_f64(obj, "take_profit_pips", &mut out.tp_pips)?;
+    set_usize(obj, "max_hold_bars", &mut out.max_hold_bars)?;
+    set_bool(obj, "trailing_enabled", &mut out.trailing_enabled)?;
+    set_f64(
+        obj,
+        "trailing_atr_multiplier",
+        &mut out.trailing_atr_multiplier,
+    )?;
+    set_f64(obj, "trailing_be_trigger_r", &mut out.trailing_be_trigger_r)?;
+    set_f64(obj, "pip_value", &mut out.pip_value)?;
+    set_f64(obj, "spread_pips", &mut out.spread_pips)?;
+    set_f64(obj, "commission_per_trade", &mut out.commission_per_trade)?;
+    set_f64(obj, "commission_per_lot", &mut out.commission_per_trade)?;
+    set_f64(obj, "pip_value_per_lot", &mut out.pip_value_per_lot)?;
+    Ok(out)
+}
+
+fn get_setting_attr<'py>(
+    obj: &Bound<'py, PyAny>,
+    key: &str,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    if let Ok(dict) = obj.cast::<PyDict>() {
+        if let Some(value) = dict.get_item(key)? {
+            return Ok(Some(value));
+        }
+    }
+    match obj.getattr(key) {
+        Ok(value) => Ok(Some(value)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn set_f64(obj: &Bound<'_, PyAny>, key: &str, slot: &mut f64) -> PyResult<()> {
+    if let Some(value) = get_setting_attr(obj, key)? {
+        *slot = value.extract::<f64>()?;
+    }
+    Ok(())
+}
+
+fn set_usize(obj: &Bound<'_, PyAny>, key: &str, slot: &mut usize) -> PyResult<()> {
+    if let Some(value) = get_setting_attr(obj, key)? {
+        *slot = value.extract::<usize>()?;
+    }
+    Ok(())
+}
+
+fn set_bool(obj: &Bound<'_, PyAny>, key: &str, slot: &mut bool) -> PyResult<()> {
+    if let Some(value) = get_setting_attr(obj, key)? {
+        *slot = value.extract::<bool>()?;
+    }
+    Ok(())
 }
 
 #[pyclass(name = "CombinatorialPurgedCV")]
