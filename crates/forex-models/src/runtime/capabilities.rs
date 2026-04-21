@@ -91,6 +91,7 @@ pub const KNOWN_MODEL_NAMES: &[&str] = &[
     "tide_nf",
     "swarm_forecaster",
     "elasticnet",
+    "logistic",
     "bayes_logit",
     "meta_blender",
     "probability_calibrator",
@@ -226,6 +227,7 @@ pub fn model_capability(name: &str) -> Option<ModelCapability> {
 
         // Meta models
         "elasticnet" => ModelCapability::new(name, ModelFamily::Meta, CapabilityState::Verified),
+        "logistic" => ModelCapability::new(name, ModelFamily::Meta, CapabilityState::Verified),
         "bayes_logit" => ModelCapability::new(name, ModelFamily::Meta, CapabilityState::Verified),
         "meta_blender" => ModelCapability::new(name, ModelFamily::Meta, CapabilityState::Verified),
         "probability_calibrator" => {
@@ -275,9 +277,9 @@ pub fn model_capability(name: &str) -> Option<ModelCapability> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_runtime_degraded_reason, gpu_policy_cpu_fallback_reason, model_capability,
-        normalize_runtime_device_policy, normalize_training_precision_policy,
-        requested_training_precision_policy, CapabilityState, ModelCapability, ModelFamily,
+        CapabilityState, ModelCapability, ModelFamily, append_runtime_degraded_reason,
+        gpu_policy_cpu_fallback_reason, model_capability, normalize_runtime_device_policy,
+        normalize_training_precision_policy, requested_training_precision_policy,
     };
     use std::collections::HashSet;
 
@@ -335,6 +337,10 @@ mod tests {
         assert_eq!(capability.state, CapabilityState::Verified);
 
         let capability = model_capability("elasticnet").expect("elasticnet should resolve");
+        assert_eq!(capability.family, ModelFamily::Meta);
+        assert_eq!(capability.state, CapabilityState::Verified);
+
+        let capability = model_capability("logistic").expect("logistic should resolve");
         assert_eq!(capability.family, ModelFamily::Meta);
         assert_eq!(capability.state, CapabilityState::Verified);
 
@@ -420,6 +426,7 @@ mod tests {
     fn statistical_meta_model_names_resolve_to_verified_capabilities() {
         let verified_models = [
             "elasticnet",
+            "logistic",
             "bayes_logit",
             "meta_blender",
             "probability_calibrator",

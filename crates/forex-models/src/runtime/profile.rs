@@ -27,6 +27,9 @@ pub struct TrainingRuntimeProfile {
     pub l1_feature_selection_enabled: bool,
     pub requested_backend: Option<String>,
     pub requested_device: Option<String>,
+    pub planned_backend: Option<String>,
+    pub planned_device: Option<String>,
+    pub planned_precision: Option<String>,
     pub checkpoint_path: Option<PathBuf>,
     pub async_requested: bool,
     pub async_wait_requested: bool,
@@ -108,6 +111,15 @@ fn validate_training_runtime_profile(profile: &TrainingRuntimeProfile) -> Result
         .is_some_and(|value| value.trim().is_empty())
     {
         anyhow::bail!("training runtime profile requested_device must not be blank");
+    }
+    for (field_name, value) in [
+        ("planned_backend", profile.planned_backend.as_deref()),
+        ("planned_device", profile.planned_device.as_deref()),
+        ("planned_precision", profile.planned_precision.as_deref()),
+    ] {
+        if value.is_some_and(|value| value.trim().is_empty()) {
+            anyhow::bail!("training runtime profile {field_name} must not be blank");
+        }
     }
     Ok(())
 }
@@ -193,6 +205,9 @@ mod tests {
             l1_feature_selection_enabled: false,
             requested_backend: Some("lightgbm".to_string()),
             requested_device: Some("cuda:0".to_string()),
+            planned_backend: Some("cuda".to_string()),
+            planned_device: Some("cuda:0".to_string()),
+            planned_precision: Some("fp32".to_string()),
             checkpoint_path: None,
             async_requested: false,
             async_wait_requested: false,

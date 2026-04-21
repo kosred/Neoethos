@@ -65,7 +65,9 @@ pub fn tree_device_preference_for(model_name: &str) -> DevicePreference {
         .to_lowercase();
     match raw.as_str() {
         "cpu" => DevicePreference::Cpu,
-        "gpu" | "cuda" => DevicePreference::Gpu,
+        value if value == "gpu" || value == "cuda" || value.starts_with("cuda:") => {
+            DevicePreference::Gpu
+        }
         "auto" => DevicePreference::Auto,
         "0" | "false" | "no" | "off" => DevicePreference::Cpu,
         "1" | "true" | "yes" | "on" => DevicePreference::Gpu,
@@ -76,7 +78,9 @@ pub fn tree_device_preference_for(model_name: &str) -> DevicePreference {
 pub fn parse_device_preference(value: &str) -> DevicePreference {
     match value.trim().to_ascii_lowercase().as_str() {
         "cpu" => DevicePreference::Cpu,
-        "gpu" | "cuda" => DevicePreference::Gpu,
+        value if value == "gpu" || value == "cuda" || value.starts_with("cuda:") => {
+            DevicePreference::Gpu
+        }
         "auto" => DevicePreference::Auto,
         "0" | "false" | "no" | "off" => DevicePreference::Cpu,
         "1" | "true" | "yes" | "on" => DevicePreference::Gpu,

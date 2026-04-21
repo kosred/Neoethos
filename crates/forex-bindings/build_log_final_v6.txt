@@ -1,6 +1,0 @@
-   Compiling talib-sys v0.1.0 (C:\Users\konst\development\forex-ai\vendor\talib-sys)
-    Checking forex-data v0.1.0 (C:\Users\konst\development\forex-ai\crates\forex-data)
-    Checking forex-models v0.1.0 (C:\Users\konst\development\forex-ai\crates\forex-models)
-    Checking forex-search v0.1.0 (C:\Users\konst\development\forex-ai\crates\forex-search)
-    Checking forex-bindings v0.1.0 (C:\Users\konst\development\forex-ai\crates\forex-bindings)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.94s

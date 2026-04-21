@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use forex_core::{AcceleratorBackend, TrainingPrecision};
 use forex_data::{FeatureCache, FeatureFrame, Ohlcv, SymbolDataset, compute_hpc_feature_frame};
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
@@ -38,6 +39,8 @@ pub struct GpuDiscoveryConfig {
     pub pos_penalty: f64,
     pub chunk_size: usize,
     pub devices: Vec<i64>,
+    pub backend: AcceleratorBackend,
+    pub precision: TrainingPrecision,
 }
 
 impl Default for GpuDiscoveryConfig {
@@ -68,6 +71,8 @@ impl Default for GpuDiscoveryConfig {
             pos_penalty: 15.0,
             chunk_size: 2048,
             devices: Vec::new(),
+            backend: AcceleratorBackend::Cuda,
+            precision: TrainingPrecision::Fp32,
         }
     }
 }
@@ -200,6 +205,18 @@ pub fn run_gpu_discovery(
     base_ohlcv: &Ohlcv,
     config: &GpuDiscoveryConfig,
 ) -> Result<GpuDiscoveryResult> {
+    if config.backend != AcceleratorBackend::Cuda {
+        bail!(
+            "forex-search GPU discovery currently supports CUDA only, requested {}",
+            config.backend.as_str()
+        );
+    }
+    if config.precision != TrainingPrecision::Fp32 {
+        bail!(
+            "forex-search GPU discovery currently executes FP32 tensors only, requested {}",
+            config.precision.as_str()
+        );
+    }
     if frames.is_empty() {
         bail!("no feature frames supplied");
     }

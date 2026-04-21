@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use ndarray::Array2;
 use polars::prelude::{DataFrame, Series};
 use rand::{Rng, SeedableRng};
@@ -10,24 +10,25 @@ use symbios_genetics::Genotype;
 use symbios_neat::{Activation, CppnEvaluator, NeatConfig, NeatGenome};
 
 use crate::base::{
-    build_runtime_artifact_metadata, build_runtime_prediction_with_details,
-    three_class_runtime_confidence, try_build_runtime_artifact_metadata, ExpertModel,
+    ExpertModel, build_runtime_artifact_metadata, build_runtime_prediction_with_details,
+    three_class_runtime_confidence, try_build_runtime_artifact_metadata,
 };
 use crate::runtime::artifacts::{
-    default_three_class_label_mapping, RuntimeArtifactMetadata, TrainingSummaryMetadata,
+    RuntimeArtifactMetadata, TrainingSummaryMetadata, default_three_class_label_mapping,
 };
 use crate::runtime::capabilities::{
-    append_runtime_degraded_reason, gpu_policy_cpu_fallback_reason, CapabilityState, ModelFamily,
+    CapabilityState, ModelFamily, append_runtime_degraded_reason, gpu_policy_cpu_fallback_reason,
 };
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
-    ensure_feature_columns_match, feature_matrix_from_dataframe, read_json,
-    remap_three_class_labels, softmax_rows, write_json, FeatureScaler, METADATA_FILE_NAME,
+    FeatureScaler, METADATA_FILE_NAME, ensure_feature_columns_match, feature_matrix_from_dataframe,
+    read_json, remap_three_class_labels, softmax_rows, write_json,
 };
 
 const NEAT_ARTIFACT_FILE_NAME: &str = "neat.json";
 const NEAT_MODEL_NAME: &str = "neat";
 const NEAT_RUNTIME_BACKEND: &str = "symbios_neat_cpu";
+const DEFAULT_NEAT_SPECIES_ELITISM: usize = 0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -64,7 +65,7 @@ impl Default for NeatArtifact {
             generations: 48,
             population_size: 96,
             mutation_rate: 0.85,
-            species_elitism: 1,
+            species_elitism: DEFAULT_NEAT_SPECIES_ELITISM,
             compatibility_threshold: 2.5,
             immigrant_fraction: 0.1,
             seed: 42,
@@ -422,7 +423,7 @@ impl NeatExpert {
             generations: generations.max(8),
             population_size: population_size.max(24),
             mutation_rate: 0.85,
-            species_elitism: 1,
+            species_elitism: DEFAULT_NEAT_SPECIES_ELITISM,
             compatibility_threshold: 2.5,
             immigrant_fraction: 0.1,
             seed: 42,
@@ -449,7 +450,7 @@ impl NeatExpert {
         seed: u64,
     ) -> Self {
         self.mutation_rate = mutation_rate.clamp(0.05, 1.5);
-        self.species_elitism = species_elitism.max(1);
+        self.species_elitism = species_elitism.min(self.population_size);
         self.compatibility_threshold = compatibility_threshold.max(0.25);
         self.immigrant_fraction = immigrant_fraction.clamp(0.0, 0.4);
         self.seed = seed;
@@ -548,7 +549,10 @@ impl NeatExpert {
 
             let mut next_population = Vec::with_capacity(self.population_size);
             for bucket in &species {
-                let elite_count = self.species_elitism.min(bucket.members.len()).max(1);
+                let elite_count = self.species_elitism.min(bucket.members.len());
+                if elite_count == 0 {
+                    continue;
+                }
                 let mut ranked = bucket.members.clone();
                 ranked.sort_by(|left, right| {
                     scores[*right]
@@ -816,6 +820,13 @@ impl NeatExpert {
                 artifact.population_size
             );
         }
+        if artifact.species_elitism > artifact.population_size {
+            bail!(
+                "NEAT artifact species_elitism ({}) cannot exceed population_size ({})",
+                artifact.species_elitism,
+                artifact.population_size
+            );
+        }
 
         if artifact.dataset_rows == 0 {
             bail!("NEAT artifact dataset rows must be greater than zero");
@@ -1065,7 +1076,7 @@ impl ExpertModel for NeatExpert {
         let next_generations = artifact.generations.max(8);
         let next_population_size = artifact.population_size.max(24);
         let next_mutation_rate = artifact.mutation_rate;
-        let next_species_elitism = artifact.species_elitism.max(1);
+        let next_species_elitism = artifact.species_elitism.min(next_population_size);
         let next_compatibility_threshold = artifact.compatibility_threshold.max(0.25);
         let next_immigrant_fraction = artifact.immigrant_fraction.clamp(0.0, 0.4);
         let next_seed = artifact.seed;
@@ -1147,6 +1158,12 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         Ok((features, labels))
+    }
+
+    #[test]
+    fn neat_search_params_allow_zero_species_elitism() {
+        let expert = NeatExpert::with_config(2, 24, 8).with_search_params(0.85, 0, 2.5, 0.1, 42);
+        assert_eq!(expert.species_elitism, 0);
     }
 
     #[test]
@@ -1358,9 +1375,10 @@ mod tests {
 
         let err = NeatExpert::validate_loaded_artifact(&metadata, &artifact)
             .expect_err("out-of-range mutation rate should be rejected");
-        assert!(err
-            .to_string()
-            .contains("mutation rate is out of contract range"));
+        assert!(
+            err.to_string()
+                .contains("mutation rate is out of contract range")
+        );
         Ok(())
     }
 

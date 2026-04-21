@@ -25,11 +25,11 @@ use crate::base::{
     dataframe_to_float32_array, feature_columns_from_dataframe, three_class_runtime_confidence,
     try_build_runtime_artifact_metadata,
 };
-use crate::burn_models::{resolve_train_device, TrainBackend};
+use crate::burn_models::{TrainBackend, resolve_train_device};
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 use crate::runtime::prediction::RuntimePrediction;
-use crate::statistical::common::{read_json, write_json, METADATA_FILE_NAME};
+use crate::statistical::common::{METADATA_FILE_NAME, read_json, write_json};
 // ============================================================================
 // BURN Q-NETWORK
 // ============================================================================
@@ -74,6 +74,8 @@ impl<B: Backend> ExitAgentNet<B> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Experience {
     pub state: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_state: Option<Vec<f32>>,
     pub action: i64,
     pub reward: f32,
     pub done: bool,
@@ -354,6 +356,21 @@ fn validate_exit_artifact(artifact: &ExitAgentArtifact) -> Result<()> {
         if experience.state.iter().any(|value| !value.is_finite()) {
             anyhow::bail!("exit-agent replay experience {idx} has non-finite state values");
         }
+        if let Some(next_state) = experience.next_state.as_ref() {
+            if next_state.len() != artifact.input_dim {
+                anyhow::bail!(
+                    "exit-agent replay experience {} has next_state width {} but input_dim is {}",
+                    idx,
+                    next_state.len(),
+                    artifact.input_dim
+                );
+            }
+            if next_state.iter().any(|value| !value.is_finite()) {
+                anyhow::bail!(
+                    "exit-agent replay experience {idx} has non-finite next_state values"
+                );
+            }
+        }
     }
     for (ticket, regret) in &artifact.pending_regret {
         if regret.state.len() != artifact.input_dim {
@@ -502,6 +519,7 @@ pub struct ExitAgentTrainingReport {
 /// Pure-Rust Burn ExitAgent
 pub struct ExitAgent {
     model: ExitAgentNet<TrainBackend>,
+    target_model: ExitAgentNet<TrainBackend>,
     optim: OptimizerAdaptor<burn::optim::AdamW, ExitAgentNet<TrainBackend>, TrainBackend>,
     memory: VecDeque<Experience>,
     pending_regret: HashMap<i32, PendingRegret>,
@@ -520,6 +538,7 @@ pub struct ExitAgent {
     average_reward: f32,
     training_report: Option<ExitAgentTrainingReport>,
     trained_checkpoint_ready: bool,
+    train_step_count: usize,
     device: <TrainBackend as Backend>::Device,
     requested_device_policy: String,
     effective_device_policy: String,
@@ -538,6 +557,8 @@ impl ExitAgent {
         self.average_reward = 0.0;
         self.training_report = None;
         self.trained_checkpoint_ready = false;
+        self.train_step_count = 0;
+        self.target_model = self.model.clone();
         self.persisted_requested_device_policy = None;
         self.persisted_effective_device_policy = None;
         self.persisted_execution_backend = None;
@@ -556,6 +577,7 @@ impl ExitAgent {
         let optim = AdamWConfig::new().with_weight_decay(1e-4).init();
 
         Self {
+            target_model: model.clone(),
             model,
             optim,
             memory: VecDeque::with_capacity(10000),
@@ -575,6 +597,7 @@ impl ExitAgent {
             average_reward: 0.0,
             training_report: None,
             trained_checkpoint_ready: false,
+            train_step_count: 0,
             device,
             requested_device_policy: selection.requested_policy,
             effective_device_policy: selection.effective_policy,
@@ -593,6 +616,7 @@ impl ExitAgent {
             .with_input_dim(self.input_dim)
             .with_hidden_dim(self.hidden_dim)
             .init(&device);
+        self.target_model = self.model.clone();
         self.optim = AdamWConfig::new().with_weight_decay(1e-4).init();
         self.invalidate_trained_runtime_state();
         self.requested_device_policy = selection.requested_policy;
@@ -645,11 +669,7 @@ impl ExitAgent {
     }
 
     fn normalize_direction(direction: i32) -> i32 {
-        if direction < 0 {
-            -1
-        } else {
-            1
-        }
+        if direction < 0 { -1 } else { 1 }
     }
 
     fn reward_from_trace(
@@ -731,6 +751,28 @@ impl ExitAgent {
         action as i32
     }
 
+    fn target_q_max(&self, state: &[f32]) -> Option<f32> {
+        if state.len() != self.input_dim || state.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        let state_tensor = Tensor::<TrainBackend, 1>::from_data(
+            TensorData::new(state.to_vec(), [self.input_dim]),
+            &self.device,
+        )
+        .unsqueeze::<2>();
+        self.target_model
+            .forward(state_tensor)
+            .into_data()
+            .to_vec::<f32>()
+            .ok()
+            .and_then(|values| {
+                values
+                    .into_iter()
+                    .filter(|value| value.is_finite())
+                    .max_by(|left, right| left.total_cmp(right))
+            })
+    }
+
     pub fn observe_exit(
         &mut self,
         ticket: i32,
@@ -767,6 +809,7 @@ impl ExitAgent {
 
             self.push_experience(Experience {
                 state: data.state,
+                next_state: None,
                 action: data.action,
                 reward,
                 done: true,
@@ -789,7 +832,7 @@ impl ExitAgent {
 
         let mut states_flat = Vec::with_capacity(batch_size * self.input_dim);
         let mut actions = Vec::with_capacity(batch_size);
-        let mut rewards = Vec::with_capacity(batch_size);
+        let mut targets = Vec::with_capacity(batch_size);
 
         for &idx in batch_indices {
             let exp = &self.memory[idx];
@@ -798,7 +841,16 @@ impl ExitAgent {
             }
             states_flat.extend_from_slice(&exp.state);
             actions.push(exp.action);
-            rewards.push(exp.reward);
+            let bootstrap = if exp.done {
+                0.0
+            } else {
+                exp.next_state
+                    .as_deref()
+                    .and_then(|next_state| self.target_q_max(next_state))
+                    .map(|max_next_q| self.gamma * max_next_q)
+                    .unwrap_or(0.0)
+            };
+            targets.push((exp.reward + bootstrap).clamp(-2.0, 2.0));
         }
 
         if actions.len() < 8 {
@@ -813,8 +865,8 @@ impl ExitAgent {
         );
         let actions_tensor: Tensor<TrainBackend, 1, Int> =
             Tensor::from_data(TensorData::new(actions, [effective_batch]), &self.device);
-        let rewards_tensor: Tensor<TrainBackend, 1> =
-            Tensor::from_data(TensorData::new(rewards, [effective_batch]), &self.device);
+        let target_tensor: Tensor<TrainBackend, 1> =
+            Tensor::from_data(TensorData::new(targets, [effective_batch]), &self.device);
 
         let q_values = self.model.forward(states_tensor);
         let q_value = q_values
@@ -823,13 +875,17 @@ impl ExitAgent {
 
         let loss = burn::nn::loss::MseLoss::new().forward(
             q_value,
-            rewards_tensor,
+            target_tensor,
             burn::nn::loss::Reduction::Mean,
         );
 
         let grads = loss.backward();
         let grads_params = GradientsParams::from_grads(grads, &self.model);
         self.model = self.optim.step(1e-4, self.model.clone(), grads_params);
+        self.train_step_count = self.train_step_count.saturating_add(1);
+        if self.train_step_count.is_multiple_of(32) {
+            self.target_model = self.model.clone();
+        }
 
         self.epsilon = self.epsilon_min.max(self.epsilon * self.epsilon_decay);
     }
@@ -1078,6 +1134,11 @@ impl ExitAgent {
         };
         for row_idx in 0..features.nrows().saturating_sub(horizon + 1) {
             let state = features.row(row_idx).iter().copied().collect::<Vec<_>>();
+            let next_state = features
+                .row((row_idx + 1).min(features.nrows() - 1))
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
             if labels[row_idx] == 0 {
                 continue;
             }
@@ -1135,9 +1196,10 @@ impl ExitAgent {
 
             self.push_experience(Experience {
                 state,
+                next_state: Some(next_state),
                 action,
                 reward,
-                done: true,
+                done: action == 1 || row_idx + horizon + 2 >= features.nrows(),
             });
         }
 
@@ -1159,6 +1221,7 @@ impl ExitAgent {
         self.trained_memory_size = self.memory.len();
         self.average_reward = average_reward;
         self.feature_columns = feature_columns;
+        self.target_model = self.model.clone();
         let training_report = ExitAgentTrainingReport {
             train_rows: self.train_rows,
             memory_size: self.trained_memory_size,
@@ -1436,6 +1499,7 @@ impl ExitAgent {
             optim
         };
         Ok(Self {
+            target_model: model.clone(),
             model,
             optim,
             memory: {
@@ -1465,6 +1529,7 @@ impl ExitAgent {
             average_reward: artifact.average_reward,
             training_report: artifact.training_report,
             trained_checkpoint_ready: true,
+            train_step_count: 0,
             device,
             requested_device_policy: selection.requested_policy,
             effective_device_policy: selection.effective_policy,
@@ -1478,9 +1543,9 @@ impl ExitAgent {
 
 #[cfg(test)]
 mod tests {
-    use super::{exit_runtime_metadata, ExitAgent, ExitAgentArtifact, Experience};
+    use super::{ExitAgent, ExitAgentArtifact, Experience, exit_runtime_metadata};
     use crate::base::three_class_runtime_confidence;
-    use crate::statistical::common::{write_json, METADATA_FILE_NAME};
+    use crate::statistical::common::{METADATA_FILE_NAME, write_json};
     use anyhow::Result;
     use burn::module::Param;
     use burn::tensor::Tensor;
@@ -1591,12 +1656,14 @@ mod tests {
             replay_memory: vec![
                 Experience {
                     state: vec![0.0; 6],
+                    next_state: None,
                     action: 0,
                     reward: 0.0,
                     done: true,
                 },
                 Experience {
                     state: vec![0.0; 6],
+                    next_state: None,
                     action: 1,
                     reward: 1.0,
                     done: true,
@@ -1642,6 +1709,7 @@ mod tests {
         agent.trained_checkpoint_ready = true;
         agent.push_experience(Experience {
             state: vec![0.0; 6],
+            next_state: None,
             action: 1,
             reward: 0.5,
             done: true,
@@ -1672,6 +1740,7 @@ mod tests {
         agent.trained_checkpoint_ready = true;
         agent.push_experience(Experience {
             state: vec![0.0; 6],
+            next_state: None,
             action: 1,
             reward: 0.5,
             done: true,
@@ -1737,6 +1806,7 @@ mod tests {
         agent.train_rows = 64;
         agent.push_experience(Experience {
             state: vec![0.0; 6],
+            next_state: None,
             action: 0,
             reward: 0.25,
             done: true,
@@ -1850,6 +1920,7 @@ mod tests {
         agent.trained_memory_size = 1;
         agent.push_experience(Experience {
             state: vec![0.0; 6],
+            next_state: None,
             action: 0,
             reward: 0.1,
             done: true,
@@ -1914,6 +1985,7 @@ mod tests {
         agent.average_reward = 0.25;
         agent.push_experience(Experience {
             state: vec![0.0; 6],
+            next_state: None,
             action: 0,
             reward: 0.25,
             done: true,
@@ -2018,6 +2090,7 @@ mod tests {
         artifact.trained_memory_size = 1;
         artifact.replay_memory.push(Experience {
             state: vec![0.0; 6],
+            next_state: None,
             action: 0,
             reward: 0.0,
             done: true,
@@ -2060,6 +2133,7 @@ mod tests {
         artifact.warmup_steps = 32;
         artifact.replay_memory.push(Experience {
             state: vec![0.0; 6],
+            next_state: None,
             action: 0,
             reward: 0.0,
             done: true,
@@ -2099,6 +2173,7 @@ mod tests {
         artifact.average_reward = 0.25;
         artifact.replay_memory.push(Experience {
             state: vec![0.0; 6],
+            next_state: None,
             action: 0,
             reward: 0.25,
             done: true,
@@ -2141,6 +2216,7 @@ mod tests {
         artifact.average_reward = 0.0;
         artifact.replay_memory.push(Experience {
             state: vec![0.0; 6],
+            next_state: None,
             action: 0,
             reward: 0.0,
             done: true,
@@ -2232,6 +2308,7 @@ mod tests {
         ];
         agent.push_experience(Experience {
             state: vec![0.0; 6],
+            next_state: None,
             action: 0,
             reward: 0.0,
             done: true,
@@ -2307,6 +2384,7 @@ mod tests {
         agent.trained_memory_size = 1;
         agent.push_experience(Experience {
             state: vec![0.0; 6],
+            next_state: None,
             action: 0,
             reward: 0.1,
             done: true,

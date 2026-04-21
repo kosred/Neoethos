@@ -12,31 +12,34 @@ use crate::ensemble::{
 };
 use crate::exit_agent::ExitAgent;
 use crate::parallel_trainer::{
-    train_models_parallel_with_progress, ModelConfig, ModelTrainingFailure, ModelTrainingProgress,
-    ModelType, TrainingPayload,
+    ModelConfig, ModelTrainingFailure, ModelTrainingProgress, ModelType, TrainingPayload,
+    train_models_parallel_with_progress,
 };
-use crate::runtime::capabilities::CapabilityState;
-use crate::runtime::dispatch::{build_dispatch_plan, DispatchPlan};
+use crate::runtime::capabilities::{CapabilityState, ModelFamily};
+use crate::runtime::dispatch::{DispatchPlan, build_dispatch_plan};
 use crate::runtime::exports::{
-    write_onnx_export_status, OnnxExportStatus, ONNX_EXPORT_STATUS_FILE_NAME,
+    ONNX_EXPORT_STATUS_FILE_NAME, OnnxExportStatus, write_onnx_export_status,
 };
 use crate::runtime::hpo::{
+    OPTIMIZATION_REPORT_FILE_NAME, OptimizationReport, OptimizationTrialRecord,
     evaluate_prediction_quality, time_series_holdout_split, write_optimization_report,
-    OptimizationReport, OptimizationTrialRecord, OPTIMIZATION_REPORT_FILE_NAME,
 };
 use crate::runtime::profile::{
-    write_training_runtime_profile, TrainingRuntimeProfile, TRAINING_RUNTIME_PROFILE_FILE_NAME,
+    TRAINING_RUNTIME_PROFILE_FILE_NAME, TrainingRuntimeProfile, write_training_runtime_profile,
 };
 use crate::tree_models::config::ParamValue;
 use crate::tree_models::{CatBoostExpert, LightGBMExpert, SklearsTreeExpert, XGBoostExpert};
 use crate::{
     BayesianLogitExpert, ElasticNetExpert, GeneticStrategyExpert, IsolationForestExpert, KANExpert,
-    MLPExpert, NBeatsExpert, NBeatsxNfExpert, NeatExpert, NeuroEvoExpert, OnlineHoeffdingExpert,
-    OnlinePassiveAggressiveExpert, PatchTSTExpert, SwarmForecaster, TabNetExpert, TiDEExpert,
-    TiDENfExpert, TimesNetExpert, TradingReinforcementLearner, TransformerExpert,
+    LogisticExpert, MLPExpert, NBeatsExpert, NBeatsxNfExpert, NeatExpert, NeuroEvoExpert,
+    OnlineHoeffdingExpert, OnlinePassiveAggressiveExpert, PatchTSTExpert, SwarmForecaster,
+    TabNetExpert, TiDEExpert, TiDENfExpert, TimesNetExpert, TradingReinforcementLearner,
+    TransformerExpert,
 };
+use forex_core::system::HardwareProbe;
+use forex_core::{HardwareExecutionPlan, WorkloadKind};
 use forex_data::{
-    load_symbol_dataset, prepare_multitimeframe_features_with_options, FeatureBuildOptions, Ohlcv,
+    FeatureBuildOptions, Ohlcv, load_symbol_dataset, prepare_multitimeframe_features_with_options,
 };
 use forex_search::genetic::{ParentSelectionPolicy, SurvivorSelectionPolicy};
 use polars::prelude::{BooleanChunked, DataFrame, NamedFrom, NewChunkedArray, Series};
@@ -55,6 +58,22 @@ pub struct TrainingOrchestrator {
 
 fn is_supported_orchestrator_burn_device_policy(policy: &str) -> bool {
     matches!(policy, "auto" | "cpu" | "gpu") || policy.starts_with("gpu:")
+}
+
+fn burn_policy_from_workload_device(device: &str) -> String {
+    let normalized = device.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized == "cpu" {
+        return "cpu".to_string();
+    }
+    if let Some((_, index)) = normalized.split_once(':') {
+        if index == "all" {
+            return "gpu".to_string();
+        }
+        if index.parse::<usize>().is_ok() {
+            return format!("gpu:{index}");
+        }
+    }
+    "gpu".to_string()
 }
 
 impl TrainingOrchestrator {
@@ -324,11 +343,18 @@ impl TrainingOrchestrator {
     }
 
     fn build_training_configs(&self, dispatch_plan: &DispatchPlan) -> Result<Vec<ModelConfig>> {
+        let hardware_plan = self.hardware_execution_plan();
         dispatch_plan
             .entries
             .iter()
             .map(|entry| {
                 let mut params = self.default_model_params(&entry.name);
+                self.apply_hardware_plan_params(
+                    &entry.name,
+                    entry.family,
+                    &hardware_plan,
+                    &mut params,
+                );
                 self.inject_runtime_model_params(&entry.name, &mut params);
                 self.apply_model_param_overrides(&entry.name, &mut params);
                 Ok(ModelConfig {
@@ -340,6 +366,62 @@ impl TrainingOrchestrator {
                 })
             })
             .collect()
+    }
+
+    fn hardware_execution_plan(&self) -> HardwareExecutionPlan {
+        let mut probe = HardwareProbe::new();
+        let profile = probe.detect();
+        HardwareExecutionPlan::from_settings_and_profile(&self.settings, profile)
+    }
+
+    fn apply_hardware_plan_params(
+        &self,
+        name: &str,
+        family: ModelFamily,
+        plan: &HardwareExecutionPlan,
+        params: &mut HashMap<String, String>,
+    ) {
+        let workload = match family {
+            ModelFamily::Tree => Some(WorkloadKind::TreeTraining),
+            ModelFamily::Deep | ModelFamily::Exit => Some(WorkloadKind::DeepTraining),
+            ModelFamily::Rl => Some(WorkloadKind::RlTraining),
+            ModelFamily::Evolutionary if canonical_model_name(name) == "genetic" => {
+                Some(WorkloadKind::StrategySearch)
+            }
+            _ => None,
+        };
+        let Some(workload) = workload.and_then(|kind| plan.workload(kind)) else {
+            return;
+        };
+        params.insert(
+            "__planned_backend".to_string(),
+            workload.backend.as_str().to_string(),
+        );
+        params.insert("__planned_device".to_string(), workload.device.clone());
+        params.insert(
+            "__planned_precision".to_string(),
+            workload.precision.as_str().to_string(),
+        );
+
+        match family {
+            ModelFamily::Tree | ModelFamily::Rl => {
+                params.insert("device".to_string(), workload.device.clone());
+            }
+            ModelFamily::Deep | ModelFamily::Exit => {
+                params.insert(
+                    "device".to_string(),
+                    burn_policy_from_workload_device(&workload.device),
+                );
+                params.insert(
+                    "training_precision".to_string(),
+                    workload.precision.as_str().to_string(),
+                );
+            }
+            ModelFamily::Evolutionary if canonical_model_name(name) == "genetic" => {
+                params.insert("device".to_string(), workload.device.clone());
+            }
+            _ => {}
+        }
     }
 
     fn epochs_from_seconds(seconds: u64, default_epochs: usize) -> usize {
@@ -894,6 +976,14 @@ impl TrainingOrchestrator {
                     ("hidden_dim".to_string(), hidden_dim.to_string()),
                     ("n_heads".to_string(), n_heads.to_string()),
                     ("n_layers".to_string(), n_layers.to_string()),
+                    (
+                        "token_count".to_string(),
+                        self.settings
+                            .models
+                            .transformer_seq_len
+                            .clamp(2, 64)
+                            .to_string(),
+                    ),
                     ("dim_ff".to_string(), (hidden_dim * 2).to_string()),
                     ("dropout".to_string(), format!("{dropout:.4}")),
                     (
@@ -969,6 +1059,10 @@ impl TrainingOrchestrator {
                     self.settings.models.kan_hidden_dim.to_string(),
                 ),
                 ("n_layers".to_string(), "3".to_string()),
+                (
+                    "grid_size".to_string(),
+                    self.settings.models.kan_grid_size.to_string(),
+                ),
                 ("dropout".to_string(), "0.05".to_string()),
                 (
                     "batch_size".to_string(),
@@ -1488,6 +1582,8 @@ impl TrainingOrchestrator {
                 ),
             ]),
             "neuro_evo" => HashMap::from([
+                ("backend".to_string(), "crfmnes_cpu".to_string()),
+                ("device".to_string(), "cpu".to_string()),
                 (
                     "hidden_dim".to_string(),
                     self.settings.models.evo_hidden_size.to_string(),
@@ -1527,10 +1623,7 @@ impl TrainingOrchestrator {
                         (self.settings.models.evo_sigma * 2.4).clamp(0.2, 1.2)
                     ),
                 ),
-                (
-                    "species_elitism".to_string(),
-                    self.settings.models.evo_islands.clamp(1, 3).to_string(),
-                ),
+                ("species_elitism".to_string(), "0".to_string()),
                 (
                     "compatibility_threshold".to_string(),
                     format!(
@@ -1562,6 +1655,7 @@ impl TrainingOrchestrator {
             "patchtst" => Ok(ModelType::PatchTST),
             "timesnet" => Ok(ModelType::TimesNet),
             "elasticnet" => Ok(ModelType::ElasticNet),
+            "logistic" => Ok(ModelType::Logistic),
             "bayes_logit" => Ok(ModelType::BayesianLogit),
             "meta_blender" => Ok(ModelType::MetaBlender),
             "probability_calibrator" => Ok(ModelType::ProbabilityCalibrator),
@@ -1927,6 +2021,9 @@ fn training_runtime_profile(
     };
     let requested_backend = parse_string_param(&config.params, "backend");
     let requested_device = parse_string_param(&config.params, "device");
+    let planned_backend = parse_string_param(&config.params, "__planned_backend");
+    let planned_device = parse_string_param(&config.params, "__planned_device");
+    let planned_precision = parse_string_param(&config.params, "__planned_precision");
     let rllib_requested = requested_backend
         .as_deref()
         .is_some_and(|backend| backend.eq_ignore_ascii_case("rllib"));
@@ -1980,6 +2077,9 @@ fn training_runtime_profile(
         l1_feature_selection_enabled: settings.models.l1_feature_selection_enabled,
         requested_backend,
         requested_device,
+        planned_backend,
+        planned_device,
+        planned_precision,
         checkpoint_path: parse_string_param(&config.params, "checkpoint").map(PathBuf::from),
         async_requested: parse_bool_param(&config.params, "async", false),
         async_wait_requested: parse_bool_param(&config.params, "async_wait", false),
@@ -2316,6 +2416,7 @@ fn supports_hpo(model_type: ModelType) -> bool {
             | ModelType::PatchTST
             | ModelType::TimesNet
             | ModelType::ElasticNet
+            | ModelType::Logistic
             | ModelType::OnlinePassiveAggressive
             | ModelType::OnlineHoeffding
             | ModelType::IsolationForest
@@ -2341,6 +2442,7 @@ fn uses_shared_expert_dispatch(model_type: ModelType) -> bool {
             | ModelType::PatchTST
             | ModelType::TimesNet
             | ModelType::ElasticNet
+            | ModelType::Logistic
             | ModelType::BayesianLogit
             | ModelType::MetaBlender
             | ModelType::ProbabilityCalibrator
@@ -2378,6 +2480,13 @@ fn build_expert_model(
                 parse_f64_param(params, "alpha", 0.1),
                 parse_f64_param(params, "l1_ratio", 0.5),
             );
+            model.learning_rate = parse_f32_param(params, "lr", model.learning_rate);
+            model.epochs = parse_usize_param(params, "epochs", model.epochs);
+            Ok(Box::new(model))
+        }
+        ModelType::Logistic => {
+            let mut model = LogisticExpert::new();
+            model.alpha = parse_f32_param(params, "alpha", model.alpha);
             model.learning_rate = parse_f32_param(params, "lr", model.learning_rate);
             model.epochs = parse_usize_param(params, "epochs", model.epochs);
             Ok(Box::new(model))
@@ -2443,6 +2552,9 @@ fn build_expert_model(
                 parse_f64_param(params, "sigma", 0.25),
                 parse_usize_param(params, "generations", 24),
             )
+            .with_device_policy(
+                parse_string_param(params, "device").unwrap_or_else(|| "auto".to_string()),
+            )
             .with_search_topology(
                 parse_usize_param(params, "population", 16),
                 parse_usize_param(params, "islands", 1),
@@ -2456,7 +2568,7 @@ fn build_expert_model(
             )
             .with_search_params(
                 parse_f32_param(params, "mutation_rate", 0.85),
-                parse_usize_param(params, "species_elitism", 1),
+                parse_usize_param(params, "species_elitism", 0),
                 parse_f32_param(params, "compatibility_threshold", 2.5),
                 parse_f32_param(params, "immigrant_fraction", 0.1),
                 parse_u64_param(params, "seed", 42),
@@ -2676,6 +2788,12 @@ fn generate_hpo_candidate_params(
                     "n_layers".to_string(),
                     sample_choice(&["2", "3", "4", "6"], trial_idx, trials, backend, 17),
                 );
+                if canonical == "transformer" {
+                    params.insert(
+                        "token_count".to_string(),
+                        sample_choice(&["8", "16", "32", "64"], trial_idx, trials, backend, 41),
+                    );
+                }
             }
             if matches!(canonical, "nbeats" | "nbeatsx_nf") {
                 params.insert(
@@ -2700,6 +2818,10 @@ fn generate_hpo_candidate_params(
                 params.insert(
                     "n_layers".to_string(),
                     sample_choice(&["2", "3", "4"], trial_idx, trials, backend, 31),
+                );
+                params.insert(
+                    "grid_size".to_string(),
+                    sample_choice(&["7", "9", "13", "17"], trial_idx, trials, backend, 37),
                 );
             }
         }
@@ -2728,6 +2850,26 @@ fn generate_hpo_candidate_params(
             params.insert(
                 "epochs".to_string(),
                 sample_usize(&[200, 400, 800, 1200], trial_idx, trials, backend, 7).to_string(),
+            );
+        }
+        "logistic" => {
+            params.insert(
+                "alpha".to_string(),
+                format!(
+                    "{:.6}",
+                    sample_f64(0.0005, 0.25, trial_idx, trials, backend, 2)
+                ),
+            );
+            params.insert(
+                "lr".to_string(),
+                format!(
+                    "{:.6}",
+                    sample_f64(0.001, 0.05, trial_idx, trials, backend, 5)
+                ),
+            );
+            params.insert(
+                "epochs".to_string(),
+                sample_usize(&[150, 250, 500, 900], trial_idx, trials, backend, 7).to_string(),
             );
         }
         "online_pa" => {

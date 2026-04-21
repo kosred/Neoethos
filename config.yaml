@@ -206,6 +206,7 @@ models:
   tide_train_seconds: 3600
   tabnet_train_seconds: 3600
   kan_train_seconds: 3600
+  kan_grid_size: 9
   mlp_train_seconds: 3600
   num_transformers: 2
   swarm_memory_limit_mb: 256.0

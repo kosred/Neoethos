@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use burn::module::{AutodiffModule, Module};
 use burn::record::{DefaultFileRecorder, FullPrecisionSettings};
 use ndarray::Array2;
@@ -8,19 +8,20 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::base::{
-    build_runtime_prediction_with_details, canonical_three_class_label_mapping,
+    ExpertModel, build_runtime_prediction_with_details, canonical_three_class_label_mapping,
     dataframe_to_float32_array, feature_columns_from_dataframe, three_class_runtime_confidence,
-    try_build_runtime_artifact_metadata, ExpertModel,
+    try_build_runtime_artifact_metadata,
 };
 use crate::burn_models::{
-    normalize_burn_device_policy, predict_proba_on_device as burn_predict_proba_on_device,
-    resolve_infer_device, resolve_train_device,
+    BurnDeviceSelection, BurnKAN, BurnKANConfig, BurnMLP, BurnMLPConfig, BurnNBeats,
+    BurnNBeatsConfig, BurnNBeatsx, BurnNBeatsxConfig, BurnPatchTST, BurnPatchTSTConfig, BurnTabNet,
+    BurnTabNetConfig, BurnTiDE, BurnTiDEConfig, BurnTiDENf, BurnTiDENfConfig, BurnTimesNet,
+    BurnTimesNetConfig, BurnTrainingReport, BurnTransformer, BurnTransformerConfig, InferBackend,
+    TrainBackend, TrainConfig, normalize_burn_device_policy,
+    predict_proba_on_device as burn_predict_proba_on_device, resolve_infer_device,
+    resolve_train_device,
     train_model_with_report_with_selection as burn_train_model_with_report_with_selection,
-    validate_burn_device_selection, BurnDeviceSelection, BurnKAN, BurnKANConfig, BurnMLP,
-    BurnMLPConfig, BurnNBeats, BurnNBeatsConfig, BurnNBeatsx, BurnNBeatsxConfig, BurnPatchTST,
-    BurnPatchTSTConfig, BurnTabNet, BurnTabNetConfig, BurnTiDE, BurnTiDEConfig, BurnTiDENf,
-    BurnTiDENfConfig, BurnTimesNet, BurnTimesNetConfig, BurnTrainingReport, BurnTransformer,
-    BurnTransformerConfig, InferBackend, TrainBackend, TrainConfig,
+    validate_burn_device_selection,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
@@ -428,6 +429,8 @@ impl BurnDeepExpert {
             "dim_ff",
             "patch_size",
             "n_periods",
+            "token_count",
+            "grid_size",
             "batch_size",
             "max_epochs",
             "patience",
@@ -439,6 +442,22 @@ impl BurnDeepExpert {
                 if parsed == 0 {
                     bail!("deep-model param `{key}` must be greater than zero");
                 }
+            }
+        }
+        if let Some(value) = self.params.get("grid_size") {
+            let parsed = value.trim().parse::<usize>().map_err(|_| {
+                anyhow::anyhow!("deep-model param `grid_size` must parse as a positive integer")
+            })?;
+            if !(3..=33).contains(&parsed) {
+                bail!("deep-model param `grid_size` must be between 3 and 33");
+            }
+        }
+        if let Some(value) = self.params.get("token_count") {
+            let parsed = value.trim().parse::<usize>().map_err(|_| {
+                anyhow::anyhow!("deep-model param `token_count` must parse as a positive integer")
+            })?;
+            if !(1..=256).contains(&parsed) {
+                bail!("deep-model param `token_count` must be between 1 and 256");
             }
         }
         if let Some(value) = self.params.get("seed") {
@@ -461,6 +480,14 @@ impl BurnDeepExpert {
             })?;
             if !parsed.is_finite() || !(0.0..1.0).contains(&parsed) {
                 bail!("deep-model param `dropout` must be finite and inside [0, 1)");
+            }
+        }
+        if let Some(value) = self.params.get("relaxation_factor") {
+            let parsed = value.trim().parse::<f64>().map_err(|_| {
+                anyhow::anyhow!("deep-model param `relaxation_factor` must parse as a finite float")
+            })?;
+            if !parsed.is_finite() || parsed < 1.0 {
+                bail!("deep-model param `relaxation_factor` must be finite and >= 1.0");
             }
         }
         Ok(())
@@ -620,12 +647,16 @@ impl BurnDeepExpert {
             .with_hidden_dim(self.usize_param("hidden_dim", 64))
             .with_n_steps(self.usize_param("n_steps", 3))
             .with_n_classes(3)
+            .with_relaxation_factor(self.float_param("relaxation_factor", 1.5))
     }
 
     fn kan_config(&self, input_dim: usize) -> BurnKANConfig {
         BurnKANConfig::new(input_dim)
             .with_hidden_dim(self.usize_param("hidden_dim", 32))
+            .with_n_layers(self.usize_param("n_layers", 3))
+            .with_grid_size(self.usize_param("grid_size", 9))
             .with_n_classes(3)
+            .with_dropout(self.float_param("dropout", 0.05))
     }
 
     fn transformer_config(&self, input_dim: usize) -> BurnTransformerConfig {
@@ -634,6 +665,7 @@ impl BurnDeepExpert {
             .with_hidden_dim(hidden_dim)
             .with_n_heads(self.compatible_head_count(hidden_dim, 8))
             .with_n_layers(self.usize_param("n_layers", 4))
+            .with_token_count(self.usize_param("token_count", 8))
             .with_dim_ff(self.usize_param("dim_ff", 512))
             .with_n_classes(3)
             .with_dropout(self.float_param("dropout", 0.1))
@@ -1523,9 +1555,10 @@ mod tests {
         let err = expert
             .metadata()
             .expect_err("missing training summary must fail");
-        assert!(err
-            .to_string()
-            .contains("missing training summary metadata"));
+        assert!(
+            err.to_string()
+                .contains("missing training summary metadata")
+        );
     }
 
     #[test]
@@ -1611,9 +1644,10 @@ mod tests {
 
         let err = BurnDeepExpert::validate_runtime_params(&params)
             .expect_err("incoherent runtime triplet should fail");
-        assert!(err
-            .to_string()
-            .contains("runtime params are internally inconsistent"));
+        assert!(
+            err.to_string()
+                .contains("runtime params are internally inconsistent")
+        );
     }
 
     #[test]
@@ -1684,14 +1718,18 @@ mod tests {
 
         let (backend, degraded_reason) = expert.runtime_details();
         assert_eq!(backend.as_deref(), Some("wgpu"));
-        assert!(degraded_reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("deep_requested_device_unavailable"));
-        assert!(degraded_reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("deep_runtime_model_missing"));
+        assert!(
+            degraded_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("deep_requested_device_unavailable")
+        );
+        assert!(
+            degraded_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("deep_runtime_model_missing")
+        );
     }
 
     #[test]
@@ -1704,10 +1742,12 @@ mod tests {
         });
 
         let (_, degraded_reason) = expert.runtime_details();
-        assert!(degraded_reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("deep_runtime_training_report_missing"));
+        assert!(
+            degraded_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("deep_runtime_training_report_missing")
+        );
     }
 
     #[test]
@@ -1715,10 +1755,12 @@ mod tests {
         let expert = BurnDeepExpert::new(DeepModelKind::Mlp, 7, None);
         let (backend, degraded_reason) = expert.runtime_details();
         assert_eq!(backend, None);
-        assert!(degraded_reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("deep_runtime_device_metadata_missing"));
+        assert!(
+            degraded_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("deep_runtime_device_metadata_missing")
+        );
     }
 
     #[test]
@@ -1767,10 +1809,12 @@ mod tests {
 
         let (backend, degraded_reason) = expert.runtime_details();
         assert_eq!(backend.as_deref(), Some(live_backend.as_str()));
-        assert!(degraded_reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("deep_runtime_host_cache_stale"));
+        assert!(
+            degraded_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("deep_runtime_host_cache_stale")
+        );
     }
 
     #[test]
@@ -2000,9 +2044,10 @@ mod tests {
         let err = expert
             .artifact_config()
             .expect_err("runtime-incoherent burn report should fail");
-        assert!(err
-            .to_string()
-            .contains("runtime provenance is internally inconsistent"));
+        assert!(
+            err.to_string()
+                .contains("runtime provenance is internally inconsistent")
+        );
     }
 
     #[test]

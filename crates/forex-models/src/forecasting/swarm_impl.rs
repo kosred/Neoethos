@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use polars::prelude::{DataFrame, DataType, Series};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -375,6 +375,7 @@ fn rebuild_forecaster_artifact_state(
                 validation_windows,
                 &artifact.config.frequency,
                 &artifact.unique_id,
+                horizon,
             )?
         } else {
             let reference = aggregate_average(&point_candidates, horizon, snapshot.last_value);
@@ -468,7 +469,7 @@ fn rebuild_forecaster_artifact_state_local(
         snapshot.last_value,
     );
     let mut reports = if !validation_windows.is_empty() {
-        build_weighted_reports_local(validation_windows)?
+        build_weighted_reports_local(validation_windows, horizon)?
     } else {
         let mut reports = candidates
             .iter()
@@ -1505,9 +1506,8 @@ fn candidate_report(
     let regime_fit = snapshot
         .map(|snapshot| candidate_regime_fit(snapshot, forecast))
         .unwrap_or(0.5);
-    let stability_score = clamp_unit(
-        1.0 - std_dev / (snapshot.map(|s| s.volatility.max(1e-6)).unwrap_or(1.0) * 2.0).min(1.0),
-    );
+    let volatility_scale = snapshot.map(|s| s.volatility.max(1e-6)).unwrap_or(1.0) * 2.0;
+    let stability_score = clamp_unit(1.0 - (std_dev / volatility_scale.max(1e-6)).min(1.0));
 
     SwarmCandidateReport {
         name: name.to_string(),
@@ -1580,11 +1580,7 @@ fn candidate_regime_fit(snapshot: &SwarmForecastSnapshot, forecast: &[f32]) -> f
 fn candidate_family_alignment(name: &str, snapshot: &SwarmForecastSnapshot) -> f32 {
     let name = name.to_ascii_lowercase();
     if name.contains("seasonal") {
-        if snapshot.has_seasonality {
-            0.95
-        } else {
-            0.15
-        }
+        if snapshot.has_seasonality { 0.95 } else { 0.15 }
     } else if name.contains("mean_reversion") || name.contains("regime_anchor") {
         0.25 + 0.75 * clamp_unit(snapshot.mean_reversion_strength)
     } else if name.contains("drift") || name.contains("momentum") || name.contains("ewma_fast") {
@@ -2054,6 +2050,7 @@ fn build_weighted_reports_external(
     windows: &[(Vec<f32>, Vec<f64>, Vec<f32>)],
     frequency: &str,
     unique_id: &str,
+    forecast_horizon: usize,
 ) -> Result<Vec<SwarmCandidateReport>> {
     let mut accumulators: HashMap<String, SwarmCandidateReport> = HashMap::new();
     let mut counts: HashMap<String, usize> = HashMap::new();
@@ -2122,6 +2119,7 @@ fn build_weighted_reports_external(
                 .filter(|weight| *weight > f32::EPSILON)
                 .unwrap_or_else(|| counts.get(&name).copied().unwrap_or(1) as f32);
             report.source = "rolling_validation".to_string();
+            report.prediction_length = forecast_horizon.max(1);
             report.prediction_mean /= total_weight;
             report.prediction_std /= total_weight;
             report.mae /= total_weight;
@@ -2143,6 +2141,7 @@ fn build_weighted_reports_external(
 
 fn build_weighted_reports_local(
     windows: &[(Vec<f32>, Vec<f64>, Vec<f32>)],
+    forecast_horizon: usize,
 ) -> Result<Vec<SwarmCandidateReport>> {
     let mut accumulators: HashMap<String, SwarmCandidateReport> = HashMap::new();
     let mut counts: HashMap<String, usize> = HashMap::new();
@@ -2218,6 +2217,7 @@ fn build_weighted_reports_local(
                 .filter(|weight| *weight > f32::EPSILON)
                 .unwrap_or_else(|| counts.get(&name).copied().unwrap_or(1) as f32);
             report.source = "rolling_validation".to_string();
+            report.prediction_length = forecast_horizon.max(1);
             report.prediction_mean /= total_weight;
             report.prediction_std /= total_weight;
             report.mae /= total_weight;
@@ -2667,7 +2667,53 @@ fn is_price_like_column_name(name: &str) -> bool {
     .any(|needle| name.contains(needle))
 }
 
-fn extract_series_from_frame(frame: &DataFrame, _labels: &Series) -> Result<Vec<f32>> {
+fn label_series_is_class_like(values: &[f32]) -> bool {
+    if values.is_empty() {
+        return true;
+    }
+    let mut unique = values.to_vec();
+    unique.sort_by(|left, right| left.total_cmp(right));
+    unique.dedup_by(|left, right| (*left - *right).abs() < 1e-6);
+    unique.len() <= 4
+        || values.iter().all(|value| {
+            [-1.0_f32, 0.0, 1.0, 2.0]
+                .iter()
+                .any(|class| (*value - *class).abs() < 1e-6)
+        })
+}
+
+fn extract_continuous_label_series(labels: &Series) -> Result<Option<Vec<f32>>> {
+    let Ok(series) = labels.cast(&DataType::Float64) else {
+        return Ok(None);
+    };
+    let values = series
+        .f64()
+        .context("access swarm label series as Float64")?
+        .into_iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            let value = value.with_context(|| {
+                format!(
+                    "swarm label series contains null at row {idx}; continuous forecasting labels must be fully materialized"
+                )
+            })?;
+            if !value.is_finite() {
+                bail!(
+                    "swarm label series contains non-finite value {} at row {}",
+                    value,
+                    idx
+                );
+            }
+            Ok(value as f32)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if values.len() < 32 || label_series_is_class_like(&values) || volatility(&values) <= 1e-8 {
+        return Ok(None);
+    }
+    Ok(Some(values))
+}
+
+fn extract_series_from_frame(frame: &DataFrame, labels: &Series) -> Result<Vec<f32>> {
     let preferred_columns = [
         "close",
         "base_close",
@@ -2676,7 +2722,9 @@ fn extract_series_from_frame(frame: &DataFrame, _labels: &Series) -> Result<Vec<
         "bid",
         "ask",
         "last",
-        "target",
+        "target_price",
+        "future_close",
+        "next_close",
         "close_M1",
         "close_m1",
     ];
@@ -2760,6 +2808,10 @@ fn extract_series_from_frame(frame: &DataFrame, _labels: &Series) -> Result<Vec<
         if values.len() >= 32 {
             return Ok(values);
         }
+    }
+
+    if let Some(values) = extract_continuous_label_series(labels)? {
+        return Ok(values);
     }
 
     let candidate_numeric_columns = frame
@@ -2983,6 +3035,7 @@ impl SwarmForecaster {
                 &validation_windows,
                 &self.config.frequency,
                 &self.unique_id,
+                horizon,
             )?
         } else {
             let report_reference =
@@ -3109,7 +3162,7 @@ impl SwarmForecaster {
         );
         let validation_windows = build_validation_windows(&self.values, &self.timestamps, horizon);
         self.candidate_reports = if !validation_windows.is_empty() {
-            build_weighted_reports_local(&validation_windows)?
+            build_weighted_reports_local(&validation_windows, horizon)?
         } else {
             let mut reports = candidates
                 .iter()
@@ -3289,6 +3342,7 @@ impl SwarmForecaster {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use polars::prelude::NamedFrom;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3302,6 +3356,65 @@ mod tests {
             "forex-ai-swarm-forecasting-{name}-{}-{unique}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn extract_series_rejects_class_like_target_column_as_price_source() {
+        let frame = DataFrame::new(vec![
+            Series::new(
+                "feature".into(),
+                (0..64).map(|idx| idx as f64).collect::<Vec<_>>(),
+            )
+            .into(),
+            Series::new(
+                "target".into(),
+                (0..64)
+                    .map(|idx| match idx % 3 {
+                        0 => -1,
+                        1 => 0,
+                        _ => 1,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .into(),
+        ])
+        .expect("frame");
+        let labels = Series::new(
+            "labels".into(),
+            (0..64)
+                .map(|idx| match idx % 3 {
+                    0 => -1,
+                    1 => 0,
+                    _ => 1,
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let err = extract_series_from_frame(&frame, &labels)
+            .expect_err("class-like target column must not be forecast as price");
+        assert!(err.to_string().contains("price-like series"));
+    }
+
+    #[test]
+    fn extract_series_uses_continuous_labels_when_price_column_is_absent() {
+        let frame = DataFrame::new(vec![
+            Series::new(
+                "feature".into(),
+                (0..64).map(|idx| idx as f64).collect::<Vec<_>>(),
+            )
+            .into(),
+        ])
+        .expect("frame");
+        let labels = Series::new(
+            "continuous_target".into(),
+            (0..64)
+                .map(|idx| 1.10_f64 + idx as f64 * 0.0001)
+                .collect::<Vec<_>>(),
+        );
+
+        let values = extract_series_from_frame(&frame, &labels).expect("continuous label series");
+        assert_eq!(values.len(), 64);
+        assert!(values[63] > values[0]);
     }
 
     #[test]
@@ -3572,18 +3685,22 @@ mod tests {
         assert!(forecaster.last_result.is_some());
         assert!(!forecaster.candidate_reports.is_empty());
         assert!(forecaster.training_report.is_some());
-        assert!(forecaster
-            .last_result
-            .as_ref()
-            .is_some_and(|result| result_is_valid(result, 12)));
+        assert!(
+            forecaster
+                .last_result
+                .as_ref()
+                .is_some_and(|result| result_is_valid(result, 12))
+        );
         assert!(candidate_reports_are_valid(
             &forecaster.candidate_reports,
             12
         ));
-        assert!(forecaster
-            .training_report
-            .as_ref()
-            .is_some_and(|report| report.fitted_horizon == 12));
+        assert!(
+            forecaster
+                .training_report
+                .as_ref()
+                .is_some_and(|report| report.fitted_horizon == 12)
+        );
         assert_eq!(
             forecaster.runtime_degraded_reason.as_deref(),
             Some("swarm_local_fallback_active")
@@ -4006,6 +4123,25 @@ mod tests {
             !training_report_matches(&report, &reports, 128, 3, 8),
             "stale validation-window counts should invalidate persisted swarm reports"
         );
+    }
+
+    #[test]
+    fn rolling_validation_reports_use_forecast_horizon_not_validation_window_length() {
+        let train_values = (0..72)
+            .map(|idx| 1.0 + idx as f32 * 0.01 + ((idx % 5) as f32 - 2.0) * 0.002)
+            .collect::<Vec<_>>();
+        let train_timestamps = (0..train_values.len())
+            .map(|idx| idx as f64)
+            .collect::<Vec<_>>();
+        let actuals = vec![1.72, 1.73, 1.74, 1.75];
+        let windows = vec![(train_values, train_timestamps, actuals)];
+
+        let reports = build_weighted_reports_local(&windows, 12).expect("rolling reports");
+
+        assert!(!reports.is_empty());
+        assert!(reports.iter().all(|report| report.prediction_length == 12));
+        assert!(candidate_reports_are_valid(&reports, 12));
+        assert!(!candidate_reports_are_valid(&reports, 4));
     }
 
     #[test]
@@ -4477,15 +4613,21 @@ mod tests {
 
         let candidates = candidate_predictions(&values, &snapshot, 8);
 
-        assert!(candidates
-            .iter()
-            .any(|(name, _, _)| name == "mean_reversion"));
-        assert!(candidates
-            .iter()
-            .any(|(name, _, _)| name == "regime_anchor"));
-        assert!(!candidates
-            .iter()
-            .any(|(name, _, _)| name == "momentum_blend"));
+        assert!(
+            candidates
+                .iter()
+                .any(|(name, _, _)| name == "mean_reversion")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|(name, _, _)| name == "regime_anchor")
+        );
+        assert!(
+            !candidates
+                .iter()
+                .any(|(name, _, _)| name == "momentum_blend")
+        );
     }
 
     #[cfg(feature = "swarm-forecasting")]

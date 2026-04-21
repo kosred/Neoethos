@@ -1,21 +1,21 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use ndarray::{Array1, Array2, Axis};
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::base::{
-    build_runtime_prediction_with_details, canonical_three_class_label_mapping,
-    three_class_runtime_confidence, try_build_runtime_artifact_metadata, ExpertModel,
+    ExpertModel, build_runtime_prediction_with_details, canonical_three_class_label_mapping,
+    three_class_runtime_confidence, try_build_runtime_artifact_metadata,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 use crate::runtime::prediction::RuntimePrediction;
 
 use super::common::{
-    ensure_feature_columns_match, feature_matrix_from_dataframe, read_json,
-    remap_three_class_labels, runtime_backend_with_gpu_fallback, softmax_rows, write_json,
-    FeatureScaler, METADATA_FILE_NAME, MODEL_FILE_NAME,
+    FeatureScaler, METADATA_FILE_NAME, MODEL_FILE_NAME, ensure_feature_columns_match,
+    feature_matrix_from_dataframe, read_json, remap_three_class_labels,
+    runtime_backend_with_gpu_fallback, softmax_rows, write_json,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +177,29 @@ fn cross_entropy_loss(probabilities: &Array2<f32>, labels: &[usize]) -> Result<f
     }
 
     Ok(loss / labels.len().max(1) as f32)
+}
+
+fn normalize_linear_softmax_params(
+    alpha: f32,
+    l1_ratio: f32,
+    learning_rate: f32,
+    epochs: usize,
+) -> Result<(f32, f32, f32, usize)> {
+    if !alpha.is_finite() {
+        bail!("linear model alpha must be finite");
+    }
+    if !l1_ratio.is_finite() {
+        bail!("linear model l1_ratio must be finite");
+    }
+    if !learning_rate.is_finite() {
+        bail!("linear model learning_rate must be finite");
+    }
+    Ok((
+        alpha.max(0.0),
+        l1_ratio.clamp(0.0, 1.0),
+        learning_rate.max(1e-5),
+        epochs.max(1),
+    ))
 }
 
 fn runtime_metadata(
@@ -429,6 +452,8 @@ fn fit_linear_softmax(
     learning_rate: f32,
     epochs: usize,
 ) -> Result<LinearSoftmaxArtifact> {
+    let (alpha, l1_ratio, learning_rate, epochs) =
+        normalize_linear_softmax_params(alpha, l1_ratio, learning_rate, epochs)?;
     let (features, feature_columns) = feature_matrix_from_dataframe(x)?;
     let rows = features.nrows();
     let cols = features.ncols();

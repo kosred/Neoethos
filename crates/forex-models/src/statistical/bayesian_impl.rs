@@ -1,21 +1,21 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use ndarray::{Array1, Array2, Axis};
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::base::{
-    build_runtime_prediction_with_details, canonical_three_class_label_mapping,
-    three_class_runtime_confidence, try_build_runtime_artifact_metadata, ExpertModel,
+    ExpertModel, build_runtime_prediction_with_details, canonical_three_class_label_mapping,
+    three_class_runtime_confidence, try_build_runtime_artifact_metadata,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 use crate::runtime::prediction::RuntimePrediction;
 
 use super::common::{
-    ensure_feature_columns_match, feature_matrix_from_dataframe, read_json,
-    remap_three_class_labels, runtime_backend_with_gpu_fallback, softmax_rows, write_json,
-    FeatureScaler, METADATA_FILE_NAME, MODEL_FILE_NAME,
+    FeatureScaler, METADATA_FILE_NAME, MODEL_FILE_NAME, ensure_feature_columns_match,
+    feature_matrix_from_dataframe, read_json, remap_three_class_labels,
+    runtime_backend_with_gpu_fallback, softmax_rows, write_json,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +149,24 @@ fn runtime_metadata(
         canonical_three_class_label_mapping(),
         TrainingSummaryMetadata::new(dataset_rows, train_rows, val_rows),
     )
+}
+
+fn normalize_bayesian_params(
+    prior_precision: f32,
+    learning_rate: f32,
+    epochs: usize,
+) -> Result<(f32, f32, usize)> {
+    if !prior_precision.is_finite() {
+        bail!("bayesian prior_precision must be finite");
+    }
+    if !learning_rate.is_finite() {
+        bail!("bayesian learning_rate must be finite");
+    }
+    Ok((
+        prior_precision.max(1e-6),
+        learning_rate.max(1e-4),
+        epochs.max(1),
+    ))
 }
 
 fn fit_binary_posterior(
@@ -560,6 +578,8 @@ impl Default for BayesianLogitExpert {
 
 impl ExpertModel for BayesianLogitExpert {
     fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
+        let (prior_precision, learning_rate, epochs) =
+            normalize_bayesian_params(self.prior_precision, self.learning_rate, self.epochs)?;
         let (features, feature_columns) = feature_matrix_from_dataframe(x)?;
         let rows = features.nrows();
         if y.len() != rows {
@@ -620,9 +640,9 @@ impl ExpertModel for BayesianLogitExpert {
                 &binary,
                 val_features.as_ref(),
                 val_binary.as_deref(),
-                self.prior_precision,
-                self.learning_rate,
-                self.epochs,
+                prior_precision,
+                learning_rate,
+                epochs,
             )?);
         }
 
@@ -639,11 +659,14 @@ impl ExpertModel for BayesianLogitExpert {
             dataset_rows: rows,
             scaler,
             runtime_metadata: Some(runtime_metadata),
-            prior_precision: self.prior_precision,
-            learning_rate: self.learning_rate,
-            epochs: self.epochs,
+            prior_precision,
+            learning_rate,
+            epochs,
             classes,
         });
+        self.prior_precision = prior_precision;
+        self.learning_rate = learning_rate;
+        self.epochs = epochs;
         Ok(())
     }
 

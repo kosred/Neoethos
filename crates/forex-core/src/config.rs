@@ -513,6 +513,7 @@ pub struct ModelsConfig {
     pub tide_hidden_dim: usize,
     pub nbeats_hidden_dim: usize,
     pub kan_hidden_dim: usize,
+    pub kan_grid_size: usize,
     pub tabnet_hidden_dim: usize,
     pub phase5_filter_meta_blender: bool,
     pub phase5_core_models: Vec<String>,
@@ -734,6 +735,7 @@ impl Default for ModelsConfig {
             tide_hidden_dim: 256,
             nbeats_hidden_dim: 256,
             kan_hidden_dim: 256,
+            kan_grid_size: 9,
             tabnet_hidden_dim: 64,
             phase5_filter_meta_blender: true,
             phase5_core_models: vec!["transformer", "nbeats", "tide", "tabnet", "kan"]

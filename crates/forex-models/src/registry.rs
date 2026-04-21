@@ -9,8 +9,9 @@ use std::sync::{Mutex, OnceLock};
 use tracing::warn;
 
 use crate::runtime::capabilities::{
-    model_capability, CapabilityState, ModelCapability, ModelFamily, KNOWN_MODEL_NAMES,
+    CapabilityState, KNOWN_MODEL_NAMES, ModelCapability, ModelFamily, model_capability,
 };
+use forex_core::{HardwareExecutionPlan, TrainingPrecision, WorkloadKind};
 
 fn dynamic_registry() -> &'static Mutex<HashMap<String, ModelCapability>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, ModelCapability>>> = OnceLock::new();
@@ -193,6 +194,19 @@ fn gpu_runtime_available_for_capability(capability: &ModelCapability) -> bool {
     }
 }
 
+fn training_workload_for_family(family: ModelFamily) -> WorkloadKind {
+    match family {
+        ModelFamily::Tree => WorkloadKind::TreeTraining,
+        ModelFamily::Deep | ModelFamily::Exit => WorkloadKind::DeepTraining,
+        ModelFamily::Rl => WorkloadKind::RlTraining,
+        ModelFamily::Evolutionary => WorkloadKind::StrategySearch,
+        ModelFamily::Forecasting
+        | ModelFamily::Meta
+        | ModelFamily::Adaptive
+        | ModelFamily::Anomaly => WorkloadKind::FeatureEngineering,
+    }
+}
+
 fn normalize_recommended_gpu_device(
     configured_device: &str,
     capability: &ModelCapability,
@@ -337,6 +351,44 @@ pub fn get_recommended_device(model_name: &str) -> Result<String> {
     Ok("cpu".to_string())
 }
 
+/// Resolve the model device from the canonical hardware plan.
+///
+/// This keeps the older `get_recommended_device` API intact for compatibility,
+/// but gives orchestrators a single source of truth when they already have a
+/// `HardwareExecutionPlan`.
+pub fn get_recommended_device_with_plan(
+    model_name: &str,
+    plan: &HardwareExecutionPlan,
+) -> Result<String> {
+    let capability = get_model_capability(model_name)
+        .context(format!("Model '{}' not found in registry", model_name))?;
+    if !supports_gpu_for_model(&capability.name, capability.family) {
+        return Ok("cpu".to_string());
+    }
+
+    let workload = training_workload_for_family(capability.family);
+    let Some(workload_plan) = plan.workload(workload) else {
+        return Ok("cpu".to_string());
+    };
+    if !workload_plan.backend.is_gpu() {
+        return Ok("cpu".to_string());
+    }
+    Ok(workload_plan.device.clone())
+}
+
+pub fn get_recommended_precision_with_plan(
+    model_name: &str,
+    plan: &HardwareExecutionPlan,
+) -> Result<TrainingPrecision> {
+    let capability = get_model_capability(model_name)
+        .context(format!("Model '{}' not found in registry", model_name))?;
+    let workload = training_workload_for_family(capability.family);
+    Ok(plan
+        .workload(workload)
+        .map(|workload_plan| workload_plan.precision)
+        .unwrap_or(TrainingPrecision::Fp32))
+}
+
 // ============================================================================
 // PYTHON COMPATIBILITY
 // ============================================================================
@@ -384,118 +436,71 @@ mod tests {
     #[test]
     fn known_configured_models_resolve_to_capabilities() {
         let expectations = [
-            ("lightgbm", ModelFamily::Tree, CapabilityState::Implemented),
-            ("xgboost", ModelFamily::Tree, CapabilityState::Implemented),
-            (
-                "xgboost_rf",
-                ModelFamily::Tree,
-                CapabilityState::Implemented,
-            ),
-            (
-                "xgboost_dart",
-                ModelFamily::Tree,
-                CapabilityState::Implemented,
-            ),
-            ("catboost", ModelFamily::Tree, CapabilityState::Implemented),
-            (
-                "catboost_alt",
-                ModelFamily::Tree,
-                CapabilityState::Implemented,
-            ),
-            (
-                "sklears_tree",
-                ModelFamily::Tree,
-                CapabilityState::Implemented,
-            ),
-            ("mlp", ModelFamily::Deep, CapabilityState::Implemented),
-            (
-                "elasticnet",
-                ModelFamily::Meta,
-                CapabilityState::Implemented,
-            ),
-            (
-                "bayes_logit",
-                ModelFamily::Meta,
-                CapabilityState::Implemented,
-            ),
-            (
-                "meta_blender",
-                ModelFamily::Meta,
-                CapabilityState::Implemented,
-            ),
+            ("lightgbm", ModelFamily::Tree, CapabilityState::Verified),
+            ("xgboost", ModelFamily::Tree, CapabilityState::Verified),
+            ("xgboost_rf", ModelFamily::Tree, CapabilityState::Verified),
+            ("xgboost_dart", ModelFamily::Tree, CapabilityState::Verified),
+            ("catboost", ModelFamily::Tree, CapabilityState::Verified),
+            ("catboost_alt", ModelFamily::Tree, CapabilityState::Verified),
+            ("sklears_tree", ModelFamily::Tree, CapabilityState::Verified),
+            ("mlp", ModelFamily::Deep, CapabilityState::Verified),
+            ("elasticnet", ModelFamily::Meta, CapabilityState::Verified),
+            ("logistic", ModelFamily::Meta, CapabilityState::Verified),
+            ("bayes_logit", ModelFamily::Meta, CapabilityState::Verified),
+            ("meta_blender", ModelFamily::Meta, CapabilityState::Verified),
             (
                 "probability_calibrator",
                 ModelFamily::Meta,
-                CapabilityState::Implemented,
+                CapabilityState::Verified,
             ),
             (
                 "conformal_gate",
                 ModelFamily::Meta,
-                CapabilityState::Implemented,
+                CapabilityState::Verified,
             ),
-            (
-                "meta_stack",
-                ModelFamily::Meta,
-                CapabilityState::Implemented,
-            ),
+            ("meta_stack", ModelFamily::Meta, CapabilityState::Verified),
             (
                 "genetic",
                 ModelFamily::Evolutionary,
                 CapabilityState::Implemented,
             ),
-            (
-                "exit_agent",
-                ModelFamily::Exit,
-                CapabilityState::Implemented,
-            ),
+            ("exit_agent", ModelFamily::Exit, CapabilityState::Verified),
             (
                 "online_pa",
                 ModelFamily::Adaptive,
-                CapabilityState::Implemented,
+                CapabilityState::Verified,
             ),
             (
                 "online_hoeffding",
                 ModelFamily::Adaptive,
-                CapabilityState::Implemented,
+                CapabilityState::Verified,
             ),
             (
                 "isolation_forest",
                 ModelFamily::Anomaly,
-                CapabilityState::Implemented,
+                CapabilityState::Verified,
             ),
-            ("dqn", ModelFamily::Rl, CapabilityState::Implemented),
-            (
-                "transformer",
-                ModelFamily::Deep,
-                CapabilityState::Implemented,
-            ),
-            ("nbeats", ModelFamily::Deep, CapabilityState::Implemented),
-            ("tide", ModelFamily::Deep, CapabilityState::Implemented),
-            ("tabnet", ModelFamily::Deep, CapabilityState::Implemented),
-            ("kan", ModelFamily::Deep, CapabilityState::Implemented),
-            ("patchtst", ModelFamily::Deep, CapabilityState::Implemented),
-            ("timesnet", ModelFamily::Deep, CapabilityState::Implemented),
-            (
-                "nbeatsx_nf",
-                ModelFamily::Deep,
-                CapabilityState::Implemented,
-            ),
-            ("tide_nf", ModelFamily::Deep, CapabilityState::Implemented),
+            ("dqn", ModelFamily::Rl, CapabilityState::Verified),
+            ("transformer", ModelFamily::Deep, CapabilityState::Verified),
+            ("nbeats", ModelFamily::Deep, CapabilityState::Verified),
+            ("tide", ModelFamily::Deep, CapabilityState::Verified),
+            ("tabnet", ModelFamily::Deep, CapabilityState::Verified),
+            ("kan", ModelFamily::Deep, CapabilityState::Verified),
+            ("patchtst", ModelFamily::Deep, CapabilityState::Verified),
+            ("timesnet", ModelFamily::Deep, CapabilityState::Verified),
+            ("nbeatsx_nf", ModelFamily::Deep, CapabilityState::Verified),
+            ("tide_nf", ModelFamily::Deep, CapabilityState::Verified),
             (
                 "swarm_forecaster",
                 ModelFamily::Forecasting,
-                CapabilityState::Implemented,
+                CapabilityState::Verified,
             ),
             (
                 "neuro_evo",
                 ModelFamily::Evolutionary,
                 CapabilityState::Implemented,
             ),
-            (
-                "neat",
-                ModelFamily::Evolutionary,
-                CapabilityState::Implemented,
-            ),
+            ("neat", ModelFamily::Evolutionary, CapabilityState::Verified),
         ];
 
         for (name, family, state) in expectations {

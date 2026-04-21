@@ -35,6 +35,10 @@ impl ForexCore {
     pub fn get_available_gpus(&self) -> Vec<String> {
         let mut probe = self.probe.lock().unwrap();
         let profile = probe.detect();
-        (0..profile.num_gpus).map(|i| format!("cuda:{}", i)).collect()
+        profile
+            .accelerator_devices
+            .iter()
+            .map(|device| device.device_string())
+            .collect()
     }
 }

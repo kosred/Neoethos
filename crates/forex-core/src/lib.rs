@@ -7,4 +7,7 @@ pub mod system;
 pub mod utils;
 
 pub use config::Settings;
-pub use system::{HardwareExecutionPlan, WorkloadExecutionPlan, WorkloadKind};
+pub use system::{
+    AcceleratorBackend, AcceleratorDevice, HardwareExecutionPlan, TrainingPrecision,
+    WorkloadExecutionPlan, WorkloadKind,
+};

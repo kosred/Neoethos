@@ -20,7 +20,7 @@ use burn::tensor::backend::Backend;
 #[cfg(not(feature = "burn-wgpu-backend"))]
 use burn_ndarray::NdArray;
 #[cfg(feature = "burn-wgpu-backend")]
-use burn_wgpu::{graphics, init_setup, Wgpu, WgpuDevice};
+use burn_wgpu::{Wgpu, WgpuDevice, graphics, init_setup};
 
 use crate::hardware::HardwareInfo;
 use crate::runtime::capabilities::requested_training_precision_policy;
@@ -698,7 +698,7 @@ impl<B: Backend> BurnNBeatsx<B> {
 }
 
 // ============================================================================
-// BURN TiDE — matches legacy TiDEExpert (deep.py)
+// BURN TiDE — residual dense encoder-decoder for tabular time-series
 // ============================================================================
 
 #[derive(Module, Debug)]
@@ -724,6 +724,7 @@ pub struct BurnTiDE<B: Backend> {
     dec1: ResidualBlock<B>,
     dec2: ResidualBlock<B>,
     output: nn::Linear<B>,
+    raw_skip: nn::Linear<B>,
 }
 
 #[derive(Config, Debug)]
@@ -752,19 +753,21 @@ impl BurnTiDEConfig {
             dec1: mk_res(),
             dec2: mk_res(),
             output: nn::LinearConfig::new(self.hidden_dim, self.n_classes).init(device),
+            raw_skip: nn::LinearConfig::new(self.input_dim, self.n_classes).init(device),
         }
     }
 }
 
 impl<B: Backend> BurnTiDE<B> {
     pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let skip = self.raw_skip.forward(x.clone());
         let h = self.feature_proj.forward(x);
         let h = self.enc1.forward(h);
         let h = self.enc2.forward(h);
         let h = self.temporal_link.forward(h);
         let h = self.dec1.forward(h);
         let h = self.dec2.forward(h);
-        self.output.forward(h)
+        self.output.forward(h) + skip
     }
 }
 
@@ -785,6 +788,7 @@ pub struct BurnTiDENf<B: Backend> {
     dec2: ResidualBlock<B>,
     output_norm: nn::LayerNorm<B>,
     output: nn::Linear<B>,
+    raw_skip: nn::Linear<B>,
 }
 
 #[derive(Config, Debug)]
@@ -818,12 +822,14 @@ impl BurnTiDENfConfig {
             dec2: mk_res(),
             output_norm: nn::LayerNormConfig::new(self.hidden_dim).init(device),
             output: nn::LinearConfig::new(self.hidden_dim, self.n_classes).init(device),
+            raw_skip: nn::LinearConfig::new(self.input_dim, self.n_classes).init(device),
         }
     }
 }
 
 impl<B: Backend> BurnTiDENf<B> {
     pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let skip = self.raw_skip.forward(x.clone());
         let base = self.feature_proj.forward(x.clone());
         let seasonal = burn::tensor::activation::gelu(self.seasonal_proj.forward(x.clone()));
         let gate = burn::tensor::activation::sigmoid(self.context_gate.forward(x));
@@ -836,13 +842,12 @@ impl<B: Backend> BurnTiDENf<B> {
         let h = self.dec1.forward(h * horizon + seasonal.clone());
         let h = self.dec2.forward(h);
         let h = self.output_norm.forward(h + seasonal);
-        self.output.forward(h)
+        self.output.forward(h) + skip
     }
 }
 
 // ============================================================================
-// BURN TabNet — matches legacy TabNetExpert (deep.py)
-// Uses GLU activation via manual split
+// BURN TabNet — attentive feature selection with GLU decision steps
 // ============================================================================
 
 #[derive(Module, Debug)]
@@ -856,6 +861,7 @@ pub struct BurnTabNet<B: Backend> {
     n_steps: usize,
     hidden_dim: usize,
     input_dim: usize,
+    relaxation_factor: f32,
 }
 
 #[derive(Config, Debug)]
@@ -867,6 +873,8 @@ pub struct BurnTabNetConfig {
     pub n_steps: usize,
     #[config(default = 3)]
     pub n_classes: usize,
+    #[config(default = 1.5)]
+    pub relaxation_factor: f64,
 }
 
 impl BurnTabNetConfig {
@@ -883,6 +891,7 @@ impl BurnTabNetConfig {
             n_steps: self.n_steps,
             hidden_dim: self.hidden_dim,
             input_dim: self.input_dim,
+            relaxation_factor: self.relaxation_factor as f32,
         }
     }
 }
@@ -904,6 +913,7 @@ impl<B: Backend> BurnTabNet<B> {
         for _ in 0..self.n_steps {
             // Feature transform with GLU
             let feat = glu(self.feat_fc1.forward(x_norm.clone()), self.hidden_dim);
+            let feat = glu(self.feat_fc2.forward(feat), self.hidden_dim);
 
             // Attention mask
             let attn = self.attn_fc.forward(feat.clone());
@@ -911,12 +921,17 @@ impl<B: Backend> BurnTabNet<B> {
             let mask = burn::tensor::activation::softmax(attn, 1);
 
             // Update prior (decay attention)
-            let threshold = Tensor::<B, 2>::ones_like(&mask) * 1.5 - mask.clone();
+            let threshold =
+                Tensor::<B, 2>::ones_like(&mask) * self.relaxation_factor - mask.clone();
             prior = prior * threshold.clamp(0.0, 1.0);
 
             // Masked feature → transform → accumulate
             let masked = x_norm.clone() * mask;
             let step_out = glu(self.feat_fc1.forward(masked), self.hidden_dim);
+            let step_out = burn::tensor::activation::relu(glu(
+                self.feat_fc2.forward(step_out),
+                self.hidden_dim,
+            ));
             out_accum = out_accum + step_out;
         }
 
@@ -925,26 +940,66 @@ impl<B: Backend> BurnTabNet<B> {
 }
 
 // ============================================================================
-// BURN KAN — matches legacy KANExpert (deep.py)
+// BURN KAN — Kolmogorov-Arnold style edge functions using grid/RBF bases
 // ============================================================================
+
+const KAN_GRID_MIN: f32 = -3.0;
+const KAN_GRID_MAX: f32 = 3.0;
 
 #[derive(Module, Debug)]
 pub struct KANLayer<B: Backend> {
-    fc1: nn::Linear<B>,
-    fc2: nn::Linear<B>,
+    base: nn::Linear<B>,
+    spline: nn::Linear<B>,
+    gate: nn::Linear<B>,
+    norm: nn::LayerNorm<B>,
+    dropout: nn::Dropout,
+    grid_size: usize,
+}
+
+fn kan_grid_center(index: usize, grid_size: usize) -> f32 {
+    if grid_size <= 1 {
+        0.0
+    } else {
+        let fraction = index as f32 / (grid_size - 1) as f32;
+        KAN_GRID_MIN + (KAN_GRID_MAX - KAN_GRID_MIN) * fraction
+    }
+}
+
+fn kan_grid_gamma(grid_size: usize) -> f32 {
+    if grid_size <= 1 {
+        1.0
+    } else {
+        let width = (KAN_GRID_MAX - KAN_GRID_MIN) / (grid_size - 1) as f32;
+        1.0 / (width * width).max(1e-6)
+    }
 }
 
 impl<B: Backend> KANLayer<B> {
+    fn basis_expand(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let bounded = x.clamp(KAN_GRID_MIN, KAN_GRID_MAX);
+        let gamma = kan_grid_gamma(self.grid_size);
+        let mut basis = Vec::with_capacity(self.grid_size);
+        for grid_idx in 0..self.grid_size {
+            let center = kan_grid_center(grid_idx, self.grid_size);
+            let radial = ((bounded.clone() - center).powi_scalar(2) * -gamma).exp();
+            basis.push(radial);
+        }
+        Tensor::cat(basis, 1)
+    }
+
     fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        let h = burn::tensor::activation::gelu(self.fc1.forward(x));
-        burn::tensor::activation::gelu(self.fc2.forward(h))
+        let basis = self.basis_expand(x.clone());
+        let base = burn::tensor::activation::silu(self.base.forward(x.clone()));
+        let spline = self.spline.forward(basis);
+        let gate = burn::tensor::activation::sigmoid(self.gate.forward(x));
+        let h = base + spline * gate;
+        burn::tensor::activation::gelu(self.dropout.forward(self.norm.forward(h)))
     }
 }
 
 #[derive(Module, Debug)]
 pub struct BurnKAN<B: Backend> {
-    layer1: KANLayer<B>,
-    layer2: KANLayer<B>,
+    layers: Vec<KANLayer<B>>,
     output: nn::Linear<B>,
 }
 
@@ -954,40 +1009,153 @@ pub struct BurnKANConfig {
     #[config(default = 32)]
     pub hidden_dim: usize,
     #[config(default = 3)]
+    pub n_layers: usize,
+    #[config(default = 9)]
+    pub grid_size: usize,
+    #[config(default = 3)]
     pub n_classes: usize,
+    #[config(default = 0.05)]
+    pub dropout: f64,
 }
 
 impl BurnKANConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> BurnKAN<B> {
+        let hidden_dim = self.hidden_dim.max(4);
+        let n_layers = self.n_layers.max(1);
+        let grid_size = self.grid_size.clamp(3, 33);
+        let mut layers = Vec::with_capacity(n_layers);
+        let mut dim = self.input_dim;
+        for _ in 0..n_layers {
+            layers.push(KANLayer {
+                base: nn::LinearConfig::new(dim, hidden_dim).init(device),
+                spline: nn::LinearConfig::new(dim * grid_size, hidden_dim).init(device),
+                gate: nn::LinearConfig::new(dim, hidden_dim).init(device),
+                norm: nn::LayerNormConfig::new(hidden_dim).init(device),
+                dropout: nn::DropoutConfig::new(self.dropout).init(),
+                grid_size,
+            });
+            dim = hidden_dim;
+        }
         BurnKAN {
-            layer1: KANLayer {
-                fc1: nn::LinearConfig::new(self.input_dim, self.hidden_dim).init(device),
-                fc2: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
-            },
-            layer2: KANLayer {
-                fc1: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
-                fc2: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
-            },
-            output: nn::LinearConfig::new(self.hidden_dim, self.n_classes).init(device),
+            layers,
+            output: nn::LinearConfig::new(hidden_dim, self.n_classes).init(device),
         }
     }
 }
 
 impl<B: Backend> BurnKAN<B> {
     pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        let h = self.layer1.forward(x);
-        let h = self.layer2.forward(h);
+        let mut h = x;
+        for layer in &self.layers {
+            h = layer.forward(h);
+        }
         self.output.forward(h)
     }
 }
 
 // ============================================================================
-// BURN TRANSFORMER — matches legacy TransformerExpert (transformers.py)
-// Manual multi-head attention (Burn has no built-in transformer module for 2D)
+// BURN TRANSFORMER — feature-token transformer for tabular time-series features
 // ============================================================================
 
 #[derive(Module, Debug)]
-pub struct TransformerBlock<B: Backend> {
+pub struct BurnTransformer<B: Backend> {
+    token_proj: nn::Linear<B>,
+    encoder: Vec<SequenceTransformerBlock<B>>,
+    final_norm: nn::LayerNorm<B>,
+    output: nn::Linear<B>,
+    token_size: usize,
+    token_count: usize,
+    input_dim: usize,
+}
+
+#[derive(Config, Debug)]
+pub struct BurnTransformerConfig {
+    pub input_dim: usize,
+    #[config(default = 128)]
+    pub hidden_dim: usize,
+    #[config(default = 8)]
+    pub n_heads: usize,
+    #[config(default = 4)]
+    pub n_layers: usize,
+    #[config(default = 8)]
+    pub token_count: usize,
+    #[config(default = 512)]
+    pub dim_ff: usize,
+    #[config(default = 3)]
+    pub n_classes: usize,
+    #[config(default = 0.1)]
+    pub dropout: f64,
+}
+
+impl BurnTransformerConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> BurnTransformer<B> {
+        let hidden_dim = self.hidden_dim.max(16);
+        let token_count = self.token_count.max(1).min(self.input_dim.max(1));
+        let token_size = self.input_dim.div_ceil(token_count);
+        let requested_heads = self.n_heads.max(1);
+        let compatible_heads = (1..=requested_heads)
+            .rev()
+            .find(|candidate| hidden_dim.is_multiple_of(*candidate))
+            .unwrap_or(1);
+        let ff_dim = self.dim_ff.max(hidden_dim);
+        let encoder = (0..self.n_layers)
+            .map(|_| SequenceTransformerBlock {
+                q_proj: nn::LinearConfig::new(hidden_dim, hidden_dim).init(device),
+                k_proj: nn::LinearConfig::new(hidden_dim, hidden_dim).init(device),
+                v_proj: nn::LinearConfig::new(hidden_dim, hidden_dim).init(device),
+                out_proj: nn::LinearConfig::new(hidden_dim, hidden_dim).init(device),
+                ff1: nn::LinearConfig::new(hidden_dim, ff_dim).init(device),
+                ff2: nn::LinearConfig::new(ff_dim, hidden_dim).init(device),
+                norm1: nn::LayerNormConfig::new(hidden_dim).init(device),
+                norm2: nn::LayerNormConfig::new(hidden_dim).init(device),
+                dropout: nn::DropoutConfig::new(self.dropout).init(),
+                n_heads: compatible_heads,
+            })
+            .collect();
+        BurnTransformer {
+            token_proj: nn::LinearConfig::new(token_size, hidden_dim).init(device),
+            encoder,
+            final_norm: nn::LayerNormConfig::new(hidden_dim).init(device),
+            output: nn::LinearConfig::new(hidden_dim, self.n_classes).init(device),
+            token_size,
+            token_count,
+            input_dim: self.input_dim,
+        }
+    }
+}
+
+impl<B: Backend> BurnTransformer<B> {
+    pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let batch = x.dims()[0];
+        let mut tokens = Vec::with_capacity(self.token_count);
+        for token_idx in 0..self.token_count {
+            let start = token_idx * self.token_size;
+            let end = ((token_idx + 1) * self.token_size).min(self.input_dim);
+            let mut token = x.clone().slice([0..batch, start..end]);
+            let observed = end.saturating_sub(start);
+            if observed < self.token_size {
+                let padding =
+                    Tensor::<B, 2>::zeros([batch, self.token_size - observed], &x.device());
+                token = Tensor::cat(vec![token, padding], 1);
+            }
+            tokens.push(
+                burn::tensor::activation::gelu(self.token_proj.forward(token))
+                    .unsqueeze_dim::<3>(1),
+            );
+        }
+
+        let mut h = Tensor::cat(tokens, 1);
+        for block in &self.encoder {
+            h = block.forward(h);
+        }
+        let pooled = h.mean_dim(1).squeeze_dim::<2>(1);
+        let pooled = self.final_norm.forward(pooled);
+        self.output.forward(pooled)
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct SequenceTransformerBlock<B: Backend> {
     q_proj: nn::Linear<B>,
     k_proj: nn::Linear<B>,
     v_proj: nn::Linear<B>,
@@ -1000,98 +1168,53 @@ pub struct TransformerBlock<B: Backend> {
     n_heads: usize,
 }
 
-impl<B: Backend> TransformerBlock<B> {
-    fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        let [batch, d_model] = x.dims();
-        let head_dim = d_model / self.n_heads.max(1);
+impl<B: Backend> SequenceTransformerBlock<B> {
+    fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [batch, seq_len, d_model] = x.dims();
+        let n_heads = self.n_heads.max(1);
+        let head_dim = d_model / n_heads;
+        let flat_rows = batch * seq_len;
+        let flat = x.clone().reshape([flat_rows, d_model]);
 
-        // Multi-head self-attention (tabular: treat each sample independently)
         let q = self
             .q_proj
-            .forward(x.clone())
-            .reshape([batch, self.n_heads, head_dim]);
+            .forward(flat.clone())
+            .reshape([batch, seq_len, n_heads, head_dim])
+            .swap_dims(1, 2);
         let k = self
             .k_proj
-            .forward(x.clone())
-            .reshape([batch, self.n_heads, head_dim]);
+            .forward(flat.clone())
+            .reshape([batch, seq_len, n_heads, head_dim])
+            .swap_dims(1, 2);
         let v = self
             .v_proj
-            .forward(x.clone())
-            .reshape([batch, self.n_heads, head_dim]);
+            .forward(flat)
+            .reshape([batch, seq_len, n_heads, head_dim])
+            .swap_dims(1, 2);
 
         let scale = (head_dim as f32).sqrt();
-        let scores = q.matmul(k.swap_dims(1, 2)) / scale;
-        let attn = burn::tensor::activation::softmax(scores, 2);
-        let attn_out = attn.matmul(v).reshape([batch, d_model]);
-        let attn_proj = self.out_proj.forward(attn_out);
+        let scores = q.matmul(k.swap_dims(2, 3)) / scale;
+        let attn = burn::tensor::activation::softmax(scores, 3);
+        let attn_flat = attn.matmul(v).swap_dims(1, 2).reshape([flat_rows, d_model]);
+        let attn_proj = self.dropout.forward(self.out_proj.forward(attn_flat));
+        let h = self
+            .norm1
+            .forward(
+                (x + attn_proj.reshape([batch, seq_len, d_model])).reshape([flat_rows, d_model]),
+            )
+            .reshape([batch, seq_len, d_model]);
 
-        let h = self.norm1.forward(x + self.dropout.forward(attn_proj));
+        let h_flat = h.clone().reshape([flat_rows, d_model]);
         let ff = self.ff2.forward(
             self.dropout
-                .forward(burn::tensor::activation::gelu(self.ff1.forward(h.clone()))),
+                .forward(burn::tensor::activation::gelu(self.ff1.forward(h_flat))),
         );
-        self.norm2.forward(h + self.dropout.forward(ff))
-    }
-}
-
-#[derive(Module, Debug)]
-pub struct BurnTransformer<B: Backend> {
-    input_proj: nn::Linear<B>,
-    encoder: Vec<TransformerBlock<B>>,
-    final_norm: nn::LayerNorm<B>,
-    output: nn::Linear<B>,
-}
-
-#[derive(Config, Debug)]
-pub struct BurnTransformerConfig {
-    pub input_dim: usize,
-    #[config(default = 128)]
-    pub hidden_dim: usize,
-    #[config(default = 8)]
-    pub n_heads: usize,
-    #[config(default = 4)]
-    pub n_layers: usize,
-    #[config(default = 512)]
-    pub dim_ff: usize,
-    #[config(default = 3)]
-    pub n_classes: usize,
-    #[config(default = 0.1)]
-    pub dropout: f64,
-}
-
-impl BurnTransformerConfig {
-    pub fn init<B: Backend>(&self, device: &B::Device) -> BurnTransformer<B> {
-        let encoder = (0..self.n_layers)
-            .map(|_| TransformerBlock {
-                q_proj: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
-                k_proj: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
-                v_proj: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
-                out_proj: nn::LinearConfig::new(self.hidden_dim, self.hidden_dim).init(device),
-                ff1: nn::LinearConfig::new(self.hidden_dim, self.dim_ff).init(device),
-                ff2: nn::LinearConfig::new(self.dim_ff, self.hidden_dim).init(device),
-                norm1: nn::LayerNormConfig::new(self.hidden_dim).init(device),
-                norm2: nn::LayerNormConfig::new(self.hidden_dim).init(device),
-                dropout: nn::DropoutConfig::new(self.dropout).init(),
-                n_heads: self.n_heads,
-            })
-            .collect();
-        BurnTransformer {
-            input_proj: nn::LinearConfig::new(self.input_dim, self.hidden_dim).init(device),
-            encoder,
-            final_norm: nn::LayerNormConfig::new(self.hidden_dim).init(device),
-            output: nn::LinearConfig::new(self.hidden_dim, self.n_classes).init(device),
-        }
-    }
-}
-
-impl<B: Backend> BurnTransformer<B> {
-    pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        let mut h = self.input_proj.forward(x);
-        for block in &self.encoder {
-            h = block.forward(h);
-        }
-        h = self.final_norm.forward(h);
-        self.output.forward(h)
+        self.norm2
+            .forward(
+                (h + self.dropout.forward(ff).reshape([batch, seq_len, d_model]))
+                    .reshape([flat_rows, d_model]),
+            )
+            .reshape([batch, seq_len, d_model])
     }
 }
 
@@ -1102,13 +1225,14 @@ impl<B: Backend> BurnTransformer<B> {
 #[derive(Module, Debug)]
 pub struct BurnPatchTST<B: Backend> {
     patch_proj: nn::Linear<B>,
-    patch_encoder: Vec<TransformerBlock<B>>,
+    patch_encoder: Vec<SequenceTransformerBlock<B>>,
     merge_proj: nn::Linear<B>,
     skip_proj: nn::Linear<B>,
     head_norm: nn::LayerNorm<B>,
     output: nn::Linear<B>,
     patch_size: usize,
     patch_count: usize,
+    hidden_dim: usize,
     input_dim: usize,
 }
 
@@ -1143,7 +1267,7 @@ impl BurnPatchTSTConfig {
             .unwrap_or(1);
         let ff_dim = self.dim_ff.max(hidden_dim);
         let patch_encoder = (0..self.n_layers.max(1))
-            .map(|_| TransformerBlock {
+            .map(|_| SequenceTransformerBlock {
                 q_proj: nn::LinearConfig::new(hidden_dim, hidden_dim).init(device),
                 k_proj: nn::LinearConfig::new(hidden_dim, hidden_dim).init(device),
                 v_proj: nn::LinearConfig::new(hidden_dim, hidden_dim).init(device),
@@ -1166,6 +1290,7 @@ impl BurnPatchTSTConfig {
             output: nn::LinearConfig::new(hidden_dim, self.n_classes).init(device),
             patch_size,
             patch_count,
+            hidden_dim,
             input_dim: self.input_dim,
         }
     }
@@ -1187,14 +1312,15 @@ impl<B: Backend> BurnPatchTST<B> {
                 patch = Tensor::cat(vec![patch, padding], 1);
             }
 
-            let mut token = burn::tensor::activation::gelu(self.patch_proj.forward(patch));
-            for block in &self.patch_encoder {
-                token = block.forward(token);
-            }
-            tokens.push(token);
+            let token = burn::tensor::activation::gelu(self.patch_proj.forward(patch));
+            tokens.push(token.unsqueeze_dim::<3>(1));
         }
 
-        let merged = Tensor::cat(tokens, 1);
+        let mut sequence = Tensor::cat(tokens, 1);
+        for block in &self.patch_encoder {
+            sequence = block.forward(sequence);
+        }
+        let merged = sequence.reshape([batch, self.patch_count * self.hidden_dim]);
         let fused = burn::tensor::activation::gelu(
             self.merge_proj.forward(merged) + self.skip_proj.forward(x),
         );
@@ -1210,12 +1336,15 @@ impl<B: Backend> BurnPatchTST<B> {
 #[derive(Module, Debug)]
 pub struct BurnTimesNet<B: Backend> {
     input_proj: nn::Linear<B>,
+    raw_period_projs: Vec<nn::Linear<B>>,
     period_mixers: Vec<nn::Linear<B>>,
     period_norms: Vec<nn::LayerNorm<B>>,
+    period_weight_proj: nn::Linear<B>,
     gate_proj: nn::Linear<B>,
     fusion_norm: nn::LayerNorm<B>,
     decoder: Vec<ResidualBlock<B>>,
     output: nn::Linear<B>,
+    hidden_dim: usize,
 }
 
 #[derive(Config, Debug)]
@@ -1234,10 +1363,14 @@ pub struct BurnTimesNetConfig {
 impl BurnTimesNetConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> BurnTimesNet<B> {
         let hidden_dim = self.hidden_dim.max(16);
-        let period_mixers = (0..self.n_periods.max(2))
+        let n_periods = self.n_periods.max(2);
+        let raw_period_projs = (0..n_periods)
+            .map(|_| nn::LinearConfig::new(self.input_dim, hidden_dim).init(device))
+            .collect();
+        let period_mixers = (0..n_periods)
             .map(|_| nn::LinearConfig::new(hidden_dim, hidden_dim).init(device))
             .collect();
-        let period_norms = (0..self.n_periods.max(2))
+        let period_norms = (0..n_periods)
             .map(|_| nn::LayerNormConfig::new(hidden_dim).init(device))
             .collect();
         let decoder = (0..2)
@@ -1250,29 +1383,44 @@ impl BurnTimesNetConfig {
 
         BurnTimesNet {
             input_proj: nn::LinearConfig::new(self.input_dim, hidden_dim).init(device),
+            raw_period_projs,
             period_mixers,
             period_norms,
+            period_weight_proj: nn::LinearConfig::new(hidden_dim, n_periods).init(device),
             gate_proj: nn::LinearConfig::new(hidden_dim, hidden_dim).init(device),
             fusion_norm: nn::LayerNormConfig::new(hidden_dim).init(device),
             decoder,
             output: nn::LinearConfig::new(hidden_dim, self.n_classes).init(device),
+            hidden_dim,
         }
     }
 }
 
 impl<B: Backend> BurnTimesNet<B> {
     pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        let base = burn::tensor::activation::gelu(self.input_proj.forward(x));
-        let branches = self
-            .period_mixers
+        let batch = x.dims()[0];
+        let base = burn::tensor::activation::gelu(self.input_proj.forward(x.clone()));
+        let period_weights =
+            burn::tensor::activation::softmax(self.period_weight_proj.forward(base.clone()), 1);
+        let mut periodic: Tensor<B, 2> = Tensor::zeros([batch, self.hidden_dim], &base.device());
+
+        for (period_idx, ((raw_proj, mixer), norm)) in self
+            .raw_period_projs
             .iter()
+            .zip(self.period_mixers.iter())
             .zip(self.period_norms.iter())
-            .map(|(mixer, norm)| {
-                let branch = burn::tensor::activation::gelu(mixer.forward(base.clone()));
-                norm.forward(branch).unsqueeze_dim::<3>(1)
-            })
-            .collect::<Vec<_>>();
-        let periodic = Tensor::cat(branches, 1).mean_dim(1).squeeze_dim::<2>(1);
+            .enumerate()
+        {
+            let raw_period = raw_proj.forward(x.clone());
+            let mixed = mixer.forward(base.clone());
+            let branch = norm.forward(burn::tensor::activation::gelu(raw_period + mixed));
+            let weight = period_weights
+                .clone()
+                .slice([0..batch, period_idx..(period_idx + 1)])
+                .repeat_dim(1, self.hidden_dim);
+            periodic = periodic + branch * weight;
+        }
+
         let gate = burn::tensor::activation::sigmoid(self.gate_proj.forward(base.clone()));
         let mut h = self.fusion_norm.forward(base + periodic * gate);
         for block in &self.decoder {
@@ -1439,6 +1587,8 @@ fn resolve_burn_training_precision(selection: &BurnDeviceSelection) -> (String, 
     }
 
     let requested = requested_training_precision_policy("burn");
+    let experimental_mixed_precision =
+        env_flag("FOREX_BURN_ENABLE_EXPERIMENTAL_MIXED_PRECISION", false);
 
     let gpu_requested = selection.effective_policy == "gpu"
         || selection.effective_policy.starts_with("gpu:")
@@ -1448,6 +1598,19 @@ fn resolve_burn_training_precision(selection: &BurnDeviceSelection) -> (String, 
             Some(format!(
                 "requested precision `{requested}`; CPU execution requires fp32"
             ))
+        } else {
+            None
+        };
+        return ("fp32".to_string(), reason);
+    }
+
+    if !experimental_mixed_precision {
+        let reason = if requested != "auto" && requested != "fp32" {
+            Some(format!(
+                "requested precision `{requested}`; Burn mixed-precision tensor execution is not enabled, using fp32"
+            ))
+        } else if requested == "auto" {
+            Some("auto precision resolved to fp32; Burn mixed-precision tensor execution is not enabled".to_string())
         } else {
             None
         };
@@ -1565,7 +1728,7 @@ fn validate_feature_matrix(x_data: &Array2<f32>, context: &str) -> anyhow::Resul
 
 use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use rand::seq::SliceRandom;
-use rand::{rngs::StdRng, SeedableRng};
+use rand::{SeedableRng, rngs::StdRng};
 
 /// Train any Burn model with production features.
 ///
@@ -1962,9 +2125,10 @@ mod tests {
 
         let err =
             predict_proba::<InferBackend, _>(&model, &x, 0).expect_err("batch_size=0 must fail");
-        assert!(err
-            .to_string()
-            .contains("batch_size must be greater than zero"));
+        assert!(
+            err.to_string()
+                .contains("batch_size must be greater than zero")
+        );
     }
 
     #[test]
@@ -2075,9 +2239,10 @@ mod tests {
 
         let err = train_model::<TrainBackend, _>(model, &x, &labels, &config)
             .expect_err("invalid train config must fail early");
-        assert!(err
-            .to_string()
-            .contains("batch_size must be greater than zero"));
+        assert!(
+            err.to_string()
+                .contains("batch_size must be greater than zero")
+        );
     }
 
     #[test]

@@ -51,5 +51,7 @@ keys.txt
 crates/audit_summary.txt
 crates/file_list.txt
 crates/*/err.txt
+crates/*/build_log*.txt
+crates/*/build_errors.txt
 rust_out.exe
 rust_out.pdb

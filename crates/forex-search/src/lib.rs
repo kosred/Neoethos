@@ -11,6 +11,7 @@ pub mod discovery_gpu {
         select_survivor_indices,
     };
     use anyhow::{Result, bail};
+    use forex_core::{AcceleratorBackend, TrainingPrecision};
     use forex_data::{FeatureCache, FeatureFrame, Ohlcv, SymbolDataset, compute_hpc_features};
     use ndarray::Array2;
     use rand::Rng;
@@ -46,6 +47,8 @@ pub mod discovery_gpu {
         pub pos_penalty: f64,
         pub chunk_size: usize,
         pub devices: Vec<i64>,
+        pub backend: AcceleratorBackend,
+        pub precision: TrainingPrecision,
     }
 
     impl Default for GpuDiscoveryConfig {
@@ -76,6 +79,8 @@ pub mod discovery_gpu {
                 pos_penalty: 15.0,
                 chunk_size: 2048,
                 devices: Vec::new(),
+                backend: AcceleratorBackend::Cuda,
+                precision: TrainingPrecision::Fp32,
             }
         }
     }
@@ -439,6 +444,18 @@ pub mod discovery_gpu {
         ohlcv: Ohlcv,
         config: &GpuDiscoveryConfig,
     ) -> Result<GpuDiscoveryResult> {
+        if config.backend != AcceleratorBackend::Cuda && config.backend != AcceleratorBackend::Cpu {
+            bail!(
+                "CPU fallback discovery cannot execute requested {} backend",
+                config.backend.as_str()
+            );
+        }
+        if config.precision != TrainingPrecision::Fp32 {
+            bail!(
+                "CPU fallback discovery executes FP32 only, requested {}",
+                config.precision.as_str()
+            );
+        }
         if frames.is_empty() {
             bail!("no feature frames supplied");
         }

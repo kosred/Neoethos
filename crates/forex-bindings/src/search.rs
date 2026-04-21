@@ -213,6 +213,8 @@ pub fn search_evolve_gpu_ohlcv(
         pos_penalty: pos_penalty.max(0.0),
         chunk_size: chunk_size.max(64),
         devices: devices.unwrap_or(defaults.devices),
+        backend: defaults.backend,
+        precision: defaults.precision,
     };
 
     let (features, result) = py

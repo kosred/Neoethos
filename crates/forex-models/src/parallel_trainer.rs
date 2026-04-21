@@ -6,8 +6,8 @@ use polars::prelude::{Column, DataFrame, NamedFrom, Series};
 use rayon::prelude::*;
 use std::env;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 use tracing::info;
 
@@ -324,6 +324,7 @@ pub enum ModelType {
     PatchTST,
     TimesNet,
     ElasticNet,
+    Logistic,
     BayesianLogit,
     MetaBlender,
     ProbabilityCalibrator,

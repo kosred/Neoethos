@@ -8,6 +8,8 @@ use std::env;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
+use forex_core::system::HardwareProbe;
+use forex_core::{AcceleratorDevice, TrainingPrecision};
 #[cfg(feature = "tch")]
 use tch::{Cuda, Device, Kind, Tensor};
 
@@ -25,6 +27,7 @@ pub struct HardwareInfo {
     pub gpu_names: Vec<String>,
     pub gpu_memory_gb: Vec<f64>,
     pub compute_capabilities: Vec<(i64, i64)>,
+    pub accelerator_devices: Vec<AcceleratorDevice>,
     pub os_name: String,
 }
 
@@ -35,7 +38,27 @@ impl HardwareInfo {
         let cpu_cores = num_cpus::get();
         let cpu_cores_usable = cpu_cores.saturating_sub(1).max(1); // Reserve 1 for OS
 
-        let (gpu_count, gpu_names, gpu_memory_gb, compute_capabilities) = Self::detect_gpus();
+        let mut core_probe = HardwareProbe::new();
+        let core_profile = core_probe.detect();
+        let accelerator_devices = core_profile.accelerator_devices;
+        let (gpu_count, gpu_names, gpu_memory_gb, compute_capabilities) =
+            if accelerator_devices.is_empty() {
+                Self::detect_gpus()
+            } else {
+                let names = accelerator_devices
+                    .iter()
+                    .map(|device| device.name.clone())
+                    .collect::<Vec<_>>();
+                let memory = accelerator_devices
+                    .iter()
+                    .map(|device| device.memory_gb)
+                    .collect::<Vec<_>>();
+                let capabilities = accelerator_devices
+                    .iter()
+                    .map(|device| device.compute_capability.unwrap_or((0, 0)))
+                    .collect::<Vec<_>>();
+                (accelerator_devices.len(), names, memory, capabilities)
+            };
 
         let os_name = env::consts::OS.to_string();
 
@@ -62,6 +85,7 @@ impl HardwareInfo {
             gpu_names,
             gpu_memory_gb,
             compute_capabilities,
+            accelerator_devices,
             os_name,
         }
     }
@@ -108,6 +132,9 @@ impl HardwareInfo {
     /// Check if GPU supports bfloat16 (Ampere+ = SM 8.0+)
     /// legacy lines 76-84
     pub fn gpu_supports_bf16(&self, gpu_idx: usize) -> bool {
+        if let Some(device) = self.accelerator_devices.get(gpu_idx) {
+            return device.supports_precision(TrainingPrecision::Bf16);
+        }
         if gpu_idx >= self.compute_capabilities.len() {
             return false;
         }
@@ -118,6 +145,9 @@ impl HardwareInfo {
     /// Check if GPU supports FP8 (Ada/Hopper/Blackwell = SM 8.9+)
     /// legacy lines 99-109
     pub fn gpu_supports_fp8(&self, gpu_idx: usize) -> bool {
+        if let Some(device) = self.accelerator_devices.get(gpu_idx) {
+            return device.supports_precision(TrainingPrecision::Fp8);
+        }
         if gpu_idx >= self.compute_capabilities.len() {
             return false;
         }
@@ -384,6 +414,7 @@ mod tests {
             gpu_names: vec![],
             gpu_memory_gb: vec![],
             compute_capabilities: vec![],
+            accelerator_devices: vec![],
             os_name: "linux".to_string(),
         };
 
@@ -403,6 +434,7 @@ mod tests {
             gpu_names: vec![],
             gpu_memory_gb: vec![],
             compute_capabilities: vec![],
+            accelerator_devices: vec![],
             os_name: "linux".to_string(),
         };
 

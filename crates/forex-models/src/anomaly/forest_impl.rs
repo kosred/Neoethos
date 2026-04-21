@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 #[cfg(feature = "anomaly-detection")]
 use extended_isolation_forest::{Forest, ForestOptions};
 use ndarray::Array2;
@@ -8,17 +8,17 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::base::{
-    build_runtime_prediction_with_details, canonical_three_class_label_mapping,
-    three_class_runtime_confidence, try_build_runtime_artifact_metadata, ExpertModel,
+    ExpertModel, build_runtime_prediction_with_details, canonical_three_class_label_mapping,
+    three_class_runtime_confidence, try_build_runtime_artifact_metadata,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{
-    append_runtime_degraded_reason, gpu_policy_cpu_fallback_reason, CapabilityState, ModelFamily,
+    CapabilityState, ModelFamily, append_runtime_degraded_reason, gpu_policy_cpu_fallback_reason,
 };
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
-    ensure_feature_columns_match, feature_matrix_from_dataframe, read_json, write_json,
-    METADATA_FILE_NAME, MODEL_FILE_NAME,
+    METADATA_FILE_NAME, MODEL_FILE_NAME, ensure_feature_columns_match,
+    feature_matrix_from_dataframe, read_json, write_json,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -531,6 +531,32 @@ impl IsolationForestExpert {
         }
     }
 
+    fn fit_diagonal_profile(
+        &mut self,
+        features: &Array2<f32>,
+        feature_columns: Vec<String>,
+    ) -> Result<()> {
+        let (means, stds) = fallback_profile(features);
+        let mut scores = (0..features.nrows())
+            .map(|row_idx| fallback_score_row(&features.row(row_idx).to_vec(), &means, &stds))
+            .collect::<Result<Vec<_>>>()?;
+        scores.sort_by(|left, right| left.total_cmp(right));
+
+        let (score_mean, score_std, score_median, score_mad) = score_statistics(&scores);
+        self.backend = None;
+        self.feature_columns = feature_columns;
+        self.dataset_rows = features.nrows();
+        self.fallback_means = means;
+        self.fallback_stds = stds;
+        self.backend_kind = "diagonal_profile".to_string();
+        self.anomaly_threshold = quantile(&scores, 0.95).max(0.5);
+        self.score_mean = score_mean;
+        self.score_std = score_std;
+        self.score_median = score_median;
+        self.score_mad = score_mad;
+        Ok(())
+    }
+
     fn artifact(&self) -> Result<IsolationForestArtifact> {
         #[cfg(feature = "anomaly-detection")]
         {
@@ -553,11 +579,14 @@ impl IsolationForestExpert {
                 score_std: self.score_std,
                 score_median: self.score_median,
                 score_mad: self.score_mad,
-                model_json: self
-                    .backend
-                    .as_ref()
-                    .context("isolation forest backend missing")?
-                    .to_json()?,
+                model_json: if self.backend_kind == "diagonal_profile" {
+                    String::new()
+                } else {
+                    self.backend
+                        .as_ref()
+                        .context("isolation forest backend missing")?
+                        .to_json()?
+                },
                 fallback_means: self.fallback_means.clone(),
                 fallback_stds: self.fallback_stds.clone(),
             })
@@ -613,24 +642,7 @@ impl ExpertModel for IsolationForestExpert {
                 bail!("isolation forest cannot train with zero feature columns");
             }
 
-            let (means, stds) = fallback_profile(&features);
-            let mut scores = (0..features.nrows())
-                .map(|row_idx| fallback_score_row(&features.row(row_idx).to_vec(), &means, &stds))
-                .collect::<Result<Vec<_>>>()?;
-            scores.sort_by(|left, right| left.total_cmp(right));
-
-            let (score_mean, score_std, score_median, score_mad) = score_statistics(&scores);
-            self.feature_columns = feature_columns;
-            self.dataset_rows = features.nrows();
-            self.fallback_means = means;
-            self.fallback_stds = stds;
-            self.backend_kind = "diagonal_profile".to_string();
-            self.anomaly_threshold = quantile(&scores, 0.95).max(0.5);
-            self.score_mean = score_mean;
-            self.score_std = score_std;
-            self.score_median = score_median;
-            self.score_mad = score_mad;
-            Ok(())
+            self.fit_diagonal_profile(&features, feature_columns)
         }
 
         #[cfg(feature = "anomaly-detection")]
@@ -645,11 +657,14 @@ impl ExpertModel for IsolationForestExpert {
             if features.ncols() == 0 {
                 bail!("isolation forest cannot train with zero feature columns");
             }
+            if features.ncols() > 128 {
+                return self.fit_diagonal_profile(&features, feature_columns);
+            }
 
             let training_rows = feature_rows(&features);
             let sample_size = self.sample_size.min(training_rows.len()).max(8);
             let extension_level = if self.extension_level == 0 {
-                features.ncols().saturating_sub(1).min(1)
+                features.ncols().saturating_sub(1)
             } else {
                 self.extension_level.min(features.ncols().saturating_sub(1))
             };
@@ -1095,9 +1110,10 @@ mod tests {
         let err = reloaded
             .load(&artifact_dir)
             .expect_err("diagonal profile with backend payload should fail");
-        assert!(err
-            .to_string()
-            .contains("must not carry serialized backend payload"));
+        assert!(
+            err.to_string()
+                .contains("must not carry serialized backend payload")
+        );
 
         std::fs::remove_dir_all(&artifact_dir).expect("cleanup artifact dir");
         Ok(())
@@ -1178,8 +1194,8 @@ mod tests {
     }
 
     #[test]
-    fn isolation_forest_load_uses_embedded_runtime_metadata_when_metadata_file_missing(
-    ) -> Result<()> {
+    fn isolation_forest_load_uses_embedded_runtime_metadata_when_metadata_file_missing()
+    -> Result<()> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let df = sample_dataframe();

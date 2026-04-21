@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 #[cfg(feature = "adaptive-models")]
 use irithyll::ensemble::config::DriftDetectorType;
 #[cfg(feature = "adaptive-models")]
@@ -6,7 +6,7 @@ use irithyll::loss::logistic::LogisticLoss;
 #[cfg(feature = "adaptive-models")]
 use irithyll::serde_support::{load_model, save_model_with};
 #[cfg(feature = "adaptive-models")]
-use irithyll::{DynSGBT, LossType, SGBTConfig, Sample, SGBT};
+use irithyll::{DynSGBT, LossType, SGBT, SGBTConfig, Sample};
 use ndarray::{Array1, Array2};
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -14,18 +14,17 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::base::{
-    build_runtime_prediction_with_details, canonical_three_class_label_mapping,
-    three_class_runtime_confidence, try_build_runtime_artifact_metadata, ExpertModel,
+    ExpertModel, build_runtime_prediction_with_details, canonical_three_class_label_mapping,
+    three_class_runtime_confidence, try_build_runtime_artifact_metadata,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{
-    append_runtime_degraded_reason, gpu_policy_cpu_fallback_reason, CapabilityState, ModelFamily,
+    CapabilityState, ModelFamily, append_runtime_degraded_reason, gpu_policy_cpu_fallback_reason,
 };
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
-    ensure_feature_columns_match, feature_matrix_from_dataframe, read_json,
-    remap_three_class_labels, softmax_rows, write_json, FeatureScaler, METADATA_FILE_NAME,
-    MODEL_FILE_NAME,
+    FeatureScaler, METADATA_FILE_NAME, MODEL_FILE_NAME, ensure_feature_columns_match,
+    feature_matrix_from_dataframe, read_json, remap_three_class_labels, softmax_rows, write_json,
 };
 #[cfg(feature = "adaptive-models")]
 use tracing::warn;
@@ -82,6 +81,13 @@ fn validate_hoeffding_fallback_basis_param(params: &HashMap<String, String>) -> 
                 value.trim()
             );
         }
+    }
+    Ok(())
+}
+
+fn ensure_label_count(model_name: &str, rows: usize, labels: usize) -> Result<()> {
+    if rows != labels {
+        bail!("{model_name} row/label mismatch: {rows} feature rows vs {labels} labels");
     }
     Ok(())
 }
@@ -639,6 +645,7 @@ impl ExpertModel for OnlinePassiveAggressiveExpert {
     fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
         let (features, feature_columns) = feature_matrix_from_dataframe(x)?;
         let labels = remap_three_class_labels(y)?;
+        ensure_label_count("online_pa", features.nrows(), labels.len())?;
         let scaler = FeatureScaler::fit(&features)?;
         let features = scaler.transform(&features)?;
         let sample_weights = balanced_class_weights(&labels, 3);
@@ -881,6 +888,8 @@ fn fit_fallback_online_committee(
     labels: &[usize],
     params: &HashMap<String, String>,
 ) -> Result<(FeatureScaler, Array2<f32>, Array1<f32>)> {
+    ensure_label_count("online_hoeffding fallback", features.nrows(), labels.len())?;
+    validate_hoeffding_fallback_basis_param(params)?;
     let scaler = FeatureScaler::fit(features)?;
     let features = scaler.transform(features)?;
     let basis = hoeffding_fallback_basis(params);
@@ -1086,6 +1095,7 @@ impl ExpertModel for OnlineHoeffdingExpert {
         {
             let (features, feature_columns) = feature_matrix_from_dataframe(x)?;
             let labels = remap_three_class_labels(y)?;
+            ensure_label_count("online_hoeffding", features.nrows(), labels.len())?;
             let (scaler, weights, bias) =
                 fit_fallback_online_committee(&features, &labels, &self.params)?;
             self.params
@@ -1113,6 +1123,8 @@ impl ExpertModel for OnlineHoeffdingExpert {
         {
             let (features, feature_columns) = feature_matrix_from_dataframe(x)?;
             let labels = remap_three_class_labels(y)?;
+            ensure_label_count("online_hoeffding", features.nrows(), labels.len())?;
+            validate_hoeffding_fallback_basis_param(&self.params)?;
             let config = self.config()?;
             let rows = (0..features.nrows())
                 .map(|row_idx| {
@@ -2065,8 +2077,8 @@ mod tests {
     }
 
     #[test]
-    fn online_hoeffding_runtime_details_mark_persisted_committees_without_runtime_backend_as_degraded(
-    ) {
+    fn online_hoeffding_runtime_details_mark_persisted_committees_without_runtime_backend_as_degraded()
+     {
         let mut expert = OnlineHoeffdingExpert::new(Some(HashMap::from([(
             "fallback_blend_weight".to_string(),
             "0.35".to_string(),
@@ -2089,8 +2101,8 @@ mod tests {
     }
 
     #[test]
-    fn online_hoeffding_runtime_details_mark_committee_only_artifact_without_runtime_backend_as_unavailable(
-    ) {
+    fn online_hoeffding_runtime_details_mark_committee_only_artifact_without_runtime_backend_as_unavailable()
+     {
         let mut expert = OnlineHoeffdingExpert::new(Some(HashMap::from([(
             "artifact_mode".to_string(),
             "committee_only".to_string(),

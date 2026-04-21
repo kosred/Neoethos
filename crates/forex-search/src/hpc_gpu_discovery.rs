@@ -6,11 +6,11 @@
 //! - Multi-fidelity screening (fast GPU → thorough CPU validation)
 //! - NUMA-aware thread pinning
 
-use anyhow::Result;
+use anyhow::{Result, bail};
+use forex_core::{AcceleratorBackend, TrainingPrecision};
 use forex_data::{FeatureFrame, Ohlcv};
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
-use std::sync::Arc;
 use std::thread;
 use tch::{Device, Kind, Tensor};
 
@@ -44,17 +44,43 @@ pub fn run_island_model_discovery(
     base_ohlcv: &Ohlcv,
     config: &IslandConfig,
 ) -> Result<GpuDiscoveryResult> {
+    if config.base_config.backend != AcceleratorBackend::Cuda {
+        bail!(
+            "HPC island discovery currently supports CUDA only, requested {}",
+            config.base_config.backend.as_str()
+        );
+    }
+    if config.base_config.precision != TrainingPrecision::Fp32 {
+        bail!(
+            "HPC island discovery currently executes FP32 tensors only, requested {}",
+            config.base_config.precision.as_str()
+        );
+    }
     if !is_hpc_mode() {
-        return Err(anyhow::anyhow!(
-            "Island model requires HPC mode. Use standard GPU discovery instead."
-        ));
+        bail!("Island model requires HPC mode. Use standard GPU discovery instead.");
     }
 
     if frames.is_empty() {
-        return Err(anyhow::anyhow!("no feature frames supplied"));
+        bail!("no feature frames supplied");
+    }
+    if config.num_islands == 0 {
+        bail!("island discovery requires at least one island");
+    }
+    if config.migration_interval == 0 {
+        bail!("island discovery migration_interval must be greater than zero");
+    }
+    if config.base_config.generations == 0 {
+        bail!("island discovery requires at least one generation");
+    }
+    if !config.migration_fraction.is_finite() || !(0.0..=1.0).contains(&config.migration_fraction) {
+        bail!(
+            "island discovery migration_fraction must be finite in [0, 1], got {}",
+            config.migration_fraction
+        );
     }
 
     let tf_count = frames.len();
+    validate_hpc_inputs(frames, base_ohlcv)?;
     let n_features = frames[0].data.ncols();
     let genome_dim = tf_count + n_features + 2;
 
@@ -63,17 +89,38 @@ pub fn run_island_model_discovery(
     let ohlc_cube = build_ohlc_cube_hpc(base_ohlcv, tf_count)?;
 
     // Initialize islands
-    let gpu_ids: Vec<i64> = (0..config.num_islands as i64).collect();
-    let pop_per_island = config.base_config.population.max(1) / config.num_islands.max(1);
+    let gpu_ids = if config.base_config.devices.is_empty() {
+        (0..config.num_islands as i64).collect::<Vec<_>>()
+    } else {
+        config
+            .base_config
+            .devices
+            .iter()
+            .copied()
+            .take(config.num_islands)
+            .collect::<Vec<_>>()
+    };
+    if gpu_ids.is_empty() {
+        bail!("island discovery requires at least one CUDA device id");
+    }
+    let total_population = config.base_config.population.max(gpu_ids.len());
+    let base_pop_per_island = total_population / gpu_ids.len();
+    let extra_population = total_population % gpu_ids.len();
 
     info!(
-        "Initializing {} islands with {} genomes each (dim={})",
-        config.num_islands, pop_per_island, genome_dim
+        "Initializing {} islands with {} genomes total (dim={})",
+        gpu_ids.len(),
+        total_population,
+        genome_dim
     );
 
     let mut islands: Vec<Island> = gpu_ids
         .iter()
-        .map(|&id| Island::new(id, pop_per_island, genome_dim))
+        .enumerate()
+        .map(|(idx, &id)| {
+            let population_size = base_pop_per_island + usize::from(idx < extra_population);
+            Island::new(id, population_size, genome_dim)
+        })
         .collect();
 
     // Evolution loop
@@ -108,8 +155,13 @@ pub fn run_island_model_discovery(
     let mut all_fitness: Vec<f32> = Vec::new();
 
     for island in &islands {
-        all_elites.extend(island.elites.clone());
-        all_fitness.extend(island.elite_fitness.clone());
+        if island.elites.is_empty() {
+            all_elites.extend(island.population.clone());
+            all_fitness.extend(island.fitness.clone());
+        } else {
+            all_elites.extend(island.elites.clone());
+            all_fitness.extend(island.elite_fitness.clone());
+        }
     }
 
     // Sort all elites by fitness
@@ -119,6 +171,9 @@ pub fn run_island_model_discovery(
         .zip(all_fitness.into_iter())
         .map(|((idx, genome), fitness)| (fitness, idx, genome))
         .collect();
+    if scored.is_empty() {
+        bail!("HPC island discovery produced no scored genomes");
+    }
     scored.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -140,6 +195,61 @@ pub fn run_island_model_discovery(
         timeframes: (0..tf_count).map(|idx| format!("tf_{idx}")).collect(),
         used_gpu: true,
     })
+}
+
+fn validate_hpc_inputs(frames: &[FeatureFrame], base_ohlcv: &Ohlcv) -> Result<()> {
+    let first = frames
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no feature frames supplied"))?;
+    let expected_rows = first.data.nrows();
+    let expected_features = first.data.ncols();
+    if expected_rows < 3 {
+        bail!("HPC island discovery requires at least 3 rows, received {expected_rows}");
+    }
+    if expected_features == 0 {
+        bail!("HPC island discovery requires at least one feature column");
+    }
+    if base_ohlcv.open.len() != base_ohlcv.close.len()
+        || base_ohlcv.high.len() != base_ohlcv.close.len()
+        || base_ohlcv.low.len() != base_ohlcv.close.len()
+    {
+        bail!("OHLC arrays must have identical lengths for HPC island discovery");
+    }
+    if base_ohlcv.close.len() != expected_rows {
+        bail!(
+            "OHLC row count ({}) must match feature row count ({expected_rows})",
+            base_ohlcv.close.len()
+        );
+    }
+
+    for (idx, frame) in frames.iter().enumerate() {
+        if frame.data.nrows() != expected_rows {
+            bail!(
+                "feature frame {idx} row count mismatch: expected {expected_rows}, got {}",
+                frame.data.nrows()
+            );
+        }
+        if frame.data.ncols() != expected_features {
+            bail!(
+                "feature frame {idx} column count mismatch: expected {expected_features}, got {}",
+                frame.data.ncols()
+            );
+        }
+        if frame.names.len() != expected_features {
+            bail!(
+                "feature frame {idx} names mismatch: expected {expected_features}, got {}",
+                frame.names.len()
+            );
+        }
+        if frame.timestamps.len() != expected_rows {
+            bail!(
+                "feature frame {idx} timestamp count mismatch: expected {expected_rows}, got {}",
+                frame.timestamps.len()
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// An evolutionary island running on a specific GPU
@@ -325,38 +435,42 @@ fn evaluate_islands_parallel(
     ohlc_cube: &Tensor,
     config: &GpuDiscoveryConfig,
 ) -> Result<()> {
-    let data_cube_arc = Arc::new(data_cube.shallow_clone());
-    let ohlc_cube_arc = Arc::new(ohlc_cube.shallow_clone());
+    thread::scope(|scope| -> Result<()> {
+        let handles = islands
+            .iter_mut()
+            .map(|island| {
+                let data = data_cube.shallow_clone();
+                let ohlc = ohlc_cube.shallow_clone();
+                let cfg = config.clone();
+                let gpu_id = island.gpu_id;
 
-    let handles: Vec<_> = islands
-        .iter_mut()
-        .map(|island| {
-            let data = Arc::clone(&data_cube_arc);
-            let ohlc = Arc::clone(&ohlc_cube_arc);
-            let cfg = config.clone();
-            let gpu_id = island.gpu_id;
-
-            thread::spawn(move || {
-                if is_hpc_mode() {
-                    let cores = get_gpu_cpu_affinity(gpu_id);
-                    if let Err(e) = set_thread_affinity(&cores) {
-                        tracing::warn!("Failed to set affinity for GPU {}: {}", gpu_id, e);
+                scope.spawn(move || {
+                    if is_hpc_mode() {
+                        let cores = get_gpu_cpu_affinity(gpu_id);
+                        if let Err(e) = set_thread_affinity(&cores) {
+                            tracing::warn!("Failed to set affinity for GPU {}: {}", gpu_id, e);
+                        }
                     }
-                }
 
-                island.evaluate(&data, &ohlc, &cfg)
+                    island.evaluate(&data, &ohlc, &cfg)
+                })
             })
-        })
-        .collect();
+            .collect::<Vec<_>>();
 
-    for handle in handles {
-        handle.join().unwrap()?;
-    }
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("HPC island worker thread panicked"))??;
+        }
 
-    Ok(())
+        Ok(())
+    })
 }
 
 fn perform_nvlink_migration(islands: &mut [Island], fraction: f64) {
+    if islands.is_empty() {
+        return;
+    }
     let n_islands = islands.len();
     let migrants_per_island = ((islands[0].elites.len() as f64) * fraction).ceil() as usize;
 
@@ -381,12 +495,14 @@ fn perform_nvlink_migration(islands: &mut [Island], fraction: f64) {
                 // Inject migrants (replace worst elites)
                 for (idx, migrant) in j_migrants.iter().enumerate() {
                     if idx < islands[i].elites.len() {
-                        islands[i].elites[islands[i].elites.len() - 1 - idx] = migrant.clone();
+                        let target_idx = islands[i].elites.len() - 1 - idx;
+                        islands[i].elites[target_idx] = migrant.clone();
                     }
                 }
                 for (idx, migrant) in i_migrants.iter().enumerate() {
                     if idx < islands[j].elites.len() {
-                        islands[j].elites[islands[j].elites.len() - 1 - idx] = migrant.clone();
+                        let target_idx = islands[j].elites.len() - 1 - idx;
+                        islands[j].elites[target_idx] = migrant.clone();
                     }
                 }
             }
@@ -469,6 +585,7 @@ fn evaluate_chunk_hpc(
 
     // Build segments for walk-forward analysis
     let segments = build_segments_hpc(n_samples as usize, config.window_bars, config.segments);
+    let segment_count = segments.len();
 
     let mut fitness_sum = Tensor::zeros([pop], (Kind::Float, device));
     let mut min_fitness = Tensor::full([pop], 1e9, (Kind::Float, device));
@@ -549,8 +666,8 @@ fn evaluate_chunk_hpc(
         pos_windows += pos.to_kind(Kind::Float);
     }
 
-    let avg_fit = fitness_sum / (segments.len() as f64);
-    let min_pos = (segments.len() as f64 * config.pos_window_fraction).ceil();
+    let avg_fit = fitness_sum / (segment_count as f64);
+    let min_pos = (segment_count as f64 * config.pos_window_fraction).ceil();
     let pos_penalty = (Tensor::from(min_pos as f32).to_device(device) - pos_windows).clamp_min(0.0)
         * config.pos_penalty as f32;
     let final_fit = avg_fit + min_fitness * config.robust_weight as f32 - pos_penalty;
