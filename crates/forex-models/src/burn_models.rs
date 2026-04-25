@@ -1845,7 +1845,7 @@ where
     B: AutodiffBackend + ManagedBurnBackend,
     M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
 {
-    let (device, selection) = resolve_train_device("auto");
+    let (device, selection) = B::managed_device_and_selection();
     train_model_with_report_with_selection::<B, M>(
         model, x_data, y_raw, config, &device, &selection,
     )

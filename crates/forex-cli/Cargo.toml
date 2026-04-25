@@ -3,6 +3,10 @@ name = "forex-cli"
 version = "0.1.0"
 edition.workspace = true
 
+[features]
+default = []
+gpu = ["forex-search/gpu", "forex-models/neuro-evolution-gpu", "forex-models/statistical-gpu"]
+
 [dependencies]
 forex-core = { path = "../forex-core" }
 forex-data = { path = "../forex-data" }

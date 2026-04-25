@@ -711,16 +711,40 @@ pub fn mutate(
 }
 
 pub fn score_from_metrics(metrics: &[f64; 11]) -> f64 {
-    let net_profit = metrics[0];
     let sharpe = metrics[1];
     let max_dd = metrics[3];
+    let win_rate = metrics[4];
     let profit_factor = metrics[5];
+    let trades = metrics[8];
     let consistency = metrics[9];
-    let dd_cap = 0.07;
-    let pfloor = 1.0;
-    let dd_penalty = 10.0 * (max_dd - dd_cap).max(0.0);
-    let pf_penalty = if profit_factor <= pfloor { 5.0 } else { 0.0 };
-    sharpe + (net_profit / 10_000.0) + (consistency * 0.5) - dd_penalty - pf_penalty
+
+    if !sharpe.is_finite() || trades < 1.0 {
+        return f64::NEG_INFINITY;
+    }
+
+    // Confidence factor: more trades → higher confidence (caps at ~100 trades)
+    let trades_confidence = (trades.sqrt() / 10.0).min(1.0);
+
+    // Sharpe weighted by confidence (primary signal)
+    let sharpe_component = sharpe * trades_confidence * 0.40;
+
+    // Consistency: reward smooth monthly returns
+    let consistency_component = consistency.clamp(0.0, 1.0) * 0.25;
+
+    // Drawdown: proportional penalty, not cliff-based
+    let dd_penalty = (max_dd * 15.0).min(5.0);
+
+    // Profit factor: smooth reward above 1.0, smooth penalty below
+    let pf_component = if profit_factor >= 1.0 {
+        ((profit_factor - 1.0) * 0.5).min(1.5) * 0.20
+    } else {
+        -(1.0 / profit_factor.max(0.1)) * 0.30
+    };
+
+    // Win rate bonus (minor, since PF already captures edge quality)
+    let wr_component = ((win_rate - 0.45) * 2.0).clamp(0.0, 0.5) * 0.10;
+
+    sharpe_component + consistency_component + pf_component + wr_component - dd_penalty
 }
 
 pub fn apply_metrics(genes: &mut [Gene], metrics: &[[f64; 11]]) {

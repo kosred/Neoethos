@@ -14,7 +14,6 @@ pub enum SubsystemSection {
     Cli,
     Discovery,
     Training,
-    Mt5,
     Bindings,
 }
 
@@ -26,7 +25,6 @@ impl SubsystemSection {
             Self::Cli,
             Self::Discovery,
             Self::Training,
-            Self::Mt5,
             Self::Bindings,
         ]
     }
@@ -38,7 +36,6 @@ impl SubsystemSection {
             Self::Cli => "CLI",
             Self::Discovery => "DISCOVERY",
             Self::Training => "TRAINING",
-            Self::Mt5 => "MT5",
             Self::Bindings => "BINDINGS",
         }
     }
@@ -50,7 +47,6 @@ impl SubsystemSection {
             "CLI" => Ok(Self::Cli),
             "DISCOVERY" => Ok(Self::Discovery),
             "TRAINING" => Ok(Self::Training),
-            "MT5" => Ok(Self::Mt5),
             "BINDINGS" => Ok(Self::Bindings),
             other => Err(anyhow!("unknown subsystem section: {other}")),
         }

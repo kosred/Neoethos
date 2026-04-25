@@ -32,7 +32,6 @@ pub fn render(
                 label: "Data Source".to_string(),
                 value: match state.data_source {
                     DataSource::CTrader => "cTrader".to_string(),
-                    DataSource::MT5 => "MT5".to_string(),
                     DataSource::Local => "Local".to_string(),
                 },
             },
@@ -67,8 +66,6 @@ pub fn render(
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut state.data_source, DataSource::CTrader, "cTrader");
-                #[cfg(feature = "legacy-mt5")]
-                ui.selectable_value(&mut state.data_source, DataSource::MT5, "MT5 Legacy");
                 ui.selectable_value(&mut state.data_source, DataSource::Local, "Local");
             });
 
@@ -99,21 +96,6 @@ fn render_adapter_configuration(
     tx: &tokio::sync::mpsc::Sender<crate::app_services::ServiceEvent>,
 ) {
     match session.configured_adapter() {
-        TradingAdapterKind::Mt5 => {
-            #[cfg(not(feature = "legacy-mt5"))]
-            {
-                ui.label("Legacy MT5 bridge is disabled in the default Rust/cTrader runtime.");
-                return;
-            }
-            #[cfg(feature = "legacy-mt5")]
-            {
-                let settings = &mut session.broker_settings_mut().mt5;
-                labeled_text_edit(ui, "Terminal Path", &mut settings.terminal_path);
-                labeled_text_edit(ui, "Server", &mut settings.server);
-                labeled_text_edit(ui, "Login", &mut settings.login);
-                render_account_targets(ui, &mut settings.accounts, "MT5 Account");
-            }
-        }
         TradingAdapterKind::CTrader => {
             let mut start_live_auth = false;
             let mut discover_accounts = false;

@@ -778,7 +778,7 @@ fn build_meta_runtime_prediction(
         .into_iter()
         .flatten(),
     );
-    build_runtime_prediction_with_details(
+    Ok(build_runtime_prediction_with_details(
         model_name,
         ModelFamily::Meta,
         CapabilityState::Implemented,
@@ -787,7 +787,7 @@ fn build_meta_runtime_prediction(
         Some(shared_abstain || conformal_abstain),
         Some("xgboost_meta_blender+conformal_gate".to_string()),
         degraded_reason,
-    )
+    )?)
 }
 
 fn calibration_method_name(method: CalibrationMethod) -> &'static str {
@@ -808,7 +808,7 @@ fn build_probability_calibration_runtime_prediction(
     } else {
         None
     };
-    build_runtime_prediction_with_details(
+    Ok(build_runtime_prediction_with_details(
         "probability_calibrator",
         ModelFamily::Meta,
         CapabilityState::Implemented,
@@ -820,7 +820,7 @@ fn build_probability_calibration_runtime_prediction(
             calibration_method_name(calibration_method)
         )),
         degraded_reason,
-    )
+    )?)
 }
 
 fn build_conformal_runtime_prediction(
@@ -848,7 +848,7 @@ fn build_conformal_runtime_prediction(
         .flatten(),
     );
 
-    build_runtime_prediction_with_details(
+    Ok(build_runtime_prediction_with_details(
         "conformal_gate",
         ModelFamily::Meta,
         CapabilityState::Implemented,
@@ -860,7 +860,7 @@ fn build_conformal_runtime_prediction(
             calibration_method_name(calibration_method)
         )),
         degraded_reason,
-    )
+    )?)
 }
 
 fn build_meta_stack_runtime_prediction(
@@ -883,7 +883,7 @@ fn build_meta_stack_runtime_prediction(
             min_prediction_set.max(1)
         ));
     }
-    build_runtime_prediction_with_details(
+    Ok(build_runtime_prediction_with_details(
         "meta_stack",
         ModelFamily::Meta,
         CapabilityState::Implemented,
@@ -899,7 +899,7 @@ fn build_meta_stack_runtime_prediction(
         } else {
             Some(degraded_reasons.join("; "))
         },
-    )
+    )?)
 }
 
 pub struct MetaBlender {

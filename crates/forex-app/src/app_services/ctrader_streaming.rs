@@ -1,18 +1,19 @@
 use crate::app_services::ctrader_data::HistoricalBar;
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::{
+    build_account_auth_request, build_application_auth_request, build_subscribe_live_trendbar_request,
+    build_subscribe_spots_request, expected_response_payload_type, is_matching_open_api_response,
+    parse_ctrader_error_payload, parse_open_api_envelope, trendbar_period_value,
     CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE,
-    build_account_auth_request, build_application_auth_request,
-    build_subscribe_live_trendbar_request, build_subscribe_spots_request,
-    expected_response_payload_type, is_matching_open_api_response, parse_ctrader_error_payload,
-    parse_open_api_envelope, trendbar_period_value,
 };
+use crate::app_services::ctrader_proto_messages::{build_proto_message, parse_proto_message};
 use anyhow::{Context, Result, anyhow};
-use serde::Deserialize;
 use std::net::TcpStream;
 use std::sync::{Mutex, OnceLock};
-use tungstenite::{Message, connect};
-type CTraderSocket = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>;
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{Message, WebSocket, connect};
+use serde::Deserialize;
+type CTraderSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CTraderLiveChartUpdateRequest {

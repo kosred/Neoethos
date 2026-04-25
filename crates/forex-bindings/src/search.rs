@@ -95,16 +95,17 @@ pub fn search_evolve_ohlcv(
         .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
 
     let metrics: Vec<Vec<f64>> = result
+        .1
         .metrics
         .iter()
         .map(|m: &[f64; 11]| m.to_vec())
         .collect();
-    let genes_py = pythonize_genes(py, &result.genes)?;
+    let genes_py = pythonize_genes(py, &result.1.genes)?;
 
     let dict = PyDict::new(py);
     dict.set_item("genes", genes_py)?;
     dict.set_item("metrics", metrics)?;
-    dict.set_item("feature_names", features.names)?;
+    dict.set_item("feature_names", result.0.names)?;
     Ok(dict.into_any().unbind())
 }
 
@@ -220,7 +221,7 @@ pub fn search_evolve_gpu_ohlcv(
         precision: defaults.precision,
     };
 
-    let (features, result) = py
+    let result = py
         .detach(|| {
             let prof = if include_raw {
                 FeatureProfile::Full
@@ -229,21 +230,9 @@ pub fn search_evolve_gpu_ohlcv(
             };
             let features = compute_hpc_feature_frame(&ohlcv, prof)
                 .map_err(|e| format!("Feature computation failed: {}", e))?;
-            let result = {
-                #[cfg(feature = "gpu")]
-                {
-                    let frames_vec = vec![features.clone()];
-                    run_gpu_discovery(&frames_vec, &ohlcv, &config)
-                        .map_err(|e| format!("GPU search failed: {}", e))?
-                }
-                #[cfg(not(feature = "gpu"))]
-                {
-                    let frames_vec = vec![features.clone()];
-                    run_gpu_discovery(&frames_vec, &ohlcv, &config)
-                        .map_err(|e| format!("GPU search failed: {}", e))?
-                }
-            };
-            Ok::<_, String>(result)
+            let frames_vec = vec![features];
+            run_gpu_discovery(&frames_vec, &ohlcv, &config)
+                .map_err(|e| format!("GPU search failed: {}", e))
         })
         .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
 

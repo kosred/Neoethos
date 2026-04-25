@@ -24,6 +24,10 @@ fn default_tree_surrogate_kind() -> String {
     TREE_LOCAL_SURROGATE_KIND.to_string()
 }
 
+fn neutral_prior_for_class(_class_idx: usize) -> f32 {
+    1.0 / 3.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TreeLocalFallbackArtifact {
     #[serde(default = "default_tree_surrogate_kind")]

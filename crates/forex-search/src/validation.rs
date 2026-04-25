@@ -264,6 +264,7 @@ pub fn embargoed_walkforward_backtest(
             slice_sig,
             slice_months,
             slice_days,
+            &[],
             settings,
         );
 

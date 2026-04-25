@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::{cmp::Ordering, f64::consts::PI};
 
+#[cfg(feature = "neuro-evolution-gpu")]
+use super::crfmnes_gpu::{neuro_evo_cuda_kernel_enabled, try_selection_losses_cuda};
 use crate::base::{
     ExpertModel, build_runtime_artifact_metadata, build_runtime_prediction_with_details,
     three_class_runtime_confidence, try_build_runtime_artifact_metadata,
@@ -41,15 +43,25 @@ fn default_neuro_evo_requested_device_policy() -> String {
     "auto".to_string()
 }
 
-fn neuro_evo_cpu_fallback_reason(policy: &str) -> Option<String> {
+fn neuro_evo_cpu_fallback_reason(policy: &str, runtime_backend: Option<&str>) -> Option<String> {
     let normalized = normalize_runtime_device_policy(policy);
     if normalized == "gpu" || normalized.starts_with("gpu:") {
+        if runtime_backend.is_some_and(|backend| backend.contains("cuda")) {
+            return None;
+        }
         Some(format!(
             "requested device policy `{normalized}`; crfmnes Rust backend is CPU/nalgebra and does not execute on GPU"
         ))
     } else {
         None
     }
+}
+
+fn is_fallback_search_backend(backend: &str) -> bool {
+    backend == FALLBACK_BACKEND_NAME
+        || backend
+            .strip_prefix(FALLBACK_BACKEND_NAME)
+            .is_some_and(|suffix| suffix.starts_with('_'))
 }
 
 struct SimpleEvolutionState {
@@ -148,7 +160,7 @@ impl SimpleEvolutionState {
 #[cfg(feature = "neuro-evolution")]
 struct CrfmnesEvolutionState {
     optimizer: CrfmnesBackendOptimizer,
-    rng: Xoroshiro128PlusPlus,
+    rng: rand08::rngs::SmallRng,
     best_weights: Vec<f64>,
     best_loss: f64,
 }
@@ -156,8 +168,11 @@ struct CrfmnesEvolutionState {
 #[cfg(feature = "neuro-evolution")]
 impl CrfmnesEvolutionState {
     fn new(dim: usize, sigma: f64, population: usize) -> Self {
-        let mut seeder = rand::rng();
-        let mut rng = Xoroshiro128PlusPlus::from_rng(&mut seeder);
+        let seed: u64 = rand::random();
+        let mut rng = {
+            use rand08::SeedableRng;
+            rand08::rngs::SmallRng::seed_from_u64(seed)
+        };
         let start = DVector::zeros(dim);
         let lamb = even_crfmnes_population(population.max(rec_lamb(dim)).max(4));
         let optimizer = CrfmnesBackendOptimizer::new(start, sigma.max(1e-4), lamb, &mut rng);
@@ -173,18 +188,37 @@ impl CrfmnesEvolutionState {
     where
         F: FnMut(&[f64]) -> Result<f64>,
     {
+        self.run_generation_batch(|candidates| {
+            candidates
+                .iter()
+                .map(|candidate| evaluate(candidate))
+                .collect::<Result<Vec<_>>>()
+        })
+    }
+
+    fn run_generation_batch<F>(&mut self, mut evaluate: F) -> Result<Vec<f64>>
+    where
+        F: FnMut(&[Vec<f64>]) -> Result<Vec<f64>>,
+    {
         let mut trial = self.optimizer.ask(&mut self.rng);
         let candidates = trial
             .x()
             .column_iter()
             .map(|candidate| candidate.iter().copied().collect::<Vec<_>>())
             .collect::<Vec<_>>();
-        let mut losses = Vec::with_capacity(candidates.len());
+        let raw_losses = evaluate(&candidates)?;
+        if raw_losses.len() != candidates.len() {
+            bail!(
+                "crfmnes evaluator returned {} losses for {} candidates",
+                raw_losses.len(),
+                candidates.len()
+            );
+        }
+        let mut losses = Vec::with_capacity(raw_losses.len());
         let mut generation_best_loss = f64::INFINITY;
         let mut generation_best_weights = None;
 
-        for candidate in &candidates {
-            let loss = evaluate(candidate)?;
+        for (candidate, loss) in candidates.iter().zip(raw_losses) {
             if loss.is_finite() && loss < generation_best_loss {
                 generation_best_loss = loss;
                 generation_best_weights = Some(candidate.clone());
@@ -310,20 +344,41 @@ impl NeuroEvoOptimizer {
     where
         F: FnMut(&[f64]) -> Result<f64>,
     {
+        self.run_generation_batch(|candidates| {
+            candidates
+                .iter()
+                .map(|candidate| evaluate(candidate))
+                .collect::<Result<Vec<_>>>()
+        })
+    }
+
+    fn run_generation_batch<F>(&mut self, mut evaluate: F) -> Result<Vec<f64>>
+    where
+        F: FnMut(&[Vec<f64>]) -> Result<Vec<f64>>,
+    {
         match &mut self.backend {
             #[cfg(feature = "neuro-evolution")]
-            NeuroEvoBackend::Crfmnes(state) => state.run_generation(evaluate),
+            NeuroEvoBackend::Crfmnes(state) => state.run_generation_batch(evaluate),
             NeuroEvoBackend::Fallback(state) => {
                 let candidates = state.ask();
-                let mut fitness = Vec::with_capacity(candidates.len());
-                for candidate in &candidates {
-                    let loss = evaluate(candidate)?;
-                    fitness.push(if loss.is_finite() {
-                        -loss
-                    } else {
-                        f64::NEG_INFINITY
-                    });
+                let losses = evaluate(&candidates)?;
+                if losses.len() != candidates.len() {
+                    bail!(
+                        "neuro-evo evaluator returned {} losses for {} candidates",
+                        losses.len(),
+                        candidates.len()
+                    );
                 }
+                let fitness = losses
+                    .iter()
+                    .map(|loss| {
+                        if loss.is_finite() {
+                            -*loss
+                        } else {
+                            f64::NEG_INFINITY
+                        }
+                    })
+                    .collect::<Vec<_>>();
                 state.tell(fitness)?;
                 Ok(state.best_weights.clone())
             }
@@ -676,14 +731,13 @@ impl NeuroEvoExpert {
         {
             bail!("neuro-evo artifact training summary does not match metadata");
         }
-        if artifact.search_backend == FALLBACK_BACKEND_NAME
+        let fallback_backend = is_fallback_search_backend(&artifact.search_backend);
+        if fallback_backend
             && artifact.runtime_degraded_reason.as_deref() != Some(FALLBACK_DEGRADED_REASON)
         {
             bail!("neuro-evo artifact fallback backend must persist the fallback degraded reason");
         }
-        if artifact.search_backend != FALLBACK_BACKEND_NAME
-            && artifact.runtime_degraded_reason.is_some()
-        {
+        if !fallback_backend && artifact.runtime_degraded_reason.is_some() {
             bail!("neuro-evo artifact non-fallback backend may not persist a degraded reason");
         }
 
@@ -766,7 +820,10 @@ impl NeuroEvoExpert {
     }
 
     fn runtime_details(&self) -> (Option<String>, Option<String>) {
-        let gpu_cpu_fallback = neuro_evo_cpu_fallback_reason(&self.requested_device_policy);
+        let gpu_cpu_fallback = neuro_evo_cpu_fallback_reason(
+            &self.requested_device_policy,
+            Some(&self.search_backend),
+        );
         if !self.fitted {
             return (
                 Some("neuro_evo_unknown".to_string()),
@@ -799,7 +856,7 @@ impl NeuroEvoExpert {
         } else {
             self.search_backend.clone()
         };
-        let degraded_reason = if backend == FALLBACK_BACKEND_NAME {
+        let degraded_reason = if is_fallback_search_backend(&backend) {
             Some(FALLBACK_DEGRADED_REASON.to_string())
         } else {
             self.runtime_degraded_reason.clone()
@@ -910,6 +967,8 @@ impl ExpertModel for NeuroEvoExpert {
         let effective_generations = self.effective_generation_count();
         let mut selected_backend = FALLBACK_BACKEND_NAME.to_string();
         let mut selected_degraded_reason = Some(FALLBACK_DEGRADED_REASON.to_string());
+        let mut used_cuda_fitness = false;
+        let mut cuda_fitness_disabled = false;
 
         if effective_generations < self.generations {
             tracing::info!(
@@ -928,23 +987,68 @@ impl ExpertModel for NeuroEvoExpert {
             selected_backend = optimizer.backend_name().to_string();
             selected_degraded_reason = optimizer.degraded_reason().map(str::to_string);
             for _ in 0..effective_generations {
-                let _ = optimizer.run_generation(|candidate| {
-                    let candidate_f32 = candidate
-                        .iter()
-                        .map(|value| *value as f32)
-                        .collect::<Vec<_>>();
-                    let (selection_loss, _train_loss, _val_loss) = self.selection_loss_for_params(
-                        &candidate_f32,
-                        &train_features,
-                        &train_labels,
-                        &val_features,
-                        &val_labels,
-                    )?;
-                    if selection_loss < best_selection_loss {
-                        best_selection_loss = selection_loss;
-                        best_params = candidate_f32;
+                let _ = optimizer.run_generation_batch(|candidates| {
+                    #[cfg(feature = "neuro-evolution-gpu")]
+                    if !cuda_fitness_disabled
+                        && neuro_evo_cuda_kernel_enabled(&self.requested_device_policy)
+                    {
+                        match try_selection_losses_cuda(
+                            candidates,
+                            &train_features,
+                            &train_labels,
+                            &val_features,
+                            &val_labels,
+                            self.input_dim,
+                            self.hidden_dim,
+                            param_dim,
+                            &self.requested_device_policy,
+                        ) {
+                            Ok(losses) => {
+                                used_cuda_fitness = true;
+                                let mut selection_losses = Vec::with_capacity(losses.len());
+                                for (candidate, (selection_loss, _train_loss, _val_loss)) in
+                                    candidates.iter().zip(losses)
+                                {
+                                    if selection_loss < best_selection_loss {
+                                        best_selection_loss = selection_loss;
+                                        best_params =
+                                            candidate.iter().map(|value| *value as f32).collect();
+                                    }
+                                    selection_losses.push(selection_loss);
+                                }
+                                return Ok(selection_losses);
+                            }
+                            Err(err) => {
+                                cuda_fitness_disabled = true;
+                                tracing::warn!(
+                                    "neuro-evo cuda fitness kernel unavailable, falling back to cpu fitness evaluation: {err}"
+                                );
+                            }
+                        }
                     }
-                    Ok(selection_loss)
+
+                    candidates
+                        .iter()
+                        .map(|candidate| {
+                            let candidate_f32 = candidate
+                                .iter()
+                                .map(|value| *value as f32)
+                                .collect::<Vec<_>>();
+                            let (selection_loss, _train_loss, _val_loss) =
+                                self.selection_loss_for_params(
+                                    &candidate_f32,
+                                    &train_features,
+                                    &train_labels,
+                                    &val_features,
+                                    &val_labels,
+                                )?;
+                            if selection_loss < best_selection_loss {
+                                best_selection_loss = selection_loss;
+                                best_params = candidate_f32;
+                            }
+                            Ok(selection_loss)
+                        })
+                        .collect::<Result<Vec<_>>>()
                 })?;
             }
 
@@ -954,6 +1058,13 @@ impl ExpertModel for NeuroEvoExpert {
             }
         }
 
+        if used_cuda_fitness && !selected_backend.contains("cuda") {
+            selected_backend = if selected_backend == "crfmnes_cpu" {
+                "crfmnes_cuda_fitness".to_string()
+            } else {
+                format!("{selected_backend}_cuda_fitness")
+            };
+        }
         self.params = best_params;
         self.search_backend = selected_backend;
         self.runtime_degraded_reason = selected_degraded_reason;
@@ -1050,7 +1161,9 @@ impl ExpertModel for NeuroEvoExpert {
         self.fitted = next_fitted;
         Ok(())
     }
+}
 
+impl NeuroEvoExpert {
     fn metadata_from_artifact(artifact: &NeuroEvoArtifact) -> Result<RuntimeArtifactMetadata> {
         try_build_runtime_artifact_metadata(
             NEURO_EVO_MODEL_NAME,

@@ -27,6 +27,7 @@ xgb = { version = "3.0.5", optional = true }
 catboost-rust = { version = "0.3.6", optional = true, features = ["gpu"] }
 sklears = { version = "0.1.0-rc.1", optional = true, features = ["tree"] }
 candle-core = { version = "0.9.1", optional = true }
+cubecl = { version = "0.9.0", optional = true, default-features = false, features = ["std", "cuda"] }
 
 # Pure Rust Evolutionary & Reinforcement Learning
 crfmnes = { version = "1.0.0", optional = true }
@@ -52,6 +53,7 @@ burn-wgpu = { version = "0.20.1", optional = true, default-features = false, fea
 
 num_cpus = "1.17.0"
 rand = "0.9.2"
+rand08 = { package = "rand", version = "0.8", optional = true }
 rayon = "1.11.0"
 chrono = "0.4.42"
 lazy_static = "1.5.0"
@@ -73,12 +75,14 @@ tree-models-core = ["lightgbm", "xgboost", "sklears-tree"]
 tree-models = ["tree-models-core", "catboost"]
 
 # Pure Rust ML features
-neuro-evolution = ["dep:crfmnes"]
+neuro-evolution = ["dep:crfmnes", "dep:rand08"]
+neuro-evolution-gpu = ["neuro-evolution", "dep:cubecl"]
 reinforcement-learning = ["dep:rlkit", "dep:candle-core"]
 reinforcement-learning-cuda = ["reinforcement-learning", "rlkit/cuda", "candle-core/cuda"]
 adaptive-models = ["dep:irithyll"]
 swarm-forecasting = ["dep:ruv-swarm-ml"]
 statistical-models = ["dep:linfa", "dep:linfa-linear", "dep:linfa-logistic", "dep:linfa-clustering", "dep:variational-regression"]
+statistical-gpu = ["statistical-models", "dep:cubecl"]
 anomaly-detection = ["dep:extended-isolation-forest"]
 
 # Burn pure-Rust deep learning (production backend)

@@ -29,7 +29,7 @@ pub fn ensure_autotrading_enabled() -> bool {
     #[cfg(target_os = "windows")]
     {
         warn!(
-            "Cannot verify MT5 AutoTrading from forex-core without broker terminal state; use the MT5 adapter before live execution."
+            "Cannot verify AutoTrading from forex-core without broker terminal state; use the broker adapter before live execution."
         );
         false
     }
@@ -65,10 +65,9 @@ pub fn focus_mt5_window() -> bool {
                     let title = OsString::from_wide(&buffer[..length as usize]);
                     let title_lossy = title.to_string_lossy();
 
-                    if title_lossy.contains("MetaTrader 5") {
-                        // Found it
+                    if title_lossy.contains("MetaTrader 5") || title_lossy.contains("cTrader") {
                         *found_ptr = Some(hwnd);
-                        return BOOL(0); // Stop enumeration
+                        return BOOL(0);
                     }
                 }
                 BOOL(1) // Continue enumeration
@@ -79,7 +78,7 @@ pub fn focus_mt5_window() -> bool {
         let _ = EnumWindows(Some(enum_window_proc), lparam);
 
         if let Some(hwnd) = found_hwnd {
-            info!("Found MT5 window. Focusing...");
+            info!("Found broker terminal window. Focusing...");
             if IsIconic(hwnd).as_bool() {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
             }
@@ -87,7 +86,7 @@ pub fn focus_mt5_window() -> bool {
             return true;
         }
     }
-    warn!("MetaTrader 5 window not found.");
+    warn!("Broker terminal window not found.");
     false
 }
 

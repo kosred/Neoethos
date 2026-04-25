@@ -216,7 +216,7 @@ impl HardwareExecutionPlan {
             device: "cpu".to_string(),
             device_ids: Vec::new(),
             precision: choose_training_precision(
-                profile,
+                &profile,
                 if gpu_enabled && search_gpu_requested && !cuda_devices.is_empty() {
                     AcceleratorBackend::Cuda
                 } else {

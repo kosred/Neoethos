@@ -261,7 +261,6 @@ impl eframe::App for ForexApp {
                                 "SOURCE",
                                 match self.state.data_source {
                                     app_state::DataSource::CTrader => "CTRADER",
-                                    app_state::DataSource::MT5 => "MT5",
                                     app_state::DataSource::Local => "LOCAL",
                                 },
                                 ui::theme::TEXT_MUTED,

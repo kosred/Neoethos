@@ -44,14 +44,6 @@ pub struct AdapterReadinessSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Mt5BrokerSettings {
-    pub terminal_path: String,
-    pub server: String,
-    pub login: String,
-    pub accounts: Vec<BrokerAccountTarget>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CTraderBrokerSettings {
     pub client_id: String,
     pub client_secret: String,
@@ -71,7 +63,6 @@ pub struct DxTradeBrokerSettings {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BrokerSettingsState {
-    pub mt5: Mt5BrokerSettings,
     pub ctrader: CTraderBrokerSettings,
     pub dxtrade: DxTradeBrokerSettings,
 }
@@ -79,31 +70,6 @@ pub struct BrokerSettingsState {
 impl BrokerSettingsState {
     pub fn readiness(&self, adapter: TradingAdapterKind) -> AdapterReadinessSnapshot {
         match adapter {
-            TradingAdapterKind::Mt5 => {
-                let target_count = count_enabled_targets(&self.mt5.accounts);
-                #[cfg(not(feature = "legacy-mt5"))]
-                {
-                    return AdapterReadinessSnapshot {
-                        adapter_name: adapter.as_str().to_string(),
-                        session_state: BrokerSessionState::Disconnected,
-                        status_line:
-                            "Legacy MT5 bridge disabled; cTrader is the canonical runtime."
-                                .to_string(),
-                        missing_fields: Vec::new(),
-                        target_count,
-                        can_attempt_connect: false,
-                    };
-                }
-                #[cfg(feature = "legacy-mt5")]
-                AdapterReadinessSnapshot {
-                    adapter_name: adapter.as_str().to_string(),
-                    session_state: BrokerSessionState::Configured,
-                    status_line: "Local terminal bridge selected.".to_string(),
-                    missing_fields: Vec::new(),
-                    target_count,
-                    can_attempt_connect: true,
-                }
-            }
             TradingAdapterKind::CTrader => {
                 let missing_fields = required_missing_fields(&[
                     ("client_id", &self.ctrader.client_id),

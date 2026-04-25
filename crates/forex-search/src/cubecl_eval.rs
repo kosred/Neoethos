@@ -107,6 +107,7 @@ fn backtest_population_kernel(
     high_pips: &Array<f32>,
     low_pips: &Array<f32>,
     signals_flat: &Array<i32>,
+    timestamp_deltas_ms: &Array<i32>,
     month_idx: &Array<i32>,
     day_idx: &Array<i32>,
     sl_pips: &Array<f32>,
@@ -119,6 +120,10 @@ fn backtest_population_kernel(
     month_capacity: u32,
     initial_equity: f32,
     max_hold_bars: u32,
+    min_hold_bars: u32,
+    max_trades_per_day: u32,
+    gap_threshold_ms: i32,
+    use_timestamps: i32,
     trailing_enabled: i32,
     trailing_atr_multiplier: f32,
     trailing_be_trigger_r: f32,
@@ -168,6 +173,7 @@ fn backtest_population_kernel(
         let mut day_peak = equity;
         let mut day_low = equity;
         let mut max_daily_dd = 0.0f32;
+        let mut day_trade_count = 0u32;
 
         let mut in_pos = 0i32;
         let mut entry_px = 0.0f32;
@@ -199,6 +205,44 @@ fn backtest_population_kernel(
                 last_day = d_val;
                 day_peak = equity;
                 day_low = equity;
+                day_trade_count = 0;
+            }
+
+            if in_pos != 0
+                && use_timestamps != 0
+                && gap_threshold_ms > 0
+                && timestamp_deltas_ms[i] >= gap_threshold_ms
+            {
+                let mut pnl = if in_pos == 1 {
+                    (close_pips[i] - entry_px) * pip_value_per_lot
+                } else {
+                    (entry_px - close_pips[i]) * pip_value_per_lot
+                };
+                pnl -= commission_per_trade + (spread_pips * 0.5 * pip_value_per_lot);
+                equity += pnl;
+                current_month_pnl += pnl;
+                trade_count += 1;
+                if pnl > 0.0 {
+                    wins += 1;
+                    gross_profit += pnl;
+                } else {
+                    gross_loss += -pnl;
+                }
+                in_pos = 0;
+                if equity > peak_equity {
+                    peak_equity = equity;
+                }
+                if equity < day_low {
+                    day_low = equity;
+                }
+                let current_dd = if peak_equity > 0.0 {
+                    (peak_equity - equity) / peak_equity
+                } else {
+                    0.0
+                };
+                if current_dd > max_dd {
+                    max_dd = current_dd;
+                }
             }
 
             if in_pos != 0 {
@@ -234,8 +278,10 @@ fn backtest_population_kernel(
 
                 let mut pnl = 0.0f32;
                 let mut exit = false;
+                let bars_held = i as i32 - entry_idx;
+                let past_min_hold = min_hold_bars == 0 || bars_held >= min_hold_bars as i32;
 
-                if in_pos == 1 {
+                if past_min_hold && in_pos == 1 {
                     let mut sl = entry_px - sl_distance;
                     let tp = entry_px + tp_distance;
                     if trailing_enabled != 0 {
@@ -257,7 +303,7 @@ fn backtest_population_kernel(
                         pnl = (tp - entry_px) * pip_value_per_lot;
                         exit = true;
                     }
-                } else {
+                } else if past_min_hold {
                     let mut sl = entry_px + sl_distance;
                     let tp = entry_px - tp_distance;
                     if trailing_enabled != 0 {
@@ -281,7 +327,8 @@ fn backtest_population_kernel(
                     }
                 }
 
-                if !exit && max_hold_bars > 0 && (i as i32 - entry_idx) >= max_hold_bars as i32 {
+                if !exit && past_min_hold && max_hold_bars > 0 && bars_held >= max_hold_bars as i32
+                {
                     pnl = if in_pos == 1 {
                         (close_pips[i] - entry_px) * pip_value_per_lot
                     } else {
@@ -291,7 +338,7 @@ fn backtest_population_kernel(
                 }
 
                 if exit {
-                    pnl -= commission_per_trade + (spread_pips * pip_value_per_lot);
+                    pnl -= commission_per_trade + (spread_pips * 0.5 * pip_value_per_lot);
                     equity += pnl;
                     current_month_pnl += pnl;
                     trade_count += 1;
@@ -321,10 +368,13 @@ fn backtest_population_kernel(
             } else {
                 let s = signals_flat[signal_base + i];
                 if s != 0 {
-                    in_pos = s;
-                    entry_px = close_pips[i];
-                    entry_idx = i as i32;
-                    trail_px = 0.0;
+                    if !(max_trades_per_day > 0 && day_trade_count >= max_trades_per_day) {
+                        in_pos = s;
+                        entry_px = close_pips[i] + (s as f32) * spread_pips * 0.5;
+                        entry_idx = i as i32;
+                        trail_px = 0.0;
+                        day_trade_count += 1;
+                    }
                 }
             }
 
@@ -699,6 +749,18 @@ fn saturating_i32(value: i64) -> i32 {
     value.clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
+fn timestamp_delta_ms(timestamps: &[i64], n_samples: usize) -> (Vec<i32>, bool) {
+    let mut deltas = vec![0i32; n_samples];
+    if timestamps.len() != n_samples {
+        return (deltas, false);
+    }
+    for i in 1..n_samples {
+        let delta = timestamps[i].saturating_sub(timestamps[i - 1]).max(0);
+        deltas[i] = saturating_i32(delta);
+    }
+    (deltas, true)
+}
+
 fn normalize_prices_to_pips(prices: &[f64], pip_value: f64) -> Vec<f32> {
     let safe_pip = if pip_value.abs() < 1e-12 {
         1e-12
@@ -717,6 +779,8 @@ fn launch_backtest_kernel(
     high_pips: &[f32],
     low_pips: &[f32],
     signals_flat: &[i32],
+    timestamp_deltas_ms: &[i32],
+    use_timestamps: bool,
     month_idx: &[i32],
     day_idx: &[i32],
     sl_pips: &[f32],
@@ -731,6 +795,7 @@ fn launch_backtest_kernel(
     }
     if high_pips.len() != n_samples
         || low_pips.len() != n_samples
+        || timestamp_deltas_ms.len() != n_samples
         || month_idx.len() != n_samples
         || day_idx.len() != n_samples
         || tp_pips.len() != n_genes
@@ -743,6 +808,7 @@ fn launch_backtest_kernel(
     let high_handle = client.create_from_slice(f32::as_bytes(high_pips));
     let low_handle = client.create_from_slice(f32::as_bytes(low_pips));
     let signals_handle = client.create_from_slice(i32::as_bytes(signals_flat));
+    let timestamp_delta_handle = client.create_from_slice(i32::as_bytes(timestamp_deltas_ms));
     let month_handle = client.create_from_slice(i32::as_bytes(month_idx));
     let day_handle = client.create_from_slice(i32::as_bytes(day_idx));
     let sl_handle = client.create_from_slice(f32::as_bytes(sl_pips));
@@ -765,6 +831,7 @@ fn launch_backtest_kernel(
         unsafe { ArrayArg::from_raw_parts::<f32>(&high_handle, n_samples, 1) },
         unsafe { ArrayArg::from_raw_parts::<f32>(&low_handle, n_samples, 1) },
         unsafe { ArrayArg::from_raw_parts::<i32>(&signals_handle, signals_flat.len(), 1) },
+        unsafe { ArrayArg::from_raw_parts::<i32>(&timestamp_delta_handle, n_samples, 1) },
         unsafe { ArrayArg::from_raw_parts::<i32>(&month_handle, month_idx.len(), 1) },
         unsafe { ArrayArg::from_raw_parts::<i32>(&day_handle, day_idx.len(), 1) },
         unsafe { ArrayArg::from_raw_parts::<f32>(&sl_handle, sl_pips.len(), 1) },
@@ -777,6 +844,10 @@ fn launch_backtest_kernel(
         ScalarArg::new(month_capacity as u32),
         ScalarArg::new(settings.initial_equity() as f32),
         ScalarArg::new(settings.max_hold_bars as u32),
+        ScalarArg::new(settings.min_hold_bars as u32),
+        ScalarArg::new(settings.max_trades_per_day as u32),
+        ScalarArg::new(saturating_i32(settings.gap_threshold_ms)),
+        ScalarArg::new(if use_timestamps { 1i32 } else { 0i32 }),
         ScalarArg::new(if settings.trailing_enabled {
             1i32
         } else {
@@ -815,6 +886,7 @@ pub(crate) fn try_evaluate_population_cuda(
     short_thr: &[f32],
     month_idx: &[i64],
     day_idx: &[i64],
+    timestamps: &[i64],
     sl_pips: &[f64],
     tp_pips: &[f64],
     smc_data: &[SmcRow],
@@ -857,6 +929,7 @@ pub(crate) fn try_evaluate_population_cuda(
     let close_pips = normalize_prices_to_pips(close, settings.pip_value);
     let high_pips = normalize_prices_to_pips(high, settings.pip_value);
     let low_pips = normalize_prices_to_pips(low, settings.pip_value);
+    let (timestamp_deltas_ms, use_timestamps) = timestamp_delta_ms(timestamps, n_samples);
     let month_idx = month_idx
         .iter()
         .map(|value| saturating_i32(*value))
@@ -881,6 +954,8 @@ pub(crate) fn try_evaluate_population_cuda(
         &high_pips,
         &low_pips,
         &signals_flat,
+        &timestamp_deltas_ms,
+        use_timestamps,
         &month_idx,
         &day_idx,
         &sl_pips,

@@ -16,6 +16,38 @@ use std::time::{Duration, Instant};
 
 type GeneArrays = (Vec<i32>, Vec<i32>, Vec<f32>, Vec<f32>, Vec<f32>);
 
+/// Holds data that is stable across all generations (OHLCV + features don't change).
+/// Computing this once outside the generation loop saves ~5-15% eval time.
+pub struct EvalDataCache {
+    pub indicators: ndarray::Array2<f32>,
+    pub months: Vec<i64>,
+    pub days: Vec<i64>,
+    pub smc_data: Vec<crate::eval::SmcRow>,
+}
+
+impl EvalDataCache {
+    pub fn build(features: &FeatureFrame, ohlcv: &Ohlcv) -> Self {
+        let indicators = transpose_features(features);
+        let (months, days) = month_day_indices(&features.timestamps);
+        let n_samples = features.data.nrows();
+        let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) =
+            build_smc_arrays(features, ohlcv);
+        let mut smc_data = Vec::with_capacity(n_samples);
+        for i in 0..n_samples {
+            smc_data.push([
+                ob[i], fvg[i], liq[i], trend[i], prem[i], ind[i], bos[i], choch[i], eqh[i], eql[i],
+                disp[i],
+            ]);
+        }
+        Self {
+            indicators,
+            months,
+            days,
+            smc_data,
+        }
+    }
+}
+
 pub fn month_day_indices(timestamps: &[i64]) -> (Vec<i64>, Vec<i64>) {
     let mut months = Vec::with_capacity(timestamps.len());
     let mut days = Vec::with_capacity(timestamps.len());
@@ -80,6 +112,86 @@ pub fn signals_for_gene(features: &FeatureFrame, gene: &Gene) -> Vec<i8> {
     signals
 }
 
+/// Evaluate genes using a pre-built EvalDataCache (avoids recomputing stable arrays each generation).
+pub fn evaluate_genes_cached(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    genes: &[Gene],
+    config: &EvaluationConfig,
+    cache: &EvalDataCache,
+) -> Result<Vec<[f64; 11]>> {
+    if genes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (offsets, indices, weights, long_thr, short_thr) = build_gene_arrays(genes);
+    let (sl_pips, tp_pips) = resolve_stop_target_arrays(genes, ohlcv, config);
+    let mut gene_smc_flags = Vec::with_capacity(genes.len());
+    for g in genes {
+        gene_smc_flags.push([
+            g.use_ob as i8,
+            g.use_fvg as i8,
+            g.use_liq_sweep as i8,
+            g.mtf_confirmation as i8,
+            g.use_premium_discount as i8,
+            g.use_inducement as i8,
+            g.use_bos as i8,
+            g.use_choch as i8,
+            g.use_eqh as i8,
+            g.use_eql as i8,
+            g.use_displacement as i8,
+        ]);
+    }
+
+    let smc_weights = [
+        config.smc_weight_ob,
+        config.smc_weight_fvg,
+        config.smc_weight_liq,
+        config.smc_weight_mtf,
+        config.smc_weight_premium,
+        config.smc_weight_inducement,
+        config.smc_weight_bos,
+        config.smc_weight_choch,
+        config.smc_weight_eqh,
+        config.smc_weight_eql,
+        config.smc_weight_displacement,
+    ];
+
+    let b_settings = BacktestSettings {
+        max_hold_bars: config.max_hold_bars,
+        trailing_enabled: config.trailing_enabled,
+        trailing_atr_multiplier: config.trailing_atr_multiplier,
+        trailing_be_trigger_r: config.trailing_be_trigger_r,
+        pip_value: config.pip_value,
+        spread_pips: config.spread_pips,
+        commission_per_trade: config.commission_per_trade,
+        pip_value_per_lot: config.pip_value_per_lot,
+        ..Default::default()
+    };
+
+    crate::eval::evaluate_population_core(crate::eval::PopulationEvalInputs {
+        close: &ohlcv.close,
+        high: &ohlcv.high,
+        low: &ohlcv.low,
+        indicators: cache.indicators.view(),
+        gene_offsets: &offsets,
+        gene_indices: &indices,
+        gene_weights: &weights,
+        long_thr: &long_thr,
+        short_thr: &short_thr,
+        month_idx: &cache.months,
+        day_idx: &cache.days,
+        timestamps: &features.timestamps,
+        sl_pips: &sl_pips,
+        tp_pips: &tp_pips,
+        smc_data: &cache.smc_data,
+        gene_smc_flags: &gene_smc_flags,
+        gate_threshold: config.smc_gate_threshold,
+        weights: &smc_weights,
+        settings: &b_settings,
+    })
+    .map_err(|e| anyhow!(e))
+}
+
 pub fn evaluate_genes(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
@@ -108,7 +220,6 @@ pub fn evaluate_genes(
             disp[i],
         ]);
     }
-
     let mut gene_smc_flags = Vec::with_capacity(genes.len());
     for g in genes {
         gene_smc_flags.push([
@@ -164,6 +275,7 @@ pub fn evaluate_genes(
         short_thr: &short_thr,
         month_idx: &months,
         day_idx: &days,
+        timestamps: &features.timestamps,
         sl_pips: &sl_pips,
         tp_pips: &tp_pips,
         smc_data: &smc_data,
@@ -384,11 +496,13 @@ where
         env_f64("FOREX_BOT_PROP_ARCHIVE_MIN_PF", 1.0),
         env_f64("FOREX_BOT_PROP_ARCHIVE_MIN_SHARPE", 0.0),
     );
+    // Cap archive to prevent memory explosion on large HPC runs (Remove #3)
     let archive_cap = std::env::var("FOREX_BOT_PROP_ARCHIVE_CAP")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(population * generations.max(1))
-        .max(population);
+        .unwrap_or((population * generations.max(1)).min(50_000))
+        .max(population)
+        .min(200_000);
     let base_immigrant_ratio = env_f64("FOREX_BOT_PROP_RANDOM_IMMIGRANTS", 0.25).clamp(0.0, 0.95);
     let base_survivor_fraction = env_f64(
         "FOREX_BOT_PROP_SURVIVOR_FRACTION",
@@ -419,12 +533,21 @@ where
         .unwrap_or(2)
         .max(1);
 
+    // Perf #1: read env vars once before the generation loop
+    let novelty_weight: f64 = std::env::var("FOREX_BOT_NOVELTY_WEIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0); // Default OFF to avoid O(n²) cost; set > 0 only for large populations
+
+    // Perf #3: build stable eval data cache ONCE before the generation loop
+    let eval_cache = EvalDataCache::build(features, ohlcv);
+
     let started_at = Instant::now();
     let mut best_score_seen = f64::NEG_INFINITY;
     let mut stagnant_gens = 0usize;
 
     if generations == 0 {
-        let metrics = evaluate_genes(features, ohlcv, &genes, &eval_cfg)?;
+        let metrics = evaluate_genes_cached(features, ohlcv, &genes, &eval_cfg, &eval_cache)?;
         apply_metrics(&mut genes, &metrics);
         seen_memory.flush();
         return Ok(SearchResult { genes, metrics });
@@ -438,7 +561,7 @@ where
         }
         eval_cfg.smc_gate_threshold = gate_now.clamp(gate_lo, gate_hi);
 
-        let metrics = evaluate_genes(features, ohlcv, &genes, &eval_cfg)?;
+        let metrics = evaluate_genes_cached(features, ohlcv, &genes, &eval_cfg, &eval_cache)?;
         apply_metrics(&mut genes, &metrics);
 
         let mut scored: Vec<(f64, usize, Gene, [f64; 11])> = genes
@@ -450,23 +573,24 @@ where
             .collect();
 
         // --- Novelty Search: Behavioral Diversity ---
-        let novelty_weight: f64 = std::env::var("FOREX_BOT_NOVELTY_WEIGHT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.15);
+        // Perf #2: pre-compute all HashSets once to avoid O(n²) allocations
         if novelty_weight > 0.0 && scored.len() > 1 {
             let n_pop = scored.len();
+            // Pre-compute index sets for all genes (one allocation pass)
+            let index_sets: Vec<HashSet<usize>> = scored
+                .iter()
+                .map(|(_, _, g, _)| g.indices.iter().copied().collect())
+                .collect();
             let mut novelty_scores = vec![0.0; n_pop];
             for i in 0..n_pop {
-                let sig_i: HashSet<_> = scored[i].2.indices.iter().copied().collect();
+                let sig_i = &index_sets[i];
                 let mut dist_sum = 0.0;
-                for (j, (_, _, gene_j, _)) in scored.iter().enumerate().take(n_pop) {
+                for (j, sig_j) in index_sets.iter().enumerate().take(n_pop) {
                     if i == j {
                         continue;
                     }
-                    let sig_j: HashSet<_> = gene_j.indices.iter().copied().collect();
-                    let intersection = sig_i.intersection(&sig_j).count() as f64;
-                    let union = sig_i.union(&sig_j).count() as f64;
+                    let intersection = sig_i.intersection(sig_j).count() as f64;
+                    let union = sig_i.union(sig_j).count() as f64;
                     let jaccard_dist = if union > 0.0 {
                         1.0 - (intersection / union)
                     } else {
@@ -563,7 +687,9 @@ where
 
         if let Some(max_runtime) = max_runtime {
             if started_at.elapsed() >= max_runtime {
-                let best_return_count = population.clamp(2, 24).min(scored.len());
+                let best_return_count = population
+                    .clamp(2, (population / 2).max(100).min(500))
+                    .min(scored.len());
                 let top_candidates: Vec<Gene> = scored
                     .iter()
                     .take(best_return_count)
@@ -597,7 +723,9 @@ where
             }
         }
 
-        let best_return_count = population.clamp(2, 24).min(scored.len());
+        let best_return_count = population
+            .clamp(2, (population / 2).max(100).min(500))
+            .min(scored.len());
         let top_candidates: Vec<Gene> = scored
             .iter()
             .take(best_return_count)

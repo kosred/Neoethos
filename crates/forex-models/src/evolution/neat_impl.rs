@@ -3,12 +3,15 @@ use ndarray::Array2;
 use polars::prelude::{DataFrame, Series};
 use rand::{Rng, SeedableRng};
 use rand_xoshiro::Xoroshiro128PlusPlus;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::path::Path;
 use symbios_genetics::Genotype;
 use symbios_neat::{Activation, CppnEvaluator, NeatConfig, NeatGenome};
 
+#[cfg(feature = "neuro-evolution-gpu")]
+use super::neat_gpu::{neat_cuda_kernel_enabled, try_population_scores_cuda};
 use crate::base::{
     ExpertModel, build_runtime_artifact_metadata, build_runtime_prediction_with_details,
     three_class_runtime_confidence, try_build_runtime_artifact_metadata,
@@ -28,15 +31,20 @@ use crate::statistical::common::{
 const NEAT_ARTIFACT_FILE_NAME: &str = "neat.json";
 const NEAT_MODEL_NAME: &str = "neat";
 const NEAT_RUNTIME_BACKEND: &str = "symbios_neat_cpu";
+#[cfg(feature = "neuro-evolution-gpu")]
+const NEAT_CUDA_FITNESS_BACKEND: &str = "symbios_neat_cuda_fitness";
 const DEFAULT_NEAT_SPECIES_ELITISM: usize = 0;
 
 fn default_neat_requested_device_policy() -> String {
     "auto".to_string()
 }
 
-fn neat_cpu_fallback_reason(policy: &str) -> Option<String> {
+fn neat_cpu_fallback_reason(policy: &str, runtime_backend: Option<&str>) -> Option<String> {
     let normalized = normalize_runtime_device_policy(policy);
     if normalized == "gpu" || normalized.starts_with("gpu:") {
+        if runtime_backend.is_some_and(|backend| backend.contains("cuda")) {
+            return None;
+        }
         Some(format!(
             "requested device policy `{normalized}`; symbios_neat Rust backend is CPU and does not execute on GPU"
         ))
@@ -540,22 +548,73 @@ impl NeatExpert {
             accuracy: 0.0,
             adjusted_fitness: f32::NEG_INFINITY,
         };
+        #[cfg(feature = "neuro-evolution-gpu")]
+        let mut used_cuda_fitness = false;
+        #[cfg(feature = "neuro-evolution-gpu")]
+        let mut cuda_fitness_disabled = false;
 
         for _generation in 0..self.generations {
-            let mut scores = population
-                .iter()
-                .map(|genome| {
-                    let mut score = train_evaluator.evaluate(genome);
-                    if let Some(evaluator) = val_evaluator.as_ref() {
-                        let val_score = evaluator.evaluate(genome);
-                        score.fitness = 0.65 * score.fitness + 0.35 * val_score.fitness;
-                        score.loss = 0.65 * score.loss + 0.35 * val_score.loss;
-                        score.accuracy = 0.65 * score.accuracy + 0.35 * val_score.accuracy;
-                        score.adjusted_fitness = score.fitness;
+            let mut cuda_scores = None;
+            #[cfg(feature = "neuro-evolution-gpu")]
+            if !cuda_fitness_disabled && neat_cuda_kernel_enabled(&self.requested_device_policy) {
+                match try_population_scores_cuda(
+                    &population,
+                    train_features,
+                    train_labels,
+                    val_features,
+                    val_labels,
+                    &self.requested_device_policy,
+                ) {
+                    Ok(metrics) if metrics.len() == population.len() => {
+                        used_cuda_fitness = true;
+                        cuda_scores = Some(
+                            population
+                                .iter()
+                                .cloned()
+                                .zip(metrics)
+                                .map(|(genome, metrics)| GenomeScore {
+                                    genome,
+                                    fitness: metrics.fitness,
+                                    loss: metrics.loss,
+                                    accuracy: metrics.accuracy,
+                                    adjusted_fitness: metrics.fitness,
+                                })
+                                .collect::<Vec<_>>(),
+                        );
                     }
-                    score
-                })
-                .collect::<Vec<_>>();
+                    Ok(metrics) => {
+                        cuda_fitness_disabled = true;
+                        tracing::warn!(
+                            "NEAT cuda fitness kernel returned {} scores for {} genomes; falling back to cpu fitness evaluation",
+                            metrics.len(),
+                            population.len()
+                        );
+                    }
+                    Err(err) => {
+                        cuda_fitness_disabled = true;
+                        tracing::warn!(
+                            "NEAT cuda fitness kernel unavailable, falling back to cpu fitness evaluation: {err}"
+                        );
+                    }
+                }
+            }
+
+            let mut scores = cuda_scores.unwrap_or_else(|| {
+                population
+                    .par_iter()
+                    .map(|genome| {
+                        let mut score = train_evaluator.evaluate(genome);
+                        if let Some(evaluator) = val_evaluator.as_ref() {
+                            let val_score = evaluator.evaluate(genome);
+                            score.fitness = 0.65 * score.fitness + 0.35 * val_score.fitness;
+                            score.loss = 0.65 * score.loss + 0.35 * val_score.loss;
+                            score.accuracy = 0.65 * score.accuracy + 0.35 * val_score.accuracy;
+                            score.adjusted_fitness = score.fitness;
+                        }
+                        score
+                    })
+                    .collect::<Vec<_>>()
+            });
             sort_scores_desc(&mut scores);
             if scores
                 .first()
@@ -643,11 +702,17 @@ impl NeatExpert {
             population = next_population;
         }
 
+        #[cfg(feature = "neuro-evolution-gpu")]
+        if used_cuda_fitness {
+            self.runtime_backend = NEAT_CUDA_FITNESS_BACKEND.to_string();
+        }
+
         Ok(best)
     }
 
     fn runtime_details(&self) -> (Option<String>, Option<String>) {
-        let gpu_cpu_fallback = neat_cpu_fallback_reason(&self.requested_device_policy);
+        let gpu_cpu_fallback =
+            neat_cpu_fallback_reason(&self.requested_device_policy, Some(&self.runtime_backend));
         if !self.fitted {
             return (
                 Some("neat_unknown".to_string()),

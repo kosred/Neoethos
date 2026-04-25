@@ -24,6 +24,7 @@ pub struct PopulationEvalInputs<'a> {
     pub short_thr: &'a [f32],
     pub month_idx: &'a [i64],
     pub day_idx: &'a [i64],
+    pub timestamps: &'a [i64],
     pub sl_pips: &'a [f64],
     pub tp_pips: &'a [f64],
     pub smc_data: &'a [SmcRow],
@@ -73,6 +74,9 @@ pub struct BacktestSettings {
     pub sl_pips: f64,
     pub tp_pips: f64,
     pub max_hold_bars: usize,
+    pub min_hold_bars: usize,
+    pub max_trades_per_day: usize,
+    pub gap_threshold_ms: i64,
     pub trailing_enabled: bool,
     pub trailing_atr_multiplier: f64,
     pub trailing_be_trigger_r: f64,
@@ -90,6 +94,9 @@ impl Default for BacktestSettings {
             sl_pips: 20.0,
             tp_pips: 40.0,
             max_hold_bars: 0,
+            min_hold_bars: 0,
+            max_trades_per_day: 0,
+            gap_threshold_ms: 0,
             trailing_enabled: false,
             trailing_atr_multiplier: 1.0,
             trailing_be_trigger_r: 1.0,
@@ -127,6 +134,7 @@ pub fn fast_evaluate_strategy_core(
     signals: &[i8],
     month_idx: &[i64],
     day_idx: &[i64],
+    timestamps: &[i64],
     settings: &BacktestSettings,
 ) -> [f64; 11] {
     let n = close.len();
@@ -154,6 +162,7 @@ pub fn fast_evaluate_strategy_core(
     let mut day_peak = equity;
     let mut day_low = equity;
     let mut max_daily_dd = 0.0;
+    let mut day_trade_count = 0usize;
 
     let mut in_pos = 0i8;
     let mut entry_px = 0.0;
@@ -165,6 +174,10 @@ pub fn fast_evaluate_strategy_core(
     } else {
         settings.pip_value
     };
+    let half_spread_px = settings.spread_pips * 0.5 * pip;
+    let half_spread_cost = settings.spread_pips * 0.5 * settings.pip_value_per_lot;
+
+    let use_timestamps = !timestamps.is_empty() && timestamps.len() == n;
 
     for i in 1..n {
         let m_val = *month_idx.get(i).unwrap_or(&last_month);
@@ -190,6 +203,46 @@ pub fn fast_evaluate_strategy_core(
             last_day = d_val;
             day_peak = equity;
             day_low = equity;
+            day_trade_count = 0;
+        }
+
+        // Gap detection: force-exit open position when market gap exceeds threshold
+        if in_pos != 0 && use_timestamps && settings.gap_threshold_ms > 0 {
+            let ts_prev = timestamps[i - 1];
+            let ts_curr = timestamps[i];
+            if ts_curr > ts_prev && (ts_curr - ts_prev) >= settings.gap_threshold_ms {
+                // Force exit at current close (proxy for gap open price)
+                let pnl = if in_pos == 1 {
+                    (close[i] - entry_px) / pip * settings.pip_value_per_lot
+                } else {
+                    (entry_px - close[i]) / pip * settings.pip_value_per_lot
+                };
+                let pnl = pnl - settings.commission_per_trade - half_spread_cost;
+                equity += pnl;
+                current_month_pnl += pnl;
+                trade_count += 1;
+                if pnl > 0.0 {
+                    wins += 1;
+                    gross_profit += pnl;
+                } else {
+                    gross_loss += pnl.abs();
+                }
+                in_pos = 0;
+                if equity > peak_equity {
+                    peak_equity = equity;
+                }
+                if equity < day_low {
+                    day_low = equity;
+                }
+                let current_dd = if peak_equity > 0.0 {
+                    (peak_equity - equity) / peak_equity
+                } else {
+                    0.0
+                };
+                if current_dd > max_dd {
+                    max_dd = current_dd;
+                }
+            }
         }
 
         if in_pos != 0 {
@@ -225,69 +278,74 @@ pub fn fast_evaluate_strategy_core(
             let mut pnl = 0.0;
             let mut exit = false;
 
-            if in_pos == 1 {
-                let mut sl = entry_px - (settings.sl_pips * pip);
-                let tp = entry_px + (settings.tp_pips * pip);
-                if settings.trailing_enabled {
-                    let mv = hi - entry_px;
-                    if mv >= (settings.trailing_be_trigger_r * settings.sl_pips * pip) {
-                        let candidate =
-                            hi - (settings.trailing_atr_multiplier * settings.sl_pips * pip);
-                        if trail_px == 0.0 || candidate > trail_px {
-                            trail_px = candidate;
-                        }
-                        if trail_px > sl {
-                            sl = trail_px;
-                        }
-                    }
-                }
-                if lo <= sl {
-                    pnl = (sl - entry_px) / pip * settings.pip_value_per_lot;
-                    exit = true;
-                } else if hi >= tp {
-                    pnl = (tp - entry_px) / pip * settings.pip_value_per_lot;
-                    exit = true;
-                }
-            } else {
-                let mut sl = entry_px + (settings.sl_pips * pip);
-                let tp = entry_px - (settings.tp_pips * pip);
-                if settings.trailing_enabled {
-                    let mv = entry_px - lo;
-                    if mv >= (settings.trailing_be_trigger_r * settings.sl_pips * pip) {
-                        let candidate =
-                            lo + (settings.trailing_atr_multiplier * settings.sl_pips * pip);
-                        if trail_px == 0.0 || candidate < trail_px {
-                            trail_px = candidate;
-                        }
-                        if trail_px < sl {
-                            sl = trail_px;
-                        }
-                    }
-                }
-                if hi >= sl {
-                    pnl = (entry_px - sl) / pip * settings.pip_value_per_lot;
-                    exit = true;
-                } else if lo <= tp {
-                    pnl = (entry_px - tp) / pip * settings.pip_value_per_lot;
-                    exit = true;
-                }
-            }
+            // Minimum holding period: skip exit checks until min_hold_bars elapsed
+            let bars_held = i as i64 - entry_idx;
+            let past_min_hold =
+                settings.min_hold_bars == 0 || bars_held >= settings.min_hold_bars as i64;
 
-            if !exit
-                && settings.max_hold_bars > 0
-                && (i as i64 - entry_idx) >= settings.max_hold_bars as i64
-            {
-                pnl = if in_pos == 1 {
-                    (close[i] - entry_px) / pip * settings.pip_value_per_lot
+            if past_min_hold {
+                if in_pos == 1 {
+                    let mut sl = entry_px - (settings.sl_pips * pip);
+                    let tp = entry_px + (settings.tp_pips * pip);
+                    if settings.trailing_enabled {
+                        let mv = hi - entry_px;
+                        if mv >= (settings.trailing_be_trigger_r * settings.sl_pips * pip) {
+                            let candidate =
+                                hi - (settings.trailing_atr_multiplier * settings.sl_pips * pip);
+                            if trail_px == 0.0 || candidate > trail_px {
+                                trail_px = candidate;
+                            }
+                            if trail_px > sl {
+                                sl = trail_px;
+                            }
+                        }
+                    }
+                    if lo <= sl {
+                        pnl = (sl - entry_px) / pip * settings.pip_value_per_lot;
+                        exit = true;
+                    } else if hi >= tp {
+                        pnl = (tp - entry_px) / pip * settings.pip_value_per_lot;
+                        exit = true;
+                    }
                 } else {
-                    (entry_px - close[i]) / pip * settings.pip_value_per_lot
-                };
-                exit = true;
+                    let mut sl = entry_px + (settings.sl_pips * pip);
+                    let tp = entry_px - (settings.tp_pips * pip);
+                    if settings.trailing_enabled {
+                        let mv = entry_px - lo;
+                        if mv >= (settings.trailing_be_trigger_r * settings.sl_pips * pip) {
+                            let candidate =
+                                lo + (settings.trailing_atr_multiplier * settings.sl_pips * pip);
+                            if trail_px == 0.0 || candidate < trail_px {
+                                trail_px = candidate;
+                            }
+                            if trail_px < sl {
+                                sl = trail_px;
+                            }
+                        }
+                    }
+                    if hi >= sl {
+                        pnl = (entry_px - sl) / pip * settings.pip_value_per_lot;
+                        exit = true;
+                    } else if lo <= tp {
+                        pnl = (entry_px - tp) / pip * settings.pip_value_per_lot;
+                        exit = true;
+                    }
+                }
+
+                if !exit && settings.max_hold_bars > 0 && bars_held >= settings.max_hold_bars as i64
+                {
+                    pnl = if in_pos == 1 {
+                        (close[i] - entry_px) / pip * settings.pip_value_per_lot
+                    } else {
+                        (entry_px - close[i]) / pip * settings.pip_value_per_lot
+                    };
+                    exit = true;
+                }
             }
 
             if exit {
-                pnl -= settings.commission_per_trade
-                    + (settings.spread_pips * settings.pip_value_per_lot);
+                // Half-spread on exit + commission (half-spread was already paid at entry via adjusted entry_px)
+                pnl -= settings.commission_per_trade + half_spread_cost;
                 equity += pnl;
                 current_month_pnl += pnl;
                 trade_count += 1;
@@ -317,10 +375,17 @@ pub fn fast_evaluate_strategy_core(
         } else {
             let s = signals[i];
             if s != 0 {
+                // max_trades_per_day gate
+                if settings.max_trades_per_day > 0 && day_trade_count >= settings.max_trades_per_day
+                {
+                    continue;
+                }
                 in_pos = s;
-                entry_px = close[i];
+                // Bug #1 fix: half-spread applied at entry (entry_px offset), half at exit
+                entry_px = close[i] + (s as f64) * half_spread_px;
                 entry_idx = i as i64;
                 trail_px = 0.0;
+                day_trade_count += 1;
             }
         }
     }
@@ -349,7 +414,7 @@ pub fn fast_evaluate_strategy_core(
     }
     let (avg_m, std_m) = mean_std(&month_returns);
 
-    // Annualize Sharpe factor: sqrt(12) = 3.4641
+    // Annualize Sharpe using monthly returns: sqrt(12)
     let sharpe = if std_m > 0.0 {
         (avg_m / std_m) * 3.4641
     } else {
@@ -402,30 +467,71 @@ pub fn simulate_trades_core(
     } else {
         settings.pip_value
     };
+    let half_spread_px = settings.spread_pips * 0.5 * pip;
+    let half_spread_cost = settings.spread_pips * 0.5 * settings.pip_value_per_lot;
 
     let mut trades = Vec::new();
     let mut in_pos = 0i8;
     let mut entry_px = 0.0;
     let mut entry_idx = 0usize;
     let mut trail_px = 0.0;
+    let mut last_day_key = -1i64;
+    let mut day_trade_count = 0usize;
 
     for i in 1..n {
+        let ts = timestamps.get(i).copied().unwrap_or_default();
+
+        // Day rollover for max_trades_per_day tracking
+        let day_key = if ts > 0 { ts / 86_400_000 } else { -1 };
+        if day_key != last_day_key {
+            last_day_key = day_key;
+            day_trade_count = 0;
+        }
+
         if in_pos != 0 {
+            // Gap detection: force-exit on large market gap
+            if settings.gap_threshold_ms > 0 && i > 0 {
+                let ts_prev = timestamps[i - 1];
+                if ts > ts_prev && (ts - ts_prev) >= settings.gap_threshold_ms {
+                    let pnl = if in_pos == 1 {
+                        (close[i] - entry_px) / pip * settings.pip_value_per_lot
+                    } else {
+                        (entry_px - close[i]) / pip * settings.pip_value_per_lot
+                    };
+                    let pnl = pnl - settings.commission_per_trade - half_spread_cost;
+                    let entry_time = timestamps.get(entry_idx).copied().unwrap_or_default();
+                    let exit_time = ts;
+                    let duration_hours = if exit_time >= entry_time {
+                        Some((exit_time - entry_time) as f64 / 3_600_000.0)
+                    } else {
+                        None
+                    };
+                    trades.push(Trade {
+                        entry_time,
+                        exit_time: Some(exit_time),
+                        pnl,
+                        pnl_pct: Some(pnl / initial_balance),
+                        duration_hours,
+                    });
+                    in_pos = 0;
+                    continue;
+                }
+            }
+
             let lo = low[i];
             let hi = high[i];
             let mut pnl = 0.0;
             let mut exit = false;
 
-            // Session-Aware Trading (Idea #4.4) - Force exit on Friday 20:00+
-            let ts = timestamps.get(i).copied().unwrap_or_default();
+            // Session-Aware Trading: force exit before weekend
             if ts > 0 && settings.kill_zones_enabled {
-                let sec_in_day = ts % 86400;
+                let sec_in_day = (ts / 1000) % 86400;
                 let hour = sec_in_day / 3600;
-                let days_since_epoch = ts / 86400;
+                let days_since_epoch = ts / 86_400_000;
                 let weekday = (days_since_epoch + 4) % 7; // 0=Sun, 1=Mon, 5=Fri
 
                 if weekday == 5 && hour >= 20 {
-                    exit = true; // Force exit before weekend
+                    exit = true;
                     pnl = if in_pos == 1 {
                         (close[i] - entry_px) / pip * settings.pip_value_per_lot
                     } else {
@@ -434,7 +540,11 @@ pub fn simulate_trades_core(
                 }
             }
 
-            if in_pos == 1 && !exit {
+            let bars_held = i as i64 - entry_idx as i64;
+            let past_min_hold =
+                settings.min_hold_bars == 0 || bars_held >= settings.min_hold_bars as i64;
+
+            if in_pos == 1 && !exit && past_min_hold {
                 let mut sl = entry_px - (settings.sl_pips * pip);
                 let tp = entry_px + (settings.tp_pips * pip);
                 if settings.trailing_enabled {
@@ -457,7 +567,7 @@ pub fn simulate_trades_core(
                     pnl = (tp - entry_px) / pip * settings.pip_value_per_lot;
                     exit = true;
                 }
-            } else {
+            } else if in_pos == -1 && !exit && past_min_hold {
                 let mut sl = entry_px + (settings.sl_pips * pip);
                 let tp = entry_px - (settings.tp_pips * pip);
                 if settings.trailing_enabled {
@@ -482,7 +592,11 @@ pub fn simulate_trades_core(
                 }
             }
 
-            if !exit && settings.max_hold_bars > 0 && (i - entry_idx) >= settings.max_hold_bars {
+            if !exit
+                && past_min_hold
+                && settings.max_hold_bars > 0
+                && (i - entry_idx) >= settings.max_hold_bars
+            {
                 pnl = if in_pos == 1 {
                     (close[i] - entry_px) / pip * settings.pip_value_per_lot
                 } else {
@@ -492,8 +606,7 @@ pub fn simulate_trades_core(
             }
 
             if exit {
-                pnl -= settings.commission_per_trade
-                    + (settings.spread_pips * settings.pip_value_per_lot);
+                pnl -= settings.commission_per_trade + half_spread_cost;
                 let entry_time = timestamps.get(entry_idx).copied().unwrap_or_default();
                 let exit_time = timestamps.get(i).copied().unwrap_or(entry_time);
                 let duration_hours = if exit_time >= entry_time {
@@ -511,15 +624,14 @@ pub fn simulate_trades_core(
                 in_pos = 0;
             }
         } else if signals[i] != 0 {
-            // Session-Aware Trading (Idea #4.4) - Block entries in Kill Zones
+            // Kill zones: block entries
             let mut block_entry = false;
-            let ts = timestamps.get(i).copied().unwrap_or_default();
             if ts > 0 && settings.kill_zones_enabled {
-                let sec_in_day = ts % 86400;
+                let sec_in_day = (ts / 1000) % 86400;
                 let hour = sec_in_day / 3600;
                 let min = (sec_in_day % 3600) / 60;
-                let days_since_epoch = ts / 86400;
-                let weekday = (days_since_epoch + 4) % 7; // 0=Sun, 1=Mon, 5=Fri
+                let days_since_epoch = ts / 86_400_000;
+                let weekday = (days_since_epoch + 4) % 7;
 
                 let is_friday_kill = weekday == 5 && hour >= 20;
                 let is_monday_kill = weekday == 1 && hour == 0 && min < 30;
@@ -528,11 +640,19 @@ pub fn simulate_trades_core(
                 }
             }
 
+            // max_trades_per_day gate
+            if settings.max_trades_per_day > 0 && day_trade_count >= settings.max_trades_per_day {
+                block_entry = true;
+            }
+
             if !block_entry {
-                in_pos = signals[i];
-                entry_px = close[i];
+                let s = signals[i];
+                in_pos = s;
+                // Bug #1 fix: half-spread at entry
+                entry_px = close[i] + (s as f64) * half_spread_px;
                 entry_idx = i;
                 trail_px = 0.0;
+                day_trade_count += 1;
             }
         }
     }
@@ -632,6 +752,7 @@ pub fn evaluate_population_core(
         short_thr,
         month_idx,
         day_idx,
+        timestamps,
         sl_pips,
         tp_pips,
         smc_data,
@@ -658,6 +779,7 @@ pub fn evaluate_population_core(
             short_thr,
             month_idx,
             day_idx,
+            timestamps,
             sl_pips,
             tp_pips,
             smc_data,
@@ -750,6 +872,7 @@ pub fn evaluate_population_core(
                 &signals,
                 month_idx,
                 day_idx,
+                timestamps,
                 &gene_settings,
             )
         })

@@ -22,7 +22,6 @@ impl AppRuntimeConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataSource {
     CTrader,
-    MT5,
     Local,
 }
 

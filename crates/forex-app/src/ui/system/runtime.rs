@@ -51,7 +51,6 @@ fn build_runtime_dashboard(
 ) -> RuntimeDashboard {
     let source = match state.data_source {
         DataSource::CTrader => "cTrader",
-        DataSource::MT5 => "MT5",
         DataSource::Local => "Local",
     };
     let runtime_mode = if matches!(state.data_source, DataSource::Local) {
@@ -179,32 +178,6 @@ fn build_runtime_dashboard(
                         "cTrader runtime is available".to_string()
                     } else {
                         "Use Broker Setup to restore cTrader auth and connect the selected account"
-                            .to_string()
-                    },
-                ),
-            ],
-        },
-        DataSource::MT5 => DashboardSection {
-            title: "Broker Status".to_string(),
-            rows: vec![
-                (
-                    "Connection".to_string(),
-                    if connection.connected {
-                        "Online".to_string()
-                    } else {
-                        "Offline".to_string()
-                    },
-                ),
-                ("Adapter".to_string(), connection.adapter_name.clone()),
-                ("Bridge".to_string(), connection.integration_mode.clone()),
-                (
-                    "Guidance".to_string(),
-                    if connection.connected {
-                        "Broker runtime is available".to_string()
-                    } else if connection.requires_local_terminal {
-                        "Use the broker page to connect and inspect terminal state".to_string()
-                    } else {
-                        "Remote adapter selected; runtime contract is staged or partially wired"
                             .to_string()
                     },
                 ),

@@ -355,14 +355,7 @@ pub fn render(
                 }
             }
             if response.clicked() {
-                match session.configured_adapter() {
-                    crate::app_services::trading::TradingAdapterKind::Mt5 => {
-                        session.connect(state);
-                    }
-                    _ => {
-                        let _ = session.start_connect(tx.clone());
-                    }
-                }
+                let _ = session.start_connect(tx.clone());
             }
         }
     }

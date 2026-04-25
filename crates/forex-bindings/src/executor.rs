@@ -256,6 +256,9 @@ impl RiskManager {
             market_volatility,
             target_volatility,
             is_volatile_regime,
+            win_rate: None,
+            avg_win: None,
+            avg_loss: None,
         })
     }
 

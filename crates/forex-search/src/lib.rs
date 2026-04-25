@@ -349,6 +349,7 @@ pub mod discovery_gpu {
                 &signals,
                 &months[start..end],
                 &days[start..end],
+                &[], // no gap detection in segment eval
                 &BacktestSettings {
                     sl_pips: 20.0,
                     tp_pips: 40.0,
@@ -360,6 +361,7 @@ pub mod discovery_gpu {
                     spread_pips: market_profile.spread_pips,
                     commission_per_trade: market_profile.commission_per_trade,
                     pip_value_per_lot: market_profile.pip_value_per_lot,
+                    ..Default::default()
                 },
             );
 

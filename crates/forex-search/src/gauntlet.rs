@@ -62,6 +62,7 @@ impl StrategyGauntlet {
             &signals,
             &months,
             &days,
+            &features.timestamps,
             &settings,
         );
 

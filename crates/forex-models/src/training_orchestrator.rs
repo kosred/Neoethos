@@ -668,6 +668,16 @@ impl TrainingOrchestrator {
         frame: &DataFrame,
         labels: &[i32],
     ) -> Result<(DataFrame, Vec<i32>, usize)> {
+        self.recent_sample_from(frame, labels)
+    }
+
+    /// Sample from any frame (not necessarily the full dataset).
+    /// Uses the most-recent rows within the provided frame up to the configured limit.
+    fn recent_sample_from(
+        &self,
+        frame: &DataFrame,
+        labels: &[i32],
+    ) -> Result<(DataFrame, Vec<i32>, usize)> {
         let sample_limit = self.settings.models.l1_feature_selection_sample_limit.max(
             self.settings
                 .models
@@ -780,7 +790,16 @@ impl TrainingOrchestrator {
             return Ok(frame.clone());
         }
 
-        let (sampled_frame, sampled_labels, sample_start) = self.recent_sample(frame, labels)?;
+        // TR-1 fix: feature selection must run only on train-split (first 80%) to
+        // prevent the L1 selector from seeing validation/test rows and overfitting.
+        let total_rows = frame.height();
+        let train_end = (total_rows * 4 / 5).max(1);
+        let train_frame = frame.slice(0, train_end);
+        let train_labels: Vec<i32> = labels[..train_end.min(labels.len())].to_vec();
+
+        // Sample up to the configured limit from within the train portion only
+        let (sampled_frame, sampled_labels, sample_start) =
+            self.recent_sample_from(&train_frame, &train_labels)?;
         let mut score_map = HashMap::<String, f32>::new();
 
         for (name, score) in self.fit_l1_ranked_features(&sampled_frame, &sampled_labels)? {

@@ -166,8 +166,10 @@ impl StrategyQualityAnalyzer {
             0.0
         };
 
-        let sharpe = calculate_sharpe(&returns);
-        let sortino = calculate_sortino(&returns);
+        let trades_per_month_raw = calculate_trade_frequency(trades);
+        let trades_per_year = (trades_per_month_raw * 12.0).max(1.0);
+        let sharpe = calculate_sharpe(&returns, trades_per_year);
+        let sortino = calculate_sortino(&returns, trades_per_year);
 
         let total_return = pnls.iter().sum::<f64>();
         let total_return_pct = total_return / initial_balance;
@@ -193,24 +195,44 @@ impl StrategyQualityAnalyzer {
         } else {
             mean(&durations)
         };
-        let trades_per_month = calculate_trade_frequency(trades);
+        let trades_per_month = trades_per_month_raw;
 
-        // --- Monte Carlo Simulation for Stress Testing ---
+        // --- Monte Carlo Simulation (QA-2: block bootstrap on daily PnL) ---
         let mut rng = rand::rng();
         let mc_iterations = 1000;
         let mut worst_dds = Vec::with_capacity(mc_iterations);
         let mut ruined_count = 0;
-        let ruin_threshold = initial_balance * 0.50; // Define ruin as 50% drawdown
+        let ruin_threshold = initial_balance * 0.50;
+
+        // Group trade PnLs by calendar day for block bootstrap
+        let mut daily_pnl_blocks: std::collections::HashMap<i64, Vec<f64>> =
+            std::collections::HashMap::new();
+        for trade in trades {
+            if trade.entry_time > 0 {
+                let day_key = trade.entry_time / 86_400_000;
+                daily_pnl_blocks.entry(day_key).or_default().push(trade.pnl);
+            }
+        }
+        let mut day_blocks: Vec<Vec<f64>> = daily_pnl_blocks.into_values().collect();
+        // Fallback to trade-level if fewer than 5 distinct days
+        let use_blocks = day_blocks.len() >= 5;
 
         for _ in 0..mc_iterations {
-            let mut mc_pnls = pnls.clone();
-            mc_pnls.shuffle(&mut rng);
+            let shuffled_pnls: Vec<f64> = if use_blocks {
+                day_blocks.shuffle(&mut rng);
+                day_blocks.iter().flatten().copied().collect()
+            } else {
+                let mut p = pnls.clone();
+                p.shuffle(&mut rng);
+                p
+            };
+
             let mut eq = initial_balance;
             let mut pk = initial_balance;
             let mut max_mc_dd = 0.0_f64;
             let mut ruined = false;
 
-            for p in mc_pnls {
+            for p in shuffled_pnls {
                 eq += p;
                 if eq < ruin_threshold {
                     ruined = true;
@@ -232,7 +254,7 @@ impl StrategyQualityAnalyzer {
         let p95_idx = ((mc_iterations as f64 * 0.95) as usize).min(mc_iterations - 1);
         let mc_worst_dd_95 = worst_dds.get(p95_idx).cloned().unwrap_or(max_dd);
         let mc_risk_of_ruin = (ruined_count as f64) / (mc_iterations as f64);
-        // -------------------------------------------------
+        // -------------------------------------------------------------------
 
         let mut metrics = StrategyMetrics {
             strategy_id: strategy_id.to_string(),
@@ -374,7 +396,9 @@ fn calculate_trade_frequency(trades: &[Trade]) -> f64 {
     trades.len() as f64 / months
 }
 
-fn calculate_sharpe(returns: &[f64]) -> f64 {
+// QA-1: Annualize using actual trade frequency, not daily assumption.
+// √trades_per_year is the correct annualization factor for per-trade returns.
+fn calculate_sharpe(returns: &[f64], trades_per_year: f64) -> f64 {
     if returns.len() < 2 {
         return 0.0;
     }
@@ -383,10 +407,11 @@ fn calculate_sharpe(returns: &[f64]) -> f64 {
     if std_ret < 1e-9 {
         return 0.0;
     }
-    (mean_ret / std_ret) * 252_f64.sqrt()
+    let annualization = trades_per_year.max(1.0).sqrt();
+    (mean_ret / std_ret) * annualization
 }
 
-fn calculate_sortino(returns: &[f64]) -> f64 {
+fn calculate_sortino(returns: &[f64], trades_per_year: f64) -> f64 {
     if returns.len() < 2 {
         return 0.0;
     }
@@ -395,13 +420,12 @@ fn calculate_sortino(returns: &[f64]) -> f64 {
     if downside.len() < 2 {
         return 0.0;
     }
-    // Standard Sortino uses 0.0 (MAR) as target, not mean of downside
     let std_down = stddev_sample(&downside, 0.0);
     if std_down < 1e-9 {
         return 0.0;
     }
-    // Note: √252 annualization assumes daily-frequency returns
-    (mean_ret / std_down) * 252_f64.sqrt()
+    let annualization = trades_per_year.max(1.0).sqrt();
+    (mean_ret / std_down) * annualization
 }
 
 fn longest_streak(pnls: &[f64], win: bool) -> usize {
@@ -472,85 +496,73 @@ fn stddev_sample(values: &[f64], mean: f64) -> f64 {
 }
 
 fn score_strategy(analyzer: &StrategyQualityAnalyzer, metrics: &mut StrategyMetrics) {
-    let mut score: f64 = 0.0;
-    if metrics.sortino_ratio >= 3.0 {
-        score += 30.0;
-    } else if metrics.sortino_ratio >= 2.0 {
-        score += 24.0;
-    } else if metrics.sortino_ratio >= 1.5 {
-        score += 18.0;
-    } else if metrics.sortino_ratio >= 1.2 {
-        score += 12.0;
-    }
+    // QA-3: Continuous scoring with diminishing returns — no cliff effects
+    // Each component uses 1 - exp(-k * x) shape: smooth, bounded, no hard steps
 
-    if metrics.profit_factor >= 2.5 {
-        score += 20.0;
-    } else if metrics.profit_factor >= 2.0 {
-        score += 15.0;
-    } else if metrics.profit_factor >= 1.8 {
-        score += 12.0;
-    } else if metrics.profit_factor >= 1.5 {
-        score += 10.0;
-    } else if metrics.profit_factor >= 1.3 {
-        score += 5.0;
-    }
+    // Sortino (0-30 pts): saturates around 3.0
+    let sortino_score = 30.0 * (1.0 - (-metrics.sortino_ratio.max(0.0) * 0.6).exp());
 
-    if metrics.win_rate >= 0.65 {
-        score += 15.0;
-    } else if metrics.win_rate >= 0.60 {
-        score += 12.0;
-    } else if metrics.win_rate >= 0.55 {
-        score += 10.0;
-    } else if metrics.win_rate >= 0.50 {
-        score += 8.0;
-    }
+    // Profit Factor (0-20 pts): saturates around 2.5
+    let pf_score = 20.0 * (1.0 - (-(metrics.profit_factor.max(0.0) - 1.0).max(0.0) * 1.5).exp());
 
-    if metrics.calmar_ratio >= 2.0 {
-        score += 20.0;
-    } else if metrics.calmar_ratio >= 1.5 {
-        score += 15.0;
-    } else if metrics.calmar_ratio >= 1.0 {
-        score += 10.0;
-    }
+    // Win Rate (0-15 pts): linear between 0.45-0.70
+    let wr_score = 15.0 * ((metrics.win_rate - 0.45) / 0.25).clamp(0.0, 1.0);
 
-    if metrics.max_drawdown_pct <= 0.08 {
-        score += 15.0;
-    } else if metrics.max_drawdown_pct <= 0.10 {
-        score += 13.0;
-    } else if metrics.max_drawdown_pct <= 0.12 {
-        score += 10.0;
-    } else if metrics.max_drawdown_pct <= 0.15 {
-        score += 7.0;
-    }
+    // Calmar (0-20 pts): saturates around 2.0
+    let calmar_score = 20.0 * (1.0 - (-metrics.calmar_ratio.max(0.0) * 0.8).exp());
 
-    if metrics.statistical_significance <= 0.01 {
-        score += 10.0;
-    } else if metrics.statistical_significance <= 0.05 {
-        score += 7.0;
-    }
+    // Drawdown (0-15 pts): penalizes progressively above 8%
+    let dd_score =
+        15.0 * (1.0 - (metrics.max_drawdown_pct / 0.15).clamp(0.0, 1.0)).max(0.0);
 
-    if metrics.monthly_win_rate >= 0.70 {
-        score += 10.0;
-    } else if metrics.monthly_win_rate >= 0.60 {
-        score += 7.0;
-    } else if metrics.monthly_win_rate >= 0.50 {
-        score += 5.0;
-    }
+    // Statistical significance (0-10 pts): smooth decay as p-value rises
+    let pval = metrics.statistical_significance.clamp(0.0, 1.0);
+    let pval_score = 10.0 * (1.0 - pval).powi(3);
 
-    if metrics.avg_monthly_return_pct >= analyzer.min_monthly_return_pct {
-        score += 10.0;
-    }
+    // Monthly consistency (0-10 pts)
+    let mwr_score = 10.0 * metrics.monthly_win_rate.clamp(0.0, 1.0);
 
+    // Monthly return (0-10 pts): smooth approach to min target
+    let mr_score = if metrics.avg_monthly_return_pct >= analyzer.min_monthly_return_pct {
+        10.0 * (metrics.avg_monthly_return_pct / analyzer.min_monthly_return_pct.max(1e-9))
+            .min(1.0)
+    } else {
+        0.0
+    };
+
+    let score = sortino_score
+        + pf_score
+        + wr_score
+        + calmar_score
+        + dd_score
+        + pval_score
+        + mwr_score
+        + mr_score;
     metrics.quality_score = score.min(100.0);
 
-    metrics.has_edge = metrics.sortino_ratio >= analyzer.min_sortino
-        && metrics.calmar_ratio >= analyzer.min_calmar
-        && metrics.profit_factor >= analyzer.min_profit_factor
-        && metrics.win_rate >= analyzer.min_win_rate
-        && metrics.max_drawdown_pct <= analyzer.max_dd_acceptable
-        && metrics.avg_monthly_return_pct >= analyzer.min_monthly_return_pct
-        && metrics.statistical_significance <= analyzer.edge_significance_pvalue
-        && (analyzer.min_trades == 0 || metrics.total_trades >= analyzer.min_trades);
+    // QA-4: Weighted edge score instead of brittle AND gate
+    // Each metric is normalized to [0, 1] relative to its threshold
+    let s_sortino = (metrics.sortino_ratio / analyzer.min_sortino.max(1e-9)).min(2.0) * 0.20;
+    let s_calmar = (metrics.calmar_ratio / analyzer.min_calmar.max(1e-9)).min(2.0) * 0.15;
+    let s_pf = (metrics.profit_factor / analyzer.min_profit_factor.max(1e-9)).min(2.0) * 0.20;
+    let s_wr = (metrics.win_rate / analyzer.min_win_rate.max(1e-9)).min(2.0) * 0.15;
+    let s_dd = ((analyzer.max_dd_acceptable - metrics.max_drawdown_pct)
+        / analyzer.max_dd_acceptable.max(1e-9))
+    .clamp(0.0, 2.0)
+        * 0.15;
+    let s_mr = if analyzer.min_monthly_return_pct > 0.0 {
+        (metrics.avg_monthly_return_pct / analyzer.min_monthly_return_pct)
+            .clamp(0.0, 2.0)
+            * 0.10
+    } else {
+        0.10
+    };
+    let s_pval = (1.0 - metrics.statistical_significance / analyzer.edge_significance_pvalue.max(1e-9))
+        .clamp(0.0, 1.0)
+        * 0.05;
+    let edge_score = s_sortino + s_calmar + s_pf + s_wr + s_dd + s_mr + s_pval;
+    let trades_ok = analyzer.min_trades == 0 || metrics.total_trades >= analyzer.min_trades;
+    metrics.has_edge = edge_score >= 0.70 && trades_ok;
 
     metrics.recommendation = if metrics.quality_score >= 80.0 {
         "EXCELLENT"

@@ -513,7 +513,7 @@ fn slice_features(features: &FeatureFrame, keep_ratio: f64) -> FeatureFrame {
     }
 }
 
-fn slice_ohlcv(ohlcv: &Ohlcv, keep_ratio: f64) -> Ohlcv {
+fn slice_ohlcv_by_ratio(ohlcv: &Ohlcv, keep_ratio: f64) -> Ohlcv {
     if keep_ratio >= 1.0 || keep_ratio <= 0.0 {
         return ohlcv.clone();
     }
@@ -783,7 +783,12 @@ where
                 &sig,
                 &discovery_backtest_settings(&gene),
             );
-            let metrics = analyzer.analyze_strategy(&gene.strategy_id, &trades, 100000.0);
+            let initial_balance = std::env::var("FOREX_BOT_BACKTEST_INITIAL_EQUITY")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .unwrap_or(100_000.0);
+            let metrics = analyzer.analyze_strategy(&gene.strategy_id, &trades, initial_balance);
             let strict_quality = passes_strict_quality(&metrics, &config.filtering);
             let opportunistic_quality =
                 !strict_quality && passes_opportunistic_quality(&metrics, &config.filtering);
@@ -932,8 +937,13 @@ where
         }
         let mut ok = true;
         for existing in &portfolio_signals {
-            let corr = pearson_corr_i8(&sig, existing);
-            if corr.abs() >= config.corr_threshold {
+            let pearson = pearson_corr_i8(&sig, existing);
+            // DS-2: also check Spearman to catch non-linear dependencies
+            let spearman = spearman_corr_i8(&sig, existing);
+            // Reject if EITHER correlation exceeds threshold
+            if pearson.abs() >= config.corr_threshold
+                || spearman.abs() >= config.corr_threshold
+            {
                 ok = false;
                 rejected_by_correlation += 1;
                 break;
@@ -989,6 +999,40 @@ fn min_trades_required(timestamps: &[i64], min_trades_per_day: f64, n_rows: usiz
     }
     let day_count = days.len().max(1) as f64;
     (day_count * min_trades_per_day).ceil() as usize
+}
+
+/// DS-2: Spearman rank correlation for i8 signals.
+/// For discrete values (-1, 0, 1), ranks ties by mean rank. Detects monotonic (non-linear) dependency.
+fn spearman_corr_i8(a: &[i8], b: &[i8]) -> f64 {
+    let n = a.len().min(b.len());
+    if n < 2 {
+        return 0.0;
+    }
+    // For i8 with only 3 distinct values, compute rank as fractional rank
+    // mean_rank(v) = (first_idx + last_idx) / 2 over sorted positions
+    let rank_of = |vals: &[i8], v: i8| -> f64 {
+        let count = vals[..n].iter().filter(|&&x| x == v).count() as f64;
+        let before = vals[..n].iter().filter(|&&x| x < v).count() as f64;
+        before + (count + 1.0) / 2.0
+    };
+    let ranks_a: Vec<f64> = a[..n].iter().map(|&v| rank_of(&a[..n], v)).collect();
+    let ranks_b: Vec<f64> = b[..n].iter().map(|&v| rank_of(&b[..n], v)).collect();
+    let mean_a: f64 = ranks_a.iter().sum::<f64>() / n as f64;
+    let mean_b: f64 = ranks_b.iter().sum::<f64>() / n as f64;
+    let mut num = 0.0_f64;
+    let mut denom_a = 0.0_f64;
+    let mut denom_b = 0.0_f64;
+    for i in 0..n {
+        let da = ranks_a[i] - mean_a;
+        let db = ranks_b[i] - mean_b;
+        num += da * db;
+        denom_a += da * da;
+        denom_b += db * db;
+    }
+    if denom_a <= 1e-12 || denom_b <= 1e-12 {
+        return 0.0;
+    }
+    num / (denom_a.sqrt() * denom_b.sqrt())
 }
 
 fn pearson_corr_i8(a: &[i8], b: &[i8]) -> f64 {

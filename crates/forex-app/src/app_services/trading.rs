@@ -50,10 +50,6 @@ use anyhow::Context;
 use forex_core::logging::write_subsystem_record;
 use forex_core::sectioned_log::SubsystemSection;
 use forex_data::{discover_timeframes, load_symbol_timeframe, Ohlcv};
-#[cfg(not(feature = "legacy-mt5"))]
-use legacy_mt5_stub::{DealInfo, MT5Engine, PendingOrderInfo, PositionInfo};
-#[cfg(feature = "legacy-mt5")]
-use mt5_bridge::{DealInfo, MT5Engine, PendingOrderInfo, PositionInfo};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
@@ -62,91 +58,8 @@ use tracing::error;
 
 const CTRADER_TOKEN_REFRESH_WINDOW_SECS: i64 = 300;
 
-#[cfg(not(feature = "legacy-mt5"))]
-mod legacy_mt5_stub {
-    #[derive(Debug)]
-    pub struct MT5Engine;
-
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct PositionInfo {
-        pub ticket: i64,
-        pub symbol: String,
-        pub order_side: String,
-        pub volume: f64,
-        pub price_open: f64,
-        pub price_current: f64,
-        pub profit: f64,
-        pub stop_loss: f64,
-        pub take_profit: f64,
-        pub comment: String,
-        pub opened_at: i64,
-    }
-
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct PendingOrderInfo {
-        pub ticket: i64,
-        pub symbol: String,
-        pub order_kind: String,
-        pub volume_initial: f64,
-        pub price_open: f64,
-        pub stop_loss: f64,
-        pub take_profit: f64,
-        pub comment: String,
-        pub created_at: i64,
-    }
-
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct DealInfo {
-        pub ticket: i64,
-        pub order_ticket: i64,
-        pub position_id: i64,
-        pub symbol: String,
-        pub entry_kind: String,
-        pub order_side: String,
-        pub volume: f64,
-        pub price: f64,
-        pub profit: f64,
-        pub fee: f64,
-        pub comment: String,
-        pub executed_at: i64,
-    }
-
-    impl MT5Engine {
-        pub fn new() -> anyhow::Result<Self> {
-            Err(anyhow::anyhow!(
-                "legacy MT5 bridge is disabled; rebuild forex-app with --features legacy-mt5"
-            ))
-        }
-
-        pub fn initialize(&mut self) -> anyhow::Result<bool> {
-            Ok(false)
-        }
-
-        pub fn terminal_info(&self) -> anyhow::Result<String> {
-            Err(anyhow::anyhow!("legacy MT5 bridge is disabled"))
-        }
-
-        pub fn positions(&self, _symbol: Option<&str>) -> anyhow::Result<Vec<PositionInfo>> {
-            Err(anyhow::anyhow!("legacy MT5 bridge is disabled"))
-        }
-
-        pub fn orders(&self, _symbol: Option<&str>) -> anyhow::Result<Vec<PendingOrderInfo>> {
-            Err(anyhow::anyhow!("legacy MT5 bridge is disabled"))
-        }
-
-        pub fn recent_deals(
-            &self,
-            _symbol: Option<&str>,
-            _lookback_hours: i64,
-        ) -> anyhow::Result<Vec<DealInfo>> {
-            Err(anyhow::anyhow!("legacy MT5 bridge is disabled"))
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradingAdapterKind {
-    Mt5,
     CTrader,
     DxTrade,
 }
@@ -154,7 +67,6 @@ pub enum TradingAdapterKind {
 impl TradingAdapterKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Mt5 => "MT5",
             Self::CTrader => "cTrader",
             Self::DxTrade => "DXtrade",
         }
@@ -162,14 +74,13 @@ impl TradingAdapterKind {
 
     pub fn integration_mode(self) -> &'static str {
         match self {
-            Self::Mt5 => "Local terminal bridge",
             Self::CTrader => "Remote Open API",
             Self::DxTrade => "Remote broker API",
         }
     }
 
     pub fn requires_local_terminal(self) -> bool {
-        matches!(self, Self::Mt5)
+        false
     }
 
     pub fn supports_market_data(self) -> bool {
@@ -181,14 +92,6 @@ impl TradingAdapterKind {
     }
 }
 
-#[cfg(feature = "legacy-mt5")]
-pub const SUPPORTED_TRADING_ADAPTERS: [TradingAdapterKind; 3] = [
-    TradingAdapterKind::Mt5,
-    TradingAdapterKind::CTrader,
-    TradingAdapterKind::DxTrade,
-];
-
-#[cfg(not(feature = "legacy-mt5"))]
 pub const SUPPORTED_TRADING_ADAPTERS: [TradingAdapterKind; 2] =
     [TradingAdapterKind::CTrader, TradingAdapterKind::DxTrade];
 
@@ -286,13 +189,6 @@ pub struct ExecutionSurfaceSnapshot {
     pub ticket: ExecutionTicketSnapshot,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct BrokerExecutionSnapshot {
-    pub positions: Vec<PositionInfo>,
-    pub pending_orders: Vec<PendingOrderInfo>,
-    pub recent_deals: Vec<DealInfo>,
-}
-
 pub struct TradingSession {
     configured_adapter: TradingAdapterKind,
     broker_settings: BrokerSettingsState,
@@ -319,8 +215,6 @@ pub struct TradingSession {
 }
 
 enum TradingAdapter {
-    #[cfg_attr(not(test), allow(dead_code))]
-    Mt5(MT5Engine),
     CTrader(CTraderAccountRuntimeSnapshot),
 }
 
@@ -382,14 +276,12 @@ struct CTraderBootstrapContext {
 }
 
 enum ExecutionFeedHandle<'a> {
-    Mt5(&'a MT5Engine),
     CTrader(&'a CTraderAccountRuntimeSnapshot),
     Unavailable { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppExecutionRuntimeSnapshot {
-    Mt5(BrokerExecutionSnapshot),
     CTrader(CTraderAccountRuntimeSnapshot),
 }
 
@@ -401,7 +293,7 @@ impl TradingSession {
     #[cfg(test)]
     pub fn from_connected_terminal_for_test(terminal_info: impl Into<String>) -> Self {
         Self {
-            configured_adapter: TradingAdapterKind::Mt5,
+            configured_adapter: TradingAdapterKind::CTrader,
             broker_settings: BrokerSettingsState::default(),
             ctrader_auth: None,
             ctrader_live_auth_backend: Arc::new(ProductionCTraderLiveAuthBackend),
@@ -1218,18 +1110,6 @@ impl TradingSession {
             return Err(anyhow::anyhow!("connection attempt already in progress"));
         }
         match self.configured_adapter {
-            TradingAdapterKind::Mt5 => {
-                let mut engine = MT5Engine::new()?;
-                if engine.initialize()? {
-                    let _ = tx.blocking_send(ServiceEvent::ConnectOutcome(Ok(
-                        "MT5 Connected".to_string()
-                    )));
-                } else {
-                    let _ = tx.blocking_send(ServiceEvent::ConnectOutcome(Err(
-                        "MT5 Initialization failed".to_string(),
-                    )));
-                }
-            }
             TradingAdapterKind::CTrader => {
                 let request = self.build_ctrader_account_runtime_request()?;
                 let backend = Arc::clone(&self.ctrader_account_runtime_backend);
@@ -1278,46 +1158,6 @@ impl TradingSession {
     pub fn connect(&mut self, state: &mut AppState) {
         let readiness = self.adapter_readiness();
         match self.configured_adapter {
-            TradingAdapterKind::Mt5 => match MT5Engine::new() {
-                Ok(mut engine) => match engine.initialize() {
-                    Ok(true) => {
-                        state.status_msg = "Connected".to_string();
-                        self.connected = true;
-                        self.adapter = Some(TradingAdapter::Mt5(engine));
-                        self.terminal_info = self
-                            .adapter
-                            .as_ref()
-                            .map(TradingAdapter::terminal_info)
-                            .unwrap_or_default();
-                        self.market_chart_cache = None;
-                        self.execution_surface_cache = None;
-                        record_app_event(
-                            "ui_mt5_connect",
-                            "SUCCESS",
-                            "UI MT5 connection succeeded",
-                        );
-                    }
-                    _ => {
-                        self.reset_connection_state();
-                        state.status_msg =
-                            "Connection Failed (module missing or terminal closed)".to_string();
-                        record_app_event(
-                            "ui_mt5_connect",
-                            "DEGRADED",
-                            "UI MT5 connection failed (module missing or terminal closed)",
-                        );
-                    }
-                },
-                Err(err) => {
-                    self.reset_connection_state();
-                    state.status_msg = format!("Error: {:?}", err);
-                    record_app_event(
-                        "ui_mt5_connect",
-                        "FAILED",
-                        format!("UI MT5 bridge error: {err}"),
-                    );
-                }
-            },
             TradingAdapterKind::CTrader => {
                 self.reset_connection_state();
                 if !readiness.can_attempt_connect {
@@ -1405,7 +1245,7 @@ impl TradingSession {
     pub fn disconnect(&mut self, state: &mut AppState) {
         self.reset_connection_state();
         state.status_msg = "Offline".to_string();
-        record_app_event("ui_mt5_disconnect", "SUCCESS", "UI MT5 connection closed");
+        record_app_event("ui_disconnect", "SUCCESS", "UI broker connection closed");
     }
 
     pub fn execute_buy_market(&mut self, state: &mut AppState) {
@@ -1525,7 +1365,6 @@ impl TradingSession {
         state.status_msg = match state.data_source {
             DataSource::Local => "Local Mode".to_string(),
             DataSource::CTrader => format!("{} selected · disconnected", kind.as_str()),
-            DataSource::MT5 => format!("{} selected · disconnected", kind.as_str()),
         };
         if matches!(kind, TradingAdapterKind::CTrader) {
             if let Ok(Some(_)) = self.restore_ctrader_session() {
@@ -1559,23 +1398,6 @@ impl TradingSession {
                 TradingAdapterKind::DxTrade => {
                     "Trade overlays will appear here once DXtrade execution events are wired.".to_string()
                 }
-                TradingAdapterKind::Mt5 => {
-                    "MT5 is legacy-only; use cTrader for the canonical live runtime.".to_string()
-                }
-            },
-            DataSource::MT5 => match self.active_adapter_kind() {
-                TradingAdapterKind::Mt5 if !self.connected => {
-                    "Trade overlays unavailable while the trading runtime is disconnected.".to_string()
-                }
-                TradingAdapterKind::Mt5 => {
-                    "Trade overlays will appear here once broker-backed fills and bot execution events are wired.".to_string()
-                }
-                TradingAdapterKind::CTrader => {
-                    "Trade overlays will appear here once cTrader positions, fills, and bot execution events are wired.".to_string()
-                }
-                TradingAdapterKind::DxTrade => {
-                    "Trade overlays will appear here once DXtrade execution events are wired.".to_string()
-                }
             },
         }
     }
@@ -1593,22 +1415,6 @@ impl TradingSession {
                 reason: "Execution feed is unavailable in Local mode.".to_string(),
             },
             DataSource::CTrader => match &self.adapter {
-                Some(TradingAdapter::CTrader(runtime)) if self.connected => {
-                    ExecutionFeedHandle::CTrader(runtime)
-                }
-                Some(TradingAdapter::Mt5(engine)) if self.connected => {
-                    ExecutionFeedHandle::Mt5(engine)
-                }
-                _ => ExecutionFeedHandle::Unavailable {
-                    reason: self
-                        .active_adapter_kind()
-                        .execution_feed_unavailable_reason(self.connected),
-                },
-            },
-            DataSource::MT5 => match &self.adapter {
-                Some(TradingAdapter::Mt5(engine)) if self.connected => {
-                    ExecutionFeedHandle::Mt5(engine)
-                }
                 Some(TradingAdapter::CTrader(runtime)) if self.connected => {
                     ExecutionFeedHandle::CTrader(runtime)
                 }
@@ -1931,10 +1737,6 @@ impl TradingSession {
             return Ok(());
         }
         match &self.adapter {
-            Some(TradingAdapter::Mt5(engine)) => {
-                self.terminal_info = engine.terminal_info().unwrap_or_default();
-                Ok(())
-            }
             Some(TradingAdapter::CTrader(_)) => {
                 if self
                     .ctrader_runtime_refreshed_at
@@ -1960,9 +1762,13 @@ impl TradingSession {
     }
 
     fn calculate_equity_from_runtime(&self, runtime: &CTraderAccountRuntimeSnapshot) -> f64 {
-        // In a real implementation, we'd sum up floating P&L from reconcile.positions.
-        // For now, we use balance as the floor.
-        runtime.trader.balance
+        let accrued: f64 = runtime
+            .reconcile
+            .positions
+            .iter()
+            .map(|pos| pos.swap.unwrap_or(0.0) + pos.commission.unwrap_or(0.0))
+            .sum();
+        runtime.trader.balance + accrued
     }
 
     fn refresh_ctrader_runtime_after_execution(&mut self) -> anyhow::Result<()> {

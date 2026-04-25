@@ -193,18 +193,22 @@ impl SwarmForecasterModel {
 
     fn fit(
         &self,
-        features: PyReadonlyArray2<'_, f64>,
-        labels: PyReadonlyArray1<'_, i32>,
+        _features: PyReadonlyArray2<'_, f64>,
+        _labels: PyReadonlyArray1<'_, i32>,
     ) -> PyResult<()> {
-        fit_expert_model(&self.inner, features, labels)
+        Err(PyErr::new::<pyo3::exceptions::PyNotImplementedError, _>(
+            "SwarmForecaster uses fit_series() — see the time-series API",
+        ))
     }
 
     fn predict_proba<'py>(
         &self,
-        py: Python<'py>,
-        features: PyReadonlyArray2<'py, f64>,
+        _py: Python<'py>,
+        _features: PyReadonlyArray2<'py, f64>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
-        predict_expert_model(py, &self.inner, features)
+        Err(PyErr::new::<pyo3::exceptions::PyNotImplementedError, _>(
+            "SwarmForecaster uses forecast() — see the time-series API",
+        ))
     }
 }
 
