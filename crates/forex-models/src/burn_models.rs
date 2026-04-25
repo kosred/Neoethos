@@ -13,17 +13,21 @@
 // - Label protocol mapping (-1 → 2)
 
 use burn::backend::Autodiff;
+use burn::module::{Module, ModuleMapper, Param};
 use burn::nn;
 use burn::prelude::*;
 use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::backend::Backend;
+use burn::tensor::{DType, FloatDType, TensorData};
 #[cfg(not(feature = "burn-wgpu-backend"))]
 use burn_ndarray::NdArray;
 #[cfg(feature = "burn-wgpu-backend")]
 use burn_wgpu::{Wgpu, WgpuDevice, graphics, init_setup};
 
 use crate::hardware::HardwareInfo;
-use crate::runtime::capabilities::requested_training_precision_policy;
+use crate::runtime::capabilities::{
+    normalize_training_precision_policy, requested_training_precision_policy,
+};
 use anyhow::Context;
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
@@ -333,6 +337,17 @@ pub fn default_train_device() -> <TrainBackend as Backend>::Device {
     resolve_train_device("auto").0
 }
 
+fn parse_accelerator_index(policy: &str) -> Option<usize> {
+    policy
+        .strip_prefix("cuda:")
+        .or_else(|| policy.strip_prefix("gpu:"))
+        .or_else(|| policy.strip_prefix("wgpu:"))
+        .or_else(|| policy.strip_prefix("rocm:"))
+        .or_else(|| policy.strip_prefix("metal:"))
+        .or_else(|| policy.strip_prefix("vulkan:"))
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
 pub trait ManagedBurnBackend: Backend {
     fn managed_device_and_selection() -> (Self::Device, BurnDeviceSelection);
 
@@ -414,6 +429,43 @@ fn scalar_loss_value(values: burn::tensor::TensorData, context: &str) -> anyhow:
     Ok(value)
 }
 
+fn float_dtype(dtype: DType) -> FloatDType {
+    match dtype {
+        DType::BF16 => FloatDType::BF16,
+        DType::F16 => FloatDType::F16,
+        DType::Flex32 => FloatDType::Flex32,
+        _ => FloatDType::F32,
+    }
+}
+
+fn cast_tensor_to_dtype<B: Backend, const D: usize>(
+    tensor: Tensor<B, D>,
+    dtype: DType,
+) -> Tensor<B, D> {
+    if tensor.dtype() == dtype {
+        tensor
+    } else {
+        tensor.cast(float_dtype(dtype))
+    }
+}
+
+pub(crate) fn cast_module_float_tensors<B: Backend, M: Module<B>>(module: M, dtype: DType) -> M {
+    struct FloatTensorDTypeMapper {
+        dtype: DType,
+    }
+
+    impl<B: Backend> ModuleMapper<B> for FloatTensorDTypeMapper {
+        fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+            let (id, tensor, mapper) = param.consume();
+            let tensor = cast_tensor_to_dtype(tensor, self.dtype);
+            Param::from_mapped_value(id, tensor, mapper)
+        }
+    }
+
+    let mut mapper = FloatTensorDTypeMapper { dtype };
+    module.map(&mut mapper)
+}
+
 /// Index-order-aware train/val split with embargo gap.
 /// The caller must provide rows in chronological order; this helper does not
 /// infer or validate timestamps.
@@ -470,11 +522,20 @@ impl EarlyStopper {
     }
 }
 
-/// Convert ndarray::Array2<f32> to Burn Tensor<B, 2>
-fn array2_to_tensor<B: Backend>(data: &Array2<f32>, device: &B::Device) -> Tensor<B, 2> {
+/// Convert ndarray::Array2<f32> to Burn Tensor<B, 2> with the requested runtime dtype.
+fn array2_to_tensor_with_dtype<B: Backend>(
+    data: &Array2<f32>,
+    device: &B::Device,
+    dtype: DType,
+) -> Tensor<B, 2> {
     let (rows, cols) = (data.nrows(), data.ncols());
     let flat: Vec<f32> = data.iter().copied().collect();
-    Tensor::from_data(TensorData::new(flat, [rows, cols]), device)
+    Tensor::from_data_dtype(TensorData::new(flat, [rows, cols]), device, dtype)
+}
+
+/// Convert ndarray::Array2<f32> to Burn Tensor<B, 2>
+fn array2_to_tensor<B: Backend>(data: &Array2<f32>, device: &B::Device) -> Tensor<B, 2> {
+    array2_to_tensor_with_dtype(data, device, DType::F32)
 }
 
 /// Convert i64 labels to Burn Int Tensor<B, 1>
@@ -1575,7 +1636,40 @@ fn validate_train_config(config: &TrainConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn resolve_burn_training_precision(selection: &BurnDeviceSelection) -> (String, Option<String>) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BurnExecutionPrecision {
+    Fp32,
+    Bf16,
+}
+
+impl BurnExecutionPrecision {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fp32 => "fp32",
+            Self::Bf16 => "bf16",
+        }
+    }
+
+    fn dtype(self) -> DType {
+        match self {
+            Self::Fp32 => DType::F32,
+            Self::Bf16 => DType::BF16,
+        }
+    }
+}
+
+fn requested_burn_training_precision(requested_precision: Option<&str>) -> String {
+    requested_precision
+        .map(normalize_training_precision_policy)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| requested_training_precision_policy("burn"))
+}
+
+fn resolve_burn_training_precision_for_backend<B: Backend>(
+    selection: &BurnDeviceSelection,
+    device: &B::Device,
+    requested_precision: Option<&str>,
+) -> (BurnExecutionPrecision, Option<String>) {
     fn env_flag(name: &str, default: bool) -> bool {
         match std::env::var(name) {
             Ok(value) => matches!(
@@ -1586,72 +1680,57 @@ fn resolve_burn_training_precision(selection: &BurnDeviceSelection) -> (String, 
         }
     }
 
-    let requested = requested_training_precision_policy("burn");
-    let experimental_mixed_precision =
-        env_flag("FOREX_BURN_ENABLE_EXPERIMENTAL_MIXED_PRECISION", false);
+    let requested = requested_burn_training_precision(requested_precision);
 
-    let gpu_requested = selection.effective_policy == "gpu"
+    let gpu_requested = selection.effective_policy == "default"
+        || selection.effective_policy == "gpu"
         || selection.effective_policy.starts_with("gpu:")
-        || selection.execution_backend.contains("gpu");
-    if !gpu_requested {
-        let reason = if requested != "auto" && requested != "fp32" {
-            Some(format!(
-                "requested precision `{requested}`; CPU execution requires fp32"
-            ))
-        } else {
-            None
-        };
-        return ("fp32".to_string(), reason);
-    }
-
-    if !experimental_mixed_precision {
-        let reason = if requested != "auto" && requested != "fp32" {
-            Some(format!(
-                "requested precision `{requested}`; Burn mixed-precision tensor execution is not enabled, using fp32"
-            ))
-        } else if requested == "auto" {
-            Some("auto precision resolved to fp32; Burn mixed-precision tensor execution is not enabled".to_string())
-        } else {
-            None
-        };
-        return ("fp32".to_string(), reason);
-    }
-
-    let hardware = HardwareInfo::detect();
-    let supports_bf16 = hardware.gpu_supports_bf16(0);
-    let supports_fp8 = hardware.gpu_supports_fp8(0);
-    let model_supports_bf16 = env_flag("FOREX_BURN_MODEL_SUPPORTS_BF16", true);
-    let model_supports_fp8 = env_flag("FOREX_BURN_MODEL_SUPPORTS_FP8", false);
-    let model_supports_bf4 = env_flag("FOREX_BURN_MODEL_SUPPORTS_BF4", false);
-
-    let selected = match requested.as_str() {
-        "bf4" if supports_fp8 && model_supports_bf4 => "bf4",
-        "fp8" if supports_fp8 && model_supports_fp8 => "fp8",
-        "bf16" if supports_bf16 && model_supports_bf16 => "bf16",
-        "fp32" => "fp32",
-        "auto" => {
-            if supports_fp8 && model_supports_bf4 {
-                "bf4"
-            } else if supports_fp8 && model_supports_fp8 {
-                "fp8"
-            } else if supports_bf16 && model_supports_bf16 {
-                "bf16"
-            } else {
-                "fp32"
-            }
-        }
-        _ => "fp32",
-    };
-    let reason = if selected != requested && requested != "auto" {
-        Some(format!(
-            "requested precision `{requested}` unsupported for current GPU/model implementation; using `{selected}`"
-        ))
-    } else if selected == "fp32" && requested == "auto" {
-        Some("auto precision fallback to fp32 for current GPU/model implementation".to_string())
+        || matches!(
+            selection.execution_backend.as_str(),
+            "wgpu_default" | "wgpu_discrete_gpu" | "wgpu_integrated_gpu"
+        );
+    let supports_bf16 = if gpu_requested {
+        let hardware = HardwareInfo::detect();
+        let accelerator_index = parse_accelerator_index(&selection.effective_policy).unwrap_or(0);
+        hardware.gpu_supports_bf16(accelerator_index) && B::supports_dtype(device, DType::BF16)
     } else {
-        None
+        B::supports_dtype(device, DType::BF16)
     };
-    (selected.to_string(), reason)
+    let model_supports_bf16 = env_flag("FOREX_BURN_MODEL_SUPPORTS_BF16", true);
+    let bf16_supported = supports_bf16 && model_supports_bf16;
+
+    match requested.as_str() {
+        "bf16" if bf16_supported => (BurnExecutionPrecision::Bf16, None),
+        "auto" if bf16_supported => (BurnExecutionPrecision::Bf16, None),
+        "fp8" | "bf4" => {
+            let selected = if bf16_supported {
+                BurnExecutionPrecision::Bf16
+            } else {
+                BurnExecutionPrecision::Fp32
+            };
+            (
+                selected,
+                Some(format!(
+                    "requested precision `{requested}`; Burn runtime currently executes training tensors as fp32/bf16 only, using `{}`",
+                    selected.label()
+                )),
+            )
+        }
+        "bf16" => (
+            BurnExecutionPrecision::Fp32,
+            Some(format!(
+                "requested precision `{requested}` unsupported by the active Burn backend/device/model implementation; using `fp32`"
+            )),
+        ),
+        "auto" => (
+            BurnExecutionPrecision::Fp32,
+            Some(
+                "auto precision fallback to fp32 for current Burn backend/device/model implementation"
+                    .to_string(),
+            ),
+        ),
+        _ => (BurnExecutionPrecision::Fp32, None),
+    }
 }
 
 // ============================================================================
@@ -1667,10 +1746,17 @@ fn cross_entropy_loss<B: Backend>(
 ) -> Tensor<B, 1> {
     let n_classes = class_weights.len();
     let batch_size = logits.dims()[0];
+    let logits_dtype = logits.dtype();
     let log_probs = burn::tensor::activation::log_softmax(logits, 1);
-    let one_hot = targets.one_hot(n_classes).float();
-    let weights =
-        Tensor::<B, 1>::from_data(TensorData::new(class_weights.to_vec(), [n_classes]), device);
+    let one_hot = targets
+        .one_hot(n_classes)
+        .float()
+        .cast(float_dtype(logits_dtype));
+    let weights = Tensor::<B, 1>::from_data_dtype(
+        TensorData::new(class_weights.to_vec(), [n_classes]),
+        device,
+        logits_dtype,
+    );
     let weighted = log_probs * one_hot * weights.unsqueeze_dim(0);
     weighted.sum().neg() / (batch_size as f32)
 }
@@ -1792,6 +1878,24 @@ where
     B: AutodiffBackend,
     M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
 {
+    train_model_with_report_with_selection_and_precision::<B, M>(
+        model, x_data, y_raw, config, device, selection, None,
+    )
+}
+
+pub fn train_model_with_report_with_selection_and_precision<B, M>(
+    model: M,
+    x_data: &Array2<f32>,
+    y_raw: &[i32],
+    config: &TrainConfig,
+    device: &B::Device,
+    selection: &BurnDeviceSelection,
+    requested_precision: Option<&str>,
+) -> anyhow::Result<(M, BurnTrainingReport)>
+where
+    B: AutodiffBackend,
+    M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
+{
     validate_train_config(config)?;
     validate_burn_device_selection(selection)?;
     let n_samples = x_data.nrows();
@@ -1808,6 +1912,9 @@ where
 
     // 1. Label mapping: -1 → 2
     let y_mapped = map_labels(y_raw)?;
+    let (training_precision, training_precision_reason) =
+        resolve_burn_training_precision_for_backend::<B>(selection, device, requested_precision);
+    let training_dtype = training_precision.dtype();
 
     // 2. Index-order-aware split with embargo.
     // We intentionally rely on caller ordering here; shuffled inputs would
@@ -1858,7 +1965,7 @@ where
     let mut best_loss = f32::INFINITY;
     let mut best_epoch = None;
     let mut final_train_loss = f32::INFINITY;
-    let mut model = model;
+    let mut model = cast_module_float_tensors(model, training_dtype);
     let mut best_model_snapshot: Option<M> = None;
     let mut rng = StdRng::seed_from_u64(config.seed);
     let mut indices: Vec<usize> = (0..n_train).collect();
@@ -1880,7 +1987,8 @@ where
                     .iter()
                     .map(|&idx| train_labels[idx])
                     .collect::<Vec<_>>();
-                let x_batch = array2_to_tensor::<B>(&x_batch_array, &device);
+                let x_batch =
+                    array2_to_tensor_with_dtype::<B>(&x_batch_array, &device, training_dtype);
                 let y_batch = labels_to_tensor::<B>(&y_batch_labels, &device);
 
                 let logits = BurnForward::forward_pass(&model, x_batch);
@@ -1919,7 +2027,7 @@ where
             let y_val = y_val_labels
                 .as_ref()
                 .expect("validation labels must exist when validation range is non-empty");
-            let x_val = array2_to_tensor::<B>(x_val, &device);
+            let x_val = array2_to_tensor_with_dtype::<B>(x_val, &device, training_dtype);
             let y_val = labels_to_tensor::<B>(y_val, &device);
             let val_logits = BurnForward::forward_pass(&model, x_val);
             let val_loss = cross_entropy_loss(val_logits, y_val, &class_weights, &device);
@@ -1958,8 +2066,6 @@ where
         model = best_model;
     }
 
-    let (training_precision, training_precision_reason) =
-        resolve_burn_training_precision(selection);
     Ok((
         model,
         BurnTrainingReport {
@@ -1979,7 +2085,7 @@ where
             requested_device_policy: selection.requested_policy.clone(),
             effective_device_policy: selection.effective_policy.clone(),
             execution_backend: selection.execution_backend.clone(),
-            training_precision,
+            training_precision: training_precision.label().to_string(),
             training_precision_reason,
         },
     ))
@@ -2205,18 +2311,50 @@ mod tests {
     }
 
     #[test]
-    fn burn_training_precision_support_flags_can_enable_fp8() {
-        std::env::set_var("FOREX_BURN_MODEL_SUPPORTS_FP8", "true");
-        std::env::set_var("FOREX_BOT_TRAIN_PRECISION", "fp8");
+    fn burn_training_precision_fp8_request_degrades_truthfully() {
         let selection = BurnDeviceSelection {
             requested_policy: "gpu".to_string(),
             effective_policy: "gpu".to_string(),
             execution_backend: "wgpu_discrete_gpu".to_string(),
         };
-        let (precision, _reason) = resolve_burn_training_precision(&selection);
-        std::env::remove_var("FOREX_BURN_MODEL_SUPPORTS_FP8");
-        std::env::remove_var("FOREX_BOT_TRAIN_PRECISION");
-        assert!(matches!(precision.as_str(), "fp8" | "bf16" | "fp32"));
+        let device = <TrainBackend as Backend>::Device::default();
+        let (precision, reason) = resolve_burn_training_precision_for_backend::<TrainBackend>(
+            &selection,
+            &device,
+            Some("fp8"),
+        );
+        assert!(matches!(
+            precision,
+            BurnExecutionPrecision::Bf16 | BurnExecutionPrecision::Fp32
+        ));
+        assert!(
+            reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("requested precision `fp8`")
+        );
+    }
+
+    #[test]
+    fn burn_training_precision_cpu_bf16_request_falls_back_to_fp32() {
+        let selection = BurnDeviceSelection {
+            requested_policy: "cpu".to_string(),
+            effective_policy: "cpu".to_string(),
+            execution_backend: "ndarray_cpu".to_string(),
+        };
+        let device = <TrainBackend as Backend>::Device::default();
+        let (precision, reason) = resolve_burn_training_precision_for_backend::<TrainBackend>(
+            &selection,
+            &device,
+            Some("bf16"),
+        );
+        assert_eq!(precision, BurnExecutionPrecision::Fp32);
+        assert!(
+            reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("CPU execution requires fp32")
+        );
     }
 
     #[test]

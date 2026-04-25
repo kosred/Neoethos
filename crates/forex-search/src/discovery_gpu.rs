@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use tch::{Device, Kind, Tensor};
 
+use crate::cubecl_ga::{cuda_reproduction_kernel_enabled, try_generate_children_cuda};
 use crate::genetic::{
     ParentSelectionPolicy, SurvivorSelectionPolicy, select_parent_index, select_survivor_indices,
 };
@@ -84,12 +85,75 @@ pub struct GpuDiscoveryResult {
     pub feature_names: Vec<String>,
     pub timeframes: Vec<String>,
     pub used_gpu: bool,
+    pub runtime_backend: String,
+    pub degraded_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct GenomeExport<'a> {
     fitness: f32,
     genome: &'a [f32],
+}
+
+fn append_degraded_reason(primary: Option<String>, secondary: Option<String>) -> Option<String> {
+    match (primary, secondary) {
+        (Some(primary), Some(secondary)) => Some(format!("{primary}; {secondary}")),
+        (Some(primary), None) => Some(primary),
+        (None, Some(secondary)) => Some(secondary),
+        (None, None) => None,
+    }
+}
+
+fn resolve_execution_mode(config: &GpuDiscoveryConfig) -> (Vec<i64>, String, Option<String>) {
+    let requested_precision_reason = (config.precision != TrainingPrecision::Fp32).then(|| {
+        format!(
+            "requested_search_precision_unavailable({})",
+            config.precision.as_str()
+        )
+    });
+
+    match config.backend {
+        AcceleratorBackend::Cpu => (
+            Vec::new(),
+            "search_cpu_fp32".to_string(),
+            requested_precision_reason,
+        ),
+        AcceleratorBackend::Cuda => {
+            let device_ids = if config.devices.is_empty() {
+                let count = tch::Cuda::device_count();
+                (0..count).collect::<Vec<_>>()
+            } else {
+                config.devices.clone()
+            };
+            let backend_reason = device_ids
+                .is_empty()
+                .then(|| "requested_search_cuda_unavailable".to_string());
+            if device_ids.is_empty() {
+                (
+                    device_ids,
+                    "search_cpu_fp32".to_string(),
+                    append_degraded_reason(backend_reason, requested_precision_reason),
+                )
+            } else {
+                (
+                    device_ids,
+                    "search_cuda_tch_fp32".to_string(),
+                    requested_precision_reason,
+                )
+            }
+        }
+        other => (
+            Vec::new(),
+            "search_cpu_fp32".to_string(),
+            append_degraded_reason(
+                Some(format!(
+                    "requested_search_backend_unavailable({})",
+                    other.as_str()
+                )),
+                requested_precision_reason,
+            ),
+        ),
+    }
 }
 
 pub fn save_gpu_genomes(path: impl AsRef<Path>, result: &GpuDiscoveryResult) -> Result<()> {
@@ -205,18 +269,6 @@ pub fn run_gpu_discovery(
     base_ohlcv: &Ohlcv,
     config: &GpuDiscoveryConfig,
 ) -> Result<GpuDiscoveryResult> {
-    if config.backend != AcceleratorBackend::Cuda {
-        bail!(
-            "forex-search GPU discovery currently supports CUDA only, requested {}",
-            config.backend.as_str()
-        );
-    }
-    if config.precision != TrainingPrecision::Fp32 {
-        bail!(
-            "forex-search GPU discovery currently executes FP32 tensors only, requested {}",
-            config.precision.as_str()
-        );
-    }
     if frames.is_empty() {
         bail!("no feature frames supplied");
     }
@@ -231,12 +283,7 @@ pub fn run_gpu_discovery(
     let data_cube = build_data_cube(frames)?;
     let ohlc_cube = build_ohlc_cube(base_ohlcv, tf_count)?;
 
-    let device_ids = if config.devices.is_empty() {
-        let count = tch::Cuda::device_count();
-        (0..count).collect::<Vec<_>>()
-    } else {
-        config.devices.clone()
-    };
+    let (device_ids, runtime_backend, degraded_reason) = resolve_execution_mode(config);
     let used_gpu = !device_ids.is_empty();
 
     let dim = tf_count + n_features + 2;
@@ -335,6 +382,34 @@ pub fn run_gpu_discovery(
         for _ in 0..immigrant_count {
             next.push(random_genome(dim, &mut rng));
         }
+        let pending_children = config.population.saturating_sub(next.len());
+        if pending_children > 0 && !device_ids.is_empty() && cuda_reproduction_kernel_enabled() {
+            let ranked_population: Vec<&[f32]> = scored
+                .iter()
+                .map(|(_, _, genome)| genome.as_slice())
+                .collect();
+            match try_generate_children_cuda(
+                &ranked_population,
+                &score_vector,
+                &parent_indices,
+                &mu,
+                &std,
+                pending_children,
+                config,
+                &mut rng,
+                &normal,
+                device_ids[0],
+            ) {
+                Ok(children) => {
+                    next.extend(children);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "cuda reproduction kernel unavailable in discovery_gpu, falling back to cpu offspring generation: {err}"
+                    );
+                }
+            }
+        }
         while next.len() < config.population {
             let use_cross = rng.random_bool(config.crossover_rate);
             let mut child = vec![0.0_f32; dim];
@@ -393,6 +468,8 @@ pub fn run_gpu_discovery(
         feature_names: frames[0].names.clone(),
         timeframes: (0..tf_count).map(|idx| format!("tf_{idx}")).collect(),
         used_gpu,
+        runtime_backend,
+        degraded_reason,
     })
 }
 

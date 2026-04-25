@@ -4067,9 +4067,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "cubecl",
  "duckdb",
  "forex-core",
  "forex-data",
+ "half",
  "itertools 0.14.0",
  "ndarray 0.17.2",
  "rand 0.9.2",
@@ -8890,8 +8892,6 @@ dependencies = [
 [[package]]
 name = "rlkit"
 version = "0.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f36b339fe9bad91ba5f46f6c819ecf3f87e305903ec53c1f3fb103d440644a4"
 dependencies = [
  "anyhow",
  "candle-core",

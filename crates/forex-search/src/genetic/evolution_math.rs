@@ -1,9 +1,9 @@
 use super::smc_indicators::{
-    enforce_min_structural_smc_flags, randomize_smc_flags, SmcSearchConfig,
+    SmcSearchConfig, enforce_min_structural_smc_flags, randomize_smc_flags,
 };
 use super::strategy_gene::Gene;
-use rand::seq::index::sample;
 use rand::Rng;
+use rand::seq::index::sample;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
@@ -434,6 +434,16 @@ impl SeenSignatureMemory {
     }
 }
 
+fn random_coarse_weight(rng: &mut impl Rng) -> f32 {
+    let levels = [0.2, 0.4, 0.6, 0.8, 1.0];
+    levels[rng.random_range(0..levels.len())]
+}
+
+fn random_coarse_threshold(rng: &mut impl Rng) -> f32 {
+    let levels = [0.15, 0.25, 0.35, 0.45, 0.55];
+    levels[rng.random_range(0..levels.len())]
+}
+
 pub fn new_random_gene(
     n_indicators: usize,
     max_indicators: usize,
@@ -446,9 +456,9 @@ pub fn new_random_gene(
     let count = rng.random_range(min_indicators..=max_indicators);
     let sample = sample(&mut rng, n_indicators.max(1), count);
     let indices: Vec<usize> = sample.iter().collect();
-    let weights: Vec<f32> = (0..count).map(|_| rng.random_range(0.1..1.0)).collect();
-    let long_threshold = rng.random_range(0.15..0.55);
-    let short_threshold = -rng.random_range(0.15..0.55);
+    let weights: Vec<f32> = (0..count).map(|_| random_coarse_weight(&mut rng)).collect();
+    let long_threshold = random_coarse_threshold(&mut rng);
+    let short_threshold = -random_coarse_threshold(&mut rng);
     let (sl_pips, tp_pips) = if rng.random_bool(0.2) {
         (15.0, 30.0)
     } else {
@@ -635,37 +645,64 @@ pub fn mutate(
     max_indicators: usize,
     generation: usize,
     smc_cfg: &SmcSearchConfig,
+    stagnant_generations: usize,
 ) -> Gene {
     let mut rng = rand::rng();
     let mut mutated = gene.clone();
-    match rng.random_range(0..4) {
-        0 => {
-            if !mutated.indices.is_empty() && rng.random_bool(0.5) {
-                let idx = rng.random_range(0..mutated.indices.len());
-                mutated.indices[idx] = rng.random_range(0..n_indicators.max(1));
-                mutated.weights[idx] = rng.random_range(0.1..1.0);
-            } else {
-                let min_indicators = 1;
-                let max_indicators = max_indicators.clamp(min_indicators, n_indicators.max(1));
-                let count = rng.random_range(min_indicators..=max_indicators);
-                let sample = sample(&mut rng, n_indicators.max(1), count);
-                mutated.indices = sample.iter().collect();
-                mutated.weights = (0..count).map(|_| rng.random_range(0.1..1.0)).collect();
+
+    // Adaptive mutation rate based on stagnation
+    let (num_mutations, intensity) = if stagnant_generations > 10 {
+        (3, 1.5_f32) // Heavy exploration
+    } else if stagnant_generations > 5 {
+        (2, 1.2_f32) // Moderate exploration
+    } else if stagnant_generations == 0 {
+        (1, 0.5_f32) // Exploitation (improvement streak)
+    } else {
+        (1, 1.0_f32) // Normal
+    };
+
+    for _ in 0..num_mutations {
+        match rng.random_range(0..4) {
+            0 => {
+                // In exploitation mode, prefer tweaking weights over full indicator replacement
+                if !mutated.indices.is_empty() && (intensity < 1.0 || rng.random_bool(0.5)) {
+                    let idx = rng.random_range(0..mutated.indices.len());
+                    if rng.random_bool(0.3 * intensity as f64) {
+                        mutated.indices[idx] = rng.random_range(0..n_indicators.max(1));
+                    }
+                    mutated.weights[idx] = random_coarse_weight(&mut rng);
+                } else {
+                    let min_indicators = 1;
+                    let max_indicators = max_indicators.clamp(min_indicators, n_indicators.max(1));
+                    let count = rng.random_range(min_indicators..=max_indicators);
+                    let sample = sample(&mut rng, n_indicators.max(1), count);
+                    mutated.indices = sample.iter().collect();
+                    mutated.weights = (0..count).map(|_| random_coarse_weight(&mut rng)).collect();
+                }
+            }
+            1 => {
+                mutated.long_threshold = random_coarse_threshold(&mut rng);
+                mutated.short_threshold = -random_coarse_threshold(&mut rng);
+            }
+            2 => {
+                let range = 0.2 * intensity as f64;
+                mutated.tp_pips = (mutated.tp_pips
+                    * rng.random_range((1.0 - range)..(1.0 + range)))
+                .clamp(10.0, 100.0);
+                mutated.sl_pips = (mutated.sl_pips
+                    * rng.random_range((1.0 - range)..(1.0 + range)))
+                .clamp(5.0, 50.0);
+            }
+            _ => {
+                // In exploitation mode, reduce the chance of randomly flipping SMC flags
+                if intensity >= 1.0 || rng.random_bool(0.3) {
+                    randomize_smc_flags(&mut mutated, smc_cfg, &mut rng);
+                }
             }
         }
-        1 => {
-            mutated.long_threshold =
-                (mutated.long_threshold * rng.random_range(0.7..1.3)).clamp(0.08, 0.8);
-            mutated.short_threshold =
-                (mutated.short_threshold * rng.random_range(0.7..1.3)).clamp(-0.8, -0.08);
-        }
-        2 => {
-            mutated.tp_pips = (mutated.tp_pips * rng.random_range(0.8..1.2)).clamp(10.0, 100.0);
-            mutated.sl_pips = (mutated.sl_pips * rng.random_range(0.8..1.2)).clamp(5.0, 50.0);
-        }
-        _ => randomize_smc_flags(&mut mutated, smc_cfg, &mut rng),
     }
-    if rng.random_bool(0.25) {
+
+    if rng.random_bool(0.25 * intensity as f64) {
         enforce_min_structural_smc_flags(&mut mutated, smc_cfg, &mut rng);
     }
     mutated.strategy_id = format!("gene_{}_{}", rng.random_range(0..1_000_000u64), generation);

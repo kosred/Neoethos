@@ -24,3 +24,4 @@ edition = "2024"
 [patch.crates-io]
 lightgbm3-sys = { path = "vendor/lightgbm3-sys" }
 sklears-core = { path = "vendor/sklears-core" }
+rlkit = { path = "vendor/rlkit" }

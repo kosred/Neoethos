@@ -9,7 +9,7 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use forex_core::system::HardwareProbe;
-use forex_core::{AcceleratorDevice, TrainingPrecision};
+use forex_core::{AcceleratorBackend, AcceleratorDevice, TrainingPrecision};
 #[cfg(feature = "tch")]
 use tch::{Cuda, Device, Kind, Tensor};
 
@@ -240,50 +240,53 @@ pub enum DevicePreference {
 /// Select device based on request and availability
 /// legacy lines 173-194
 pub fn select_device(requested: DevicePreference) -> Vec<String> {
+    let mut probe = HardwareProbe::new();
+    let profile = probe.detect();
+    let accelerator_devices = profile.accelerator_devices;
+    let first_cuda = accelerator_devices
+        .iter()
+        .find(|device| device.backend == AcceleratorBackend::Cuda)
+        .map(AcceleratorDevice::device_string);
+    let first_accelerator = accelerator_devices
+        .first()
+        .map(AcceleratorDevice::device_string);
+
     match requested {
         DevicePreference::Cpu => vec!["cpu".to_string()],
-        DevicePreference::Gpu(_idx) => {
-            #[cfg(feature = "tch")]
-            {
-                if Cuda::is_available() && (_idx as i64) < Cuda::device_count() {
-                    return vec![format!("cuda:{}", _idx)];
-                }
-            }
-            vec!["cpu".to_string()]
-        }
+        DevicePreference::Gpu(idx) => accelerator_devices
+            .iter()
+            .find(|device| device.id == idx)
+            .map(AcceleratorDevice::device_string)
+            .map(|device| vec![device])
+            .unwrap_or_else(|| vec!["cpu".to_string()]),
         DevicePreference::AllGpus => {
-            #[cfg(feature = "tch")]
-            {
-                if Cuda::is_available() {
-                    let count = Cuda::device_count();
-                    return (0..count).map(|i| format!("cuda:{}", i)).collect();
-                }
+            let devices = accelerator_devices
+                .iter()
+                .map(AcceleratorDevice::device_string)
+                .collect::<Vec<_>>();
+            if devices.is_empty() {
+                vec!["cpu".to_string()]
+            } else {
+                devices
             }
-            vec!["cpu".to_string()]
         }
-        DevicePreference::Auto => {
-            #[cfg(feature = "tch")]
-            {
-                if Cuda::is_available() && Cuda::device_count() > 0 {
-                    return vec!["cuda:0".to_string()];
-                }
-            }
-            vec!["cpu".to_string()]
-        }
+        DevicePreference::Auto => first_cuda
+            .or(first_accelerator)
+            .map(|device| vec![device])
+            .unwrap_or_else(|| vec!["cpu".to_string()]),
     }
 }
 
 /// Get list of available GPU device strings
 /// legacy lines 70-73
 pub fn get_available_gpus() -> Vec<String> {
-    #[cfg(feature = "tch")]
-    {
-        if Cuda::is_available() {
-            let count = Cuda::device_count();
-            return (0..count).map(|i| format!("cuda:{}", i)).collect();
-        }
-    }
-    vec![]
+    let mut probe = HardwareProbe::new();
+    probe
+        .detect()
+        .accelerator_devices
+        .into_iter()
+        .map(|device| device.device_string())
+        .collect()
 }
 
 // ============================================================================

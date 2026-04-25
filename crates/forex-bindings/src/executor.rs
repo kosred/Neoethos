@@ -222,6 +222,8 @@ impl RiskManager {
             current_min,
             weekday,
             market_volatility,
+            strategy_sharpe: None,
+            strategy_rank: None,
         })
     }
 

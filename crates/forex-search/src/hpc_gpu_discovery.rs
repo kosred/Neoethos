@@ -14,6 +14,7 @@ use rand_distr::{Distribution, Normal};
 use std::thread;
 use tch::{Device, Kind, Tensor};
 
+use crate::cubecl_ga::{cuda_reproduction_kernel_enabled, try_generate_children_cuda};
 use crate::discovery_gpu::{GpuDiscoveryConfig, GpuDiscoveryResult};
 use crate::genetic::{SurvivorSelectionPolicy, select_parent_index, select_survivor_indices};
 use crate::hpc::{get_gpu_cpu_affinity, is_hpc_mode, is_nvlink_pair, set_thread_affinity};
@@ -194,6 +195,8 @@ pub fn run_island_model_discovery(
         feature_names: frames[0].names.clone(),
         timeframes: (0..tf_count).map(|idx| format!("tf_{idx}")).collect(),
         used_gpu: true,
+        runtime_backend: "search_hpc_island_cuda_tch_fp32".to_string(),
+        degraded_reason: None,
     })
 }
 
@@ -367,6 +370,36 @@ impl Island {
 
         let score_vector: Vec<f64> = self.fitness.iter().map(|fitness| *fitness as f64).collect();
         let parent_indices: Vec<usize> = (0..self.population.len()).collect();
+
+        let pending_children = self.population.len().saturating_sub(next.len());
+        if pending_children > 0 && cuda_reproduction_kernel_enabled() {
+            let population_refs: Vec<&[f32]> = self
+                .population
+                .iter()
+                .map(|genome| genome.as_slice())
+                .collect();
+            match try_generate_children_cuda(
+                &population_refs,
+                &score_vector,
+                &parent_indices,
+                &mu,
+                &std,
+                pending_children,
+                config,
+                &mut rng,
+                &normal,
+                self.gpu_id,
+            ) {
+                Ok(children) => {
+                    next.extend(children);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "cuda reproduction kernel unavailable in island evolution, falling back to cpu offspring generation: {err}"
+                    );
+                }
+            }
+        }
 
         while next.len() < self.population.len() {
             let use_cross = rng.random_bool(config.crossover_rate);

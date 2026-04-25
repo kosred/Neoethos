@@ -79,7 +79,7 @@ pub fn search_evolve_ohlcv(
     )
     .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
 
-    let (features, result) = py
+    let result = py
         .detach(|| {
             let prof = if include_raw {
                 FeatureProfile::Full
@@ -233,26 +233,38 @@ pub fn search_evolve_gpu_ohlcv(
                 #[cfg(feature = "gpu")]
                 {
                     let frames_vec = vec![features.clone()];
-                    run_gpu_discovery(frames_vec, features.names.clone(), ohlcv.clone(), &config)
+                    run_gpu_discovery(&frames_vec, &ohlcv, &config)
                         .map_err(|e| format!("GPU search failed: {}", e))?
                 }
                 #[cfg(not(feature = "gpu"))]
                 {
                     let frames_vec = vec![features.clone()];
-                    run_gpu_discovery(frames_vec, features.names.clone(), ohlcv.clone(), &config)
+                    run_gpu_discovery(&frames_vec, &ohlcv, &config)
                         .map_err(|e| format!("GPU search failed: {}", e))?
                 }
             };
-            Ok::<_, String>((features, result))
+            Ok::<_, String>(result)
         })
         .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
 
+    let forex_search::GpuDiscoveryResult {
+        genomes,
+        fitness,
+        feature_names,
+        timeframes,
+        used_gpu,
+        runtime_backend,
+        degraded_reason,
+    } = result;
+
     let dict = PyDict::new(py);
-    dict.set_item("genomes", result.genomes)?;
-    dict.set_item("fitness", result.fitness)?;
-    dict.set_item("feature_names", features.names)?;
-    dict.set_item("timeframes", result.timeframes)?;
-    dict.set_item("gpu", result.used_gpu)?;
+    dict.set_item("genomes", genomes)?;
+    dict.set_item("fitness", fitness)?;
+    dict.set_item("feature_names", feature_names)?;
+    dict.set_item("timeframes", timeframes)?;
+    dict.set_item("gpu", used_gpu)?;
+    dict.set_item("runtime_backend", runtime_backend)?;
+    dict.set_item("degraded_reason", degraded_reason)?;
     Ok(dict.into_any().unbind())
 }
 

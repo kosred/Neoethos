@@ -763,6 +763,7 @@ impl GeneticStrategyExpert {
                         self.max_indicators,
                         generation + 1,
                         &smc_cfg,
+                        0,
                     );
                 }
                 if rng.random_bool(0.25) {

@@ -1583,7 +1583,7 @@ impl TrainingOrchestrator {
             ]),
             "neuro_evo" => HashMap::from([
                 ("backend".to_string(), "crfmnes_cpu".to_string()),
-                ("device".to_string(), "cpu".to_string()),
+                ("device".to_string(), self.settings.system.device.clone()),
                 (
                     "hidden_dim".to_string(),
                     self.settings.models.evo_hidden_size.to_string(),
@@ -1633,6 +1633,7 @@ impl TrainingOrchestrator {
                 ),
                 ("immigrant_fraction".to_string(), "0.100000".to_string()),
                 ("seed".to_string(), "42".to_string()),
+                ("device".to_string(), self.settings.system.device.clone()),
             ]),
             _ => HashMap::new(),
         }
@@ -2565,6 +2566,9 @@ fn build_expert_model(
                 input_dim.max(1),
                 parse_usize_param(params, "population", 96),
                 parse_usize_param(params, "generations", 48),
+            )
+            .with_device_policy(
+                parse_string_param(params, "device").unwrap_or_else(|| "auto".to_string()),
             )
             .with_search_params(
                 parse_f32_param(params, "mutation_rate", 0.85),

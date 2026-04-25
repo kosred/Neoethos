@@ -719,6 +719,7 @@ where
                     max_indicators,
                     generation + 1,
                     &smc_cfg,
+                    stagnant_gens,
                 ),
                 &mut seen_memory,
                 n_indicators,

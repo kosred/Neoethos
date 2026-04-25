@@ -1,4 +1,8 @@
 pub mod challenge;
+#[cfg(feature = "gpu")]
+mod cubecl_eval;
+#[cfg(feature = "gpu")]
+mod cubecl_ga;
 pub mod discovery;
 #[cfg(feature = "gpu")]
 pub mod discovery_gpu;
@@ -92,12 +96,47 @@ pub mod discovery_gpu {
         pub feature_names: Vec<String>,
         pub timeframes: Vec<String>,
         pub used_gpu: bool,
+        pub runtime_backend: String,
+        pub degraded_reason: Option<String>,
     }
 
     #[derive(Debug, Serialize)]
     struct GenomeExport<'a> {
         fitness: f32,
         genome: &'a [f32],
+    }
+
+    fn append_degraded_reason(
+        primary: Option<String>,
+        secondary: Option<String>,
+    ) -> Option<String> {
+        match (primary, secondary) {
+            (Some(primary), Some(secondary)) => Some(format!("{primary}; {secondary}")),
+            (Some(primary), None) => Some(primary),
+            (None, Some(secondary)) => Some(secondary),
+            (None, None) => None,
+        }
+    }
+
+    fn resolve_cpu_fallback_runtime(config: &GpuDiscoveryConfig) -> (String, Option<String>) {
+        let backend_reason = match config.backend {
+            AcceleratorBackend::Cpu => None,
+            AcceleratorBackend::Cuda => Some("requested_search_cuda_unavailable".to_string()),
+            other => Some(format!(
+                "requested_search_backend_unavailable({})",
+                other.as_str()
+            )),
+        };
+        let precision_reason = (config.precision != TrainingPrecision::Fp32).then(|| {
+            format!(
+                "requested_search_precision_unavailable({})",
+                config.precision.as_str()
+            )
+        });
+        (
+            "search_cpu_fp32".to_string(),
+            append_degraded_reason(backend_reason, precision_reason),
+        )
     }
 
     pub fn save_gpu_genomes(path: impl AsRef<Path>, result: &GpuDiscoveryResult) -> Result<()> {
@@ -439,23 +478,10 @@ pub mod discovery_gpu {
     }
 
     pub fn run_gpu_discovery(
-        frames: Vec<FeatureFrame>,
-        features: Vec<String>,
-        ohlcv: Ohlcv,
+        frames: &[FeatureFrame],
+        ohlcv: &Ohlcv,
         config: &GpuDiscoveryConfig,
     ) -> Result<GpuDiscoveryResult> {
-        if config.backend != AcceleratorBackend::Cuda && config.backend != AcceleratorBackend::Cpu {
-            bail!(
-                "CPU fallback discovery cannot execute requested {} backend",
-                config.backend.as_str()
-            );
-        }
-        if config.precision != TrainingPrecision::Fp32 {
-            bail!(
-                "CPU fallback discovery executes FP32 only, requested {}",
-                config.precision.as_str()
-            );
-        }
         if frames.is_empty() {
             bail!("no feature frames supplied");
         }
@@ -471,6 +497,7 @@ pub mod discovery_gpu {
         {
             bail!("ohlcv length does not match feature frame rows");
         }
+        let (runtime_backend, degraded_reason) = resolve_cpu_fallback_runtime(config);
 
         let dim = tf_count + n_features + 2;
         let mut rng = rand::rng();
@@ -490,7 +517,7 @@ pub mod discovery_gpu {
         for generation in 0..generations {
             let fitness: Vec<f32> = genomes
                 .iter()
-                .map(|genome| evaluate_genome_cpu(genome, &frames, &ohlcv, config, &months, &days))
+                .map(|genome| evaluate_genome_cpu(genome, frames, ohlcv, config, &months, &days))
                 .collect();
 
             let mut scored: Vec<(f32, Vec<f32>)> = genomes
@@ -612,7 +639,7 @@ pub mod discovery_gpu {
             .zip(best_scores)
             .map(|(genome, score)| {
                 let (refined_genome, refined_score) =
-                    refine_genome_cpu(&genome, &frames, &ohlcv, config, &months, &days);
+                    refine_genome_cpu(&genome, frames, ohlcv, config, &months, &days);
                 if refined_score > score {
                     (refined_genome, refined_score)
                 } else {
@@ -625,13 +652,11 @@ pub mod discovery_gpu {
         Ok(GpuDiscoveryResult {
             genomes: refined.iter().map(|(genome, _)| genome.clone()).collect(),
             fitness: refined.iter().map(|(_, score)| *score).collect(),
-            feature_names: if features.is_empty() {
-                frames[0].names.clone()
-            } else {
-                features
-            },
+            feature_names: frames[0].names.clone(),
             timeframes: (0..tf_count).map(|idx| format!("tf_{idx}")).collect(),
             used_gpu: false,
+            runtime_backend,
+            degraded_reason,
         })
     }
 }

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use burn::module::{AutodiffModule, Module};
 use burn::record::{DefaultFileRecorder, FullPrecisionSettings};
+use burn::tensor::DType;
 use ndarray::Array2;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -17,14 +18,16 @@ use crate::burn_models::{
     BurnNBeatsConfig, BurnNBeatsx, BurnNBeatsxConfig, BurnPatchTST, BurnPatchTSTConfig, BurnTabNet,
     BurnTabNetConfig, BurnTiDE, BurnTiDEConfig, BurnTiDENf, BurnTiDENfConfig, BurnTimesNet,
     BurnTimesNetConfig, BurnTrainingReport, BurnTransformer, BurnTransformerConfig, InferBackend,
-    TrainBackend, TrainConfig, normalize_burn_device_policy,
+    TrainBackend, TrainConfig, cast_module_float_tensors, normalize_burn_device_policy,
     predict_proba_on_device as burn_predict_proba_on_device, resolve_infer_device,
     resolve_train_device,
-    train_model_with_report_with_selection as burn_train_model_with_report_with_selection,
+    train_model_with_report_with_selection_and_precision as burn_train_model_with_report_with_selection_and_precision,
     validate_burn_device_selection,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
-use crate::runtime::capabilities::{CapabilityState, ModelFamily};
+use crate::runtime::capabilities::{
+    CapabilityState, ModelFamily, normalize_training_precision_policy,
+};
 use crate::runtime::prediction::RuntimePrediction;
 
 const METADATA_FILE_NAME: &str = "metadata.json";
@@ -282,8 +285,11 @@ impl BurnDeepExpert {
             }
         }
         if let Some(value) = params.get("training_precision") {
-            let normalized = value.trim().to_ascii_lowercase();
-            if !matches!(normalized.as_str(), "fp32" | "bf16" | "fp8" | "bf4") {
+            let normalized = normalize_training_precision_policy(value);
+            if !matches!(
+                normalized.as_str(),
+                "auto" | "fp32" | "bf16" | "fp8" | "bf4"
+            ) {
                 bail!(
                     "deep-model runtime param `training_precision` uses unsupported precision `{}`",
                     value
@@ -389,6 +395,13 @@ impl BurnDeepExpert {
                     self.model_name()
                 );
             }
+        }
+        if !matches!(report.training_precision.as_str(), "fp32" | "bf16") {
+            bail!(
+                "{} Burn training report `training_precision` must be an implemented runtime precision, got `{}`",
+                self.model_name(),
+                report.training_precision
+            );
         }
         if let Some(reason) = report.training_precision_reason.as_ref() {
             if reason.trim().is_empty() {
@@ -727,6 +740,12 @@ impl BurnDeepExpert {
             .unwrap_or_else(|| self.string_param("device", "auto"))
     }
 
+    fn configured_requested_training_precision(&self) -> Option<String> {
+        self.params
+            .get("training_precision")
+            .map(|value| normalize_training_precision_policy(value))
+    }
+
     fn resolve_runtime_infer_device(
         &self,
     ) -> (
@@ -737,43 +756,87 @@ impl BurnDeepExpert {
         resolve_infer_device(&requested_device)
     }
 
-    fn init_runtime_model(&self, input_dim: usize) -> RuntimeDeepModel {
-        let (device, _) = self.resolve_runtime_infer_device();
-        match self.kind {
-            DeepModelKind::Mlp => {
-                RuntimeDeepModel::Mlp(self.mlp_config(input_dim).init::<InferBackend>(&device))
+    fn runtime_model_dtype(
+        &self,
+        device: &<InferBackend as burn::tensor::backend::Backend>::Device,
+    ) -> Result<DType> {
+        match self
+            .configured_requested_training_precision()
+            .unwrap_or_else(|| "fp32".to_string())
+            .as_str()
+        {
+            "bf16" => {
+                if <InferBackend as burn::tensor::backend::Backend>::supports_dtype(
+                    device,
+                    DType::BF16,
+                ) {
+                    Ok(DType::BF16)
+                } else {
+                    bail!(
+                        "{} runtime backend does not support persisted bf16 model precision",
+                        self.model_name()
+                    );
+                }
             }
-            DeepModelKind::NBeats => RuntimeDeepModel::NBeats(
-                self.nbeats_config(input_dim).init::<InferBackend>(&device),
+            "fp32" | "auto" => Ok(DType::F32),
+            other => bail!(
+                "{} runtime precision `{}` is not loadable for inference; expected fp32 or bf16",
+                self.model_name(),
+                other
             ),
-            DeepModelKind::NBeatsxNf => RuntimeDeepModel::NBeatsxNf(
+        }
+    }
+
+    fn init_runtime_model(&self, input_dim: usize) -> Result<RuntimeDeepModel> {
+        let (device, _) = self.resolve_runtime_infer_device();
+        let runtime_dtype = self.runtime_model_dtype(&device)?;
+        match self.kind {
+            DeepModelKind::Mlp => Ok(RuntimeDeepModel::Mlp(cast_module_float_tensors(
+                self.mlp_config(input_dim).init::<InferBackend>(&device),
+                runtime_dtype,
+            ))),
+            DeepModelKind::NBeats => Ok(RuntimeDeepModel::NBeats(cast_module_float_tensors(
+                self.nbeats_config(input_dim).init::<InferBackend>(&device),
+                runtime_dtype,
+            ))),
+            DeepModelKind::NBeatsxNf => Ok(RuntimeDeepModel::NBeatsxNf(cast_module_float_tensors(
                 self.nbeatsx_nf_config(input_dim)
                     .init::<InferBackend>(&device),
-            ),
-            DeepModelKind::TiDE => {
-                RuntimeDeepModel::TiDE(self.tide_config(input_dim).init::<InferBackend>(&device))
-            }
-            DeepModelKind::TiDENf => RuntimeDeepModel::TiDENf(
+                runtime_dtype,
+            ))),
+            DeepModelKind::TiDE => Ok(RuntimeDeepModel::TiDE(cast_module_float_tensors(
+                self.tide_config(input_dim).init::<InferBackend>(&device),
+                runtime_dtype,
+            ))),
+            DeepModelKind::TiDENf => Ok(RuntimeDeepModel::TiDENf(cast_module_float_tensors(
                 self.tide_nf_config(input_dim).init::<InferBackend>(&device),
-            ),
-            DeepModelKind::TabNet => RuntimeDeepModel::TabNet(
+                runtime_dtype,
+            ))),
+            DeepModelKind::TabNet => Ok(RuntimeDeepModel::TabNet(cast_module_float_tensors(
                 self.tabnet_config(input_dim).init::<InferBackend>(&device),
-            ),
-            DeepModelKind::Kan => {
-                RuntimeDeepModel::Kan(self.kan_config(input_dim).init::<InferBackend>(&device))
-            }
-            DeepModelKind::Transformer => RuntimeDeepModel::Transformer(
+                runtime_dtype,
+            ))),
+            DeepModelKind::Kan => Ok(RuntimeDeepModel::Kan(cast_module_float_tensors(
+                self.kan_config(input_dim).init::<InferBackend>(&device),
+                runtime_dtype,
+            ))),
+            DeepModelKind::Transformer => Ok(RuntimeDeepModel::Transformer(
+                cast_module_float_tensors(
                 self.transformer_config(input_dim)
                     .init::<InferBackend>(&device),
-            ),
-            DeepModelKind::PatchTst => RuntimeDeepModel::PatchTst(
+                    runtime_dtype,
+                ),
+            )),
+            DeepModelKind::PatchTst => Ok(RuntimeDeepModel::PatchTst(cast_module_float_tensors(
                 self.patchtst_config(input_dim)
                     .init::<InferBackend>(&device),
-            ),
-            DeepModelKind::TimesNet => RuntimeDeepModel::TimesNet(
+                runtime_dtype,
+            ))),
+            DeepModelKind::TimesNet => Ok(RuntimeDeepModel::TimesNet(cast_module_float_tensors(
                 self.timesnet_config(input_dim)
                     .init::<InferBackend>(&device),
-            ),
+                runtime_dtype,
+            ))),
         }
     }
 
@@ -794,18 +857,20 @@ impl BurnDeepExpert {
     )> {
         let train_config = self.train_config();
         let requested_device = self.configured_requested_device_policy();
+        let requested_training_precision = self.configured_requested_training_precision();
         let (device, device_selection) = resolve_train_device(&requested_device);
         match self.kind {
             DeepModelKind::Mlp => {
                 let model = self.mlp_config(input_dim).init::<TrainBackend>(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_selection::<TrainBackend, _>(
+                    burn_train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
                         model,
                         features,
                         labels,
                         &train_config,
                         &device,
                         &device_selection,
+                        requested_training_precision.as_deref(),
                     )?;
                 Ok((
                     RuntimeDeepModel::Mlp(trained.valid()),
@@ -817,13 +882,14 @@ impl BurnDeepExpert {
             DeepModelKind::NBeats => {
                 let model = self.nbeats_config(input_dim).init::<TrainBackend>(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_selection::<TrainBackend, _>(
+                    burn_train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
                         model,
                         features,
                         labels,
                         &train_config,
                         &device,
                         &device_selection,
+                        requested_training_precision.as_deref(),
                     )?;
                 Ok((
                     RuntimeDeepModel::NBeats(trained.valid()),
@@ -837,13 +903,14 @@ impl BurnDeepExpert {
                     .nbeatsx_nf_config(input_dim)
                     .init::<TrainBackend>(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_selection::<TrainBackend, _>(
+                    burn_train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
                         model,
                         features,
                         labels,
                         &train_config,
                         &device,
                         &device_selection,
+                        requested_training_precision.as_deref(),
                     )?;
                 Ok((
                     RuntimeDeepModel::NBeatsxNf(trained.valid()),
@@ -855,13 +922,14 @@ impl BurnDeepExpert {
             DeepModelKind::TiDE => {
                 let model = self.tide_config(input_dim).init::<TrainBackend>(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_selection::<TrainBackend, _>(
+                    burn_train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
                         model,
                         features,
                         labels,
                         &train_config,
                         &device,
                         &device_selection,
+                        requested_training_precision.as_deref(),
                     )?;
                 Ok((
                     RuntimeDeepModel::TiDE(trained.valid()),
@@ -873,13 +941,14 @@ impl BurnDeepExpert {
             DeepModelKind::TiDENf => {
                 let model = self.tide_nf_config(input_dim).init::<TrainBackend>(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_selection::<TrainBackend, _>(
+                    burn_train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
                         model,
                         features,
                         labels,
                         &train_config,
                         &device,
                         &device_selection,
+                        requested_training_precision.as_deref(),
                     )?;
                 Ok((
                     RuntimeDeepModel::TiDENf(trained.valid()),
@@ -891,13 +960,14 @@ impl BurnDeepExpert {
             DeepModelKind::TabNet => {
                 let model = self.tabnet_config(input_dim).init::<TrainBackend>(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_selection::<TrainBackend, _>(
+                    burn_train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
                         model,
                         features,
                         labels,
                         &train_config,
                         &device,
                         &device_selection,
+                        requested_training_precision.as_deref(),
                     )?;
                 Ok((
                     RuntimeDeepModel::TabNet(trained.valid()),
@@ -909,13 +979,14 @@ impl BurnDeepExpert {
             DeepModelKind::Kan => {
                 let model = self.kan_config(input_dim).init::<TrainBackend>(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_selection::<TrainBackend, _>(
+                    burn_train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
                         model,
                         features,
                         labels,
                         &train_config,
                         &device,
                         &device_selection,
+                        requested_training_precision.as_deref(),
                     )?;
                 Ok((
                     RuntimeDeepModel::Kan(trained.valid()),
@@ -929,13 +1000,14 @@ impl BurnDeepExpert {
                     .transformer_config(input_dim)
                     .init::<TrainBackend>(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_selection::<TrainBackend, _>(
+                    burn_train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
                         model,
                         features,
                         labels,
                         &train_config,
                         &device,
                         &device_selection,
+                        requested_training_precision.as_deref(),
                     )?;
                 Ok((
                     RuntimeDeepModel::Transformer(trained.valid()),
@@ -949,13 +1021,14 @@ impl BurnDeepExpert {
                     .patchtst_config(input_dim)
                     .init::<TrainBackend>(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_selection::<TrainBackend, _>(
+                    burn_train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
                         model,
                         features,
                         labels,
                         &train_config,
                         &device,
                         &device_selection,
+                        requested_training_precision.as_deref(),
                     )?;
                 Ok((
                     RuntimeDeepModel::PatchTst(trained.valid()),
@@ -969,13 +1042,14 @@ impl BurnDeepExpert {
                     .timesnet_config(input_dim)
                     .init::<TrainBackend>(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_selection::<TrainBackend, _>(
+                    burn_train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
                         model,
                         features,
                         labels,
                         &train_config,
                         &device,
                         &device_selection,
+                        requested_training_precision.as_deref(),
                     )?;
                 Ok((
                     RuntimeDeepModel::TimesNet(trained.valid()),
@@ -1405,7 +1479,7 @@ impl ExpertModel for BurnDeepExpert {
         next_state.burn_training_report = config.burn_training_report;
         next_state.persisted_runtime_selection = persisted_runtime_selection;
         next_state.validate_model_params()?;
-        let next_model = next_state.init_runtime_model(next_feature_columns.len());
+        let next_model = next_state.init_runtime_model(next_feature_columns.len())?;
 
         let recorder = DefaultFileRecorder::<FullPrecisionSettings>::new();
         let base_path = Self::model_record_path(path);
@@ -1791,7 +1865,9 @@ mod tests {
             7,
             Some(HashMap::from([("device".to_string(), "cpu".to_string())])),
         );
-        let model = expert.init_runtime_model(2);
+        let model = expert
+            .init_runtime_model(2)
+            .expect("runtime model should initialize");
         let live_backend = expert.resolve_runtime_infer_device().1.execution_backend;
         expert.model = Some(model);
         expert.feature_columns = vec!["rsi".to_string(), "atr".to_string()];
@@ -1857,6 +1933,7 @@ mod tests {
         );
         assert!(expert.params.contains_key("effective_device_policy"));
         assert!(expert.params.contains_key("execution_backend"));
+        assert!(expert.params.contains_key("training_precision"));
         assert!(expert.persisted_runtime_selection.is_some());
         assert!(expert.host_runtime_selection.is_some());
         Ok(())

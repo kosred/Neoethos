@@ -1,0 +1,25 @@
+[package]
+name = "rlkit"
+version = "0.0.3"
+edition = "2024"
+authors = ["Hifive <hi55555.cn>"]
+description = "A deep reinforcement learning library based on Rust and Candle."
+license = "MIT"
+repository = "https://github.com/Hifive55555/rlkit"
+
+[features]
+cuda = [
+    "candle-core/cuda",
+    "candle-nn/cuda",
+]
+
+[lib]
+name = "rlkit"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0.100"
+candle-core = "0.9.1"
+candle-nn = "0.9.1"
+indicatif = "0.18.0"
+rand = "0.9"

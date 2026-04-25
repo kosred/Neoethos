@@ -164,9 +164,9 @@ impl HardwareExecutionPlan {
                     .to_string(),
             );
         }
-        if primary_backend.is_wgpu_family() {
+        if primary_backend.is_wgpu_family() || primary_backend == AcceleratorBackend::Rocm {
             warnings.push(
-                "WGPU-family planning applies to Burn/deep workloads; current search/RL native tensor paths remain CUDA-only unless explicitly refactored."
+                "Non-CUDA deep planning applies to Burn/deep workloads; current search/RL native tensor paths remain CUDA-only unless explicitly refactored."
                     .to_string(),
             );
         }
@@ -181,8 +181,8 @@ impl HardwareExecutionPlan {
         let primary_device = if gpu_enabled {
             backend_devices
                 .first()
-                .map(AcceleratorDevice::device_string)
-                .unwrap_or_else(|| "gpu:0".to_string())
+                .map(|device| device.device_string())
+                .unwrap_or_else(|| "none".to_string())
         } else {
             "cpu".to_string()
         };
@@ -215,7 +215,14 @@ impl HardwareExecutionPlan {
             backend: AcceleratorBackend::Cpu,
             device: "cpu".to_string(),
             device_ids: Vec::new(),
-            precision: TrainingPrecision::Fp32,
+            precision: choose_training_precision(
+                profile,
+                if gpu_enabled && search_gpu_requested && !cuda_devices.is_empty() {
+                    AcceleratorBackend::Cuda
+                } else {
+                    AcceleratorBackend::Cpu
+                },
+            ),
             cpu_threads: cpu_budget.clamp(1, 8),
             batch_size: 0,
             memory_budget_gb: memory_budget_gb * 0.20,
@@ -259,7 +266,7 @@ impl HardwareExecutionPlan {
             cpu_threads: cpu_budget,
             batch_size: if gpu_enabled { train_batch_size } else { 0 },
             memory_budget_gb: memory_budget_gb * 0.45,
-            notes: vec!["Search GPU execution is currently CUDA/tch FP32 only; WGPU/ROCm/Metal devices must be reported as CPU fallback until a backend exists.".to_string()],
+            notes: vec!["Search evaluation now uses CUDA kernels for GA offspring generation, generic signal synthesis, and the per-gene stateful backtest loop; signal synthesis can follow the requested training precision, while the price-normalized backtest kernel stays FP32 for pip-safe arithmetic; WGPU/ROCm/Metal discovery still reports CPU fallback until native evaluator kernels exist there.".to_string()],
         });
         workloads.push(WorkloadExecutionPlan {
             workload: WorkloadKind::TreeTraining,
@@ -605,6 +612,13 @@ impl HardwareProfile {
             .collect()
     }
 
+    pub fn wgpu_native_devices(&self) -> Vec<&AcceleratorDevice> {
+        self.accelerator_devices
+            .iter()
+            .filter(|device| device.backend.is_wgpu_family())
+            .collect()
+    }
+
     pub fn wgpu_capable_devices(&self) -> Vec<&AcceleratorDevice> {
         self.accelerator_devices
             .iter()
@@ -780,7 +794,7 @@ fn choose_primary_backend(preference: &str, profile: &HardwareProfile) -> Accele
     let has_rocm = !profile
         .devices_for_backend(AcceleratorBackend::Rocm)
         .is_empty();
-    let has_wgpu = !profile.wgpu_capable_devices().is_empty();
+    let has_wgpu = !profile.wgpu_native_devices().is_empty();
 
     match preference {
         "cuda" => {
@@ -792,7 +806,7 @@ fn choose_primary_backend(preference: &str, profile: &HardwareProfile) -> Accele
         }
         "rocm" => {
             if has_rocm {
-                AcceleratorBackend::Wgpu
+                AcceleratorBackend::Rocm
             } else {
                 AcceleratorBackend::Cpu
             }
@@ -828,10 +842,10 @@ fn choose_primary_backend(preference: &str, profile: &HardwareProfile) -> Accele
         "gpu" | "auto" => {
             if has_cuda {
                 AcceleratorBackend::Cuda
-            } else if has_wgpu {
-                AcceleratorBackend::Wgpu
             } else if has_rocm {
                 AcceleratorBackend::Rocm
+            } else if has_wgpu {
+                AcceleratorBackend::Wgpu
             } else {
                 AcceleratorBackend::Cpu
             }
@@ -1014,5 +1028,43 @@ mod tests {
         assert!(!plan.gpu_enabled);
         assert_eq!(plan.primary_backend, AcceleratorBackend::Cpu);
         assert!(!plan.warnings.is_empty());
+    }
+
+    #[test]
+    fn hardware_plan_keeps_rocm_as_primary_backend_when_only_rocm_is_available() {
+        let mut settings = Settings::default();
+        settings.system.enable_gpu_preference = "rocm".to_string();
+        let profile = HardwareProfile {
+            cpu_cores: 64,
+            total_ram_gb: 256.0,
+            available_ram_gb: 192.0,
+            gpu_names: vec!["AMD GPU".to_string()],
+            num_gpus: 1,
+            gpu_mem_gb: vec![24.0],
+            accelerator_devices: vec![AcceleratorDevice {
+                id: 0,
+                name: "AMD GPU".to_string(),
+                backend: AcceleratorBackend::Rocm,
+                memory_gb: 24.0,
+                supported_precisions: vec![TrainingPrecision::Fp32, TrainingPrecision::Fp16],
+                compute_capability: None,
+                source: "test".to_string(),
+            }],
+            timestamp: "test".to_string(),
+            platform_label: "test".to_string(),
+        };
+
+        let plan = HardwareExecutionPlan::from_settings_and_profile(&settings, profile);
+
+        assert!(plan.gpu_enabled);
+        assert_eq!(plan.primary_backend, AcceleratorBackend::Rocm);
+        assert_eq!(
+            plan.workload(WorkloadKind::DeepTraining).unwrap().device,
+            "rocm:0"
+        );
+        assert_eq!(
+            plan.workload(WorkloadKind::StrategySearch).unwrap().backend,
+            AcceleratorBackend::Cpu
+        );
     }
 }

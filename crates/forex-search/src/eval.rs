@@ -1,3 +1,8 @@
+#[cfg(feature = "gpu")]
+use crate::cubecl_eval::{
+    cuda_eval_backtest_kernel_enabled, cuda_eval_signal_kernel_enabled,
+    try_evaluate_population_cuda, try_generate_signal_rows_cuda,
+};
 use crate::genetic::strategy_gene::infer_market_cost_profile;
 use crate::quality::Trade;
 use ndarray::ArrayView2;
@@ -75,6 +80,7 @@ pub struct BacktestSettings {
     pub spread_pips: f64,
     pub commission_per_trade: f64,
     pub pip_value_per_lot: f64,
+    pub kill_zones_enabled: bool,
 }
 
 impl Default for BacktestSettings {
@@ -91,7 +97,26 @@ impl Default for BacktestSettings {
             spread_pips: profile.spread_pips,
             commission_per_trade: profile.commission_per_trade,
             pip_value_per_lot: profile.pip_value_per_lot,
+            kill_zones_enabled: false,
         }
+    }
+}
+
+impl BacktestSettings {
+    pub fn initial_equity(&self) -> f64 {
+        env::var("FOREX_BOT_BACKTEST_INITIAL_EQUITY")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(100000.0)
+    }
+
+    pub fn month_capacity(&self) -> usize {
+        env::var("FOREX_BOT_BACKTEST_MAX_MONTH_BUCKETS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(240)
     }
 }
 
@@ -109,8 +134,11 @@ pub fn fast_evaluate_strategy_core(
         return [0.0; 11];
     }
 
-    let mut equity = 100000.0;
-    let mut peak_equity = 100000.0;
+    let initial_equity = settings.initial_equity();
+    let month_capacity = settings.month_capacity();
+
+    let mut equity = initial_equity;
+    let mut peak_equity = initial_equity;
     let mut max_dd = 0.0;
     let mut trade_count = 0usize;
     let mut wins = 0usize;
@@ -119,7 +147,7 @@ pub fn fast_evaluate_strategy_core(
 
     let mut last_month = -1i64;
     let mut current_month_pnl = 0.0;
-    let mut monthly_pnls = [0.0; 240];
+    let mut monthly_pnls = vec![0.0; month_capacity];
     let mut month_ptr = -1i64;
 
     let mut last_day = -1i64;
@@ -143,7 +171,7 @@ pub fn fast_evaluate_strategy_core(
         if m_val != last_month {
             if last_month != -1 {
                 month_ptr += 1;
-                if month_ptr < 240 {
+                if month_ptr < month_capacity as i64 {
                     monthly_pnls[month_ptr as usize] = current_month_pnl;
                 }
             }
@@ -297,7 +325,7 @@ pub fn fast_evaluate_strategy_core(
         }
     }
 
-    let net_profit = equity - 100000.0;
+    let net_profit = equity - initial_equity;
     let win_rate = if trade_count > 0 {
         wins as f64 / trade_count as f64
     } else {
@@ -315,8 +343,9 @@ pub fn fast_evaluate_strategy_core(
     };
 
     let mut month_returns = Vec::new();
-    for i in 0..=month_ptr.min(239) {
-        month_returns.push(monthly_pnls[i as usize]);
+    if month_ptr >= 0 {
+        let limit = month_ptr.min(month_capacity.saturating_sub(1) as i64) as usize;
+        month_returns.extend_from_slice(&monthly_pnls[..=limit]);
     }
     let (avg_m, std_m) = mean_std(&month_returns);
 
@@ -367,7 +396,7 @@ pub fn simulate_trades_core(
         return Vec::new();
     }
 
-    let initial_balance = 100000.0;
+    let initial_balance = settings.initial_equity();
     let pip = if settings.pip_value.abs() < 1e-12 {
         1e-12
     } else {
@@ -387,7 +416,25 @@ pub fn simulate_trades_core(
             let mut pnl = 0.0;
             let mut exit = false;
 
-            if in_pos == 1 {
+            // Session-Aware Trading (Idea #4.4) - Force exit on Friday 20:00+
+            let ts = timestamps.get(i).copied().unwrap_or_default();
+            if ts > 0 && settings.kill_zones_enabled {
+                let sec_in_day = ts % 86400;
+                let hour = sec_in_day / 3600;
+                let days_since_epoch = ts / 86400;
+                let weekday = (days_since_epoch + 4) % 7; // 0=Sun, 1=Mon, 5=Fri
+
+                if weekday == 5 && hour >= 20 {
+                    exit = true; // Force exit before weekend
+                    pnl = if in_pos == 1 {
+                        (close[i] - entry_px) / pip * settings.pip_value_per_lot
+                    } else {
+                        (entry_px - close[i]) / pip * settings.pip_value_per_lot
+                    };
+                }
+            }
+
+            if in_pos == 1 && !exit {
                 let mut sl = entry_px - (settings.sl_pips * pip);
                 let tp = entry_px + (settings.tp_pips * pip);
                 if settings.trailing_enabled {
@@ -463,10 +510,26 @@ pub fn simulate_trades_core(
                 });
                 in_pos = 0;
             }
-        } else {
-            let s = signals[i];
-            if s != 0 {
-                in_pos = s;
+        } else if signals[i] != 0 {
+            // Session-Aware Trading (Idea #4.4) - Block entries in Kill Zones
+            let mut block_entry = false;
+            let ts = timestamps.get(i).copied().unwrap_or_default();
+            if ts > 0 && settings.kill_zones_enabled {
+                let sec_in_day = ts % 86400;
+                let hour = sec_in_day / 3600;
+                let min = (sec_in_day % 3600) / 60;
+                let days_since_epoch = ts / 86400;
+                let weekday = (days_since_epoch + 4) % 7; // 0=Sun, 1=Mon, 5=Fri
+
+                let is_friday_kill = weekday == 5 && hour >= 20;
+                let is_monday_kill = weekday == 1 && hour == 0 && min < 30;
+                if is_friday_kill || is_monday_kill {
+                    block_entry = true;
+                }
+            }
+
+            if !block_entry {
+                in_pos = signals[i];
                 entry_px = close[i];
                 entry_idx = i;
                 trail_px = 0.0;
@@ -475,6 +538,83 @@ pub fn simulate_trades_core(
     }
 
     trades
+}
+
+fn synthesize_signals_cpu(
+    indicators: ArrayView2<'_, f32>,
+    gene_offsets: &[i32],
+    gene_indices: &[i32],
+    gene_weights: &[f32],
+    long_thr: &[f32],
+    short_thr: &[f32],
+    smc_data: &[SmcRow],
+    gene_smc_flags: &[SmcRow],
+    gate_threshold: f32,
+    weights: &[f32; 11],
+    gene_index: usize,
+    n_samples: usize,
+) -> Vec<i8> {
+    let mut combined = vec![0.0_f32; n_samples];
+    let start = gene_offsets[gene_index] as usize;
+    let end = gene_offsets[gene_index + 1] as usize;
+    for i in start..end {
+        let idx = gene_indices[i] as usize;
+        let w = gene_weights[i];
+        if idx < indicators.nrows() {
+            let row = indicators.row(idx);
+            for (j, &v) in row.iter().enumerate() {
+                combined[j] += w * v;
+            }
+        }
+    }
+
+    let mut signals = vec![0i8; n_samples];
+    let lt = long_thr[gene_index];
+    let st = short_thr[gene_index];
+    let flags = gene_smc_flags[gene_index];
+    let active_sum: f32 = flags
+        .iter()
+        .enumerate()
+        .map(|(i, &f)| if f != 0 { weights[i] } else { 0.0 })
+        .sum();
+    let gate = gate_threshold.min(active_sum);
+
+    for i in 0..n_samples {
+        let v = combined[i];
+        let sig = if v >= lt {
+            1
+        } else if v <= st {
+            -1
+        } else {
+            0
+        };
+        if sig == 0 {
+            continue;
+        }
+
+        if active_sum > 0.0 {
+            let mut score = 0.0f32;
+            let smc = smc_data[i];
+            for j in 0..11 {
+                if flags[j] != 0 {
+                    if j == 5 {
+                        if smc[j] == 1 {
+                            score += weights[j];
+                        }
+                    } else if smc[j] == sig {
+                        score += weights[j];
+                    }
+                }
+            }
+            if score >= gate {
+                signals[i] = sig;
+            }
+        } else {
+            signals[i] = sig;
+        }
+    }
+
+    signals
 }
 
 pub fn evaluate_population_core(
@@ -504,69 +644,101 @@ pub fn evaluate_population_core(
     let n_genes = long_thr.len();
     let n_samples = close.len();
 
+    #[cfg(feature = "gpu")]
+    if cuda_eval_signal_kernel_enabled() && cuda_eval_backtest_kernel_enabled() {
+        match try_evaluate_population_cuda(
+            close,
+            high,
+            low,
+            indicators,
+            gene_offsets,
+            gene_indices,
+            gene_weights,
+            long_thr,
+            short_thr,
+            month_idx,
+            day_idx,
+            sl_pips,
+            tp_pips,
+            smc_data,
+            gene_smc_flags,
+            gate_threshold,
+            weights,
+            settings,
+        ) {
+            Ok(results) => return Ok(results),
+            Err(err) => {
+                tracing::warn!(
+                    "full cuda evaluator unavailable, falling back to partial gpu/cpu evaluation: {err}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    let gpu_signal_rows = if cuda_eval_signal_kernel_enabled() {
+        match try_generate_signal_rows_cuda(
+            indicators,
+            gene_offsets,
+            gene_indices,
+            gene_weights,
+            long_thr,
+            short_thr,
+            smc_data,
+            gene_smc_flags,
+            gate_threshold,
+            weights,
+        ) {
+            Ok(rows) => Some(rows),
+            Err(err) => {
+                tracing::warn!(
+                    "cuda evaluator signal kernel unavailable, falling back to cpu evaluator synthesis: {err}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let results: Vec<[f64; 11]> = (0..n_genes)
         .into_par_iter()
         .map(|g| {
-            let mut combined = vec![0.0_f32; n_samples];
-            let start = gene_offsets[g] as usize;
-            let end = gene_offsets[g + 1] as usize;
-            for i in start..end {
-                let idx = gene_indices[i] as usize;
-                let w = gene_weights[i];
-                if idx < indicators.nrows() {
-                    let row = indicators.row(idx);
-                    for (j, &v) in row.iter().enumerate() {
-                        combined[j] += w * v;
-                    }
-                }
-            }
+            #[cfg(feature = "gpu")]
+            let signals = if let Some(signal_rows) = gpu_signal_rows.as_ref() {
+                signal_rows[g].clone()
+            } else {
+                synthesize_signals_cpu(
+                    indicators,
+                    gene_offsets,
+                    gene_indices,
+                    gene_weights,
+                    long_thr,
+                    short_thr,
+                    smc_data,
+                    gene_smc_flags,
+                    gate_threshold,
+                    weights,
+                    g,
+                    n_samples,
+                )
+            };
 
-            let mut signals = vec![0i8; n_samples];
-            let lt = long_thr[g];
-            let st = short_thr[g];
-            let flags = gene_smc_flags[g];
-            let active_sum: f32 = flags
-                .iter()
-                .enumerate()
-                .map(|(i, &f)| if f != 0 { weights[i] } else { 0.0 })
-                .sum();
-            let gate = gate_threshold.min(active_sum);
-
-            for i in 0..n_samples {
-                let v = combined[i];
-                let sig = if v >= lt {
-                    1
-                } else if v <= st {
-                    -1
-                } else {
-                    0
-                };
-                if sig == 0 {
-                    continue;
-                }
-
-                if active_sum > 0.0 {
-                    let mut score = 0.0f32;
-                    let smc = smc_data[i];
-                    for j in 0..11 {
-                        if flags[j] != 0 {
-                            // Logic for SMC matching (sig matches smc[j] or binary inducement)
-                            if j == 5 {
-                                if smc[j] == 1 {
-                                    score += weights[j];
-                                }
-                            } else if smc[j] == sig {
-                                score += weights[j];
-                            }
-                        }
-                    }
-                    if score >= gate {
-                        signals[i] = sig;
-                    }
-                } else {
-                    signals[i] = sig;
-                }
-            }
+            #[cfg(not(feature = "gpu"))]
+            let signals = synthesize_signals_cpu(
+                indicators,
+                gene_offsets,
+                gene_indices,
+                gene_weights,
+                long_thr,
+                short_thr,
+                smc_data,
+                gene_smc_flags,
+                gate_threshold,
+                weights,
+                g,
+                n_samples,
+            );
 
             let mut gene_settings = settings.clone();
             gene_settings.sl_pips = sl_pips[g];

@@ -135,6 +135,8 @@ pub struct TradeGateInput {
     pub current_min: u32,
     pub weekday: u32,
     pub market_volatility: f64,
+    pub strategy_sharpe: Option<f64>,
+    pub strategy_rank: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -147,6 +149,9 @@ pub struct PositionSizingInput {
     pub market_volatility: f64,
     pub target_volatility: f64,
     pub is_volatile_regime: bool,
+    pub win_rate: Option<f64>,
+    pub avg_win: Option<f64>,
+    pub avg_loss: Option<f64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -482,10 +487,38 @@ impl RiskManager {
         }
 
         let (daily_dd, intraday_dd, _dd_used, _dd_limit, total_dd) = self.drawdown_state(input.equity);
+        if total_dd >= 0.05 {
+            self.circuit_breaker_triggered = true;
+            return (false, "Drawdown Recovery: HALT trading (DD > 5%)".to_string());
+        }
         if total_dd >= self.prop_rules.max_total_loss_pct {
             self.circuit_breaker_triggered = true;
             return (false, format!("Total drawdown limit ({:.2}%)", total_dd * 100.0));
         }
+
+        if total_dd >= 0.04 {
+            if let Some(rank) = input.strategy_rank {
+                if rank > 1 {
+                    return (false, "Drawdown Recovery: DD > 4%, only top 1 strategy allowed".to_string());
+                }
+            }
+            if self.session_trades >= 2 {
+                return (false, "Drawdown Recovery: DD > 4%, max 2 trades/day".to_string());
+            }
+        } else if total_dd >= 0.03 {
+            if let Some(sharpe) = input.strategy_sharpe {
+                if sharpe <= 1.0 {
+                    return (false, "Drawdown Recovery: DD > 3%, only Sharpe > 1.0 allowed".to_string());
+                }
+            }
+        } else if total_dd >= 0.02 {
+            if let Some(rank) = input.strategy_rank {
+                if rank > 3 {
+                    return (false, "Drawdown Recovery: DD > 2%, only top 3 strategies allowed".to_string());
+                }
+            }
+        }
+
         if daily_dd >= self.prop_rules.daily_dd_stop_trading_pct {
             self.circuit_breaker_triggered = true;
             return (false, format!("Daily drawdown limit ({:.2}%)", daily_dd * 100.0));
@@ -533,7 +566,21 @@ impl RiskManager {
         };
 
         let uncertainty_penalty = 1.0 - (input.uncertainty * 0.5);
-        let mut risk_pct = input.base_risk_pct * signal_multiplier * uncertainty_penalty;
+        
+        // Dynamic Kelly Sizing (Idea #4.2)
+        let mut base_risk = input.base_risk_pct;
+        if let (Some(wr), Some(aw), Some(al)) = (input.win_rate, input.avg_win, input.avg_loss) {
+            if aw > 0.0 && al > 0.0 {
+                let f_star = (wr * aw - (1.0 - wr) * al) / aw;
+                if f_star > 0.0 {
+                    let quarter_kelly = f_star / 4.0;
+                    // Floor 0.5%, Ceiling 3% (or max_risk_cap)
+                    base_risk = quarter_kelly.clamp(0.005, input.max_risk_cap.min(0.03));
+                }
+            }
+        }
+
+        let mut risk_pct = base_risk * signal_multiplier * uncertainty_penalty;
 
         let mut current_cap = input.max_risk_cap;
         if self.recovery_mode {
@@ -561,8 +608,14 @@ impl RiskManager {
         }
 
         let max_total_loss = self.prop_rules.max_total_loss_pct.max(1e-6);
-        if total_dd_pct >= max_total_loss {
+        if total_dd_pct >= max_total_loss || total_dd_pct >= 0.05 {
             return 0.0;
+        } else if total_dd_pct >= 0.04 {
+            risk_pct *= 0.25; // Recovery Mode
+        } else if total_dd_pct >= 0.03 {
+            risk_pct *= 0.50; // Defensive Mode
+        } else if total_dd_pct >= 0.02 {
+            risk_pct *= 0.75; // Caution Mode
         } else if total_dd_pct > 0.0 {
             let scale = 1.0 - (total_dd_pct / max_total_loss);
             risk_pct *= scale.max(0.3);
@@ -605,6 +658,8 @@ mod tests {
             current_min: 0,
             weekday: 2,
             market_volatility: 0.0015,
+            strategy_sharpe: None,
+            strategy_rank: None,
         });
 
         assert!(!allowed);
@@ -625,6 +680,9 @@ mod tests {
             market_volatility: 0.0010,
             target_volatility: 0.0010,
             is_volatile_regime: false,
+            win_rate: None,
+            avg_win: None,
+            avg_loss: None,
         });
 
         assert_eq!(position_size_risk, 0.0);

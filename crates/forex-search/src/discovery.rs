@@ -4,6 +4,7 @@ use crate::quality::{StrategyMetrics, StrategyQualityAnalyzer, Trade};
 use anyhow::Result;
 use chrono::{Datelike, TimeZone, Utc};
 use forex_data::{FeatureFrame, Ohlcv};
+use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -48,7 +49,7 @@ impl Default for DiscoveryConfig {
             evaluation_commission_per_trade: 0.0,
             population: 1000,
             generations: 10,
-            max_indicators: 12,
+            max_indicators: 5,
             candidate_count: 5000,
             portfolio_size: 2000,
             max_rows: 0,
@@ -109,7 +110,7 @@ impl DiscoveryConfig {
             population: model_settings.prop_search_population.max(10),
             generations: model_settings.prop_search_generations.max(1),
             max_indicators: if model_settings.prop_search_max_indicators == 0 {
-                64
+                5
             } else {
                 model_settings.prop_search_max_indicators.max(1)
             },
@@ -352,6 +353,7 @@ fn discovery_backtest_settings(gene: &Gene) -> crate::eval::BacktestSettings {
         } else {
             40.0
         },
+        kill_zones_enabled: true,
         ..crate::eval::BacktestSettings::default()
     }
 }
@@ -432,7 +434,35 @@ pub fn run_discovery_cycle_with_progress<F>(
 where
     F: FnMut(DiscoveryProgress),
 {
-    let (features, ohlcv, _) = trim_recent_history(features, ohlcv, config)?;
+    let (mut features, ohlcv, _) = trim_recent_history(features, ohlcv, config)?;
+
+    // Feature Pre-filtering (Idea #3)
+    let prefilter_top_k = std::env::var("FOREX_BOT_PREFILTER_TOP_K")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(50);
+
+    if prefilter_top_k > 0 && features.names.len() > prefilter_top_k {
+        features = prefilter_features(&features, &ohlcv, prefilter_top_k);
+    }
+
+    // Multi-stage Funnel: Stage 1 (Fast Evaluation)
+    let stage1_pct = std::env::var("FOREX_BOT_FUNNEL_STAGE1_PCT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.25)
+        .clamp(0.01, 1.0);
+
+    let stage1_len = (ohlcv.close.len() as f64 * stage1_pct) as usize;
+    let ohlcv_stage1 = slice_ohlcv(&ohlcv, ohlcv.close.len() - stage1_len, ohlcv.close.len());
+    let features_stage1 = FeatureFrame {
+        timestamps: features.timestamps[features.timestamps.len() - stage1_len..].to_vec(),
+        names: features.names.clone(),
+        data: features
+            .data
+            .slice(ndarray::s![features.data.nrows() - stage1_len.., ..])
+            .to_owned(),
+    };
     progress_fn(DiscoveryProgress::SearchStarted {
         population: config.population,
         generations: config.generations,
@@ -446,13 +476,13 @@ where
         None
     };
     let search = evolve_search_with_progress_and_limits(
-        &features,
-        &ohlcv,
+        &features_stage1,
+        &ohlcv_stage1,
         config.population,
         config.generations,
         config.max_indicators,
         max_runtime,
-        Some(config.evaluation_config(ohlcv.close.last().copied())),
+        Some(config.evaluation_config(ohlcv_stage1.close.last().copied())),
         |generation, total_generations, best_fitness, stagnant_generations, archived_profitable| {
             progress_fn(DiscoveryProgress::GenerationCompleted {
                 generation,
@@ -467,6 +497,191 @@ where
     finalize_candidates_with_progress(search.genes, &features, &ohlcv, config, progress_fn)
 }
 
+fn slice_features(features: &FeatureFrame, keep_ratio: f64) -> FeatureFrame {
+    if keep_ratio >= 1.0 || keep_ratio <= 0.0 {
+        return features.clone();
+    }
+    let total = features.data.nrows();
+    let start = total.saturating_sub((total as f64 * keep_ratio) as usize);
+    if start == 0 {
+        return features.clone();
+    }
+    FeatureFrame {
+        timestamps: features.timestamps[start..].to_vec(),
+        names: features.names.clone(),
+        data: features.data.slice(ndarray::s![start.., ..]).to_owned(),
+    }
+}
+
+fn slice_ohlcv(ohlcv: &Ohlcv, keep_ratio: f64) -> Ohlcv {
+    if keep_ratio >= 1.0 || keep_ratio <= 0.0 {
+        return ohlcv.clone();
+    }
+    let total = ohlcv.close.len();
+    let start = total.saturating_sub((total as f64 * keep_ratio) as usize);
+    if start == 0 {
+        return ohlcv.clone();
+    }
+    Ohlcv {
+        timestamp: ohlcv.timestamp.as_ref().map(|ts| ts[start..].to_vec()),
+        open: ohlcv.open[start..].to_vec(),
+        high: ohlcv.high[start..].to_vec(),
+        low: ohlcv.low[start..].to_vec(),
+        close: ohlcv.close[start..].to_vec(),
+        volume: ohlcv.volume.as_ref().map(|v| v[start..].to_vec()),
+    }
+}
+
+fn pearson_correlation(x: &[f32], y: &[f32]) -> f32 {
+    let n = x.len() as f32;
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    let mut sum_xy = 0.0;
+    let mut sum_x2 = 0.0;
+    let mut sum_y2 = 0.0;
+
+    for i in 0..x.len() {
+        let a = x[i];
+        let b = y[i];
+        sum_x += a;
+        sum_y += b;
+        sum_xy += a * b;
+        sum_x2 += a * a;
+        sum_y2 += b * b;
+    }
+
+    let num = n * sum_xy - sum_x * sum_y;
+    let den = ((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y)).sqrt();
+    if den == 0.0 || !den.is_finite() {
+        0.0
+    } else {
+        num / den
+    }
+}
+
+fn prefilter_features(features: &FeatureFrame, ohlcv: &Ohlcv, top_k: usize) -> FeatureFrame {
+    let n_rows = features.data.nrows();
+    let n_cols = features.data.ncols();
+    if n_rows < 2 || n_cols <= top_k {
+        return features.clone();
+    }
+
+    // Calculate 1-bar forward returns
+    let mut returns = vec![0.0f32; n_rows];
+    for i in 0..(n_rows - 1) {
+        let ret = (ohlcv.close[i + 1] - ohlcv.close[i]) / ohlcv.close[i];
+        returns[i] = ret as f32;
+    }
+
+    let mut correlations = Vec::with_capacity(n_cols);
+    for col_idx in 0..n_cols {
+        let name = &features.names[col_idx];
+        if name.starts_with("regime_") {
+            // Force keep regime columns by giving them infinite correlation
+            correlations.push((col_idx, f32::INFINITY));
+        } else {
+            let col = features.data.column(col_idx);
+            let corr = pearson_correlation(col.to_slice().unwrap_or(&col.to_vec()), &returns);
+            correlations.push((col_idx, corr.abs()));
+        }
+    }
+
+    correlations.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Calculate how many to actually keep: top_k + any regime columns
+    let regime_count = features
+        .names
+        .iter()
+        .filter(|n| n.starts_with("regime_"))
+        .count();
+    let actual_top_k = (top_k + regime_count).min(n_cols);
+
+    let mut keep_indices: Vec<usize> = correlations
+        .iter()
+        .take(actual_top_k)
+        .map(|(idx, _)| *idx)
+        .collect();
+    keep_indices.sort(); // Maintain original order
+
+    let mut new_names = Vec::with_capacity(actual_top_k);
+    let mut new_data = ndarray::Array2::zeros((n_rows, actual_top_k));
+
+    for (new_col_idx, &orig_col_idx) in keep_indices.iter().enumerate() {
+        new_names.push(features.names[orig_col_idx].clone());
+        new_data
+            .column_mut(new_col_idx)
+            .assign(&features.data.column(orig_col_idx));
+    }
+
+    FeatureFrame {
+        timestamps: features.timestamps.clone(),
+        names: new_names,
+        data: new_data,
+    }
+}
+
+fn validate_regime_robustness(trades: &[crate::quality::Trade], features: &FeatureFrame) -> bool {
+    let trend_idx = features
+        .names
+        .iter()
+        .position(|n| n == "regime_trend_strength");
+    let vol_idx = features.names.iter().position(|n| n == "regime_vol_state");
+
+    if trend_idx.is_none() || vol_idx.is_none() {
+        return true;
+    }
+    let t_idx = trend_idx.unwrap();
+    let v_idx = vol_idx.unwrap();
+
+    let mut trend_pnl = 0.0;
+    let mut range_pnl = 0.0;
+    let mut high_vol_pnl = 0.0;
+    let mut low_vol_pnl = 0.0;
+
+    let mut last_idx = 0;
+    let t_len = features.timestamps.len();
+
+    for trade in trades {
+        let ts = trade.entry_time;
+        while last_idx < t_len && features.timestamps[last_idx] < ts {
+            last_idx += 1;
+        }
+        let idx = if last_idx < t_len {
+            last_idx
+        } else {
+            t_len.saturating_sub(1)
+        };
+        if idx >= features.data.nrows() {
+            continue;
+        }
+
+        let trend_str = features.data[(idx, t_idx)];
+        let vol_state = features.data[(idx, v_idx)];
+
+        if trend_str > 0.25 {
+            trend_pnl += trade.pnl;
+        } else if trend_str < 0.15 {
+            range_pnl += trade.pnl;
+        }
+
+        if vol_state > 0.5 {
+            high_vol_pnl += trade.pnl;
+        } else if vol_state < -0.5 {
+            low_vol_pnl += trade.pnl;
+        }
+    }
+
+    // We reject if the strategy wipes out > 3% of account in ANY specific regime
+    // Assuming 100k account balance, 3% is 3000.
+    let limit = -3000.0;
+
+    if trend_pnl < limit || range_pnl < limit || high_vol_pnl < limit || low_vol_pnl < limit {
+        return false;
+    }
+
+    true
+}
+
 fn finalize_candidates_with_progress<F>(
     candidates: Vec<Gene>,
     features: &FeatureFrame,
@@ -477,11 +692,27 @@ fn finalize_candidates_with_progress<F>(
 where
     F: FnMut(DiscoveryProgress),
 {
-    // Sort by a weighted combo of fitness and consistency to find reliably profitable ones
+    // Sort by an income-focused ranking score to find reliably profitable ones
     let mut ranked_candidates: Vec<(usize, Gene)> = candidates.into_iter().enumerate().collect();
+
+    let calculate_income_score = |gene: &Gene| -> f64 {
+        let pf_capped = gene.profit_factor.min(3.0) / 3.0; // Normalized 0-1
+        let safety = (1.0 - gene.max_drawdown / 0.07).clamp(0.0, 1.0);
+        let consistency_score = gene.consistency; // 0-1
+        let win_rate_score = gene.win_rate; // 0-1
+
+        let multiplier =
+            (consistency_score * 0.4) + (win_rate_score * 0.3) + (safety * 0.2) + (pf_capped * 0.1);
+
+        // Bonus for high consistency (proxy for 10/12+ positive months)
+        let bonus = if consistency_score > 0.8 { 2.0 } else { 1.0 };
+
+        gene.fitness * multiplier * bonus
+    };
+
     ranked_candidates.sort_by(|(idx_a, a), (idx_b, b)| {
-        let score_a = a.fitness + (a.consistency * 0.5);
-        let score_b = b.fitness + (b.consistency * 0.5);
+        let score_a = calculate_income_score(a);
+        let score_b = calculate_income_score(b);
         score_b
             .partial_cmp(&score_a)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -558,6 +789,75 @@ where
                 !strict_quality && passes_opportunistic_quality(&metrics, &config.filtering);
 
             if strict_quality || opportunistic_quality {
+                // Regime-Aware Validation (Idea #3.2)
+                let regime_robust = validate_regime_robustness(&trades, features);
+                if !regime_robust {
+                    continue; // Skip strategy, it fails massively in a specific regime!
+                }
+
+                // Monte Carlo Parameter Perturbation Test (100 runs)
+                let mc_runs = 100;
+                let profitable_runs: usize = (0..mc_runs)
+                    .into_par_iter()
+                    .map(|_| {
+                        use rand::Rng;
+                        let mut rng = rand::rng();
+                        let mut perturbed = gene.clone();
+
+                        // Thresholds ±15%
+                        perturbed.long_threshold *= 1.0 + rng.random_range(-0.15..=0.15);
+                        perturbed.short_threshold *= 1.0 + rng.random_range(-0.15..=0.15);
+
+                        // Weights ±20%
+                        for w in &mut perturbed.weights {
+                            *w *= 1.0 + rng.random_range(-0.20..=0.20);
+                        }
+
+                        // SL/TP ±25%
+                        if perturbed.sl_pips.is_finite() && perturbed.sl_pips > 0.0 {
+                            perturbed.sl_pips *= 1.0 + rng.random_range(-0.25..=0.25);
+                        }
+                        if perturbed.tp_pips.is_finite() && perturbed.tp_pips > 0.0 {
+                            perturbed.tp_pips *= 1.0 + rng.random_range(-0.25..=0.25);
+                        }
+
+                        let p_sig = crate::genetic::signals_for_gene(features, &perturbed);
+                        let p_trades = crate::eval::simulate_trades_core(
+                            &ohlcv.close,
+                            &ohlcv.high,
+                            &ohlcv.low,
+                            &features.timestamps,
+                            &p_sig,
+                            &discovery_backtest_settings(&perturbed),
+                        );
+                        let pnl: f64 = p_trades.iter().map(|t| t.pnl).sum();
+                        if pnl > 0.0 { 1 } else { 0 }
+                    })
+                    .sum();
+
+                // Require at least 70% of perturbed variations to be profitable
+                if profitable_runs < 70 {
+                    continue; // Strategy is too fragile
+                }
+
+                // Spread/Slippage Sensitivity Test
+                let mut sensitive_settings = discovery_backtest_settings(&gene);
+                sensitive_settings.spread_pips = 2.0; // Test with 2.0 spread
+                sensitive_settings.commission_per_trade = 7.0; // Baseline commission
+
+                let sens_trades = crate::eval::simulate_trades_core(
+                    &ohlcv.close,
+                    &ohlcv.high,
+                    &ohlcv.low,
+                    &features.timestamps,
+                    &sig,
+                    &sensitive_settings,
+                );
+                let sens_pnl: f64 = sens_trades.iter().map(|t| t.pnl).sum();
+                if sens_pnl < 0.0 {
+                    continue; // Strategy becomes unprofitable at 2.0 spread
+                }
+
                 if opportunistic_quality {
                     opportunistic_passed += 1;
                 }

@@ -17,7 +17,7 @@ use crate::runtime::artifacts::{
     RuntimeArtifactMetadata, TrainingSummaryMetadata, default_three_class_label_mapping,
 };
 use crate::runtime::capabilities::{
-    CapabilityState, ModelFamily, append_runtime_degraded_reason, gpu_policy_cpu_fallback_reason,
+    CapabilityState, ModelFamily, append_runtime_degraded_reason, normalize_runtime_device_policy,
 };
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
@@ -29,6 +29,21 @@ const NEAT_ARTIFACT_FILE_NAME: &str = "neat.json";
 const NEAT_MODEL_NAME: &str = "neat";
 const NEAT_RUNTIME_BACKEND: &str = "symbios_neat_cpu";
 const DEFAULT_NEAT_SPECIES_ELITISM: usize = 0;
+
+fn default_neat_requested_device_policy() -> String {
+    "auto".to_string()
+}
+
+fn neat_cpu_fallback_reason(policy: &str) -> Option<String> {
+    let normalized = normalize_runtime_device_policy(policy);
+    if normalized == "gpu" || normalized.starts_with("gpu:") {
+        Some(format!(
+            "requested device policy `{normalized}`; symbios_neat Rust backend is CPU and does not execute on GPU"
+        ))
+    } else {
+        None
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -49,6 +64,8 @@ struct NeatArtifact {
     train_rows: usize,
     val_rows: usize,
     runtime_backend: String,
+    #[serde(default = "default_neat_requested_device_policy")]
+    requested_device_policy: String,
     best_fitness: f32,
     best_loss: f32,
     best_accuracy: f32,
@@ -80,6 +97,7 @@ impl Default for NeatArtifact {
             train_rows: 0,
             val_rows: 0,
             runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
+            requested_device_policy: default_neat_requested_device_policy(),
             best_fitness: f32::NEG_INFINITY,
             best_loss: f32::INFINITY,
             best_accuracy: 0.0,
@@ -407,6 +425,7 @@ pub struct NeatExpert {
     train_rows: usize,
     val_rows: usize,
     runtime_backend: String,
+    requested_device_policy: String,
     best_fitness: f32,
     best_loss: f32,
     best_accuracy: f32,
@@ -435,6 +454,7 @@ impl NeatExpert {
             train_rows: 0,
             val_rows: 0,
             runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
+            requested_device_policy: default_neat_requested_device_policy(),
             best_fitness: f32::NEG_INFINITY,
             best_loss: f32::INFINITY,
             best_accuracy: 0.0,
@@ -454,6 +474,11 @@ impl NeatExpert {
         self.compatibility_threshold = compatibility_threshold.max(0.25);
         self.immigrant_fraction = immigrant_fraction.clamp(0.0, 0.4);
         self.seed = seed;
+        self
+    }
+
+    pub fn with_device_policy(mut self, policy: impl AsRef<str>) -> Self {
+        self.requested_device_policy = normalize_runtime_device_policy(policy.as_ref());
         self
     }
 
@@ -622,7 +647,7 @@ impl NeatExpert {
     }
 
     fn runtime_details(&self) -> (Option<String>, Option<String>) {
-        let gpu_cpu_fallback = gpu_policy_cpu_fallback_reason("neat");
+        let gpu_cpu_fallback = neat_cpu_fallback_reason(&self.requested_device_policy);
         if !self.fitted {
             return (
                 Some("neat_unknown".to_string()),
@@ -839,6 +864,9 @@ impl NeatExpert {
         }
         if artifact.runtime_backend.trim().is_empty() {
             bail!("NEAT artifact must persist a runtime backend label");
+        }
+        if artifact.requested_device_policy.trim().is_empty() {
+            bail!("NEAT artifact requested_device_policy must not be blank");
         }
 
         if artifact.mutation_rate.is_nan()
@@ -1059,6 +1087,7 @@ impl ExpertModel for NeatExpert {
                 train_rows: self.train_rows,
                 val_rows: self.val_rows,
                 runtime_backend: self.runtime_backend.clone(),
+                requested_device_policy: self.requested_device_policy.clone(),
                 best_fitness: self.best_fitness,
                 best_loss: self.best_loss,
                 best_accuracy: self.best_accuracy,
@@ -1088,6 +1117,8 @@ impl ExpertModel for NeatExpert {
         let next_train_rows = artifact.train_rows;
         let next_val_rows = artifact.val_rows;
         let next_runtime_backend = artifact.runtime_backend;
+        let next_requested_device_policy =
+            normalize_runtime_device_policy(&artifact.requested_device_policy);
         let next_best_fitness = artifact.best_fitness;
         let next_best_loss = artifact.best_loss;
         let next_best_accuracy = artifact.best_accuracy;
@@ -1108,6 +1139,7 @@ impl ExpertModel for NeatExpert {
         self.train_rows = next_train_rows;
         self.val_rows = next_val_rows;
         self.runtime_backend = next_runtime_backend;
+        self.requested_device_policy = next_requested_device_policy;
         self.best_fitness = next_best_fitness;
         self.best_loss = next_best_loss;
         self.best_accuracy = next_best_accuracy;
@@ -1277,6 +1309,7 @@ mod tests {
             train_rows: 32,
             val_rows: 1,
             runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
+            requested_device_policy: default_neat_requested_device_policy(),
             best_fitness: 0.5,
             best_loss: 1.0,
             best_accuracy: 0.5,
@@ -1322,6 +1355,7 @@ mod tests {
             train_rows: 26,
             val_rows: 6,
             runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
+            requested_device_policy: default_neat_requested_device_policy(),
             best_fitness: 0.5,
             best_loss: 1.0,
             best_accuracy: 0.5,
@@ -1367,6 +1401,7 @@ mod tests {
             train_rows: 26,
             val_rows: 6,
             runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
+            requested_device_policy: default_neat_requested_device_policy(),
             best_fitness: 0.5,
             best_loss: 1.0,
             best_accuracy: 0.5,

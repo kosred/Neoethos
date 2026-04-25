@@ -220,11 +220,25 @@ fn normalize_recommended_gpu_device(
         ModelFamily::Deep | ModelFamily::Exit => {
             if normalized == "gpu"
                 || normalized == "wgpu"
+                || normalized == "rocm"
+                || normalized == "metal"
+                || normalized == "vulkan"
+                || normalized == "dx12"
                 || normalized == "wgpu_vulkan"
                 || normalized == "wgpu_dx12"
                 || normalized == "wgpu_metal"
             {
                 Some("wgpu".to_string())
+            } else if let Some((prefix, index)) = normalized.split_once(':') {
+                if matches!(
+                    prefix,
+                    "gpu" | "wgpu" | "rocm" | "metal" | "vulkan" | "dx12" | "cuda"
+                ) && index.parse::<usize>().is_ok()
+                {
+                    Some(format!("gpu:{index}"))
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -592,6 +606,10 @@ mod tests {
         assert_eq!(
             normalize_recommended_gpu_device("wgpu_vulkan", &deep).as_deref(),
             Some("wgpu")
+        );
+        assert_eq!(
+            normalize_recommended_gpu_device("rocm:2", &deep).as_deref(),
+            Some("gpu:2")
         );
         assert_eq!(
             normalize_recommended_gpu_device("gpu", &tree).as_deref(),
