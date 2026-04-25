@@ -820,13 +820,13 @@ impl BurnDeepExpert {
                 self.kan_config(input_dim).init::<InferBackend>(&device),
                 runtime_dtype,
             ))),
-            DeepModelKind::Transformer => Ok(RuntimeDeepModel::Transformer(
-                cast_module_float_tensors(
-                self.transformer_config(input_dim)
-                    .init::<InferBackend>(&device),
+            DeepModelKind::Transformer => {
+                Ok(RuntimeDeepModel::Transformer(cast_module_float_tensors(
+                    self.transformer_config(input_dim)
+                        .init::<InferBackend>(&device),
                     runtime_dtype,
-                ),
-            )),
+                )))
+            }
             DeepModelKind::PatchTst => Ok(RuntimeDeepModel::PatchTst(cast_module_float_tensors(
                 self.patchtst_config(input_dim)
                     .init::<InferBackend>(&device),

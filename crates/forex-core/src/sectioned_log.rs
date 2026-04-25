@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -109,11 +109,7 @@ impl CanonicalSectionedLog {
             if index > 0 {
                 out.push('\n');
             }
-            let slot = self
-                .sections
-                .get(section)
-                .cloned()
-                .unwrap_or_default();
+            let slot = self.sections.get(section).cloned().unwrap_or_default();
             out.push_str(&format!("===== SECTION {} =====\n", section.as_str()));
             Self::render_slot(&mut out, "CURRENT", slot.current.as_ref());
             Self::render_slot(&mut out, "PREVIOUS", slot.previous.as_ref());
@@ -130,9 +126,9 @@ impl CanonicalSectionedLog {
                 lines.next();
             }
 
-            let header = lines
-                .next()
-                .with_context(|| format!("missing section header for {}", expected_section.as_str()))?;
+            let header = lines.next().with_context(|| {
+                format!("missing section header for {}", expected_section.as_str())
+            })?;
             let section_name = header
                 .strip_prefix("===== SECTION ")
                 .and_then(|rest| rest.strip_suffix(" ====="))
@@ -149,7 +145,9 @@ impl CanonicalSectionedLog {
             let current = Self::parse_slot(&mut lines, "CURRENT")?;
             let previous = Self::parse_slot(&mut lines, "PREVIOUS")?;
 
-            parsed.sections.insert(parsed_section, SectionSlot { current, previous });
+            parsed
+                .sections
+                .insert(parsed_section, SectionSlot { current, previous });
         }
 
         Ok(parsed)
@@ -177,7 +175,10 @@ impl CanonicalSectionedLog {
                 out.push_str(&format!("subsystem={}\n", record.subsystem.as_str()));
                 out.push_str(&format!("operation={}\n", record.operation));
                 out.push_str(&format!("status={}\n", record.status));
-                out.push_str(&format!("symbol={}\n", record.symbol.as_deref().unwrap_or("")));
+                out.push_str(&format!(
+                    "symbol={}\n",
+                    record.symbol.as_deref().unwrap_or("")
+                ));
                 out.push_str(&format!(
                     "timeframe={}\n",
                     record.timeframe.as_deref().unwrap_or("")
@@ -193,7 +194,10 @@ impl CanonicalSectionedLog {
         }
     }
 
-    fn parse_slot<'a, I>(lines: &mut std::iter::Peekable<I>, slot_name: &str) -> Result<Option<SectionedRunRecord>>
+    fn parse_slot<'a, I>(
+        lines: &mut std::iter::Peekable<I>,
+        slot_name: &str,
+    ) -> Result<Option<SectionedRunRecord>>
     where
         I: Iterator<Item = &'a str>,
     {
@@ -260,11 +264,7 @@ impl CanonicalSectionedLog {
     }
 
     fn empty_to_none(raw: String) -> Option<String> {
-        if raw.is_empty() {
-            None
-        } else {
-            Some(raw)
-        }
+        if raw.is_empty() { None } else { Some(raw) }
     }
 
     fn recovery_record(target: SubsystemSection, error: &anyhow::Error) -> SectionedRunRecord {
@@ -314,7 +314,10 @@ impl LockFileGuard {
                 }
                 Err(err) => {
                     return Err(err).with_context(|| {
-                        format!("failed to create canonical log lock {}", lock_path.display())
+                        format!(
+                            "failed to create canonical log lock {}",
+                            lock_path.display()
+                        )
                     });
                 }
             }
@@ -342,7 +345,10 @@ pub fn update_section_file(
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create canonical log parent directory {}", parent.display())
+                format!(
+                    "failed to create canonical log parent directory {}",
+                    parent.display()
+                )
             })?;
         }
     }
@@ -370,8 +376,12 @@ pub fn update_section_file(
     log.update_section(section, record);
 
     let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
-    fs::write(&tmp_path, log.render())
-        .with_context(|| format!("failed to write canonical log temp file {}", tmp_path.display()))?;
+    fs::write(&tmp_path, log.render()).with_context(|| {
+        format!(
+            "failed to write canonical log temp file {}",
+            tmp_path.display()
+        )
+    })?;
     fs::rename(&tmp_path, path).with_context(|| {
         format!(
             "failed to atomically replace canonical log {} with {}",

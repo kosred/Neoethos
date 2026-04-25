@@ -1,11 +1,15 @@
+use crate::utils::{vec_from_py_f64, vec_from_py_i64};
 use ndarray::{Array2, Ix1, Ix2};
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArrayDyn};
 use pyo3::prelude::*;
-use crate::utils::{vec_from_py_f64, vec_from_py_i64};
 
 type PyArray1Pair<'py> = (Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>);
 
-pub fn causal_tanh_zscore_column(data: &Array2<f32>, col_idx: usize, min_periods: usize) -> Vec<f64> {
+pub fn causal_tanh_zscore_column(
+    data: &Array2<f32>,
+    col_idx: usize,
+    min_periods: usize,
+) -> Vec<f64> {
     let n = data.nrows();
     let mut out = vec![0.0_f64; n];
     if n == 0 {
@@ -65,7 +69,11 @@ pub fn causal_tanh_zscore_py<'py>(
         if count >= min_periods {
             let var = m2 / (count as f64);
             let std = if var > 0.0 { var.sqrt() } else { 0.0 };
-            let z = if std > 1e-12 { (v - mean) / std } else { v - mean };
+            let z = if std > 1e-12 {
+                (v - mean) / std
+            } else {
+                v - mean
+            };
             out[i] = z.tanh();
         }
         if v.is_finite() {
@@ -89,7 +97,11 @@ pub fn detect_divergence_py<'py>(
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let p = price.as_array();
     let ind = indicator.as_array();
-    let res = forex_data::detect_divergence(p.as_slice().unwrap_or(&[]), ind.as_slice().unwrap_or(&[]), window);
+    let res = forex_data::detect_divergence(
+        p.as_slice().unwrap_or(&[]),
+        ind.as_slice().unwrap_or(&[]),
+        window,
+    );
     Ok(PyArray1::from_vec(py, res))
 }
 
@@ -108,10 +120,7 @@ pub fn vortex_indicator_py<'py>(
         close.as_array().as_slice().unwrap_or(&[]),
         period,
     );
-    Ok((
-        PyArray1::from_vec(py, vp),
-        PyArray1::from_vec(py, vm),
-    ))
+    Ok((PyArray1::from_vec(py, vp), PyArray1::from_vec(py, vm)))
 }
 
 #[pyfunction(name = "fisher_transform")]
@@ -255,7 +264,7 @@ pub fn pad_probs_neutral_buy_sell<'py>(
         _ => {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 "probs must be 1D or 2D",
-            ))
+            ));
         }
     };
 

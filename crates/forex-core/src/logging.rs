@@ -1,13 +1,15 @@
 // Logging setup for Forex trading system
 // Port of src/forex_bot/core/logging.py
 
-use crate::sectioned_log::{update_section_file, CanonicalSectionedLog, SectionedRunRecord, SubsystemSection};
+use crate::sectioned_log::{
+    CanonicalSectionedLog, SectionedRunRecord, SubsystemSection, update_section_file,
+};
 use chrono::Utc;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use tracing::Level;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 static TRACING_INITIALIZED: OnceLock<()> = OnceLock::new();
 
@@ -111,11 +113,7 @@ fn canonical_log_path_from_dir(log_dir: impl AsRef<Path>) -> PathBuf {
 fn system_record(operation: &str, status: &str, message: String) -> SectionedRunRecord {
     let now = Utc::now().to_rfc3339();
     SectionedRunRecord {
-        run_id: format!(
-            "system-{}-{}",
-            operation,
-            now.replace(':', "-")
-        ),
+        run_id: format!("system-{}-{}", operation, now.replace(':', "-")),
         parent_run_id: None,
         started_at: now.clone(),
         finished_at: now,

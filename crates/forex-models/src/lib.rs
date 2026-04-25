@@ -70,7 +70,7 @@ use anyhow::{Context, Result};
 #[cfg(feature = "onnx")]
 use ndarray::Array2;
 #[cfg(feature = "onnx")]
-use ort::{inputs, Session, Value};
+use ort::{Session, Value, inputs};
 #[cfg(feature = "onnx")]
 use std::collections::HashMap;
 #[cfg(feature = "onnx")]

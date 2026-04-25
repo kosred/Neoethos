@@ -277,9 +277,10 @@ pub fn model_capability(name: &str) -> Option<ModelCapability> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CapabilityState, ModelCapability, ModelFamily, append_runtime_degraded_reason,
-        gpu_policy_cpu_fallback_reason, model_capability, normalize_runtime_device_policy,
-        normalize_training_precision_policy, requested_training_precision_policy,
+        CapabilityState, KNOWN_MODEL_NAMES, ModelCapability, ModelFamily,
+        append_runtime_degraded_reason, gpu_policy_cpu_fallback_reason, model_capability,
+        normalize_runtime_device_policy, normalize_training_precision_policy,
+        requested_training_precision_policy,
     };
     use std::collections::HashSet;
 
@@ -508,9 +509,13 @@ mod tests {
 
     #[test]
     fn gpu_policy_cpu_fallback_reason_detects_model_override() {
-        std::env::set_var("FOREX_BOT_NEAT_DEVICE", "cuda:3");
+        unsafe {
+            std::env::set_var("FOREX_BOT_NEAT_DEVICE", "cuda:3");
+        }
         let reason = gpu_policy_cpu_fallback_reason("neat");
-        std::env::remove_var("FOREX_BOT_NEAT_DEVICE");
+        unsafe {
+            std::env::remove_var("FOREX_BOT_NEAT_DEVICE");
+        }
         assert_eq!(
             reason.as_deref(),
             Some("requested device policy `gpu:3`; runtime currently executes on CPU")
@@ -527,11 +532,15 @@ mod tests {
 
     #[test]
     fn requested_training_precision_policy_prefers_model_scoped_env() {
-        std::env::set_var("FOREX_BOT_DQN_TRAIN_PRECISION", "bf16");
-        std::env::set_var("FOREX_BOT_TRAIN_PRECISION", "fp32");
+        unsafe {
+            std::env::set_var("FOREX_BOT_DQN_TRAIN_PRECISION", "bf16");
+            std::env::set_var("FOREX_BOT_TRAIN_PRECISION", "fp32");
+        }
         let requested = requested_training_precision_policy("dqn");
-        std::env::remove_var("FOREX_BOT_DQN_TRAIN_PRECISION");
-        std::env::remove_var("FOREX_BOT_TRAIN_PRECISION");
+        unsafe {
+            std::env::remove_var("FOREX_BOT_DQN_TRAIN_PRECISION");
+            std::env::remove_var("FOREX_BOT_TRAIN_PRECISION");
+        }
         assert_eq!(requested, "bf16");
     }
 }

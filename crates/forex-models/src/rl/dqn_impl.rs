@@ -186,7 +186,7 @@ impl Default for TradingRlArtifact {
             requested_device_policy: None,
             effective_backend: None,
             effective_device_policy: None,
-                        network_precision: None,
+            network_precision: None,
             backend: "rlkit_cpu".to_string(),
             device_policy: "auto".to_string(),
             parallel_envs: 1,
@@ -387,13 +387,6 @@ fn is_known_rl_effective_device_policy(value: &str) -> bool {
     normalized == "cpu" || normalized.starts_with("cuda:") || normalized.starts_with("gpu:")
 }
 
-fn artifact_requested_backend(artifact: &TradingRlArtifact) -> String {
-    artifact
-        .requested_backend
-        .clone()
-        .unwrap_or_else(|| artifact.backend.clone())
-}
-
 fn artifact_requested_device_policy(artifact: &TradingRlArtifact) -> String {
     artifact
         .requested_device_policy
@@ -459,7 +452,10 @@ fn dtype_to_rl_network_precision(dtype: DType) -> Result<String> {
     match dtype {
         DType::F32 => Ok("fp32".to_string()),
         DType::BF16 => Ok("bf16".to_string()),
-        other => bail!("RL network dtype {:?} is not supported for persistence", other),
+        other => bail!(
+            "RL network dtype {:?} is not supported for persistence",
+            other
+        ),
     }
 }
 
@@ -938,10 +934,9 @@ fn resolve_rl_training_device(policy: &str) -> Result<(Device, String, String)> 
 
 #[cfg(feature = "reinforcement-learning")]
 fn resolve_rl_inference_device(policy: &str) -> (Device, String, String) {
-    let normalized = normalize_rl_device_policy(policy);
-
     #[cfg(feature = "reinforcement-learning-cuda")]
     {
+        let normalized = normalize_rl_device_policy(policy);
         let ordinal = requested_cuda_ordinal(&normalized).unwrap_or(0);
         if matches!(normalized.as_str(), "auto" | "gpu") || normalized.starts_with("gpu:") {
             if let Ok(device) = Device::new_cuda(ordinal) {
@@ -949,6 +944,8 @@ fn resolve_rl_inference_device(policy: &str) -> (Device, String, String) {
             }
         }
     }
+    #[cfg(not(feature = "reinforcement-learning-cuda"))]
+    let _ = policy;
 
     (Device::Cpu, "cpu".to_string(), "rlkit_cpu".to_string())
 }
@@ -1719,7 +1716,9 @@ impl TradingReinforcementLearner {
         }
         if let Some(network_precision) = artifact_network_precision(artifact)? {
             let effective_backend = artifact_effective_backend(artifact);
-            if effective_backend.starts_with("linear_q_") || effective_backend.starts_with("quadratic_q_") {
+            if effective_backend.starts_with("linear_q_")
+                || effective_backend.starts_with("quadratic_q_")
+            {
                 bail!(
                     "RL artifact network_precision {} requires a neural runtime backend, got {}",
                     network_precision,
@@ -1987,9 +1986,7 @@ impl TradingReinforcementLearner {
             );
         }
         if !report.used_network_snapshot && artifact.network_precision.is_some() {
-            bail!(
-                "RL artifact persists network_precision without a persisted network snapshot"
-            );
+            bail!("RL artifact persists network_precision without a persisted network snapshot");
         }
         Ok(())
     }
@@ -2659,6 +2656,7 @@ impl Default for TradingReinforcementLearner {
 mod tests {
     use super::*;
     use ndarray::{Array1, Array2};
+    use polars::prelude::NamedFrom;
     use std::path::PathBuf;
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -2852,7 +2850,7 @@ mod tests {
             requested_device_policy: Some("cpu".to_string()),
             effective_backend: Some("linear_q_cpu".to_string()),
             effective_device_policy: Some("cpu".to_string()),
-                        network_precision: None,
+            network_precision: None,
             backend: "linear_q_cpu".to_string(),
             device_policy: "cpu".to_string(),
             parallel_envs: 1,
@@ -2940,10 +2938,14 @@ mod tests {
 
     #[test]
     fn runtime_backend_details_explain_requested_precision_when_unavailable() {
-        std::env::set_var("FOREX_BOT_DQN_TRAIN_PRECISION", "bf16");
+        unsafe {
+            std::env::set_var("FOREX_BOT_DQN_TRAIN_PRECISION", "bf16");
+        }
         let learner = TradingReinforcementLearner::new();
         let (_backend, degraded_reason) = learner.runtime_backend_details();
-        std::env::remove_var("FOREX_BOT_DQN_TRAIN_PRECISION");
+        unsafe {
+            std::env::remove_var("FOREX_BOT_DQN_TRAIN_PRECISION");
+        }
 
         let degraded_reason =
             degraded_reason.expect("precision request should appear in degraded reason");
@@ -3093,7 +3095,7 @@ mod tests {
             requested_device_policy: Some("cpu".to_string()),
             effective_backend: Some("rlkit_cpu".to_string()),
             effective_device_policy: Some("cpu".to_string()),
-                        network_precision: None,
+            network_precision: None,
             backend: "rlkit_cpu".to_string(),
             device_policy: "cpu".to_string(),
             parallel_envs: 1,
@@ -3154,7 +3156,7 @@ mod tests {
             requested_device_policy: Some("cpu".to_string()),
             effective_backend: Some("quadratic_q_cpu".to_string()),
             effective_device_policy: Some("cpu".to_string()),
-                        network_precision: None,
+            network_precision: None,
             backend: "quadratic_q_cpu".to_string(),
             device_policy: "cpu".to_string(),
             parallel_envs: 1,
@@ -3215,7 +3217,7 @@ mod tests {
             requested_device_policy: Some("cuda:0".to_string()),
             effective_backend: Some("quadratic_q_cpu".to_string()),
             effective_device_policy: Some("cpu".to_string()),
-                        network_precision: None,
+            network_precision: None,
             backend: "rlkit".to_string(),
             device_policy: "cuda:0".to_string(),
             parallel_envs: 1,
@@ -3276,7 +3278,7 @@ mod tests {
             requested_device_policy: Some("cpu".to_string()),
             effective_backend: Some("linear_q_cpu".to_string()),
             effective_device_policy: Some("cpu".to_string()),
-                        network_precision: None,
+            network_precision: None,
             backend: "linear_q_cpu".to_string(),
             device_policy: "cpu".to_string(),
             parallel_envs: 1,
@@ -3324,7 +3326,7 @@ mod tests {
             requested_device_policy: Some("auto".to_string()),
             effective_backend: Some("quadratic_q_cpu".to_string()),
             effective_device_policy: Some("cpu".to_string()),
-                        network_precision: None,
+            network_precision: None,
             backend: "rlkit".to_string(),
             device_policy: "auto".to_string(),
             parallel_envs: 1,
@@ -3437,7 +3439,7 @@ mod tests {
             requested_device_policy: None,
             effective_backend: Some("quadratic_q_cpu".to_string()),
             effective_device_policy: Some("cpu".to_string()),
-                        network_precision: None,
+            network_precision: None,
             backend: "rlkit".to_string(),
             device_policy: "auto".to_string(),
             parallel_envs: 1,
@@ -3498,7 +3500,7 @@ mod tests {
             requested_device_policy: Some("auto".to_string()),
             effective_backend: Some("mystery_backend".to_string()),
             effective_device_policy: Some("cpu".to_string()),
-                        network_precision: None,
+            network_precision: None,
             backend: "rlkit".to_string(),
             device_policy: "auto".to_string(),
             parallel_envs: 1,
@@ -3559,7 +3561,7 @@ mod tests {
             requested_device_policy: Some("cuda:0".to_string()),
             effective_backend: Some("quadratic_q_cpu".to_string()),
             effective_device_policy: Some("cpu".to_string()),
-                        network_precision: None,
+            network_precision: None,
             backend: "rlkit_cuda".to_string(),
             device_policy: "cuda:0".to_string(),
             parallel_envs: 1,
@@ -3666,7 +3668,7 @@ mod tests {
             requested_device_policy: Some("cpu".to_string()),
             effective_backend: Some("quadratic_q_cpu".to_string()),
             effective_device_policy: Some("cpu".to_string()),
-                        network_precision: None,
+            network_precision: None,
             backend: "rlkit".to_string(),
             device_policy: "cpu".to_string(),
             parallel_envs: 1,
@@ -3730,7 +3732,7 @@ mod tests {
             requested_device_policy: Some("cpu".to_string()),
             effective_backend: Some("quadratic_q_cpu".to_string()),
             effective_device_policy: Some("cpu".to_string()),
-                        network_precision: None,
+            network_precision: None,
             backend: "rlkit".to_string(),
             device_policy: "cpu".to_string(),
             parallel_envs: 1,
@@ -3902,7 +3904,7 @@ mod tests {
             requested_device_policy: Some("cpu".to_string()),
             effective_backend: Some("rlkit_cpu".to_string()),
             effective_device_policy: Some("cpu".to_string()),
-                        network_precision: None,
+            network_precision: None,
             backend: "rlkit_cpu".to_string(),
             device_policy: "cpu".to_string(),
             parallel_envs: 1,
@@ -3936,8 +3938,10 @@ mod tests {
         write_json(&path.join(METADATA_FILE_NAME), &metadata).expect("write metadata");
         write_json(&path.join("rl_config.json"), &artifact).expect("write config");
 
-        let err = TradingReinforcementLearner::load(&path)
-            .expect_err("load should reject missing network snapshot");
+        let err = match TradingReinforcementLearner::load(&path) {
+            Ok(_) => panic!("load should reject missing network snapshot"),
+            Err(err) => err,
+        };
         assert!(err.to_string().contains("claims a network snapshot"));
 
         let _ = std::fs::remove_dir_all(&path);
@@ -3970,7 +3974,7 @@ mod tests {
             requested_device_policy: Some("cpu".to_string()),
             effective_backend: Some("rlkit_cpu".to_string()),
             effective_device_policy: Some("cpu".to_string()),
-                        network_precision: None,
+            network_precision: None,
             backend: "rlkit_cpu".to_string(),
             device_policy: "cpu".to_string(),
             parallel_envs: 1,
@@ -4036,7 +4040,7 @@ mod tests {
             requested_device_policy: Some("cpu".to_string()),
             effective_backend: Some("rlkit_cpu".to_string()),
             effective_device_policy: Some("cpu".to_string()),
-                        network_precision: None,
+            network_precision: None,
             backend: "rlkit_cpu".to_string(),
             device_policy: "cpu".to_string(),
             parallel_envs: 1,
@@ -4075,8 +4079,10 @@ mod tests {
         write_json(&path.join("rl_config.json"), &artifact).expect("write config");
         write_json(&path.join(METADATA_FILE_NAME), &drifted_metadata).expect("write metadata");
 
-        let err =
-            TradingReinforcementLearner::load(&path).expect_err("drifted sidecar should fail load");
+        let err = match TradingReinforcementLearner::load(&path) {
+            Ok(_) => panic!("drifted sidecar should fail load"),
+            Err(err) => err,
+        };
         assert!(err.to_string().contains("metadata sidecar mismatch"));
 
         let _ = std::fs::remove_dir_all(&path);

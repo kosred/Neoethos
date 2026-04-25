@@ -37,11 +37,14 @@ impl NewsFilter {
     }
 
     /// Run synchronously (should be spawned in a dedicated blocking thread by the app)
-    pub fn poll_llm_news_sentiment(&mut self, currency_pair: &str) -> Result<String, anyhow::Error> {
+    pub fn poll_llm_news_sentiment(
+        &mut self,
+        currency_pair: &str,
+    ) -> Result<String, anyhow::Error> {
         if !self.enabled {
             return Ok("SAFE".to_string());
         }
-        
+
         let api_key = match &self.api_key {
             Some(k) if !k.trim().is_empty() => k,
             _ => return Ok("SAFE".to_string()),
@@ -53,7 +56,7 @@ impl NewsFilter {
         );
 
         let client = reqwest::blocking::Client::new();
-        
+
         let (endpoint, model) = if self.llm_provider == "openai" {
             ("https://api.openai.com/v1/chat/completions", "gpt-4o-mini")
         } else {
@@ -69,7 +72,8 @@ impl NewsFilter {
             "temperature": 0.0
         });
 
-        let res = client.post(endpoint)
+        let res = client
+            .post(endpoint)
             .header("Authorization", format!("Bearer {}", api_key))
             .json(&body)
             .send()
@@ -78,7 +82,11 @@ impl NewsFilter {
         if res.status().is_success() {
             let json: Value = res.json()?;
             if let Some(content) = json["choices"][0]["message"]["content"].as_str() {
-                let status = if content.to_uppercase().contains("BLACKOUT") { "BLACKOUT" } else { "SAFE" };
+                let status = if content.to_uppercase().contains("BLACKOUT") {
+                    "BLACKOUT"
+                } else {
+                    "SAFE"
+                };
                 self.current_status = status.to_string();
                 return Ok(status.to_string());
             }
@@ -87,7 +95,7 @@ impl NewsFilter {
             let text = res.text().unwrap_or_default();
             return Err(anyhow::anyhow!("LLM API returned {}: {}", status, text));
         }
-        
+
         Ok("SAFE".to_string())
     }
 

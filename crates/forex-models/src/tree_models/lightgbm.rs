@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 #[cfg(feature = "lightgbm")]
 use lightgbm3;
 use ndarray::Array2;
@@ -7,30 +7,31 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::path::PathBuf;
 
-use crate::base::{feature_columns_from_dataframe, ExpertModel};
+use crate::base::{ExpertModel, feature_columns_from_dataframe};
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::ModelFamily;
 use crate::runtime::prediction::RuntimePrediction;
 
 use super::common::{
-    atomic_write, build_tree_local_fallback_artifact, build_tree_runtime_predictions,
+    LIGHTGBM_MODEL_FILE_NAME, TreeLocalFallbackArtifact, atomic_write,
+    build_tree_local_fallback_artifact, build_tree_runtime_predictions,
     calibrate_three_class_probabilities, dataframe_to_row_major_vec, default_training_summary,
     ensure_feature_columns_match, normalize_three_class_probabilities, predict_tree_local_fallback,
     read_runtime_metadata, remap_labels_to_tree_targets, reshape_three_class_probabilities,
     tree_artifact_paths, tree_runtime_metadata, validate_tree_local_fallback_artifact,
-    write_runtime_metadata, TreeLocalFallbackArtifact, LIGHTGBM_MODEL_FILE_NAME,
+    write_runtime_metadata,
 };
 #[cfg(feature = "lightgbm")]
 use super::config::{
-    cpu_threads_from_params, cpu_threads_hint_for, device_preference_from_params, gpu_count,
-    gpu_only_from_params, gpu_only_mode_for, param_bool, param_float, param_int, param_string,
-    tree_device_preference_for, DevicePreference, ParamValue, TreeModelConfig,
+    DevicePreference, ParamValue, TreeModelConfig, cpu_threads_from_params, cpu_threads_hint_for,
+    device_preference_from_params, gpu_count, gpu_only_from_params, gpu_only_mode_for, param_bool,
+    param_float, param_int, param_string, tree_device_preference_for,
 };
 #[cfg(not(feature = "lightgbm"))]
 use super::config::{
-    cpu_threads_from_params, cpu_threads_hint_for, device_preference_from_params, gpu_count,
-    gpu_only_from_params, gpu_only_mode_for, param_float, param_string, tree_device_preference_for,
-    DevicePreference, ParamValue, TreeModelConfig,
+    DevicePreference, ParamValue, TreeModelConfig, cpu_threads_from_params, cpu_threads_hint_for,
+    device_preference_from_params, gpu_count, gpu_only_from_params, gpu_only_mode_for, param_float,
+    param_string, tree_device_preference_for,
 };
 use std::collections::HashMap;
 
@@ -809,7 +810,7 @@ impl LightGBMExpert {
 
 #[cfg(all(test, feature = "lightgbm"))]
 mod tests {
-    use super::{build_tree_local_fallback_artifact, ExpertModel, LightGBMExpert};
+    use super::{ExpertModel, LightGBMExpert, build_tree_local_fallback_artifact};
     use crate::runtime::artifacts::TrainingSummaryMetadata;
     use crate::tree_models::config::{DevicePreference, ParamValue};
     use ndarray::Array2;

@@ -512,8 +512,7 @@ fn score_strategy(analyzer: &StrategyQualityAnalyzer, metrics: &mut StrategyMetr
     let calmar_score = 20.0 * (1.0 - (-metrics.calmar_ratio.max(0.0) * 0.8).exp());
 
     // Drawdown (0-15 pts): penalizes progressively above 8%
-    let dd_score =
-        15.0 * (1.0 - (metrics.max_drawdown_pct / 0.15).clamp(0.0, 1.0)).max(0.0);
+    let dd_score = 15.0 * (1.0 - (metrics.max_drawdown_pct / 0.15).clamp(0.0, 1.0)).max(0.0);
 
     // Statistical significance (0-10 pts): smooth decay as p-value rises
     let pval = metrics.statistical_significance.clamp(0.0, 1.0);
@@ -524,8 +523,7 @@ fn score_strategy(analyzer: &StrategyQualityAnalyzer, metrics: &mut StrategyMetr
 
     // Monthly return (0-10 pts): smooth approach to min target
     let mr_score = if metrics.avg_monthly_return_pct >= analyzer.min_monthly_return_pct {
-        10.0 * (metrics.avg_monthly_return_pct / analyzer.min_monthly_return_pct.max(1e-9))
-            .min(1.0)
+        10.0 * (metrics.avg_monthly_return_pct / analyzer.min_monthly_return_pct.max(1e-9)).min(1.0)
     } else {
         0.0
     };
@@ -551,14 +549,13 @@ fn score_strategy(analyzer: &StrategyQualityAnalyzer, metrics: &mut StrategyMetr
     .clamp(0.0, 2.0)
         * 0.15;
     let s_mr = if analyzer.min_monthly_return_pct > 0.0 {
-        (metrics.avg_monthly_return_pct / analyzer.min_monthly_return_pct)
-            .clamp(0.0, 2.0)
-            * 0.10
+        (metrics.avg_monthly_return_pct / analyzer.min_monthly_return_pct).clamp(0.0, 2.0) * 0.10
     } else {
         0.10
     };
-    let s_pval = (1.0 - metrics.statistical_significance / analyzer.edge_significance_pvalue.max(1e-9))
-        .clamp(0.0, 1.0)
+    let s_pval = (1.0
+        - metrics.statistical_significance / analyzer.edge_significance_pvalue.max(1e-9))
+    .clamp(0.0, 1.0)
         * 0.05;
     let edge_score = s_sortino + s_calmar + s_pf + s_wr + s_dd + s_mr + s_pval;
     let trades_ok = analyzer.min_trades == 0 || metrics.total_trades >= analyzer.min_trades;

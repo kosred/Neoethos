@@ -397,12 +397,7 @@ impl RiskLedger {
         severity: &str,
         context: Option<JsonValue>,
     ) {
-        let event = RiskEvent::new(
-            event_type,
-            message,
-            severity,
-            context,
-        );
+        let event = RiskEvent::new(event_type, message, severity, context);
 
         if let Ok(mut lock) = self.events.lock() {
             if lock.len() >= self.max_events {

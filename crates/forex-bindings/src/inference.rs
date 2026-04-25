@@ -1,13 +1,13 @@
 #[cfg(feature = "onnx")]
 use forex_models::ONNXInferenceEngine;
 #[cfg(feature = "onnx")]
+use ndarray::Array2;
+#[cfg(feature = "onnx")]
 use numpy::{PyArray2, PyReadonlyArray2};
 #[cfg(feature = "onnx")]
 use pyo3::prelude::*;
 #[cfg(feature = "onnx")]
 use std::sync::{Arc, Mutex};
-#[cfg(feature = "onnx")]
-use ndarray::Array2;
 
 #[cfg(feature = "onnx")]
 #[pyclass]

@@ -4,6 +4,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
 /// Helper macro to create PyO3 wrappers for each Burn model
+#[rustfmt::skip]
 macro_rules! burn_model_wrapper {
     (
         $py_name:ident,

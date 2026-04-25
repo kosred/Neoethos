@@ -1,4 +1,5 @@
 //! Policy module, containing implementations of various action selection policies.
+#![allow(deprecated)]
 
 use crate::{types::{Action, QValue}};
 use candle_core::{Tensor, Result};  

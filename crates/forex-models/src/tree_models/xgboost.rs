@@ -1,10 +1,10 @@
 use super::common::{
-    atomic_write, build_tree_local_fallback_artifact, build_tree_runtime_predictions,
+    TreeLocalFallbackArtifact, XGBOOST_MODEL_FILE_NAME, atomic_write,
+    build_tree_local_fallback_artifact, build_tree_runtime_predictions,
     calibrate_three_class_probabilities, dataframe_to_row_major_vec, default_training_summary,
     ensure_feature_columns_match, normalize_three_class_probabilities, predict_tree_local_fallback,
     read_runtime_metadata, remap_labels_to_tree_targets, tree_artifact_paths,
     tree_runtime_metadata, validate_tree_local_fallback_artifact, write_runtime_metadata,
-    TreeLocalFallbackArtifact, XGBOOST_MODEL_FILE_NAME,
 };
 use super::config::*;
 use crate::base::ExpertModel;
@@ -12,7 +12,7 @@ use crate::base::{compute_sample_weights, feature_columns_from_dataframe};
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::ModelFamily;
 use crate::runtime::prediction::RuntimePrediction;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use ndarray::Array2;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -1060,7 +1060,7 @@ impl XGBoostExpert {
 
 #[cfg(all(test, feature = "xgboost"))]
 mod tests {
-    use super::{ExpertModel, ParamValue, XGBoostExpert};
+    use super::{ExpertModel, ParamValue, TrainingSummaryMetadata, XGBoostExpert};
     use ndarray::Array2;
     use polars::df;
     use polars::prelude::*;
@@ -1205,14 +1205,18 @@ mod tests {
         let mut expert = XGBoostExpert::new(11, None);
         expert.feature_columns = vec!["momentum".to_string()];
         expert.local_fallback = Some(super::TreeLocalFallbackArtifact {
+            surrogate_kind: "gaussian_centroid_surrogate".to_string(),
             feature_columns: vec!["momentum".to_string()],
+            training_summary: TrainingSummaryMetadata::new(9, 9, 0),
+            class_priors: vec![1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
+            class_support: vec![1.0, 1.0, 1.0],
+            feature_means: vec![0.0],
+            feature_scales: vec![1.0],
+            feature_salience: vec![1.0],
             class_centroids: vec![vec![0.1], vec![0.2], vec![0.3]],
             class_variances: vec![vec![1.0], vec![1.0], vec![1.0]],
-            class_support: vec![1, 1, 1],
-            training_summary: TrainingSummaryMetadata::new(9, 9, 0),
-            distance_location: 0.0,
-            distance_scale: 1.0,
-            surrogate_kind: "gaussian_centroid".to_string(),
+            distance_location: vec![0.0, 0.0, 0.0],
+            distance_scale: vec![1.0, 1.0, 1.0],
         });
         let artifact_dir = unique_temp_dir("xgboost-missing-summary");
 

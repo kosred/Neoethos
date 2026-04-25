@@ -1,11 +1,11 @@
+use forex_data::{FeatureProfile, Ohlcv};
+pub use forex_models::tree_models::config::ParamValue;
 use ndarray::Array2;
 use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use polars::prelude::*;
 use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::str::FromStr;
-use forex_data::{FeatureProfile, Ohlcv};
-pub use forex_models::tree_models::config::ParamValue;
 
 pub fn dataframe_from_ndarray(features: &Array2<f64>) -> Result<DataFrame, String> {
     let mut df_data: Vec<Column> = Vec::with_capacity(features.ncols());
@@ -242,11 +242,7 @@ pub fn pip_size_from_parts(symbol: &str, parts: Option<&(String, String)>) -> f6
         "crypto" => 1.0,
         "fx" => {
             if let Some((_base, quote)) = parts {
-                if quote == "JPY" {
-                    0.01
-                } else {
-                    0.0001
-                }
+                if quote == "JPY" { 0.01 } else { 0.0001 }
             } else {
                 0.0001
             }
@@ -362,7 +358,7 @@ pub fn params_from_py(
     for (k, v) in dict.iter() {
         let key: String = k
             .extract()
-            .map_err(|_| "params keys must be strings".to_string())? ;
+            .map_err(|_| "params keys must be strings".to_string())?;
         if let Some(val) = param_value_from_py(&v) {
             map.insert(key, val);
         }
@@ -418,7 +414,11 @@ pub fn load_strategy_specs(path: &std::path::PathBuf) -> Result<Vec<StrategySpec
 #[pyfunction]
 pub fn rank_scores_desc(scores: Vec<f64>) -> Vec<usize> {
     let mut indices: Vec<usize> = (0..scores.len()).collect();
-    indices.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap_or(std::cmp::Ordering::Equal));
+    indices.sort_by(|&a, &b| {
+        scores[b]
+            .partial_cmp(&scores[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     indices
 }
 
@@ -475,7 +475,11 @@ pub fn threshold_signals_and_accuracy(
             }
         }
     }
-    let acc = if total > 0 { correct as f64 / total as f64 } else { 0.0 };
+    let acc = if total > 0 {
+        correct as f64 / total as f64
+    } else {
+        0.0
+    };
     (signals, acc)
 }
 
@@ -504,15 +508,17 @@ pub fn balanced_class_weights(labels: PyReadonlyArray1<i64>) -> Vec<f64> {
 #[pyfunction]
 pub fn sample_weights_from_labels(labels: PyReadonlyArray1<i64>, weights: Vec<f64>) -> Vec<f64> {
     let l = labels.as_array();
-    l.iter().map(|&val| {
-        let idx = match val {
-            -1 => 2,
-            0 => 0,
-            1 => 1,
-            _ => 0,
-        };
-        weights.get(idx).copied().unwrap_or(1.0)
-    }).collect()
+    l.iter()
+        .map(|&val| {
+            let idx = match val {
+                -1 => 2,
+                0 => 0,
+                1 => 1,
+                _ => 0,
+            };
+            weights.get(idx).copied().unwrap_or(1.0)
+        })
+        .collect()
 }
 
 #[pyfunction]
@@ -526,15 +532,17 @@ pub fn sort_rows_with_labels_by_index<'py>(
     let idx = index.as_array();
     let mut p: Vec<usize> = (0..idx.len()).collect();
     p.sort_by_key(|&i| idx[i]);
-    
+
     let mut sorted_idx = Vec::with_capacity(idx.len());
     let mut sorted_l = Vec::with_capacity(idx.len());
     let f = features.as_array();
     let mut sorted_f = Array2::<f32>::zeros((f.nrows(), f.ncols()));
     let l = labels.as_array();
-    
+
     for (new_row, &old_row) in p.iter().enumerate() {
-        if new_row >= f.nrows() { break; }
+        if new_row >= f.nrows() {
+            break;
+        }
         sorted_idx.push(idx[old_row]);
         sorted_l.push(l[old_row]);
         for col in 0..f.ncols() {
@@ -553,11 +561,11 @@ pub fn sort_dedup_rows_by_index<'py>(
     let idx = index.as_array();
     let mut p: Vec<usize> = (0..idx.len()).collect();
     p.sort_by_key(|&i| idx[i]);
-    
+
     let mut sorted_idx = Vec::new();
     let f = features.as_array();
     let mut rows = Vec::new();
-    
+
     let mut last = None;
     for &old_row in &p {
         let current = idx[old_row];
@@ -567,7 +575,7 @@ pub fn sort_dedup_rows_by_index<'py>(
             last = Some(current);
         }
     }
-    
+
     let mut sorted_f = Array2::<f32>::zeros((rows.len(), f.ncols()));
     for (new_row, &old_row) in rows.iter().enumerate() {
         for col in 0..f.ncols() {

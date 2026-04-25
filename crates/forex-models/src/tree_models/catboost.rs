@@ -1,7 +1,7 @@
 #[cfg(feature = "catboost")]
 use catboost_rust as catboost;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use ndarray::Array2;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -10,18 +10,19 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
-use crate::base::{feature_columns_from_dataframe, ExpertModel};
+use crate::base::{ExpertModel, feature_columns_from_dataframe};
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::ModelFamily;
 use crate::runtime::prediction::RuntimePrediction;
 
 use super::common::{
-    atomic_write, build_tree_local_fallback_artifact, build_tree_runtime_predictions,
+    CATBOOST_MODEL_FILE_NAME, TreeLocalFallbackArtifact, atomic_write,
+    build_tree_local_fallback_artifact, build_tree_runtime_predictions,
     calibrate_three_class_probabilities, dataframe_to_row_major_vec, default_training_summary,
     ensure_feature_columns_match, normalize_three_class_probabilities, predict_tree_local_fallback,
     read_runtime_metadata, remap_labels_to_tree_targets, reshape_three_class_probabilities,
     tree_artifact_paths, tree_runtime_metadata, validate_tree_local_fallback_artifact,
-    write_runtime_metadata, TreeLocalFallbackArtifact, CATBOOST_MODEL_FILE_NAME,
+    write_runtime_metadata,
 };
 use super::config::*;
 
@@ -1181,6 +1182,7 @@ impl CatBoostExpert {
 mod tests {
     use super::{CatBoostExpert, ExpertModel};
     use crate::base::feature_columns_from_dataframe;
+    use crate::runtime::artifacts::TrainingSummaryMetadata;
     use crate::tree_models::common::{
         build_tree_local_fallback_artifact, default_training_summary,
     };
@@ -1263,6 +1265,12 @@ mod tests {
             thread_count: 4,
             random_seed: 1,
             loss_function: "MultiClass".into(),
+            feature_columns: vec![
+                "momentum".to_string(),
+                "trend".to_string(),
+                "volatility".to_string(),
+            ],
+            training_summary: TrainingSummaryMetadata::new(9, 9, 0),
         };
 
         let err = super::validate_runtime_artifact(&artifact, 3)

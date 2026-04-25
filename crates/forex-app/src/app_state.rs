@@ -1,5 +1,5 @@
 use crate::app_services::jobs::JobSnapshot;
-use forex_core::{logging::canonical_log_path, Settings};
+use forex_core::{Settings, logging::canonical_log_path};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]

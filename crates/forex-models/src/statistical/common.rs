@@ -1,14 +1,14 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use ndarray::Array2;
 use polars::prelude::*;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::Path;
 
 use crate::base::{
     dataframe_to_float32_array, feature_columns_from_dataframe, try_build_runtime_artifact_metadata,
 };
 use crate::runtime::artifacts::{
-    default_three_class_label_mapping, RuntimeArtifactMetadata, TrainingSummaryMetadata,
+    RuntimeArtifactMetadata, TrainingSummaryMetadata, default_three_class_label_mapping,
 };
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 
@@ -283,13 +283,19 @@ mod tests {
 
     #[test]
     fn runtime_backend_marks_gpu_request_as_cpu_fallback() {
-        std::env::set_var("FOREX_BOT_META_DEVICE", "gpu:0");
+        unsafe {
+            std::env::set_var("FOREX_BOT_META_DEVICE", "gpu:0");
+        }
         let (backend, degraded_reason) =
             runtime_backend_with_gpu_fallback("elasticnet", "cpu_backend");
         assert_eq!(backend.as_deref(), Some("cpu_backend"));
-        assert!(degraded_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("currently executes on CPU")));
-        std::env::remove_var("FOREX_BOT_META_DEVICE");
+        assert!(
+            degraded_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("currently executes on CPU"))
+        );
+        unsafe {
+            std::env::remove_var("FOREX_BOT_META_DEVICE");
+        }
     }
 }

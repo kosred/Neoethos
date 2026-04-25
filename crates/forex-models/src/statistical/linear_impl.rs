@@ -9,13 +9,17 @@ use crate::base::{
     three_class_runtime_confidence, try_build_runtime_artifact_metadata,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
-use crate::runtime::capabilities::{CapabilityState, ModelFamily};
+use crate::runtime::capabilities::{CapabilityState, ModelFamily, append_runtime_degraded_reason};
 use crate::runtime::prediction::RuntimePrediction;
 
 use super::common::{
     FeatureScaler, METADATA_FILE_NAME, MODEL_FILE_NAME, ensure_feature_columns_match,
     feature_matrix_from_dataframe, read_json, remap_three_class_labels,
     runtime_backend_with_gpu_fallback, softmax_rows, write_json,
+};
+#[cfg(feature = "statistical-gpu")]
+use super::linear_gpu::{
+    statistical_cuda_kernel_enabled, try_fit_linear_softmax_cuda, try_predict_linear_softmax_cuda,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +31,10 @@ struct LinearSoftmaxArtifact {
     dataset_rows: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     runtime_metadata: Option<RuntimeArtifactMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_degraded_reason: Option<String>,
     alpha: f32,
     l1_ratio: f32,
     learning_rate: f32,
@@ -222,10 +230,9 @@ fn runtime_metadata(
 fn runtime_predictions(
     model_name: &str,
     probabilities: &Array2<f32>,
+    execution_backend: Option<String>,
+    degraded_reason: Option<String>,
 ) -> Result<Vec<RuntimePrediction>> {
-    let cpu_backend = format!("{model_name}_softmax_cpu");
-    let (execution_backend, degraded_reason) =
-        runtime_backend_with_gpu_fallback(model_name, &cpu_backend);
     let mut predictions = Vec::with_capacity(probabilities.nrows());
     for row in probabilities.outer_iter() {
         let row_values = [row[0], row[1], row[2]];
@@ -247,6 +254,12 @@ fn runtime_predictions(
     }
 
     Ok(predictions)
+}
+
+struct LinearSoftmaxPrediction {
+    probabilities: Array2<f32>,
+    execution_backend: Option<String>,
+    degraded_reason: Option<String>,
 }
 
 fn validate_runtime_metadata(
@@ -497,6 +510,66 @@ fn fit_linear_softmax(
         None
     };
 
+    let cpu_backend = format!("{model_name}_softmax_cpu");
+    let (mut runtime_backend, runtime_degraded_reason) =
+        runtime_backend_with_gpu_fallback(model_name, &cpu_backend);
+    if runtime_backend.is_none() {
+        runtime_backend = Some(cpu_backend);
+    }
+    #[cfg(feature = "statistical-gpu")]
+    let mut runtime_degraded_reason = runtime_degraded_reason;
+
+    #[cfg(feature = "statistical-gpu")]
+    if statistical_cuda_kernel_enabled(model_name) {
+        match try_fit_linear_softmax_cuda(
+            model_name,
+            &train_features,
+            &train_labels,
+            val_features.as_ref(),
+            &val_labels,
+            alpha,
+            l1_ratio,
+            learning_rate,
+            epochs,
+        ) {
+            Ok(cuda_fit) => {
+                let train_rows = train_labels.len();
+                let val_rows = val_labels.len();
+                let runtime_metadata = runtime_metadata(
+                    model_name,
+                    feature_columns.clone(),
+                    rows,
+                    train_rows,
+                    val_rows,
+                )?;
+                return Ok(LinearSoftmaxArtifact {
+                    weights: cuda_fit.weights,
+                    bias: cuda_fit.bias,
+                    scaler,
+                    feature_columns,
+                    dataset_rows: rows,
+                    runtime_metadata: Some(runtime_metadata),
+                    runtime_backend: Some(cuda_fit.runtime_backend),
+                    runtime_degraded_reason: None,
+                    alpha,
+                    l1_ratio,
+                    learning_rate,
+                    epochs,
+                    model_name: model_name.to_string(),
+                });
+            }
+            Err(err) => {
+                runtime_degraded_reason = append_runtime_degraded_reason(
+                    runtime_degraded_reason,
+                    Some(format!("statistical_cuda_fit_fallback_to_cpu: {err}")),
+                );
+                tracing::warn!(
+                    "statistical cuda fit unavailable for {model_name}, falling back to cpu: {err}"
+                );
+            }
+        }
+    }
+
     let mut weights = Array2::<f32>::zeros((cols, n_classes));
     let mut bias = Array1::<f32>::zeros(n_classes);
     let lr = learning_rate.max(1e-5);
@@ -578,6 +651,8 @@ fn fit_linear_softmax(
         feature_columns,
         dataset_rows: rows,
         runtime_metadata: Some(runtime_metadata),
+        runtime_backend,
+        runtime_degraded_reason,
         alpha,
         l1_ratio,
         learning_rate,
@@ -586,12 +661,75 @@ fn fit_linear_softmax(
     })
 }
 
-fn predict_linear_softmax(artifact: &LinearSoftmaxArtifact, x: &DataFrame) -> Result<Array2<f32>> {
+fn predict_linear_softmax_with_runtime(
+    artifact: &LinearSoftmaxArtifact,
+    x: &DataFrame,
+) -> Result<LinearSoftmaxPrediction> {
     ensure_feature_columns_match(&artifact.feature_columns, x)?;
     let (features, _) = feature_matrix_from_dataframe(x)?;
     let features = artifact.scaler.transform(&features)?;
+
+    let cpu_backend = format!("{}_softmax_cpu", artifact.model_name);
+    let (fallback_backend, fallback_reason) =
+        runtime_backend_with_gpu_fallback(&artifact.model_name, &cpu_backend);
+    let execution_backend = artifact
+        .runtime_backend
+        .as_ref()
+        .filter(|backend| !backend.contains("cuda"))
+        .cloned()
+        .or(fallback_backend)
+        .or_else(|| Some(cpu_backend));
+    let degraded_reason =
+        append_runtime_degraded_reason(fallback_reason, artifact.runtime_degraded_reason.clone());
+    #[cfg(feature = "statistical-gpu")]
+    let (mut execution_backend, mut degraded_reason) = (execution_backend, degraded_reason);
+
+    #[cfg(feature = "statistical-gpu")]
+    if statistical_cuda_kernel_enabled(&artifact.model_name) {
+        match try_predict_linear_softmax_cuda(
+            &artifact.model_name,
+            &features,
+            &artifact.weights,
+            &artifact.bias,
+        ) {
+            Ok(probabilities) => {
+                return Ok(LinearSoftmaxPrediction {
+                    probabilities,
+                    execution_backend: Some(
+                        artifact
+                            .runtime_backend
+                            .as_ref()
+                            .filter(|backend| backend.contains("cuda"))
+                            .cloned()
+                            .unwrap_or_else(|| format!("{}_softmax_cuda", artifact.model_name)),
+                    ),
+                    degraded_reason: None,
+                });
+            }
+            Err(err) => {
+                execution_backend = Some(format!("{}_softmax_cpu", artifact.model_name));
+                degraded_reason = append_runtime_degraded_reason(
+                    degraded_reason,
+                    Some(format!("statistical_cuda_predict_fallback_to_cpu: {err}")),
+                );
+                tracing::warn!(
+                    "statistical cuda prediction unavailable for {}, falling back to cpu: {err}",
+                    artifact.model_name
+                );
+            }
+        }
+    }
+
     let logits = logits_from_features(&features, &artifact.weights, &artifact.bias)?;
-    Ok(softmax_rows(&logits))
+    Ok(LinearSoftmaxPrediction {
+        probabilities: softmax_rows(&logits),
+        execution_backend,
+        degraded_reason,
+    })
+}
+
+fn predict_linear_softmax(artifact: &LinearSoftmaxArtifact, x: &DataFrame) -> Result<Array2<f32>> {
+    Ok(predict_linear_softmax_with_runtime(artifact, x)?.probabilities)
 }
 
 pub struct ElasticNetExpert {
@@ -654,8 +792,13 @@ impl ElasticNetExpert {
             &model.feature_columns,
             model.dataset_rows,
         )?;
-        let probabilities = predict_linear_softmax(model, x)?;
-        runtime_predictions(&model.model_name, &probabilities)
+        let prediction = predict_linear_softmax_with_runtime(model, x)?;
+        runtime_predictions(
+            &model.model_name,
+            &prediction.probabilities,
+            prediction.execution_backend,
+            prediction.degraded_reason,
+        )
     }
 }
 
@@ -811,8 +954,13 @@ impl LogisticExpert {
             &model.feature_columns,
             model.dataset_rows,
         )?;
-        let probabilities = predict_linear_softmax(model, x)?;
-        runtime_predictions(&model.model_name, &probabilities)
+        let prediction = predict_linear_softmax_with_runtime(model, x)?;
+        runtime_predictions(
+            &model.model_name,
+            &prediction.probabilities,
+            prediction.execution_backend,
+            prediction.degraded_reason,
+        )
     }
 }
 
@@ -893,7 +1041,12 @@ mod tests {
     #[test]
     fn runtime_predictions_use_shared_three_class_confidence_gate() -> Result<()> {
         let probabilities = Array2::from_shape_vec((1, 3), vec![0.58_f32, 0.20, 0.22])?;
-        let predictions = runtime_predictions("logistic", &probabilities)?;
+        let predictions = runtime_predictions(
+            "logistic",
+            &probabilities,
+            Some("logistic_softmax_cpu".to_string()),
+            None,
+        )?;
         let prediction = predictions
             .first()
             .expect("one runtime prediction should be produced");
@@ -908,10 +1061,15 @@ mod tests {
     #[test]
     fn runtime_predictions_persist_linear_backend_details() -> Result<()> {
         let probabilities = Array2::from_shape_vec((1, 3), vec![0.58_f32, 0.20, 0.22])?;
-        let prediction = runtime_predictions("logistic", &probabilities)?
-            .into_iter()
-            .next()
-            .expect("one runtime prediction");
+        let prediction = runtime_predictions(
+            "logistic",
+            &probabilities,
+            Some("logistic_softmax_cpu".to_string()),
+            None,
+        )?
+        .into_iter()
+        .next()
+        .expect("one runtime prediction");
 
         assert_eq!(
             prediction.metadata().execution_backend.as_deref(),
@@ -944,6 +1102,8 @@ mod tests {
             feature_columns: vec!["f1".to_string(), "f2".to_string()],
             dataset_rows: 8,
             runtime_metadata: None,
+            runtime_backend: Some("logistic_softmax_cpu".to_string()),
+            runtime_degraded_reason: None,
             alpha: 0.01,
             l1_ratio: 0.0,
             learning_rate: 0.05,
@@ -977,6 +1137,8 @@ mod tests {
                 )
                 .expect("build metadata"),
             ),
+            runtime_backend: Some("logistic_softmax_cpu".to_string()),
+            runtime_degraded_reason: None,
             alpha: 0.01,
             l1_ratio: 0.0,
             learning_rate: 0.05,

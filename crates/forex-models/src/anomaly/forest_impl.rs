@@ -1038,6 +1038,10 @@ mod tests {
         .expect("sample dataframe")
     }
 
+    fn sample_labels() -> Series {
+        Series::new("label".into(), vec![0_i32; 8])
+    }
+
     #[test]
     fn isolation_forest_rejects_tampered_backend_kind_on_load() -> Result<()> {
         use std::time::{SystemTime, UNIX_EPOCH};

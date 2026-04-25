@@ -497,41 +497,6 @@ where
     finalize_candidates_with_progress(search.genes, &features, &ohlcv, config, progress_fn)
 }
 
-fn slice_features(features: &FeatureFrame, keep_ratio: f64) -> FeatureFrame {
-    if keep_ratio >= 1.0 || keep_ratio <= 0.0 {
-        return features.clone();
-    }
-    let total = features.data.nrows();
-    let start = total.saturating_sub((total as f64 * keep_ratio) as usize);
-    if start == 0 {
-        return features.clone();
-    }
-    FeatureFrame {
-        timestamps: features.timestamps[start..].to_vec(),
-        names: features.names.clone(),
-        data: features.data.slice(ndarray::s![start.., ..]).to_owned(),
-    }
-}
-
-fn slice_ohlcv_by_ratio(ohlcv: &Ohlcv, keep_ratio: f64) -> Ohlcv {
-    if keep_ratio >= 1.0 || keep_ratio <= 0.0 {
-        return ohlcv.clone();
-    }
-    let total = ohlcv.close.len();
-    let start = total.saturating_sub((total as f64 * keep_ratio) as usize);
-    if start == 0 {
-        return ohlcv.clone();
-    }
-    Ohlcv {
-        timestamp: ohlcv.timestamp.as_ref().map(|ts| ts[start..].to_vec()),
-        open: ohlcv.open[start..].to_vec(),
-        high: ohlcv.high[start..].to_vec(),
-        low: ohlcv.low[start..].to_vec(),
-        close: ohlcv.close[start..].to_vec(),
-        volume: ohlcv.volume.as_ref().map(|v| v[start..].to_vec()),
-    }
-}
-
 fn pearson_correlation(x: &[f32], y: &[f32]) -> f32 {
     let n = x.len() as f32;
     let mut sum_x = 0.0;
@@ -941,9 +906,7 @@ where
             // DS-2: also check Spearman to catch non-linear dependencies
             let spearman = spearman_corr_i8(&sig, existing);
             // Reject if EITHER correlation exceeds threshold
-            if pearson.abs() >= config.corr_threshold
-                || spearman.abs() >= config.corr_threshold
-            {
+            if pearson.abs() >= config.corr_threshold || spearman.abs() >= config.corr_threshold {
                 ok = false;
                 rejected_by_correlation += 1;
                 break;

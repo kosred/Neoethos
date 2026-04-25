@@ -1,6 +1,6 @@
+use ndarray::Array2;
 use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
-use ndarray::Array2;
 
 #[derive(Debug, Clone)]
 pub enum CalibrationModel {
@@ -37,7 +37,7 @@ impl ProbabilityCalibrator {
     ) -> PyResult<bool> {
         let p = probs.as_array();
         let y = y_true.as_array();
-        
+
         if p.shape()[0] != y.len() || p.shape()[1] < 3 {
             return Ok(false);
         }
@@ -46,12 +46,16 @@ impl ProbabilityCalibrator {
         for cls in 0..3 {
             let mut x_cls = Vec::with_capacity(y.len());
             let mut y_cls = Vec::with_capacity(y.len());
-            
+
             for i in 0..y.len() {
                 let prob = p[[i, cls]].clamp(1e-6, 1.0 - 1e-6);
                 let logit = (prob / (1.0 - prob)).ln();
                 x_cls.push(logit);
-                let target = if y[i] == cls as i64 || (y[i] == -1 && cls == 2) { 1.0 } else { 0.0 };
+                let target = if y[i] == cls as i64 || (y[i] == -1 && cls == 2) {
+                    1.0
+                } else {
+                    0.0
+                };
                 y_cls.push(target);
             }
 
@@ -74,7 +78,9 @@ impl ProbabilityCalibrator {
 
         if !self.fitted || self.models.len() < 3 {
             for i in 0..n_rows {
-                for j in 0..3 { out[[i, j]] = p[[i, j]]; }
+                for j in 0..3 {
+                    out[[i, j]] = p[[i, j]];
+                }
             }
             return Ok(out.to_pyarray(py));
         }
@@ -96,7 +102,9 @@ impl ProbabilityCalibrator {
         for i in 0..n_rows {
             let sum: f64 = (0..3).map(|j| out[[i, j]]).sum();
             if sum > 0.0 {
-                for j in 0..3 { out[[i, j]] /= sum; }
+                for j in 0..3 {
+                    out[[i, j]] /= sum;
+                }
             }
         }
 

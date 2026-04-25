@@ -1,6 +1,6 @@
+use chrono::{DateTime, Duration, NaiveDate, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use chrono::{NaiveDate, DateTime, Utc, Duration};
-use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsistencyMetrics {
@@ -54,17 +54,18 @@ impl ConsistencyTracker {
     pub fn update(&mut self, event: &TradeEvent) {
         let ts = match DateTime::parse_from_rfc3339(&event.entry_time) {
             Ok(dt) => dt.with_timezone(&Utc),
-            Err(_) => {
-                match event.entry_time.parse::<DateTime<Utc>>() {
-                    Ok(dt) => dt,
-                    Err(_) => {
-                        tracing::warn!("ConsistencyTracker dropped trade with invalid entry_time: {}", event.entry_time);
-                        return;
-                    }
+            Err(_) => match event.entry_time.parse::<DateTime<Utc>>() {
+                Ok(dt) => dt,
+                Err(_) => {
+                    tracing::warn!(
+                        "ConsistencyTracker dropped trade with invalid entry_time: {}",
+                        event.entry_time
+                    );
+                    return;
                 }
-            }
+            },
         };
-        
+
         let d = ts.date_naive();
         let pnl = event.pnl;
         let risk_pct = event.risk_pct;
@@ -76,13 +77,19 @@ impl ConsistencyTracker {
         *self.daily_trades.entry(d).or_insert(0) += 1;
         *self.daily_risk.entry(d).or_insert(0.0) += risk_pct;
 
-        if self.trade_sizes.len() >= self.max_hist { self.trade_sizes.pop_front(); }
+        if self.trade_sizes.len() >= self.max_hist {
+            self.trade_sizes.pop_front();
+        }
         self.trade_sizes.push_back(size);
 
-        if self.hold_times.len() >= self.max_hist { self.hold_times.pop_front(); }
+        if self.hold_times.len() >= self.max_hist {
+            self.hold_times.pop_front();
+        }
         self.hold_times.push_back(hold_minutes);
 
-        if self.trade_outcomes.len() >= self.max_hist { self.trade_outcomes.pop_front(); }
+        if self.trade_outcomes.len() >= self.max_hist {
+            self.trade_outcomes.pop_front();
+        }
         self.trade_outcomes.push_back(win_flag);
 
         let cutoff_date = d - Duration::days(self.lookback_days);
@@ -113,18 +120,27 @@ impl ConsistencyTracker {
         let start_idx = days.len().saturating_sub(self.lookback_days as usize);
         let recent_days = &days[start_idx..];
 
-        let pnls: Vec<f64> = recent_days.iter().map(|d| *self.daily_pnl.get(d).unwrap_or(&0.0)).collect();
+        let pnls: Vec<f64> = recent_days
+            .iter()
+            .map(|d| *self.daily_pnl.get(d).unwrap_or(&0.0))
+            .collect();
         let daily_profit_consistency = if !pnls.is_empty() {
             pnls.iter().filter(|&&p| p > 0.0).count() as f64 / pnls.len().max(1) as f64
         } else {
             0.0
         };
 
-        let trades: Vec<f64> = recent_days.iter().map(|d| *self.daily_trades.get(d).unwrap_or(&0) as f64).collect();
+        let trades: Vec<f64> = recent_days
+            .iter()
+            .map(|d| *self.daily_trades.get(d).unwrap_or(&0) as f64)
+            .collect();
         let trade_var = variance(&trades);
         let daily_trade_consistency = 1.0 / (1.0 + trade_var);
 
-        let risks: Vec<f64> = recent_days.iter().map(|d| *self.daily_risk.get(d).unwrap_or(&0.0)).collect();
+        let risks: Vec<f64> = recent_days
+            .iter()
+            .map(|d| *self.daily_risk.get(d).unwrap_or(&0.0))
+            .collect();
         let risk_var = variance(&risks);
         let daily_risk_consistency = 1.0 / (1.0 + risk_var);
 
@@ -144,30 +160,42 @@ impl ConsistencyTracker {
             1.0
         };
 
-        let size_var = if self.trade_sizes.len() > 1 { variance(&self.trade_sizes.iter().copied().collect::<Vec<f64>>()) } else { 0.0 };
+        let size_var = if self.trade_sizes.len() > 1 {
+            variance(&self.trade_sizes.iter().copied().collect::<Vec<f64>>())
+        } else {
+            0.0
+        };
         let trade_size_consistency = 1.0 / (1.0 + size_var);
 
-        let hold_var = if self.hold_times.len() > 1 { variance(&self.hold_times.iter().copied().collect::<Vec<f64>>()) } else { 0.0 };
+        let hold_var = if self.hold_times.len() > 1 {
+            variance(&self.hold_times.iter().copied().collect::<Vec<f64>>())
+        } else {
+            0.0
+        };
         let hold_time_consistency = 1.0 / (1.0 + hold_var);
 
         let win_rate = if !self.trade_outcomes.is_empty() {
             let n = self.trade_outcomes.len().min(30);
-            let recent: f64 = self.trade_outcomes.iter().skip(self.trade_outcomes.len() - n).map(|&v| v as f64).sum();
+            let recent: f64 = self
+                .trade_outcomes
+                .iter()
+                .skip(self.trade_outcomes.len() - n)
+                .map(|&v| v as f64)
+                .sum();
             recent / (n as f64)
         } else {
             0.0
         };
 
-        let score = (
-            0.25 * daily_profit_consistency
+        let score = (0.25 * daily_profit_consistency
             + 0.2 * daily_trade_consistency
             + 0.15 * daily_risk_consistency
             + 0.1 * weekly_profit_consistency
             + 0.1 * weekly_dd_consistency
             + 0.1 * trade_size_consistency
             + 0.05 * hold_time_consistency
-            + 0.05 * win_rate
-        ) * 100.0;
+            + 0.05 * win_rate)
+            * 100.0;
 
         let grade = if score >= 90.0 {
             "A+"
@@ -182,7 +210,6 @@ impl ConsistencyTracker {
         } else {
             "F"
         };
-
 
         ConsistencyMetrics {
             score,
@@ -200,12 +227,17 @@ impl ConsistencyTracker {
 }
 
 fn variance(data: &[f64]) -> f64 {
-    if data.len() < 2 { return 0.0; }
+    if data.len() < 2 {
+        return 0.0;
+    }
     let mean = data.iter().sum::<f64>() / data.len() as f64;
-    data.iter().map(|&value| {
-        let diff = mean - value;
-        diff * diff
-    }).sum::<f64>() / (data.len() as f64 - 1.0)
+    data.iter()
+        .map(|&value| {
+            let diff = mean - value;
+            diff * diff
+        })
+        .sum::<f64>()
+        / (data.len() as f64 - 1.0)
 }
 
 fn std_dev(data: &[f64]) -> f64 {

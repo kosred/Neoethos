@@ -764,6 +764,10 @@ mod tests {
         .expect("sample dataframe")
     }
 
+    fn sample_labels() -> Series {
+        Series::new("label".into(), vec![-1_i32, 0, 1, -1, 0, 1])
+    }
+
     #[test]
     fn bayesian_logit_rejects_label_row_mismatch() {
         let df = sample_dataframe();

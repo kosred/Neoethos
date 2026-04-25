@@ -3,8 +3,8 @@ use crate::app_services::ctrader_auth::CTraderAuthSnapshot;
 use crate::app_services::trading::{ConnectionSnapshot, TradingSession};
 use crate::app_state::{AppState, DataSource};
 use crate::ui::components::{
-    render_dashboard_sections, render_summary_cards, render_view_header, DashboardCard,
-    DashboardSection,
+    DashboardCard, DashboardSection, render_dashboard_sections, render_summary_cards,
+    render_view_header,
 };
 use eframe::egui;
 

@@ -1,6 +1,6 @@
 use forex_core::domain::consistency::{ConsistencyTracker as CoreConsistencyTracker, TradeEvent};
-use forex_core::domain::meta_controller::{MetaController as CoreMetaController, PropMetaState};
 use forex_core::domain::drift_monitor::ConceptDriftMonitor as CoreDriftMonitor;
+use forex_core::domain::meta_controller::{MetaController as CoreMetaController, PropMetaState};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
 
@@ -22,11 +22,23 @@ impl ConsistencyTracker {
 
     pub fn update(&mut self, trade_event: &Bound<'_, PyDict>) -> PyResult<()> {
         let entry_time: String = trade_event.get_item("entry_time")?.unwrap().extract()?;
-        let pnl: f64 = trade_event.get_item("pnl")?.map(|x| x.extract().unwrap_or(0.0)).unwrap_or(0.0);
-        let risk_pct: f64 = trade_event.get_item("risk_pct")?.map(|x| x.extract().unwrap_or(0.0)).unwrap_or(0.0);
-        let size: f64 = trade_event.get_item("size")?.map(|x| x.extract().unwrap_or(0.0)).unwrap_or(0.0);
-        let hold_minutes: f64 = trade_event.get_item("hold_minutes")?.map(|x| x.extract().unwrap_or(0.0)).unwrap_or(0.0);
-        
+        let pnl: f64 = trade_event
+            .get_item("pnl")?
+            .map(|x| x.extract().unwrap_or(0.0))
+            .unwrap_or(0.0);
+        let risk_pct: f64 = trade_event
+            .get_item("risk_pct")?
+            .map(|x| x.extract().unwrap_or(0.0))
+            .unwrap_or(0.0);
+        let size: f64 = trade_event
+            .get_item("size")?
+            .map(|x| x.extract().unwrap_or(0.0))
+            .unwrap_or(0.0);
+        let hold_minutes: f64 = trade_event
+            .get_item("hold_minutes")?
+            .map(|x| x.extract().unwrap_or(0.0))
+            .unwrap_or(0.0);
+
         let win: Option<i32> = match trade_event.get_item("win")? {
             Some(v) => {
                 if let Ok(b) = v.extract::<bool>() {
@@ -34,11 +46,18 @@ impl ConsistencyTracker {
                 } else {
                     v.extract::<i32>().ok()
                 }
-            },
+            }
             None => None,
         };
 
-        let event = TradeEvent { entry_time, pnl, risk_pct, size, hold_minutes, win };
+        let event = TradeEvent {
+            entry_time,
+            pnl,
+            risk_pct,
+            size,
+            hold_minutes,
+            win,
+        };
         self.inner.update(&event);
         Ok(())
     }
@@ -50,13 +69,19 @@ impl ConsistencyTracker {
         dict.set_item("daily_profit_consistency", metrics.daily_profit_consistency)?;
         dict.set_item("daily_trade_consistency", metrics.daily_trade_consistency)?;
         dict.set_item("daily_risk_consistency", metrics.daily_risk_consistency)?;
-        dict.set_item("weekly_profit_consistency", metrics.weekly_profit_consistency)?;
-        dict.set_item("weekly_drawdown_consistency", metrics.weekly_drawdown_consistency)?;
+        dict.set_item(
+            "weekly_profit_consistency",
+            metrics.weekly_profit_consistency,
+        )?;
+        dict.set_item(
+            "weekly_drawdown_consistency",
+            metrics.weekly_drawdown_consistency,
+        )?;
         dict.set_item("trade_size_consistency", metrics.trade_size_consistency)?;
         dict.set_item("hold_time_consistency", metrics.hold_time_consistency)?;
         dict.set_item("win_rate_rolling", metrics.win_rate_rolling)?;
         dict.set_item("grade", metrics.grade)?;
-        
+
         let dataclass_module = PyModule::import(py, "forex_bot.execution.consistency")?;
         let class = dataclass_module.getattr("ConsistencyMetrics")?;
         let inst = class.call((), Some(&dict))?;
@@ -87,7 +112,8 @@ impl MetaController {
         if let Some(s) = settings {
             if let Ok(dyn_cfg) = s.getattr("dynamic") {
                 if let Ok(risk_params) = dyn_cfg.call_method0("get") {
-                    if let Ok(k) = risk_params.call_method1("get", ("risk_curve_steepness", 200.0)) {
+                    if let Ok(k) = risk_params.call_method1("get", ("risk_curve_steepness", 200.0))
+                    {
                         k_steepness = k.extract().unwrap_or(200.0);
                     }
                     if let Ok(c) = risk_params.call_method1("get", ("confidence_threshold",)) {
@@ -100,7 +126,14 @@ impl MetaController {
         }
 
         Ok(Self {
-            inner: CoreMetaController::new(max_daily_dd, safety_buffer, base_risk_per_trade, Some(final_base_confidence), silent, Some(k_steepness)),
+            inner: CoreMetaController::new(
+                max_daily_dd,
+                safety_buffer,
+                base_risk_per_trade,
+                Some(final_base_confidence),
+                silent,
+                Some(k_steepness),
+            ),
         })
     }
 
@@ -111,7 +144,7 @@ impl MetaController {
                 m_regime = r;
             }
         }
-        
+
         let s = PropMetaState {
             daily_dd_pct: state.getattr("daily_dd_pct")?.extract()?,
             daily_profit_pct: 0.0,

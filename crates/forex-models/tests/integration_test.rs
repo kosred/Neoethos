@@ -12,8 +12,12 @@ fn test_registry() {
     use forex_models::registry::*;
 
     // Test available models
-    assert!(!AVAILABLE_MODELS.is_empty(), "Should have available models");
-    println!("Available models: {:?}", AVAILABLE_MODELS);
+    let available_models = list_models_by_category()
+        .into_values()
+        .flatten()
+        .collect::<Vec<_>>();
+    assert!(!available_models.is_empty(), "Should have available models");
+    println!("Available models: {:?}", available_models);
 
     // Test model info
     let lgbm_info = get_model_info("lightgbm").expect("LightGBM should be in registry");

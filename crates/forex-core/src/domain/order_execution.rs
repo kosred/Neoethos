@@ -51,7 +51,9 @@ impl OrderExecutor {
         sl_dist: f64,
         default_tp: f64,
     ) -> Vec<(f64, f64)> {
-        if !self.config.partial_take_profit_enabled || total_size < self.config.partial_tp_min_total_lot {
+        if !self.config.partial_take_profit_enabled
+            || total_size < self.config.partial_tp_min_total_lot
+        {
             return vec![(Self::round_2(total_size), default_tp)];
         }
 

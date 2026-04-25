@@ -1543,7 +1543,7 @@ impl ExitAgent {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExitAgent, ExitAgentArtifact, Experience, exit_runtime_metadata};
+    use super::{ExitAgent, ExitAgentArtifact, Experience, PendingRegret, exit_runtime_metadata};
     use crate::base::three_class_runtime_confidence;
     use crate::statistical::common::{METADATA_FILE_NAME, write_json};
     use anyhow::Result;

@@ -699,7 +699,7 @@ impl<'a> AutoTuner<'a> {
             HardwareExecutionPlan::from_settings_and_profile(self.settings, self.profile.clone());
         let cpu_cores = self.profile.cpu_cores.max(1);
         let ram_gb = self.profile.available_ram_gb;
-        let cpu_budget = resolve_cpu_budget_from_env(cpu_cores);
+        let cpu_budget = self.resolve_cpu_budget(cpu_cores);
         let (
             train_device,
             train_batch_size,

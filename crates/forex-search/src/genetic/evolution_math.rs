@@ -764,7 +764,6 @@ pub fn apply_metrics(genes: &mut [Gene], metrics: &[[f64; 11]]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::mock::StepRng;
 
     #[test]
     fn rank_weights_follow_candidate_order() {
@@ -774,7 +773,7 @@ mod tests {
 
     #[test]
     fn zero_weight_fallback_is_deterministic() {
-        let mut rng = StepRng::new(0, 1);
+        let mut rng = rand::rng();
         assert_eq!(draw_weighted_offset(&[0.0, f64::NAN, -1.0], &mut rng), 0);
     }
 }

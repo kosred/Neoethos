@@ -1,9 +1,9 @@
 use crate::app_services::broker_config::CTraderBrokerEnvironment;
 use crate::app_services::trading::{
-    TradingAdapterKind, TradingSession, SUPPORTED_TRADING_ADAPTERS,
+    SUPPORTED_TRADING_ADAPTERS, TradingAdapterKind, TradingSession,
 };
 use crate::app_state::{AppState, DataSource};
-use crate::ui::components::{render_summary_cards, render_view_header, DashboardCard};
+use crate::ui::components::{DashboardCard, render_summary_cards, render_view_header};
 use crate::ui::system::shared::{labeled_text_edit, render_account_targets};
 use crate::ui::theme;
 use eframe::egui;

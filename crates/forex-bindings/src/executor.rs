@@ -1,14 +1,13 @@
+use crate::utils::{
+    contract_size_from_parts, norm_symbol, pip_size_from_parts, quote_to_account_rate, split_symbol,
+};
+use forex_core::domain::risk::{
+    PositionSizingInput, PropFirmRules, RiskManager as CoreRiskManager, TradeGateInput,
+};
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
-use forex_core::domain::risk::{
-    PositionSizingInput,
-    PropFirmRules,
-    RiskManager as CoreRiskManager,
-    TradeGateInput,
-};
-use crate::utils::{split_symbol, pip_size_from_parts, contract_size_from_parts, norm_symbol, quote_to_account_rate};
-use std::collections::HashMap;
 use pyo3::types::PyDict;
+use std::collections::HashMap;
 
 #[pyfunction]
 #[pyo3(signature = (
@@ -74,7 +73,11 @@ pub fn compute_position_size_lots(
 
 #[pyfunction]
 #[pyo3(signature = (symbol, point=None, digits=None))]
-pub fn pip_size_from_symbol(symbol: &str, point: Option<f64>, digits: Option<i64>) -> PyResult<f64> {
+pub fn pip_size_from_symbol(
+    symbol: &str,
+    point: Option<f64>,
+    digits: Option<i64>,
+) -> PyResult<f64> {
     let sym = symbol.to_ascii_uppercase();
     let pip_size = if let (Some(pt), Some(dig)) = (point, digits) {
         let ptv = if pt.is_finite() && pt > 0.0 {
@@ -267,11 +270,13 @@ impl RiskManager {
     }
 
     pub fn save_state_json(&self) -> PyResult<String> {
-        serde_json::to_string(&self.inner).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+        serde_json::to_string(&self.inner)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
     }
 
     pub fn load_state_json(&mut self, json: String) -> PyResult<()> {
-        self.inner = serde_json::from_str(&json).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+        self.inner = serde_json::from_str(&json)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
         Ok(())
     }
 }
@@ -338,7 +343,8 @@ impl OrderExecutor {
         sl_dist: f64,
         default_tp: f64,
     ) -> Vec<(f64, f64)> {
-        self.inner.build_order_legs(total_size, signal, entry_price, sl, sl_dist, default_tp)
+        self.inner
+            .build_order_legs(total_size, signal, entry_price, sl, sl_dist, default_tp)
     }
 
     pub fn compute_order_prices(

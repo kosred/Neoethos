@@ -7,7 +7,7 @@
 // - ExpertModel: Abstract trait for all expert models
 // - Training utilities for time-series aware data handling
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use ndarray::Array2;
 use polars::prelude::*;
 use std::collections::HashMap;
@@ -15,8 +15,8 @@ use std::path::Path;
 use tracing::*;
 
 use crate::runtime::artifacts::{
-    default_three_class_label_mapping, LabelMapping, RuntimeArtifactMetadata,
-    TrainingSummaryMetadata,
+    LabelMapping, RuntimeArtifactMetadata, TrainingSummaryMetadata,
+    default_three_class_label_mapping,
 };
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 use crate::runtime::prediction::{PredictionMetadata, RuntimePrediction, RuntimePredictionError};
@@ -353,8 +353,7 @@ fn normalize_training_summary_for_metadata(
     if summary.train_rows == 0 && summary.dataset_rows > 0 {
         warn!(
             "runtime artifact metadata for {} has zero train rows; promoting split to train_rows={} val_rows=0",
-            model_name,
-            summary.dataset_rows
+            model_name, summary.dataset_rows
         );
         summary.train_rows = summary.dataset_rows;
         summary.val_rows = 0;
@@ -532,8 +531,8 @@ pub fn stratified_downsample(
         return Ok((x.clone(), y.clone()));
     }
 
-    use rand::prelude::*;
     use rand::SeedableRng;
+    use rand::prelude::*;
     let mut rng = StdRng::seed_from_u64(random_state);
 
     // Group by class
@@ -1163,9 +1162,10 @@ mod tests {
         )
         .expect_err("expected contract validation error");
 
-        assert!(err
-            .to_string()
-            .contains("requires at least one feature column"));
+        assert!(
+            err.to_string()
+                .contains("requires at least one feature column")
+        );
     }
 
     #[test]
@@ -1361,7 +1361,7 @@ mod tests {
     #[test]
     fn strict_numeric_column_values_rejects_non_finite_values() -> Result<()> {
         let df = DataFrame::new(vec![
-            Series::new("close".into(), vec![1.0_f64, f64::NAN]).into()
+            Series::new("close".into(), vec![1.0_f64, f64::NAN]).into(),
         ])?;
 
         let err = strict_numeric_column_values(&df, "close")

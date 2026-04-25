@@ -205,7 +205,8 @@ impl RevengeTradeDetector {
         }
 
         let last_trade = self.recent_trades.last().unwrap();
-        let time_since_last_min = (current_time_sec.saturating_sub(last_trade.exit_time_sec)) as f64 / 60.0;
+        let time_since_last_min =
+            (current_time_sec.saturating_sub(last_trade.exit_time_sec)) as f64 / 60.0;
 
         if time_since_last_min < 15.0 && last_trade.pnl < 0.0 {
             return true;
@@ -219,7 +220,7 @@ impl RevengeTradeDetector {
                 break;
             }
         }
-        
+
         if consecutive_losses >= 3 {
             let optimal_times = (7..9).contains(&current_hour) || (13..15).contains(&current_hour);
             if !optimal_times {
@@ -252,11 +253,11 @@ impl RevengeTradeDetector {
             let t2 = &self.recent_trades[n - 2];
             let t3 = &self.recent_trades[n - 1];
 
-            if t1.direction.is_some() 
-                && t1.direction == t2.direction 
-                && t2.direction == t3.direction 
-                && t3.pnl < 0.0 
-                && t2.pnl < 0.0 
+            if t1.direction.is_some()
+                && t1.direction == t2.direction
+                && t2.direction == t3.direction
+                && t3.pnl < 0.0
+                && t2.pnl < 0.0
             {
                 return true;
             }
@@ -408,7 +409,13 @@ impl RiskManager {
         };
         let dd_used = daily_dd_pct.max(intraday_dd_pct).max(0.0);
         let dd_limit = self.prop_rules.daily_dd_stop_trading_pct.max(1e-9);
-        (daily_dd_pct, intraday_dd_pct, dd_used, dd_limit, total_dd_pct)
+        (
+            daily_dd_pct,
+            intraday_dd_pct,
+            dd_used,
+            dd_limit,
+            total_dd_pct,
+        )
     }
 
     pub fn update_recovery_state(&mut self, equity: f64) {
@@ -472,7 +479,13 @@ impl RiskManager {
                 input.current_hour >= s && input.current_hour < e
             };
             if in_window && input.market_volatility < self.night_min_volatility {
-                return (false, format!("Night session blocked (vol={:.5}<{:.5})", input.market_volatility, self.night_min_volatility));
+                return (
+                    false,
+                    format!(
+                        "Night session blocked (vol={:.5}<{:.5})",
+                        input.market_volatility, self.night_min_volatility
+                    ),
+                );
             }
         }
 
@@ -482,50 +495,78 @@ impl RiskManager {
             }
         }
 
-        if self.revenge_detector.is_revenge_trading(input.current_time_sec, input.current_hour) {
+        if self
+            .revenge_detector
+            .is_revenge_trading(input.current_time_sec, input.current_hour)
+        {
             return (false, "Revenge trading detected".to_string());
         }
 
-        let (daily_dd, intraday_dd, _dd_used, _dd_limit, total_dd) = self.drawdown_state(input.equity);
+        let (daily_dd, intraday_dd, _dd_used, _dd_limit, total_dd) =
+            self.drawdown_state(input.equity);
         if total_dd >= 0.05 {
             self.circuit_breaker_triggered = true;
-            return (false, "Drawdown Recovery: HALT trading (DD > 5%)".to_string());
+            return (
+                false,
+                "Drawdown Recovery: HALT trading (DD > 5%)".to_string(),
+            );
         }
         if total_dd >= self.prop_rules.max_total_loss_pct {
             self.circuit_breaker_triggered = true;
-            return (false, format!("Total drawdown limit ({:.2}%)", total_dd * 100.0));
+            return (
+                false,
+                format!("Total drawdown limit ({:.2}%)", total_dd * 100.0),
+            );
         }
 
         if total_dd >= 0.04 {
             if let Some(rank) = input.strategy_rank {
                 if rank > 1 {
-                    return (false, "Drawdown Recovery: DD > 4%, only top 1 strategy allowed".to_string());
+                    return (
+                        false,
+                        "Drawdown Recovery: DD > 4%, only top 1 strategy allowed".to_string(),
+                    );
                 }
             }
             if self.session_trades >= 2 {
-                return (false, "Drawdown Recovery: DD > 4%, max 2 trades/day".to_string());
+                return (
+                    false,
+                    "Drawdown Recovery: DD > 4%, max 2 trades/day".to_string(),
+                );
             }
         } else if total_dd >= 0.03 {
             if let Some(sharpe) = input.strategy_sharpe {
                 if sharpe <= 1.0 {
-                    return (false, "Drawdown Recovery: DD > 3%, only Sharpe > 1.0 allowed".to_string());
+                    return (
+                        false,
+                        "Drawdown Recovery: DD > 3%, only Sharpe > 1.0 allowed".to_string(),
+                    );
                 }
             }
         } else if total_dd >= 0.02 {
             if let Some(rank) = input.strategy_rank {
                 if rank > 3 {
-                    return (false, "Drawdown Recovery: DD > 2%, only top 3 strategies allowed".to_string());
+                    return (
+                        false,
+                        "Drawdown Recovery: DD > 2%, only top 3 strategies allowed".to_string(),
+                    );
                 }
             }
         }
 
         if daily_dd >= self.prop_rules.daily_dd_stop_trading_pct {
             self.circuit_breaker_triggered = true;
-            return (false, format!("Daily drawdown limit ({:.2}%)", daily_dd * 100.0));
+            return (
+                false,
+                format!("Daily drawdown limit ({:.2}%)", daily_dd * 100.0),
+            );
         }
         if intraday_dd >= self.prop_rules.daily_dd_stop_trading_pct {
             self.circuit_breaker_triggered = true;
-            return (false, format!("Intraday trailing limit ({:.2}%)", intraday_dd * 100.0));
+            return (
+                false,
+                format!("Intraday trailing limit ({:.2}%)", intraday_dd * 100.0),
+            );
         }
 
         if self.session_trades >= self.prop_rules.max_trades_per_day {
@@ -533,7 +574,7 @@ impl RiskManager {
         }
 
         if input.confidence < self.min_confidence_threshold {
-             return (false, format!("Confidence {:.2} too low", input.confidence));
+            return (false, format!("Confidence {:.2} too low", input.confidence));
         }
 
         (true, "OK".to_string())
@@ -551,8 +592,12 @@ impl RiskManager {
             self.daily_loss += pnl.abs();
             self.consecutive_losses += 1;
         }
-        if equity > self.total_peak_equity { self.total_peak_equity = equity; }
-        if equity > self.day_peak_equity { self.day_peak_equity = equity; }
+        if equity > self.total_peak_equity {
+            self.total_peak_equity = equity;
+        }
+        if equity > self.day_peak_equity {
+            self.day_peak_equity = equity;
+        }
         self.update_recovery_state(equity);
     }
 
@@ -566,7 +611,7 @@ impl RiskManager {
         };
 
         let uncertainty_penalty = 1.0 - (input.uncertainty * 0.5);
-        
+
         // Dynamic Kelly Sizing (Idea #4.2)
         let mut base_risk = input.base_risk_pct;
         if let (Some(wr), Some(aw), Some(al)) = (input.win_rate, input.avg_win, input.avg_loss) {

@@ -1,13 +1,16 @@
-use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use futures::prelude::*;
-use anyhow::{Result, Context, anyhow};
-use tracing::{info, error, warn};
-use tokio::time::{interval, Duration};
+#![allow(dead_code)]
 
-use crate::app_services::ctrader_proto_messages::{build_heartbeat, build_app_auth_req, build_account_auth_req};
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
+use crate::app_services::ctrader_proto_messages::{
+    build_account_auth_req, build_app_auth_req, build_heartbeat,
+};
+use anyhow::{Context, Result};
+use futures::prelude::*;
+use std::sync::Arc;
+use tokio::sync::{Mutex, mpsc};
+use tokio::time::{Duration, interval};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tracing::{error, warn};
 
 pub struct CTraderSession {
     tx: mpsc::Sender<Vec<u8>>,
@@ -23,7 +26,9 @@ impl CTraderSession {
         access_token: String,
     ) -> Result<Self> {
         let url = format!("wss://{}:5036", environment.endpoint_host());
-        let (ws_stream, _) = connect_async(url).await.context("failed to connect to cTrader")?;
+        let (ws_stream, _) = connect_async(url)
+            .await
+            .context("failed to connect to cTrader")?;
         let (mut write, mut read) = ws_stream.split();
 
         let (tx_out, mut rx_out) = mpsc::channel::<Vec<u8>>(100);
@@ -50,7 +55,7 @@ impl CTraderSession {
                         }
                     }
                     Ok(Message::Text(text)) => {
-                        // Some environments might send JSON even over binary socket if requested, 
+                        // Some environments might send JSON even over binary socket if requested,
                         // but we are moving to binary.
                         warn!("received unexpected text message: {}", text);
                     }
@@ -64,10 +69,12 @@ impl CTraderSession {
         });
 
         // Initial Auth sequence
-        let app_auth = build_app_auth_req(&client_id, &client_secret, Some("app-auth".to_string()))?;
+        let app_auth =
+            build_app_auth_req(&client_id, &client_secret, Some("app-auth".to_string()))?;
         tx_out.send(app_auth).await?;
 
-        let account_auth = build_account_auth_req(account_id, &access_token, Some("acc-auth".to_string()))?;
+        let account_auth =
+            build_account_auth_req(account_id, &access_token, Some("acc-auth".to_string()))?;
         tx_out.send(account_auth).await?;
 
         // Heartbeat task

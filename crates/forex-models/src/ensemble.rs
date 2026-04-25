@@ -1,17 +1,17 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use ndarray::Array2;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::base::{
-    build_runtime_prediction_with_details, three_class_runtime_confidence, ExpertModel,
+    ExpertModel, build_runtime_prediction_with_details, three_class_runtime_confidence,
 };
-use crate::runtime::artifacts::{default_three_class_label_mapping, RuntimeArtifactMetadata};
+use crate::runtime::artifacts::{RuntimeArtifactMetadata, default_three_class_label_mapping};
 use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
-    ensure_feature_columns_match, meta_runtime_metadata, read_json, write_json, METADATA_FILE_NAME,
+    METADATA_FILE_NAME, ensure_feature_columns_match, meta_runtime_metadata, read_json, write_json,
 };
 use crate::tree_models::XGBoostExpert;
 
@@ -762,6 +762,7 @@ fn select_temperature(probabilities: &Array2<f32>, labels: &[i32]) -> Result<f32
     Ok(best_temperature)
 }
 
+#[cfg(test)]
 fn build_meta_runtime_prediction(
     model_name: &str,
     row: [f32; 3],
@@ -1973,12 +1974,14 @@ mod tests {
             build_probability_calibration_runtime_prediction(row, CalibrationMethod::Temperature)?;
 
         assert_eq!(prediction.abstain_recommended(), Some(true));
-        assert!(prediction
-            .metadata()
-            .degraded_reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("shared three-class confidence gate recommended abstain"));
+        assert!(
+            prediction
+                .metadata()
+                .degraded_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("shared three-class confidence gate recommended abstain")
+        );
         Ok(())
     }
 

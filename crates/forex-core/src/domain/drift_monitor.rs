@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
-use tracing::{info, warn};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
 pub struct DriftMonitorStatus {
@@ -29,7 +29,7 @@ pub struct ConceptDriftMonitor {
     pub psi_score: f64,
     pub kl_divergence: f64,
 
-    // Feature monitor stats 
+    // Feature monitor stats
     pub feature_stats: std::collections::HashMap<String, FeatureStat>,
     pub alpha: f64,
 }
@@ -88,12 +88,16 @@ impl ConceptDriftMonitor {
         let n = self.error_stream.len() as f64;
         let sum: f64 = self.error_stream.iter().sum();
         self.mean_error = sum / n;
-        
+
         if n > 1.0 {
-            let var_sum: f64 = self.error_stream.iter().map(|&x| {
-                let diff = x - self.mean_error;
-                diff * diff
-            }).sum();
+            let var_sum: f64 = self
+                .error_stream
+                .iter()
+                .map(|&x| {
+                    let diff = x - self.mean_error;
+                    diff * diff
+                })
+                .sum();
             self.variance = var_sum / (n - 1.0); // sample variance
         } else {
             self.variance = 0.0;
@@ -102,7 +106,12 @@ impl ConceptDriftMonitor {
         if self.error_stream.len() >= self.window_size {
             self.drift_detected = self.check_drift();
             if self.drift_detected {
-                self.last_drift_at = Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
+                self.last_drift_at = Some(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                );
             }
         }
 
@@ -111,7 +120,9 @@ impl ConceptDriftMonitor {
 
     fn check_drift(&mut self) -> bool {
         let n = self.error_stream.len();
-        if n < self.window_size * 2 { return false; }
+        if n < self.window_size * 2 {
+            return false;
+        }
 
         let mid = n / 2;
         let mut slice1: Vec<f64> = self.error_stream.iter().take(mid).copied().collect();
@@ -129,7 +140,7 @@ impl ConceptDriftMonitor {
         let mut ks_drift = false;
         slice1.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         slice2.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        
+
         let (ks_stat, ks_pval) = Self::ks_2samp(&slice1, &slice2);
         self.ks_statistic = ks_stat;
         if ks_pval < 0.001 {
@@ -144,9 +155,15 @@ impl ConceptDriftMonitor {
         }
 
         let mut drift_votes = 0;
-        if variance_drift { drift_votes += 1; }
-        if ks_drift { drift_votes += 1; }
-        if psi_drift { drift_votes += 1; }
+        if variance_drift {
+            drift_votes += 1;
+        }
+        if ks_drift {
+            drift_votes += 1;
+        }
+        if psi_drift {
+            drift_votes += 1;
+        }
 
         let drift_detected = drift_votes >= 2;
         if drift_detected {
@@ -169,15 +186,23 @@ impl ConceptDriftMonitor {
             let val2 = data2[j];
 
             let d = if val1 <= val2 {
-                while i < data1.len() && data1[i] <= val1 { i += 1; }
+                while i < data1.len() && data1[i] <= val1 {
+                    i += 1;
+                }
                 let cdf1 = i as f64 / n1;
-                while j < data2.len() && data2[j] <= val1 { j += 1; }
+                while j < data2.len() && data2[j] <= val1 {
+                    j += 1;
+                }
                 let cdf2 = j as f64 / n2;
                 (cdf1 - cdf2).abs()
             } else {
-                while j < data2.len() && data2[j] <= val2 { j += 1; }
+                while j < data2.len() && data2[j] <= val2 {
+                    j += 1;
+                }
                 let cdf2 = j as f64 / n2;
-                while i < data1.len() && data1[i] <= val2 { i += 1; }
+                while i < data1.len() && data1[i] <= val2 {
+                    i += 1;
+                }
                 let cdf1 = i as f64 / n1;
                 (cdf1 - cdf2).abs()
             };
@@ -186,22 +211,26 @@ impl ConceptDriftMonitor {
                 max_d = d;
             }
         }
-        
+
         // P-value approximation
         let en = (n1 * n2) / (n1 + n2);
         let arg = (en.sqrt() + 0.12 + 0.11 / en.sqrt()) * max_d;
         let p_val = if arg < 0.0 { 1.0 } else { smirnov_p(arg) };
-        
+
         (max_d, p_val.clamp(0.0, 1.0))
     }
 
     fn calculate_psi(&self, expected: &[f64], actual: &[f64], bins: usize) -> f64 {
-        if expected.is_empty() || actual.is_empty() { return 0.0; }
+        if expected.is_empty() || actual.is_empty() {
+            return 0.0;
+        }
 
         let min_val = expected.first().unwrap();
         let max_val = expected.last().unwrap();
-        
-        if (max_val - min_val).abs() < 1e-9 { return 0.0; }
+
+        if (max_val - min_val).abs() < 1e-9 {
+            return 0.0;
+        }
 
         let step = (max_val - min_val) / bins as f64;
         let mut expected_counts = vec![0.0; bins];
@@ -209,19 +238,23 @@ impl ConceptDriftMonitor {
 
         for &val in expected {
             let mut b = ((val - min_val) / step).floor() as usize;
-            if b >= bins { b = bins - 1; }
+            if b >= bins {
+                b = bins - 1;
+            }
             expected_counts[b] += 1.0;
         }
 
         for &val in actual {
             let mut b = ((val - min_val) / step).floor() as usize;
-            if b >= bins { b = bins - 1; }
+            if b >= bins {
+                b = bins - 1;
+            }
             actual_counts[b] += 1.0;
         }
 
         let e_sum: f64 = expected_counts.iter().sum();
         let a_sum: f64 = actual_counts.iter().sum();
-        
+
         let mut psi = 0.0;
         for i in 0..bins {
             let e_pct = (expected_counts[i] + 1e-6) / (e_sum + bins as f64 * 1e-6);
@@ -248,23 +281,29 @@ impl ConceptDriftMonitor {
 }
 
 fn variance(data: &[f64]) -> f64 {
-    if data.len() < 2 { return 0.0; }
+    if data.len() < 2 {
+        return 0.0;
+    }
     let mean = data.iter().sum::<f64>() / data.len() as f64;
     data.iter().map(|&x| (x - mean) * (x - mean)).sum::<f64>() / (data.len() as f64 - 1.0)
 }
 
 fn smirnov_p(x: f64) -> f64 {
     // Asymptotic p-value for KS test
-    if x < 0.27 { return 1.0; }
-    if x > 3.0 { return 0.0; }
-    
+    if x < 0.27 {
+        return 1.0;
+    }
+    if x > 3.0 {
+        return 0.0;
+    }
+
     let mut sum = 0.0;
     for k in 1..=5 {
         let f = k as f64;
         let sign = if k % 2 == 1 { 1.0 } else { -1.0 };
         sum += sign * f64::exp(-2.0 * f * f * x * x);
     }
-    
+
     let prob = 2.0 * sum;
     prob.clamp(0.0, 1.0)
 }

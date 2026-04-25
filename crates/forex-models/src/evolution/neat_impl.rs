@@ -13,8 +13,8 @@ use symbios_neat::{Activation, CppnEvaluator, NeatConfig, NeatGenome};
 #[cfg(feature = "neuro-evolution-gpu")]
 use super::neat_gpu::{neat_cuda_kernel_enabled, try_population_scores_cuda};
 use crate::base::{
-    ExpertModel, build_runtime_artifact_metadata, build_runtime_prediction_with_details,
-    three_class_runtime_confidence, try_build_runtime_artifact_metadata,
+    ExpertModel, build_runtime_prediction_with_details, three_class_runtime_confidence,
+    try_build_runtime_artifact_metadata,
 };
 use crate::runtime::artifacts::{
     RuntimeArtifactMetadata, TrainingSummaryMetadata, default_three_class_label_mapping,
@@ -554,6 +554,7 @@ impl NeatExpert {
         let mut cuda_fitness_disabled = false;
 
         for _generation in 0..self.generations {
+            #[cfg(feature = "neuro-evolution-gpu")]
             let mut cuda_scores = None;
             #[cfg(feature = "neuro-evolution-gpu")]
             if !cuda_fitness_disabled && neat_cuda_kernel_enabled(&self.requested_device_policy) {
@@ -598,6 +599,8 @@ impl NeatExpert {
                     }
                 }
             }
+            #[cfg(not(feature = "neuro-evolution-gpu"))]
+            let cuda_scores: Option<Vec<GenomeScore>> = None;
 
             let mut scores = cuda_scores.unwrap_or_else(|| {
                 population
@@ -1215,6 +1218,7 @@ impl ExpertModel for NeatExpert {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::base::build_runtime_artifact_metadata;
     use crate::statistical::common::read_json;
     use polars::prelude::{DataFrame, NamedFrom, Series};
     use std::time::{SystemTime, UNIX_EPOCH};

@@ -5,19 +5,19 @@ mod workspace;
 
 use crate::ui::components::render_ribbon_item;
 use app_services::{
-    discovery::DiscoveryJobHandle, trading::TradingSession, training::TrainingJobHandle,
-    ServiceEvent,
+    ServiceEvent, discovery::DiscoveryJobHandle, trading::TradingSession,
+    training::TrainingJobHandle,
 };
 use app_state::{AppRuntimeConfig, AppState};
 use clap::Parser;
 use eframe::egui;
+use forex_core::Settings;
 use forex_core::logging::{setup_logging, write_subsystem_record};
 use forex_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
-use forex_core::Settings;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{error, info};
-use workspace::{render_workspace, WorkspaceState, WorkspaceViewer};
+use workspace::{WorkspaceState, WorkspaceViewer, render_workspace};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -377,7 +377,7 @@ fn spawn_account_heartbeat(tx: mpsc::Sender<ServiceEvent>) -> tokio::task::JoinH
 
 #[cfg(test)]
 mod tests {
-    use super::{app_record, AppRuntimeConfig};
+    use super::{AppRuntimeConfig, app_record};
     use crate::app_state::DataSource;
     use forex_core::Settings;
     use std::path::PathBuf;

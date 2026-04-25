@@ -1,21 +1,21 @@
 use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
 
-pub mod utils;
-pub mod conformal;
-pub mod calibration;
-pub mod core;
-pub mod inference;
-pub mod indicators;
-pub mod executor;
-pub mod monitoring;
-pub mod models;
-pub mod data;
-pub mod search;
-pub mod evaluation;
-pub mod validation;
-pub mod training;
 pub mod burn_bindings;
+pub mod calibration;
+pub mod conformal;
+pub mod core;
+pub mod data;
+pub mod evaluation;
+pub mod executor;
+pub mod indicators;
+pub mod inference;
+pub mod models;
+pub mod monitoring;
+pub mod search;
+pub mod training;
+pub mod utils;
+pub mod validation;
 
 #[pymodule]
 fn forex_bindings(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -23,47 +23,62 @@ fn forex_bindings(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<monitoring::ConsistencyTracker>()?;
     m.add_class::<monitoring::MetaController>()?;
     m.add_class::<monitoring::ConceptDriftMonitor>()?;
-    
+
     // Risk & Execution
     m.add_class::<executor::RiskManager>()?;
     m.add_class::<executor::OrderExecutor>()?;
-    
+
     // Core & Hardware
     m.add_class::<core::ForexCore>()?;
-    
+
     // Prediction & Inference
     m.add_class::<conformal::ConformalGate>()?;
     m.add_class::<calibration::ProbabilityCalibrator>()?;
-    
+
     #[cfg(feature = "onnx")]
     m.add_class::<inference::ModelEngine>()?;
-    
+
     // Training Orchestration
     m.add_class::<training::TrainingOrchestrator>()?;
-    
+
     // Strategy Search & Evolution
     m.add_function(wrap_pyfunction!(search::search_evolve_ohlcv, m)?)?;
     m.add_function(wrap_pyfunction!(search::search_evolve_gpu_ohlcv, m)?)?;
     m.add_function(wrap_pyfunction!(search::search_discovery_ohlcv, m)?)?;
-    
+
     // Data Loading & Features
     m.add_function(wrap_pyfunction!(data::load_symbol_frames, m)?)?;
     m.add_function(wrap_pyfunction!(data::load_symbol_features, m)?)?;
     m.add_function(wrap_pyfunction!(data::load_strategy_signals, m)?)?;
-    
+
     // Utility Indicators & Math
-    m.add_function(wrap_pyfunction!(evaluation::infer_stop_target_pips_ohlcv, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        evaluation::infer_stop_target_pips_ohlcv,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(evaluation::fast_evaluate_strategy, m)?)?;
     m.add_function(wrap_pyfunction!(evaluation::batch_evaluate_strategies, m)?)?;
-    m.add_function(wrap_pyfunction!(evaluation::evaluate_population_vector_ta_ohlcv, m)?)?;
-    m.add_function(wrap_pyfunction!(evaluation::evaluate_population_core_py, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        evaluation::evaluate_population_vector_ta_ohlcv,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        evaluation::evaluate_population_core_py,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(evaluation::trade_journal_metrics, m)?)?;
     m.add_function(wrap_pyfunction!(evaluation::triple_barrier_labels, m)?)?;
     m.add_function(wrap_pyfunction!(evaluation::quick_backtest_metrics, m)?)?;
-    m.add_function(wrap_pyfunction!(evaluation::vector_ta_bulk_signals_ohlcv, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        evaluation::vector_ta_bulk_signals_ohlcv,
+        m
+    )?)?;
 
     // Validation
-    m.add_function(wrap_pyfunction!(validation::embargoed_walkforward_backtest_py, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        validation::embargoed_walkforward_backtest_py,
+        m
+    )?)?;
     m.add_class::<validation::PyCombinatorialPurgedCV>()?;
 
     // Utility Functions
@@ -84,13 +99,22 @@ fn forex_bindings(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Indicator logic
     m.add_function(wrap_pyfunction!(indicators::extract_regime_features, m)?)?;
-    m.add_function(wrap_pyfunction!(indicators::remap_labels_neutral_buy_sell, m)?)?;
-    m.add_function(wrap_pyfunction!(indicators::remap_labels_sell_neutral_buy, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        indicators::remap_labels_neutral_buy_sell,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        indicators::remap_labels_sell_neutral_buy,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(indicators::pad_probs_neutral_buy_sell, m)?)?;
     m.add_function(wrap_pyfunction!(indicators::margins_to_probs, m)?)?;
     m.add_function(wrap_pyfunction!(utils::probs_to_signals, m)?)?;
     m.add_function(wrap_pyfunction!(utils::threshold_signals_and_accuracy, m)?)?;
-    m.add_function(wrap_pyfunction!(evaluation::aggregate_prop_score_metrics, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        evaluation::aggregate_prop_score_metrics,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(utils::balanced_class_weights, m)?)?;
     m.add_function(wrap_pyfunction!(utils::sample_weights_from_labels, m)?)?;
     m.add_function(wrap_pyfunction!(utils::sort_rows_with_labels_by_index, m)?)?;

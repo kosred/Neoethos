@@ -361,8 +361,12 @@ mod tests {
 
     #[test]
     fn gpu_count_reads_generic_override() {
-        std::env::set_var("FOREX_GPU_COUNT", "3");
+        unsafe {
+            std::env::set_var("FOREX_GPU_COUNT", "3");
+        }
         assert_eq!(gpu_count(), 3);
-        std::env::remove_var("FOREX_GPU_COUNT");
+        unsafe {
+            std::env::remove_var("FOREX_GPU_COUNT");
+        }
     }
 }

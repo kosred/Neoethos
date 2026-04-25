@@ -102,11 +102,7 @@ fn softmax_gradient_kernel(
         } else {
             pos % CLASS_COUNT as u32
         };
-        let feature_idx = if is_bias {
-            0
-        } else {
-            pos / CLASS_COUNT as u32
-        };
+        let feature_idx = if is_bias { 0 } else { pos / CLASS_COUNT as u32 };
 
         let mut grad = 0.0f32;
         let mut row = 0u32;
@@ -289,7 +285,10 @@ fn flatten_labels(labels: &[usize], rows: usize) -> Result<Vec<i32>> {
     Ok(labels.iter().map(|label| *label as i32).collect())
 }
 
-fn read_f32_buffer(client: &ComputeClient<CudaRuntime>, handle: cubecl::server::Handle) -> Vec<f32> {
+fn read_f32_buffer(
+    client: &ComputeClient<CudaRuntime>,
+    handle: cubecl::server::Handle,
+) -> Vec<f32> {
     let bytes = client.read_one(handle);
     f32::from_bytes(&bytes).to_vec()
 }

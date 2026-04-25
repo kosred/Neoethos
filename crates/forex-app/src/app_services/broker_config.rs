@@ -3,7 +3,6 @@ use crate::app_services::trading::TradingAdapterKind;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrokerSessionState {
     Disconnected,
-    Configured,
     ReadyForAuth,
     Authenticated,
     #[cfg_attr(not(test), allow(dead_code))]

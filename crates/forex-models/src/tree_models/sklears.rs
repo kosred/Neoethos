@@ -1,11 +1,11 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use ndarray::Array2;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::path::Path;
 
-use crate::base::{dataframe_to_float32_array, feature_columns_from_dataframe, ExpertModel};
+use crate::base::{ExpertModel, dataframe_to_float32_array, feature_columns_from_dataframe};
 use crate::runtime::artifacts::TrainingSummaryMetadata;
 use crate::runtime::capabilities::ModelFamily;
 use crate::runtime::prediction::RuntimePrediction;
@@ -308,11 +308,7 @@ impl SklearsTreeExpert {
             }
         }
 
-        if best_gain > 1e-6 {
-            best_split
-        } else {
-            None
-        }
+        if best_gain > 1e-6 { best_split } else { None }
     }
 
     fn build_node(

@@ -14,8 +14,8 @@ use std::{cmp::Ordering, f64::consts::PI};
 #[cfg(feature = "neuro-evolution-gpu")]
 use super::crfmnes_gpu::{neuro_evo_cuda_kernel_enabled, try_selection_losses_cuda};
 use crate::base::{
-    ExpertModel, build_runtime_artifact_metadata, build_runtime_prediction_with_details,
-    three_class_runtime_confidence, try_build_runtime_artifact_metadata,
+    ExpertModel, build_runtime_prediction_with_details, three_class_runtime_confidence,
+    try_build_runtime_artifact_metadata,
 };
 use crate::runtime::artifacts::{
     RuntimeArtifactMetadata, TrainingSummaryMetadata, default_three_class_label_mapping,
@@ -184,18 +184,6 @@ impl CrfmnesEvolutionState {
         }
     }
 
-    fn run_generation<F>(&mut self, mut evaluate: F) -> Result<Vec<f64>>
-    where
-        F: FnMut(&[f64]) -> Result<f64>,
-    {
-        self.run_generation_batch(|candidates| {
-            candidates
-                .iter()
-                .map(|candidate| evaluate(candidate))
-                .collect::<Result<Vec<_>>>()
-        })
-    }
-
     fn run_generation_batch<F>(&mut self, mut evaluate: F) -> Result<Vec<f64>>
     where
         F: FnMut(&[Vec<f64>]) -> Result<Vec<f64>>,
@@ -338,18 +326,6 @@ impl NeuroEvoOptimizer {
             NeuroEvoBackend::Crfmnes(state) => Ok(state.best_weights.clone()),
             NeuroEvoBackend::Fallback(state) => Ok(state.best_weights.clone()),
         }
-    }
-
-    fn run_generation<F>(&mut self, mut evaluate: F) -> Result<Vec<f64>>
-    where
-        F: FnMut(&[f64]) -> Result<f64>,
-    {
-        self.run_generation_batch(|candidates| {
-            candidates
-                .iter()
-                .map(|candidate| evaluate(candidate))
-                .collect::<Result<Vec<_>>>()
-        })
     }
 
     fn run_generation_batch<F>(&mut self, mut evaluate: F) -> Result<Vec<f64>>
@@ -967,7 +943,9 @@ impl ExpertModel for NeuroEvoExpert {
         let effective_generations = self.effective_generation_count();
         let mut selected_backend = FALLBACK_BACKEND_NAME.to_string();
         let mut selected_degraded_reason = Some(FALLBACK_DEGRADED_REASON.to_string());
+        #[cfg(feature = "neuro-evolution-gpu")]
         let mut used_cuda_fitness = false;
+        #[cfg(feature = "neuro-evolution-gpu")]
         let mut cuda_fitness_disabled = false;
 
         if effective_generations < self.generations {
@@ -1058,12 +1036,15 @@ impl ExpertModel for NeuroEvoExpert {
             }
         }
 
-        if used_cuda_fitness && !selected_backend.contains("cuda") {
-            selected_backend = if selected_backend == "crfmnes_cpu" {
-                "crfmnes_cuda_fitness".to_string()
-            } else {
-                format!("{selected_backend}_cuda_fitness")
-            };
+        #[cfg(feature = "neuro-evolution-gpu")]
+        {
+            if used_cuda_fitness && !selected_backend.contains("cuda") {
+                selected_backend = if selected_backend == "crfmnes_cpu" {
+                    "crfmnes_cuda_fitness".to_string()
+                } else {
+                    format!("{selected_backend}_cuda_fitness")
+                };
+            }
         }
         self.params = best_params;
         self.search_backend = selected_backend;
@@ -1244,6 +1225,7 @@ impl NeuroEvoExpert {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::base::build_runtime_artifact_metadata;
     use polars::prelude::{DataFrame, NamedFrom, Series};
     use std::time::{SystemTime, UNIX_EPOCH};
 

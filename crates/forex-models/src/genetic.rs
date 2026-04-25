@@ -1,22 +1,22 @@
 use crate::base::{
-    build_runtime_prediction_with_details, canonical_three_class_label_mapping,
+    ExpertModel, build_runtime_prediction_with_details, canonical_three_class_label_mapping,
     dataframe_to_float32_array, feature_columns_from_dataframe, three_class_runtime_confidence,
-    try_build_runtime_artifact_metadata, ExpertModel,
+    try_build_runtime_artifact_metadata,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
 use crate::runtime::capabilities::{
-    append_runtime_degraded_reason, gpu_policy_cpu_fallback_reason, CapabilityState, ModelFamily,
+    CapabilityState, ModelFamily, append_runtime_degraded_reason, gpu_policy_cpu_fallback_reason,
 };
 use crate::runtime::prediction::RuntimePrediction;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{Duration, TimeZone, Utc};
 use forex_data::{FeatureFrame, Ohlcv};
 use forex_search::genetic::{
+    Gene, ParentSelectionPolicy, SeenSignatureMemory, SmcSearchConfig, SurvivorSelectionPolicy,
     crossover, generate_random_genes, mutate, select_parent_index, select_survivor_indices,
-    signals_for_gene, unique_candidate_or_retry, Gene, ParentSelectionPolicy, SeenSignatureMemory,
-    SmcSearchConfig, SurvivorSelectionPolicy,
+    signals_for_gene, unique_candidate_or_retry,
 };
-use forex_search::{run_discovery_cycle, DiscoveryConfig, FilteringConfig};
+use forex_search::{DiscoveryConfig, FilteringConfig, run_discovery_cycle};
 use ndarray::Array2;
 use polars::prelude::*;
 use rand::Rng;

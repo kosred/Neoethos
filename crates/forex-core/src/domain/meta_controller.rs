@@ -1,5 +1,5 @@
-use tracing::{debug, info, warn};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone)]
 pub struct PropMetaState {
@@ -51,7 +51,10 @@ impl MetaController {
         let k_steepness = k_steepness.unwrap_or(200.0);
         let base_confidence = base_confidence.unwrap_or(0.55);
         if !silent {
-            info!("MetaController init: k={:.1}, base_conf={:.2}", k_steepness, base_confidence);
+            info!(
+                "MetaController init: k={:.1}, base_conf={:.2}",
+                k_steepness, base_confidence
+            );
         }
 
         Self {
@@ -67,7 +70,7 @@ impl MetaController {
 
     pub fn get_risk_parameters(&mut self, state: &PropMetaState) -> (f64, f64, bool) {
         let dd_delta = state.daily_dd_pct - self.safety_buffer;
-        
+
         // Clip exponent to prevent overflow/underflow
         let exponent = (self.k_steepness * dd_delta).clamp(-20.0, 20.0);
         let survival_multiplier = 1.0 / (1.0 + exponent.exp());
@@ -103,31 +106,43 @@ impl MetaController {
             perf_multiplier = perf_multiplier.min(0.5);
         }
 
-        
         if state.daily_profit_pct >= 0.035 {
             perf_multiplier = perf_multiplier.min(0.01);
-            let now_capper = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let now_capper = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
             if !self.silent && (now_capper - self.last_log_time > 10) {
-                warn!("Meta-Controller: Consistency Capper active. Daily Profit >= 3.5% ({:.2}%). Risk drastically scaled down.", state.daily_profit_pct * 100.0);
+                warn!(
+                    "Meta-Controller: Consistency Capper active. Daily Profit >= 3.5% ({:.2}%). Risk drastically scaled down.",
+                    state.daily_profit_pct * 100.0
+                );
             }
         }
-        let mut final_risk_multiplier = survival_multiplier * vol_multiplier * regime_scale * perf_multiplier;
-
+        let mut final_risk_multiplier =
+            survival_multiplier * vol_multiplier * regime_scale * perf_multiplier;
 
         let confidence_adjustment = (1.0 - survival_multiplier) * 0.2;
         let mut final_confidence_threshold = self.base_confidence + confidence_adjustment;
         final_confidence_threshold = final_confidence_threshold.min(0.85);
 
         let mut allow_trading = true;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
         if state.daily_dd_pct >= (self.max_daily_dd - 0.002) {
             allow_trading = false;
             final_risk_multiplier = 0.0;
-            let now_capper = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let now_capper = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
             if !self.silent && (now_capper - self.last_log_time > 10) {
-                warn!("Meta-Controller: Hard Stop Triggered! DD={:.2}% >= {:.2}%", 
-                    state.daily_dd_pct * 100.0, 
+                warn!(
+                    "Meta-Controller: Hard Stop Triggered! DD={:.2}% >= {:.2}%",
+                    state.daily_dd_pct * 100.0,
                     (self.max_daily_dd - 0.002) * 100.0
                 );
                 self.last_log_time = now;
@@ -136,7 +151,8 @@ impl MetaController {
 
         if !self.silent && state.daily_dd_pct > 0.01 {
             if (now - self.last_log_time > 60) && survival_multiplier < 0.5 {
-                info!("Meta-Controller: DD={:.2}% | Regime={} | RiskMult={:.2} | ReqConf={:.2}",
+                info!(
+                    "Meta-Controller: DD={:.2}% | Regime={} | RiskMult={:.2} | ReqConf={:.2}",
                     state.daily_dd_pct * 100.0,
                     state.market_regime,
                     final_risk_multiplier,
@@ -144,7 +160,8 @@ impl MetaController {
                 );
                 self.last_log_time = now;
             } else if now - self.last_log_time > 60 {
-                debug!("Meta-Controller: DD={:.2}% | Regime={} | RiskMult={:.2} | ReqConf={:.2}",
+                debug!(
+                    "Meta-Controller: DD={:.2}% | Regime={} | RiskMult={:.2} | ReqConf={:.2}",
                     state.daily_dd_pct * 100.0,
                     state.market_regime,
                     final_risk_multiplier,
@@ -153,6 +170,10 @@ impl MetaController {
             }
         }
 
-        (final_risk_multiplier, final_confidence_threshold, allow_trading)
+        (
+            final_risk_multiplier,
+            final_confidence_threshold,
+            allow_trading,
+        )
     }
 }

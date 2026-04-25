@@ -1,4 +1,5 @@
 use crate::app_record;
+use crate::app_services::ServiceEvent;
 use crate::app_services::broker_config::{
     AdapterReadinessSnapshot, BrokerAccountTarget, BrokerSessionState, BrokerSettingsState,
     CTraderBrokerEnvironment,
@@ -16,43 +17,41 @@ use crate::app_services::ctrader_bootstrap::{
     bootstrap_from_ctrader_history, plan_bootstrap_chunks,
 };
 use crate::app_services::ctrader_data::{
-    load_chart_history, resolve_symbol, CTraderChartHistoryRequest, CTraderSymbolInfo,
-    CTraderSymbolLookupRequest, HistoricalBar,
+    CTraderChartHistoryRequest, CTraderSymbolInfo, CTraderSymbolLookupRequest, HistoricalBar,
+    load_chart_history, resolve_symbol,
 };
 use crate::app_services::ctrader_execution::{
     CTraderExecutionBackend, CTraderExecutionOutcome, CTraderExecutionRequest,
     CTraderExecutionRuntimeRequest, CTraderExecutionStatus, ProductionCTraderExecutionBackend,
 };
 use crate::app_services::ctrader_live_auth::{
-    build_default_loopback_config, CTraderAccountDiscoveryBackend, CTraderAccountDiscoveryRequest,
+    CTRADER_DEFAULT_SCOPE, CTraderAccountDiscoveryBackend, CTraderAccountDiscoveryRequest,
     CTraderEnvironment, CTraderLiveAuthBackend, CTraderLiveAuthRequest, CTraderLiveAuthResult,
-    CTraderTokenRefreshRequest, ProductionCTraderLiveAuthBackend, CTRADER_DEFAULT_SCOPE,
+    CTraderTokenRefreshRequest, ProductionCTraderLiveAuthBackend, build_default_loopback_config,
 };
 use crate::app_services::ctrader_messages::{
-    build_amend_order_request, build_cancel_order_request, build_close_position_request,
-    build_new_order_request, CTraderAmendOrderRequest, CTraderCancelOrderRequest,
-    CTraderClosePositionRequest, CTraderNewOrderRequest, CTraderOrderTriggerMethod,
-    CTraderOrderType, CTraderTimeInForce, CTraderTradeSide,
-    SUPPORTED_CTRADER_ORDER_TRIGGER_METHODS, SUPPORTED_CTRADER_ORDER_TYPES,
-    SUPPORTED_CTRADER_TIME_IN_FORCE, SUPPORTED_CTRADER_TRADE_SIDES,
+    CTraderAmendOrderRequest, CTraderCancelOrderRequest, CTraderClosePositionRequest,
+    CTraderNewOrderRequest, CTraderOrderTriggerMethod, CTraderOrderType, CTraderTimeInForce,
+    CTraderTradeSide, SUPPORTED_CTRADER_ORDER_TRIGGER_METHODS, SUPPORTED_CTRADER_ORDER_TYPES,
+    SUPPORTED_CTRADER_TIME_IN_FORCE, SUPPORTED_CTRADER_TRADE_SIDES, build_amend_order_request,
+    build_cancel_order_request, build_close_position_request, build_new_order_request,
 };
 use crate::app_services::ctrader_streaming::{
-    merge_live_spot_update_into_bars, CTraderLiveChartUpdate, CTraderLiveChartUpdateRequest,
-    CTraderLiveStreamingBackend, ProductionCTraderLiveStreamingBackend,
+    CTraderLiveChartUpdate, CTraderLiveChartUpdateRequest, CTraderLiveStreamingBackend,
+    ProductionCTraderLiveStreamingBackend, merge_live_spot_update_into_bars,
 };
-use crate::app_services::jobs::{push_recent_event, JobEventLevel, JobKind, JobSnapshot, JobState};
+use crate::app_services::jobs::{JobEventLevel, JobKind, JobSnapshot, JobState, push_recent_event};
 use crate::app_services::secure_store::{
     CTraderSecureStore, CTraderTokenStore, KeyringSecretStoreBackend,
 };
-use crate::app_services::ServiceEvent;
 use crate::app_state::{AppState, DataSource, OrderTicketState};
 use anyhow::Context;
 use forex_core::logging::write_subsystem_record;
 use forex_core::sectioned_log::SubsystemSection;
-use forex_data::{discover_timeframes, load_symbol_timeframe, Ohlcv};
+use forex_data::{Ohlcv, discover_timeframes, load_symbol_timeframe};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::error;
 
@@ -288,38 +287,6 @@ pub enum AppExecutionRuntimeSnapshot {
 impl TradingSession {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    #[cfg(test)]
-    pub fn from_connected_terminal_for_test(terminal_info: impl Into<String>) -> Self {
-        Self {
-            configured_adapter: TradingAdapterKind::CTrader,
-            broker_settings: BrokerSettingsState::default(),
-            ctrader_auth: None,
-            ctrader_live_auth_backend: Arc::new(ProductionCTraderLiveAuthBackend),
-            ctrader_account_discovery_backend: Arc::new(ProductionCTraderLiveAuthBackend),
-            ctrader_account_runtime_backend: Arc::new(ProductionCTraderAccountRuntimeBackend),
-            ctrader_execution_backend: Arc::new(ProductionCTraderExecutionBackend),
-            ctrader_live_streaming_backend: Arc::new(ProductionCTraderLiveStreamingBackend),
-            ctrader_token_store: Arc::new(CTraderSecureStore::new(
-                "forex-ai",
-                "ctrader.default",
-                KeyringSecretStoreBackend,
-            )),
-            ctrader_live_auth_rx: None,
-            adapter: None,
-            connected: true,
-            terminal_info: terminal_info.into(),
-            market_chart_cache: None,
-            execution_surface_cache: None,
-            ctrader_live_spot_cache: None,
-            trade_journal: Vec::new(),
-            initial_equity: None,
-            day_start_equity: None,
-            ctrader_runtime_refreshed_at: None,
-            connect_handle: None,
-            bootstrap_handle: None,
-        }
     }
 
     #[cfg(test)]
@@ -2389,25 +2356,7 @@ fn run_ctrader_bootstrap_batch_with_context(
 impl TradingAdapter {
     fn kind(&self) -> TradingAdapterKind {
         match self {
-            Self::Mt5(_) => TradingAdapterKind::Mt5,
             Self::CTrader(_) => TradingAdapterKind::CTrader,
-        }
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn terminal_info(&self) -> String {
-        match self {
-            Self::Mt5(engine) => engine.terminal_info().unwrap_or_default(),
-            Self::CTrader(runtime) => format!(
-                "{} · account {} · balance {:.2}",
-                runtime
-                    .trader
-                    .broker_name
-                    .as_deref()
-                    .unwrap_or("cTrader Open API"),
-                runtime.trader.account_id,
-                runtime.trader.balance
-            ),
         }
     }
 }
@@ -2415,10 +2364,6 @@ impl TradingAdapter {
 impl TradingAdapterKind {
     fn execution_feed_unavailable_reason(self, connected: bool) -> String {
         match self {
-            Self::Mt5 if !connected => {
-                "MT5 execution feed is unavailable until the local terminal connects.".to_string()
-            }
-            Self::Mt5 => "MT5 execution feed is currently unavailable.".to_string(),
             Self::CTrader if !connected => {
                 "cTrader execution feed is unavailable until the remote account session connects."
                     .to_string()
@@ -2493,8 +2438,6 @@ pub fn panel_mode(data_source: DataSource, connected: bool) -> TradingPanelMode 
         (DataSource::Local, _) => TradingPanelMode::LocalOnly,
         (DataSource::CTrader, false) => TradingPanelMode::Disconnected,
         (DataSource::CTrader, true) => TradingPanelMode::Connected,
-        (DataSource::MT5, false) => TradingPanelMode::Disconnected,
-        (DataSource::MT5, true) => TradingPanelMode::Connected,
     }
 }
 
@@ -2716,37 +2659,6 @@ pub fn build_execution_surface_snapshot_with_runtime(
         pending_order_choices,
     ) = if let Some(runtime) = runtime {
         match runtime {
-            AppExecutionRuntimeSnapshot::Mt5(runtime) => {
-                diagnostics.push(format!("Open positions: {}", runtime.positions.len()));
-                diagnostics.push(format!("Pending orders: {}", runtime.pending_orders.len()));
-                diagnostics.push(format!("Recent fills: {}", runtime.recent_deals.len()));
-                (
-                    runtime.positions.iter().map(format_position_line).collect(),
-                    runtime
-                        .pending_orders
-                        .iter()
-                        .map(format_pending_order_line)
-                        .collect(),
-                    runtime.recent_deals.iter().map(format_deal_line).collect(),
-                    runtime.recent_deals.iter().map(format_deal_line).collect(),
-                    runtime
-                        .positions
-                        .iter()
-                        .map(|position| ExecutionSelectionOption {
-                            id: position.ticket,
-                            label: format_position_line(position),
-                        })
-                        .collect(),
-                    runtime
-                        .pending_orders
-                        .iter()
-                        .map(|order| ExecutionSelectionOption {
-                            id: order.ticket,
-                            label: format_pending_order_line(order),
-                        })
-                        .collect(),
-                )
-            }
             AppExecutionRuntimeSnapshot::CTrader(runtime) => {
                 diagnostics.push(format!("Trader balance: {:.2}", runtime.trader.balance));
                 diagnostics.push(format!("Trader account id: {}", runtime.trader.account_id));
@@ -2891,71 +2803,17 @@ impl MarketChartSnapshot {
     }
 }
 
-fn broker_execution_snapshot_from_mt5(
-    engine: &MT5Engine,
-    symbol: Option<&str>,
-    lookback_hours: i64,
-) -> anyhow::Result<BrokerExecutionSnapshot> {
-    Ok(BrokerExecutionSnapshot {
-        positions: engine.positions(symbol)?,
-        pending_orders: engine.orders(symbol)?,
-        recent_deals: engine.recent_deals(symbol, lookback_hours)?,
-    })
-}
-
 impl ExecutionFeedHandle<'_> {
     fn load_runtime_snapshot(
         &self,
-        symbol: &str,
-        lookback_hours: i64,
+        _symbol: &str,
+        _lookback_hours: i64,
     ) -> anyhow::Result<AppExecutionRuntimeSnapshot> {
         match self {
-            Self::Mt5(engine) => Ok(AppExecutionRuntimeSnapshot::Mt5(
-                broker_execution_snapshot_from_mt5(engine, Some(symbol), lookback_hours)?,
-            )),
             Self::CTrader(runtime) => Ok(AppExecutionRuntimeSnapshot::CTrader((*runtime).clone())),
             Self::Unavailable { reason } => Err(anyhow::anyhow!(reason.clone())),
         }
     }
-}
-
-fn format_position_line(position: &PositionInfo) -> String {
-    format!(
-        "#{} · {} {} {:.2} · open {:.5} · current {:.5} · pnl {:+.2}",
-        position.ticket,
-        position.symbol,
-        position.order_side,
-        position.volume,
-        position.price_open,
-        position.price_current,
-        position.profit
-    )
-}
-
-fn format_pending_order_line(order: &PendingOrderInfo) -> String {
-    format!(
-        "#{} · {} {} {:.2} @ {:.5} · sl {:.5} · tp {:.5}",
-        order.ticket,
-        order.symbol,
-        order.order_kind,
-        order.volume_initial,
-        order.price_open,
-        order.stop_loss,
-        order.take_profit
-    )
-}
-
-fn format_deal_line(deal: &DealInfo) -> String {
-    format!(
-        "#{} · {} {} {:.2} @ {:.5} · pnl {:+.2} · fee {:+.2}",
-        deal.ticket,
-        deal.entry_kind,
-        deal.order_side,
-        deal.volume,
-        deal.price,
-        deal.profit,
-        deal.fee
-    )
 }
 
 fn format_ctrader_terminal_info(
@@ -3467,24 +3325,6 @@ mod tests {
     }
 
     #[test]
-    fn connection_snapshot_reports_connected_mt5_session_details() {
-        let state = sample_state(DataSource::MT5, "Connected");
-        let session = TradingSession::from_connected_terminal_for_test(
-            "TerminalInfo(community_account=False, connected=True)",
-        );
-
-        let snapshot = session.snapshot(&state);
-
-        assert_eq!(snapshot.adapter_name, "MT5");
-        assert_eq!(snapshot.mode, TradingPanelMode::Connected);
-        assert!(snapshot.connected);
-        assert_eq!(snapshot.status_text, "Connected");
-        assert!(snapshot
-            .terminal_info
-            .contains("TerminalInfo(community_account=False"));
-    }
-
-    #[test]
     fn panel_mode_uses_data_source_and_connection_state() {
         assert_eq!(
             panel_mode(DataSource::Local, false),
@@ -3498,27 +3338,6 @@ mod tests {
             panel_mode(DataSource::CTrader, true),
             TradingPanelMode::Connected
         );
-        assert_eq!(
-            panel_mode(DataSource::MT5, false),
-            TradingPanelMode::Disconnected
-        );
-        assert_eq!(
-            panel_mode(DataSource::MT5, true),
-            TradingPanelMode::Connected
-        );
-    }
-
-    #[test]
-    fn connection_snapshot_reports_adapter_kind_for_connected_runtime() {
-        let state = sample_state(DataSource::MT5, "Connected");
-        let session = TradingSession::from_connected_terminal_for_test(
-            "TerminalInfo(community_account=False, connected=True)",
-        );
-
-        let snapshot = session.snapshot(&state);
-
-        assert_eq!(snapshot.adapter_name, "MT5");
-        assert_eq!(snapshot.mode, TradingPanelMode::Connected);
     }
 
     #[test]
@@ -3667,10 +3486,12 @@ mod tests {
             snapshot.available_timeframes.first().map(String::as_str),
             Some("M1")
         );
-        assert!(snapshot
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("stored token bundle")));
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("stored token bundle"))
+        );
         assert!(snapshot.headline.contains("No cTrader market data loaded"));
     }
 
@@ -3685,88 +3506,24 @@ mod tests {
         assert_eq!(snapshot.symbol, "EURUSD");
         assert_eq!(snapshot.adapter_name, "cTrader");
         assert_eq!(snapshot.primary_actions.len(), 2);
-        assert!(snapshot
-            .primary_actions
-            .iter()
-            .all(|action| !action.enabled));
-        assert!(snapshot
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("Local mode")));
-        assert!(snapshot
-            .diagnostics
-            .iter()
-            .any(|line| line.contains("central broker background loop")));
-    }
-
-    #[test]
-    fn execution_surface_snapshot_formats_positions_orders_and_recent_fills() {
-        let state = sample_state(DataSource::MT5, "Connected");
-        let connection =
-            TradingSession::from_connected_terminal_for_test("TerminalInfo(connected=True)")
-                .snapshot(&state);
-        let runtime = BrokerExecutionSnapshot {
-            positions: vec![PositionInfo {
-                ticket: 1001,
-                symbol: "EURUSD".to_string(),
-                order_side: "BUY".to_string(),
-                volume: 0.20,
-                price_open: 1.1000,
-                price_current: 1.1025,
-                profit: 50.0,
-                stop_loss: 1.0950,
-                take_profit: 1.1100,
-                comment: "trend".to_string(),
-                opened_at: 1710001000,
-            }],
-            pending_orders: vec![PendingOrderInfo {
-                ticket: 2001,
-                symbol: "EURUSD".to_string(),
-                order_kind: "BUY_LIMIT".to_string(),
-                volume_initial: 0.15,
-                price_open: 1.0985,
-                stop_loss: 1.0940,
-                take_profit: 1.1070,
-                comment: "breakout".to_string(),
-                created_at: 1710002000,
-            }],
-            recent_deals: vec![DealInfo {
-                ticket: 3001,
-                order_ticket: 2001,
-                position_id: 4001,
-                symbol: "EURUSD".to_string(),
-                entry_kind: "IN".to_string(),
-                order_side: "BUY".to_string(),
-                volume: 0.15,
-                price: 1.0990,
-                profit: 12.5,
-                fee: -0.4,
-                comment: "filled".to_string(),
-                executed_at: 1710003000,
-            }],
-        };
-
-        let runtime = AppExecutionRuntimeSnapshot::Mt5(runtime);
-        let snapshot = build_execution_surface_snapshot_with_runtime(
-            &state,
-            &connection,
-            Some(&runtime),
-            Vec::new(),
+        assert!(
+            snapshot
+                .primary_actions
+                .iter()
+                .all(|action| !action.enabled)
         );
-
-        assert!(snapshot
-            .positions
-            .iter()
-            .any(|line| line.contains("BUY 0.20")));
-        assert!(snapshot
-            .pending_orders
-            .iter()
-            .any(|line| line.contains("BUY_LIMIT 0.15")));
-        assert!(snapshot
-            .bot_timeline
-            .iter()
-            .any(|line| line.contains("IN BUY 0.15")));
-        assert!(snapshot.warnings.is_empty());
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Local mode"))
+        );
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("central broker background loop"))
+        );
     }
 
     #[test]
@@ -4010,22 +3767,30 @@ mod tests {
         let snapshot = session.execution_surface_snapshot(&state);
 
         assert!(snapshot.positions.iter().any(|line| line.contains("#9001")));
-        assert!(snapshot
-            .pending_orders
-            .iter()
-            .any(|line| line.contains("#8001")));
-        assert!(snapshot
-            .bot_timeline
-            .iter()
-            .any(|line| line.contains("#3001")));
-        assert!(snapshot
-            .diagnostics
-            .iter()
-            .any(|line| line.contains("Recent fills: 1")));
-        assert!(snapshot
-            .diagnostics
-            .iter()
-            .any(|line| line.contains("Trader balance")));
+        assert!(
+            snapshot
+                .pending_orders
+                .iter()
+                .any(|line| line.contains("#8001"))
+        );
+        assert!(
+            snapshot
+                .bot_timeline
+                .iter()
+                .any(|line| line.contains("#3001"))
+        );
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("Recent fills: 1"))
+        );
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("Trader balance"))
+        );
         assert!(snapshot.warnings.is_empty());
     }
 
@@ -4131,10 +3896,12 @@ mod tests {
         let snapshot = session.execution_surface_snapshot(&state);
 
         assert!(state.status_msg.contains("Cancelled order"));
-        assert!(snapshot
-            .journal_rows
-            .iter()
-            .any(|line| line.contains("Cancel order #8001")));
+        assert!(
+            snapshot
+                .journal_rows
+                .iter()
+                .any(|line| line.contains("Cancel order #8001"))
+        );
     }
 
     #[test]
@@ -4204,10 +3971,12 @@ mod tests {
         session.close_selected_position(&mut state);
 
         assert!(state.status_msg.contains("failed"));
-        assert!(session
-            .trade_journal
-            .iter()
-            .any(|line| line.contains("BROKER_REJECTED")));
+        assert!(
+            session
+                .trade_journal
+                .iter()
+                .any(|line| line.contains("BROKER_REJECTED"))
+        );
     }
 
     #[test]
@@ -4224,11 +3993,13 @@ mod tests {
             snapshot.state,
             crate::app_services::ctrader_auth::CTraderAuthState::AwaitingAuthorizationCode
         );
-        assert!(snapshot
-            .authorize_url
-            .as_deref()
-            .unwrap_or_default()
-            .contains("client_id=client"));
+        assert!(
+            snapshot
+                .authorize_url
+                .as_deref()
+                .unwrap_or_default()
+                .contains("client_id=client")
+        );
     }
 
     #[test]
@@ -4473,20 +4244,24 @@ mod tests {
         assert_eq!(snapshot.account_count, 2);
         assert_eq!(snapshot.enabled_target_count, 1);
         assert_eq!(session.broker_settings_mut().ctrader.accounts.len(), 2);
-        assert!(session
-            .broker_settings_mut()
-            .ctrader
-            .accounts
-            .iter()
-            .any(|account| account.account_id == "101"
-                && account.label == "Operator Primary"
-                && account.enabled_for_execution));
-        assert!(session
-            .broker_settings_mut()
-            .ctrader
-            .accounts
-            .iter()
-            .any(|account| account.account_id == "202" && !account.enabled_for_execution));
+        assert!(
+            session
+                .broker_settings_mut()
+                .ctrader
+                .accounts
+                .iter()
+                .any(|account| account.account_id == "101"
+                    && account.label == "Operator Primary"
+                    && account.enabled_for_execution)
+        );
+        assert!(
+            session
+                .broker_settings_mut()
+                .ctrader
+                .accounts
+                .iter()
+                .any(|account| account.account_id == "202" && !account.enabled_for_execution)
+        );
     }
 
     #[test]
@@ -4542,9 +4317,10 @@ mod tests {
             .discover_ctrader_accounts()
             .expect_err("discovery should fail without a restored token");
 
-        assert!(err
-            .to_string()
-            .contains("cTrader account discovery requires a restored token session"));
+        assert!(
+            err.to_string()
+                .contains("cTrader account discovery requires a restored token session")
+        );
     }
 
     #[test]
@@ -4585,9 +4361,10 @@ mod tests {
             .discover_ctrader_accounts()
             .expect_err("discovery should fail without persisted token bundle");
 
-        assert!(err
-            .to_string()
-            .contains("cTrader account discovery requires a stored token bundle"));
+        assert!(
+            err.to_string()
+                .contains("cTrader account discovery requires a stored token bundle")
+        );
     }
 
     #[test]

@@ -45,7 +45,9 @@ fn create_canonical_log_from_empty_state() {
 
     assert_eq!(parsed.section_order(), SubsystemSection::ordered());
     for section in SubsystemSection::ordered() {
-        let entry = parsed.section(section).expect("all default sections should exist");
+        let entry = parsed
+            .section(section)
+            .expect("all default sections should exist");
         assert!(entry.current.is_none(), "section should start empty");
         assert!(entry.previous.is_none(), "section should start empty");
     }
@@ -121,8 +123,12 @@ fn update_section_file_rewrites_only_target_section() {
     let first_training = sample_record("training-1", "train", "FAILED", "first train");
     let second_training = sample_record("training-2", "train", "SUCCESS", "second train");
 
-    sectioned_log::update_section_file(&path, SubsystemSection::Discovery, discovery_record.clone())
-        .expect("first write should succeed");
+    sectioned_log::update_section_file(
+        &path,
+        SubsystemSection::Discovery,
+        discovery_record.clone(),
+    )
+    .expect("first write should succeed");
     sectioned_log::update_section_file(&path, SubsystemSection::Training, first_training.clone())
         .expect("second write should succeed");
     sectioned_log::update_section_file(&path, SubsystemSection::Training, second_training.clone())
@@ -169,7 +175,9 @@ fn update_section_file_recovers_malformed_file_and_records_system_event() {
     assert_eq!(recovery.subsystem, SubsystemSection::System);
     assert_eq!(recovery.status, "DEGRADED");
     assert!(
-        recovery.message.contains("recovered malformed canonical log"),
+        recovery
+            .message
+            .contains("recovered malformed canonical log"),
         "unexpected recovery message: {}",
         recovery.message
     );

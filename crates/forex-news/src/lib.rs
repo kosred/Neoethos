@@ -12,6 +12,6 @@ pub struct NewsEvent {
     pub timestamp: DateTime<Utc>,
     pub source: String,
     pub symbol: Option<String>,
-    pub tier: i32, // 1 = High impact, 2 = Medium, 3 = Low
+    pub tier: i32,      // 1 = High impact, 2 = Medium, 3 = Low
     pub sentiment: f64, // -1.0 to 1.0
 }

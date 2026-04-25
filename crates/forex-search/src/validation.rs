@@ -466,6 +466,9 @@ mod tests {
             sl_pips: 1_000_000.0,
             tp_pips: 1_000_000.0,
             max_hold_bars: 1,
+            min_hold_bars: 1,
+            max_trades_per_day: 0,
+            gap_threshold_ms: 0,
             trailing_enabled: false,
             trailing_atr_multiplier: 1.0,
             trailing_be_trigger_r: 1.0,
@@ -473,6 +476,7 @@ mod tests {
             spread_pips: 0.0,
             commission_per_trade: 0.0,
             pip_value_per_lot: 10_000.0,
+            kill_zones_enabled: false,
         }
     }
 

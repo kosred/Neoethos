@@ -38,7 +38,8 @@ impl PerplexitySearcher {
             "temperature": 0.2
         });
 
-        let resp = self.client
+        let resp = self
+            .client
             .post("https://api.perplexity.ai/chat/completions")
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&body)

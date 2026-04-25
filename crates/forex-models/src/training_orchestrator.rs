@@ -663,14 +663,6 @@ impl TrainingOrchestrator {
         selector.ranked_feature_importance()
     }
 
-    fn recent_sample(
-        &self,
-        frame: &DataFrame,
-        labels: &[i32],
-    ) -> Result<(DataFrame, Vec<i32>, usize)> {
-        self.recent_sample_from(frame, labels)
-    }
-
     /// Sample from any frame (not necessarily the full dataset).
     /// Uses the most-recent rows within the provided frame up to the configured limit.
     fn recent_sample_from(
