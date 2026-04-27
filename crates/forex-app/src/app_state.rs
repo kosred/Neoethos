@@ -7,14 +7,27 @@ pub struct AppRuntimeConfig {
     pub config_path: String,
     pub data_dir: PathBuf,
     pub start_local: bool,
+    /// Auto-start discovery on headless launch (VPS/WSL2 use-case).
+    /// The UI start/stop controls are one of several interfaces to this subsystem.
+    pub auto_discovery: bool,
+    /// Auto-start training on headless launch (VPS/WSL2 use-case).
+    pub auto_training: bool,
 }
 
 impl AppRuntimeConfig {
-    pub fn from_settings(config_path: String, start_local: bool, settings: &Settings) -> Self {
+    pub fn from_settings(
+        config_path: String,
+        start_local: bool,
+        auto_discovery: bool,
+        auto_training: bool,
+        settings: &Settings,
+    ) -> Self {
         Self {
             config_path,
             data_dir: settings.system.data_dir.clone(),
             start_local,
+            auto_discovery,
+            auto_training,
         }
     }
 }
@@ -247,10 +260,18 @@ mod tests {
         let mut settings = Settings::default();
         settings.system.data_dir = PathBuf::from("custom-data-root");
 
-        let runtime = AppRuntimeConfig::from_settings("config.yaml".to_string(), true, &settings);
+        let runtime = AppRuntimeConfig::from_settings(
+            "config.yaml".to_string(),
+            true,
+            false,
+            false,
+            &settings,
+        );
 
         assert_eq!(runtime.data_dir, PathBuf::from("custom-data-root"));
         assert!(runtime.start_local);
+        assert!(!runtime.auto_discovery);
+        assert!(!runtime.auto_training);
     }
 
     #[test]
@@ -259,6 +280,8 @@ mod tests {
             config_path: "config.yaml".to_string(),
             data_dir: PathBuf::from("data"),
             start_local: true,
+            auto_discovery: false,
+            auto_training: false,
         };
 
         let state = AppState::new(
@@ -301,6 +324,8 @@ mod tests {
             config_path: "config.yaml".to_string(),
             data_dir: PathBuf::from("data"),
             start_local: false,
+            auto_discovery: false,
+            auto_training: false,
         };
 
         let state = AppState::new(runtime, &forex_core::Settings::default(), Vec::new());

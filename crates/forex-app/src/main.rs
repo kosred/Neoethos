@@ -17,7 +17,7 @@ use forex_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{error, info};
-use workspace::{WorkspaceState, WorkspaceViewer, render_workspace};
+use workspace::{WorkspaceState, WorkspaceTab, WorkspaceViewer, render_workspace};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -30,6 +30,14 @@ struct Args {
 
     #[arg(short, long, default_value_t = false)]
     local: bool,
+
+    /// Auto-start discovery on launch (headless VPS/WSL2 use-case)
+    #[arg(long, default_value_t = false)]
+    auto_discovery: bool,
+
+    /// Auto-start training on launch (headless VPS/WSL2 use-case)
+    #[arg(long, default_value_t = false)]
+    auto_training: bool,
 }
 
 #[tokio::main]
@@ -37,7 +45,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     setup_logging(true)?;
     let settings = Settings::from_yaml(&args.config)?;
-    let runtime = AppRuntimeConfig::from_settings(args.config.clone(), args.local, &settings);
+    let runtime = AppRuntimeConfig::from_settings(
+        args.config.clone(),
+        args.local,
+        args.auto_discovery,
+        args.auto_training,
+        &settings,
+    );
     write_subsystem_record(
         SubsystemSection::App,
         app_record(
@@ -77,63 +91,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_headless_loop(runtime: AppRuntimeConfig) {
+    use app_services::{
+        discovery::{DiscoveryRequest, start_discovery_job},
+        training::{TrainingRequest, start_training_job},
+    };
+    use std::path::PathBuf;
+
     info!("Loading configuration from: {}", runtime.config_path);
 
-    if runtime.start_local {
-        info!("Running in Pure Local Mode (Linux Server Discovery/Training).");
-        let symbols = forex_data::discover_symbols(&runtime.data_dir).unwrap_or_default();
-        info!(
-            "Successfully mapped {} local symbols in '{}' directory.",
-            symbols.len(),
-            runtime.data_dir.display()
-        );
-        if let Err(err) = write_subsystem_record(
-            SubsystemSection::App,
-            app_record(
-                "headless_local_start",
-                "SUCCESS",
-                format!(
-                    "mapped {} symbols from {}",
-                    symbols.len(),
-                    runtime.data_dir.display()
-                ),
-            ),
-        ) {
-            error!("Failed to write APP section log: {}", err);
-        }
-        for sym in &symbols {
-            info!("  - Symbol available: {}", sym);
-        }
+    let symbols = forex_data::discover_symbols(&runtime.data_dir).unwrap_or_default();
+    info!(
+        "Headless: mapped {} local symbols in '{}'",
+        symbols.len(),
+        runtime.data_dir.display()
+    );
 
-        info!("Headless engine is now active and monitoring background tasks.");
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
-        loop {
-            interval.tick().await;
-            info!(
-                "Headless keep-alive tick: System Health OK | Cores: {} | Mode: LOCAL",
-                num_cpus::get()
-            );
+    let (tx, _rx) = mpsc::channel(1000);
+
+    if runtime.auto_discovery {
+        let symbol = symbols.first().cloned().unwrap_or_else(|| "EURUSD".to_string());
+        info!("Headless: auto-starting discovery for {}", symbol);
+        let request = DiscoveryRequest {
+            data_root: runtime.data_dir.clone(),
+            symbol,
+            base_tf: "M1".to_string(),
+            higher_tfs: vec!["M5".to_string(), "M15".to_string(), "H1".to_string()],
+            config: forex_search::DiscoveryConfig::default(),
+        };
+        match start_discovery_job(request, tx.clone()) {
+            Ok(_handle) => info!("Headless: discovery job started"),
+            Err(err) => error!("Headless: failed to start discovery: {}", err),
         }
-    } else {
-        info!("Running in cTrader-first Headless Broker Mode.");
-        if let Err(err) = write_subsystem_record(
-            SubsystemSection::App,
-            app_record(
-                "headless_ctrader_start",
-                "READY",
-                "cTrader is the canonical broker runtime; auth/connect are managed by app services",
+    }
+
+    if runtime.auto_training {
+        let symbol = symbols.first().cloned().unwrap_or_else(|| "EURUSD".to_string());
+        info!("Headless: auto-starting training for {}", symbol);
+        let request = TrainingRequest {
+            config_path: runtime.config_path.clone(),
+            models_dir: PathBuf::from("models"),
+            symbol,
+            base_tf: "M1".to_string(),
+        };
+        match start_training_job(request, tx.clone()) {
+            Ok(_handle) => info!("Headless: training job started"),
+            Err(err) => error!("Headless: failed to start training: {}", err),
+        }
+    }
+
+    let mode = if runtime.start_local { "LOCAL" } else { "CTRADER" };
+    if let Err(err) = write_subsystem_record(
+        SubsystemSection::App,
+        app_record(
+            "headless_start",
+            "READY",
+            format!(
+                "mode={} auto_discovery={} auto_training={}",
+                mode, runtime.auto_discovery, runtime.auto_training
             ),
-        ) {
-            error!("Failed to write APP section log: {}", err);
-        }
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
-        loop {
-            interval.tick().await;
-            info!(
-                "Headless keep-alive tick: System Health OK | Cores: {} | Mode: CTRADER",
-                num_cpus::get()
-            );
-        }
+        ),
+    ) {
+        error!("Failed to write APP section log: {}", err);
+    }
+
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+    loop {
+        interval.tick().await;
+        info!(
+            "Headless keep-alive: Cores={} Mode={} Discovery={} Training={}",
+            num_cpus::get(),
+            mode,
+            runtime.auto_discovery,
+            runtime.auto_training,
+        );
     }
 }
 
@@ -175,6 +205,64 @@ impl ForexApp {
     fn refresh_symbols(&mut self) {
         self.state.available_symbols =
             forex_data::discover_symbols(&self.state.runtime.data_dir).unwrap_or_default();
+    }
+
+    fn trigger_start_discovery(&mut self) {
+        use app_services::discovery::{DiscoveryRequest, failed_snapshot, start_discovery_job};
+        let higher_tfs: Vec<String> = self.state.discovery_form.higher_tfs
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let request = DiscoveryRequest {
+            data_root: self.state.runtime.data_dir.clone(),
+            symbol: self.state.selected_pair.clone(),
+            base_tf: self.state.discovery_form.base_tf.clone(),
+            higher_tfs,
+            config: forex_search::DiscoveryConfig {
+                timeframe_label: self.state.discovery_form.base_tf.clone(),
+                population: self.state.discovery_form.population as usize,
+                generations: self.state.discovery_form.generations as usize,
+                max_indicators: self.state.discovery_form.max_indicators as usize,
+                candidate_count: self.state.discovery_form.target_candidates as usize,
+                portfolio_size: self.state.discovery_form.portfolio_size as usize,
+                corr_threshold: self.state.discovery_form.correlation_threshold as f64,
+                min_trades_per_day: self.state.discovery_form.min_trades_per_day as f64,
+                ..forex_search::DiscoveryConfig::default()
+            },
+        };
+        match start_discovery_job(request, self.tx.clone()) {
+            Ok(handle) => {
+                self.state.discovery_job = Some(handle.snapshot.clone());
+                self.discovery_handle = Some(handle);
+            }
+            Err(err) => {
+                self.state.discovery_job = Some(failed_snapshot(
+                    app_services::jobs::JobKind::Discovery,
+                    err,
+                ));
+            }
+        }
+    }
+
+    fn trigger_start_training(&mut self) {
+        use app_services::training::{TrainingRequest, failed_snapshot, start_training_job};
+        use std::path::PathBuf;
+        let request = TrainingRequest {
+            config_path: self.state.runtime.config_path.clone(),
+            models_dir: PathBuf::from("models"),
+            symbol: self.state.selected_pair.clone(),
+            base_tf: self.state.chart_timeframe.clone(),
+        };
+        match start_training_job(request, self.tx.clone()) {
+            Ok(handle) => {
+                self.state.training_job = Some(handle.snapshot.clone());
+                self.training_handle = Some(handle);
+            }
+            Err(err) => {
+                self.state.training_job = Some(failed_snapshot(err));
+            }
+        }
     }
 
     fn process_messages(&mut self, ctx: &egui::Context) {
@@ -235,58 +323,266 @@ impl eframe::App for ForexApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_messages(ctx);
 
+        // --- Snapshot display state before the panel borrows begin ---
+        let discovery_running = self
+            .state
+            .discovery_job
+            .as_ref()
+            .map(|s| matches!(s.state, app_services::jobs::JobState::Queued | app_services::jobs::JobState::Running))
+            .unwrap_or(false);
+        let training_running = self
+            .state
+            .training_job
+            .as_ref()
+            .map(|s| matches!(s.state, app_services::jobs::JobState::Queued | app_services::jobs::JobState::Running))
+            .unwrap_or(false);
+        let discovery_dot = engine_dot_color(self.state.discovery_job.as_ref());
+        let training_dot = engine_dot_color(self.state.training_job.as_ref());
+        let discovery_label = engine_short_label(self.state.discovery_job.as_ref());
+        let training_label = engine_short_label(self.state.training_job.as_ref());
+
+        // Intent variables — set inside closures, acted on after
+        let mut nav_target: Option<WorkspaceTab> = None;
+        let mut start_discovery = false;
+        let mut stop_discovery = false;
+        let mut start_training = false;
+        let mut stop_training = false;
+
         egui::TopBottomPanel::top("top_panel")
             .frame(ui::theme::top_panel_frame(ctx.style().as_ref()))
+            .exact_height(50.0)
             .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(8.0);
-                    // Branding
-                    ui.heading(" FOREX AI"); // Using a chart icon placeholder or just text
-                    ui.add_space(20.0);
+                ui.horizontal_centered(|ui| {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("FOREX AI")
+                            .size(15.0)
+                            .strong()
+                            .color(ui::theme::TEXT_PRIMARY),
+                    );
+                    ui::theme::status_badge(ui, "PRO", ui::theme::ACCENT);
+                    ui.add(egui::Separator::default().vertical().spacing(10.0));
 
-                    // Ribbon Data
-                    ui.vertical_centered(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 24.0;
+                    // ── Navigation dropdown ──────────────────────────────
+                    egui::menu::menu_button(ui, "  Navigate ", |ui| {
+                        ui.set_min_width(160.0);
 
-                            render_ribbon_item(
-                                ui,
-                                "SYMBOL",
-                                &self.state.selected_pair,
-                                ui::theme::ACCENT,
-                            );
-                            render_ribbon_item(
-                                ui,
-                                "SOURCE",
-                                match self.state.data_source {
-                                    app_state::DataSource::CTrader => "CTRADER",
-                                    app_state::DataSource::Local => "LOCAL",
-                                },
-                                ui::theme::TEXT_MUTED,
-                            );
+                        ui.label(egui::RichText::new("TRADING").size(10.0).color(ui::theme::TEXT_MUTED).strong());
+                        for (tab, label, hint) in [
+                            (WorkspaceTab::Dashboard, "Dashboard", "Overview & equity"),
+                            (WorkspaceTab::Chart, "Chart", "Price chart"),
+                            (WorkspaceTab::Watchlist, "Markets", "Watchlist"),
+                            (WorkspaceTab::Execution, "Order Ticket", "Place orders"),
+                            (WorkspaceTab::BottomStrip, "Trade Watch", "Open positions"),
+                            (WorkspaceTab::News, "News", "Filtered news feed"),
+                        ] {
+                            if ui.button(label).on_hover_text(hint).clicked() {
+                                nav_target = Some(tab);
+                                ui.close_menu();
+                            }
+                        }
 
-                            let status_color = if self.state.status_msg.contains("Connected")
-                                || self.state.status_msg.contains("Online")
-                            {
-                                ui::theme::SUCCESS
-                            } else {
-                                ui::theme::DANGER
-                            };
-                            render_ribbon_item(ui, "STATUS", &self.state.status_msg, status_color);
-                        });
+                        ui.separator();
+                        ui.label(egui::RichText::new("AI ENGINE").size(10.0).color(ui::theme::TEXT_MUTED).strong());
+                        for (tab, label, hint) in [
+                            (WorkspaceTab::Discovery, "Discovery", "Genetic strategy search"),
+                            (WorkspaceTab::Training, "Training", "Swarm model training"),
+                            (WorkspaceTab::Intelligence, "Intelligence", "AI model status"),
+                        ] {
+                            if ui.button(label).on_hover_text(hint).clicked() {
+                                nav_target = Some(tab);
+                                ui.close_menu();
+                            }
+                        }
+
+                        ui.separator();
+                        ui.label(egui::RichText::new("SYSTEM").size(10.0).color(ui::theme::TEXT_MUTED).strong());
+                        for (tab, label, hint) in [
+                            (WorkspaceTab::BrokerSetup, "Broker Setup", "cTrader auth & accounts"),
+                            (WorkspaceTab::Runtime, "Runtime", "Connection & session"),
+                            (WorkspaceTab::DataBootstrap, "Data Bootstrap", "Download OHLCV history"),
+                            (WorkspaceTab::Hardware, "Hardware", "CPU / GPU config"),
+                            (WorkspaceTab::Risk, "Risk Settings", "Drawdown & lot rules"),
+                            (WorkspaceTab::Settings, "Settings", "App configuration"),
+                        ] {
+                            if ui.button(label).on_hover_text(hint).clicked() {
+                                nav_target = Some(tab);
+                                ui.close_menu();
+                            }
+                        }
                     });
 
+                    ui.add_space(2.0);
+
+                    // ── Engine controls dropdown ─────────────────────────
+                    egui::menu::menu_button(ui, "  Engine ", |ui| {
+                        ui.set_min_width(220.0);
+
+                        // Discovery row
+                        ui.horizontal(|ui| {
+                            ui::theme::status_dot(ui, discovery_dot, 8.0);
+                            ui.label(egui::RichText::new("Discovery").size(12.0).color(ui::theme::TEXT_PRIMARY));
+                            ui.label(egui::RichText::new(&discovery_label).size(10.0).color(discovery_dot));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if discovery_running {
+                                    if ui.small_button("Stop").on_hover_text("Cancel active discovery run").clicked() {
+                                        stop_discovery = true;
+                                        ui.close_menu();
+                                    }
+                                } else {
+                                    if ui.small_button("Start").on_hover_text("Start discovery with current form settings").clicked() {
+                                        start_discovery = true;
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                        });
+
+                        ui.separator();
+
+                        // Training row
+                        ui.horizontal(|ui| {
+                            ui::theme::status_dot(ui, training_dot, 8.0);
+                            ui.label(egui::RichText::new("Training").size(12.0).color(ui::theme::TEXT_PRIMARY));
+                            ui.label(egui::RichText::new(&training_label).size(10.0).color(training_dot));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if training_running {
+                                    if ui.small_button("Stop").on_hover_text("Cancel active training run").clicked() {
+                                        stop_training = true;
+                                        ui.close_menu();
+                                    }
+                                } else {
+                                    if ui.small_button("Start").on_hover_text("Start training with current symbol & TF").clicked() {
+                                        start_training = true;
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                        });
+
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("Configure via Navigate → AI Engine panels")
+                                .size(10.0)
+                                .color(ui::theme::TEXT_MUTED),
+                        );
+                    });
+
+                    ui.add(egui::Separator::default().vertical().spacing(10.0));
+
+                    // ── Status ribbon ────────────────────────────────────
+                    ui.spacing_mut().item_spacing.x = 14.0;
+                    render_ribbon_item(ui, "SYMBOL", &self.state.selected_pair, ui::theme::ACCENT);
+                    render_ribbon_item(ui, "TF", &self.state.chart_timeframe, ui::theme::TEXT_PRIMARY);
+                    render_ribbon_item(
+                        ui,
+                        "SRC",
+                        match self.state.data_source {
+                            app_state::DataSource::CTrader => "cTrader",
+                            app_state::DataSource::Local => "Local",
+                        },
+                        ui::theme::TEXT_MUTED,
+                    );
+                    let equity = if self.state.account_equity > 0.0 {
+                        self.state.account_equity
+                    } else {
+                        self.state.account_balance
+                    };
+                    render_ribbon_item(
+                        ui,
+                        "EQ",
+                        &format!("{equity:.2}"),
+                        if equity > 0.0 { ui::theme::SUCCESS } else { ui::theme::TEXT_MUTED },
+                    );
+
+                    let status_color = if self.state.status_msg.contains("Connected")
+                        || self.state.status_msg.contains("Online")
+                        || self.state.status_msg.contains("Ready")
+                    {
+                        ui::theme::SUCCESS
+                    } else if self.state.status_msg.contains("Error")
+                        || self.state.status_msg.contains("Fail")
+                    {
+                        ui::theme::DANGER
+                    } else {
+                        ui::theme::WARNING
+                    };
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui::theme::status_dot(ui, status_color, 11.0);
+                        ui.label(
+                            egui::RichText::new(compact_status_text(&self.state.status_msg))
+                                .color(status_color)
+                                .strong()
+                                .size(12.0),
+                        );
+                    });
+
+                    // ── Right-aligned controls ───────────────────────────
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(8.0);
-                        if ui.button("⚙").clicked() {
-                            // Toggle settings
+                        ui.add_space(6.0);
+                        if ui
+                            .add(egui::Button::new(
+                                egui::RichText::new("Settings").size(12.0).color(ui::theme::TEXT_MUTED),
+                            ))
+                            .on_hover_text("Open Settings panel")
+                            .clicked()
+                        {
+                            self.workspace.focus_tab(WorkspaceTab::Settings);
                         }
-                        ui.label(format!("CPU Cores: {}", self.state.hardware.cpu_cores));
+
+                        ui.add(egui::Separator::default().vertical().spacing(8.0));
+
+                        let auto_label = if self.state.auto_trade_enabled {
+                            egui::RichText::new("AUTO ON").color(ui::theme::SUCCESS).strong().size(12.0)
+                        } else {
+                            egui::RichText::new("AUTO OFF").color(ui::theme::TEXT_MUTED).size(12.0)
+                        };
+                        if ui
+                            .add(egui::Button::new(auto_label))
+                            .on_hover_text("Toggle automatic trade execution")
+                            .clicked()
+                        {
+                            self.state.auto_trade_enabled = !self.state.auto_trade_enabled;
+                        }
+
+                        ui.add(egui::Separator::default().vertical().spacing(8.0));
+
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "CPU {}  GPU {}",
+                                self.state.hardware.cpu_cores,
+                                if self.state.hardware.gpu_enabled { "ON" } else { "OFF" }
+                            ))
+                            .size(11.0)
+                            .color(ui::theme::TEXT_MUTED),
+                        );
                     });
                 });
-                ui.add_space(4.0);
             });
+
+        // ── Handle navigation intent ─────────────────────────────────────
+        if let Some(tab) = nav_target {
+            self.workspace.focus_tab(tab);
+        }
+
+        // ── Handle engine start/stop intents ─────────────────────────────
+        if start_discovery {
+            self.trigger_start_discovery();
+        }
+        if stop_discovery {
+            if let Some(handle) = &self.discovery_handle {
+                handle.cancel.request();
+            }
+        }
+        if start_training {
+            self.trigger_start_training();
+        }
+        if stop_training {
+            if let Some(handle) = &self.training_handle {
+                handle.cancel.request();
+            }
+        }
 
         egui::CentralPanel::default()
             .frame(ui::theme::central_panel_frame(ctx.style().as_ref()))
@@ -304,30 +600,7 @@ impl eframe::App for ForexApp {
                 }
             });
 
-        let discovery_active = self
-            .state
-            .discovery_job
-            .as_ref()
-            .map(|snapshot| {
-                matches!(
-                    snapshot.state,
-                    app_services::jobs::JobState::Queued | app_services::jobs::JobState::Running
-                )
-            })
-            .unwrap_or(false);
-        let training_active = self
-            .state
-            .training_job
-            .as_ref()
-            .map(|snapshot| {
-                matches!(
-                    snapshot.state,
-                    app_services::jobs::JobState::Queued | app_services::jobs::JobState::Running
-                )
-            })
-            .unwrap_or(false);
-
-        if discovery_active || training_active {
+        if discovery_running || training_running {
             ctx.request_repaint();
         }
     }
@@ -363,6 +636,51 @@ fn system_time_string() -> String {
     format!("unix:{seconds}")
 }
 
+fn compact_status_text(status: &str) -> String {
+    const MAX_CHARS: usize = 30;
+    if status.chars().count() <= MAX_CHARS {
+        return status.to_string();
+    }
+    let mut compact = status.chars().take(MAX_CHARS - 3).collect::<String>();
+    compact.push_str("...");
+    compact
+}
+
+fn engine_dot_color(job: Option<&app_services::jobs::JobSnapshot>) -> egui::Color32 {
+    match job {
+        None => ui::theme::TEXT_MUTED,
+        Some(s) => match s.state {
+            app_services::jobs::JobState::Queued | app_services::jobs::JobState::Running => {
+                ui::theme::ACCENT
+            }
+            app_services::jobs::JobState::Succeeded => ui::theme::SUCCESS,
+            app_services::jobs::JobState::Degraded => ui::theme::WARNING,
+            app_services::jobs::JobState::Failed => ui::theme::DANGER,
+            app_services::jobs::JobState::Cancelled => ui::theme::TEXT_MUTED,
+        },
+    }
+}
+
+fn engine_short_label(job: Option<&app_services::jobs::JobSnapshot>) -> String {
+    match job {
+        None => "Idle".to_string(),
+        Some(s) => match s.state {
+            app_services::jobs::JobState::Queued => "Queued".to_string(),
+            app_services::jobs::JobState::Running => {
+                if s.progress.stage.is_empty() {
+                    "Running".to_string()
+                } else {
+                    s.progress.stage.clone()
+                }
+            }
+            app_services::jobs::JobState::Succeeded => "Done".to_string(),
+            app_services::jobs::JobState::Degraded => "Degraded".to_string(),
+            app_services::jobs::JobState::Failed => "Failed".to_string(),
+            app_services::jobs::JobState::Cancelled => "Cancelled".to_string(),
+        },
+    }
+}
+
 fn spawn_account_heartbeat(tx: mpsc::Sender<ServiceEvent>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -387,10 +705,18 @@ mod tests {
         let mut settings = Settings::default();
         settings.system.data_dir = PathBuf::from("custom-data-root");
 
-        let runtime = AppRuntimeConfig::from_settings("config.yaml".to_string(), true, &settings);
+        let runtime = AppRuntimeConfig::from_settings(
+            "config.yaml".to_string(),
+            true,
+            false,
+            false,
+            &settings,
+        );
 
         assert_eq!(runtime.data_dir, PathBuf::from("custom-data-root"));
         assert!(runtime.start_local);
+        assert!(!runtime.auto_discovery);
+        assert!(!runtime.auto_training);
     }
 
     #[test]

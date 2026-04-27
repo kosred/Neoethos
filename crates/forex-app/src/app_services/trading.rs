@@ -121,6 +121,7 @@ pub struct ChartCandle {
     pub high: f64,
     pub low: f64,
     pub close: f64,
+    pub volume: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,6 +140,9 @@ pub struct MarketChartSnapshot {
     pub overlays: Vec<ChartOverlay>,
     pub price_min: f64,
     pub price_max: f64,
+    pub bid: Option<f64>,
+    pub ask: Option<f64>,
+    pub price_change_pct: Option<f64>,
     pub headline: String,
     pub overlay_status: String,
     pub warnings: Vec<String>,
@@ -901,9 +905,12 @@ impl TradingSession {
         let adapter_name = adapter_kind.as_str().to_string();
         let status_text = match mode {
             TradingPanelMode::LocalOnly => "Local Mode".to_string(),
-            TradingPanelMode::Disconnected => state.status_msg.clone(),
+            TradingPanelMode::Disconnected => "Offline".to_string(),
             TradingPanelMode::Connected => {
-                if state.status_msg.trim().is_empty() {
+                if state.status_msg.trim().is_empty()
+                    || state.status_msg == "cTrader Ready"
+                    || state.status_msg == "Local Mode"
+                {
                     "Connected".to_string()
                 } else {
                     state.status_msg.clone()
@@ -992,28 +999,24 @@ impl TradingSession {
                     Vec::new(),
                 )
                 .with_overlay_status(overlay_status),
-                Err(err) => MarketChartSnapshot {
-                    symbol: state.selected_pair.clone(),
-                    timeframe: timeframe.clone(),
-                    available_timeframes: if available_timeframes.is_empty() {
+                Err(err) => MarketChartSnapshot::empty_for(
+                    &state.selected_pair,
+                    &timeframe,
+                    if available_timeframes.is_empty() {
                         vec![timeframe.clone()]
                     } else {
                         available_timeframes.clone()
                     },
-                    candles: Vec::new(),
-                    overlays: Vec::new(),
-                    price_min: 0.0,
-                    price_max: 0.0,
-                    headline: format!(
+                    format!(
                         "No market data loaded for {} {}",
                         state.selected_pair, timeframe
                     ),
                     overlay_status,
-                    warnings: vec![format!(
+                    vec![format!(
                         "Failed to load {} market data for {}: {}",
                         timeframe, state.selected_pair, err
                     )],
-                },
+                ),
             },
         };
 
@@ -1035,10 +1038,11 @@ impl TradingSession {
             connected: self.connected,
         };
 
-        if let Some(cache) = &self.execution_surface_cache {
-            if cache.key == cache_key && cache.refreshed_at.elapsed() < Duration::from_secs(1) {
-                return cache.snapshot.clone();
-            }
+        if let Some(cache) = &self.execution_surface_cache
+            && cache.key == cache_key
+            && cache.refreshed_at.elapsed() < Duration::from_secs(1)
+        {
+            return cache.snapshot.clone();
         }
 
         let mut runtime_warnings = Vec::new();
@@ -1333,10 +1337,10 @@ impl TradingSession {
             DataSource::Local => "Local Mode".to_string(),
             DataSource::CTrader => format!("{} selected · disconnected", kind.as_str()),
         };
-        if matches!(kind, TradingAdapterKind::CTrader) {
-            if let Ok(Some(_)) = self.restore_ctrader_session() {
-                state.status_msg = "cTrader selected · session restored".to_string();
-            }
+        if matches!(kind, TradingAdapterKind::CTrader)
+            && let Ok(Some(_)) = self.restore_ctrader_session()
+        {
+            state.status_msg = "cTrader selected · session restored".to_string();
         }
         record_app_event(
             "ui_adapter_select",
@@ -1819,12 +1823,14 @@ impl TradingSession {
                     )
                     .with_overlay_status(overlay_status);
                     if let Some(update) = live_update {
+                        snapshot.bid = update.bid;
+                        snapshot.ask = update.ask;
                         let quote_line = match (update.bid, update.ask) {
                             (Some(bid), Some(ask)) => {
-                                format!(" · live tick bid {:.5} · ask {:.5}", bid, ask)
+                                format!(" · bid {:.5} ask {:.5}", bid, ask)
                             }
-                            (Some(bid), None) => format!(" · live tick bid {:.5}", bid),
-                            (None, Some(ask)) => format!(" · live tick ask {:.5}", ask),
+                            (Some(bid), None) => format!(" · bid {:.5}", bid),
+                            (None, Some(ask)) => format!(" · ask {:.5}", ask),
                             (None, None) => String::new(),
                         };
                         if !quote_line.is_empty() {
@@ -1833,37 +1839,29 @@ impl TradingSession {
                     }
                     snapshot
                 }
-                Err(err) => MarketChartSnapshot {
-                    symbol: symbol.to_string(),
-                    timeframe: timeframe.to_string(),
+                Err(err) => MarketChartSnapshot::empty_for(
+                    symbol,
+                    timeframe,
                     available_timeframes,
-                    candles: Vec::new(),
-                    overlays: Vec::new(),
-                    price_min: 0.0,
-                    price_max: 0.0,
-                    headline: format!("No cTrader market data loaded for {} {}", symbol, timeframe),
+                    format!("No cTrader market data loaded for {} {}", symbol, timeframe),
                     overlay_status,
-                    warnings: vec![format!(
+                    vec![format!(
                         "Failed to load cTrader {} market data for {}: {}",
                         timeframe, symbol, err
                     )],
-                },
+                ),
             },
-            Err(err) => MarketChartSnapshot {
-                symbol: symbol.to_string(),
-                timeframe: timeframe.to_string(),
+            Err(err) => MarketChartSnapshot::empty_for(
+                symbol,
+                timeframe,
                 available_timeframes,
-                candles: Vec::new(),
-                overlays: Vec::new(),
-                price_min: 0.0,
-                price_max: 0.0,
-                headline: format!("No cTrader market data loaded for {} {}", symbol, timeframe),
+                format!("No cTrader market data loaded for {} {}", symbol, timeframe),
                 overlay_status,
-                warnings: vec![format!(
+                vec![format!(
                     "cTrader chart history is unavailable for {} {}: {}",
                     symbol, timeframe, err
                 )],
-            },
+            ),
         }
     }
 
@@ -1878,10 +1876,11 @@ impl TradingSession {
             timeframe: request.timeframe.clone(),
         };
 
-        if let Some(cache) = &self.ctrader_live_spot_cache {
-            if cache.key == cache_key && cache.refreshed_at.elapsed() < Duration::from_secs(1) {
-                return Ok(cache.update.clone());
-            }
+        if let Some(cache) = &self.ctrader_live_spot_cache
+            && cache.key == cache_key
+            && cache.refreshed_at.elapsed() < Duration::from_secs(1)
+        {
+            return Ok(cache.update.clone());
         }
 
         let update = self
@@ -2075,19 +2074,17 @@ impl TradingSession {
             .connect_handle
             .as_ref()
             .is_some_and(|handle| handle.is_finished())
+            && let Some(handle) = self.connect_handle.take()
         {
-            if let Some(handle) = self.connect_handle.take() {
-                let _ = handle.join();
-            }
+            let _ = handle.join();
         }
         if self
             .bootstrap_handle
             .as_ref()
             .is_some_and(|handle| handle.is_finished())
+            && let Some(handle) = self.bootstrap_handle.take()
         {
-            if let Some(handle) = self.bootstrap_handle.take() {
-                let _ = handle.join();
-            }
+            let _ = handle.join();
         }
     }
 
@@ -2517,6 +2514,7 @@ pub fn build_market_chart_snapshot_from_ohlcv(
 ) -> MarketChartSnapshot {
     let start = ohlcv.len().saturating_sub(MAX_CHART_CANDLES);
     let timestamps = ohlcv.timestamp.as_deref();
+    let volumes = ohlcv.volume.as_deref();
     let candles: Vec<ChartCandle> = (start..ohlcv.len())
         .map(|idx| ChartCandle {
             timestamp: timestamps.and_then(|ts| ts.get(idx)).copied(),
@@ -2524,6 +2522,7 @@ pub fn build_market_chart_snapshot_from_ohlcv(
             high: ohlcv.high[idx],
             low: ohlcv.low[idx],
             close: ohlcv.close[idx],
+            volume: volumes.and_then(|v| v.get(idx)).copied().unwrap_or(0.0),
         })
         .collect();
 
@@ -2553,6 +2552,18 @@ pub fn build_market_chart_snapshot_from_ohlcv(
         )
     };
 
+    let price_change_pct = if candles.len() >= 2 {
+        let first_open = candles.first().map(|c| c.open).unwrap_or(0.0);
+        let last_close = candles.last().map(|c| c.close).unwrap_or(0.0);
+        if first_open > 0.0 {
+            Some((last_close - first_open) / first_open * 100.0)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     MarketChartSnapshot {
         symbol: symbol.to_string(),
         timeframe: timeframe.to_string(),
@@ -2561,6 +2572,9 @@ pub fn build_market_chart_snapshot_from_ohlcv(
         overlays,
         price_min,
         price_max,
+        bid: None,
+        ask: None,
+        price_change_pct,
         headline,
         overlay_status: "Trade overlays will appear here once execution events are available."
             .to_string(),
@@ -2800,6 +2814,31 @@ impl MarketChartSnapshot {
     fn with_overlay_status(mut self, overlay_status: String) -> Self {
         self.overlay_status = overlay_status;
         self
+    }
+
+    pub fn empty_for(
+        symbol: &str,
+        timeframe: &str,
+        available_timeframes: Vec<String>,
+        headline: String,
+        overlay_status: String,
+        warnings: Vec<String>,
+    ) -> Self {
+        Self {
+            symbol: symbol.to_string(),
+            timeframe: timeframe.to_string(),
+            available_timeframes,
+            candles: Vec::new(),
+            overlays: Vec::new(),
+            price_min: 0.0,
+            price_max: 0.0,
+            bid: None,
+            ask: None,
+            price_change_pct: None,
+            headline,
+            overlay_status,
+            warnings,
+        }
     }
 }
 
@@ -3087,31 +3126,32 @@ fn validate_and_convert_lot_size_to_ctrader_volume(
         ));
     }
     let protocol_volume = ctrader_protocol_volume_from_lots(ticket.lot_size, symbol)?;
-    if let Some(min_volume) = symbol.min_volume {
-        if protocol_volume < min_volume {
-            return Err(anyhow::anyhow!(
-                "lot size {:.2} is below broker minimum {:.2}",
-                ticket.lot_size,
-                min_volume as f64 / symbol.lot_size.unwrap_or(1) as f64
-            ));
-        }
+    if let Some(min_volume) = symbol.min_volume
+        && protocol_volume < min_volume
+    {
+        return Err(anyhow::anyhow!(
+            "lot size {:.2} is below broker minimum {:.2}",
+            ticket.lot_size,
+            min_volume as f64 / symbol.lot_size.unwrap_or(1) as f64
+        ));
     }
-    if let Some(max_volume) = symbol.max_volume {
-        if protocol_volume > max_volume {
-            return Err(anyhow::anyhow!(
-                "lot size {:.2} exceeds broker maximum {:.2}",
-                ticket.lot_size,
-                max_volume as f64 / symbol.lot_size.unwrap_or(1) as f64
-            ));
-        }
+    if let Some(max_volume) = symbol.max_volume
+        && protocol_volume > max_volume
+    {
+        return Err(anyhow::anyhow!(
+            "lot size {:.2} exceeds broker maximum {:.2}",
+            ticket.lot_size,
+            max_volume as f64 / symbol.lot_size.unwrap_or(1) as f64
+        ));
     }
-    if let Some(step_volume) = symbol.step_volume {
-        if step_volume > 0 && protocol_volume % step_volume != 0 {
-            return Err(anyhow::anyhow!(
-                "lot size {:.2} does not align with broker step volume",
-                ticket.lot_size
-            ));
-        }
+    if let Some(step_volume) = symbol.step_volume
+        && step_volume > 0
+        && protocol_volume % step_volume != 0
+    {
+        return Err(anyhow::anyhow!(
+            "lot size {:.2} does not align with broker step volume",
+            ticket.lot_size
+        ));
     }
     Ok(protocol_volume)
 }
@@ -3286,6 +3326,8 @@ mod tests {
             config_path: "config.yaml".to_string(),
             data_dir: PathBuf::from("data"),
             start_local: matches!(source, DataSource::Local),
+            auto_discovery: false,
+            auto_training: false,
         };
         let mut state = AppState::new(
             runtime,
