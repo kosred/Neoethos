@@ -1,4 +1,6 @@
 pub mod bootstrap_writer;
+#[cfg(test)]
+mod ctrader_integration_tests;
 pub mod broker_config;
 pub mod ctrader_account;
 pub mod ctrader_auth;

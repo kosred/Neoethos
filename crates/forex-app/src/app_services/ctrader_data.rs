@@ -573,7 +573,10 @@ pub fn resolve_symbol_with_transport<T: CTraderOpenApiTransport>(
         build_symbols_list_request(account_id, false, "symbols-1"),
     ])?;
 
-    if auth_responses.len() != 3 {
+    if auth_responses.len() < 3 {
+        if let Some(first) = auth_responses.first() {
+            ensure_success_payload_type(first, CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+        }
         return Err(anyhow!(
             "expected 3 cTrader auth/symbol responses, received {}",
             auth_responses.len()
