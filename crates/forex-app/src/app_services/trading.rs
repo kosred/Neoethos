@@ -901,9 +901,12 @@ impl TradingSession {
         let adapter_name = adapter_kind.as_str().to_string();
         let status_text = match mode {
             TradingPanelMode::LocalOnly => "Local Mode".to_string(),
-            TradingPanelMode::Disconnected => state.status_msg.clone(),
+            TradingPanelMode::Disconnected => "Offline".to_string(),
             TradingPanelMode::Connected => {
-                if state.status_msg.trim().is_empty() {
+                if state.status_msg.trim().is_empty()
+                    || state.status_msg == "cTrader Ready"
+                    || state.status_msg == "Local Mode"
+                {
                     "Connected".to_string()
                 } else {
                     state.status_msg.clone()

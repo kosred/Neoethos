@@ -539,7 +539,7 @@ impl ProductionCTraderExecutionBackend {
         }
         ensure_payload_type(
             &responses[0],
-            CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE - 2,
+            CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
         )?;
         ensure_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
         parse_execution_outcome(&responses[2])
