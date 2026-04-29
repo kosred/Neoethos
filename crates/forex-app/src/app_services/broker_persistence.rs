@@ -5,32 +5,23 @@
 //! so the application can pre-populate the Settings → Brokers UI on startup
 //! instead of requiring the user to retype credentials every launch.
 //!
-//! # Lookup order
+//! # Lookup order (highest priority first)
 //!
-//! Resolved by [`credentials_file_path`]:
-//!
-//! 1. The path in environment variable `FOREX_AI_BROKER_CREDENTIALS_PATH`,
-//!    if set. Useful for tests and CI.
-//! 2. `<config_dir>/forex-ai/broker_credentials.toml` where `<config_dir>` is
-//!    `dirs::config_dir()` — `%APPDATA%` on Windows, `$XDG_CONFIG_HOME` (or
-//!    `~/.config`) on Linux, `~/Library/Application Support` on macOS.
-//! 3. `<cwd>/.local/forex-ai/broker_credentials.toml` as a fallback for
-//!    development environments where the user hasn't set up `%APPDATA%`.
+//! 1. `$FOREX_AI_BROKER_CREDENTIALS_PATH` runtime env var (tests / CI).
+//! 2. `<dirs::config_dir>/forex-ai/broker_credentials.toml` — `%APPDATA%` on
+//!    Windows, `$XDG_CONFIG_HOME` on Linux, `~/Library/Application Support` on
+//!    macOS.
+//! 3. `<cwd>/.local/forex-ai/broker_credentials.toml` — dev machine fallback.
+//! 4. Compile-time embedded constants from [`crate::app_services::embedded_credentials`]
+//!    — baked into the binary by `build.rs` for zero-config distribution.
 //!
 //! # Security
 //!
-//! The TOML file is intended to live OUTSIDE the git repository. The
-//! `.gitignore` should include both `**/broker_credentials.toml` and
-//! `.local/` to prevent accidental commits.
-//!
+//! The TOML file is intended to live OUTSIDE the git repository.
 //! Two transient fields are explicitly NEVER serialized:
 //!
-//! - `CTraderBrokerSettings::authorization_code_input` — short-lived OAuth
-//!   intermediate value
-//! - `DxTradeBrokerSettings::password` — must be re-entered each session
-//!
-//! These are enforced at the type level via `#[serde(skip_serializing,
-//! skip_deserializing, default)]` on the field declarations.
+//! - `CTraderBrokerSettings::authorization_code_input` — short-lived OAuth value
+//! - `DxTradeBrokerSettings::password` — re-entered each session
 
 use crate::app_services::broker_config::BrokerSettingsState;
 use anyhow::{Context, Result};
@@ -93,13 +84,18 @@ fn candidate_paths() -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// Loads broker settings from disk.
+/// Loads broker settings, applying the four-level resolution chain.
 ///
-/// Returns [`BrokerSettingsState::default`] if no file exists at any of the
-/// candidate paths, or if the file is malformed (after logging the parse
-/// error). This function never panics — startup must succeed even with a
-/// missing or corrupt credentials file.
+/// Never panics. Returns settings with cTrader credentials populated from
+/// the highest-priority source that has a non-empty `client_id`.
 pub fn load_broker_settings() -> BrokerSettingsState {
+    let mut settings = load_from_filesystem();
+    apply_embedded_fallback(&mut settings);
+    settings
+}
+
+/// Filesystem portion of the load (levels 1–3).
+fn load_from_filesystem() -> BrokerSettingsState {
     let path = match credentials_file_path() {
         Ok(p) => p,
         Err(err) => {
@@ -111,25 +107,22 @@ pub fn load_broker_settings() -> BrokerSettingsState {
     if !path.is_file() {
         tracing::debug!(
             path = %path.display(),
-            "no broker credentials file found; using empty defaults"
+            "no broker credentials file found; will use embedded defaults"
         );
         return BrokerSettingsState::default();
     }
 
     match fs::read_to_string(&path) {
         Ok(contents) => match toml::from_str::<BrokerSettingsState>(&contents) {
-            Ok(settings) => {
-                tracing::info!(
-                    path = %path.display(),
-                    "loaded broker credentials from disk"
-                );
-                settings
+            Ok(s) => {
+                tracing::info!(path = %path.display(), "loaded broker credentials from disk");
+                s
             }
             Err(err) => {
                 tracing::warn!(
                     path = %path.display(),
                     error = %err,
-                    "failed to parse broker credentials TOML; using defaults"
+                    "failed to parse broker credentials TOML; will try embedded defaults"
                 );
                 BrokerSettingsState::default()
             }
@@ -138,10 +131,45 @@ pub fn load_broker_settings() -> BrokerSettingsState {
             tracing::warn!(
                 path = %path.display(),
                 error = %err,
-                "failed to read broker credentials file; using defaults"
+                "failed to read broker credentials file; will try embedded defaults"
             );
             BrokerSettingsState::default()
         }
+    }
+}
+
+/// Level-4 fallback: fill any empty cTrader fields from compile-time constants.
+/// User-supplied values (non-empty) are never overwritten.
+fn apply_embedded_fallback(settings: &mut BrokerSettingsState) {
+    use crate::app_services::embedded_credentials::{
+        EMBEDDED_CTRADER_CLIENT_ID, EMBEDDED_CTRADER_CLIENT_SECRET,
+        EMBEDDED_CTRADER_REDIRECT_URI,
+    };
+
+    if EMBEDDED_CTRADER_CLIENT_ID.is_empty() {
+        return; // binary was built without embedded credentials — nothing to do
+    }
+
+    let ct = &mut settings.ctrader;
+    let used_embedded = ct.client_id.is_empty()
+        || ct.client_secret.is_empty()
+        || ct.redirect_uri.is_empty();
+
+    if ct.client_id.is_empty() {
+        ct.client_id = EMBEDDED_CTRADER_CLIENT_ID.to_string();
+    }
+    if ct.client_secret.is_empty() {
+        ct.client_secret = EMBEDDED_CTRADER_CLIENT_SECRET.to_string();
+    }
+    if ct.redirect_uri.is_empty() {
+        ct.redirect_uri = EMBEDDED_CTRADER_REDIRECT_URI.to_string();
+    }
+
+    if used_embedded {
+        tracing::info!(
+            "using embedded compile-time cTrader credentials \
+             (no user-level config file with credentials found)"
+        );
     }
 }
 
@@ -223,12 +251,20 @@ mod tests {
     }
 
     #[test]
-    fn load_returns_default_when_file_missing() {
+    fn load_returns_embedded_or_default_when_file_missing() {
+        use crate::app_services::embedded_credentials::EMBEDDED_CTRADER_CLIENT_ID;
+
         let dir = tempdir_or_skip();
         let path = dir.join("does-not-exist.toml");
         with_env_path(&path, |_| {
             let loaded = load_broker_settings();
-            assert_eq!(loaded, BrokerSettingsState::default());
+            if EMBEDDED_CTRADER_CLIENT_ID.is_empty() {
+                // No embedded credentials baked in — expect empty defaults.
+                assert_eq!(loaded.ctrader.client_id, "");
+            } else {
+                // Embedded credentials should fill the gap.
+                assert_eq!(loaded.ctrader.client_id, EMBEDDED_CTRADER_CLIENT_ID);
+            }
         });
     }
 
@@ -295,6 +331,57 @@ mod tests {
 
             let loaded = load_broker_settings();
             assert_eq!(loaded.ctrader.authorization_code_input, "");
+        });
+    }
+
+    #[test]
+    fn embedded_fallback_fills_empty_client_id() {
+        use crate::app_services::embedded_credentials::EMBEDDED_CTRADER_CLIENT_ID;
+
+        if EMBEDDED_CTRADER_CLIENT_ID.is_empty() {
+            // Binary was built without embedded credentials — test is vacuously passing.
+            return;
+        }
+
+        let dir = tempdir_or_skip();
+        // Write a TOML that is valid but has no ctrader section (all defaults = empty).
+        let path = dir.join("empty_creds.toml");
+        fs::write(&path, "[ctrader]\n[dxtrade]\n").expect("write");
+
+        with_env_path(&path, |_| {
+            let loaded = load_broker_settings();
+            assert_eq!(
+                loaded.ctrader.client_id,
+                EMBEDDED_CTRADER_CLIENT_ID,
+                "empty client_id should be filled from embedded constant"
+            );
+        });
+    }
+
+    #[test]
+    fn user_credentials_win_over_embedded() {
+        use crate::app_services::embedded_credentials::EMBEDDED_CTRADER_CLIENT_ID;
+
+        if EMBEDDED_CTRADER_CLIENT_ID.is_empty() {
+            return; // no embedded credentials to compete with
+        }
+
+        let dir = tempdir_or_skip();
+        let path = dir.join("user_creds.toml");
+
+        with_env_path(&path, |_| {
+            let original = populated_settings(); // has client_id = "client-123"
+            save_broker_settings(&original).expect("save");
+
+            let loaded = load_broker_settings();
+            assert_eq!(
+                loaded.ctrader.client_id, "client-123",
+                "user-supplied client_id must not be overwritten by embedded constant"
+            );
+            assert_ne!(
+                loaded.ctrader.client_id, EMBEDDED_CTRADER_CLIENT_ID,
+                "embedded constant must not win when user value is present"
+            );
         });
     }
 

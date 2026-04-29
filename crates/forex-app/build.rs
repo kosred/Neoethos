@@ -2,6 +2,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 fn main() {
+    emit_embedded_credentials();
+
     let protoc_path = protoc_bin_vendored::protoc_bin_path().unwrap();
     let protoc_dir = protoc_path.parent().unwrap();
 
@@ -120,4 +122,103 @@ fn generated_c_file(gen_dir: &Path, proto_file: &str) -> PathBuf {
     let mut path = PathBuf::from(proto_file);
     assert!(path.set_extension("upb_minitable.c"));
     gen_dir.join(path)
+}
+
+/// Generates `$OUT_DIR/embedded_credentials.rs` with compile-time cTrader
+/// Open API credentials that are baked into the binary for distribution.
+///
+/// Resolution order (first non-empty value wins for each field):
+/// 1. `FOREX_AI_EMBED_CTRADER_CLIENT_ID` / `_CLIENT_SECRET` / `_REDIRECT_URI`
+///    environment variables (CI / explicit override).
+/// 2. `.local/forex-ai/broker_credentials.toml` in the crate root (dev
+///    machine fallback — the same file used by the runtime persistence layer).
+/// 3. Empty string (build succeeds; embedded fallback is effectively disabled).
+fn emit_embedded_credentials() {
+    // CARGO_MANIFEST_DIR = <workspace>/crates/forex-app  →  workspace root is two levels up.
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let workspace_root = manifest_dir
+        .parent()  // crates/
+        .and_then(|p| p.parent())  // <workspace root>
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| manifest_dir.clone());
+
+    // Tell Cargo when to re-run this step.
+    println!("cargo:rerun-if-env-changed=FOREX_AI_EMBED_CTRADER_CLIENT_ID");
+    println!("cargo:rerun-if-env-changed=FOREX_AI_EMBED_CTRADER_CLIENT_SECRET");
+    println!("cargo:rerun-if-env-changed=FOREX_AI_EMBED_CTRADER_REDIRECT_URI");
+    let local_toml = workspace_root.join(".local/forex-ai/broker_credentials.toml");
+    println!("cargo:rerun-if-changed={}", local_toml.display());
+
+    // --- Step 1: env vars ---
+    let mut client_id = std::env::var("FOREX_AI_EMBED_CTRADER_CLIENT_ID")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let mut client_secret = std::env::var("FOREX_AI_EMBED_CTRADER_CLIENT_SECRET")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let mut redirect_uri = std::env::var("FOREX_AI_EMBED_CTRADER_REDIRECT_URI")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    // --- Step 2: workspace .local TOML fallback (simple line-by-line key=value scan) ---
+    if client_id.is_empty() || client_secret.is_empty() || redirect_uri.is_empty() {
+        let toml_path = local_toml;
+        if let Ok(contents) = std::fs::read_to_string(&toml_path) {
+            for line in contents.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("client_id") {
+                    if client_id.is_empty() {
+                        client_id = extract_toml_string_value(rest);
+                    }
+                } else if let Some(rest) = line.strip_prefix("client_secret") {
+                    if client_secret.is_empty() {
+                        client_secret = extract_toml_string_value(rest);
+                    }
+                } else if let Some(rest) = line.strip_prefix("redirect_uri") {
+                    if redirect_uri.is_empty() {
+                        redirect_uri = extract_toml_string_value(rest);
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Emit ---
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let dest = out_dir.join("embedded_credentials.rs");
+
+    let content = format!(
+        "pub const EMBEDDED_CTRADER_CLIENT_ID: &str = r#\"{}\"#;\n\
+         pub const EMBEDDED_CTRADER_CLIENT_SECRET: &str = r#\"{}\"#;\n\
+         pub const EMBEDDED_CTRADER_REDIRECT_URI: &str = r#\"{}\"#;\n",
+        client_id, client_secret, redirect_uri
+    );
+
+    std::fs::write(&dest, content).expect("failed to write embedded_credentials.rs");
+
+    if !client_id.is_empty() {
+        println!(
+            "cargo:warning=Embedded cTrader client_id ({} chars) into binary.",
+            client_id.len()
+        );
+    } else {
+        println!("cargo:warning=No embedded cTrader credentials found; binary uses empty fallback.");
+    }
+}
+
+/// Extracts the string value from a TOML assignment fragment like ` = "value"`.
+/// Returns empty string if the line doesn't look like a quoted assignment.
+fn extract_toml_string_value(after_key: &str) -> String {
+    // after_key is everything after the key name: ` = "value"` or ` = "value" # comment`
+    let after_eq = after_key.trim_start().strip_prefix('=').unwrap_or("").trim();
+    if let Some(inner) = after_eq.strip_prefix('"') {
+        // Find closing quote (ignore escaped quotes for simplicity — our values are simple)
+        if let Some(end) = inner.find('"') {
+            return inner[..end].to_string();
+        }
+    }
+    String::new()
 }
