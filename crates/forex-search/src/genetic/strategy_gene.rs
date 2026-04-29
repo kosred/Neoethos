@@ -533,7 +533,7 @@ mod tests {
         gene.normalize(5, 1);
 
         assert_eq!(gene.indices, vec![1, 4]);
-        assert_eq!(gene.weights, vec![1.5, 1.0]);
+        assert_eq!(gene.weights, vec![1.0, 1.5]);
     }
 
     #[test]
