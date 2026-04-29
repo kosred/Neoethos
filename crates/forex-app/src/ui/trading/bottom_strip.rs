@@ -18,33 +18,29 @@ pub fn build_bottom_strip(snapshot: &ExecutionSurfaceSnapshot) -> BottomStripPan
     BottomStripPanel {
         sections: vec![
             BottomStripSection {
-                title: "Positions / Orders / PnL".to_string(),
-                lines: snapshot
-                    .positions
-                    .iter()
-                    .cloned()
-                    .chain(
-                        snapshot
-                            .pending_orders
-                            .iter()
-                            .map(|order| format!("Pending · {order}")),
-                    )
-                    .collect(),
+                title: "Positions".to_string(),
+                lines: snapshot.positions.clone(),
             },
             BottomStripSection {
-                title: "Bot Decisions Timeline".to_string(),
+                title: "Orders".to_string(),
+                lines: snapshot.pending_orders.clone(),
+            },
+            BottomStripSection {
+                title: "Bot Log".to_string(),
                 lines: snapshot.bot_timeline.clone(),
             },
             BottomStripSection {
-                title: "Execution Diagnostics".to_string(),
+                title: "Diagnostics".to_string(),
                 lines: snapshot.diagnostics.clone(),
             },
             BottomStripSection {
-                title: "Manual Notes".to_string(),
-                lines: vec![
-                    format!("Symbol focus: {}", snapshot.symbol),
-                    "Operator notes are local-only until workspace persistence lands.".to_string(),
-                ],
+                title: "Journal".to_string(),
+                lines: snapshot
+                    .history_rows
+                    .iter()
+                    .cloned()
+                    .chain(snapshot.journal_rows.iter().cloned())
+                    .collect(),
             },
         ],
     }
@@ -54,32 +50,130 @@ pub fn render(ui: &mut egui::Ui, state: &AppState, session: &mut TradingSession)
     let snapshot = session.execution_surface_snapshot(state);
     let panel = build_bottom_strip(&snapshot);
 
-    ui.columns(panel.sections.len(), |columns| {
+    let tab_id = egui::Id::new("bottom_strip_selected_tab");
+    let mut selected: usize = ui.data(|d| d.get_temp(tab_id).unwrap_or(0usize));
+    // Clamp in case panel has fewer sections than the stored index.
+    if selected >= panel.sections.len() {
+        selected = 0;
+    }
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
         for (idx, section) in panel.sections.iter().enumerate() {
-            theme::section_frame(columns[idx].style()).show(&mut columns[idx], |ui| {
-                ui.strong(&section.title);
-                ui.add_space(8.0);
-                if section.lines.is_empty() {
-                    ui.label(
-                        egui::RichText::new(match section.title.as_str() {
-                            "Positions / Orders / PnL" => {
-                                "No broker positions or pending orders are available yet."
-                            }
-                            "Bot Decisions Timeline" => {
-                                "No bot execution decisions are available yet."
-                            }
-                            _ => "No entries available.",
-                        })
-                        .color(theme::TEXT_MUTED),
-                    );
+            let count = section.lines.len();
+            let label = if count > 0 {
+                format!("{}  ({})", section.title, count)
+            } else {
+                section.title.clone()
+            };
+
+            let is_selected = idx == selected;
+            let text = egui::RichText::new(&label)
+                .size(13.0)
+                .color(if is_selected {
+                    theme::ACCENT
                 } else {
-                    for line in &section.lines {
-                        ui.label(egui::RichText::new(line).color(theme::TEXT_MUTED));
-                    }
-                }
-            });
+                    theme::TEXT_MUTED
+                });
+
+            let btn =
+                egui::Button::new(text)
+                    .selected(is_selected)
+                    .corner_radius(egui::CornerRadius {
+                        nw: 6,
+                        ne: 6,
+                        sw: 0,
+                        se: 0,
+                    });
+            if ui.add(btn).clicked() {
+                selected = idx;
+            }
         }
     });
+
+    ui.add(egui::Separator::default().horizontal().spacing(0.0));
+    ui.add_space(4.0);
+
+    egui::ScrollArea::vertical()
+        .id_salt("bottom_strip_scroll")
+        .show(ui, |ui| {
+            if let Some(section) = panel.sections.get(selected) {
+                if section.lines.is_empty() {
+                    let empty_msg = match selected {
+                        0 => "No open positions.",
+                        1 => "No pending orders.",
+                        2 => "No bot decisions recorded yet.",
+                        3 => "No diagnostics available.",
+                        _ => "No entries.",
+                    };
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            egui::RichText::new(empty_msg)
+                                .color(theme::TEXT_MUTED)
+                                .size(13.0),
+                        );
+                    });
+                } else {
+                    render_trade_watch_header(ui, section.title.as_str());
+                    ui.add_space(2.0);
+                    for (idx, line) in section.lines.iter().enumerate() {
+                        let color = if selected == 1 {
+                            theme::WARNING
+                        } else if line.starts_with("ERROR") || line.starts_with("FAIL") {
+                            theme::DANGER
+                        } else if selected == 0 {
+                            theme::SUCCESS
+                        } else {
+                            theme::TEXT_MUTED
+                        };
+                        let fill = if idx % 2 == 0 {
+                            theme::SURFACE_BG
+                        } else {
+                            theme::PANEL_BG
+                        };
+                        egui::Frame::new()
+                            .fill(fill)
+                            .inner_margin(egui::Margin::symmetric(6, 3))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.label(
+                                    egui::RichText::new(line)
+                                        .monospace()
+                                        .color(color)
+                                        .size(12.0),
+                                );
+                            });
+                    }
+                }
+            }
+        });
+
+    // Persist selected tab across frames.
+    ui.data_mut(|d| d.insert_temp(tab_id, selected));
+}
+
+fn render_trade_watch_header(ui: &mut egui::Ui, title: &str) {
+    let label = match title {
+        "Positions" => "POSITION / SYMBOL / SIDE / SIZE / PNL",
+        "Orders" => "ORDER / SYMBOL / TYPE / SIZE / PRICE",
+        "Bot Log" => "AUTOMATION EVENT",
+        "Diagnostics" => "RUNTIME DIAGNOSTIC",
+        "Journal" => "JOURNAL ENTRY",
+        _ => "ENTRY",
+    };
+    egui::Frame::new()
+        .fill(theme::SURFACE_ALT)
+        .inner_margin(egui::Margin::symmetric(6, 3))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(label)
+                    .monospace()
+                    .size(10.0)
+                    .strong()
+                    .color(theme::TEXT_MUTED),
+            );
+        });
 }
 
 #[cfg(test)]
@@ -87,17 +181,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bottom_strip_uses_execution_snapshot_for_sections_and_notes() {
+    fn bottom_strip_uses_execution_snapshot_for_trade_watch_sections() {
         let snapshot = ExecutionSurfaceSnapshot {
             symbol: "EURUSD".to_string(),
-            adapter_name: "MT5".to_string(),
-            integration_mode: "Local terminal bridge".to_string(),
+            adapter_name: "cTrader".to_string(),
+            integration_mode: "Remote Open API".to_string(),
             connection_status: "Connected".to_string(),
-            supported_adapters: vec!["MT5".to_string(), "cTrader".to_string()],
+            supported_adapters: vec!["cTrader".to_string(), "DXtrade".to_string()],
             primary_actions: Vec::new(),
             warnings: Vec::new(),
             diagnostics: vec![
-                "Adapter: MT5".to_string(),
+                "Adapter: cTrader".to_string(),
                 "Market data capability: available".to_string(),
             ],
             positions: vec!["Open Position · EURUSD long · +24.5 pips".to_string()],
@@ -126,38 +220,39 @@ mod tests {
 
         let panel = build_bottom_strip(&snapshot);
 
-        assert_eq!(panel.sections.len(), 4);
-        assert_eq!(panel.sections[0].title, "Positions / Orders / PnL");
+        assert_eq!(panel.sections.len(), 5);
+        assert_eq!(panel.sections[0].title, "Positions");
         assert!(
             panel.sections[0]
                 .lines
                 .iter()
                 .any(|line| line.contains("Open Position"))
         );
+        assert_eq!(panel.sections[1].title, "Orders");
         assert!(
-            panel.sections[0]
+            panel.sections[1]
                 .lines
                 .iter()
-                .any(|line| line.contains("Pending"))
+                .any(|line| line.contains("EURUSD buy stop"))
         );
-        assert_eq!(panel.sections[1].title, "Bot Decisions Timeline");
+        assert_eq!(panel.sections[2].title, "Bot Log");
         assert_eq!(
-            panel.sections[1].lines,
+            panel.sections[2].lines,
             vec!["Bot entry approved · confidence 0.74".to_string()]
         );
-        assert_eq!(panel.sections[2].title, "Execution Diagnostics");
-        assert!(
-            panel.sections[2]
-                .lines
-                .iter()
-                .any(|line| line.contains("Market data capability"))
-        );
-        assert_eq!(panel.sections[3].title, "Manual Notes");
+        assert_eq!(panel.sections[3].title, "Diagnostics");
         assert!(
             panel.sections[3]
                 .lines
                 .iter()
-                .any(|line| line.contains("Symbol focus: EURUSD"))
+                .any(|line| line.contains("Market data capability"))
+        );
+        assert_eq!(panel.sections[4].title, "Journal");
+        assert!(
+            panel.sections[4]
+                .lines
+                .iter()
+                .any(|line| line.contains("History row"))
         );
     }
 }

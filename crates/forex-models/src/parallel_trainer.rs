@@ -16,12 +16,11 @@ use crate::runtime::capabilities::{CapabilityState, ModelFamily};
 
 fn read_threads_env(keys: &[&str]) -> Option<usize> {
     for key in keys {
-        if let Ok(val) = env::var(key) {
-            if let Ok(parsed) = val.trim().parse::<usize>() {
-                if parsed > 0 {
-                    return Some(parsed);
-                }
-            }
+        if let Ok(val) = env::var(key)
+            && let Ok(parsed) = val.trim().parse::<usize>()
+            && parsed > 0
+        {
+            return Some(parsed);
         }
     }
     None

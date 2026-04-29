@@ -17,8 +17,6 @@ pub struct SystemConfig {
     pub multi_resolution_prefix_base: bool,
     pub indices_path: String,
     pub use_online_indices: bool,
-    pub mt5_dxy_symbol: String,
-    pub mt5_eur_symbol: String,
     pub base_timeframe: String,
     pub use_volume_features: bool,
     pub higher_timeframes: Vec<String>,
@@ -30,13 +28,6 @@ pub struct SystemConfig {
     pub trading_session_end: String,
     pub session_timezone: String,
     pub broker_backend: String,
-    pub mt5_required: bool,
-    pub mt5_terminal_path: PathBuf,
-    pub mt5_login: i64,
-    pub mt5_password: String,
-    pub mt5_server: String,
-    pub mt5_timeout_seconds: u64,
-    pub mt5_timezone_offset_hours: i32,
     pub poll_interval_seconds: u64,
     pub metrics_logging_enabled: bool,
     pub metrics_db_path: PathBuf,
@@ -89,8 +80,6 @@ impl Default for SystemConfig {
             multi_resolution_prefix_base: false,
             indices_path: String::new(),
             use_online_indices: false,
-            mt5_dxy_symbol: "USDX".to_string(),
-            mt5_eur_symbol: "EXY".to_string(),
             base_timeframe: "M1".to_string(),
             use_volume_features: true,
             higher_timeframes: vec![
@@ -114,13 +103,6 @@ impl Default for SystemConfig {
             trading_session_end: "23:55".to_string(),
             session_timezone: "UTC".to_string(),
             broker_backend: "ctrader".to_string(),
-            mt5_required: false,
-            mt5_terminal_path: PathBuf::new(),
-            mt5_login: 0,
-            mt5_password: String::new(),
-            mt5_server: String::new(),
-            mt5_timeout_seconds: 30,
-            mt5_timezone_offset_hours: 0,
             poll_interval_seconds: 60,
             metrics_logging_enabled: true,
             metrics_db_path: PathBuf::from("metrics.sqlite"),
@@ -750,8 +732,6 @@ impl Default for ModelsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NewsConfig {
-    pub news_model: String,
-    pub news_model_path: PathBuf,
     pub news_decay_minutes: usize,
     pub news_kill_window_min: usize,
     pub news_confidence_threshold: f64,
@@ -792,8 +772,6 @@ pub struct NewsConfig {
 impl Default for NewsConfig {
     fn default() -> Self {
         Self {
-            news_model: "tfidf_linear".to_string(),
-            news_model_path: PathBuf::from("models/news_nlp.joblib"),
             news_decay_minutes: 120,
             news_kill_window_min: 30,
             news_confidence_threshold: 0.65,

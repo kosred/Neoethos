@@ -567,7 +567,7 @@ where
         let mut scored: Vec<(f64, usize, Gene, [f64; 11])> = genes
             .iter()
             .cloned()
-            .zip(metrics.into_iter())
+            .zip(metrics)
             .enumerate()
             .map(|(idx, (g, m))| (g.fitness, idx, g, m))
             .collect();
@@ -685,46 +685,46 @@ where
             profitable_archive.len(),
         );
 
-        if let Some(max_runtime) = max_runtime {
-            if started_at.elapsed() >= max_runtime {
-                let best_return_count = population
-                    .clamp(2, (population / 2).max(100).min(500))
-                    .min(scored.len());
-                let top_candidates: Vec<Gene> = scored
-                    .iter()
-                    .take(best_return_count)
-                    .map(|(_, _, g, _)| g.clone())
-                    .collect();
-                let top_metrics: Vec<[f64; 11]> = scored
-                    .iter()
-                    .take(best_return_count)
-                    .map(|(_, _, _, m)| *m)
-                    .collect();
-                seen_memory.flush();
-                if !profitable_archive.is_empty() {
-                    profitable_archive.sort_by(|a, b| {
-                        b.1[0]
-                            .partial_cmp(&a.1[0])
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| a.2.cmp(&b.2))
-                    });
-                    return Ok(SearchResult {
-                        genes: profitable_archive
-                            .iter()
-                            .map(|(g, _, _)| g.clone())
-                            .collect(),
-                        metrics: profitable_archive.iter().map(|(_, m, _)| *m).collect(),
-                    });
-                }
+        if let Some(max_runtime) = max_runtime
+            && started_at.elapsed() >= max_runtime
+        {
+            let best_return_count = population
+                .clamp(2, (population / 2).clamp(100, 500))
+                .min(scored.len());
+            let top_candidates: Vec<Gene> = scored
+                .iter()
+                .take(best_return_count)
+                .map(|(_, _, g, _)| g.clone())
+                .collect();
+            let top_metrics: Vec<[f64; 11]> = scored
+                .iter()
+                .take(best_return_count)
+                .map(|(_, _, _, m)| *m)
+                .collect();
+            seen_memory.flush();
+            if !profitable_archive.is_empty() {
+                profitable_archive.sort_by(|a, b| {
+                    b.1[0]
+                        .partial_cmp(&a.1[0])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.2.cmp(&b.2))
+                });
                 return Ok(SearchResult {
-                    genes: top_candidates,
-                    metrics: top_metrics,
+                    genes: profitable_archive
+                        .iter()
+                        .map(|(g, _, _)| g.clone())
+                        .collect(),
+                    metrics: profitable_archive.iter().map(|(_, m, _)| *m).collect(),
                 });
             }
+            return Ok(SearchResult {
+                genes: top_candidates,
+                metrics: top_metrics,
+            });
         }
 
         let best_return_count = population
-            .clamp(2, (population / 2).max(100).min(500))
+            .clamp(2, (population / 2).clamp(100, 500))
             .min(scored.len());
         let top_candidates: Vec<Gene> = scored
             .iter()

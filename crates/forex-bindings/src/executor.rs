@@ -123,32 +123,33 @@ pub fn infer_pip_metrics(
     let pip_value_quote = pip_size * contract_size;
 
     let mut refs: HashMap<String, f64> = HashMap::new();
-    if let Some(raw) = reference_prices {
-        if let Ok(dict) = raw.cast::<PyDict>() {
-            for (k, v) in dict.iter() {
-                let key = match k.extract::<String>() {
-                    Ok(s) => norm_symbol(&s),
-                    Err(_) => continue,
-                };
-                if key.len() != 6 {
-                    continue;
-                }
-                let val = match v.extract::<f64>() {
-                    Ok(x) if x.is_finite() && x > 0.0 => x,
-                    _ => continue,
-                };
-                refs.insert(key, val);
+    if let Some(raw) = reference_prices
+        && let Ok(dict) = raw.cast::<PyDict>()
+    {
+        for (k, v) in dict.iter() {
+            let key = match k.extract::<String>() {
+                Ok(s) => norm_symbol(&s),
+                Err(_) => continue,
+            };
+            if key.len() != 6 {
+                continue;
             }
+            let val = match v.extract::<f64>() {
+                Ok(x) if x.is_finite() && x > 0.0 => x,
+                _ => continue,
+            };
+            refs.insert(key, val);
         }
     }
 
     let mut pip_value = pip_value_quote;
     if let Some((base, quote)) = parts {
         let rate = quote_to_account_rate(&base, &quote, account_currency, price, &refs);
-        if let Some(r) = rate {
-            if r.is_finite() && r > 0.0 {
-                pip_value = pip_value_quote * r;
-            }
+        if let Some(r) = rate
+            && r.is_finite()
+            && r > 0.0
+        {
+            pip_value = pip_value_quote * r;
         }
     }
 

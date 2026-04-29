@@ -489,10 +489,10 @@ impl RiskManager {
             }
         }
 
-        if let Some(kill_until) = self.kill_window_until_sec {
-            if input.current_time_sec < kill_until {
-                return (false, "News kill window active".to_string());
-            }
+        if let Some(kill_until) = self.kill_window_until_sec
+            && input.current_time_sec < kill_until
+        {
+            return (false, "News kill window active".to_string());
         }
 
         if self
@@ -504,13 +504,7 @@ impl RiskManager {
 
         let (daily_dd, intraday_dd, _dd_used, _dd_limit, total_dd) =
             self.drawdown_state(input.equity);
-        if total_dd >= 0.05 {
-            self.circuit_breaker_triggered = true;
-            return (
-                false,
-                "Drawdown Recovery: HALT trading (DD > 5%)".to_string(),
-            );
-        }
+        // Check the hard limit first — it is the most severe condition.
         if total_dd >= self.prop_rules.max_total_loss_pct {
             self.circuit_breaker_triggered = true;
             return (
@@ -518,15 +512,23 @@ impl RiskManager {
                 format!("Total drawdown limit ({:.2}%)", total_dd * 100.0),
             );
         }
+        // Secondary recovery halt (below the hard limit but above 5%).
+        if total_dd >= 0.05 {
+            self.circuit_breaker_triggered = true;
+            return (
+                false,
+                "Drawdown Recovery: HALT trading (DD > 5%)".to_string(),
+            );
+        }
 
         if total_dd >= 0.04 {
-            if let Some(rank) = input.strategy_rank {
-                if rank > 1 {
-                    return (
-                        false,
-                        "Drawdown Recovery: DD > 4%, only top 1 strategy allowed".to_string(),
-                    );
-                }
+            if let Some(rank) = input.strategy_rank
+                && rank > 1
+            {
+                return (
+                    false,
+                    "Drawdown Recovery: DD > 4%, only top 1 strategy allowed".to_string(),
+                );
             }
             if self.session_trades >= 2 {
                 return (
@@ -535,23 +537,22 @@ impl RiskManager {
                 );
             }
         } else if total_dd >= 0.03 {
-            if let Some(sharpe) = input.strategy_sharpe {
-                if sharpe <= 1.0 {
-                    return (
-                        false,
-                        "Drawdown Recovery: DD > 3%, only Sharpe > 1.0 allowed".to_string(),
-                    );
-                }
+            if let Some(sharpe) = input.strategy_sharpe
+                && sharpe <= 1.0
+            {
+                return (
+                    false,
+                    "Drawdown Recovery: DD > 3%, only Sharpe > 1.0 allowed".to_string(),
+                );
             }
-        } else if total_dd >= 0.02 {
-            if let Some(rank) = input.strategy_rank {
-                if rank > 3 {
-                    return (
-                        false,
-                        "Drawdown Recovery: DD > 2%, only top 3 strategies allowed".to_string(),
-                    );
-                }
-            }
+        } else if total_dd >= 0.02
+            && let Some(rank) = input.strategy_rank
+            && rank > 3
+        {
+            return (
+                false,
+                "Drawdown Recovery: DD > 2%, only top 3 strategies allowed".to_string(),
+            );
         }
 
         if daily_dd >= self.prop_rules.daily_dd_stop_trading_pct {
@@ -614,14 +615,15 @@ impl RiskManager {
 
         // Dynamic Kelly Sizing (Idea #4.2)
         let mut base_risk = input.base_risk_pct;
-        if let (Some(wr), Some(aw), Some(al)) = (input.win_rate, input.avg_win, input.avg_loss) {
-            if aw > 0.0 && al > 0.0 {
-                let f_star = (wr * aw - (1.0 - wr) * al) / aw;
-                if f_star > 0.0 {
-                    let quarter_kelly = f_star / 4.0;
-                    // Floor 0.5%, Ceiling 3% (or max_risk_cap)
-                    base_risk = quarter_kelly.clamp(0.005, input.max_risk_cap.min(0.03));
-                }
+        if let (Some(wr), Some(aw), Some(al)) = (input.win_rate, input.avg_win, input.avg_loss)
+            && aw > 0.0
+            && al > 0.0
+        {
+            let f_star = (wr * aw - (1.0 - wr) * al) / aw;
+            if f_star > 0.0 {
+                let quarter_kelly = f_star / 4.0;
+                // Floor 0.5%, Ceiling 3% (or max_risk_cap)
+                base_risk = quarter_kelly.clamp(0.005, input.max_risk_cap.min(0.03));
             }
         }
 

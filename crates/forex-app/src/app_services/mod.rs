@@ -1,12 +1,13 @@
 pub mod bootstrap_writer;
-#[cfg(test)]
-mod ctrader_integration_tests;
 pub mod broker_config;
+pub mod broker_persistence;
 pub mod ctrader_account;
 pub mod ctrader_auth;
 pub mod ctrader_bootstrap;
 pub mod ctrader_data;
 pub mod ctrader_execution;
+#[cfg(test)]
+mod ctrader_integration_tests;
 pub mod ctrader_live_auth;
 pub mod ctrader_messages;
 pub mod ctrader_openapi;

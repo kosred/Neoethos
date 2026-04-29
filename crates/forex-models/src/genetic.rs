@@ -238,16 +238,15 @@ impl GeneticStrategyExpert {
 
     fn timestamps_from_frame(df: &DataFrame) -> Vec<i64> {
         for name in ["timestamp", "time", "date", "datetime"] {
-            if let Ok(column) = df.column(name) {
-                if let Ok(series) = column.as_materialized_series().cast(&DataType::Int64) {
-                    if let Ok(values) = series.i64() {
-                        return values
-                            .into_iter()
-                            .enumerate()
-                            .map(|(idx, value)| value.unwrap_or(idx as i64))
-                            .collect();
-                    }
-                }
+            if let Ok(column) = df.column(name)
+                && let Ok(series) = column.as_materialized_series().cast(&DataType::Int64)
+                && let Ok(values) = series.i64()
+            {
+                return values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, value)| value.unwrap_or(idx as i64))
+                    .collect();
             }
         }
         (0..df.height()).map(|idx| idx as i64).collect()
@@ -1126,10 +1125,10 @@ impl GeneticStrategyExpert {
     ) -> Result<RuntimeArtifactMetadata> {
         match Self::read_runtime_metadata(path)? {
             Some(metadata) => {
-                if let Some(embedded) = artifact.runtime_metadata.as_ref() {
-                    if embedded != &metadata {
-                        bail!("runtime metadata file does not match genetic artifact");
-                    }
+                if let Some(embedded) = artifact.runtime_metadata.as_ref()
+                    && embedded != &metadata
+                {
+                    bail!("runtime metadata file does not match genetic artifact");
                 }
                 Self::validate_runtime_metadata(&metadata, &artifact.feature_columns)?;
                 Ok(metadata)
@@ -1516,6 +1515,8 @@ impl Default for GeneticStrategyExpert {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::field_reassign_with_default)]
+
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 

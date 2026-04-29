@@ -1,5 +1,5 @@
-use duckdb::{params, Connection, Result};
 use crate::genetic::strategy_gene::Gene;
+use duckdb::{Connection, Result, params};
 use tracing::info;
 
 pub struct StrategyDb {
@@ -46,7 +46,7 @@ impl StrategyDb {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS idx_strategies_symbol_tf ON strategies (symbol, timeframe);
-            CREATE INDEX IF NOT EXISTS idx_strategies_id ON strategies (strategy_id);"
+            CREATE INDEX IF NOT EXISTS idx_strategies_id ON strategies (strategy_id);",
         )?;
 
         info!("StrategyDb initialized (path: {:?})", path);
@@ -96,19 +96,29 @@ impl StrategyDb {
                 gene.sl_pips
             ])?;
         }
-        
-        info!("Inserted {} strategies into DB (run: {}, symbol: {}, tf: {})", genes.len(), run_id, symbol, tf);
+
+        info!(
+            "Inserted {} strategies into DB (run: {}, symbol: {}, tf: {})",
+            genes.len(),
+            run_id,
+            symbol,
+            tf
+        );
         Ok(())
     }
 
-    pub fn cross_tf_winners(&self, min_tfs: usize, min_sharpe: f64) -> Result<Vec<(String, usize)>> {
+    pub fn cross_tf_winners(
+        &self,
+        min_tfs: usize,
+        min_sharpe: f64,
+    ) -> Result<Vec<(String, usize)>> {
         let mut stmt = self.conn.prepare(
             "SELECT strategy_id, COUNT(DISTINCT timeframe) as tf_count
              FROM strategies
              WHERE sharpe_ratio >= ?
              GROUP BY strategy_id
              HAVING tf_count >= ?
-             ORDER BY tf_count DESC"
+             ORDER BY tf_count DESC",
         )?;
 
         let rows = stmt.query_map(params![min_sharpe, min_tfs as i32], |row| {
@@ -139,7 +149,7 @@ impl StrategyDb {
              )
              WHERE rn = 1
              ORDER BY fitness DESC
-             LIMIT ?"
+             LIMIT ?",
         )?;
 
         let rows = stmt.query_map(params![symbol, limit as i32], |row| {
@@ -178,11 +188,15 @@ impl StrategyDb {
         for row in rows {
             genes.push(row?);
         }
-        
+
         if !genes.is_empty() {
-            info!("Seeding population with {} strategies from DB for symbol {}", genes.len(), symbol);
+            info!(
+                "Seeding population with {} strategies from DB for symbol {}",
+                genes.len(),
+                symbol
+            );
         }
-        
+
         Ok(genes)
     }
 }
@@ -205,7 +219,7 @@ mod tests {
         };
 
         db.insert_batch("run1", "EURUSD", "M15", std::slice::from_ref(&gene))?;
-        
+
         // Add another timeframe for same strategy
         db.insert_batch("run1", "EURUSD", "H1", std::slice::from_ref(&gene))?;
 

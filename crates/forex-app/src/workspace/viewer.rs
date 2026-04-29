@@ -51,19 +51,30 @@ impl TabViewer for WorkspaceViewer<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         match tab {
             WorkspaceTab::Dashboard => {
+                let auto_trade = self.state.auto_trade_enabled;
+                let balance = self.state.account_balance;
+                let equity = self.state.account_equity;
+                let discovery_snap = self.state.discovery_job.clone();
+                let training_snap = self.state.training_job.clone();
+                let ai_snap = self.state.ai_insights_panel.clone();
                 let panel = &mut self.state.dashboard_panel;
                 panel.show(
                     ui,
-                    self.state.auto_trade_enabled,
-                    self.state.account_balance,
-                    self.state.account_equity,
+                    ui::dashboard::DashboardInputs {
+                        auto_trade_enabled: auto_trade,
+                        account_balance: balance,
+                        account_equity: equity,
+                        discovery_job: discovery_snap.as_ref(),
+                        training_job: training_snap.as_ref(),
+                        ai_insights: &ai_snap,
+                    },
                 );
             }
             WorkspaceTab::Chart => {
                 ui::trading::chart_panel::render(ui, self.state, self.trading_session)
             }
             WorkspaceTab::Watchlist => {
-                ui::trading::watchlist_panel::render(ui, self.state, self.trading_session)
+                ui::trading::watchlist_panel::render(ui, self.state, self.trading_session);
             }
             WorkspaceTab::Execution => {
                 ui::trading::execution_panel::render(ui, self.state, self.trading_session, self.tx)
@@ -103,6 +114,9 @@ impl TabViewer for WorkspaceViewer<'_> {
                     ui::risk::render(ui, &mut self.state.risk);
                 });
             }
+            WorkspaceTab::Settings => {
+                ui::settings::render(ui, self.state, self.tx);
+            }
         }
     }
 
@@ -116,10 +130,40 @@ pub fn render_workspace(
     workspace: &mut WorkspaceState,
     viewer: &mut WorkspaceViewer<'_>,
 ) {
-    let style = Style::from_egui(ui.style().as_ref());
+    let style = trading_dock_style(ui.style().as_ref());
     DockArea::new(workspace.dock_state_mut())
         .style(style)
         .show_add_buttons(false)
         .show_close_buttons(false)
         .show_inside(ui, viewer);
+}
+
+fn trading_dock_style(style: &egui::Style) -> Style {
+    let mut dock_style = Style::from_egui(style);
+    dock_style.dock_area_padding = Some(egui::Margin::same(0));
+    dock_style.main_surface_border_stroke = egui::Stroke::new(1.0, ui::theme::BORDER);
+    dock_style.main_surface_border_rounding = egui::CornerRadius::same(4);
+    dock_style.separator.width = 1.0;
+    dock_style.separator.extra_interact_width = 4.0;
+    dock_style.separator.color_idle = ui::theme::BORDER;
+    dock_style.separator.color_hovered = ui::theme::ACCENT.linear_multiply(0.65);
+    dock_style.separator.color_dragged = ui::theme::ACCENT;
+    dock_style.tab_bar.bg_fill = ui::theme::APP_BG;
+    dock_style.tab_bar.height = 24.0;
+    dock_style.tab_bar.corner_radius = egui::CornerRadius::ZERO;
+    dock_style.tab_bar.hline_color = ui::theme::BORDER;
+    dock_style.tab.minimum_width = Some(76.0);
+    dock_style.tab.active.bg_fill = ui::theme::SURFACE_BG;
+    dock_style.tab.active.text_color = ui::theme::TEXT_PRIMARY;
+    dock_style.tab.inactive.bg_fill = ui::theme::PANEL_BG;
+    dock_style.tab.inactive.text_color = ui::theme::TEXT_MUTED;
+    dock_style.tab.hovered.bg_fill = ui::theme::SURFACE_ALT;
+    dock_style.tab.hovered.text_color = ui::theme::TEXT_PRIMARY;
+    dock_style.tab.focused.bg_fill = ui::theme::SURFACE_BG;
+    dock_style.tab.focused.text_color = ui::theme::ACCENT;
+    dock_style.tab.tab_body.bg_fill = ui::theme::PANEL_BG;
+    dock_style.tab.tab_body.stroke = egui::Stroke::new(1.0, ui::theme::BORDER);
+    dock_style.tab.tab_body.corner_radius = egui::CornerRadius::same(4);
+    dock_style.tab.tab_body.inner_margin = egui::Margin::same(6);
+    dock_style
 }

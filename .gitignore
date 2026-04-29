@@ -55,3 +55,14 @@ crates/*/build_log*.txt
 crates/*/build_errors.txt
 rust_out.exe
 rust_out.pdb
+/dist/
+.mypy_cache/
+
+# Native ML library DLLs (generated at build time, not committed)
+catboostmodel.dll
+xgboost.dll
+
+# Per-user broker credentials (cTrader Open API client_id/secret etc.).
+# Loaded by app_services::broker_persistence on startup. Never commit.
+**/broker_credentials.toml
+.local/

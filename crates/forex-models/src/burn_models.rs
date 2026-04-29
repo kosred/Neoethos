@@ -1988,11 +1988,11 @@ where
                     .map(|&idx| train_labels[idx])
                     .collect::<Vec<_>>();
                 let x_batch =
-                    array2_to_tensor_with_dtype::<B>(&x_batch_array, &device, training_dtype);
-                let y_batch = labels_to_tensor::<B>(&y_batch_labels, &device);
+                    array2_to_tensor_with_dtype::<B>(&x_batch_array, device, training_dtype);
+                let y_batch = labels_to_tensor::<B>(&y_batch_labels, device);
 
                 let logits = BurnForward::forward_pass(&model, x_batch);
-                let loss = cross_entropy_loss(logits, y_batch, &class_weights, &device);
+                let loss = cross_entropy_loss(logits, y_batch, &class_weights, device);
                 let loss_val =
                     scalar_loss_value(loss.clone().into_data(), "extract Burn training loss")?;
 
@@ -2027,10 +2027,10 @@ where
             let y_val = y_val_labels
                 .as_ref()
                 .expect("validation labels must exist when validation range is non-empty");
-            let x_val = array2_to_tensor_with_dtype::<B>(x_val, &device, training_dtype);
-            let y_val = labels_to_tensor::<B>(y_val, &device);
+            let x_val = array2_to_tensor_with_dtype::<B>(x_val, device, training_dtype);
+            let y_val = labels_to_tensor::<B>(y_val, device);
             let val_logits = BurnForward::forward_pass(&model, x_val);
-            let val_loss = cross_entropy_loss(val_logits, y_val, &class_weights, &device);
+            let val_loss = cross_entropy_loss(val_logits, y_val, &class_weights, device);
             let vl = scalar_loss_value(val_loss.into_data(), "extract Burn validation loss")?;
 
             if vl < best_loss {

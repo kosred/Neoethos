@@ -34,6 +34,28 @@ pub fn render(
     );
     ui.separator();
 
+    ui.horizontal(|ui| {
+        ui.label("Symbol:");
+        egui::ComboBox::from_id_salt("training_symbol")
+            .selected_text(&state.selected_pair)
+            .show_ui(ui, |ui| {
+                for sym in &state.available_symbols {
+                    ui.selectable_value(&mut state.selected_pair, sym.clone(), sym);
+                }
+            });
+        ui.add_space(12.0);
+        ui.label("Base TF:");
+        let timeframes = ["M1", "M5", "M15", "H1", "H4", "D1"];
+        egui::ComboBox::from_id_salt("training_tf")
+            .selected_text(&state.chart_timeframe)
+            .show_ui(ui, |ui| {
+                for tf in timeframes {
+                    ui.selectable_value(&mut state.chart_timeframe, tf.to_string(), tf);
+                }
+            });
+    });
+    ui.add_space(4.0);
+
     render_status_badge(ui, "Training", state.training_job.as_ref());
 
     if let Some(snapshot) = state.training_job.as_ref() {
@@ -58,7 +80,7 @@ pub fn render(
                 config_path: state.runtime.config_path.clone(),
                 models_dir: PathBuf::from("models"),
                 symbol: state.selected_pair.clone(),
-                base_tf: "M1".to_string(),
+                base_tf: state.chart_timeframe.clone(),
             };
 
             match start_training_job(request, tx.clone()) {
@@ -72,20 +94,21 @@ pub fn render(
             }
         }
 
-        if running && ui.button("Stop Training").clicked() {
-            if let Some(handle) = handle.as_ref() {
-                handle.cancel.request();
-            }
+        if running
+            && ui.button("Stop Training").clicked()
+            && let Some(handle) = handle.as_ref()
+        {
+            handle.cancel.request();
         }
 
-        if ui.button("Open Log").clicked() {
-            if let Err(err) = open_log(&state.canonical_log_path) {
-                state.training_job = Some(failed_snapshot(anyhow::anyhow!(
-                    "failed to open log {}: {}",
-                    state.canonical_log_path.display(),
-                    err
-                )));
-            }
+        if ui.button("Open Log").clicked()
+            && let Err(err) = open_log(&state.canonical_log_path)
+        {
+            state.training_job = Some(failed_snapshot(anyhow::anyhow!(
+                "failed to open log {}: {}",
+                state.canonical_log_path.display(),
+                err
+            )));
         }
     });
 }

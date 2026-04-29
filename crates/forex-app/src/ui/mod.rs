@@ -4,6 +4,7 @@ pub mod dashboard;
 pub mod discovery;
 pub mod hardware;
 pub mod risk;
+pub mod settings;
 pub mod system;
 pub mod theme;
 pub mod trading;

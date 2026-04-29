@@ -450,84 +450,84 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> SmcSignalTuple {
     ) = derive_smc_arrays(ohlcv);
 
     let apply_dir_col = |target: &mut Vec<i8>, col_opt: Option<usize>| {
-        if let Some(col) = col_opt {
-            if col < frame.data.ncols() {
-                for (i, slot) in target.iter_mut().enumerate().take(n) {
+        if let Some(col) = col_opt
+            && col < frame.data.ncols()
+        {
+            for (i, slot) in target.iter_mut().enumerate().take(n) {
+                *slot = quantize_dir(frame.data[(i, col)]);
+            }
+        }
+    };
+    let apply_binary_col = |target: &mut Vec<i8>, col_opt: Option<usize>| {
+        if let Some(col) = col_opt
+            && col < frame.data.ncols()
+        {
+            for (i, slot) in target.iter_mut().enumerate().take(n) {
+                *slot = quantize_binary(frame.data[(i, col)]);
+            }
+        }
+    };
+    let apply_eqh_col = |target: &mut Vec<i8>, col_opt: Option<usize>| {
+        if let Some(col) = col_opt
+            && col < frame.data.ncols()
+        {
+            for (i, slot) in target.iter_mut().enumerate().take(n) {
+                let v = frame.data[(i, col)];
+                let q = quantize_dir(v);
+                *slot = if q != 0 {
+                    q
+                } else if quantize_binary(v) != 0 {
+                    -1
+                } else {
+                    0
+                };
+            }
+        }
+    };
+    let apply_eql_col = |target: &mut Vec<i8>, col_opt: Option<usize>| {
+        if let Some(col) = col_opt
+            && col < frame.data.ncols()
+        {
+            for (i, slot) in target.iter_mut().enumerate().take(n) {
+                let v = frame.data[(i, col)];
+                let q = quantize_dir(v);
+                *slot = if q != 0 {
+                    q
+                } else if quantize_binary(v) != 0 {
+                    1
+                } else {
+                    0
+                };
+            }
+        }
+    };
+    let apply_dir_fill_zeros = |target: &mut Vec<i8>, col_opt: Option<usize>| {
+        if let Some(col) = col_opt
+            && col < frame.data.ncols()
+        {
+            for (i, slot) in target.iter_mut().enumerate().take(n) {
+                if *slot == 0 {
                     *slot = quantize_dir(frame.data[(i, col)]);
                 }
             }
         }
     };
-    let apply_binary_col = |target: &mut Vec<i8>, col_opt: Option<usize>| {
-        if let Some(col) = col_opt {
-            if col < frame.data.ncols() {
-                for (i, slot) in target.iter_mut().enumerate().take(n) {
-                    *slot = quantize_binary(frame.data[(i, col)]);
-                }
-            }
-        }
-    };
-    let apply_eqh_col = |target: &mut Vec<i8>, col_opt: Option<usize>| {
-        if let Some(col) = col_opt {
-            if col < frame.data.ncols() {
-                for (i, slot) in target.iter_mut().enumerate().take(n) {
-                    let v = frame.data[(i, col)];
-                    let q = quantize_dir(v);
-                    *slot = if q != 0 {
-                        q
-                    } else if quantize_binary(v) != 0 {
-                        -1
-                    } else {
-                        0
-                    };
-                }
-            }
-        }
-    };
-    let apply_eql_col = |target: &mut Vec<i8>, col_opt: Option<usize>| {
-        if let Some(col) = col_opt {
-            if col < frame.data.ncols() {
-                for (i, slot) in target.iter_mut().enumerate().take(n) {
-                    let v = frame.data[(i, col)];
-                    let q = quantize_dir(v);
-                    *slot = if q != 0 {
-                        q
-                    } else if quantize_binary(v) != 0 {
-                        1
-                    } else {
-                        0
-                    };
-                }
-            }
-        }
-    };
-    let apply_dir_fill_zeros = |target: &mut Vec<i8>, col_opt: Option<usize>| {
-        if let Some(col) = col_opt {
-            if col < frame.data.ncols() {
-                for (i, slot) in target.iter_mut().enumerate().take(n) {
-                    if *slot == 0 {
-                        *slot = quantize_dir(frame.data[(i, col)]);
-                    }
-                }
-            }
-        }
-    };
     let apply_eq_levels = |target: &mut Vec<i8>, eqh_col: Option<usize>, eql_col: Option<usize>| {
-        if let Some(col) = eqh_col {
-            if col < frame.data.ncols() {
-                for (i, slot) in target.iter_mut().enumerate().take(n) {
-                    if quantize_binary(frame.data[(i, col)]) != 0 {
-                        *slot = -1;
-                    }
+        if let Some(col) = eqh_col
+            && col < frame.data.ncols()
+        {
+            for (i, slot) in target.iter_mut().enumerate().take(n) {
+                if quantize_binary(frame.data[(i, col)]) != 0 {
+                    *slot = -1;
                 }
             }
         }
-        if let Some(col) = eql_col {
-            if col < frame.data.ncols() {
-                for (i, slot) in target.iter_mut().enumerate().take(n) {
-                    if quantize_binary(frame.data[(i, col)]) != 0 {
-                        *slot = 1;
-                    }
+        if let Some(col) = eql_col
+            && col < frame.data.ncols()
+        {
+            for (i, slot) in target.iter_mut().enumerate().take(n) {
+                if quantize_binary(frame.data[(i, col)]) != 0 {
+                    *slot = 1;
                 }
             }
         }
@@ -551,12 +551,12 @@ pub fn build_smc_arrays(frame: &FeatureFrame, ohlcv: &Ohlcv) -> SmcSignalTuple {
     apply_dir_fill_zeros(&mut trend, cols.choch);
     apply_dir_fill_zeros(&mut trend, cols.displacement);
 
-    if let Some(col) = cols.displacement {
-        if col < frame.data.ncols() {
-            for (i, slot) in inducement.iter_mut().enumerate().take(n) {
-                if quantize_dir(frame.data[(i, col)]) != 0 {
-                    *slot = 1;
-                }
+    if let Some(col) = cols.displacement
+        && col < frame.data.ncols()
+    {
+        for (i, slot) in inducement.iter_mut().enumerate().take(n) {
+            if quantize_dir(frame.data[(i, col)]) != 0 {
+                *slot = 1;
             }
         }
     }

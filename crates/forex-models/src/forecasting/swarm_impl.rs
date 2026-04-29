@@ -887,28 +887,27 @@ fn candidate_predictions(
         ));
     }
 
-    if snapshot.has_seasonality {
-        if let Some(seasonal) = seasonal_forecast(values, &snapshot.seasonal_periods, horizon) {
-            predictions.push(("seasonal".to_string(), ModelType::NHITS, seasonal));
-            if trend_dominant {
-                if let Some((_, _, drift)) = predictions.iter().find(|(name, _, _)| name == "drift")
-                {
-                    let seasonal_drift = blend_forecasts(
-                        drift,
-                        predictions
-                            .iter()
-                            .find(|(name, _, _)| name == "seasonal")
-                            .map(|(_, _, forecast)| forecast.as_slice())
-                            .unwrap_or(&[]),
-                        0.55 + 0.25 * snapshot.trend_strength,
-                    );
-                    predictions.push((
-                        "seasonal_drift".to_string(),
-                        ModelType::NHITS,
-                        seasonal_drift,
-                    ));
-                }
-            }
+    if snapshot.has_seasonality
+        && let Some(seasonal) = seasonal_forecast(values, &snapshot.seasonal_periods, horizon)
+    {
+        predictions.push(("seasonal".to_string(), ModelType::NHITS, seasonal));
+        if trend_dominant
+            && let Some((_, _, drift)) = predictions.iter().find(|(name, _, _)| name == "drift")
+        {
+            let seasonal_drift = blend_forecasts(
+                drift,
+                predictions
+                    .iter()
+                    .find(|(name, _, _)| name == "seasonal")
+                    .map(|(_, _, forecast)| forecast.as_slice())
+                    .unwrap_or(&[]),
+                0.55 + 0.25 * snapshot.trend_strength,
+            );
+            predictions.push((
+                "seasonal_drift".to_string(),
+                ModelType::NHITS,
+                seasonal_drift,
+            ));
         }
     }
 
@@ -1062,11 +1061,11 @@ fn aggregate_average(predictions: &[Vec<f32>], horizon: usize, baseline: f32) ->
             let mut sum = 0.0_f32;
             let mut count = 0usize;
             for forecast in predictions {
-                if let Some(value) = forecast.get(step) {
-                    if value.is_finite() {
-                        sum += *value;
-                        count += 1;
-                    }
+                if let Some(value) = forecast.get(step)
+                    && value.is_finite()
+                {
+                    sum += *value;
+                    count += 1;
                 }
             }
             if count == 0 {
@@ -1935,7 +1934,7 @@ fn write_swarm_artifact_atomically(artifact_path: &Path, payload: &[u8]) -> Resu
     })?;
 
     let replaced_existing = if artifact_path.exists() {
-        std::fs::rename(&artifact_path, &backup_path).with_context(|| {
+        std::fs::rename(artifact_path, &backup_path).with_context(|| {
             format!(
                 "rotate previous swarm forecaster artifact {} into {}",
                 artifact_path.display(),
@@ -1947,9 +1946,9 @@ fn write_swarm_artifact_atomically(artifact_path: &Path, payload: &[u8]) -> Resu
         false
     };
 
-    if let Err(err) = std::fs::rename(&temp_path, &artifact_path) {
+    if let Err(err) = std::fs::rename(&temp_path, artifact_path) {
         if replaced_existing && backup_path.exists() {
-            let _ = std::fs::rename(&backup_path, &artifact_path);
+            let _ = std::fs::rename(&backup_path, artifact_path);
         }
         let _ = std::fs::remove_file(&temp_path);
         return Err(err).with_context(|| {
@@ -2013,15 +2012,15 @@ fn aggregate_weighted(
             let mut weighted_sum = 0.0_f32;
             let mut total_weight = 0.0_f32;
             for (name, forecast) in candidates {
-                if let Some(value) = forecast.get(step).copied() {
-                    if value.is_finite() {
-                        let weight = weights
-                            .get(name)
-                            .copied()
-                            .unwrap_or_else(|| 1.0 / candidates.len().max(1) as f32);
-                        weighted_sum += value * weight;
-                        total_weight += weight;
-                    }
+                if let Some(value) = forecast.get(step).copied()
+                    && value.is_finite()
+                {
+                    let weight = weights
+                        .get(name)
+                        .copied()
+                        .unwrap_or_else(|| 1.0 / candidates.len().max(1) as f32);
+                    weighted_sum += value * weight;
+                    total_weight += weight;
                 }
             }
             if total_weight <= f32::EPSILON {
@@ -2442,27 +2441,27 @@ fn candidate_forecasts_local(
         ));
     }
 
-    if snapshot.has_seasonality {
-        if let Some(seasonal) = seasonal_forecast(values, &snapshot.seasonal_periods, horizon) {
-            predictions.push(("seasonal".to_string(), seasonal));
-            if trend_dominant {
-                predictions.push((
-                    "seasonal_drift".to_string(),
-                    blend_forecasts(
-                        predictions
-                            .iter()
-                            .find(|(name, _)| name == "drift")
-                            .map(|(_, forecast)| forecast.as_slice())
-                            .unwrap_or(&[]),
-                        predictions
-                            .iter()
-                            .find(|(name, _)| name == "seasonal")
-                            .map(|(_, forecast)| forecast.as_slice())
-                            .unwrap_or(&[]),
-                        0.55 + 0.25 * snapshot.trend_strength,
-                    ),
-                ));
-            }
+    if snapshot.has_seasonality
+        && let Some(seasonal) = seasonal_forecast(values, &snapshot.seasonal_periods, horizon)
+    {
+        predictions.push(("seasonal".to_string(), seasonal));
+        if trend_dominant {
+            predictions.push((
+                "seasonal_drift".to_string(),
+                blend_forecasts(
+                    predictions
+                        .iter()
+                        .find(|(name, _)| name == "drift")
+                        .map(|(_, forecast)| forecast.as_slice())
+                        .unwrap_or(&[]),
+                    predictions
+                        .iter()
+                        .find(|(name, _)| name == "seasonal")
+                        .map(|(_, forecast)| forecast.as_slice())
+                        .unwrap_or(&[]),
+                    0.55 + 0.25 * snapshot.trend_strength,
+                ),
+            ));
         }
     }
 
@@ -4411,7 +4410,7 @@ mod tests {
             volatility_ratio: 1.0,
         };
         let step_values = vec![1.00, 1.02, 1.03, 1.01];
-        let strong = vec![SwarmCandidateReport {
+        let strong = [SwarmCandidateReport {
             name: "a".to_string(),
             model_type: "local".to_string(),
             source: "rolling_validation".to_string(),
@@ -4429,7 +4428,7 @@ mod tests {
             regime_fit: 0.9,
             stability_score: 0.9,
         }];
-        let weak = vec![SwarmCandidateReport {
+        let weak = [SwarmCandidateReport {
             coverage: 0.45,
             mae: 0.03,
             prediction_std: 0.02,

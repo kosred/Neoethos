@@ -190,16 +190,15 @@ fn fit_binary_posterior(
             train_labels.len()
         );
     }
-    if let Some(val_features) = val_features {
-        if let Some(val_labels) = val_labels {
-            if val_features.nrows() != val_labels.len() {
-                bail!(
-                    "bayesian validation mismatch: {} rows vs {} labels",
-                    val_features.nrows(),
-                    val_labels.len()
-                );
-            }
-        }
+    if let Some(val_features) = val_features
+        && let Some(val_labels) = val_labels
+        && val_features.nrows() != val_labels.len()
+    {
+        bail!(
+            "bayesian validation mismatch: {} rows vs {} labels",
+            val_features.nrows(),
+            val_labels.len()
+        );
     }
 
     let prior = prior_precision.max(1e-6);
@@ -240,33 +239,32 @@ fn fit_binary_posterior(
         grad_b /= rows as f32;
         bias -= lr * grad_b;
 
-        if let (Some(val_features), Some(val_labels)) = (val_features, val_labels) {
-            if val_features.nrows() > 0 {
-                let mut val_loss = 0.0_f32;
-                for (row, target) in val_labels.iter().enumerate().take(val_features.nrows()) {
-                    let x_row = val_features.row(row);
-                    let logit = weights
-                        .iter()
-                        .zip(x_row.iter())
-                        .map(|(weight, value)| weight * value)
-                        .sum::<f32>()
-                        + bias;
-                    let probability = sigmoid(logit).clamp(1e-6, 1.0 - 1e-6);
-                    val_loss -=
-                        *target * probability.ln() + (1.0 - *target) * (1.0 - probability).ln();
-                }
-                val_loss /= val_features.nrows() as f32;
+        if let (Some(val_features), Some(val_labels)) = (val_features, val_labels)
+            && val_features.nrows() > 0
+        {
+            let mut val_loss = 0.0_f32;
+            for (row, target) in val_labels.iter().enumerate().take(val_features.nrows()) {
+                let x_row = val_features.row(row);
+                let logit = weights
+                    .iter()
+                    .zip(x_row.iter())
+                    .map(|(weight, value)| weight * value)
+                    .sum::<f32>()
+                    + bias;
+                let probability = sigmoid(logit).clamp(1e-6, 1.0 - 1e-6);
+                val_loss -= *target * probability.ln() + (1.0 - *target) * (1.0 - probability).ln();
+            }
+            val_loss /= val_features.nrows() as f32;
 
-                if val_loss + 1e-6 < best_val_loss {
-                    best_val_loss = val_loss;
-                    best_weights = weights.clone();
-                    best_bias = bias;
-                    stale_epochs = 0;
-                } else {
-                    stale_epochs += 1;
-                    if stale_epochs >= patience {
-                        break;
-                    }
+            if val_loss + 1e-6 < best_val_loss {
+                best_val_loss = val_loss;
+                best_weights = weights.clone();
+                best_bias = bias;
+                stale_epochs = 0;
+            } else {
+                stale_epochs += 1;
+                if stale_epochs >= patience {
+                    break;
                 }
             }
         }
@@ -439,8 +437,8 @@ fn resolve_runtime_metadata_from_artifact(
                 &artifact.feature_columns,
                 artifact.dataset_rows,
             )?;
-            if let Some(embedded) = artifact.runtime_metadata.as_ref() {
-                if embedded.model_name != metadata.model_name
+            if let Some(embedded) = artifact.runtime_metadata.as_ref()
+                && (embedded.model_name != metadata.model_name
                     || embedded.family != metadata.family
                     || embedded.state != metadata.state
                     || embedded.feature_columns != metadata.feature_columns
@@ -448,13 +446,12 @@ fn resolve_runtime_metadata_from_artifact(
                     || embedded.training_summary.dataset_rows
                         != metadata.training_summary.dataset_rows
                     || embedded.training_summary.train_rows != metadata.training_summary.train_rows
-                    || embedded.training_summary.val_rows != metadata.training_summary.val_rows
-                {
-                    bail!(
-                        "runtime metadata sidecar mismatch with embedded bayes_logit metadata at {}",
-                        metadata_path.display()
-                    );
-                }
+                    || embedded.training_summary.val_rows != metadata.training_summary.val_rows)
+            {
+                bail!(
+                    "runtime metadata sidecar mismatch with embedded bayes_logit metadata at {}",
+                    metadata_path.display()
+                );
             }
             Ok(metadata)
         }

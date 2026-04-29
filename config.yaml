@@ -13,7 +13,6 @@ system:
   trading_session_end: "23:55"
   session_timezone: UTC
   broker_backend: ctrader
-  mt5_required: false  # Legacy MT5 bridge is optional and disabled by default
   poll_interval_seconds: 60
   metrics_logging_enabled: true
   metrics_db_path: metrics.sqlite
@@ -283,8 +282,6 @@ models:
   cpcv_max_rows: 0
 
 news:
-  news_model: tfidf_linear
-  news_model_path: models/news_nlp.joblib
   news_decay_minutes: 120
   news_kill_window_min: 30
   news_confidence_threshold: 0.65

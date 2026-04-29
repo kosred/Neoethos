@@ -973,78 +973,6 @@ pub fn reorder_to_neutral_buy_sell(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sample_fallback_artifact() -> TreeLocalFallbackArtifact {
-        TreeLocalFallbackArtifact {
-            surrogate_kind: TREE_LOCAL_SURROGATE_KIND.to_string(),
-            feature_columns: vec!["momentum".into(), "trend".into()],
-            training_summary: TrainingSummaryMetadata::new(12, 12, 0),
-            class_priors: vec![0.2, 0.5, 0.3],
-            class_support: vec![2.0, 5.0, 3.0],
-            feature_means: vec![0.0, 0.0],
-            feature_scales: vec![1.0, 1.0],
-            feature_salience: vec![1.0, 1.0],
-            class_centroids: vec![vec![0.0, 0.0], vec![1.0, 1.0], vec![-1.0, -1.0]],
-            class_variances: vec![vec![1.0, 1.0], vec![1.0, 1.0], vec![1.0, 1.0]],
-            distance_location: vec![1.0, 1.0, 1.0],
-            distance_scale: vec![1.0, 1.0, 1.0],
-        }
-    }
-
-    #[test]
-    fn validate_tree_local_fallback_artifact_rejects_unnormalized_class_priors() {
-        let mut artifact = sample_fallback_artifact();
-        artifact.class_priors = vec![0.2, 0.5, 0.5];
-
-        let err =
-            validate_tree_local_fallback_artifact(&artifact, &["momentum".into(), "trend".into()])
-                .expect_err("unnormalized priors should fail");
-        assert!(err.to_string().contains("sum to 1.0"));
-    }
-
-    #[test]
-    fn normalize_three_class_probabilities_rejects_non_finite_values() {
-        let probabilities =
-            Array2::from_shape_vec((1, 3), vec![0.2, f32::NAN, 0.8]).expect("array");
-        let err = normalize_three_class_probabilities(probabilities, "tree-test")
-            .expect_err("non-finite row should fail");
-        assert!(err.to_string().contains("non-finite"));
-    }
-
-    #[test]
-    fn tree_runtime_backend_details_marks_missing_backend_as_degraded() {
-        let (backend, degraded_reason) = tree_runtime_backend_details(
-            false,
-            "lightgbm_native",
-            None,
-            "native_lightgbm_unavailable",
-            "lightgbm_unknown",
-        );
-        assert_eq!(backend.as_deref(), Some("lightgbm_unknown"));
-        assert_eq!(
-            degraded_reason.as_deref(),
-            Some("tree_runtime_backend_unavailable")
-        );
-    }
-
-    #[test]
-    fn reorder_to_neutral_buy_sell_two_columns_returns_neutral_rows() {
-        let probabilities =
-            Array2::from_shape_vec((2, 2), vec![0.3, 0.7, 0.4, 0.6]).expect("array");
-        let reordered = reorder_to_neutral_buy_sell(probabilities, None);
-        assert_eq!(reordered.ncols(), 3);
-        assert_eq!(reordered[(0, 0)], 1.0);
-        assert_eq!(reordered[(0, 1)], 0.0);
-        assert_eq!(reordered[(0, 2)], 0.0);
-        assert_eq!(reordered[(1, 0)], 1.0);
-        assert_eq!(reordered[(1, 1)], 0.0);
-        assert_eq!(reordered[(1, 2)], 0.0);
-    }
-}
-
 pub fn augment_time_features(mut df: DataFrame) -> Result<DataFrame> {
     let close = df
         .column("close")
@@ -1116,4 +1044,76 @@ pub fn augment_time_features(mut df: DataFrame) -> Result<DataFrame> {
     }
 
     Ok(df)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_fallback_artifact() -> TreeLocalFallbackArtifact {
+        TreeLocalFallbackArtifact {
+            surrogate_kind: TREE_LOCAL_SURROGATE_KIND.to_string(),
+            feature_columns: vec!["momentum".into(), "trend".into()],
+            training_summary: TrainingSummaryMetadata::new(12, 12, 0),
+            class_priors: vec![0.2, 0.5, 0.3],
+            class_support: vec![2.0, 5.0, 3.0],
+            feature_means: vec![0.0, 0.0],
+            feature_scales: vec![1.0, 1.0],
+            feature_salience: vec![1.0, 1.0],
+            class_centroids: vec![vec![0.0, 0.0], vec![1.0, 1.0], vec![-1.0, -1.0]],
+            class_variances: vec![vec![1.0, 1.0], vec![1.0, 1.0], vec![1.0, 1.0]],
+            distance_location: vec![1.0, 1.0, 1.0],
+            distance_scale: vec![1.0, 1.0, 1.0],
+        }
+    }
+
+    #[test]
+    fn validate_tree_local_fallback_artifact_rejects_unnormalized_class_priors() {
+        let mut artifact = sample_fallback_artifact();
+        artifact.class_priors = vec![0.2, 0.5, 0.5];
+
+        let err =
+            validate_tree_local_fallback_artifact(&artifact, &["momentum".into(), "trend".into()])
+                .expect_err("unnormalized priors should fail");
+        assert!(err.to_string().contains("sum to 1.0"));
+    }
+
+    #[test]
+    fn normalize_three_class_probabilities_rejects_non_finite_values() {
+        let probabilities =
+            Array2::from_shape_vec((1, 3), vec![0.2, f32::NAN, 0.8]).expect("array");
+        let err = normalize_three_class_probabilities(probabilities, "tree-test")
+            .expect_err("non-finite row should fail");
+        assert!(err.to_string().contains("non-finite"));
+    }
+
+    #[test]
+    fn tree_runtime_backend_details_marks_missing_backend_as_degraded() {
+        let (backend, degraded_reason) = tree_runtime_backend_details(
+            false,
+            "lightgbm_native",
+            None,
+            "native_lightgbm_unavailable",
+            "lightgbm_unknown",
+        );
+        assert_eq!(backend.as_deref(), Some("lightgbm_unknown"));
+        assert_eq!(
+            degraded_reason.as_deref(),
+            Some("tree_runtime_backend_unavailable")
+        );
+    }
+
+    #[test]
+    fn reorder_to_neutral_buy_sell_two_columns_returns_neutral_rows() {
+        let probabilities =
+            Array2::from_shape_vec((2, 2), vec![0.3, 0.7, 0.4, 0.6]).expect("array");
+        let reordered = reorder_to_neutral_buy_sell(probabilities, None);
+        assert_eq!(reordered.ncols(), 3);
+        assert_eq!(reordered[(0, 0)], 1.0);
+        assert_eq!(reordered[(0, 1)], 0.0);
+        assert_eq!(reordered[(0, 2)], 0.0);
+        assert_eq!(reordered[(1, 0)], 1.0);
+        assert_eq!(reordered[(1, 1)], 0.0);
+        assert_eq!(reordered[(1, 2)], 0.0);
+    }
 }

@@ -702,19 +702,19 @@ fn extract_trade_pnls(obj: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
 
     if let Ok(dict) = obj.cast::<PyDict>() {
         for key in ["pnl", "profit", "net_pnl", "pnl_pct"] {
-            if let Some(value) = dict.get_item(key)? {
-                if let Some(values) = extract_numeric_vec(&value)? {
-                    return Ok(values);
-                }
+            if let Some(value) = dict.get_item(key)?
+                && let Some(values) = extract_numeric_vec(&value)?
+            {
+                return Ok(values);
             }
         }
     }
 
     for key in ["pnl", "profit", "net_pnl", "pnl_pct"] {
-        if let Ok(value) = obj.getattr(key) {
-            if let Some(values) = extract_numeric_vec(&value)? {
-                return Ok(values);
-            }
+        if let Ok(value) = obj.getattr(key)
+            && let Some(values) = extract_numeric_vec(&value)?
+        {
+            return Ok(values);
         }
     }
 

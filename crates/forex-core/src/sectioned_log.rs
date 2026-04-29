@@ -342,15 +342,15 @@ pub fn update_section_file(
     record: SectionedRunRecord,
 ) -> Result<CanonicalSectionedLog> {
     let path = path.as_ref();
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "failed to create canonical log parent directory {}",
-                    parent.display()
-                )
-            })?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create canonical log parent directory {}",
+                parent.display()
+            )
+        })?;
     }
 
     let _lock = LockFileGuard::acquire(path)?;

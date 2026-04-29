@@ -19,9 +19,10 @@ statrs = "0.18.0"
 tracing = "0.1.41"
 forex-data = { path = "../forex-data" }
 forex-core = { path = "../forex-core" }
-duckdb = { version = "1.1.1", features = ["bundled"] }
+duckdb = { version = "1.1.1", optional = true, features = ["bundled"] }
 tch = { version = "0.22.0", optional = true }
 
 [features]
 default = []
 gpu = ["dep:rand_distr", "dep:tch", "dep:cubecl", "dep:half"]
+strategy-db = ["dep:duckdb"]

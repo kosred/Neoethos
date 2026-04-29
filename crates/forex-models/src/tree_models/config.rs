@@ -30,12 +30,11 @@ pub struct TreeModelConfig {
 pub fn cpu_threads_hint() -> usize {
     fn read_threads_env(keys: &[&str]) -> Option<usize> {
         for key in keys {
-            if let Ok(val) = env::var(key) {
-                if let Ok(parsed) = val.trim().parse::<usize>() {
-                    if parsed > 0 {
-                        return Some(parsed);
-                    }
-                }
+            if let Ok(val) = env::var(key)
+                && let Ok(parsed) = val.trim().parse::<usize>()
+                && parsed > 0
+            {
+                return Some(parsed);
             }
         }
         None
@@ -114,12 +113,11 @@ pub fn cpu_threads_hint_for(model_name: &str) -> usize {
         "FOREX_BOT_{}_THREADS",
         model_name.trim().to_ascii_uppercase().replace('-', "_")
     );
-    if let Ok(value) = env::var(&model_key) {
-        if let Ok(parsed) = value.trim().parse::<usize>() {
-            if parsed > 0 {
-                return parsed;
-            }
-        }
+    if let Ok(value) = env::var(&model_key)
+        && let Ok(parsed) = value.trim().parse::<usize>()
+        && parsed > 0
+    {
+        return parsed;
     }
     cpu_threads_hint()
 }
@@ -197,28 +195,24 @@ pub fn gpu_count() -> usize {
 
     fn rocm_gpu_count() -> Option<usize> {
         let rocminfo = Command::new("rocminfo").output().ok();
-        if let Some(output) = rocminfo {
-            if output.status.success() {
-                if let Ok(stdout) = String::from_utf8(output.stdout) {
-                    if let Some(count) = parse_rocm_output(&stdout) {
-                        return Some(count);
-                    }
-                }
-            }
+        if let Some(output) = rocminfo
+            && output.status.success()
+            && let Ok(stdout) = String::from_utf8(output.stdout)
+            && let Some(count) = parse_rocm_output(&stdout)
+        {
+            return Some(count);
         }
 
         let rocm_smi = Command::new("rocm-smi")
             .arg("--showproductname")
             .output()
             .ok();
-        if let Some(output) = rocm_smi {
-            if output.status.success() {
-                if let Ok(stdout) = String::from_utf8(output.stdout) {
-                    if let Some(count) = parse_rocm_output(&stdout) {
-                        return Some(count);
-                    }
-                }
-            }
+        if let Some(output) = rocm_smi
+            && output.status.success()
+            && let Ok(stdout) = String::from_utf8(output.stdout)
+            && let Some(count) = parse_rocm_output(&stdout)
+        {
+            return Some(count);
         }
         None
     }
@@ -235,10 +229,10 @@ pub fn gpu_count() -> usize {
         return count;
     }
 
-    if let Ok(value) = env::var("FOREX_GPU_COUNT") {
-        if let Ok(parsed) = value.trim().parse::<usize>() {
-            return parsed;
-        }
+    if let Ok(value) = env::var("FOREX_GPU_COUNT")
+        && let Ok(parsed) = value.trim().parse::<usize>()
+    {
+        return parsed;
     }
 
     if let Some(count) = nvidia_smi_gpu_count() {
@@ -323,17 +317,16 @@ pub fn gpu_only_from_params(params: &HashMap<String, ParamValue>, default: bool)
 
 pub fn cpu_threads_from_params(params: &HashMap<String, ParamValue>, default: usize) -> usize {
     for key in ["cpu_threads", "threads", "num_threads"] {
-        if let Some(ParamValue::Int(value)) = params.get(key) {
-            if *value > 0 {
-                return *value as usize;
-            }
+        if let Some(ParamValue::Int(value)) = params.get(key)
+            && *value > 0
+        {
+            return *value as usize;
         }
-        if let Some(ParamValue::String(value)) = params.get(key) {
-            if let Ok(parsed) = value.trim().parse::<usize>() {
-                if parsed > 0 {
-                    return parsed;
-                }
-            }
+        if let Some(ParamValue::String(value)) = params.get(key)
+            && let Ok(parsed) = value.trim().parse::<usize>()
+            && parsed > 0
+        {
+            return parsed;
         }
     }
     default

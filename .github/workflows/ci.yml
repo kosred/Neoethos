@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main, develop]
+  pull_request:
+    branches: [master, main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  BINDGEN_EXTRA_CLANG_ARGS: "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # Check + Test on Windows (primary dev platform)
+  # ────────────────────────────────────────────────────────────────────────────
+  test-windows:
+    name: Test (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: windows-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: windows-ci-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+        continue-on-error: true
+
+      - name: Cargo check
+        run: cargo check -p forex-app -p forex-core -p forex-news --no-default-features
+
+      - name: Run app + core tests
+        run: cargo test -p forex-app -p forex-core -p forex-news
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Check on Linux (catch cross-platform issues early)
+  # ────────────────────────────────────────────────────────────────────────────
+  check-linux:
+    name: Check (Linux)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake pkg-config \
+            libasound2-dev libudev-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libx11-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: linux-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-ci-
+
+      - name: Cargo check (app + core)
+        run: cargo check -p forex-app -p forex-core -p forex-news --no-default-features
+
+      - name: Run app + core tests
+        run: cargo test -p forex-app -p forex-core -p forex-news

@@ -251,7 +251,7 @@ fn gaussian_sample(rng: &mut Xoroshiro128PlusPlus) -> f64 {
 
 enum NeuroEvoBackend {
     #[cfg(feature = "neuro-evolution")]
-    Crfmnes(CrfmnesEvolutionState),
+    Crfmnes(Box<CrfmnesEvolutionState>),
     Fallback(SimpleEvolutionState),
 }
 
@@ -272,9 +272,9 @@ impl NeuroEvoOptimizer {
         #[cfg(feature = "neuro-evolution")]
         {
             Self {
-                backend: NeuroEvoBackend::Crfmnes(CrfmnesEvolutionState::new(
+                backend: NeuroEvoBackend::Crfmnes(Box::new(CrfmnesEvolutionState::new(
                     dim, sigma, population,
-                )),
+                ))),
                 dim,
             }
         }

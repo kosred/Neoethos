@@ -532,13 +532,12 @@ impl TrainingOrchestrator {
         }
 
         let canonical = canonical_model_name(name);
-        if canonical != name {
-            if let Some(canonical_overrides) =
+        if canonical != name
+            && let Some(canonical_overrides) =
                 self.settings.models.model_param_overrides.get(canonical)
-            {
-                for (key, value) in canonical_overrides {
-                    params.entry(key.clone()).or_insert_with(|| value.clone());
-                }
+        {
+            for (key, value) in canonical_overrides {
+                params.entry(key.clone()).or_insert_with(|| value.clone());
             }
         }
     }
@@ -2378,6 +2377,7 @@ where
     replace_training_artifact_dir(&staged_path, path)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_training_artifacts<F>(
     artifact_dir: &Path,
     settings: &forex_core::Settings,

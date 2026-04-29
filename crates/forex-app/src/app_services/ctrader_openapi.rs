@@ -2,7 +2,13 @@
 // Each file is wrapped in an internal module and re-exported with `pub use *`
 // so that super:: cross-references between proto files resolve correctly.
 
-#[allow(nonstandard_style, mismatched_lifetime_syntaxes)]
+#[allow(
+    clippy::all,
+    clippy::nursery,
+    clippy::pedantic,
+    mismatched_lifetime_syntaxes,
+    nonstandard_style
+)]
 pub mod internal_do_not_use_OpenApiCommonModelMessages {
     include!(concat!(
         env!("OUT_DIR"),
@@ -12,7 +18,13 @@ pub mod internal_do_not_use_OpenApiCommonModelMessages {
 #[allow(unused_imports, nonstandard_style)]
 pub use internal_do_not_use_OpenApiCommonModelMessages::*;
 
-#[allow(nonstandard_style, mismatched_lifetime_syntaxes)]
+#[allow(
+    clippy::all,
+    clippy::nursery,
+    clippy::pedantic,
+    mismatched_lifetime_syntaxes,
+    nonstandard_style
+)]
 pub mod internal_do_not_use_OpenApiModelMessages {
     include!(concat!(
         env!("OUT_DIR"),
@@ -22,7 +34,13 @@ pub mod internal_do_not_use_OpenApiModelMessages {
 #[allow(unused_imports, nonstandard_style)]
 pub use internal_do_not_use_OpenApiModelMessages::*;
 
-#[allow(nonstandard_style, mismatched_lifetime_syntaxes)]
+#[allow(
+    clippy::all,
+    clippy::nursery,
+    clippy::pedantic,
+    mismatched_lifetime_syntaxes,
+    nonstandard_style
+)]
 pub mod internal_do_not_use_OpenApiCommonMessages {
     include!(concat!(
         env!("OUT_DIR"),
@@ -32,7 +50,13 @@ pub mod internal_do_not_use_OpenApiCommonMessages {
 #[allow(unused_imports, nonstandard_style)]
 pub use internal_do_not_use_OpenApiCommonMessages::*;
 
-#[allow(nonstandard_style, mismatched_lifetime_syntaxes)]
+#[allow(
+    clippy::all,
+    clippy::nursery,
+    clippy::pedantic,
+    mismatched_lifetime_syntaxes,
+    nonstandard_style
+)]
 pub mod internal_do_not_use_OpenApiMessages {
     include!(concat!(
         env!("OUT_DIR"),

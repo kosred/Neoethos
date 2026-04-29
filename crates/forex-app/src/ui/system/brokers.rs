@@ -1,4 +1,5 @@
 use crate::app_services::broker_config::CTraderBrokerEnvironment;
+use crate::app_services::ctrader_auth::CTraderAuthSnapshot;
 use crate::app_services::trading::{
     SUPPORTED_TRADING_ADAPTERS, TradingAdapterKind, TradingSession,
 };
@@ -15,7 +16,9 @@ pub fn render(
     tx: &tokio::sync::mpsc::Sender<crate::app_services::ServiceEvent>,
 ) {
     egui::ScrollArea::vertical().show(ui, |ui| {
-        let _ = session.poll_ctrader_live_auth();
+        if let Some(snapshot) = session.poll_ctrader_live_auth() {
+            state.status_msg = snapshot.status_line;
+        }
         let connection = session.snapshot(state);
         let readiness = session.adapter_readiness();
         let ctrader_auth = session.ctrader_auth_snapshot();
@@ -85,13 +88,34 @@ pub fn render(
         theme::section_frame(ui.style()).show(ui, |ui| {
             ui.strong("Adapter Configuration");
             ui.add_space(6.0);
-            render_adapter_configuration(ui, session, tx);
+            render_adapter_configuration(ui, state, session, tx);
         });
     });
 }
 
+fn ctrader_result_status<T>(
+    result: anyhow::Result<T>,
+    success_status: impl FnOnce(T) -> String,
+    failure_prefix: &str,
+) -> String {
+    match result {
+        Ok(value) => success_status(value),
+        Err(err) => format!("{failure_prefix}: {err}"),
+    }
+}
+
+fn ctrader_optional_snapshot_status(
+    snapshot: Option<CTraderAuthSnapshot>,
+    fallback: &str,
+) -> String {
+    snapshot
+        .map(|snapshot| snapshot.status_line)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 fn render_adapter_configuration(
     ui: &mut egui::Ui,
+    state: &mut AppState,
     session: &mut TradingSession,
     tx: &tokio::sync::mpsc::Sender<crate::app_services::ServiceEvent>,
 ) {
@@ -104,6 +128,9 @@ fn render_adapter_configuration(
             let mut start_auth = false;
             let mut accept_code = false;
             let mut prepare_token_request = false;
+            let mut create_demo_account = false;
+            let mut create_live_account = false;
+            let mut save_credentials = false;
             let code_to_accept = {
                 let settings = &mut session.broker_settings_mut().ctrader;
                 labeled_text_edit(ui, "Client ID", &mut settings.client_id);
@@ -137,6 +164,15 @@ fn render_adapter_configuration(
                     if ui.button("Prepare Token Request").clicked() {
                         prepare_token_request = true;
                     }
+                    if ui
+                        .button("Save Credentials to Disk")
+                        .on_hover_text(
+                            "Persists Client ID / Secret / Redirect URI / Environment / accounts to the broker_credentials.toml file so they auto-load next launch. Transient fields (auth code, DxTrade password) are never saved.",
+                        )
+                        .clicked()
+                    {
+                        save_credentials = true;
+                    }
                 });
 
                 ui.add_space(4.0);
@@ -167,10 +203,10 @@ fn render_adapter_configuration(
                 ui.label("Account Management");
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Create Demo Account").clicked() {
-                        let _ = open::that("https://app.ctrader.com/accounts/create-demo");
+                        create_demo_account = true;
                     }
                     if ui.button("Create Live Account").clicked() {
-                        let _ = open::that("https://app.ctrader.com/accounts/create-live");
+                        create_live_account = true;
                     }
                 });
                 render_account_targets(ui, &mut settings.accounts, "cTrader Account");
@@ -178,25 +214,88 @@ fn render_adapter_configuration(
             };
 
             if start_live_auth {
-                let _ = session.start_ctrader_live_auth(tx.clone());
+                state.status_msg = ctrader_result_status(
+                    session.start_ctrader_live_auth(tx.clone()),
+                    |snapshot| snapshot.status_line,
+                    "cTrader login failed",
+                );
             }
             if discover_accounts {
-                let _ = session.discover_ctrader_accounts();
+                state.status_msg = ctrader_result_status(
+                    session.discover_ctrader_accounts(),
+                    |snapshot| {
+                        ctrader_optional_snapshot_status(
+                            snapshot,
+                            "No cTrader account discovery snapshot returned.",
+                        )
+                    },
+                    "cTrader account discovery failed",
+                );
             }
             if restore_saved_session {
-                let _ = session.restore_ctrader_session();
+                state.status_msg = ctrader_result_status(
+                    session.restore_ctrader_session(),
+                    |snapshot| {
+                        ctrader_optional_snapshot_status(
+                            snapshot,
+                            "No saved cTrader session found.",
+                        )
+                    },
+                    "cTrader session restore failed",
+                );
             }
             if clear_saved_session {
-                let _ = session.clear_ctrader_saved_session();
+                state.status_msg = ctrader_result_status(
+                    session.clear_ctrader_saved_session(),
+                    |_| "cTrader saved session cleared.".to_string(),
+                    "cTrader session clear failed",
+                );
             }
             if start_auth {
-                let _ = session.start_ctrader_auth();
+                state.status_msg = ctrader_result_status(
+                    session.start_ctrader_auth(),
+                    |snapshot| snapshot.status_line,
+                    "cTrader auth setup failed",
+                );
             }
             if accept_code {
-                session.receive_ctrader_authorization_code(code_to_accept);
+                let snapshot = session.receive_ctrader_authorization_code(code_to_accept);
+                state.status_msg = snapshot.status_line;
             }
             if prepare_token_request {
-                let _ = session.build_ctrader_token_exchange_request();
+                state.status_msg = ctrader_result_status(
+                    session.build_ctrader_token_exchange_request(),
+                    |_| {
+                        session
+                            .ctrader_auth_snapshot()
+                            .map(|snapshot| snapshot.status_line)
+                            .unwrap_or_else(|| "cTrader token request is ready.".to_string())
+                    },
+                    "cTrader token request failed",
+                );
+            }
+            if create_demo_account {
+                state.status_msg = match open::that("https://app.ctrader.com/accounts/create-demo")
+                {
+                    Ok(()) => "Opened cTrader demo account page.".to_string(),
+                    Err(err) => format!("Failed to open cTrader demo account page: {err}"),
+                };
+            }
+            if create_live_account {
+                state.status_msg = match open::that("https://app.ctrader.com/accounts/create-live")
+                {
+                    Ok(()) => "Opened cTrader live account page.".to_string(),
+                    Err(err) => format!("Failed to open cTrader live account page: {err}"),
+                };
+            }
+            if save_credentials {
+                let settings_snapshot = session.broker_settings_mut().clone();
+                state.status_msg = match crate::app_services::broker_persistence::save_broker_settings(
+                    &settings_snapshot,
+                ) {
+                    Ok(()) => "Broker credentials saved to disk.".to_string(),
+                    Err(err) => format!("Failed to save broker credentials: {err}"),
+                };
             }
         }
         TradingAdapterKind::DxTrade => {
@@ -206,5 +305,21 @@ fn render_adapter_configuration(
             labeled_text_edit(ui, "Password", &mut settings.password);
             render_account_targets(ui, &mut settings.accounts, "DXtrade Account");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctrader_result_status_includes_error_details() {
+        let status = ctrader_result_status::<()>(
+            Err(anyhow::anyhow!("INVALID_CLIENT")),
+            |_| "ok".to_string(),
+            "cTrader login failed",
+        );
+
+        assert_eq!(status, "cTrader login failed: INVALID_CLIENT");
     }
 }

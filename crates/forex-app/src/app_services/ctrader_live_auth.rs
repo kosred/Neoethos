@@ -8,9 +8,9 @@ use crate::app_services::ctrader_messages::{
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
-use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 use crate::app_services::ctrader_messages::{
@@ -21,11 +21,14 @@ use std::sync::{Arc, Mutex};
 
 pub const CTRADER_DEFAULT_SCOPE: &str = "trading";
 pub const CTRADER_TOKEN_ENDPOINT_BASE: &str = "https://openapi.ctrader.com";
+const CTRADER_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+const CTRADER_CALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CTraderLoopbackConfig {
     allowed_ports: Vec<u16>,
     callback_path: String,
+    bind_host: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,7 +155,19 @@ impl CTraderLoopbackConfig {
         Self {
             allowed_ports,
             callback_path: callback_path.into(),
+            bind_host: "127.0.0.1".to_string(),
         }
+    }
+
+    pub fn with_bind_host(
+        primary_port: u16,
+        fallback_ports: Vec<u16>,
+        callback_path: impl Into<String>,
+        bind_host: impl Into<String>,
+    ) -> Self {
+        let mut config = Self::new(primary_port, fallback_ports, callback_path);
+        config.bind_host = bind_host.into();
+        config
     }
 
     pub fn callback_path(&self) -> &str {
@@ -162,12 +177,16 @@ impl CTraderLoopbackConfig {
     pub fn allowed_ports(&self) -> &[u16] {
         &self.allowed_ports
     }
+
+    pub fn bind_host(&self) -> &str {
+        &self.bind_host
+    }
 }
 
 impl ProductionCTraderLiveAuthBackend {
     fn bind_loopback_listener(&self, config: &CTraderLoopbackConfig) -> Result<(u16, TcpListener)> {
         for port in config.allowed_ports() {
-            match TcpListener::bind(("127.0.0.1", *port)) {
+            match TcpListener::bind((config.bind_host(), *port)) {
                 Ok(listener) => return Ok((*port, listener)),
                 Err(_) => continue,
             }
@@ -180,9 +199,50 @@ impl ProductionCTraderLiveAuthBackend {
         listener: TcpListener,
         expected_path: &str,
     ) -> Result<String> {
-        let (mut stream, _) = listener
-            .accept()
-            .context("failed to accept cTrader callback")?;
+        self.capture_authorization_code_with_timeout(
+            listener,
+            expected_path,
+            CTRADER_CALLBACK_TIMEOUT,
+        )
+    }
+
+    fn capture_authorization_code_with_timeout(
+        &self,
+        listener: TcpListener,
+        expected_path: &str,
+        timeout: Duration,
+    ) -> Result<String> {
+        listener
+            .set_nonblocking(true)
+            .context("failed to configure cTrader callback listener")?;
+        let started = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    return self.read_authorization_code_from_stream(stream, expected_path);
+                }
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    if started.elapsed() >= timeout {
+                        return Err(anyhow!(
+                            "timed out waiting for cTrader callback; verify the registered redirect_uri and browser login flow"
+                        ));
+                    }
+                    let remaining = timeout.saturating_sub(started.elapsed());
+                    std::thread::sleep(CTRADER_CALLBACK_POLL_INTERVAL.min(remaining));
+                }
+                Err(err) => return Err(err).context("failed to accept cTrader callback"),
+            }
+        }
+    }
+
+    fn read_authorization_code_from_stream(
+        &self,
+        mut stream: TcpStream,
+        expected_path: &str,
+    ) -> Result<String> {
+        stream
+            .set_nonblocking(false)
+            .context("failed to configure cTrader callback stream")?;
         let mut buffer = [0_u8; 4096];
         let bytes_read = stream
             .read(&mut buffer)
@@ -339,6 +399,13 @@ impl StubCTraderAccountDiscoveryBackend {
         }
     }
 
+    pub fn failure(message: impl Into<String>) -> Self {
+        Self {
+            outcome: Arc::new(Mutex::new(Some(Err(message.into())))),
+            last_request: Arc::new(Mutex::new(None)),
+        }
+    }
+
     pub fn last_request(&self) -> Option<CTraderAccountDiscoveryRequest> {
         self.last_request
             .lock()
@@ -412,24 +479,22 @@ impl CTraderLiveAuthBackend for StubCTraderLiveAuthBackend {
 }
 
 pub fn build_default_loopback_config(redirect_uri: &str) -> Result<CTraderLoopbackConfig> {
-    let (_, remainder) = redirect_uri
-        .split_once("://")
-        .context("redirect URI is missing scheme")?;
-    let (host_port, suffix) = remainder
-        .split_once('/')
-        .map_or((remainder, ""), |(host_port, suffix)| (host_port, suffix));
-    let port = host_port
-        .split(':')
-        .nth(1)
-        .context("redirect URI is missing port")?
-        .parse::<u16>()
-        .context("redirect URI port is invalid")?;
-    let callback_path = format!("/{}", suffix.trim_start_matches('/'));
-    Ok(CTraderLoopbackConfig::new(
-        port,
-        vec![port.saturating_add(1), port.saturating_add(2)],
-        callback_path,
+    let parts = parse_redirect_uri_parts(redirect_uri)?;
+    if !is_loopback_redirect_host(&parts.bind_host) {
+        return Err(anyhow!(
+            "cTrader loopback redirect URI host must be localhost, 127.0.0.1, or [::1]"
+        ));
+    }
+    Ok(CTraderLoopbackConfig::with_bind_host(
+        parts.port,
+        vec![parts.port.saturating_add(1), parts.port.saturating_add(2)],
+        callback_path_from_suffix(&parts.suffix),
+        parts.bind_host,
     ))
+}
+
+fn is_loopback_redirect_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 pub fn build_authorize_url(
@@ -801,22 +866,80 @@ impl CTraderOpenApiTransport for StubCTraderOpenApiTransport {
 }
 
 fn rewrite_redirect_uri_port(redirect_uri: &str, callback_port: u16) -> Result<String> {
+    let parts = parse_redirect_uri_parts(redirect_uri)?;
+    Ok(format!(
+        "{}://{}:{}{}",
+        parts.scheme, parts.host_for_uri, callback_port, parts.suffix
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RedirectUriParts {
+    scheme: String,
+    host_for_uri: String,
+    bind_host: String,
+    port: u16,
+    suffix: String,
+}
+
+fn parse_redirect_uri_parts(redirect_uri: &str) -> Result<RedirectUriParts> {
     let (scheme, remainder) = redirect_uri
         .split_once("://")
         .context("redirect URI is missing scheme")?;
-    let (host_port, suffix) = remainder
+    let (authority, suffix) = remainder
         .split_once('/')
-        .map_or((remainder, ""), |(host_port, suffix)| (host_port, suffix));
-    let host = host_port
-        .split(':')
-        .next()
-        .context("redirect URI host is missing")?;
+        .map_or((remainder, ""), |(authority, suffix)| (authority, suffix));
+    let (host_for_uri, bind_host, port) = parse_redirect_authority(authority)?;
     let suffix = if suffix.is_empty() {
         String::new()
     } else {
         format!("/{}", suffix.trim_start_matches('/'))
     };
-    Ok(format!("{scheme}://{host}:{callback_port}{suffix}"))
+    Ok(RedirectUriParts {
+        scheme: scheme.to_string(),
+        host_for_uri,
+        bind_host,
+        port,
+        suffix,
+    })
+}
+
+fn parse_redirect_authority(authority: &str) -> Result<(String, String, u16)> {
+    if authority.trim().is_empty() {
+        return Err(anyhow!("redirect URI host is missing"));
+    }
+    if let Some(remainder) = authority.strip_prefix('[') {
+        let (host, after_host) = remainder
+            .split_once(']')
+            .context("redirect URI IPv6 host is missing closing bracket")?;
+        let port = after_host
+            .strip_prefix(':')
+            .context("redirect URI is missing port")?
+            .parse::<u16>()
+            .context("redirect URI port is invalid")?;
+        if host.trim().is_empty() {
+            return Err(anyhow!("redirect URI host is missing"));
+        }
+        return Ok((format!("[{host}]"), host.to_string(), port));
+    }
+
+    let (host, port) = authority
+        .rsplit_once(':')
+        .context("redirect URI is missing port")?;
+    if host.trim().is_empty() {
+        return Err(anyhow!("redirect URI host is missing"));
+    }
+    if host.contains(':') {
+        return Err(anyhow!("redirect URI IPv6 host must be bracketed"));
+    }
+    let port = port
+        .parse::<u16>()
+        .context("redirect URI port is invalid")?;
+    Ok((host.to_string(), host.to_string(), port))
+}
+
+fn callback_path_from_suffix(suffix: &str) -> String {
+    format!("/{}", suffix.trim_start_matches('/'))
 }
 
 fn percent_encode(value: &str) -> String {
@@ -886,6 +1009,61 @@ mod tests {
             .expect_err("malformed redirect must fail");
 
         assert!(err.to_string().contains("redirect URI"));
+    }
+
+    #[test]
+    fn default_loopback_config_rejects_non_loopback_redirect_host() {
+        let err = build_default_loopback_config("http://example.com:43001/callback")
+            .expect_err("non-loopback redirect host must fail");
+
+        assert!(err.to_string().contains("loopback"));
+    }
+
+    #[test]
+    fn default_loopback_config_preserves_localhost_for_listener_binding() {
+        let config = build_default_loopback_config("http://localhost:43001/callback")
+            .expect("localhost loopback redirect should build");
+
+        assert_eq!(config.bind_host(), "localhost");
+        assert_eq!(config.allowed_ports(), &[43001, 43002, 43003]);
+        assert_eq!(config.callback_path(), "/callback");
+    }
+
+    #[test]
+    fn default_loopback_config_accepts_ipv6_loopback_redirect_host() {
+        let config = build_default_loopback_config("http://[::1]:43001/callback")
+            .expect("IPv6 loopback redirect should build");
+
+        assert_eq!(config.bind_host(), "::1");
+        assert_eq!(config.allowed_ports(), &[43001, 43002, 43003]);
+        assert_eq!(config.callback_path(), "/callback");
+    }
+
+    #[test]
+    fn authorize_url_rewrites_ipv6_loopback_port() {
+        let authorize_url =
+            build_authorize_url("client-id", "http://[::1]:43001/callback", 43002, "trading")
+                .expect("IPv6 authorize url should build");
+
+        assert!(
+            authorize_url.contains("redirect_uri=http%3A%2F%2F%5B%3A%3A1%5D%3A43002%2Fcallback")
+        );
+    }
+
+    #[test]
+    fn callback_capture_times_out_when_browser_never_redirects() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("test listener should bind");
+        let backend = ProductionCTraderLiveAuthBackend;
+
+        let err = backend
+            .capture_authorization_code_with_timeout(
+                listener,
+                "/callback",
+                std::time::Duration::from_millis(10),
+            )
+            .expect_err("missing browser callback should time out");
+
+        assert!(err.to_string().contains("timed out waiting"));
     }
 
     #[test]

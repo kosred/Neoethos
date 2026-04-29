@@ -599,10 +599,7 @@ impl NeatExpert {
                     }
                 }
             }
-            #[cfg(not(feature = "neuro-evolution-gpu"))]
-            let cuda_scores: Option<Vec<GenomeScore>> = None;
-
-            let mut scores = cuda_scores.unwrap_or_else(|| {
+            let cpu_scores = || {
                 population
                     .par_iter()
                     .map(|genome| {
@@ -617,7 +614,11 @@ impl NeatExpert {
                         score
                     })
                     .collect::<Vec<_>>()
-            });
+            };
+            #[cfg(feature = "neuro-evolution-gpu")]
+            let mut scores = cuda_scores.unwrap_or_else(cpu_scores);
+            #[cfg(not(feature = "neuro-evolution-gpu"))]
+            let mut scores = cpu_scores();
             sort_scores_desc(&mut scores);
             if scores
                 .first()

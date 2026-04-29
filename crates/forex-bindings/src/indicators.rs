@@ -285,30 +285,30 @@ pub fn pad_probs_neutral_buy_sell<'py>(
             })?;
             let rows = arr.nrows();
             let cols = arr.ncols();
-            if let Some(class_map) = classes.as_ref() {
-                if class_map.len() == cols {
-                    for (col, cls_val) in class_map.iter().copied().enumerate() {
-                        match cls_val {
-                            0 => {
-                                for r in 0..rows {
-                                    out[(r, 0)] = arr[(r, col)];
-                                }
+            if let Some(class_map) = classes.as_ref()
+                && class_map.len() == cols
+            {
+                for (col, cls_val) in class_map.iter().copied().enumerate() {
+                    match cls_val {
+                        0 => {
+                            for r in 0..rows {
+                                out[(r, 0)] = arr[(r, col)];
                             }
-                            1 => {
-                                for r in 0..rows {
-                                    out[(r, 1)] = arr[(r, col)];
-                                }
-                            }
-                            -1 | 2 => {
-                                for r in 0..rows {
-                                    out[(r, 2)] = arr[(r, col)];
-                                }
-                            }
-                            _ => {}
                         }
+                        1 => {
+                            for r in 0..rows {
+                                out[(r, 1)] = arr[(r, col)];
+                            }
+                        }
+                        -1 | 2 => {
+                            for r in 0..rows {
+                                out[(r, 2)] = arr[(r, col)];
+                            }
+                        }
+                        _ => {}
                     }
-                    return Ok(out.into_pyarray(py));
                 }
+                return Ok(out.into_pyarray(py));
             }
             if cols == 3 {
                 for r in 0..rows {

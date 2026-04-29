@@ -728,20 +728,8 @@ impl ExpertModel for XGBoostExpert {
                 .context("predict XGBoost class probabilities")?;
             let cols = match shape.as_slice() {
                 [rows, cols] if *rows as usize == n_rows => *cols as usize,
-                [_cols] => {
-                    if n_rows == 0 {
-                        0
-                    } else {
-                        probabilities.len() / n_rows
-                    }
-                }
-                _ => {
-                    if n_rows == 0 {
-                        0
-                    } else {
-                        probabilities.len() / n_rows
-                    }
-                }
+                [_cols] => probabilities.len().checked_div(n_rows).unwrap_or(0),
+                _ => probabilities.len().checked_div(n_rows).unwrap_or(0),
             };
             let probabilities = reshape_three_class_probabilities(probabilities, n_rows, cols)?;
             let probabilities = self.calibrate_probabilities(probabilities)?;

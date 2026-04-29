@@ -83,11 +83,11 @@ impl CTraderSession {
             let mut ticker = interval(Duration::from_secs(10));
             loop {
                 ticker.tick().await;
-                if let Ok(hb) = build_heartbeat() {
-                    if let Err(e) = tx_heartbeat.send(hb).await {
-                        error!("failed to send heartbeat: {}", e);
-                        break;
-                    }
+                if let Ok(hb) = build_heartbeat()
+                    && let Err(e) = tx_heartbeat.send(hb).await
+                {
+                    error!("failed to send heartbeat: {}", e);
+                    break;
                 }
             }
         });

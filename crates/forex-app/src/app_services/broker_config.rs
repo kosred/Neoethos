@@ -1,4 +1,5 @@
 use crate::app_services::trading::TradingAdapterKind;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrokerSessionState {
@@ -9,14 +10,15 @@ pub enum BrokerSessionState {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BrokerAccountTarget {
     pub account_id: String,
     pub label: String,
+    #[serde(default)]
     pub enabled_for_execution: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum CTraderBrokerEnvironment {
     #[default]
     Live,
@@ -42,27 +44,41 @@ pub struct AdapterReadinessSnapshot {
     pub can_attempt_connect: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CTraderBrokerSettings {
+    #[serde(default)]
     pub client_id: String,
+    #[serde(default)]
     pub client_secret: String,
+    #[serde(default)]
     pub redirect_uri: String,
+    /// Transient input. NEVER persisted to disk for security.
+    #[serde(skip_serializing, skip_deserializing, default)]
     pub authorization_code_input: String,
+    #[serde(default)]
     pub environment: CTraderBrokerEnvironment,
+    #[serde(default)]
     pub accounts: Vec<BrokerAccountTarget>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct DxTradeBrokerSettings {
+    #[serde(default)]
     pub platform_url: String,
+    #[serde(default)]
     pub username: String,
+    /// NEVER persisted to disk. The user enters this each session.
+    #[serde(skip_serializing, skip_deserializing, default)]
     pub password: String,
+    #[serde(default)]
     pub accounts: Vec<BrokerAccountTarget>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BrokerSettingsState {
+    #[serde(default)]
     pub ctrader: CTraderBrokerSettings,
+    #[serde(default)]
     pub dxtrade: DxTradeBrokerSettings,
 }
 

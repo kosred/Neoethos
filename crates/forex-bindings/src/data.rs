@@ -172,10 +172,10 @@ pub fn derive_time_index_arrays(
 pub fn count_weekday_trading_days(timestamps: PyReadonlyArray1<i64>) -> PyResult<usize> {
     let mut days = HashSet::new();
     for &ts in timestamps.as_slice()? {
-        if let Some(dt) = Utc.timestamp_millis_opt(ts).single() {
-            if !matches!(dt.weekday(), Weekday::Sat | Weekday::Sun) {
-                days.insert(dt.date_naive());
-            }
+        if let Some(dt) = Utc.timestamp_millis_opt(ts).single()
+            && !matches!(dt.weekday(), Weekday::Sat | Weekday::Sun)
+        {
+            days.insert(dt.date_naive());
         }
     }
     Ok(days.len())

@@ -175,10 +175,10 @@ pub mod discovery_gpu {
         cache_key: &str,
         cache: Option<&FeatureCache>,
     ) -> Result<FeatureFrame> {
-        if let Some(cache) = cache {
-            if let Some(frame) = cache.load(cache_key)? {
-                return Ok(frame);
-            }
+        if let Some(cache) = cache
+            && let Some(frame) = cache.load(cache_key)?
+        {
+            return Ok(frame);
         }
 
         let frame = compute_hpc_features(ohlcv)?;
@@ -524,7 +524,7 @@ pub mod discovery_gpu {
 
             let mut scored: Vec<(f32, Vec<f32>)> = genomes
                 .into_iter()
-                .zip(fitness.into_iter())
+                .zip(fitness)
                 .map(|(g, f)| (f, g))
                 .collect();
             scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
@@ -690,6 +690,8 @@ pub mod orchestration;
 pub mod portfolio;
 pub mod quality;
 pub mod stop_target;
+#[cfg(feature = "strategy-db")]
+pub mod strategy_db;
 pub mod validation;
 
 pub use challenge::{ChallengeOptimizer, ChallengeTarget};

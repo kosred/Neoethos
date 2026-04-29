@@ -533,9 +533,9 @@ fn prefilter_features(features: &FeatureFrame, ohlcv: &Ohlcv, top_k: usize) -> F
 
     // Calculate 1-bar forward returns
     let mut returns = vec![0.0f32; n_rows];
-    for i in 0..(n_rows - 1) {
+    for (i, ret_slot) in returns.iter_mut().enumerate().take(n_rows - 1) {
         let ret = (ohlcv.close[i + 1] - ohlcv.close[i]) / ohlcv.close[i];
-        returns[i] = ret as f32;
+        *ret_slot = ret as f32;
     }
 
     let mut correlations = Vec::with_capacity(n_cols);
@@ -739,7 +739,7 @@ where
         let mut strict_passed: Vec<QualityCandidate> = Vec::new();
         let mut opportunistic_passed = 0usize;
 
-        for ((candidate_idx, gene), sig) in filtered.into_iter().zip(signals_map.into_iter()) {
+        for ((candidate_idx, gene), sig) in filtered.into_iter().zip(signals_map) {
             let trades = crate::eval::simulate_trades_core(
                 &ohlcv.close,
                 &ohlcv.high,
@@ -896,7 +896,7 @@ where
     let mut portfolio = Vec::new();
     let mut portfolio_signals: Vec<Vec<i8>> = Vec::new();
     let mut rejected_by_correlation = 0usize;
-    for ((_, gene), sig) in filtered.into_iter().zip(signals_map.into_iter()) {
+    for ((_, gene), sig) in filtered.into_iter().zip(signals_map) {
         if portfolio.len() >= config.portfolio_size {
             break;
         }
@@ -953,11 +953,11 @@ fn min_trades_required(timestamps: &[i64], min_trades_per_day: f64, n_rows: usiz
     }
     let mut days = HashSet::new();
     for ts in timestamps {
-        if let Some(dt) = Utc.timestamp_millis_opt(*ts).single() {
-            if dt.weekday().num_days_from_monday() < 5 {
-                let key = (dt.year() as i64) * 10000 + (dt.month() as i64) * 100 + dt.day() as i64;
-                days.insert(key);
-            }
+        if let Some(dt) = Utc.timestamp_millis_opt(*ts).single()
+            && dt.weekday().num_days_from_monday() < 5
+        {
+            let key = (dt.year() as i64) * 10000 + (dt.month() as i64) * 100 + dt.day() as i64;
+            days.insert(key);
         }
     }
     let day_count = days.len().max(1) as f64;
@@ -1061,10 +1061,10 @@ pub fn save_portfolio_json(
 
 pub fn save_quality_report_json(path: impl AsRef<Path>, result: &DiscoveryResult) -> Result<()> {
     let path = path.as_ref();
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
     let payload = serde_json::to_string_pretty(&result.quality_metrics)?;
     fs::write(path, payload)?;
@@ -1073,10 +1073,10 @@ pub fn save_quality_report_json(path: impl AsRef<Path>, result: &DiscoveryResult
 
 pub fn save_trade_log_json(path: impl AsRef<Path>, result: &DiscoveryResult) -> Result<()> {
     let path = path.as_ref();
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
     let payload = serde_json::to_string_pretty(&result.logged_trades)?;
     fs::write(path, payload)?;
@@ -1138,10 +1138,10 @@ pub fn save_discovery_profile_json(
     result: &DiscoveryResult,
 ) -> Result<()> {
     let path = path.as_ref();
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
     let payload = serde_json::to_string_pretty(&build_discovery_profile(config, result))?;
     fs::write(path, payload)?;

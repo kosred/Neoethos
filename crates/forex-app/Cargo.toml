@@ -20,6 +20,8 @@ open = "5.3.2"
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+toml = "0.8.20"
+dirs = "5.0.1"
 tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
 tokio-tungstenite = { version = "0.26.1", features = ["rustls-tls-native-roots"] }
 futures = "0.3.31"
@@ -39,7 +41,6 @@ clap = { version = "4.6.0", features = ["derive"] }
 num_cpus = "1.17.0"
 
 [build-dependencies]
-protobuf-codegen = "4.31.1-release"
 protoc-bin-vendored = "3.2.0"
 cc = "1.2.14"
 
@@ -49,12 +50,9 @@ product_name = "ForexAI"
 identifier = "com.forexai.app"
 authors = ["Konstantinos Red"]
 description = "Advanced Algorithmic Forex Terminal with ML and Live Execution"
-formats = ["nsis", "wix"]
-resources = ["config.yaml"]
+formats = ["nsis"]
+resources = ["config.yaml", "catboostmodel.dll", "xgboost.dll"]
 
 [[package.metadata.packager.binaries]]
 path = "forex-app"
 main = true
-
-[package.metadata.packager.windows]
-wix = { language = "en-US" }

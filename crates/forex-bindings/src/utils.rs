@@ -289,38 +289,42 @@ pub fn quote_to_account_rate(
         _ => None,
     };
 
-    if let Some(v) = px {
-        if base == acc {
-            return Some(1.0 / v);
-        }
+    if let Some(v) = px
+        && base == acc
+    {
+        return Some(1.0 / v);
     }
 
     let direct_key = format!("{quote}{acc}");
-    if let Some(v) = refs.get(&direct_key) {
-        if v.is_finite() && *v > 0.0 {
-            return Some(*v);
-        }
+    if let Some(v) = refs.get(&direct_key)
+        && v.is_finite()
+        && *v > 0.0
+    {
+        return Some(*v);
     }
 
     let inverse_key = format!("{acc}{quote}");
-    if let Some(v) = refs.get(&inverse_key) {
-        if v.is_finite() && *v > 0.0 {
-            return Some(1.0 / *v);
-        }
+    if let Some(v) = refs.get(&inverse_key)
+        && v.is_finite()
+        && *v > 0.0
+    {
+        return Some(1.0 / *v);
     }
 
     if let Some(v) = px {
         let base_to_acc = format!("{base}{acc}");
-        if let Some(bv) = refs.get(&base_to_acc) {
-            if bv.is_finite() && *bv > 0.0 {
-                return Some(*bv / v);
-            }
+        if let Some(bv) = refs.get(&base_to_acc)
+            && bv.is_finite()
+            && *bv > 0.0
+        {
+            return Some(*bv / v);
         }
         let acc_to_base = format!("{acc}{base}");
-        if let Some(av) = refs.get(&acc_to_base) {
-            if av.is_finite() && *av > 0.0 {
-                return Some(1.0 / (*av * v));
-            }
+        if let Some(av) = refs.get(&acc_to_base)
+            && av.is_finite()
+            && *av > 0.0
+        {
+            return Some(1.0 / (*av * v));
         }
         return Some(1.0 / v);
     }

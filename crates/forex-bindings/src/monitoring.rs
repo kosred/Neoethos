@@ -109,19 +109,17 @@ impl MetaController {
         let mut k_steepness = 200.0;
         let mut final_base_confidence = base_confidence.unwrap_or(0.55);
 
-        if let Some(s) = settings {
-            if let Ok(dyn_cfg) = s.getattr("dynamic") {
-                if let Ok(risk_params) = dyn_cfg.call_method0("get") {
-                    if let Ok(k) = risk_params.call_method1("get", ("risk_curve_steepness", 200.0))
-                    {
-                        k_steepness = k.extract().unwrap_or(200.0);
-                    }
-                    if let Ok(c) = risk_params.call_method1("get", ("confidence_threshold",)) {
-                        if let Ok(c_val) = c.extract::<f64>() {
-                            final_base_confidence = c_val;
-                        }
-                    }
-                }
+        if let Some(s) = settings
+            && let Ok(dyn_cfg) = s.getattr("dynamic")
+            && let Ok(risk_params) = dyn_cfg.call_method0("get")
+        {
+            if let Ok(k) = risk_params.call_method1("get", ("risk_curve_steepness", 200.0)) {
+                k_steepness = k.extract().unwrap_or(200.0);
+            }
+            if let Ok(c) = risk_params.call_method1("get", ("confidence_threshold",))
+                && let Ok(c_val) = c.extract::<f64>()
+            {
+                final_base_confidence = c_val;
             }
         }
 
@@ -139,10 +137,10 @@ impl MetaController {
 
     pub fn get_risk_parameters(&mut self, state: &Bound<'_, PyAny>) -> PyResult<(f64, f64, bool)> {
         let mut m_regime = "Normal".to_string();
-        if let Ok(regime) = state.getattr("market_regime") {
-            if let Ok(r) = regime.extract::<String>() {
-                m_regime = r;
-            }
+        if let Ok(regime) = state.getattr("market_regime")
+            && let Ok(r) = regime.extract::<String>()
+        {
+            m_regime = r;
         }
 
         let s = PropMetaState {

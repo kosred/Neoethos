@@ -647,16 +647,16 @@ pub fn infer_regime(
     let ema_fast = compute_ema(close, settings.ema_fast_period);
     let ema_slow = compute_ema(close, settings.ema_slow_period);
     let atr = compute_atr(high, low, close, settings.atr_period);
-    if let (Some(ef), Some(es), Some(a)) = (ema_fast.last(), ema_slow.last(), atr.last()) {
-        if *a > 0.0 {
-            let spread = (ef - es).abs();
-            let strength = spread / a;
-            if strength >= 0.6 {
-                return "trend".to_string();
-            }
-            if strength <= 0.3 {
-                return "range".to_string();
-            }
+    if let (Some(ef), Some(es), Some(a)) = (ema_fast.last(), ema_slow.last(), atr.last())
+        && *a > 0.0
+    {
+        let spread = (ef - es).abs();
+        let strength = spread / a;
+        if strength >= 0.6 {
+            return "trend".to_string();
+        }
+        if strength <= 0.3 {
+            return "range".to_string();
         }
     }
 

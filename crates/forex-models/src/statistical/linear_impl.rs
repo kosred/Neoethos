@@ -341,8 +341,8 @@ fn resolve_runtime_metadata_from_artifact(
                 &artifact.feature_columns,
                 artifact.dataset_rows,
             )?;
-            if let Some(embedded) = artifact.runtime_metadata.as_ref() {
-                if embedded.model_name != metadata.model_name
+            if let Some(embedded) = artifact.runtime_metadata.as_ref()
+                && (embedded.model_name != metadata.model_name
                     || embedded.family != metadata.family
                     || embedded.state != metadata.state
                     || embedded.feature_columns != metadata.feature_columns
@@ -350,14 +350,13 @@ fn resolve_runtime_metadata_from_artifact(
                     || embedded.training_summary.dataset_rows
                         != metadata.training_summary.dataset_rows
                     || embedded.training_summary.train_rows != metadata.training_summary.train_rows
-                    || embedded.training_summary.val_rows != metadata.training_summary.val_rows
-                {
-                    bail!(
-                        "runtime metadata sidecar mismatch with embedded {} metadata at {}",
-                        model_name,
-                        metadata_path.display()
-                    );
-                }
+                    || embedded.training_summary.val_rows != metadata.training_summary.val_rows)
+            {
+                bail!(
+                    "runtime metadata sidecar mismatch with embedded {} metadata at {}",
+                    model_name,
+                    metadata_path.display()
+                );
             }
             Ok(metadata)
         }
@@ -678,7 +677,7 @@ fn predict_linear_softmax_with_runtime(
         .filter(|backend| !backend.contains("cuda"))
         .cloned()
         .or(fallback_backend)
-        .or_else(|| Some(cpu_backend));
+        .or(Some(cpu_backend));
     let degraded_reason =
         append_runtime_degraded_reason(fallback_reason, artifact.runtime_degraded_reason.clone());
     #[cfg(feature = "statistical-gpu")]

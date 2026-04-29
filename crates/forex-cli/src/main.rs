@@ -375,10 +375,10 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         };
         let result = forex_search::run_discovery_cycle(&features, base_ohlcv, &config)?;
         forex_search::ensure_non_empty_portfolio(&result, &format!("{} {}", symbol, base))?;
-        if let Some(parent) = std::path::Path::new(&out).parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = std::path::Path::new(&out).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         forex_search::save_portfolio_json(&out, &result.portfolio, &features.names)?;
         let profile_path = format!("{out}.profile.json");

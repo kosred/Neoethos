@@ -137,10 +137,10 @@ impl RuntimePrediction {
     }
 
     fn validate_optional_probability(value: Option<f32>) -> Result<(), RuntimePredictionError> {
-        if let Some(value) = value {
-            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-                return Err(RuntimePredictionError::InvalidConfidence { value });
-            }
+        if let Some(value) = value
+            && (!value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            return Err(RuntimePredictionError::InvalidConfidence { value });
         }
 
         Ok(())

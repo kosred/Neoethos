@@ -127,6 +127,7 @@ impl BacktestSettings {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn fast_evaluate_strategy_core(
     close: &[f64],
     high: &[f64],
@@ -660,6 +661,7 @@ pub fn simulate_trades_core(
     trades
 }
 
+#[allow(clippy::too_many_arguments)]
 fn synthesize_signals_cpu(
     indicators: ArrayView2<'_, f32>,
     gene_offsets: &[i32],

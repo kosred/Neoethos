@@ -259,10 +259,10 @@ impl BurnDeepExpert {
             );
         }
         for key in runtime_keys {
-            if let Some(value) = params.get(key) {
-                if value.trim().is_empty() {
-                    bail!("deep-model runtime param `{key}` may not be blank");
-                }
+            if let Some(value) = params.get(key)
+                && value.trim().is_empty()
+            {
+                bail!("deep-model runtime param `{key}` may not be blank");
             }
         }
         for key in ["requested_device_policy", "effective_device_policy"] {
@@ -276,13 +276,13 @@ impl BurnDeepExpert {
                 }
             }
         }
-        if let Some(value) = params.get("execution_backend") {
-            if !Self::is_supported_execution_backend(value) {
-                bail!(
-                    "deep-model runtime param `execution_backend` uses unsupported backend `{}`",
-                    value
-                );
-            }
+        if let Some(value) = params.get("execution_backend")
+            && !Self::is_supported_execution_backend(value)
+        {
+            bail!(
+                "deep-model runtime param `execution_backend` uses unsupported backend `{}`",
+                value
+            );
         }
         if let Some(value) = params.get("training_precision") {
             let normalized = normalize_training_precision_policy(value);
@@ -296,15 +296,15 @@ impl BurnDeepExpert {
                 );
             }
         }
-        if let Some(value) = params.get("training_precision_reason") {
-            if value.trim().is_empty() {
-                bail!("deep-model runtime param `training_precision_reason` may not be blank");
-            }
+        if let Some(value) = params.get("training_precision_reason")
+            && value.trim().is_empty()
+        {
+            bail!("deep-model runtime param `training_precision_reason` may not be blank");
         }
-        if let Some(device) = params.get("device") {
-            if device.trim().is_empty() {
-                bail!("deep-model runtime param `device` may not be blank");
-            }
+        if let Some(device) = params.get("device")
+            && device.trim().is_empty()
+        {
+            bail!("deep-model runtime param `device` may not be blank");
         }
         if let (Some(device), Some(requested_runtime)) =
             (params.get("device"), params.get("requested_device_policy"))
@@ -403,13 +403,13 @@ impl BurnDeepExpert {
                 report.training_precision
             );
         }
-        if let Some(reason) = report.training_precision_reason.as_ref() {
-            if reason.trim().is_empty() {
-                bail!(
-                    "{} Burn training report `training_precision_reason` may not be blank",
-                    self.model_name()
-                );
-            }
+        if let Some(reason) = report.training_precision_reason.as_ref()
+            && reason.trim().is_empty()
+        {
+            bail!(
+                "{} Burn training report `training_precision_reason` may not be blank",
+                self.model_name()
+            );
         }
         let report_runtime = Self::runtime_selection_from_report(report);
         validate_burn_device_selection(&report_runtime).with_context(|| {
@@ -418,16 +418,15 @@ impl BurnDeepExpert {
                 self.model_name()
             )
         })?;
-        if let Some(selection) = runtime_selection {
-            if report_runtime.requested_policy != selection.requested_policy
+        if let Some(selection) = runtime_selection
+            && (report_runtime.requested_policy != selection.requested_policy
                 || report_runtime.effective_policy != selection.effective_policy
-                || report_runtime.execution_backend != selection.execution_backend
-            {
-                bail!(
-                    "{} Burn training report runtime provenance does not match persisted runtime selection",
-                    self.model_name()
-                );
-            }
+                || report_runtime.execution_backend != selection.execution_backend)
+        {
+            bail!(
+                "{} Burn training report runtime provenance does not match persisted runtime selection",
+                self.model_name()
+            );
         }
         Ok(())
     }
@@ -538,8 +537,8 @@ impl BurnDeepExpert {
         let metadata_path = Self::metadata_path(path);
         if metadata_path.exists() {
             let sidecar: RuntimeArtifactMetadata = Self::read_json(&metadata_path)?;
-            if let Some(embedded) = config.runtime_metadata.as_ref() {
-                if sidecar.model_name != embedded.model_name
+            if let Some(embedded) = config.runtime_metadata.as_ref()
+                && (sidecar.model_name != embedded.model_name
                     || sidecar.family != embedded.family
                     || sidecar.state != embedded.state
                     || sidecar.feature_columns != embedded.feature_columns
@@ -547,13 +546,12 @@ impl BurnDeepExpert {
                     || sidecar.training_summary.dataset_rows
                         != embedded.training_summary.dataset_rows
                     || sidecar.training_summary.train_rows != embedded.training_summary.train_rows
-                    || sidecar.training_summary.val_rows != embedded.training_summary.val_rows
-                {
-                    bail!(
-                        "deep artifact {} metadata sidecar mismatch with embedded runtime metadata",
-                        path.display()
-                    );
-                }
+                    || sidecar.training_summary.val_rows != embedded.training_summary.val_rows)
+            {
+                bail!(
+                    "deep artifact {} metadata sidecar mismatch with embedded runtime metadata",
+                    path.display()
+                );
             }
             return Ok(sidecar);
         }
@@ -1278,18 +1276,16 @@ impl BurnDeepExpert {
         if let (Some(cached_host), Some(live_host)) = (
             self.host_runtime_selection.as_ref(),
             live_host_runtime_selection.as_ref(),
-        ) {
-            if cached_host.requested_policy != live_host.requested_policy
-                || cached_host.effective_policy != live_host.effective_policy
-                || cached_host.execution_backend != live_host.execution_backend
-            {
-                degraded.push("deep_runtime_host_cache_stale".to_string());
-            }
+        ) && (cached_host.requested_policy != live_host.requested_policy
+            || cached_host.effective_policy != live_host.effective_policy
+            || cached_host.execution_backend != live_host.execution_backend)
+        {
+            degraded.push("deep_runtime_host_cache_stale".to_string());
         }
-        if let Some(persisted) = persisted {
-            if persisted.requested_policy != persisted.effective_policy {
-                degraded.push("deep_requested_device_unavailable".to_string());
-            }
+        if let Some(persisted) = persisted
+            && persisted.requested_policy != persisted.effective_policy
+        {
+            degraded.push("deep_requested_device_unavailable".to_string());
         }
         if let (Some(report), Some(persisted)) = (self.burn_training_report.as_ref(), persisted) {
             let report_runtime = Self::runtime_selection_from_report(report);
@@ -1484,21 +1480,20 @@ impl ExpertModel for BurnDeepExpert {
         let recorder = DefaultFileRecorder::<FullPrecisionSettings>::new();
         let base_path = Self::model_record_path(path);
         let (device, host_runtime_selection) = next_state.resolve_runtime_infer_device();
-        if let Some(persisted_runtime_selection) = next_state.persisted_runtime_selection.as_ref() {
-            if persisted_runtime_selection.requested_policy
+        if let Some(persisted_runtime_selection) = next_state.persisted_runtime_selection.as_ref()
+            && (persisted_runtime_selection.requested_policy
                 != host_runtime_selection.requested_policy
                 || persisted_runtime_selection.effective_policy
                     != host_runtime_selection.effective_policy
                 || persisted_runtime_selection.execution_backend
-                    != host_runtime_selection.execution_backend
-            {
-                bail!(
-                    "{} runtime identity drift between persisted {:?} and host {:?}",
-                    self.model_name(),
-                    persisted_runtime_selection,
-                    host_runtime_selection
-                );
-            }
+                    != host_runtime_selection.execution_backend)
+        {
+            bail!(
+                "{} runtime identity drift between persisted {:?} and host {:?}",
+                self.model_name(),
+                persisted_runtime_selection,
+                host_runtime_selection
+            );
         }
         let loaded = match next_model {
             RuntimeDeepModel::Mlp(model) => RuntimeDeepModel::Mlp(

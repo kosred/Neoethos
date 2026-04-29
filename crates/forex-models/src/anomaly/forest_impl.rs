@@ -226,8 +226,8 @@ fn resolve_runtime_metadata_from_artifact(
     match read_json::<RuntimeArtifactMetadata>(&metadata_path) {
         Ok(metadata) => {
             validate_runtime_metadata(&metadata, &artifact.feature_columns, artifact.dataset_rows)?;
-            if let Some(embedded) = artifact.runtime_metadata.as_ref() {
-                if embedded.model_name != metadata.model_name
+            if let Some(embedded) = artifact.runtime_metadata.as_ref()
+                && (embedded.model_name != metadata.model_name
                     || embedded.family != metadata.family
                     || embedded.state != metadata.state
                     || embedded.feature_columns != metadata.feature_columns
@@ -235,13 +235,12 @@ fn resolve_runtime_metadata_from_artifact(
                     || embedded.training_summary.dataset_rows
                         != metadata.training_summary.dataset_rows
                     || embedded.training_summary.train_rows != metadata.training_summary.train_rows
-                    || embedded.training_summary.val_rows != metadata.training_summary.val_rows
-                {
-                    bail!(
-                        "runtime metadata sidecar mismatch with embedded isolation_forest metadata at {}",
-                        metadata_path.display()
-                    );
-                }
+                    || embedded.training_summary.val_rows != metadata.training_summary.val_rows)
+            {
+                bail!(
+                    "runtime metadata sidecar mismatch with embedded isolation_forest metadata at {}",
+                    metadata_path.display()
+                );
             }
             Ok(metadata)
         }

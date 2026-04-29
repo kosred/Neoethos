@@ -100,11 +100,12 @@ impl StrategyQualityAnalyzer {
             returns.push(pnl_pct);
             if let Some(dur) = trade.duration_hours {
                 durations.push(dur);
-            } else if let Some(exit) = trade.exit_time {
-                if trade.entry_time > 0 && exit >= trade.entry_time {
-                    let hours = (exit - trade.entry_time) as f64 / 3_600_000.0;
-                    durations.push(hours);
-                }
+            } else if let Some(exit) = trade.exit_time
+                && trade.entry_time > 0
+                && exit >= trade.entry_time
+            {
+                let hours = (exit - trade.entry_time) as f64 / 3_600_000.0;
+                durations.push(hours);
             }
         }
 
@@ -373,12 +374,11 @@ fn calculate_trade_frequency(trades: &[Trade]) -> f64 {
         if trade.entry_time <= 0 {
             continue;
         }
-        if let Some(dt) = Utc.timestamp_millis_opt(trade.entry_time).single() {
-            if dt.weekday().num_days_from_monday() < 5 {
-                let day_key =
-                    (dt.year() as i64) * 10000 + (dt.month() as i64) * 100 + dt.day() as i64;
-                days.insert(day_key);
-            }
+        if let Some(dt) = Utc.timestamp_millis_opt(trade.entry_time).single()
+            && dt.weekday().num_days_from_monday() < 5
+        {
+            let day_key = (dt.year() as i64) * 10000 + (dt.month() as i64) * 100 + dt.day() as i64;
+            days.insert(day_key);
         }
     }
 

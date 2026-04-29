@@ -1,36 +1,209 @@
 name: Release
 
 on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v0.1.0-alpha)'
+        required: false
+        default: 'v0.1.0-alpha'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Fix bindgen against latest MSVC STL headers
+  BINDGEN_EXTRA_CLANG_ARGS: "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
 
 jobs:
-  build:
-    name: Build on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+  # ────────────────────────────────────────────────────────────────────────────
+  # Windows release — NSIS installer + portable zip
+  # ────────────────────────────────────────────────────────────────────────────
+  build-windows:
+    name: Windows (x86_64-msvc)
+    runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Install dependencies (Ubuntu)
-        if: startsWith(matrix.os, 'ubuntu')
+        with:
+          submodules: false
+
+      - name: Setup Rust toolchain (stable MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+
+      - name: Cache Cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: windows-cargo-
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked --version "^0.11"
+
+      - name: Build release binary
+        run: cargo build -p forex-app --release --no-default-features
+
+      - name: Collect native DLLs next to binary
+        # catboostmodel.dll lands in target/release/ automatically.
+        # xgboost.dll is placed in target/release/deps/ by its build script —
+        # copy it up so it is found both at runtime and by cargo-packager.
+        # Also stage them in the crate root so packager picks them up as resources.
+        shell: pwsh
+        run: |
+          Copy-Item "target\release\deps\xgboost.dll"    "target\release\xgboost.dll"    -Force
+          Copy-Item "target\release\catboostmodel.dll"   "crates\forex-app\catboostmodel.dll" -Force
+          Copy-Item "target\release\deps\xgboost.dll"    "crates\forex-app\xgboost.dll"   -Force
+
+      - name: Package NSIS installer
+        run: cargo packager --release -p forex-app --formats nsis
+        env:
+          NSIS_PLUGINS: "${{ runner.tool_cache }}\\nsis"
+
+      - name: Cleanup staged DLLs from crate root
+        shell: pwsh
+        run: |
+          Remove-Item "crates\forex-app\catboostmodel.dll" -ErrorAction SilentlyContinue
+          Remove-Item "crates\forex-app\xgboost.dll"       -ErrorAction SilentlyContinue
+
+      - name: Create portable zip
+        shell: pwsh
+        run: |
+          $outDir = "dist\ForexAI-windows-x64"
+          New-Item -ItemType Directory -Path $outDir -Force
+          Copy-Item "target\release\forex-app.exe"       "$outDir\ForexAI.exe"
+          Copy-Item "target\release\catboostmodel.dll"   "$outDir\catboostmodel.dll"
+          Copy-Item "target\release\xgboost.dll"         "$outDir\xgboost.dll"
+          Copy-Item "config.yaml"                        "$outDir\config.yaml"
+          Compress-Archive -Path $outDir -DestinationPath "dist\ForexAI-${{ github.ref_name }}-windows-x64.zip" -Force
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: |
+            target/release/nsis/*.exe
+            dist/*.zip
+          if-no-files-found: warn
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Linux release — .tar.gz portable bundle + .deb
+  # ────────────────────────────────────────────────────────────────────────────
+  build-linux:
+    name: Linux (x86_64-gnu)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libudev-dev pkg-config cmake build-essential libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+          sudo apt-get install -y \
+            build-essential cmake pkg-config \
+            libasound2-dev libudev-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libxrandr-dev libxcursor-dev \
+            libxi-dev libgl1-mesa-dev \
+            dpkg-dev
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build Release
-        run: cargo build --release
+      - name: Cache Cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-
 
-      - name: Upload Artifact
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked --version "^0.11"
+
+      - name: Build release binary
+        run: cargo build -p forex-app --release --no-default-features
+
+      - name: Create portable tar.gz
+        run: |
+          VERSION="${{ github.ref_name }}"
+          OUTDIR="dist/ForexAI-${VERSION}-linux-x64"
+          mkdir -p "$OUTDIR"
+          cp target/release/forex-app "$OUTDIR/ForexAI"
+          cp config.yaml "$OUTDIR/config.yaml"
+          chmod +x "$OUTDIR/ForexAI"
+          tar -czf "dist/ForexAI-${VERSION}-linux-x64.tar.gz" -C dist "ForexAI-${VERSION}-linux-x64"
+
+      - name: Package .deb (optional)
+        run: cargo packager --release -p forex-app --formats deb || true
+
+      - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: forex-app-${{ matrix.os }}
+          name: linux-release
           path: |
-            target/release/forex-app
-            target/release/forex-app.exe
-          if-no-files-found: ignore
+            dist/*.tar.gz
+            target/release/debian/*.deb
+          if-no-files-found: warn
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Publish GitHub Release with all artifacts
+  # ────────────────────────────────────────────────────────────────────────────
+  publish:
+    name: Publish GitHub Release
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: List artifacts
+        run: find release-artifacts -type f | sort
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || inputs.version }}
+          name: "ForexAI ${{ github.ref_name || inputs.version }}"
+          draft: true
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          body: |
+            ## ForexAI ${{ github.ref_name || inputs.version }}
+
+            ### Downloads
+            | Platform | File |
+            |----------|------|
+            | Windows (installer) | `ForexAI-*-setup.exe` |
+            | Windows (portable)  | `ForexAI-*-windows-x64.zip` |
+            | Linux (portable)    | `ForexAI-*-linux-x64.tar.gz` |
+            | Linux (.deb)        | `*.deb` (if present) |
+
+            ### What's included
+            - Algorithmic forex trading terminal with ML ensemble
+            - cTrader broker integration via Open API
+            - TradingView-style chart with volume + bid/ask
+            - Strategy discovery (genetic search engine)
+            - AI model training pipeline
+            - LLM-based news blackout filter
+            - Prop-firm risk guard rails
+
+            > **Alpha release** — validated on demo accounts only. Do not use live without further testing.
+          files: release-artifacts/**/*

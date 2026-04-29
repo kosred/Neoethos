@@ -482,29 +482,28 @@ impl HardwareProbe {
             if let Ok(output) = Command::new(cmd)
                 .args(["--query-gpu=name", "--format=csv,noheader"])
                 .output()
+                && output.status.success()
             {
-                if output.status.success() {
-                    let out_str = String::from_utf8_lossy(&output.stdout);
-                    for line in out_str.lines() {
-                        let trimmed = line.trim();
-                        if !trimmed.is_empty() {
-                            names.push(trimmed.to_string());
-                        }
+                let out_str = String::from_utf8_lossy(&output.stdout);
+                for line in out_str.lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        names.push(trimmed.to_string());
                     }
-                    if !names.is_empty() {
-                        if let Ok(mem_out) = Command::new(cmd)
-                            .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-                            .output()
-                        {
-                            let mem_str = String::from_utf8_lossy(&mem_out.stdout);
-                            for line in mem_str.lines() {
-                                if let Ok(mb) = line.trim().parse::<f64>() {
-                                    mems.push(mb / 1024.0);
-                                }
+                }
+                if !names.is_empty() {
+                    if let Ok(mem_out) = Command::new(cmd)
+                        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+                        .output()
+                    {
+                        let mem_str = String::from_utf8_lossy(&mem_out.stdout);
+                        for line in mem_str.lines() {
+                            if let Ok(mb) = line.trim().parse::<f64>() {
+                                mems.push(mb / 1024.0);
                             }
                         }
-                        return (names, mems);
                     }
+                    return (names, mems);
                 }
             }
         }
@@ -548,34 +547,34 @@ impl HardwareProbe {
 
     fn detect_rocm_accelerators(&self, id_offset: usize) -> Vec<AcceleratorDevice> {
         let rocminfo = Command::new("rocminfo").output().ok();
-        if let Some(output) = rocminfo {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let names = stdout
-                    .lines()
-                    .filter_map(|line| {
-                        line.split_once("Marketing Name:")
-                            .map(|(_, value)| value.trim().to_string())
+        if let Some(output) = rocminfo
+            && output.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let names = stdout
+                .lines()
+                .filter_map(|line| {
+                    line.split_once("Marketing Name:")
+                        .map(|(_, value)| value.trim().to_string())
+                })
+                .filter(|name| !name.is_empty())
+                .collect::<Vec<_>>();
+            if !names.is_empty() {
+                return names
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, name)| AcceleratorDevice {
+                        id: id_offset + idx,
+                        name,
+                        backend: AcceleratorBackend::Rocm,
+                        memory_gb: 0.0,
+                        supported_precisions: env_precision_override("rocm").unwrap_or_else(|| {
+                            vec![TrainingPrecision::Fp32, TrainingPrecision::Fp16]
+                        }),
+                        compute_capability: None,
+                        source: "rocminfo".to_string(),
                     })
-                    .filter(|name| !name.is_empty())
-                    .collect::<Vec<_>>();
-                if !names.is_empty() {
-                    return names
-                        .into_iter()
-                        .enumerate()
-                        .map(|(idx, name)| AcceleratorDevice {
-                            id: id_offset + idx,
-                            name,
-                            backend: AcceleratorBackend::Rocm,
-                            memory_gb: 0.0,
-                            supported_precisions: env_precision_override("rocm").unwrap_or_else(
-                                || vec![TrainingPrecision::Fp32, TrainingPrecision::Fp16],
-                            ),
-                            compute_capability: None,
-                            source: "rocminfo".to_string(),
-                        })
-                        .collect();
-                }
+                    .collect();
             }
         }
 
@@ -960,10 +959,10 @@ fn inference_batch_size(enable_gpu: bool, min_vram_gb: f64) -> usize {
 }
 
 fn resolve_cpu_budget_from_env(total_cores: usize) -> usize {
-    if let Ok(val) = env::var("FOREX_BOT_CPU_BUDGET") {
-        if let Ok(n) = val.parse::<usize>() {
-            return n.min(total_cores).max(1);
-        }
+    if let Ok(val) = env::var("FOREX_BOT_CPU_BUDGET")
+        && let Ok(n) = val.parse::<usize>()
+    {
+        return n.min(total_cores).max(1);
     }
     total_cores.saturating_sub(1).max(1)
 }

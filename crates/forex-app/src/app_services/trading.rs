@@ -293,6 +293,21 @@ impl TradingSession {
         Self::default()
     }
 
+    /// Construct a session with broker settings pre-loaded from the
+    /// per-user credentials TOML file (see
+    /// [`crate::app_services::broker_persistence::load_broker_settings`]).
+    ///
+    /// Used by `main.rs` so the production app starts with credentials the
+    /// user has already saved. Tests should keep using [`Self::new`] /
+    /// [`Self::with_configured_adapter_for_test`] which start with empty
+    /// defaults and are unaffected by whatever is on the developer's disk.
+    pub fn new_with_persisted_credentials() -> Self {
+        let mut session = Self::default();
+        session.broker_settings =
+            crate::app_services::broker_persistence::load_broker_settings();
+        session
+    }
+
     #[cfg(test)]
     pub fn with_configured_adapter_for_test(kind: TradingAdapterKind) -> Self {
         Self {
@@ -693,7 +708,7 @@ impl TradingSession {
             .to_string();
         if client_secret.is_empty() {
             if let Some(session) = self.ctrader_auth.as_mut() {
-                session.mark_failed();
+                session.mark_failed("cTrader token exchange requires client_secret");
             }
             return Err(anyhow::anyhow!(
                 "cTrader token exchange requires client_secret"
@@ -781,7 +796,9 @@ impl TradingSession {
             Err(TryRecvError::Empty) => return None,
             Err(TryRecvError::Disconnected) => {
                 if let Some(session) = self.ctrader_auth.as_mut() {
-                    session.mark_failed();
+                    session.mark_failed(
+                        "cTrader live auth worker disconnected before returning a result",
+                    );
                     let snapshot = session.snapshot();
                     self.ctrader_live_auth_rx = None;
                     return Some(snapshot);
@@ -792,30 +809,44 @@ impl TradingSession {
         };
         self.ctrader_live_auth_rx = None;
 
-        let session = self.ctrader_auth.get_or_insert_with(|| {
-            CTraderAuthSession::new(
-                self.broker_settings.ctrader.client_id.clone(),
-                self.broker_settings.ctrader.redirect_uri.clone(),
-            )
-        });
-
         match outcome {
             Ok(result) => {
-                session.mark_listening_for_callback(result.callback_port);
-                session.receive_authorization_code(result.authorization_code);
-                if self
-                    .ctrader_token_store
-                    .save_token_bundle(&result.token_bundle)
-                    .is_err()
                 {
-                    session.mark_failed();
-                    return Some(session.snapshot());
+                    let session = self.ctrader_auth.get_or_insert_with(|| {
+                        CTraderAuthSession::new(
+                            self.broker_settings.ctrader.client_id.clone(),
+                            self.broker_settings.ctrader.redirect_uri.clone(),
+                        )
+                    });
+                    session.mark_listening_for_callback(result.callback_port);
+                    session.receive_authorization_code(result.authorization_code);
+                    if let Err(err) = self
+                        .ctrader_token_store
+                        .save_token_bundle(&result.token_bundle)
+                    {
+                        session.mark_failed(format!("failed to save cTrader token bundle: {err}"));
+                        return Some(session.snapshot());
+                    }
+                    session.restore_from_storage(result.token_bundle);
                 }
-                session.restore_from_storage(result.token_bundle);
-                Some(session.snapshot())
+                match self.discover_ctrader_accounts() {
+                    Ok(Some(snapshot)) => Some(snapshot),
+                    Ok(None) => self.ctrader_auth.as_ref().map(|session| session.snapshot()),
+                    Err(err) => {
+                        let session = self.ctrader_auth.as_mut()?;
+                        session.mark_failed(format!("cTrader account discovery failed: {err}"));
+                        Some(session.snapshot())
+                    }
+                }
             }
-            Err(_) => {
-                session.mark_failed();
+            Err(message) => {
+                let session = self.ctrader_auth.get_or_insert_with(|| {
+                    CTraderAuthSession::new(
+                        self.broker_settings.ctrader.client_id.clone(),
+                        self.broker_settings.ctrader.redirect_uri.clone(),
+                    )
+                });
+                session.mark_failed(message);
                 Some(session.snapshot())
             }
         }
@@ -4167,6 +4198,24 @@ mod tests {
                 },
             ),
         );
+        session.set_ctrader_account_discovery_backend_for_test(
+            crate::app_services::ctrader_live_auth::StubCTraderAccountDiscoveryBackend::success(
+                crate::app_services::ctrader_live_auth::CTraderAccountDiscoveryResult {
+                    access_token: "access".to_string(),
+                    permission_scope: "SCOPE_TRADE".to_string(),
+                    accounts: vec![
+                        crate::app_services::ctrader_auth::CTraderDiscoveredAccount {
+                            account_id: "101".to_string(),
+                            broker_title: "Broker A".to_string(),
+                            account_name: "Primary Demo".to_string(),
+                            trader_login: Some(500101),
+                            is_live: Some(false),
+                            enabled_for_execution: false,
+                        },
+                    ],
+                },
+            ),
+        );
 
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let snapshot = session
@@ -4189,9 +4238,106 @@ mod tests {
 
         assert_eq!(
             completed.state,
-            crate::app_services::ctrader_auth::CTraderAuthState::RestoredFromStorage
+            crate::app_services::ctrader_auth::CTraderAuthState::AccountsAvailable
         );
         assert!(completed.token_persisted);
+        assert_eq!(completed.account_count, 1);
+        assert_eq!(
+            session.broker_settings_mut().ctrader.accounts[0].account_id,
+            "101"
+        );
+    }
+
+    #[test]
+    fn failed_ctrader_live_auth_reports_backend_error() {
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
+        session.broker_settings_mut().ctrader.redirect_uri =
+            "http://127.0.0.1:43001/callback".to_string();
+        session.set_ctrader_store_for_test(
+            crate::app_services::secure_store::MemorySecretStoreBackend::default(),
+        );
+        session.set_ctrader_live_auth_backend_for_test(
+            crate::app_services::ctrader_live_auth::StubCTraderLiveAuthBackend::failure(
+                "INVALID_CLIENT: cTrader rejected the OAuth application",
+            ),
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        session
+            .start_ctrader_live_auth(tx)
+            .expect("live auth should start");
+
+        let mut completed = None;
+        for _ in 0..20 {
+            if let Some(snapshot) = session.poll_ctrader_live_auth() {
+                completed = Some(snapshot);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let completed = completed.expect("poll should return failure");
+
+        assert_eq!(
+            completed.state,
+            crate::app_services::ctrader_auth::CTraderAuthState::Failed
+        );
+        assert!(completed.status_line.contains("INVALID_CLIENT"));
+    }
+
+    #[test]
+    fn live_auth_completion_reports_account_discovery_failure() {
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        session.broker_settings_mut().ctrader.client_id = "client".to_string();
+        session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
+        session.broker_settings_mut().ctrader.redirect_uri =
+            "http://127.0.0.1:43001/callback".to_string();
+        session.set_ctrader_store_for_test(
+            crate::app_services::secure_store::MemorySecretStoreBackend::default(),
+        );
+        session.set_ctrader_live_auth_backend_for_test(
+            crate::app_services::ctrader_live_auth::StubCTraderLiveAuthBackend::success(
+                crate::app_services::ctrader_live_auth::CTraderLiveAuthResult {
+                    callback_port: 43001,
+                    authorization_code: "code-123".to_string(),
+                    token_bundle: fresh_ctrader_token_bundle("access", "refresh"),
+                },
+            ),
+        );
+        session.set_ctrader_account_discovery_backend_for_test(
+            crate::app_services::ctrader_live_auth::StubCTraderAccountDiscoveryBackend::failure(
+                "INVALID_REQUEST: account list failed",
+            ),
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        session
+            .start_ctrader_live_auth(tx)
+            .expect("live auth should start");
+
+        let mut completed = None;
+        for _ in 0..20 {
+            if let Some(snapshot) = session.poll_ctrader_live_auth() {
+                completed = Some(snapshot);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let completed = completed.expect("poll should return discovery failure");
+
+        assert_eq!(
+            completed.state,
+            crate::app_services::ctrader_auth::CTraderAuthState::Failed
+        );
+        assert!(completed.token_persisted);
+        assert!(
+            completed
+                .status_line
+                .contains("INVALID_REQUEST: account list failed")
+        );
     }
 
     #[test]

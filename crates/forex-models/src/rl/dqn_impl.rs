@@ -629,20 +629,20 @@ fn stage_rl_target(
             )
         })?;
     }
-    if let Some(staged_path) = staged_path {
-        if let Err(err) = std::fs::rename(staged_path, final_path) {
-            if replaced_existing && backup_path.exists() {
-                let _ = std::fs::rename(backup_path, final_path);
-            }
-            cleanup_rl_temp_file(staged_path);
-            return Err(err).with_context(|| {
-                format!(
-                    "promote staged RL artifact {} to {}",
-                    staged_path.display(),
-                    final_path.display()
-                )
-            });
+    if let Some(staged_path) = staged_path
+        && let Err(err) = std::fs::rename(staged_path, final_path)
+    {
+        if replaced_existing && backup_path.exists() {
+            let _ = std::fs::rename(backup_path, final_path);
         }
+        cleanup_rl_temp_file(staged_path);
+        return Err(err).with_context(|| {
+            format!(
+                "promote staged RL artifact {} to {}",
+                staged_path.display(),
+                final_path.display()
+            )
+        });
     }
     if replaced_existing && backup_path.exists() {
         let _ = std::fs::remove_file(backup_path);
@@ -1607,7 +1607,7 @@ impl TradingReinforcementLearner {
         if artifact.train_rows == 0 {
             bail!("RL artifact is missing training-row metadata");
         }
-        if artifact.hidden_dims.is_empty() || artifact.hidden_dims.iter().any(|dim| *dim == 0) {
+        if artifact.hidden_dims.is_empty() || artifact.hidden_dims.contains(&0) {
             bail!("RL artifact hidden_dims must contain only positive layer widths");
         }
         if artifact.state_bins < 2 {
@@ -1800,14 +1800,14 @@ impl TradingReinforcementLearner {
                 "RL artifact must persist requested/effective backend and device policy together"
             );
         }
-        if let Some(effective_backend) = artifact.effective_backend.as_ref() {
-            if artifact.backend != *effective_backend {
-                bail!(
-                    "RL artifact legacy backend {} conflicts with effective_backend {}",
-                    artifact.backend,
-                    effective_backend
-                );
-            }
+        if let Some(effective_backend) = artifact.effective_backend.as_ref()
+            && artifact.backend != *effective_backend
+        {
+            bail!(
+                "RL artifact legacy backend {} conflicts with effective_backend {}",
+                artifact.backend,
+                effective_backend
+            );
         }
         if let Some(effective_device_policy) = artifact.effective_device_policy.as_ref() {
             let normalized_legacy = normalize_rl_device_policy(&artifact.device_policy);
@@ -1968,14 +1968,14 @@ impl TradingReinforcementLearner {
                 artifact_effective_backend(artifact)
             );
         }
+        let effective_backend = artifact_effective_backend(artifact);
         if report.used_network_snapshot
-            && artifact_effective_backend(artifact).starts_with("linear_q")
-            || report.used_network_snapshot
-                && artifact_effective_backend(artifact).starts_with("quadratic_q")
+            && (effective_backend.starts_with("linear_q")
+                || effective_backend.starts_with("quadratic_q"))
         {
             bail!(
                 "RL training report marks network snapshot as used but effective artifact backend {} is a fallback backend",
-                artifact_effective_backend(artifact)
+                effective_backend
             );
         }
         if report.used_feature_scaler != artifact.feature_scaler.is_some() {
@@ -2243,24 +2243,23 @@ impl TradingReinforcementLearner {
                     .transpose()
                     .ok()
                     .flatten()
+                    && persisted_network_precision != runtime_network_precision
                 {
-                    if persisted_network_precision != runtime_network_precision {
-                        reasons.push("rl_persisted_network_precision_drift".to_string());
-                    }
+                    reasons.push("rl_persisted_network_precision_drift".to_string());
                 }
             } else {
                 reasons.push("rl_runtime_network_precision_unknown".to_string());
             }
         }
-        if let Some(persisted_backend) = self.train_args.effective_backend.as_ref() {
-            if persisted_backend != &effective_backend {
-                reasons.push("rl_persisted_runtime_backend_drift".to_string());
-            }
+        if let Some(persisted_backend) = self.train_args.effective_backend.as_ref()
+            && persisted_backend != &effective_backend
+        {
+            reasons.push("rl_persisted_runtime_backend_drift".to_string());
         }
-        if let Some(persisted_policy) = self.train_args.effective_device_policy.as_ref() {
-            if persisted_policy != &effective_device_policy {
-                reasons.push("rl_persisted_runtime_device_drift".to_string());
-            }
+        if let Some(persisted_policy) = self.train_args.effective_device_policy.as_ref()
+            && persisted_policy != &effective_device_policy
+        {
+            reasons.push("rl_persisted_runtime_device_drift".to_string());
         }
         if let Some(gap_reason) = self
             .train_args
@@ -2302,10 +2301,9 @@ impl TradingReinforcementLearner {
         if let (Some(persisted_report), Some(runtime_report)) = (
             self.train_args.training_report.as_ref(),
             self.training_report.as_ref(),
-        ) {
-            if persisted_report != runtime_report {
-                reasons.push("rl_training_report_state_drift".to_string());
-            }
+        ) && persisted_report != runtime_report
+        {
+            reasons.push("rl_training_report_state_drift".to_string());
         }
         if let Some(report) = self.training_report.as_ref() {
             if report.backend != effective_backend {

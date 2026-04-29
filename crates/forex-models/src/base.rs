@@ -77,23 +77,20 @@ pub fn get_early_stop_params(default_patience: usize, default_min_delta: f64) ->
     let mut min_delta = default_min_delta;
 
     // Try to read env var for patience
-    if let Ok(env_pat) = std::env::var("FOREX_BOT_EARLY_STOP_PATIENCE") {
-        if !env_pat.is_empty() {
-            if let Ok(val) = env_pat.parse::<usize>() {
-                if val > 0 {
-                    patience = val;
-                }
-            }
-        }
+    if let Ok(env_pat) = std::env::var("FOREX_BOT_EARLY_STOP_PATIENCE")
+        && !env_pat.is_empty()
+        && let Ok(val) = env_pat.parse::<usize>()
+        && val > 0
+    {
+        patience = val;
     }
 
     // Try to read env var for min_delta
-    if let Ok(env_delta) = std::env::var("FOREX_BOT_EARLY_STOP_MIN_DELTA") {
-        if !env_delta.is_empty() {
-            if let Ok(val) = env_delta.parse::<f64>() {
-                min_delta = val;
-            }
-        }
+    if let Ok(env_delta) = std::env::var("FOREX_BOT_EARLY_STOP_MIN_DELTA")
+        && !env_delta.is_empty()
+        && let Ok(val) = env_delta.parse::<f64>()
+    {
+        min_delta = val;
     }
 
     (patience, min_delta)
@@ -451,23 +448,22 @@ pub fn validate_time_ordering(df: &DataFrame, context: &str) -> Result<bool> {
 
     let time_cols = ["timestamp", "time", "date", "datetime"];
     for col_name in time_cols {
-        if let Ok(series) = df.column(col_name) {
-            if let Ok(ca) = series.cast(&polars::datatypes::DataType::Int64) {
-                if let Ok(ca_i64) = ca.i64() {
-                    let mut prev = i64::MIN;
-                    for val in ca_i64.into_iter().flatten() {
-                        if val < prev {
-                            return Err(anyhow::anyhow!(
-                                "{}: Datetime column '{}' is NOT monotonically increasing. Look-ahead bias structural risk!",
-                                context,
-                                col_name
-                            ));
-                        }
-                        prev = val;
-                    }
-                    return Ok(true);
+        if let Ok(series) = df.column(col_name)
+            && let Ok(ca) = series.cast(&polars::datatypes::DataType::Int64)
+            && let Ok(ca_i64) = ca.i64()
+        {
+            let mut prev = i64::MIN;
+            for val in ca_i64.into_iter().flatten() {
+                if val < prev {
+                    return Err(anyhow::anyhow!(
+                        "{}: Datetime column '{}' is NOT monotonically increasing. Look-ahead bias structural risk!",
+                        context,
+                        col_name
+                    ));
                 }
+                prev = val;
             }
+            return Ok(true);
         }
     }
 
@@ -715,15 +711,14 @@ pub fn detect_feature_drift(
         .unwrap_or(0.20);
 
     let mut vol_scale = 1.0;
-    if let Ok(vol_col) = val_df.column("realized_volatility") {
-        if let Ok(series) = vol_col.cast(&DataType::Float64) {
-            if let Ok(ca) = series.f64() {
-                let vol_sum: f64 = ca.into_iter().flatten().sum();
-                let count = ca.into_iter().flatten().count();
-                if count > 0 && vol_sum > 0.0 {
-                    vol_scale = ((vol_sum / count as f64) * 1000.0).clamp(0.2, 5.0);
-                }
-            }
+    if let Ok(vol_col) = val_df.column("realized_volatility")
+        && let Ok(series) = vol_col.cast(&DataType::Float64)
+        && let Ok(ca) = series.f64()
+    {
+        let vol_sum: f64 = ca.into_iter().flatten().sum();
+        let count = ca.into_iter().flatten().count();
+        if count > 0 && vol_sum > 0.0 {
+            vol_scale = ((vol_sum / count as f64) * 1000.0).clamp(0.2, 5.0);
         }
     }
     let threshold = base_threshold * vol_scale;

@@ -42,7 +42,7 @@ pub fn ensure_autotrading_window_shortcut() -> bool {
 
 #[cfg(target_os = "windows")]
 pub fn ensure_autotrading_window_shortcut() -> bool {
-    if !focus_mt5_window() {
+    if !focus_broker_terminal() {
         return false;
     }
     send_ctrl_e();
@@ -50,7 +50,7 @@ pub fn ensure_autotrading_window_shortcut() -> bool {
 }
 
 #[cfg(target_os = "windows")]
-pub fn focus_mt5_window() -> bool {
+pub fn focus_broker_terminal() -> bool {
     unsafe {
         let mut found_hwnd: Option<HWND> = None;
 
@@ -91,7 +91,7 @@ pub fn focus_mt5_window() -> bool {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn focus_mt5_window() -> bool {
+pub fn focus_broker_terminal() -> bool {
     warn!("Window control is not supported on this OS.");
     false
 }

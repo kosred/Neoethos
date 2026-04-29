@@ -109,7 +109,10 @@ async fn run_headless_loop(runtime: AppRuntimeConfig) {
     let (tx, _rx) = mpsc::channel(1000);
 
     if runtime.auto_discovery {
-        let symbol = symbols.first().cloned().unwrap_or_else(|| "EURUSD".to_string());
+        let symbol = symbols
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "EURUSD".to_string());
         info!("Headless: auto-starting discovery for {}", symbol);
         let request = DiscoveryRequest {
             data_root: runtime.data_dir.clone(),
@@ -125,7 +128,10 @@ async fn run_headless_loop(runtime: AppRuntimeConfig) {
     }
 
     if runtime.auto_training {
-        let symbol = symbols.first().cloned().unwrap_or_else(|| "EURUSD".to_string());
+        let symbol = symbols
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "EURUSD".to_string());
         info!("Headless: auto-starting training for {}", symbol);
         let request = TrainingRequest {
             config_path: runtime.config_path.clone(),
@@ -139,7 +145,11 @@ async fn run_headless_loop(runtime: AppRuntimeConfig) {
         }
     }
 
-    let mode = if runtime.start_local { "LOCAL" } else { "CTRADER" };
+    let mode = if runtime.start_local {
+        "LOCAL"
+    } else {
+        "CTRADER"
+    };
     if let Err(err) = write_subsystem_record(
         SubsystemSection::App,
         app_record(
@@ -192,7 +202,7 @@ impl ForexApp {
         let _heartbeat_handle = spawn_account_heartbeat(tx.clone());
 
         Self {
-            trading_session: TradingSession::new(),
+            trading_session: TradingSession::new_with_persisted_credentials(),
             workspace: WorkspaceState::default(),
             state,
             tx: tx.clone(),
@@ -209,7 +219,10 @@ impl ForexApp {
 
     fn trigger_start_discovery(&mut self) {
         use app_services::discovery::{DiscoveryRequest, failed_snapshot, start_discovery_job};
-        let higher_tfs: Vec<String> = self.state.discovery_form.higher_tfs
+        let higher_tfs: Vec<String> = self
+            .state
+            .discovery_form
+            .higher_tfs
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -237,10 +250,8 @@ impl ForexApp {
                 self.discovery_handle = Some(handle);
             }
             Err(err) => {
-                self.state.discovery_job = Some(failed_snapshot(
-                    app_services::jobs::JobKind::Discovery,
-                    err,
-                ));
+                self.state.discovery_job =
+                    Some(failed_snapshot(app_services::jobs::JobKind::Discovery, err));
             }
         }
     }
@@ -328,13 +339,23 @@ impl eframe::App for ForexApp {
             .state
             .discovery_job
             .as_ref()
-            .map(|s| matches!(s.state, app_services::jobs::JobState::Queued | app_services::jobs::JobState::Running))
+            .map(|s| {
+                matches!(
+                    s.state,
+                    app_services::jobs::JobState::Queued | app_services::jobs::JobState::Running
+                )
+            })
             .unwrap_or(false);
         let training_running = self
             .state
             .training_job
             .as_ref()
-            .map(|s| matches!(s.state, app_services::jobs::JobState::Queued | app_services::jobs::JobState::Running))
+            .map(|s| {
+                matches!(
+                    s.state,
+                    app_services::jobs::JobState::Queued | app_services::jobs::JobState::Running
+                )
+            })
             .unwrap_or(false);
         let discovery_dot = engine_dot_color(self.state.discovery_job.as_ref());
         let training_dot = engine_dot_color(self.state.training_job.as_ref());
@@ -367,7 +388,12 @@ impl eframe::App for ForexApp {
                     egui::menu::menu_button(ui, "  Navigate ", |ui| {
                         ui.set_min_width(160.0);
 
-                        ui.label(egui::RichText::new("TRADING").size(10.0).color(ui::theme::TEXT_MUTED).strong());
+                        ui.label(
+                            egui::RichText::new("TRADING")
+                                .size(10.0)
+                                .color(ui::theme::TEXT_MUTED)
+                                .strong(),
+                        );
                         for (tab, label, hint) in [
                             (WorkspaceTab::Dashboard, "Dashboard", "Overview & equity"),
                             (WorkspaceTab::Chart, "Chart", "Price chart"),
@@ -383,11 +409,24 @@ impl eframe::App for ForexApp {
                         }
 
                         ui.separator();
-                        ui.label(egui::RichText::new("AI ENGINE").size(10.0).color(ui::theme::TEXT_MUTED).strong());
+                        ui.label(
+                            egui::RichText::new("AI ENGINE")
+                                .size(10.0)
+                                .color(ui::theme::TEXT_MUTED)
+                                .strong(),
+                        );
                         for (tab, label, hint) in [
-                            (WorkspaceTab::Discovery, "Discovery", "Genetic strategy search"),
+                            (
+                                WorkspaceTab::Discovery,
+                                "Discovery",
+                                "Genetic strategy search",
+                            ),
                             (WorkspaceTab::Training, "Training", "Swarm model training"),
-                            (WorkspaceTab::Intelligence, "Intelligence", "AI model status"),
+                            (
+                                WorkspaceTab::Intelligence,
+                                "Intelligence",
+                                "AI model status",
+                            ),
                         ] {
                             if ui.button(label).on_hover_text(hint).clicked() {
                                 nav_target = Some(tab);
@@ -396,11 +435,24 @@ impl eframe::App for ForexApp {
                         }
 
                         ui.separator();
-                        ui.label(egui::RichText::new("SYSTEM").size(10.0).color(ui::theme::TEXT_MUTED).strong());
+                        ui.label(
+                            egui::RichText::new("SYSTEM")
+                                .size(10.0)
+                                .color(ui::theme::TEXT_MUTED)
+                                .strong(),
+                        );
                         for (tab, label, hint) in [
-                            (WorkspaceTab::BrokerSetup, "Broker Setup", "cTrader auth & accounts"),
+                            (
+                                WorkspaceTab::BrokerSetup,
+                                "Broker Setup",
+                                "cTrader auth & accounts",
+                            ),
                             (WorkspaceTab::Runtime, "Runtime", "Connection & session"),
-                            (WorkspaceTab::DataBootstrap, "Data Bootstrap", "Download OHLCV history"),
+                            (
+                                WorkspaceTab::DataBootstrap,
+                                "Data Bootstrap",
+                                "Download OHLCV history",
+                            ),
                             (WorkspaceTab::Hardware, "Hardware", "CPU / GPU config"),
                             (WorkspaceTab::Risk, "Risk Settings", "Drawdown & lot rules"),
                             (WorkspaceTab::Settings, "Settings", "App configuration"),
@@ -421,21 +473,42 @@ impl eframe::App for ForexApp {
                         // Discovery row
                         ui.horizontal(|ui| {
                             ui::theme::status_dot(ui, discovery_dot, 8.0);
-                            ui.label(egui::RichText::new("Discovery").size(12.0).color(ui::theme::TEXT_PRIMARY));
-                            ui.label(egui::RichText::new(&discovery_label).size(10.0).color(discovery_dot));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if discovery_running {
-                                    if ui.small_button("Stop").on_hover_text("Cancel active discovery run").clicked() {
-                                        stop_discovery = true;
-                                        ui.close_menu();
+                            ui.label(
+                                egui::RichText::new("Discovery")
+                                    .size(12.0)
+                                    .color(ui::theme::TEXT_PRIMARY),
+                            );
+                            ui.label(
+                                egui::RichText::new(&discovery_label)
+                                    .size(10.0)
+                                    .color(discovery_dot),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if discovery_running {
+                                        if ui
+                                            .small_button("Stop")
+                                            .on_hover_text("Cancel active discovery run")
+                                            .clicked()
+                                        {
+                                            stop_discovery = true;
+                                            ui.close_menu();
+                                        }
+                                    } else {
+                                        if ui
+                                            .small_button("Start")
+                                            .on_hover_text(
+                                                "Start discovery with current form settings",
+                                            )
+                                            .clicked()
+                                        {
+                                            start_discovery = true;
+                                            ui.close_menu();
+                                        }
                                     }
-                                } else {
-                                    if ui.small_button("Start").on_hover_text("Start discovery with current form settings").clicked() {
-                                        start_discovery = true;
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
+                                },
+                            );
                         });
 
                         ui.separator();
@@ -443,21 +516,42 @@ impl eframe::App for ForexApp {
                         // Training row
                         ui.horizontal(|ui| {
                             ui::theme::status_dot(ui, training_dot, 8.0);
-                            ui.label(egui::RichText::new("Training").size(12.0).color(ui::theme::TEXT_PRIMARY));
-                            ui.label(egui::RichText::new(&training_label).size(10.0).color(training_dot));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if training_running {
-                                    if ui.small_button("Stop").on_hover_text("Cancel active training run").clicked() {
-                                        stop_training = true;
-                                        ui.close_menu();
+                            ui.label(
+                                egui::RichText::new("Training")
+                                    .size(12.0)
+                                    .color(ui::theme::TEXT_PRIMARY),
+                            );
+                            ui.label(
+                                egui::RichText::new(&training_label)
+                                    .size(10.0)
+                                    .color(training_dot),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if training_running {
+                                        if ui
+                                            .small_button("Stop")
+                                            .on_hover_text("Cancel active training run")
+                                            .clicked()
+                                        {
+                                            stop_training = true;
+                                            ui.close_menu();
+                                        }
+                                    } else {
+                                        if ui
+                                            .small_button("Start")
+                                            .on_hover_text(
+                                                "Start training with current symbol & TF",
+                                            )
+                                            .clicked()
+                                        {
+                                            start_training = true;
+                                            ui.close_menu();
+                                        }
                                     }
-                                } else {
-                                    if ui.small_button("Start").on_hover_text("Start training with current symbol & TF").clicked() {
-                                        start_training = true;
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
+                                },
+                            );
                         });
 
                         ui.separator();
@@ -473,7 +567,12 @@ impl eframe::App for ForexApp {
                     // ── Status ribbon ────────────────────────────────────
                     ui.spacing_mut().item_spacing.x = 14.0;
                     render_ribbon_item(ui, "SYMBOL", &self.state.selected_pair, ui::theme::ACCENT);
-                    render_ribbon_item(ui, "TF", &self.state.chart_timeframe, ui::theme::TEXT_PRIMARY);
+                    render_ribbon_item(
+                        ui,
+                        "TF",
+                        &self.state.chart_timeframe,
+                        ui::theme::TEXT_PRIMARY,
+                    );
                     render_ribbon_item(
                         ui,
                         "SRC",
@@ -492,7 +591,11 @@ impl eframe::App for ForexApp {
                         ui,
                         "EQ",
                         &format!("{equity:.2}"),
-                        if equity > 0.0 { ui::theme::SUCCESS } else { ui::theme::TEXT_MUTED },
+                        if equity > 0.0 {
+                            ui::theme::SUCCESS
+                        } else {
+                            ui::theme::TEXT_MUTED
+                        },
                     );
 
                     let status_color = if self.state.status_msg.contains("Connected")
@@ -523,7 +626,9 @@ impl eframe::App for ForexApp {
                         ui.add_space(6.0);
                         if ui
                             .add(egui::Button::new(
-                                egui::RichText::new("Settings").size(12.0).color(ui::theme::TEXT_MUTED),
+                                egui::RichText::new("Settings")
+                                    .size(12.0)
+                                    .color(ui::theme::TEXT_MUTED),
                             ))
                             .on_hover_text("Open Settings panel")
                             .clicked()
@@ -534,9 +639,14 @@ impl eframe::App for ForexApp {
                         ui.add(egui::Separator::default().vertical().spacing(8.0));
 
                         let auto_label = if self.state.auto_trade_enabled {
-                            egui::RichText::new("AUTO ON").color(ui::theme::SUCCESS).strong().size(12.0)
+                            egui::RichText::new("AUTO ON")
+                                .color(ui::theme::SUCCESS)
+                                .strong()
+                                .size(12.0)
                         } else {
-                            egui::RichText::new("AUTO OFF").color(ui::theme::TEXT_MUTED).size(12.0)
+                            egui::RichText::new("AUTO OFF")
+                                .color(ui::theme::TEXT_MUTED)
+                                .size(12.0)
                         };
                         if ui
                             .add(egui::Button::new(auto_label))
@@ -552,7 +662,11 @@ impl eframe::App for ForexApp {
                             egui::RichText::new(format!(
                                 "CPU {}  GPU {}",
                                 self.state.hardware.cpu_cores,
-                                if self.state.hardware.gpu_enabled { "ON" } else { "OFF" }
+                                if self.state.hardware.gpu_enabled {
+                                    "ON"
+                                } else {
+                                    "OFF"
+                                }
                             ))
                             .size(11.0)
                             .color(ui::theme::TEXT_MUTED),

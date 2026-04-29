@@ -92,6 +92,7 @@ pub struct CTraderAuthSession {
     token_bundle: Option<CTraderTokenBundle>,
     accounts: Vec<CTraderAccountSummary>,
     discovered_accounts: Vec<CTraderDiscoveredAccount>,
+    failure_message: Option<String>,
 }
 
 impl CTraderAuthSession {
@@ -114,10 +115,12 @@ impl CTraderAuthSession {
             token_bundle: None,
             accounts: Vec::new(),
             discovered_accounts: Vec::new(),
+            failure_message: None,
         }
     }
 
     pub fn start_authorization(&mut self, scope: &str) -> String {
+        self.failure_message = None;
         let url = format!(
             "https://id.ctrader.com/my/settings/openapi/grantingaccess/?client_id={}&redirect_uri={}&scope={}&product=web",
             percent_encode(&self.client_id),
@@ -130,11 +133,13 @@ impl CTraderAuthSession {
     }
 
     pub fn mark_listening_for_callback(&mut self, callback_port: u16) {
+        self.failure_message = None;
         self.callback_port = Some(callback_port);
         self.state = CTraderAuthState::ListeningForCallback;
     }
 
     pub fn receive_authorization_code(&mut self, code: impl Into<String>) {
+        self.failure_message = None;
         self.authorization_code = Some(code.into());
         self.state = CTraderAuthState::AuthorizationCodeReceived;
     }
@@ -143,6 +148,7 @@ impl CTraderAuthSession {
         &mut self,
         client_secret: impl Into<String>,
     ) -> CTraderTokenExchangeRequest {
+        self.failure_message = None;
         self.state = CTraderAuthState::ExchangingToken;
         let request = CTraderTokenExchangeRequest {
             grant_type: "authorization_code".to_string(),
@@ -162,6 +168,7 @@ impl CTraderAuthSession {
         self.token_bundle = Some(token_bundle);
         self.accounts.clear();
         self.discovered_accounts.clear();
+        self.failure_message = None;
         self.state = CTraderAuthState::RestoredFromStorage;
     }
 
@@ -170,6 +177,7 @@ impl CTraderAuthSession {
         self.callback_port = None;
         self.authorization_code = None;
         self.token_bundle = Some(token_bundle);
+        self.failure_message = None;
         if !matches!(self.state, CTraderAuthState::AccountsAvailable) {
             self.state = CTraderAuthState::RestoredFromStorage;
         }
@@ -189,10 +197,12 @@ impl CTraderAuthSession {
                 enabled_for_execution: account.enabled_for_execution,
             })
             .collect();
+        self.failure_message = None;
         self.state = CTraderAuthState::AccountsAvailable;
     }
 
-    pub fn mark_failed(&mut self) {
+    pub fn mark_failed(&mut self, message: impl Into<String>) {
+        self.failure_message = Some(message.into());
         self.state = CTraderAuthState::Failed;
     }
 
@@ -226,7 +236,12 @@ impl CTraderAuthSession {
                         self.discovered_accounts.len()
                     )
                 }
-                CTraderAuthState::Failed => "cTrader auth failed.".to_string(),
+                CTraderAuthState::Failed => self
+                    .failure_message
+                    .as_ref()
+                    .filter(|message| !message.trim().is_empty())
+                    .map(|message| format!("cTrader auth failed: {message}"))
+                    .unwrap_or_else(|| "cTrader auth failed.".to_string()),
             },
             authorize_url: self.authorize_url.clone(),
             callback_port: self.callback_port,

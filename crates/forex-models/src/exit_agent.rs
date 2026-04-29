@@ -970,13 +970,13 @@ impl ExitAgent {
 
     fn runtime_degraded_reason(&self) -> Option<String> {
         let mut reasons = Vec::new();
-        if let Some(persisted_requested_policy) = self.persisted_requested_device_policy.as_ref() {
-            if persisted_requested_policy != &self.requested_device_policy {
-                reasons.push(format!(
+        if let Some(persisted_requested_policy) = self.persisted_requested_device_policy.as_ref()
+            && persisted_requested_policy != &self.requested_device_policy
+        {
+            reasons.push(format!(
                     "persisted requested device `{persisted_requested_policy}` differs from current runtime `{}`",
                     self.requested_device_policy
                 ));
-            }
         }
         if self.requested_device_policy != self.effective_device_policy {
             reasons.push(format!(
@@ -984,21 +984,21 @@ impl ExitAgent {
                 self.requested_device_policy, self.effective_device_policy
             ));
         }
-        if let Some(persisted_policy) = self.persisted_effective_device_policy.as_ref() {
-            if persisted_policy != &self.effective_device_policy {
-                reasons.push(format!(
-                    "persisted effective device `{persisted_policy}` differs from current runtime `{}`",
-                    self.effective_device_policy
-                ));
-            }
+        if let Some(persisted_policy) = self.persisted_effective_device_policy.as_ref()
+            && persisted_policy != &self.effective_device_policy
+        {
+            reasons.push(format!(
+                "persisted effective device `{persisted_policy}` differs from current runtime `{}`",
+                self.effective_device_policy
+            ));
         }
-        if let Some(persisted_backend) = self.persisted_execution_backend.as_ref() {
-            if persisted_backend != &self.execution_backend {
-                reasons.push(format!(
+        if let Some(persisted_backend) = self.persisted_execution_backend.as_ref()
+            && persisted_backend != &self.execution_backend
+        {
+            reasons.push(format!(
                     "persisted execution backend `{persisted_backend}` differs from current runtime `{}`",
                     self.execution_backend
                 ));
-            }
         }
         if !self.has_runtime_feature_schema() {
             reasons.push("exit_agent is missing persisted feature schema".to_string());
@@ -1457,25 +1457,25 @@ impl ExitAgent {
         let persisted_effective_device_policy = artifact.effective_device_policy.clone();
         let persisted_execution_backend = artifact.execution_backend.clone();
         let (device, selection) = resolve_train_device(&requested_device_policy);
-        if let Some(persisted_policy) = persisted_effective_device_policy.as_deref() {
-            if persisted_policy != selection.effective_policy {
-                warn!(
-                    "exit-agent persisted effective device policy `{}` differs from current runtime `{}` while loading {}",
-                    persisted_policy,
-                    selection.effective_policy,
-                    path.display()
-                );
-            }
+        if let Some(persisted_policy) = persisted_effective_device_policy.as_deref()
+            && persisted_policy != selection.effective_policy
+        {
+            warn!(
+                "exit-agent persisted effective device policy `{}` differs from current runtime `{}` while loading {}",
+                persisted_policy,
+                selection.effective_policy,
+                path.display()
+            );
         }
-        if let Some(persisted_backend) = persisted_execution_backend.as_deref() {
-            if persisted_backend != selection.execution_backend {
-                warn!(
-                    "exit-agent persisted execution backend `{}` differs from current runtime `{}` while loading {}",
-                    persisted_backend,
-                    selection.execution_backend,
-                    path.display()
-                );
-            }
+        if let Some(persisted_backend) = persisted_execution_backend.as_deref()
+            && persisted_backend != selection.execution_backend
+        {
+            warn!(
+                "exit-agent persisted execution backend `{}` differs from current runtime `{}` while loading {}",
+                persisted_backend,
+                selection.execution_backend,
+                path.display()
+            );
         }
         let recorder = DefaultFileRecorder::<FullPrecisionSettings>::new();
         let model = ExitAgentNetConfig::new()
@@ -1543,6 +1543,8 @@ impl ExitAgent {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::field_reassign_with_default)]
+
     use super::{ExitAgent, ExitAgentArtifact, Experience, PendingRegret, exit_runtime_metadata};
     use crate::base::three_class_runtime_confidence;
     use crate::statistical::common::{METADATA_FILE_NAME, write_json};

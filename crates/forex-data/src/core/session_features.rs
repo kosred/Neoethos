@@ -139,124 +139,124 @@ pub fn compute_session_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)>
             (high - low).max(1e-10)
         };
 
-        if let Some(ts) = ohlcv.timestamp.as_ref().map(|t| t[i]) {
-            if let chrono::LocalResult::Single(dt) = Utc.timestamp_millis_opt(ts) {
-                let hour = dt.hour();
-                let minute = dt.minute();
+        if let Some(ts) = ohlcv.timestamp.as_ref().map(|t| t[i])
+            && let chrono::LocalResult::Single(dt) = Utc.timestamp_millis_opt(ts)
+        {
+            let hour = dt.hour();
+            let minute = dt.minute();
 
-                // === Session Boundaries ===
-                // Asian: 00:00-08:00 UTC
-                // London: 07:00-16:00 UTC
-                // NY: 12:00-21:00 UTC
-                // Overlap: 12:00-16:00 UTC
+            // === Session Boundaries ===
+            // Asian: 00:00-08:00 UTC
+            // London: 07:00-16:00 UTC
+            // NY: 12:00-21:00 UTC
+            // Overlap: 12:00-16:00 UTC
 
-                // Asian session
-                if hour == 0 && minute == 0 {
-                    if asian.started {
-                        prev_session_close = asian.close;
-                        prev_asian_range = asian.range();
-                    }
-                    asian.reset(open);
+            // Asian session
+            if hour == 0 && minute == 0 {
+                if asian.started {
+                    prev_session_close = asian.close;
+                    prev_asian_range = asian.range();
                 }
-                if hour < 8 && asian.started {
-                    asian.update(high, low, close, vol);
-                }
+                asian.reset(open);
+            }
+            if hour < 8 && asian.started {
+                asian.update(high, low, close, vol);
+            }
 
-                // London session
-                if hour == 7 && minute == 0 {
-                    if london.started {
-                        prev_session_close = london.close;
-                    }
-                    london.reset(open);
-                    // Session open gap
-                    if prev_session_close.is_finite() {
-                        session_open_gap[i] = (open - prev_session_close) / atr.max(1e-10);
-                    }
+            // London session
+            if hour == 7 && minute == 0 {
+                if london.started {
+                    prev_session_close = london.close;
                 }
-                if (7..16).contains(&hour) && london.started {
-                    london.update(high, low, close, vol);
-                }
-
-                // NY session
-                if hour == 12 && minute == 0 {
-                    if ny.started {
-                        prev_session_close = ny.close;
-                    }
-                    ny.reset(open);
-                    if prev_session_close.is_finite() {
-                        session_open_gap[i] = (open - prev_session_close) / atr.max(1e-10);
-                    }
-                }
-                if (12..21).contains(&hour) && ny.started {
-                    ny.update(high, low, close, vol);
-                }
-
-                // Daily
-                if hour == 0 && minute == 0 {
-                    daily.reset(open);
-                }
-                daily.update(high, low, close, vol);
-
-                // === Compute Feature Values ===
-
-                // London distances
-                if london.started && london.bar_count > 0 {
-                    london_open_dist[i] = (close - london.open) / atr.max(1e-10);
-                    london_high_dist[i] = (close - london.high) / atr.max(1e-10);
-                    london_low_dist[i] = (close - london.low) / atr.max(1e-10);
-                    london_range[i] = london.range() / atr.max(1e-10);
-                    london_vwap_dist[i] = (close - london.vwap()) / atr.max(1e-10);
-                }
-
-                // NY distances
-                if ny.started && ny.bar_count > 0 {
-                    ny_open_dist[i] = (close - ny.open) / atr.max(1e-10);
-                    ny_high_dist[i] = (close - ny.high) / atr.max(1e-10);
-                    ny_low_dist[i] = (close - ny.low) / atr.max(1e-10);
-                    ny_range[i] = ny.range() / atr.max(1e-10);
-                    ny_vwap_dist[i] = (close - ny.vwap()) / atr.max(1e-10);
-                }
-
-                // Asian distances
-                if asian.started && asian.bar_count > 0 {
-                    asian_open_dist[i] = (close - asian.open) / atr.max(1e-10);
-                    asian_close_dist[i] = (close - asian.close) / atr.max(1e-10);
-                    asian_range_norm[i] = asian.range() / atr.max(1e-10);
-                }
-
-                // London-NY overlap zone
-                if (12..16).contains(&hour) {
-                    london_ny_overlap[i] = 1.0;
-                }
-
-                // Session volatility ratio
-                if prev_asian_range > 1e-10 && london.started {
-                    session_volatility_ratio[i] = london.range() / prev_asian_range;
-                }
-
-                // Previous session close distance
+                london.reset(open);
+                // Session open gap
                 if prev_session_close.is_finite() {
-                    prev_session_close_dist[i] = (close - prev_session_close) / atr.max(1e-10);
+                    session_open_gap[i] = (open - prev_session_close) / atr.max(1e-10);
                 }
+            }
+            if (7..16).contains(&hour) && london.started {
+                london.update(high, low, close, vol);
+            }
 
-                // Daily features
-                if daily.started && daily.bar_count > 0 {
-                    let dr = daily.range();
-                    daily_range_pct[i] = if close > 1e-10 { dr / close } else { 0.0 };
-                    daily_body_pct[i] = if close > 1e-10 {
-                        daily.body() / close
-                    } else {
-                        0.0
-                    };
-                    daily_position[i] = if dr > 1e-10 {
-                        (close - daily.low) / dr
-                    } else {
-                        0.5
-                    };
-                    daily_high_dist[i] = (close - daily.high) / atr.max(1e-10);
-                    daily_low_dist[i] = (close - daily.low) / atr.max(1e-10);
-                    daily_vwap_dist[i] = (close - daily.vwap()) / atr.max(1e-10);
+            // NY session
+            if hour == 12 && minute == 0 {
+                if ny.started {
+                    prev_session_close = ny.close;
                 }
+                ny.reset(open);
+                if prev_session_close.is_finite() {
+                    session_open_gap[i] = (open - prev_session_close) / atr.max(1e-10);
+                }
+            }
+            if (12..21).contains(&hour) && ny.started {
+                ny.update(high, low, close, vol);
+            }
+
+            // Daily
+            if hour == 0 && minute == 0 {
+                daily.reset(open);
+            }
+            daily.update(high, low, close, vol);
+
+            // === Compute Feature Values ===
+
+            // London distances
+            if london.started && london.bar_count > 0 {
+                london_open_dist[i] = (close - london.open) / atr.max(1e-10);
+                london_high_dist[i] = (close - london.high) / atr.max(1e-10);
+                london_low_dist[i] = (close - london.low) / atr.max(1e-10);
+                london_range[i] = london.range() / atr.max(1e-10);
+                london_vwap_dist[i] = (close - london.vwap()) / atr.max(1e-10);
+            }
+
+            // NY distances
+            if ny.started && ny.bar_count > 0 {
+                ny_open_dist[i] = (close - ny.open) / atr.max(1e-10);
+                ny_high_dist[i] = (close - ny.high) / atr.max(1e-10);
+                ny_low_dist[i] = (close - ny.low) / atr.max(1e-10);
+                ny_range[i] = ny.range() / atr.max(1e-10);
+                ny_vwap_dist[i] = (close - ny.vwap()) / atr.max(1e-10);
+            }
+
+            // Asian distances
+            if asian.started && asian.bar_count > 0 {
+                asian_open_dist[i] = (close - asian.open) / atr.max(1e-10);
+                asian_close_dist[i] = (close - asian.close) / atr.max(1e-10);
+                asian_range_norm[i] = asian.range() / atr.max(1e-10);
+            }
+
+            // London-NY overlap zone
+            if (12..16).contains(&hour) {
+                london_ny_overlap[i] = 1.0;
+            }
+
+            // Session volatility ratio
+            if prev_asian_range > 1e-10 && london.started {
+                session_volatility_ratio[i] = london.range() / prev_asian_range;
+            }
+
+            // Previous session close distance
+            if prev_session_close.is_finite() {
+                prev_session_close_dist[i] = (close - prev_session_close) / atr.max(1e-10);
+            }
+
+            // Daily features
+            if daily.started && daily.bar_count > 0 {
+                let dr = daily.range();
+                daily_range_pct[i] = if close > 1e-10 { dr / close } else { 0.0 };
+                daily_body_pct[i] = if close > 1e-10 {
+                    daily.body() / close
+                } else {
+                    0.0
+                };
+                daily_position[i] = if dr > 1e-10 {
+                    (close - daily.low) / dr
+                } else {
+                    0.5
+                };
+                daily_high_dist[i] = (close - daily.high) / atr.max(1e-10);
+                daily_low_dist[i] = (close - daily.low) / atr.max(1e-10);
+                daily_vwap_dist[i] = (close - daily.vwap()) / atr.max(1e-10);
             }
         }
     }

@@ -146,23 +146,24 @@ pub fn render(
             }
         }
 
-        if running && ui.button("Stop Search").clicked() {
-            if let Some(handle) = handle.as_ref() {
-                handle.cancel.request();
-            }
+        if running
+            && ui.button("Stop Search").clicked()
+            && let Some(handle) = handle.as_ref()
+        {
+            handle.cancel.request();
         }
 
-        if ui.button("Open Log").clicked() {
-            if let Err(err) = open_log(&state.canonical_log_path) {
-                state.discovery_job = Some(failed_snapshot(
-                    crate::app_services::jobs::JobKind::Discovery,
-                    anyhow::anyhow!(
-                        "failed to open log {}: {}",
-                        state.canonical_log_path.display(),
-                        err
-                    ),
-                ));
-            }
+        if ui.button("Open Log").clicked()
+            && let Err(err) = open_log(&state.canonical_log_path)
+        {
+            state.discovery_job = Some(failed_snapshot(
+                crate::app_services::jobs::JobKind::Discovery,
+                anyhow::anyhow!(
+                    "failed to open log {}: {}",
+                    state.canonical_log_path.display(),
+                    err
+                ),
+            ));
         }
     });
 }

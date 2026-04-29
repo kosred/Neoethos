@@ -168,92 +168,92 @@ pub fn compute_smc_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
         // 1. Killzones (Macro Time Delivery Algorithm)
         // London Killzone 07:00-11:00 UTC, NY Killzone 13:00-17:00 UTC
         macro_active[i] = 1.0;
-        if let Some(t_ms) = ts {
-            if let chrono::LocalResult::Single(dt) = Utc.timestamp_millis_opt(t_ms) {
-                let hour = dt.hour();
-                let minute = dt.minute();
-                if (7..11).contains(&hour) || (13..17).contains(&hour) {
-                    macro_active[i] = 1.0;
-                } else {
-                    macro_active[i] = 0.0;
+        if let Some(t_ms) = ts
+            && let chrono::LocalResult::Single(dt) = Utc.timestamp_millis_opt(t_ms)
+        {
+            let hour = dt.hour();
+            let minute = dt.minute();
+            if (7..11).contains(&hour) || (13..17).contains(&hour) {
+                macro_active[i] = 1.0;
+            } else {
+                macro_active[i] = 0.0;
+            }
+
+            // ICT Macro Time Windows (precise 15-90min windows of institutional activity)
+            // 9:50-10:10 UTC, 10:50-11:10, 13:10-13:40, 14:50-15:10, 15:15-15:45
+            let hm = hour * 60 + minute;
+            if (590..=610).contains(&hm)
+                || (650..=670).contains(&hm)
+                || (790..=820).contains(&hm)
+                || (890..=910).contains(&hm)
+                || (915..=945).contains(&hm)
+            {
+                ict_macro[i] = 1.0;
+            }
+
+            // Silver Bullet Windows: 10:00-11:00 UTC (London), 14:00-15:00 UTC (NY AM), 18:00-19:00 UTC (NY PM)
+            if (hour == 10) || (hour == 14) || (hour == 18) {
+                silver_bullet[i] = 1.0;
+            }
+
+            // Asian Range: 00:00-08:00 UTC (track high/low for the session)
+            if hour < 8 {
+                if high > asian_high {
+                    asian_high = high;
                 }
-
-                // ICT Macro Time Windows (precise 15-90min windows of institutional activity)
-                // 9:50-10:10 UTC, 10:50-11:10, 13:10-13:40, 14:50-15:10, 15:15-15:45
-                let hm = hour * 60 + minute;
-                if (590..=610).contains(&hm)
-                    || (650..=670).contains(&hm)
-                    || (790..=820).contains(&hm)
-                    || (890..=910).contains(&hm)
-                    || (915..=945).contains(&hm)
-                {
-                    ict_macro[i] = 1.0;
+                if low < asian_low {
+                    asian_low = low;
                 }
+                asian_range_set = true;
+            } else if hour == 8 && minute == 0 {
+                // Reset at end of Asian session
+                asian_range_set = true;
+            }
 
-                // Silver Bullet Windows: 10:00-11:00 UTC (London), 14:00-15:00 UTC (NY AM), 18:00-19:00 UTC (NY PM)
-                if (hour == 10) || (hour == 14) || (hour == 18) {
-                    silver_bullet[i] = 1.0;
+            // Asian Range Position (where is price relative to the Asian range?)
+            if asian_range_set && asian_high > asian_low {
+                let ar = asian_high - asian_low;
+                asian_range[i] = (close - asian_low) / ar; // 0=at low, 1=at high, <0 or >1 = outside
+            }
+
+            // Reset Asian range at midnight UTC
+            if hour == 0 && minute == 0 {
+                asian_high = f64::NEG_INFINITY;
+                asian_low = f64::INFINITY;
+                asian_range_set = false;
+            }
+
+            // NWOG/NDOG: New Day/Week Opening Gaps
+            let day_key = dt.ordinal() as i64 + dt.year() as i64 * 400;
+            let week_key = dt.iso_week().week() as i64 + dt.year() as i64 * 60;
+
+            if day_key != last_day {
+                if prev_day_close.is_finite() {
+                    // Gap between previous day close and current open
+                    let gap = open - prev_day_close;
+                    ndog[i] = gap / running_atr.max(1e-10);
                 }
+                prev_day_close = if i > 0 { ohlcv.close[i - 1] } else { close };
+                last_day = day_key;
+            }
 
-                // Asian Range: 00:00-08:00 UTC (track high/low for the session)
-                if hour < 8 {
-                    if high > asian_high {
-                        asian_high = high;
-                    }
-                    if low < asian_low {
-                        asian_low = low;
-                    }
-                    asian_range_set = true;
-                } else if hour == 8 && minute == 0 {
-                    // Reset at end of Asian session
-                    asian_range_set = true;
+            if week_key != last_week {
+                if prev_week_close.is_finite() {
+                    let gap = open - prev_week_close;
+                    nwog[i] = gap / running_atr.max(1e-10);
                 }
+                prev_week_close = if i > 0 { ohlcv.close[i - 1] } else { close };
+                last_week = week_key;
+            }
 
-                // Asian Range Position (where is price relative to the Asian range?)
-                if asian_range_set && asian_high > asian_low {
-                    let ar = asian_high - asian_low;
-                    asian_range[i] = (close - asian_low) / ar; // 0=at low, 1=at high, <0 or >1 = outside
-                }
-
-                // Reset Asian range at midnight UTC
-                if hour == 0 && minute == 0 {
-                    asian_high = f64::NEG_INFINITY;
-                    asian_low = f64::INFINITY;
-                    asian_range_set = false;
-                }
-
-                // NWOG/NDOG: New Day/Week Opening Gaps
-                let day_key = dt.ordinal() as i64 + dt.year() as i64 * 400;
-                let week_key = dt.iso_week().week() as i64 + dt.year() as i64 * 60;
-
-                if day_key != last_day {
-                    if prev_day_close.is_finite() {
-                        // Gap between previous day close and current open
-                        let gap = open - prev_day_close;
-                        ndog[i] = gap / running_atr.max(1e-10);
-                    }
-                    prev_day_close = if i > 0 { ohlcv.close[i - 1] } else { close };
-                    last_day = day_key;
-                }
-
-                if week_key != last_week {
-                    if prev_week_close.is_finite() {
-                        let gap = open - prev_week_close;
-                        nwog[i] = gap / running_atr.max(1e-10);
-                    }
-                    prev_week_close = if i > 0 { ohlcv.close[i - 1] } else { close };
-                    last_week = week_key;
-                }
-
-                // Judas Swing: Fake move in first 30 minutes of London/NY session
-                if (hour == 7 || hour == 13) && minute < 30 && i >= 1 {
-                    let prev_c = ohlcv.close[i - 1];
-                    // If price moves strongly one way then reverses
-                    if (high - prev_c).abs() > running_atr * 0.5 && close < prev_c {
-                        judas_swing[i] = -1.0; // Bearish Judas (faked up)
-                    } else if (prev_c - low).abs() > running_atr * 0.5 && close > prev_c {
-                        judas_swing[i] = 1.0; // Bullish Judas (faked down)
-                    }
+            // Judas Swing: Fake move in first 30 minutes of London/NY session
+            if (hour == 7 || hour == 13) && minute < 30 && i >= 1 {
+                let prev_c = ohlcv.close[i - 1];
+                // If price moves strongly one way then reverses
+                if (high - prev_c).abs() > running_atr * 0.5 && close < prev_c {
+                    judas_swing[i] = -1.0; // Bearish Judas (faked up)
+                } else if (prev_c - low).abs() > running_atr * 0.5 && close > prev_c {
+                    judas_swing[i] = 1.0; // Bullish Judas (faked down)
                 }
             }
         }
@@ -393,19 +393,21 @@ pub fn compute_smc_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
         // Displacement past opposite swing high/low AFTER a sweep
         if displacement[i] == 1.0 && latest_bull_sweep_idx > 0 && i - latest_bull_sweep_idx <= 15 {
             // Swept lows, now displaced up past a recent swing high?
-            if let Some(&recent_sh) = swing_highs.last() {
-                if close > recent_sh && ohlcv.close[i - 1] <= recent_sh {
-                    mss[i] = 1.0; // Bullish CHOCH
-                }
+            if let Some(&recent_sh) = swing_highs.last()
+                && close > recent_sh
+                && ohlcv.close[i - 1] <= recent_sh
+            {
+                mss[i] = 1.0; // Bullish CHOCH
             }
         }
         if displacement[i] == -1.0 && latest_bear_sweep_idx > 0 && i - latest_bear_sweep_idx <= 15 {
             // Swept highs, now displaced down past a recent swing low?
-            if let Some(&recent_sl) = swing_lows.last() {
-                if close < recent_sl && ohlcv.close[i - 1] >= recent_sl {
-                    mss[i] = -1.0; // Bearish CHOCH
-                } // Bearish CHOCH
-            }
+            if let Some(&recent_sl) = swing_lows.last()
+                && close < recent_sl
+                && ohlcv.close[i - 1] >= recent_sl
+            {
+                mss[i] = -1.0; // Bearish CHOCH
+            } // Bearish CHOCH
         }
 
         // Order Block / Mitigation / Breaker Block Validation

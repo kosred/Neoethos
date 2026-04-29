@@ -111,10 +111,10 @@ fn get_setting_attr<'py>(
     obj: &Bound<'py, PyAny>,
     key: &str,
 ) -> PyResult<Option<Bound<'py, PyAny>>> {
-    if let Ok(dict) = obj.cast::<PyDict>() {
-        if let Some(value) = dict.get_item(key)? {
-            return Ok(Some(value));
-        }
+    if let Ok(dict) = obj.cast::<PyDict>()
+        && let Some(value) = dict.get_item(key)?
+    {
+        return Ok(Some(value));
     }
     match obj.getattr(key) {
         Ok(value) => Ok(Some(value)),
