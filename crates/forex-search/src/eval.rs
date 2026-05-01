@@ -55,10 +55,16 @@ fn mean_std(values: &[f64]) -> (f64, f64) {
     if values.len() < 2 {
         return (0.0, 0.0);
     }
-    let n = values.len() as f64;
-    let sum: f64 = values.iter().sum();
+    // Drop non-finite samples so a single corrupt bar (NaN feature, infinity in
+    // a degenerate fit) cannot poison the entire population's Sharpe/consistency.
+    let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite.len() < 2 {
+        return (0.0, 0.0);
+    }
+    let n = finite.len() as f64;
+    let sum: f64 = finite.iter().sum();
     let mean = sum / n;
-    let var = values
+    let var = finite
         .iter()
         .map(|&v| {
             let d = v - mean;
@@ -66,7 +72,11 @@ fn mean_std(values: &[f64]) -> (f64, f64) {
         })
         .sum::<f64>()
         / (n - 1.0);
-    (mean, var.sqrt())
+    let std = var.max(0.0).sqrt();
+    if !mean.is_finite() || !std.is_finite() {
+        return (0.0, 0.0);
+    }
+    (mean, std)
 }
 
 #[derive(Debug, Clone)]
@@ -399,8 +409,10 @@ pub fn fast_evaluate_strategy_core(
     };
     let pf = if gross_loss > 0.0 {
         gross_profit / gross_loss
+    } else if gross_profit > 0.0 {
+        10.0
     } else {
-        if gross_profit > 0.0 { 10.0 } else { 0.0 }
+        0.0
     };
     let expectancy = if trade_count > 0 {
         net_profit / trade_count as f64
@@ -429,18 +441,21 @@ pub fn fast_evaluate_strategy_core(
         0.0
     };
 
+    // Final NaN/inf scrub. A single non-finite slot would poison sorting in
+    // the GA (any comparison with NaN returns Equal via partial_cmp fallback).
+    let sanitize = |v: f64| if v.is_finite() { v } else { 0.0 };
     [
-        net_profit,
-        sharpe,
-        peak_equity,
-        max_dd,
-        win_rate,
-        pf,
-        expectancy,
+        sanitize(net_profit),
+        sanitize(sharpe),
+        sanitize(peak_equity),
+        sanitize(max_dd),
+        sanitize(win_rate),
+        sanitize(pf),
+        sanitize(expectancy),
         0.0,
         trade_count as f64,
-        consistency,
-        max_daily_dd,
+        sanitize(consistency),
+        sanitize(max_daily_dd),
     ]
 }
 

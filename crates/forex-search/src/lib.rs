@@ -18,7 +18,8 @@ pub mod discovery_gpu {
     use forex_core::{AcceleratorBackend, TrainingPrecision};
     use forex_data::{FeatureCache, FeatureFrame, Ohlcv, SymbolDataset, compute_hpc_features};
     use ndarray::Array2;
-    use rand::Rng;
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+    use rayon::prelude::*;
     use serde::Serialize;
     use std::cmp::Ordering;
     use std::collections::HashMap;
@@ -53,6 +54,10 @@ pub mod discovery_gpu {
         pub devices: Vec<i64>,
         pub backend: AcceleratorBackend,
         pub precision: TrainingPrecision,
+        /// Optional deterministic seed. When `Some`, both CPU and GPU paths use the same
+        /// RNG sequence for genome init, segment selection, and offspring noise — required
+        /// for CPU/GPU parity. When `None`, the search is non-deterministic.
+        pub seed: Option<u64>,
     }
 
     impl Default for GpuDiscoveryConfig {
@@ -85,8 +90,17 @@ pub mod discovery_gpu {
                 devices: Vec::new(),
                 backend: AcceleratorBackend::Cuda,
                 precision: TrainingPrecision::Fp32,
+                seed: None,
             }
         }
+    }
+
+    fn make_rng(config: &GpuDiscoveryConfig, salt: u64) -> StdRng {
+        let seed = match config.seed {
+            Some(s) => s.wrapping_add(salt),
+            None => rand::rng().random::<u64>(),
+        };
+        StdRng::seed_from_u64(seed)
     }
 
     #[derive(Debug, Clone)]
@@ -236,16 +250,22 @@ pub mod discovery_gpu {
         out
     }
 
-    fn build_segments(n_samples: usize, window: usize, segments: usize) -> Vec<(usize, usize)> {
+    fn build_segments(
+        n_samples: usize,
+        window: usize,
+        segments: usize,
+        rng: &mut impl Rng,
+    ) -> Vec<(usize, usize)> {
         if n_samples <= window + 2 {
             return vec![(0, n_samples)];
         }
-        let mut rng = rand::rng();
         let mut out = Vec::new();
-        let start_recent = n_samples.saturating_sub(window + 1);
+        // Most-recent segment ends at the LAST bar (inclusive). Previous code produced a
+        // start that left an extra bar on the right tail (off-by-one) — fixed here.
+        let start_recent = n_samples.saturating_sub(window);
         out.push((start_recent, window));
         for _ in 0..segments.saturating_sub(1) {
-            let start = rng.random_range(0..(n_samples - window - 1));
+            let start = rng.random_range(0..(n_samples - window));
             out.push((start, window));
         }
         out
@@ -322,13 +342,13 @@ pub mod discovery_gpu {
         config: &GpuDiscoveryConfig,
         months: &[i64],
         days: &[i64],
+        segments: &[(usize, usize)],
     ) -> f32 {
         if frames.is_empty() || frames[0].data.nrows() == 0 {
             return f32::NEG_INFINITY;
         }
 
         let n_samples = frames[0].data.nrows().min(ohlcv.close.len());
-        let segments = build_segments(n_samples, config.window_bars, config.segments);
         let mut fitness_sum = 0.0_f32;
         let mut min_fitness = f32::INFINITY;
         let mut pos_windows = 0.0_f32;
@@ -336,7 +356,7 @@ pub mod discovery_gpu {
         let market_profile =
             infer_market_cost_profile("", "", ohlcv.close.last().copied(), None, None);
 
-        for &(start, len) in &segments {
+        for &(start, len) in segments {
             let end = (start + len).min(n_samples);
             if end <= start + 1 {
                 continue;
@@ -392,9 +412,15 @@ pub mod discovery_gpu {
         let avg_fit = fitness_sum / (segments.len().max(1) as f32);
         let min_pos = (segments.len() as f32 * config.pos_window_fraction as f32).ceil();
         let pos_penalty = (min_pos - pos_windows).max(0.0) * config.pos_penalty as f32;
-        avg_fit + min_fitness * config.robust_weight as f32 - pos_penalty
+        let final_fit = avg_fit + min_fitness * config.robust_weight as f32 - pos_penalty;
+        if final_fit.is_finite() {
+            final_fit
+        } else {
+            f32::NEG_INFINITY
+        }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn refine_genome_cpu(
         genome: &[f32],
         frames: &[FeatureFrame],
@@ -402,10 +428,13 @@ pub mod discovery_gpu {
         config: &GpuDiscoveryConfig,
         months: &[i64],
         days: &[i64],
+        segments: &[(usize, usize)],
+        seed_salt: u64,
     ) -> (Vec<f32>, f32) {
-        let mut rng = rand::rng();
+        let mut rng = make_rng(config, seed_salt);
         let mut best_genome = genome.to_vec();
-        let mut best_score = evaluate_genome_cpu(&best_genome, frames, ohlcv, config, months, days);
+        let mut best_score =
+            evaluate_genome_cpu(&best_genome, frames, ohlcv, config, months, days, segments);
         let mutation_scale = config.sigma.max(0.05) as f32 * 0.5;
 
         for _ in 0..24 {
@@ -414,7 +443,8 @@ pub mod discovery_gpu {
                 let delta = rng.random_range(-mutation_scale..mutation_scale);
                 *value = (*value + delta).clamp(-1.0, 1.0);
             }
-            let score = evaluate_genome_cpu(&candidate, frames, ohlcv, config, months, days);
+            let score =
+                evaluate_genome_cpu(&candidate, frames, ohlcv, config, months, days, segments);
             if score.is_finite() && (score > best_score || !best_score.is_finite()) {
                 best_genome = candidate;
                 best_score = score;
@@ -422,6 +452,43 @@ pub mod discovery_gpu {
         }
 
         (best_genome, best_score)
+    }
+
+    /// Causal preprocessing: shift each feature down by 1 row (so that row[i] holds
+    /// the value computed at bar i-1) and apply a causal z-score using only past
+    /// rows [0..=i]. Mirrors the GPU path in `discovery_gpu.rs::build_data_cube`.
+    fn shift_and_zscore_frame(data: &Array2<f32>) -> Array2<f32> {
+        let n_rows = data.nrows();
+        let n_cols = data.ncols();
+        let mut out = Array2::<f32>::zeros((n_rows, n_cols));
+        if n_rows == 0 || n_cols == 0 {
+            return out;
+        }
+        // Causal moments per column: at row i, mean/std are computed from rows
+        // [0..i] of the SHIFTED series, i.e. original rows [0..i-1].
+        for c in 0..n_cols {
+            let mut sum = 0.0_f64;
+            let mut sumsq = 0.0_f64;
+            let mut count = 0_usize;
+            for i in 0..n_rows {
+                if i == 0 {
+                    out[(i, c)] = 0.0;
+                    continue;
+                }
+                let v = data[(i - 1, c)] as f64;
+                sum += v;
+                sumsq += v * v;
+                count += 1;
+                let mean = sum / count as f64;
+                let var = (sumsq / count as f64) - (mean * mean);
+                let std = var.max(0.0).sqrt().max(1e-6);
+                out[(i, c)] = ((v - mean) / std) as f32;
+                if !out[(i, c)].is_finite() {
+                    out[(i, c)] = 0.0;
+                }
+            }
+        }
+        out
     }
 
     pub fn build_feature_cube(
@@ -501,8 +568,23 @@ pub mod discovery_gpu {
         }
         let (runtime_backend, degraded_reason) = resolve_cpu_fallback_runtime(config);
 
+        // Apply causal shift+zscore once so the CPU fallback consumes the same
+        // preprocessed feature space as the GPU path. This eliminates a 1-bar
+        // look-ahead the CPU path used to have (it read the current bar's raw
+        // features, GPU read the prior bar's z-scored features).
+        let preproc_frames: Vec<FeatureFrame> = frames
+            .iter()
+            .map(|f| FeatureFrame {
+                timestamps: f.timestamps.clone(),
+                names: f.names.clone(),
+                data: shift_and_zscore_frame(&f.data),
+            })
+            .collect();
+        let frames: &[FeatureFrame] = &preproc_frames;
+
         let dim = tf_count + n_features + 2;
-        let mut rng = rand::rng();
+        // Genome init RNG (deterministic if config.seed is set).
+        let mut rng = make_rng(config, 0xA5A5_A5A5);
         let population = config.population.max(8);
         let generations = config.generations.max(1);
         let mut genomes: Vec<Vec<f32>> = (0..population)
@@ -513,13 +595,24 @@ pub mod discovery_gpu {
             _ => (vec![0_i64; n_samples], vec![0_i64; n_samples]),
         };
 
+        // Build segments ONCE with a seeded RNG so every genome is evaluated
+        // on the same windows (parity with GPU + reproducibility).
+        let usable_samples = n_samples.min(ohlcv.close.len());
+        let mut seg_rng = make_rng(config, 0x5A5A_5A5A);
+        let segments =
+            build_segments(usable_samples, config.window_bars, config.segments, &mut seg_rng);
+
         let mut best_genomes = Vec::new();
         let mut best_scores = Vec::new();
 
         for generation in 0..generations {
+            // Parallel fitness evaluation across the population — eliminates the
+            // single-threaded bottleneck that made full-search wall-time blow up.
             let fitness: Vec<f32> = genomes
-                .iter()
-                .map(|genome| evaluate_genome_cpu(genome, frames, ohlcv, config, &months, &days))
+                .par_iter()
+                .map(|genome| {
+                    evaluate_genome_cpu(genome, frames, ohlcv, config, &months, &days, &segments)
+                })
                 .collect();
 
             let mut scored: Vec<(f32, Vec<f32>)> = genomes
@@ -639,9 +732,20 @@ pub mod discovery_gpu {
         let mut refined: Vec<(Vec<f32>, f32)> = best_genomes
             .into_iter()
             .zip(best_scores)
-            .map(|(genome, score)| {
-                let (refined_genome, refined_score) =
-                    refine_genome_cpu(&genome, frames, ohlcv, config, &months, &days);
+            .enumerate()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|(i, (genome, score))| {
+                let (refined_genome, refined_score) = refine_genome_cpu(
+                    &genome,
+                    frames,
+                    ohlcv,
+                    config,
+                    &months,
+                    &days,
+                    &segments,
+                    0xC0FF_EE00 ^ (i as u64),
+                );
                 if refined_score > score {
                     (refined_genome, refined_score)
                 } else {

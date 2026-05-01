@@ -142,7 +142,8 @@ pub fn search_evolve_ohlcv(
     pos_window_fraction=0.5,
     pos_penalty=15.0,
     chunk_size=2048,
-    devices=None
+    devices=None,
+    seed=None
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn search_evolve_gpu_ohlcv(
@@ -179,6 +180,7 @@ pub fn search_evolve_gpu_ohlcv(
     pos_penalty: f64,
     chunk_size: usize,
     devices: Option<Vec<i64>>,
+    seed: Option<u64>,
 ) -> PyResult<Py<PyAny>> {
     let ohlcv = build_ohlcv(
         &open,
@@ -219,6 +221,7 @@ pub fn search_evolve_gpu_ohlcv(
         devices: devices.unwrap_or(defaults.devices),
         backend: defaults.backend,
         precision: defaults.precision,
+        seed,
     };
 
     let result = py

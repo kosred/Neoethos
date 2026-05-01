@@ -1,7 +1,9 @@
 use anyhow::{Result, bail};
 use forex_core::{AcceleratorBackend, TrainingPrecision};
-use forex_data::{FeatureCache, FeatureFrame, Ohlcv, SymbolDataset, compute_hpc_feature_frame};
-use rand::Rng;
+use forex_data::{
+    FeatureCache, FeatureFrame, FeatureProfile, Ohlcv, SymbolDataset, compute_hpc_feature_frame,
+};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, Normal};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -42,6 +44,10 @@ pub struct GpuDiscoveryConfig {
     pub devices: Vec<i64>,
     pub backend: AcceleratorBackend,
     pub precision: TrainingPrecision,
+    /// Optional deterministic seed. When `Some`, the GA + segment selection use a
+    /// reproducible RNG sequence so a given (config, dataset) pair yields the same
+    /// genomes/segments across runs and across CPU/GPU paths.
+    pub seed: Option<u64>,
 }
 
 impl Default for GpuDiscoveryConfig {
@@ -74,8 +80,17 @@ impl Default for GpuDiscoveryConfig {
             devices: Vec::new(),
             backend: AcceleratorBackend::Cuda,
             precision: TrainingPrecision::Fp32,
+            seed: None,
         }
     }
+}
+
+fn make_rng(config: &GpuDiscoveryConfig, salt: u64) -> StdRng {
+    let seed = match config.seed {
+        Some(s) => s.wrapping_add(salt),
+        None => rand::rng().random::<u64>(),
+    };
+    StdRng::seed_from_u64(seed)
 }
 
 #[derive(Debug, Clone)]
@@ -200,12 +215,12 @@ pub fn build_feature_cube(
         if let Some(frame) = cache.load(&base_key)? {
             frame
         } else {
-            let frame = compute_hpc_feature_frame(base_ohlcv, true)?;
+            let frame = compute_hpc_feature_frame(base_ohlcv, FeatureProfile::Standard)?;
             cache.store(&base_key, &frame)?;
             frame
         }
     } else {
-        compute_hpc_feature_frame(base_ohlcv, true)?
+        compute_hpc_feature_frame(base_ohlcv, FeatureProfile::Standard)?
     };
 
     let base_ts = base_frame.timestamps.clone();
@@ -244,12 +259,12 @@ pub fn build_feature_cube(
             if let Some(frame) = cache.load(&key)? {
                 frame
             } else {
-                let frame = compute_hpc_feature_frame(htf, true)?;
+                let frame = compute_hpc_feature_frame(htf, FeatureProfile::Standard)?;
                 cache.store(&key, &frame)?;
                 frame
             }
         } else {
-            compute_hpc_feature_frame(htf, true)?
+            compute_hpc_feature_frame(htf, FeatureProfile::Standard)?
         };
 
         let aligned = align_features(&base_ts, &htf_frame.timestamps, &htf_frame.data);
@@ -287,19 +302,38 @@ pub fn run_gpu_discovery(
     let used_gpu = !device_ids.is_empty();
 
     let dim = tf_count + n_features + 2;
-    let mut rng = rand::rng();
+    // Seedable RNG so genome init / mutation / segment selection are reproducible
+    // when `config.seed` is set. This is required for CPU/GPU parity checks.
+    let mut rng = make_rng(config, 0xA5A5_A5A5);
     let normal = Normal::new(0.0, 1.0).unwrap();
 
     let mut genomes: Vec<Vec<f32>> = (0..config.population)
         .map(|_| random_genome(dim, &mut rng))
         .collect();
 
+    // Build segments once with a deterministic RNG so every chunk/device sees
+    // the SAME windows for the SAME genomes. Previously each call to
+    // `build_segments` made its own unseeded RNG → results changed per call.
+    let mut seg_rng = make_rng(config, 0x5A5A_5A5A);
+    let segments = build_segments(
+        n_samples,
+        config.window_bars,
+        config.segments,
+        &mut seg_rng,
+    );
+
     let mut best_genomes = Vec::new();
     let mut best_scores = Vec::new();
 
     for generation in 0..config.generations {
-        let fitness =
-            evaluate_population_multi_gpu(&data_cube, &ohlc_cube, &genomes, config, &device_ids)?;
+        let fitness = evaluate_population_multi_gpu(
+            &data_cube,
+            &ohlc_cube,
+            &genomes,
+            config,
+            &device_ids,
+            &segments,
+        )?;
 
         let mut scored: Vec<(f32, usize, Vec<f32>)> = genomes
             .into_iter()
@@ -520,6 +554,7 @@ fn evaluate_population_multi_gpu(
     genomes: &[Vec<f32>],
     config: &GpuDiscoveryConfig,
     device_ids: &[i64],
+    segments: &[(usize, usize)],
 ) -> Result<Vec<f32>> {
     let mut results = vec![0.0_f32; genomes.len()];
 
@@ -534,8 +569,14 @@ fn evaluate_population_multi_gpu(
             }
             let chunk_tensor = Tensor::from_slice(&chunk_buf)
                 .reshape(&[chunk.len() as i64, chunk[0].len() as i64]);
-            let fitness =
-                evaluate_population_gpu(data_cube, ohlc_cube, &chunk_tensor, config, Device::Cpu)?;
+            let fitness = evaluate_population_gpu(
+                data_cube,
+                ohlc_cube,
+                &chunk_tensor,
+                config,
+                Device::Cpu,
+                segments,
+            )?;
             for (idx, value) in Vec::<f32>::from(&fitness).into_iter().enumerate() {
                 results[offset + idx] = value;
             }
@@ -568,7 +609,8 @@ fn evaluate_population_multi_gpu(
         let split = split_tensor(&chunk_tensor, device_ids.len());
         for (i, part) in split.into_iter().enumerate() {
             let (device, data_dev, ohlc_dev) = &per_device_cubes[i];
-            let fit = evaluate_population_gpu(data_dev, ohlc_dev, &part, config, *device)?;
+            let fit =
+                evaluate_population_gpu(data_dev, ohlc_dev, &part, config, *device, segments)?;
             per_device.push(fit);
         }
 
@@ -615,9 +657,10 @@ fn evaluate_population_gpu(
     genomes: &Tensor,
     config: &GpuDiscoveryConfig,
     device: Device,
+    segments: &[(usize, usize)],
 ) -> Result<Tensor> {
     let tf_count = data_cube.size()[0];
-    let n_samples = data_cube.size()[1];
+    let _n_samples = data_cube.size()[1];
     let n_features = data_cube.size()[2];
     let pop = genomes.size()[0];
 
@@ -644,13 +687,18 @@ fn evaluate_population_gpu(
     let sell_th =
         thresholds.select(1, 0).minimum(&thresholds.select(1, 1)) - config.threshold_margin as f32;
 
-    let segments = build_segments(n_samples as usize, config.window_bars, config.segments);
+    // Segments are pre-built once with a deterministic RNG by the caller — every
+    // chunk and every device evaluates the SAME windows. This is required for
+    // CPU/GPU parity (same windows ⇒ comparable fitness).
+    let segments_owned: Vec<(usize, usize)> = segments.to_vec();
 
     let mut fitness_sum = Tensor::zeros([pop], (Kind::Float, device));
     let mut min_fitness = Tensor::full([pop], 1e9, (Kind::Float, device));
     let mut pos_windows = Tensor::zeros([pop], (Kind::Float, device));
 
-    for (start, len) in segments {
+    for (start, len) in &segments_owned {
+        let start = *start;
+        let len = *len;
         let data_slice = data.narrow(1, start as i64, len as i64);
         let ohlc_slice = ohlc.narrow(1, start as i64, len as i64);
         let mut all_signals = Tensor::zeros([pop, len as i64], (Kind::Float, device));
@@ -718,25 +766,30 @@ fn evaluate_population_gpu(
         pos_windows += pos.to_kind(Kind::Float);
     }
 
-    let avg_fit = fitness_sum / (segments.len() as f64);
-    let min_pos = (segments.len() as f64 * config.pos_window_fraction).ceil();
+    let avg_fit = fitness_sum / (segments_owned.len() as f64);
+    let min_pos = (segments_owned.len() as f64 * config.pos_window_fraction).ceil();
     let pos_penalty = (Tensor::from(min_pos as f32).to_device(device) - pos_windows).clamp_min(0.0)
         * config.pos_penalty as f32;
     let final_fit = avg_fit + min_fitness * config.robust_weight as f32 - pos_penalty;
     Ok(final_fit.to_device(Device::Cpu))
 }
 
-fn build_segments(n_samples: usize, window: usize, segments: usize) -> Vec<(usize, usize)> {
+fn build_segments(
+    n_samples: usize,
+    window: usize,
+    segments: usize,
+    rng: &mut impl Rng,
+) -> Vec<(usize, usize)> {
     if n_samples <= window + 2 {
         return vec![(0, n_samples)];
     }
-    let mut rng = rand::rng();
     let mut out = Vec::new();
-    let start_recent = n_samples.saturating_sub(window + 1);
+    // Most-recent window must end at the LAST bar (inclusive).
+    let start_recent = n_samples.saturating_sub(window);
     out.push((start_recent, window));
     let segs = segments.saturating_sub(1);
     for _ in 0..segs {
-        let start = rng.random_range(0..(n_samples - window - 1));
+        let start = rng.random_range(0..(n_samples - window));
         out.push((start, window));
     }
     out
