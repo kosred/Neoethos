@@ -711,18 +711,31 @@ where
         config.min_trades_per_day,
         features.data.nrows(),
     );
-    let mut filtered: Vec<(usize, Gene)> = Vec::new();
-    let mut signals_map = Vec::new();
-    for (candidate_idx, gene) in &ranked_candidates {
-        if !gene.passes_filter(&config.filtering) {
-            continue;
-        }
-        let sig = signals_for_gene(features, gene);
-        let trade_count = sig.iter().filter(|v| **v != 0).count() as f64;
-        if trade_count >= min_trades as f64 {
-            filtered.push((*candidate_idx, gene.clone()));
-            signals_map.push(sig);
-        }
+    // Generate signals for all qualifying candidates in parallel — each call
+    // accumulates weighted-feature columns over n_samples bars and the work
+    // grows with the candidate count, so this scales well across cores.
+    let prefiltered: Vec<(usize, Gene)> = ranked_candidates
+        .iter()
+        .filter(|(_, g)| g.passes_filter(&config.filtering))
+        .map(|(idx, g)| (*idx, g.clone()))
+        .collect();
+    let signals_with_idx: Vec<(usize, Gene, Vec<i8>)> = prefiltered
+        .into_par_iter()
+        .filter_map(|(candidate_idx, gene)| {
+            let sig = signals_for_gene(features, &gene);
+            let trade_count = sig.iter().filter(|v| **v != 0).count() as f64;
+            if trade_count >= min_trades as f64 {
+                Some((candidate_idx, gene, sig))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut filtered: Vec<(usize, Gene)> = Vec::with_capacity(signals_with_idx.len());
+    let mut signals_map: Vec<Vec<i8>> = Vec::with_capacity(signals_with_idx.len());
+    for (idx, gene, sig) in signals_with_idx {
+        filtered.push((idx, gene));
+        signals_map.push(sig);
     }
     progress_fn(DiscoveryProgress::CandidatesFiltered {
         passed_filters: filtered.len(),
@@ -736,85 +749,91 @@ where
     if Gene::requires_quality_screen(&config.filtering) {
         type QualityCandidate = (usize, Gene, Vec<i8>, StrategyMetrics, bool, Vec<Trade>);
         let analyzer = quality_analyzer_for_config(config);
-        let mut strict_passed: Vec<QualityCandidate> = Vec::new();
-        let mut opportunistic_passed = 0usize;
+        let initial_balance = std::env::var("FOREX_BOT_BACKTEST_INITIAL_EQUITY")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(100_000.0);
 
-        for ((candidate_idx, gene), sig) in filtered.into_iter().zip(signals_map) {
-            let trades = crate::eval::simulate_trades_core(
-                &ohlcv.close,
-                &ohlcv.high,
-                &ohlcv.low,
-                &features.timestamps,
-                &sig,
-                &discovery_backtest_settings(&gene),
-            );
-            let initial_balance = std::env::var("FOREX_BOT_BACKTEST_INITIAL_EQUITY")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .filter(|v| v.is_finite() && *v > 0.0)
-                .unwrap_or(100_000.0);
-            let metrics = analyzer.analyze_strategy(&gene.strategy_id, &trades, initial_balance);
-            let strict_quality = passes_strict_quality(&metrics, &config.filtering);
-            let opportunistic_quality =
-                !strict_quality && passes_opportunistic_quality(&metrics, &config.filtering);
+        // Outer-parallel quality screen: each candidate runs simulate_trades +
+        // 100 MC perturbations + spread sensitivity independently. Previously
+        // the outer loop was serial and only the 100-run MC was parallel,
+        // which under-utilised cores when the candidate set was large. Move
+        // parallelism to the outer level and keep the MC loop serial — this
+        // avoids rayon nested-parallel oversubscription and gives ~Ncores×
+        // throughput on the per-candidate work.
+        let pairs: Vec<((usize, Gene), Vec<i8>)> =
+            filtered.into_iter().zip(signals_map).collect();
+        let screened: Vec<Option<QualityCandidate>> = pairs
+            .into_par_iter()
+            .map(|((candidate_idx, gene), sig)| {
+                let trades = crate::eval::simulate_trades_core(
+                    &ohlcv.close,
+                    &ohlcv.high,
+                    &ohlcv.low,
+                    &features.timestamps,
+                    &sig,
+                    &discovery_backtest_settings(&gene),
+                );
+                let metrics =
+                    analyzer.analyze_strategy(&gene.strategy_id, &trades, initial_balance);
+                let strict_quality = passes_strict_quality(&metrics, &config.filtering);
+                let opportunistic_quality =
+                    !strict_quality && passes_opportunistic_quality(&metrics, &config.filtering);
 
-            if strict_quality || opportunistic_quality {
+                if !(strict_quality || opportunistic_quality) {
+                    return None;
+                }
+
                 // Regime-Aware Validation (Idea #3.2)
                 let regime_robust = validate_regime_robustness(&trades, features);
                 if !regime_robust {
-                    continue; // Skip strategy, it fails massively in a specific regime!
+                    return None;
                 }
 
-                // Monte Carlo Parameter Perturbation Test (100 runs)
-                let mc_runs = 100;
-                let profitable_runs: usize = (0..mc_runs)
-                    .into_par_iter()
-                    .map(|_| {
-                        use rand::Rng;
-                        let mut rng = rand::rng();
-                        let mut perturbed = gene.clone();
+                // Monte Carlo Parameter Perturbation Test (100 runs).
+                // Serial here because we are already inside a par_iter on
+                // candidates — nesting rayon would oversubscribe cores.
+                let mc_runs = 100usize;
+                let mut profitable_runs = 0usize;
+                let mut rng = rand::rng();
+                use rand::Rng;
+                for _ in 0..mc_runs {
+                    let mut perturbed = gene.clone();
+                    perturbed.long_threshold *= 1.0 + rng.random_range(-0.15..=0.15);
+                    perturbed.short_threshold *= 1.0 + rng.random_range(-0.15..=0.15);
+                    for w in &mut perturbed.weights {
+                        *w *= 1.0 + rng.random_range(-0.20..=0.20);
+                    }
+                    if perturbed.sl_pips.is_finite() && perturbed.sl_pips > 0.0 {
+                        perturbed.sl_pips *= 1.0 + rng.random_range(-0.25..=0.25);
+                    }
+                    if perturbed.tp_pips.is_finite() && perturbed.tp_pips > 0.0 {
+                        perturbed.tp_pips *= 1.0 + rng.random_range(-0.25..=0.25);
+                    }
+                    let p_sig = crate::genetic::signals_for_gene(features, &perturbed);
+                    let p_trades = crate::eval::simulate_trades_core(
+                        &ohlcv.close,
+                        &ohlcv.high,
+                        &ohlcv.low,
+                        &features.timestamps,
+                        &p_sig,
+                        &discovery_backtest_settings(&perturbed),
+                    );
+                    let pnl: f64 = p_trades.iter().map(|t| t.pnl).sum();
+                    if pnl > 0.0 {
+                        profitable_runs += 1;
+                    }
+                }
 
-                        // Thresholds ±15%
-                        perturbed.long_threshold *= 1.0 + rng.random_range(-0.15..=0.15);
-                        perturbed.short_threshold *= 1.0 + rng.random_range(-0.15..=0.15);
-
-                        // Weights ±20%
-                        for w in &mut perturbed.weights {
-                            *w *= 1.0 + rng.random_range(-0.20..=0.20);
-                        }
-
-                        // SL/TP ±25%
-                        if perturbed.sl_pips.is_finite() && perturbed.sl_pips > 0.0 {
-                            perturbed.sl_pips *= 1.0 + rng.random_range(-0.25..=0.25);
-                        }
-                        if perturbed.tp_pips.is_finite() && perturbed.tp_pips > 0.0 {
-                            perturbed.tp_pips *= 1.0 + rng.random_range(-0.25..=0.25);
-                        }
-
-                        let p_sig = crate::genetic::signals_for_gene(features, &perturbed);
-                        let p_trades = crate::eval::simulate_trades_core(
-                            &ohlcv.close,
-                            &ohlcv.high,
-                            &ohlcv.low,
-                            &features.timestamps,
-                            &p_sig,
-                            &discovery_backtest_settings(&perturbed),
-                        );
-                        let pnl: f64 = p_trades.iter().map(|t| t.pnl).sum();
-                        if pnl > 0.0 { 1 } else { 0 }
-                    })
-                    .sum();
-
-                // Require at least 70% of perturbed variations to be profitable
                 if profitable_runs < 70 {
-                    continue; // Strategy is too fragile
+                    return None;
                 }
 
                 // Spread/Slippage Sensitivity Test
                 let mut sensitive_settings = discovery_backtest_settings(&gene);
-                sensitive_settings.spread_pips = 2.0; // Test with 2.0 spread
-                sensitive_settings.commission_per_trade = 7.0; // Baseline commission
-
+                sensitive_settings.spread_pips = 2.0;
+                sensitive_settings.commission_per_trade = 7.0;
                 let sens_trades = crate::eval::simulate_trades_core(
                     &ohlcv.close,
                     &ohlcv.high,
@@ -825,22 +844,28 @@ where
                 );
                 let sens_pnl: f64 = sens_trades.iter().map(|t| t.pnl).sum();
                 if sens_pnl < 0.0 {
-                    continue; // Strategy becomes unprofitable at 2.0 spread
+                    return None;
                 }
 
-                if opportunistic_quality {
-                    opportunistic_passed += 1;
-                }
-                quality_metrics.push(metrics.clone());
-                strict_passed.push((
+                Some((
                     candidate_idx,
                     gene,
                     sig,
                     metrics,
                     opportunistic_quality,
                     trades,
-                ));
+                ))
+            })
+            .collect();
+
+        let mut strict_passed: Vec<QualityCandidate> = Vec::new();
+        let mut opportunistic_passed = 0usize;
+        for entry in screened.into_iter().flatten() {
+            if entry.4 {
+                opportunistic_passed += 1;
             }
+            quality_metrics.push(entry.3.clone());
+            strict_passed.push(entry);
         }
 
         strict_passed.sort_by(|a, b| {

@@ -573,33 +573,40 @@ where
             .collect();
 
         // --- Novelty Search: Behavioral Diversity ---
-        // Perf #2: pre-compute all HashSets once to avoid O(n²) allocations
+        // Pre-compute all HashSets once and run the O(n²) Jaccard pass in
+        // parallel — turns a single-threaded bottleneck into Ncores× faster.
         if novelty_weight > 0.0 && scored.len() > 1 {
+            use rayon::prelude::*;
             let n_pop = scored.len();
-            // Pre-compute index sets for all genes (one allocation pass)
             let index_sets: Vec<HashSet<usize>> = scored
                 .iter()
                 .map(|(_, _, g, _)| g.indices.iter().copied().collect())
                 .collect();
-            let mut novelty_scores = vec![0.0; n_pop];
-            for i in 0..n_pop {
-                let sig_i = &index_sets[i];
-                let mut dist_sum = 0.0;
-                for (j, sig_j) in index_sets.iter().enumerate().take(n_pop) {
-                    if i == j {
-                        continue;
+
+            // Parallel: each row i computes its mean Jaccard distance to the
+            // remaining population. Each pair is touched twice (i→j and j→i),
+            // matching the previous semantics exactly while running in parallel.
+            let novelty_scores: Vec<f64> = (0..n_pop)
+                .into_par_iter()
+                .map(|i| {
+                    let sig_i = &index_sets[i];
+                    let mut dist_sum = 0.0;
+                    for (j, sig_j) in index_sets.iter().enumerate() {
+                        if i == j {
+                            continue;
+                        }
+                        let intersection = sig_i.intersection(sig_j).count() as f64;
+                        let union = sig_i.union(sig_j).count() as f64;
+                        let jaccard_dist = if union > 0.0 {
+                            1.0 - (intersection / union)
+                        } else {
+                            0.0
+                        };
+                        dist_sum += jaccard_dist;
                     }
-                    let intersection = sig_i.intersection(sig_j).count() as f64;
-                    let union = sig_i.union(sig_j).count() as f64;
-                    let jaccard_dist = if union > 0.0 {
-                        1.0 - (intersection / union)
-                    } else {
-                        0.0
-                    };
-                    dist_sum += jaccard_dist;
-                }
-                novelty_scores[i] = dist_sum / (n_pop as f64 - 1.0);
-            }
+                    dist_sum / (n_pop as f64 - 1.0)
+                })
+                .collect();
 
             // Normalize and blend
             let min_fit = scored
