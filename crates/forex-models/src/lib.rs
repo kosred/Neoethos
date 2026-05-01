@@ -23,10 +23,6 @@ pub use training_orchestrator::{TrainingOrchestrator, TrainingRunSummary};
 // Hardware detection (derived from models/device.py)
 pub mod hardware;
 
-// ONNX export for ultra-fast inference
-#[cfg(feature = "onnx-export-bridge")]
-pub mod onnx_exporter;
-
 // Evaluation helpers (simple backtest, signal conversion)
 pub mod evaluation_helpers;
 

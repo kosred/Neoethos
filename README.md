@@ -10,13 +10,17 @@ The project has been fully migrated from a hybrid Python/Rust structure to a **P
 - **`forex-data`**: High-speed OHLCV data engine with zero lookahead bias.
 - **`forex-models`**: Native Rust machine learning models (XGBoost, Neural Networks via Burn, etc.).
 - **`forex-search`**: Genetic algorithms and strategy discovery.
-- **`mt5-bridge`**: Embedded MetaTrader 5 bridge that calls official APIs directly from Rust memory.
+- **`forex-news`**: Async news aggregation and sentiment analysis.
+- **`forex-cli`**: Command-line front-end for batch jobs and operator tasks.
+
+Brokers are integrated entirely through native Rust transports (cTrader Open
+API over OAuth/WebSocket and FIX gateways). No embedded Python runtime is
+required at runtime — the project is 100% pure Rust on the hot path.
 
 ## 🚀 Getting Started
 
 ### Prerequisites
 - [Rust](https://rustup.rs/) (1.80+)
-- [MetaTrader 5 Terminal](https://www.metatrader5.com/) installed on your machine.
 
 ### Build the Executable
 ```bash

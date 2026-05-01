@@ -3191,25 +3191,19 @@ fn write_onnx_status_sidecar(
         );
     }
 
-    let exporter = if cfg!(feature = "onnx-export-bridge") {
-        "onnx-export-bridge"
-    } else {
-        "none"
-    };
-    let reason = if cfg!(feature = "onnx-export-bridge") {
-        "trained runtime artifact saved; ONNX export was requested but not attempted because the current Rust training path does not wire the exporter yet"
-    } else {
-        "trained runtime artifact saved; ONNX export was requested but the optional export bridge feature is not enabled for this build"
-    };
+    // ONNX export through PyO3/Python has been removed in favour of pure-Rust
+    // inference via the `ort` crate; no in-process Python runtime is wired any
+    // more. Record a placeholder status so downstream tooling that reads the
+    // export manifest still sees a deterministic entry.
     let status = OnnxExportStatus::skipped(
         config.name.clone(),
         config.capability_family,
         config.capability_state,
-        exporter,
+        "none",
         artifact_dir.to_path_buf(),
         payload.frame.width(),
         payload.frame.height().min(512),
-        reason,
+        "trained runtime artifact saved; ONNX export not attempted (Python export bridge has been removed in the pure-Rust runtime)",
     );
     write_onnx_export_status(&artifact_dir.join(ONNX_EXPORT_STATUS_FILE_NAME), &status)
 }

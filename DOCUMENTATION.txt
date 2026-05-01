@@ -15,7 +15,6 @@ bottlenecks and ensure sub-millisecond execution safety.
 - forex-models: Pure Rust Machine Learning (XGBoost, Neural Nets via Burn).
 - forex-search: Genetic algorithms for strategy discovery & SMC tracking.
 - forex-news: Async news aggregator (Perplexity) & sentiment analyzer (OpenAI).
-- mt5-bridge: Embedded Python runtime calling native MetaTrader 5 APIs.
 
 3. OPERATION MODES
 ------------------
@@ -40,11 +39,11 @@ Mathematically rigid constraints are compiled into the Rust binary:
 - Security: Logic is isolated from the trading terminal to prevent GIL lag 
   during high-volatility events.
 
-6. METATRADER 5 BRIDGE
-----------------------
-Maintains 100% compatibility with official MT5 APIs by embedding an isolated 
-Python runtime inside the Rust process. All order execution and account 
-polling are handled via memory pointers, bypassing typical API latency.
+6. BROKER INTEGRATION
+---------------------
+The runtime talks to brokers entirely through native Rust transports (cTrader
+Open API over OAuth/WebSocket and FIX gateways) — no embedded Python runtime
+or MetaTrader 5 Python package is required at runtime any more.
 
 =========================================
 STATUS: STABLE | VERSION: 2.0 (PURE RUST)
