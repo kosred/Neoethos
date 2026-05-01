@@ -147,6 +147,25 @@ pub mod discovery_gpu {
                 config.precision.as_str()
             )
         });
+        // Loud warning when CUDA was requested but the binary was built without
+        // the `gpu` feature — this is the path that turns a 1-day GPU run into
+        // a 1500-year CPU run. Honour FOREX_BOT_REQUIRE_GPU for fail-fast.
+        if matches!(config.backend, AcceleratorBackend::Cuda) {
+            tracing::error!(
+                target: "forex_search::gpu",
+                "CUDA backend requested but this binary was built WITHOUT the `gpu` feature; \
+                 the strategy search will run on CPU only. Rebuild with `--features gpu`."
+            );
+            if std::env::var("FOREX_BOT_REQUIRE_GPU")
+                .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+                .unwrap_or(false)
+            {
+                panic!(
+                    "FOREX_BOT_REQUIRE_GPU is set but the binary lacks the `gpu` feature. \
+                     Rebuild with --features gpu or unset FOREX_BOT_REQUIRE_GPU."
+                );
+            }
+        }
         (
             "search_cpu_fp32".to_string(),
             append_degraded_reason(backend_reason, precision_reason),
@@ -546,6 +565,18 @@ pub mod discovery_gpu {
         Ok((frames, base_names, base_ohlcv.clone()))
     }
 
+    /// Tensor-style strategy search (CPU fallback variant).
+    ///
+    /// **Design note — fitness parity:** this entry point uses a *returns-based*
+    /// fitness on continuous-action signals (cumulative `action * forward_return`
+    /// minus a flat 0.0002 cost). It is NOT equivalent to the CPU GA driven by
+    /// [`crate::evolve_search`], which runs the full SL/TP / spread / commission
+    /// trade simulation in [`crate::eval::fast_evaluate_strategy_core`]. If you
+    /// need a GPU search that ranks strategies the same way as the CPU GA,
+    /// use `evolve_search` with the `gpu` feature enabled — that path goes
+    /// through `cubecl_eval` and preserves the SL/TP backtest semantics. The
+    /// two are exposed as separate Python bindings on purpose, but they are
+    /// not interchangeable for portfolio-quality comparisons.
     pub fn run_gpu_discovery(
         frames: &[FeatureFrame],
         ohlcv: &Ohlcv,

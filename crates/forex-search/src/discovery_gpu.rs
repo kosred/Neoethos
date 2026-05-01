@@ -144,12 +144,38 @@ fn resolve_execution_mode(config: &GpuDiscoveryConfig) -> (Vec<i64>, String, Opt
                 .is_empty()
                 .then(|| "requested_search_cuda_unavailable".to_string());
             if device_ids.is_empty() {
+                // The user asked for CUDA but we can't find any device. This is
+                // the failure mode that turns a 1-day GPU search into a 1500-year
+                // CPU run; emit a loud, structured log so the operator notices
+                // *during* the run, not three weeks later.
+                tracing::error!(
+                    target: "forex_search::gpu",
+                    backend = ?config.backend,
+                    devices = ?config.devices,
+                    "CUDA backend requested for strategy search but no CUDA devices are available; \
+                     falling back to CPU. Set FOREX_BOT_REQUIRE_GPU=1 to fail fast instead."
+                );
+                if std::env::var("FOREX_BOT_REQUIRE_GPU")
+                    .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+                    .unwrap_or(false)
+                {
+                    panic!(
+                        "FOREX_BOT_REQUIRE_GPU is set but no CUDA devices were detected for the \
+                         strategy search. Refusing to silently fall back to CPU."
+                    );
+                }
                 (
                     device_ids,
                     "search_cpu_fp32".to_string(),
                     append_degraded_reason(backend_reason, requested_precision_reason),
                 )
             } else {
+                tracing::info!(
+                    target: "forex_search::gpu",
+                    devices = ?device_ids,
+                    "Strategy search running on {} CUDA device(s)",
+                    device_ids.len()
+                );
                 (
                     device_ids,
                     "search_cuda_tch_fp32".to_string(),
@@ -279,6 +305,14 @@ pub fn build_feature_cube(
     Ok((frames, base_names, base_ohlcv.clone()))
 }
 
+/// Tensor-based GPU strategy search (tch / CUDA path).
+///
+/// **Design note — fitness parity:** this entry point uses a *returns-based*
+/// fitness (cumulative `action * (close_next - open_next)/open_next` minus a
+/// flat 0.0002 cost) and does NOT model SL/TP, spread, or commission. It is
+/// not equivalent to the CPU GA driven by [`crate::evolve_search`]. If you
+/// need an SL/TP-faithful GPU search use `evolve_search` with the `gpu`
+/// feature enabled — that path uses the cubecl backtest kernel.
 pub fn run_gpu_discovery(
     frames: &[FeatureFrame],
     base_ohlcv: &Ohlcv,

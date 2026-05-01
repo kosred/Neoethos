@@ -531,11 +531,34 @@ fn prefilter_features(features: &FeatureFrame, ohlcv: &Ohlcv, top_k: usize) -> F
         return features.clone();
     }
 
-    // Calculate 1-bar forward returns
+    // BUGFIX (data snooping): the prefilter ranks indicators by correlation
+    // with 1-bar FORWARD returns. Computing this over the full dataset means
+    // the "best" indicators are chosen with full knowledge of the OOS bars
+    // they will later be evaluated on, inflating in-sample metrics.
+    // Restrict the ranking to an IN-SAMPLE prefix so the final 30% of bars
+    // (which the GA/walk-forward later treats as held-out) cannot leak into
+    // the feature-selection step. Override with FOREX_BOT_PREFILTER_INSAMPLE.
+    let insample_frac = std::env::var("FOREX_BOT_PREFILTER_INSAMPLE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0 && *v <= 1.0)
+        .unwrap_or(0.70);
+    let train_end = ((n_rows as f64) * insample_frac).floor() as usize;
+    let train_end = train_end.clamp(2, n_rows.saturating_sub(1)).max(2);
+
+    // Calculate 1-bar forward returns ONLY for the in-sample window.
+    // Returns past `train_end-1` are ignored (treated as zeros) so the
+    // correlation reflects in-sample behaviour only.
     let mut returns = vec![0.0f32; n_rows];
-    for (i, ret_slot) in returns.iter_mut().enumerate().take(n_rows - 1) {
-        let ret = (ohlcv.close[i + 1] - ohlcv.close[i]) / ohlcv.close[i];
-        *ret_slot = ret as f32;
+    for (i, ret_slot) in returns
+        .iter_mut()
+        .enumerate()
+        .take(train_end.saturating_sub(1))
+    {
+        let denom = ohlcv.close[i];
+        if denom.abs() > 1e-12 {
+            *ret_slot = ((ohlcv.close[i + 1] - denom) / denom) as f32;
+        }
     }
 
     let mut correlations = Vec::with_capacity(n_cols);
@@ -545,8 +568,13 @@ fn prefilter_features(features: &FeatureFrame, ohlcv: &Ohlcv, top_k: usize) -> F
             // Force keep regime columns by giving them infinite correlation
             correlations.push((col_idx, f32::INFINITY));
         } else {
+            // Restrict the column slice to the in-sample window so the
+            // Pearson correlation only sees in-sample co-movement.
             let col = features.data.column(col_idx);
-            let corr = pearson_correlation(col.to_slice().unwrap_or(&col.to_vec()), &returns);
+            let col_full: Vec<f32> = col.iter().copied().collect();
+            let col_train = &col_full[..train_end.saturating_sub(1)];
+            let ret_train = &returns[..train_end.saturating_sub(1)];
+            let corr = pearson_correlation(col_train, ret_train);
             correlations.push((col_idx, corr.abs()));
         }
     }
