@@ -449,16 +449,16 @@ pub fn new_random_gene(
     max_indicators: usize,
     generation: usize,
     smc_cfg: &SmcSearchConfig,
+    rng: &mut impl Rng,
 ) -> Gene {
-    let mut rng = rand::rng();
     let min_indicators = 1;
     let max_indicators = max_indicators.clamp(min_indicators, n_indicators.max(1));
     let count = rng.random_range(min_indicators..=max_indicators);
-    let sample = sample(&mut rng, n_indicators.max(1), count);
+    let sample = sample(rng, n_indicators.max(1), count);
     let indices: Vec<usize> = sample.iter().collect();
-    let weights: Vec<f32> = (0..count).map(|_| random_coarse_weight(&mut rng)).collect();
-    let long_threshold = random_coarse_threshold(&mut rng);
-    let short_threshold = -random_coarse_threshold(&mut rng);
+    let weights: Vec<f32> = (0..count).map(|_| random_coarse_weight(rng)).collect();
+    let long_threshold = random_coarse_threshold(rng);
+    let short_threshold = -random_coarse_threshold(rng);
     let (sl_pips, tp_pips) = if rng.random_bool(0.2) {
         (15.0, 30.0)
     } else {
@@ -498,8 +498,8 @@ pub fn new_random_gene(
         slice_pass_rate: 0.0,
         consistency: 0.0,
     };
-    randomize_smc_flags(&mut gene, smc_cfg, &mut rng);
-    enforce_min_structural_smc_flags(&mut gene, smc_cfg, &mut rng);
+    randomize_smc_flags(&mut gene, smc_cfg, rng);
+    enforce_min_structural_smc_flags(&mut gene, smc_cfg, rng);
     gene
 }
 
@@ -509,9 +509,10 @@ pub fn generate_random_genes(
     max_indicators: usize,
     generation: usize,
     smc_cfg: &SmcSearchConfig,
+    rng: &mut impl Rng,
 ) -> Vec<Gene> {
     (0..n_genes)
-        .map(|_| new_random_gene(n_indicators, max_indicators, generation, smc_cfg))
+        .map(|_| new_random_gene(n_indicators, max_indicators, generation, smc_cfg, rng))
         .collect()
 }
 
@@ -523,6 +524,7 @@ pub fn unique_candidate_or_retry(
     generation: usize,
     max_attempts: usize,
     smc_cfg: &SmcSearchConfig,
+    rng: &mut impl Rng,
 ) -> Gene {
     candidate.normalize(n_indicators, 1);
     if seen.insert_gene(&candidate) {
@@ -530,7 +532,7 @@ pub fn unique_candidate_or_retry(
     }
     let attempts = max_attempts.max(1);
     for _ in 0..attempts {
-        let mut probe = new_random_gene(n_indicators, max_indicators, generation, smc_cfg);
+        let mut probe = new_random_gene(n_indicators, max_indicators, generation, smc_cfg, rng);
         probe.normalize(n_indicators, 1);
         if seen.insert_gene(&probe) {
             return probe;
@@ -539,8 +541,7 @@ pub fn unique_candidate_or_retry(
     candidate
 }
 
-pub fn crossover(a: &Gene, b: &Gene, generation: usize) -> Gene {
-    let mut rng = rand::rng();
+pub fn crossover(a: &Gene, b: &Gene, generation: usize, rng: &mut impl Rng) -> Gene {
     let mut indices = Vec::new();
     let mut weights = Vec::new();
     let split_a = a.indices.len() / 2;
@@ -646,8 +647,8 @@ pub fn mutate(
     generation: usize,
     smc_cfg: &SmcSearchConfig,
     stagnant_generations: usize,
+    rng: &mut impl Rng,
 ) -> Gene {
-    let mut rng = rand::rng();
     let mut mutated = gene.clone();
 
     // Adaptive mutation rate based on stagnation
@@ -670,19 +671,19 @@ pub fn mutate(
                     if rng.random_bool(0.3 * intensity as f64) {
                         mutated.indices[idx] = rng.random_range(0..n_indicators.max(1));
                     }
-                    mutated.weights[idx] = random_coarse_weight(&mut rng);
+                    mutated.weights[idx] = random_coarse_weight(rng);
                 } else {
                     let min_indicators = 1;
                     let max_indicators = max_indicators.clamp(min_indicators, n_indicators.max(1));
                     let count = rng.random_range(min_indicators..=max_indicators);
-                    let sample = sample(&mut rng, n_indicators.max(1), count);
+                    let sample = sample(rng, n_indicators.max(1), count);
                     mutated.indices = sample.iter().collect();
-                    mutated.weights = (0..count).map(|_| random_coarse_weight(&mut rng)).collect();
+                    mutated.weights = (0..count).map(|_| random_coarse_weight(rng)).collect();
                 }
             }
             1 => {
-                mutated.long_threshold = random_coarse_threshold(&mut rng);
-                mutated.short_threshold = -random_coarse_threshold(&mut rng);
+                mutated.long_threshold = random_coarse_threshold(rng);
+                mutated.short_threshold = -random_coarse_threshold(rng);
             }
             2 => {
                 let range = 0.2 * intensity as f64;
@@ -696,14 +697,14 @@ pub fn mutate(
             _ => {
                 // In exploitation mode, reduce the chance of randomly flipping SMC flags
                 if intensity >= 1.0 || rng.random_bool(0.3) {
-                    randomize_smc_flags(&mut mutated, smc_cfg, &mut rng);
+                    randomize_smc_flags(&mut mutated, smc_cfg, rng);
                 }
             }
         }
     }
 
     if rng.random_bool(0.25 * intensity as f64) {
-        enforce_min_structural_smc_flags(&mut mutated, smc_cfg, &mut rng);
+        enforce_min_structural_smc_flags(&mut mutated, smc_cfg, rng);
     }
     mutated.strategy_id = format!("gene_{}_{}", rng.random_range(0..1_000_000u64), generation);
     mutated.generation = generation;

@@ -11,8 +11,21 @@ use anyhow::{Result, anyhow, bail};
 use chrono::{Datelike, TimeZone, Utc};
 use forex_data::{FeatureFrame, Ohlcv};
 use ndarray::Array2;
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
+
+/// Build a deterministic RNG seeded from `FOREX_BOT_SEARCH_SEED` (if set) or
+/// from the OS RNG otherwise. Used by the GA so that runs are reproducible
+/// when the operator pins a seed (matching the parity work in
+/// `discovery_gpu`/`lib.rs`).
+fn build_search_rng() -> StdRng {
+    let seed = std::env::var("FOREX_BOT_SEARCH_SEED")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or_else(|| rand::rng().random::<u64>());
+    StdRng::seed_from_u64(seed)
+}
 
 type GeneArrays = (Vec<i32>, Vec<i32>, Vec<f32>, Vec<f32>, Vec<f32>);
 
@@ -335,7 +348,9 @@ pub fn random_search(
 ) -> Result<SearchResult> {
     let n_indicators = features.data.ncols();
     let smc_cfg = SmcSearchConfig::from_env();
-    let mut genes = generate_random_genes(n_genes, n_indicators, max_indicators, 0, &smc_cfg);
+    let mut rng = build_search_rng();
+    let mut genes =
+        generate_random_genes(n_genes, n_indicators, max_indicators, 0, &smc_cfg, &mut rng);
     enforce_population_smc_ratio(&mut genes, &smc_cfg);
     for gene in genes.iter_mut() {
         gene.normalize(n_indicators, 1);
@@ -456,7 +471,15 @@ where
         .unwrap_or(16)
         .max(1);
     let mut seen_memory = SeenSignatureMemory::from_env();
-    let mut genes = generate_random_genes(population, n_indicators, max_indicators, 0, &smc_cfg);
+    let mut rng = build_search_rng();
+    let mut genes = generate_random_genes(
+        population,
+        n_indicators,
+        max_indicators,
+        0,
+        &smc_cfg,
+        &mut rng,
+    );
     enforce_population_smc_ratio(&mut genes, &smc_cfg);
 
     genes = genes
@@ -470,6 +493,7 @@ where
                 0,
                 seen_retry_attempts,
                 &smc_cfg,
+                &mut rng,
             )
         })
         .collect();
@@ -767,7 +791,9 @@ where
             });
         }
 
-        let mut rng = rand::rng();
+        // Reuse the seeded RNG built at the top of `evolve_search_with_progress_impl`
+        // (was `let mut rng = rand::rng();` here, which shadowed the seeded one and
+        // broke the determinism work in the GPU path). `rng` is available in scope.
         let score_vector: Vec<f64> = scored.iter().map(|(score, _, _, _)| *score).collect();
         let survivor_fraction = if stagnant_gens >= stagnation_patience {
             (search_policy.survivor_fraction * 0.75).clamp(0.0, 0.5)
@@ -802,14 +828,22 @@ where
         let immigrant_count = ((population as f64) * immigrant_ratio).round() as usize;
         let immigrant_count = immigrant_count.min(population - next.len());
         for _ in 0..immigrant_count {
+            let immigrant = new_random_gene(
+                n_indicators,
+                max_indicators,
+                generation + 1,
+                &smc_cfg,
+                &mut rng,
+            );
             next.push(unique_candidate_or_retry(
-                new_random_gene(n_indicators, max_indicators, generation + 1, &smc_cfg),
+                immigrant,
                 &mut seen_memory,
                 n_indicators,
                 max_indicators,
                 generation + 1,
                 seen_retry_attempts,
                 &smc_cfg,
+                &mut rng,
             ));
         }
 
@@ -847,21 +881,25 @@ where
             }
             let a = &scored[a_idx].2;
             let b = &scored[b_idx].2;
+            let crossed = crossover(a, b, generation + 1, &mut rng);
+            let mutated = mutate(
+                &crossed,
+                n_indicators,
+                max_indicators,
+                generation + 1,
+                &smc_cfg,
+                stagnant_gens,
+                &mut rng,
+            );
             next.push(unique_candidate_or_retry(
-                mutate(
-                    &crossover(a, b, generation + 1),
-                    n_indicators,
-                    max_indicators,
-                    generation + 1,
-                    &smc_cfg,
-                    stagnant_gens,
-                ),
+                mutated,
                 &mut seen_memory,
                 n_indicators,
                 max_indicators,
                 generation + 1,
                 seen_retry_attempts,
                 &smc_cfg,
+                &mut rng,
             ));
         }
         enforce_population_smc_ratio(&mut next, &smc_cfg);
