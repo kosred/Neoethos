@@ -72,21 +72,46 @@ impl StrategyGauntlet {
         let profit_factor = metrics[5];
         let max_daily_dd = metrics[10];
 
+        let mut failures: Vec<String> = Vec::new();
         if win_rate < self.config.min_win_rate {
-            return self.config.warn_only;
+            failures.push(format!(
+                "win_rate {:.3} < {:.3}",
+                win_rate, self.config.min_win_rate
+            ));
         }
         if max_dd > self.config.max_drawdown_pct {
-            return self.config.warn_only;
+            failures.push(format!(
+                "max_dd {:.3} > {:.3}",
+                max_dd, self.config.max_drawdown_pct
+            ));
         }
         if max_daily_dd > self.config.max_daily_dd {
-            return self.config.warn_only;
+            failures.push(format!(
+                "max_daily_dd {:.3} > {:.3}",
+                max_daily_dd, self.config.max_daily_dd
+            ));
         }
         if profit_factor <= self.config.min_profit_factor {
-            return self.config.warn_only;
+            failures.push(format!(
+                "profit_factor {:.3} <= {:.3}",
+                profit_factor, self.config.min_profit_factor
+            ));
         }
         if net_profit <= 0.0 {
-            return self.config.warn_only;
+            failures.push(format!("net_profit {:.2} <= 0.0", net_profit));
         }
-        true
+        if failures.is_empty() {
+            return true;
+        }
+        // Previously the function silently returned `warn_only` here without
+        // surfacing WHICH metric failed, hiding bad strategies in warn-only
+        // mode. Always emit a structured warn so operators can audit.
+        tracing::warn!(
+            target: "forex_search::gauntlet",
+            warn_only = self.config.warn_only,
+            failures = failures.join("; "),
+            "strategy gauntlet failed"
+        );
+        self.config.warn_only
     }
 }

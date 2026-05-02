@@ -803,8 +803,6 @@ pub mod discovery_gpu {
 pub mod hpc;
 #[cfg(feature = "gpu")]
 pub mod hpc_gpu_discovery;
-#[cfg(feature = "gpu")]
-pub mod hpc_simd;
 
 // Re-export HPC functions when GPU feature is enabled.
 #[cfg(feature = "gpu")]
@@ -815,8 +813,6 @@ pub use hpc::{
 };
 #[cfg(feature = "gpu")]
 pub use hpc_gpu_discovery::{IslandConfig, run_island_model_discovery};
-#[cfg(feature = "gpu")]
-pub use hpc_simd::{batch_evaluate_simd, compute_sharpe_ratio, has_avx2};
 
 pub mod eval;
 pub mod gauntlet;

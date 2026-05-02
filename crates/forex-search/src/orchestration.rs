@@ -2,7 +2,7 @@ use crate::discovery::{
     DiscoveryConfig, ensure_non_empty_portfolio, run_discovery_cycle, save_discovery_profile_json,
     save_portfolio_json, save_quality_report_json, save_trade_log_json,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use forex_data::{
     MANDATORY_TFS, ensure_timeframes_with_resample, load_symbol_dataset,
     prepare_multitimeframe_features,
@@ -19,19 +19,21 @@ pub struct BatchDiscoverySummary {
     pub skipped_timeframes: usize,
     pub feature_failures: usize,
     pub empty_portfolios: usize,
+    pub discovery_failures: usize,
 }
 
 impl BatchDiscoverySummary {
     fn finalize(self) -> Result<Self> {
         if self.portfolios_saved == 0 {
             anyhow::bail!(
-                "Batch discovery produced no usable portfolios (symbols={}, work_units={}, skipped_symbols={}, skipped_timeframes={}, feature_failures={}, empty_portfolios={})",
+                "Batch discovery produced no usable portfolios (symbols={}, work_units={}, skipped_symbols={}, skipped_timeframes={}, feature_failures={}, empty_portfolios={}, discovery_failures={})",
                 self.symbols_seen,
                 self.work_units_seen,
                 self.skipped_symbols,
                 self.skipped_timeframes,
                 self.feature_failures,
-                self.empty_portfolios
+                self.empty_portfolios,
+                self.discovery_failures
             );
         }
         Ok(self)
@@ -94,10 +96,27 @@ impl DiscoveryOrchestrator {
                     }
                 };
 
-                let base_ohlcv = ds_ready.frames.get(tf).context("base tf missing")?;
+                let base_ohlcv = match ds_ready.frames.get(tf) {
+                    Some(o) => o,
+                    None => {
+                        summary.feature_failures += 1;
+                        info!("    Skipping tf {}: base ohlcv missing", tf);
+                        continue;
+                    }
+                };
                 let mut runtime_config = self.config.clone();
                 runtime_config.timeframe_label = tf.clone();
-                let result = run_discovery_cycle(&features, base_ohlcv, &runtime_config)?;
+                // Previously this used `?` and aborted the whole batch on a
+                // single discovery failure, while every other error in the
+                // loop counted toward `summary.skipped_*` and continued.
+                let result = match run_discovery_cycle(&features, base_ohlcv, &runtime_config) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        summary.discovery_failures += 1;
+                        info!("    Discovery failed for {} {}: {}", symbol, tf, e);
+                        continue;
+                    }
+                };
                 if let Err(err) = ensure_non_empty_portfolio(&result, &format!("{} {}", symbol, tf))
                 {
                     summary.empty_portfolios += 1;
@@ -143,6 +162,7 @@ mod tests {
             feature_failures: 1,
             empty_portfolios: 0,
             portfolios_saved: 0,
+            ..Default::default()
         };
 
         let err = summary
