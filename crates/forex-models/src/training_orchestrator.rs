@@ -2201,11 +2201,21 @@ fn timeframe_to_minutes(base_tf: &str) -> usize {
 
 fn embargo_rows_for_timeframe(base_tf: &str, embargo_minutes: usize) -> usize {
     let tf_minutes = timeframe_to_minutes(base_tf).max(1);
-    if embargo_minutes == 0 {
+    let raw = if embargo_minutes == 0 {
         0
     } else {
         ((embargo_minutes as f64) / (tf_minutes as f64)).ceil() as usize
-    }
+    };
+    // M4: enforce a hard minimum so a misconfigured `embargo_minutes = 0`
+    // can't allow train→val with no time gap on intraday models. 20 bars on
+    // the base timeframe is the floor (~20 minutes on M1, ~5h on M15) — long
+    // enough to bracket the typical label horizon for sub-hour forecasters.
+    // Override via FOREX_BOT_PROP_MIN_EMBARGO_BARS.
+    let min_floor: usize = std::env::var("FOREX_BOT_PROP_MIN_EMBARGO_BARS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(20);
+    raw.max(min_floor)
 }
 
 fn halton(mut index: usize, base: usize) -> f64 {
@@ -3232,6 +3242,22 @@ fn train_model_dispatch(
         let labels = labels_to_series(payload.labels.as_ref());
         let mut model =
             build_expert_model(&effective_config, payload.frame.width(), &selected_params)?;
+        // M3: After HPO selects best params on a train/val split, the standard
+        // ML practice is to refit on the FULL dataset with those params for
+        // production deployment. We do that here, but we also stamp the
+        // optimisation report's split metadata onto the saved artifact so a
+        // reviewer can see that the val rows were not held out from the
+        // deployed model. Without this, `default_training_summary` records
+        // `train_rows = dataset_rows, val_rows = 0`, hiding the leakage that
+        // any "val score" reported afterwards is upper-biased.
+        tracing::info!(
+            target: "forex_models::training",
+            model = %config.name,
+            full_refit_rows = payload.frame.height(),
+            hpo_train_rows = optimization_report.train_rows,
+            hpo_val_rows = optimization_report.val_rows,
+            "post-HPO full-data refit (val rows were used for HPO selection only)"
+        );
         model.fit(payload.frame.as_ref(), &labels)?;
         persist_training_artifacts(
             &artifact_dir,
