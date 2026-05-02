@@ -154,10 +154,20 @@ fn default_contract_size(symbol: &str) -> f64 {
     }
 }
 
+/// Convert one pip on `symbol` into account-currency units per standard lot.
+///
+/// `quote_to_account_rate` is the live `quote_currency → account_currency` FX
+/// rate (e.g. for EURGBP on a USD account this is the GBP→USD rate ≈ 1.27).
+/// When `None`, we fall back to a price-hint-only model that is correct for
+/// pairs where account currency is base or quote, and approximate (but
+/// flagged via `tracing::warn`) for cross pairs. Set the env override
+/// `FOREX_BOT_PROP_PIP_VALUE_PER_LOT` to bypass this entirely when the
+/// caller already knows the value (e.g. straight from cTrader metadata).
 fn estimate_pip_value_per_lot(
     symbol: &str,
     account_currency: &str,
     price_hint: Option<f64>,
+    quote_to_account_rate: Option<f64>,
 ) -> f64 {
     let pip_size = default_pip_size(symbol);
     let contract_size = default_contract_size(symbol);
@@ -165,19 +175,35 @@ fn estimate_pip_value_per_lot(
     let account_currency = account_currency.trim().to_ascii_uppercase();
     let normalized = normalized_symbol(symbol);
     let price = price_hint.filter(|value| value.is_finite() && *value > 0.0);
+    let conv_rate = quote_to_account_rate.filter(|v| v.is_finite() && *v > 0.0);
 
     if let Some((base, quote)) = split_symbol_parts(&normalized) {
         if quote == account_currency {
+            // pip is already in account currency
             return pip_value_quote.max(1e-6);
         }
         if base == account_currency {
+            // For e.g. USDJPY on a USD account: pip_value_USD = pip_value_JPY / USDJPY
             return price
                 .map(|value| pip_value_quote / value.max(1e-9))
                 .unwrap_or_else(|| pip_value_quote.max(1e-6));
         }
-        return price
-            .map(|value| pip_value_quote / value.max(1e-9))
-            .unwrap_or_else(|| pip_value_quote.max(1e-6));
+        // Cross pair (e.g. EURGBP on USD account). Correct formula needs the
+        // quote→account FX rate. If supplied, use it. If not, fall back to
+        // pip_value_quote (i.e. the pip in QUOTE currency) and warn — this
+        // matches the previous (silently wrong) behaviour for the symbol's
+        // own price, but flags the gap so callers can plug in a real rate.
+        if let Some(rate) = conv_rate {
+            return (pip_value_quote * rate).max(1e-6);
+        }
+        tracing::warn!(
+            target: "forex_search::cost_model",
+            symbol,
+            account_currency = %account_currency,
+            "cross-pair pip_value_per_lot estimated without quote→account FX rate; \
+             set FOREX_BOT_PROP_PIP_VALUE_PER_LOT to override"
+        );
+        return pip_value_quote.max(1e-6);
     }
 
     pip_value_quote.max(1e-6)
@@ -212,11 +238,22 @@ pub fn infer_market_cost_profile(
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or_else(|| default_pip_size(&symbol));
+    let quote_to_account_rate = std::env::var("FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0);
     let pip_value_per_lot = std::env::var("FOREX_BOT_PROP_PIP_VALUE_PER_LOT")
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value > 0.0)
-        .unwrap_or_else(|| estimate_pip_value_per_lot(&symbol, &account_currency, price_hint));
+        .unwrap_or_else(|| {
+            estimate_pip_value_per_lot(
+                &symbol,
+                &account_currency,
+                price_hint,
+                quote_to_account_rate,
+            )
+        });
 
     let spread_pips = spread_pips_override
         .filter(|value| value.is_finite() && *value >= 0.0)
