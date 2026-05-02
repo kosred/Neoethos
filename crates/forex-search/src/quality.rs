@@ -174,8 +174,14 @@ impl StrategyQualityAnalyzer {
 
         let total_return = pnls.iter().sum::<f64>();
         let total_return_pct = total_return / initial_balance;
+        // A flawless equity curve (max_dd ≈ 0 with positive return) used to
+        // rank Calmar=0 — i.e. worst — flipping the rank intent. Saturate the
+        // ratio so a zero-DD profitable strategy ranks at the top of the sort,
+        // then clamp so a single outlier can't dominate downstream weighting.
         let calmar = if max_dd > 1e-9 {
-            total_return_pct / max_dd
+            (total_return_pct / max_dd).clamp(-1000.0, 1000.0)
+        } else if total_return_pct > 0.0 {
+            1000.0
         } else {
             0.0
         };
@@ -314,18 +320,28 @@ fn analyze_monthly_consistency(trades: &[Trade], initial_balance: f64) -> Monthl
         };
     }
 
-    let mut monthly_pnl: HashMap<i64, f64> = HashMap::new();
+    // Bucket per-month PnL AND per-month trade count so we can drop months
+    // with too few trades (a month with 1 lucky trade should not get the same
+    // weight in monthly_win_rate as a month with 50 trades). Override threshold
+    // via FOREX_BOT_PROP_MIN_TRADES_PER_MONTH (default 4).
+    let min_trades_per_month: usize = std::env::var("FOREX_BOT_PROP_MIN_TRADES_PER_MONTH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4);
+    let mut monthly: HashMap<i64, (f64, usize)> = HashMap::new();
     for trade in trades {
         if trade.entry_time <= 0 {
             continue;
         }
         if let Some(dt) = Utc.timestamp_millis_opt(trade.entry_time).single() {
             let key = (dt.year() as i64) * 12 + dt.month() as i64;
-            *monthly_pnl.entry(key).or_insert(0.0) += trade.pnl;
+            let entry = monthly.entry(key).or_insert((0.0, 0));
+            entry.0 += trade.pnl;
+            entry.1 += 1;
         }
     }
 
-    if monthly_pnl.is_empty() {
+    if monthly.is_empty() {
         return MonthlyMetrics {
             monthly_win_rate: 0.0,
             positive: 0,
@@ -337,15 +353,20 @@ fn analyze_monthly_consistency(trades: &[Trade], initial_balance: f64) -> Monthl
     let mut positive = 0;
     let mut negative = 0;
     let mut sum = 0.0;
-    for val in monthly_pnl.values() {
-        sum += *val;
-        if *val > 0.0 {
+    let mut counted = 0usize;
+    for &(pnl, n) in monthly.values() {
+        if n < min_trades_per_month {
+            continue;
+        }
+        sum += pnl;
+        counted += 1;
+        if pnl > 0.0 {
             positive += 1;
         } else {
             negative += 1;
         }
     }
-    let total = monthly_pnl.len();
+    let total = counted;
     let avg_return_pct = if total > 0 {
         (sum / total as f64) / initial_balance
     } else {

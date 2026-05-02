@@ -384,7 +384,13 @@ pub fn fast_evaluate_strategy_core(
                 }
             }
         } else {
-            let s = signals[i];
+            // Causal entry: act on the signal observed at the PRIOR bar's
+            // close, fill at the CURRENT bar's close. Previously the code
+            // read `signals[i]` and immediately filled at `close[i]` — but
+            // the signal itself is computed from bar i's close/high/low, so
+            // the trade was peeking at the very bar it was supposed to
+            // execute on. This 1-bar shift removes that intra-bar look-ahead.
+            let s = signals[i - 1];
             if s != 0 {
                 // max_trades_per_day gate
                 if settings.max_trades_per_day > 0 && day_trade_count >= settings.max_trades_per_day
@@ -639,7 +645,9 @@ pub fn simulate_trades_core(
                 });
                 in_pos = 0;
             }
-        } else if signals[i] != 0 {
+        } else if signals[i - 1] != 0 {
+            // Causal: act on the PRIOR bar's signal at THIS bar's close.
+            // Same intra-bar look-ahead fix as `fast_evaluate_strategy_core`.
             // Kill zones: block entries
             let mut block_entry = false;
             if ts > 0 && settings.kill_zones_enabled {
@@ -662,7 +670,7 @@ pub fn simulate_trades_core(
             }
 
             if !block_entry {
-                let s = signals[i];
+                let s = signals[i - 1];
                 in_pos = s;
                 // Bug #1 fix: half-spread at entry
                 entry_px = close[i] + (s as f64) * half_spread_px;
