@@ -356,32 +356,85 @@ impl Gene {
     }
 
     pub fn normalize(&mut self, n_indicators: usize, min_indicators: usize) {
+        let n_indicators = n_indicators.max(1);
+        let min_indicators = min_indicators.clamp(1, n_indicators);
+
         if self.indices.is_empty() {
             self.indices.push(0);
         }
         if self.weights.len() != self.indices.len() {
             self.weights = vec![1.0; self.indices.len()];
         }
-        let n_indicators = n_indicators.max(1);
-        for idx in &mut self.indices {
-            if *idx >= n_indicators {
-                *idx %= n_indicators;
-            }
-        }
-        let min_indicators = min_indicators.clamp(1, n_indicators);
-        if self.indices.len() < min_indicators {
-            let mut rng = rand::rng();
-            let mut seen = HashSet::new();
-            for idx in &self.indices {
-                seen.insert(*idx);
-            }
-            while self.indices.len() < min_indicators {
-                let idx = rng.random_range(0..n_indicators);
-                if seen.insert(idx) {
-                    self.indices.push(idx);
-                    self.weights.push(rng.random_range(0.1..1.0));
+
+        let mut terms: Vec<(usize, f32)> = self
+            .indices
+            .iter()
+            .copied()
+            .zip(self.weights.iter().copied())
+            .map(|(idx, weight)| {
+                let idx = idx % n_indicators;
+                let weight = if weight.is_finite() { weight } else { 0.0 };
+                (idx, weight)
+            })
+            .collect();
+        terms.sort_by_key(|(idx, _)| *idx);
+
+        let mut merged: Vec<(usize, f32)> = Vec::with_capacity(terms.len());
+        for (idx, weight) in terms {
+            if let Some((last_idx, last_weight)) = merged.last_mut() {
+                if *last_idx == idx {
+                    *last_weight += weight;
+                    continue;
                 }
             }
+            merged.push((idx, weight));
+        }
+
+        if merged.len() > min_indicators {
+            merged.retain(|(_, weight)| weight.abs() > 1e-6);
+        }
+        if merged.is_empty() {
+            merged.push((0, 1.0));
+        }
+
+        let mut rng = rand::rng();
+        let mut seen: HashSet<usize> = merged.iter().map(|(idx, _)| *idx).collect();
+        while merged.len() < min_indicators {
+            let idx = rng.random_range(0..n_indicators);
+            if seen.insert(idx) {
+                merged.push((idx, rng.random_range(0.1..1.0)));
+            }
+        }
+        merged.sort_by_key(|(idx, _)| *idx);
+
+        self.indices = merged.iter().map(|(idx, _)| *idx).collect();
+        self.weights = merged
+            .iter()
+            .map(|(_, weight)| {
+                if weight.is_finite() && weight.abs() > 1e-6 {
+                    weight.clamp(-5.0, 5.0)
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+
+        if !self.long_threshold.is_finite() {
+            self.long_threshold = 0.25;
+        }
+        if !self.short_threshold.is_finite() {
+            self.short_threshold = -0.25;
+        }
+        if self.long_threshold <= self.short_threshold {
+            let mid = (self.long_threshold + self.short_threshold) * 0.5;
+            self.long_threshold = mid + 0.05;
+            self.short_threshold = mid - 0.05;
+        }
+        if !self.tp_pips.is_finite() || self.tp_pips <= 0.0 {
+            self.tp_pips = 40.0;
+        }
+        if !self.sl_pips.is_finite() || self.sl_pips <= 0.0 {
+            self.sl_pips = 20.0;
         }
     }
 }
@@ -491,5 +544,48 @@ impl EvaluationConfig {
             commission_per_trade: profile.commission_per_trade,
             ..Self::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_canonicalizes_duplicate_indicator_terms() {
+        let mut gene = Gene {
+            indices: vec![4, 1, 4, 9],
+            weights: vec![0.25, 1.0, 0.75, 0.5],
+            long_threshold: 0.4,
+            short_threshold: -0.4,
+            tp_pips: 40.0,
+            sl_pips: 20.0,
+            ..Default::default()
+        };
+
+        gene.normalize(5, 1);
+
+        assert_eq!(gene.indices, vec![1, 4]);
+        assert_eq!(gene.weights, vec![1.0, 1.5]);
+    }
+
+    #[test]
+    fn normalize_repairs_invalid_numeric_fields() {
+        let mut gene = Gene {
+            indices: vec![0],
+            weights: vec![f32::NAN],
+            long_threshold: f32::NAN,
+            short_threshold: f32::NAN,
+            tp_pips: f64::NAN,
+            sl_pips: -1.0,
+            ..Default::default()
+        };
+
+        gene.normalize(3, 1);
+
+        assert_eq!(gene.weights, vec![1.0]);
+        assert!(gene.long_threshold > gene.short_threshold);
+        assert_eq!(gene.tp_pips, 40.0);
+        assert_eq!(gene.sl_pips, 20.0);
     }
 }
