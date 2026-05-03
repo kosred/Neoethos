@@ -542,6 +542,9 @@ pub fn unique_candidate_or_retry(
 }
 
 pub fn crossover(a: &Gene, b: &Gene, generation: usize, rng: &mut impl Rng) -> Gene {
+    // Note: callers must pass the same `rng` they use elsewhere in the same
+    // search; using a fresh `rand::rng()` here would break the deterministic
+    // seed introduced for CPU/GPU parity (see search_engine::build_search_rng).
     let mut indices = Vec::new();
     let mut weights = Vec::new();
     let split_a = a.indices.len() / 2;

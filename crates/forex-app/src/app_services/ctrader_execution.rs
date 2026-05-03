@@ -427,6 +427,31 @@ impl ProductionCTraderExecutionBackend {
         let url = format!("wss://{}:5036", request.environment.endpoint_host());
         let (socket, _) = connect(url.as_str())
             .with_context(|| format!("failed to connect to cTrader endpoint {url}"))?;
+        // M10: cap the underlying TCP read at 30s so a broker stall or a
+        // mismatched payload cannot wedge the trading loop forever. The loop
+        // in `read_matching_response` previously blocked indefinitely; with a
+        // timeout the I/O error bubbles up, the caller drops the session,
+        // and the next `execute_via_session` retry re-authenticates.
+        // Override via `FOREX_BOT_CTRADER_READ_TIMEOUT_SECS` (0 disables).
+        let read_timeout_secs: u64 = std::env::var("FOREX_BOT_CTRADER_READ_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+        if read_timeout_secs > 0 {
+            let timeout = std::time::Duration::from_secs(read_timeout_secs);
+            let apply_result = match socket.get_ref() {
+                MaybeTlsStream::Plain(stream) => stream.set_read_timeout(Some(timeout)),
+                MaybeTlsStream::Rustls(stream) => stream.get_ref().set_read_timeout(Some(timeout)),
+                _ => Ok(()), // unknown TLS variant — not critical
+            };
+            if let Err(err) = apply_result {
+                tracing::warn!(
+                    target: "forex_app::ctrader",
+                    error = ?err,
+                    "failed to apply cTrader socket read timeout"
+                );
+            }
+        }
         session.socket = Some(socket);
         session.auth_key = Some(auth_key);
 
@@ -815,6 +840,35 @@ fn validate_execution_outcome(
             requested_account_id,
             outcome.account_id
         );
+    }
+
+    // D10: surface broker-side rejections / partial fills explicitly. The
+    // previous implementation only checked IDs, so a PartialFill or Failed
+    // status was silently treated as success — caller could not see that
+    // `filled_volume < requested_volume`. We bail here on Failed and flag
+    // PartialFill as an error so the trading loop can decide between retry
+    // for the residual or cancel-and-log. Set
+    // `FOREX_BOT_CTRADER_ALLOW_PARTIAL_FILL=1` to opt back into the previous
+    // permissive behaviour (e.g. for replay tests).
+    if matches!(outcome.status, CTraderExecutionStatus::Failed) {
+        anyhow::bail!(
+            "cTrader execution rejected: status=Failed code={:?} description={:?}",
+            outcome.error_code,
+            outcome.description
+        );
+    }
+    if matches!(outcome.status, CTraderExecutionStatus::PartialFill) {
+        let allow_partial = std::env::var("FOREX_BOT_CTRADER_ALLOW_PARTIAL_FILL")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        if !allow_partial {
+            anyhow::bail!(
+                "cTrader execution returned PartialFill (deal_id={:?}, lot_size={:?}); \
+                 set FOREX_BOT_CTRADER_ALLOW_PARTIAL_FILL=1 to accept partial fills",
+                outcome.deal_id,
+                outcome.lot_size
+            );
+        }
     }
 
     match &request.request {
