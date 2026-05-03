@@ -1,4 +1,7 @@
-// Base classes and utilities (derived from models/base.py)
+// Pure-Rust ExpertModel trait + label/probability helpers shared across
+// every concrete model in this crate. (Historically migrated from a
+// Python `models/base.py` during the Rust-first rewrite — kept as
+// migration context only; the active codebase is 100% Rust.)
 pub mod base;
 pub mod runtime;
 
@@ -20,7 +23,10 @@ pub use ensemble::{
 pub use parallel_trainer::{ModelTrainingFailure, ModelTrainingProgress, ParallelTrainingSummary};
 pub use training_orchestrator::{TrainingOrchestrator, TrainingRunSummary};
 
-// Hardware detection (derived from models/device.py)
+// CPU/GPU device detection used by every model trainer to pick the right
+// backend (CUDA via tch / cubecl / WGPU via burn-wgpu / pure-CPU rayon).
+// (Historically migrated from a Python `models/device.py` — kept as
+// migration context only; the active codebase is 100% Rust.)
 pub mod hardware;
 
 // Evaluation helpers (simple backtest, signal conversion)
