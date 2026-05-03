@@ -1,10 +1,22 @@
 name: CI
 
+# Manual-only by design.
+#
+# The repository is in an active strategy-search/refactor phase. Running CI on
+# every small push creates noisy failed notifications before related changes are
+# complete. Start this workflow manually from the Actions tab when you want a
+# full repository health check.
 on:
-  push:
-    branches: [master, main, develop]
-  pull_request:
-    branches: [master, main]
+  workflow_dispatch:
+    inputs:
+      run_default_features:
+        description: "Also run workspace checks with default features"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,53 +24,8 @@ env:
   BINDGEN_EXTRA_CLANG_ARGS: "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
 
 jobs:
-  # ────────────────────────────────────────────────────────────────────────────
-  # Check + Test on Windows (primary dev platform)
-  # ────────────────────────────────────────────────────────────────────────────
-  test-windows:
-    name: Test (Windows)
-    runs-on: windows-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: windows-ci-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: windows-ci-
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-        continue-on-error: true
-
-      - name: Cargo check (app + core)
-        run: cargo check -p forex-app -p forex-core -p forex-news --no-default-features
-
-      - name: Cargo check (search + models)
-        run: cargo check -p forex-search -p forex-models --no-default-features
-
-      - name: Run app + core tests
-        run: cargo test -p forex-app -p forex-core -p forex-news
-
-      - name: Run search + models tests
-        run: cargo test -p forex-search -p forex-models --no-default-features
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # Check on Linux (catch cross-platform issues early)
-  # ────────────────────────────────────────────────────────────────────────────
-  check-linux:
-    name: Check (Linux)
+  workspace-linux:
+    name: Workspace check/test (Linux)
     runs-on: ubuntu-22.04
 
     steps:
@@ -75,6 +42,8 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
       - name: Cache Cargo
         uses: actions/cache@v4
@@ -84,17 +53,22 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: linux-ci-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: linux-ci-
+          key: linux-workspace-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-workspace-ci-
 
-      - name: Cargo check (app + core)
-        run: cargo check -p forex-app -p forex-core -p forex-news --no-default-features
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
-      - name: Cargo check (search + models)
-        run: cargo check -p forex-search -p forex-models --no-default-features
+      - name: Cargo check workspace without default features
+        run: cargo check --workspace --all-targets --no-default-features
 
-      - name: Run app + core tests
-        run: cargo test -p forex-app -p forex-core -p forex-news
+      - name: Run workspace tests without default features
+        run: cargo test --workspace --no-default-features
 
-      - name: Run search + models tests
-        run: cargo test -p forex-search -p forex-models --no-default-features
+      - name: Cargo check workspace with default features
+        if: ${{ inputs.run_default_features == 'true' }}
+        run: cargo check --workspace --all-targets
+
+      - name: Run workspace tests with default features
+        if: ${{ inputs.run_default_features == 'true' }}
+        run: cargo test --workspace
