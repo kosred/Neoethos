@@ -1,7 +1,7 @@
 # Search / Backtest / Forward Validation / CPU-GPU Audit
 
 **Created:** 2026-05-03 14:46 Europe/Berlin  
-**Last updated:** 2026-05-03 15:44 Europe/Berlin  
+**Last updated:** 2026-05-03 16:02 Europe/Berlin  
 **Repository:** `kosred/forex-ai`  
 **Target branch:** `master`  
 **Scope:** data ingestion, feature alignment, search/discovery, backtest, forward/walk-forward validation, CPCV, CPU/GPU parity, and HPC GPU search semantics.
@@ -30,6 +30,7 @@ Highest-priority risks:
 - Search, quality screen, gauntlet, walk-forward, live order execution, and trade logs can use different signal/cost/session/execution contracts.
 - The bot does not yet expose one canonical trader-style day/week/month ledger.
 - Several feature/stop-target helpers are not yet clearly bound to the same timeframe and walk-forward data contract.
+- UI discovery withholds 20% OOS from search, but current reading does not show a mandatory OOS replay before portfolio export.
 
 ---
 
@@ -52,6 +53,7 @@ Known relevant components:
 - `crates/forex-search/src/quality.rs` — trade-based quality analysis, monthly consistency, Monte Carlo daily-block bootstrap.
 - `crates/forex-search/src/discovery_gpu.rs` and `crates/forex-search/src/hpc_gpu_discovery.rs` — tensor/HPC GPU discovery paths.
 - `crates/forex-core/src/domain/order_execution.rs` — live/order execution helper with partial TP, entry patience, and edge/cost checks.
+- `crates/forex-core/src/domain/risk.rs` — live risk manager with prop-firm gates, dynamic sizing, recovery mode, and circuit breaker logic.
 
 ### In PR branch, not merged to `master`
 
@@ -453,8 +455,6 @@ System config defaults include many higher timeframes, including `M1`. `prepare_
 
 ---
 
-## Additional findings appended 2026-05-03 15:44 Europe/Berlin
-
 ### 28. Backtest appears to use fixed pip-value / implicit fixed position sizing, not live dynamic risk sizing
 
 **Files:** `eval.rs`, `cubecl_eval.rs`, `forex-core/src/domain/risk.rs`, `forex-core/src/config.rs`
@@ -525,16 +525,89 @@ The visible full CUDA kernel computes final net profit after the main loop, and 
 
 ---
 
+## Additional findings appended 2026-05-03 16:02 Europe/Berlin
+
+### 33. UI withholds OOS rows but does not appear to replay/export mandatory OOS validation
+
+**Files:** `forex-app/src/app_services/discovery.rs`, `forex-search/src/discovery.rs`
+
+The UI discovery service cuts the data to 80% in-sample before running `run_discovery_cycle_with_progress`. It then saves the resulting portfolio, profile, quality report, and trade logs. Current reading does not show an automatic replay on the withheld final 20% before saving/exporting the portfolio.
+
+**Risk:** the code may give a false sense of OOS protection. Withholding 20% is only useful if strategies are later replayed on that withheld slice and the OOS result gates export. Otherwise the final 20% is merely unused, not validating anything.
+
+**Severity:** High.
+
+**Fix direction:** after discovery on the 80% in-sample segment, replay the selected candidates on the withheld 20% OOS segment using the same canonical backtest contract. Export OOS metrics and block portfolio save unless configured OOS gates pass.
+
+---
+
+### 34. Discovery profile records validation configuration but not validation execution results
+
+**Files:** `forex-search/src/discovery.rs`, `forex-app/src/app_services/discovery.rs`
+
+`DiscoveryRunProfile` records fields such as `walkforward_splits`, `embargo_minutes`, `enable_cpcv`, `cpcv_n_splits`, and filter settings. It also records observed candidate and portfolio counts. Current reading does not show executed WFV/CPCV/OOS result objects in the profile.
+
+**Risk:** exported metadata can look validation-aware because it contains WFV/CPCV config values, while the profile may not prove that validation actually ran or passed.
+
+**Severity:** Medium-High.
+
+**Fix direction:** add explicit execution/result fields: `oos_tested`, `oos_passed`, `walkforward_tested`, `walkforward_passed`, `cpcv_tested`, `cpcv_passed`, plus summary metrics and failure reasons.
+
+---
+
+### 35. Regime robustness gate uses a hardcoded absolute account loss assumption
+
+**File:** `forex-search/src/discovery.rs`
+
+`validate_regime_robustness` rejects if regime-specific PnL falls below `-3000.0`, with a comment assuming a 100k account and 3% loss. This is disconnected from the configured initial balance and prop-firm risk contract.
+
+**Risk:** on a 10k account, -3000 is a 30% loss and far too loose. On a 200k account, -3000 is 1.5% and may be too strict. This can distort regime validation and candidate selection.
+
+**Severity:** High.
+
+**Fix direction:** compute regime loss limits from the canonical `initial_balance` and configured max regime loss percentage. Export regime-specific PnL/DD as part of the period/regime ledger.
+
+---
+
+### 36. Portfolio export lacks a complete feature/backtest schema contract
+
+**Files:** `forex-search/src/discovery.rs`, `forex-app/src/app_services/discovery.rs`
+
+`GeneExport` exports strategy id, selected indicator names, feature indices, weights, thresholds, fitness, Sharpe, win rate, TP, and SL. Current reading did not show a full feature schema hash, timeframe contract, timestamp unit, HTF alignment policy, feature sanitation policy, cost model, execution policy, or validation-gate summary in the portfolio artifact.
+
+**Risk:** a portfolio can be loaded later against a different feature order, feature set, timeframe list, data timing convention, cost model, or live execution policy. Since genes depend on feature indices, this can silently change strategy behavior.
+
+**Severity:** High.
+
+**Fix direction:** export a `PortfolioContract` alongside every portfolio: feature names and hash, base/higher timeframes, timestamp unit, HTF availability policy, feature sanitation policy, cost/slippage/commission model, sizing mode, execution policy, validation gates/results, git commit, and config hash. Refuse to load/deploy if the live contract does not match.
+
+---
+
+### 37. UI completion summary still ranks “best” by fitness rather than validation/quality contract
+
+**File:** `forex-app/src/app_services/discovery.rs`
+
+`completed_snapshot` selects the best displayed strategy from the portfolio by `gene.fitness`. It separately reports best quality strategy if quality metrics exist, but the main best strategy highlight still uses fitness.
+
+**Risk:** the UI can promote a strategy based on composite fitness rather than validated OOS/quality/risk-adjusted results. This reinforces the earlier `fitness != net_profit` problem at the user-facing layer.
+
+**Severity:** Medium.
+
+**Fix direction:** choose UI “best strategy” from a typed ranking contract: OOS pass first, WFV/CPCV pass, quality score, live-gate-adjusted expectancy, and drawdown safety. Display raw fitness only as an internal search score.
+
+---
+
 ## GPU-first architecture note
 
 The target is valid: expensive search/backtest/training-adjacent work should run mostly on GPU.
 
-But GPU-first is only safe if GPU means **semantic-parity GPU**, not just “a faster metric on GPU”. A parity GPU path must match CPU/live contract on:
+But GPU-first is only safe if GPU means **semantic-parity GPU**, not just “a faster metric on GPU”. A parity GPU path must match CPU/live/export contract on:
 
 - timestamp unit,
 - HTF feature availability timing,
 - timeframe-aware feature windows,
 - feature sanitation / non-finite policy,
+- feature schema hash and load-time contract checks,
 - causal stop/target inference,
 - initial balance,
 - fixed vs dynamic position sizing,
@@ -553,6 +626,7 @@ But GPU-first is only safe if GPU means **semantic-parity GPU**, not just “a f
 - kill-zone/session rules,
 - broker timezone/day boundary,
 - day/week/month ledger,
+- OOS/WFV/CPCV validation gates,
 - metric layout.
 
 Tensor/HPC discovery can remain a fast approximate presearch path, but final acceptance should require parity backtest.
@@ -568,21 +642,23 @@ Tensor/HPC discovery can remain a fast approximate presearch path, but final acc
 5. Introduce one canonical search/backtest/execution contract from config/risk/symbol metadata, including initial balance, slippage, sizing mode, and live risk gates.
 6. Add canonical signal synthesis shared by CPU, CUDA, trade logs, gauntlet, and validation.
 7. Fix or freeze causal SL/TP inference.
-8. Decide whether live-only partial TP / entry patience must be simulated or disabled for validated strategies.
-9. Fix walk-forward diagnostics to pass true timestamps into `simulate_trades_core`.
-10. Build and return day/week/month period ledger; close all open periods at test end.
-11. Unify fast metrics and trade simulation via one position state machine.
-12. Add a feature sanitation contract for NaN/Inf/warmup rows.
-13. Pass real timestamps into VectorTA classic indicator computation.
-14. Separate `fitness_score` from `net_profit`.
-15. Replace raw metric indexes with typed metrics or named constants.
-16. Make timeframe-dependent features timeframe-aware.
-17. Make duplicate timestamp handling explicit and audited.
-18. Enforce validation flags in discovery output.
-19. Wire WFV/CPCV as optional-but-real hard gates.
-20. Treat tensor/HPC GPU discovery as approximate presearch unless parity evaluator is used.
-21. Add CI coverage for `forex-search` and GPU-relevant feature combinations.
-22. Add deterministic CPU-vs-GPU-live parity tests.
+8. Add mandatory OOS replay on withheld UI data before saving/exporting portfolios.
+9. Decide whether live-only partial TP / entry patience must be simulated or disabled for validated strategies.
+10. Fix walk-forward diagnostics to pass true timestamps into `simulate_trades_core`.
+11. Build and return day/week/month period ledger; close all open periods at test end.
+12. Unify fast metrics and trade simulation via one position state machine.
+13. Add a feature sanitation contract for NaN/Inf/warmup rows.
+14. Pass real timestamps into VectorTA classic indicator computation.
+15. Export a portfolio contract with feature schema hash, config hash, validation results, and git commit.
+16. Separate `fitness_score` from `net_profit` and UI best-strategy ranking.
+17. Replace raw metric indexes with typed metrics or named constants.
+18. Make timeframe-dependent features timeframe-aware.
+19. Make duplicate timestamp handling explicit and audited.
+20. Enforce validation flags in discovery output.
+21. Wire WFV/CPCV as optional-but-real hard gates.
+22. Treat tensor/HPC GPU discovery as approximate presearch unless parity evaluator is used.
+23. Add CI coverage for `forex-search` and GPU-relevant feature combinations.
+24. Add deterministic CPU-vs-GPU-live parity tests.
 
 ---
 
@@ -590,6 +666,7 @@ Tensor/HPC discovery can remain a fast approximate presearch path, but final acc
 
 - [ ] Confirm whether `validation.rs` functions are called from all relevant discovery entrypoints.
 - [ ] Confirm whether `CombinatorialPurgedCV` affects final portfolio acceptance.
+- [ ] Confirm whether UI withheld 20% OOS is replayed before portfolio export.
 - [ ] Confirm exact metric layout in CPU evaluator vs cubecl evaluator.
 - [ ] Add deterministic CPU/GPU backtest parity fixture.
 - [ ] Add HTF leakage regression test using synthetic M1 → H1 resampling.
@@ -600,6 +677,9 @@ Tensor/HPC discovery can remain a fast approximate presearch path, but final acc
 - [ ] Add CUDA kill-zone/session parity tests.
 - [ ] Add slippage-cost parity tests.
 - [ ] Add dynamic sizing and live-risk-gate replay tests.
+- [ ] Add OOS replay/export gate tests.
+- [ ] Add portfolio schema-hash/load-contract tests.
+- [ ] Add regime robustness threshold tests using different initial balances.
 - [ ] Add partial-TP/entry-patience backtest vs live execution tests, or assert those features are disabled for validated portfolios.
 - [ ] Add final open-position policy tests.
 - [ ] Add single-day/week/month tests to ensure final periods are included.
@@ -620,4 +700,4 @@ Tensor/HPC discovery can remain a fast approximate presearch path, but final acc
 
 The bot already has serious pieces for search, GPU acceleration, WFV/CPCV utilities, quality analysis, gauntlet filtering, live order execution, and live risk management.
 
-But `master` currently has multiple search/backtest/validation/live-execution paths with different semantics. The next milestone should be one documented contract for data timing, timestamp unit, timeframe-aware features, feature sanitation, causal stop/target inference, cost/slippage model, initial balance, position sizing, live risk gates, execution policy, signal timing, SMC signal synthesis, position state machine, final open-position policy, period ledger, metric layout, and validation gates — with CPU/GPU/live-execution parity tests around that contract.
+But `master` currently has multiple search/backtest/validation/live-execution/export paths with different semantics. The next milestone should be one documented contract for data timing, timestamp unit, timeframe-aware features, feature sanitation, feature schema, causal stop/target inference, cost/slippage model, initial balance, position sizing, live risk gates, execution policy, signal timing, SMC signal synthesis, position state machine, final open-position policy, period ledger, metric layout, validation gates, and portfolio export/load safety — with CPU/GPU/live-execution/OOS parity tests around that contract.
