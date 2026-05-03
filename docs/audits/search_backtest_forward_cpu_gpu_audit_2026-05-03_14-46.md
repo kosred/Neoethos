@@ -1,7 +1,7 @@
 # Search / Backtest / Forward Validation / CPU-GPU Audit
 
 **Created:** 2026-05-03 14:46 Europe/Berlin  
-**Last updated:** 2026-05-03 15:06 Europe/Berlin  
+**Last updated:** 2026-05-03 15:18 Europe/Berlin  
 **Repository:** `kosred/forex-ai`  
 **Target branch:** `master`  
 **Scope:** data ingestion, feature alignment, search/discovery, backtest, forward/walk-forward validation, CPCV, CPU/GPU parity, and HPC GPU search semantics.
@@ -28,6 +28,7 @@ Highest-priority risks:
 - `fitness` is used with different meanings and should not be treated as net profit.
 - Search, quality screen, gauntlet, walk-forward, and trade logs can use different signal/cost/session contracts.
 - The bot does not yet expose one canonical trader-style day/week/month ledger.
+- Several feature/stop-target helpers are not yet clearly bound to the same timeframe and walk-forward data contract.
 
 ---
 
@@ -39,6 +40,8 @@ Known relevant components:
 
 - `crates/forex-data/src/core/resample.rs` — OHLCV resampling.
 - `crates/forex-data/src/core/features.rs` — feature alignment.
+- `crates/forex-data/src/core/quant_features.rs` — timeframe-dependent quant features.
+- `crates/forex-search/src/stop_target.rs` — volatility/regime based SL/TP inference.
 - `crates/forex-search/src/eval.rs` — CPU reference backtest/evaluation and GPU dispatch.
 - `crates/forex-search/src/cubecl_eval.rs` — cubecl CUDA signal/backtest evaluator.
 - `crates/forex-search/src/genetic/search_engine.rs` — GA search and archive.
@@ -260,34 +263,6 @@ A trader needs period knowledge: daily PnL/DD, weekly rhythm, monthly consistenc
 
 **Fix direction:** replace the narrow “flush final month” idea with a full day/week/month period ledger emitted by reference backtest and mirrored by GPU parity evaluator.
 
-Suggested shape:
-
-```rust
-struct PeriodLedger {
-    days: Vec<PeriodStats>,
-    weeks: Vec<PeriodStats>,
-    months: Vec<PeriodStats>,
-}
-
-struct PeriodStats {
-    key: i64,
-    start_ts: i64,
-    end_ts: i64,
-    equity_open: f64,
-    equity_close: f64,
-    pnl: f64,
-    pnl_pct: f64,
-    max_drawdown: f64,
-    max_intraday_drawdown: f64,
-    trade_count: usize,
-    wins: usize,
-    losses: usize,
-    profit_factor: f64,
-    expectancy: f64,
-    rule_breaches: Vec<String>,
-}
-```
-
 ---
 
 ### 15. Final open period is not safely closed
@@ -360,6 +335,62 @@ Gauntlet uses its own settings/defaults and appears to use `signals_for_gene`, n
 
 ---
 
+### 20. Stop/target inference can use future data when defaults are inferred from the full OHLCV slice
+
+**Files:** `search_engine.rs`, `stop_target.rs`
+
+`resolve_stop_target_arrays` calls `infer_stop_target_pips` using the full OHLCV arrays when a gene has invalid/missing SL/TP. The stop-target helper contains volatility/regime logic based on trailing slices and `.last()` style calculations over the supplied data.
+
+**Risk:** if SL/TP defaults are inferred from the whole search/evaluation slice, the stop/target choice can be influenced by future volatility/regime information. This is especially dangerous if the same inferred defaults are then used for all bars in the backtest or during validation.
+
+**Severity:** High.
+
+**Fix direction:** SL/TP inference must be causal. Either genes must carry fixed SL/TP values created before validation, or stop/target inference must be computed per bar using only data available up to that bar, or per train split using only train data and then frozen for test/OOS.
+
+---
+
+### 21. Initial balance is not part of one canonical backtest contract
+
+**Files:** `validation.rs`, `quality.rs`, `forex-core/src/config.rs`, `discovery.rs`
+
+`validation.rs` hardcodes `WALKFORWARD_INITIAL_BALANCE = 100_000.0`. `RiskConfig` has its own `initial_balance` default. `quality.rs` receives `initial_balance` from the caller. Search/eval metrics also need a consistent base equity to calculate percentages and drawdowns.
+
+**Risk:** daily returns, max daily DD, total DD, Calmar, monthly returns, and prop-compliance checks can be calculated against different account sizes depending on module.
+
+**Severity:** High.
+
+**Fix direction:** `initial_balance` must be part of the canonical `SearchBacktestContract` and passed into search, validation, quality, ledger, CPU evaluator, and GPU evaluator.
+
+---
+
+### 22. Some “daily/weekly” quant features use fixed bar counts instead of timeframe-aware calendar windows
+
+**File:** `forex-data/src/core/quant_features.rs`
+
+`quant_features.rs` contains features described as previous day/week distances using fixed periods such as 24 and 120 bars, with comments like “proxy for previous day on H1”. But the same feature function is called for whatever timeframe is being processed.
+
+**Risk:** on M1, 24 bars is 24 minutes, not a previous day. On M5, 24 bars is two hours. On H1 it approximates a day. This can make feature meanings inconsistent across base and higher timeframes and can mislead the GA.
+
+**Severity:** Medium-High.
+
+**Fix direction:** timeframe-dependent features must receive timeframe metadata and convert calendar periods into bar counts, or be renamed honestly as fixed-bar lookback features.
+
+---
+
+### 23. Higher timeframe list can duplicate the base timeframe
+
+**Files:** `forex-core/src/config.rs`, `forex-data/src/lib.rs`
+
+System config defaults include many higher timeframes, including `M1`. `prepare_multitimeframe_features_with_options` always pushes base features first, then aligns every requested higher timeframe if present. If `higher_tfs` includes the base timeframe, the base feature set can be duplicated under a timeframe prefix.
+
+**Risk:** duplicated columns can overweight the base timeframe, create redundant genes, and make archive diversity look better than it really is.
+
+**Severity:** Medium.
+
+**Fix direction:** remove `base_tf` from `higher_tfs` before alignment, or explicitly allow duplication only when intended and log it.
+
+---
+
 ## GPU-first architecture note
 
 The target is valid: expensive search/backtest/training-adjacent work should run mostly on GPU.
@@ -368,6 +399,9 @@ But GPU-first is only safe if GPU means **semantic-parity GPU**, not just “a f
 
 - timestamp unit,
 - HTF feature availability timing,
+- timeframe-aware feature windows,
+- causal stop/target inference,
+- initial balance,
 - signal timing,
 - canonical signal synthesis including SMC gating,
 - position state machine,
@@ -389,18 +423,20 @@ Tensor/HPC discovery can remain a fast approximate presearch path, but final acc
 1. Fix HTF resampling/alignment leakage.
 2. Normalize timestamp units across data/search/backtest/validation.
 3. Fix CUDA full backtest prior-bar signal timing.
-4. Introduce one canonical search/backtest contract from config/risk/symbol metadata.
+4. Introduce one canonical search/backtest contract from config/risk/symbol metadata, including initial balance.
 5. Add canonical signal synthesis shared by CPU, CUDA, trade logs, gauntlet, and validation.
-6. Fix walk-forward diagnostics to pass true timestamps into `simulate_trades_core`.
-7. Build and return day/week/month period ledger; close all open periods at test end.
-8. Unify fast metrics and trade simulation via one position state machine.
-9. Separate `fitness_score` from `net_profit`.
-10. Replace raw metric indexes with typed metrics or named constants.
-11. Enforce validation flags in discovery output.
-12. Wire WFV/CPCV as optional-but-real hard gates.
-13. Treat tensor/HPC GPU discovery as approximate presearch unless parity evaluator is used.
-14. Add CI coverage for `forex-search` and GPU-relevant feature combinations.
-15. Add deterministic CPU-vs-GPU parity tests.
+6. Fix or freeze causal SL/TP inference.
+7. Fix walk-forward diagnostics to pass true timestamps into `simulate_trades_core`.
+8. Build and return day/week/month period ledger; close all open periods at test end.
+9. Unify fast metrics and trade simulation via one position state machine.
+10. Separate `fitness_score` from `net_profit`.
+11. Replace raw metric indexes with typed metrics or named constants.
+12. Make timeframe-dependent features timeframe-aware.
+13. Enforce validation flags in discovery output.
+14. Wire WFV/CPCV as optional-but-real hard gates.
+15. Treat tensor/HPC GPU discovery as approximate presearch unless parity evaluator is used.
+16. Add CI coverage for `forex-search` and GPU-relevant feature combinations.
+17. Add deterministic CPU-vs-GPU parity tests.
 
 ---
 
@@ -419,6 +455,9 @@ Tensor/HPC discovery can remain a fast approximate presearch path, but final acc
 - [ ] Add kill-zone parity tests between fast metrics and full trade simulation.
 - [ ] Add signal synthesis parity tests: CPU evaluator vs `signals_for_gene` vs CUDA signal kernel.
 - [ ] Add SMC-gated signal parity tests.
+- [ ] Add causal SL/TP inference tests.
+- [ ] Add timeframe-aware quant feature tests.
+- [ ] Add duplicate-feature guard tests when `higher_tfs` includes `base_tf`.
 
 ---
 
@@ -426,4 +465,4 @@ Tensor/HPC discovery can remain a fast approximate presearch path, but final acc
 
 The bot already has serious pieces for search, GPU acceleration, WFV/CPCV utilities, quality analysis, and gauntlet filtering.
 
-But `master` currently has multiple search/backtest/validation paths with different semantics. The next milestone should be one documented contract for data timing, timestamp unit, cost model, signal timing, SMC signal synthesis, position state machine, period ledger, metric layout, and validation gates — with CPU/GPU parity tests around that contract.
+But `master` currently has multiple search/backtest/validation paths with different semantics. The next milestone should be one documented contract for data timing, timestamp unit, timeframe-aware features, causal stop/target inference, cost model, initial balance, signal timing, SMC signal synthesis, position state machine, period ledger, metric layout, and validation gates — with CPU/GPU parity tests around that contract.
