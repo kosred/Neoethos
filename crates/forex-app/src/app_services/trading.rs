@@ -1779,13 +1779,18 @@ impl TradingSession {
         if self.last_observed_day_id == Some(day_id) {
             return;
         }
-        if let Some(runtime) = self.connected_ctrader_runtime() {
-            let live_equity = runtime.trader.balance + runtime.trader.unrealized_pnl;
-            self.day_start_equity = Some(live_equity);
+        // Snapshot the live equity in a separate scope so the immutable borrow
+        // on `self.connected_ctrader_runtime()` is released before we assign
+        // back into `self.day_start_equity`.
+        let live_equity: Option<f64> = self
+            .connected_ctrader_runtime()
+            .map(|r| r.trader.balance + r.trader.unrealized_pnl);
+        if let Some(equity) = live_equity {
+            self.day_start_equity = Some(equity);
             tracing::info!(
                 target: "forex_app::risk",
                 day_id,
-                day_start_equity = live_equity,
+                day_start_equity = equity,
                 "day boundary crossed; daily-DD reference reset"
             );
         }
