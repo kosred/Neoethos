@@ -478,18 +478,204 @@ Final acceptance should require CPU/GPU parity backtest or a proven GPU parity e
 
 ---
 
+## Additional findings appended 2026-05-03 14:51 Europe/Berlin
+
+### 12. Timestamp unit contract is inconsistent across data and evaluation code
+
+**Files:**
+
+- `crates/forex-data/src/core/resample.rs`
+- `crates/forex-search/src/eval.rs`
+- `crates/forex-search/src/validation.rs`
+
+**Observed behavior:**
+
+The resampling code uses nanosecond units (`period_ns = minutes * 60 * 1_000_000_000`). The evaluation code uses millisecond constants such as `86_400_000` and `3_600_000`, and parameters named `gap_threshold_ms`.
+
+**Risk:**
+
+If OHLCV/FeatureFrame timestamps are nanoseconds in some paths and milliseconds in others, gap detection, day bucketing, duration calculations, kill-zone checks, and max-trades-per-day logic can all be wrong by a factor of 1,000,000.
+
+This can create silent false validation results: daily drawdown, daily trade limits, weekend exits, and gap exits may not represent reality.
+
+**Severity:** Critical.
+
+**Recommended fix direction:**
+
+Introduce a single timestamp unit contract for all search/backtest/validation code. Recommended options:
+
+- normalize all timestamps to milliseconds before entering `forex-search`; or
+- add explicit timestamp-unit detection/conversion at the boundary; or
+- use a typed timestamp wrapper instead of raw `i64`.
+
+Add tests for ms/us/ns input timestamps.
+
+---
+
+### 13. Walk-forward risk diagnostics pass `days` into `simulate_trades_core` as if they were timestamps
+
+**Files:**
+
+- `crates/forex-search/src/validation.rs`
+- `crates/forex-search/src/eval.rs`
+
+**Observed behavior:**
+
+`walkforward_risk_diagnostics` receives `days: &[i64]` and then calls:
+
+```rust
+simulate_trades_core(close, high, low, days, signals, settings)
+```
+
+But `simulate_trades_core` expects real timestamps, not day-index buckets.
+
+**Risk:**
+
+The trade simulation used inside walk-forward risk diagnostics can mis-handle:
+
+- duration hours,
+- gap detection,
+- kill-zone / weekend rules,
+- internal day bucketing,
+- max-trades-per-day behavior.
+
+Some daily PnL aggregation may appear to work accidentally because day IDs are stable buckets, but the simulator itself is not receiving the data contract it expects.
+
+**Severity:** High.
+
+**Recommended fix direction:**
+
+Change `WalkforwardBacktestInput` to carry both:
+
+- `timestamps`, real timestamp vector,
+- `days`, day bucket vector.
+
+Then pass `timestamps` to `simulate_trades_core`, and use `days` only for daily aggregation.
+
+---
+
+### 14. Final open month is not flushed into monthly return buckets
+
+**Files:**
+
+- `crates/forex-search/src/eval.rs`
+- `crates/forex-search/src/cubecl_eval.rs`
+
+**Observed behavior:**
+
+Monthly PnL is stored when the month changes. The current/open final month is not clearly flushed into `monthly_pnls` before Sharpe/consistency calculation.
+
+In `fast_evaluate_strategy_core`, `month_returns` are built only if `month_ptr >= 0`. If a backtest window does not cross a month boundary, the monthly return vector can be empty even if trades occurred.
+
+The CUDA kernel has a similar pattern: month buckets are written on month changes and `filled_months` is derived from `month_ptr`, which can exclude the final active month.
+
+**Risk:**
+
+Short windows, stage-1 evaluation windows, and same-month tests can report zero or distorted Sharpe/consistency. This affects ranking and selection pressure during search.
+
+Even if CPU and GPU share the same bug, the metrics are still economically wrong.
+
+**Severity:** High.
+
+**Recommended fix direction:**
+
+At the end of every backtest, flush the final `current_month_pnl` into monthly buckets before computing monthly Sharpe/consistency.
+
+Add a regression test where all trades occur within a single month and profitable strategies must not get zero consistency only because no month rollover happened.
+
+---
+
+### 15. `fast_evaluate_strategy_core` and `simulate_trades_core` appear to differ on kill-zone/session rules
+
+**File:** `crates/forex-search/src/eval.rs`
+
+**Observed behavior:**
+
+`simulate_trades_core` contains explicit session-aware logic, including weekend/Friday force-exit and Monday/Friday entry blocking when `kill_zones_enabled` is true.
+
+The visible `fast_evaluate_strategy_core` path does not show equivalent kill-zone entry blocking or Friday force-exit logic in the main evaluation loop.
+
+**Risk:**
+
+Search metrics and detailed trade logs/walk-forward diagnostics can disagree. A strategy may pass fast evaluation but fail trade simulation, or vice versa, because session rules differ.
+
+**Severity:** High.
+
+**Recommended fix direction:**
+
+Unify the position state machine. Ideally `fast_evaluate_strategy_core` and `simulate_trades_core` should share the same core step function, with one version collecting only metrics and the other collecting full trade logs.
+
+---
+
+### 16. Metric layout is implicit and duplicated across CPU, CUDA, validation, and discovery
+
+**Files:**
+
+- `crates/forex-search/src/eval.rs`
+- `crates/forex-search/src/cubecl_eval.rs`
+- `crates/forex-search/src/validation.rs`
+- `crates/forex-search/src/discovery.rs`
+
+**Observed behavior:**
+
+Evaluation returns `[f64; 11]` and many downstream modules rely on numeric indexes such as:
+
+- `metrics[0]` = net profit,
+- `metrics[3]` = max drawdown,
+- `metrics[4]` = win rate,
+- `metrics[5]` = profit factor,
+- `metrics[8]` = trade count,
+- `metrics[9]` = consistency,
+- `metrics[10]` = max daily drawdown.
+
+CUDA internally has a smaller core metric width and then reconstructs/derives the full metric array.
+
+**Risk:**
+
+A single index mismatch can silently corrupt selection, validation, UI display, or portfolio export. This risk increases with separate CPU, cubecl CUDA, tensor GPU, validation, and quality modules.
+
+**Severity:** Medium-High.
+
+**Recommended fix direction:**
+
+Replace raw metric arrays with a typed struct, for example:
+
+```rust
+struct BacktestMetrics {
+    net_profit: f64,
+    sharpe: f64,
+    peak_equity: f64,
+    max_drawdown: f64,
+    win_rate: f64,
+    profit_factor: f64,
+    expectancy: f64,
+    trade_count: usize,
+    consistency: f64,
+    max_daily_drawdown: f64,
+}
+```
+
+If arrays must remain for performance, define named constants for indexes and use them everywhere.
+
+---
+
 ## Recommended next action order
 
 1. Fix HTF resampling/alignment leakage.
-2. Fix full CUDA backtest signal timing.
-3. Define canonical cost model and pass it everywhere.
-4. Separate `fitness_score` from `net_profit`.
-5. Enforce validation flags in discovery output.
-6. Wire walk-forward/CPCV as optional-but-real hard gates.
-7. Treat tensor/HPC GPU discovery as approximate presearch unless parity evaluator is used.
-8. Add CI coverage for `forex-search` and GPU-relevant compile paths where feasible.
-9. Add CPU-vs-GPU parity tests on tiny deterministic OHLCV/signals.
-10. Add data contract tests for resampled HTF timestamps and MTF alignment.
+2. Normalize timestamp units across data/search/backtest/validation.
+3. Fix full CUDA backtest signal timing.
+4. Fix walk-forward diagnostics to pass true timestamps into `simulate_trades_core`.
+5. Flush final month PnL in CPU and CUDA evaluators.
+6. Unify kill-zone/session logic between fast metrics and trade simulation.
+7. Define canonical cost model and pass it everywhere.
+8. Separate `fitness_score` from `net_profit`.
+9. Replace raw metric indexes with a typed `BacktestMetrics` or named constants.
+10. Enforce validation flags in discovery output.
+11. Wire walk-forward/CPCV as optional-but-real hard gates.
+12. Treat tensor/HPC GPU discovery as approximate presearch unless parity evaluator is used.
+13. Add CI coverage for `forex-search` and GPU-relevant compile paths where feasible.
+14. Add CPU-vs-GPU parity tests on tiny deterministic OHLCV/signals.
+15. Add data contract tests for resampled HTF timestamps and MTF alignment.
 
 ---
 
@@ -502,6 +688,9 @@ Final acceptance should require CPU/GPU parity backtest or a proven GPU parity e
 - [ ] Add HTF leakage regression test using synthetic M1 → H1 resampling.
 - [ ] Confirm whether all exported portfolios record which validation gates were actually run.
 - [ ] Confirm CI runs `cargo check/test -p forex-search` and relevant feature combinations.
+- [ ] Add timestamp unit tests for ms/us/ns input vectors.
+- [ ] Add single-month backtest test to ensure Sharpe/consistency includes the final month.
+- [ ] Add kill-zone parity tests between fast metrics and full trade simulation.
 
 ---
 
@@ -513,7 +702,7 @@ But today the safest interpretation is:
 
 - `master` has multiple search/backtest/validation paths with different semantics.
 - PR branch fixes some gene-evolution correctness issues but does not yet merge into `master`.
-- Two critical leakage/parity issues remain open: HTF resampling timestamp leakage and CUDA same-bar entry.
+- Critical leakage/parity issues remain open: HTF resampling timestamp leakage, timestamp-unit ambiguity, CUDA same-bar entry, final-month metric handling, and walk-forward diagnostics using day buckets as timestamps.
 - HPC/tensor GPU discovery should not be treated as equivalent to the full SL/TP backtest path until parity is proven or explicitly implemented.
 
 For prop-challenge-grade reliability, the next milestone should be a single documented contract for data timing, cost model, signal timing, metric layout, and validation gates, with CPU/GPU parity tests around that contract.
