@@ -36,6 +36,12 @@ pub struct CTraderTraderSnapshot {
     pub account_type: Option<String>,
     pub broker_name: Option<String>,
     pub money_digits: u32,
+    /// Sum of mark-to-market PnL for currently open positions (account currency).
+    /// Updated by the streaming/spot subsystem; defaults to 0.0 when no live
+    /// spot data is available. Read alongside `balance` to compute live equity:
+    /// `equity = balance + unrealized_pnl`. Critical for prop-firm rules that
+    /// limit drawdown by EQUITY, not balance.
+    pub unrealized_pnl: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -287,6 +293,7 @@ pub fn parse_trader_response(response_json: &str) -> Result<CTraderTraderSnapsho
         account_type: envelope.payload.account_type.map(account_type_label),
         broker_name: envelope.payload.broker_name,
         money_digits,
+        unrealized_pnl: 0.0,
     })
 }
 

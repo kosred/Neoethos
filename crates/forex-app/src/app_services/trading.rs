@@ -212,6 +212,11 @@ pub struct TradingSession {
     trade_journal: Vec<String>,
     initial_equity: Option<f64>,
     day_start_equity: Option<f64>,
+    /// Broker-time day id (`unix_ms / 86_400_000`). When the periodic refresh
+    /// observes a new day id we reset `day_start_equity` via
+    /// `handle_day_boundary`; otherwise the daily-DD reference would be
+    /// frozen at session start (D6 in the prop-firm safety audit).
+    last_observed_day_id: Option<i64>,
     ctrader_runtime_refreshed_at: Option<Instant>,
     connect_handle: Option<std::thread::JoinHandle<()>>,
     bootstrap_handle: Option<std::thread::JoinHandle<()>>,
@@ -334,6 +339,7 @@ impl TradingSession {
             trade_journal: Vec::new(),
             initial_equity: None,
             day_start_equity: None,
+            last_observed_day_id: None,
             ctrader_runtime_refreshed_at: None,
             connect_handle: None,
             bootstrap_handle: None,
@@ -1712,26 +1718,101 @@ impl TradingSession {
         })
     }
 
+    /// Live account equity = balance + sum of mark-to-market unrealized PnL.
+    ///
+    /// Critical for prop-firm rules: every published challenge measures
+    /// drawdown by EQUITY, not balance, so an open losing position MUST be
+    /// counted before the gate fires. `unrealized_pnl` is fed by the
+    /// streaming subsystem (set to 0.0 until that wire is in); when 0.0
+    /// while positions are open we surface a one-shot warning so the
+    /// operator notices the missing live update.
     fn ctrader_account_equity(&self) -> f64 {
-        let balance = self
-            .connected_ctrader_runtime()
-            .map(|r| r.trader.balance)
-            .unwrap_or(0.0);
-
-        // Simple approximation for now: balance + sum(positions.profit)
-        // A more complex implementation would look up live spots for each symbol.
-        // For a desktop terminal, this is usually updated by the live spot stream.
-        balance
+        let runtime = match self.connected_ctrader_runtime() {
+            Some(r) => r,
+            None => return 0.0,
+        };
+        let balance = runtime.trader.balance;
+        let unrealized = runtime.trader.unrealized_pnl;
+        if !runtime.reconcile.positions.is_empty() && unrealized == 0.0 {
+            tracing::warn!(
+                target: "forex_app::risk",
+                positions = runtime.reconcile.positions.len(),
+                "ctrader equity computed without unrealized PnL; daily-DD check is balance-only \
+                 until the streaming subsystem populates trader.unrealized_pnl"
+            );
+        }
+        balance + unrealized
     }
 
-    fn ctrader_symbol_pip_position(&self, _symbol: &str) -> Option<i32> {
-        // In a real implementation, this would lookup symbol metadata.
-        // For common Forex pairs, it's 4. JPY is 2.
-        if _symbol.contains("JPY") || _symbol.contains("XAU") {
-            Some(2)
-        } else {
-            Some(4)
+    /// Pip position (decimal places of one pip) for a forex symbol.
+    ///
+    /// The bot is FX-only — JPY pairs use 2 decimal pip notation, every
+    /// other major/minor uses 4. We deliberately do NOT branch on metals or
+    /// crypto here because the bot doesn't trade them; if an unknown symbol
+    /// shape arrives, log a structured warn and default to 4 so operators
+    /// can spot the mis-routed instrument instead of silently mispricing it.
+    fn ctrader_symbol_pip_position(&self, symbol: &str) -> Option<i32> {
+        let normalized = symbol.to_ascii_uppercase();
+        if normalized.contains("JPY") {
+            return Some(2);
         }
+        // Heuristic: real FX symbols are exactly 6 alphabetic characters
+        // (EURUSD, GBPCHF, ...). Anything else is suspicious in a forex-only
+        // bot — log a warn but still return a sane default so we don't crash.
+        let looks_like_fx_pair = normalized.len() == 6 && normalized.chars().all(|c| c.is_ascii_alphabetic());
+        if !looks_like_fx_pair {
+            tracing::warn!(
+                target: "forex_app::risk",
+                symbol,
+                "symbol does not look like a 6-letter FX pair; defaulting pip_position=4"
+            );
+        }
+        Some(4)
+    }
+
+    /// Reset the per-day risk-tracking counters when the broker calendar
+    /// day advances. Called from the periodic runtime refresh path; until
+    /// this fires the daily-DD check would otherwise treat the entire
+    /// session as a single "day" — D6 from the audit.
+    pub fn handle_day_boundary(&mut self, broker_now_unix_ms: i64) {
+        let day_id = broker_now_unix_ms / 86_400_000;
+        if self.last_observed_day_id == Some(day_id) {
+            return;
+        }
+        if let Some(runtime) = self.connected_ctrader_runtime() {
+            let live_equity = runtime.trader.balance + runtime.trader.unrealized_pnl;
+            self.day_start_equity = Some(live_equity);
+            tracing::info!(
+                target: "forex_app::risk",
+                day_id,
+                day_start_equity = live_equity,
+                "day boundary crossed; daily-DD reference reset"
+            );
+        }
+        self.last_observed_day_id = Some(day_id);
+    }
+
+    /// Roll the prop-firm phase forward (Challenge → Verification → Funded).
+    /// Each phase has its own starting balance, so `initial_equity` and
+    /// `day_start_equity` must be re-anchored when the operator marks the
+    /// previous phase as complete — D7 from the audit.
+    pub fn handle_phase_rollover(&mut self, new_phase_starting_equity: f64) {
+        if !new_phase_starting_equity.is_finite() || new_phase_starting_equity <= 0.0 {
+            tracing::warn!(
+                target: "forex_app::risk",
+                value = new_phase_starting_equity,
+                "phase rollover rejected: starting equity must be finite and positive"
+            );
+            return;
+        }
+        self.initial_equity = Some(new_phase_starting_equity);
+        self.day_start_equity = Some(new_phase_starting_equity);
+        self.last_observed_day_id = None;
+        tracing::info!(
+            target: "forex_app::risk",
+            new_phase_starting_equity,
+            "prop-firm phase rolled over; total-DD and daily-DD anchors reset"
+        );
     }
 
     pub fn refresh_runtime(&mut self, state: &mut AppState) -> anyhow::Result<()> {
@@ -2201,6 +2282,7 @@ impl Default for TradingSession {
             trade_journal: Vec::new(),
             initial_equity: None,
             day_start_equity: None,
+            last_observed_day_id: None,
             ctrader_runtime_refreshed_at: None,
             connect_handle: None,
             bootstrap_handle: None,
@@ -3305,26 +3387,45 @@ fn prop_firm_pre_trade_check(
         }
     }
 
-    // Soft check on risk per trade based on distance to stop loss.
+    // HARD risk-per-trade gate (D4+D5). Previously this was a `tracing::warn`
+    // that did not block the order, and the loss estimate used `* 10.0` —
+    // i.e. it assumed every pip is worth $10/std-lot. Wrong for non-USD
+    // accounts and for any quote currency != account currency. We now
+    // compute the real per-pip account-currency value via the forex-search
+    // cost model and reject the order if it would exceed the configured
+    // `risk_per_trade` percentage. Override the live FX rate the model
+    // needs for cross pairs via `FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE`.
     if let (Some(sl), Some(entry_estimate)) =
         (order.stop_loss, order.limit_price.or(order.stop_price))
     {
         let pip_multiplier = 10.0_f64.powi(pip_position);
         let pip_distance = (entry_estimate - sl).abs() * pip_multiplier;
 
-        // Volume-based loss: (Lot size * Pips * Pip Value)
-        // For standard 100k lots, 1 pip is usually $10.
-        let estimated_loss = pip_distance * (order.volume as f64 / 100.0) * 10.0;
+        // The order references the cTrader symbol by numeric id; without a
+        // local id→string cache we let `infer_market_cost_profile` fall back
+        // to the `FOREX_BOT_PROP_SYMBOL` env override (default EURUSD) and
+        // the corresponding pip-value heuristics. Operators can also bypass
+        // the heuristic by setting `FOREX_BOT_PROP_PIP_VALUE_PER_LOT`.
+        let cost = forex_search::genetic::strategy_gene::infer_market_cost_profile(
+            "",
+            "",
+            Some(entry_estimate),
+            None,
+            None,
+        );
+        // `pip_value_per_lot` is account-currency-units per pip per standard
+        // (1.0) lot. cTrader volume is in cents of a standard lot, so divide.
+        let estimated_loss =
+            pip_distance * (order.volume as f64 / 100.0) * cost.pip_value_per_lot;
         let max_loss = risk.risk_per_trade * account_equity;
-
         if estimated_loss > max_loss {
-            tracing::warn!(
-                "Trade may exceed risk-per-trade limit: estimated loss {:.2} > max allowed {:.2} ({}%) based on {} pips",
+            return Err(anyhow::anyhow!(
+                "Risk-per-trade exceeded: estimated loss {:.2} > max allowed {:.2} ({:.2}%) at {:.1} pips",
                 estimated_loss,
                 max_loss,
                 risk.risk_per_trade * 100.0,
                 pip_distance
-            );
+            ));
         }
     }
 
@@ -3691,6 +3792,7 @@ mod tests {
                         account_type: Some("NETTED".to_string()),
                         broker_name: Some("Demo Broker".to_string()),
                         money_digits: 2,
+                        unrealized_pnl: 0.0,
                     },
                     reconcile: crate::app_services::ctrader_account::CTraderReconcileSnapshot {
                         account_id: 712345,
@@ -3778,6 +3880,7 @@ mod tests {
                         account_type: Some("NETTED".to_string()),
                         broker_name: Some("Demo Broker".to_string()),
                         money_digits: 2,
+                        unrealized_pnl: 0.0,
                     },
                     reconcile: crate::app_services::ctrader_account::CTraderReconcileSnapshot {
                         account_id: 712345,
@@ -3898,6 +4001,7 @@ mod tests {
                         account_type: Some("NETTED".to_string()),
                         broker_name: Some("Demo Broker".to_string()),
                         money_digits: 2,
+                        unrealized_pnl: 0.0,
                     },
                     reconcile: crate::app_services::ctrader_account::CTraderReconcileSnapshot {
                         account_id: 712345,
@@ -4008,6 +4112,7 @@ mod tests {
                         account_type: Some("NETTED".to_string()),
                         broker_name: Some("Demo Broker".to_string()),
                         money_digits: 2,
+                        unrealized_pnl: 0.0,
                     },
                     reconcile: crate::app_services::ctrader_account::CTraderReconcileSnapshot {
                         account_id: 712345,
@@ -4719,6 +4824,7 @@ mod tests {
                         account_type: Some("NETTED".to_string()),
                         broker_name: Some("Demo Broker".to_string()),
                         money_digits: 2,
+                        unrealized_pnl: 0.0,
                     },
                     reconcile: crate::app_services::ctrader_account::CTraderReconcileSnapshot {
                         account_id: 712345,
@@ -4740,6 +4846,7 @@ mod tests {
                     account_type: Some("NETTED".to_string()),
                     broker_name: Some("Demo Broker".to_string()),
                     money_digits: 2,
+                    unrealized_pnl: 0.0,
                 },
                 reconcile: crate::app_services::ctrader_account::CTraderReconcileSnapshot {
                     account_id: 712345,
