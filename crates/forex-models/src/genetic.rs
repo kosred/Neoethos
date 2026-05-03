@@ -586,12 +586,16 @@ impl GeneticStrategyExpert {
         let population_size = self.population_size.max(16);
         let effective_generations =
             Self::effective_generation_count(population_size, self.generations);
+        // GA helpers in forex-search now accept `&mut impl Rng` for
+        // determinism; create a single RNG up front and thread it through.
+        let mut rng = rand::rng();
         let mut population = generate_random_genes(
             population_size,
             n_indicators,
             self.max_indicators,
             0,
             &smc_cfg,
+            &mut rng,
         );
         let mut seen_memory = SeenSignatureMemory::default();
         population = population
@@ -605,6 +609,7 @@ impl GeneticStrategyExpert {
                     0,
                     12,
                     &smc_cfg,
+                    &mut rng,
                 )
             })
             .collect();
@@ -619,7 +624,8 @@ impl GeneticStrategyExpert {
         let selection_temperature = self.selection_temperature.max(1e-3);
         let tournament_size = self.tournament_size.max(2);
         let immigrant_fraction = self.immigrant_fraction.clamp(0.0, 0.95);
-        let mut rng = rand::rng();
+        // `rng` is the seeded one created at the top of this fn (kept across
+        // generations so consumers can reproduce by setting a known seed).
 
         if effective_generations < self.generations {
             info!(
@@ -704,19 +710,22 @@ impl GeneticStrategyExpert {
             let immigrant_count =
                 immigrant_count.min(population_size.saturating_sub(next_generation.len()));
             for _ in 0..immigrant_count {
+                let new_gene = forex_search::genetic::new_random_gene(
+                    n_indicators,
+                    self.max_indicators,
+                    generation + 1,
+                    &smc_cfg,
+                    &mut rng,
+                );
                 let immigrant = unique_candidate_or_retry(
-                    forex_search::genetic::new_random_gene(
-                        n_indicators,
-                        self.max_indicators,
-                        generation + 1,
-                        &smc_cfg,
-                    ),
+                    new_gene,
                     &mut seen_memory,
                     n_indicators,
                     self.max_indicators,
                     generation + 1,
                     12,
                     &smc_cfg,
+                    &mut rng,
                 );
                 next_generation.push(immigrant);
             }
@@ -754,7 +763,7 @@ impl GeneticStrategyExpert {
                 }
                 let parent_a = &scored[parent_a_idx].1;
                 let parent_b = &scored[parent_b_idx].1;
-                let mut child = crossover(parent_a, parent_b, generation + 1);
+                let mut child = crossover(parent_a, parent_b, generation + 1, &mut rng);
                 if rng.random_bool(0.8) {
                     child = mutate(
                         &child,
@@ -763,6 +772,7 @@ impl GeneticStrategyExpert {
                         generation + 1,
                         &smc_cfg,
                         0,
+                        &mut rng,
                     );
                 }
                 if rng.random_bool(0.25) {
@@ -775,7 +785,7 @@ impl GeneticStrategyExpert {
                         &mut rng,
                     );
                     let challenger = &scored[challenger_idx].1;
-                    child = crossover(&child, challenger, generation + 1);
+                    child = crossover(&child, challenger, generation + 1, &mut rng);
                 }
                 next_generation.push(unique_candidate_or_retry(
                     child,
@@ -785,6 +795,7 @@ impl GeneticStrategyExpert {
                     generation + 1,
                     12,
                     &smc_cfg,
+                    &mut rng,
                 ));
             }
 
