@@ -1,0 +1,17 @@
+Wire the new diversity module into crates/forex-search/src/genetic/mod.rs.
+
+Add near the top:
+
+pub mod diversity;
+
+Add this export block before the evolution_math exports:
+
+pub use diversity::{
+    DiversityArchiveConfig, DiversityKey, EvalMetrics, archive_quality_score, diversity_key,
+    select_diverse_archive, smc_mask,
+};
+
+Then run:
+
+cargo fmt
+cargo test -p forex-search --no-default-features
