@@ -1,0 +1,27 @@
+Wire the new regime label module into crates/forex-search/src/genetic/mod.rs.
+
+Add near the top:
+
+pub mod regime_labels;
+
+Add this export block near the other exports:
+
+pub use regime_labels::{
+    RegimeLabelPolicy, RegimeWindow, StrategyRegimeProfile, WindowPerformanceLabel,
+    build_rolling_regime_windows, label_strategies_by_regime_windows,
+    rank_training_profiles, window_quality_score,
+};
+
+Intended use after evolve_search returns a candidate archive:
+
+let policy = RegimeLabelPolicy::from_env();
+let profiles = label_strategies_by_regime_windows(
+    &features,
+    &ohlcv,
+    &search_result.genes,
+    &eval_config,
+    policy,
+)?;
+let profiles = rank_training_profiles(profiles);
+
+This should feed model training labels. It must not be used as a hard filter during initial candidate generation.
