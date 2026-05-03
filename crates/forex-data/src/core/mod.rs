@@ -9,4 +9,5 @@ pub mod regime_detection;
 pub mod resample;
 pub mod session_features;
 pub mod smc;
+pub mod timestamps;
 pub mod vortex_io;
