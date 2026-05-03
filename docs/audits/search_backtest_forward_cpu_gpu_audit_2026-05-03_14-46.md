@@ -1,7 +1,7 @@
 # Search / Backtest / Forward Validation / CPU-GPU Audit
 
 **Created:** 2026-05-03 14:46 Europe/Berlin  
-**Last updated:** 2026-05-03 15:29 Europe/Berlin  
+**Last updated:** 2026-05-03 15:44 Europe/Berlin  
 **Repository:** `kosred/forex-ai`  
 **Target branch:** `master`  
 **Scope:** data ingestion, feature alignment, search/discovery, backtest, forward/walk-forward validation, CPCV, CPU/GPU parity, and HPC GPU search semantics.
@@ -453,6 +453,78 @@ System config defaults include many higher timeframes, including `M1`. `prepare_
 
 ---
 
+## Additional findings appended 2026-05-03 15:44 Europe/Berlin
+
+### 28. Backtest appears to use fixed pip-value / implicit fixed position sizing, not live dynamic risk sizing
+
+**Files:** `eval.rs`, `cubecl_eval.rs`, `forex-core/src/domain/risk.rs`, `forex-core/src/config.rs`
+
+The backtest PnL path uses pip movement multiplied by `pip_value_per_lot` / pip-value style settings. The live risk module has a much richer position sizing model with equity, confidence, uncertainty, volatility targeting, Kelly-style scaling, recovery mode, and drawdown-aware risk reduction.
+
+**Risk:** the search can rank strategies under an implicit fixed-size model while live trading resizes positions dynamically. That changes return, drawdown, daily loss risk, recovery behavior, and prop-firm compliance. A strategy that is good under fixed sizing is not necessarily good under dynamic risk sizing, and vice versa.
+
+**Severity:** High.
+
+**Fix direction:** add position sizing mode to the canonical backtest contract: fixed lot, fixed risk percent, volatility-targeted risk, or live-risk-manager parity. The same sizing policy must be used in search, validation, quality reports, and live deployment.
+
+---
+
+### 29. Live risk gates are not represented as a first-class search/backtest gate
+
+**Files:** `forex-core/src/domain/risk.rs`, `eval.rs`, `validation.rs`, `discovery.rs`
+
+The live `RiskManager` can block trades based on total/daily/intraday drawdown, recovery mode, circuit breaker, monthly/challenge target reached, confidence threshold, session window, night block, news kill window, revenge-trade detection, max trades per day, and strategy rank/sharpe restrictions under drawdown.
+
+**Risk:** search/backtest can accept a strategy that live runtime would frequently block. This means the backtested equity curve may not match the deployable equity curve.
+
+**Severity:** High.
+
+**Fix direction:** model live risk gates in the backtest engine, or export a separate `live_gate_adjusted_backtest`. At minimum, report the number of trades that would have been blocked by live risk rules.
+
+---
+
+### 30. Classic VectorTA feature generation uses zero timestamps
+
+**File:** `forex-data/src/core/hpc_ta.rs`
+
+`compute_classic_ta_columns` builds a `Candles` object for VectorTA with `timestamps = vec![0i64; n]` instead of the real OHLCV timestamps.
+
+**Risk:** most classic price-only indicators may still work, but any indicator that depends on timestamps, sessions, day boundaries, anchored periods, or calendar logic will be wrong or degenerate. This also makes feature parity weaker between modules that use real timestamps and modules that do not.
+
+**Severity:** Medium-High.
+
+**Fix direction:** pass real timestamps into the VectorTA candle object. Add a test that a time-dependent indicator changes when timestamps change.
+
+---
+
+### 31. FeatureFrame construction does not clearly sanitize non-finite feature values
+
+**Files:** `forex-data/src/lib.rs`, `forex-data/src/core/features.rs`, `cubecl_eval.rs`, `eval.rs`
+
+`compute_hpc_feature_frame` copies feature columns into an `Array2<f32>` without a visible central non-finite cleanup stage. Feature alignment can also return `NaN` for unavailable higher-timeframe rows.
+
+**Risk:** NaN/Inf values can enter CPU and GPU signal synthesis. CPU and GPU can handle NaNs differently, and threshold comparisons with NaN usually produce no signal. That can silently bias early rows, HTF alignment gaps, or entire indicators.
+
+**Severity:** Medium-High.
+
+**Fix direction:** introduce a feature sanitation policy at the `FeatureFrame` boundary: reject non-finite values, fill with a documented neutral value, add validity masks, or drop warmup rows. The same policy must run before CPU and GPU evaluation.
+
+---
+
+### 32. Final open position handling must be explicit and parity-tested
+
+**Files:** `eval.rs`, `cubecl_eval.rs`, `quality.rs`
+
+The visible full CUDA kernel computes final net profit after the main loop, and no explicit final close of an open position is visible in the kernel excerpt. CPU behavior must be checked and matched exactly.
+
+**Risk:** if one path leaves final positions unrealized while another force-closes or mark-to-markets them, net profit, trade count, win rate, PF, expectancy, daily/monthly ledger, and prop compliance can diverge.
+
+**Severity:** Medium-High.
+
+**Fix direction:** define one end-of-test policy: force close at final close, mark-to-market open positions separately, or reject windows with open positions. Apply the same policy in CPU metrics, CUDA metrics, trade logs, quality reports, WFV/CPCV, and live replay.
+
+---
+
 ## GPU-first architecture note
 
 The target is valid: expensive search/backtest/training-adjacent work should run mostly on GPU.
@@ -462,13 +534,17 @@ But GPU-first is only safe if GPU means **semantic-parity GPU**, not just “a f
 - timestamp unit,
 - HTF feature availability timing,
 - timeframe-aware feature windows,
+- feature sanitation / non-finite policy,
 - causal stop/target inference,
 - initial balance,
+- fixed vs dynamic position sizing,
+- live risk gates,
 - slippage/spread/commission,
 - live execution policy such as partial TP and entry patience,
 - signal timing,
 - canonical signal synthesis including SMC gating,
 - position state machine,
+- final open-position policy,
 - TP/SL/trailing rules,
 - pip value / lot sizing contract,
 - max hold/min hold,
@@ -489,22 +565,24 @@ Tensor/HPC discovery can remain a fast approximate presearch path, but final acc
 2. Normalize timestamp units across data/search/backtest/validation/GPU.
 3. Fix CUDA full backtest prior-bar signal timing.
 4. Add kill-zone/session/broker-day parity to CUDA or disable CUDA full backtest as final acceptance path until implemented.
-5. Introduce one canonical search/backtest/execution contract from config/risk/symbol metadata, including initial balance and slippage.
+5. Introduce one canonical search/backtest/execution contract from config/risk/symbol metadata, including initial balance, slippage, sizing mode, and live risk gates.
 6. Add canonical signal synthesis shared by CPU, CUDA, trade logs, gauntlet, and validation.
 7. Fix or freeze causal SL/TP inference.
 8. Decide whether live-only partial TP / entry patience must be simulated or disabled for validated strategies.
 9. Fix walk-forward diagnostics to pass true timestamps into `simulate_trades_core`.
 10. Build and return day/week/month period ledger; close all open periods at test end.
 11. Unify fast metrics and trade simulation via one position state machine.
-12. Separate `fitness_score` from `net_profit`.
-13. Replace raw metric indexes with typed metrics or named constants.
-14. Make timeframe-dependent features timeframe-aware.
-15. Make duplicate timestamp handling explicit and audited.
-16. Enforce validation flags in discovery output.
-17. Wire WFV/CPCV as optional-but-real hard gates.
-18. Treat tensor/HPC GPU discovery as approximate presearch unless parity evaluator is used.
-19. Add CI coverage for `forex-search` and GPU-relevant feature combinations.
-20. Add deterministic CPU-vs-GPU parity tests.
+12. Add a feature sanitation contract for NaN/Inf/warmup rows.
+13. Pass real timestamps into VectorTA classic indicator computation.
+14. Separate `fitness_score` from `net_profit`.
+15. Replace raw metric indexes with typed metrics or named constants.
+16. Make timeframe-dependent features timeframe-aware.
+17. Make duplicate timestamp handling explicit and audited.
+18. Enforce validation flags in discovery output.
+19. Wire WFV/CPCV as optional-but-real hard gates.
+20. Treat tensor/HPC GPU discovery as approximate presearch unless parity evaluator is used.
+21. Add CI coverage for `forex-search` and GPU-relevant feature combinations.
+22. Add deterministic CPU-vs-GPU-live parity tests.
 
 ---
 
@@ -521,7 +599,9 @@ Tensor/HPC discovery can remain a fast approximate presearch path, but final acc
 - [ ] Add CUDA timestamp delta/gap-exit tests.
 - [ ] Add CUDA kill-zone/session parity tests.
 - [ ] Add slippage-cost parity tests.
+- [ ] Add dynamic sizing and live-risk-gate replay tests.
 - [ ] Add partial-TP/entry-patience backtest vs live execution tests, or assert those features are disabled for validated portfolios.
+- [ ] Add final open-position policy tests.
 - [ ] Add single-day/week/month tests to ensure final periods are included.
 - [ ] Add daily/weekly/monthly ledger tests.
 - [ ] Add kill-zone parity tests between fast metrics and full trade simulation.
@@ -531,11 +611,13 @@ Tensor/HPC discovery can remain a fast approximate presearch path, but final acc
 - [ ] Add timeframe-aware quant feature tests.
 - [ ] Add duplicate-feature guard tests when `higher_tfs` includes `base_tf`.
 - [ ] Add duplicate timestamp ingest tests.
+- [ ] Add feature sanitation tests for NaN/Inf/warmup values.
+- [ ] Add VectorTA timestamp propagation test.
 
 ---
 
 ## Bottom line
 
-The bot already has serious pieces for search, GPU acceleration, WFV/CPCV utilities, quality analysis, and gauntlet filtering.
+The bot already has serious pieces for search, GPU acceleration, WFV/CPCV utilities, quality analysis, gauntlet filtering, live order execution, and live risk management.
 
-But `master` currently has multiple search/backtest/validation/live-execution paths with different semantics. The next milestone should be one documented contract for data timing, timestamp unit, timeframe-aware features, causal stop/target inference, cost/slippage model, initial balance, execution policy, signal timing, SMC signal synthesis, position state machine, period ledger, metric layout, and validation gates — with CPU/GPU/live-execution parity tests around that contract.
+But `master` currently has multiple search/backtest/validation/live-execution paths with different semantics. The next milestone should be one documented contract for data timing, timestamp unit, timeframe-aware features, feature sanitation, causal stop/target inference, cost/slippage model, initial balance, position sizing, live risk gates, execution policy, signal timing, SMC signal synthesis, position state machine, final open-position policy, period ledger, metric layout, and validation gates — with CPU/GPU/live-execution parity tests around that contract.
