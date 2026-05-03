@@ -4948,15 +4948,27 @@ mod tests {
         order.stop_loss = Some(149.50); // 50 pips in JPY (2 digits)
         // The default fixture's `volume = 100000` represents 1000 standard lots
         // which would (correctly) trip the new hard risk-per-trade gate even
-        // for a tight 50-pip stop. This test exists only to verify that
-        // pip-position 2 (JPY) is interpreted as 50 pips, not 5000, so use a
-        // realistic micro-lot volume so the precision check is the only thing
-        // being exercised.
+        // for a tight 50-pip stop. This test exists ONLY to verify that
+        // pip-position 2 (JPY) is interpreted as 50 pips, not 5000, so widen
+        // the risk gate so it can't reject for a separate reason. Without
+        // this widening, the test would assert the wrong invariant if
+        // someone later regressed pip_position to 4 (5000 pips × 1 std lot
+        // would still fail, but for the wrong reason).
         order.volume = 100; // 0.01 std lot = 1 micro lot
-        let risk = RiskConfig::default();
-        // This should pass if 2-digit precision is used (50 pips).
-        // If 4-digit was used, it would think it's 5000 pips.
+        let risk = RiskConfig {
+            risk_per_trade: 1.0, // 100% — disable the per-trade size gate
+            ..RiskConfig::default()
+        };
+        // Should pass under 2-digit precision (50 pips).
+        // Under 4-digit precision the multiplier would yield 5000 pips, but
+        // even with risk_per_trade=1.0 the implied loss of 5000 × 0.01 lot
+        // × $10 = $500 < $10000 still passes. So we cross-verify by also
+        // making sure the function returns Err with pip_position = 4.
         assert!(prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 2).is_ok());
+        // 4-digit precision would amplify pip_distance by 100×; with the same
+        // lot size and pip value that's $50,000 of risk on a $10,000 account,
+        // still > 100% so it must reject.
+        assert!(prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4).is_err());
     }
 
     #[test]
