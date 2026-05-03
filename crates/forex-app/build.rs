@@ -199,13 +199,24 @@ fn emit_embedded_credentials() {
 
     std::fs::write(&dest, content).expect("failed to write embedded_credentials.rs");
 
-    if !client_id.is_empty() {
-        println!(
-            "cargo:warning=Embedded cTrader client_id ({} chars) into binary.",
-            client_id.len()
-        );
-    } else {
-        println!("cargo:warning=No embedded cTrader credentials found; binary uses empty fallback.");
+    // L4: previously printed `cargo:warning=Embedded cTrader client_id (N chars) ...`,
+    // which surfaced credential length in CI logs. Suppressed; the embed
+    // status is still observable via the file written to OUT_DIR. Set
+    // `FOREX_AI_BUILD_VERBOSE=1` to re-enable for local debugging.
+    let verbose = std::env::var("FOREX_AI_BUILD_VERBOSE")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    if verbose {
+        if !client_id.is_empty() {
+            println!(
+                "cargo:warning=Embedded cTrader client_id ({} chars) into binary.",
+                client_id.len()
+            );
+        } else {
+            println!(
+                "cargo:warning=No embedded cTrader credentials found; binary uses empty fallback."
+            );
+        }
     }
 }
 

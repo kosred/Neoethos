@@ -321,6 +321,10 @@ pub fn fast_evaluate_strategy_core(
                 } else {
                     let mut sl = entry_px + (settings.sl_pips * pip);
                     let tp = entry_px - (settings.tp_pips * pip);
+                    // L2: trailing stop on a short position only activates once
+                    // the price has moved at least `trailing_be_trigger_r * sl_pips`
+                    // in the trader's favour. Until then `trail_px` stays at 0.0
+                    // and the original `entry_px - sl_pips` stop holds.
                     if settings.trailing_enabled {
                         let mv = entry_px - lo;
                         if mv >= (settings.trailing_be_trigger_r * settings.sl_pips * pip) {
