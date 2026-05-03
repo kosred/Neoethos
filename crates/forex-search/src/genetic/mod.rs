@@ -12,7 +12,8 @@ pub use diversity::{
 pub use evolution_math::{
     EvolutionSearchPolicy, ParentSelectionPolicy, SeenSignatureMemory, SurvivorSelectionPolicy,
     apply_metrics, crossover, gene_signature_hash, generate_random_genes, mutate, new_random_gene,
-    score_from_metrics, select_parent_index, select_survivor_indices, unique_candidate_or_retry,
+    reset_gene_metrics, score_from_metrics, select_parent_index, select_survivor_indices,
+    unique_candidate_or_retry,
 };
 pub use regime_labels::{
     RegimeLabelPolicy, RegimeWindow, StrategyRegimeProfile, WindowPerformanceLabel,
