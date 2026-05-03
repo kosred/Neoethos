@@ -1,10 +1,14 @@
 name: CI
 
+# Keep CI available, but do not run it on every feature-branch/PR update.
+# During active strategy-search development the branch can receive many small
+# commits, and the Windows/Linux matrix is too noisy and expensive to trigger
+# after every source edit. Run automatically only when code reaches long-lived
+# branches, or start it manually from the Actions tab when needed.
 on:
+  workflow_dispatch:
   push:
     branches: [master, main, develop]
-  pull_request:
-    branches: [master, main]
 
 env:
   CARGO_TERM_COLOR: always
