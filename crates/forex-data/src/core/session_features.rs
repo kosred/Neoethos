@@ -4,6 +4,7 @@
 /// and provides key institutional reference levels like session VWAP,
 /// session open gaps, and session range positions.
 use super::super::Ohlcv;
+use crate::core::timestamps::{TimestampUnit, infer_timestamp_unit, timestamp_to_millis};
 use chrono::{TimeZone, Timelike, Utc};
 
 #[derive(Default, Clone)]
@@ -106,6 +107,11 @@ pub fn compute_session_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)>
     let mut daily_vwap_dist = vec![0.0_f64; n];
 
     let volume = ohlcv.volume.as_deref();
+    let timestamp_unit = ohlcv
+        .timestamp
+        .as_deref()
+        .and_then(infer_timestamp_unit)
+        .unwrap_or(TimestampUnit::Milliseconds);
 
     let mut asian = SessionAccum::default();
     let mut london = SessionAccum::default();
@@ -139,8 +145,9 @@ pub fn compute_session_feature_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)>
             (high - low).max(1e-10)
         };
 
-        if let Some(ts) = ohlcv.timestamp.as_ref().map(|t| t[i])
-            && let chrono::LocalResult::Single(dt) = Utc.timestamp_millis_opt(ts)
+        if let Some(raw_ts) = ohlcv.timestamp.as_ref().map(|t| t[i])
+            && let Ok(ts_ms) = timestamp_to_millis(raw_ts, timestamp_unit)
+            && let chrono::LocalResult::Single(dt) = Utc.timestamp_millis_opt(ts_ms)
         {
             let hour = dt.hour();
             let minute = dt.minute();
