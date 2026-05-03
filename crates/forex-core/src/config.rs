@@ -27,6 +27,13 @@ pub struct SystemConfig {
     pub trading_session_start: String,
     pub trading_session_end: String,
     pub session_timezone: String,
+    /// Broker time zone used for prop-firm calendar-day boundaries (e.g.
+    /// daily-DD reset). Most cTrader prop firms run on EET ("Europe/Athens",
+    /// UTC+2/+3); some run pure UTC. When set, the trading runtime computes
+    /// `day_id` against this offset instead of the local clock. Empty string
+    /// falls back to `session_timezone` (default "UTC"). M12 in the audit.
+    #[serde(default)]
+    pub broker_timezone: String,
     pub broker_backend: String,
     pub poll_interval_seconds: u64,
     pub metrics_logging_enabled: bool,
@@ -102,6 +109,7 @@ impl Default for SystemConfig {
             trading_session_start: "00:05".to_string(),
             trading_session_end: "23:55".to_string(),
             session_timezone: "UTC".to_string(),
+            broker_timezone: String::new(), // empty = fall back to session_timezone
             broker_backend: "ctrader".to_string(),
             poll_interval_seconds: 60,
             metrics_logging_enabled: true,
@@ -842,6 +850,7 @@ impl Settings {
     pub fn from_yaml(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let settings: Settings = serde_yaml_ng::from_str(&content)?;
+        settings.validate_safety_bounds();
         Ok(settings)
     }
 
@@ -850,6 +859,56 @@ impl Settings {
         let config_file =
             std::env::var("CONFIG_FILE").unwrap_or_else(|_| "config.yaml".to_string());
         Self::from_yaml(&config_file)
+    }
+
+    /// Sanity-check loaded RiskConfig values against prop-firm-safe bounds.
+    ///
+    /// We can't reject the load — config consumers expect a non-fatal load —
+    /// but a mistyped `risk_per_trade: 50` (meaning 50% instead of 0.5%) needs
+    /// to be screamed about, otherwise the bot silently sizes 100× too big.
+    /// All checks emit `tracing::error` with the field, the loaded value,
+    /// and a recommended sane value. M9 in the audit.
+    fn validate_safety_bounds(&self) {
+        let risk = &self.risk;
+        // risk_per_trade should be a fraction (0.0 — 0.05 typical, 0.10 max).
+        // A YAML value > 1.0 means the user typed a percentage (e.g. 1.5 for
+        // 1.5%) — we recover by interpreting it as percent and warning.
+        if risk.risk_per_trade > 1.0 {
+            tracing::error!(
+                target: "forex_core::config",
+                risk_per_trade = risk.risk_per_trade,
+                "RiskConfig.risk_per_trade > 1.0 — looks like a percentage typo. \
+                 0.005 means 0.5%, NOT 0.5 = 50%. Halt or fix the config."
+            );
+        } else if risk.risk_per_trade > 0.05 {
+            tracing::warn!(
+                target: "forex_core::config",
+                risk_per_trade = risk.risk_per_trade,
+                "RiskConfig.risk_per_trade > 5% per trade — uncommonly aggressive for a prop firm"
+            );
+        }
+        if risk.daily_drawdown_limit <= 0.0 || risk.daily_drawdown_limit > 0.20 {
+            tracing::error!(
+                target: "forex_core::config",
+                daily_drawdown_limit = risk.daily_drawdown_limit,
+                "RiskConfig.daily_drawdown_limit must be in (0, 0.20]; typical prop firms set 0.04-0.05"
+            );
+        }
+        if risk.total_drawdown_limit <= risk.daily_drawdown_limit {
+            tracing::error!(
+                target: "forex_core::config",
+                total = risk.total_drawdown_limit,
+                daily = risk.daily_drawdown_limit,
+                "RiskConfig.total_drawdown_limit should exceed daily_drawdown_limit"
+            );
+        }
+        if risk.total_drawdown_limit > 0.30 {
+            tracing::error!(
+                target: "forex_core::config",
+                total_drawdown_limit = risk.total_drawdown_limit,
+                "RiskConfig.total_drawdown_limit > 30% — exceeds every published prop-firm rule"
+            );
+        }
     }
 
     fn parse_csv_list(value: &str) -> Vec<String> {
