@@ -1,0 +1,117 @@
+diff --git a/crates/forex-search/src/genetic/evolution_math.rs b/crates/forex-search/src/genetic/evolution_math.rs
+--- a/crates/forex-search/src/genetic/evolution_math.rs
++++ b/crates/forex-search/src/genetic/evolution_math.rs
+@@
+ fn random_coarse_threshold(rng: &mut impl Rng) -> f32 {
+     let levels = [0.15, 0.25, 0.35, 0.45, 0.55];
+     levels[rng.random_range(0..levels.len())]
+ }
++
++pub fn reset_gene_metrics(gene: &mut Gene) {
++    gene.fitness = 0.0;
++    gene.sharpe_ratio = 0.0;
++    gene.win_rate = 0.0;
++    gene.max_drawdown = 0.0;
++    gene.profit_factor = 0.0;
++    gene.expectancy = 0.0;
++    gene.trades_count = 0;
++    gene.slice_pass_rate = 0.0;
++    gene.consistency = 0.0;
++}
+@@
+     randomize_smc_flags(&mut gene, smc_cfg, rng);
+     enforce_min_structural_smc_flags(&mut gene, smc_cfg, rng);
++    gene.normalize(n_indicators, 1);
+     gene
+ }
+@@
+     child.strategy_id = format!("gene_{}_{}", rng.random_range(0..1_000_000u64), generation);
+     child.generation = generation;
+-    child.fitness = 0.0;
++    reset_gene_metrics(&mut child);
+@@
+     mutated.strategy_id = format!("gene_{}_{}", rng.random_range(0..1_000_000u64), generation);
+     mutated.generation = generation;
++    reset_gene_metrics(&mut mutated);
++    mutated.normalize(n_indicators, 1);
+     mutated
+ }
+@@
+     fn zero_weight_fallback_is_deterministic() {
+         let mut rng = rand::rng();
+         assert_eq!(draw_weighted_offset(&[0.0, f64::NAN, -1.0], &mut rng), 0);
+     }
++
++    #[test]
++    fn reset_gene_metrics_clears_parent_scores() {
++        let mut gene = Gene {
++            fitness: 3.2,
++            sharpe_ratio: 1.4,
++            win_rate: 0.7,
++            max_drawdown: 0.05,
++            profit_factor: 1.8,
++            expectancy: 12.0,
++            trades_count: 42,
++            slice_pass_rate: 0.9,
++            consistency: 0.6,
++            ..Default::default()
++        };
++
++        reset_gene_metrics(&mut gene);
++
++        assert_eq!(gene.fitness, 0.0);
++        assert_eq!(gene.sharpe_ratio, 0.0);
++        assert_eq!(gene.win_rate, 0.0);
++        assert_eq!(gene.max_drawdown, 0.0);
++        assert_eq!(gene.profit_factor, 0.0);
++        assert_eq!(gene.expectancy, 0.0);
++        assert_eq!(gene.trades_count, 0);
++        assert_eq!(gene.slice_pass_rate, 0.0);
++        assert_eq!(gene.consistency, 0.0);
++    }
+ }
+diff --git a/crates/forex-search/src/genetic/search_engine.rs b/crates/forex-search/src/genetic/search_engine.rs
+--- a/crates/forex-search/src/genetic/search_engine.rs
++++ b/crates/forex-search/src/genetic/search_engine.rs
+@@
+ use super::evolution_math::{
+     EvolutionSearchPolicy, ParentSelectionPolicy, SeenSignatureMemory, SurvivorSelectionPolicy,
+-    apply_metrics, crossover, generate_random_genes, mutate, new_random_gene, select_parent_index,
+-    select_survivor_indices, unique_candidate_or_retry,
++    apply_metrics, crossover, gene_signature_hash, generate_random_genes, mutate, new_random_gene,
++    select_parent_index, select_survivor_indices, unique_candidate_or_retry,
+ };
+@@
+     let mut best_metrics = Vec::new();
+     let mut profitable_archive: Vec<(Gene, [f64; 11], usize)> = Vec::new();
+     let mut archive_seq = 0usize;
+-    let mut seen_strategy_ids: HashSet<String> = HashSet::new();
++    let mut seen_archive_signatures: HashSet<u64> = HashSet::new();
+@@
+-            let sid = if gene.strategy_id.is_empty() {
+-                format!(
+-                    "{:?}|{:?}|{:.3}|{:.3}",
+-                    gene.indices, gene.weights, gene.long_threshold, gene.short_threshold
+-                )
+-            } else {
+-                gene.strategy_id.clone()
+-            };
+-            if !seen_strategy_ids.insert(sid) {
++            let archive_sig = gene_signature_hash(gene);
++            if !seen_archive_signatures.insert(archive_sig) {
+                 continue;
+             }
+             profitable_archive.push((gene.clone(), *m, archive_seq));
+diff --git a/crates/forex-search/src/cubecl_eval.rs b/crates/forex-search/src/cubecl_eval.rs
+--- a/crates/forex-search/src/cubecl_eval.rs
++++ b/crates/forex-search/src/cubecl_eval.rs
+@@
+             } else {
+-                let s = signals_flat[signal_base + i];
++                // Match the CPU evaluator: act on the prior bar signal and fill
++                // on the current bar. Using signal i here would reintroduce
++                // same-bar look-ahead in the full CUDA backtest path.
++                let s = signals_flat[signal_base + i - 1];
+                 if s != 0 {
+                     if !(max_trades_per_day > 0 && day_trade_count >= max_trades_per_day) {
+                         in_pos = s;
