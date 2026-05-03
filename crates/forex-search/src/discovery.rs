@@ -37,6 +37,13 @@ pub struct DiscoveryConfig {
     pub cpcv_min_phi: f64,
     pub cpcv_max_rows: usize,
     pub filtering: crate::genetic::FilteringConfig,
+    /// Starting account balance used for PnL%, DD%, and regime loss limits.
+    pub initial_balance: f64,
+    /// Reject a gene if any regime-specific PnL drops below
+    /// `-initial_balance * max_regime_loss_pct / 100`.
+    pub max_regime_loss_pct: f64,
+    /// Higher timeframes to include in multitimeframe feature preparation.
+    pub higher_timeframes: Vec<String>,
 }
 
 impl Default for DiscoveryConfig {
@@ -67,6 +74,9 @@ impl Default for DiscoveryConfig {
             cpcv_min_phi: 0.80,
             cpcv_max_rows: 0,
             filtering: crate::genetic::FilteringConfig::default(),
+            initial_balance: 100_000.0,
+            max_regime_loss_pct: 3.0,
+            higher_timeframes: Vec::new(),
         }
     }
 }
@@ -131,6 +141,9 @@ impl DiscoveryConfig {
             cpcv_min_phi: model_settings.cpcv_min_phi.max(0.0),
             cpcv_max_rows: model_settings.cpcv_max_rows,
             filtering,
+            initial_balance: settings.risk.initial_balance.max(1.0),
+            max_regime_loss_pct: 3.0,
+            higher_timeframes: settings.system.higher_timeframes.clone(),
         }
     }
 
@@ -151,6 +164,9 @@ pub struct DiscoveryResult {
     pub candidates: Vec<Gene>,
     pub quality_metrics: Vec<StrategyMetrics>,
     pub logged_trades: Vec<LoggedStrategyTrades>,
+    /// Feature names as they existed *after* prefiltering inside discovery.
+    /// Gene indices refer to columns in this list, not the caller's original names.
+    pub effective_feature_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -445,6 +461,8 @@ where
     if prefilter_top_k > 0 && features.names.len() > prefilter_top_k {
         features = prefilter_features(&features, &ohlcv, prefilter_top_k);
     }
+    // Capture names after prefilter — gene indices refer to this list.
+    let effective_feature_names = features.names.clone();
 
     // Multi-stage Funnel: Stage 1 (Fast Evaluation)
     let stage1_pct = std::env::var("FOREX_BOT_FUNNEL_STAGE1_PCT")
@@ -494,7 +512,14 @@ where
         },
     )?;
 
-    finalize_candidates_with_progress(search.genes, &features, &ohlcv, config, progress_fn)
+    finalize_candidates_with_progress(
+        search.genes,
+        &features,
+        &ohlcv,
+        config,
+        effective_feature_names,
+        progress_fn,
+    )
 }
 
 fn pearson_correlation(x: &[f32], y: &[f32]) -> f32 {
@@ -613,7 +638,12 @@ fn prefilter_features(features: &FeatureFrame, ohlcv: &Ohlcv, top_k: usize) -> F
     }
 }
 
-fn validate_regime_robustness(trades: &[crate::quality::Trade], features: &FeatureFrame) -> bool {
+fn validate_regime_robustness(
+    trades: &[crate::quality::Trade],
+    features: &FeatureFrame,
+    initial_balance: f64,
+    max_regime_loss_pct: f64,
+) -> bool {
     let trend_idx = features
         .names
         .iter()
@@ -664,9 +694,7 @@ fn validate_regime_robustness(trades: &[crate::quality::Trade], features: &Featu
         }
     }
 
-    // We reject if the strategy wipes out > 3% of account in ANY specific regime
-    // Assuming 100k account balance, 3% is 3000.
-    let limit = -3000.0;
+    let limit = -(initial_balance * max_regime_loss_pct / 100.0);
 
     if trend_pnl < limit || range_pnl < limit || high_vol_pnl < limit || low_vol_pnl < limit {
         return false;
@@ -680,6 +708,7 @@ fn finalize_candidates_with_progress<F>(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
     config: &DiscoveryConfig,
+    effective_feature_names: Vec<String>,
     mut progress_fn: F,
 ) -> Result<DiscoveryResult>
 where
@@ -783,11 +812,7 @@ where
     if Gene::requires_quality_screen(&config.filtering) {
         type QualityCandidate = (usize, Gene, Vec<i8>, StrategyMetrics, bool, Vec<Trade>);
         let analyzer = quality_analyzer_for_config(config);
-        let initial_balance = std::env::var("FOREX_BOT_BACKTEST_INITIAL_EQUITY")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .unwrap_or(100_000.0);
+        let initial_balance = config.initial_balance;
 
         // Outer-parallel quality screen: each candidate runs simulate_trades +
         // 100 MC perturbations + spread sensitivity independently. Previously
@@ -820,7 +845,12 @@ where
                 }
 
                 // Regime-Aware Validation (Idea #3.2)
-                let regime_robust = validate_regime_robustness(&trades, features);
+                let regime_robust = validate_regime_robustness(
+                    &trades,
+                    features,
+                    config.initial_balance,
+                    config.max_regime_loss_pct,
+                );
                 if !regime_robust {
                     return None;
                 }
@@ -999,6 +1029,7 @@ where
         candidates: ranked_candidate_genes,
         quality_metrics,
         logged_trades,
+        effective_feature_names,
     })
 }
 
@@ -1296,6 +1327,7 @@ mod tests {
             candidates: vec![Gene::default()],
             quality_metrics: Vec::new(),
             logged_trades: Vec::new(),
+            effective_feature_names: Vec::new(),
         };
 
         let err = ensure_non_empty_portfolio(&result, "EURUSD M1")
@@ -1312,6 +1344,7 @@ mod tests {
             candidates: vec![Gene::default()],
             quality_metrics: Vec::new(),
             logged_trades: Vec::new(),
+            effective_feature_names: Vec::new(),
         };
 
         ensure_non_empty_portfolio(&result, "EURUSD M1")
@@ -1351,11 +1384,15 @@ mod tests {
         let candidates = vec![profitable_gene("alpha-1"), profitable_gene("alpha-2")];
         let mut progress_events = Vec::new();
 
-        let result =
-            finalize_candidates_with_progress(candidates, &features, &ohlcv, &config, |event| {
-                progress_events.push(event)
-            })
-            .expect("candidate finalization should succeed");
+        let result = finalize_candidates_with_progress(
+            candidates,
+            &features,
+            &ohlcv,
+            &config,
+            features.names.clone(),
+            |event| progress_events.push(event),
+        )
+        .expect("candidate finalization should succeed");
 
         assert_eq!(result.candidates.len(), 2);
         assert_eq!(result.portfolio.len(), 1);

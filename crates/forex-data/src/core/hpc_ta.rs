@@ -17,7 +17,10 @@ pub fn compute_classic_ta_columns(ohlcv: &Ohlcv) -> Vec<(String, Vec<f64>)> {
     let mut cols = Vec::new();
 
     // 1. Pack data into VectorTA Candles struct
-    let timestamps = vec![0i64; n];
+    let timestamps = ohlcv
+        .timestamp
+        .clone()
+        .unwrap_or_else(|| vec![0i64; n]);
     let volume = ohlcv.volume.clone().unwrap_or_else(|| vec![0.0; n]);
 
     let candles = Candles::new(

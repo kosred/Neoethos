@@ -366,7 +366,9 @@ fn backtest_population_kernel(
                     }
                 }
             } else {
-                let s = signals_flat[signal_base + i];
+                // Use prior-bar signal to match CPU eval.rs: signal[i-1] drives entry at bar i.
+                // Loop starts at i=1 so i-1 >= 0 is always valid.
+                let s = signals_flat[signal_base + i - 1];
                 if s != 0 {
                     if !(max_trades_per_day > 0 && day_trade_count >= max_trades_per_day) {
                         in_pos = s;

@@ -3,7 +3,6 @@ use anyhow::{Result, bail};
 use itertools::Itertools;
 use std::collections::BTreeMap;
 
-const WALKFORWARD_INITIAL_BALANCE: f64 = 100_000.0;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WalkforwardSplitResult {
@@ -47,6 +46,9 @@ pub struct WalkforwardBacktestInput<'a> {
     pub signals: &'a [i8],
     pub months: &'a [i64],
     pub days: &'a [i64],
+    /// Real bar timestamps (ms or ns, same unit as `simulate_trades_core` expects).
+    /// Used for gap detection, kill-zone rules, and day/week/month boundaries.
+    pub timestamps: &'a [i64],
     pub train_ratio: f64,
     pub n_splits: usize,
     pub embargo_bars: usize,
@@ -55,6 +57,8 @@ pub struct WalkforwardBacktestInput<'a> {
     pub max_daily_profit_pct: f64,
     pub min_trading_days: usize,
     pub max_trades_per_day: usize,
+    /// Starting account balance used to convert absolute PnL into daily return %.
+    pub initial_balance: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -88,16 +92,23 @@ fn walkforward_risk_diagnostics(
     low: &[f64],
     signals: &[i8],
     days: &[i64],
+    timestamps: &[i64],
     settings: &BacktestSettings,
     evaluator_max_daily_dd: f64,
     max_daily_loss_pct: f64,
     max_daily_profit_pct: f64,
     min_trading_days: usize,
     max_trades_per_day: usize,
+    initial_balance: f64,
 ) -> WalkforwardRiskDiagnostics {
     if close.is_empty() || days.is_empty() {
         return WalkforwardRiskDiagnostics::default();
     }
+    let initial_balance = if initial_balance.is_finite() && initial_balance > 0.0 {
+        initial_balance
+    } else {
+        100_000.0
+    };
 
     let mut day_offsets = BTreeMap::<i64, usize>::new();
     let mut daily_pnl = Vec::<f64>::new();
@@ -111,7 +122,13 @@ fn walkforward_risk_diagnostics(
         });
     }
 
-    let trades = simulate_trades_core(close, high, low, days, signals, settings);
+    // Use real timestamps so simulate_trades_core applies correct gap/session/kill-zone logic.
+    let ts = if timestamps.len() == close.len() {
+        timestamps
+    } else {
+        days
+    };
+    let trades = simulate_trades_core(close, high, low, ts, signals, settings);
     let mut max_consec_losses = 0usize;
     let mut current_consec_losses = 0usize;
 
@@ -139,7 +156,7 @@ fn walkforward_risk_diagnostics(
 
     let daily_returns: Vec<f64> = daily_pnl
         .iter()
-        .map(|pnl| pnl / WALKFORWARD_INITIAL_BALANCE)
+        .map(|pnl| pnl / initial_balance)
         .collect();
     let daily_min_return = daily_returns.iter().copied().fold(0.0, f64::min);
     let closed_trade_daily_loss = daily_returns
@@ -207,6 +224,7 @@ pub fn embargoed_walkforward_backtest(
         signals,
         months,
         days,
+        timestamps,
         train_ratio,
         n_splits,
         embargo_bars,
@@ -215,6 +233,7 @@ pub fn embargoed_walkforward_backtest(
         max_daily_profit_pct,
         min_trading_days,
         max_trades_per_day,
+        initial_balance,
     } = input;
     let n = close.len();
     if n == 0
@@ -256,6 +275,11 @@ pub fn embargoed_walkforward_backtest(
         let slice_sig = &signals[test_start..end];
         let slice_months = &months[test_start..end];
         let slice_days = &days[test_start..end];
+        let slice_ts = if timestamps.len() == n {
+            &timestamps[test_start..end]
+        } else {
+            slice_days
+        };
 
         let metrics = fast_evaluate_strategy_core(
             slice_close,
@@ -280,12 +304,14 @@ pub fn embargoed_walkforward_backtest(
             slice_low,
             slice_sig,
             slice_days,
+            slice_ts,
             settings,
             max_daily_dd,
             max_daily_loss_pct,
             max_daily_profit_pct,
             min_trading_days,
             max_trades_per_day,
+            initial_balance,
         );
 
         let res = WalkforwardSplitResult {
@@ -494,12 +520,14 @@ mod tests {
             &low,
             &signals,
             &days,
+            &days,
             &flat_settings(),
             0.0,
             0.01,
             0.50,
             3,
             1,
+            100_000.0,
         );
 
         assert_eq!(risk.max_consec_losses, 2);
