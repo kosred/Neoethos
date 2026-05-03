@@ -1,5 +1,5 @@
 use crate::genetic::strategy_gene::EvaluationConfig;
-use crate::genetic::{Gene, evolve_search_with_progress_and_limits, signals_for_gene};
+use crate::genetic::{Gene, evolve_search_with_progress_and_limits, signals_for_gene_full};
 use crate::quality::{StrategyMetrics, StrategyQualityAnalyzer, Trade};
 use anyhow::Result;
 use chrono::{Datelike, TimeZone, Utc};
@@ -747,10 +747,16 @@ where
         .filter(|(_, g)| g.passes_filter(&config.filtering))
         .map(|(idx, g)| (*idx, g.clone()))
         .collect();
+    // Item 6: use the SMC-gated signal path so the post-search "min_trades"
+    // filter sees the SAME trade count the evaluator scored. The previous
+    // `signals_for_gene` ignored gene SMC flags; some candidates passed the
+    // search archive (with their SMC-gated trade count) but were then pruned
+    // here because the un-gated count was higher than min_trades.
+    let eval_config_for_signals = config.evaluation_config(ohlcv.close.last().copied());
     let signals_with_idx: Vec<(usize, Gene, Vec<i8>)> = prefiltered
         .into_par_iter()
         .filter_map(|(candidate_idx, gene)| {
-            let sig = signals_for_gene(features, &gene);
+            let sig = signals_for_gene_full(features, ohlcv, &gene, &eval_config_for_signals);
             let trade_count = sig.iter().filter(|v| **v != 0).count() as f64;
             if trade_count >= min_trades as f64 {
                 Some((candidate_idx, gene, sig))
@@ -839,7 +845,14 @@ where
                     if perturbed.tp_pips.is_finite() && perturbed.tp_pips > 0.0 {
                         perturbed.tp_pips *= 1.0 + rng.random_range(-0.25..=0.25);
                     }
-                    let p_sig = crate::genetic::signals_for_gene(features, &perturbed);
+                    // Item 6: SMC-gated signal so the MC perturbation reward is
+                    // measured against the same execution rule the search used.
+                    let p_sig = crate::genetic::signals_for_gene_full(
+                        features,
+                        ohlcv,
+                        &perturbed,
+                        &eval_config_for_signals,
+                    );
                     let p_trades = crate::eval::simulate_trades_core(
                         &ohlcv.close,
                         &ohlcv.high,

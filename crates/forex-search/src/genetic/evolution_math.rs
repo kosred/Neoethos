@@ -541,6 +541,25 @@ pub fn unique_candidate_or_retry(
     candidate
 }
 
+/// Reset every derived/financial metric on a Gene that was inherited from a
+/// parent during crossover/mutation but is no longer accurate for the
+/// child. Previously we only zeroed `fitness` here, which left stale
+/// `sharpe_ratio`, `max_drawdown`, `profit_factor`, etc. on the child;
+/// downstream code that ranked or archived genes therefore mixed
+/// already-evaluated metrics with not-yet-evaluated metrics
+/// (item 2 from the search optimization notes).
+pub fn reset_derived_metrics(gene: &mut Gene) {
+    gene.fitness = 0.0;
+    gene.sharpe_ratio = 0.0;
+    gene.win_rate = 0.0;
+    gene.max_drawdown = 0.0;
+    gene.profit_factor = 0.0;
+    gene.expectancy = 0.0;
+    gene.trades_count = 0;
+    gene.consistency = 0.0;
+    gene.slice_pass_rate = 0.0;
+}
+
 pub fn crossover(a: &Gene, b: &Gene, generation: usize, rng: &mut impl Rng) -> Gene {
     // Note: callers must pass the same `rng` they use elsewhere in the same
     // search; using a fresh `rand::rng()` here would break the deterministic
@@ -562,7 +581,7 @@ pub fn crossover(a: &Gene, b: &Gene, generation: usize, rng: &mut impl Rng) -> G
     child.weights = weights;
     child.strategy_id = format!("gene_{}_{}", rng.random_range(0..1_000_000u64), generation);
     child.generation = generation;
-    child.fitness = 0.0;
+    reset_derived_metrics(&mut child);
 
     child.long_threshold = if rng.random_bool(0.5) {
         a.long_threshold
@@ -711,6 +730,12 @@ pub fn mutate(
     }
     mutated.strategy_id = format!("gene_{}_{}", rng.random_range(0..1_000_000u64), generation);
     mutated.generation = generation;
+    // Mutation invalidates every previously-evaluated financial metric on
+    // the parent gene. Without this reset, a mutated child carried its
+    // parent's `sharpe_ratio`/`win_rate`/etc. into the archive even though
+    // the new genome had never been backtested (item 2 from the search
+    // optimization notes).
+    reset_derived_metrics(&mut mutated);
     mutated
 }
 
