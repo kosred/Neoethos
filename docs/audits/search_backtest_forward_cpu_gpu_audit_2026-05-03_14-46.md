@@ -1,7 +1,7 @@
 # Search / Backtest / Forward Validation / CPU-GPU Audit
 
 **Created:** 2026-05-03 14:46 Europe/Berlin  
-**Last updated:** 2026-05-03 15:18 Europe/Berlin  
+**Last updated:** 2026-05-03 15:29 Europe/Berlin  
 **Repository:** `kosred/forex-ai`  
 **Target branch:** `master`  
 **Scope:** data ingestion, feature alignment, search/discovery, backtest, forward/walk-forward validation, CPCV, CPU/GPU parity, and HPC GPU search semantics.
@@ -17,7 +17,7 @@ The main issue is not whether the bot uses GPU. The critical issue is whether th
 Current reading shows three different search/evaluation families:
 
 1. **CPU / cubecl evaluator GA path** — closest to real SL/TP/spread/commission stateful backtest semantics.
-2. **cubecl full CUDA backtest path** — intended to accelerate the same GA evaluation, but still has a known CPU/GPU signal-timing mismatch.
+2. **cubecl full CUDA backtest path** — intended to accelerate the same GA evaluation, but still has known CPU/GPU semantic gaps.
 3. **tensor GPU discovery / HPC island discovery paths** — fast GPU search using simplified return/action-style fitness and flat costs. Useful as approximate presearch, but not equivalent to the full SL/TP backtest path unless parity is implemented and tested.
 
 Highest-priority risks:
@@ -25,8 +25,9 @@ Highest-priority risks:
 - Higher-timeframe resampling/alignment can leak future HTF candle information.
 - Timestamp unit handling appears inconsistent: data/resampling uses nanoseconds while search/eval/quality expects milliseconds.
 - Full CUDA backtest uses current-bar signal while CPU uses prior-bar signal.
+- Full CUDA backtest does not expose the same kill-zone/session/live execution contract as the CPU/trade simulation paths.
 - `fitness` is used with different meanings and should not be treated as net profit.
-- Search, quality screen, gauntlet, walk-forward, and trade logs can use different signal/cost/session contracts.
+- Search, quality screen, gauntlet, walk-forward, live order execution, and trade logs can use different signal/cost/session/execution contracts.
 - The bot does not yet expose one canonical trader-style day/week/month ledger.
 - Several feature/stop-target helpers are not yet clearly bound to the same timeframe and walk-forward data contract.
 
@@ -50,6 +51,7 @@ Known relevant components:
 - `crates/forex-search/src/gauntlet.rs` — strategy gauntlet validation layer.
 - `crates/forex-search/src/quality.rs` — trade-based quality analysis, monthly consistency, Monte Carlo daily-block bootstrap.
 - `crates/forex-search/src/discovery_gpu.rs` and `crates/forex-search/src/hpc_gpu_discovery.rs` — tensor/HPC GPU discovery paths.
+- `crates/forex-core/src/domain/order_execution.rs` — live/order execution helper with partial TP, entry patience, and edge/cost checks.
 
 ### In PR branch, not merged to `master`
 
@@ -87,11 +89,13 @@ Queued but not applied to source:
 
 ### 2. Timestamp unit contract is inconsistent
 
-**Files:** `resample.rs`, `search_engine.rs`, `eval.rs`, `validation.rs`, `quality.rs`
+**Files:** `resample.rs`, `search_engine.rs`, `eval.rs`, `validation.rs`, `quality.rs`, `cubecl_eval.rs`
 
 The resampling code uses nanosecond units (`1_000_000_000` per second). Search/evaluation/quality code expects milliseconds in multiple places: `timestamp_millis_opt`, `86_400_000`, `3_600_000`, `gap_threshold_ms`, and daily Monte Carlo bucketing via `entry_time / 86_400_000`.
 
-**Risk:** If nanosecond timestamps reach search/eval, day/month bucketing, duration hours, gap exits, max-trades-per-day, weekend/kill-zone logic, daily DD, monthly consistency, and Monte Carlo daily blocks can all silently break.
+`cubecl_eval.rs` also names and passes `timestamp_deltas_ms`, but the delta is computed directly from raw timestamps. If those timestamps are nanoseconds, the GPU path receives nanosecond deltas as if they were milliseconds.
+
+**Risk:** day/month bucketing, duration hours, gap exits, max-trades-per-day, weekend/kill-zone logic, daily DD, monthly consistency, Monte Carlo daily blocks, and CUDA gap exits can silently break.
 
 **Severity:** Critical.
 
@@ -113,13 +117,29 @@ CPU evaluator enters using the prior bar signal: `signals[i - 1]`, fill at bar `
 
 ---
 
-### 4. Tensor/HPC GPU discovery is not semantic parity with CPU GA backtest
+### 4. Full CUDA backtest lacks the full session/kill-zone contract
+
+**Files:** `cubecl_eval.rs`, `eval.rs`, `forex-core/src/config.rs`
+
+The CUDA backtest kernel accepts max hold, min hold, max trades/day, gap threshold, trailing settings, spread, commission, and pip value. It does not expose `kill_zones_enabled`, Friday force-exit, Monday/Friday entry blocks, broker timezone day boundaries, or trading session windows.
+
+`simulate_trades_core` contains more session-aware behavior, while CUDA full backtest is a narrower position simulator.
+
+**Risk:** full CUDA backtest can become fast but not equivalent to the CPU/live/session contract. Search results may pass GPU backtest and fail when realistic session constraints are applied.
+
+**Severity:** Critical.
+
+**Fix direction:** move all session/kill-zone/day-boundary logic into a shared backtest contract and implement it in both CPU and GPU evaluators. GPU parity tests must include Friday close, Monday entry block, max trades/day, gap exits, and broker day boundaries.
+
+---
+
+### 5. Tensor/HPC GPU discovery is not semantic parity with CPU GA backtest
 
 **Files:** `discovery_gpu.rs`, `hpc_gpu_discovery.rs`, `lib.rs`
 
 Tensor/HPC GPU discovery appears to use action/return-style fitness, next open/close returns, simplified flat cost, and tensor-level scoring. It does not run the same stateful SL/TP/spread/commission/position-machine as CPU GA evaluation.
 
-**Risk:** A strategy found by HPC GPU search can look good under approximate tensor fitness and fail under the real backtest.
+**Risk:** a strategy found by HPC GPU search can look good under approximate tensor fitness and fail under the real backtest.
 
 **Severity:** High.
 
@@ -127,7 +147,7 @@ Tensor/HPC GPU discovery appears to use action/return-style fitness, next open/c
 
 ---
 
-### 5. `fitness` does not always mean net profit
+### 6. `fitness` does not always mean net profit
 
 **Files:** `strategy_gene.rs`, `evolution_math.rs`, `discovery.rs`
 
@@ -141,7 +161,7 @@ Tensor/HPC GPU discovery appears to use action/return-style fitness, next open/c
 
 ---
 
-### 6. Search and final quality screen can use different cost/session contracts
+### 7. Search and final quality screen can use different cost/session contracts
 
 **Files:** `discovery.rs`, `search_engine.rs`, `eval.rs`, `gauntlet.rs`
 
@@ -155,7 +175,7 @@ GA search receives `EvaluationConfig`, but later quality/gauntlet paths can buil
 
 ---
 
-### 7. Search evaluation ignores important live/prop settings
+### 8. Search evaluation ignores important live/prop settings
 
 **Files:** `strategy_gene.rs`, `search_engine.rs`, `forex-core/src/config.rs`
 
@@ -169,7 +189,35 @@ GA search receives `EvaluationConfig`, but later quality/gauntlet paths can buil
 
 ---
 
-### 8. Signal count is used as proxy for trade count
+### 9. Backtest cost model does not include slippage as a first-class setting
+
+**Files:** `eval.rs`, `cubecl_eval.rs`, `forex-core/src/config.rs`, `forex-core/src/domain/order_execution.rs`
+
+`RiskConfig` has `slippage_pips` and `slippage_guard_multiplier`. Live/order edge checks accept `slippage_pips`. But the search backtest settings visible in `eval.rs`/CUDA carry spread and commission, not slippage.
+
+**Risk:** search can select strategies whose edge disappears once realistic slippage is applied. This matters especially for M1/M5 and high trade count strategies.
+
+**Severity:** High.
+
+**Fix direction:** include slippage in `BacktestSettings` / `SearchBacktestContract` and apply it consistently in CPU, CUDA, WFV/CPCV, gauntlet, quality, and live edge checks.
+
+---
+
+### 10. Live order execution has features not represented in search/backtest
+
+**Files:** `forex-core/src/domain/order_execution.rs`, `eval.rs`, `cubecl_eval.rs`
+
+Live/order execution supports partial take profit, multiple R-level TP legs, entry patience/pullback behavior, and min edge cost multiple checks. The search/backtest path appears to simulate one entry, one SL, one TP, optional trailing, and fixed spread/commission.
+
+**Risk:** the strategy that is backtested is not necessarily the strategy that is live-executed. Partial TP and entry patience can materially change expectancy, drawdown, win rate, trade duration, and prop-firm compliance.
+
+**Severity:** High.
+
+**Fix direction:** either backtest the same execution policy used live, or disable live-only execution features for strategies that were not validated with those features. Execution policy must be part of the canonical contract and exported with the portfolio.
+
+---
+
+### 11. Signal count is used as proxy for trade count
 
 **File:** `discovery.rs`
 
@@ -183,7 +231,7 @@ Candidate filtering counts non-zero signals as trade-count proxy.
 
 ---
 
-### 9. Walk-forward/CPCV exists but does not appear to be a hard discovery gate
+### 12. Walk-forward/CPCV exists but does not appear to be a hard discovery gate
 
 **Files:** `validation.rs`, `discovery.rs`
 
@@ -197,7 +245,7 @@ Candidate filtering counts non-zero signals as trade-count proxy.
 
 ---
 
-### 10. Existing walk-forward evaluates fixed signals, not full retrain-per-split WFO
+### 13. Existing walk-forward evaluates fixed signals, not full retrain-per-split WFO
 
 **File:** `validation.rs`
 
@@ -209,7 +257,7 @@ Candidate filtering counts non-zero signals as trade-count proxy.
 
 ---
 
-### 11. Walk-forward diagnostics pass `days` as timestamps
+### 14. Walk-forward diagnostics pass `days` as timestamps
 
 **Files:** `validation.rs`, `eval.rs`
 
@@ -223,7 +271,7 @@ Candidate filtering counts non-zero signals as trade-count proxy.
 
 ---
 
-### 12. UI discovery and batch discovery slice data differently
+### 15. UI discovery and batch discovery slice data differently
 
 **Files:** `forex-app/src/app_services/discovery.rs`, `orchestration.rs`
 
@@ -237,7 +285,7 @@ UI/app discovery cuts the dataset to an 80% in-sample region before discovery. B
 
 ---
 
-### 13. Stage-1 search window may be narrower than expected
+### 16. Stage-1 search window may be narrower than expected
 
 **File:** `discovery.rs`
 
@@ -251,7 +299,7 @@ Discovery does stage-1 fast evaluation on a recent fraction. If app service alre
 
 ---
 
-### 14. Canonical day/week/month ledger is missing
+### 17. Canonical day/week/month ledger is missing
 
 **Files:** `eval.rs`, `cubecl_eval.rs`, `quality.rs`, `validation.rs`
 
@@ -265,7 +313,7 @@ A trader needs period knowledge: daily PnL/DD, weekly rhythm, monthly consistenc
 
 ---
 
-### 15. Final open period is not safely closed
+### 18. Final open period is not safely closed
 
 **Files:** `eval.rs`, `cubecl_eval.rs`
 
@@ -277,7 +325,7 @@ Monthly PnL appears written when month changes. The current/open final month can
 
 ---
 
-### 16. Fast metrics and trade simulation appear to differ on kill-zone/session rules
+### 19. Fast metrics and trade simulation appear to differ on kill-zone/session rules
 
 **File:** `eval.rs`
 
@@ -291,7 +339,7 @@ Monthly PnL appears written when month changes. The current/open final month can
 
 ---
 
-### 17. `signals_for_gene` used outside evaluator does not apply SMC gating
+### 20. `signals_for_gene` used outside evaluator does not apply SMC gating
 
 **Files:** `search_engine.rs`, `discovery.rs`, `gauntlet.rs`
 
@@ -307,7 +355,7 @@ That function appears used by validation/gauntlet/discovery trade-log style path
 
 ---
 
-### 18. Metric layout is implicit and duplicated
+### 21. Metric layout is implicit and duplicated
 
 **Files:** `eval.rs`, `cubecl_eval.rs`, `validation.rs`, `discovery.rs`
 
@@ -321,7 +369,7 @@ Evaluation returns `[f64; 11]` and downstream modules depend on numeric indexes.
 
 ---
 
-### 19. Gauntlet must share the same contract
+### 22. Gauntlet must share the same contract
 
 **File:** `gauntlet.rs`
 
@@ -335,7 +383,7 @@ Gauntlet uses its own settings/defaults and appears to use `signals_for_gene`, n
 
 ---
 
-### 20. Stop/target inference can use future data when defaults are inferred from the full OHLCV slice
+### 23. Stop/target inference can use future data when defaults are inferred from the full OHLCV slice
 
 **Files:** `search_engine.rs`, `stop_target.rs`
 
@@ -349,7 +397,7 @@ Gauntlet uses its own settings/defaults and appears to use `signals_for_gene`, n
 
 ---
 
-### 21. Initial balance is not part of one canonical backtest contract
+### 24. Initial balance is not part of one canonical backtest contract
 
 **Files:** `validation.rs`, `quality.rs`, `forex-core/src/config.rs`, `discovery.rs`
 
@@ -363,7 +411,7 @@ Gauntlet uses its own settings/defaults and appears to use `signals_for_gene`, n
 
 ---
 
-### 22. Some “daily/weekly” quant features use fixed bar counts instead of timeframe-aware calendar windows
+### 25. Some “daily/weekly” quant features use fixed bar counts instead of timeframe-aware calendar windows
 
 **File:** `forex-data/src/core/quant_features.rs`
 
@@ -377,7 +425,7 @@ Gauntlet uses its own settings/defaults and appears to use `signals_for_gene`, n
 
 ---
 
-### 23. Higher timeframe list can duplicate the base timeframe
+### 26. Higher timeframe list can duplicate the base timeframe
 
 **Files:** `forex-core/src/config.rs`, `forex-data/src/lib.rs`
 
@@ -391,26 +439,43 @@ System config defaults include many higher timeframes, including `M1`. `prepare_
 
 ---
 
+### 27. Duplicate timestamp handling drops rows instead of reconciling market data
+
+**File:** `forex-data/src/lib.rs`
+
+`normalize_ohlcv` sorts rows by timestamp and then deduplicates by timestamp. This keeps one row and drops the rest.
+
+**Risk:** if duplicate timestamps come from broker corrections, overlapping imports, or partial candles, data can be silently lost. Depending on ordering, the kept row may not be the final/correct candle.
+
+**Severity:** Medium.
+
+**Fix direction:** duplicate timestamp handling should be explicit: reject duplicates, keep last with log, or aggregate deterministically according to OHLCV rules. Silent dedup should not be allowed for backtest-grade data.
+
+---
+
 ## GPU-first architecture note
 
 The target is valid: expensive search/backtest/training-adjacent work should run mostly on GPU.
 
-But GPU-first is only safe if GPU means **semantic-parity GPU**, not just “a faster metric on GPU”. A parity GPU path must match CPU on:
+But GPU-first is only safe if GPU means **semantic-parity GPU**, not just “a faster metric on GPU”. A parity GPU path must match CPU/live contract on:
 
 - timestamp unit,
 - HTF feature availability timing,
 - timeframe-aware feature windows,
 - causal stop/target inference,
 - initial balance,
+- slippage/spread/commission,
+- live execution policy such as partial TP and entry patience,
 - signal timing,
 - canonical signal synthesis including SMC gating,
 - position state machine,
 - TP/SL/trailing rules,
-- spread/commission/pip value,
+- pip value / lot sizing contract,
 - max hold/min hold,
 - max trades/day,
 - gap handling,
 - kill-zone/session rules,
+- broker timezone/day boundary,
 - day/week/month ledger,
 - metric layout.
 
@@ -421,22 +486,25 @@ Tensor/HPC discovery can remain a fast approximate presearch path, but final acc
 ## Recommended next action order
 
 1. Fix HTF resampling/alignment leakage.
-2. Normalize timestamp units across data/search/backtest/validation.
+2. Normalize timestamp units across data/search/backtest/validation/GPU.
 3. Fix CUDA full backtest prior-bar signal timing.
-4. Introduce one canonical search/backtest contract from config/risk/symbol metadata, including initial balance.
-5. Add canonical signal synthesis shared by CPU, CUDA, trade logs, gauntlet, and validation.
-6. Fix or freeze causal SL/TP inference.
-7. Fix walk-forward diagnostics to pass true timestamps into `simulate_trades_core`.
-8. Build and return day/week/month period ledger; close all open periods at test end.
-9. Unify fast metrics and trade simulation via one position state machine.
-10. Separate `fitness_score` from `net_profit`.
-11. Replace raw metric indexes with typed metrics or named constants.
-12. Make timeframe-dependent features timeframe-aware.
-13. Enforce validation flags in discovery output.
-14. Wire WFV/CPCV as optional-but-real hard gates.
-15. Treat tensor/HPC GPU discovery as approximate presearch unless parity evaluator is used.
-16. Add CI coverage for `forex-search` and GPU-relevant feature combinations.
-17. Add deterministic CPU-vs-GPU parity tests.
+4. Add kill-zone/session/broker-day parity to CUDA or disable CUDA full backtest as final acceptance path until implemented.
+5. Introduce one canonical search/backtest/execution contract from config/risk/symbol metadata, including initial balance and slippage.
+6. Add canonical signal synthesis shared by CPU, CUDA, trade logs, gauntlet, and validation.
+7. Fix or freeze causal SL/TP inference.
+8. Decide whether live-only partial TP / entry patience must be simulated or disabled for validated strategies.
+9. Fix walk-forward diagnostics to pass true timestamps into `simulate_trades_core`.
+10. Build and return day/week/month period ledger; close all open periods at test end.
+11. Unify fast metrics and trade simulation via one position state machine.
+12. Separate `fitness_score` from `net_profit`.
+13. Replace raw metric indexes with typed metrics or named constants.
+14. Make timeframe-dependent features timeframe-aware.
+15. Make duplicate timestamp handling explicit and audited.
+16. Enforce validation flags in discovery output.
+17. Wire WFV/CPCV as optional-but-real hard gates.
+18. Treat tensor/HPC GPU discovery as approximate presearch unless parity evaluator is used.
+19. Add CI coverage for `forex-search` and GPU-relevant feature combinations.
+20. Add deterministic CPU-vs-GPU parity tests.
 
 ---
 
@@ -450,6 +518,10 @@ Tensor/HPC discovery can remain a fast approximate presearch path, but final acc
 - [ ] Confirm whether exported portfolios record which validation gates actually ran.
 - [ ] Confirm CI runs `cargo check/test -p forex-search` and relevant feature combinations.
 - [ ] Add timestamp unit tests for ms/us/ns input vectors.
+- [ ] Add CUDA timestamp delta/gap-exit tests.
+- [ ] Add CUDA kill-zone/session parity tests.
+- [ ] Add slippage-cost parity tests.
+- [ ] Add partial-TP/entry-patience backtest vs live execution tests, or assert those features are disabled for validated portfolios.
 - [ ] Add single-day/week/month tests to ensure final periods are included.
 - [ ] Add daily/weekly/monthly ledger tests.
 - [ ] Add kill-zone parity tests between fast metrics and full trade simulation.
@@ -458,6 +530,7 @@ Tensor/HPC discovery can remain a fast approximate presearch path, but final acc
 - [ ] Add causal SL/TP inference tests.
 - [ ] Add timeframe-aware quant feature tests.
 - [ ] Add duplicate-feature guard tests when `higher_tfs` includes `base_tf`.
+- [ ] Add duplicate timestamp ingest tests.
 
 ---
 
@@ -465,4 +538,4 @@ Tensor/HPC discovery can remain a fast approximate presearch path, but final acc
 
 The bot already has serious pieces for search, GPU acceleration, WFV/CPCV utilities, quality analysis, and gauntlet filtering.
 
-But `master` currently has multiple search/backtest/validation paths with different semantics. The next milestone should be one documented contract for data timing, timestamp unit, timeframe-aware features, causal stop/target inference, cost model, initial balance, signal timing, SMC signal synthesis, position state machine, period ledger, metric layout, and validation gates — with CPU/GPU parity tests around that contract.
+But `master` currently has multiple search/backtest/validation/live-execution paths with different semantics. The next milestone should be one documented contract for data timing, timestamp unit, timeframe-aware features, causal stop/target inference, cost/slippage model, initial balance, execution policy, signal timing, SMC signal synthesis, position state machine, period ledger, metric layout, and validation gates — with CPU/GPU/live-execution parity tests around that contract.
