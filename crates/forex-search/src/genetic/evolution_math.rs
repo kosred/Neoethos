@@ -444,6 +444,18 @@ fn random_coarse_threshold(rng: &mut impl Rng) -> f32 {
     levels[rng.random_range(0..levels.len())]
 }
 
+pub fn reset_gene_metrics(gene: &mut Gene) {
+    gene.fitness = 0.0;
+    gene.sharpe_ratio = 0.0;
+    gene.win_rate = 0.0;
+    gene.max_drawdown = 0.0;
+    gene.profit_factor = 0.0;
+    gene.expectancy = 0.0;
+    gene.trades_count = 0;
+    gene.slice_pass_rate = 0.0;
+    gene.consistency = 0.0;
+}
+
 pub fn new_random_gene(
     n_indicators: usize,
     max_indicators: usize,
@@ -500,6 +512,7 @@ pub fn new_random_gene(
     };
     randomize_smc_flags(&mut gene, smc_cfg, rng);
     enforce_min_structural_smc_flags(&mut gene, smc_cfg, rng);
+    gene.normalize(n_indicators, 1);
     gene
 }
 
@@ -562,7 +575,7 @@ pub fn crossover(a: &Gene, b: &Gene, generation: usize, rng: &mut impl Rng) -> G
     child.weights = weights;
     child.strategy_id = format!("gene_{}_{}", rng.random_range(0..1_000_000u64), generation);
     child.generation = generation;
-    child.fitness = 0.0;
+    reset_gene_metrics(&mut child);
 
     child.long_threshold = if rng.random_bool(0.5) {
         a.long_threshold
@@ -711,6 +724,8 @@ pub fn mutate(
     }
     mutated.strategy_id = format!("gene_{}_{}", rng.random_range(0..1_000_000u64), generation);
     mutated.generation = generation;
+    reset_gene_metrics(&mut mutated);
+    mutated.normalize(n_indicators, 1);
     mutated
 }
 
@@ -779,5 +794,33 @@ mod tests {
     fn zero_weight_fallback_is_deterministic() {
         let mut rng = rand::rng();
         assert_eq!(draw_weighted_offset(&[0.0, f64::NAN, -1.0], &mut rng), 0);
+    }
+
+    #[test]
+    fn reset_gene_metrics_clears_parent_scores() {
+        let mut gene = Gene {
+            fitness: 3.2,
+            sharpe_ratio: 1.4,
+            win_rate: 0.7,
+            max_drawdown: 0.05,
+            profit_factor: 1.8,
+            expectancy: 12.0,
+            trades_count: 42,
+            slice_pass_rate: 0.9,
+            consistency: 0.6,
+            ..Default::default()
+        };
+
+        reset_gene_metrics(&mut gene);
+
+        assert_eq!(gene.fitness, 0.0);
+        assert_eq!(gene.sharpe_ratio, 0.0);
+        assert_eq!(gene.win_rate, 0.0);
+        assert_eq!(gene.max_drawdown, 0.0);
+        assert_eq!(gene.profit_factor, 0.0);
+        assert_eq!(gene.expectancy, 0.0);
+        assert_eq!(gene.trades_count, 0);
+        assert_eq!(gene.slice_pass_rate, 0.0);
+        assert_eq!(gene.consistency, 0.0);
     }
 }
