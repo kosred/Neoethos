@@ -23,6 +23,7 @@ pub use regime_labels::{
 pub use search_engine::{
     evaluate_genes, evolve_search, evolve_search_with_progress,
     evolve_search_with_progress_and_limits, month_day_indices, random_search, signals_for_gene,
+    signals_for_gene_full,
 };
 pub use smc_indicators::{
     SmcSearchConfig, build_smc_arrays, derive_smc_arrays, enforce_min_structural_smc_flags,

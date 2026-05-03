@@ -444,6 +444,8 @@ fn random_coarse_threshold(rng: &mut impl Rng) -> f32 {
     levels[rng.random_range(0..levels.len())]
 }
 
+/// Reset every derived/financial metric on a Gene that was inherited from a
+/// parent during crossover/mutation but is no longer accurate for the child.
 pub fn reset_gene_metrics(gene: &mut Gene) {
     gene.fitness = 0.0;
     gene.sharpe_ratio = 0.0;

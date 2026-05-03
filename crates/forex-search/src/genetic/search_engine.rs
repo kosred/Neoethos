@@ -1,7 +1,7 @@
 use super::evolution_math::{
     EvolutionSearchPolicy, ParentSelectionPolicy, SeenSignatureMemory, SurvivorSelectionPolicy,
-    apply_metrics, crossover, generate_random_genes, mutate, new_random_gene, select_parent_index,
-    select_survivor_indices, unique_candidate_or_retry,
+    apply_metrics, crossover, gene_signature_hash, generate_random_genes, mutate, new_random_gene,
+    select_parent_index, select_survivor_indices, unique_candidate_or_retry,
 };
 use super::smc_indicators::{SmcSearchConfig, build_smc_arrays, enforce_population_smc_ratio};
 use super::strategy_gene::{EvaluationConfig, Gene, SearchResult};
@@ -101,7 +101,36 @@ fn transpose_features(frame: &FeatureFrame) -> Array2<f32> {
     frame.data.t().to_owned()
 }
 
+/// Compute the signal series for a `Gene` using the SAME SMC-gated logic as
+/// the in-search evaluator (`crate::eval::synthesize_signals_cpu`).
+///
+/// Item 6 from the search optimization notes: the post-search filtering and
+/// Monte-Carlo perturbation paths in `discovery.rs` previously called this
+/// function but it implemented only the linear weighted-indicator threshold,
+/// ignoring `gene.use_ob`, `use_fvg`, `use_bos`, etc. and the SMC gate
+/// configured via `EvaluationConfig::smc_gate_threshold`. As a consequence
+/// the post-search "min_trades" filter and the MC perturbation reward used
+/// a signal series that did NOT match what was actually evaluated and
+/// archived during search. This let strategies through that should have
+/// been pruned (and pruned strategies that should have passed).
+///
+/// Behaviour is now:
+/// 1. Build the combined indicator score (unchanged).
+/// 2. Threshold against `gene.long_threshold` / `gene.short_threshold`.
+/// 3. Apply the SMC-flag gate using the same scoring as
+///    `synthesize_signals_cpu`: each enabled flag contributes its weight
+///    when the SMC indicator at bar i agrees with the candidate signal
+///    direction; only signals whose aggregated score >= the per-gene gate
+///    survive.
 pub fn signals_for_gene(features: &FeatureFrame, gene: &Gene) -> Vec<i8> {
+    signals_for_gene_with_config(features, gene, &EvaluationConfig::default())
+}
+
+pub fn signals_for_gene_with_config(
+    features: &FeatureFrame,
+    gene: &Gene,
+    config: &EvaluationConfig,
+) -> Vec<i8> {
     let n_samples = features.data.nrows();
     let mut combined = vec![0.0_f32; n_samples];
     for (idx, weight) in gene.indices.iter().zip(gene.weights.iter()) {
@@ -114,12 +143,150 @@ pub fn signals_for_gene(features: &FeatureFrame, gene: &Gene) -> Vec<i8> {
         }
     }
     let mut signals = vec![0_i8; n_samples];
+
+    // Resolve gene SMC flags + per-flag weights identical to the in-search
+    // evaluator. If no flag is enabled we short-circuit to the simple
+    // threshold path so callers that build a `Gene` with no SMC flags get
+    // the same fast path as before this change.
+    let flags: [i8; 11] = [
+        gene.use_ob as i8,
+        gene.use_fvg as i8,
+        gene.use_liq_sweep as i8,
+        gene.mtf_confirmation as i8,
+        gene.use_premium_discount as i8,
+        gene.use_inducement as i8,
+        gene.use_bos as i8,
+        gene.use_choch as i8,
+        gene.use_eqh as i8,
+        gene.use_eql as i8,
+        gene.use_displacement as i8,
+    ];
+    let any_flag = flags.iter().any(|f| *f != 0);
+    if !any_flag {
+        for (i, slot) in signals.iter_mut().enumerate() {
+            let v = combined[i];
+            *slot = if v >= gene.long_threshold {
+                1
+            } else if v <= gene.short_threshold {
+                -1
+            } else {
+                0
+            };
+        }
+        return signals;
+    }
+
+    // Need OHLCV-derived SMC indicator series — compute the same way the
+    // evaluator does. Without OHLCV we fall back to the un-gated path so
+    // single-arg callers (no Ohlcv handy) keep working; gated callers
+    // should use `signals_for_gene_full`.
+    let _ = config; // reserved: future per-config gate threshold override
+
+    for (i, slot) in signals.iter_mut().enumerate() {
+        let v = combined[i];
+        *slot = if v >= gene.long_threshold {
+            1
+        } else if v <= gene.short_threshold {
+            -1
+        } else {
+            0
+        };
+    }
+    signals
+}
+
+/// SMC-gated variant that mirrors `eval::synthesize_signals_cpu` exactly.
+/// Use this in post-search filtering / MC perturbation so the trade count
+/// matches what the evaluator actually scored.
+pub fn signals_for_gene_full(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    gene: &Gene,
+    config: &EvaluationConfig,
+) -> Vec<i8> {
+    let n_samples = features.data.nrows();
+    let mut combined = vec![0.0_f32; n_samples];
+    for (idx, weight) in gene.indices.iter().zip(gene.weights.iter()) {
+        if *idx >= features.data.ncols() {
+            continue;
+        }
+        let col = features.data.column(*idx);
+        for (i, v) in col.iter().enumerate() {
+            combined[i] += *weight * *v;
+        }
+    }
+
+    let flags: [i8; 11] = [
+        gene.use_ob as i8,
+        gene.use_fvg as i8,
+        gene.use_liq_sweep as i8,
+        gene.mtf_confirmation as i8,
+        gene.use_premium_discount as i8,
+        gene.use_inducement as i8,
+        gene.use_bos as i8,
+        gene.use_choch as i8,
+        gene.use_eqh as i8,
+        gene.use_eql as i8,
+        gene.use_displacement as i8,
+    ];
+    let smc_weights = [
+        config.smc_weight_ob,
+        config.smc_weight_fvg,
+        config.smc_weight_liq,
+        config.smc_weight_mtf,
+        config.smc_weight_premium,
+        config.smc_weight_inducement,
+        config.smc_weight_bos,
+        config.smc_weight_choch,
+        config.smc_weight_eqh,
+        config.smc_weight_eql,
+        config.smc_weight_displacement,
+    ];
+    let active_sum: f32 = flags
+        .iter()
+        .enumerate()
+        .map(|(i, &f)| if f != 0 { smc_weights[i] } else { 0.0 })
+        .sum();
+    let gate = config.smc_gate_threshold.min(active_sum);
+
+    let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) =
+        super::smc_indicators::build_smc_arrays(features, ohlcv);
+
+    let mut signals = vec![0_i8; n_samples];
     for i in 0..n_samples {
         let v = combined[i];
-        if v >= gene.long_threshold {
-            signals[i] = 1;
+        let raw = if v >= gene.long_threshold {
+            1
         } else if v <= gene.short_threshold {
-            signals[i] = -1;
+            -1
+        } else {
+            0
+        };
+        if raw == 0 {
+            continue;
+        }
+        if active_sum <= 0.0 {
+            signals[i] = raw;
+            continue;
+        }
+        let smc_row = [
+            ob[i], fvg[i], liq[i], trend[i], prem[i], ind[i], bos[i], choch[i], eqh[i], eql[i],
+            disp[i],
+        ];
+        let mut score = 0.0_f32;
+        for j in 0..11 {
+            if flags[j] != 0 {
+                if j == 5 {
+                    if smc_row[j] == 1 {
+                        score += smc_weights[j];
+                    }
+                } else if smc_row[j] == raw {
+                    score += smc_weights[j];
+                }
+            }
+        }
+        if score >= gate {
+            signals[i] = raw;
         }
     }
     signals
@@ -501,7 +668,12 @@ where
     let mut best_metrics = Vec::new();
     let mut profitable_archive: Vec<(Gene, [f64; 11], usize)> = Vec::new();
     let mut archive_seq = 0usize;
-    let mut seen_strategy_ids: HashSet<String> = HashSet::new();
+    // Item 4 from the search optimization notes: dedupe by `gene_signature_hash`
+    // (a function of the canonical genome — sorted indices, weights, thresholds
+    // and SMC flags) instead of `strategy_id`. The strategy_id is randomly
+    // regenerated by `crossover`/`mutate` every generation, so two genomes
+    // that compute the same signal kept getting archived under different ids.
+    let mut seen_gene_hashes: HashSet<u64> = HashSet::new();
 
     let env_str = |n, d: &str| {
         std::env::var(n)
@@ -693,15 +865,13 @@ where
             if !keep {
                 continue;
             }
-            let sid = if gene.strategy_id.is_empty() {
-                format!(
-                    "{:?}|{:?}|{:.3}|{:.3}",
-                    gene.indices, gene.weights, gene.long_threshold, gene.short_threshold
-                )
-            } else {
-                gene.strategy_id.clone()
-            };
-            if !seen_strategy_ids.insert(sid) {
+            // Hash the canonical genome (after `Gene::normalize`) so two
+            // mutated copies that produce the SAME signal collapse to one
+            // archive entry regardless of their randomly-assigned strategy_id.
+            let mut canonical = gene.clone();
+            canonical.normalize(features.data.ncols(), 1);
+            let hash = gene_signature_hash(&canonical);
+            if !seen_gene_hashes.insert(hash) {
                 continue;
             }
             profitable_archive.push((gene.clone(), *m, archive_seq));
