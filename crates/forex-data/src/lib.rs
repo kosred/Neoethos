@@ -455,6 +455,9 @@ pub fn prepare_multitimeframe_features_with_options(
     all_data_parts.push(base_feats.data);
 
     for h_tf in &opts.higher_tfs {
+        if h_tf == base_tf {
+            continue;
+        }
         if let Some(h_ohlcv) = ds.frames.get(h_tf) {
             let h_feats = compute_hpc_feature_frame(h_ohlcv, opts.profile)?;
             let h_ns = h_ohlcv

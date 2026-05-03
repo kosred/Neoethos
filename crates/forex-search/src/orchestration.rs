@@ -87,7 +87,18 @@ impl DiscoveryOrchestrator {
                     }
                 };
 
-                let features = match prepare_multitimeframe_features(&ds_ready, tf, &[], None) {
+                let htfs: Vec<&str> = self
+                    .config
+                    .higher_timeframes
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect();
+                let features = match prepare_multitimeframe_features(
+                    &ds_ready,
+                    tf,
+                    &htfs,
+                    None,
+                ) {
                     Ok(f) => f,
                     Err(e) => {
                         summary.feature_failures += 1;
@@ -127,7 +138,7 @@ impl DiscoveryOrchestrator {
                 info!("    Found {} strategies", result.portfolio.len());
 
                 let out_path = Path::new(&self.output_dir).join(format!("{}_{}.json", symbol, tf));
-                save_portfolio_json(&out_path, &result.portfolio, &features.names)?;
+                save_portfolio_json(&out_path, &result.portfolio, &result.effective_feature_names)?;
                 let profile_path =
                     Path::new(&self.output_dir).join(format!("{}_{}_profile.json", symbol, tf));
                 save_discovery_profile_json(profile_path, &runtime_config, &result)?;
