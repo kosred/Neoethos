@@ -18,6 +18,7 @@ pub use crate::core::regime_detection::*;
 pub use crate::core::resample::*;
 pub use crate::core::session_features::*;
 pub use crate::core::smc::*;
+pub use crate::core::timestamps::*;
 pub use crate::core::vortex_io::*;
 
 #[derive(Debug, Clone)]
