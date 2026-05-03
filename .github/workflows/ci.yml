@@ -42,11 +42,17 @@ jobs:
         run: cargo fmt --all -- --check
         continue-on-error: true
 
-      - name: Cargo check
+      - name: Cargo check (app + core)
         run: cargo check -p forex-app -p forex-core -p forex-news --no-default-features
+
+      - name: Cargo check (search + models)
+        run: cargo check -p forex-search -p forex-models --no-default-features
 
       - name: Run app + core tests
         run: cargo test -p forex-app -p forex-core -p forex-news
+
+      - name: Run search + models tests
+        run: cargo test -p forex-search -p forex-models --no-default-features
 
   # ────────────────────────────────────────────────────────────────────────────
   # Check on Linux (catch cross-platform issues early)
@@ -84,5 +90,11 @@ jobs:
       - name: Cargo check (app + core)
         run: cargo check -p forex-app -p forex-core -p forex-news --no-default-features
 
+      - name: Cargo check (search + models)
+        run: cargo check -p forex-search -p forex-models --no-default-features
+
       - name: Run app + core tests
         run: cargo test -p forex-app -p forex-core -p forex-news
+
+      - name: Run search + models tests
+        run: cargo test -p forex-search -p forex-models --no-default-features
