@@ -4946,6 +4946,13 @@ mod tests {
         let mut order = sample_prop_firm_order();
         order.limit_price = Some(150.00);
         order.stop_loss = Some(149.50); // 50 pips in JPY (2 digits)
+        // The default fixture's `volume = 100000` represents 1000 standard lots
+        // which would (correctly) trip the new hard risk-per-trade gate even
+        // for a tight 50-pip stop. This test exists only to verify that
+        // pip-position 2 (JPY) is interpreted as 50 pips, not 5000, so use a
+        // realistic micro-lot volume so the precision check is the only thing
+        // being exercised.
+        order.volume = 100; // 0.01 std lot = 1 micro lot
         let risk = RiskConfig::default();
         // This should pass if 2-digit precision is used (50 pips).
         // If 4-digit was used, it would think it's 5000 pips.
