@@ -366,7 +366,12 @@ fn backtest_population_kernel(
                     }
                 }
             } else {
-                let s = signals_flat[signal_base + i];
+                // Causal entry: read PRIOR-bar signal, fill at CURRENT-bar
+                // close. Mirrors `eval.rs::simulate_trades_core` exactly so
+                // CUDA backtest is semantically equivalent to CPU canonical.
+                // Reading `signals_flat[signal_base + i]` (current bar) would
+                // re-introduce intra-bar look-ahead.
+                let s = signals_flat[signal_base + i - 1];
                 if s != 0 {
                     if !(max_trades_per_day > 0 && day_trade_count >= max_trades_per_day) {
                         in_pos = s;
