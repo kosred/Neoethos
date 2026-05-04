@@ -1896,6 +1896,42 @@ where
     B: AutodiffBackend,
     M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
 {
+    train_model_with_report_with_external_val::<B, M>(
+        model,
+        x_data,
+        y_raw,
+        config,
+        device,
+        selection,
+        requested_precision,
+        None,
+        None,
+    )
+}
+
+/// M5: variant that accepts an explicit external validation frame from the
+/// HPO orchestrator. When `external_val_x` and `external_val_y` are
+/// supplied, Burn skips its internal `time_series_split` 15% holdout and
+/// drives early stopping against the same val data the HPO objective uses.
+/// This keeps train/val/early-stopping consistent across the model
+/// pipeline so HPO scores reflect what the trained weights will actually
+/// generalise to.
+#[allow(clippy::too_many_arguments)]
+pub fn train_model_with_report_with_external_val<B, M>(
+    model: M,
+    x_data: &Array2<f32>,
+    y_raw: &[i32],
+    config: &TrainConfig,
+    device: &B::Device,
+    selection: &BurnDeviceSelection,
+    requested_precision: Option<&str>,
+    external_val_x: Option<&Array2<f32>>,
+    external_val_y: Option<&[i32]>,
+) -> anyhow::Result<(M, BurnTrainingReport)>
+where
+    B: AutodiffBackend,
+    M: burn::module::AutodiffModule<B> + BurnForward<B> + Clone,
+{
     validate_train_config(config)?;
     validate_burn_device_selection(selection)?;
     let n_samples = x_data.nrows();
@@ -1910,32 +1946,71 @@ where
         ));
     }
 
+    let use_external_val = matches!(
+        (external_val_x, external_val_y),
+        (Some(_), Some(_))
+    );
+    if let (Some(vx), Some(vy)) = (external_val_x, external_val_y) {
+        validate_feature_matrix(vx, "Burn external validation")?;
+        if vx.ncols() != x_data.ncols() {
+            return Err(anyhow::anyhow!(
+                "Burn external validation column mismatch: train {}, val {}",
+                x_data.ncols(),
+                vx.ncols()
+            ));
+        }
+        if vx.nrows() != vy.len() {
+            return Err(anyhow::anyhow!(
+                "Burn external validation row/label mismatch: {} rows vs {} labels",
+                vx.nrows(),
+                vy.len()
+            ));
+        }
+    }
+
     // 1. Label mapping: -1 → 2
     let y_mapped = map_labels(y_raw)?;
     let (training_precision, training_precision_reason) =
         resolve_burn_training_precision_for_backend::<B>(selection, device, requested_precision);
     let training_dtype = training_precision.dtype();
 
-    // 2. Index-order-aware split with embargo.
-    // We intentionally rely on caller ordering here; shuffled inputs would
-    // invalidate the chronology assumptions of this holdout.
-    let embargo = (n_samples as f32 * 0.005).ceil() as usize;
-    let (train_range, val_range) = time_series_split(n_samples, 0.15, 100, embargo.max(10));
+    // 2. Resolve train/val ranges. When the caller supplied an external val
+    // frame, treat the entire `x_data` as training rows. Otherwise fall
+    // back to the legacy index-order-aware split with embargo.
+    let (train_range, val_range, embargo) = if use_external_val {
+        (0..n_samples, 0..0, 0usize)
+    } else {
+        let embargo = (n_samples as f32 * 0.005).ceil() as usize;
+        let (train_range, val_range) =
+            time_series_split(n_samples, 0.15, 100, embargo.max(10));
+        (train_range, val_range, embargo)
+    };
     let n_train = train_range.len();
-    if n_train == 0 || val_range.is_empty() {
+
+    let external_val_labels_mapped = if let Some(vy) = external_val_y {
+        Some(map_labels(vy)?)
+    } else {
+        None
+    };
+
+    let val_rows_for_report = if use_external_val {
+        external_val_x.map(|vx| vx.nrows()).unwrap_or(0)
+    } else {
+        val_range.len()
+    };
+
+    if n_train == 0 || val_rows_for_report == 0 {
         return Err(anyhow::anyhow!(
-            "Burn training requires enough rows for a validation split after embargo; rows={}, train_rows={}, val_rows={}, embargo={}",
+            "Burn training requires enough rows for a validation set; rows={}, train_rows={}, val_rows={}, embargo={}",
             n_samples,
             n_train,
-            val_range.len(),
+            val_rows_for_report,
             embargo
         ));
     }
     info!(
-        "Burn training: {} train, {} val, embargo={}",
-        n_train,
-        val_range.len(),
-        embargo
+        "Burn training: {} train, {} val, embargo={}, external_val={}",
+        n_train, val_rows_for_report, embargo, use_external_val
     );
 
     // 3. Class weights
@@ -1947,16 +2022,21 @@ where
     let x_train_array = x_data
         .slice(ndarray::s![train_range.clone(), ..])
         .to_owned();
-    let x_val_array = if val_range.is_empty() {
+    let x_val_array = if use_external_val {
+        external_val_x.map(|vx| vx.to_owned())
+    } else if val_range.is_empty() {
         None
     } else {
         Some(x_data.slice(ndarray::s![val_range.clone(), ..]).to_owned())
     };
-    let y_val_labels = if val_range.is_empty() {
+    let y_val_labels = if use_external_val {
+        external_val_labels_mapped
+    } else if val_range.is_empty() {
         None
     } else {
         Some(y_mapped[val_range.clone()].to_vec())
     };
+    let val_is_empty = x_val_array.is_none();
 
     // 5. Optimizer + early stopping
     // Use AdamW with 5e-4 decoupled weight decay as recommended for noisy time-series
@@ -2013,14 +2093,14 @@ where
             f32::INFINITY
         };
         final_train_loss = train_epoch_loss;
-        if train_epoch_loss.is_finite() && val_range.is_empty() && train_epoch_loss < best_loss {
+        if train_epoch_loss.is_finite() && val_is_empty && train_epoch_loss < best_loss {
             best_loss = train_epoch_loss;
             best_epoch = Some(epoch);
             best_model_snapshot = Some(model.clone());
         }
 
         // Validation on holdout (sequential, no shuffle)
-        if !val_range.is_empty() {
+        if !val_is_empty {
             let x_val = x_val_array
                 .as_ref()
                 .expect("validation array must exist when validation range is non-empty");
@@ -2071,7 +2151,7 @@ where
         BurnTrainingReport {
             dataset_rows: n_samples,
             train_rows: n_train,
-            val_rows: val_range.len(),
+            val_rows: val_rows_for_report,
             embargo_rows: embargo,
             class_weights,
             best_loss,
