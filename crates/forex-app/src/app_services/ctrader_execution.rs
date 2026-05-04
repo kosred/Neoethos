@@ -3,11 +3,11 @@ use crate::app_services::ctrader_messages::{
     CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_EXECUTION_EVENT_PAYLOAD_TYPE, CTRADER_OA_ORDER_ERROR_EVENT_PAYLOAD_TYPE,
-    CTraderCancelOrderRequest, CTraderNewOrderRequest, CTraderOpenApiJsonMessage,
-    CTraderOpenApiTransport, build_account_auth_request, build_application_auth_request,
-    build_cancel_order_request, build_close_position_request, build_new_order_request,
-    expected_response_payload_type, is_matching_open_api_response, parse_ctrader_error_payload,
-    parse_open_api_envelope,
+    CTRADER_TOKEN_EXPIRED_SENTINEL, CTraderCancelOrderRequest, CTraderNewOrderRequest,
+    CTraderOpenApiJsonMessage, CTraderOpenApiTransport, build_account_auth_request,
+    build_application_auth_request, build_cancel_order_request, build_close_position_request,
+    build_new_order_request, expected_response_payload_type, is_ctrader_auth_token_error,
+    is_matching_open_api_response, parse_ctrader_error_payload_parts, parse_open_api_envelope,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -475,9 +475,34 @@ impl ProductionCTraderExecutionBackend {
             .as_mut()
             .context("cTrader execution socket missing after connect")?;
         let response = Self::send_message_and_wait(socket, &app_auth)?;
-        ensure_payload_type(&response, CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+        // D11: surface auth-token failures with a sentinel-prefixed error so
+        // the trading-session caller can force-refresh the OAuth bundle and
+        // retry. Previously a stale access_token would loop here forever
+        // because `ensure_authenticated` reused the same token on every
+        // retry. The application-auth response can also fail for other
+        // reasons; only the token-expired codes trigger refresh.
+        Self::ensure_auth_payload(&response, CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
         let response = Self::send_message_and_wait(socket, &account_auth)?;
-        ensure_payload_type(&response, CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+        Self::ensure_auth_payload(&response, CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+        Ok(())
+    }
+
+    fn ensure_auth_payload(response: &str, expected_payload_type: u32) -> Result<()> {
+        let envelope = parse_open_api_envelope(response)
+            .context("failed to inspect cTrader auth response")?;
+        if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+            let (code, message) = parse_ctrader_error_payload_parts(&envelope.payload)?;
+            if is_ctrader_auth_token_error(&code) {
+                return Err(anyhow!("{CTRADER_TOKEN_EXPIRED_SENTINEL}: {message}"));
+            }
+            return Err(anyhow!(message));
+        }
+        if envelope.payload_type != expected_payload_type {
+            return Err(anyhow!(
+                "expected cTrader payload type {expected_payload_type}, received {}",
+                envelope.payload_type
+            ));
+        }
         Ok(())
     }
 
@@ -515,10 +540,19 @@ impl ProductionCTraderExecutionBackend {
                     let response_envelope = parse_open_api_envelope(&response)
                         .context("failed to inspect cTrader execution response")?;
                     if response_envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
-                        let error_message =
-                            parse_ctrader_error_payload(&response_envelope.payload)?;
+                        let (error_code, error_message) =
+                            parse_ctrader_error_payload_parts(&response_envelope.payload)?;
                         session.socket = None;
                         session.auth_key = None;
+                        // D11: tag token-failure errors with the sentinel so
+                        // the caller knows to force-refresh the OAuth bundle
+                        // before retrying. Other errors (insufficient margin,
+                        // invalid stop, etc.) bubble up unchanged.
+                        if is_ctrader_auth_token_error(&error_code) {
+                            return Err(anyhow!(
+                                "{CTRADER_TOKEN_EXPIRED_SENTINEL}: {error_message}"
+                            ));
+                        }
                         return Err(anyhow!(error_message));
                     }
                     let outcome = parse_execution_outcome(&response)?;
