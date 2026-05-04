@@ -472,10 +472,20 @@ impl LightGBMExpert {
         );
         Ok(metadata)
     }
-}
 
-impl ExpertModel for LightGBMExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
+    /// M6: shared body for `fit` and `fit_with_validation`. When `val_x`
+    /// and `val_y` are supplied, builds a LightGBM eval dataset and uses
+    /// `Booster::train_with_valid` so `early_stopping_rounds` from the
+    /// training params is honoured. Without external val, falls back to
+    /// the legacy `Booster::train` call which trains for the full
+    /// `num_iterations`.
+    fn fit_internal(
+        &mut self,
+        x: &DataFrame,
+        y: &Series,
+        val_x: Option<&DataFrame>,
+        val_y: Option<&Series>,
+    ) -> Result<()> {
         #[cfg(not(feature = "lightgbm"))]
         {
             if x.height() == 0 || y.is_empty() {
@@ -486,6 +496,15 @@ impl ExpertModel for LightGBMExpert {
                     "LightGBM requires matching feature and label rows: {} features vs {} labels",
                     x.height(),
                     y.len()
+                );
+            }
+            // Validation data is ignored in the no-feature path because the
+            // local fallback surrogate does not support eval-set early
+            // stopping. Surface a debug log so the caller can see why their
+            // val frame was dropped.
+            if val_x.is_some() && val_y.is_some() {
+                tracing::debug!(
+                    "LightGBM compiled without `lightgbm` feature; ignoring supplied val frame"
                 );
             }
 
@@ -533,8 +552,43 @@ impl ExpertModel for LightGBMExpert {
                 params["device_type"] = serde_json::json!("cpu");
             }
 
-            let model =
-                lightgbm3::Booster::train(dataset, &params).context("train LightGBM booster")?;
+            let valid_dataset = match (val_x, val_y) {
+                (Some(vx), Some(vy)) => {
+                    if vx.width() != x.width() {
+                        anyhow::bail!(
+                            "LightGBM validation column count mismatch: train {}, val {}",
+                            x.width(),
+                            vx.width()
+                        );
+                    }
+                    if vx.height() != vy.len() {
+                        anyhow::bail!(
+                            "LightGBM validation row/label mismatch: {} rows vs {} labels",
+                            vx.height(),
+                            vy.len()
+                        );
+                    }
+                    let (vflat, _vrows, vcols) = dataframe_to_row_major_vec(vx)?;
+                    let vlabels = remap_labels_to_tree_targets(vy)?;
+                    let valid =
+                        lightgbm3::Dataset::from_slice(&vflat, &vlabels, vcols as i32, true)
+                            .context("create LightGBM validation dataset from dataframe")?;
+                    // Default early_stopping_rounds when caller did not
+                    // explicitly set one. 50 rounds is a conservative
+                    // patience for `num_iterations >= 200`.
+                    if !params.get("early_stopping_rounds").is_some_and(|v| v.is_i64()) {
+                        params["early_stopping_rounds"] = serde_json::json!(50);
+                    }
+                    Some(valid)
+                }
+                (None, None) => None,
+                _ => bail!(
+                    "LightGBMExpert::fit_with_validation requires both val_x and val_y or neither"
+                ),
+            };
+
+            let model = lightgbm3::Booster::train_with_valid(dataset, valid_dataset, &params)
+                .context("train LightGBM booster")?;
 
             self.feature_columns = feature_columns_from_dataframe(x);
             self.training_summary = Some(default_training_summary(x));
@@ -547,6 +601,22 @@ impl ExpertModel for LightGBMExpert {
             self.model = Some(model);
             Ok(())
         }
+    }
+}
+
+impl ExpertModel for LightGBMExpert {
+    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
+        self.fit_internal(x, y, None, None)
+    }
+
+    fn fit_with_validation(
+        &mut self,
+        x: &DataFrame,
+        y: &Series,
+        val_x: Option<&DataFrame>,
+        val_y: Option<&Series>,
+    ) -> Result<()> {
+        self.fit_internal(x, y, val_x, val_y)
     }
 
     fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {

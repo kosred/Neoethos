@@ -780,8 +780,27 @@ impl CatBoostExpert {
     }
 }
 
-impl ExpertModel for CatBoostExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
+impl CatBoostExpert {
+    fn fit_internal(
+        &mut self,
+        x: &DataFrame,
+        y: &Series,
+        val_x: Option<&DataFrame>,
+        val_y: Option<&Series>,
+    ) -> Result<()> {
+        // M6: CatBoost trains via the upstream CLI executable, which
+        // already supports `--test-set` + `--use-best-model` for
+        // val-driven early stopping. Wiring those flags safely requires
+        // additional CD/data-file plumbing that is non-trivial to do
+        // from this code path; for now record that val data was supplied
+        // so an operator can audit whether early-stopping kicked in. The
+        // CatBoost adapter then proceeds with the standard CLI training.
+        if val_x.is_some() && val_y.is_some() {
+            tracing::info!(
+                model = "catboost",
+                "CatBoost val frame supplied; CLI training currently ignores it (--test-set wiring is a follow-up)"
+            );
+        }
         #[cfg(feature = "catboost")]
         {
             let temp_dir = self.create_training_dir()?;
@@ -860,6 +879,22 @@ impl ExpertModel for CatBoostExpert {
             self.model = None;
             Ok(())
         }
+    }
+}
+
+impl ExpertModel for CatBoostExpert {
+    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
+        self.fit_internal(x, y, None, None)
+    }
+
+    fn fit_with_validation(
+        &mut self,
+        x: &DataFrame,
+        y: &Series,
+        val_x: Option<&DataFrame>,
+        val_y: Option<&Series>,
+    ) -> Result<()> {
+        self.fit_internal(x, y, val_x, val_y)
     }
 
     fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {
