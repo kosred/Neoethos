@@ -9,6 +9,7 @@
 /.ruff_cache/
 /catboost_info/
 /target/
+target/
 /target-codex-*/
 /.worktrees/
 /rust_core/
