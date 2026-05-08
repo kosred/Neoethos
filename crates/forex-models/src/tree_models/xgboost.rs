@@ -568,10 +568,19 @@ impl XGBoostExpert {
     fn normalize_probabilities(probabilities: Array2<f32>) -> Result<Array2<f32>> {
         normalize_three_class_probabilities(probabilities, "XGBoost")
     }
-}
 
-impl ExpertModel for XGBoostExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
+    /// M6: shared body for `fit` and `fit_with_validation`. When external
+    /// val data is supplied, builds an evaluation `DMatrix` and breaks the
+    /// boosting loop early once `mlogloss` has not improved on the val
+    /// frame for `early_stopping_rounds` iterations (default 50). Without
+    /// external val, runs the full `n_estimators` rounds as before.
+    fn fit_internal(
+        &mut self,
+        x: &DataFrame,
+        y: &Series,
+        val_x: Option<&DataFrame>,
+        val_y: Option<&Series>,
+    ) -> Result<()> {
         #[cfg(feature = "xgboost")]
         {
             if x.height() == 0 || y.is_empty() {
@@ -617,6 +626,36 @@ impl ExpertModel for XGBoostExpert {
                 .set_weights(&sample_weights)
                 .context("set XGBoost sample weights")?;
 
+            let dval = match (val_x, val_y) {
+                (Some(vx), Some(vy)) => {
+                    if vx.width() != x.width() {
+                        anyhow::bail!(
+                            "XGBoost validation column count mismatch: train {}, val {}",
+                            x.width(),
+                            vx.width()
+                        );
+                    }
+                    if vx.height() != vy.len() {
+                        anyhow::bail!(
+                            "XGBoost validation row/label mismatch: {} rows vs {} labels",
+                            vx.height(),
+                            vy.len()
+                        );
+                    }
+                    let (vflat, v_rows, _vcols) = dataframe_to_row_major_vec(vx)?;
+                    let vlabels = remap_labels_to_tree_targets(vy)?;
+                    let mut dval = xgb::DMatrix::from_dense(&vflat, v_rows)
+                        .context("create XGBoost validation matrix from dataframe")?;
+                    dval.set_labels(&vlabels)
+                        .context("set XGBoost validation labels")?;
+                    Some(dval)
+                }
+                (None, None) => None,
+                _ => bail!(
+                    "XGBoostExpert::fit_with_validation requires both val_x and val_y or neither"
+                ),
+            };
+
             let tree_params =
                 TreeBoosterParametersBuilder::default()
                     .eta(param_float(&self.config.params, "learning_rate", 0.05) as f32)
@@ -648,17 +687,51 @@ impl ExpertModel for XGBoostExpert {
                 .context("build XGBoost booster parameters")?;
 
             let boost_rounds = param_int(&self.config.params, "n_estimators", 800).max(1) as u32;
+            let early_stopping_rounds =
+                param_int(&self.config.params, "early_stopping_rounds", 50).max(1) as i32;
 
             let mut model = xgb::Booster::new_with_cached_dmats(&booster_params, &[&dtrain])
                 .context("create XGBoost booster")?;
             self.apply_variant_params(&mut model)?;
             self.feature_columns = feature_columns_from_dataframe(x);
             self.set_runtime_attributes(&mut model)?;
+
+            let mut best_loss = f32::INFINITY;
+            let mut best_iter: i32 = 0;
+            let mut rounds_without_improvement: i32 = 0;
             for iteration in 0..boost_rounds as i32 {
                 model
                     .update(&dtrain, iteration)
                     .with_context(|| format!("update XGBoost booster at iteration {iteration}"))?;
+                if let Some(dval) = dval.as_ref() {
+                    let metrics = model
+                        .evaluate(dval)
+                        .context("evaluate XGBoost booster against val matrix")?;
+                    let val_loss = metrics
+                        .get("mlogloss")
+                        .or_else(|| metrics.get("merror"))
+                        .copied()
+                        .unwrap_or(f32::INFINITY);
+                    if val_loss < best_loss {
+                        best_loss = val_loss;
+                        best_iter = iteration;
+                        rounds_without_improvement = 0;
+                    } else {
+                        rounds_without_improvement += 1;
+                        if rounds_without_improvement >= early_stopping_rounds {
+                            tracing::info!(
+                                model = "xgboost",
+                                iteration,
+                                best_iter,
+                                best_loss,
+                                "XGBoost early-stopping triggered after {early_stopping_rounds} rounds without val improvement"
+                            );
+                            break;
+                        }
+                    }
+                }
             }
+
             self.training_summary = Some(default_training_summary(x));
             self.local_fallback = Some(self.build_local_fallback_artifact(x, y)?);
             self.gpu_only_disabled = false;
@@ -677,6 +750,11 @@ impl ExpertModel for XGBoostExpert {
                     y.len()
                 );
             }
+            if val_x.is_some() && val_y.is_some() {
+                tracing::debug!(
+                    "XGBoost compiled without `xgboost` feature; ignoring supplied val frame"
+                );
+            }
 
             self.feature_columns = feature_columns_from_dataframe(x);
             self.training_summary = Some(default_training_summary(x));
@@ -685,6 +763,22 @@ impl ExpertModel for XGBoostExpert {
             self._model = None;
             Ok(())
         }
+    }
+}
+
+impl ExpertModel for XGBoostExpert {
+    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
+        self.fit_internal(x, y, None, None)
+    }
+
+    fn fit_with_validation(
+        &mut self,
+        x: &DataFrame,
+        y: &Series,
+        val_x: Option<&DataFrame>,
+        val_y: Option<&Series>,
+    ) -> Result<()> {
+        self.fit_internal(x, y, val_x, val_y)
     }
 
     fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {

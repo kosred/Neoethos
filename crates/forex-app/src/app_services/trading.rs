@@ -30,9 +30,10 @@ use crate::app_services::ctrader_live_auth::{
     CTraderTokenRefreshRequest, ProductionCTraderLiveAuthBackend, build_default_loopback_config,
 };
 use crate::app_services::ctrader_messages::{
-    CTraderAmendOrderRequest, CTraderCancelOrderRequest, CTraderClosePositionRequest,
-    CTraderNewOrderRequest, CTraderOrderTriggerMethod, CTraderOrderType, CTraderTimeInForce,
-    CTraderTradeSide, SUPPORTED_CTRADER_ORDER_TRIGGER_METHODS, SUPPORTED_CTRADER_ORDER_TYPES,
+    CTRADER_TOKEN_EXPIRED_SENTINEL, CTraderAmendOrderRequest, CTraderCancelOrderRequest,
+    CTraderClosePositionRequest, CTraderNewOrderRequest, CTraderOrderTriggerMethod,
+    CTraderOrderType, CTraderTimeInForce, CTraderTradeSide,
+    SUPPORTED_CTRADER_ORDER_TRIGGER_METHODS, SUPPORTED_CTRADER_ORDER_TYPES,
     SUPPORTED_CTRADER_TIME_IN_FORCE, SUPPORTED_CTRADER_TRADE_SIDES, build_amend_order_request,
     build_cancel_order_request, build_close_position_request, build_new_order_request,
 };
@@ -1510,7 +1511,30 @@ impl TradingSession {
         }
 
         let runtime_request = self.build_ctrader_execution_runtime_request(request.clone())?;
-        let outcome = self.ctrader_execution_backend.execute(&runtime_request)?;
+        let outcome = match self.ctrader_execution_backend.execute(&runtime_request) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                // D11: cTrader signalled an OAuth-token failure. Force-
+                // refresh the bundle (bypassing the time-window check) and
+                // retry once. If refresh or retry also fails, surface the
+                // original error so the operator sees the broker message.
+                if !err.to_string().contains(CTRADER_TOKEN_EXPIRED_SENTINEL) {
+                    return Err(err);
+                }
+                let warn = format!(
+                    "cTrader token rejected by broker — forcing OAuth refresh and retrying: {err}"
+                );
+                self.append_trade_journal(warn.clone());
+                state.status_msg = warn.clone();
+                record_app_event("ctrader_token_refresh", "FORCED", warn);
+                if let Err(refresh_err) = self.force_refresh_ctrader_token_bundle() {
+                    return Err(refresh_err.context(err));
+                }
+                let retry_request =
+                    self.build_ctrader_execution_runtime_request(request.clone())?;
+                self.ctrader_execution_backend.execute(&retry_request)?
+            }
+        };
         let journal_line = format_execution_journal_line(&operator_action, &outcome);
         self.append_trade_journal(journal_line.clone());
         record_app_event(
@@ -2241,11 +2265,48 @@ impl TradingSession {
             return Ok(bundle);
         }
 
+        self.refresh_ctrader_token_bundle(&client_id, &client_secret, &bundle)
+    }
+
+    /// D11: force a token refresh regardless of the local expiry timer.
+    /// Used when the broker rejects the current `access_token` mid-session
+    /// (e.g. server-side revocation, clock skew). Returns the new bundle so
+    /// the next execution request rebuilds with a valid token.
+    fn force_refresh_ctrader_token_bundle(&mut self) -> anyhow::Result<CTraderTokenBundle> {
+        let client_id = self.broker_settings.ctrader.client_id.trim().to_string();
+        let client_secret = self
+            .broker_settings
+            .ctrader
+            .client_secret
+            .trim()
+            .to_string();
+        if client_id.is_empty() || client_secret.is_empty() {
+            return Err(anyhow::anyhow!(
+                "cTrader token refresh requires configured client_id and client_secret"
+            ));
+        }
+        let bundle = self
+            .ctrader_token_store
+            .load_token_bundle()?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cTrader force-refresh requires a stored token bundle with a refresh token"
+                )
+            })?;
+        self.refresh_ctrader_token_bundle(&client_id, &client_secret, &bundle)
+    }
+
+    fn refresh_ctrader_token_bundle(
+        &mut self,
+        client_id: &str,
+        client_secret: &str,
+        bundle: &CTraderTokenBundle,
+    ) -> anyhow::Result<CTraderTokenBundle> {
         let refreshed_bundle =
             self.ctrader_live_auth_backend
                 .refresh_token_bundle(&CTraderTokenRefreshRequest {
-                    client_id,
-                    client_secret,
+                    client_id: client_id.to_string(),
+                    client_secret: client_secret.to_string(),
                     refresh_token: bundle.refresh_token.clone(),
                     scope: bundle.scope.clone(),
                 })?;

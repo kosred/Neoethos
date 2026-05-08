@@ -107,6 +107,24 @@ pub trait ExpertModel {
     /// Derived from legacy fit method (lines 74-77)
     fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()>;
 
+    /// Train the model using an explicit validation frame for early stopping
+    /// or `eval_set`-style monitoring (M5/M6/M7 audit fixes). The default
+    /// implementation ignores the validation data and falls back to plain
+    /// `fit`, which preserves the legacy contract for models that have not
+    /// opted in. Implementations that genuinely support a validation set
+    /// (Burn deep learners, gradient boosters, anomaly detectors) override
+    /// this method so the HPO val frame flows through end-to-end and we
+    /// stop relying on tail-of-train internal splits.
+    fn fit_with_validation(
+        &mut self,
+        x: &DataFrame,
+        y: &Series,
+        _val_x: Option<&DataFrame>,
+        _val_y: Option<&Series>,
+    ) -> Result<()> {
+        self.fit(x, y)
+    }
+
     /// Predict probabilities for classes [-1, 0, 1].
     ///
     /// Returns:

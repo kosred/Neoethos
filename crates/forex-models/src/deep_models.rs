@@ -21,7 +21,7 @@ use crate::burn_models::{
     TrainBackend, TrainConfig, cast_module_float_tensors, normalize_burn_device_policy,
     predict_proba_on_device as burn_predict_proba_on_device, resolve_infer_device,
     resolve_train_device,
-    train_model_with_report_with_selection_and_precision as burn_train_model_with_report_with_selection_and_precision,
+    train_model_with_report_with_external_val as burn_train_model_with_report_with_external_val,
     validate_burn_device_selection,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
@@ -853,6 +853,27 @@ impl BurnDeepExpert {
         BurnDeviceSelection,
         BurnTrainingReport,
     )> {
+        self.train_runtime_model_with_val(input_dim, features, labels, None, None)
+    }
+
+    /// M5: same as [`train_runtime_model`] but allows the caller to supply
+    /// an explicit external validation pair (used by HPO so the early-
+    /// stopping signal matches the HPO objective). Passing `None` for both
+    /// reverts to Burn's internal time_series_split holdout.
+    #[allow(clippy::too_many_arguments)]
+    fn train_runtime_model_with_val(
+        &self,
+        input_dim: usize,
+        features: &Array2<f32>,
+        labels: &[i32],
+        external_val_x: Option<&Array2<f32>>,
+        external_val_y: Option<&[i32]>,
+    ) -> Result<(
+        RuntimeDeepModel,
+        TrainingSummaryMetadata,
+        BurnDeviceSelection,
+        BurnTrainingReport,
+    )> {
         let train_config = self.train_config();
         let requested_device = self.configured_requested_device_policy();
         let requested_training_precision = self.configured_requested_training_precision();
@@ -861,7 +882,7 @@ impl BurnDeepExpert {
             DeepModelKind::Mlp => {
                 let model = self.mlp_config(input_dim).init::<TrainBackend>(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
+                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
                         model,
                         features,
                         labels,
@@ -869,6 +890,8 @@ impl BurnDeepExpert {
                         &device,
                         &device_selection,
                         requested_training_precision.as_deref(),
+                        external_val_x,
+                        external_val_y,
                     )?;
                 Ok((
                     RuntimeDeepModel::Mlp(trained.valid()),
@@ -880,7 +903,7 @@ impl BurnDeepExpert {
             DeepModelKind::NBeats => {
                 let model = self.nbeats_config(input_dim).init::<TrainBackend>(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
+                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
                         model,
                         features,
                         labels,
@@ -888,6 +911,8 @@ impl BurnDeepExpert {
                         &device,
                         &device_selection,
                         requested_training_precision.as_deref(),
+                        external_val_x,
+                        external_val_y,
                     )?;
                 Ok((
                     RuntimeDeepModel::NBeats(trained.valid()),
@@ -901,7 +926,7 @@ impl BurnDeepExpert {
                     .nbeatsx_nf_config(input_dim)
                     .init::<TrainBackend>(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
+                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
                         model,
                         features,
                         labels,
@@ -909,6 +934,8 @@ impl BurnDeepExpert {
                         &device,
                         &device_selection,
                         requested_training_precision.as_deref(),
+                        external_val_x,
+                        external_val_y,
                     )?;
                 Ok((
                     RuntimeDeepModel::NBeatsxNf(trained.valid()),
@@ -920,7 +947,7 @@ impl BurnDeepExpert {
             DeepModelKind::TiDE => {
                 let model = self.tide_config(input_dim).init::<TrainBackend>(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
+                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
                         model,
                         features,
                         labels,
@@ -928,6 +955,8 @@ impl BurnDeepExpert {
                         &device,
                         &device_selection,
                         requested_training_precision.as_deref(),
+                        external_val_x,
+                        external_val_y,
                     )?;
                 Ok((
                     RuntimeDeepModel::TiDE(trained.valid()),
@@ -939,7 +968,7 @@ impl BurnDeepExpert {
             DeepModelKind::TiDENf => {
                 let model = self.tide_nf_config(input_dim).init::<TrainBackend>(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
+                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
                         model,
                         features,
                         labels,
@@ -947,6 +976,8 @@ impl BurnDeepExpert {
                         &device,
                         &device_selection,
                         requested_training_precision.as_deref(),
+                        external_val_x,
+                        external_val_y,
                     )?;
                 Ok((
                     RuntimeDeepModel::TiDENf(trained.valid()),
@@ -958,7 +989,7 @@ impl BurnDeepExpert {
             DeepModelKind::TabNet => {
                 let model = self.tabnet_config(input_dim).init::<TrainBackend>(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
+                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
                         model,
                         features,
                         labels,
@@ -966,6 +997,8 @@ impl BurnDeepExpert {
                         &device,
                         &device_selection,
                         requested_training_precision.as_deref(),
+                        external_val_x,
+                        external_val_y,
                     )?;
                 Ok((
                     RuntimeDeepModel::TabNet(trained.valid()),
@@ -977,7 +1010,7 @@ impl BurnDeepExpert {
             DeepModelKind::Kan => {
                 let model = self.kan_config(input_dim).init::<TrainBackend>(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
+                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
                         model,
                         features,
                         labels,
@@ -985,6 +1018,8 @@ impl BurnDeepExpert {
                         &device,
                         &device_selection,
                         requested_training_precision.as_deref(),
+                        external_val_x,
+                        external_val_y,
                     )?;
                 Ok((
                     RuntimeDeepModel::Kan(trained.valid()),
@@ -998,7 +1033,7 @@ impl BurnDeepExpert {
                     .transformer_config(input_dim)
                     .init::<TrainBackend>(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
+                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
                         model,
                         features,
                         labels,
@@ -1006,6 +1041,8 @@ impl BurnDeepExpert {
                         &device,
                         &device_selection,
                         requested_training_precision.as_deref(),
+                        external_val_x,
+                        external_val_y,
                     )?;
                 Ok((
                     RuntimeDeepModel::Transformer(trained.valid()),
@@ -1019,7 +1056,7 @@ impl BurnDeepExpert {
                     .patchtst_config(input_dim)
                     .init::<TrainBackend>(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
+                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
                         model,
                         features,
                         labels,
@@ -1027,6 +1064,8 @@ impl BurnDeepExpert {
                         &device,
                         &device_selection,
                         requested_training_precision.as_deref(),
+                        external_val_x,
+                        external_val_y,
                     )?;
                 Ok((
                     RuntimeDeepModel::PatchTst(trained.valid()),
@@ -1040,7 +1079,7 @@ impl BurnDeepExpert {
                     .timesnet_config(input_dim)
                     .init::<TrainBackend>(&device);
                 let (trained, report) =
-                    burn_train_model_with_report_with_selection_and_precision::<TrainBackend, _>(
+                    burn_train_model_with_report_with_external_val::<TrainBackend, _>(
                         model,
                         features,
                         labels,
@@ -1048,6 +1087,8 @@ impl BurnDeepExpert {
                         &device,
                         &device_selection,
                         requested_training_precision.as_deref(),
+                        external_val_x,
+                        external_val_y,
                     )?;
                 Ok((
                     RuntimeDeepModel::TimesNet(trained.valid()),
@@ -1335,10 +1376,19 @@ impl BurnDeepExpert {
         }
         Ok(predictions)
     }
-}
 
-impl ExpertModel for BurnDeepExpert {
-    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
+    /// M5: shared body for `fit` and `fit_with_validation`. When the caller
+    /// supplies an explicit validation pair (HPO path), it is forwarded to
+    /// `train_runtime_model_with_val` so Burn drives early stopping against
+    /// the same val data the HPO objective scores. When no external val is
+    /// supplied we fall back to Burn's internal time_series_split holdout.
+    fn fit_internal(
+        &mut self,
+        x: &DataFrame,
+        y: &Series,
+        val_x: Option<&DataFrame>,
+        val_y: Option<&Series>,
+    ) -> Result<()> {
         let features = dataframe_to_float32_array(x)
             .with_context(|| format!("build {} feature matrix", self.model_name()))?;
         let labels = Self::labels_from_series(y)?;
@@ -1352,10 +1402,47 @@ impl ExpertModel for BurnDeepExpert {
         }
         let input_dim = features.ncols();
 
+        let val_arrays = match (val_x, val_y) {
+            (Some(vx), Some(vy)) => {
+                let vx_array = dataframe_to_float32_array(vx).with_context(|| {
+                    format!("build {} validation feature matrix", self.model_name())
+                })?;
+                let vy_labels = Self::labels_from_series(vy)?;
+                if vx_array.nrows() != vy_labels.len() {
+                    bail!(
+                        "{} validation feature/label mismatch: {} rows vs {} labels",
+                        self.model_name(),
+                        vx_array.nrows(),
+                        vy_labels.len()
+                    );
+                }
+                let val_columns = feature_columns_from_dataframe(vx);
+                let train_columns = feature_columns_from_dataframe(x);
+                if val_columns != train_columns {
+                    bail!(
+                        "{} validation column mismatch: train {:?} vs val {:?}",
+                        self.model_name(),
+                        train_columns,
+                        val_columns
+                    );
+                }
+                Some((vx_array, vy_labels))
+            }
+            (None, None) => None,
+            _ => bail!(
+                "{} fit_with_validation requires both val_x and val_y or neither",
+                self.model_name()
+            ),
+        };
+
         self.feature_columns = feature_columns_from_dataframe(x);
         self.validate_model_params()?;
-        let (model, summary, device_selection, burn_training_report) =
-            self.train_runtime_model(input_dim, &features, &labels)?;
+        let (val_x_ref, val_y_ref) = match val_arrays.as_ref() {
+            Some((vx, vy)) => (Some(vx), Some(vy.as_slice())),
+            None => (None, None),
+        };
+        let (model, summary, device_selection, burn_training_report) = self
+            .train_runtime_model_with_val(input_dim, &features, &labels, val_x_ref, val_y_ref)?;
         self.training_summary = Some(summary);
         self.burn_training_report = Some(burn_training_report);
         self.params.insert(
@@ -1386,6 +1473,22 @@ impl ExpertModel for BurnDeepExpert {
         self.host_runtime_selection = self.persisted_runtime_selection.clone();
         self.model = Some(model);
         Ok(())
+    }
+}
+
+impl ExpertModel for BurnDeepExpert {
+    fn fit(&mut self, x: &DataFrame, y: &Series) -> Result<()> {
+        self.fit_internal(x, y, None, None)
+    }
+
+    fn fit_with_validation(
+        &mut self,
+        x: &DataFrame,
+        y: &Series,
+        val_x: Option<&DataFrame>,
+        val_y: Option<&Series>,
+    ) -> Result<()> {
+        self.fit_internal(x, y, val_x, val_y)
     }
 
     fn predict_proba(&self, x: &DataFrame) -> Result<Array2<f32>> {

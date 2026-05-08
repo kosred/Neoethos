@@ -792,6 +792,11 @@ pub fn is_matching_open_api_response(
 }
 
 pub fn parse_ctrader_error_payload(payload: &Value) -> Result<String> {
+    let (_code, message) = parse_ctrader_error_payload_parts(payload)?;
+    Ok(message)
+}
+
+pub fn parse_ctrader_error_payload_parts(payload: &Value) -> Result<(String, String)> {
     #[derive(Debug, Deserialize)]
     struct CTraderErrorPayload {
         #[serde(rename = "errorCode")]
@@ -801,13 +806,40 @@ pub fn parse_ctrader_error_payload(payload: &Value) -> Result<String> {
 
     let error: CTraderErrorPayload =
         serde_json::from_value(payload.clone()).context("failed to parse cTrader error payload")?;
-    Ok(match error.description {
+    let formatted = match &error.description {
         Some(description) if !description.trim().is_empty() => {
             format!("{}: {}", error.error_code, description)
         }
-        _ => error.error_code,
-    })
+        _ => error.error_code.clone(),
+    };
+    Ok((error.error_code, formatted))
 }
+
+/// True when a cTrader Open API error code indicates the OAuth access token
+/// is no longer valid and a refresh + retry should be attempted before giving
+/// up. Codes are matched case-insensitively against the patterns published by
+/// Spotware's Open API (see Open API Bridge error codes documentation).
+pub fn is_ctrader_auth_token_error(error_code: &str) -> bool {
+    let upper = error_code.trim().to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "OA_AUTH_TOKEN_EXPIRED"
+            | "CH_ACCESS_TOKEN_INVALID"
+            | "CH_ACCESS_TOKEN_EXPIRED"
+            | "INVALID_TOKEN"
+            | "INVALID_ACCESS_TOKEN"
+            | "ACCESS_TOKEN_EXPIRED"
+            | "TOKEN_EXPIRED"
+            | "EXPIRED_TOKEN"
+    ) || upper.contains("TOKEN_EXPIRED")
+        || upper.contains("ACCESS_TOKEN_INVALID")
+        || upper.contains("INVALID_ACCESS_TOKEN")
+}
+
+/// Sentinel prefix that `ProductionCTraderExecutionBackend` uses to flag
+/// auth-token failures so the trading-session caller can force-refresh and
+/// retry once. Kept as a constant so caller and producer agree on the marker.
+pub const CTRADER_TOKEN_EXPIRED_SENTINEL: &str = "CTRADER_TOKEN_EXPIRED";
 
 impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
     fn send_sequence(&self, messages: &[CTraderOpenApiJsonMessage]) -> Result<Vec<String>> {
@@ -1462,5 +1494,54 @@ mod tests {
             error,
             "ACCOUNT_NOT_AUTHORIZED: The trading account is not authorized"
         );
+    }
+
+    #[test]
+    fn ctrader_error_payload_parts_separates_code_and_message() {
+        let (code, message) = parse_ctrader_error_payload_parts(&serde_json::json!({
+            "errorCode": "OA_AUTH_TOKEN_EXPIRED",
+            "description": "OAuth access token has expired"
+        }))
+        .expect("error payload should parse");
+
+        assert_eq!(code, "OA_AUTH_TOKEN_EXPIRED");
+        assert_eq!(
+            message,
+            "OA_AUTH_TOKEN_EXPIRED: OAuth access token has expired"
+        );
+    }
+
+    #[test]
+    fn auth_token_error_classifier_matches_known_codes() {
+        for code in [
+            "OA_AUTH_TOKEN_EXPIRED",
+            "ACCESS_TOKEN_EXPIRED",
+            "TOKEN_EXPIRED",
+            "INVALID_TOKEN",
+            "INVALID_ACCESS_TOKEN",
+            "CH_ACCESS_TOKEN_INVALID",
+            "CH_ACCESS_TOKEN_EXPIRED",
+        ] {
+            assert!(
+                is_ctrader_auth_token_error(code),
+                "expected {code} to be classified as a token-expired error"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_token_error_classifier_rejects_unrelated_codes() {
+        for code in [
+            "ACCOUNT_NOT_AUTHORIZED",
+            "INSUFFICIENT_FUNDS",
+            "MARKET_CLOSED",
+            "INVALID_VOLUME",
+            "",
+        ] {
+            assert!(
+                !is_ctrader_auth_token_error(code),
+                "expected {code} NOT to be classified as a token-expired error"
+            );
+        }
     }
 }

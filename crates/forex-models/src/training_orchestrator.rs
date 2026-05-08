@@ -3109,8 +3109,19 @@ fn optimize_model_config(
         };
 
         let train_labels_series = labels_to_series(&train_labels);
+        let val_labels_series = labels_to_series(&val_labels);
+        // M5/M6/M7: forward the explicit HPO val frame through to models
+        // that support val-based early stopping (Burn deep learners,
+        // gradient boosters, anomaly detectors). Models that do not opt in
+        // fall back to `fit` via the default trait impl, so existing
+        // models keep working without changes.
         match model
-            .fit(&train_frame, &train_labels_series)
+            .fit_with_validation(
+                &train_frame,
+                &train_labels_series,
+                Some(&val_frame),
+                Some(&val_labels_series),
+            )
             .and_then(|_| model.predict_proba(&val_frame))
         {
             Ok(probabilities) => {
