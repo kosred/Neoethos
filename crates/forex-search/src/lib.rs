@@ -1,4 +1,6 @@
+mod artifact_io;
 pub mod challenge;
+pub mod checkpoint;
 #[cfg(feature = "gpu")]
 mod cubecl_eval;
 #[cfg(feature = "gpu")]
@@ -6,16 +8,21 @@ mod cubecl_ga;
 pub mod discovery;
 #[cfg(feature = "gpu")]
 pub mod discovery_gpu;
+mod scheduler_assignment;
 #[cfg(not(feature = "gpu"))]
 pub mod discovery_gpu {
+    use crate::artifact_io::write_json_atomic;
     use crate::eval::{BacktestSettings, fast_evaluate_strategy_core};
     use crate::genetic::strategy_gene::infer_market_cost_profile;
     use crate::genetic::{
         ParentSelectionPolicy, SurvivorSelectionPolicy, month_day_indices, select_parent_index,
         select_survivor_indices,
     };
+    use crate::scheduler_assignment::accelerator_backend_from_assignment;
     use anyhow::{Result, bail};
-    use forex_core::{AcceleratorBackend, TrainingPrecision};
+    use forex_core::{
+        AcceleratorBackend, ResolvedWorkloadAssignment, TrainingPrecision, WorkloadKind,
+    };
     use forex_data::{FeatureCache, FeatureFrame, Ohlcv, SymbolDataset, compute_hpc_features};
     use ndarray::Array2;
     use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -92,6 +99,37 @@ pub mod discovery_gpu {
                 precision: TrainingPrecision::Fp32,
                 seed: None,
             }
+        }
+    }
+
+    impl GpuDiscoveryConfig {
+        pub fn apply_scheduler_assignment(
+            &mut self,
+            assignment: &ResolvedWorkloadAssignment,
+        ) -> &mut Self {
+            if assignment.workload != WorkloadKind::StrategySearch {
+                return self;
+            }
+            self.backend = accelerator_backend_from_assignment(assignment);
+            self.devices = assignment
+                .device_assignment
+                .device_ids
+                .iter()
+                .map(|id| *id as i64)
+                .collect();
+            self.precision = assignment.precision_policy.precision;
+            if assignment.batch_size > 0 {
+                self.chunk_size = assignment.batch_size;
+            }
+            self
+        }
+
+        pub fn with_scheduler_assignment(
+            mut self,
+            assignment: &ResolvedWorkloadAssignment,
+        ) -> Self {
+            self.apply_scheduler_assignment(assignment);
+            self
         }
     }
 
@@ -180,9 +218,7 @@ pub mod discovery_gpu {
                 genome: g,
             });
         }
-        let json = serde_json::to_string_pretty(&payload)?;
-        std::fs::write(path, json)?;
-        Ok(())
+        write_json_atomic(path, &payload)
     }
 
     fn base_timeframe(dataset: &SymbolDataset, requested: &str) -> Result<String> {
@@ -630,8 +666,12 @@ pub mod discovery_gpu {
         // on the same windows (parity with GPU + reproducibility).
         let usable_samples = n_samples.min(ohlcv.close.len());
         let mut seg_rng = make_rng(config, 0x5A5A_5A5A);
-        let segments =
-            build_segments(usable_samples, config.window_bars, config.segments, &mut seg_rng);
+        let segments = build_segments(
+            usable_samples,
+            config.window_bars,
+            config.segments,
+            &mut seg_rng,
+        );
 
         let mut best_genomes = Vec::new();
         let mut best_scores = Vec::new();
@@ -796,6 +836,59 @@ pub mod discovery_gpu {
             degraded_reason,
         })
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use forex_core::{
+            BackendKind, CpuBudget, DeviceAssignment, PrecisionPolicy, ResolvedWorkloadAssignment,
+        };
+
+        fn assignment(
+            backend: BackendKind,
+            device: &str,
+            device_ids: Vec<usize>,
+            batch_size: usize,
+        ) -> ResolvedWorkloadAssignment {
+            ResolvedWorkloadAssignment {
+                workload: WorkloadKind::StrategySearch,
+                hardware_profile_id: "hardware-profile".to_string(),
+                device_assignment: DeviceAssignment {
+                    backend,
+                    device: device.to_string(),
+                    device_ids,
+                },
+                cpu_budget: CpuBudget::new(8),
+                gpu_budget: None,
+                precision_policy: PrecisionPolicy::from_precision(TrainingPrecision::Bf16),
+                batch_size,
+                runtime_degraded_reason: None,
+                notes: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn gpu_discovery_config_accepts_scheduler_assignment() {
+            let assignment = assignment(BackendKind::NativeCuda, "cuda:all", vec![0, 1], 4096);
+            let config = GpuDiscoveryConfig::default().with_scheduler_assignment(&assignment);
+
+            assert_eq!(config.backend, AcceleratorBackend::Cuda);
+            assert_eq!(config.devices, vec![0, 1]);
+            assert_eq!(config.precision, TrainingPrecision::Bf16);
+            assert_eq!(config.chunk_size, 4096);
+        }
+
+        #[test]
+        fn gpu_discovery_config_ignores_non_search_assignment() {
+            let mut assignment = assignment(BackendKind::NativeCuda, "cuda:0", vec![0], 1024);
+            assignment.workload = WorkloadKind::Inference;
+            let config = GpuDiscoveryConfig::default().with_scheduler_assignment(&assignment);
+
+            assert_eq!(config.backend, AcceleratorBackend::Cuda);
+            assert!(config.devices.is_empty());
+            assert_eq!(config.precision, TrainingPrecision::Fp32);
+        }
+    }
 }
 
 // HPC-specific modules - only compiled on GPU-enabled builds.
@@ -818,6 +911,7 @@ pub mod eval;
 pub mod gauntlet;
 pub mod genetic;
 pub mod orchestration;
+pub mod parity;
 pub mod portfolio;
 pub mod quality;
 pub mod stop_target;
@@ -836,7 +930,8 @@ pub use discovery_gpu::{
     GpuDiscoveryConfig, GpuDiscoveryResult, build_feature_cube, run_gpu_discovery, save_gpu_genomes,
 };
 pub use eval::{
-    BacktestSettings, evaluate_population_core, fast_evaluate_strategy_core, simulate_trades_core,
+    BacktestMetrics, BacktestSettings, evaluate_population_core, fast_evaluate_strategy_core,
+    simulate_trades_core,
 };
 pub use gauntlet::{GauntletConfig, StrategyGauntlet};
 pub use genetic::{
@@ -850,6 +945,11 @@ pub use portfolio::{AllocationResult, PortfolioOptimizer, SymbolMetrics};
 pub use quality::{StrategyMetrics, StrategyQualityAnalyzer, StrategyRanker, Trade};
 pub use stop_target::{StopTargetSettings, compute_stop_distance_series, infer_stop_target_pips};
 pub use validation::{
-    CombinatorialPurgedCV, WalkforwardSplitResult, WalkforwardSummary,
-    embargoed_walkforward_backtest,
+    CANONICAL_BACKTEST_ARTIFACT_KIND, CANONICAL_BACKTEST_SCHEMA_VERSION,
+    CanonicalBacktestArtifactFile, CanonicalBacktestScope, CombinatorialPurgedCV,
+    WALKFORWARD_VALIDATION_ARTIFACT_KIND, WALKFORWARD_VALIDATION_SCHEMA_VERSION,
+    WalkforwardSplitResult, WalkforwardSummary, WalkforwardValidationArtifactFile,
+    WalkforwardValidationScope, embargoed_walkforward_backtest, read_canonical_backtest_artifact,
+    read_walkforward_validation_artifact, write_canonical_backtest_artifact_atomic,
+    write_walkforward_validation_artifact_atomic,
 };

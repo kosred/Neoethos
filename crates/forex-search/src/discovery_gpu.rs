@@ -1,5 +1,7 @@
+use crate::artifact_io::write_json_atomic;
+use crate::scheduler_assignment::accelerator_backend_from_assignment;
 use anyhow::{Result, bail};
-use forex_core::{AcceleratorBackend, TrainingPrecision};
+use forex_core::{AcceleratorBackend, ResolvedWorkloadAssignment, TrainingPrecision, WorkloadKind};
 use forex_data::{
     FeatureCache, FeatureFrame, FeatureProfile, Ohlcv, SymbolDataset, compute_hpc_feature_frame,
 };
@@ -82,6 +84,34 @@ impl Default for GpuDiscoveryConfig {
             precision: TrainingPrecision::Fp32,
             seed: None,
         }
+    }
+}
+
+impl GpuDiscoveryConfig {
+    pub fn apply_scheduler_assignment(
+        &mut self,
+        assignment: &ResolvedWorkloadAssignment,
+    ) -> &mut Self {
+        if assignment.workload != WorkloadKind::StrategySearch {
+            return self;
+        }
+        self.backend = accelerator_backend_from_assignment(assignment);
+        self.devices = assignment
+            .device_assignment
+            .device_ids
+            .iter()
+            .map(|id| *id as i64)
+            .collect();
+        self.precision = assignment.precision_policy.precision;
+        if assignment.batch_size > 0 {
+            self.chunk_size = assignment.batch_size;
+        }
+        self
+    }
+
+    pub fn with_scheduler_assignment(mut self, assignment: &ResolvedWorkloadAssignment) -> Self {
+        self.apply_scheduler_assignment(assignment);
+        self
     }
 }
 
@@ -205,9 +235,7 @@ pub fn save_gpu_genomes(path: impl AsRef<Path>, result: &GpuDiscoveryResult) -> 
             genome: g,
         });
     }
-    let json = serde_json::to_string_pretty(&payload)?;
-    std::fs::write(path, json)?;
-    Ok(())
+    write_json_atomic(path, &payload)
 }
 
 pub fn build_feature_cube(
@@ -349,12 +377,7 @@ pub fn run_gpu_discovery(
     // the SAME windows for the SAME genomes. Previously each call to
     // `build_segments` made its own unseeded RNG → results changed per call.
     let mut seg_rng = make_rng(config, 0x5A5A_5A5A);
-    let segments = build_segments(
-        n_samples,
-        config.window_bars,
-        config.segments,
-        &mut seg_rng,
-    );
+    let segments = build_segments(n_samples, config.window_bars, config.segments, &mut seg_rng);
 
     let mut best_genomes = Vec::new();
     let mut best_scores = Vec::new();

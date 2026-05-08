@@ -1,9 +1,9 @@
+use crate::artifact_io::write_json_atomic;
 use chrono::{Datelike, TimeZone, Utc};
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use statrs::distribution::{ContinuousCDF, StudentsT};
 use std::collections::HashMap;
-use std::fs;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -690,7 +690,6 @@ impl StrategyRanker {
                 "recommendation": m.recommendation,
             }));
         }
-        let payload = serde_json::to_string_pretty(&rankings).unwrap_or_else(|_| "[]".to_string());
-        fs::write(path, payload)
+        write_json_atomic(path, &rankings).map_err(|err| std::io::Error::other(err.to_string()))
     }
 }

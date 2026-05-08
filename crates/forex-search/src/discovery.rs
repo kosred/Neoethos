@@ -1,3 +1,4 @@
+use crate::artifact_io::write_json_atomic;
 use crate::genetic::strategy_gene::EvaluationConfig;
 use crate::genetic::{Gene, evolve_search_with_progress_and_limits, signals_for_gene_full};
 use crate::quality::{StrategyMetrics, StrategyQualityAnalyzer, Trade};
@@ -7,7 +8,6 @@ use forex_data::{FeatureFrame, Ohlcv};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -821,8 +821,7 @@ where
         // parallelism to the outer level and keep the MC loop serial — this
         // avoids rayon nested-parallel oversubscription and gives ~Ncores×
         // throughput on the per-candidate work.
-        let pairs: Vec<((usize, Gene), Vec<i8>)> =
-            filtered.into_iter().zip(signals_map).collect();
+        let pairs: Vec<((usize, Gene), Vec<i8>)> = filtered.into_iter().zip(signals_map).collect();
         let screened: Vec<Option<QualityCandidate>> = pairs
             .into_par_iter()
             .map(|((candidate_idx, gene), sig)| {
@@ -1151,33 +1150,15 @@ pub fn save_portfolio_json(
             sl_pips: gene.sl_pips,
         });
     }
-    let payload = serde_json::to_string_pretty(&exports)?;
-    fs::write(path, payload)?;
-    Ok(())
+    write_json_atomic(path, &exports)
 }
 
 pub fn save_quality_report_json(path: impl AsRef<Path>, result: &DiscoveryResult) -> Result<()> {
-    let path = path.as_ref();
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
-    }
-    let payload = serde_json::to_string_pretty(&result.quality_metrics)?;
-    fs::write(path, payload)?;
-    Ok(())
+    write_json_atomic(path, &result.quality_metrics)
 }
 
 pub fn save_trade_log_json(path: impl AsRef<Path>, result: &DiscoveryResult) -> Result<()> {
-    let path = path.as_ref();
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
-    }
-    let payload = serde_json::to_string_pretty(&result.logged_trades)?;
-    fs::write(path, payload)?;
-    Ok(())
+    write_json_atomic(path, &result.logged_trades)
 }
 
 pub fn build_discovery_profile(
@@ -1234,15 +1215,7 @@ pub fn save_discovery_profile_json(
     config: &DiscoveryConfig,
     result: &DiscoveryResult,
 ) -> Result<()> {
-    let path = path.as_ref();
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
-    }
-    let payload = serde_json::to_string_pretty(&build_discovery_profile(config, result))?;
-    fs::write(path, payload)?;
-    Ok(())
+    write_json_atomic(path, &build_discovery_profile(config, result))
 }
 
 #[cfg(test)]
