@@ -1,9 +1,14 @@
 use crate::config::Settings;
+use crate::contracts::{DeviceAssignment, RuntimeDegradedReason};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::process::Command;
 use sysinfo::System;
 use tracing::{info, warn};
+
+mod backends;
+pub use backends::AcceleratorBackend;
+use backends::{choose_primary_backend, normalize_accelerator_preference};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HardwareProfile {
@@ -21,42 +26,56 @@ pub struct HardwareProfile {
 
 pub struct HardwareProbe {
     sys: System,
+    runtime_overrides: HardwareRuntimeOverrides,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AcceleratorBackend {
-    Cpu,
-    Cuda,
-    Rocm,
-    Wgpu,
-    Vulkan,
-    Metal,
-    Dx12,
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct HardwareRuntimeOverrides {
+    pub cpu_budget: Option<usize>,
+    pub training_precision: Option<TrainingPrecision>,
+    pub cuda_precisions: Option<Vec<TrainingPrecision>>,
+    pub rocm_precisions: Option<Vec<TrainingPrecision>>,
+    pub wgpu_precisions: Option<Vec<TrainingPrecision>>,
+    pub wgpu_device_names: Vec<String>,
 }
 
-impl AcceleratorBackend {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Cpu => "cpu",
-            Self::Cuda => "cuda",
-            Self::Rocm => "rocm",
-            Self::Wgpu => "wgpu",
-            Self::Vulkan => "vulkan",
-            Self::Metal => "metal",
-            Self::Dx12 => "dx12",
+impl HardwareRuntimeOverrides {
+    pub fn from_env() -> Self {
+        Self {
+            cpu_budget: parse_env_usize("FOREX_BOT_CPU_BUDGET"),
+            training_precision: ["FOREX_BOT_TRAIN_PRECISION", "FOREX_TRAIN_PRECISION"]
+                .iter()
+                .find_map(|key| env::var(key).ok())
+                .and_then(|value| parse_training_precision(&value)),
+            cuda_precisions: parse_env_precisions("FOREX_BOT_CUDA_PRECISIONS"),
+            rocm_precisions: parse_env_precisions("FOREX_BOT_ROCM_PRECISIONS"),
+            wgpu_precisions: parse_env_precisions("FOREX_BOT_WGPU_PRECISIONS"),
+            wgpu_device_names: env::var("FOREX_BOT_WGPU_DEVICES")
+                .ok()
+                .map(|raw| {
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 
-    pub fn is_gpu(self) -> bool {
-        !matches!(self, Self::Cpu)
-    }
-
-    pub fn is_cuda_native(self) -> bool {
-        matches!(self, Self::Cuda)
-    }
-
-    pub fn is_wgpu_family(self) -> bool {
-        matches!(self, Self::Wgpu | Self::Vulkan | Self::Metal | Self::Dx12)
+    pub fn precision_override(
+        &self,
+        backend: AcceleratorBackend,
+    ) -> Option<Vec<TrainingPrecision>> {
+        match backend {
+            AcceleratorBackend::Cuda => self.cuda_precisions.clone(),
+            AcceleratorBackend::Rocm => self.rocm_precisions.clone(),
+            AcceleratorBackend::Wgpu
+            | AcceleratorBackend::Vulkan
+            | AcceleratorBackend::Metal
+            | AcceleratorBackend::Dx12 => self.wgpu_precisions.clone(),
+            AcceleratorBackend::Cpu => None,
+        }
     }
 }
 
@@ -114,6 +133,62 @@ pub enum WorkloadKind {
     Ui,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CpuBudget {
+    pub threads: usize,
+}
+
+impl CpuBudget {
+    pub fn new(threads: usize) -> Self {
+        Self {
+            threads: threads.max(1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GpuBudget {
+    pub device_ids: Vec<usize>,
+    pub memory_budget_gb: f64,
+}
+
+impl GpuBudget {
+    pub fn new(device_ids: Vec<usize>, memory_budget_gb: f64) -> Self {
+        Self {
+            device_ids,
+            memory_budget_gb: memory_budget_gb.max(0.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrecisionPolicy {
+    pub precision: TrainingPrecision,
+    pub mixed_precision_allowed: bool,
+}
+
+impl PrecisionPolicy {
+    pub fn from_precision(precision: TrainingPrecision) -> Self {
+        Self {
+            precision,
+            mixed_precision_allowed: !matches!(precision, TrainingPrecision::Fp32),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedWorkloadAssignment {
+    pub workload: WorkloadKind,
+    pub hardware_profile_id: String,
+    pub device_assignment: DeviceAssignment,
+    pub cpu_budget: CpuBudget,
+    pub gpu_budget: Option<GpuBudget>,
+    pub precision_policy: PrecisionPolicy,
+    pub batch_size: usize,
+    pub runtime_degraded_reason: Option<RuntimeDegradedReason>,
+    pub notes: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkloadExecutionPlan {
     pub workload: WorkloadKind,
@@ -125,6 +200,30 @@ pub struct WorkloadExecutionPlan {
     pub batch_size: usize,
     pub memory_budget_gb: f64,
     pub notes: Vec<String>,
+}
+
+impl WorkloadExecutionPlan {
+    pub fn device_assignment(&self) -> DeviceAssignment {
+        DeviceAssignment {
+            backend: self.backend.backend_kind(),
+            device: self.device.clone(),
+            device_ids: self.device_ids.clone(),
+        }
+    }
+
+    pub fn cpu_budget(&self) -> CpuBudget {
+        CpuBudget::new(self.cpu_threads)
+    }
+
+    pub fn gpu_budget(&self) -> Option<GpuBudget> {
+        self.backend
+            .is_gpu()
+            .then(|| GpuBudget::new(self.device_ids.clone(), self.memory_budget_gb))
+    }
+
+    pub fn precision_policy(&self) -> PrecisionPolicy {
+        PrecisionPolicy::from_precision(self.precision)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -139,6 +238,18 @@ pub struct HardwareExecutionPlan {
 
 impl HardwareExecutionPlan {
     pub fn from_settings_and_profile(settings: &Settings, profile: HardwareProfile) -> Self {
+        Self::from_settings_profile_and_overrides(
+            settings,
+            profile,
+            &HardwareRuntimeOverrides::from_env(),
+        )
+    }
+
+    pub fn from_settings_profile_and_overrides(
+        settings: &Settings,
+        profile: HardwareProfile,
+        runtime_overrides: &HardwareRuntimeOverrides,
+    ) -> Self {
         let preference = normalize_accelerator_preference(&settings.system.enable_gpu_preference);
         let cuda_devices = profile.devices_for_backend(AcceleratorBackend::Cuda);
         let has_gpu = !profile.accelerator_devices.is_empty();
@@ -150,7 +261,8 @@ impl HardwareExecutionPlan {
         let primary_backend = choose_primary_backend(&preference, &profile);
         let gpu_enabled = has_gpu && gpu_allowed && primary_backend.is_gpu();
         let backend_devices = profile.devices_for_planned_backend(primary_backend);
-        let preferred_precision = choose_training_precision(&profile, primary_backend);
+        let preferred_precision =
+            choose_training_precision(&profile, primary_backend, runtime_overrides);
         let mut warnings = Vec::new();
         if gpu_forced && !has_gpu {
             warnings.push(
@@ -171,7 +283,7 @@ impl HardwareExecutionPlan {
             );
         }
 
-        let cpu_budget = resolve_cpu_budget_from_env(profile.cpu_cores.max(1));
+        let cpu_budget = resolve_cpu_budget(profile.cpu_cores.max(1), runtime_overrides);
         let memory_budget_gb = profile.available_ram_gb.max(1.0);
         let device_ids: Vec<usize> = if gpu_enabled {
             backend_devices.iter().map(|device| device.id).collect()
@@ -222,6 +334,7 @@ impl HardwareExecutionPlan {
                 } else {
                     AcceleratorBackend::Cpu
                 },
+                runtime_overrides,
             ),
             cpu_threads: cpu_budget.clamp(1, 8),
             batch_size: 0,
@@ -370,6 +483,59 @@ impl HardwareExecutionPlan {
     pub fn workload(&self, kind: WorkloadKind) -> Option<&WorkloadExecutionPlan> {
         self.workloads.iter().find(|plan| plan.workload == kind)
     }
+
+    pub fn profile_id(&self) -> String {
+        self.profile.stable_id()
+    }
+
+    pub fn workload_assignment(&self, kind: WorkloadKind) -> Option<ResolvedWorkloadAssignment> {
+        let hardware_profile_id = self.profile_id();
+        self.workload(kind)
+            .map(|plan| plan.resolved_assignment(hardware_profile_id))
+    }
+
+    pub fn workload_assignments(&self) -> Vec<ResolvedWorkloadAssignment> {
+        let hardware_profile_id = self.profile_id();
+        self.workloads
+            .iter()
+            .map(|plan| plan.resolved_assignment(hardware_profile_id.clone()))
+            .collect()
+    }
+}
+
+impl WorkloadExecutionPlan {
+    pub fn resolved_assignment(
+        &self,
+        hardware_profile_id: impl Into<String>,
+    ) -> ResolvedWorkloadAssignment {
+        ResolvedWorkloadAssignment {
+            workload: self.workload,
+            hardware_profile_id: hardware_profile_id.into(),
+            device_assignment: self.device_assignment(),
+            cpu_budget: self.cpu_budget(),
+            gpu_budget: self.gpu_budget(),
+            precision_policy: self.precision_policy(),
+            batch_size: self.batch_size,
+            runtime_degraded_reason: self.runtime_degraded_reason(),
+            notes: self.notes.clone(),
+        }
+    }
+
+    fn runtime_degraded_reason(&self) -> Option<RuntimeDegradedReason> {
+        if self.backend.is_gpu() {
+            return None;
+        }
+        let requested_gpu_fallback = self.notes.iter().any(|note| {
+            let note = note.to_ascii_lowercase();
+            note.contains("fallback") || note.contains("degrade") || note.contains("unavailable")
+        });
+        requested_gpu_fallback.then(|| {
+            RuntimeDegradedReason::new(
+                "gpu_path_unavailable",
+                "Scheduler resolved this workload to CPU while notes indicate a GPU path is unavailable or falling back.",
+            )
+        })
+    }
 }
 
 impl Default for HardwareProbe {
@@ -380,9 +546,16 @@ impl Default for HardwareProbe {
 
 impl HardwareProbe {
     pub fn new() -> Self {
+        Self::with_runtime_overrides(HardwareRuntimeOverrides::from_env())
+    }
+
+    pub fn with_runtime_overrides(runtime_overrides: HardwareRuntimeOverrides) -> Self {
         let mut sys = System::new_all();
         sys.refresh_all();
-        Self { sys }
+        Self {
+            sys,
+            runtime_overrides,
+        }
     }
 
     pub fn detect(&mut self) -> HardwareProfile {
@@ -568,9 +741,12 @@ impl HardwareProbe {
                         name,
                         backend: AcceleratorBackend::Rocm,
                         memory_gb: 0.0,
-                        supported_precisions: env_precision_override("rocm").unwrap_or_else(|| {
-                            vec![TrainingPrecision::Fp32, TrainingPrecision::Fp16]
-                        }),
+                        supported_precisions: self
+                            .runtime_overrides
+                            .precision_override(AcceleratorBackend::Rocm)
+                            .unwrap_or_else(|| {
+                                vec![TrainingPrecision::Fp32, TrainingPrecision::Fp16]
+                            }),
                         compute_capability: None,
                         source: "rocminfo".to_string(),
                     })
@@ -582,28 +758,49 @@ impl HardwareProbe {
     }
 
     fn detect_wgpu_hint_accelerators(&self, id_offset: usize) -> Vec<AcceleratorDevice> {
-        let Ok(raw) = env::var("FOREX_BOT_WGPU_DEVICES") else {
-            return Vec::new();
-        };
-        raw.split(',')
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
+        self.runtime_overrides
+            .wgpu_device_names
+            .iter()
             .enumerate()
             .map(|(idx, name)| AcceleratorDevice {
                 id: id_offset + idx,
-                name: name.to_string(),
+                name: name.clone(),
                 backend: AcceleratorBackend::Wgpu,
                 memory_gb: 0.0,
-                supported_precisions: env_precision_override("wgpu")
+                supported_precisions: self
+                    .runtime_overrides
+                    .precision_override(AcceleratorBackend::Wgpu)
                     .unwrap_or_else(|| vec![TrainingPrecision::Fp32]),
                 compute_capability: None,
-                source: "FOREX_BOT_WGPU_DEVICES".to_string(),
+                source: "hardware_runtime_overrides.wgpu_device_names".to_string(),
             })
             .collect()
     }
 }
 
 impl HardwareProfile {
+    pub fn stable_id(&self) -> String {
+        let device_fingerprint = self
+            .accelerator_devices
+            .iter()
+            .map(|device| {
+                format!(
+                    "{}:{}:{:.3}:{:?}:{:?}",
+                    device.backend.as_str(),
+                    device.name,
+                    device.memory_gb,
+                    device.supported_precisions,
+                    device.compute_capability
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        stable_hex_hash(&format!(
+            "cpu={};ram={:.3};platform={};devices={}",
+            self.cpu_cores, self.total_ram_gb, self.platform_label, device_fingerprint
+        ))
+    }
+
     pub fn devices_for_backend(&self, backend: AcceleratorBackend) -> Vec<&AcceleratorDevice> {
         self.accelerator_devices
             .iter()
@@ -694,8 +891,12 @@ impl<'a> AutoTuner<'a> {
     }
 
     fn evaluate_hints(&self) -> AutoTuneHints {
-        let plan =
-            HardwareExecutionPlan::from_settings_and_profile(self.settings, self.profile.clone());
+        let runtime_overrides = HardwareRuntimeOverrides::from_env();
+        let plan = HardwareExecutionPlan::from_settings_profile_and_overrides(
+            self.settings,
+            self.profile.clone(),
+            &runtime_overrides,
+        );
         let cpu_cores = self.profile.cpu_cores.max(1);
         let ram_gb = self.profile.available_ram_gb;
         let cpu_budget = self.resolve_cpu_budget(cpu_cores);
@@ -754,7 +955,7 @@ impl<'a> AutoTuner<'a> {
     }
 
     fn resolve_cpu_budget(&self, total_cores: usize) -> usize {
-        resolve_cpu_budget_from_env(total_cores)
+        resolve_cpu_budget(total_cores, &HardwareRuntimeOverrides::from_env())
     }
 
     fn apply_thread_env_defaults(&self, hints: &AutoTuneHints) {
@@ -767,100 +968,24 @@ impl<'a> AutoTuner<'a> {
     }
 }
 
-fn normalize_accelerator_preference(value: &str) -> String {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "" | "auto" => "auto".to_string(),
-        "cpu" | "false" | "0" | "no" | "off" => "cpu".to_string(),
-        "gpu" | "true" | "1" | "yes" | "on" | "nvidia" | "amd" => "gpu".to_string(),
-        "cuda" | "cuda:0" => "cuda".to_string(),
-        "rocm" | "hip" | "rocm:0" | "hip:0" => "rocm".to_string(),
-        "wgpu" | "wgpu:0" | "wgpu_vulkan" => "wgpu".to_string(),
-        "vulkan" | "vulkan:0" => "vulkan".to_string(),
-        "metal" | "metal:0" => "metal".to_string(),
-        "dx12" | "directx12" | "d3d12" | "dx12:0" => "dx12".to_string(),
-        other => other.to_string(),
-    }
-}
+fn stable_hex_hash(value: &str) -> String {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001B3;
 
-fn choose_primary_backend(preference: &str, profile: &HardwareProfile) -> AcceleratorBackend {
-    if profile.accelerator_devices.is_empty() || preference == "cpu" || preference == "off" {
-        return AcceleratorBackend::Cpu;
+    let mut hash = FNV_OFFSET;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
     }
-
-    let has_cuda = !profile
-        .devices_for_backend(AcceleratorBackend::Cuda)
-        .is_empty();
-    let has_rocm = !profile
-        .devices_for_backend(AcceleratorBackend::Rocm)
-        .is_empty();
-    let has_wgpu = !profile.wgpu_native_devices().is_empty();
-
-    match preference {
-        "cuda" => {
-            if has_cuda {
-                AcceleratorBackend::Cuda
-            } else {
-                AcceleratorBackend::Cpu
-            }
-        }
-        "rocm" => {
-            if has_rocm {
-                AcceleratorBackend::Rocm
-            } else {
-                AcceleratorBackend::Cpu
-            }
-        }
-        "wgpu" => {
-            if has_wgpu {
-                AcceleratorBackend::Wgpu
-            } else {
-                AcceleratorBackend::Cpu
-            }
-        }
-        "vulkan" => {
-            if has_wgpu {
-                AcceleratorBackend::Vulkan
-            } else {
-                AcceleratorBackend::Cpu
-            }
-        }
-        "metal" => {
-            if has_wgpu {
-                AcceleratorBackend::Metal
-            } else {
-                AcceleratorBackend::Cpu
-            }
-        }
-        "dx12" => {
-            if has_wgpu {
-                AcceleratorBackend::Dx12
-            } else {
-                AcceleratorBackend::Cpu
-            }
-        }
-        "gpu" | "auto" => {
-            if has_cuda {
-                AcceleratorBackend::Cuda
-            } else if has_rocm {
-                AcceleratorBackend::Rocm
-            } else if has_wgpu {
-                AcceleratorBackend::Wgpu
-            } else {
-                AcceleratorBackend::Cpu
-            }
-        }
-        _ if has_cuda => AcceleratorBackend::Cuda,
-        _ if has_wgpu => AcceleratorBackend::Wgpu,
-        _ if has_rocm => AcceleratorBackend::Rocm,
-        _ => AcceleratorBackend::Cpu,
-    }
+    format!("{hash:016x}")
 }
 
 fn choose_training_precision(
     profile: &HardwareProfile,
     backend: AcceleratorBackend,
+    runtime_overrides: &HardwareRuntimeOverrides,
 ) -> TrainingPrecision {
-    let requested = requested_training_precision_from_env();
+    let requested = runtime_overrides.training_precision;
     let devices = profile.devices_for_planned_backend(backend);
     let supported_by_all = |precision| {
         !devices.is_empty()
@@ -880,11 +1005,19 @@ fn choose_training_precision(
     }
 }
 
-fn requested_training_precision_from_env() -> Option<TrainingPrecision> {
-    ["FOREX_BOT_TRAIN_PRECISION", "FOREX_TRAIN_PRECISION"]
-        .iter()
-        .find_map(|key| env::var(key).ok())
-        .and_then(|value| parse_training_precision(&value))
+fn parse_env_usize(key: &str) -> Option<usize> {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+}
+
+fn parse_env_precisions(key: &str) -> Option<Vec<TrainingPrecision>> {
+    let values = env::var(key)
+        .ok()?
+        .split(',')
+        .filter_map(parse_training_precision)
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then_some(values)
 }
 
 fn parse_training_precision(value: &str) -> Option<TrainingPrecision> {
@@ -897,18 +1030,6 @@ fn parse_training_precision(value: &str) -> Option<TrainingPrecision> {
         "auto" | "" => None,
         _ => None,
     }
-}
-
-fn env_precision_override(backend: &str) -> Option<Vec<TrainingPrecision>> {
-    let key = format!("FOREX_BOT_{}_PRECISIONS", backend.to_ascii_uppercase());
-    let Ok(raw) = env::var(key) else {
-        return None;
-    };
-    let values = raw
-        .split(',')
-        .filter_map(parse_training_precision)
-        .collect::<Vec<_>>();
-    (!values.is_empty()).then_some(values)
 }
 
 fn parse_compute_capability(value: &str) -> Option<(i64, i64)> {
@@ -958,10 +1079,8 @@ fn inference_batch_size(enable_gpu: bool, min_vram_gb: f64) -> usize {
     }
 }
 
-fn resolve_cpu_budget_from_env(total_cores: usize) -> usize {
-    if let Ok(val) = env::var("FOREX_BOT_CPU_BUDGET")
-        && let Ok(n) = val.parse::<usize>()
-    {
+fn resolve_cpu_budget(total_cores: usize, runtime_overrides: &HardwareRuntimeOverrides) -> usize {
+    if let Some(n) = runtime_overrides.cpu_budget {
         return n.min(total_cores).max(1);
     }
     total_cores.saturating_sub(1).max(1)
@@ -970,6 +1089,7 @@ fn resolve_cpu_budget_from_env(total_cores: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contracts::BackendKind;
 
     fn profile(gpus: usize, vram_gb: f64) -> HardwareProfile {
         HardwareProfile {
@@ -1027,6 +1147,142 @@ mod tests {
         assert!(!plan.gpu_enabled);
         assert_eq!(plan.primary_backend, AcceleratorBackend::Cpu);
         assert!(!plan.warnings.is_empty());
+    }
+
+    #[test]
+    fn explicit_runtime_overrides_resolve_cpu_budget_and_precision_without_env() {
+        let mut settings = Settings::default();
+        settings.system.enable_gpu_preference = "cuda".to_string();
+        let runtime_overrides = HardwareRuntimeOverrides {
+            cpu_budget: Some(4),
+            training_precision: Some(TrainingPrecision::Bf16),
+            ..HardwareRuntimeOverrides::default()
+        };
+
+        let plan = HardwareExecutionPlan::from_settings_profile_and_overrides(
+            &settings,
+            profile(1, 24.0),
+            &runtime_overrides,
+        );
+
+        assert_eq!(plan.preferred_precision, TrainingPrecision::Bf16);
+        assert_eq!(
+            plan.workload(WorkloadKind::DeepTraining)
+                .expect("deep training workload should exist")
+                .cpu_threads,
+            4
+        );
+        assert_eq!(
+            plan.workload_assignment(WorkloadKind::DeepTraining)
+                .expect("deep training assignment should exist")
+                .precision_policy
+                .precision,
+            TrainingPrecision::Bf16
+        );
+    }
+
+    #[test]
+    fn hardware_probe_consumes_typed_wgpu_overrides() {
+        let runtime_overrides = HardwareRuntimeOverrides {
+            wgpu_precisions: Some(vec![TrainingPrecision::Fp32, TrainingPrecision::Fp16]),
+            wgpu_device_names: vec!["wgpu-test-device".to_string()],
+            ..HardwareRuntimeOverrides::default()
+        };
+        let probe = HardwareProbe::with_runtime_overrides(runtime_overrides);
+
+        let devices = probe.detect_wgpu_hint_accelerators(10);
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].id, 10);
+        assert_eq!(devices[0].name, "wgpu-test-device");
+        assert_eq!(devices[0].backend, AcceleratorBackend::Wgpu);
+        assert_eq!(
+            devices[0].supported_precisions,
+            vec![TrainingPrecision::Fp32, TrainingPrecision::Fp16]
+        );
+        assert_eq!(
+            devices[0].source,
+            "hardware_runtime_overrides.wgpu_device_names"
+        );
+    }
+
+    #[test]
+    fn hardware_profile_stable_id_ignores_ephemeral_probe_state() {
+        let mut first = profile(1, 24.0);
+        let mut second = first.clone();
+        first.timestamp = "2026-05-06T00:00:00Z".to_string();
+        second.timestamp = "2026-05-06T01:00:00Z".to_string();
+        first.available_ram_gb = 190.0;
+        second.available_ram_gb = 128.0;
+
+        assert_eq!(first.stable_id(), second.stable_id());
+    }
+
+    #[test]
+    fn workload_assignment_exposes_scheduler_owned_budgets_and_device() {
+        let mut settings = Settings::default();
+        settings.system.enable_gpu_preference = "cuda".to_string();
+        settings.models.prop_search_device = "auto".to_string();
+        let plan = HardwareExecutionPlan::from_settings_and_profile(&settings, profile(2, 24.0));
+
+        let assignment = plan
+            .workload_assignment(WorkloadKind::StrategySearch)
+            .expect("search workload assignment should exist");
+
+        assert_eq!(assignment.hardware_profile_id, plan.profile_id());
+        assert_eq!(
+            assignment.device_assignment.backend,
+            BackendKind::NativeCuda
+        );
+        assert_eq!(assignment.device_assignment.device, "cuda:all");
+        assert_eq!(assignment.device_assignment.device_ids, vec![0, 1]);
+        assert!(assignment.cpu_budget.threads > 0);
+        assert_eq!(
+            assignment.gpu_budget.as_ref().unwrap().device_ids,
+            vec![0, 1]
+        );
+        assert_eq!(
+            assignment.precision_policy.precision,
+            TrainingPrecision::Fp32
+        );
+        assert!(assignment.runtime_degraded_reason.is_none());
+    }
+
+    #[test]
+    fn workload_assignment_records_cpu_degradation_when_gpu_path_falls_back() {
+        let mut settings = Settings::default();
+        settings.system.enable_gpu_preference = "rocm".to_string();
+        let profile = HardwareProfile {
+            cpu_cores: 64,
+            total_ram_gb: 256.0,
+            available_ram_gb: 192.0,
+            gpu_names: vec!["AMD GPU".to_string()],
+            num_gpus: 1,
+            gpu_mem_gb: vec![24.0],
+            accelerator_devices: vec![AcceleratorDevice {
+                id: 0,
+                name: "AMD GPU".to_string(),
+                backend: AcceleratorBackend::Rocm,
+                memory_gb: 24.0,
+                supported_precisions: vec![TrainingPrecision::Fp32, TrainingPrecision::Fp16],
+                compute_capability: None,
+                source: "test".to_string(),
+            }],
+            timestamp: "test".to_string(),
+            platform_label: "test".to_string(),
+        };
+        let plan = HardwareExecutionPlan::from_settings_and_profile(&settings, profile);
+
+        let assignment = plan
+            .workload_assignment(WorkloadKind::StrategySearch)
+            .expect("search workload assignment should exist");
+
+        assert_eq!(assignment.device_assignment.backend, BackendKind::NativeCpu);
+        assert_eq!(assignment.device_assignment.device, "cpu");
+        assert_eq!(
+            assignment.runtime_degraded_reason.unwrap().code,
+            "gpu_path_unavailable"
+        );
     }
 
     #[test]

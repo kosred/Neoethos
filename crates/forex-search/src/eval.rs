@@ -7,6 +7,7 @@ use crate::genetic::strategy_gene::infer_market_cost_profile;
 use crate::quality::Trade;
 use ndarray::ArrayView2;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::Once;
 
@@ -95,6 +96,69 @@ pub struct BacktestSettings {
     pub commission_per_trade: f64,
     pub pip_value_per_lot: f64,
     pub kill_zones_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BacktestMetrics {
+    pub net_profit: f64,
+    pub sharpe: f64,
+    pub peak_equity: f64,
+    pub max_drawdown: f64,
+    pub win_rate: f64,
+    pub profit_factor: f64,
+    pub expectancy: f64,
+    pub trade_count: usize,
+    pub consistency: f64,
+    pub max_daily_drawdown: f64,
+}
+
+impl BacktestMetrics {
+    pub fn from_metric_array(metrics: [f64; 11]) -> Self {
+        Self {
+            net_profit: metrics[0],
+            sharpe: metrics[1],
+            peak_equity: metrics[2],
+            max_drawdown: metrics[3],
+            win_rate: metrics[4],
+            profit_factor: metrics[5],
+            expectancy: metrics[6],
+            trade_count: if metrics[8].is_finite() && metrics[8] > 0.0 {
+                metrics[8].round() as usize
+            } else {
+                0
+            },
+            consistency: metrics[9],
+            max_daily_drawdown: metrics[10],
+        }
+    }
+
+    pub fn to_metric_array(self) -> [f64; 11] {
+        [
+            self.net_profit,
+            self.sharpe,
+            self.peak_equity,
+            self.max_drawdown,
+            self.win_rate,
+            self.profit_factor,
+            self.expectancy,
+            0.0,
+            self.trade_count as f64,
+            self.consistency,
+            self.max_daily_drawdown,
+        ]
+    }
+}
+
+impl From<[f64; 11]> for BacktestMetrics {
+    fn from(metrics: [f64; 11]) -> Self {
+        Self::from_metric_array(metrics)
+    }
+}
+
+impl From<BacktestMetrics> for [f64; 11] {
+    fn from(metrics: BacktestMetrics) -> Self {
+        metrics.to_metric_array()
+    }
 }
 
 impl Default for BacktestSettings {

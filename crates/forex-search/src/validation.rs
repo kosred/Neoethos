@@ -1,11 +1,17 @@
-use crate::eval::{BacktestSettings, fast_evaluate_strategy_core, simulate_trades_core};
+use crate::artifact_io::{read_json, stable_json_hash, write_json_atomic};
+use crate::eval::{
+    BacktestMetrics, BacktestSettings, fast_evaluate_strategy_core, simulate_trades_core,
+};
 use anyhow::{Result, bail};
+use forex_core::contracts::{TemporalFeatureContract, TemporalScopeHashes};
 use itertools::Itertools;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::Path;
 
 const WALKFORWARD_INITIAL_BALANCE: f64 = 100_000.0;
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalkforwardSplitResult {
     pub split: usize,
     pub trades: usize,
@@ -24,7 +30,7 @@ pub struct WalkforwardSplitResult {
     pub prop_compliant: bool,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalkforwardSummary {
     pub walk_forward_splits: usize,
     pub avg_pnl: f64,
@@ -38,6 +44,208 @@ pub struct WalkforwardSummary {
     pub any_trade_limit_violation: bool,
     pub all_min_trading_days_ok: bool,
     pub splits: Vec<WalkforwardSplitResult>,
+}
+
+pub const WALKFORWARD_VALIDATION_ARTIFACT_KIND: &str = "walkforward_validation_artifact";
+pub const WALKFORWARD_VALIDATION_SCHEMA_VERSION: u32 = 1;
+pub const CANONICAL_BACKTEST_ARTIFACT_KIND: &str = "canonical_strategy_backtest_artifact";
+pub const CANONICAL_BACKTEST_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CanonicalBacktestScope {
+    pub dataset_hash: String,
+    pub evaluation_config_hash: String,
+    pub strategy_hash: String,
+    pub temporal_scope: TemporalScopeHashes,
+}
+
+impl CanonicalBacktestScope {
+    pub fn new(
+        dataset_hash: impl Into<String>,
+        evaluation_config_hash: impl Into<String>,
+        strategy_hash: impl Into<String>,
+        temporal_contract: &TemporalFeatureContract,
+    ) -> Self {
+        Self {
+            dataset_hash: dataset_hash.into(),
+            evaluation_config_hash: evaluation_config_hash.into(),
+            strategy_hash: strategy_hash.into(),
+            temporal_scope: TemporalScopeHashes::from_contract(temporal_contract),
+        }
+    }
+
+    pub fn from_parts<T: Serialize, U: Serialize, V: Serialize>(
+        dataset: &T,
+        evaluation_config: &U,
+        strategy: &V,
+        temporal_contract: &TemporalFeatureContract,
+    ) -> Result<Self> {
+        Ok(Self::new(
+            stable_json_hash(dataset)?,
+            stable_json_hash(evaluation_config)?,
+            stable_json_hash(strategy)?,
+            temporal_contract,
+        ))
+    }
+
+    pub fn validate_temporal_contract(
+        &self,
+        temporal_contract: &TemporalFeatureContract,
+    ) -> Result<()> {
+        self.temporal_scope
+            .validate_contract(temporal_contract)
+            .map_err(|err| anyhow::anyhow!("canonical backtest {err}"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalBacktestArtifactFile {
+    pub artifact_kind: String,
+    pub artifact_schema_version: u32,
+    pub scope: CanonicalBacktestScope,
+    pub metrics: BacktestMetrics,
+}
+
+impl CanonicalBacktestArtifactFile {
+    pub fn new(scope: CanonicalBacktestScope, metrics: BacktestMetrics) -> Self {
+        Self {
+            artifact_kind: CANONICAL_BACKTEST_ARTIFACT_KIND.to_string(),
+            artifact_schema_version: CANONICAL_BACKTEST_SCHEMA_VERSION,
+            scope,
+            metrics,
+        }
+    }
+
+    pub fn validate_for_temporal_contract(
+        &self,
+        temporal_contract: &TemporalFeatureContract,
+    ) -> Result<()> {
+        if self.artifact_kind != CANONICAL_BACKTEST_ARTIFACT_KIND {
+            bail!(
+                "artifact kind {} cannot be used as a canonical backtest artifact",
+                self.artifact_kind
+            );
+        }
+        if self.artifact_schema_version != CANONICAL_BACKTEST_SCHEMA_VERSION {
+            bail!(
+                "unsupported canonical backtest schema version {}",
+                self.artifact_schema_version
+            );
+        }
+        self.scope.validate_temporal_contract(temporal_contract)
+    }
+}
+
+pub fn write_canonical_backtest_artifact_atomic(
+    path: impl AsRef<Path>,
+    artifact: &CanonicalBacktestArtifactFile,
+) -> Result<()> {
+    write_json_atomic(path, artifact)
+}
+
+pub fn read_canonical_backtest_artifact(
+    path: impl AsRef<Path>,
+    temporal_contract: &TemporalFeatureContract,
+) -> Result<CanonicalBacktestArtifactFile> {
+    let artifact: CanonicalBacktestArtifactFile = read_json(path, "canonical backtest")?;
+    artifact.validate_for_temporal_contract(temporal_contract)?;
+    Ok(artifact)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WalkforwardValidationScope {
+    pub dataset_hash: String,
+    pub evaluation_config_hash: String,
+    pub temporal_scope: TemporalScopeHashes,
+}
+
+impl WalkforwardValidationScope {
+    pub fn new(
+        dataset_hash: impl Into<String>,
+        evaluation_config_hash: impl Into<String>,
+        temporal_contract: &TemporalFeatureContract,
+    ) -> Self {
+        Self {
+            dataset_hash: dataset_hash.into(),
+            evaluation_config_hash: evaluation_config_hash.into(),
+            temporal_scope: TemporalScopeHashes::from_contract(temporal_contract),
+        }
+    }
+
+    pub fn from_parts<T: Serialize, U: Serialize>(
+        dataset: &T,
+        evaluation_config: &U,
+        temporal_contract: &TemporalFeatureContract,
+    ) -> Result<Self> {
+        Ok(Self::new(
+            stable_json_hash(dataset)?,
+            stable_json_hash(evaluation_config)?,
+            temporal_contract,
+        ))
+    }
+
+    pub fn validate_temporal_contract(
+        &self,
+        temporal_contract: &TemporalFeatureContract,
+    ) -> Result<()> {
+        self.temporal_scope
+            .validate_contract(temporal_contract)
+            .map_err(|err| anyhow::anyhow!("walk-forward validation {err}"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalkforwardValidationArtifactFile {
+    pub artifact_kind: String,
+    pub artifact_schema_version: u32,
+    pub scope: WalkforwardValidationScope,
+    pub summary: WalkforwardSummary,
+}
+
+impl WalkforwardValidationArtifactFile {
+    pub fn new(scope: WalkforwardValidationScope, summary: WalkforwardSummary) -> Self {
+        Self {
+            artifact_kind: WALKFORWARD_VALIDATION_ARTIFACT_KIND.to_string(),
+            artifact_schema_version: WALKFORWARD_VALIDATION_SCHEMA_VERSION,
+            scope,
+            summary,
+        }
+    }
+
+    pub fn validate_for_temporal_contract(
+        &self,
+        temporal_contract: &TemporalFeatureContract,
+    ) -> Result<()> {
+        if self.artifact_kind != WALKFORWARD_VALIDATION_ARTIFACT_KIND {
+            bail!(
+                "artifact kind {} cannot be used as a walk-forward validation artifact",
+                self.artifact_kind
+            );
+        }
+        if self.artifact_schema_version != WALKFORWARD_VALIDATION_SCHEMA_VERSION {
+            bail!(
+                "unsupported walk-forward validation schema version {}",
+                self.artifact_schema_version
+            );
+        }
+        self.scope.validate_temporal_contract(temporal_contract)
+    }
+}
+
+pub fn write_walkforward_validation_artifact_atomic(
+    path: impl AsRef<Path>,
+    artifact: &WalkforwardValidationArtifactFile,
+) -> Result<()> {
+    write_json_atomic(path, artifact)
+}
+
+pub fn read_walkforward_validation_artifact(
+    path: impl AsRef<Path>,
+    temporal_contract: &TemporalFeatureContract,
+) -> Result<WalkforwardValidationArtifactFile> {
+    let artifact: WalkforwardValidationArtifactFile = read_json(path, "walk-forward validation")?;
+    artifact.validate_for_temporal_contract(temporal_contract)?;
+    Ok(artifact)
 }
 
 pub struct WalkforwardBacktestInput<'a> {
@@ -461,6 +669,42 @@ impl CombinatorialPurgedCV {
 mod tests {
     use super::*;
 
+    fn temporal_contract(label_policy_hash: &str) -> TemporalFeatureContract {
+        TemporalFeatureContract::strict_live(
+            "UTC",
+            "alignment-policy-v1",
+            label_policy_hash,
+            "walk-forward-policy-v1",
+            "live-readiness-policy-v1",
+        )
+        .expect("strict temporal contract should be valid")
+    }
+
+    fn sample_summary() -> WalkforwardSummary {
+        WalkforwardSummary {
+            walk_forward_splits: 1,
+            avg_pnl: 12.0,
+            avg_win_rate: 0.5,
+            avg_max_dd: 0.1,
+            avg_max_consec_losses: 1.0,
+            avg_daily_min_dd: -0.01,
+            avg_max_daily_loss: 0.01,
+            any_daily_loss_breach: false,
+            any_consistency_violation: false,
+            any_trade_limit_violation: false,
+            all_min_trading_days_ok: true,
+            splits: Vec::new(),
+        }
+    }
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("forex-validation-{name}-{unique}.json"))
+    }
+
     fn flat_settings() -> BacktestSettings {
         BacktestSettings {
             sl_pips: 1_000_000.0,
@@ -482,10 +726,10 @@ mod tests {
 
     #[test]
     fn risk_diagnostics_enforce_prop_constraints_from_simulated_trades() {
-        let close = [100.0, 101.0, 103.0, 104.0, 100.0, 99.0, 98.0];
+        let close = [100.0, 101.0, 103.0, 102.0, 100.0, 99.0, 98.0];
         let high = close;
         let low = close;
-        let signals = [0, 1, 0, 1, 0, 1, 0];
+        let signals = [1, 0, 1, 0, 1, 0, 0];
         let days = [1, 1, 1, 2, 2, 2, 2];
 
         let risk = walkforward_risk_diagnostics(
@@ -509,5 +753,99 @@ mod tests {
         assert!(!risk.min_trading_days_ok);
         assert!(!risk.prop_compliant);
         assert_eq!(risk.daily_returns.len(), 2);
+    }
+
+    #[test]
+    fn walkforward_validation_artifact_binds_temporal_scope() {
+        let contract = temporal_contract("label-policy-v1");
+        let scope = WalkforwardValidationScope::new("dataset-a", "eval-a", &contract);
+        let artifact = WalkforwardValidationArtifactFile::new(scope.clone(), sample_summary());
+
+        assert_eq!(artifact.artifact_kind, WALKFORWARD_VALIDATION_ARTIFACT_KIND);
+        assert_eq!(artifact.scope, scope);
+        artifact
+            .validate_for_temporal_contract(&contract)
+            .expect("matching temporal contract should validate");
+    }
+
+    #[test]
+    fn walkforward_validation_artifact_rejects_temporal_drift_and_wrong_kind() {
+        let contract = temporal_contract("label-policy-v1");
+        let changed_contract = temporal_contract("label-policy-v2");
+        let scope = WalkforwardValidationScope::new("dataset-a", "eval-a", &contract);
+        let mut artifact = WalkforwardValidationArtifactFile::new(scope, sample_summary());
+
+        let err = artifact
+            .validate_for_temporal_contract(&changed_contract)
+            .expect_err("changed temporal contract must not validate");
+        assert!(err.to_string().contains("temporal_contract_hash"));
+
+        artifact.artifact_kind = "search_checkpoint_artifact".to_string();
+        let err = artifact
+            .validate_for_temporal_contract(&contract)
+            .expect_err("wrong artifact kind must not validate");
+        assert!(err.to_string().contains("cannot be used as a walk-forward"));
+    }
+
+    #[test]
+    fn walkforward_validation_artifact_uses_shared_atomic_io() {
+        let contract = temporal_contract("label-policy-v1");
+        let scope = WalkforwardValidationScope::new("dataset-a", "eval-a", &contract);
+        let artifact = WalkforwardValidationArtifactFile::new(scope, sample_summary());
+        let path = temp_path("artifact");
+
+        write_walkforward_validation_artifact_atomic(&path, &artifact)
+            .expect("atomic validation artifact write should succeed");
+        let loaded = read_walkforward_validation_artifact(&path, &contract)
+            .expect("matching validation artifact should load");
+        assert_eq!(loaded.artifact_kind, WALKFORWARD_VALIDATION_ARTIFACT_KIND);
+        assert_eq!(loaded.summary.walk_forward_splits, 1);
+
+        let changed_contract = temporal_contract("label-policy-v2");
+        let err = read_walkforward_validation_artifact(&path, &changed_contract)
+            .expect_err("temporal drift must reject persisted validation artifact");
+        assert!(err.to_string().contains("temporal_contract_hash"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn backtest_metrics_preserve_canonical_metric_layout() {
+        let raw = [
+            12.0, 1.5, 100_012.0, 0.02, 0.60, 1.8, 4.0, 0.0, 7.0, 0.9, 0.01,
+        ];
+        let metrics = BacktestMetrics::from_metric_array(raw);
+
+        assert_eq!(metrics.net_profit, 12.0);
+        assert_eq!(metrics.sharpe, 1.5);
+        assert_eq!(metrics.trade_count, 7);
+        assert_eq!(metrics.to_metric_array(), raw);
+    }
+
+    #[test]
+    fn canonical_backtest_artifact_uses_shared_atomic_io_and_temporal_scope() {
+        let contract = temporal_contract("label-policy-v1");
+        let scope = CanonicalBacktestScope::new("dataset-a", "eval-a", "strategy-a", &contract);
+        let artifact = CanonicalBacktestArtifactFile::new(
+            scope,
+            BacktestMetrics::from_metric_array([
+                12.0, 1.5, 100_012.0, 0.02, 0.60, 1.8, 4.0, 0.0, 7.0, 0.9, 0.01,
+            ]),
+        );
+        let path = temp_path("canonical-backtest");
+
+        write_canonical_backtest_artifact_atomic(&path, &artifact)
+            .expect("atomic canonical backtest artifact write should succeed");
+        let loaded = read_canonical_backtest_artifact(&path, &contract)
+            .expect("matching canonical backtest artifact should load");
+        assert_eq!(loaded.artifact_kind, CANONICAL_BACKTEST_ARTIFACT_KIND);
+        assert_eq!(loaded.metrics.trade_count, 7);
+
+        let changed_contract = temporal_contract("label-policy-v2");
+        let err = read_canonical_backtest_artifact(&path, &changed_contract)
+            .expect_err("temporal drift must reject persisted backtest artifact");
+        assert!(err.to_string().contains("temporal_contract_hash"));
+
+        let _ = std::fs::remove_file(path);
     }
 }

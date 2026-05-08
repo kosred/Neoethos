@@ -9,7 +9,10 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use forex_core::system::HardwareProbe;
-use forex_core::{AcceleratorBackend, AcceleratorDevice, TrainingPrecision};
+use forex_core::{
+    AcceleratorBackend, AcceleratorDevice, BackendKind, ResolvedWorkloadAssignment,
+    TrainingPrecision,
+};
 #[cfg(feature = "tch")]
 use tch::{Cuda, Device, Kind, Tensor};
 
@@ -277,6 +280,51 @@ pub fn select_device(requested: DevicePreference) -> Vec<String> {
     }
 }
 
+/// Select devices from a scheduler-owned workload assignment.
+pub fn select_device_from_assignment(assignment: &ResolvedWorkloadAssignment) -> Vec<String> {
+    match assignment.device_assignment.backend {
+        BackendKind::NativeCpu
+        | BackendKind::BurnCpu
+        | BackendKind::CpuReference
+        | BackendKind::LocalSurrogateFallback
+        | BackendKind::Unavailable => vec!["cpu".to_string()],
+        _ if !assignment.device_assignment.device_ids.is_empty() => assignment
+            .device_assignment
+            .device_ids
+            .iter()
+            .map(|id| {
+                format!(
+                    "{}:{}",
+                    assignment.device_assignment.backend.as_device_prefix(),
+                    id
+                )
+            })
+            .collect(),
+        _ => vec![assignment.device_assignment.device.clone()],
+    }
+}
+
+trait BackendDevicePrefix {
+    fn as_device_prefix(self) -> &'static str;
+}
+
+impl BackendDevicePrefix for BackendKind {
+    fn as_device_prefix(self) -> &'static str {
+        match self {
+            BackendKind::NativeCuda | BackendKind::CudaKernel => "cuda",
+            BackendKind::BurnWgpu => "wgpu",
+            BackendKind::NativeTreeGpu => "gpu",
+            BackendKind::NativeCpu
+            | BackendKind::BurnCpu
+            | BackendKind::NativeTreeCpu
+            | BackendKind::CpuReference
+            | BackendKind::LocalSurrogateFallback
+            | BackendKind::ExternalRuntime
+            | BackendKind::Unavailable => "cpu",
+        }
+    }
+}
+
 /// Get list of available GPU device strings
 /// legacy lines 70-73
 pub fn get_available_gpus() -> Vec<String> {
@@ -426,6 +474,51 @@ mod tests {
         assert_eq!(distribute_gpu_assignment(2, &hw), 1); // Model 2 → GPU 1
         assert_eq!(distribute_gpu_assignment(8, &hw), 7); // Model 8 → GPU 7
         assert_eq!(distribute_gpu_assignment(9, &hw), 0); // Model 9 → GPU 0 (wraps)
+    }
+
+    #[test]
+    fn select_device_uses_scheduler_assignment() {
+        let assignment = ResolvedWorkloadAssignment {
+            workload: forex_core::WorkloadKind::DeepTraining,
+            hardware_profile_id: "hardware-profile".to_string(),
+            device_assignment: forex_core::DeviceAssignment {
+                backend: BackendKind::NativeCuda,
+                device: "cuda:all".to_string(),
+                device_ids: vec![0, 2],
+            },
+            cpu_budget: forex_core::CpuBudget::new(8),
+            gpu_budget: None,
+            precision_policy: forex_core::PrecisionPolicy::from_precision(TrainingPrecision::Fp32),
+            batch_size: 512,
+            runtime_degraded_reason: None,
+            notes: Vec::new(),
+        };
+
+        assert_eq!(
+            select_device_from_assignment(&assignment),
+            vec!["cuda:0", "cuda:2"]
+        );
+    }
+
+    #[test]
+    fn select_device_uses_cpu_for_degraded_assignment() {
+        let assignment = ResolvedWorkloadAssignment {
+            workload: forex_core::WorkloadKind::DeepTraining,
+            hardware_profile_id: "hardware-profile".to_string(),
+            device_assignment: forex_core::DeviceAssignment {
+                backend: BackendKind::CpuReference,
+                device: "cpu".to_string(),
+                device_ids: Vec::new(),
+            },
+            cpu_budget: forex_core::CpuBudget::new(8),
+            gpu_budget: None,
+            precision_policy: forex_core::PrecisionPolicy::from_precision(TrainingPrecision::Fp32),
+            batch_size: 512,
+            runtime_degraded_reason: None,
+            notes: Vec::new(),
+        };
+
+        assert_eq!(select_device_from_assignment(&assignment), vec!["cpu"]);
     }
 
     #[test]
