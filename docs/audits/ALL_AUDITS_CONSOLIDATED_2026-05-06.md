@@ -531,6 +531,19 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 ## Execution log
 
 
+### 2026-05-08: Follow-on Phase 15 completed — discovery validation gates and profile exports
+
+Continued the discovery/backtest validation wiring from P0-10/P1-4/H39 by making portfolio export depend on explicit validation gate state instead of implicit discovery success:
+
+- added `DiscoveryValidationGates` to `DiscoveryResult`, including mandatory `walkforward_passed` and `cpcv_passed` booleans, canonical/walk-forward artifact counts, CPCV fold count/ratio, and the temporal-contract hash used for validation;
+- wired final portfolio candidates into canonical backtest artifact construction and per-strategy walk-forward validation artifacts using the shared `TemporalFeatureContract`;
+- added a CPCV gate based on purged combinatorial test folds and the configured minimum profitable-fold ratio;
+- changed `save_portfolio_json` to accept the full `DiscoveryResult`, require both validation gates before writing, and continue exporting indicator names from the effective post-prefilter feature list;
+- extended `DiscoveryRunProfile` with validation gate status, artifact counts, CPCV diagnostics, and the validation temporal-contract hash.
+
+Next follow-on targets are persisting the generated validation artifacts alongside portfolio/profile outputs, UI exposure of scheduler-owned hardware plans, and operator-facing artifact safety documentation.
+
+
 ### 2026-05-08: Follow-on Phase 14 completed — canonical backtest artifact persistence
 
 Continued the backtest/validation artifact persistence wiring after shared search artifact IO was established:

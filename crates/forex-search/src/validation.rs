@@ -154,6 +154,8 @@ pub fn read_canonical_backtest_artifact(
 pub struct WalkforwardValidationScope {
     pub dataset_hash: String,
     pub evaluation_config_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy_hash: Option<String>,
     pub temporal_scope: TemporalScopeHashes,
 }
 
@@ -166,6 +168,21 @@ impl WalkforwardValidationScope {
         Self {
             dataset_hash: dataset_hash.into(),
             evaluation_config_hash: evaluation_config_hash.into(),
+            strategy_hash: None,
+            temporal_scope: TemporalScopeHashes::from_contract(temporal_contract),
+        }
+    }
+
+    pub fn for_strategy(
+        dataset_hash: impl Into<String>,
+        evaluation_config_hash: impl Into<String>,
+        strategy_hash: impl Into<String>,
+        temporal_contract: &TemporalFeatureContract,
+    ) -> Self {
+        Self {
+            dataset_hash: dataset_hash.into(),
+            evaluation_config_hash: evaluation_config_hash.into(),
+            strategy_hash: Some(strategy_hash.into()),
             temporal_scope: TemporalScopeHashes::from_contract(temporal_contract),
         }
     }

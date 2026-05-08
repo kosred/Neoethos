@@ -1,9 +1,18 @@
-use crate::artifact_io::write_json_atomic;
+use crate::artifact_io::{stable_json_hash, write_json_atomic};
+use crate::eval::{BacktestMetrics, fast_evaluate_strategy_core};
 use crate::genetic::strategy_gene::EvaluationConfig;
-use crate::genetic::{Gene, evolve_search_with_progress_and_limits, signals_for_gene_full};
+use crate::genetic::{
+    Gene, evolve_search_with_progress_and_limits, month_day_indices, signals_for_gene_full,
+};
 use crate::quality::{StrategyMetrics, StrategyQualityAnalyzer, Trade};
-use anyhow::Result;
+use crate::validation::{
+    CanonicalBacktestArtifactFile, CanonicalBacktestScope, CombinatorialPurgedCV,
+    WalkforwardBacktestInput, WalkforwardSummary, WalkforwardValidationArtifactFile,
+    WalkforwardValidationScope, embargoed_walkforward_backtest,
+};
+use anyhow::{Context, Result};
 use chrono::{Datelike, TimeZone, Utc};
+use forex_core::contracts::TemporalFeatureContract;
 use forex_data::{FeatureFrame, Ohlcv};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -167,6 +176,9 @@ pub struct DiscoveryResult {
     /// Feature names as they existed *after* prefiltering inside discovery.
     /// Gene indices refer to columns in this list, not the caller's original names.
     pub effective_feature_names: Vec<String>,
+    pub validation_gates: DiscoveryValidationGates,
+    pub canonical_backtest_artifacts: Vec<CanonicalBacktestArtifactFile>,
+    pub walkforward_validation_artifacts: Vec<WalkforwardValidationArtifactFile>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -197,6 +209,35 @@ pub struct DiscoveryFilterProfile {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct DiscoveryValidationGates {
+    pub walkforward_passed: bool,
+    pub cpcv_passed: bool,
+    pub canonical_backtest_artifacts: usize,
+    pub walkforward_validation_artifacts: usize,
+    pub cpcv_fold_count: usize,
+    pub cpcv_profitable_fold_ratio: f64,
+    pub temporal_contract_hash: Option<String>,
+}
+
+impl DiscoveryValidationGates {
+    pub fn pending() -> Self {
+        Self {
+            walkforward_passed: false,
+            cpcv_passed: false,
+            canonical_backtest_artifacts: 0,
+            walkforward_validation_artifacts: 0,
+            cpcv_fold_count: 0,
+            cpcv_profitable_fold_ratio: 0.0,
+            temporal_contract_hash: None,
+        }
+    }
+
+    pub fn is_portfolio_export_ready(&self) -> bool {
+        self.walkforward_passed && self.cpcv_passed
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct DiscoveryRunProfile {
     pub timeframe_label: String,
     pub population: usize,
@@ -221,6 +262,13 @@ pub struct DiscoveryRunProfile {
     pub portfolio_observed: usize,
     pub quality_metrics_observed: usize,
     pub logged_trade_sets: usize,
+    pub walkforward_passed: bool,
+    pub cpcv_passed: bool,
+    pub canonical_backtest_artifacts_observed: usize,
+    pub walkforward_validation_artifacts_observed: usize,
+    pub cpcv_fold_count: usize,
+    pub cpcv_profitable_fold_ratio: f64,
+    pub validation_temporal_contract_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -357,7 +405,12 @@ fn quality_analyzer_for_config(config: &DiscoveryConfig) -> StrategyQualityAnaly
     }
 }
 
-fn discovery_backtest_settings(gene: &Gene) -> crate::eval::BacktestSettings {
+fn discovery_backtest_settings(
+    config: &DiscoveryConfig,
+    gene: &Gene,
+    price_hint: Option<f64>,
+) -> crate::eval::BacktestSettings {
+    let evaluation = config.evaluation_config(price_hint);
     crate::eval::BacktestSettings {
         sl_pips: if gene.sl_pips.is_finite() && gene.sl_pips > 0.0 {
             gene.sl_pips
@@ -369,6 +422,14 @@ fn discovery_backtest_settings(gene: &Gene) -> crate::eval::BacktestSettings {
         } else {
             40.0
         },
+        max_hold_bars: evaluation.max_hold_bars,
+        trailing_enabled: evaluation.trailing_enabled,
+        trailing_atr_multiplier: evaluation.trailing_atr_multiplier,
+        trailing_be_trigger_r: evaluation.trailing_be_trigger_r,
+        pip_value: evaluation.pip_value,
+        spread_pips: evaluation.spread_pips,
+        commission_per_trade: evaluation.commission_per_trade,
+        pip_value_per_lot: evaluation.pip_value_per_lot,
         kill_zones_enabled: true,
         ..crate::eval::BacktestSettings::default()
     }
@@ -416,6 +477,367 @@ fn passes_opportunistic_quality(
         return false;
     }
     true
+}
+
+#[derive(Debug, Serialize)]
+struct DiscoveryDatasetFingerprint<'a> {
+    row_count: usize,
+    first_timestamp: Option<i64>,
+    last_timestamp: Option<i64>,
+    feature_names: &'a [String],
+    close_rows: usize,
+    first_close: Option<f64>,
+    last_close: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscoveryTemporalPolicy<'a> {
+    timeframe_label: &'a str,
+    higher_timeframes: &'a [String],
+    feature_names: &'a [String],
+}
+
+#[derive(Debug, Serialize)]
+struct DiscoveryWalkforwardPolicy {
+    train_ratio: f64,
+    walkforward_splits: usize,
+    embargo_minutes: usize,
+    enable_cpcv: bool,
+    cpcv_n_splits: usize,
+    cpcv_n_test_groups: usize,
+    cpcv_embargo_pct: f64,
+    cpcv_purge_pct: f64,
+    cpcv_min_phi: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscoveryLiveReadinessPolicy {
+    portfolio_size_target: usize,
+    max_regime_loss_pct: f64,
+    filtering: crate::genetic::FilteringConfig,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscoveryBacktestPolicy {
+    symbol: String,
+    account_currency: String,
+    timeframe_label: String,
+    sl_pips: f64,
+    tp_pips: f64,
+    max_hold_bars: usize,
+    min_hold_bars: usize,
+    trailing_enabled: bool,
+    trailing_atr_multiplier: f64,
+    trailing_be_trigger_r: f64,
+    pip_value: f64,
+    spread_pips: f64,
+    commission_per_trade: f64,
+    pip_value_per_lot: f64,
+    kill_zones_enabled: bool,
+}
+
+fn discovery_temporal_contract(
+    config: &DiscoveryConfig,
+    feature_names: &[String],
+) -> Result<TemporalFeatureContract> {
+    let feature_policy_hash = stable_json_hash(&DiscoveryTemporalPolicy {
+        timeframe_label: &config.timeframe_label,
+        higher_timeframes: &config.higher_timeframes,
+        feature_names,
+    })?;
+    let label_policy_hash = stable_json_hash(&(
+        "strategy-search-signal-v1",
+        "prior-bar-signal-next-bar-fill",
+        &config.timeframe_label,
+    ))?;
+    let walk_forward_policy_hash = stable_json_hash(&DiscoveryWalkforwardPolicy {
+        train_ratio: 0.70,
+        walkforward_splits: config.walkforward_splits,
+        embargo_minutes: config.embargo_minutes,
+        enable_cpcv: config.enable_cpcv,
+        cpcv_n_splits: config.cpcv_n_splits,
+        cpcv_n_test_groups: config.cpcv_n_test_groups,
+        cpcv_embargo_pct: config.cpcv_embargo_pct,
+        cpcv_purge_pct: config.cpcv_purge_pct,
+        cpcv_min_phi: config.cpcv_min_phi,
+    })?;
+    let live_readiness_policy_hash = stable_json_hash(&DiscoveryLiveReadinessPolicy {
+        portfolio_size_target: config.portfolio_size,
+        max_regime_loss_pct: config.max_regime_loss_pct,
+        filtering: config.filtering,
+    })?;
+
+    Ok(TemporalFeatureContract::strict_live(
+        "UTC",
+        feature_policy_hash,
+        label_policy_hash,
+        walk_forward_policy_hash,
+        live_readiness_policy_hash,
+    )?)
+}
+
+fn validation_row_count(features: &FeatureFrame, ohlcv: &Ohlcv) -> Result<usize> {
+    let n = features.data.nrows();
+    if n == 0
+        || features.timestamps.len() != n
+        || ohlcv.close.len() != n
+        || ohlcv.high.len() != n
+        || ohlcv.low.len() != n
+    {
+        anyhow::bail!(
+            "discovery validation requires aligned non-empty features/OHLCV rows (features={}, timestamps={}, close={}, high={}, low={})",
+            n,
+            features.timestamps.len(),
+            ohlcv.close.len(),
+            ohlcv.high.len(),
+            ohlcv.low.len()
+        );
+    }
+    Ok(n)
+}
+
+fn discovery_dataset_hash(features: &FeatureFrame, ohlcv: &Ohlcv) -> Result<String> {
+    stable_json_hash(&DiscoveryDatasetFingerprint {
+        row_count: features.data.nrows(),
+        first_timestamp: features.timestamps.first().copied(),
+        last_timestamp: features.timestamps.last().copied(),
+        feature_names: &features.names,
+        close_rows: ohlcv.close.len(),
+        first_close: ohlcv.close.first().copied(),
+        last_close: ohlcv.close.last().copied(),
+    })
+}
+
+fn discovery_backtest_policy_hash(
+    config: &DiscoveryConfig,
+    gene: &Gene,
+    settings: &crate::eval::BacktestSettings,
+) -> Result<String> {
+    stable_json_hash(&DiscoveryBacktestPolicy {
+        symbol: config.evaluation_symbol.clone(),
+        account_currency: config.evaluation_account_currency.clone(),
+        timeframe_label: config.timeframe_label.clone(),
+        sl_pips: settings.sl_pips,
+        tp_pips: settings.tp_pips,
+        max_hold_bars: settings.max_hold_bars,
+        min_hold_bars: settings.min_hold_bars,
+        trailing_enabled: settings.trailing_enabled,
+        trailing_atr_multiplier: settings.trailing_atr_multiplier,
+        trailing_be_trigger_r: settings.trailing_be_trigger_r,
+        pip_value: settings.pip_value,
+        spread_pips: settings.spread_pips,
+        commission_per_trade: settings.commission_per_trade,
+        pip_value_per_lot: settings.pip_value_per_lot,
+        kill_zones_enabled: settings.kill_zones_enabled,
+    })
+    .with_context(|| format!("hashing backtest policy for {}", gene.strategy_id))
+}
+
+fn embargo_bars_from_timestamps(timestamps: &[i64], embargo_minutes: usize) -> usize {
+    if embargo_minutes == 0 || timestamps.len() < 2 {
+        return 0;
+    }
+    let step_ms = timestamps
+        .windows(2)
+        .filter_map(|window| {
+            let step = window[1].saturating_sub(window[0]);
+            (step > 0).then_some(step)
+        })
+        .min()
+        .unwrap_or(60_000);
+    let embargo_ms = (embargo_minutes as i64).saturating_mul(60_000);
+    ((embargo_ms + step_ms - 1) / step_ms).max(0) as usize
+}
+
+fn walkforward_summary_passed(summary: &WalkforwardSummary) -> bool {
+    summary.walk_forward_splits > 0
+        && summary.avg_pnl > 0.0
+        && !summary.any_daily_loss_breach
+        && !summary.any_consistency_violation
+        && !summary.any_trade_limit_violation
+        && summary.all_min_trading_days_ok
+}
+
+fn evaluate_cpcv_gate(
+    portfolio: &[Gene],
+    portfolio_signals: &[Vec<i8>],
+    ohlcv: &Ohlcv,
+    config: &DiscoveryConfig,
+    months: &[i64],
+    days: &[i64],
+) -> Result<(bool, usize, f64)> {
+    if portfolio.is_empty() {
+        return Ok((false, 0, 0.0));
+    }
+    if !config.enable_cpcv {
+        return Ok((true, 0, 1.0));
+    }
+
+    let n = ohlcv.close.len();
+    let capped_n = if config.cpcv_max_rows > 0 {
+        config.cpcv_max_rows.min(n)
+    } else {
+        n
+    };
+    let offset = n.saturating_sub(capped_n);
+    let cv = CombinatorialPurgedCV::new(
+        config.cpcv_n_splits,
+        config.cpcv_n_test_groups,
+        config.cpcv_embargo_pct,
+        config.cpcv_purge_pct,
+    );
+    let splits = cv.split(capped_n);
+    if splits.is_empty() {
+        return Ok((false, 0, 0.0));
+    }
+
+    let mut fold_count = 0usize;
+    let mut profitable_folds = 0usize;
+    for (gene, signals) in portfolio.iter().zip(portfolio_signals) {
+        let settings = discovery_backtest_settings(config, gene, ohlcv.close.last().copied());
+        for (_, test_idx) in &splits {
+            if test_idx.is_empty() {
+                continue;
+            }
+            let absolute_idx: Vec<usize> = test_idx.iter().map(|idx| offset + *idx).collect();
+            let close: Vec<f64> = absolute_idx.iter().map(|idx| ohlcv.close[*idx]).collect();
+            let high: Vec<f64> = absolute_idx.iter().map(|idx| ohlcv.high[*idx]).collect();
+            let low: Vec<f64> = absolute_idx.iter().map(|idx| ohlcv.low[*idx]).collect();
+            let sig: Vec<i8> = absolute_idx.iter().map(|idx| signals[*idx]).collect();
+            let fold_months: Vec<i64> = absolute_idx.iter().map(|idx| months[*idx]).collect();
+            let fold_days: Vec<i64> = absolute_idx.iter().map(|idx| days[*idx]).collect();
+            let metrics = BacktestMetrics::from_metric_array(fast_evaluate_strategy_core(
+                &close,
+                &high,
+                &low,
+                &sig,
+                &fold_months,
+                &fold_days,
+                &[],
+                &settings,
+            ));
+            fold_count += 1;
+            let drawdown_ok =
+                config.filtering.max_dd <= 0.0 || metrics.max_drawdown <= config.filtering.max_dd;
+            if metrics.trade_count > 0 && metrics.net_profit > 0.0 && drawdown_ok {
+                profitable_folds += 1;
+            }
+        }
+    }
+
+    if fold_count == 0 {
+        return Ok((false, 0, 0.0));
+    }
+    let ratio = profitable_folds as f64 / fold_count as f64;
+    Ok((
+        ratio >= config.cpcv_min_phi.clamp(0.0, 1.0),
+        fold_count,
+        ratio,
+    ))
+}
+
+fn build_discovery_validation_artifacts(
+    portfolio: &[Gene],
+    portfolio_signals: &[Vec<i8>],
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    config: &DiscoveryConfig,
+) -> Result<(
+    DiscoveryValidationGates,
+    Vec<CanonicalBacktestArtifactFile>,
+    Vec<WalkforwardValidationArtifactFile>,
+)> {
+    if portfolio.is_empty() {
+        return Ok((DiscoveryValidationGates::pending(), Vec::new(), Vec::new()));
+    }
+    let n = validation_row_count(features, ohlcv)?;
+    if portfolio_signals.iter().any(|signals| signals.len() != n) {
+        anyhow::bail!("discovery validation requires portfolio signals aligned to feature rows");
+    }
+
+    let temporal_contract = discovery_temporal_contract(config, &features.names)?;
+    let temporal_contract_hash = temporal_contract.temporal_contract_hash();
+    let dataset_hash = discovery_dataset_hash(features, ohlcv)?;
+    let (months, days) = month_day_indices(&features.timestamps);
+    let timestamps = &features.timestamps[..n];
+    let embargo_bars = embargo_bars_from_timestamps(timestamps, config.embargo_minutes);
+
+    let mut canonical_backtest_artifacts = Vec::with_capacity(portfolio.len());
+    let mut walkforward_validation_artifacts = Vec::with_capacity(portfolio.len());
+    let mut walkforward_passed = true;
+
+    for (gene, signals) in portfolio.iter().zip(portfolio_signals) {
+        let settings = discovery_backtest_settings(config, gene, ohlcv.close.last().copied());
+        let strategy_hash = stable_json_hash(gene)?;
+        let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
+        let metrics = BacktestMetrics::from_metric_array(fast_evaluate_strategy_core(
+            &ohlcv.close,
+            &ohlcv.high,
+            &ohlcv.low,
+            signals,
+            &months,
+            &days,
+            timestamps,
+            &settings,
+        ));
+        canonical_backtest_artifacts.push(CanonicalBacktestArtifactFile::new(
+            CanonicalBacktestScope::new(
+                dataset_hash.clone(),
+                evaluation_config_hash.clone(),
+                strategy_hash.clone(),
+                &temporal_contract,
+            ),
+            metrics,
+        ));
+
+        let walkforward_summary = embargoed_walkforward_backtest(WalkforwardBacktestInput {
+            close: &ohlcv.close,
+            high: &ohlcv.high,
+            low: &ohlcv.low,
+            signals,
+            months: &months,
+            days: &days,
+            timestamps,
+            train_ratio: 0.70,
+            n_splits: config.walkforward_splits.max(1),
+            embargo_bars,
+            settings: &settings,
+            max_daily_loss_pct: config.max_regime_loss_pct,
+            max_daily_profit_pct: 0.0,
+            min_trading_days: 0,
+            max_trades_per_day: 0,
+            initial_balance: config.initial_balance,
+        })?;
+        walkforward_passed &= walkforward_summary_passed(&walkforward_summary);
+        walkforward_validation_artifacts.push(WalkforwardValidationArtifactFile::new(
+            WalkforwardValidationScope::for_strategy(
+                dataset_hash.clone(),
+                evaluation_config_hash,
+                strategy_hash,
+                &temporal_contract,
+            ),
+            walkforward_summary,
+        ));
+    }
+
+    let (cpcv_passed, cpcv_fold_count, cpcv_profitable_fold_ratio) =
+        evaluate_cpcv_gate(portfolio, portfolio_signals, ohlcv, config, &months, &days)?;
+
+    let validation_gates = DiscoveryValidationGates {
+        walkforward_passed,
+        cpcv_passed,
+        canonical_backtest_artifacts: canonical_backtest_artifacts.len(),
+        walkforward_validation_artifacts: walkforward_validation_artifacts.len(),
+        cpcv_fold_count,
+        cpcv_profitable_fold_ratio,
+        temporal_contract_hash: Some(temporal_contract_hash),
+    };
+
+    Ok((
+        validation_gates,
+        canonical_backtest_artifacts,
+        walkforward_validation_artifacts,
+    ))
 }
 
 #[derive(Debug, Serialize)]
@@ -831,7 +1253,7 @@ where
                     &ohlcv.low,
                     &features.timestamps,
                     &sig,
-                    &discovery_backtest_settings(&gene),
+                    &discovery_backtest_settings(config, &gene, ohlcv.close.last().copied()),
                 );
                 let metrics =
                     analyzer.analyze_strategy(&gene.strategy_id, &trades, initial_balance);
@@ -888,7 +1310,11 @@ where
                         &ohlcv.low,
                         &features.timestamps,
                         &p_sig,
-                        &discovery_backtest_settings(&perturbed),
+                        &discovery_backtest_settings(
+                            config,
+                            &perturbed,
+                            ohlcv.close.last().copied(),
+                        ),
                     );
                     let pnl: f64 = p_trades.iter().map(|t| t.pnl).sum();
                     if pnl > 0.0 {
@@ -901,7 +1327,8 @@ where
                 }
 
                 // Spread/Slippage Sensitivity Test
-                let mut sensitive_settings = discovery_backtest_settings(&gene);
+                let mut sensitive_settings =
+                    discovery_backtest_settings(config, &gene, ohlcv.close.last().copied());
                 sensitive_settings.spread_pips = 2.0;
                 sensitive_settings.commission_per_trade = 7.0;
                 let sens_trades = crate::eval::simulate_trades_core(
@@ -1017,6 +1444,14 @@ where
         rejected_by_correlation,
         target_portfolio: config.portfolio_size,
     });
+    let (validation_gates, canonical_backtest_artifacts, walkforward_validation_artifacts) =
+        build_discovery_validation_artifacts(
+            &portfolio,
+            &portfolio_signals,
+            features,
+            ohlcv,
+            config,
+        )?;
     progress_fn(DiscoveryProgress::Completed {
         candidate_count: ranked_candidate_genes.len(),
         filtered_count,
@@ -1029,6 +1464,9 @@ where
         quality_metrics,
         logged_trades,
         effective_feature_names,
+        validation_gates,
+        canonical_backtest_artifacts,
+        walkforward_validation_artifacts,
     })
 }
 
@@ -1123,11 +1561,21 @@ fn pearson_corr_i8(a: &[i8], b: &[i8]) -> f64 {
     num / (denom_a.sqrt() * denom_b.sqrt())
 }
 
-pub fn save_portfolio_json(
-    path: impl AsRef<Path>,
-    portfolio: &[Gene],
-    feature_names: &[String],
-) -> Result<()> {
+pub fn ensure_portfolio_export_ready(result: &DiscoveryResult) -> Result<()> {
+    if result.validation_gates.is_portfolio_export_ready() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "portfolio export requires validation gates: walkforward_passed={} cpcv_passed={}",
+        result.validation_gates.walkforward_passed,
+        result.validation_gates.cpcv_passed
+    );
+}
+
+fn build_portfolio_exports<'a>(
+    portfolio: &'a [Gene],
+    feature_names: &'a [String],
+) -> Vec<GeneExport<'a>> {
     let mut exports = Vec::new();
     for gene in portfolio {
         let mut names = Vec::new();
@@ -1150,6 +1598,12 @@ pub fn save_portfolio_json(
             sl_pips: gene.sl_pips,
         });
     }
+    exports
+}
+
+pub fn save_portfolio_json(path: impl AsRef<Path>, result: &DiscoveryResult) -> Result<()> {
+    ensure_portfolio_export_ready(result)?;
+    let exports = build_portfolio_exports(&result.portfolio, &result.effective_feature_names);
     write_json_atomic(path, &exports)
 }
 
@@ -1207,6 +1661,15 @@ pub fn build_discovery_profile(
         portfolio_observed: result.portfolio.len(),
         quality_metrics_observed: result.quality_metrics.len(),
         logged_trade_sets: result.logged_trades.len(),
+        walkforward_passed: result.validation_gates.walkforward_passed,
+        cpcv_passed: result.validation_gates.cpcv_passed,
+        canonical_backtest_artifacts_observed: result.validation_gates.canonical_backtest_artifacts,
+        walkforward_validation_artifacts_observed: result
+            .validation_gates
+            .walkforward_validation_artifacts,
+        cpcv_fold_count: result.validation_gates.cpcv_fold_count,
+        cpcv_profitable_fold_ratio: result.validation_gates.cpcv_profitable_fold_ratio,
+        validation_temporal_contract_hash: result.validation_gates.temporal_contract_hash.clone(),
     }
 }
 
@@ -1293,6 +1756,14 @@ mod tests {
         }
     }
 
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("forex-discovery-{name}-{unique}.json"))
+    }
+
     #[test]
     fn empty_portfolio_is_an_explicit_error() {
         let result = DiscoveryResult {
@@ -1301,6 +1772,9 @@ mod tests {
             quality_metrics: Vec::new(),
             logged_trades: Vec::new(),
             effective_feature_names: Vec::new(),
+            validation_gates: DiscoveryValidationGates::pending(),
+            canonical_backtest_artifacts: Vec::new(),
+            walkforward_validation_artifacts: Vec::new(),
         };
 
         let err = ensure_non_empty_portfolio(&result, "EURUSD M1")
@@ -1318,6 +1792,9 @@ mod tests {
             quality_metrics: Vec::new(),
             logged_trades: Vec::new(),
             effective_feature_names: Vec::new(),
+            validation_gates: DiscoveryValidationGates::pending(),
+            canonical_backtest_artifacts: Vec::new(),
+            walkforward_validation_artifacts: Vec::new(),
         };
 
         ensure_non_empty_portfolio(&result, "EURUSD M1")
@@ -1369,6 +1846,19 @@ mod tests {
 
         assert_eq!(result.candidates.len(), 2);
         assert_eq!(result.portfolio.len(), 1);
+        assert_eq!(
+            result.canonical_backtest_artifacts.len(),
+            result.portfolio.len()
+        );
+        assert_eq!(
+            result.walkforward_validation_artifacts.len(),
+            result.portfolio.len()
+        );
+        assert_eq!(
+            result.validation_gates.canonical_backtest_artifacts,
+            result.portfolio.len()
+        );
+        assert!(result.validation_gates.temporal_contract_hash.is_some());
         assert!(progress_events.iter().any(|event| matches!(
             event,
             DiscoveryProgress::CandidatesRanked { candidate_count, truncated_to }
@@ -1389,5 +1879,78 @@ mod tests {
             DiscoveryProgress::Completed { candidate_count, filtered_count, portfolio_size }
                 if *candidate_count == 2 && *filtered_count == 2 && *portfolio_size == 1
         )));
+    }
+
+    #[test]
+    fn portfolio_export_requires_validation_gates() {
+        let result = DiscoveryResult {
+            portfolio: vec![profitable_gene("alpha-1")],
+            candidates: Vec::new(),
+            quality_metrics: Vec::new(),
+            logged_trades: Vec::new(),
+            effective_feature_names: vec!["signal".to_string()],
+            validation_gates: DiscoveryValidationGates::pending(),
+            canonical_backtest_artifacts: Vec::new(),
+            walkforward_validation_artifacts: Vec::new(),
+        };
+        let path = temp_path("portfolio-gates");
+
+        let err = save_portfolio_json(&path, &result)
+            .expect_err("portfolio export must fail before validation gates pass");
+        assert!(err.to_string().contains("walkforward_passed"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn portfolio_export_uses_effective_names_after_validation_gates_pass() {
+        let mut result = DiscoveryResult {
+            portfolio: vec![profitable_gene("alpha-1")],
+            candidates: Vec::new(),
+            quality_metrics: Vec::new(),
+            logged_trades: Vec::new(),
+            effective_feature_names: vec!["filtered_signal".to_string()],
+            validation_gates: DiscoveryValidationGates::pending(),
+            canonical_backtest_artifacts: Vec::new(),
+            walkforward_validation_artifacts: Vec::new(),
+        };
+        result.validation_gates.walkforward_passed = true;
+        result.validation_gates.cpcv_passed = true;
+        let path = temp_path("portfolio-export");
+
+        save_portfolio_json(&path, &result)
+            .expect("portfolio export should pass once validation gates are true");
+        let exported = std::fs::read_to_string(&path).expect("portfolio export should exist");
+        assert!(exported.contains("filtered_signal"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn discovery_profile_exports_validation_gate_status() {
+        let mut result = DiscoveryResult {
+            portfolio: vec![profitable_gene("alpha-1")],
+            candidates: vec![profitable_gene("alpha-1")],
+            quality_metrics: Vec::new(),
+            logged_trades: Vec::new(),
+            effective_feature_names: vec!["signal".to_string()],
+            validation_gates: DiscoveryValidationGates::pending(),
+            canonical_backtest_artifacts: Vec::new(),
+            walkforward_validation_artifacts: Vec::new(),
+        };
+        result.validation_gates.walkforward_passed = true;
+        result.validation_gates.cpcv_passed = true;
+        result.validation_gates.canonical_backtest_artifacts = 1;
+        result.validation_gates.walkforward_validation_artifacts = 1;
+        result.validation_gates.cpcv_fold_count = 3;
+        result.validation_gates.cpcv_profitable_fold_ratio = 1.0;
+
+        let profile = build_discovery_profile(&DiscoveryConfig::default(), &result);
+
+        assert!(profile.walkforward_passed);
+        assert!(profile.cpcv_passed);
+        assert_eq!(profile.canonical_backtest_artifacts_observed, 1);
+        assert_eq!(profile.walkforward_validation_artifacts_observed, 1);
+        assert_eq!(profile.cpcv_fold_count, 3);
+        assert_eq!(profile.cpcv_profitable_fold_ratio, 1.0);
     }
 }

@@ -921,8 +921,9 @@ pub mod validation;
 
 pub use challenge::{ChallengeOptimizer, ChallengeTarget};
 pub use discovery::{
-    DiscoveryConfig, DiscoveryProgress, DiscoveryResult, DiscoveryRunProfile, LoggedStrategyTrades,
-    build_discovery_profile, ensure_non_empty_portfolio, run_discovery_cycle,
+    DiscoveryConfig, DiscoveryProgress, DiscoveryResult, DiscoveryRunProfile,
+    DiscoveryValidationGates, LoggedStrategyTrades, build_discovery_profile,
+    ensure_non_empty_portfolio, ensure_portfolio_export_ready, run_discovery_cycle,
     run_discovery_cycle_with_progress, save_discovery_profile_json, save_portfolio_json,
     save_quality_report_json, save_trade_log_json,
 };

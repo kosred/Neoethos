@@ -133,11 +133,7 @@ impl DiscoveryOrchestrator {
                 info!("    Found {} strategies", result.portfolio.len());
 
                 let out_path = Path::new(&self.output_dir).join(format!("{}_{}.json", symbol, tf));
-                save_portfolio_json(
-                    &out_path,
-                    &result.portfolio,
-                    &result.effective_feature_names,
-                )?;
+                save_portfolio_json(&out_path, &result)?;
                 let profile_path =
                     Path::new(&self.output_dir).join(format!("{}_{}_profile.json", symbol, tf));
                 save_discovery_profile_json(profile_path, &runtime_config, &result)?;
