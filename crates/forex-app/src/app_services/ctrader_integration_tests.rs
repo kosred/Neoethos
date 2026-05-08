@@ -13,9 +13,8 @@ mod ctrader_integration_tests {
         perform_account_discovery_with_transport,
     };
     use crate::app_services::ctrader_messages::{
-        CTraderOpenApiJsonMessage, CTraderOpenApiTransport,
         CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
-        build_application_auth_request,
+        CTraderOpenApiJsonMessage, CTraderOpenApiTransport, build_application_auth_request,
     };
     use anyhow::{Result, anyhow};
     use std::sync::Mutex;
@@ -54,10 +53,7 @@ mod ctrader_integration_tests {
             use crate::app_services::ctrader_messages::{
                 CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE, parse_open_api_envelope,
             };
-            self.sent
-                .lock()
-                .unwrap()
-                .extend(messages.iter().cloned());
+            self.sent.lock().unwrap().extend(messages.iter().cloned());
             let mut queue = self.queue.lock().unwrap();
             let mut out = Vec::with_capacity(messages.len());
             for _ in messages {
@@ -180,10 +176,7 @@ mod ctrader_integration_tests {
         assert_eq!(result.symbol.digits, 5);
         assert_eq!(transport.sent_count(), 4);
         // Expected: app-auth(2100), account-auth(2102), symbols-list(2114), symbol-by-id(2116)
-        assert_eq!(
-            transport.sent_payload_types(),
-            vec![2100, 2102, 2114, 2116]
-        );
+        assert_eq!(transport.sent_payload_types(), vec![2100, 2102, 2114, 2116]);
     }
 
     #[test]
@@ -327,8 +320,17 @@ mod ctrader_integration_tests {
         assert_eq!(result.bars.len(), 1);
         assert_eq!(result.bid_ticks.len(), 2);
         assert_eq!(result.ask_ticks.len(), 2);
-        assert_eq!(result.live_subscription_plan.subscribe_spots.payload_type, 2127);
-        assert_eq!(result.live_subscription_plan.subscribe_trendbars.payload_type, 2135);
+        assert_eq!(
+            result.live_subscription_plan.subscribe_spots.payload_type,
+            2127
+        );
+        assert_eq!(
+            result
+                .live_subscription_plan
+                .subscribe_trendbars
+                .payload_type,
+            2135
+        );
     }
 
     // ─── Account discovery flow ─────────────────────────────────────────────

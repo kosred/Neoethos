@@ -488,8 +488,8 @@ impl ProductionCTraderExecutionBackend {
     }
 
     fn ensure_auth_payload(response: &str, expected_payload_type: u32) -> Result<()> {
-        let envelope = parse_open_api_envelope(response)
-            .context("failed to inspect cTrader auth response")?;
+        let envelope =
+            parse_open_api_envelope(response).context("failed to inspect cTrader auth response")?;
         if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
             let (code, message) = parse_ctrader_error_payload_parts(&envelope.payload)?;
             if is_ctrader_auth_token_error(&code) {

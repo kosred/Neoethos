@@ -309,8 +309,7 @@ impl TradingSession {
     /// defaults and are unaffected by whatever is on the developer's disk.
     pub fn new_with_persisted_credentials() -> Self {
         let mut session = Self::default();
-        session.broker_settings =
-            crate::app_services::broker_persistence::load_broker_settings();
+        session.broker_settings = crate::app_services::broker_persistence::load_broker_settings();
         session
     }
 
@@ -1625,7 +1624,8 @@ impl TradingSession {
         // Heuristic: real FX symbols are exactly 6 alphabetic characters
         // (EURUSD, GBPCHF, ...). Anything else is suspicious in a forex-only
         // bot — log a warn but still return a sane default so we don't crash.
-        let looks_like_fx_pair = normalized.len() == 6 && normalized.chars().all(|c| c.is_ascii_alphabetic());
+        let looks_like_fx_pair =
+            normalized.len() == 6 && normalized.chars().all(|c| c.is_ascii_alphabetic());
         if !looks_like_fx_pair {
             tracing::warn!(
                 target: "forex_app::risk",
@@ -3323,8 +3323,7 @@ fn prop_firm_pre_trade_check(
         );
         // `pip_value_per_lot` is account-currency-units per pip per standard
         // (1.0) lot. cTrader volume is in cents of a standard lot, so divide.
-        let estimated_loss =
-            pip_distance * (order.volume as f64 / 100.0) * cost.pip_value_per_lot;
+        let estimated_loss = pip_distance * (order.volume as f64 / 100.0) * cost.pip_value_per_lot;
         let max_loss = risk.risk_per_trade * account_equity;
         if estimated_loss > max_loss {
             return Err(anyhow::anyhow!(

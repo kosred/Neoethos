@@ -67,7 +67,11 @@ fn candidate_paths() -> Result<Vec<PathBuf>> {
     }
 
     if let Some(config_dir) = dirs::config_dir() {
-        paths.push(config_dir.join(APP_CONFIG_SUBDIR).join(CREDENTIALS_FILENAME));
+        paths.push(
+            config_dir
+                .join(APP_CONFIG_SUBDIR)
+                .join(CREDENTIALS_FILENAME),
+        );
     }
 
     if let Ok(cwd) = env::current_dir() {
@@ -142,8 +146,7 @@ fn load_from_filesystem() -> BrokerSettingsState {
 /// User-supplied values (non-empty) are never overwritten.
 fn apply_embedded_fallback(settings: &mut BrokerSettingsState) {
     use crate::app_services::embedded_credentials::{
-        EMBEDDED_CTRADER_CLIENT_ID, EMBEDDED_CTRADER_CLIENT_SECRET,
-        EMBEDDED_CTRADER_REDIRECT_URI,
+        EMBEDDED_CTRADER_CLIENT_ID, EMBEDDED_CTRADER_CLIENT_SECRET, EMBEDDED_CTRADER_REDIRECT_URI,
     };
 
     if EMBEDDED_CTRADER_CLIENT_ID.is_empty() {
@@ -151,9 +154,8 @@ fn apply_embedded_fallback(settings: &mut BrokerSettingsState) {
     }
 
     let ct = &mut settings.ctrader;
-    let used_embedded = ct.client_id.is_empty()
-        || ct.client_secret.is_empty()
-        || ct.redirect_uri.is_empty();
+    let used_embedded =
+        ct.client_id.is_empty() || ct.client_secret.is_empty() || ct.redirect_uri.is_empty();
 
     if ct.client_id.is_empty() {
         ct.client_id = EMBEDDED_CTRADER_CLIENT_ID.to_string();
@@ -204,8 +206,7 @@ pub fn save_broker_settings(settings: &BrokerSettingsState) -> Result<()> {
 mod tests {
     use super::*;
     use crate::app_services::broker_config::{
-        BrokerAccountTarget, CTraderBrokerEnvironment, CTraderBrokerSettings,
-        DxTradeBrokerSettings,
+        BrokerAccountTarget, CTraderBrokerEnvironment, CTraderBrokerSettings, DxTradeBrokerSettings,
     };
     use std::sync::Mutex;
 
@@ -351,8 +352,7 @@ mod tests {
         with_env_path(&path, |_| {
             let loaded = load_broker_settings();
             assert_eq!(
-                loaded.ctrader.client_id,
-                EMBEDDED_CTRADER_CLIENT_ID,
+                loaded.ctrader.client_id, EMBEDDED_CTRADER_CLIENT_ID,
                 "empty client_id should be filled from embedded constant"
             );
         });

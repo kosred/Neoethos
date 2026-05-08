@@ -77,10 +77,7 @@ pub fn timestamp_from_millis(value: i64, unit: TimestampUnit) -> Result<i64> {
     }
 }
 
-pub fn normalize_timestamps_to_millis(
-    values: &[i64],
-    unit: TimestampUnit,
-) -> Result<Vec<i64>> {
+pub fn normalize_timestamps_to_millis(values: &[i64], unit: TimestampUnit) -> Result<Vec<i64>> {
     values
         .iter()
         .copied()
@@ -89,7 +86,8 @@ pub fn normalize_timestamps_to_millis(
 }
 
 pub fn normalize_timestamps_to_inferred_millis(values: &[i64]) -> Result<Vec<i64>> {
-    let unit = infer_timestamp_unit(values).ok_or_else(|| anyhow::anyhow!("no timestamp values"))?;
+    let unit =
+        infer_timestamp_unit(values).ok_or_else(|| anyhow::anyhow!("no timestamp values"))?;
     normalize_timestamps_to_millis(values, unit)
 }
 
@@ -142,10 +140,22 @@ mod tests {
 
     #[test]
     fn converts_supported_units_to_millis() -> Result<()> {
-        assert_eq!(timestamp_to_millis(1_700_000_000, TimestampUnit::Seconds)?, 1_700_000_000_000);
-        assert_eq!(timestamp_to_millis(1_700_000_000_000, TimestampUnit::Milliseconds)?, 1_700_000_000_000);
-        assert_eq!(timestamp_to_millis(1_700_000_000_000_000, TimestampUnit::Microseconds)?, 1_700_000_000_000);
-        assert_eq!(timestamp_to_millis(1_700_000_000_000_000_000, TimestampUnit::Nanoseconds)?, 1_700_000_000_000);
+        assert_eq!(
+            timestamp_to_millis(1_700_000_000, TimestampUnit::Seconds)?,
+            1_700_000_000_000
+        );
+        assert_eq!(
+            timestamp_to_millis(1_700_000_000_000, TimestampUnit::Milliseconds)?,
+            1_700_000_000_000
+        );
+        assert_eq!(
+            timestamp_to_millis(1_700_000_000_000_000, TimestampUnit::Microseconds)?,
+            1_700_000_000_000
+        );
+        assert_eq!(
+            timestamp_to_millis(1_700_000_000_000_000_000, TimestampUnit::Nanoseconds)?,
+            1_700_000_000_000
+        );
         Ok(())
     }
 

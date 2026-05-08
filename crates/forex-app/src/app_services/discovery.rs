@@ -833,7 +833,11 @@ pub fn start_discovery_job(
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            save_portfolio_json(&out_path, &result.portfolio, &result.effective_feature_names)?;
+            save_portfolio_json(
+                &out_path,
+                &result.portfolio,
+                &result.effective_feature_names,
+            )?;
             save_discovery_profile_json(
                 out_path.with_extension("profile.json"),
                 &search_request.config,

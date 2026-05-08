@@ -116,13 +116,9 @@ impl RegimeLabelPolicy {
                 "FOREX_BOT_REGIME_LABEL_MIN_PROFIT",
                 default.min_window_profit,
             ),
-            min_profit_factor: env_f64(
-                "FOREX_BOT_REGIME_LABEL_MIN_PF",
-                default.min_profit_factor,
-            )
-            .max(0.0),
-            max_drawdown: env_f64("FOREX_BOT_REGIME_LABEL_MAX_DD", default.max_drawdown)
+            min_profit_factor: env_f64("FOREX_BOT_REGIME_LABEL_MIN_PF", default.min_profit_factor)
                 .max(0.0),
+            max_drawdown: env_f64("FOREX_BOT_REGIME_LABEL_MAX_DD", default.max_drawdown).max(0.0),
             min_quality_score: env_f64(
                 "FOREX_BOT_REGIME_LABEL_MIN_SCORE",
                 default.min_quality_score,
@@ -253,7 +249,12 @@ pub fn label_strategies_by_regime_windows(
 
     for window in &windows {
         let wf = slice_feature_frame(features, window.start_idx, window.end_idx);
-        let wo = slice_ohlcv(ohlcv, window.start_idx, window.end_idx, &features.timestamps);
+        let wo = slice_ohlcv(
+            ohlcv,
+            window.start_idx,
+            window.end_idx,
+            &features.timestamps,
+        );
         let metrics = evaluate_genes(&wf, &wo, genes, eval_config)?;
 
         for (gene_idx, metric) in metrics.iter().enumerate() {
@@ -384,13 +385,20 @@ fn summarize_profile(
     scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let best_window_score = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let median_window_score = scores[scores.len() / 2];
-    let positive_scores: Vec<f64> = scores.iter().copied().filter(|score| *score > 0.0).collect();
+    let positive_scores: Vec<f64> = scores
+        .iter()
+        .copied()
+        .filter(|score| *score > 0.0)
+        .collect();
     let avg_positive_window_score = if positive_scores.is_empty() {
         0.0
     } else {
         positive_scores.iter().sum::<f64>() / positive_scores.len() as f64
     };
-    let negative_windows = labels.iter().filter(|label| label.quality_score < 0.0).count();
+    let negative_windows = labels
+        .iter()
+        .filter(|label| label.quality_score < 0.0)
+        .count();
     let fragility_score = negative_windows as f64 / evaluated_windows as f64;
 
     let specialist_candidate = tradable_windows >= policy.min_specialist_windows
@@ -409,7 +417,8 @@ fn summarize_profile(
     let deployment_candidate = hit_rate >= policy.min_always_on_hit_rate
         && tradable_rate >= policy.min_always_on_hit_rate * 0.75
         && fragility_score <= 0.35;
-    let training_candidate = specialist_candidate || deployment_candidate || avg_positive_window_score > 0.0;
+    let training_candidate =
+        specialist_candidate || deployment_candidate || avg_positive_window_score > 0.0;
 
     StrategyRegimeProfile {
         strategy_id: gene.strategy_id.clone(),
@@ -458,7 +467,9 @@ fn empty_profile(gene: &Gene) -> StrategyRegimeProfile {
     }
 }
 
-pub fn rank_training_profiles(mut profiles: Vec<StrategyRegimeProfile>) -> Vec<StrategyRegimeProfile> {
+pub fn rank_training_profiles(
+    mut profiles: Vec<StrategyRegimeProfile>,
+) -> Vec<StrategyRegimeProfile> {
     profiles.sort_by(|a, b| {
         let score_a = a.regime_specialist_score.max(a.always_on_score);
         let score_b = b.regime_specialist_score.max(b.always_on_score);
@@ -485,15 +496,25 @@ mod tests {
         trades: f64,
         consistency: f64,
     ) -> EvalMetrics {
-        [net, sharpe, 100_000.0 + net, dd, wr, pf, exp, 0.0, trades, consistency, 0.0]
+        [
+            net,
+            sharpe,
+            100_000.0 + net,
+            dd,
+            wr,
+            pf,
+            exp,
+            0.0,
+            trades,
+            consistency,
+            0.0,
+        ]
     }
 
     #[test]
     fn rolling_windows_can_find_sub_two_year_regimes() {
         let start = 1_700_000_000_000_i64;
-        let timestamps: Vec<i64> = (0..730)
-            .map(|day| start + day * MILLIS_PER_DAY)
-            .collect();
+        let timestamps: Vec<i64> = (0..730).map(|day| start + day * MILLIS_PER_DAY).collect();
         let windows = build_rolling_regime_windows(&timestamps, 90, 30, 30);
 
         assert!(windows.len() > 12);

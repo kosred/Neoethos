@@ -380,7 +380,11 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         {
             std::fs::create_dir_all(parent)?;
         }
-        forex_search::save_portfolio_json(&out, &result.portfolio, &result.effective_feature_names)?;
+        forex_search::save_portfolio_json(
+            &out,
+            &result.portfolio,
+            &result.effective_feature_names,
+        )?;
         let profile_path = format!("{out}.profile.json");
         forex_search::save_discovery_profile_json(&profile_path, &config, &result)?;
         if !result.quality_metrics.is_empty() {

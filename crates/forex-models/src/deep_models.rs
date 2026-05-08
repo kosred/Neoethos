@@ -1441,8 +1441,8 @@ impl BurnDeepExpert {
             Some((vx, vy)) => (Some(vx), Some(vy.as_slice())),
             None => (None, None),
         };
-        let (model, summary, device_selection, burn_training_report) = self
-            .train_runtime_model_with_val(input_dim, &features, &labels, val_x_ref, val_y_ref)?;
+        let (model, summary, device_selection, burn_training_report) =
+            self.train_runtime_model_with_val(input_dim, &features, &labels, val_x_ref, val_y_ref)?;
         self.training_summary = Some(summary);
         self.burn_training_report = Some(burn_training_report);
         self.params.insert(

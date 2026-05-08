@@ -290,12 +290,13 @@ fn render_adapter_configuration(
             }
             if save_credentials {
                 let settings_snapshot = session.broker_settings_mut().clone();
-                state.status_msg = match crate::app_services::broker_persistence::save_broker_settings(
-                    &settings_snapshot,
-                ) {
-                    Ok(()) => "Broker credentials saved to disk.".to_string(),
-                    Err(err) => format!("Failed to save broker credentials: {err}"),
-                };
+                state.status_msg =
+                    match crate::app_services::broker_persistence::save_broker_settings(
+                        &settings_snapshot,
+                    ) {
+                        Ok(()) => "Broker credentials saved to disk.".to_string(),
+                        Err(err) => format!("Failed to save broker credentials: {err}"),
+                    };
             }
         }
         TradingAdapterKind::DxTrade => {

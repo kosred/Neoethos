@@ -72,9 +72,12 @@ pub fn smc_mask(gene: &Gene) -> u16 {
         gene.use_displacement,
     ];
 
-    flags.iter().enumerate().fold(0_u16, |mask, (idx, flag)| {
-        if *flag { mask | (1_u16 << idx) } else { mask }
-    })
+    flags.iter().enumerate().fold(
+        0_u16,
+        |mask, (idx, flag)| {
+            if *flag { mask | (1_u16 << idx) } else { mask }
+        },
+    )
 }
 
 pub fn diversity_key(gene: &Gene, metrics: &EvalMetrics) -> DiversityKey {
@@ -170,7 +173,19 @@ mod tests {
     use super::*;
 
     fn test_metrics(net: f64, pf: f64, dd: f64, trades: f64) -> EvalMetrics {
-        [net, 1.0, 100_000.0 + net, dd, 0.55, pf, net / trades.max(1.0), 0.0, trades, 0.6, 0.0]
+        [
+            net,
+            1.0,
+            100_000.0 + net,
+            dd,
+            0.55,
+            pf,
+            net / trades.max(1.0),
+            0.0,
+            trades,
+            0.6,
+            0.0,
+        ]
     }
 
     fn test_gene(id: &str, use_ob: bool, tp: f64, sl: f64) -> Gene {
@@ -213,6 +228,10 @@ mod tests {
         );
 
         assert_eq!(selected.len(), 4);
-        assert!(selected.iter().any(|(gene, _, _)| gene.strategy_id == "different"));
+        assert!(
+            selected
+                .iter()
+                .any(|(gene, _, _)| gene.strategy_id == "different")
+        );
     }
 }

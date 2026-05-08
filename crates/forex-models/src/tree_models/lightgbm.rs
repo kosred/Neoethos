@@ -576,7 +576,10 @@ impl LightGBMExpert {
                     // Default early_stopping_rounds when caller did not
                     // explicitly set one. 50 rounds is a conservative
                     // patience for `num_iterations >= 200`.
-                    if !params.get("early_stopping_rounds").is_some_and(|v| v.is_i64()) {
+                    if !params
+                        .get("early_stopping_rounds")
+                        .is_some_and(|v| v.is_i64())
+                    {
                         params["early_stopping_rounds"] = serde_json::json!(50);
                     }
                     Some(valid)

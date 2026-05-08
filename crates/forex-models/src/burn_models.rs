@@ -1946,10 +1946,7 @@ where
         ));
     }
 
-    let use_external_val = matches!(
-        (external_val_x, external_val_y),
-        (Some(_), Some(_))
-    );
+    let use_external_val = matches!((external_val_x, external_val_y), (Some(_), Some(_)));
     if let (Some(vx), Some(vy)) = (external_val_x, external_val_y) {
         validate_feature_matrix(vx, "Burn external validation")?;
         if vx.ncols() != x_data.ncols() {
@@ -1981,8 +1978,7 @@ where
         (0..n_samples, 0..0, 0usize)
     } else {
         let embargo = (n_samples as f32 * 0.005).ceil() as usize;
-        let (train_range, val_range) =
-            time_series_split(n_samples, 0.15, 100, embargo.max(10));
+        let (train_range, val_range) = time_series_split(n_samples, 0.15, 100, embargo.max(10));
         (train_range, val_range, embargo)
     };
     let n_train = train_range.len();

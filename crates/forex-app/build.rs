@@ -137,8 +137,8 @@ fn emit_embedded_credentials() {
     // CARGO_MANIFEST_DIR = <workspace>/crates/forex-app  →  workspace root is two levels up.
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let workspace_root = manifest_dir
-        .parent()  // crates/
-        .and_then(|p| p.parent())  // <workspace root>
+        .parent() // crates/
+        .and_then(|p| p.parent()) // <workspace root>
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| manifest_dir.clone());
 
@@ -224,7 +224,11 @@ fn emit_embedded_credentials() {
 /// Returns empty string if the line doesn't look like a quoted assignment.
 fn extract_toml_string_value(after_key: &str) -> String {
     // after_key is everything after the key name: ` = "value"` or ` = "value" # comment`
-    let after_eq = after_key.trim_start().strip_prefix('=').unwrap_or("").trim();
+    let after_eq = after_key
+        .trim_start()
+        .strip_prefix('=')
+        .unwrap_or("")
+        .trim();
     if let Some(inner) = after_eq.strip_prefix('"') {
         // Find closing quote (ignore escaped quotes for simplicity — our values are simple)
         if let Some(end) = inner.find('"') {

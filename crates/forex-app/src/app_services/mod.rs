@@ -1,7 +1,6 @@
 pub mod bootstrap_writer;
 pub mod broker_config;
 pub mod broker_persistence;
-pub mod embedded_credentials;
 pub mod ctrader_account;
 pub mod ctrader_auth;
 pub mod ctrader_bootstrap;
@@ -16,6 +15,7 @@ pub mod ctrader_proto_messages;
 pub mod ctrader_session;
 pub mod ctrader_streaming;
 pub mod discovery;
+pub mod embedded_credentials;
 pub mod jobs;
 pub mod secure_store;
 pub mod trading;

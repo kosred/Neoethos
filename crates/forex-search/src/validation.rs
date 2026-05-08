@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalkforwardSplitResult {
     pub split: usize,
@@ -362,10 +361,7 @@ fn walkforward_risk_diagnostics(
         daily_trade_counts[offset] += 1;
     }
 
-    let daily_returns: Vec<f64> = daily_pnl
-        .iter()
-        .map(|pnl| pnl / initial_balance)
-        .collect();
+    let daily_returns: Vec<f64> = daily_pnl.iter().map(|pnl| pnl / initial_balance).collect();
     let daily_min_return = daily_returns.iter().copied().fold(0.0, f64::min);
     let closed_trade_daily_loss = daily_returns
         .iter()
