@@ -1,6 +1,6 @@
 use std::fmt;
 
-use super::{ArtifactKind, BackendKind, RuntimeMode};
+use super::{ArtifactKind, BackendKind, DeterminismPolicy, RuntimeMode};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtifactContractError {
@@ -41,6 +41,10 @@ pub enum ArtifactContractError {
         field: &'static str,
         actual: String,
         expected: String,
+    },
+    MissingValidationEvidence(&'static str),
+    PromotionRejectedDeterminism {
+        actual: DeterminismPolicy,
     },
 }
 
@@ -114,6 +118,13 @@ impl fmt::Display for ArtifactContractError {
             } => write!(
                 f,
                 "temporal feature contract mismatch for {field}: actual `{actual}` expected `{expected}`"
+            ),
+            Self::MissingValidationEvidence(field) => {
+                write!(f, "live promotion is missing validation evidence `{field}`")
+            }
+            Self::PromotionRejectedDeterminism { actual } => write!(
+                f,
+                "live promotion requires deterministic execution; actual policy was {actual:?}"
             ),
         }
     }

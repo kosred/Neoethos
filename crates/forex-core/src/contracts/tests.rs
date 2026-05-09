@@ -505,3 +505,139 @@ fn temporal_scope_hashes_validate_contract_drift() {
         }
     ));
 }
+
+fn complete_validation_evidence() -> ValidationEvidenceManifest {
+    ValidationEvidenceManifest::new(
+        "canonical-backtest-fnv",
+        "walkforward-fnv",
+        "forward-test-fnv",
+        "live-execution-sim-fnv",
+        "prop-firm-risk-fnv",
+    )
+    .expect("fixture validation evidence should be complete")
+}
+
+#[test]
+fn validation_evidence_manifest_requires_all_promotion_artifacts() {
+    let error = ValidationEvidenceManifest::new(
+        "canonical-backtest-fnv",
+        "walkforward-fnv",
+        "",
+        "live-execution-sim-fnv",
+        "prop-firm-risk-fnv",
+    )
+    .expect_err("missing forward-test evidence must fail");
+
+    assert_eq!(
+        error,
+        ArtifactContractError::MissingValidationEvidence("forward_test_validation_hash")
+    );
+}
+
+#[test]
+fn live_promotion_gate_accepts_canonical_deterministic_artifact_with_complete_evidence() {
+    let envelope = ArtifactEnvelope::new(canonical_live_provenance(), ())
+        .expect("fixture envelope should be structurally valid");
+    let gate =
+        LivePromotionGate::new(canonical_live_execution_contract()).require_deterministic(true);
+
+    gate.validate(&envelope, &complete_validation_evidence())
+        .expect("complete deterministic live artifact should pass promotion gate");
+}
+
+#[test]
+fn live_promotion_gate_rejects_best_effort_when_deterministic_required() {
+    let mut provenance = canonical_live_provenance();
+    provenance.determinism_policy = DeterminismPolicy::BestEffort;
+    let envelope =
+        ArtifactEnvelope::new(provenance, ()).expect("best-effort artifact is structurally valid");
+    let gate =
+        LivePromotionGate::new(canonical_live_execution_contract()).require_deterministic(true);
+
+    let error = gate
+        .validate(&envelope, &complete_validation_evidence())
+        .expect_err("deterministic promotion gate must reject best-effort artifacts");
+
+    assert_eq!(
+        error,
+        ArtifactContractError::PromotionRejectedDeterminism {
+            actual: DeterminismPolicy::BestEffort,
+        }
+    );
+}
+
+#[test]
+fn live_promotion_gate_rejects_degraded_runtime_even_with_complete_evidence() {
+    let provenance = ArtifactProvenance::new(
+        ArtifactKind::LiveReadyStrategy,
+        "feature-schema-v1",
+        "dataset-a",
+        "symbols-eurusd",
+        "m1-m5",
+        "timestamp-policy-v1",
+        "feature-availability-v1",
+        "label-policy-v1",
+        "training-config-v1",
+        "search-config-v1",
+        "runtime-config-v1",
+        "risk-config-v1",
+        DeterminismPolicy::Deterministic { seed: 42 },
+        "hardware-profile-1",
+        DeviceAssignment {
+            backend: BackendKind::CpuReference,
+            device: "cpu".to_string(),
+            device_ids: Vec::new(),
+        },
+        BackendKind::CpuReference,
+        RuntimeMode::Degraded,
+        Some(RuntimeDegradedReason::new(
+            "cuda_unavailable",
+            "CUDA was requested but unavailable",
+        )),
+        "abc1234",
+    )
+    .expect("degraded provenance is structurally valid");
+    let envelope = ArtifactEnvelope::new(provenance, ()).expect("degraded envelope");
+    let gate =
+        LivePromotionGate::new(canonical_live_execution_contract()).require_deterministic(true);
+
+    let error = gate
+        .validate(&envelope, &complete_validation_evidence())
+        .expect_err("degraded runtime must not pass promotion gate");
+
+    assert_eq!(
+        error,
+        ArtifactContractError::LiveRejectedRuntimeMode {
+            mode: RuntimeMode::Degraded,
+            backend: BackendKind::CpuReference,
+        }
+    );
+}
+
+#[test]
+fn live_promotion_readiness_report_collects_operator_reasons_without_failing() {
+    let mut provenance = canonical_live_provenance();
+    provenance.determinism_policy = DeterminismPolicy::BestEffort;
+    let envelope =
+        ArtifactEnvelope::new(provenance, ()).expect("best-effort artifact is structurally valid");
+    let gate =
+        LivePromotionGate::new(canonical_live_execution_contract()).require_deterministic(true);
+
+    let report = gate.readiness_report(&envelope, None);
+
+    assert!(!report.ready);
+    assert!(!report.validation_evidence_complete);
+    assert!(!report.determinism_requirement_passed);
+    assert!(
+        report
+            .rejection_reasons
+            .iter()
+            .any(|reason| reason.contains("validation evidence"))
+    );
+    assert!(
+        report
+            .rejection_reasons
+            .iter()
+            .any(|reason| reason.contains("deterministic"))
+    );
+}
