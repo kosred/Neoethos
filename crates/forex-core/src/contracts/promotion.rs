@@ -1,7 +1,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::{ArtifactContractError, ArtifactEnvelope, DeterminismPolicy, LiveExecutionContract};
+use super::{
+    ArtifactContractError, ArtifactEnvelope, DeterminismPolicy, LiveExecutionContract,
+    RuntimeSafetyReport,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -146,6 +149,7 @@ impl ValidationEvidenceManifest {
 #[serde(rename_all = "snake_case")]
 pub enum PromotionReadinessCheckKind {
     ValidationEvidence,
+    RuntimeSafety,
     LiveExecutionContract,
     DeterminismRequirement,
 }
@@ -191,10 +195,12 @@ pub struct LivePromotionGate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromotionReadinessReport {
     pub validation_evidence_complete: bool,
+    pub runtime_safety_passed: bool,
     pub live_contract_passed: bool,
     pub determinism_requirement_passed: bool,
     pub ready: bool,
     pub rejection_reasons: Vec<String>,
+    pub runtime_safety: RuntimeSafetyReport,
     pub evidence_checks: Vec<ValidationEvidenceCheck>,
     pub checks: Vec<PromotionReadinessCheck>,
 }
@@ -258,6 +264,8 @@ impl LivePromotionGate {
     ) -> PromotionReadinessReport {
         let mut rejection_reasons = Vec::new();
         let mut checks = Vec::new();
+        let runtime_safety = artifact.provenance.runtime_safety_report();
+        let runtime_safety_passed = runtime_safety.live_safe;
 
         let validation_evidence_complete = match evidence {
             Some(evidence) => match evidence.validate() {
@@ -297,6 +305,21 @@ impl LivePromotionGate {
             },
             ValidationEvidenceManifest::evidence_checks,
         );
+
+        if runtime_safety_passed {
+            checks.push(PromotionReadinessCheck::passed(
+                PromotionReadinessCheckKind::RuntimeSafety,
+            ));
+        } else {
+            let reason = runtime_safety.rejection_reason().unwrap_or_else(|| {
+                "runtime safety report rejected the artifact for live promotion".to_string()
+            });
+            rejection_reasons.push(reason.clone());
+            checks.push(PromotionReadinessCheck::failed(
+                PromotionReadinessCheckKind::RuntimeSafety,
+                reason,
+            ));
+        }
 
         let live_contract_passed = match self
             .live_execution_contract
@@ -342,12 +365,15 @@ impl LivePromotionGate {
 
         PromotionReadinessReport {
             validation_evidence_complete,
+            runtime_safety_passed,
             live_contract_passed,
             determinism_requirement_passed,
             ready: validation_evidence_complete
+                && runtime_safety_passed
                 && live_contract_passed
                 && determinism_requirement_passed,
             rejection_reasons,
+            runtime_safety,
             evidence_checks,
             checks,
         }

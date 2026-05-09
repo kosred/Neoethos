@@ -173,6 +173,55 @@ impl RuntimeDegradedReason {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSafetyIssue {
+    NonCanonicalRuntimeMode,
+    DegradedBackend,
+    BackendAssignmentMismatch,
+    MissingDegradedReason,
+    CanonicalArtifactHasDegradedReason,
+}
+
+impl RuntimeSafetyIssue {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NonCanonicalRuntimeMode => "runtime mode is not canonical",
+            Self::DegradedBackend => "backend is degraded or unavailable",
+            Self::BackendAssignmentMismatch => "backend does not match device assignment",
+            Self::MissingDegradedReason => "degraded runtime reason is missing",
+            Self::CanonicalArtifactHasDegradedReason => {
+                "canonical runtime carries a degraded reason"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeSafetyReport {
+    pub runtime_mode: RuntimeMode,
+    pub backend_kind: BackendKind,
+    pub assignment_backend: BackendKind,
+    pub live_safe: bool,
+    pub backend_assignment_matches: bool,
+    pub degraded_reason: Option<RuntimeDegradedReason>,
+    pub issues: Vec<RuntimeSafetyIssue>,
+}
+
+impl RuntimeSafetyReport {
+    pub fn has_issue(&self, issue: RuntimeSafetyIssue) -> bool {
+        self.issues.contains(&issue)
+    }
+
+    pub fn issue_labels(&self) -> Vec<&'static str> {
+        self.issues.iter().map(|issue| issue.label()).collect()
+    }
+
+    pub fn rejection_reason(&self) -> Option<String> {
+        (!self.live_safe).then(|| self.issue_labels().join("; "))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceAssignment {
     pub backend: BackendKind,
@@ -263,6 +312,38 @@ impl ArtifactProvenance {
         };
         provenance.validate()?;
         Ok(provenance)
+    }
+
+    pub fn runtime_safety_report(&self) -> RuntimeSafetyReport {
+        let backend_assignment_matches = self.backend_kind == self.device_assignment.backend;
+        let mut issues = Vec::new();
+        if !self.runtime_mode.is_live_safe() {
+            issues.push(RuntimeSafetyIssue::NonCanonicalRuntimeMode);
+        }
+        if self.backend_kind.is_degraded() {
+            issues.push(RuntimeSafetyIssue::DegradedBackend);
+        }
+        if !backend_assignment_matches {
+            issues.push(RuntimeSafetyIssue::BackendAssignmentMismatch);
+        }
+        if self.runtime_mode == RuntimeMode::Canonical && self.runtime_degraded_reason.is_some() {
+            issues.push(RuntimeSafetyIssue::CanonicalArtifactHasDegradedReason);
+        }
+        if (!self.runtime_mode.is_live_safe() || self.backend_kind.is_degraded())
+            && self.runtime_degraded_reason.is_none()
+        {
+            issues.push(RuntimeSafetyIssue::MissingDegradedReason);
+        }
+
+        RuntimeSafetyReport {
+            runtime_mode: self.runtime_mode,
+            backend_kind: self.backend_kind,
+            assignment_backend: self.device_assignment.backend,
+            live_safe: issues.is_empty(),
+            backend_assignment_matches,
+            degraded_reason: self.runtime_degraded_reason.clone(),
+            issues,
+        }
     }
 
     pub fn validate(&self) -> Result<(), ArtifactContractError> {

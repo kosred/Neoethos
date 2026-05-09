@@ -16,9 +16,10 @@ pub use contracts::{
     ModelRuntimeArtifactContract, MultiTimeframeAvailabilityPolicy, PortfolioSelectionArtifact,
     PortfolioSelectionArtifactContract, PromotionReadinessCheck, PromotionReadinessCheckKind,
     PromotionReadinessReport, PromotionReadinessStatus, RuntimeDegradedReason, RuntimeMode,
-    SearchCheckpointArtifact, SearchCheckpointArtifactContract, TimestampPolicy, TimestampUnit,
-    TrainingModelArtifact, TrainingModelArtifactContract, TypedArtifactEnvelope,
-    ValidationEvidenceCheck, ValidationEvidenceKind, ValidationEvidenceManifest,
+    RuntimeSafetyIssue, RuntimeSafetyReport, SearchCheckpointArtifact,
+    SearchCheckpointArtifactContract, TimestampPolicy, TimestampUnit, TrainingModelArtifact,
+    TrainingModelArtifactContract, TypedArtifactEnvelope, ValidationEvidenceCheck,
+    ValidationEvidenceKind, ValidationEvidenceManifest,
 };
 pub use system::{
     AcceleratorBackend, AcceleratorDevice, CpuBudget, GpuBudget, HardwareExecutionPlan,
