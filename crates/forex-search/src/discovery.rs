@@ -6,9 +6,12 @@ use crate::genetic::{
 };
 use crate::quality::{StrategyMetrics, StrategyQualityAnalyzer, Trade};
 use crate::validation::{
-    CanonicalBacktestArtifactFile, CanonicalBacktestScope, CombinatorialPurgedCV,
-    WalkforwardBacktestInput, WalkforwardSummary, WalkforwardValidationArtifactFile,
-    WalkforwardValidationScope, embargoed_walkforward_backtest,
+    CanonicalBacktestArtifactFile, CanonicalBacktestScope, CombinatorialPurgedCV, ForwardTestInput,
+    ForwardTestValidationArtifactFile, ForwardTestValidationScope, WalkforwardBacktestInput,
+    WalkforwardSummary, WalkforwardValidationArtifactFile, WalkforwardValidationScope,
+    compute_forward_test_summary, embargoed_walkforward_backtest,
+    write_canonical_backtest_artifact_atomic, write_forward_test_validation_artifact_atomic,
+    write_walkforward_validation_artifact_atomic,
 };
 use anyhow::{Context, Result};
 use chrono::{Datelike, TimeZone, Utc};
@@ -18,6 +21,88 @@ use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+/// Typed runtime knobs that previously lived only in `FOREX_BOT_*` env vars.
+///
+/// These values change *production* discovery semantics (which features are
+/// kept, how much data the stage-1 funnel sees, what counts as in-sample for
+/// the prefilter), so they belong in typed config rather than ambient env
+/// state. Callers that still want to honour the env vars must opt in via
+/// [`DiscoveryRuntimeOverrides::from_env`] or
+/// [`DiscoveryConfig::with_env_runtime_overrides`] — the discovery cycle
+/// itself no longer reads the environment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DiscoveryRuntimeOverrides {
+    /// Maximum number of features to keep after the in-sample correlation
+    /// prefilter. `0` disables the prefilter entirely.
+    pub prefilter_top_k: usize,
+    /// Fraction of rows treated as in-sample when ranking features. Must be
+    /// strictly positive and at most `1.0`.
+    pub prefilter_insample_frac: f64,
+    /// Fraction of recent rows fed to the multi-stage funnel's first stage.
+    /// Clamped to `[0.01, 1.0]` at use time.
+    pub funnel_stage1_pct: f64,
+}
+
+impl Default for DiscoveryRuntimeOverrides {
+    fn default() -> Self {
+        Self {
+            prefilter_top_k: 50,
+            prefilter_insample_frac: 0.70,
+            funnel_stage1_pct: 0.25,
+        }
+    }
+}
+
+impl DiscoveryRuntimeOverrides {
+    /// One-shot read of the legacy `FOREX_BOT_*` env vars. This is the only
+    /// place in `forex-search` that consults the environment for these
+    /// knobs; production callers should prefer constructing the struct from
+    /// typed config.
+    pub fn from_env() -> Self {
+        let mut overrides = Self::default();
+        if let Some(top_k) = std::env::var("FOREX_BOT_PREFILTER_TOP_K")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            overrides.prefilter_top_k = top_k;
+        }
+        if let Some(insample) = std::env::var("FOREX_BOT_PREFILTER_INSAMPLE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0 && *v <= 1.0)
+        {
+            overrides.prefilter_insample_frac = insample;
+        }
+        if let Some(stage1) = std::env::var("FOREX_BOT_FUNNEL_STAGE1_PCT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+        {
+            overrides.funnel_stage1_pct = stage1.clamp(0.01, 1.0);
+        }
+        overrides
+    }
+
+    fn resolved_funnel_stage1_pct(&self) -> f64 {
+        if self.funnel_stage1_pct.is_finite() {
+            self.funnel_stage1_pct.clamp(0.01, 1.0)
+        } else {
+            0.25
+        }
+    }
+
+    fn resolved_prefilter_insample_frac(&self) -> f64 {
+        if self.prefilter_insample_frac.is_finite()
+            && self.prefilter_insample_frac > 0.0
+            && self.prefilter_insample_frac <= 1.0
+        {
+            self.prefilter_insample_frac
+        } else {
+            0.70
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DiscoveryConfig {
@@ -53,6 +138,9 @@ pub struct DiscoveryConfig {
     pub max_regime_loss_pct: f64,
     /// Higher timeframes to include in multitimeframe feature preparation.
     pub higher_timeframes: Vec<String>,
+    /// Typed replacements for the legacy `FOREX_BOT_PREFILTER_*` /
+    /// `FOREX_BOT_FUNNEL_STAGE1_PCT` env vars.
+    pub runtime_overrides: DiscoveryRuntimeOverrides,
 }
 
 impl Default for DiscoveryConfig {
@@ -86,6 +174,7 @@ impl Default for DiscoveryConfig {
             initial_balance: 100_000.0,
             max_regime_loss_pct: 3.0,
             higher_timeframes: Vec::new(),
+            runtime_overrides: DiscoveryRuntimeOverrides::default(),
         }
     }
 }
@@ -153,7 +242,16 @@ impl DiscoveryConfig {
             initial_balance: settings.risk.initial_balance.max(1.0),
             max_regime_loss_pct: 3.0,
             higher_timeframes: settings.system.higher_timeframes.clone(),
+            runtime_overrides: DiscoveryRuntimeOverrides::default(),
         }
+    }
+
+    /// Opt-in helper that resolves legacy `FOREX_BOT_*` discovery env vars
+    /// into the typed `runtime_overrides` field. Production callers should
+    /// prefer setting `runtime_overrides` explicitly.
+    pub fn with_env_runtime_overrides(mut self) -> Self {
+        self.runtime_overrides = DiscoveryRuntimeOverrides::from_env();
+        self
     }
 
     pub fn evaluation_config(&self, price_hint: Option<f64>) -> EvaluationConfig {
@@ -179,6 +277,10 @@ pub struct DiscoveryResult {
     pub validation_gates: DiscoveryValidationGates,
     pub canonical_backtest_artifacts: Vec<CanonicalBacktestArtifactFile>,
     pub walkforward_validation_artifacts: Vec<WalkforwardValidationArtifactFile>,
+    /// Forward-test artifacts produced by replaying the portfolio on a
+    /// held-out tail. Empty until the caller invokes
+    /// [`compute_discovery_forward_test_artifacts`] with a tail dataset.
+    pub forward_test_validation_artifacts: Vec<ForwardTestValidationArtifactFile>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -266,9 +368,13 @@ pub struct DiscoveryRunProfile {
     pub cpcv_passed: bool,
     pub canonical_backtest_artifacts_observed: usize,
     pub walkforward_validation_artifacts_observed: usize,
+    pub forward_test_validation_artifacts_observed: usize,
     pub cpcv_fold_count: usize,
     pub cpcv_profitable_fold_ratio: f64,
     pub validation_temporal_contract_hash: Option<String>,
+    pub prefilter_top_k: usize,
+    pub prefilter_insample_frac: f64,
+    pub funnel_stage1_pct: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -840,6 +946,112 @@ fn build_discovery_validation_artifacts(
     ))
 }
 
+/// Replay each portfolio gene on a held-out tail window and produce one
+/// [`ForwardTestValidationArtifactFile`] per strategy. The caller passes
+/// the *raw* tail (with the same `feature_names` ordering it had before
+/// discovery) and `effective_feature_names` produced by discovery; the
+/// helper aligns the tail's columns to the post-prefilter set so the
+/// gene indices match.
+///
+/// Returns `Err` when any name in `effective_feature_names` is missing
+/// from the tail's columns — this indicates the tail comes from a
+/// different feature pipeline than the discovery run that produced the
+/// portfolio, and a forward-test on it would be meaningless.
+pub fn compute_discovery_forward_test_artifacts(
+    portfolio: &[Gene],
+    effective_feature_names: &[String],
+    tail_features: &FeatureFrame,
+    tail_ohlcv: &Ohlcv,
+    config: &DiscoveryConfig,
+) -> Result<Vec<ForwardTestValidationArtifactFile>> {
+    if portfolio.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Project the tail's columns onto the post-prefilter set used by the
+    // portfolio. When the tail already matches, this is a cheap clone of
+    // the underlying ndarray; when it does not, we slice column-by-column.
+    let tail_features = if tail_features.names == effective_feature_names {
+        std::borrow::Cow::Borrowed(tail_features)
+    } else {
+        let mut keep_indices = Vec::with_capacity(effective_feature_names.len());
+        for name in effective_feature_names {
+            let idx = tail_features
+                .names
+                .iter()
+                .position(|candidate| candidate == name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "forward-test tail is missing feature '{}' from the discovery effective \
+                         feature set; the tail must come from the same feature pipeline as the \
+                         in-sample discovery run",
+                        name
+                    )
+                })?;
+            keep_indices.push(idx);
+        }
+        let n_rows = tail_features.data.nrows();
+        let mut projected = ndarray::Array2::<f32>::zeros((n_rows, keep_indices.len()));
+        for (new_idx, &orig_idx) in keep_indices.iter().enumerate() {
+            projected
+                .column_mut(new_idx)
+                .assign(&tail_features.data.column(orig_idx));
+        }
+        std::borrow::Cow::Owned(FeatureFrame {
+            timestamps: tail_features.timestamps.clone(),
+            names: effective_feature_names.to_vec(),
+            data: projected,
+        })
+    };
+    let tail_features = tail_features.as_ref();
+
+    let n = validation_row_count(tail_features, tail_ohlcv)?;
+    if n == 0 {
+        anyhow::bail!("forward-test tail must contain at least one bar");
+    }
+
+    let temporal_contract = discovery_temporal_contract(config, &tail_features.names)?;
+    let tail_dataset_hash = discovery_dataset_hash(tail_features, tail_ohlcv)?;
+    let (months, days) = month_day_indices(&tail_features.timestamps);
+    let timestamps = &tail_features.timestamps[..n];
+
+    let mut artifacts = Vec::with_capacity(portfolio.len());
+    for gene in portfolio {
+        let settings = discovery_backtest_settings(config, gene, tail_ohlcv.close.last().copied());
+        let strategy_hash = stable_json_hash(gene)?;
+        let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
+        let evaluation_config = config.evaluation_config(tail_ohlcv.close.last().copied());
+        let signals = signals_for_gene_full(tail_features, tail_ohlcv, gene, &evaluation_config);
+        if signals.len() != n {
+            anyhow::bail!(
+                "forward-test signals length {} does not match validation row count {}",
+                signals.len(),
+                n
+            );
+        }
+        let summary = compute_forward_test_summary(ForwardTestInput {
+            close: &tail_ohlcv.close[..n],
+            high: &tail_ohlcv.high[..n],
+            low: &tail_ohlcv.low[..n],
+            signals: &signals[..n],
+            months: &months[..n],
+            days: &days[..n],
+            timestamps,
+            settings: &settings,
+        })?;
+        artifacts.push(ForwardTestValidationArtifactFile::new(
+            ForwardTestValidationScope::new(
+                tail_dataset_hash.clone(),
+                evaluation_config_hash,
+                strategy_hash,
+                &temporal_contract,
+            ),
+            summary,
+        ));
+    }
+    Ok(artifacts)
+}
+
 #[derive(Debug, Serialize)]
 struct GeneExport<'a> {
     strategy_id: &'a str,
@@ -875,23 +1087,17 @@ where
     let (mut features, ohlcv, _) = trim_recent_history(features, ohlcv, config)?;
 
     // Feature Pre-filtering (Idea #3)
-    let prefilter_top_k = std::env::var("FOREX_BOT_PREFILTER_TOP_K")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(50);
+    let prefilter_top_k = config.runtime_overrides.prefilter_top_k;
+    let prefilter_insample_frac = config.runtime_overrides.resolved_prefilter_insample_frac();
 
     if prefilter_top_k > 0 && features.names.len() > prefilter_top_k {
-        features = prefilter_features(&features, &ohlcv, prefilter_top_k);
+        features = prefilter_features(&features, &ohlcv, prefilter_top_k, prefilter_insample_frac);
     }
     // Capture names after prefilter — gene indices refer to this list.
     let effective_feature_names = features.names.clone();
 
     // Multi-stage Funnel: Stage 1 (Fast Evaluation)
-    let stage1_pct = std::env::var("FOREX_BOT_FUNNEL_STAGE1_PCT")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.25)
-        .clamp(0.01, 1.0);
+    let stage1_pct = config.runtime_overrides.resolved_funnel_stage1_pct();
 
     let stage1_len = (ohlcv.close.len() as f64 * stage1_pct) as usize;
     let ohlcv_stage1 = slice_ohlcv(&ohlcv, ohlcv.close.len() - stage1_len, ohlcv.close.len());
@@ -971,7 +1177,12 @@ fn pearson_correlation(x: &[f32], y: &[f32]) -> f32 {
     }
 }
 
-fn prefilter_features(features: &FeatureFrame, ohlcv: &Ohlcv, top_k: usize) -> FeatureFrame {
+fn prefilter_features(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    top_k: usize,
+    insample_frac: f64,
+) -> FeatureFrame {
     let n_rows = features.data.nrows();
     let n_cols = features.data.ncols();
     if n_rows < 2 || n_cols <= top_k {
@@ -984,12 +1195,8 @@ fn prefilter_features(features: &FeatureFrame, ohlcv: &Ohlcv, top_k: usize) -> F
     // they will later be evaluated on, inflating in-sample metrics.
     // Restrict the ranking to an IN-SAMPLE prefix so the final 30% of bars
     // (which the GA/walk-forward later treats as held-out) cannot leak into
-    // the feature-selection step. Override with FOREX_BOT_PREFILTER_INSAMPLE.
-    let insample_frac = std::env::var("FOREX_BOT_PREFILTER_INSAMPLE")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0 && *v <= 1.0)
-        .unwrap_or(0.70);
+    // the feature-selection step. The fraction is supplied by the caller
+    // through `DiscoveryRuntimeOverrides::prefilter_insample_frac`.
     let train_end = ((n_rows as f64) * insample_frac).floor() as usize;
     let train_end = train_end.clamp(2, n_rows.saturating_sub(1)).max(2);
 
@@ -1467,6 +1674,7 @@ where
         validation_gates,
         canonical_backtest_artifacts,
         walkforward_validation_artifacts,
+        forward_test_validation_artifacts: Vec::new(),
     })
 }
 
@@ -1615,6 +1823,77 @@ pub fn save_trade_log_json(path: impl AsRef<Path>, result: &DiscoveryResult) -> 
     write_json_atomic(path, &result.logged_trades)
 }
 
+fn artifact_filename_for_strategy_hash(strategy_hash: &str, fallback_index: usize) -> String {
+    let cleaned: String = strategy_hash
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => c,
+            _ => '_',
+        })
+        .collect();
+    if cleaned.is_empty() {
+        format!("strategy_{fallback_index:04}.json")
+    } else {
+        format!("{cleaned}.json")
+    }
+}
+
+pub fn save_canonical_backtest_artifacts(
+    dir: impl AsRef<Path>,
+    result: &DiscoveryResult,
+) -> Result<usize> {
+    let dir = dir.as_ref();
+    if result.canonical_backtest_artifacts.is_empty() {
+        return Ok(0);
+    }
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("create canonical backtest dir {}", dir.display()))?;
+    for (idx, artifact) in result.canonical_backtest_artifacts.iter().enumerate() {
+        let file_name = artifact_filename_for_strategy_hash(&artifact.scope.strategy_hash, idx);
+        write_canonical_backtest_artifact_atomic(dir.join(file_name), artifact)?;
+    }
+    Ok(result.canonical_backtest_artifacts.len())
+}
+
+pub fn save_walkforward_validation_artifacts(
+    dir: impl AsRef<Path>,
+    result: &DiscoveryResult,
+) -> Result<usize> {
+    let dir = dir.as_ref();
+    if result.walkforward_validation_artifacts.is_empty() {
+        return Ok(0);
+    }
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("create walk-forward validation dir {}", dir.display()))?;
+    for (idx, artifact) in result.walkforward_validation_artifacts.iter().enumerate() {
+        let strategy_hash = artifact
+            .scope
+            .strategy_hash
+            .as_deref()
+            .unwrap_or("portfolio");
+        let file_name = artifact_filename_for_strategy_hash(strategy_hash, idx);
+        write_walkforward_validation_artifact_atomic(dir.join(file_name), artifact)?;
+    }
+    Ok(result.walkforward_validation_artifacts.len())
+}
+
+pub fn save_forward_test_validation_artifacts(
+    dir: impl AsRef<Path>,
+    result: &DiscoveryResult,
+) -> Result<usize> {
+    let dir = dir.as_ref();
+    if result.forward_test_validation_artifacts.is_empty() {
+        return Ok(0);
+    }
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("create forward-test validation dir {}", dir.display()))?;
+    for (idx, artifact) in result.forward_test_validation_artifacts.iter().enumerate() {
+        let file_name = artifact_filename_for_strategy_hash(&artifact.scope.strategy_hash, idx);
+        write_forward_test_validation_artifact_atomic(dir.join(file_name), artifact)?;
+    }
+    Ok(result.forward_test_validation_artifacts.len())
+}
+
 pub fn build_discovery_profile(
     config: &DiscoveryConfig,
     result: &DiscoveryResult,
@@ -1667,9 +1946,13 @@ pub fn build_discovery_profile(
         walkforward_validation_artifacts_observed: result
             .validation_gates
             .walkforward_validation_artifacts,
+        forward_test_validation_artifacts_observed: result.forward_test_validation_artifacts.len(),
         cpcv_fold_count: result.validation_gates.cpcv_fold_count,
         cpcv_profitable_fold_ratio: result.validation_gates.cpcv_profitable_fold_ratio,
         validation_temporal_contract_hash: result.validation_gates.temporal_contract_hash.clone(),
+        prefilter_top_k: config.runtime_overrides.prefilter_top_k,
+        prefilter_insample_frac: config.runtime_overrides.resolved_prefilter_insample_frac(),
+        funnel_stage1_pct: config.runtime_overrides.resolved_funnel_stage1_pct(),
     }
 }
 
@@ -1775,6 +2058,7 @@ mod tests {
             validation_gates: DiscoveryValidationGates::pending(),
             canonical_backtest_artifacts: Vec::new(),
             walkforward_validation_artifacts: Vec::new(),
+            forward_test_validation_artifacts: Vec::new(),
         };
 
         let err = ensure_non_empty_portfolio(&result, "EURUSD M1")
@@ -1795,6 +2079,7 @@ mod tests {
             validation_gates: DiscoveryValidationGates::pending(),
             canonical_backtest_artifacts: Vec::new(),
             walkforward_validation_artifacts: Vec::new(),
+            forward_test_validation_artifacts: Vec::new(),
         };
 
         ensure_non_empty_portfolio(&result, "EURUSD M1")
@@ -1892,6 +2177,7 @@ mod tests {
             validation_gates: DiscoveryValidationGates::pending(),
             canonical_backtest_artifacts: Vec::new(),
             walkforward_validation_artifacts: Vec::new(),
+            forward_test_validation_artifacts: Vec::new(),
         };
         let path = temp_path("portfolio-gates");
 
@@ -1912,6 +2198,7 @@ mod tests {
             validation_gates: DiscoveryValidationGates::pending(),
             canonical_backtest_artifacts: Vec::new(),
             walkforward_validation_artifacts: Vec::new(),
+            forward_test_validation_artifacts: Vec::new(),
         };
         result.validation_gates.walkforward_passed = true;
         result.validation_gates.cpcv_passed = true;
@@ -1936,6 +2223,7 @@ mod tests {
             validation_gates: DiscoveryValidationGates::pending(),
             canonical_backtest_artifacts: Vec::new(),
             walkforward_validation_artifacts: Vec::new(),
+            forward_test_validation_artifacts: Vec::new(),
         };
         result.validation_gates.walkforward_passed = true;
         result.validation_gates.cpcv_passed = true;
@@ -1952,5 +2240,349 @@ mod tests {
         assert_eq!(profile.walkforward_validation_artifacts_observed, 1);
         assert_eq!(profile.cpcv_fold_count, 3);
         assert_eq!(profile.cpcv_profitable_fold_ratio, 1.0);
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("forex-discovery-{name}-{unique}"))
+    }
+
+    fn sample_temporal_contract() -> TemporalFeatureContract {
+        discovery_temporal_contract(&DiscoveryConfig::default(), &["signal".to_string()])
+            .expect("temporal contract for default discovery config")
+    }
+
+    fn sample_canonical_backtest_artifact(strategy_hash: &str) -> CanonicalBacktestArtifactFile {
+        let contract = sample_temporal_contract();
+        let scope = CanonicalBacktestScope::new("dataset", "evaluation", strategy_hash, &contract);
+        CanonicalBacktestArtifactFile::new(scope, BacktestMetrics::from_metric_array([0.0; 11]))
+    }
+
+    fn sample_walkforward_summary() -> WalkforwardSummary {
+        WalkforwardSummary {
+            walk_forward_splits: 1,
+            avg_pnl: 1.0,
+            avg_win_rate: 0.5,
+            avg_max_dd: 0.1,
+            avg_max_consec_losses: 0.0,
+            avg_daily_min_dd: 0.0,
+            avg_max_daily_loss: 0.0,
+            any_daily_loss_breach: false,
+            any_consistency_violation: false,
+            any_trade_limit_violation: false,
+            all_min_trading_days_ok: true,
+            splits: Vec::new(),
+        }
+    }
+
+    fn sample_walkforward_validation_artifact(
+        strategy_hash: &str,
+    ) -> WalkforwardValidationArtifactFile {
+        let contract = sample_temporal_contract();
+        let scope = WalkforwardValidationScope::for_strategy(
+            "dataset",
+            "evaluation",
+            strategy_hash,
+            &contract,
+        );
+        WalkforwardValidationArtifactFile::new(scope, sample_walkforward_summary())
+    }
+
+    #[test]
+    fn save_canonical_backtest_artifacts_writes_one_file_per_strategy() {
+        let dir = temp_dir("canonical-backtests");
+        let result = DiscoveryResult {
+            portfolio: vec![profitable_gene("alpha-1"), profitable_gene("alpha-2")],
+            candidates: Vec::new(),
+            quality_metrics: Vec::new(),
+            logged_trades: Vec::new(),
+            effective_feature_names: vec!["signal".to_string()],
+            validation_gates: DiscoveryValidationGates::pending(),
+            canonical_backtest_artifacts: vec![
+                sample_canonical_backtest_artifact("fnv64:0123456789abcdef"),
+                sample_canonical_backtest_artifact("fnv64:fedcba9876543210"),
+            ],
+            walkforward_validation_artifacts: Vec::new(),
+            forward_test_validation_artifacts: Vec::new(),
+        };
+
+        let written = save_canonical_backtest_artifacts(&dir, &result)
+            .expect("canonical backtest artifacts should persist");
+        assert_eq!(written, 2);
+
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("backtest dir should exist")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        assert_eq!(entries.len(), 2);
+        for entry in &entries {
+            let payload = std::fs::read_to_string(entry.path()).expect("artifact readable");
+            assert!(payload.contains(crate::validation::CANONICAL_BACKTEST_ARTIFACT_KIND));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_walkforward_validation_artifacts_writes_one_file_per_strategy() {
+        let dir = temp_dir("walkforward-validations");
+        let result = DiscoveryResult {
+            portfolio: vec![profitable_gene("alpha-1")],
+            candidates: Vec::new(),
+            quality_metrics: Vec::new(),
+            logged_trades: Vec::new(),
+            effective_feature_names: vec!["signal".to_string()],
+            validation_gates: DiscoveryValidationGates::pending(),
+            canonical_backtest_artifacts: Vec::new(),
+            walkforward_validation_artifacts: vec![sample_walkforward_validation_artifact(
+                "fnv64:0011223344556677",
+            )],
+            forward_test_validation_artifacts: Vec::new(),
+        };
+
+        let written = save_walkforward_validation_artifacts(&dir, &result)
+            .expect("walk-forward validation artifacts should persist");
+        assert_eq!(written, 1);
+
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("walkforward dir should exist")
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let payload = std::fs::read_to_string(entries[0].path()).expect("artifact readable");
+        assert!(payload.contains(crate::validation::WALKFORWARD_VALIDATION_ARTIFACT_KIND));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_canonical_backtest_artifacts_skips_when_empty() {
+        let dir = temp_dir("canonical-backtests-empty");
+        let result = DiscoveryResult {
+            portfolio: Vec::new(),
+            candidates: Vec::new(),
+            quality_metrics: Vec::new(),
+            logged_trades: Vec::new(),
+            effective_feature_names: Vec::new(),
+            validation_gates: DiscoveryValidationGates::pending(),
+            canonical_backtest_artifacts: Vec::new(),
+            walkforward_validation_artifacts: Vec::new(),
+            forward_test_validation_artifacts: Vec::new(),
+        };
+
+        let written = save_canonical_backtest_artifacts(&dir, &result)
+            .expect("empty canonical backtest list should be a no-op");
+        assert_eq!(written, 0);
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn artifact_filename_strips_invalid_characters() {
+        let name = artifact_filename_for_strategy_hash("fnv64:abc123", 0);
+        assert!(!name.contains(':'));
+        assert!(name.ends_with(".json"));
+        assert!(name.contains("abc123"));
+    }
+
+    #[test]
+    fn discovery_runtime_overrides_defaults_match_legacy_env_defaults() {
+        let defaults = DiscoveryRuntimeOverrides::default();
+        assert_eq!(defaults.prefilter_top_k, 50);
+        assert!((defaults.prefilter_insample_frac - 0.70).abs() < 1e-9);
+        assert!((defaults.funnel_stage1_pct - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn discovery_runtime_overrides_clamp_invalid_values() {
+        let overrides = DiscoveryRuntimeOverrides {
+            prefilter_top_k: 0,
+            prefilter_insample_frac: f64::NAN,
+            funnel_stage1_pct: 5.0,
+        };
+        assert!((overrides.resolved_prefilter_insample_frac() - 0.70).abs() < 1e-9);
+        assert!((overrides.resolved_funnel_stage1_pct() - 1.0).abs() < 1e-9);
+
+        let too_small = DiscoveryRuntimeOverrides {
+            prefilter_top_k: 0,
+            prefilter_insample_frac: 0.0,
+            funnel_stage1_pct: 0.0001,
+        };
+        assert!((too_small.resolved_prefilter_insample_frac() - 0.70).abs() < 1e-9);
+        assert!((too_small.resolved_funnel_stage1_pct() - 0.01).abs() < 1e-9);
+    }
+
+    #[test]
+    fn default_discovery_config_does_not_read_environment() {
+        // Sanity guard: the default config should be deterministic regardless
+        // of the legacy env vars set by other test runners.
+        let cfg = DiscoveryConfig::default();
+        assert_eq!(
+            cfg.runtime_overrides,
+            DiscoveryRuntimeOverrides::default(),
+            "default DiscoveryConfig must not pick up legacy env overrides"
+        );
+    }
+
+    #[test]
+    fn discovery_profile_exports_runtime_override_resolution() {
+        let mut config = DiscoveryConfig::default();
+        config.runtime_overrides = DiscoveryRuntimeOverrides {
+            prefilter_top_k: 17,
+            prefilter_insample_frac: 0.6,
+            funnel_stage1_pct: 0.5,
+        };
+        let result = DiscoveryResult {
+            portfolio: vec![profitable_gene("alpha-1")],
+            candidates: Vec::new(),
+            quality_metrics: Vec::new(),
+            logged_trades: Vec::new(),
+            effective_feature_names: Vec::new(),
+            validation_gates: DiscoveryValidationGates::pending(),
+            canonical_backtest_artifacts: Vec::new(),
+            walkforward_validation_artifacts: Vec::new(),
+            forward_test_validation_artifacts: Vec::new(),
+        };
+
+        let profile = build_discovery_profile(&config, &result);
+        assert_eq!(profile.prefilter_top_k, 17);
+        assert!((profile.prefilter_insample_frac - 0.6).abs() < 1e-9);
+        assert!((profile.funnel_stage1_pct - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compute_discovery_forward_test_artifacts_returns_empty_for_empty_portfolio() {
+        let config = DiscoveryConfig::default();
+        let features = sample_feature_frame();
+        let ohlcv = sample_ohlcv();
+        let artifacts = compute_discovery_forward_test_artifacts(
+            &[],
+            &features.names,
+            &features,
+            &ohlcv,
+            &config,
+        )
+        .expect("empty portfolio should produce zero artifacts");
+        assert!(artifacts.is_empty());
+    }
+
+    #[test]
+    fn compute_discovery_forward_test_artifacts_rejects_tails_missing_features() {
+        let config = DiscoveryConfig::default();
+        let portfolio = vec![profitable_gene("alpha-1")];
+        let mut tail_features = sample_feature_frame();
+        tail_features.names = vec!["unrelated_feature".to_string()];
+        let err = compute_discovery_forward_test_artifacts(
+            &portfolio,
+            &["signal".to_string()],
+            &tail_features,
+            &sample_ohlcv(),
+            &config,
+        )
+        .expect_err("tail without the effective feature must be rejected");
+        assert!(err.to_string().contains("missing feature 'signal'"));
+    }
+
+    #[test]
+    fn compute_discovery_forward_test_artifacts_produces_one_artifact_per_strategy() {
+        let mut config = DiscoveryConfig::default();
+        config.runtime_overrides.prefilter_top_k = 0;
+        let portfolio = vec![profitable_gene("alpha-1"), profitable_gene("alpha-2")];
+        let features = sample_feature_frame();
+        let ohlcv = sample_ohlcv();
+        let artifacts = compute_discovery_forward_test_artifacts(
+            &portfolio,
+            &features.names,
+            &features,
+            &ohlcv,
+            &config,
+        )
+        .expect("forward-test artifacts should build for in-band tail");
+        assert_eq!(artifacts.len(), portfolio.len());
+        for artifact in &artifacts {
+            assert_eq!(
+                artifact.artifact_kind,
+                crate::validation::FORWARD_TEST_VALIDATION_ARTIFACT_KIND
+            );
+            assert!(artifact.summary.bars > 0);
+            assert!(!artifact.scope.strategy_hash.is_empty());
+        }
+    }
+
+    #[test]
+    fn save_forward_test_validation_artifacts_writes_one_file_per_strategy() {
+        let dir = temp_dir("forward-test-validations");
+        let config = DiscoveryConfig::default();
+        let portfolio = vec![profitable_gene("alpha-1")];
+        let features = sample_feature_frame();
+        let ohlcv = sample_ohlcv();
+        let artifacts = compute_discovery_forward_test_artifacts(
+            &portfolio,
+            &features.names,
+            &features,
+            &ohlcv,
+            &config,
+        )
+        .expect("forward-test artifacts should build");
+
+        let result = DiscoveryResult {
+            portfolio,
+            candidates: Vec::new(),
+            quality_metrics: Vec::new(),
+            logged_trades: Vec::new(),
+            effective_feature_names: features.names.clone(),
+            validation_gates: DiscoveryValidationGates::pending(),
+            canonical_backtest_artifacts: Vec::new(),
+            walkforward_validation_artifacts: Vec::new(),
+            forward_test_validation_artifacts: artifacts,
+        };
+
+        let written = save_forward_test_validation_artifacts(&dir, &result)
+            .expect("forward-test artifacts should persist");
+        assert_eq!(written, 1);
+
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("forward-test dir should exist")
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let payload = std::fs::read_to_string(entries[0].path()).expect("artifact readable");
+        assert!(payload.contains(crate::validation::FORWARD_TEST_VALIDATION_ARTIFACT_KIND));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discovery_profile_exports_forward_test_artifact_count() {
+        let config = DiscoveryConfig::default();
+        let temporal = discovery_temporal_contract(&config, &["signal".to_string()])
+            .expect("temporal contract for default discovery config");
+        let scope = ForwardTestValidationScope::new("dataset", "eval", "strategy", &temporal);
+        let summary = crate::validation::ForwardTestSummary {
+            bars: 5,
+            metrics: BacktestMetrics::from_metric_array([0.0; 11]),
+            span_days: 0.0,
+        };
+        let mut result = DiscoveryResult {
+            portfolio: vec![profitable_gene("alpha-1")],
+            candidates: Vec::new(),
+            quality_metrics: Vec::new(),
+            logged_trades: Vec::new(),
+            effective_feature_names: vec!["signal".to_string()],
+            validation_gates: DiscoveryValidationGates::pending(),
+            canonical_backtest_artifacts: Vec::new(),
+            walkforward_validation_artifacts: Vec::new(),
+            forward_test_validation_artifacts: vec![ForwardTestValidationArtifactFile::new(
+                scope, summary,
+            )],
+        };
+        result.validation_gates.walkforward_passed = true;
+        result.validation_gates.cpcv_passed = true;
+
+        let profile = build_discovery_profile(&config, &result);
+        assert_eq!(profile.forward_test_validation_artifacts_observed, 1);
     }
 }

@@ -5,6 +5,81 @@ use serde::{Deserialize, Serialize};
 use statrs::distribution::{ContinuousCDF, StudentsT};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::OnceLock;
+
+/// Typed replacement for the legacy `FOREX_BOT_PROP_MIN_TRADES_PER_MONTH`
+/// and `FOREX_BOT_TRADING_DAYS_PER_MONTH` env vars. Previously read inline
+/// inside monthly metric aggregation, both knobs change canonical strategy
+/// quality scoring, so they belong in typed runtime config.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QualityRuntimeOverrides {
+    /// Minimum number of trades a calendar month must contain to count
+    /// toward `monthly_win_rate` / `avg_return_pct`.
+    pub min_trades_per_month: usize,
+    /// Number of trading days per month used to convert observed trading
+    /// days into a months-traded estimate.
+    pub trading_days_per_month: f64,
+}
+
+impl Default for QualityRuntimeOverrides {
+    fn default() -> Self {
+        Self {
+            min_trades_per_month: 4,
+            trading_days_per_month: 21.0,
+        }
+    }
+}
+
+impl QualityRuntimeOverrides {
+    /// One-shot read of the legacy `FOREX_BOT_PROP_*` quality env vars.
+    pub fn from_env() -> Self {
+        let mut overrides = Self::default();
+        if let Some(value) = std::env::var("FOREX_BOT_PROP_MIN_TRADES_PER_MONTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            overrides.min_trades_per_month = value;
+        }
+        if let Some(value) = std::env::var("FOREX_BOT_TRADING_DAYS_PER_MONTH")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 1.0)
+        {
+            overrides.trading_days_per_month = value;
+        }
+        overrides
+    }
+
+    fn resolved_trading_days_per_month(&self) -> f64 {
+        if self.trading_days_per_month.is_finite() && self.trading_days_per_month >= 1.0 {
+            self.trading_days_per_month
+        } else {
+            21.0
+        }
+    }
+}
+
+static QUALITY_RUNTIME_OVERRIDES: OnceLock<QualityRuntimeOverrides> = OnceLock::new();
+
+/// Install process-wide quality runtime overrides. Returns `Err(existing)`
+/// if overrides were already installed earlier (first install wins).
+pub fn install_quality_runtime_overrides(
+    overrides: QualityRuntimeOverrides,
+) -> Result<(), QualityRuntimeOverrides> {
+    QUALITY_RUNTIME_OVERRIDES.set(overrides)
+}
+
+/// Convenience wrapper that resolves the legacy `FOREX_BOT_PROP_*` quality
+/// env vars once and installs them. Idempotent.
+pub fn install_quality_runtime_overrides_from_env() {
+    let _ = QUALITY_RUNTIME_OVERRIDES.set(QualityRuntimeOverrides::from_env());
+}
+
+/// Returns the currently installed quality runtime overrides, or the
+/// deterministic defaults when no install has happened.
+pub fn current_quality_runtime_overrides() -> QualityRuntimeOverrides {
+    QUALITY_RUNTIME_OVERRIDES.get().copied().unwrap_or_default()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trade {
@@ -322,12 +397,9 @@ fn analyze_monthly_consistency(trades: &[Trade], initial_balance: f64) -> Monthl
 
     // Bucket per-month PnL AND per-month trade count so we can drop months
     // with too few trades (a month with 1 lucky trade should not get the same
-    // weight in monthly_win_rate as a month with 50 trades). Override threshold
-    // via FOREX_BOT_PROP_MIN_TRADES_PER_MONTH (default 4).
-    let min_trades_per_month: usize = std::env::var("FOREX_BOT_PROP_MIN_TRADES_PER_MONTH")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(4);
+    // weight in monthly_win_rate as a month with 50 trades). Threshold is
+    // resolved from `QualityRuntimeOverrides::min_trades_per_month`.
+    let min_trades_per_month = current_quality_runtime_overrides().min_trades_per_month;
     let mut monthly: HashMap<i64, (f64, usize)> = HashMap::new();
     for trade in trades {
         if trade.entry_time <= 0 {
@@ -408,11 +480,7 @@ fn calculate_trade_frequency(trades: &[Trade]) -> f64 {
     }
 
     let trading_days = days.len() as f64;
-    let days_per_month = std::env::var("FOREX_BOT_TRADING_DAYS_PER_MONTH")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(21.0)
-        .max(1.0);
+    let days_per_month = current_quality_runtime_overrides().resolved_trading_days_per_month();
     let months = (trading_days / days_per_month).max(1e-6);
     trades.len() as f64 / months
 }
@@ -691,5 +759,45 @@ impl StrategyRanker {
             }));
         }
         write_json_atomic(path, &rankings).map_err(|err| std::io::Error::other(err.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod overrides_tests {
+    use super::*;
+
+    #[test]
+    fn quality_runtime_overrides_defaults_match_legacy_env_defaults() {
+        let defaults = QualityRuntimeOverrides::default();
+        assert_eq!(defaults.min_trades_per_month, 4);
+        assert!((defaults.trading_days_per_month - 21.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn quality_runtime_overrides_clamp_invalid_trading_days() {
+        let bad = QualityRuntimeOverrides {
+            min_trades_per_month: 0,
+            trading_days_per_month: 0.0,
+        };
+        assert!((bad.resolved_trading_days_per_month() - 21.0).abs() < 1e-9);
+
+        let nan = QualityRuntimeOverrides {
+            min_trades_per_month: 0,
+            trading_days_per_month: f64::NAN,
+        };
+        assert!((nan.resolved_trading_days_per_month() - 21.0).abs() < 1e-9);
+
+        let valid = QualityRuntimeOverrides {
+            min_trades_per_month: 8,
+            trading_days_per_month: 23.0,
+        };
+        assert!((valid.resolved_trading_days_per_month() - 23.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn current_quality_runtime_overrides_returns_legal_values() {
+        let observed = current_quality_runtime_overrides();
+        assert!(observed.min_trades_per_month >= 1);
+        assert!(observed.trading_days_per_month.is_finite());
     }
 }

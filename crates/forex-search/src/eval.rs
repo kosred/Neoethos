@@ -9,7 +9,7 @@ use ndarray::ArrayView2;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 
 pub type SmcRow = [i8; 11];
 
@@ -183,21 +183,87 @@ impl Default for BacktestSettings {
     }
 }
 
+/// Typed replacement for the legacy `FOREX_BOT_BACKTEST_*` env vars that
+/// previously changed canonical backtest math (`initial_equity`,
+/// `month_capacity`) on every metric evaluation. The struct is the single
+/// place these values live; production callers install them once via
+/// [`install_backtest_runtime_overrides`] (or
+/// [`install_backtest_runtime_overrides_from_env`] for backward compat).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BacktestRuntimeOverrides {
+    /// Starting equity used for canonical backtest PnL accounting. Must be
+    /// strictly positive.
+    pub initial_equity: f64,
+    /// Maximum number of monthly PnL buckets retained for consistency math.
+    /// Must be non-zero.
+    pub month_capacity: usize,
+}
+
+impl Default for BacktestRuntimeOverrides {
+    fn default() -> Self {
+        Self {
+            initial_equity: 100_000.0,
+            month_capacity: 240,
+        }
+    }
+}
+
+impl BacktestRuntimeOverrides {
+    /// One-shot read of the legacy `FOREX_BOT_BACKTEST_*` env vars. This is
+    /// the only place the backtest evaluator consults the environment for
+    /// these knobs.
+    pub fn from_env() -> Self {
+        let mut overrides = Self::default();
+        if let Some(value) = env::var("FOREX_BOT_BACKTEST_INITIAL_EQUITY")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+        {
+            overrides.initial_equity = value;
+        }
+        if let Some(value) = env::var("FOREX_BOT_BACKTEST_MAX_MONTH_BUCKETS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+        {
+            overrides.month_capacity = value;
+        }
+        overrides
+    }
+}
+
+static BACKTEST_RUNTIME_OVERRIDES: OnceLock<BacktestRuntimeOverrides> = OnceLock::new();
+
+/// Install process-wide backtest runtime overrides. Returns `Err(existing)`
+/// if overrides were already installed earlier (the first install wins).
+pub fn install_backtest_runtime_overrides(
+    overrides: BacktestRuntimeOverrides,
+) -> Result<(), BacktestRuntimeOverrides> {
+    BACKTEST_RUNTIME_OVERRIDES.set(overrides)
+}
+
+/// Convenience wrapper that resolves the legacy `FOREX_BOT_BACKTEST_*` env
+/// vars once and installs them. Idempotent: subsequent calls are ignored.
+pub fn install_backtest_runtime_overrides_from_env() {
+    let _ = BACKTEST_RUNTIME_OVERRIDES.set(BacktestRuntimeOverrides::from_env());
+}
+
+/// Returns the currently installed backtest runtime overrides, or the
+/// deterministic defaults when no install has happened.
+pub fn current_backtest_runtime_overrides() -> BacktestRuntimeOverrides {
+    BACKTEST_RUNTIME_OVERRIDES
+        .get()
+        .copied()
+        .unwrap_or_default()
+}
+
 impl BacktestSettings {
     pub fn initial_equity(&self) -> f64 {
-        env::var("FOREX_BOT_BACKTEST_INITIAL_EQUITY")
-            .ok()
-            .and_then(|value| value.parse::<f64>().ok())
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .unwrap_or(100000.0)
+        current_backtest_runtime_overrides().initial_equity
     }
 
     pub fn month_capacity(&self) -> usize {
-        env::var("FOREX_BOT_BACKTEST_MAX_MONTH_BUCKETS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(240)
+        current_backtest_runtime_overrides().month_capacity
     }
 }
 
@@ -972,4 +1038,40 @@ pub fn evaluate_population_core(
         .collect();
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod overrides_tests {
+    use super::*;
+
+    #[test]
+    fn backtest_runtime_overrides_defaults_match_legacy_env_defaults() {
+        let defaults = BacktestRuntimeOverrides::default();
+        assert!((defaults.initial_equity - 100_000.0).abs() < 1e-9);
+        assert_eq!(defaults.month_capacity, 240);
+    }
+
+    #[test]
+    fn backtest_settings_methods_use_typed_overrides() {
+        // Without a process-wide install the BacktestSettings accessors must
+        // return the audited defaults rather than reading the environment
+        // directly each call.
+        let settings = BacktestSettings::default();
+        assert!((settings.initial_equity() - 100_000.0).abs() < 1e-9);
+        assert_eq!(settings.month_capacity(), 240);
+    }
+
+    #[test]
+    fn current_backtest_runtime_overrides_falls_back_to_defaults() {
+        // Without a process-wide install, the current-overrides accessor
+        // must surface the audited defaults rather than panicking or
+        // reading the environment.
+        let observed = current_backtest_runtime_overrides();
+        // We cannot assume the OnceLock is unset (other tests in the same
+        // process may have installed it), but the returned value must at
+        // least be one of the legal configurations: either the documented
+        // defaults or whatever was installed earlier.
+        assert!(observed.initial_equity.is_finite() && observed.initial_equity > 0.0);
+        assert!(observed.month_capacity > 0);
+    }
 }

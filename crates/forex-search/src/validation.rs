@@ -48,6 +48,12 @@ pub const WALKFORWARD_VALIDATION_ARTIFACT_KIND: &str = "walkforward_validation_a
 pub const WALKFORWARD_VALIDATION_SCHEMA_VERSION: u32 = 1;
 pub const CANONICAL_BACKTEST_ARTIFACT_KIND: &str = "canonical_strategy_backtest_artifact";
 pub const CANONICAL_BACKTEST_SCHEMA_VERSION: u32 = 1;
+pub const FORWARD_TEST_VALIDATION_ARTIFACT_KIND: &str = "forward_test_validation_artifact";
+pub const FORWARD_TEST_VALIDATION_SCHEMA_VERSION: u32 = 1;
+pub const LIVE_EXECUTION_SIMULATION_ARTIFACT_KIND: &str = "live_execution_simulation_artifact";
+pub const LIVE_EXECUTION_SIMULATION_SCHEMA_VERSION: u32 = 1;
+pub const PROP_FIRM_RISK_VALIDATION_ARTIFACT_KIND: &str = "prop_firm_risk_validation_artifact";
+pub const PROP_FIRM_RISK_VALIDATION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CanonicalBacktestScope {
@@ -261,6 +267,565 @@ pub fn read_walkforward_validation_artifact(
     let artifact: WalkforwardValidationArtifactFile = read_json(path, "walk-forward validation")?;
     artifact.validate_for_temporal_contract(temporal_contract)?;
     Ok(artifact)
+}
+
+/// Forward-test validation summary: a single backtest pass over a tail
+/// window that was withheld from both training and walk-forward CV. The
+/// summary is intentionally flat (no `splits`) because forward testing
+/// produces one unbiased OOS estimate, not a folded distribution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForwardTestSummary {
+    /// Number of bars in the held-out tail window.
+    pub bars: usize,
+    /// Canonical metrics computed on the held-out tail.
+    pub metrics: BacktestMetrics,
+    /// Wall-clock span of the tail window in days (`exit_time - entry_time`
+    /// of the first/last bar). `0.0` when the tail has fewer than two bars.
+    pub span_days: f64,
+}
+
+/// Forward-test validation scope. The dataset hash binds the *tail*
+/// dataset (not the full discovery dataset) so the artifact cannot be
+/// confused with a canonical backtest produced from in-sample data.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForwardTestValidationScope {
+    pub dataset_hash: String,
+    pub evaluation_config_hash: String,
+    pub strategy_hash: String,
+    pub temporal_scope: TemporalScopeHashes,
+}
+
+impl ForwardTestValidationScope {
+    pub fn new(
+        dataset_hash: impl Into<String>,
+        evaluation_config_hash: impl Into<String>,
+        strategy_hash: impl Into<String>,
+        temporal_contract: &TemporalFeatureContract,
+    ) -> Self {
+        Self {
+            dataset_hash: dataset_hash.into(),
+            evaluation_config_hash: evaluation_config_hash.into(),
+            strategy_hash: strategy_hash.into(),
+            temporal_scope: TemporalScopeHashes::from_contract(temporal_contract),
+        }
+    }
+
+    pub fn from_parts<T: Serialize, U: Serialize, V: Serialize>(
+        dataset: &T,
+        evaluation_config: &U,
+        strategy: &V,
+        temporal_contract: &TemporalFeatureContract,
+    ) -> Result<Self> {
+        Ok(Self::new(
+            stable_json_hash(dataset)?,
+            stable_json_hash(evaluation_config)?,
+            stable_json_hash(strategy)?,
+            temporal_contract,
+        ))
+    }
+
+    pub fn validate_temporal_contract(
+        &self,
+        temporal_contract: &TemporalFeatureContract,
+    ) -> Result<()> {
+        self.temporal_scope
+            .validate_contract(temporal_contract)
+            .map_err(|err| anyhow::anyhow!("forward test {err}"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForwardTestValidationArtifactFile {
+    pub artifact_kind: String,
+    pub artifact_schema_version: u32,
+    pub scope: ForwardTestValidationScope,
+    pub summary: ForwardTestSummary,
+}
+
+impl ForwardTestValidationArtifactFile {
+    pub fn new(scope: ForwardTestValidationScope, summary: ForwardTestSummary) -> Self {
+        Self {
+            artifact_kind: FORWARD_TEST_VALIDATION_ARTIFACT_KIND.to_string(),
+            artifact_schema_version: FORWARD_TEST_VALIDATION_SCHEMA_VERSION,
+            scope,
+            summary,
+        }
+    }
+
+    pub fn validate_for_temporal_contract(
+        &self,
+        temporal_contract: &TemporalFeatureContract,
+    ) -> Result<()> {
+        if self.artifact_kind != FORWARD_TEST_VALIDATION_ARTIFACT_KIND {
+            bail!(
+                "artifact kind {} cannot be used as a forward-test validation artifact",
+                self.artifact_kind
+            );
+        }
+        if self.artifact_schema_version != FORWARD_TEST_VALIDATION_SCHEMA_VERSION {
+            bail!(
+                "unsupported forward-test validation schema version {}",
+                self.artifact_schema_version
+            );
+        }
+        self.scope.validate_temporal_contract(temporal_contract)
+    }
+}
+
+pub fn write_forward_test_validation_artifact_atomic(
+    path: impl AsRef<Path>,
+    artifact: &ForwardTestValidationArtifactFile,
+) -> Result<()> {
+    write_json_atomic(path, artifact)
+}
+
+pub fn read_forward_test_validation_artifact(
+    path: impl AsRef<Path>,
+    temporal_contract: &TemporalFeatureContract,
+) -> Result<ForwardTestValidationArtifactFile> {
+    let artifact: ForwardTestValidationArtifactFile = read_json(path, "forward-test validation")?;
+    artifact.validate_for_temporal_contract(temporal_contract)?;
+    Ok(artifact)
+}
+
+/// Inputs for [`compute_forward_test_summary`] — a single tail-window
+/// replay using the same evaluation core as canonical backtests.
+pub struct ForwardTestInput<'a> {
+    pub close: &'a [f64],
+    pub high: &'a [f64],
+    pub low: &'a [f64],
+    pub signals: &'a [i8],
+    pub months: &'a [i64],
+    pub days: &'a [i64],
+    pub timestamps: &'a [i64],
+    pub settings: &'a BacktestSettings,
+}
+
+/// Run a single canonical backtest pass over the held-out tail and
+/// package the result as a [`ForwardTestSummary`]. Callers are responsible
+/// for slicing `close`/`high`/`low`/`signals`/`months`/`days`/`timestamps`
+/// to the tail window before calling this helper — the function does no
+/// internal partitioning.
+pub fn compute_forward_test_summary(input: ForwardTestInput<'_>) -> Result<ForwardTestSummary> {
+    let bars = input.close.len();
+    if bars == 0 {
+        bail!("forward-test tail must contain at least one bar");
+    }
+    if input.high.len() != bars
+        || input.low.len() != bars
+        || input.signals.len() != bars
+        || input.months.len() != bars
+        || input.days.len() != bars
+    {
+        bail!("forward-test tail length mismatch across input arrays");
+    }
+    let timestamps_len = input.timestamps.len();
+    if timestamps_len != 0 && timestamps_len != bars {
+        bail!("forward-test timestamps must be empty or match the tail length");
+    }
+    let metrics = BacktestMetrics::from_metric_array(fast_evaluate_strategy_core(
+        input.close,
+        input.high,
+        input.low,
+        input.signals,
+        input.months,
+        input.days,
+        input.timestamps,
+        input.settings,
+    ));
+    let span_days = if timestamps_len >= 2 {
+        let first = input.timestamps[0];
+        let last = input.timestamps[timestamps_len - 1];
+        let delta = (last - first) as f64;
+        if delta > 0.0 {
+            // `simulate_trades_core` accepts ms timestamps; convert to
+            // days so the artifact is self-describing without leaking the
+            // unit assumption.
+            delta / 86_400_000.0
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+    Ok(ForwardTestSummary {
+        bars,
+        metrics,
+        span_days,
+    })
+}
+
+/// Runtime model used by a live-execution simulation. The artifact
+/// records which slippage / latency / spread / commission assumptions
+/// produced the metrics so a downstream live bridge can reject artifacts
+/// whose execution semantics do not match its current configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LiveExecutionRuntimeModel {
+    pub avg_slippage_pips: f64,
+    pub avg_latency_ms: f64,
+    pub spread_pips: f64,
+    pub commission_per_trade: f64,
+    pub partial_fill_rate: f64,
+    pub kill_zone_blocking: bool,
+    pub backend_kind: String,
+}
+
+/// Live-execution simulation summary — canonical metrics under live-like
+/// execution assumptions, plus the simulator-observed counters that
+/// distinguish a live-sim from a canonical backtest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveExecutionSimulationSummary {
+    pub bars_simulated: usize,
+    pub trades_simulated: usize,
+    pub trades_blocked_by_kill_zone: usize,
+    pub trades_partially_filled: usize,
+    pub metrics: BacktestMetrics,
+    pub runtime_model: LiveExecutionRuntimeModel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveExecutionSimulationScope {
+    pub dataset_hash: String,
+    pub evaluation_config_hash: String,
+    pub strategy_hash: String,
+    pub runtime_model_hash: String,
+    pub temporal_scope: TemporalScopeHashes,
+}
+
+impl LiveExecutionSimulationScope {
+    pub fn new(
+        dataset_hash: impl Into<String>,
+        evaluation_config_hash: impl Into<String>,
+        strategy_hash: impl Into<String>,
+        runtime_model: &LiveExecutionRuntimeModel,
+        temporal_contract: &TemporalFeatureContract,
+    ) -> Result<Self> {
+        Ok(Self {
+            dataset_hash: dataset_hash.into(),
+            evaluation_config_hash: evaluation_config_hash.into(),
+            strategy_hash: strategy_hash.into(),
+            runtime_model_hash: stable_json_hash(runtime_model)?,
+            temporal_scope: TemporalScopeHashes::from_contract(temporal_contract),
+        })
+    }
+
+    pub fn validate_temporal_contract(
+        &self,
+        temporal_contract: &TemporalFeatureContract,
+    ) -> Result<()> {
+        self.temporal_scope
+            .validate_contract(temporal_contract)
+            .map_err(|err| anyhow::anyhow!("live execution simulation {err}"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveExecutionSimulationArtifactFile {
+    pub artifact_kind: String,
+    pub artifact_schema_version: u32,
+    pub scope: LiveExecutionSimulationScope,
+    pub summary: LiveExecutionSimulationSummary,
+}
+
+impl LiveExecutionSimulationArtifactFile {
+    pub fn new(
+        scope: LiveExecutionSimulationScope,
+        summary: LiveExecutionSimulationSummary,
+    ) -> Self {
+        Self {
+            artifact_kind: LIVE_EXECUTION_SIMULATION_ARTIFACT_KIND.to_string(),
+            artifact_schema_version: LIVE_EXECUTION_SIMULATION_SCHEMA_VERSION,
+            scope,
+            summary,
+        }
+    }
+
+    pub fn validate_for_temporal_contract(
+        &self,
+        temporal_contract: &TemporalFeatureContract,
+    ) -> Result<()> {
+        if self.artifact_kind != LIVE_EXECUTION_SIMULATION_ARTIFACT_KIND {
+            bail!(
+                "artifact kind {} cannot be used as a live execution simulation artifact",
+                self.artifact_kind
+            );
+        }
+        if self.artifact_schema_version != LIVE_EXECUTION_SIMULATION_SCHEMA_VERSION {
+            bail!(
+                "unsupported live execution simulation schema version {}",
+                self.artifact_schema_version
+            );
+        }
+        self.scope.validate_temporal_contract(temporal_contract)
+    }
+}
+
+pub fn write_live_execution_simulation_artifact_atomic(
+    path: impl AsRef<Path>,
+    artifact: &LiveExecutionSimulationArtifactFile,
+) -> Result<()> {
+    write_json_atomic(path, artifact)
+}
+
+pub fn read_live_execution_simulation_artifact(
+    path: impl AsRef<Path>,
+    temporal_contract: &TemporalFeatureContract,
+) -> Result<LiveExecutionSimulationArtifactFile> {
+    let artifact: LiveExecutionSimulationArtifactFile =
+        read_json(path, "live execution simulation")?;
+    artifact.validate_for_temporal_contract(temporal_contract)?;
+    Ok(artifact)
+}
+
+/// Prop-firm rule set applied to observed trade outcomes. Each numeric
+/// field is a pass threshold (`<= 0.0` means "rule disabled" so callers
+/// can opt out per-field); booleans toggle structural rules.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct PropFirmRiskRules {
+    pub max_daily_loss_pct: f64,
+    pub max_overall_drawdown_pct: f64,
+    pub max_profit_consistency_ratio: f64,
+    pub min_trading_days: usize,
+    pub max_trades_per_day: usize,
+    pub require_profit_target: bool,
+    pub min_profit_target_pct: f64,
+}
+
+impl Default for PropFirmRiskRules {
+    fn default() -> Self {
+        // FTMO-style baseline; callers should override per challenge.
+        Self {
+            max_daily_loss_pct: 0.05,
+            max_overall_drawdown_pct: 0.10,
+            max_profit_consistency_ratio: 0.50,
+            min_trading_days: 5,
+            max_trades_per_day: 0,
+            require_profit_target: false,
+            min_profit_target_pct: 0.10,
+        }
+    }
+}
+
+/// Prop-firm validation summary — explicit per-rule pass/fail flags plus
+/// the worst observed values, so a downstream challenge gate can reject
+/// the artifact without re-running the simulation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PropFirmRiskValidationSummary {
+    pub rules: PropFirmRiskRules,
+    pub trades_observed: usize,
+    pub trading_days_observed: usize,
+    pub max_daily_loss_pct_observed: f64,
+    pub max_overall_drawdown_pct_observed: f64,
+    pub largest_profit_share_observed: f64,
+    pub max_trades_per_day_observed: usize,
+    pub net_return_pct: f64,
+    pub daily_loss_breach: bool,
+    pub overall_drawdown_breach: bool,
+    pub consistency_violation: bool,
+    pub trade_limit_violation: bool,
+    pub min_trading_days_ok: bool,
+    pub profit_target_met: bool,
+    pub all_rules_passed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PropFirmRiskValidationScope {
+    pub dataset_hash: String,
+    pub evaluation_config_hash: String,
+    pub strategy_hash: String,
+    pub rules_hash: String,
+    pub temporal_scope: TemporalScopeHashes,
+}
+
+impl PropFirmRiskValidationScope {
+    pub fn new(
+        dataset_hash: impl Into<String>,
+        evaluation_config_hash: impl Into<String>,
+        strategy_hash: impl Into<String>,
+        rules: &PropFirmRiskRules,
+        temporal_contract: &TemporalFeatureContract,
+    ) -> Result<Self> {
+        Ok(Self {
+            dataset_hash: dataset_hash.into(),
+            evaluation_config_hash: evaluation_config_hash.into(),
+            strategy_hash: strategy_hash.into(),
+            rules_hash: stable_json_hash(rules)?,
+            temporal_scope: TemporalScopeHashes::from_contract(temporal_contract),
+        })
+    }
+
+    pub fn validate_temporal_contract(
+        &self,
+        temporal_contract: &TemporalFeatureContract,
+    ) -> Result<()> {
+        self.temporal_scope
+            .validate_contract(temporal_contract)
+            .map_err(|err| anyhow::anyhow!("prop firm risk validation {err}"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PropFirmRiskValidationArtifactFile {
+    pub artifact_kind: String,
+    pub artifact_schema_version: u32,
+    pub scope: PropFirmRiskValidationScope,
+    pub summary: PropFirmRiskValidationSummary,
+}
+
+impl PropFirmRiskValidationArtifactFile {
+    pub fn new(scope: PropFirmRiskValidationScope, summary: PropFirmRiskValidationSummary) -> Self {
+        Self {
+            artifact_kind: PROP_FIRM_RISK_VALIDATION_ARTIFACT_KIND.to_string(),
+            artifact_schema_version: PROP_FIRM_RISK_VALIDATION_SCHEMA_VERSION,
+            scope,
+            summary,
+        }
+    }
+
+    pub fn validate_for_temporal_contract(
+        &self,
+        temporal_contract: &TemporalFeatureContract,
+    ) -> Result<()> {
+        if self.artifact_kind != PROP_FIRM_RISK_VALIDATION_ARTIFACT_KIND {
+            bail!(
+                "artifact kind {} cannot be used as a prop-firm risk validation artifact",
+                self.artifact_kind
+            );
+        }
+        if self.artifact_schema_version != PROP_FIRM_RISK_VALIDATION_SCHEMA_VERSION {
+            bail!(
+                "unsupported prop-firm risk validation schema version {}",
+                self.artifact_schema_version
+            );
+        }
+        self.scope.validate_temporal_contract(temporal_contract)
+    }
+}
+
+pub fn write_prop_firm_risk_validation_artifact_atomic(
+    path: impl AsRef<Path>,
+    artifact: &PropFirmRiskValidationArtifactFile,
+) -> Result<()> {
+    write_json_atomic(path, artifact)
+}
+
+pub fn read_prop_firm_risk_validation_artifact(
+    path: impl AsRef<Path>,
+    temporal_contract: &TemporalFeatureContract,
+) -> Result<PropFirmRiskValidationArtifactFile> {
+    let artifact: PropFirmRiskValidationArtifactFile =
+        read_json(path, "prop-firm risk validation")?;
+    artifact.validate_for_temporal_contract(temporal_contract)?;
+    Ok(artifact)
+}
+
+/// Inputs for [`compute_prop_firm_risk_summary`]. Callers pass observed
+/// trades plus the rule set; the helper aggregates daily PnL, applies
+/// the rules, and returns a summary with explicit pass/fail flags.
+pub struct PropFirmRiskInput<'a> {
+    pub trades: &'a [crate::quality::Trade],
+    pub initial_balance: f64,
+    pub rules: PropFirmRiskRules,
+}
+
+/// Aggregate observed trades against [`PropFirmRiskRules`] and produce a
+/// validation summary. The function is deterministic and contains no
+/// simulation — callers feed trades from a canonical backtest,
+/// walk-forward, forward-test, or live-execution simulation.
+pub fn compute_prop_firm_risk_summary(
+    input: PropFirmRiskInput<'_>,
+) -> PropFirmRiskValidationSummary {
+    let initial_balance = if input.initial_balance.is_finite() && input.initial_balance > 0.0 {
+        input.initial_balance
+    } else {
+        100_000.0
+    };
+
+    let mut day_pnl: BTreeMap<i64, f64> = BTreeMap::new();
+    let mut day_trade_count: BTreeMap<i64, usize> = BTreeMap::new();
+    let mut total_pnl = 0.0_f64;
+    for trade in input.trades {
+        total_pnl += trade.pnl;
+        let day_key = trade.exit_time.unwrap_or(trade.entry_time) / 86_400_000;
+        *day_pnl.entry(day_key).or_insert(0.0) += trade.pnl;
+        *day_trade_count.entry(day_key).or_insert(0) += 1;
+    }
+
+    let trading_days_observed = day_trade_count.values().filter(|&&n| n > 0).count();
+    let max_trades_per_day_observed = day_trade_count.values().copied().max().unwrap_or(0);
+
+    let max_daily_loss_pct_observed = day_pnl
+        .values()
+        .copied()
+        .filter(|pnl| *pnl < 0.0)
+        .map(|pnl| pnl.abs() / initial_balance)
+        .fold(0.0, f64::max);
+
+    let mut equity = initial_balance;
+    let mut peak = initial_balance;
+    let mut max_overall_drawdown_pct_observed = 0.0_f64;
+    for (_day, pnl) in &day_pnl {
+        equity += pnl;
+        peak = peak.max(equity);
+        if peak > 0.0 {
+            let dd = (peak - equity) / peak;
+            if dd > max_overall_drawdown_pct_observed {
+                max_overall_drawdown_pct_observed = dd;
+            }
+        }
+    }
+
+    let total_positive: f64 = day_pnl.values().copied().filter(|pnl| *pnl > 0.0).sum();
+    let largest_positive: f64 = day_pnl.values().copied().fold(0.0, f64::max);
+    let largest_profit_share_observed = if total_positive > f64::EPSILON {
+        largest_positive / total_positive
+    } else {
+        0.0
+    };
+
+    let net_return_pct = if initial_balance > 0.0 {
+        total_pnl / initial_balance
+    } else {
+        0.0
+    };
+
+    let rules = input.rules;
+    let daily_loss_breach =
+        rules.max_daily_loss_pct > 0.0 && max_daily_loss_pct_observed >= rules.max_daily_loss_pct;
+    let overall_drawdown_breach = rules.max_overall_drawdown_pct > 0.0
+        && max_overall_drawdown_pct_observed >= rules.max_overall_drawdown_pct;
+    let consistency_violation = rules.max_profit_consistency_ratio > 0.0
+        && largest_profit_share_observed > rules.max_profit_consistency_ratio;
+    let trade_limit_violation =
+        rules.max_trades_per_day > 0 && max_trades_per_day_observed > rules.max_trades_per_day;
+    let min_trading_days_ok =
+        rules.min_trading_days == 0 || trading_days_observed >= rules.min_trading_days;
+    let profit_target_met = !rules.require_profit_target
+        || (rules.min_profit_target_pct > 0.0 && net_return_pct >= rules.min_profit_target_pct);
+    let all_rules_passed = !daily_loss_breach
+        && !overall_drawdown_breach
+        && !consistency_violation
+        && !trade_limit_violation
+        && min_trading_days_ok
+        && profit_target_met;
+
+    PropFirmRiskValidationSummary {
+        rules,
+        trades_observed: input.trades.len(),
+        trading_days_observed,
+        max_daily_loss_pct_observed,
+        max_overall_drawdown_pct_observed,
+        largest_profit_share_observed,
+        max_trades_per_day_observed,
+        net_return_pct,
+        daily_loss_breach,
+        overall_drawdown_breach,
+        consistency_violation,
+        trade_limit_violation,
+        min_trading_days_ok,
+        profit_target_met,
+        all_rules_passed,
+    }
 }
 
 pub struct WalkforwardBacktestInput<'a> {
@@ -888,5 +1453,384 @@ mod tests {
         assert!(err.to_string().contains("temporal_contract_hash"));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    fn sample_forward_test_summary() -> ForwardTestSummary {
+        ForwardTestSummary {
+            bars: 5,
+            metrics: BacktestMetrics::from_metric_array([
+                25.0, 1.6, 100_025.0, 0.015, 0.62, 1.9, 5.0, 0.0, 5.0, 0.85, 0.008,
+            ]),
+            span_days: 0.0,
+        }
+    }
+
+    #[test]
+    fn forward_test_artifact_binds_temporal_scope_and_rejects_drift() {
+        let contract = temporal_contract("label-policy-v1");
+        let scope =
+            ForwardTestValidationScope::new("dataset-tail", "eval-config", "strategy", &contract);
+        let artifact = ForwardTestValidationArtifactFile::new(scope, sample_forward_test_summary());
+
+        artifact
+            .validate_for_temporal_contract(&contract)
+            .expect("matching contract should accept the forward-test artifact");
+
+        let drifted = temporal_contract("label-policy-v2");
+        let err = artifact
+            .validate_for_temporal_contract(&drifted)
+            .expect_err("temporal drift must reject the forward-test artifact");
+        assert!(err.to_string().contains("forward test"));
+    }
+
+    #[test]
+    fn forward_test_artifact_rejects_wrong_kind_and_unsupported_schema() {
+        let contract = temporal_contract("label-policy-v1");
+        let scope =
+            ForwardTestValidationScope::new("dataset-tail", "eval-config", "strategy", &contract);
+        let mut artifact =
+            ForwardTestValidationArtifactFile::new(scope, sample_forward_test_summary());
+        artifact.artifact_kind = "canonical_strategy_backtest_artifact".to_string();
+        let err = artifact
+            .validate_for_temporal_contract(&contract)
+            .expect_err("wrong artifact_kind must reject the forward-test load");
+        assert!(err.to_string().contains("forward-test validation artifact"));
+
+        artifact.artifact_kind = FORWARD_TEST_VALIDATION_ARTIFACT_KIND.to_string();
+        artifact.artifact_schema_version = FORWARD_TEST_VALIDATION_SCHEMA_VERSION + 1;
+        let err = artifact
+            .validate_for_temporal_contract(&contract)
+            .expect_err("unsupported schema must reject the forward-test load");
+        assert!(err.to_string().contains("forward-test validation schema"));
+    }
+
+    #[test]
+    fn forward_test_artifact_round_trips_through_atomic_io() {
+        let contract = temporal_contract("label-policy-v1");
+        let scope =
+            ForwardTestValidationScope::new("dataset-tail", "eval-config", "strategy", &contract);
+        let artifact = ForwardTestValidationArtifactFile::new(scope, sample_forward_test_summary());
+        let path = temp_path("forward-test");
+
+        write_forward_test_validation_artifact_atomic(&path, &artifact)
+            .expect("atomic forward-test artifact write should succeed");
+        let loaded = read_forward_test_validation_artifact(&path, &contract)
+            .expect("matching forward-test artifact should load");
+        assert_eq!(loaded.artifact_kind, FORWARD_TEST_VALIDATION_ARTIFACT_KIND);
+        assert_eq!(loaded.summary.bars, 5);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn compute_forward_test_summary_builds_metrics_and_span() {
+        let close = [1.0, 1.01, 1.02, 1.015, 1.025];
+        let high = close;
+        let low = close;
+        let signals = [1_i8, 0, 1, 0, 0];
+        let months = [1_i64; 5];
+        let days = [1_i64, 1, 1, 2, 2];
+        let timestamps = [
+            1_700_000_000_000_i64,
+            1_700_000_060_000,
+            1_700_000_120_000,
+            1_700_086_400_000,
+            1_700_086_460_000,
+        ];
+        let summary = compute_forward_test_summary(ForwardTestInput {
+            close: &close,
+            high: &high,
+            low: &low,
+            signals: &signals,
+            months: &months,
+            days: &days,
+            timestamps: &timestamps,
+            settings: &flat_settings(),
+        })
+        .expect("forward-test summary should build");
+        assert_eq!(summary.bars, 5);
+        // The window spans roughly one calendar day (last - first ≈ 86 460s).
+        assert!(summary.span_days >= 1.0 && summary.span_days < 2.0);
+    }
+
+    #[test]
+    fn compute_forward_test_summary_rejects_mismatched_inputs() {
+        let close = [1.0, 1.0, 1.0];
+        let bad_high = [1.0, 1.0]; // length mismatch
+        let signals = [0_i8; 3];
+        let months = [1_i64; 3];
+        let days = [1_i64; 3];
+        let err = compute_forward_test_summary(ForwardTestInput {
+            close: &close,
+            high: &bad_high,
+            low: &close,
+            signals: &signals,
+            months: &months,
+            days: &days,
+            timestamps: &[],
+            settings: &flat_settings(),
+        })
+        .expect_err("length mismatch must be rejected");
+        assert!(err.to_string().contains("length mismatch"));
+
+        let err = compute_forward_test_summary(ForwardTestInput {
+            close: &[],
+            high: &[],
+            low: &[],
+            signals: &[],
+            months: &[],
+            days: &[],
+            timestamps: &[],
+            settings: &flat_settings(),
+        })
+        .expect_err("empty tail must be rejected");
+        assert!(err.to_string().contains("at least one bar"));
+    }
+
+    fn sample_live_runtime_model() -> LiveExecutionRuntimeModel {
+        LiveExecutionRuntimeModel {
+            avg_slippage_pips: 0.4,
+            avg_latency_ms: 35.0,
+            spread_pips: 1.5,
+            commission_per_trade: 7.0,
+            partial_fill_rate: 0.05,
+            kill_zone_blocking: true,
+            backend_kind: "ctrader_live".to_string(),
+        }
+    }
+
+    fn sample_live_summary() -> LiveExecutionSimulationSummary {
+        LiveExecutionSimulationSummary {
+            bars_simulated: 1_000,
+            trades_simulated: 42,
+            trades_blocked_by_kill_zone: 3,
+            trades_partially_filled: 1,
+            metrics: BacktestMetrics::from_metric_array([
+                30.0, 1.4, 100_030.0, 0.025, 0.58, 1.7, 0.7, 0.0, 42.0, 0.82, 0.012,
+            ]),
+            runtime_model: sample_live_runtime_model(),
+        }
+    }
+
+    #[test]
+    fn live_execution_simulation_artifact_binds_runtime_model_and_temporal_scope() {
+        let contract = temporal_contract("label-policy-v1");
+        let model = sample_live_runtime_model();
+        let scope = LiveExecutionSimulationScope::new(
+            "dataset",
+            "eval-config",
+            "strategy",
+            &model,
+            &contract,
+        )
+        .expect("live execution scope construction should succeed");
+        let artifact = LiveExecutionSimulationArtifactFile::new(scope, sample_live_summary());
+
+        artifact
+            .validate_for_temporal_contract(&contract)
+            .expect("matching contract should accept the live-sim artifact");
+
+        let drifted = temporal_contract("label-policy-v2");
+        let err = artifact
+            .validate_for_temporal_contract(&drifted)
+            .expect_err("temporal drift must reject the live-sim artifact");
+        assert!(err.to_string().contains("live execution simulation"));
+    }
+
+    #[test]
+    fn live_execution_simulation_artifact_round_trips_through_atomic_io() {
+        let contract = temporal_contract("label-policy-v1");
+        let scope = LiveExecutionSimulationScope::new(
+            "dataset",
+            "eval-config",
+            "strategy",
+            &sample_live_runtime_model(),
+            &contract,
+        )
+        .expect("scope construction should succeed");
+        let artifact = LiveExecutionSimulationArtifactFile::new(scope, sample_live_summary());
+        let path = temp_path("live-execution-simulation");
+
+        write_live_execution_simulation_artifact_atomic(&path, &artifact)
+            .expect("atomic live-sim artifact write should succeed");
+        let loaded = read_live_execution_simulation_artifact(&path, &contract)
+            .expect("matching live-sim artifact should load");
+        assert_eq!(
+            loaded.artifact_kind,
+            LIVE_EXECUTION_SIMULATION_ARTIFACT_KIND
+        );
+        assert_eq!(loaded.summary.trades_simulated, 42);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn live_execution_simulation_artifact_rejects_wrong_kind_and_unsupported_schema() {
+        let contract = temporal_contract("label-policy-v1");
+        let scope = LiveExecutionSimulationScope::new(
+            "dataset",
+            "eval-config",
+            "strategy",
+            &sample_live_runtime_model(),
+            &contract,
+        )
+        .expect("scope construction should succeed");
+        let mut artifact = LiveExecutionSimulationArtifactFile::new(scope, sample_live_summary());
+        artifact.artifact_kind = "canonical_strategy_backtest_artifact".to_string();
+        let err = artifact
+            .validate_for_temporal_contract(&contract)
+            .expect_err("wrong artifact_kind must reject the live-sim load");
+        assert!(
+            err.to_string()
+                .contains("live execution simulation artifact")
+        );
+
+        artifact.artifact_kind = LIVE_EXECUTION_SIMULATION_ARTIFACT_KIND.to_string();
+        artifact.artifact_schema_version = LIVE_EXECUTION_SIMULATION_SCHEMA_VERSION + 1;
+        let err = artifact
+            .validate_for_temporal_contract(&contract)
+            .expect_err("unsupported schema must reject the live-sim load");
+        assert!(err.to_string().contains("live execution simulation schema"));
+    }
+
+    fn sample_prop_firm_trades() -> Vec<crate::quality::Trade> {
+        vec![
+            crate::quality::Trade {
+                entry_time: 1_700_000_000_000,
+                exit_time: Some(1_700_000_300_000),
+                pnl: 800.0,
+                pnl_pct: None,
+                duration_hours: None,
+            },
+            crate::quality::Trade {
+                entry_time: 1_700_086_400_000,
+                exit_time: Some(1_700_086_700_000),
+                pnl: -400.0,
+                pnl_pct: None,
+                duration_hours: None,
+            },
+            crate::quality::Trade {
+                entry_time: 1_700_172_800_000,
+                exit_time: Some(1_700_173_100_000),
+                pnl: 600.0,
+                pnl_pct: None,
+                duration_hours: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn prop_firm_risk_summary_passes_when_thresholds_are_respected() {
+        let trades = sample_prop_firm_trades();
+        // Relax the consistency knob — the 3-trade fixture has only two
+        // winning days, so the larger winner naturally takes more than
+        // the FTMO-default 50% share. The other defaults (loss limit,
+        // overall DD, profit target) all pass for this fixture.
+        let rules = PropFirmRiskRules {
+            min_trading_days: 0,
+            max_profit_consistency_ratio: 0.0,
+            ..PropFirmRiskRules::default()
+        };
+        let summary = compute_prop_firm_risk_summary(PropFirmRiskInput {
+            trades: &trades,
+            initial_balance: 100_000.0,
+            rules,
+        });
+        assert_eq!(summary.trades_observed, 3);
+        assert_eq!(summary.trading_days_observed, 3);
+        assert!(summary.all_rules_passed);
+        assert!(!summary.daily_loss_breach);
+        assert!(!summary.consistency_violation);
+    }
+
+    #[test]
+    fn prop_firm_risk_summary_flags_daily_loss_breach() {
+        let trades = vec![crate::quality::Trade {
+            entry_time: 1_700_000_000_000,
+            exit_time: Some(1_700_000_300_000),
+            pnl: -7_000.0,
+            pnl_pct: None,
+            duration_hours: None,
+        }];
+        let summary = compute_prop_firm_risk_summary(PropFirmRiskInput {
+            trades: &trades,
+            initial_balance: 100_000.0,
+            rules: PropFirmRiskRules::default(),
+        });
+        assert!(summary.daily_loss_breach);
+        assert!(!summary.all_rules_passed);
+        assert!(summary.max_daily_loss_pct_observed >= 0.05);
+    }
+
+    #[test]
+    fn prop_firm_risk_artifact_round_trips_and_rejects_drift() {
+        let contract = temporal_contract("label-policy-v1");
+        let rules = PropFirmRiskRules::default();
+        let scope = PropFirmRiskValidationScope::new(
+            "dataset",
+            "eval-config",
+            "strategy",
+            &rules,
+            &contract,
+        )
+        .expect("prop-firm scope construction should succeed");
+        let summary = compute_prop_firm_risk_summary(PropFirmRiskInput {
+            trades: &sample_prop_firm_trades(),
+            initial_balance: 100_000.0,
+            rules,
+        });
+        let artifact = PropFirmRiskValidationArtifactFile::new(scope, summary);
+        let path = temp_path("prop-firm-risk-validation");
+
+        write_prop_firm_risk_validation_artifact_atomic(&path, &artifact)
+            .expect("atomic prop-firm artifact write should succeed");
+        let loaded = read_prop_firm_risk_validation_artifact(&path, &contract)
+            .expect("matching prop-firm artifact should load");
+        assert_eq!(
+            loaded.artifact_kind,
+            PROP_FIRM_RISK_VALIDATION_ARTIFACT_KIND
+        );
+
+        let drifted = temporal_contract("label-policy-v2");
+        let err = read_prop_firm_risk_validation_artifact(&path, &drifted)
+            .expect_err("temporal drift must reject the prop-firm artifact load");
+        assert!(err.to_string().contains("temporal_contract_hash"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn prop_firm_risk_artifact_rejects_wrong_kind_and_unsupported_schema() {
+        let contract = temporal_contract("label-policy-v1");
+        let rules = PropFirmRiskRules::default();
+        let scope = PropFirmRiskValidationScope::new(
+            "dataset",
+            "eval-config",
+            "strategy",
+            &rules,
+            &contract,
+        )
+        .expect("scope construction should succeed");
+        let summary = compute_prop_firm_risk_summary(PropFirmRiskInput {
+            trades: &sample_prop_firm_trades(),
+            initial_balance: 100_000.0,
+            rules,
+        });
+        let mut artifact = PropFirmRiskValidationArtifactFile::new(scope, summary);
+        artifact.artifact_kind = "live_execution_simulation_artifact".to_string();
+        let err = artifact
+            .validate_for_temporal_contract(&contract)
+            .expect_err("wrong artifact_kind must reject the prop-firm load");
+        assert!(
+            err.to_string()
+                .contains("prop-firm risk validation artifact")
+        );
+
+        artifact.artifact_kind = PROP_FIRM_RISK_VALIDATION_ARTIFACT_KIND.to_string();
+        artifact.artifact_schema_version = PROP_FIRM_RISK_VALIDATION_SCHEMA_VERSION + 1;
+        let err = artifact
+            .validate_for_temporal_contract(&contract)
+            .expect_err("unsupported schema must reject the prop-firm load");
+        assert!(err.to_string().contains("prop-firm risk validation schema"));
     }
 }

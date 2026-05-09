@@ -96,72 +96,14 @@ impl Default for RegimeLabelPolicy {
     }
 }
 
-impl RegimeLabelPolicy {
-    pub fn from_env() -> Self {
-        let default = Self::default();
-        Self {
-            window_days: env_i64("FOREX_BOT_REGIME_LABEL_WINDOW_DAYS", default.window_days).max(1),
-            step_days: env_i64("FOREX_BOT_REGIME_LABEL_STEP_DAYS", default.step_days).max(1),
-            min_bars_per_window: env_usize(
-                "FOREX_BOT_REGIME_LABEL_MIN_BARS",
-                default.min_bars_per_window,
-            )
-            .max(2),
-            min_trades_per_window: env_f64(
-                "FOREX_BOT_REGIME_LABEL_MIN_TRADES",
-                default.min_trades_per_window,
-            )
-            .max(0.0),
-            min_window_profit: env_f64(
-                "FOREX_BOT_REGIME_LABEL_MIN_PROFIT",
-                default.min_window_profit,
-            ),
-            min_profit_factor: env_f64("FOREX_BOT_REGIME_LABEL_MIN_PF", default.min_profit_factor)
-                .max(0.0),
-            max_drawdown: env_f64("FOREX_BOT_REGIME_LABEL_MAX_DD", default.max_drawdown).max(0.0),
-            min_quality_score: env_f64(
-                "FOREX_BOT_REGIME_LABEL_MIN_SCORE",
-                default.min_quality_score,
-            ),
-            min_specialist_windows: env_usize(
-                "FOREX_BOT_REGIME_LABEL_MIN_SPECIALIST_WINDOWS",
-                default.min_specialist_windows,
-            )
-            .max(1),
-            min_specialist_score: env_f64(
-                "FOREX_BOT_REGIME_LABEL_MIN_SPECIALIST_SCORE",
-                default.min_specialist_score,
-            ),
-            min_always_on_hit_rate: env_f64(
-                "FOREX_BOT_REGIME_LABEL_ALWAYS_ON_HIT_RATE",
-                default.min_always_on_hit_rate,
-            )
-            .clamp(0.0, 1.0),
-        }
-    }
-}
-
-fn env_i64(name: &str, default: i64) -> i64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(default)
-}
-
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(default)
-}
-
-fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(default)
-}
+// `RegimeLabelPolicy::from_env` and its `env_i64` / `env_usize` / `env_f64`
+// helpers were retired during Phase 22 of the consolidated audit
+// follow-on: the constructor had no callers in this crate or any of its
+// dependents, so the only behavior was reading 11 `FOREX_BOT_REGIME_LABEL_*`
+// env vars on demand. Production code constructs `RegimeLabelPolicy`
+// through its struct fields directly; if a future feature needs
+// env-driven defaults, route them through a typed `*RuntimeOverrides`
+// boundary like the others under `genetic::runtime_overrides`.
 
 fn finite_or(value: f64, fallback: f64) -> f64 {
     if value.is_finite() { value } else { fallback }

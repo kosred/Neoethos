@@ -1,3 +1,4 @@
+use super::runtime_overrides::current_strategy_evaluation_runtime_overrides;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -216,53 +217,38 @@ pub fn infer_market_cost_profile(
     spread_pips_override: Option<f64>,
     commission_override: Option<f64>,
 ) -> MarketCostProfile {
+    // Cost-profile fallbacks resolve through the typed
+    // `CostProfileRuntimeOverrides` boundary so the legacy
+    // `FOREX_BOT_PROP_*` env vars are read at most once per process.
+    let runtime_overrides = current_strategy_evaluation_runtime_overrides();
+    let cost = runtime_overrides.cost_profile;
+
     let symbol = if symbol.trim().is_empty() {
-        std::env::var("FOREX_BOT_PROP_SYMBOL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "EURUSD".to_string())
+        cost.symbol.clone().unwrap_or_else(|| "EURUSD".to_string())
     } else {
         symbol.trim().to_string()
     };
     let account_currency = if account_currency.trim().is_empty() {
-        std::env::var("FOREX_BOT_PROP_ACCOUNT_CURRENCY")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
+        cost.account_currency
+            .clone()
             .unwrap_or_else(|| "USD".to_string())
     } else {
         account_currency.trim().to_string()
     };
 
-    let pip_value = std::env::var("FOREX_BOT_PROP_PIP_VALUE")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .unwrap_or_else(|| default_pip_size(&symbol));
-    let quote_to_account_rate = std::env::var("FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value > 0.0);
-    let pip_value_per_lot = std::env::var("FOREX_BOT_PROP_PIP_VALUE_PER_LOT")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .unwrap_or_else(|| {
-            estimate_pip_value_per_lot(
-                &symbol,
-                &account_currency,
-                price_hint,
-                quote_to_account_rate,
-            )
-        });
+    let pip_value = cost.pip_value.unwrap_or_else(|| default_pip_size(&symbol));
+    let pip_value_per_lot = cost.pip_value_per_lot.unwrap_or_else(|| {
+        estimate_pip_value_per_lot(
+            &symbol,
+            &account_currency,
+            price_hint,
+            cost.quote_to_account_rate,
+        )
+    });
 
     let spread_pips = spread_pips_override
         .filter(|value| value.is_finite() && *value >= 0.0)
-        .or_else(|| {
-            std::env::var("FOREX_BOT_PROP_SPREAD_PIPS")
-                .ok()
-                .and_then(|value| value.parse::<f64>().ok())
-                .filter(|value| value.is_finite() && *value >= 0.0)
-        })
+        .or(cost.spread_pips)
         .unwrap_or_else(|| match symbol_kind(&symbol) {
             "metal" => 2.5,
             "crypto" => 8.0,
@@ -271,12 +257,7 @@ pub fn infer_market_cost_profile(
         });
     let commission_per_trade = commission_override
         .filter(|value| value.is_finite() && *value >= 0.0)
-        .or_else(|| {
-            std::env::var("FOREX_BOT_PROP_COMMISSION")
-                .ok()
-                .and_then(|value| value.parse::<f64>().ok())
-                .filter(|value| value.is_finite() && *value >= 0.0)
-        })
+        .or(cost.commission_per_trade)
         .unwrap_or(7.0);
 
     MarketCostProfile {
@@ -473,19 +454,13 @@ pub struct EvaluationConfig {
 
 impl Default for EvaluationConfig {
     fn default() -> Self {
-        fn env_f64(name: &str, default: f64) -> f64 {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(default)
-        }
-        fn env_f32(name: &str, default: f32) -> f32 {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or(default)
-        }
+        // The cost profile already consults the typed
+        // `StrategyEvaluationRuntimeOverrides` boundary, so the four cost
+        // fields below come straight from the resolved profile rather
+        // than re-reading the env. SMC weights come from the typed SMC
+        // weight overrides on the same boundary.
         let profile = infer_market_cost_profile("", "", None, None, None);
+        let smc = current_strategy_evaluation_runtime_overrides().smc_weights;
 
         Self {
             symbol: profile.symbol,
@@ -494,28 +469,22 @@ impl Default for EvaluationConfig {
             trailing_enabled: false,
             trailing_atr_multiplier: 1.0,
             trailing_be_trigger_r: 1.0,
-            pip_value: env_f64("FOREX_BOT_PROP_PIP_VALUE", profile.pip_value),
-            spread_pips: env_f64("FOREX_BOT_PROP_SPREAD_PIPS", profile.spread_pips),
-            commission_per_trade: env_f64(
-                "FOREX_BOT_PROP_COMMISSION",
-                profile.commission_per_trade,
-            ),
-            pip_value_per_lot: env_f64(
-                "FOREX_BOT_PROP_PIP_VALUE_PER_LOT",
-                profile.pip_value_per_lot,
-            ),
-            smc_gate_threshold: env_f32("FOREX_BOT_PROP_SMC_GATE", 0.75),
-            smc_weight_ob: env_f32("FOREX_BOT_PROP_SMC_W_OB", 1.0),
-            smc_weight_fvg: env_f32("FOREX_BOT_PROP_SMC_W_FVG", 1.0),
-            smc_weight_liq: env_f32("FOREX_BOT_PROP_SMC_W_LIQ", 1.0),
-            smc_weight_mtf: env_f32("FOREX_BOT_PROP_SMC_W_MTF", 1.0),
-            smc_weight_premium: env_f32("FOREX_BOT_PROP_SMC_W_PREMIUM", 1.0),
-            smc_weight_inducement: env_f32("FOREX_BOT_PROP_SMC_W_INDUCEMENT", 1.0),
-            smc_weight_bos: env_f32("FOREX_BOT_PROP_SMC_W_BOS", 1.0),
-            smc_weight_choch: env_f32("FOREX_BOT_PROP_SMC_W_CHOCH", 1.0),
-            smc_weight_eqh: env_f32("FOREX_BOT_PROP_SMC_W_EQH", 1.0),
-            smc_weight_eql: env_f32("FOREX_BOT_PROP_SMC_W_EQL", 1.0),
-            smc_weight_displacement: env_f32("FOREX_BOT_PROP_SMC_W_DISPLACEMENT", 1.0),
+            pip_value: profile.pip_value,
+            spread_pips: profile.spread_pips,
+            commission_per_trade: profile.commission_per_trade,
+            pip_value_per_lot: profile.pip_value_per_lot,
+            smc_gate_threshold: smc.gate_threshold,
+            smc_weight_ob: smc.w_ob,
+            smc_weight_fvg: smc.w_fvg,
+            smc_weight_liq: smc.w_liq,
+            smc_weight_mtf: smc.w_mtf,
+            smc_weight_premium: smc.w_premium,
+            smc_weight_inducement: smc.w_inducement,
+            smc_weight_bos: smc.w_bos,
+            smc_weight_choch: smc.w_choch,
+            smc_weight_eqh: smc.w_eqh,
+            smc_weight_eql: smc.w_eql,
+            smc_weight_displacement: smc.w_displacement,
         }
     }
 }

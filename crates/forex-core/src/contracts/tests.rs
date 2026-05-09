@@ -505,3 +505,147 @@ fn temporal_scope_hashes_validate_contract_drift() {
         }
     ));
 }
+
+#[test]
+fn live_validation_evidence_default_is_neutral_pass_only_for_walkforward_and_cpcv() {
+    let evidence = LiveValidationEvidence::default();
+    assert!(!evidence.walkforward_passed);
+    assert!(!evidence.cpcv_passed);
+    assert_eq!(evidence.forward_test_passed, None);
+    assert_eq!(evidence.prop_firm_passed, None);
+    assert!(evidence.live_sim_runtime_model_hash.is_none());
+
+    let passed = LiveValidationEvidence::passed_all();
+    assert!(passed.walkforward_passed);
+    assert!(passed.cpcv_passed);
+    assert_eq!(passed.forward_test_passed, Some(true));
+    assert_eq!(passed.prop_firm_passed, Some(true));
+}
+
+#[test]
+fn live_contract_validate_evidence_accepts_when_no_gates_required() {
+    let contract = canonical_live_execution_contract();
+    let evidence = LiveValidationEvidence::default();
+    contract
+        .validate_evidence(&evidence)
+        .expect("default contract has no required gates");
+}
+
+#[test]
+fn live_contract_rejects_failed_walkforward_and_cpcv_gates() {
+    let contract = canonical_live_execution_contract()
+        .with_required_walkforward_pass()
+        .with_required_cpcv_pass();
+    let mut evidence = LiveValidationEvidence::passed_all();
+    evidence.walkforward_passed = false;
+    let err = contract
+        .validate_evidence(&evidence)
+        .expect_err("failed walkforward gate must reject");
+    assert_eq!(
+        err,
+        ArtifactContractError::LiveRejectedFailedEvidenceGate {
+            gate: "walkforward",
+        }
+    );
+
+    let mut evidence = LiveValidationEvidence::passed_all();
+    evidence.cpcv_passed = false;
+    let err = contract
+        .validate_evidence(&evidence)
+        .expect_err("failed cpcv gate must reject");
+    assert_eq!(
+        err,
+        ArtifactContractError::LiveRejectedFailedEvidenceGate { gate: "cpcv" }
+    );
+}
+
+#[test]
+fn live_contract_rejects_missing_forward_test_evidence_when_required() {
+    let contract = canonical_live_execution_contract().with_required_forward_test_pass();
+
+    let mut evidence = LiveValidationEvidence::passed_all();
+    evidence.forward_test_passed = None;
+    let err = contract
+        .validate_evidence(&evidence)
+        .expect_err("missing forward-test evidence must reject");
+    assert_eq!(
+        err,
+        ArtifactContractError::LiveRejectedMissingEvidence {
+            gate: "forward_test",
+        }
+    );
+
+    let mut evidence = LiveValidationEvidence::passed_all();
+    evidence.forward_test_passed = Some(false);
+    let err = contract
+        .validate_evidence(&evidence)
+        .expect_err("failed forward-test evidence must reject");
+    assert_eq!(
+        err,
+        ArtifactContractError::LiveRejectedFailedEvidenceGate {
+            gate: "forward_test",
+        }
+    );
+}
+
+#[test]
+fn live_contract_rejects_missing_or_failed_prop_firm_evidence() {
+    let contract = canonical_live_execution_contract().with_required_prop_firm_pass();
+
+    let mut evidence = LiveValidationEvidence::passed_all();
+    evidence.prop_firm_passed = None;
+    let err = contract
+        .validate_evidence(&evidence)
+        .expect_err("missing prop-firm evidence must reject");
+    assert_eq!(
+        err,
+        ArtifactContractError::LiveRejectedMissingEvidence { gate: "prop_firm" }
+    );
+
+    let mut evidence = LiveValidationEvidence::passed_all();
+    evidence.prop_firm_passed = Some(false);
+    let err = contract
+        .validate_evidence(&evidence)
+        .expect_err("failed prop-firm evidence must reject");
+    assert_eq!(
+        err,
+        ArtifactContractError::LiveRejectedFailedEvidenceGate { gate: "prop_firm" }
+    );
+}
+
+#[test]
+fn live_contract_rejects_live_sim_runtime_hash_mismatch() {
+    let contract = canonical_live_execution_contract()
+        .with_required_live_sim_runtime_model_hash("runtime-model-v1");
+
+    let mut evidence = LiveValidationEvidence::passed_all();
+    evidence.live_sim_runtime_model_hash = None;
+    let err = contract
+        .validate_evidence(&evidence)
+        .expect_err("missing live-sim runtime hash must reject");
+    assert_eq!(
+        err,
+        ArtifactContractError::LiveRejectedMissingEvidence {
+            gate: "live_sim_runtime_model",
+        }
+    );
+
+    let mut evidence = LiveValidationEvidence::passed_all();
+    evidence.live_sim_runtime_model_hash = Some("runtime-model-v2".to_string());
+    let err = contract
+        .validate_evidence(&evidence)
+        .expect_err("mismatched live-sim runtime hash must reject");
+    assert!(matches!(
+        err,
+        ArtifactContractError::LiveRejectedMismatch {
+            field: "live_sim_runtime_model_hash",
+            ..
+        }
+    ));
+
+    let mut evidence = LiveValidationEvidence::passed_all();
+    evidence.live_sim_runtime_model_hash = Some("runtime-model-v1".to_string());
+    contract
+        .validate_evidence(&evidence)
+        .expect("matching live-sim runtime hash must accept");
+}

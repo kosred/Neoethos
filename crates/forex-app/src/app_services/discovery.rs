@@ -15,9 +15,11 @@ use forex_data::{
     prepare_multitimeframe_features,
 };
 use forex_search::{
-    DiscoveryConfig, DiscoveryProgress, DiscoveryResult, ensure_non_empty_portfolio,
-    run_discovery_cycle_with_progress, save_discovery_profile_json, save_portfolio_json,
-    save_quality_report_json, save_trade_log_json,
+    DiscoveryConfig, DiscoveryProgress, DiscoveryResult, compute_discovery_forward_test_artifacts,
+    ensure_non_empty_portfolio, run_discovery_cycle_with_progress,
+    save_canonical_backtest_artifacts, save_discovery_profile_json,
+    save_forward_test_validation_artifacts, save_portfolio_json, save_quality_report_json,
+    save_trade_log_json, save_walkforward_validation_artifacts,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -807,10 +809,11 @@ pub fn start_discovery_job(
             let rows = features.data.nrows().min(wfv_feat_bound);
             is_features.data = features.data.slice(ndarray::s![..rows, ..]).to_owned();
 
-            let result = run_discovery_cycle_with_progress(
+            let resolved_config = search_request.config.clone().with_env_runtime_overrides();
+            let mut result = run_discovery_cycle_with_progress(
                 &is_features,
                 &is_ohlcv,
-                &search_request.config,
+                &resolved_config,
                 move |event| {
                     if let Ok(mut snapshot) = live_snapshot_for_progress.lock() {
                         apply_backend_discovery_event(&mut snapshot, &event);
@@ -826,6 +829,55 @@ pub fn start_discovery_job(
                 &format!("{} {}", search_request.symbol, search_request.base_tf),
             )?;
 
+            // Forward-test the portfolio on the strictly held-out 20% tail
+            // (`wfv_bound..`). This is the OOS slice the discovery cycle
+            // never saw, so the resulting forward-test summary is an
+            // unbiased estimate of out-of-sample behavior.
+            if !result.portfolio.is_empty() && wfv_bound < base_ohlcv.close.len() {
+                let tail_ohlcv = forex_data::Ohlcv {
+                    timestamp: base_ohlcv
+                        .timestamp
+                        .as_ref()
+                        .map(|ts| ts[wfv_bound..].to_vec()),
+                    open: base_ohlcv.open[wfv_bound..].to_vec(),
+                    high: base_ohlcv.high[wfv_bound..].to_vec(),
+                    low: base_ohlcv.low[wfv_bound..].to_vec(),
+                    close: base_ohlcv.close[wfv_bound..].to_vec(),
+                    volume: base_ohlcv.volume.as_ref().map(|v| v[wfv_bound..].to_vec()),
+                };
+                let tail_feat_start = wfv_bound.min(features.data.nrows());
+                let tail_feat_rows = features.data.nrows().saturating_sub(tail_feat_start);
+                if tail_feat_rows > 0 && !tail_ohlcv.close.is_empty() {
+                    let tail_features = forex_data::FeatureFrame {
+                        timestamps: features.timestamps[tail_feat_start..].to_vec(),
+                        names: features.names.clone(),
+                        data: features
+                            .data
+                            .slice(ndarray::s![tail_feat_start.., ..])
+                            .to_owned(),
+                    };
+                    match compute_discovery_forward_test_artifacts(
+                        &result.portfolio,
+                        &result.effective_feature_names,
+                        &tail_features,
+                        &tail_ohlcv,
+                        &resolved_config,
+                    ) {
+                        Ok(artifacts) => {
+                            result.forward_test_validation_artifacts = artifacts;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "forex_app::discovery",
+                                error = %err,
+                                "forward-test artifact computation failed; portfolio export \
+                                 will proceed without forward-test evidence"
+                            );
+                        }
+                    }
+                }
+            }
+
             let out_path = PathBuf::from("cache").join("discovery").join(format!(
                 "{}_{}.json",
                 search_request.symbol, search_request.base_tf
@@ -836,7 +888,7 @@ pub fn start_discovery_job(
             save_portfolio_json(&out_path, &result)?;
             save_discovery_profile_json(
                 out_path.with_extension("profile.json"),
-                &search_request.config,
+                &resolved_config,
                 &result,
             )?;
             if !result.quality_metrics.is_empty() {
@@ -844,6 +896,24 @@ pub fn start_discovery_job(
             }
             if !result.logged_trades.is_empty() {
                 save_trade_log_json(out_path.with_extension("trades.json"), &result)?;
+            }
+            if !result.canonical_backtest_artifacts.is_empty() {
+                save_canonical_backtest_artifacts(
+                    out_path.with_extension("canonical_backtests"),
+                    &result,
+                )?;
+            }
+            if !result.walkforward_validation_artifacts.is_empty() {
+                save_walkforward_validation_artifacts(
+                    out_path.with_extension("walkforward_validations"),
+                    &result,
+                )?;
+            }
+            if !result.forward_test_validation_artifacts.is_empty() {
+                save_forward_test_validation_artifacts(
+                    out_path.with_extension("forward_tests"),
+                    &result,
+                )?;
             }
             Ok::<_, anyhow::Error>(result)
         })

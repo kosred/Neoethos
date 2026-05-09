@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() -> Result<()> {
     setup_logging(false)?;
+    forex_search::install_search_runtime_overrides_from_env();
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         print_help();
@@ -372,7 +373,8 @@ fn cmd_discover(args: &[String]) -> Result<()> {
             min_trades_per_day,
             filtering: defaults.filtering,
             ..defaults.clone()
-        };
+        }
+        .with_env_runtime_overrides();
         let result = forex_search::run_discovery_cycle(&features, base_ohlcv, &config)?;
         forex_search::ensure_non_empty_portfolio(&result, &format!("{} {}", symbol, base))?;
         if let Some(parent) = std::path::Path::new(&out).parent()
@@ -390,6 +392,14 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         if !result.logged_trades.is_empty() {
             let trade_log_path = format!("{out}.trades.json");
             forex_search::save_trade_log_json(&trade_log_path, &result)?;
+        }
+        if !result.canonical_backtest_artifacts.is_empty() {
+            let backtest_dir = format!("{out}.canonical_backtests");
+            forex_search::save_canonical_backtest_artifacts(&backtest_dir, &result)?;
+        }
+        if !result.walkforward_validation_artifacts.is_empty() {
+            let validation_dir = format!("{out}.walkforward_validations");
+            forex_search::save_walkforward_validation_artifacts(&validation_dir, &result)?;
         }
         println!(
             "Discovery {} portfolio={} candidates={} out={}",

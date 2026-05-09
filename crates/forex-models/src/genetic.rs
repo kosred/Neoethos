@@ -482,7 +482,8 @@ impl GeneticStrategyExpert {
             (features, ohlcv)
         };
 
-        let result = run_discovery_cycle(features, ohlcv, &self.discovery_config())
+        let resolved_config = self.discovery_config().with_env_runtime_overrides();
+        let result = run_discovery_cycle(features, ohlcv, &resolved_config)
             .context("run Rust-native discovery-backed genetic search")?;
         if !result.portfolio.is_empty() {
             return Ok(result.portfolio);
