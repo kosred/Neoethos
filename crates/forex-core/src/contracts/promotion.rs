@@ -1,6 +1,76 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::{ArtifactContractError, ArtifactEnvelope, DeterminismPolicy, LiveExecutionContract};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationEvidenceKind {
+    CanonicalBacktest,
+    WalkForward,
+    ForwardTest,
+    LiveExecutionSimulation,
+    PropFirmRisk,
+}
+
+impl ValidationEvidenceKind {
+    pub const ALL: [Self; 5] = [
+        Self::CanonicalBacktest,
+        Self::WalkForward,
+        Self::ForwardTest,
+        Self::LiveExecutionSimulation,
+        Self::PropFirmRisk,
+    ];
+
+    pub fn field_name(self) -> &'static str {
+        match self {
+            Self::CanonicalBacktest => "canonical_backtest_validation_hash",
+            Self::WalkForward => "walkforward_validation_hash",
+            Self::ForwardTest => "forward_test_validation_hash",
+            Self::LiveExecutionSimulation => "live_execution_simulation_hash",
+            Self::PropFirmRisk => "prop_firm_risk_validation_hash",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CanonicalBacktest => "canonical backtest validation",
+            Self::WalkForward => "walk-forward validation",
+            Self::ForwardTest => "forward-test validation",
+            Self::LiveExecutionSimulation => "live-execution simulation",
+            Self::PropFirmRisk => "prop-firm risk validation",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationEvidenceCheck {
+    pub kind: ValidationEvidenceKind,
+    pub hash: Option<String>,
+    pub present: bool,
+}
+
+impl ValidationEvidenceCheck {
+    fn from_manifest(manifest: &ValidationEvidenceManifest, kind: ValidationEvidenceKind) -> Self {
+        let hash = manifest
+            .hash_for(kind)
+            .filter(|hash| !hash.trim().is_empty())
+            .map(str::to_string);
+        Self {
+            kind,
+            present: hash.is_some(),
+            hash,
+        }
+    }
+
+    fn missing(kind: ValidationEvidenceKind) -> Self {
+        Self {
+            kind,
+            hash: None,
+            present: false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationEvidenceManifest {
@@ -31,34 +101,84 @@ impl ValidationEvidenceManifest {
     }
 
     pub fn validate(&self) -> Result<(), ArtifactContractError> {
-        let required = [
-            (
-                "canonical_backtest_validation_hash",
-                &self.canonical_backtest_validation_hash,
-            ),
-            (
-                "walkforward_validation_hash",
-                &self.walkforward_validation_hash,
-            ),
-            (
-                "forward_test_validation_hash",
-                &self.forward_test_validation_hash,
-            ),
-            (
-                "live_execution_simulation_hash",
-                &self.live_execution_simulation_hash,
-            ),
-            (
-                "prop_firm_risk_validation_hash",
-                &self.prop_firm_risk_validation_hash,
-            ),
-        ];
-        for (field, value) in required {
-            if value.trim().is_empty() {
-                return Err(ArtifactContractError::MissingValidationEvidence(field));
+        for kind in ValidationEvidenceKind::ALL {
+            if self
+                .hash_for(kind)
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(ArtifactContractError::MissingValidationEvidence(
+                    kind.field_name(),
+                ));
             }
         }
         Ok(())
+    }
+
+    pub fn hash_for(&self, kind: ValidationEvidenceKind) -> Option<&str> {
+        let value = match kind {
+            ValidationEvidenceKind::CanonicalBacktest => &self.canonical_backtest_validation_hash,
+            ValidationEvidenceKind::WalkForward => &self.walkforward_validation_hash,
+            ValidationEvidenceKind::ForwardTest => &self.forward_test_validation_hash,
+            ValidationEvidenceKind::LiveExecutionSimulation => &self.live_execution_simulation_hash,
+            ValidationEvidenceKind::PropFirmRisk => &self.prop_firm_risk_validation_hash,
+        };
+        Some(value.as_str()).filter(|value| !value.trim().is_empty())
+    }
+
+    pub fn missing_kinds(&self) -> Vec<ValidationEvidenceKind> {
+        ValidationEvidenceKind::ALL
+            .iter()
+            .copied()
+            .filter(|kind| self.hash_for(*kind).is_none())
+            .collect()
+    }
+
+    pub fn evidence_checks(&self) -> Vec<ValidationEvidenceCheck> {
+        ValidationEvidenceKind::ALL
+            .iter()
+            .copied()
+            .map(|kind| ValidationEvidenceCheck::from_manifest(self, kind))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionReadinessCheckKind {
+    ValidationEvidence,
+    LiveExecutionContract,
+    DeterminismRequirement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionReadinessStatus {
+    Passed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromotionReadinessCheck {
+    pub kind: PromotionReadinessCheckKind,
+    pub status: PromotionReadinessStatus,
+    pub reason: Option<String>,
+}
+
+impl PromotionReadinessCheck {
+    fn passed(kind: PromotionReadinessCheckKind) -> Self {
+        Self {
+            kind,
+            status: PromotionReadinessStatus::Passed,
+            reason: None,
+        }
+    }
+
+    fn failed(kind: PromotionReadinessCheckKind, reason: String) -> Self {
+        Self {
+            kind,
+            status: PromotionReadinessStatus::Failed,
+            reason: Some(reason),
+        }
     }
 }
 
@@ -75,6 +195,8 @@ pub struct PromotionReadinessReport {
     pub determinism_requirement_passed: bool,
     pub ready: bool,
     pub rejection_reasons: Vec<String>,
+    pub evidence_checks: Vec<ValidationEvidenceCheck>,
+    pub checks: Vec<PromotionReadinessCheck>,
 }
 
 impl LivePromotionGate {
@@ -95,9 +217,18 @@ impl LivePromotionGate {
         artifact: &ArtifactEnvelope<T>,
         evidence: &ValidationEvidenceManifest,
     ) -> Result<(), ArtifactContractError> {
+        self.validate_at(artifact, evidence, Utc::now())
+    }
+
+    pub fn validate_at<T>(
+        &self,
+        artifact: &ArtifactEnvelope<T>,
+        evidence: &ValidationEvidenceManifest,
+        now: DateTime<Utc>,
+    ) -> Result<(), ArtifactContractError> {
         evidence.validate()?;
         self.live_execution_contract
-            .validate_provenance(&artifact.provenance)?;
+            .validate_provenance_at(&artifact.provenance, now)?;
         if self.require_deterministic
             && !matches!(
                 artifact.provenance.determinism_policy,
@@ -116,29 +247,74 @@ impl LivePromotionGate {
         artifact: &ArtifactEnvelope<T>,
         evidence: Option<&ValidationEvidenceManifest>,
     ) -> PromotionReadinessReport {
+        self.readiness_report_at(artifact, evidence, Utc::now())
+    }
+
+    pub fn readiness_report_at<T>(
+        &self,
+        artifact: &ArtifactEnvelope<T>,
+        evidence: Option<&ValidationEvidenceManifest>,
+        now: DateTime<Utc>,
+    ) -> PromotionReadinessReport {
         let mut rejection_reasons = Vec::new();
+        let mut checks = Vec::new();
 
         let validation_evidence_complete = match evidence {
             Some(evidence) => match evidence.validate() {
-                Ok(()) => true,
+                Ok(()) => {
+                    checks.push(PromotionReadinessCheck::passed(
+                        PromotionReadinessCheckKind::ValidationEvidence,
+                    ));
+                    true
+                }
                 Err(err) => {
-                    rejection_reasons.push(err.to_string());
+                    let reason = err.to_string();
+                    rejection_reasons.push(reason.clone());
+                    checks.push(PromotionReadinessCheck::failed(
+                        PromotionReadinessCheckKind::ValidationEvidence,
+                        reason,
+                    ));
                     false
                 }
             },
             None => {
-                rejection_reasons.push("validation evidence manifest is missing".to_string());
+                let reason = "validation evidence manifest is missing".to_string();
+                rejection_reasons.push(reason.clone());
+                checks.push(PromotionReadinessCheck::failed(
+                    PromotionReadinessCheckKind::ValidationEvidence,
+                    reason,
+                ));
                 false
             }
         };
+        let evidence_checks = evidence.map_or_else(
+            || {
+                ValidationEvidenceKind::ALL
+                    .iter()
+                    .copied()
+                    .map(ValidationEvidenceCheck::missing)
+                    .collect()
+            },
+            ValidationEvidenceManifest::evidence_checks,
+        );
 
         let live_contract_passed = match self
             .live_execution_contract
-            .validate_provenance(&artifact.provenance)
+            .validate_provenance_at(&artifact.provenance, now)
         {
-            Ok(()) => true,
+            Ok(()) => {
+                checks.push(PromotionReadinessCheck::passed(
+                    PromotionReadinessCheckKind::LiveExecutionContract,
+                ));
+                true
+            }
             Err(err) => {
-                rejection_reasons.push(err.to_string());
+                let reason = err.to_string();
+                rejection_reasons.push(reason.clone());
+                checks.push(PromotionReadinessCheck::failed(
+                    PromotionReadinessCheckKind::LiveExecutionContract,
+                    reason,
+                ));
                 false
             }
         };
@@ -149,12 +325,19 @@ impl LivePromotionGate {
                 DeterminismPolicy::Deterministic { .. }
             );
         if !determinism_requirement_passed {
-            rejection_reasons.push(
-                ArtifactContractError::PromotionRejectedDeterminism {
-                    actual: artifact.provenance.determinism_policy.clone(),
-                }
-                .to_string(),
-            );
+            let reason = ArtifactContractError::PromotionRejectedDeterminism {
+                actual: artifact.provenance.determinism_policy.clone(),
+            }
+            .to_string();
+            rejection_reasons.push(reason.clone());
+            checks.push(PromotionReadinessCheck::failed(
+                PromotionReadinessCheckKind::DeterminismRequirement,
+                reason,
+            ));
+        } else {
+            checks.push(PromotionReadinessCheck::passed(
+                PromotionReadinessCheckKind::DeterminismRequirement,
+            ));
         }
 
         PromotionReadinessReport {
@@ -165,6 +348,8 @@ impl LivePromotionGate {
                 && live_contract_passed
                 && determinism_requirement_passed,
             rejection_reasons,
+            evidence_checks,
+            checks,
         }
     }
 }

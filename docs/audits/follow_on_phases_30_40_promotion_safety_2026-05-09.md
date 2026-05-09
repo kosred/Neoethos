@@ -50,13 +50,53 @@ This gives UI/operator layers a non-throwing summary:
 - final readiness boolean,
 - rejection reasons suitable for display/logging.
 
-## Handoff for phases 35-40
+### Phase 35 — typed validation evidence registry
 
-These stages should be wired after Claude Code's Phase 25+ artifact work lands:
+Added `ValidationEvidenceKind` as the shared registry for the five required
+promotion evidence inputs. Future discovery / validation producers can target
+the enum instead of stringly-typed field names.
 
-35. Feed live-execution simulation artifact hashes into `ValidationEvidenceManifest`.
-36. Feed prop-firm risk validation artifact hashes into `ValidationEvidenceManifest`.
-37. Attach promotion readiness reports to discovery/profile outputs.
-38. Surface promotion readiness in the UI hardware/runtime panel.
-39. Add operator docs for promotion rejection reasons and remediation.
-40. Add end-to-end promotion tests once all artifact producers are merged.
+### Phase 36 — evidence completeness telemetry
+
+Added `ValidationEvidenceCheck` plus `ValidationEvidenceManifest::hash_for`,
+`missing_kinds`, and `evidence_checks`. Operator and UI layers can now show
+which validation artifact is missing without parsing error strings.
+
+### Phase 37 — deterministic promotion clock
+
+Added `LivePromotionGate::validate_at` and `readiness_report_at`, so stale
+artifact checks can be tested and reproduced with an injected clock instead of
+depending on wall-clock time.
+
+### Phase 38 — structured readiness checks
+
+Extended `PromotionReadinessReport` with structured `PromotionReadinessCheck`
+items for validation evidence, live execution contract, and deterministic
+execution requirements. This preserves the existing boolean summary while
+giving UI / logs stable machine-readable statuses.
+
+### Phase 39 — cross-crate export surface
+
+Re-exported the promotion gate, evidence manifest, evidence checks, and
+readiness report types from `forex_core`, so downstream `forex-search` /
+`forex-app` code can consume the contract without reaching through internal
+modules.
+
+### Phase 40 — integration handoff guardrails
+
+The remaining work is intentionally integration-only and should start after
+Claude Code's Phase 25+ artifact producers are committed. The guardrail is:
+wire producers into this contract, do not create another live-readiness schema
+in discovery or UI code.
+
+## Handoff after Claude Phase 25+ lands
+
+These integration stages should be wired after Claude Code's artifact work
+lands:
+
+1. Feed live-execution simulation artifact hashes into `ValidationEvidenceManifest`.
+2. Feed prop-firm risk validation artifact hashes into `ValidationEvidenceManifest`.
+3. Attach promotion readiness reports to discovery/profile outputs.
+4. Surface promotion readiness in the UI hardware/runtime panel.
+5. Add operator docs for promotion rejection reasons and remediation.
+6. Add end-to-end promotion tests once all artifact producers are merged.

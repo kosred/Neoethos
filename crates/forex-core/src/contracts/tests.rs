@@ -1,5 +1,5 @@
 use super::*;
-use chrono::Utc;
+use chrono::{Duration, Utc};
 
 fn canonical_provenance(artifact_kind: ArtifactKind) -> ArtifactProvenance {
     ArtifactProvenance::new(
@@ -535,6 +535,29 @@ fn validation_evidence_manifest_requires_all_promotion_artifacts() {
 }
 
 #[test]
+fn validation_evidence_manifest_reports_structured_evidence_status() {
+    let mut evidence = complete_validation_evidence();
+    evidence.prop_firm_risk_validation_hash.clear();
+
+    assert_eq!(
+        evidence.missing_kinds(),
+        vec![ValidationEvidenceKind::PropFirmRisk]
+    );
+
+    let checks = evidence.evidence_checks();
+    assert_eq!(checks.len(), ValidationEvidenceKind::ALL.len());
+    assert!(
+        checks
+            .iter()
+            .any(|check| check.kind == ValidationEvidenceKind::PropFirmRisk && !check.present)
+    );
+    assert_eq!(
+        evidence.hash_for(ValidationEvidenceKind::ForwardTest),
+        Some("forward-test-fnv")
+    );
+}
+
+#[test]
 fn live_promotion_gate_accepts_canonical_deterministic_artifact_with_complete_evidence() {
     let envelope = ArtifactEnvelope::new(canonical_live_provenance(), ())
         .expect("fixture envelope should be structurally valid");
@@ -543,6 +566,40 @@ fn live_promotion_gate_accepts_canonical_deterministic_artifact_with_complete_ev
 
     gate.validate(&envelope, &complete_validation_evidence())
         .expect("complete deterministic live artifact should pass promotion gate");
+}
+
+#[test]
+fn crate_root_exports_live_promotion_contract_types() {
+    let _kind = crate::ValidationEvidenceKind::PropFirmRisk;
+    let _status = crate::PromotionReadinessStatus::Passed;
+    let gate: crate::LivePromotionGate =
+        LivePromotionGate::new(canonical_live_execution_contract());
+
+    assert!(gate.require_deterministic);
+}
+
+#[test]
+fn live_promotion_gate_rejects_stale_artifact_with_injected_clock() {
+    let now = Utc::now();
+    let mut provenance = canonical_live_provenance();
+    provenance.created_at = now - Duration::seconds(61);
+    let envelope =
+        ArtifactEnvelope::new(provenance, ()).expect("stale artifact is structurally valid");
+    let gate = LivePromotionGate::new(
+        canonical_live_execution_contract().with_max_artifact_age_seconds(60),
+    );
+
+    let error = gate
+        .validate_at(&envelope, &complete_validation_evidence(), now)
+        .expect_err("promotion gate must reject stale artifacts at the supplied clock");
+
+    assert_eq!(
+        error,
+        ArtifactContractError::LiveRejectedStaleArtifact {
+            age_seconds: 61,
+            max_age_seconds: 60,
+        }
+    );
 }
 
 #[test]
@@ -640,4 +697,15 @@ fn live_promotion_readiness_report_collects_operator_reasons_without_failing() {
             .iter()
             .any(|reason| reason.contains("deterministic"))
     );
+    assert!(report.checks.iter().any(|check| check.kind
+        == PromotionReadinessCheckKind::ValidationEvidence
+        && check.status == PromotionReadinessStatus::Failed));
+    assert!(report.checks.iter().any(|check| check.kind
+        == PromotionReadinessCheckKind::DeterminismRequirement
+        && check.status == PromotionReadinessStatus::Failed));
+    assert_eq!(
+        report.evidence_checks.len(),
+        ValidationEvidenceKind::ALL.len()
+    );
+    assert!(report.evidence_checks.iter().all(|check| !check.present));
 }
