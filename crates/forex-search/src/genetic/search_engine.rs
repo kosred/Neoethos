@@ -1,8 +1,9 @@
 use super::evolution_math::{
-    EvolutionSearchPolicy, ParentSelectionPolicy, SeenSignatureMemory, SurvivorSelectionPolicy,
-    apply_metrics, crossover, gene_signature_hash, generate_random_genes, mutate, new_random_gene,
-    select_parent_index, select_survivor_indices, unique_candidate_or_retry,
+    EvolutionSearchPolicy, SeenSignatureMemory, SurvivorSelectionPolicy, apply_metrics, crossover,
+    gene_signature_hash, generate_random_genes, mutate, new_random_gene, select_parent_index,
+    select_survivor_indices, unique_candidate_or_retry,
 };
+use super::runtime_overrides::current_genetic_search_runtime_overrides;
 use super::smc_indicators::{SmcSearchConfig, build_smc_arrays, enforce_population_smc_ratio};
 use super::strategy_gene::{EvaluationConfig, Gene, SearchResult};
 use crate::eval::BacktestSettings;
@@ -15,15 +16,21 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-/// Build a deterministic RNG seeded from `FOREX_BOT_SEARCH_SEED` (if set) or
-/// from the OS RNG otherwise. Used by the GA so that runs are reproducible
-/// when the operator pins a seed (matching the parity work in
-/// `discovery_gpu`/`lib.rs`).
+/// Build a deterministic RNG by routing the genetic-search runtime
+/// overrides through the canonical
+/// [`forex_core::contracts::DeterminismPolicy`] enum:
+/// `Deterministic { seed }` produces reproducible runs, while
+/// `BestEffort` and `NonDeterministicAllowed` both fall back to a fresh
+/// OS-derived seed (the latter is the legacy "no seed configured"
+/// behavior). Matching the parity work in `discovery_gpu` / `lib.rs`.
 fn build_search_rng() -> StdRng {
-    let seed = std::env::var("FOREX_BOT_SEARCH_SEED")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or_else(|| rand::rng().random::<u64>());
+    use forex_core::contracts::DeterminismPolicy;
+    let seed = match current_genetic_search_runtime_overrides().determinism_policy() {
+        DeterminismPolicy::Deterministic { seed } => seed,
+        DeterminismPolicy::BestEffort | DeterminismPolicy::NonDeterministicAllowed => {
+            rand::rng().random::<u64>()
+        }
+    };
     StdRng::seed_from_u64(seed)
 }
 
@@ -614,29 +621,23 @@ where
     let n_indicators = features.data.ncols();
     let smc_cfg = SmcSearchConfig::from_env();
 
-    let env_f32 = |n, d| {
-        std::env::var(n)
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(d)
-    };
-    let gate_start = env_f32(
-        "FOREX_BOT_PROP_SMC_GATE_START",
-        env_f32("FOREX_BOT_PROP_SMC_GATE", 0.75),
-    );
-    let gate_end = env_f32("FOREX_BOT_PROP_SMC_GATE_END", 0.35);
-    let gate_curve = env_f32("FOREX_BOT_PROP_SMC_GATE_CURVE", 1.0).max(0.1);
-    let gate_stagnation_step = env_f32("FOREX_BOT_PROP_SMC_GATE_STAGNATION_STEP", 0.03).max(0.0);
+    // All `FOREX_BOT_*` search-engine knobs are resolved through the typed
+    // `GeneticSearchRuntimeOverrides` boundary; the inline env reads that
+    // used to live here are gone (P0-8).
+    let genetic_runtime_overrides = current_genetic_search_runtime_overrides();
+    let resolved_smc_gate = genetic_runtime_overrides.resolved_smc_gate();
+    let resolved_selection = genetic_runtime_overrides.resolved_selection();
+
+    let gate_start = resolved_smc_gate.start;
+    let gate_end = resolved_smc_gate.end;
+    let gate_curve = resolved_smc_gate.curve;
+    let gate_stagnation_step = resolved_smc_gate.stagnation_step;
     let (gate_lo, gate_hi) = (gate_start.min(gate_end), gate_start.max(gate_end));
 
     let mut eval_cfg = eval_config.unwrap_or_default();
     eval_cfg.smc_gate_threshold = gate_start.clamp(gate_lo, gate_hi);
 
-    let seen_retry_attempts = std::env::var("FOREX_BOT_PROP_SEEN_RETRY")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(16)
-        .max(1);
+    let seen_retry_attempts = genetic_runtime_overrides.effective_seen_retry_attempts();
     let mut seen_memory = SeenSignatureMemory::from_env();
     let mut rng = build_search_rng();
     let mut genes = generate_random_genes(
@@ -675,46 +676,19 @@ where
     // that compute the same signal kept getting archived under different ids.
     let mut seen_gene_hashes: HashSet<u64> = HashSet::new();
 
-    let env_str = |n, d: &str| {
-        std::env::var(n)
-            .unwrap_or_else(|_| d.to_string())
-            .to_ascii_lowercase()
-    };
-    let env_f64 = |n, d| {
-        std::env::var(n)
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(d)
-    };
-    let archive_mode = env_str("FOREX_BOT_PROP_ARCHIVE_MODE", "net");
-    let (archive_min_net, archive_min_pf, archive_min_sharpe) = (
-        env_f64("FOREX_BOT_PROP_ARCHIVE_MIN_NET", 0.0),
-        env_f64("FOREX_BOT_PROP_ARCHIVE_MIN_PF", 1.0),
-        env_f64("FOREX_BOT_PROP_ARCHIVE_MIN_SHARPE", 0.0),
-    );
-    // Cap archive to prevent memory explosion on large HPC runs (Remove #3)
-    let archive_cap = std::env::var("FOREX_BOT_PROP_ARCHIVE_CAP")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or((population * generations.max(1)).min(50_000))
-        .max(population)
-        .min(200_000);
-    let base_immigrant_ratio = env_f64("FOREX_BOT_PROP_RANDOM_IMMIGRANTS", 0.25).clamp(0.0, 0.95);
-    let base_survivor_fraction = env_f64(
-        "FOREX_BOT_PROP_SURVIVOR_FRACTION",
-        env_f64("FOREX_BOT_PROP_ELITE_FRACTION", 0.10),
-    )
-    .clamp(0.0, 0.95);
-    let parent_selection =
-        ParentSelectionPolicy::parse(&env_str("FOREX_BOT_PROP_PARENT_SELECTION", "rank"));
-    let survivor_selection =
-        SurvivorSelectionPolicy::parse(&env_str("FOREX_BOT_PROP_SURVIVOR_SELECTION", "rank"));
-    let selection_temperature = env_f64("FOREX_BOT_PROP_SELECTION_TEMPERATURE", 0.75).max(1e-3);
-    let tournament_size = std::env::var("FOREX_BOT_PROP_TOURNAMENT_SIZE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or((population / 12).max(3))
-        .max(2);
+    // Archive scoring thresholds and selection policy come from the typed
+    // overrides resolved above; no further env reads are necessary here.
+    let archive_mode = genetic_runtime_overrides.archive_scoring.mode.clone();
+    let archive_min_net = genetic_runtime_overrides.archive_scoring.min_net;
+    let archive_min_pf = genetic_runtime_overrides.archive_scoring.min_pf;
+    let archive_min_sharpe = genetic_runtime_overrides.archive_scoring.min_sharpe;
+    let archive_cap = genetic_runtime_overrides.effective_archive_cap(population, generations);
+    let base_immigrant_ratio = resolved_selection.immigrant_ratio;
+    let base_survivor_fraction = resolved_selection.survivor_fraction;
+    let parent_selection = resolved_selection.parent;
+    let survivor_selection = resolved_selection.survivor;
+    let selection_temperature = resolved_selection.temperature;
+    let tournament_size = genetic_runtime_overrides.effective_tournament_size(population);
     let search_policy = EvolutionSearchPolicy::new(
         base_survivor_fraction,
         base_immigrant_ratio,
@@ -723,17 +697,10 @@ where
         selection_temperature,
         tournament_size,
     );
-    let stagnation_patience = std::env::var("FOREX_BOT_PROP_STAGNATION_GENS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(2)
-        .max(1);
+    let stagnation_patience = genetic_runtime_overrides.effective_stagnation_patience();
 
-    // Perf #1: read env vars once before the generation loop
-    let novelty_weight: f64 = std::env::var("FOREX_BOT_NOVELTY_WEIGHT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.0); // Default OFF to avoid O(n²) cost; set > 0 only for large populations
+    // Default OFF to avoid O(n²) cost; set > 0 only for large populations.
+    let novelty_weight = genetic_runtime_overrides.novelty_weight;
 
     // Perf #3: build stable eval data cache ONCE before the generation loop
     let eval_cache = EvalDataCache::build(features, ohlcv);

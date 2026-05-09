@@ -1,6 +1,7 @@
 use super::strategy_gene::Gene;
 use forex_data::{FeatureFrame, Ohlcv};
 use rand::Rng;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SmcSearchConfig {
@@ -19,53 +20,129 @@ pub struct SmcSearchConfig {
     pub p_displacement: f64,
 }
 
-impl SmcSearchConfig {
-    pub fn from_env() -> Self {
-        fn env_f64(name: &str, default: f64) -> f64 {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(default)
+impl Default for SmcSearchConfig {
+    fn default() -> Self {
+        let default_p = 0.50;
+        Self {
+            force_ratio: 0.65,
+            min_flags: 1,
+            p_ob: default_p,
+            p_fvg: default_p,
+            p_liq: default_p,
+            p_premium: default_p,
+            p_inducement: default_p,
+            p_mtf: 0.85,
+            p_bos: default_p,
+            p_choch: default_p,
+            p_eqh: default_p,
+            p_eql: default_p,
+            p_displacement: default_p,
         }
-        fn env_usize(name: &str, default: usize) -> usize {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(default)
-        }
-        fn env_bool(name: &str, default: bool) -> bool {
-            std::env::var(name)
-                .ok()
-                .map(|v| {
-                    matches!(
-                        v.trim().to_ascii_lowercase().as_str(),
-                        "1" | "true" | "yes" | "on"
-                    )
-                })
-                .unwrap_or(default)
-        }
+    }
+}
 
-        let default_p = env_f64("FOREX_BOT_PROP_SMC_ENABLE_P", 0.50).clamp(0.0, 1.0);
-        let mut cfg = Self {
-            force_ratio: env_f64("FOREX_BOT_PROP_SMC_FORCE_RATIO", 0.65).clamp(0.0, 1.0),
-            min_flags: env_usize("FOREX_BOT_PROP_SMC_MIN_FLAGS", 1),
-            p_ob: env_f64("FOREX_BOT_PROP_SMC_P_OB", default_p).clamp(0.0, 1.0),
-            p_fvg: env_f64("FOREX_BOT_PROP_SMC_P_FVG", default_p).clamp(0.0, 1.0),
-            p_liq: env_f64("FOREX_BOT_PROP_SMC_P_LIQ", default_p).clamp(0.0, 1.0),
-            p_premium: env_f64("FOREX_BOT_PROP_SMC_P_PREMIUM", default_p).clamp(0.0, 1.0),
-            p_inducement: env_f64("FOREX_BOT_PROP_SMC_P_INDUCEMENT", default_p).clamp(0.0, 1.0),
-            p_mtf: env_f64("FOREX_BOT_PROP_SMC_P_MTF", 0.85).clamp(0.0, 1.0),
-            p_bos: env_f64("FOREX_BOT_PROP_SMC_P_BOS", default_p).clamp(0.0, 1.0),
-            p_choch: env_f64("FOREX_BOT_PROP_SMC_P_CHOCH", default_p).clamp(0.0, 1.0),
-            p_eqh: env_f64("FOREX_BOT_PROP_SMC_P_EQH", default_p).clamp(0.0, 1.0),
-            p_eql: env_f64("FOREX_BOT_PROP_SMC_P_EQL", default_p).clamp(0.0, 1.0),
-            p_displacement: env_f64("FOREX_BOT_PROP_SMC_P_DISPLACEMENT", default_p).clamp(0.0, 1.0),
-        };
-        if !env_bool("FOREX_BOT_PROP_SMC_FORCE_ENABLED", true) {
-            cfg.force_ratio = 0.0;
-            cfg.min_flags = 0;
+static SMC_SEARCH_CONFIG_CACHE: OnceLock<SmcSearchConfig> = OnceLock::new();
+
+fn smc_env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(default)
+}
+
+fn smc_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn smc_env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
+fn read_smc_search_config_from_env() -> SmcSearchConfig {
+    let default_p = smc_env_f64("FOREX_BOT_PROP_SMC_ENABLE_P", 0.50).clamp(0.0, 1.0);
+    let mut cfg = SmcSearchConfig {
+        force_ratio: smc_env_f64("FOREX_BOT_PROP_SMC_FORCE_RATIO", 0.65).clamp(0.0, 1.0),
+        min_flags: smc_env_usize("FOREX_BOT_PROP_SMC_MIN_FLAGS", 1),
+        p_ob: smc_env_f64("FOREX_BOT_PROP_SMC_P_OB", default_p).clamp(0.0, 1.0),
+        p_fvg: smc_env_f64("FOREX_BOT_PROP_SMC_P_FVG", default_p).clamp(0.0, 1.0),
+        p_liq: smc_env_f64("FOREX_BOT_PROP_SMC_P_LIQ", default_p).clamp(0.0, 1.0),
+        p_premium: smc_env_f64("FOREX_BOT_PROP_SMC_P_PREMIUM", default_p).clamp(0.0, 1.0),
+        p_inducement: smc_env_f64("FOREX_BOT_PROP_SMC_P_INDUCEMENT", default_p).clamp(0.0, 1.0),
+        p_mtf: smc_env_f64("FOREX_BOT_PROP_SMC_P_MTF", 0.85).clamp(0.0, 1.0),
+        p_bos: smc_env_f64("FOREX_BOT_PROP_SMC_P_BOS", default_p).clamp(0.0, 1.0),
+        p_choch: smc_env_f64("FOREX_BOT_PROP_SMC_P_CHOCH", default_p).clamp(0.0, 1.0),
+        p_eqh: smc_env_f64("FOREX_BOT_PROP_SMC_P_EQH", default_p).clamp(0.0, 1.0),
+        p_eql: smc_env_f64("FOREX_BOT_PROP_SMC_P_EQL", default_p).clamp(0.0, 1.0),
+        p_displacement: smc_env_f64("FOREX_BOT_PROP_SMC_P_DISPLACEMENT", default_p).clamp(0.0, 1.0),
+    };
+    if !smc_env_bool("FOREX_BOT_PROP_SMC_FORCE_ENABLED", true) {
+        cfg.force_ratio = 0.0;
+        cfg.min_flags = 0;
+    }
+    cfg
+}
+
+impl SmcSearchConfig {
+    /// Returns the cached SMC search config, lazily reading the
+    /// `FOREX_BOT_PROP_SMC_*` env vars at most once per process. Existing
+    /// callers (`evolve_search`, `forex-models::genetic`) keep their
+    /// `SmcSearchConfig::from_env()` API; the change is that subsequent
+    /// invocations no longer re-walk `std::env`.
+    pub fn from_env() -> Self {
+        *SMC_SEARCH_CONFIG_CACHE.get_or_init(read_smc_search_config_from_env)
+    }
+}
+
+/// Eagerly install the SMC search config from the legacy
+/// `FOREX_BOT_PROP_SMC_*` env vars. Idempotent — calling this from a
+/// binary's `main` simply forces the cache to populate at startup.
+pub fn install_smc_search_config_from_env() {
+    let _ = SMC_SEARCH_CONFIG_CACHE.set(read_smc_search_config_from_env());
+}
+
+#[cfg(test)]
+mod overrides_tests {
+    use super::*;
+
+    #[test]
+    fn smc_search_config_default_matches_documented_defaults() {
+        let defaults = SmcSearchConfig::default();
+        assert!((defaults.force_ratio - 0.65).abs() < 1e-9);
+        assert_eq!(defaults.min_flags, 1);
+        assert!((defaults.p_mtf - 0.85).abs() < 1e-9);
+        assert!((defaults.p_ob - 0.50).abs() < 1e-9);
+    }
+
+    #[test]
+    fn smc_search_config_from_env_returns_legal_values() {
+        let cfg = SmcSearchConfig::from_env();
+        assert!((0.0..=1.0).contains(&cfg.force_ratio));
+        for p in [
+            cfg.p_ob,
+            cfg.p_fvg,
+            cfg.p_liq,
+            cfg.p_premium,
+            cfg.p_inducement,
+            cfg.p_mtf,
+            cfg.p_bos,
+            cfg.p_choch,
+            cfg.p_eqh,
+            cfg.p_eql,
+            cfg.p_displacement,
+        ] {
+            assert!((0.0..=1.0).contains(&p), "probability out of range: {p}");
         }
-        cfg
     }
 }
 

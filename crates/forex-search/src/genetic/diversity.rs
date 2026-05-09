@@ -20,31 +20,15 @@ pub struct DiversityArchiveConfig {
     pub min_archive_score: f64,
 }
 
-impl DiversityArchiveConfig {
-    pub fn from_env(default_max_total: usize) -> Self {
-        let max_total = std::env::var("FOREX_BOT_PROP_DIVERSE_ARCHIVE_CAP")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(default_max_total.max(1));
-        let per_bucket_cap = std::env::var("FOREX_BOT_PROP_DIVERSE_BUCKET_CAP")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(8);
-        let min_archive_score = std::env::var("FOREX_BOT_PROP_DIVERSE_MIN_SCORE")
-            .ok()
-            .and_then(|value| value.parse::<f64>().ok())
-            .filter(|value| value.is_finite())
-            .unwrap_or(f64::NEG_INFINITY);
-
-        Self {
-            max_total,
-            per_bucket_cap,
-            min_archive_score,
-        }
-    }
-}
+// `DiversityArchiveConfig::from_env` was retired during Phase 19 of the
+// consolidated audit follow-on: the helper had no callers in this crate or
+// any of its dependents, so the only remaining behavior was reading the
+// `FOREX_BOT_PROP_DIVERSE_*` env vars on demand. Production diversity
+// archive caps are configured directly through the typed
+// `DiversityArchiveConfig` fields by the caller; if a future feature needs
+// env-driven defaults again, add them through a typed `*RuntimeOverrides`
+// boundary like `GeneticSearchRuntimeOverrides` rather than reintroducing
+// inline env reads.
 
 fn finite_or(value: f64, fallback: f64) -> f64 {
     if value.is_finite() { value } else { fallback }

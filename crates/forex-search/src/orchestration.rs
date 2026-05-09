@@ -1,6 +1,7 @@
 use crate::discovery::{
-    DiscoveryConfig, ensure_non_empty_portfolio, run_discovery_cycle, save_discovery_profile_json,
-    save_portfolio_json, save_quality_report_json, save_trade_log_json,
+    DiscoveryConfig, ensure_non_empty_portfolio, run_discovery_cycle,
+    save_canonical_backtest_artifacts, save_discovery_profile_json, save_portfolio_json,
+    save_quality_report_json, save_trade_log_json, save_walkforward_validation_artifacts,
 };
 use anyhow::Result;
 use forex_data::{
@@ -110,7 +111,7 @@ impl DiscoveryOrchestrator {
                         continue;
                     }
                 };
-                let mut runtime_config = self.config.clone();
+                let mut runtime_config = self.config.clone().with_env_runtime_overrides();
                 runtime_config.timeframe_label = tf.clone();
                 // Previously this used `?` and aborted the whole batch on a
                 // single discovery failure, while every other error in the
@@ -146,6 +147,16 @@ impl DiscoveryOrchestrator {
                     let trade_log_path = Path::new(&self.output_dir)
                         .join(format!("{}_{}_trade_logs.json", symbol, tf));
                     save_trade_log_json(trade_log_path, &result)?;
+                }
+                if !result.canonical_backtest_artifacts.is_empty() {
+                    let backtest_dir = Path::new(&self.output_dir)
+                        .join(format!("{}_{}_canonical_backtests", symbol, tf));
+                    save_canonical_backtest_artifacts(&backtest_dir, &result)?;
+                }
+                if !result.walkforward_validation_artifacts.is_empty() {
+                    let validation_dir = Path::new(&self.output_dir)
+                        .join(format!("{}_{}_walkforward_validations", symbol, tf));
+                    save_walkforward_validation_artifacts(&validation_dir, &result)?;
                 }
                 summary.portfolios_saved += 1;
             }

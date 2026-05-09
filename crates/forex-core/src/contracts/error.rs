@@ -33,6 +33,17 @@ pub enum ArtifactContractError {
         age_seconds: i64,
         max_age_seconds: i64,
     },
+    /// Live execution requires a validation gate to have passed but the
+    /// evidence record reports it as failed (or missing).
+    LiveRejectedFailedEvidenceGate {
+        gate: &'static str,
+    },
+    /// Live execution requires evidence (e.g. a forward-test summary)
+    /// that the caller did not provide on the [`LiveValidationEvidence`]
+    /// record.
+    LiveRejectedMissingEvidence {
+        gate: &'static str,
+    },
     TemporalPolicyViolation {
         field: &'static str,
         reason: String,
@@ -104,6 +115,14 @@ impl fmt::Display for ArtifactContractError {
             } => write!(
                 f,
                 "live artifact is stale: age {age_seconds}s exceeds max {max_age_seconds}s"
+            ),
+            Self::LiveRejectedFailedEvidenceGate { gate } => write!(
+                f,
+                "live execution rejected: validation gate `{gate}` did not pass"
+            ),
+            Self::LiveRejectedMissingEvidence { gate } => write!(
+                f,
+                "live execution rejected: required validation evidence for gate `{gate}` was not provided"
             ),
             Self::TemporalPolicyViolation { field, reason } => {
                 write!(

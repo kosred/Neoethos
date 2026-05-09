@@ -15,6 +15,57 @@ pub struct LiveExecutionContract {
     pub risk_config_hash: String,
     pub required_backend_kind: Option<BackendKind>,
     pub max_artifact_age_seconds: Option<i64>,
+    /// When `true`, the live bridge rejects any evidence record whose
+    /// `walkforward_passed` flag is `false`. Defaults to `false` so
+    /// upgrading a contract instance never unintentionally tightens the
+    /// gate.
+    pub require_walkforward_pass: bool,
+    /// When `true`, the live bridge rejects any evidence record whose
+    /// `cpcv_passed` flag is `false`.
+    pub require_cpcv_pass: bool,
+    /// When `true`, the live bridge rejects any evidence record whose
+    /// `forward_test_passed` flag is `Some(false)` (and rejects missing
+    /// forward-test evidence as `LiveRejectedMissingEvidence`).
+    pub require_forward_test_pass: bool,
+    /// When `true`, the live bridge rejects any evidence record whose
+    /// `prop_firm_passed` flag is `Some(false)` (and rejects missing
+    /// prop-firm evidence as `LiveRejectedMissingEvidence`).
+    pub require_prop_firm_pass: bool,
+    /// Required `runtime_model_hash` for the live execution simulation
+    /// that produced the evidence. When `Some`, mismatched / missing
+    /// evidence rejects the load.
+    pub required_live_sim_runtime_model_hash: Option<String>,
+}
+
+/// Validation evidence accompanying a live-execution acceptance check.
+/// Each gate is split into "required → required-pass" pairs so callers
+/// can opt out per-gate; the `LiveExecutionContract` decides which gates
+/// are enforced.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveValidationEvidence {
+    pub walkforward_passed: bool,
+    pub cpcv_passed: bool,
+    /// `Some(true)`/`Some(false)` records a forward-test outcome;
+    /// `None` means "no forward-test was run" and the live bridge will
+    /// reject the artifact when forward-test evidence is required.
+    pub forward_test_passed: Option<bool>,
+    pub prop_firm_passed: Option<bool>,
+    /// Optional hash of the [`live_execution_simulation`] runtime model
+    /// the evidence was derived from. Mirrors the hash on
+    /// `LiveExecutionContract::required_live_sim_runtime_model_hash`.
+    pub live_sim_runtime_model_hash: Option<String>,
+}
+
+impl LiveValidationEvidence {
+    pub fn passed_all() -> Self {
+        Self {
+            walkforward_passed: true,
+            cpcv_passed: true,
+            forward_test_passed: Some(true),
+            prop_firm_passed: Some(true),
+            live_sim_runtime_model_hash: None,
+        }
+    }
 }
 
 impl LiveExecutionContract {
@@ -36,6 +87,11 @@ impl LiveExecutionContract {
             risk_config_hash: risk_config_hash.into(),
             required_backend_kind: None,
             max_artifact_age_seconds: None,
+            require_walkforward_pass: false,
+            require_cpcv_pass: false,
+            require_forward_test_pass: false,
+            require_prop_firm_pass: false,
+            required_live_sim_runtime_model_hash: None,
         }
     }
 
@@ -51,6 +107,98 @@ impl LiveExecutionContract {
         );
         self.max_artifact_age_seconds = Some(max_artifact_age_seconds);
         self
+    }
+
+    pub fn with_required_walkforward_pass(mut self) -> Self {
+        self.require_walkforward_pass = true;
+        self
+    }
+
+    pub fn with_required_cpcv_pass(mut self) -> Self {
+        self.require_cpcv_pass = true;
+        self
+    }
+
+    pub fn with_required_forward_test_pass(mut self) -> Self {
+        self.require_forward_test_pass = true;
+        self
+    }
+
+    pub fn with_required_prop_firm_pass(mut self) -> Self {
+        self.require_prop_firm_pass = true;
+        self
+    }
+
+    pub fn with_required_live_sim_runtime_model_hash(mut self, hash: impl Into<String>) -> Self {
+        self.required_live_sim_runtime_model_hash = Some(hash.into());
+        self
+    }
+
+    /// Reject the evidence record when any gate that the contract marks
+    /// required is missing or did not pass. Production callers chain
+    /// this after `validate_provenance` so live execution refuses
+    /// artifacts that survived the provenance / temporal checks but lack
+    /// validation evidence.
+    pub fn validate_evidence(
+        &self,
+        evidence: &LiveValidationEvidence,
+    ) -> Result<(), ArtifactContractError> {
+        if self.require_walkforward_pass && !evidence.walkforward_passed {
+            return Err(ArtifactContractError::LiveRejectedFailedEvidenceGate {
+                gate: "walkforward",
+            });
+        }
+        if self.require_cpcv_pass && !evidence.cpcv_passed {
+            return Err(ArtifactContractError::LiveRejectedFailedEvidenceGate { gate: "cpcv" });
+        }
+        if self.require_forward_test_pass {
+            match evidence.forward_test_passed {
+                Some(true) => {}
+                Some(false) => {
+                    return Err(ArtifactContractError::LiveRejectedFailedEvidenceGate {
+                        gate: "forward_test",
+                    });
+                }
+                None => {
+                    return Err(ArtifactContractError::LiveRejectedMissingEvidence {
+                        gate: "forward_test",
+                    });
+                }
+            }
+        }
+        if self.require_prop_firm_pass {
+            match evidence.prop_firm_passed {
+                Some(true) => {}
+                Some(false) => {
+                    return Err(ArtifactContractError::LiveRejectedFailedEvidenceGate {
+                        gate: "prop_firm",
+                    });
+                }
+                None => {
+                    return Err(ArtifactContractError::LiveRejectedMissingEvidence {
+                        gate: "prop_firm",
+                    });
+                }
+            }
+        }
+        if let Some(expected) = &self.required_live_sim_runtime_model_hash {
+            match &evidence.live_sim_runtime_model_hash {
+                Some(actual) if actual == expected => {}
+                Some(actual) => {
+                    return Err(ArtifactContractError::LiveRejectedMismatch {
+                        field: "live_sim_runtime_model_hash",
+                        actual: actual.clone(),
+                        expected: expected.clone(),
+                    });
+                }
+                None => {
+                    return Err(ArtifactContractError::LiveRejectedMissingEvidence {
+                        gate: "live_sim_runtime_model",
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn validate_provenance(

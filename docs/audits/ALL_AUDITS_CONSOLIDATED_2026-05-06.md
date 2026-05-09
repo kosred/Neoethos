@@ -531,6 +531,193 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 ## Execution log
 
 
+### 2026-05-09: Follow-on Phase 27 completed — live bridge validation evidence gate
+
+Started P1-4 by extending `forex_core::contracts::LiveExecutionContract` so the live bridge can demand validation evidence from the new walk-forward / CPCV / forward-test / prop-firm / live-sim artifact kinds — Phase 5's contract validated provenance and runtime mode but not the *evidence* of validation:
+
+- added `LiveValidationEvidence` (typed `walkforward_passed` / `cpcv_passed` booleans + `Option<bool>` flags for `forward_test_passed` / `prop_firm_passed` so callers can record "no test was run" vs "test failed", plus an `Option<String>` for the live-sim `runtime_model_hash`); a `passed_all()` constructor for the canonical green-path fixture and a `Default` impl that surfaces no evidence;
+- extended `LiveExecutionContract` with five new fields (`require_walkforward_pass`, `require_cpcv_pass`, `require_forward_test_pass`, `require_prop_firm_pass`, `required_live_sim_runtime_model_hash`) plus matching builder methods (`with_required_*`); the existing `new` keeps every gate disabled, so upgrading a contract instance never silently tightens the bar;
+- added `LiveExecutionContract::validate_evidence(&LiveValidationEvidence)` — production callers chain it after `validate_provenance` so the live bridge refuses artifacts that survived the provenance / temporal checks but lack the audited validation outcomes;
+- added two new error variants to `ArtifactContractError`: `LiveRejectedFailedEvidenceGate { gate: &'static str }` for "evidence present but did not pass" and `LiveRejectedMissingEvidence { gate: &'static str }` for "the contract requires a gate the evidence record never carried"; both are surfaced through a new branch of the `Display` impl;
+- re-exported `LiveValidationEvidence` from `forex_core::lib` so downstream crates (forex-search, forex-app, forex-cli) can build evidence records without depending on the contracts submodule directly;
+- added contracts-tests covering: default vs `passed_all` evidence, `validate_evidence` accepting when no gate is required, walkforward / cpcv failed-gate rejection, forward-test missing-vs-failed differentiation, prop-firm missing-vs-failed differentiation, and live-sim runtime-model hash missing / mismatch / accept paths.
+
+The contract surface for P1-4 is in place. Wiring real `LiveValidationEvidence` records from the discovery / forex-app pipeline (so a portfolio's persisted forward-test + prop-firm artifacts feed the gate at live-bridge load time) is the next concrete slice.
+
+Next follow-on targets: build a `LiveValidationEvidence` from `DiscoveryResult` + persisted prop-firm / live-sim artifacts (P1-4 second slice), explicit degraded-mode metadata propagation through runtime layers (P1-3), DeterminismPolicy rollout into `forex-models` RL / exit-agent / genetic wrapper (P0-9), UI exposure of scheduler/hardware plans (P2-1), and operator-facing artifact safety documentation (P2-3).
+
+
+### 2026-05-09: Follow-on Phase 26 completed — DeterminismPolicy through search
+
+Started P0-9 by routing the genetic-search RNG seed through the canonical [`forex_core::contracts::DeterminismPolicy`] enum that was added in Phase 1 but until now was used only by the artifact provenance struct:
+
+- added `GeneticSearchRuntimeOverrides::determinism_policy()` returning the typed enum: `Some(seed)` maps to `Deterministic { seed }`, `None` maps to `NonDeterministicAllowed` (preserving the existing "seed from OS RNG" behavior that fell out of the legacy `seed: Option<u64>` field);
+- rewrote `build_search_rng` in `genetic/search_engine.rs` to consume the typed policy via an explicit `match`, so adding new modes (e.g. `BestEffort`) only requires a new arm rather than an `Option` re-interpretation;
+- added a public `current_determinism_policy()` accessor at the genetic-runtime-overrides module + lib boundary so artifact-emitting paths can record the determinism mode in `ArtifactProvenance` without re-deriving it from the seed field;
+- re-exported `DeterminismPolicy` itself from `forex-search::lib` so downstream crates do not need to depend on `forex_core::contracts` just to inspect / construct the enum;
+- added unit tests covering the seed-Some → Deterministic, seed-None → NonDeterministicAllowed mapping; the `DeterminismPolicy::seed()` round-trip for all three variants; and the legality of the lib-level `current_determinism_policy()` accessor under any installed override.
+
+The change is intentionally a thin typed wrapper — it does not change runtime behavior, but it gives every downstream caller (artifact provenance, RL, exit-agent exploration, sampling) a typed boundary to consume instead of `Option<u64>`. Subsequent P0-9 phases can migrate those callers (forex-models RL, forex-models exit-agent, evolution_math sampling) onto the same enum without further public-API churn.
+
+Next follow-on targets: extend `DeterminismPolicy` consumption into `forex-models` (RL exploration, exit-agent search, genetic-discovery wrapper), wire the new validation artifacts into the search → portfolio → live bridge gate (P1-4), explicit degraded-mode metadata propagation through runtime layers (P1-3), UI exposure of scheduler/hardware plans (P2-1), and operator-facing artifact safety documentation (P2-3).
+
+
+### 2026-05-09: Follow-on Phase 25 completed — live-sim and prop-firm artifact contracts
+
+Closed out the P0-10 separation list by adding the last two missing typed contracts so each evaluation kind has an explicit `artifact_kind` boundary:
+
+- added `LiveExecutionRuntimeModel` (slippage / latency / spread / commission / partial-fill rate / kill-zone toggle / backend kind) — recorded inside the live-sim artifact so a downstream live bridge can reject artifacts whose execution semantics do not match its current configuration;
+- added `LiveExecutionSimulationSummary` (bars / trades / blocked-by-killzone / partial-fill counters + canonical `BacktestMetrics`) and the supporting `LiveExecutionSimulationScope` that hashes dataset + evaluation-config + strategy + runtime model into the shared `TemporalScopeHashes` boundary;
+- added `LiveExecutionSimulationArtifactFile` with `LIVE_EXECUTION_SIMULATION_ARTIFACT_KIND` / v1 schema, `validate_for_temporal_contract` rejecting wrong artifact kinds, unsupported schema versions, and temporal-contract drift, plus atomic `write_*` / validating `read_*` helpers reusing `forex-search::artifact_io`;
+- added `PropFirmRiskRules` (loss / overall-DD / consistency / min-days / max-trades-per-day / profit-target knobs with FTMO-style defaults and per-field opt-out via `<= 0.0`), `PropFirmRiskValidationSummary` (per-rule pass/fail flags + worst-observed values + net return), and `PropFirmRiskValidationScope` hashing dataset + evaluation-config + strategy + rules + temporal scope;
+- added `PropFirmRiskValidationArtifactFile` mirroring the canonical / walk-forward / forward-test pattern, plus atomic `write_*` / `read_*` helpers that reject wrong kind / unsupported schema / temporal drift on load;
+- added `PropFirmRiskInput` and `compute_prop_firm_risk_summary` so callers feed observed trades from any source (canonical backtest, walk-forward, forward-test, live-sim) and the helper aggregates daily PnL / overall drawdown / consistency / trade limits / profit target into explicit pass/fail flags — entirely deterministic, no simulation embedded;
+- re-exported every new type, IO helper, kind constant, schema-version constant, and compute helper from `forex-search::lib`;
+- added validation-module unit tests covering the live-sim artifact's runtime-model + temporal-scope binding, atomic round-trip, wrong-kind / unsupported-schema rejection, plus the prop-firm helper's pass / daily-loss-breach paths and the prop-firm artifact's atomic round-trip and load-time validation.
+
+P0-10 is now complete on the contract surface (`canonical_strategy_backtest`, `walk_forward_validation`, `forward_test_validation`, `live_execution_simulation`, `prop_firm_risk_validation` — five distinct kinds, each with a shared temporal scope + atomic-IO + load-time validation). Wiring the live-sim / prop-firm artifacts into the discovery / forex-app flow is intentionally deferred since it requires picking a slippage/latency model and a default rule set per challenge — both decisions belong in their own phases.
+
+Next follow-on targets: P0-9 `DeterminismPolicy` rollout across genetic / RL / exit-agent paths, P1-3 explicit degraded-mode metadata propagation through the runtime layers, P1-4 wiring the new validation artifacts into the search → portfolio → live bridge gate (Phase 5 already enforces typed live-readiness; the new artifacts let live execution accept / reject based on prop-firm and live-sim evidence), P2-1 UI exposure of scheduler/hardware plans, and P2-3 operator-facing artifact safety documentation.
+
+
+### 2026-05-09: Follow-on Phase 24 completed — forward-test wired into discovery
+
+Continued P0-10 by wiring the Phase 23 forward-test contract into the discovery / forex-app pipeline so the held-out 20% tail produces persisted forward-test evidence:
+
+- added `forward_test_validation_artifacts: Vec<ForwardTestValidationArtifactFile>` to `DiscoveryResult` and updated every internal/test constructor (and the discovery cycle return path) to populate it (defaults to `Vec::new()`);
+- added `compute_discovery_forward_test_artifacts(portfolio, effective_feature_names, tail_features, tail_ohlcv, config)` in `forex-search::discovery` that aligns the tail's columns to the post-prefilter set, replays each gene via `signals_for_gene_full` + `compute_forward_test_summary`, and returns one `ForwardTestValidationArtifactFile` per strategy — the helper bails when the tail is missing any effective feature so callers cannot mismatch feature pipelines;
+- added `save_forward_test_validation_artifacts(dir, result)` for atomic per-strategy persistence using the same content-addressable filename scheme as the canonical backtest / walk-forward helpers;
+- extended `DiscoveryRunProfile` with `forward_test_validation_artifacts_observed` so the persisted profile JSON now reports forward-test coverage alongside canonical/walk-forward counts;
+- re-exported the new compute / save helpers from `forex-search::lib`;
+- wired the helper into the `forex-app` UI discovery service: after `run_discovery_cycle_with_progress` returns and the portfolio passes the existing non-empty check, the service builds a tail `Ohlcv` / `FeatureFrame` from rows past `wfv_bound`, calls `compute_discovery_forward_test_artifacts` with the resolved config, stores the result on `DiscoveryResult`, and persists it to a sibling `*.forward_tests/` directory next to the existing portfolio / profile / canonical / walk-forward outputs. Forward-test failures are logged at `warn` and do not block portfolio export, since the existing `walkforward_passed` / `cpcv_passed` gates remain the production-blocking signals;
+- added `discovery` unit tests covering the empty-portfolio short-circuit, missing-feature rejection, one-artifact-per-strategy emission, atomic save, and the run-profile field exposure.
+
+The forex-cli / orchestrator paths intentionally remain untouched in this phase — they currently process the full dataset without an explicit OOS partition, so wiring forward-test there would require deciding how to partition CLI-driven runs (a separate decision that does not belong inside the contract-completion slice).
+
+Next follow-on targets: `LiveExecutionSimulationArtifactFile` and `PropFirmRiskValidationArtifactFile` typed contracts (P0-10), `DeterminismPolicy` rollout across genetic / RL / exit-agent paths (P0-9), explicit degraded-mode metadata propagation through runtime layers (P1-3), UI exposure of scheduler/hardware plans (P2-1), and operator-facing artifact safety documentation (P2-3).
+
+
+### 2026-05-09: Follow-on Phase 23 completed — forward-test validation artifact contract
+
+Started P0-10 by adding the missing `forward_test_validation` artifact type next to the existing canonical backtest (Phase 14) and walk-forward (Phase 10) contracts:
+
+- added `FORWARD_TEST_VALIDATION_ARTIFACT_KIND` and a v1 schema constant alongside the existing canonical/walk-forward kind constants so the load-time validation paths cannot confuse the three;
+- added `ForwardTestSummary` (intentionally flat — `bars`, canonical `BacktestMetrics`, `span_days` — because forward testing produces one unbiased OOS estimate, not a folded distribution);
+- added `ForwardTestValidationScope` binding dataset / evaluation-config / strategy hashes plus the shared `TemporalScopeHashes`, with `new`, `from_parts`, and `validate_temporal_contract` mirroring the canonical/walk-forward scopes;
+- added `ForwardTestValidationArtifactFile` with explicit kind/schema metadata and `validate_for_temporal_contract` rejecting wrong artifact kinds, unsupported schema versions, and temporal-contract drift;
+- added atomic `write_forward_test_validation_artifact_atomic` and validating `read_forward_test_validation_artifact` IO helpers reusing `forex-search::artifact_io`;
+- added `ForwardTestInput` and `compute_forward_test_summary` so callers can produce a forward-test summary from a pre-sliced held-out tail using the same evaluation core as canonical backtests, with input-length validation that refuses empty tails or mismatched array lengths;
+- re-exported every new type / IO helper / kind constant from `forex-search`;
+- added `validation` unit tests covering temporal-contract acceptance, temporal drift rejection, wrong-kind / unsupported-schema rejection, atomic round-trip, span-days computation across day boundaries, and the input-length / empty-tail rejection paths.
+
+The artifact contract is in place for the next slice of P0-10 work; wiring the forward-test gate into the discovery / forex-app pipelines is intentionally deferred to a separate phase so this change stays scoped to the contract surface.
+
+Next follow-on targets: wire the forward-test artifact into the discovery / forex-app held-out tail (Phase 24), `LiveExecutionSimulationArtifactFile` and `PropFirmRiskValidationArtifactFile` typed contracts, P0-9 `DeterminismPolicy` rollout across genetic / RL / exit-agent paths, P1-3 explicit degraded-mode metadata propagation through the runtime layers, P2-1 UI exposure of scheduler/hardware plans, and P2-3 operator-facing artifact safety documentation.
+
+
+### 2026-05-09: Follow-on Phase 22 completed — install-once for remaining genetic env-readers
+
+Closed out the genetic-module env-reader cleanup so `forex-search/src/genetic` no longer touches `std::env` per call:
+
+- retired `RegimeLabelPolicy::from_env` and its private `env_i64` / `env_usize` / `env_f64` helpers (no callers in this crate or any dependent), eliminating 11 `FOREX_BOT_REGIME_LABEL_*` env reads from the regime-labels surface — the typed `RegimeLabelPolicy` struct fields remain the canonical configuration boundary;
+- converted `SmcSearchConfig::from_env` into a lazy `OnceLock`-cached reader: the `FOREX_BOT_PROP_SMC_*` env vars are now read at most once per process, the existing `SmcSearchConfig::from_env()` call sites in `evolve_search_with_progress_and_limits` (×2) and `forex-models::genetic::train_with_discovery` keep their public API, and a new `install_smc_search_config_from_env` lets binaries force the cache to populate at startup;
+- added `Default` for `SmcSearchConfig` (with audit-aligned probability defaults) so future tests / callers can build a deterministic config without touching either the env or the cache;
+- introduced `SeenSignatureMemoryRuntimeOverrides` (typed `flush_every`, `load_max`, `max_entries`, `file_path`) plus the matching `OnceLock` install path (`install_seen_signature_memory_runtime_overrides`, `install_seen_signature_memory_runtime_overrides_from_env`, `current_seen_signature_memory_runtime_overrides`); rewrote `SeenSignatureMemory::from_env` to consult the cached overrides instead of inlining four `std::env::var` calls per construction (the file is still loaded each call because the in-memory state is per-search, but the env surface is read at most once);
+- exported the new types and install helpers through `genetic::mod` and `forex_search::lib`, and extended `forex_search::install_search_runtime_overrides_from_env` so the unified entry point already wired into both binary `main()` paths now also primes the SMC and seen-signature caches;
+- added module-local override unit tests for the new surfaces (SMC search-config defaults / legality, seen-signature-memory override defaults, current-accessor legality).
+
+After Phase 22, `forex-search/src/genetic/*` has zero per-call `std::env::var` invocations: every env-driven knob is read at process startup via `install_search_runtime_overrides_from_env` (or lazily once on first use). The remaining env reads in `forex-search` live entirely outside the genetic submodule (CUDA/WGPU diagnostics in `cubecl_*.rs`, `discovery_gpu.rs`, and the `FOREX_BOT_REQUIRE_GPU` safety gate in `lib.rs`), and they are explicitly diagnostic rather than production-semantic.
+
+Next follow-on targets: P0-9 `DeterminismPolicy` rollout across genetic / RL / exit-agent paths, P0-10 forward-test / live-execution / prop-firm validation contracts, P1-3 explicit degraded-mode metadata propagation through the runtime layers, P2-1 UI exposure of scheduler/hardware plans, and P2-3 operator-facing artifact safety documentation.
+
+
+### 2026-05-09: Follow-on Phase 21 completed — typed cost profile and SMC weight overrides
+
+Continued P0-8 cleanup into the most production-critical evaluation surface — symbol identity, account currency, pip value, spread/commission cost model, and SMC weighting — which previously read `FOREX_BOT_PROP_*` env vars on every `EvaluationConfig::default` call:
+
+- added `CostProfileRuntimeOverrides` (typed `Option`s for `symbol`, `account_currency`, `pip_value`, `quote_to_account_rate`, `pip_value_per_lot`, `spread_pips`, `commission_per_trade`) so production callers that pass explicit values continue to bypass any fallback while env-driven fallbacks resolve through the typed boundary;
+- added `SmcWeightRuntimeOverrides` covering the `FOREX_BOT_PROP_SMC_GATE` threshold and all 11 `FOREX_BOT_PROP_SMC_W_*` weights with documented unit-weight defaults;
+- combined the two into `StrategyEvaluationRuntimeOverrides` with a single `from_env` reader and a `OnceLock` install path (`install_strategy_evaluation_runtime_overrides`, `install_strategy_evaluation_runtime_overrides_from_env`, `current_strategy_evaluation_runtime_overrides`);
+- replaced the inline env reads in `infer_market_cost_profile` and the env-driven branches in `EvaluationConfig::default`; both now consult the typed overrides exactly once, eliminating the previous double-read of cost env vars (once via `infer_market_cost_profile`, once via `EvaluationConfig::default`);
+- exported every new override type through `genetic::mod` and `forex_search::lib`, and extended `install_search_runtime_overrides_from_env` so the unified entry point already wired into the binary `main()` paths now also resolves the strategy-evaluation overrides — production binaries continue to honour the legacy env vars with one explicit call at startup;
+- added override-module unit tests covering documented defaults for `CostProfileRuntimeOverrides`, the unit-weight default invariant for `SmcWeightRuntimeOverrides`, the neutral-state composition of `StrategyEvaluationRuntimeOverrides`, and the legal-values guarantee on the runtime accessor when no install has happened.
+
+After Phase 21, `forex-search/src/genetic/strategy_gene.rs` no longer touches `std::env` at all. The remaining env readers in the crate live inside typed `from_env` constructors (`SmcSearchConfig`, `SeenSignatureMemory`, `RegimeLabelPolicy`) that are already audit-aligned struct boundaries used at construction time rather than per-call.
+
+Next follow-on targets are `genetic/regime_labels::RegimeLabelPolicy::from_env` and `genetic/smc_indicators::SmcSearchConfig::from_env` (already typed, but read on every search invocation), `evolution_math::SeenSignatureMemory::from_env` (file path + flush thresholds), `DeterminismPolicy` rollout (P0-9), additional canonical evaluation contracts (P0-10), UI exposure of scheduler/hardware plans (P2-1), and operator-facing artifact safety documentation (P2-3).
+
+
+### 2026-05-09: Follow-on Phase 20 completed — finished search-engine env-flag cleanup
+
+Closed out the Phase 19 follow-on by extending `GeneticSearchRuntimeOverrides` to cover every remaining `FOREX_BOT_PROP_*` knob that the genetic search engine still read inline at the top of `evolve_search_with_progress_and_limits`:
+
+- added three nested override sub-structs — `SmcGateOverrides` (start/end/curve/stagnation_step), `ArchiveScoringOverrides` (mode/min_net/min_pf/min_sharpe), `SelectionPolicyOverrides` (parent/survivor policies, immigrant ratio, survivor fraction, temperature) — plus a top-level `seen_retry_attempts` field, all with audit-aligned defaults that match the legacy env-var fallbacks;
+- consolidated the legacy clamp logic (curve ≥ 0.1, stagnation_step ≥ 0, immigrant ratio / survivor fraction in `[0, 0.95]`, temperature ≥ 1e-3, retry attempts ≥ 1) into typed `resolved_*` and `effective_*` accessor methods so the search engine no longer duplicates min/max gymnastics at the call site;
+- extended `GeneticSearchRuntimeOverrides::from_env` to consume the full `FOREX_BOT_PROP_SMC_GATE_*`, `FOREX_BOT_PROP_ARCHIVE_*`, `FOREX_BOT_PROP_RANDOM_IMMIGRANTS`, `FOREX_BOT_PROP_SURVIVOR_FRACTION` (or legacy `FOREX_BOT_PROP_ELITE_FRACTION`), `FOREX_BOT_PROP_PARENT_SELECTION` / `SURVIVOR_SELECTION` / `SELECTION_TEMPERATURE`, and `FOREX_BOT_PROP_SEEN_RETRY` env surface in one place;
+- removed the inline `env_f32` / `env_f64` / `env_str` closures plus every `std::env::var` call from `evolve_search_with_progress_and_limits`; the body now reads only `current_genetic_search_runtime_overrides()` and the resolved sub-structs;
+- pruned the now-unused `ParentSelectionPolicy` import from `search_engine.rs` since the typed override boundary owns parent-policy parsing;
+- added `runtime_overrides` unit tests covering documented defaults across every sub-struct, the SMC-gate clamp behavior on invalid curve/stagnation values, the selection-policy clamp behavior on out-of-range immigrant ratio / survivor fraction / temperature, and the seen-retry minimum-of-1 floor.
+
+The search engine no longer touches the environment at all during a run; the legacy `SmcSearchConfig::from_env` and `SeenSignatureMemory::from_env` constructors are the only remaining env-readers in `forex-search/src/genetic`, and both are already typed boundaries used at struct-construction time rather than per-call.
+
+Next follow-on targets are the remaining production-affecting env vars in `genetic/strategy_gene` (SMC weight knobs and prop-firm cost profile fields), `genetic/regime_labels` and `genetic/smc_indicators` (still typed `from_env` constructors, but they read on every call), `DeterminismPolicy` rollout (P0-9), additional canonical evaluation contracts (P0-10), UI exposure of scheduler/hardware plans (P2-1), and operator-facing artifact safety documentation (P2-3).
+
+
+### 2026-05-09: Follow-on Phase 19 completed — typed genetic search runtime overrides
+
+Continued P0-8 cleanup into the genetic search engine, where the most production-affecting `FOREX_BOT_*` knobs (RNG seed, novelty weighting, tournament size, stagnation patience, archive cap) were previously read with inline `std::env::var` calls at the top of every `evolve_search` invocation:
+
+- added a new `forex_search::genetic::runtime_overrides` module with `GeneticSearchRuntimeOverrides` (`seed`, `novelty_weight`, `stagnation_patience`, `tournament_size_override`, `archive_cap_override`) plus a one-shot `from_env` reader and the `OnceLock` install path (`install_genetic_search_runtime_overrides`, `install_genetic_search_runtime_overrides_from_env`, `current_genetic_search_runtime_overrides`);
+- consolidated the legacy formula for tournament size, archive cap, and stagnation patience into typed methods (`effective_tournament_size`, `effective_archive_cap`, `effective_stagnation_patience`) so `search_engine.rs` no longer duplicates min/max/clamp logic at the call site;
+- replaced `build_search_rng` and the inline `FOREX_BOT_SEARCH_SEED` / `FOREX_BOT_NOVELTY_WEIGHT` / `FOREX_BOT_PROP_STAGNATION_GENS` / `FOREX_BOT_PROP_TOURNAMENT_SIZE` / `FOREX_BOT_PROP_ARCHIVE_CAP` reads in `evolve_search_with_progress_and_limits` with a single resolved `current_genetic_search_runtime_overrides()` call;
+- retired the dead `DiversityArchiveConfig::from_env` helper (no callers in this crate or any dependent), eliminating the last `FOREX_BOT_PROP_DIVERSE_*` env reads from the diversity archive surface and leaving an explanatory comment that future env-driven defaults must come through a typed `*RuntimeOverrides` boundary;
+- re-exported the new genetic-search override types from `forex-search`, and extended `install_search_runtime_overrides_from_env` so the unified entry point already wired into `forex-cli::main` and `forex-app::main` now also resolves the genetic-search overrides — production binaries continue to pick up the legacy env vars with one explicit call at startup;
+- added override-module unit tests covering documented defaults, the legacy population-derived tournament-size formula (including the algorithmic minimum-of-2 clamp), the archive cap floor/ceiling around `population` and `200_000`, and the stagnation patience minimum-of-1.
+
+Next follow-on targets are the remaining `FOREX_BOT_PROP_*` knobs in `evolve_search_with_progress_and_limits` (SMC gate curves, archive thresholds, immigrant/elite/parent/survivor selection knobs), `DeterminismPolicy` rollout (P0-9), additional canonical evaluation contracts (P0-10), UI exposure of scheduler/hardware plans (P2-1), and operator-facing artifact safety documentation (P2-3).
+
+
+### 2026-05-09: Follow-on Phase 18 completed — typed backtest and quality runtime overrides
+
+Continued the P0-8 cleanup beyond discovery into the canonical backtest and strategy-quality math, both of which previously read `FOREX_BOT_*` env vars on every metric call:
+
+- added `BacktestRuntimeOverrides` (`initial_equity`, `month_capacity`) plus a one-shot `from_env` reader and a process-wide `OnceLock` install path (`install_backtest_runtime_overrides`, `install_backtest_runtime_overrides_from_env`, `current_backtest_runtime_overrides`) in `forex-search::eval`;
+- replaced the env-driven `BacktestSettings::initial_equity` / `month_capacity` accessors so canonical backtest math now resolves through the typed overrides instead of `std::env::var` per call, while keeping the same accessor signatures for compatibility with all existing struct-literal call sites;
+- added `QualityRuntimeOverrides` (`min_trades_per_month`, `trading_days_per_month`) plus the matching install/current accessors in `forex-search::quality`, and removed the inline env reads from monthly metric aggregation and the trade-frequency annualization helper;
+- exposed both override types and a unified `forex_search::install_search_runtime_overrides_from_env` convenience entry point so binaries can resolve every legacy `FOREX_BOT_BACKTEST_*` / `FOREX_BOT_PROP_*` / `FOREX_BOT_TRADING_DAYS_PER_MONTH` knob in one explicit call;
+- wired `install_search_runtime_overrides_from_env` into `forex-cli::main` and `forex-app::main` so the existing env-driven behavior is preserved end-to-end while `forex-search` itself stops touching the environment during a run;
+- added `eval` and `quality` override unit tests covering documented defaults, clamp behavior on bad inputs, and the deterministic fallback path of the runtime accessors when no install has happened.
+
+Next follow-on targets are deeper P0-8 cleanup of the remaining `FOREX_BOT_PROP_*` knobs in genetic search/diversity/regime modules, `DeterminismPolicy` rollout (P0-9), additional canonical evaluation contracts (P0-10), UI exposure of scheduler/hardware plans (P2-1), and operator-facing artifact safety documentation (P2-3).
+
+
+### 2026-05-09: Follow-on Phase 17 completed — typed discovery runtime overrides
+
+Implemented the next P0-8 slice by removing production-affecting env-var reads from `forex-search::discovery` and replacing them with a typed runtime-overrides boundary:
+
+- added `DiscoveryRuntimeOverrides` (typed `prefilter_top_k`, `prefilter_insample_frac`, `funnel_stage1_pct`) plus a single explicit `DiscoveryRuntimeOverrides::from_env` reader for the legacy `FOREX_BOT_PREFILTER_TOP_K`, `FOREX_BOT_PREFILTER_INSAMPLE`, and `FOREX_BOT_FUNNEL_STAGE1_PCT` env vars;
+- added `runtime_overrides` to `DiscoveryConfig` with deterministic defaults and a `with_env_runtime_overrides` opt-in helper, so `DiscoveryConfig::default()` and `DiscoveryConfig::from_settings` no longer pick up ambient env state;
+- removed the env reads inside `run_discovery_cycle_with_progress` and `prefilter_features` and made `prefilter_features` accept the in-sample fraction as an explicit argument resolved from typed config;
+- exposed the resolved `prefilter_top_k`, `prefilter_insample_frac`, and `funnel_stage1_pct` in `DiscoveryRunProfile` so persisted profile JSONs document exactly which knobs were used;
+- wired the `with_env_runtime_overrides` opt-in into `forex-cli` `discover`, `forex-search::DiscoveryOrchestrator::run_batch`, the `forex-app` discovery service (also using the resolved config to write the profile), and `forex-models::genetic` so existing call sites keep their previous env-driven behavior explicitly;
+- added discovery tests proving default determinism, clamp behavior on bad inputs, that `DiscoveryConfig::default` ignores the legacy env vars, and that the run profile reports the resolved overrides.
+
+Next follow-on targets are wider P0-8 cleanup of the remaining `FOREX_BOT_*` knobs in eval/genetic search/regime modules, `DeterminismPolicy` rollout (P0-9), additional canonical evaluation contracts (P0-10), UI exposure of scheduler/hardware plans (P2-1), and operator-facing artifact safety documentation (P2-3).
+
+
+### 2026-05-09: Follow-on Phase 16 completed — discovery validation artifact persistence
+
+Continued the discovery validation wiring from Phase 15 by persisting the canonical backtest and walk-forward validation artifacts that Phase 15 only computed in memory:
+
+- added `save_canonical_backtest_artifacts` and `save_walkforward_validation_artifacts` in `forex-search::discovery`, each writing one atomic per-strategy JSON file under a caller-supplied directory using the shared validation artifact IO helpers and content-addressable filenames derived from the strategy hash;
+- re-exported the new save helpers from `forex-search` so CLI/UI/orchestration callers can persist validation evidence without reaching into the validation submodule;
+- wired the helpers into `DiscoveryOrchestrator::run_batch` so each `{symbol}_{tf}` work unit produces sibling `{symbol}_{tf}_canonical_backtests/` and `{symbol}_{tf}_walkforward_validations/` directories whenever the discovery result carries those artifacts;
+- wired the same helpers into the `forex-cli discover` and `forex-app` discovery service so single-symbol and UI-driven runs produce matching `.canonical_backtests/` and `.walkforward_validations/` directories alongside the existing portfolio/profile/quality/trade-log outputs;
+- added discovery tests covering per-strategy file emission, the empty-result no-op path, and filename sanitization for the `fnv64:` strategy hash format.
+
+Next follow-on targets are UI exposure of scheduler-owned hardware plans and operator-facing artifact safety documentation.
+
+
 ### 2026-05-08: Follow-on Phase 15 completed — discovery validation gates and profile exports
 
 Continued the discovery/backtest validation wiring from P0-10/P1-4/H39 by making portfolio export depend on explicit validation gate state instead of implicit discovery success:

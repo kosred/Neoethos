@@ -9,6 +9,7 @@ use std::collections::{HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
 const FNV_PRIME: u64 = 1099511628211;
@@ -304,7 +305,31 @@ pub struct SeenSignatureMemory {
     pub max_entries: usize,
 }
 
-impl SeenSignatureMemory {
+/// Typed runtime knobs that previously lived only in
+/// `FOREX_BOT_PROP_SEEN_*` env vars. The seen-signature memory consults
+/// the cached overrides each time it is constructed, but the env vars
+/// themselves are read at most once per process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeenSignatureMemoryRuntimeOverrides {
+    pub flush_every: usize,
+    pub load_max: usize,
+    pub max_entries: usize,
+    pub file_path: Option<PathBuf>,
+}
+
+impl Default for SeenSignatureMemoryRuntimeOverrides {
+    fn default() -> Self {
+        Self {
+            flush_every: 4096,
+            load_max: 3_000_000,
+            max_entries: 3_000_000,
+            file_path: None,
+        }
+    }
+}
+
+impl SeenSignatureMemoryRuntimeOverrides {
+    /// One-shot read of the legacy `FOREX_BOT_PROP_SEEN_*` env vars.
     pub fn from_env() -> Self {
         let flush_every = std::env::var("FOREX_BOT_PROP_SEEN_FLUSH_EVERY")
             .ok()
@@ -315,20 +340,64 @@ impl SeenSignatureMemory {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(3_000_000);
-        let max_entries = std::env::var("FOREX_BOT_PROP_SEEN_MAX_ENTRIES")
+        let max_entries_raw = std::env::var("FOREX_BOT_PROP_SEEN_MAX_ENTRIES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(load_max);
-        let max_entries = if max_entries == 0 {
+        let max_entries = if max_entries_raw == 0 {
             usize::MAX
         } else {
-            max_entries.max(1)
+            max_entries_raw.max(1)
         };
-        let file_raw = std::env::var("FOREX_BOT_PROP_SEEN_FILE")
+        let file_path = std::env::var("FOREX_BOT_PROP_SEEN_FILE")
             .ok()
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        let file_path = file_raw.map(PathBuf::from);
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        Self {
+            flush_every,
+            load_max,
+            max_entries,
+            file_path,
+        }
+    }
+}
+
+static SEEN_SIGNATURE_MEMORY_RUNTIME_OVERRIDES: OnceLock<SeenSignatureMemoryRuntimeOverrides> =
+    OnceLock::new();
+
+/// Install process-wide seen-signature-memory overrides. Returns
+/// `Err(existing)` when overrides were already installed earlier (the
+/// first install wins).
+pub fn install_seen_signature_memory_runtime_overrides(
+    overrides: SeenSignatureMemoryRuntimeOverrides,
+) -> Result<(), SeenSignatureMemoryRuntimeOverrides> {
+    SEEN_SIGNATURE_MEMORY_RUNTIME_OVERRIDES.set(overrides)
+}
+
+/// Convenience wrapper that resolves the legacy `FOREX_BOT_PROP_SEEN_*`
+/// env vars once and installs them. Idempotent.
+pub fn install_seen_signature_memory_runtime_overrides_from_env() {
+    let _ = SEEN_SIGNATURE_MEMORY_RUNTIME_OVERRIDES
+        .set(SeenSignatureMemoryRuntimeOverrides::from_env());
+}
+
+/// Returns the currently installed seen-signature-memory overrides, or
+/// the deterministic defaults when no install has happened.
+pub fn current_seen_signature_memory_runtime_overrides() -> SeenSignatureMemoryRuntimeOverrides {
+    SEEN_SIGNATURE_MEMORY_RUNTIME_OVERRIDES
+        .get()
+        .cloned()
+        .unwrap_or_default()
+}
+
+impl SeenSignatureMemory {
+    pub fn from_env() -> Self {
+        let overrides = current_seen_signature_memory_runtime_overrides();
+        let flush_every = overrides.flush_every.max(1);
+        let load_max = overrides.load_max;
+        let max_entries = overrides.max_entries;
+        let file_path = overrides.file_path;
 
         let mut memory = Self {
             all: HashSet::new(),
@@ -824,5 +893,21 @@ mod tests {
         assert_eq!(gene.trades_count, 0);
         assert_eq!(gene.slice_pass_rate, 0.0);
         assert_eq!(gene.consistency, 0.0);
+    }
+
+    #[test]
+    fn seen_signature_memory_runtime_overrides_defaults_match_legacy_env_defaults() {
+        let defaults = SeenSignatureMemoryRuntimeOverrides::default();
+        assert_eq!(defaults.flush_every, 4096);
+        assert_eq!(defaults.load_max, 3_000_000);
+        assert_eq!(defaults.max_entries, 3_000_000);
+        assert!(defaults.file_path.is_none());
+    }
+
+    #[test]
+    fn current_seen_signature_memory_runtime_overrides_returns_legal_values() {
+        let observed = current_seen_signature_memory_runtime_overrides();
+        assert!(observed.flush_every >= 1);
+        assert!(observed.max_entries >= 1);
     }
 }

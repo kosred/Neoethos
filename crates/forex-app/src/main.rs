@@ -44,6 +44,7 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     setup_logging(true)?;
+    forex_search::install_search_runtime_overrides_from_env();
     let settings = Settings::from_yaml(&args.config)?;
     let runtime = AppRuntimeConfig::from_settings(
         args.config.clone(),
