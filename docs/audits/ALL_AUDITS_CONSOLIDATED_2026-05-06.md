@@ -531,6 +531,21 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 ## Execution log
 
 
+### 2026-05-10: Follow-on Phase 48 completed — DiscoveryResult → ValidationEvidenceManifest
+
+Connected the producer-side artifact pipeline to Codex's promotion-contract surface (Phases 30-44) so the search bridge feeds the typed `ValidationEvidenceManifest` directly:
+
+- added `discovery_validation_evidence_manifest(result)` in `forex-search::discovery` that hashes the four DiscoveryResult artifact vectors (canonical / walk-forward / forward-test / prop-firm) into a typed manifest. Live-execution simulation hash is intentionally left empty so `ValidationEvidenceManifest::validate` surfaces the typed `MissingValidationEvidence("live_execution_simulation_hash")` error rather than a silently-filled placeholder — the simulator is still deferred and the gate must reject until it lands;
+- added `discovery_per_kind_evidence_hashes(result)` returning the typed `DiscoveryPerKindEvidenceHashes` struct (one `Option<String>` per kind) so operator/UI layers can render a diagnostic view ("forward-test present, live-sim missing") without forcing manifest validation;
+- relaxed `forex_search::artifact_io::stable_json_hash` to accept `T: Serialize + ?Sized` so the helpers can hash `&[T]` slice arguments without intermediate copies;
+- re-exported `DiscoveryPerKindEvidenceHashes`, `discovery_validation_evidence_manifest`, and `discovery_per_kind_evidence_hashes` from `forex-search::lib`;
+- added discovery-tests covering: manifest rejects missing live-sim evidence (the always-failing gate), manifest rejects missing walk-forward evidence (an explicitly-empty kind), per-kind hashes return `Some` only for present kinds, and per-kind hashes return all-`None` for an empty result.
+
+The integration handoff guardrail from Codex's Phase 40 doc — "wire producers into this contract, do not create another live-readiness schema in discovery or UI code" — is now satisfied on the discovery side. The forex-app discovery service can call `discovery_validation_evidence_manifest` after running the cycle to feed Codex's `LivePromotionGate` directly.
+
+Next follow-on targets: persist a `PromotionReadinessReport` as part of `DiscoveryRunProfile` so operators see promotion verdicts without code, populate `live_sim_runtime_model_hash` once a live-execution simulator is in place, explicit degraded-mode metadata propagation through runtime layers (P1-3), DeterminismPolicy rollout into `forex-models` (P0-9), UI exposure of scheduler/hardware plans (P2-1).
+
+
 ### 2026-05-10: Follow-on Phase 47 completed — operator-facing artifact safety reference
 
 Closed P2-3 by writing the short, opinionated reference document the audit explicitly requires for every critical artifact type. The document lives at [`docs/operator/artifact_safety.md`](../operator/artifact_safety.md) and answers the audit's five operator questions for each of the five validation artifact kinds (`canonical_strategy_backtest`, `walkforward_validation`, `forward_test_validation`, `live_execution_simulation`, `prop_firm_risk_validation`):

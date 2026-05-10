@@ -921,10 +921,11 @@ pub mod validation;
 
 pub use challenge::{ChallengeOptimizer, ChallengeTarget};
 pub use discovery::{
-    DiscoveryConfig, DiscoveryProgress, DiscoveryResult, DiscoveryRunProfile,
-    DiscoveryRuntimeOverrides, DiscoveryValidationGates, LoggedStrategyTrades,
+    DiscoveryConfig, DiscoveryPerKindEvidenceHashes, DiscoveryProgress, DiscoveryResult,
+    DiscoveryRunProfile, DiscoveryRuntimeOverrides, DiscoveryValidationGates, LoggedStrategyTrades,
     build_discovery_profile, compute_discovery_forward_test_artifacts,
-    compute_discovery_prop_firm_artifacts, ensure_non_empty_portfolio,
+    compute_discovery_prop_firm_artifacts, discovery_per_kind_evidence_hashes,
+    discovery_validation_evidence_manifest, ensure_non_empty_portfolio,
     ensure_portfolio_export_ready, live_validation_evidence_from_discovery, run_discovery_cycle,
     run_discovery_cycle_with_progress, save_canonical_backtest_artifacts,
     save_discovery_profile_json, save_forward_test_validation_artifacts, save_portfolio_json,

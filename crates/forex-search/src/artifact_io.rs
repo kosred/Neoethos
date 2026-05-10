@@ -52,7 +52,7 @@ pub fn temporary_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()))
 }
 
-pub fn stable_json_hash<T: Serialize>(value: &T) -> Result<String> {
+pub fn stable_json_hash<T: Serialize + ?Sized>(value: &T) -> Result<String> {
     let bytes = serde_json::to_vec(value).context("serialize value for stable hash")?;
     Ok(format!("fnv64:{:016x}", fnv1a64(&bytes)))
 }

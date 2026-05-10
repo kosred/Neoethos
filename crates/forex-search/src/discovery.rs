@@ -17,7 +17,9 @@ use crate::validation::{
 };
 use anyhow::{Context, Result};
 use chrono::{Datelike, TimeZone, Utc};
-use forex_core::contracts::{LiveValidationEvidence, TemporalFeatureContract};
+use forex_core::contracts::{
+    LiveValidationEvidence, TemporalFeatureContract, ValidationEvidenceManifest,
+};
 use forex_data::{FeatureFrame, Ohlcv};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -2080,6 +2082,81 @@ pub fn live_validation_evidence_from_discovery(result: &DiscoveryResult) -> Live
     }
 }
 
+/// Build a [`ValidationEvidenceManifest`] from the persisted discovery
+/// artifacts. The helper computes one stable hash per artifact kind by
+/// hashing the full vector of per-strategy artifacts; an empty vector
+/// produces an empty hash, which causes
+/// [`ValidationEvidenceManifest::validate`] to surface a typed
+/// `MissingValidationEvidence` error naming the missing kind.
+///
+/// Today this always returns an error for the
+/// `live_execution_simulation_hash` kind because `DiscoveryResult` does
+/// not yet carry live-sim artifacts (the simulator is still deferred).
+/// Callers that want a partial manifest for diagnostic display should
+/// use the per-kind helpers below; callers that need a fully-validated
+/// manifest must wait until the live-execution simulator lands.
+pub fn discovery_validation_evidence_manifest(
+    result: &DiscoveryResult,
+) -> Result<ValidationEvidenceManifest> {
+    let canonical = hash_validation_artifacts(&result.canonical_backtest_artifacts)?;
+    let walkforward = hash_validation_artifacts(&result.walkforward_validation_artifacts)?;
+    let forward_test = hash_validation_artifacts(&result.forward_test_validation_artifacts)?;
+    let prop_firm = hash_validation_artifacts(&result.prop_firm_validation_artifacts)?;
+    // Live-execution simulation artifacts are not yet emitted by the
+    // discovery pipeline — propagate as the empty string so the
+    // manifest's `validate()` rejects with the typed
+    // `MissingValidationEvidence("live_execution_simulation_hash")`
+    // variant rather than silently filling a placeholder.
+    let live_sim = String::new();
+    ValidationEvidenceManifest::new(canonical, walkforward, forward_test, live_sim, prop_firm)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))
+}
+
+/// Per-kind helper that returns `Some(hash)` when the artifact vector
+/// is non-empty and `None` otherwise. Operator/UI layers can use this
+/// to build a diagnostic view ("forward-test artifact present, live-sim
+/// missing") without forcing a full manifest validation.
+pub fn discovery_per_kind_evidence_hashes(
+    result: &DiscoveryResult,
+) -> Result<DiscoveryPerKindEvidenceHashes> {
+    Ok(DiscoveryPerKindEvidenceHashes {
+        canonical_backtest: optional_hash_validation_artifacts(
+            &result.canonical_backtest_artifacts,
+        )?,
+        walkforward: optional_hash_validation_artifacts(&result.walkforward_validation_artifacts)?,
+        forward_test: optional_hash_validation_artifacts(
+            &result.forward_test_validation_artifacts,
+        )?,
+        prop_firm: optional_hash_validation_artifacts(&result.prop_firm_validation_artifacts)?,
+        live_execution_simulation: None,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryPerKindEvidenceHashes {
+    pub canonical_backtest: Option<String>,
+    pub walkforward: Option<String>,
+    pub forward_test: Option<String>,
+    pub prop_firm: Option<String>,
+    pub live_execution_simulation: Option<String>,
+}
+
+fn hash_validation_artifacts<T: Serialize>(artifacts: &[T]) -> Result<String> {
+    if artifacts.is_empty() {
+        Ok(String::new())
+    } else {
+        stable_json_hash(artifacts)
+    }
+}
+
+fn optional_hash_validation_artifacts<T: Serialize>(artifacts: &[T]) -> Result<Option<String>> {
+    if artifacts.is_empty() {
+        Ok(None)
+    } else {
+        stable_json_hash(artifacts).map(Some)
+    }
+}
+
 pub fn build_discovery_profile(
     config: &DiscoveryConfig,
     result: &DiscoveryResult,
@@ -3020,5 +3097,73 @@ mod tests {
         assert!(payload.contains(crate::validation::PROP_FIRM_RISK_VALIDATION_ARTIFACT_KIND));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn populated_discovery_result(
+        canonical_count: usize,
+        walkforward_count: usize,
+        forward_test_count: usize,
+        prop_firm_count: usize,
+    ) -> DiscoveryResult {
+        DiscoveryResult {
+            portfolio: vec![profitable_gene("alpha-1")],
+            candidates: Vec::new(),
+            quality_metrics: Vec::new(),
+            logged_trades: Vec::new(),
+            effective_feature_names: vec!["signal".to_string()],
+            validation_gates: DiscoveryValidationGates::pending(),
+            canonical_backtest_artifacts: (0..canonical_count)
+                .map(|idx| sample_canonical_backtest_artifact(&format!("canonical-{idx}")))
+                .collect(),
+            walkforward_validation_artifacts: (0..walkforward_count)
+                .map(|idx| sample_walkforward_validation_artifact(&format!("walkforward-{idx}")))
+                .collect(),
+            forward_test_validation_artifacts: (0..forward_test_count)
+                .map(|idx| forward_test_artifact_with_metrics(&format!("forward-{idx}"), 1.0, 1))
+                .collect(),
+            prop_firm_validation_artifacts: (0..prop_firm_count)
+                .map(|idx| prop_firm_artifact_with_pass_flag(&format!("prop-{idx}"), true))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn discovery_validation_evidence_manifest_rejects_missing_live_sim_evidence() {
+        let result = populated_discovery_result(1, 1, 1, 1);
+        let err = discovery_validation_evidence_manifest(&result)
+            .expect_err("manifest must surface missing live-sim evidence");
+        assert!(err.to_string().contains("live_execution_simulation_hash"));
+    }
+
+    #[test]
+    fn discovery_validation_evidence_manifest_rejects_missing_walkforward_evidence() {
+        let result = populated_discovery_result(1, 0, 1, 1);
+        let err = discovery_validation_evidence_manifest(&result)
+            .expect_err("manifest must surface missing walkforward evidence");
+        assert!(err.to_string().contains("walkforward_validation_hash"));
+    }
+
+    #[test]
+    fn discovery_per_kind_evidence_hashes_returns_some_only_for_present_kinds() {
+        let result = populated_discovery_result(1, 0, 1, 1);
+        let hashes = discovery_per_kind_evidence_hashes(&result)
+            .expect("per-kind hash extraction should succeed");
+        assert!(hashes.canonical_backtest.is_some());
+        assert!(hashes.walkforward.is_none());
+        assert!(hashes.forward_test.is_some());
+        assert!(hashes.prop_firm.is_some());
+        assert!(hashes.live_execution_simulation.is_none());
+    }
+
+    #[test]
+    fn discovery_per_kind_evidence_hashes_returns_none_for_empty_result() {
+        let result = populated_discovery_result(0, 0, 0, 0);
+        let hashes = discovery_per_kind_evidence_hashes(&result)
+            .expect("per-kind hash extraction should succeed");
+        assert!(hashes.canonical_backtest.is_none());
+        assert!(hashes.walkforward.is_none());
+        assert!(hashes.forward_test.is_none());
+        assert!(hashes.prop_firm.is_none());
+        assert!(hashes.live_execution_simulation.is_none());
     }
 }
