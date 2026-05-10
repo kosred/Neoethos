@@ -430,17 +430,8 @@ fn feature_rows(features: &Array2<f32>) -> Vec<Vec<f64>> {
 }
 
 fn median(mut values: Vec<f32>) -> f32 {
-    if values.is_empty() {
-        return 0.0;
-    }
-
     values.sort_by(|left, right| left.total_cmp(right));
-    let mid = values.len() / 2;
-    if values.len().is_multiple_of(2) {
-        (values[mid - 1] + values[mid]) * 0.5
-    } else {
-        values[mid]
-    }
+    forex_core::utils::median_sorted_f32(&values)
 }
 
 fn fallback_profile(features: &Array2<f32>) -> (Vec<f32>, Vec<f32>) {

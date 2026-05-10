@@ -286,19 +286,7 @@ fn cmp_f64(a: &f64, b: &f64) -> std::cmp::Ordering {
 }
 
 fn median_ignore_nan(values: &[f64]) -> f64 {
-    let mut vals: Vec<f64> = values.iter().cloned().filter(|v| v.is_finite()).collect();
-    if vals.is_empty() {
-        return f64::NAN;
-    }
-    let mid = vals.len() / 2;
-    let (_, upper_ref, _) = vals.select_nth_unstable_by(mid, cmp_f64);
-    let upper = *upper_ref;
-    if vals.len().is_multiple_of(2) {
-        let (_, lower_ref, _) = vals[..mid].select_nth_unstable_by(mid - 1, cmp_f64);
-        (*lower_ref + upper) / 2.0
-    } else {
-        upper
-    }
+    forex_core::utils::median_ignore_nan(values)
 }
 
 pub struct VolatilityEstimateInput<'a> {
