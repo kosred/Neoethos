@@ -531,6 +531,22 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 ## Execution log
 
 
+### 2026-05-10: Follow-on Phase 50 completed — operator promotion readiness reference
+
+Closed item 39 from Codex's Phase 30-40 doc handoff list ("Add operator docs for promotion rejection reasons and remediation") by writing [`docs/operator/promotion_readiness.md`](../operator/promotion_readiness.md). The document is the runbook for reading the `LivePromotionGate` verdict and acting on every rejection reason it can produce; it complements [`artifact_safety.md`](../operator/artifact_safety.md) which covers the per-artifact contracts.
+
+The runbook covers:
+
+- the gate-at-a-glance table mapping the four orthogonal checks (validation evidence, runtime safety, live execution contract, determinism requirement) to the report fields they populate;
+- how to read the new `validation_evidence_*` fields surfaced in `*_profile.json` from Phase 49, including a worked example showing the always-missing `live_execution_simulation` hash;
+- one section per rejection variant — `MissingValidationEvidence`, `LiveRejectedRuntimeMode`, `LiveRejectedMismatch`, `LiveRejectedStaleArtifact`, `LiveRejectedFailedEvidenceGate`, `LiveRejectedMissingEvidence`, `PromotionRejectedDeterminism` — with the source contract method, the plain-language meaning, the common causes (specific to discovery, walk-forward, forward-test, prop-firm, and live-sim), and the rebuild instructions;
+- a recommended fix-order walkthrough: runtime safety → validation evidence → live-contract mismatches → determinism, so operators do not chase secondary errors before their root cause is resolved.
+
+No code changes; the doc is self-contained and references the existing crates / helpers. The `live_execution_simulation` always-missing rejection is documented as structural (deferred until the simulator lands) rather than a bug, so operators are not confused by gates that cannot pass today.
+
+Next follow-on targets: populate `live_sim_runtime_model_hash` once a live-execution simulator is in place, explicit degraded-mode metadata propagation through runtime layers (P1-3), DeterminismPolicy rollout into `forex-models` (P0-9), UI exposure of scheduler/hardware plans (P2-1).
+
+
 ### 2026-05-10: Follow-on Phase 49 completed — promotion-evidence summary in DiscoveryRunProfile
 
 Continued the Phase 48 producer-consumer wiring by surfacing the typed evidence-summary directly in the persisted `DiscoveryRunProfile` so operators see promotion-readiness signals in the profile JSON without instantiating a `LivePromotionGate`:
