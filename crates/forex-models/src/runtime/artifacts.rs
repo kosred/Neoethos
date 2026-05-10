@@ -48,6 +48,19 @@ impl TrainingSummaryMetadata {
             val_rows,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn raw_for_validation(
+        dataset_rows: usize,
+        train_rows: usize,
+        val_rows: usize,
+    ) -> Self {
+        Self {
+            dataset_rows,
+            train_rows,
+            val_rows,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

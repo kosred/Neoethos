@@ -1189,7 +1189,7 @@ mod tests {
             CapabilityState::Implemented,
             vec!["rsi".to_string()],
             canonical_three_class_label_mapping(),
-            TrainingSummaryMetadata::new(10, 8, 1),
+            TrainingSummaryMetadata::raw_for_validation(10, 8, 1),
         )
         .expect("metadata split should be repaired");
 
@@ -1224,7 +1224,7 @@ mod tests {
             CapabilityState::Implemented,
             vec!["rsi".to_string()],
             canonical_three_class_label_mapping(),
-            TrainingSummaryMetadata::new(10, 12, 12),
+            TrainingSummaryMetadata::raw_for_validation(10, 12, 12),
         )
         .expect_err("split larger than dataset should remain invalid");
 
@@ -1239,7 +1239,7 @@ mod tests {
             CapabilityState::Implemented,
             vec!["rsi".to_string()],
             canonical_three_class_label_mapping(),
-            TrainingSummaryMetadata::new(7, 0, 7),
+            TrainingSummaryMetadata::raw_for_validation(7, 0, 7),
         )
         .expect("zero-train split should be promoted");
 

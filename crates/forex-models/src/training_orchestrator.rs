@@ -3757,7 +3757,7 @@ mod tests {
             profile.capability_family,
             crate::runtime::capabilities::ModelFamily::Tree
         );
-        assert_eq!(profile.capability_state, CapabilityState::Implemented);
+        assert_eq!(profile.capability_state, CapabilityState::Verified);
         assert_eq!(profile.label_horizon_bars, 0);
         assert_eq!(profile.effective_label_horizon_bars, 3);
         assert_eq!(profile.meta_label_max_hold_bars, 3);
@@ -3771,7 +3771,7 @@ mod tests {
             model_type: ModelType::MLP,
             capability_family: crate::runtime::capabilities::ModelFamily::Deep,
             capability_state: CapabilityState::Implemented,
-            params: HashMap::from([("export_onnx".to_string(), "true".to_string())]),
+            params: HashMap::from([("__export_onnx".to_string(), "true".to_string())]),
         };
         let payload =
             TrainingPayload::from_dense(ndarray::Array2::<f32>::zeros((4, 2)), vec![0, 1, 2, 1])

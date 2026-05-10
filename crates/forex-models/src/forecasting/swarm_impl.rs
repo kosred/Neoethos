@@ -1718,16 +1718,25 @@ fn prune_external_candidates(
     let max_keep = if snapshot.has_seasonality { 6 } else { 5 };
 
     let mut kept = Vec::new();
+    let mut duplicate_backfill = Vec::new();
     for (_, candidate) in scored {
         let is_duplicate = kept.iter().any(|existing: &(String, ModelType, Vec<f32>)| {
             forecast_distance_ratio(&candidate.2, &existing.2, scale) <= duplicate_threshold
         });
-        if !is_duplicate || kept.len() < 2 {
+        if is_duplicate {
+            duplicate_backfill.push(candidate);
+        } else {
             kept.push(candidate);
         }
         if kept.len() >= max_keep {
             break;
         }
+    }
+    for candidate in duplicate_backfill {
+        if kept.len() >= 2 || kept.len() >= max_keep {
+            break;
+        }
+        kept.push(candidate);
     }
 
     kept
@@ -2550,16 +2559,25 @@ fn prune_local_candidates(
     let max_keep = if snapshot.has_seasonality { 6 } else { 5 };
 
     let mut kept = Vec::new();
+    let mut duplicate_backfill = Vec::new();
     for (_, candidate) in scored {
         let is_duplicate = kept.iter().any(|existing: &(String, Vec<f32>)| {
             forecast_distance_ratio(&candidate.1, &existing.1, scale) <= duplicate_threshold
         });
-        if !is_duplicate || kept.len() < 2 {
+        if is_duplicate {
+            duplicate_backfill.push(candidate);
+        } else {
             kept.push(candidate);
         }
         if kept.len() >= max_keep {
             break;
         }
+    }
+    for candidate in duplicate_backfill {
+        if kept.len() >= 2 || kept.len() >= max_keep {
+            break;
+        }
+        kept.push(candidate);
     }
 
     kept

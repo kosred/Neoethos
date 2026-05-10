@@ -430,7 +430,13 @@ fn resolve_runtime_metadata_from_artifact(
                 "bayes_logit",
                 &artifact.feature_columns,
                 artifact.dataset_rows,
-            )?;
+            )
+            .with_context(|| {
+                format!(
+                    "runtime metadata sidecar mismatch with embedded bayes_logit metadata at {}",
+                    metadata_path.display()
+                )
+            })?;
             if let Some(embedded) = artifact.runtime_metadata.as_ref()
                 && (embedded.model_name != metadata.model_name
                     || embedded.family != metadata.family
@@ -884,14 +890,14 @@ mod tests {
 
     #[test]
     fn validate_runtime_metadata_rejects_zero_train_rows() {
-        let metadata = runtime_metadata(
-            "bayes_logit",
-            vec!["f1".to_string(), "f2".to_string()],
-            8,
-            0,
-            8,
-        )
-        .expect("build metadata");
+        let metadata = RuntimeArtifactMetadata {
+            model_name: "bayes_logit".to_string(),
+            family: ModelFamily::Meta,
+            state: CapabilityState::Implemented,
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            label_mapping: canonical_three_class_label_mapping(),
+            training_summary: TrainingSummaryMetadata::raw_for_validation(8, 0, 8),
+        };
 
         let err = validate_runtime_metadata(
             &metadata,

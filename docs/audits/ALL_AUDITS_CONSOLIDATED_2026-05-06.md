@@ -530,6 +530,12 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 
 ## Execution log
 
+### 2026-05-10: Follow-on Phases 80-85 completed — model contract cleanup
+
+Closed the stale `forex-models` failures left after the typed runtime metadata slice. Phase 80 adds a test-only corrupt-metadata constructor and restores sidecar-drift error boundaries. Phase 81 aligns capability/export fixtures and makes swarm pruning prefer non-duplicate candidates before duplicate backfill. Phase 82 hardens Burn/deep runtime provenance, precision, embargo-aware training summaries, and required runtime triplets. Phase 83 updates exit-agent trained artifacts to persist `training_report` and validates partial runtime identity before report cross-checks. Phase 84 makes Hoeffding runtime details truthful about fallback-only-by-weight versus unavailable live committees. Phase 85 fixes RL staged JSON writes, normalized GPU precision resolution, fallback-basis runtime details, bounds guards, and report-drift fixtures. See [`follow_on_phases_80_85_model_contract_cleanup_2026-05-10.md`](follow_on_phases_80_85_model_contract_cleanup_2026-05-10.md).
+
+Verification: `cargo test -p forex-models --lib -- --test-threads=1` now passes with 335 tests.
+
 
 ### 2026-05-10: Follow-on Phase 71 completed — audit coverage matrix
 

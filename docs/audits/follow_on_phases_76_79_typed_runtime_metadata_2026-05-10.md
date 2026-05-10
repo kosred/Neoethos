@@ -48,3 +48,7 @@ metadata tests outside this typed propagation slice.
 Known pre-existing warning during these tests:
 `crates/forex-models/src/deep_models.rs:845` reports unused
 `train_runtime_model`.
+
+Superseded on 2026-05-10 by Follow-on Phases 80-85:
+`cargo test -p forex-models --lib -- --test-threads=1` now passes with
+335 tests after the model-contract cleanup slice.

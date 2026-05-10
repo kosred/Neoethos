@@ -402,6 +402,20 @@ fn validate_exit_artifact(artifact: &ExitAgentArtifact) -> Result<()> {
             );
         }
     }
+    let runtime_fields = [
+        artifact.requested_device_policy.as_deref(),
+        artifact.effective_device_policy.as_deref(),
+        artifact.execution_backend.as_deref(),
+    ];
+    let runtime_fields_present = runtime_fields
+        .iter()
+        .filter(|value| value.is_some())
+        .count();
+    if runtime_fields_present != 0 && runtime_fields_present != runtime_fields.len() {
+        anyhow::bail!(
+            "exit-agent artifact must persist requested_device_policy, effective_device_policy, and execution_backend together"
+        );
+    }
     if let Some(report) = artifact.training_report.as_ref() {
         if report.train_rows != artifact.train_rows {
             anyhow::bail!(
@@ -464,20 +478,6 @@ fn validate_exit_artifact(artifact: &ExitAgentArtifact) -> Result<()> {
                 "exit-agent training report runtime identity does not match artifact runtime identity"
             );
         }
-    }
-    let runtime_fields = [
-        artifact.requested_device_policy.as_deref(),
-        artifact.effective_device_policy.as_deref(),
-        artifact.execution_backend.as_deref(),
-    ];
-    let runtime_fields_present = runtime_fields
-        .iter()
-        .filter(|value| value.is_some())
-        .count();
-    if runtime_fields_present != 0 && runtime_fields_present != runtime_fields.len() {
-        anyhow::bail!(
-            "exit-agent artifact must persist requested_device_policy, effective_device_policy, and execution_backend together"
-        );
     }
     if (artifact.trained_memory_size > 0 || !artifact.replay_memory.is_empty())
         && artifact.training_report.is_none()
@@ -1650,10 +1650,20 @@ mod tests {
             train_rows: 1,
             trained_memory_size: 2,
             average_reward: 0.0,
-            training_report: None,
-            requested_device_policy: None,
-            effective_device_policy: None,
-            execution_backend: None,
+            training_report: Some(super::ExitAgentTrainingReport {
+                train_rows: 1,
+                memory_size: 2,
+                warmup_steps: 0,
+                average_reward: 0.0,
+                reward_horizon: 0,
+                feature_count: 6,
+                requested_device_policy: "cpu".to_string(),
+                effective_device_policy: "cpu".to_string(),
+                execution_backend: "burn_ndarray".to_string(),
+            }),
+            requested_device_policy: Some("cpu".to_string()),
+            effective_device_policy: Some("cpu".to_string()),
+            execution_backend: Some("burn_ndarray".to_string()),
             runtime_metadata: None,
             replay_memory: vec![
                 Experience {
@@ -1716,6 +1726,7 @@ mod tests {
             reward: 0.5,
             done: true,
         });
+        attach_training_report(&mut agent, 0.5);
         let path = unique_temp_dir("exit-agent-embedded-metadata");
         agent.save(&path).expect("save should succeed");
         std::fs::remove_file(path.join(METADATA_FILE_NAME)).expect("remove metadata sidecar");
@@ -1747,6 +1758,7 @@ mod tests {
             reward: 0.5,
             done: true,
         });
+        attach_training_report(&mut agent, 0.5);
         let path = unique_temp_dir("exit-agent-metadata-drift");
         agent.save(&path).expect("save should succeed");
 
@@ -1772,6 +1784,22 @@ mod tests {
         let path = std::env::temp_dir().join(format!("{prefix}-{stamp}-{}", std::process::id()));
         std::fs::create_dir_all(&path).expect("create temp directory");
         path
+    }
+
+    fn attach_training_report(agent: &mut ExitAgent, average_reward: f32) {
+        agent.trained_memory_size = agent.memory.len();
+        agent.average_reward = average_reward;
+        agent.training_report = Some(super::ExitAgentTrainingReport {
+            train_rows: agent.train_rows,
+            memory_size: agent.memory.len(),
+            warmup_steps: agent.warmup_steps,
+            average_reward,
+            reward_horizon: agent.reward_horizon,
+            feature_count: agent.input_dim,
+            requested_device_policy: agent.requested_device_policy.clone(),
+            effective_device_policy: agent.effective_device_policy.clone(),
+            execution_backend: agent.execution_backend.clone(),
+        });
     }
 
     #[test]
@@ -2391,6 +2419,7 @@ mod tests {
             reward: 0.1,
             done: true,
         });
+        agent.trained_checkpoint_ready = true;
         agent.training_report = None;
 
         let df = DataFrame::new(vec![

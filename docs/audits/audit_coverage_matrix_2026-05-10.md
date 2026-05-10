@@ -15,6 +15,12 @@ models, and swarm forecasting results. Legacy string fields remain for
 backward compatibility, but new writes now carry typed `BackendKind`,
 `RuntimeMode`, and degraded-reason metadata where this slice touched artifacts.
 
+Postscript 3: Phases 80-85 cleaned up the stale `forex-models` contract test
+failures that remained after typed propagation. The slice hardened Burn/deep
+runtime provenance, exit-agent trained-artifact reports, streaming Hoeffding
+runtime details, and RL fallback/runtime contracts; the forex-models lib suite
+is green at 335 tests after this cleanup.
+
 `✅` = addressed by the listed phase(s); `🟡` = partially addressed;
 `🔴` = not addressed yet (actionable gap).
 
@@ -32,13 +38,13 @@ backward compatibility, but new writes now carry typed `BackendKind`,
 | 10 | `evolution_neat_crfmnes_gpu_first` | 🟡 | preserved kernels, 77-78 | runtime parity tests for evolution kernels |
 | 11 | `feature_timestamp_mtf_causality_deep_audit_pass5` | ✅ | 7 | — |
 | 12 | `forex_data_functional` | 🟡 | 7, 68, 74-75 | explicit candle-timestamp-policy threading inside resample / hpc_ta / quant_features / smc / parquet_migration; volume-validation surface |
-| 13 | `forex_models_functional` | 🟡 | 26, 59, 67, 76, 79 | RL exit-agent runtime/device routing; streaming/adaptive runtime metadata; ONNX legacy boundary |
+| 13 | `forex_models_functional` | 🟡 | 26, 59, 67, 76, 79, 80-85 | ONNX legacy boundary |
 | 14 | `forex_search_functional` | ✅ | 16-32, 45-51 | — |
 | 15 | `generic_scheduler_small_files_refactor_note` | ✅ | 6 | — |
 | 16 | `gpu_cuda_hpc_parity_deep_audit_pass4` | 🟡 | 4 | parity tests beyond strategy search (statistical / NEAT / CRFMNES backends) |
 | 17 | `gpu_first_kernel_everywhere_report` | ✅ | preserved, 76-79 | — |
 | 18 | `hardware_autodetect_config_ui_architecture` | 🟡 | 2 | UI hardware/runtime panel exposing scheduler-owned plans (P2-1) |
-| 19 | `model_runtime_backend_fragmentation` | 🟡 | 2, 76-79 | model runtime artifact contract wired in forex-models bridge; backend adapter for RL / streaming paths |
+| 19 | `model_runtime_backend_fragmentation` | 🟡 | 2, 76-79, 80-85 | model runtime artifact contract wired in forex-models bridge |
 | 20 | `modularization_maintainability_refactor_principle` | ✅ | 6 + 61-70 | — |
 | 21 | `python_pyo3_legacy` | ✅ | confirmed clean, 72 | — |
 | 22 | `quality_challenge_validation_refactor` | ✅ | 25, 29-31 | — |

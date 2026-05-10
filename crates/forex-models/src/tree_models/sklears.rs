@@ -637,7 +637,7 @@ mod tests {
         let mut metadata: crate::runtime::artifacts::RuntimeArtifactMetadata =
             serde_json::from_slice(&std::fs::read(&metadata_path).expect("read metadata"))
                 .expect("deserialize metadata");
-        metadata.training_summary = TrainingSummaryMetadata::new(9, 8, 0);
+        metadata.training_summary = TrainingSummaryMetadata::raw_for_validation(9, 8, 0);
         std::fs::write(
             &metadata_path,
             serde_json::to_vec_pretty(&metadata).expect("serialize metadata"),

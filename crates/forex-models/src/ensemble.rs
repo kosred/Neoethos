@@ -1857,7 +1857,7 @@ mod tests {
             CapabilityState::Implemented,
             vec!["feature".to_string()],
             default_three_class_label_mapping(),
-            crate::runtime::artifacts::TrainingSummaryMetadata::new(12, 8, 1),
+            crate::runtime::artifacts::TrainingSummaryMetadata::raw_for_validation(12, 8, 1),
         );
 
         let err = validate_meta_metadata(&metadata, "meta_stack")
