@@ -483,6 +483,18 @@ impl GeneticStrategyExpert {
         };
 
         let resolved_config = self.discovery_config().with_env_runtime_overrides();
+        // Surface the resolved determinism policy so operators can
+        // correlate forex-models genetic-search runs with the typed
+        // policy persisted on the discovery profile (Phase 51).
+        // Reproducible runs require `Deterministic { seed }`; the two
+        // non-deterministic variants are still permitted but flagged
+        // here so they are visible in run logs.
+        let determinism_policy = forex_search::current_determinism_policy();
+        tracing::info!(
+            target: "forex_models::genetic",
+            ?determinism_policy,
+            "running Rust-native genetic discovery"
+        );
         let result = run_discovery_cycle(features, ohlcv, &resolved_config)
             .context("run Rust-native discovery-backed genetic search")?;
         if !result.portfolio.is_empty() {

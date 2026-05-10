@@ -531,6 +531,11 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 ## Execution log
 
 
+### 2026-05-10: Follow-on Phase 59 completed — forex-models genetic surfaces DeterminismPolicy
+
+Continued the P0-9 rollout one wrapper deeper: `forex_models::genetic::train_with_discovery` now logs the resolved `DeterminismPolicy` (via `forex_search::current_determinism_policy()` re-exported at the lib root in Phase 26) at `tracing::info` level immediately before invoking `run_discovery_cycle`. Operators that read the run log can now correlate forex-models genetic-search runs with the same typed policy persisted on `DiscoveryRunProfile::determinism_policy` (Phase 51). The change is additive — existing call paths and the env-driven `seed: Option<u64>` field are unchanged.
+
+
 ### 2026-05-10: Follow-on Phase 58 completed — promotion summary side-file in forex-app
 
 Added `save_promotion_summary_json` in `forex-search::discovery` and wired it into the forex-app discovery service. Each portfolio export now writes a focused `*_promotion_summary.json` next to the existing `*_profile.json`, carrying just the validation-evidence hashes, missing-kinds list, producer-side completeness, per-kind check summary, and resolved determinism policy. UI scrapers / CI gates can poll the small file without parsing the full profile JSON. Failures during the summary write are logged at `warn` and never block portfolio export; the same data remains in the profile JSON regardless.
