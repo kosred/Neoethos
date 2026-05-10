@@ -223,7 +223,7 @@ fn runtime_metadata(
         CapabilityState::Implemented,
         feature_columns,
         canonical_three_class_label_mapping(),
-        TrainingSummaryMetadata::new(dataset_rows, train_rows, val_rows),
+        TrainingSummaryMetadata::new_unchecked(dataset_rows, train_rows, val_rows),
     )
 }
 
