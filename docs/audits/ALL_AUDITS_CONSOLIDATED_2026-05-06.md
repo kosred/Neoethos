@@ -531,6 +531,11 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 ## Execution log
 
 
+### 2026-05-10: Follow-on Phase 55 completed — operator docs index
+
+Added [`docs/operator/README.md`](../operator/README.md) — an index for the three existing operator docs (artifact_safety, promotion_readiness, profile_json_reference) with a recommended reading order, contents synopsis, and conventions section. Operators arriving at the docs directory now have a clear entry point.
+
+
 ### 2026-05-10: Follow-on Phase 54 completed — BatchDiscoverySummary missing-evidence counter
 
 Added `portfolios_with_missing_producer_evidence: usize` to `BatchDiscoverySummary` so a multi-symbol orchestrator run reports how many portfolios shipped with at least one producer-side validation kind missing. The counter excludes the structural live-sim absence (Phase 52's `all_producer_kinds_present` boundary), so the number reflects actionable gaps rather than the simulator-not-wired plateau. The counter increments inside `run_batch` after persistence; existing test coverage on `BatchDiscoverySummary::finalize` continues to pass unchanged.
