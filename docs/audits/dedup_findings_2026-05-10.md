@@ -344,3 +344,45 @@ items (atomic-IO unification across forex-search ↔ forex-models,
 documented above with the reasons each was deferred — none of them
 introduce new contract risk; they are pure code-organisation work that
 can land in a future slice without touching any audit deliverable.
+
+## Phases 67-70 — deferred items landed
+
+| Module | Phase | Status |
+|---|---|---|
+| `forex-models::common::cuda_flatten_features` | 67 | ✅ landed; 3 sites switched (`evolution::crfmnes_gpu`, `evolution::neat_gpu`, `statistical::linear_gpu`). The statistical site preserves its non-finite check by post-validating the flattened buffer. |
+| `forex-data::core::slicing::slice_ohlcv` | 68 | ✅ landed; 2 sites switched (`forex-search::discovery`, `forex-search::genetic::regime_labels`). The unified signature accepts `Option<&[i64]>` for fallback timestamps so both shapes converge. |
+| `forex-core::utils::series` (`median_ignore_nan`, `median_sorted_f32`, `percentile_sorted_f32`, `rolling_mean_f64`, `moving_average_f32`, `ewma_f32`) | 69 | ✅ landed; 2 sites switched (`forex-search::stop_target::median_ignore_nan`, `forex-models::anomaly::forest_impl::median`). |
+| `forex-search::stop_target::rolling_mean` | — | not extracted: the local copy returns `NaN` for warm-up positions whereas the shared `rolling_mean_f64` returns the partial mean. Different invariant; intentionally local. |
+| `forex-models::forecasting::swarm_impl::percentile` | — | not extracted: the local copy uses nearest-neighbor (rounded position) whereas the shared `percentile_sorted_f32` uses linear interpolation. Different statistical convention; intentionally local. |
+| `forex-models::ensemble::clamp_probability` | — | already deferred in Phase 65 (clamps to `[1e-6, 1-1e-6]` for logit safety). |
+| Atomic IO unification across forex-search ↔ forex-models | — | deferred again: the durability budget for forex-models artifacts (training checkpoints) is currently softer than the search-side artifact contract; converging would require a separate phase that either tightens model-artifact crash-safety or formally documents the asymmetry. |
+
+Test counts after Phases 67-69: forex-core 62 → 67 (+5 series tests),
+plus 2 new tests in `forex-models::common::tests` and 3 in
+`forex-data::core::slicing::tests`. forex-search lib stays at 107.
+Cargo check on forex-cli / forex-app / forex-models remains clean.
+
+## Phase 70 — final closure
+
+The dedup audit pass is now complete from finding through extraction
+to call-site switch. Five shared modules landed:
+
+- `forex-core::utils::hashing` — Phase 63
+- `forex-core::utils::stats` — Phase 64
+- `forex-core::utils::numeric` — Phase 65
+- `forex-models::common` — Phase 67
+- `forex-data::core::slicing` — Phase 68
+- `forex-core::utils::series` — Phase 69
+
+Three intentional non-extractions are documented above with the
+semantic reason each local copy must stay local (different warm-up
+behaviour, different statistical convention, different clamp range).
+The remaining infrastructure-asymmetry item (forex-models artifact
+crash-safety) is escalated for a separate audit phase rather than
+landed here.
+
+Engineers continuing this work should: re-grep the repo periodically
+for new private duplicates as fresh code lands, especially in the
+forex-models nested subdirectories where helpers tend to accrete; and
+prefer extending the existing `forex-core::utils` surface over
+introducing a new module per finding.

@@ -531,6 +531,21 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 ## Execution log
 
 
+### 2026-05-10: Follow-on Phases 67-70 completed — dedup deferred items landed
+
+Closed the dedup audit's "deferred items" block from the Phase 66 closure note. Three additional shared modules / helpers landed and one atomic-IO unification was explicitly re-deferred with a documented reason.
+
+- **Phase 67 — `forex-models::common::cuda_flatten_features`**: extracted from `evolution::crfmnes_gpu`, `evolution::neat_gpu`, and `statistical::linear_gpu`. The statistical site preserves its non-finite check by post-validating the flattened buffer; the other two are pure delegations. Caller-label parameter folds into the error message so the operator still sees "neuro-evo cuda…" / "NEAT cuda…" / "statistical cuda…".
+- **Phase 68 — `forex-data::core::slicing::slice_ohlcv`**: extracted from `forex-search::discovery` and `forex-search::genetic::regime_labels`. The unified signature accepts `Option<&[i64]>` for fallback timestamps so both shapes converge into one helper. The Ohlcv type lives at `forex-data::lib::Ohlcv` (not in `core::loader`) so the helper imports from `crate::Ohlcv`.
+- **Phase 69 — `forex-core::utils::series`**: extracted `median_ignore_nan` (with NaN drop), `median_sorted_f32` (no copy), `percentile_sorted_f32` (linear interpolation), `rolling_mean_f64`, `moving_average_f32`, `ewma_f32`. Two sites switched: `forex-search::stop_target::median_ignore_nan` and `forex-models::anomaly::forest_impl::median`. Two sites intentionally NOT switched: `forex-search::stop_target::rolling_mean` (returns NaN for warm-up positions whereas the shared helper returns partial means) and `forex-models::forecasting::swarm_impl::percentile` (nearest-neighbor rounding whereas the shared helper interpolates linearly). Both keep their local copies with the semantic reason documented in `dedup_findings_2026-05-10.md`.
+
+Phase 70 closes the dedup pass. Five shared modules landed (`forex-core::utils::hashing`, `stats`, `numeric`, `series`; `forex-models::common`; `forex-data::core::slicing`); three intentional non-extractions are documented; one infrastructure asymmetry (atomic-IO crash-safety budget across forex-search ↔ forex-models) is escalated for a separate audit phase rather than collapsed silently here.
+
+Test counts after Phases 67-69: forex-core 62 → 67 (+5 series tests), forex-models gains 2 cuda-flatten tests, forex-data gains 3 slicing tests, forex-search lib stays at 107. cargo check on every downstream crate remains clean.
+
+The user-directed "dig further and mostly in the master branch" pass is complete: the 16-70 follow-on slice now sits on local master at `34580150`. Future engineers continuing this work should periodically re-grep for new private duplicates (forex-models nested subdirectories accrete helpers) and prefer extending `forex-core::utils` over introducing a new module per finding.
+
+
 ### 2026-05-10: Follow-on Phases 62-66 completed — dedup deeper scan + extraction
 
 Executed the user-requested dedup pass announced in Phase 61. Phase 62 broadened the scan beyond the 16-60 work surface to cover forex-data, forex-app, forex-cli, and the nested forex-models subdirectories — adding four new finding categories (10-13) for `flatten_features` (3 cuda-prep sites in forex-models), naive vs stable `sigmoid` (2 forex-models sites), median/percentile/rolling-mean/EWMA series helpers (5 sites split between forex-search/stop_target and forex-models/forecasting + anomaly), and the `cfg`-gated `discovery_gpu` fallback chain duplication.
