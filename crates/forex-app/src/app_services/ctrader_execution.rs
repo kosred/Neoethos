@@ -624,7 +624,22 @@ impl ProductionCTraderExecutionBackend {
 
 impl CTraderExecutionBackend for ProductionCTraderExecutionBackend {
     fn execute(&self, request: &CTraderExecutionRuntimeRequest) -> Result<CTraderExecutionOutcome> {
-        Self::execute_via_session(request)
+        let outcome = Self::execute_via_session(request)?;
+        let entry = crate::app_services::live_journal::LiveTradeJournalEntry::from_outcome(
+            request_action_label(&request.request),
+            request,
+            &outcome,
+        );
+        crate::app_services::live_journal::record_live_outcome_best_effort(&entry);
+        Ok(outcome)
+    }
+}
+
+fn request_action_label(request: &CTraderExecutionRequest) -> &'static str {
+    match request {
+        CTraderExecutionRequest::NewOrder(_) => "new_order",
+        CTraderExecutionRequest::CancelOrder(_) => "cancel_order",
+        CTraderExecutionRequest::ClosePosition(_) => "close_position",
     }
 }
 
