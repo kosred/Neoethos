@@ -531,6 +531,11 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 ## Execution log
 
 
+### 2026-05-10: Follow-on Phase 53 completed — profile_json_reference operator doc
+
+Added [`docs/operator/profile_json_reference.md`](../operator/profile_json_reference.md) — a field-by-field reference for the persisted `*_profile.json`. The doc is grouped into seven sections (run identity, search filters, resolved runtime overrides, run observations, validation gates, per-kind artifact counts, promotion-readiness summary) and cross-references the artifact_safety + promotion_readiness runbooks. The forward-compatibility note clarifies that the schema is additive so consumers should not reject profiles with new keys.
+
+
 ### 2026-05-10: Follow-on Phase 52 completed — lossy manifest excluding live-sim
 
 Added a diagnostic-only manifest builder that ignores the structural live-sim absence so producer-side completeness can be reported on its own. `discovery_validation_evidence_manifest_excluding_live_sim` substitutes a `deferred:live_execution_simulator_not_wired` placeholder for the missing hash; the manifest's `validate()` accepts it (non-empty string), letting operators tell "all four producer-side kinds shipped" apart from "live-sim still missing". `DiscoveryPerKindEvidenceHashes::all_producer_kinds_present()` is the same idea on the per-kind view. Tests cover both the accept-when-all-producers-present path and the still-rejected-when-walkforward-missing path; lib tests grew 103 → 106.
