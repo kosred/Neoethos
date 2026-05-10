@@ -1,5 +1,5 @@
 use super::*;
-use chrono::Utc;
+use chrono::{Duration, Utc};
 
 fn canonical_provenance(artifact_kind: ArtifactKind) -> ArtifactProvenance {
     ArtifactProvenance::new(
@@ -178,6 +178,75 @@ fn live_rejects_degraded_artifact() {
             backend: BackendKind::CpuReference,
         }
     );
+}
+
+#[test]
+fn runtime_safety_report_marks_canonical_native_artifact_live_safe() {
+    let report = canonical_live_provenance().runtime_safety_report();
+
+    assert!(report.live_safe);
+    assert!(report.issues.is_empty());
+    assert!(report.degraded_reason.is_none());
+    assert!(report.backend_assignment_matches);
+}
+
+#[test]
+fn runtime_safety_report_exposes_degraded_backend_metadata() {
+    let provenance = ArtifactProvenance::new(
+        ArtifactKind::LiveReadyStrategy,
+        "feature-schema-v1",
+        "dataset-a",
+        "symbols-eurusd",
+        "m1-m5",
+        "timestamp-policy-v1",
+        "feature-availability-v1",
+        "label-policy-v1",
+        "training-config-v1",
+        "search-config-v1",
+        "runtime-config-v1",
+        "risk-config-v1",
+        DeterminismPolicy::Deterministic { seed: 42 },
+        "hardware-profile-1",
+        DeviceAssignment {
+            backend: BackendKind::CpuReference,
+            device: "cpu".to_string(),
+            device_ids: Vec::new(),
+        },
+        BackendKind::CpuReference,
+        RuntimeMode::Degraded,
+        Some(RuntimeDegradedReason::new(
+            "cuda_unavailable",
+            "CUDA was requested but unavailable",
+        )),
+        "abc1234",
+    )
+    .expect("degraded provenance is structurally valid");
+
+    let report = provenance.runtime_safety_report();
+
+    assert!(!report.live_safe);
+    assert_eq!(
+        report
+            .degraded_reason
+            .as_ref()
+            .map(|reason| reason.code.as_str()),
+        Some("cuda_unavailable")
+    );
+    assert!(report.has_issue(RuntimeSafetyIssue::NonCanonicalRuntimeMode));
+    assert!(report.has_issue(RuntimeSafetyIssue::DegradedBackend));
+}
+
+#[test]
+fn runtime_safety_report_exposes_backend_assignment_mismatch() {
+    let mut provenance = canonical_live_provenance();
+    provenance.backend_kind = BackendKind::CpuReference;
+
+    let report = provenance.runtime_safety_report();
+
+    assert!(!report.live_safe);
+    assert!(!report.backend_assignment_matches);
+    assert!(report.has_issue(RuntimeSafetyIssue::BackendAssignmentMismatch));
+    assert!(report.has_issue(RuntimeSafetyIssue::DegradedBackend));
 }
 
 #[test]
@@ -648,4 +717,258 @@ fn live_contract_rejects_live_sim_runtime_hash_mismatch() {
     contract
         .validate_evidence(&evidence)
         .expect("matching live-sim runtime hash must accept");
+}
+
+fn complete_validation_evidence() -> ValidationEvidenceManifest {
+    ValidationEvidenceManifest::new(
+        "canonical-backtest-fnv",
+        "walkforward-fnv",
+        "forward-test-fnv",
+        "live-execution-sim-fnv",
+        "prop-firm-risk-fnv",
+    )
+    .expect("fixture validation evidence should be complete")
+}
+
+#[test]
+fn validation_evidence_manifest_requires_all_promotion_artifacts() {
+    let error = ValidationEvidenceManifest::new(
+        "canonical-backtest-fnv",
+        "walkforward-fnv",
+        "",
+        "live-execution-sim-fnv",
+        "prop-firm-risk-fnv",
+    )
+    .expect_err("missing forward-test evidence must fail");
+
+    assert_eq!(
+        error,
+        ArtifactContractError::MissingValidationEvidence("forward_test_validation_hash")
+    );
+}
+
+#[test]
+fn validation_evidence_manifest_reports_structured_evidence_status() {
+    let mut evidence = complete_validation_evidence();
+    evidence.prop_firm_risk_validation_hash.clear();
+
+    assert_eq!(
+        evidence.missing_kinds(),
+        vec![ValidationEvidenceKind::PropFirmRisk]
+    );
+
+    let checks = evidence.evidence_checks();
+    assert_eq!(checks.len(), ValidationEvidenceKind::ALL.len());
+    assert!(
+        checks
+            .iter()
+            .any(|check| check.kind == ValidationEvidenceKind::PropFirmRisk && !check.present)
+    );
+    assert_eq!(
+        evidence.hash_for(ValidationEvidenceKind::ForwardTest),
+        Some("forward-test-fnv")
+    );
+}
+
+#[test]
+fn live_promotion_gate_accepts_canonical_deterministic_artifact_with_complete_evidence() {
+    let envelope = ArtifactEnvelope::new(canonical_live_provenance(), ())
+        .expect("fixture envelope should be structurally valid");
+    let gate =
+        LivePromotionGate::new(canonical_live_execution_contract()).require_deterministic(true);
+
+    gate.validate(&envelope, &complete_validation_evidence())
+        .expect("complete deterministic live artifact should pass promotion gate");
+}
+
+#[test]
+fn crate_root_exports_live_contract_types() {
+    let _kind = crate::ValidationEvidenceKind::PropFirmRisk;
+    let _issue = crate::RuntimeSafetyIssue::DegradedBackend;
+    let _status = crate::PromotionReadinessStatus::Passed;
+    let _evidence = crate::LiveValidationEvidence::default();
+    let gate: crate::LivePromotionGate =
+        LivePromotionGate::new(canonical_live_execution_contract());
+
+    assert!(gate.require_deterministic);
+}
+
+#[test]
+fn live_promotion_gate_rejects_stale_artifact_with_injected_clock() {
+    let now = Utc::now();
+    let mut provenance = canonical_live_provenance();
+    provenance.created_at = now - Duration::seconds(61);
+    let envelope =
+        ArtifactEnvelope::new(provenance, ()).expect("stale artifact is structurally valid");
+    let gate = LivePromotionGate::new(
+        canonical_live_execution_contract().with_max_artifact_age_seconds(60),
+    );
+
+    let error = gate
+        .validate_at(&envelope, &complete_validation_evidence(), now)
+        .expect_err("promotion gate must reject stale artifacts at the supplied clock");
+
+    assert_eq!(
+        error,
+        ArtifactContractError::LiveRejectedStaleArtifact {
+            age_seconds: 61,
+            max_age_seconds: 60,
+        }
+    );
+}
+
+#[test]
+fn live_promotion_gate_rejects_best_effort_when_deterministic_required() {
+    let mut provenance = canonical_live_provenance();
+    provenance.determinism_policy = DeterminismPolicy::BestEffort;
+    let envelope =
+        ArtifactEnvelope::new(provenance, ()).expect("best-effort artifact is structurally valid");
+    let gate =
+        LivePromotionGate::new(canonical_live_execution_contract()).require_deterministic(true);
+
+    let error = gate
+        .validate(&envelope, &complete_validation_evidence())
+        .expect_err("deterministic promotion gate must reject best-effort artifacts");
+
+    assert_eq!(
+        error,
+        ArtifactContractError::PromotionRejectedDeterminism {
+            actual: DeterminismPolicy::BestEffort,
+        }
+    );
+}
+
+#[test]
+fn live_promotion_gate_rejects_degraded_runtime_even_with_complete_evidence() {
+    let provenance = ArtifactProvenance::new(
+        ArtifactKind::LiveReadyStrategy,
+        "feature-schema-v1",
+        "dataset-a",
+        "symbols-eurusd",
+        "m1-m5",
+        "timestamp-policy-v1",
+        "feature-availability-v1",
+        "label-policy-v1",
+        "training-config-v1",
+        "search-config-v1",
+        "runtime-config-v1",
+        "risk-config-v1",
+        DeterminismPolicy::Deterministic { seed: 42 },
+        "hardware-profile-1",
+        DeviceAssignment {
+            backend: BackendKind::CpuReference,
+            device: "cpu".to_string(),
+            device_ids: Vec::new(),
+        },
+        BackendKind::CpuReference,
+        RuntimeMode::Degraded,
+        Some(RuntimeDegradedReason::new(
+            "cuda_unavailable",
+            "CUDA was requested but unavailable",
+        )),
+        "abc1234",
+    )
+    .expect("degraded provenance is structurally valid");
+    let envelope = ArtifactEnvelope::new(provenance, ()).expect("degraded envelope");
+    let gate =
+        LivePromotionGate::new(canonical_live_execution_contract()).require_deterministic(true);
+
+    let error = gate
+        .validate(&envelope, &complete_validation_evidence())
+        .expect_err("degraded runtime must not pass promotion gate");
+
+    assert_eq!(
+        error,
+        ArtifactContractError::LiveRejectedRuntimeMode {
+            mode: RuntimeMode::Degraded,
+            backend: BackendKind::CpuReference,
+        }
+    );
+}
+
+#[test]
+fn live_promotion_readiness_report_collects_operator_reasons_without_failing() {
+    let mut provenance = canonical_live_provenance();
+    provenance.determinism_policy = DeterminismPolicy::BestEffort;
+    let envelope =
+        ArtifactEnvelope::new(provenance, ()).expect("best-effort artifact is structurally valid");
+    let gate =
+        LivePromotionGate::new(canonical_live_execution_contract()).require_deterministic(true);
+
+    let report = gate.readiness_report(&envelope, None);
+
+    assert!(!report.ready);
+    assert!(!report.validation_evidence_complete);
+    assert!(!report.determinism_requirement_passed);
+    assert!(
+        report
+            .rejection_reasons
+            .iter()
+            .any(|reason| reason.contains("validation evidence"))
+    );
+    assert!(
+        report
+            .rejection_reasons
+            .iter()
+            .any(|reason| reason.contains("deterministic"))
+    );
+    assert!(report.checks.iter().any(|check| check.kind
+        == PromotionReadinessCheckKind::ValidationEvidence
+        && check.status == PromotionReadinessStatus::Failed));
+    assert!(report.checks.iter().any(|check| check.kind
+        == PromotionReadinessCheckKind::DeterminismRequirement
+        && check.status == PromotionReadinessStatus::Failed));
+    assert_eq!(
+        report.evidence_checks.len(),
+        ValidationEvidenceKind::ALL.len()
+    );
+    assert!(report.evidence_checks.iter().all(|check| !check.present));
+}
+
+#[test]
+fn live_promotion_readiness_report_includes_runtime_safety_snapshot() {
+    let provenance = ArtifactProvenance::new(
+        ArtifactKind::LiveReadyStrategy,
+        "feature-schema-v1",
+        "dataset-a",
+        "symbols-eurusd",
+        "m1-m5",
+        "timestamp-policy-v1",
+        "feature-availability-v1",
+        "label-policy-v1",
+        "training-config-v1",
+        "search-config-v1",
+        "runtime-config-v1",
+        "risk-config-v1",
+        DeterminismPolicy::Deterministic { seed: 42 },
+        "hardware-profile-1",
+        DeviceAssignment {
+            backend: BackendKind::CpuReference,
+            device: "cpu".to_string(),
+            device_ids: Vec::new(),
+        },
+        BackendKind::CpuReference,
+        RuntimeMode::Degraded,
+        Some(RuntimeDegradedReason::new(
+            "cuda_unavailable",
+            "CUDA was requested but unavailable",
+        )),
+        "abc1234",
+    )
+    .expect("degraded provenance is structurally valid");
+    let envelope = ArtifactEnvelope::new(provenance, ()).expect("degraded envelope");
+    let gate = LivePromotionGate::new(canonical_live_execution_contract());
+
+    let report = gate.readiness_report(&envelope, Some(&complete_validation_evidence()));
+
+    assert!(!report.ready);
+    assert!(!report.runtime_safety.live_safe);
+    assert!(
+        report
+            .runtime_safety
+            .has_issue(RuntimeSafetyIssue::DegradedBackend)
+    );
+    assert!(report.checks.iter().any(|check| check.kind
+        == PromotionReadinessCheckKind::RuntimeSafety
+        && check.status == PromotionReadinessStatus::Failed));
 }

@@ -4,6 +4,7 @@ mod envelope;
 mod error;
 mod live;
 mod primitives;
+mod promotion;
 mod temporal;
 
 #[cfg(test)]
@@ -13,6 +14,7 @@ pub use envelope::*;
 pub use error::*;
 pub use live::*;
 pub use primitives::*;
+pub use promotion::*;
 pub use temporal::*;
 
 /// Stable schema version for the shared cross-subsystem artifact contract.
