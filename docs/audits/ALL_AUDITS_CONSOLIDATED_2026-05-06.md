@@ -531,6 +531,11 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 ## Execution log
 
 
+### 2026-05-10: Follow-on Phase 57 completed — DiscoveryPerKindEvidenceHashes::check_summary
+
+Added `DiscoveryPerKindEvidenceHashes::check_summary()` returning a `Vec<(&'static str, &'static str)>` with one `(kind_name, "present"|"missing")` tuple per validation kind. Operator-facing log lines and UI tables can render this directly without re-deriving per-kind logic; the same data is reachable through `missing_kinds()` but `check_summary` lays out every kind in one pass for tabular display.
+
+
 ### 2026-05-10: Follow-on Phase 56 completed — full validation chain integration test
 
 Added a single integration-style test in `forex-search::discovery::tests` that walks the entire validation chain end-to-end: per-kind hashes → strict manifest (rejects on live-sim) → lossy manifest (accepts) → evidence bridge → run profile. Asserts producer-side completeness (`all_producer_kinds_present`), missing-kind list, prop-firm and forward-test counts on the profile, and the structural live-sim absence in `validation_evidence_missing_kinds`. Lib tests grew 106 → 107.

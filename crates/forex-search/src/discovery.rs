@@ -2199,6 +2199,24 @@ impl DiscoveryPerKindEvidenceHashes {
             && self.prop_firm.is_some()
     }
 
+    /// Returns one `(kind_name, status)` tuple per validation kind,
+    /// where `status` is `"present"` or `"missing"`. Render directly
+    /// in operator-facing log lines / UI tables without re-deriving
+    /// per-kind logic.
+    pub fn check_summary(&self) -> Vec<(&'static str, &'static str)> {
+        let label = |opt: &Option<String>| if opt.is_some() { "present" } else { "missing" };
+        vec![
+            ("canonical_backtest", label(&self.canonical_backtest)),
+            ("walkforward", label(&self.walkforward)),
+            ("forward_test", label(&self.forward_test)),
+            ("prop_firm", label(&self.prop_firm)),
+            (
+                "live_execution_simulation",
+                label(&self.live_execution_simulation),
+            ),
+        ]
+    }
+
     /// Returns the list of kinds that have no hash on this profile.
     /// Operators / UI layers can render this directly without parsing
     /// `MissingValidationEvidence` strings.
