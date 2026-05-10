@@ -22,11 +22,17 @@ env:
   RUST_BACKTRACE: 1
   BINDGEN_EXTRA_CLANG_ARGS: "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
 
-  # libtorch / CUDA target. Bump these together when PyTorch publishes
-  # a newer build that matches tch-rs 0.22. Confirmed compatible:
-  # libtorch 2.5.0 + cu121.
-  LIBTORCH_VERSION: "2.5.0"
-  LIBTORCH_CUDA: "cu121"
+  # libtorch / CUDA target. tch-rs 0.22 (our pinned version) requires
+  # libtorch 2.9.0; PyTorch 2.9 was the first release to ship CUDA 13
+  # binaries (cu130). The cu130 build is binary-compatible with any
+  # CUDA 13.x runtime — including the user-installed CUDA 13.2 the
+  # release is targeted at. Bump LIBTORCH_VERSION when tch-rs is
+  # bumped (0.23 → libtorch 2.11; 0.24 → 2.12; etc.).
+  LIBTORCH_VERSION: "2.9.0"
+  LIBTORCH_CUDA: "cu130"
+  # CUDA toolkit version installed on the build runner via Jimver/cuda-toolkit.
+  # Must be >= the libtorch CUDA target above. Default: latest CUDA 13.x.
+  CUDA_TOOLKIT_VERSION: "13.2.0"
 
   # Cargo features enabled in the release. Keep in sync with the
   # forex-app Cargo.toml `gpu` feature definition.
@@ -63,11 +69,11 @@ jobs:
             windows-cargo-gpu-${{ env.LIBTORCH_VERSION }}-${{ env.LIBTORCH_CUDA }}-
             windows-cargo-gpu-
 
-      - name: Install CUDA toolkit
+      - name: Install CUDA toolkit (Windows)
         uses: Jimver/cuda-toolkit@v0.2.19
         id: cuda-toolkit
         with:
-          cuda: '12.1.0'
+          cuda: ${{ env.CUDA_TOOLKIT_VERSION }}
           method: 'network'
           sub-packages: '["nvcc", "cudart", "thrust", "cublas", "cusparse", "cusolver", "curand"]'
 
@@ -156,9 +162,10 @@ jobs:
           ================================
 
           Runtime requirements:
-            - NVIDIA driver supporting CUDA $(${env:LIBTORCH_CUDA}.Replace('cu','').Insert(2,'.')) or newer
+            - NVIDIA driver supporting CUDA 13.0 or newer (CUDA 13.2 recommended)
+              -> verify with: nvidia-smi
             - The CUDA runtime DLLs bundled here cover libtorch; you do NOT
-              need to install CUDA toolkit separately.
+              need to install the CUDA toolkit separately.
 
           To run: just double-click ForexAI.exe (or run from a terminal
           for log output).
@@ -217,17 +224,20 @@ jobs:
             linux-cargo-gpu-${{ env.LIBTORCH_VERSION }}-${{ env.LIBTORCH_CUDA }}-
             linux-cargo-gpu-
 
-      - name: Install CUDA toolkit
+      - name: Install CUDA toolkit (Linux)
         uses: Jimver/cuda-toolkit@v0.2.19
         id: cuda-toolkit
         with:
-          cuda: '12.1.0'
+          cuda: ${{ env.CUDA_TOOLKIT_VERSION }}
           method: 'network'
           sub-packages: '["nvcc", "cudart-dev", "thrust", "libcublas-dev", "libcusparse-dev", "libcusolver-dev", "libcurand-dev"]'
 
-      - name: Download libtorch (Linux, CUDA, cxx11-abi)
+      - name: Download libtorch (Linux, CUDA)
+        # PyTorch dropped the cxx11-abi-prefixed Linux libtorch starting
+        # with the cu130 builds — the unprefixed file ships both ABIs
+        # internally. Use plain `libtorch-shared-with-deps-...`.
         run: |
-          URL="https://download.pytorch.org/libtorch/${LIBTORCH_CUDA}/libtorch-cxx11-abi-shared-with-deps-${LIBTORCH_VERSION}%2B${LIBTORCH_CUDA}.zip"
+          URL="https://download.pytorch.org/libtorch/${LIBTORCH_CUDA}/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2B${LIBTORCH_CUDA}.zip"
           echo "Downloading $URL"
           curl -fsSL "$URL" -o libtorch.zip
           unzip -q libtorch.zip
@@ -271,10 +281,10 @@ jobs:
           =============================
 
           Runtime requirements:
-            - NVIDIA driver supporting CUDA ${LIBTORCH_CUDA#cu} or newer
-              (e.g. 'nvidia-smi' must work and show CUDA 12.1+ runtime).
+            - NVIDIA driver supporting CUDA 13.0 or newer (CUDA 13.2 recommended)
+              -> verify with: nvidia-smi
             - The CUDA runtime libs bundled in lib/ cover libtorch; you do
-              NOT need to install CUDA toolkit separately.
+              NOT need to install the CUDA toolkit separately.
 
           To run: ./run-forexai.sh   (the wrapper sets LD_LIBRARY_PATH)
           Or run directly with:
@@ -338,7 +348,7 @@ jobs:
             | Linux .deb        | `*.deb` | System libtorch required (apt install) |
 
             ### Runtime requirements
-            - **Windows / Linux**: NVIDIA driver supporting **CUDA 12.1+**
+            - **Windows / Linux**: NVIDIA driver supporting **CUDA 13.0+** (CUDA 13.2 recommended)
             - libtorch CUDA runtime DLLs/.so are bundled inside the archive — no separate PyTorch / Python install required
             - cTrader Open API credentials for live trading (Demo or Live)
 
