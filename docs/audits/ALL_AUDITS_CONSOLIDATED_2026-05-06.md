@@ -542,6 +542,11 @@ The Phase 1-70 contract / validation / extraction work is complete; the matrix i
 Closed the high-leverage quick-win bucket identified by the Phase 71 matrix. Phase 72 adds a CI guardrail against active Python/PyO3 reintroduction outside `docs/` and `vendor/`. Phase 73 audits every active-source `allow(dead_code)` occurrence, removes the stale `SessionAccum` suppression, and records the retained generated/feature-gated/integration boundaries in [`dead_code_allowlist_2026-05-10.md`](dead_code_allowlist_2026-05-10.md). Phase 74 adds typed `forex-data` feature registry metadata for SMC, session, regime, quantitative, and VectorTA TA outputs. Phase 75 exposes `FeatureFrame::column_metadata()` / `validate_registry()` plus tests so downstream discovery/training code can reject feature-name drift through the shared registry instead of ad hoc lists.
 
 
+### 2026-05-10: Follow-on Phases 76-79 completed — typed model runtime metadata
+
+Closed the medium-risk typed propagation slice from the Phase 71 matrix without changing legacy string fields. Phase 76 adds shared typed inference helpers for model runtime backend labels, runtime modes, and degraded reasons, then attaches those fields to `PredictionMetadata`. Phase 77 propagates typed `BackendKind` into NEAT artifacts and runtime predictions. Phase 78 does the same for CRFMNES / neuro-evolution artifacts, including local surrogate fallback reasons. Phase 79 carries typed backend/runtime metadata through statistical linear artifacts, CUDA linear fit results, and swarm forecast results. See [`follow_on_phases_76_79_typed_runtime_metadata_2026-05-10.md`](follow_on_phases_76_79_typed_runtime_metadata_2026-05-10.md).
+
+
 ### 2026-05-10: Follow-on Phases 67-70 completed — dedup deferred items landed
 
 Closed the dedup audit's "deferred items" block from the Phase 66 closure note. Three additional shared modules / helpers landed and one atomic-IO unification was explicitly re-deferred with a documented reason.

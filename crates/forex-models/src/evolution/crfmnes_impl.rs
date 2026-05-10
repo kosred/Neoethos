@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::{cmp::Ordering, f64::consts::PI};
 
+use forex_core::BackendKind;
+
 #[cfg(feature = "neuro-evolution-gpu")]
 use super::crfmnes_gpu::{neuro_evo_cuda_kernel_enabled, try_selection_losses_cuda};
 use crate::base::{
@@ -22,6 +24,7 @@ use crate::runtime::artifacts::{
 };
 use crate::runtime::capabilities::{
     CapabilityState, ModelFamily, append_runtime_degraded_reason, normalize_runtime_device_policy,
+    runtime_backend_kind_from_label,
 };
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
@@ -62,6 +65,10 @@ fn is_fallback_search_backend(backend: &str) -> bool {
         || backend
             .strip_prefix(FALLBACK_BACKEND_NAME)
             .is_some_and(|suffix| suffix.starts_with('_'))
+}
+
+fn neuro_evo_runtime_backend_kind(runtime_backend: &str) -> BackendKind {
+    runtime_backend_kind_from_label(Some(runtime_backend)).unwrap_or(BackendKind::Unavailable)
 }
 
 struct SimpleEvolutionState {
@@ -378,6 +385,8 @@ struct NeuroEvoArtifact {
     scaler: FeatureScaler,
     params: Vec<f32>,
     search_backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_backend_kind: Option<BackendKind>,
     #[serde(default = "default_neuro_evo_requested_device_policy")]
     requested_device_policy: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -406,6 +415,7 @@ impl Default for NeuroEvoArtifact {
             },
             params: Vec::new(),
             search_backend: FALLBACK_BACKEND_NAME.to_string(),
+            runtime_backend_kind: Some(neuro_evo_runtime_backend_kind(FALLBACK_BACKEND_NAME)),
             requested_device_policy: default_neuro_evo_requested_device_policy(),
             runtime_degraded_reason: Some(FALLBACK_DEGRADED_REASON.to_string()),
             runtime_metadata: None,
@@ -690,6 +700,17 @@ impl NeuroEvoExpert {
         }
         if artifact.search_backend.trim().is_empty() {
             bail!("neuro-evo artifact must persist a runtime backend label");
+        }
+        if let Some(runtime_backend_kind) = artifact.runtime_backend_kind {
+            let expected = neuro_evo_runtime_backend_kind(&artifact.search_backend);
+            if runtime_backend_kind != expected {
+                bail!(
+                    "neuro-evo artifact runtime_backend_kind {:?} does not match search backend label `{}` ({:?})",
+                    runtime_backend_kind,
+                    artifact.search_backend,
+                    expected
+                );
+            }
         }
         if artifact.requested_device_policy.trim().is_empty() {
             bail!("neuro-evo artifact requested_device_policy must not be blank");
@@ -1093,6 +1114,7 @@ impl ExpertModel for NeuroEvoExpert {
                 scaler: self.scaler.clone().context("neuro-evo scaler missing")?,
                 params: self.params.clone(),
                 search_backend: self.search_backend.clone(),
+                runtime_backend_kind: Some(neuro_evo_runtime_backend_kind(&self.search_backend)),
                 requested_device_policy: self.requested_device_policy.clone(),
                 runtime_degraded_reason: self.runtime_degraded_reason.clone(),
                 runtime_metadata: Some(runtime_metadata),
@@ -1240,6 +1262,17 @@ mod tests {
         }
     }
 
+    fn expected_training_backend_kind() -> forex_core::BackendKind {
+        #[cfg(feature = "neuro-evolution")]
+        {
+            forex_core::BackendKind::NativeCpu
+        }
+        #[cfg(not(feature = "neuro-evolution"))]
+        {
+            forex_core::BackendKind::LocalSurrogateFallback
+        }
+    }
+
     fn temp_model_dir(name: &str) -> std::path::PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1294,6 +1327,10 @@ mod tests {
         assert_eq!(artifact.val_rows, 6);
         let (expected_backend, expected_reason) = expected_training_backend();
         assert_eq!(artifact.search_backend, expected_backend);
+        assert_eq!(
+            artifact.runtime_backend_kind,
+            Some(expected_training_backend_kind())
+        );
         assert_eq!(artifact.runtime_degraded_reason.as_deref(), expected_reason);
 
         let _ = std::fs::remove_dir_all(&path);
@@ -1310,6 +1347,9 @@ mod tests {
         expert.feature_columns = vec!["f1".to_string(), "f2".to_string()];
         expert.scaler = Some(scaler);
         expert.params = vec![0.0; NeuroEvoExpert::parameter_dim(2, 8)];
+        expert.dataset_rows = 32;
+        expert.train_rows = 26;
+        expert.val_rows = 6;
         expert.fitted = true;
 
         let df = DataFrame::new(vec![
@@ -1352,6 +1392,14 @@ mod tests {
             Some(FALLBACK_BACKEND_NAME)
         );
         assert_eq!(
+            predictions[0].metadata().backend_kind,
+            Some(forex_core::BackendKind::LocalSurrogateFallback)
+        );
+        assert_eq!(
+            predictions[0].metadata().runtime_mode,
+            Some(forex_core::RuntimeMode::Degraded)
+        );
+        assert_eq!(
             predictions[0].metadata().degraded_reason.as_deref(),
             Some(FALLBACK_DEGRADED_REASON)
         );
@@ -1385,6 +1433,7 @@ mod tests {
             },
             params: vec![0.0; NeuroEvoExpert::parameter_dim(1, 8)],
             search_backend: FALLBACK_BACKEND_NAME.to_string(),
+            runtime_backend_kind: Some(neuro_evo_runtime_backend_kind(FALLBACK_BACKEND_NAME)),
             requested_device_policy: default_neuro_evo_requested_device_policy(),
             runtime_degraded_reason: Some(FALLBACK_DEGRADED_REASON.to_string()),
             runtime_metadata: None,
@@ -1424,6 +1473,7 @@ mod tests {
             },
             params: vec![0.0; NeuroEvoExpert::parameter_dim(1, 8)],
             search_backend: FALLBACK_BACKEND_NAME.to_string(),
+            runtime_backend_kind: Some(neuro_evo_runtime_backend_kind(FALLBACK_BACKEND_NAME)),
             requested_device_policy: default_neuro_evo_requested_device_policy(),
             runtime_degraded_reason: None,
             runtime_metadata: None,
@@ -1463,6 +1513,7 @@ mod tests {
             },
             params: vec![0.0; NeuroEvoExpert::parameter_dim(1, 8)],
             search_backend: "crfmnes_cpu".to_string(),
+            runtime_backend_kind: Some(neuro_evo_runtime_backend_kind("crfmnes_cpu")),
             requested_device_policy: default_neuro_evo_requested_device_policy(),
             runtime_degraded_reason: Some("stale_degraded_reason".to_string()),
             runtime_metadata: None,
