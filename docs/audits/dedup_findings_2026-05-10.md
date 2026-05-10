@@ -13,7 +13,14 @@ copies in a follow-up commit.
 
 ---
 
-## Findings by category
+## Findings by category (updated 2026-05-10 with deeper scan)
+
+The initial scan covered forex-search and forex-models surface-level
+duplicates. The deeper pass below extends across forex-data,
+forex-app, forex-cli and the nested forex-models subdirectories,
+adding categories 10-13.
+
+
 
 ### 1. Hash helpers — FNV-1a + stable JSON hash
 
@@ -171,6 +178,78 @@ a fallback timestamp slice for cases where `Ohlcv::timestamp` is
 
 **Extraction target:** `forex-data::slicing::slice_ohlcv` (new
 module on `forex-data`, the natural owner of the `Ohlcv` type).
+
+### 10. `flatten_features` (CUDA prep)
+
+| File | Function | Visibility |
+|---|---|---|
+| `crates/forex-models/src/evolution/crfmnes_gpu.rs` | `flatten_features` | private |
+| `crates/forex-models/src/evolution/neat_gpu.rs` | `flatten_features` | private |
+| `crates/forex-models/src/statistical/linear_gpu.rs` | `flatten_features` | private |
+
+Three near-identical `fn flatten_features(features: &Array2<f32>,
+input_dim: usize) -> Result<Vec<f32>>` bodies that validate column
+count and flatten the matrix. Each emits a different error message
+("neuro-evo cuda…", "NEAT cuda…", "statistical cuda…") but the math
+is identical.
+
+**Extraction target:** `forex-models::common::cuda_prep::flatten_features`
+with a `&'static str` `caller_label` parameter for the error message.
+
+### 11. `sigmoid` (activation)
+
+| File | Function | Visibility |
+|---|---|---|
+| `crates/forex-models/src/ensemble.rs` | `sigmoid` | private |
+| `crates/forex-models/src/statistical/bayesian_impl.rs` | `sigmoid` | private |
+
+The bayesian variant is numerically stable (handles negative values
+without overflow); the ensemble variant is the naive `1/(1+e^{-x})`.
+The stable form should win.
+
+**Extraction target:** `forex-core::utils::numeric::stable_sigmoid_f32`.
+Switch both call sites; document why the stable form is preferred.
+
+### 12. Other forex-models math helpers
+
+| File | Function | Visibility | Notes |
+|---|---|---|---|
+| `crates/forex-models/src/anomaly/forest_impl.rs` | `median(Vec<f32>)` | private | Sort-based median. |
+| `crates/forex-search/src/stop_target.rs` | `median_ignore_nan(&[f64])` | private | Same idea, different element type + NaN policy. |
+| `crates/forex-models/src/forecasting/swarm_impl.rs` | `percentile(&[f32], q)` | private | Single-quantile lookup. |
+| `crates/forex-models/src/forecasting/swarm_impl.rs` | `moving_average_forecast` / `ewma_forecast` | private | Series helpers. |
+| `crates/forex-search/src/stop_target.rs` | `rolling_mean` | private | Equivalent to MA. |
+
+The median / percentile / rolling-mean / EWMA helpers are not
+straight duplicates but they live in the same conceptual space. They
+should converge under `forex-core::utils::stats::series` so the
+forex-models RL / forecasting paths and the search stop-target
+helpers share one tested implementation.
+
+**Extraction target:** the new `forex-core::utils::stats` module
+gains a `series` submodule covering `median_ignore_nan`,
+`percentile_sorted`, `rolling_mean`, `ewma`, `moving_average`. Each
+caller picks the variant it needs; no behavior change.
+
+### 13. Discovery_gpu fallback chains
+
+| File | Function | Visibility |
+|---|---|---|
+| `crates/forex-search/src/discovery_gpu.rs` | `append_degraded_reason` | private |
+| `crates/forex-search/src/lib.rs` (gpu-disabled stub) | duplicate `append_degraded_reason` | private |
+| `crates/forex-search/src/discovery_gpu.rs` | `resolve_cpu_fallback_runtime` | private |
+| `crates/forex-search/src/lib.rs` (gpu-disabled stub) | duplicate `resolve_cpu_fallback_runtime` | private |
+
+The `cfg(not(feature = "gpu"))` stub in `lib.rs` shadows the entire
+`discovery_gpu` module with copies of the helpers. This is by
+design (different code paths) but the two helper bodies have drifted
+enough that consolidating them would catch future divergence.
+
+**Extraction target:** keep the `cfg`-gated stub but lift the
+shared helpers (`append_degraded_reason`,
+`resolve_cpu_fallback_runtime`) to `forex-search::scheduler_assignment`
+so both the gpu-enabled and gpu-disabled paths import the same
+implementation.
 
 ---
 
