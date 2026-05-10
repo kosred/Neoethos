@@ -265,14 +265,7 @@ fn activation_code(activation: Activation) -> i32 {
 }
 
 fn flatten_features(features: &Array2<f32>, input_dim: usize) -> Result<Vec<f32>> {
-    if features.ncols() != input_dim {
-        bail!(
-            "NEAT cuda feature dimension mismatch: expected {}, received {}",
-            input_dim,
-            features.ncols()
-        );
-    }
-    Ok(features.iter().copied().collect())
+    crate::common::cuda_flatten_features(features, input_dim, "NEAT")
 }
 
 fn flatten_labels(labels: &[usize], expected_rows: usize) -> Result<Vec<i32>> {

@@ -150,14 +150,7 @@ fn flatten_candidates(candidates: &[Vec<f64>], param_dim: usize) -> Result<Vec<f
 }
 
 fn flatten_features(features: &Array2<f32>, input_dim: usize) -> Result<Vec<f32>> {
-    if features.ncols() != input_dim {
-        bail!(
-            "neuro-evo cuda feature dimension mismatch: expected {}, received {}",
-            input_dim,
-            features.ncols()
-        );
-    }
-    Ok(features.iter().copied().collect())
+    crate::common::cuda_flatten_features(features, input_dim, "neuro-evo")
 }
 
 fn launch_loss_kernel(

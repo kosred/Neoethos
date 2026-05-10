@@ -258,17 +258,11 @@ fn kernel_units(client: &ComputeClient<CudaRuntime>) -> u32 {
 }
 
 fn flatten_features(features: &Array2<f32>, cols: usize) -> Result<Vec<f32>> {
-    if features.ncols() != cols {
-        bail!(
-            "statistical cuda feature dimension mismatch: expected {}, received {}",
-            cols,
-            features.ncols()
-        );
-    }
-    if features.iter().any(|value| !value.is_finite()) {
+    let flat = crate::common::cuda_flatten_features(features, cols, "statistical")?;
+    if flat.iter().any(|value| !value.is_finite()) {
         bail!("statistical cuda feature matrix contains non-finite values");
     }
-    Ok(features.iter().copied().collect())
+    Ok(flat)
 }
 
 fn flatten_labels(labels: &[usize], rows: usize) -> Result<Vec<i32>> {

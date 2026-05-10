@@ -1,5 +1,6 @@
 // Base classes and utilities (derived from models/base.py)
 pub mod base;
+pub mod common;
 pub mod runtime;
 
 // Machine learning models
