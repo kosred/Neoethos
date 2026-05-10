@@ -17,7 +17,7 @@ use forex_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{error, info};
-use workspace::{WorkspaceState, WorkspaceTab, WorkspaceViewer, render_workspace};
+use workspace::{WorkspaceGroup, WorkspaceState, WorkspaceTab, WorkspaceViewer, render_workspace};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -371,6 +371,9 @@ impl eframe::App for ForexApp {
         let mut stop_discovery = false;
         let mut start_training = false;
         let mut stop_training = false;
+        let mut connect_broker = false;
+        let mut disconnect_broker = false;
+        let broker_connected = self.trading_session.is_connected();
 
         egui::TopBottomPanel::top("top_panel")
             .frame(ui::theme::top_panel_frame(ctx.style().as_ref()))
@@ -624,6 +627,109 @@ impl eframe::App for ForexApp {
                         );
                     });
 
+                    ui.add(egui::Separator::default().vertical().spacing(10.0));
+
+                    // ── Quick-action engine controls (one-click) ──────────
+                    // Promote Start/Stop out of the Engine dropdown so the
+                    // operator never has to drill through a menu mid-session.
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui::theme::status_dot(ui, discovery_dot, 9.0);
+                        let (label, color, hover) = if discovery_running {
+                            (
+                                "Stop Disc",
+                                ui::theme::DANGER,
+                                "Cancel active discovery run",
+                            )
+                        } else {
+                            (
+                                "Start Disc",
+                                ui::theme::SUCCESS,
+                                "Start discovery with current form settings",
+                            )
+                        };
+                        if ui
+                            .add(egui::Button::new(
+                                egui::RichText::new(label).size(11.0).color(color).strong(),
+                            ))
+                            .on_hover_text(hover)
+                            .clicked()
+                        {
+                            if discovery_running {
+                                stop_discovery = true;
+                            } else {
+                                start_discovery = true;
+                            }
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui::theme::status_dot(ui, training_dot, 9.0);
+                        let (label, color, hover) = if training_running {
+                            (
+                                "Stop Train",
+                                ui::theme::DANGER,
+                                "Cancel active training run",
+                            )
+                        } else {
+                            (
+                                "Start Train",
+                                ui::theme::SUCCESS,
+                                "Start training with current symbol & TF",
+                            )
+                        };
+                        if ui
+                            .add(egui::Button::new(
+                                egui::RichText::new(label).size(11.0).color(color).strong(),
+                            ))
+                            .on_hover_text(hover)
+                            .clicked()
+                        {
+                            if training_running {
+                                stop_training = true;
+                            } else {
+                                start_training = true;
+                            }
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let broker_dot_color = if broker_connected {
+                            ui::theme::SUCCESS
+                        } else {
+                            ui::theme::TEXT_MUTED
+                        };
+                        ui::theme::status_dot(ui, broker_dot_color, 9.0);
+                        let (label, color, hover) = if broker_connected {
+                            (
+                                "Disconnect",
+                                ui::theme::DANGER,
+                                "Disconnect from broker (cTrader / DXTrade)",
+                            )
+                        } else {
+                            (
+                                "Connect",
+                                ui::theme::SUCCESS,
+                                "Connect to broker using saved credentials",
+                            )
+                        };
+                        if ui
+                            .add(egui::Button::new(
+                                egui::RichText::new(label).size(11.0).color(color).strong(),
+                            ))
+                            .on_hover_text(hover)
+                            .clicked()
+                        {
+                            if broker_connected {
+                                disconnect_broker = true;
+                            } else {
+                                connect_broker = true;
+                            }
+                        }
+                    });
+
                     // ── Right-aligned controls ───────────────────────────
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(6.0);
@@ -699,6 +805,74 @@ impl eframe::App for ForexApp {
             if let Some(handle) = &self.training_handle {
                 handle.cancel.request();
             }
+        }
+        if connect_broker {
+            self.trading_session.connect(&mut self.state);
+        }
+        if disconnect_broker {
+            self.trading_session.disconnect(&mut self.state);
+        }
+
+        // ── Left navigation sidebar ──────────────────────────────────────
+        // Groups the 15 dock tabs into 3 collapsible sections
+        // (Trading / AI Engine / System) so the operator does not have
+        // to scan a flat egui_dock tab strip mid-session. Clicking a
+        // tab name routes through `WorkspaceState::focus_tab` and reuses
+        // the existing dock layout — the dock area still owns the panes.
+        let mut sidebar_target: Option<WorkspaceTab> = None;
+        egui::SidePanel::left("workspace_nav")
+            .frame(ui::theme::central_panel_frame(ctx.style().as_ref()))
+            .resizable(true)
+            .default_width(190.0)
+            .min_width(160.0)
+            .max_width(260.0)
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("NAVIGATE")
+                        .size(11.0)
+                        .strong()
+                        .color(ui::theme::TEXT_MUTED),
+                );
+                ui.add_space(6.0);
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for group in WorkspaceGroup::ordered() {
+                        ui.add_space(6.0);
+                        egui::CollapsingHeader::new(
+                            egui::RichText::new(group.title())
+                                .size(13.0)
+                                .strong()
+                                .color(ui::theme::ACCENT),
+                        )
+                        .id_salt(group.title())
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(group.description())
+                                    .size(10.0)
+                                    .italics()
+                                    .color(ui::theme::TEXT_MUTED),
+                            );
+                            ui.add_space(2.0);
+                            for tab in WorkspaceTab::all_for_group(*group) {
+                                let label = egui::RichText::new(tab.title())
+                                    .size(12.0)
+                                    .color(ui::theme::TEXT_PRIMARY);
+                                if ui
+                                    .add(egui::Button::new(label).frame(false))
+                                    .on_hover_text(tab.description())
+                                    .clicked()
+                                {
+                                    sidebar_target = Some(*tab);
+                                }
+                            }
+                        });
+                    }
+                });
+            });
+        if let Some(tab) = sidebar_target {
+            self.workspace.focus_tab(tab);
         }
 
         egui::CentralPanel::default()
