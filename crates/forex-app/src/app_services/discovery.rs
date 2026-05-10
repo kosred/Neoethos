@@ -1129,6 +1129,12 @@ mod tests {
             candidates: vec![best, Gene::default(), Gene::default()],
             quality_metrics: Vec::new(),
             logged_trades: Vec::new(),
+            effective_feature_names: Vec::new(),
+            validation_gates: forex_search::DiscoveryValidationGates::pending(),
+            canonical_backtest_artifacts: Vec::new(),
+            walkforward_validation_artifacts: Vec::new(),
+            forward_test_validation_artifacts: Vec::new(),
+            prop_firm_validation_artifacts: Vec::new(),
         };
 
         let snapshot = completed_snapshot(JobSnapshot::new(JobKind::Discovery), &result);

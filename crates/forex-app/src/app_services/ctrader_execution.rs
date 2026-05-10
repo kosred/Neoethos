@@ -517,8 +517,12 @@ impl ProductionCTraderExecutionBackend {
             return Ok(cached);
         }
 
+        let max_attempts = ctrader_max_attempts();
         let mut last_error = None;
-        for attempt in 0..2 {
+        for attempt in 0..max_attempts {
+            if attempt > 0 {
+                ctrader_backoff_sleep(attempt);
+            }
             if let Err(err) = Self::ensure_authenticated(&mut session, request) {
                 session.socket = None;
                 session.auth_key = None;
@@ -639,6 +643,46 @@ impl CTraderExecutionBackend for StubCTraderExecutionBackend {
             .unwrap_or_else(|| Err("missing stub execution outcome".to_string()))
             .map_err(|err| anyhow!(err))
     }
+}
+
+/// Maximum number of attempts (initial + retries) for a single
+/// `execute_via_session` call. Tunable via `FOREX_BOT_CTRADER_MAX_ATTEMPTS`
+/// (clamped to `[1, 5]`; default 3). The default is deliberately small —
+/// retry safety relies on the broker deduping by `clientOrderId`.
+fn ctrader_max_attempts() -> u32 {
+    std::env::var("FOREX_BOT_CTRADER_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(3)
+        .clamp(1, 5)
+}
+
+/// Base backoff in ms for retries; tunable via
+/// `FOREX_BOT_CTRADER_BACKOFF_BASE_MS` (clamped to `[10, 2000]`; default 200).
+fn ctrader_backoff_base_ms() -> u64 {
+    std::env::var("FOREX_BOT_CTRADER_BACKOFF_BASE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(200)
+        .clamp(10, 2_000)
+}
+
+/// Sleep before the n-th retry attempt (n >= 1).
+/// Delay = `base * 2^(n-1)` plus 0-99ms jitter derived from the wall clock,
+/// capped at 5 seconds total. The jitter spreads simultaneous retries from
+/// concurrent workers so they do not collide on the broker.
+fn ctrader_backoff_sleep(attempt: u32) {
+    if attempt == 0 {
+        return;
+    }
+    let base = ctrader_backoff_base_ms();
+    let factor = 1u64 << (attempt - 1).min(5);
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() % 100) as u64)
+        .unwrap_or(0);
+    let delay_ms = (base.saturating_mul(factor) + jitter).min(5_000);
+    std::thread::sleep(Duration::from_millis(delay_ms));
 }
 
 fn ensure_payload_type(response_json: &str, expected_payload_type: u32) -> Result<()> {

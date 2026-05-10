@@ -38,13 +38,24 @@ pub struct CTraderLiveChartUpdate {
 }
 
 impl CTraderLiveChartUpdate {
+    /// Returns `(bid + ask) / 2` only when both sides are present.
+    /// Previously this fell back to the available side, which silently
+    /// biased SL/TP evaluation by half a spread when one quote was stale.
+    /// Callers that need a one-sided fallback must opt in via
+    /// [`Self::bid`] / [`Self::ask`].
     pub fn mid_price(&self) -> Option<f64> {
         match (self.bid, self.ask) {
             (Some(bid), Some(ask)) => Some((bid + ask) / 2.0),
-            (Some(bid), None) => Some(bid),
-            (None, Some(ask)) => Some(ask),
-            (None, None) => None,
+            _ => None,
         }
+    }
+
+    pub fn bid(&self) -> Option<f64> {
+        self.bid
+    }
+
+    pub fn ask(&self) -> Option<f64> {
+        self.ask
     }
 }
 
@@ -335,7 +346,62 @@ pub fn load_live_chart_update(
 ) -> Result<CTraderLiveChartUpdate> {
     let transport =
         ProductionCTraderLiveStreamingTransport::new(request.environment.endpoint_host());
-    load_live_chart_update_with_transport(&transport, request)
+    let max_attempts = streaming_max_attempts();
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            streaming_backoff_sleep(attempt);
+        }
+        match load_live_chart_update_with_transport(&transport, request) {
+            Ok(update) => return Ok(update),
+            Err(err) => {
+                tracing::warn!(
+                    target: "forex_app::ctrader",
+                    attempt = attempt + 1,
+                    max_attempts,
+                    error = %err,
+                    "cTrader streaming attempt failed"
+                );
+                last_error = Some(err);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("cTrader streaming attempts exhausted")))
+}
+
+/// Maximum number of attempts (initial + retries) for `load_live_chart_update`.
+/// Tunable via `FOREX_BOT_CTRADER_STREAM_MAX_ATTEMPTS` (clamped to `[1, 5]`;
+/// default 3). Retry is safe here because each call is a stateless poll.
+fn streaming_max_attempts() -> u32 {
+    std::env::var("FOREX_BOT_CTRADER_STREAM_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(3)
+        .clamp(1, 5)
+}
+
+/// Base backoff in ms; tunable via `FOREX_BOT_CTRADER_STREAM_BACKOFF_BASE_MS`
+/// (clamped to `[10, 2000]`; default 200).
+fn streaming_backoff_base_ms() -> u64 {
+    std::env::var("FOREX_BOT_CTRADER_STREAM_BACKOFF_BASE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(200)
+        .clamp(10, 2_000)
+}
+
+fn streaming_backoff_sleep(attempt: u32) {
+    if attempt == 0 {
+        return;
+    }
+    let base = streaming_backoff_base_ms();
+    let factor = 1u64 << (attempt - 1).min(5);
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() % 100) as u64)
+        .unwrap_or(0);
+    let delay_ms = (base.saturating_mul(factor) + jitter).min(5_000);
+    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
 }
 
 impl CTraderLiveStreamingBackend for ProductionCTraderLiveStreamingBackend {
@@ -587,15 +653,15 @@ fn normalize_spot_trendbar(payload: SpotTrendbarPayload, digits: i32) -> Option<
     let timestamp_ms = i64::from(payload.utc_timestamp_in_minutes?) * 60_000;
     let low = scaled_price(payload.low, digits);
     let open = scaled_price(
-        payload.low + payload.delta_open.unwrap_or_default() as i64,
+        checked_low_plus_delta(payload.low, payload.delta_open)?,
         digits,
     );
     let close = scaled_price(
-        payload.low + payload.delta_close.unwrap_or_default() as i64,
+        checked_low_plus_delta(payload.low, payload.delta_close)?,
         digits,
     );
     let high = scaled_price(
-        payload.low + payload.delta_high.unwrap_or_default() as i64,
+        checked_low_plus_delta(payload.low, payload.delta_high)?,
         digits,
     );
     Some(HistoricalBar {
@@ -606,6 +672,17 @@ fn normalize_spot_trendbar(payload: SpotTrendbarPayload, digits: i32) -> Option<
         close,
         volume: payload.volume,
     })
+}
+
+/// Reconstructs `low + delta` while detecting silent wraparound.
+/// cTrader sends `delta_*` as `u64`; the protocol's real range is well
+/// below `i64::MAX` but a malformed broker payload could push the cast
+/// negative or overflow the addition. Returns `None` on either case so
+/// the caller can drop the bar instead of producing a garbage price.
+fn checked_low_plus_delta(low: i64, delta: Option<u64>) -> Option<i64> {
+    let delta = delta.unwrap_or(0);
+    let delta_i64 = i64::try_from(delta).ok()?;
+    low.checked_add(delta_i64)
 }
 
 fn scaled_price(value: i64, digits: i32) -> f64 {
@@ -840,6 +917,36 @@ mod tests {
         assert!((merged[0].close - 1.1000).abs() < 1e-9);
         assert!((merged[0].high - 1.1010).abs() < 1e-9);
         assert!((merged[0].low - 1.0990).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mid_price_requires_both_sides_to_avoid_half_spread_bias() {
+        let bid_only = CTraderLiveChartUpdate {
+            symbol_id: 1,
+            bid: Some(1.1000),
+            ask: None,
+            timestamp_ms: Some(0),
+            latest_trendbar: None,
+        };
+        let ask_only = CTraderLiveChartUpdate {
+            symbol_id: 1,
+            bid: None,
+            ask: Some(1.1010),
+            timestamp_ms: Some(0),
+            latest_trendbar: None,
+        };
+        let both = CTraderLiveChartUpdate {
+            symbol_id: 1,
+            bid: Some(1.1000),
+            ask: Some(1.1010),
+            timestamp_ms: Some(0),
+            latest_trendbar: None,
+        };
+        assert!(bid_only.mid_price().is_none());
+        assert!(ask_only.mid_price().is_none());
+        assert!((both.mid_price().unwrap() - 1.1005).abs() < 1e-9);
+        assert_eq!(bid_only.bid(), Some(1.1000));
+        assert_eq!(ask_only.ask(), Some(1.1010));
     }
 
     struct StubStreamingTransport {
