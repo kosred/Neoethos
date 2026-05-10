@@ -930,8 +930,8 @@ pub use discovery::{
     ensure_portfolio_export_ready, live_validation_evidence_from_discovery, run_discovery_cycle,
     run_discovery_cycle_with_progress, save_canonical_backtest_artifacts,
     save_discovery_profile_json, save_forward_test_validation_artifacts, save_portfolio_json,
-    save_prop_firm_validation_artifacts, save_quality_report_json, save_trade_log_json,
-    save_walkforward_validation_artifacts,
+    save_promotion_summary_json, save_prop_firm_validation_artifacts, save_quality_report_json,
+    save_trade_log_json, save_walkforward_validation_artifacts,
 };
 pub use discovery_gpu::{
     GpuDiscoveryConfig, GpuDiscoveryResult, build_feature_cube, run_gpu_discovery, save_gpu_genomes,

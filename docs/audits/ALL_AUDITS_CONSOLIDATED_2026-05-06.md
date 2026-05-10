@@ -531,6 +531,11 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 ## Execution log
 
 
+### 2026-05-10: Follow-on Phase 58 completed — promotion summary side-file in forex-app
+
+Added `save_promotion_summary_json` in `forex-search::discovery` and wired it into the forex-app discovery service. Each portfolio export now writes a focused `*_promotion_summary.json` next to the existing `*_profile.json`, carrying just the validation-evidence hashes, missing-kinds list, producer-side completeness, per-kind check summary, and resolved determinism policy. UI scrapers / CI gates can poll the small file without parsing the full profile JSON. Failures during the summary write are logged at `warn` and never block portfolio export; the same data remains in the profile JSON regardless.
+
+
 ### 2026-05-10: Follow-on Phase 57 completed — DiscoveryPerKindEvidenceHashes::check_summary
 
 Added `DiscoveryPerKindEvidenceHashes::check_summary()` returning a `Vec<(&'static str, &'static str)>` with one `(kind_name, "present"|"missing")` tuple per validation kind. Operator-facing log lines and UI tables can render this directly without re-deriving per-kind logic; the same data is reachable through `missing_kinds()` but `check_summary` lays out every kind in one pass for tabular display.

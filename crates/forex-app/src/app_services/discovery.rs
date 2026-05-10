@@ -19,7 +19,7 @@ use forex_search::{
     compute_discovery_forward_test_artifacts, compute_discovery_prop_firm_artifacts,
     ensure_non_empty_portfolio, run_discovery_cycle_with_progress,
     save_canonical_backtest_artifacts, save_discovery_profile_json,
-    save_forward_test_validation_artifacts, save_portfolio_json,
+    save_forward_test_validation_artifacts, save_portfolio_json, save_promotion_summary_json,
     save_prop_firm_validation_artifacts, save_quality_report_json, save_trade_log_json,
     save_walkforward_validation_artifacts,
 };
@@ -952,6 +952,19 @@ pub fn start_discovery_job(
                     out_path.with_extension("prop_firm_validations"),
                     &result,
                 )?;
+            }
+            // Always emit a focused promotion summary so a UI / scraper
+            // can poll one small file instead of parsing the full
+            // profile JSON. Failures here are diagnostic, not blocking.
+            if let Err(err) = save_promotion_summary_json(
+                out_path.with_extension("promotion_summary.json"),
+                &result,
+            ) {
+                tracing::warn!(
+                    target: "forex_app::discovery",
+                    error = %err,
+                    "promotion summary export failed; profile JSON still carries the same data"
+                );
             }
             Ok::<_, anyhow::Error>(result)
         })

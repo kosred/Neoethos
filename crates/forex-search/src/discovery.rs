@@ -2026,6 +2026,34 @@ pub fn save_forward_test_validation_artifacts(
     Ok(result.forward_test_validation_artifacts.len())
 }
 
+/// Persist a focused promotion-readiness summary at `path` derived
+/// from the discovery result. The summary is the same per-kind
+/// evidence + missing-kinds + producer-side-completeness payload that
+/// already lives on `DiscoveryRunProfile` (Phase 49), but written to
+/// its own file so operators / UI scrapers can poll it without
+/// parsing the full profile JSON.
+pub fn save_promotion_summary_json(path: impl AsRef<Path>, result: &DiscoveryResult) -> Result<()> {
+    #[derive(Serialize)]
+    struct PromotionSummary<'a> {
+        validation_evidence_hashes: &'a DiscoveryPerKindEvidenceHashes,
+        validation_evidence_complete: bool,
+        validation_evidence_missing_kinds: Vec<&'static str>,
+        producer_side_complete: bool,
+        check_summary: Vec<(&'static str, &'static str)>,
+        determinism_policy: forex_core::contracts::DeterminismPolicy,
+    }
+    let hashes = discovery_per_kind_evidence_hashes(result)?;
+    let summary = PromotionSummary {
+        producer_side_complete: hashes.all_producer_kinds_present(),
+        check_summary: hashes.check_summary(),
+        validation_evidence_complete: hashes.all_present(),
+        validation_evidence_missing_kinds: hashes.missing_kinds(),
+        validation_evidence_hashes: &hashes,
+        determinism_policy: crate::genetic::current_determinism_policy(),
+    };
+    write_json_atomic(path, &summary)
+}
+
 pub fn save_prop_firm_validation_artifacts(
     dir: impl AsRef<Path>,
     result: &DiscoveryResult,
