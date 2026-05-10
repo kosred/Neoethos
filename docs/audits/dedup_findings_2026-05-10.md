@@ -314,3 +314,33 @@ cleanup commit.
 Each phase keeps the same testing discipline as Phases 16-60: small
 diff, tests around the change, `cargo fmt` + `cargo test` + `cargo
 check` on every downstream crate before commit.
+
+---
+
+## Status update — what landed in Phases 63-65
+
+| Module | Phase | Status |
+|---|---|---|
+| `forex-core::utils::hashing` (`fnv1a64`, `fnv1a64_update`) | 63 | ✅ landed; `forex-core::contracts::temporal`, `forex-search::artifact_io`, `forex-search::genetic::evolution_math` switched. Local `fnv1a64` re-exports kept as thin shims. |
+| `forex-core::utils::stats` (`mean`, `stddev`, `stddev_sample`, `mean_std`, `pearson_correlation_f32`, `mean_vector_f32`) | 64 | ✅ landed; `forex-search::portfolio`, `quality`, `stop_target`, `eval`, `cubecl_eval` switched. Local one-arg `stddev` wrappers retained for ergonomic call shape. |
+| `forex-core::utils::numeric` (`finite_or`, `finite_or_f32`, `clamp_unit_f32`, `clamp_unit_f64`, `stable_sigmoid_f32`) | 65 | ✅ landed; `forex-search::genetic::diversity` and `regime_labels` switched to the shared `finite_or`. `forex-models::ensemble` and `bayesian_impl` `sigmoid` now route through `stable_sigmoid_f32`. `forex-models::forecasting::swarm_impl::clamp_unit` switched. |
+| `forex-models::ensemble::clamp_probability` | — | not extracted (clamps to `[1e-6, 1-1e-6]` for logit safety, distinct from `clamp_unit`; intentionally local). |
+| `forex-models::evolution::flatten_features` (×3 sites) | — | deferred; needs `forex-models::common::cuda_prep` module which is out of scope for this slice. |
+| `forex-models::statistical::common::write_json` / `read_json` | — | deferred to a follow-up that lifts the full `artifact_io` surface; current state acceptable because forex-models artifacts have a different durability budget than search artifacts. |
+
+Test counts after Phases 63-65: forex-core 51 → 62 (+11), forex-search
+107 (unchanged); cargo check on forex-cli / forex-app / forex-models
+remains clean.
+
+---
+
+## Phase 66 — slice closure
+
+The user-requested dedup audit pass is complete. Phases 61-65 surfaced
+13 finding categories, extracted three shared modules, and switched
+the call sites that compile cleanly today. The remaining out-of-scope
+items (atomic-IO unification across forex-search ↔ forex-models,
+`flatten_features` cuda_prep, OHLCV slicing on forex-data) are
+documented above with the reasons each was deferred — none of them
+introduce new contract risk; they are pure code-organisation work that
+can land in a future slice without touching any audit deliverable.
