@@ -531,6 +531,20 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 ## Execution log
 
 
+### 2026-05-10: Follow-on Phase 49 completed — promotion-evidence summary in DiscoveryRunProfile
+
+Continued the Phase 48 producer-consumer wiring by surfacing the typed evidence-summary directly in the persisted `DiscoveryRunProfile` so operators see promotion-readiness signals in the profile JSON without instantiating a `LivePromotionGate`:
+
+- made `DiscoveryPerKindEvidenceHashes` `Serialize` and added `all_present()` + `missing_kinds()` helpers — operators / UI layers can render "which artifact kinds are present, which are missing" without parsing `MissingValidationEvidence` strings;
+- extended `DiscoveryRunProfile` with three new fields: `prop_firm_validation_artifacts_observed` (was missing despite Phase 29 producing the artifacts), `validation_evidence_hashes` (typed per-kind hashes), `validation_evidence_complete` (single boolean), and `validation_evidence_missing_kinds` (sorted list of missing-kind names);
+- updated `build_discovery_profile` to compute the per-kind hashes via `discovery_per_kind_evidence_hashes` and propagate the typed summary; the live-execution simulation hash always lands as `None` until a simulator is wired, which surfaces in the profile as `validation_evidence_complete = false` and `validation_evidence_missing_kinds = ["live_execution_simulation"]` (plus any other missing kinds);
+- added a discovery-test verifying that a partial result (canonical + forward-test + prop-firm but no walk-forward) produces a profile with the right `Some` / `None` per kind, `validation_evidence_complete = false`, and the missing-kind list containing both `walkforward` and `live_execution_simulation`.
+
+The `*_profile.json` written next to every portfolio export now documents exactly which validation evidence hashes were produced and which are still missing for live promotion. UI / operator dashboards can read this single field to decide whether a portfolio is promotion-ready without re-deriving any hash logic.
+
+Next follow-on targets: populate `live_sim_runtime_model_hash` once a live-execution simulator is in place, explicit degraded-mode metadata propagation through runtime layers (P1-3), DeterminismPolicy rollout into `forex-models` (P0-9), UI exposure of scheduler/hardware plans (P2-1).
+
+
 ### 2026-05-10: Follow-on Phase 48 completed — DiscoveryResult → ValidationEvidenceManifest
 
 Connected the producer-side artifact pipeline to Codex's promotion-contract surface (Phases 30-44) so the search bridge feeds the typed `ValidationEvidenceManifest` directly:

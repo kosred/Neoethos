@@ -379,12 +379,20 @@ pub struct DiscoveryRunProfile {
     pub canonical_backtest_artifacts_observed: usize,
     pub walkforward_validation_artifacts_observed: usize,
     pub forward_test_validation_artifacts_observed: usize,
+    pub prop_firm_validation_artifacts_observed: usize,
     pub cpcv_fold_count: usize,
     pub cpcv_profitable_fold_ratio: f64,
     pub validation_temporal_contract_hash: Option<String>,
     pub prefilter_top_k: usize,
     pub prefilter_insample_frac: f64,
     pub funnel_stage1_pct: f64,
+    /// Per-kind validation-evidence hashes ready for the typed
+    /// [`forex_core::contracts::ValidationEvidenceManifest`]. `None`
+    /// per field indicates that artifact kind was not produced for
+    /// this run.
+    pub validation_evidence_hashes: DiscoveryPerKindEvidenceHashes,
+    pub validation_evidence_complete: bool,
+    pub validation_evidence_missing_kinds: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2132,13 +2140,50 @@ pub fn discovery_per_kind_evidence_hashes(
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiscoveryPerKindEvidenceHashes {
     pub canonical_backtest: Option<String>,
     pub walkforward: Option<String>,
     pub forward_test: Option<String>,
     pub prop_firm: Option<String>,
     pub live_execution_simulation: Option<String>,
+}
+
+impl DiscoveryPerKindEvidenceHashes {
+    /// Returns `true` only when every kind has a non-empty hash. The
+    /// live-execution simulation hash is part of this check, so the
+    /// summary will currently always return `false` until a simulator
+    /// produces evidence.
+    pub fn all_present(&self) -> bool {
+        self.canonical_backtest.is_some()
+            && self.walkforward.is_some()
+            && self.forward_test.is_some()
+            && self.prop_firm.is_some()
+            && self.live_execution_simulation.is_some()
+    }
+
+    /// Returns the list of kinds that have no hash on this profile.
+    /// Operators / UI layers can render this directly without parsing
+    /// `MissingValidationEvidence` strings.
+    pub fn missing_kinds(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.canonical_backtest.is_none() {
+            missing.push("canonical_backtest");
+        }
+        if self.walkforward.is_none() {
+            missing.push("walkforward");
+        }
+        if self.forward_test.is_none() {
+            missing.push("forward_test");
+        }
+        if self.prop_firm.is_none() {
+            missing.push("prop_firm");
+        }
+        if self.live_execution_simulation.is_none() {
+            missing.push("live_execution_simulation");
+        }
+        missing
+    }
 }
 
 fn hash_validation_artifacts<T: Serialize>(artifacts: &[T]) -> Result<String> {
@@ -2161,6 +2206,16 @@ pub fn build_discovery_profile(
     config: &DiscoveryConfig,
     result: &DiscoveryResult,
 ) -> DiscoveryRunProfile {
+    let validation_evidence_hashes =
+        discovery_per_kind_evidence_hashes(result).unwrap_or_else(|_| {
+            DiscoveryPerKindEvidenceHashes {
+                canonical_backtest: None,
+                walkforward: None,
+                forward_test: None,
+                prop_firm: None,
+                live_execution_simulation: None,
+            }
+        });
     DiscoveryRunProfile {
         timeframe_label: config.timeframe_label.clone(),
         population: config.population,
@@ -2210,12 +2265,20 @@ pub fn build_discovery_profile(
             .validation_gates
             .walkforward_validation_artifacts,
         forward_test_validation_artifacts_observed: result.forward_test_validation_artifacts.len(),
+        prop_firm_validation_artifacts_observed: result.prop_firm_validation_artifacts.len(),
         cpcv_fold_count: result.validation_gates.cpcv_fold_count,
         cpcv_profitable_fold_ratio: result.validation_gates.cpcv_profitable_fold_ratio,
         validation_temporal_contract_hash: result.validation_gates.temporal_contract_hash.clone(),
         prefilter_top_k: config.runtime_overrides.prefilter_top_k,
         prefilter_insample_frac: config.runtime_overrides.resolved_prefilter_insample_frac(),
         funnel_stage1_pct: config.runtime_overrides.resolved_funnel_stage1_pct(),
+        validation_evidence_hashes: validation_evidence_hashes.clone(),
+        validation_evidence_complete: validation_evidence_hashes.all_present(),
+        validation_evidence_missing_kinds: validation_evidence_hashes
+            .missing_kinds()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
     }
 }
 
@@ -3165,5 +3228,41 @@ mod tests {
         assert!(hashes.forward_test.is_none());
         assert!(hashes.prop_firm.is_none());
         assert!(hashes.live_execution_simulation.is_none());
+    }
+
+    #[test]
+    fn discovery_run_profile_exposes_validation_evidence_hashes_and_missing_kinds() {
+        let config = DiscoveryConfig::default();
+        let result = populated_discovery_result(1, 0, 1, 1);
+        let profile = build_discovery_profile(&config, &result);
+        assert!(
+            profile
+                .validation_evidence_hashes
+                .canonical_backtest
+                .is_some()
+        );
+        assert!(profile.validation_evidence_hashes.walkforward.is_none());
+        assert!(profile.validation_evidence_hashes.forward_test.is_some());
+        assert!(profile.validation_evidence_hashes.prop_firm.is_some());
+        assert!(
+            profile
+                .validation_evidence_hashes
+                .live_execution_simulation
+                .is_none()
+        );
+        assert!(!profile.validation_evidence_complete);
+        assert!(
+            profile
+                .validation_evidence_missing_kinds
+                .iter()
+                .any(|k| k == "walkforward")
+        );
+        assert!(
+            profile
+                .validation_evidence_missing_kinds
+                .iter()
+                .any(|k| k == "live_execution_simulation")
+        );
+        assert_eq!(profile.prop_firm_validation_artifacts_observed, 1);
     }
 }
