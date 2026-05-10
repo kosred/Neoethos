@@ -235,9 +235,63 @@ pub fn merge_live_trendbar_into_bars(
     merged
 }
 
+/// Which quote to use when merging a spot update into chart bars.
+/// `Mid` is the default and matches the historical OHLCV files used
+/// during backtest, so chart display lines up with the data the
+/// strategies were trained on. `Bid` / `Ask` are useful for visualising
+/// the side a trade would actually fill at, or for chart parity tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeQuoteSide {
+    Mid,
+    Bid,
+    Ask,
+}
+
+impl MergeQuoteSide {
+    pub fn from_env() -> Self {
+        match std::env::var("FOREX_BOT_CHART_MERGE_SIDE")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("bid") => Self::Bid,
+            Some("ask") => Self::Ask,
+            _ => Self::Mid,
+        }
+    }
+
+    fn select(self, update: &CTraderLiveChartUpdate) -> Option<f64> {
+        match self {
+            Self::Mid => update.mid_price(),
+            Self::Bid => update.bid(),
+            Self::Ask => update.ask(),
+        }
+    }
+}
+
 pub fn merge_live_spot_update_into_bars(
     existing_bars: &[HistoricalBar],
     live_update: Option<&CTraderLiveChartUpdate>,
+) -> Vec<HistoricalBar> {
+    merge_live_spot_update_into_bars_with_side(
+        existing_bars,
+        live_update,
+        MergeQuoteSide::from_env(),
+    )
+}
+
+/// Side-aware variant of [`merge_live_spot_update_into_bars`]. Picks the
+/// merge price from the chosen quote side (mid / bid / ask) and falls
+/// back to copying `existing_bars` unchanged when the chosen side is
+/// missing. Strategies and chart layers that need to reason in pure
+/// bid- or ask-space (e.g. for slippage parity testing) should call
+/// this directly instead of the env-driven default.
+pub fn merge_live_spot_update_into_bars_with_side(
+    existing_bars: &[HistoricalBar],
+    live_update: Option<&CTraderLiveChartUpdate>,
+    side: MergeQuoteSide,
 ) -> Vec<HistoricalBar> {
     let Some(live_update) = live_update else {
         return existing_bars.to_vec();
@@ -247,7 +301,7 @@ pub fn merge_live_spot_update_into_bars(
         return merge_live_trendbar_into_bars(existing_bars, live_update.latest_trendbar.as_ref());
     }
 
-    let Some(mid_price) = live_update.mid_price() else {
+    let Some(merge_price) = side.select(live_update) else {
         return existing_bars.to_vec();
     };
     let Some(last_bar) = existing_bars.last() else {
@@ -259,9 +313,9 @@ pub fn merge_live_spot_update_into_bars(
         *last = HistoricalBar {
             timestamp_ms: last_bar.timestamp_ms,
             open: last_bar.open,
-            high: last_bar.high.max(mid_price),
-            low: last_bar.low.min(mid_price),
-            close: mid_price,
+            high: last_bar.high.max(merge_price),
+            low: last_bar.low.min(merge_price),
+            close: merge_price,
             volume: last_bar.volume,
         };
     }
@@ -917,6 +971,45 @@ mod tests {
         assert!((merged[0].close - 1.1000).abs() < 1e-9);
         assert!((merged[0].high - 1.1010).abs() < 1e-9);
         assert!((merged[0].low - 1.0990).abs() < 1e-9);
+    }
+
+    #[test]
+    fn merge_live_spot_update_with_side_uses_requested_quote() {
+        let existing = vec![HistoricalBar {
+            timestamp_ms: 2_000,
+            open: 1.1000,
+            high: 1.1010,
+            low: 1.0990,
+            close: 1.1005,
+            volume: Some(2),
+        }];
+        let update = CTraderLiveChartUpdate {
+            symbol_id: 14,
+            bid: Some(1.0985),
+            ask: Some(1.1015),
+            timestamp_ms: Some(2_100),
+            latest_trendbar: None,
+        };
+
+        let bid_merged = merge_live_spot_update_into_bars_with_side(
+            &existing,
+            Some(&update),
+            MergeQuoteSide::Bid,
+        );
+        let ask_merged = merge_live_spot_update_into_bars_with_side(
+            &existing,
+            Some(&update),
+            MergeQuoteSide::Ask,
+        );
+        let mid_merged = merge_live_spot_update_into_bars_with_side(
+            &existing,
+            Some(&update),
+            MergeQuoteSide::Mid,
+        );
+
+        assert!((bid_merged[0].close - 1.0985).abs() < 1e-9);
+        assert!((ask_merged[0].close - 1.1015).abs() < 1e-9);
+        assert!((mid_merged[0].close - 1.1000).abs() < 1e-9);
     }
 
     #[test]
