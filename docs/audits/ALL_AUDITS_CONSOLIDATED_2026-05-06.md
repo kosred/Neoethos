@@ -531,6 +531,81 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 ## Execution log
 
 
+### 2026-05-10: Follow-on Phase 47 completed — operator-facing artifact safety reference
+
+Closed P2-3 by writing the short, opinionated reference document the audit explicitly requires for every critical artifact type. The document lives at [`docs/operator/artifact_safety.md`](../operator/artifact_safety.md) and answers the audit's five operator questions for each of the five validation artifact kinds (`canonical_strategy_backtest`, `walkforward_validation`, `forward_test_validation`, `live_execution_simulation`, `prop_firm_risk_validation`):
+
+- what it is and the one-line intent boundary that prevents kind-confusion;
+- how it is produced, including the discovery / forex-app helper that builds it and the persistence directory layout;
+- the required provenance fields (`artifact_kind`, schema version, scope hashes, temporal scope);
+- whether it is live-safe — and which gate / aggregate flag the live bridge reads to decide acceptance vs rejection;
+- how it is invalidated and how to rebuild it.
+
+The document closes with two operator-facing sections that did not previously exist anywhere in the repo: a worked example showing how `LiveExecutionContract::validate_provenance` + `validate_evidence` chain together via the `live_validation_evidence_from_discovery` bridge, and a "trigger → affected artifacts" rebuild matrix that maps real operational events (dataset re-fetch, rule override, temporal-contract upgrade, gene mutation) to the artifacts that need rebuilding. The matrix surfaces the Phase 25 / 29 rule that `prop_firm_risk_validation` is bound to a specific `rules_hash` so different challenges produce coexisting files.
+
+No code changes; the doc is self-contained and references the existing crates / helpers. Working tree clean apart from the new file and this audit-log entry.
+
+Next follow-on targets: per-challenge prop-firm preset selector in the UI, populate `live_sim_runtime_model_hash` once a live-execution simulator is in place, explicit degraded-mode metadata propagation through runtime layers (P1-3), DeterminismPolicy rollout into `forex-models` (P0-9), UI exposure of scheduler/hardware plans (P2-1).
+
+
+### 2026-05-10: Follow-on Phase 46 completed — per-challenge PropFirmRiskRules on DiscoveryRequest
+
+Removed the last hardcoded fallback in the prop-firm wiring so non-FTMO challenges drive the gate without code changes:
+
+- added `prop_firm_rules: PropFirmRiskRules` to `forex_app::app_services::discovery::DiscoveryRequest`. The field is typed (no `Option`) so every caller is forced to make an explicit choice — defaults to `PropFirmRiskRules::default()` for backward compatibility, but the type makes "I'm using FTMO defaults" visible in the call site;
+- updated the discovery service's prop-firm compute call to read `search_request.prop_firm_rules` instead of constructing a fresh `PropFirmRiskRules::default()` inline; the same OOS tail still drives forward-test and prop-firm validation, but the rule set is now caller-controlled;
+- updated the three production `DiscoveryRequest` constructors (`forex_app::main::run_app` headless boot, `forex_app::main` UI request builder, and `forex_app::ui::discovery::render` UI form submission) to populate the new field with `PropFirmRiskRules::default()` until per-challenge UI controls are added;
+- updated the discovery test fixture (`sample_request`) so existing test coverage stays compilable.
+
+Per-challenge UI controls (e.g. an FTMO vs The Funded Trader vs MFF preset selector) belong in a UI follow-on phase that wires real challenge configurations onto the discovery form. The contract surface and the call-site plumbing are in place — the only remaining work is exposing the knobs to operators.
+
+Next follow-on targets: per-challenge prop-firm preset selector in the UI, populate `live_sim_runtime_model_hash` once a live-execution simulator is in place, explicit degraded-mode metadata propagation through runtime layers (P1-3), DeterminismPolicy rollout into `forex-models` (P0-9), UI exposure of scheduler/hardware plans (P2-1), and operator-facing artifact safety documentation (P2-3).
+
+
+### 2026-05-10: Follow-on Phase 45 completed — prop-firm wired into forex-app discovery service
+
+Closed the final P1-4 wiring slice so the forex-app UI discovery flow now produces prop-firm evidence end-to-end without any caller intervention:
+
+- imported `PropFirmRiskRules`, `compute_discovery_prop_firm_artifacts`, and `save_prop_firm_validation_artifacts` into `forex-app::app_services::discovery`;
+- ran `compute_discovery_prop_firm_artifacts` immediately after the existing forward-test computation, reusing the same OOS tail (`tail_features` + `tail_ohlcv` built from rows past `wfv_bound`) so both gates evaluate the same held-out window. The default `PropFirmRiskRules` (FTMO-style) drive the validation; per-challenge rule overrides belong on the discovery request and are tracked as a follow-on;
+- prop-firm computation failures are logged at `warn` and do not block portfolio export, mirroring the forward-test fallback so existing `walkforward_passed` / `cpcv_passed` gates remain the production-blocking signals while prop-firm evidence becomes diagnostic-or-blocking depending on the live contract;
+- persisted artifacts now write to a sibling `*.prop_firm_validations/` directory next to `*.forward_tests/` / `*.canonical_backtests/` / `*.walkforward_validations/`, so a downstream live bridge can discover all four validation kinds from one portfolio export root.
+
+After Phase 30, the discovery flow produces every validation kind required for `LiveExecutionContract::validate_evidence` to accept a portfolio without external preprocessing: walkforward + CPCV from the discovery cycle itself, forward-test from the OOS tail (Phase 24), and prop-firm from the same OOS tail (this phase). The Phase 28 evidence bridge already aggregates all four into `LiveValidationEvidence`, so the live bridge's gate work is purely a contract-load operation now.
+
+Next follow-on targets: per-challenge `PropFirmRiskRules` on `DiscoveryRequest` so the forex-app UI can drive non-FTMO challenges, populate `live_sim_runtime_model_hash` once a live-execution simulator is in place, explicit degraded-mode metadata propagation through runtime layers (P1-3), DeterminismPolicy rollout into `forex-models` (P0-9), UI exposure of scheduler/hardware plans (P2-1), and operator-facing artifact safety documentation (P2-3).
+
+
+### 2026-05-10: Follow-on Phase 29 completed — discovery prop-firm validation artifacts
+
+Closed the third slice of P1-4 by giving the discovery pipeline a prop-firm validator that mirrors the Phase 24 forward-test wiring, so a portfolio's persisted prop-firm artifacts feed the live-bridge gate at acceptance time:
+
+- added `prop_firm_validation_artifacts: Vec<PropFirmRiskValidationArtifactFile>` to `DiscoveryResult` (defaults empty) and updated every internal/test constructor;
+- added `compute_discovery_prop_firm_artifacts(portfolio, effective_feature_names, tail_features, tail_ohlcv, config, rules)` that aligns the tail's columns to the post-prefilter set, replays each gene through `signals_for_gene_full` + `simulate_trades_core`, and aggregates the trades through `compute_prop_firm_risk_summary` to build one `PropFirmRiskValidationArtifactFile` per strategy. The signature matches `compute_discovery_forward_test_artifacts` so the forex-app discovery service can reuse the same tail it already builds for forward-test;
+- added `save_prop_firm_validation_artifacts(dir, result)` for atomic per-strategy persistence using the same content-addressable filename scheme as the canonical / walk-forward / forward-test helpers;
+- extended `live_validation_evidence_from_discovery` to populate `prop_firm_passed` from the persisted artifacts: `Some(true)` when every artifact reports `all_rules_passed`, `Some(false)` when at least one fails, `None` when no artifact was produced (the live bridge then treats `None` as missing evidence whenever the gate is required);
+- re-exported the new compute / save helpers from `forex-search::lib`;
+- added `discovery::tests` covering: empty-portfolio short-circuit, missing-feature rejection, one-artifact-per-strategy emission, atomic save round-trip, and the evidence-bridge `prop_firm_passed` aggregation across passing / failing artifact mixes.
+
+The end-to-end search → live pipeline now reaches every gate the audit's P0-10 separation list requires: walkforward, CPCV, forward-test, and prop-firm evidence is built, persisted, aggregated into typed `LiveValidationEvidence`, and consumed by `LiveExecutionContract::validate_evidence` at the live boundary. The forex-app discovery service still needs to actively call `compute_discovery_prop_firm_artifacts` (currently only forward-test is wired) — that wiring is the next slice along with the live-sim runtime-model hash.
+
+Next follow-on targets: wire the prop-firm helper into the forex-app discovery service so persisted artifacts appear automatically in the OOS path, populate `live_sim_runtime_model_hash` once a live-execution simulator is in place, explicit degraded-mode metadata propagation through runtime layers (P1-3), DeterminismPolicy rollout into `forex-models` (P0-9), UI exposure of scheduler/hardware plans (P2-1), and operator-facing artifact safety documentation (P2-3).
+
+
+### 2026-05-10: Follow-on Phase 28 completed — DiscoveryResult → LiveValidationEvidence bridge
+
+Closed the second slice of P1-4 by giving downstream callers a single function that turns a `DiscoveryResult` into the typed `LiveValidationEvidence` record introduced in Phase 27, so a live bridge can call `LiveExecutionContract::validate_evidence` without re-deriving any pass/fail logic itself:
+
+- added `live_validation_evidence_from_discovery(result)` in `forex-search::discovery` mapping `validation_gates.walkforward_passed` / `cpcv_passed` directly, and deriving `forward_test_passed` from the persisted artifacts: `Some(true)` only when at least one artifact exists AND every artifact reports `trade_count > 0` AND `net_profit > 0`, `Some(false)` when artifacts exist but at least one fails the rule, `None` when no artifact was produced (the live bridge then treats `None` as missing evidence whenever the gate is required);
+- `prop_firm_passed` and `live_sim_runtime_model_hash` are intentionally `None` in this slice — Phase 25 added the contract surface for both, but the actual computation is opt-in per challenge / per simulator and belongs to its own phase;
+- re-exported the helper from `forex-search::lib`;
+- added `discovery::tests` covering the empty-forward-test passthrough, the all-profitable → `Some(true)` aggregation, the any-unprofitable → `Some(false)` aggregation, the zero-trades → `Some(false)` rejection, and the failed-walkforward / failed-cpcv propagation.
+
+The pipeline now reaches end-to-end on the search side: `run_discovery_cycle_with_progress` produces the result, `compute_discovery_forward_test_artifacts` populates the held-out tail evidence, `live_validation_evidence_from_discovery` translates that into the typed record, and `LiveExecutionContract::validate_evidence` is the single point of acceptance / rejection at the live boundary.
+
+Next follow-on targets: extend the bridge to populate `prop_firm_passed` from a discovery-driven prop-firm validator (third slice of P1-4), explicit degraded-mode metadata propagation through runtime layers (P1-3), DeterminismPolicy rollout into `forex-models` (P0-9), UI exposure of scheduler/hardware plans (P2-1), and operator-facing artifact safety documentation (P2-3).
+
+
 ### 2026-05-09: Follow-on Phase 27 completed — live bridge validation evidence gate
 
 Started P1-4 by extending `forex_core::contracts::LiveExecutionContract` so the live bridge can demand validation evidence from the new walk-forward / CPCV / forward-test / prop-firm / live-sim artifact kinds — Phase 5's contract validated provenance and runtime mode but not the *evidence* of validation:

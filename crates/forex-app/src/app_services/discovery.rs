@@ -15,11 +15,13 @@ use forex_data::{
     prepare_multitimeframe_features,
 };
 use forex_search::{
-    DiscoveryConfig, DiscoveryProgress, DiscoveryResult, compute_discovery_forward_test_artifacts,
+    DiscoveryConfig, DiscoveryProgress, DiscoveryResult, PropFirmRiskRules,
+    compute_discovery_forward_test_artifacts, compute_discovery_prop_firm_artifacts,
     ensure_non_empty_portfolio, run_discovery_cycle_with_progress,
     save_canonical_backtest_artifacts, save_discovery_profile_json,
-    save_forward_test_validation_artifacts, save_portfolio_json, save_quality_report_json,
-    save_trade_log_json, save_walkforward_validation_artifacts,
+    save_forward_test_validation_artifacts, save_portfolio_json,
+    save_prop_firm_validation_artifacts, save_quality_report_json, save_trade_log_json,
+    save_walkforward_validation_artifacts,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -33,6 +35,10 @@ pub struct DiscoveryRequest {
     pub base_tf: String,
     pub higher_tfs: Vec<String>,
     pub config: DiscoveryConfig,
+    /// Prop-firm rule set applied to the OOS prop-firm validation pass.
+    /// Defaults to `PropFirmRiskRules::default()` (FTMO-style) when the
+    /// caller does not need to override per-challenge thresholds.
+    pub prop_firm_rules: PropFirmRiskRules,
 }
 
 impl DiscoveryRequest {
@@ -875,6 +881,32 @@ pub fn start_discovery_job(
                             );
                         }
                     }
+
+                    // Reuse the same OOS tail to compute prop-firm
+                    // validation evidence. The rule set is sourced from
+                    // the typed `DiscoveryRequest::prop_firm_rules`
+                    // field so non-FTMO challenges drive the gate
+                    // without code changes.
+                    match compute_discovery_prop_firm_artifacts(
+                        &result.portfolio,
+                        &result.effective_feature_names,
+                        &tail_features,
+                        &tail_ohlcv,
+                        &resolved_config,
+                        search_request.prop_firm_rules,
+                    ) {
+                        Ok(artifacts) => {
+                            result.prop_firm_validation_artifacts = artifacts;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "forex_app::discovery",
+                                error = %err,
+                                "prop-firm artifact computation failed; portfolio export \
+                                 will proceed without prop-firm evidence"
+                            );
+                        }
+                    }
                 }
             }
 
@@ -912,6 +944,12 @@ pub fn start_discovery_job(
             if !result.forward_test_validation_artifacts.is_empty() {
                 save_forward_test_validation_artifacts(
                     out_path.with_extension("forward_tests"),
+                    &result,
+                )?;
+            }
+            if !result.prop_firm_validation_artifacts.is_empty() {
+                save_prop_firm_validation_artifacts(
+                    out_path.with_extension("prop_firm_validations"),
                     &result,
                 )?;
             }
@@ -1020,6 +1058,7 @@ mod tests {
             base_tf: "M1".to_string(),
             higher_tfs: vec!["M5".to_string(), "M15".to_string()],
             config: forex_search::DiscoveryConfig::default(),
+            prop_firm_rules: PropFirmRiskRules::default(),
         }
     }
 

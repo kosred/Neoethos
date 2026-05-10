@@ -121,6 +121,7 @@ async fn run_headless_loop(runtime: AppRuntimeConfig) {
             base_tf: "M1".to_string(),
             higher_tfs: vec!["M5".to_string(), "M15".to_string(), "H1".to_string()],
             config: forex_search::DiscoveryConfig::default(),
+            prop_firm_rules: forex_search::PropFirmRiskRules::default(),
         };
         match start_discovery_job(request, tx.clone()) {
             Ok(_handle) => info!("Headless: discovery job started"),
@@ -244,6 +245,7 @@ impl ForexApp {
                 min_trades_per_day: self.state.discovery_form.min_trades_per_day as f64,
                 ..forex_search::DiscoveryConfig::default()
             },
+            prop_firm_rules: forex_search::PropFirmRiskRules::default(),
         };
         match start_discovery_job(request, self.tx.clone()) {
             Ok(handle) => {

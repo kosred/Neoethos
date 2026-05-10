@@ -130,6 +130,7 @@ pub fn render(
                     min_trades_per_day: state.discovery_form.min_trades_per_day as f64,
                     ..forex_search::DiscoveryConfig::default()
                 },
+                prop_firm_rules: forex_search::PropFirmRiskRules::default(),
             };
 
             match start_discovery_job(request, tx.clone()) {
