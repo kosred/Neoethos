@@ -41,13 +41,7 @@ struct BayesianOneVsRestArtifact {
 }
 
 fn sigmoid(value: f32) -> f32 {
-    if value >= 0.0 {
-        let z = (-value).exp();
-        1.0 / (1.0 + z)
-    } else {
-        let z = value.exp();
-        z / (1.0 + z)
-    }
+    forex_core::utils::stable_sigmoid_f32(value)
 }
 
 fn split_train_val_indices(rows: usize) -> (Vec<usize>, Vec<usize>) {

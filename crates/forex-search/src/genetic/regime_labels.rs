@@ -105,9 +105,7 @@ impl Default for RegimeLabelPolicy {
 // env-driven defaults, route them through a typed `*RuntimeOverrides`
 // boundary like the others under `genetic::runtime_overrides`.
 
-fn finite_or(value: f64, fallback: f64) -> f64 {
-    if value.is_finite() { value } else { fallback }
-}
+use forex_core::utils::finite_or;
 
 pub fn build_rolling_regime_windows(
     timestamps: &[i64],

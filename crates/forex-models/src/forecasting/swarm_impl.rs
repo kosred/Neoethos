@@ -936,7 +936,7 @@ fn prediction_stats(values: &[f32]) -> (f32, f32) {
 }
 
 fn clamp_unit(value: f32) -> f32 {
-    value.clamp(0.0, 1.0)
+    forex_core::utils::clamp_unit_f32(value)
 }
 
 fn swarm_trend_dominant(snapshot: &SwarmForecastSnapshot) -> bool {

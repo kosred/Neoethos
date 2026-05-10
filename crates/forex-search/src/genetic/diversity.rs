@@ -30,9 +30,7 @@ pub struct DiversityArchiveConfig {
 // boundary like `GeneticSearchRuntimeOverrides` rather than reintroducing
 // inline env reads.
 
-fn finite_or(value: f64, fallback: f64) -> f64 {
-    if value.is_finite() { value } else { fallback }
-}
+use forex_core::utils::finite_or;
 
 fn clamp_bin(value: f64, step: f64, max_bin: u8) -> u8 {
     if !value.is_finite() || step <= 0.0 {

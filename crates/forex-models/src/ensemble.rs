@@ -178,7 +178,7 @@ fn logit(probability: f32) -> f32 {
 }
 
 fn sigmoid(value: f32) -> f32 {
-    1.0 / (1.0 + (-value).exp())
+    forex_core::utils::stable_sigmoid_f32(value)
 }
 
 fn validate_meta_metadata(
