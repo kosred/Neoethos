@@ -199,17 +199,5 @@ fn require_match(
 
 fn stable_contract_hash<T: Serialize>(value: &T) -> String {
     let bytes = serde_json::to_vec(value).expect("contract policy serialization must be stable");
-    format!("fnv64:{:016x}", fnv1a64(&bytes))
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x00000100000001B3;
-
-    let mut hash = FNV_OFFSET;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+    format!("fnv64:{:016x}", crate::utils::fnv1a64(&bytes))
 }

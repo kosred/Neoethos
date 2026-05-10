@@ -1,11 +1,9 @@
 use anyhow::{Context, Result};
+use forex_core::utils::fnv1a64 as core_fnv1a64;
 use serde::{Serialize, de::DeserializeOwned};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-
-const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x00000100000001B3;
 
 pub fn write_json_atomic<T: Serialize>(path: impl AsRef<Path>, value: &T) -> Result<()> {
     let path = path.as_ref();
@@ -57,11 +55,9 @@ pub fn stable_json_hash<T: Serialize + ?Sized>(value: &T) -> Result<String> {
     Ok(format!("fnv64:{:016x}", fnv1a64(&bytes)))
 }
 
+/// Backward-compatible re-export of [`forex_core::utils::fnv1a64`].
+/// Phase 63 extraction lifted the canonical FNV-1a constants to
+/// `forex-core` so callers see the same hash regardless of crate.
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = FNV_OFFSET;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+    core_fnv1a64(bytes)
 }

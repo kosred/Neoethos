@@ -2,6 +2,7 @@ use super::smc_indicators::{
     SmcSearchConfig, enforce_min_structural_smc_flags, randomize_smc_flags,
 };
 use super::strategy_gene::Gene;
+use forex_core::utils::fnv1a64_update;
 use rand::Rng;
 use rand::seq::index::sample;
 use serde::{Deserialize, Serialize};
@@ -11,8 +12,12 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
-const FNV_PRIME: u64 = 1099511628211;
+// Phase 63 lifted the FNV-1a constants into `forex_core::utils::hashing`
+// so the seen-signature ledger and the contract-policy hashes produce
+// byte-for-byte identical output. `FNV_OFFSET_BASIS` is kept here only
+// because the gene-signature hash chains it explicitly through
+// `fnv1a_update` calls that pre-date the extraction.
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParentSelectionPolicy {
@@ -97,12 +102,8 @@ impl Default for EvolutionSearchPolicy {
     }
 }
 
-fn fnv1a_update(mut hash: u64, bytes: &[u8]) -> u64 {
-    for b in bytes {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+fn fnv1a_update(hash: u64, bytes: &[u8]) -> u64 {
+    fnv1a64_update(hash, bytes)
 }
 
 fn quantize_f32(value: f32, scale: f32) -> i64 {
