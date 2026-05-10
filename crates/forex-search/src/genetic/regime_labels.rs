@@ -218,20 +218,7 @@ fn slice_feature_frame(features: &FeatureFrame, start: usize, end: usize) -> Fea
 }
 
 fn slice_ohlcv(ohlcv: &Ohlcv, start: usize, end: usize, fallback_timestamps: &[i64]) -> Ohlcv {
-    Ohlcv {
-        timestamp: Some(
-            ohlcv
-                .timestamp
-                .as_ref()
-                .map(|ts| ts[start..end].to_vec())
-                .unwrap_or_else(|| fallback_timestamps[start..end].to_vec()),
-        ),
-        open: ohlcv.open[start..end].to_vec(),
-        high: ohlcv.high[start..end].to_vec(),
-        low: ohlcv.low[start..end].to_vec(),
-        close: ohlcv.close[start..end].to_vec(),
-        volume: ohlcv.volume.as_ref().map(|v| v[start..end].to_vec()),
-    }
+    forex_data::slice_ohlcv(ohlcv, start, end, Some(fallback_timestamps))
 }
 
 fn window_label(

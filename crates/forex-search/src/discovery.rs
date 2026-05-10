@@ -505,20 +505,7 @@ fn trim_recent_history(
 }
 
 fn slice_ohlcv(ohlcv: &Ohlcv, start_idx: usize, end_idx: usize) -> Ohlcv {
-    Ohlcv {
-        timestamp: ohlcv
-            .timestamp
-            .as_ref()
-            .map(|ts| ts[start_idx..end_idx].to_vec()),
-        open: ohlcv.open[start_idx..end_idx].to_vec(),
-        high: ohlcv.high[start_idx..end_idx].to_vec(),
-        low: ohlcv.low[start_idx..end_idx].to_vec(),
-        close: ohlcv.close[start_idx..end_idx].to_vec(),
-        volume: ohlcv
-            .volume
-            .as_ref()
-            .map(|vol| vol[start_idx..end_idx].to_vec()),
-    }
+    forex_data::slice_ohlcv(ohlcv, start_idx, end_idx, None)
 }
 
 fn quality_analyzer_for_config(config: &DiscoveryConfig) -> StrategyQualityAnalyzer {
