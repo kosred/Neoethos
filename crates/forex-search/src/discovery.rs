@@ -35,6 +35,28 @@ use std::path::Path;
 /// [`DiscoveryRuntimeOverrides::from_env`] or
 /// [`DiscoveryConfig::with_env_runtime_overrides`] — the discovery cycle
 /// itself no longer reads the environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage1Window {
+    /// Slice from the most recent rows. Captures the latest regime but is
+    /// catastrophic if the caller passed full data including the held-out
+    /// OOS tail — stage 1 then trains directly on OOS rows. Use only when
+    /// the caller has already split in-sample / out-of-sample.
+    MostRecent,
+    /// Slice from the earliest rows. Maximally distant from any held-out
+    /// tail, so it is OOS-safe even if the caller forgot to split. Default.
+    Earliest,
+}
+
+impl Stage1Window {
+    fn from_env_str(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "most_recent" | "recent" | "tail" => Some(Self::MostRecent),
+            "earliest" | "head" | "oldest" => Some(Self::Earliest),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DiscoveryRuntimeOverrides {
     /// Maximum number of features to keep after the in-sample correlation
@@ -43,9 +65,12 @@ pub struct DiscoveryRuntimeOverrides {
     /// Fraction of rows treated as in-sample when ranking features. Must be
     /// strictly positive and at most `1.0`.
     pub prefilter_insample_frac: f64,
-    /// Fraction of recent rows fed to the multi-stage funnel's first stage.
+    /// Fraction of rows fed to the multi-stage funnel's first stage.
     /// Clamped to `[0.01, 1.0]` at use time.
     pub funnel_stage1_pct: f64,
+    /// Where in the input window to slice the stage-1 fast-evaluation
+    /// rows. Defaults to [`Stage1Window::Earliest`] for OOS safety.
+    pub stage1_window: Stage1Window,
 }
 
 impl Default for DiscoveryRuntimeOverrides {
@@ -54,6 +79,7 @@ impl Default for DiscoveryRuntimeOverrides {
             prefilter_top_k: 50,
             prefilter_insample_frac: 0.70,
             funnel_stage1_pct: 0.25,
+            stage1_window: Stage1Window::Earliest,
         }
     }
 }
@@ -84,6 +110,12 @@ impl DiscoveryRuntimeOverrides {
             .filter(|v| v.is_finite())
         {
             overrides.funnel_stage1_pct = stage1.clamp(0.01, 1.0);
+        }
+        if let Some(window) = std::env::var("FOREX_BOT_FUNNEL_STAGE1_WINDOW")
+            .ok()
+            .and_then(|v| Stage1Window::from_env_str(&v))
+        {
+            overrides.stage1_window = window;
         }
         overrides
     }
@@ -1216,15 +1248,29 @@ where
 
     // Multi-stage Funnel: Stage 1 (Fast Evaluation)
     let stage1_pct = config.runtime_overrides.resolved_funnel_stage1_pct();
+    let stage1_window = config.runtime_overrides.stage1_window;
 
-    let stage1_len = (ohlcv.close.len() as f64 * stage1_pct) as usize;
-    let ohlcv_stage1 = slice_ohlcv(&ohlcv, ohlcv.close.len() - stage1_len, ohlcv.close.len());
+    let total_rows = ohlcv.close.len();
+    let stage1_len = ((total_rows as f64 * stage1_pct) as usize).min(total_rows);
+    let (stage1_start, stage1_end) = match stage1_window {
+        Stage1Window::MostRecent => (total_rows.saturating_sub(stage1_len), total_rows),
+        Stage1Window::Earliest => (0, stage1_len),
+    };
+    tracing::info!(
+        target: "forex_search::funnel",
+        window = ?stage1_window,
+        stage1_pct,
+        stage1_rows = stage1_len,
+        total_rows,
+        "stage 1 fast-evaluation slice"
+    );
+    let ohlcv_stage1 = slice_ohlcv(&ohlcv, stage1_start, stage1_end);
     let features_stage1 = FeatureFrame {
-        timestamps: features.timestamps[features.timestamps.len() - stage1_len..].to_vec(),
+        timestamps: features.timestamps[stage1_start..stage1_end].to_vec(),
         names: features.names.clone(),
         data: features
             .data
-            .slice(ndarray::s![features.data.nrows() - stage1_len.., ..])
+            .slice(ndarray::s![stage1_start..stage1_end, ..])
             .to_owned(),
     };
     progress_fn(DiscoveryProgress::SearchStarted {
@@ -2807,6 +2853,7 @@ mod tests {
             prefilter_top_k: 0,
             prefilter_insample_frac: f64::NAN,
             funnel_stage1_pct: 5.0,
+            stage1_window: Stage1Window::Earliest,
         };
         assert!((overrides.resolved_prefilter_insample_frac() - 0.70).abs() < 1e-9);
         assert!((overrides.resolved_funnel_stage1_pct() - 1.0).abs() < 1e-9);
@@ -2815,6 +2862,7 @@ mod tests {
             prefilter_top_k: 0,
             prefilter_insample_frac: 0.0,
             funnel_stage1_pct: 0.0001,
+            stage1_window: Stage1Window::Earliest,
         };
         assert!((too_small.resolved_prefilter_insample_frac() - 0.70).abs() < 1e-9);
         assert!((too_small.resolved_funnel_stage1_pct() - 0.01).abs() < 1e-9);
@@ -2839,6 +2887,7 @@ mod tests {
             prefilter_top_k: 17,
             prefilter_insample_frac: 0.6,
             funnel_stage1_pct: 0.5,
+            stage1_window: Stage1Window::Earliest,
         };
         let result = DiscoveryResult {
             portfolio: vec![profitable_gene("alpha-1")],
