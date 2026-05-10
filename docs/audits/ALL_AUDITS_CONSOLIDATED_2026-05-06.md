@@ -537,6 +537,10 @@ User-requested cross-reference of every source audit under `docs/audits/` agains
 
 The Phase 1-70 contract / validation / extraction work is complete; the matrix is the working list for any future follow-on slice.
 
+### 2026-05-10: Follow-on Phases 72-75 completed — quick-win audit gaps
+
+Closed the high-leverage quick-win bucket identified by the Phase 71 matrix. Phase 72 adds a CI guardrail against active Python/PyO3 reintroduction outside `docs/` and `vendor/`. Phase 73 audits every active-source `allow(dead_code)` occurrence, removes the stale `SessionAccum` suppression, and records the retained generated/feature-gated/integration boundaries in [`dead_code_allowlist_2026-05-10.md`](dead_code_allowlist_2026-05-10.md). Phase 74 adds typed `forex-data` feature registry metadata for SMC, session, regime, quantitative, and VectorTA TA outputs. Phase 75 exposes `FeatureFrame::column_metadata()` / `validate_registry()` plus tests so downstream discovery/training code can reject feature-name drift through the shared registry instead of ad hoc lists.
+
 
 ### 2026-05-10: Follow-on Phases 67-70 completed — dedup deferred items landed
 

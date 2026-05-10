@@ -5,6 +5,10 @@ Phase 1-70 follow-on slice. Built after Phase 70 closure to identify
 what still has actionable items the consolidated plan
 (`ALL_AUDITS_CONSOLIDATED_2026-05-06.md`) marked but did not land.
 
+Postscript: Phases 72-75 landed the quick-win bucket this matrix originally
+recommended: Python/PyO3 guardrail, `allow(dead_code)` audit, indicator
+registry metadata, and registry validation surface.
+
 `✅` = addressed by the listed phase(s); `🟡` = partially addressed;
 `🔴` = not addressed yet (actionable gap).
 
@@ -15,13 +19,13 @@ what still has actionable items the consolidated plan
 | 3 | `core_config_domain_modularization` | 🟡 | 6, 17-22 | training/search large-file split deeper than Phase 6 |
 | 4 | `cpu_gpu_semantic_parity_requirement` | ✅ | 4 | — |
 | 5 | `custom_cuda_kernel_preservation` | ✅ | preserved (no deletion) | — |
-| 6 | `dead_code_and_stale_artifacts` | 🟡 | 6, 9, 12, 13 + 61-70 | `allow(dead_code)` audit; vendor-patches review; CI feature-matrix |
+| 6 | `dead_code_and_stale_artifacts` | 🟡 | 6, 9, 12, 13, 61-70, 73 | vendor-patches review; CI feature-matrix |
 | 7 | `deep_duplicate_logic_and_unified_scheduler` | ✅ | 2, 6 | — |
 | 8 | `deep_search_engine_state_audit_pass2` | ✅ | 3, 8, 9 | — |
 | 9 | `evaluation_contract_deep_audit_pass3` | ✅ | 10-16, 23-31 | — |
 | 10 | `evolution_neat_crfmnes_gpu_first` | 🟡 | preserved kernels | typed degraded reasons in NEAT/CRFMNES result; runtime parity tests for evolution kernels |
 | 11 | `feature_timestamp_mtf_causality_deep_audit_pass5` | ✅ | 7 | — |
-| 12 | `forex_data_functional` | 🟡 | 7, 68 | indicator registry metadata; explicit candle-timestamp-policy threading inside resample / hpc_ta / quant_features / smc / parquet_migration; volume-validation surface |
+| 12 | `forex_data_functional` | 🟡 | 7, 68, 74-75 | explicit candle-timestamp-policy threading inside resample / hpc_ta / quant_features / smc / parquet_migration; volume-validation surface |
 | 13 | `forex_models_functional` | 🟡 | 26, 59, 67 | RL exit-agent runtime/device routing; streaming/adaptive runtime metadata; ONNX legacy boundary; forecasting/swarm runtime metadata |
 | 14 | `forex_search_functional` | ✅ | 16-32, 45-51 | — |
 | 15 | `generic_scheduler_small_files_refactor_note` | ✅ | 6 | — |
@@ -30,7 +34,7 @@ what still has actionable items the consolidated plan
 | 18 | `hardware_autodetect_config_ui_architecture` | 🟡 | 2 | UI hardware/runtime panel exposing scheduler-owned plans (P2-1) |
 | 19 | `model_runtime_backend_fragmentation` | 🟡 | 2 | model runtime artifact contract wired in forex-models bridge; backend adapter for statistical / RL / forecasting paths |
 | 20 | `modularization_maintainability_refactor_principle` | ✅ | 6 + 61-70 | — |
-| 21 | `python_pyo3_legacy` | 🟡 | confirmed clean | CI guardrail to fail on accidental Python/PyO3 reintroduction; archive `cache/audit/2026-03-20-file-manifest.txt` |
+| 21 | `python_pyo3_legacy` | ✅ | confirmed clean, 72 | — |
 | 22 | `quality_challenge_validation_refactor` | ✅ | 25, 29-31 | — |
 | 23 | `rust_env_flags_config_debt` | ✅ | 17-22 | — |
 | 24 | `search_backtest_forward_cpu_gpu` | ✅ | 14-16, 23-31 | — |
@@ -46,21 +50,16 @@ what still has actionable items the consolidated plan
 
 ## Actionable gaps grouped by impact
 
-### High-leverage, low-risk (do next)
+### High-leverage, low-risk (landed in Phases 72-75)
 
-- **CI guardrail for Python/PyO3 reintroduction** (#21). Tiny CI script
-  that fails when `*.py`, `pyproject.toml`, or PyO3 binding directories
-  reappear. Archive the stale `cache/audit/2026-03-20-file-manifest.txt`
-  reference. Pure infra; no code risk.
-- **`allow(dead_code)` audit** (#6). Grep every active source file for
-  `#[allow(dead_code)]`, document each, remove the suppression where
-  safe, and replace with `#[cfg(test)]` or actual deletion otherwise.
-- **Indicator registry metadata** (#12). The `forex_data_functional`
-  audit calls out that every indicator should expose output / parameter
-  schema metadata. The Phase 7 `TemporalFeatureContract` covers
-  causality but not per-indicator metadata. A typed registry would let
-  the discovery cycle reject feature pipelines that drift from the
-  contract.
+- **CI guardrail for Python/PyO3 reintroduction** (#21): landed in
+  Phase 72 via `scripts/check_no_python_legacy.sh` and CI wiring.
+- **`allow(dead_code)` audit** (#6): landed in Phase 73 via
+  `dead_code_allowlist_2026-05-10.md`; the stale `SessionAccum`
+  suppression was removed.
+- **Indicator registry metadata** (#12): landed in Phases 74-75 via
+  `forex-data::core::feature_registry` and `FeatureFrame` registry
+  validation helpers.
 
 ### Medium-leverage, medium-risk
 
@@ -96,10 +95,10 @@ what still has actionable items the consolidated plan
 The contract / validation / extraction work that occupied Phases 1-70
 is complete. The gaps above split into three buckets:
 
-1. **Quick wins (Phase 71-73)**: CI guardrail, `allow(dead_code)`
-   audit, indicator registry metadata. Each is small and low-risk; can
-   land in one session.
-2. **Typed propagation (Phase 74-77)**: `BackendKind` /
+1. **Quick wins (Phases 72-75)**: landed. CI guardrail,
+   `allow(dead_code)` audit, indicator registry metadata, and registry
+   validation surface are now in the follow-on log.
+2. **Typed propagation (next)**: `BackendKind` /
    `RuntimeMode` / `RuntimeDegradedReason` sweeps across the remaining
    model surfaces. Each touches one model module; tests local to that
    module.
@@ -108,5 +107,6 @@ is complete. The gaps above split into three buckets:
    producer, large-file splits. Each needs its own design pass before
    landing — out of scope for a routine follow-on slice.
 
-The next concrete slice should be the quick-wins bucket; that's what
-this matrix flags as actionable now.
+The next concrete slice should be typed propagation across the remaining
+model result/runtime surfaces, unless the larger deferred infrastructure gets
+its own design pass first.

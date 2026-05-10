@@ -31,6 +31,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Guard against Python/PyO3 reintroduction
+        run: bash scripts/check_no_python_legacy.sh
+
       - name: Install system dependencies
         run: |
           sudo apt-get update

@@ -1,4 +1,5 @@
 pub mod all_indicators;
+pub mod feature_registry;
 pub mod features;
 pub mod hpc_ta;
 pub mod indicators;
