@@ -531,6 +531,11 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 ## Execution log
 
 
+### 2026-05-10: Follow-on Phase 60 completed — slice summary 28-60
+
+Wrote [`follow_on_phases_28_60_summary.md`](follow_on_phases_28_60_summary.md) — the synoptic reference for the 33-phase Claude Code slice that ran on top of `master @ 99f634bc` (which already carried Codex's Phases 30-44). The doc groups landed work into three buckets (discovery validation chain 28-49, promotion verdict + operator surfaces 50-58, determinism rollout 59), records test-coverage growth (forex-search 86 → 107, forex-core stable at 51), and lists what is still open: live-execution simulator, P1-3 degraded-mode propagation in `discovery_gpu`, deeper P0-9 coverage in forex-models RL/exit-agent/sampling, P2-1 UI scheduler exposure, and the per-challenge prop-firm UI selector. Closes the 28-60 slice; future engineers should read the audit master report + this summary + the operator README to onboard.
+
+
 ### 2026-05-10: Follow-on Phase 59 completed — forex-models genetic surfaces DeterminismPolicy
 
 Continued the P0-9 rollout one wrapper deeper: `forex_models::genetic::train_with_discovery` now logs the resolved `DeterminismPolicy` (via `forex_search::current_determinism_policy()` re-exported at the lib root in Phase 26) at `tracing::info` level immediately before invoking `run_discovery_cycle`. Operators that read the run log can now correlate forex-models genetic-search runs with the same typed policy persisted on `DiscoveryRunProfile::determinism_policy` (Phase 51). The change is additive — existing call paths and the env-driven `seed: Option<u64>` field are unchanged.
