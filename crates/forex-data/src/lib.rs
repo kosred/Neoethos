@@ -8,6 +8,7 @@ use vortex_array::arrays::{PrimitiveArray, StructArray};
 use vortex_array::dtype::NativePType;
 
 pub mod core;
+pub use crate::core::feature_registry::*;
 pub use crate::core::features::*;
 pub use crate::core::hpc_ta::*;
 pub use crate::core::indicators::*;

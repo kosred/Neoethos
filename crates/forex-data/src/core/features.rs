@@ -1,3 +1,6 @@
+use crate::core::feature_registry::{
+    FeatureColumnMetadata, feature_metadata_for_names, validate_feature_names,
+};
 use anyhow::Result;
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
@@ -55,6 +58,16 @@ pub struct FeatureFrame {
     pub timestamps: Vec<i64>,
     pub names: Vec<String>,
     pub data: Array2<f32>,
+}
+
+impl FeatureFrame {
+    pub fn column_metadata(&self) -> Result<Vec<FeatureColumnMetadata>> {
+        feature_metadata_for_names(&self.names)
+    }
+
+    pub fn validate_registry(&self) -> Result<()> {
+        validate_feature_names(&self.names)
+    }
 }
 
 pub fn align_features_by_ns(

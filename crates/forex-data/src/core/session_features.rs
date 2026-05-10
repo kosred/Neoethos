@@ -8,7 +8,6 @@ use crate::core::timestamps::{TimestampUnit, infer_timestamp_unit, timestamp_to_
 use chrono::{TimeZone, Timelike, Utc};
 
 #[derive(Default, Clone)]
-#[allow(dead_code)]
 struct SessionAccum {
     open: f64,
     high: f64,
