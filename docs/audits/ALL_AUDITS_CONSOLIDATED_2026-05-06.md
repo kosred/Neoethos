@@ -531,6 +531,11 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 ## Execution log
 
 
+### 2026-05-10: Follow-on Phase 56 completed — full validation chain integration test
+
+Added a single integration-style test in `forex-search::discovery::tests` that walks the entire validation chain end-to-end: per-kind hashes → strict manifest (rejects on live-sim) → lossy manifest (accepts) → evidence bridge → run profile. Asserts producer-side completeness (`all_producer_kinds_present`), missing-kind list, prop-firm and forward-test counts on the profile, and the structural live-sim absence in `validation_evidence_missing_kinds`. Lib tests grew 106 → 107.
+
+
 ### 2026-05-10: Follow-on Phase 55 completed — operator docs index
 
 Added [`docs/operator/README.md`](../operator/README.md) — an index for the three existing operator docs (artifact_safety, promotion_readiness, profile_json_reference) with a recommended reading order, contents synopsis, and conventions section. Operators arriving at the docs directory now have a clear entry point.

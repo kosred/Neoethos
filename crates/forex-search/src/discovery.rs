@@ -3302,6 +3302,69 @@ mod tests {
     }
 
     #[test]
+    fn full_validation_chain_with_complete_producer_evidence_passes_lossy_manifest() {
+        // Build a result with all four producer-side artifact kinds populated.
+        let result = populated_discovery_result(2, 1, 1, 2);
+
+        // 1. Per-kind hashes know which kinds are present.
+        let hashes = discovery_per_kind_evidence_hashes(&result)
+            .expect("per-kind hash extraction should succeed");
+        assert!(hashes.canonical_backtest.is_some());
+        assert!(hashes.walkforward.is_some());
+        assert!(hashes.forward_test.is_some());
+        assert!(hashes.prop_firm.is_some());
+        assert!(hashes.live_execution_simulation.is_none());
+        assert!(hashes.all_producer_kinds_present());
+        assert!(!hashes.all_present()); // live-sim missing keeps full check off
+
+        // 2. Strict manifest rejects on missing live-sim.
+        let strict_err = discovery_validation_evidence_manifest(&result)
+            .expect_err("strict manifest must reject when live-sim hash is empty");
+        assert!(strict_err.to_string().contains("live_execution_simulation"));
+
+        // 3. Lossy manifest accepts the same result.
+        let lossy = discovery_validation_evidence_manifest_excluding_live_sim(&result)
+            .expect("lossy manifest accepts complete producer-side evidence");
+        assert!(
+            lossy
+                .live_execution_simulation_hash
+                .starts_with("deferred:")
+        );
+
+        // 4. Evidence bridge surfaces the producer-side outcomes.
+        let mut result_for_evidence = result.clone();
+        result_for_evidence.validation_gates.walkforward_passed = true;
+        result_for_evidence.validation_gates.cpcv_passed = true;
+        let evidence = live_validation_evidence_from_discovery(&result_for_evidence);
+        assert!(evidence.walkforward_passed);
+        assert!(evidence.cpcv_passed);
+        assert_eq!(evidence.forward_test_passed, Some(true));
+        assert_eq!(evidence.prop_firm_passed, Some(true));
+        assert!(evidence.live_sim_runtime_model_hash.is_none());
+
+        // 5. Profile carries the same data without re-deriving anything.
+        let profile = build_discovery_profile(&DiscoveryConfig::default(), &result_for_evidence);
+        // The Phase 49 prop-firm count IS sourced from the artifact
+        // vector directly (not from validation_gates), so it should
+        // reflect the constructed fixture.
+        assert_eq!(profile.prop_firm_validation_artifacts_observed, 2);
+        assert_eq!(profile.forward_test_validation_artifacts_observed, 1);
+        assert!(!profile.validation_evidence_complete); // live-sim still missing
+        assert!(
+            profile
+                .validation_evidence_missing_kinds
+                .iter()
+                .any(|k| k == "live_execution_simulation")
+        );
+        // Producer-side completeness is true (all four kinds present).
+        assert!(
+            profile
+                .validation_evidence_hashes
+                .all_producer_kinds_present()
+        );
+    }
+
+    #[test]
     fn discovery_run_profile_records_typed_determinism_policy() {
         // The OnceLock-installed determinism policy may carry whatever
         // any earlier test in this process installed, so we assert only
