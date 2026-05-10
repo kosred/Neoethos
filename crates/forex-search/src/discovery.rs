@@ -2126,6 +2126,25 @@ pub fn discovery_validation_evidence_manifest(
         .map_err(|err| anyhow::anyhow!(err.to_string()))
 }
 
+/// Build a [`ValidationEvidenceManifest`] without enforcing the
+/// always-missing `live_execution_simulation_hash` gate. Producer-side
+/// kinds that are missing still return an error — the relaxation only
+/// covers the simulator hash that is structurally absent until the
+/// simulator lands. Operators / UI layers can use this for diagnostic
+/// display ("which producer-side kinds shipped?") without tripping on
+/// the structural live-sim absence.
+pub fn discovery_validation_evidence_manifest_excluding_live_sim(
+    result: &DiscoveryResult,
+) -> Result<ValidationEvidenceManifest> {
+    let canonical = hash_validation_artifacts(&result.canonical_backtest_artifacts)?;
+    let walkforward = hash_validation_artifacts(&result.walkforward_validation_artifacts)?;
+    let forward_test = hash_validation_artifacts(&result.forward_test_validation_artifacts)?;
+    let prop_firm = hash_validation_artifacts(&result.prop_firm_validation_artifacts)?;
+    let live_sim = "deferred:live_execution_simulator_not_wired".to_string();
+    ValidationEvidenceManifest::new(canonical, walkforward, forward_test, live_sim, prop_firm)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))
+}
+
 /// Per-kind helper that returns `Some(hash)` when the artifact vector
 /// is non-empty and `None` otherwise. Operator/UI layers can use this
 /// to build a diagnostic view ("forward-test artifact present, live-sim
@@ -2166,6 +2185,18 @@ impl DiscoveryPerKindEvidenceHashes {
             && self.forward_test.is_some()
             && self.prop_firm.is_some()
             && self.live_execution_simulation.is_some()
+    }
+
+    /// Returns `true` when every producer-side kind (canonical,
+    /// walkforward, forward-test, prop-firm) is present, ignoring the
+    /// always-missing `live_execution_simulation` hash. Operators that
+    /// want to gauge producer-side completeness without waiting for the
+    /// simulator can use this instead of `all_present()`.
+    pub fn all_producer_kinds_present(&self) -> bool {
+        self.canonical_backtest.is_some()
+            && self.walkforward.is_some()
+            && self.forward_test.is_some()
+            && self.prop_firm.is_some()
     }
 
     /// Returns the list of kinds that have no hash on this profile.
@@ -3235,6 +3266,39 @@ mod tests {
         assert!(hashes.forward_test.is_none());
         assert!(hashes.prop_firm.is_none());
         assert!(hashes.live_execution_simulation.is_none());
+    }
+
+    #[test]
+    fn lossy_manifest_accepts_complete_producer_side_evidence() {
+        let result = populated_discovery_result(1, 1, 1, 1);
+        let manifest = discovery_validation_evidence_manifest_excluding_live_sim(&result)
+            .expect("lossy manifest should accept complete producer-side evidence");
+        assert!(
+            manifest
+                .live_execution_simulation_hash
+                .starts_with("deferred:")
+        );
+    }
+
+    #[test]
+    fn lossy_manifest_still_rejects_missing_producer_side_evidence() {
+        let result = populated_discovery_result(1, 0, 1, 1);
+        let err = discovery_validation_evidence_manifest_excluding_live_sim(&result)
+            .expect_err("lossy manifest must still reject missing walk-forward");
+        assert!(err.to_string().contains("walkforward_validation_hash"));
+    }
+
+    #[test]
+    fn all_producer_kinds_present_ignores_live_sim() {
+        let hashes = DiscoveryPerKindEvidenceHashes {
+            canonical_backtest: Some("h1".into()),
+            walkforward: Some("h2".into()),
+            forward_test: Some("h3".into()),
+            prop_firm: Some("h4".into()),
+            live_execution_simulation: None,
+        };
+        assert!(hashes.all_producer_kinds_present());
+        assert!(!hashes.all_present());
     }
 
     #[test]
