@@ -215,11 +215,13 @@ impl PortfolioOptimizer {
     }
 }
 
-fn mean(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    values.iter().sum::<f64>() / values.len() as f64
+use forex_core::utils::{mean, stddev_sample};
+
+// Local `stddev` wrapper retains the previous one-arg call shape used
+// throughout this module while routing the math through the canonical
+// sample-stddev helper in `forex-core::utils::stats` (Phase 64).
+fn stddev(values: &[f64], mean: f64) -> f64 {
+    stddev_sample(values, mean)
 }
 
 fn bounded_lookback_returns(returns: &[f64], lookback_days: usize) -> Vec<f64> {
@@ -232,18 +234,6 @@ fn bounded_lookback_returns(returns: &[f64], lookback_days: usize) -> Vec<f64> {
         return finite_returns;
     }
     finite_returns[(finite_returns.len() - lookback_days)..].to_vec()
-}
-
-fn stddev(values: &[f64], mean: f64) -> f64 {
-    if values.len() < 2 {
-        return 0.0;
-    }
-    let mut sum = 0.0;
-    for v in values {
-        let d = *v - mean;
-        sum += d * d;
-    }
-    (sum / (values.len() as f64 - 1.0)).sqrt()
 }
 
 fn cov(a: &[f64], mean_a: f64, b: &[f64], mean_b: f64) -> f64 {

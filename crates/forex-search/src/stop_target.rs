@@ -279,12 +279,7 @@ fn vol_ewma(close: &[f64], window: usize, lam: f64) -> Vec<f64> {
     sigma
 }
 
-fn mean(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    values.iter().sum::<f64>() / values.len() as f64
-}
+use forex_core::utils::{mean, stddev_sample};
 
 fn cmp_f64(a: &f64, b: &f64) -> std::cmp::Ordering {
     a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
@@ -509,16 +504,8 @@ fn linreg_slope(x: &[f64], y: &[f64]) -> Option<f64> {
 }
 
 fn stddev(values: &[f64]) -> f64 {
-    if values.len() < 2 {
-        return 0.0;
-    }
-    let mean = mean(values);
-    let mut sum = 0.0;
-    for v in values {
-        let d = *v - mean;
-        sum += d * d;
-    }
-    (sum / (values.len() as f64 - 1.0)).sqrt()
+    let m = mean(values);
+    stddev_sample(values, m)
 }
 
 fn compute_ema(values: &[f64], period: usize) -> Vec<f64> {

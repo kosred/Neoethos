@@ -53,27 +53,7 @@ fn init_rayon() {
 }
 
 fn mean_std(values: &[f64]) -> (f64, f64) {
-    if values.len() < 2 {
-        return (0.0, 0.0);
-    }
-    // Drop non-finite samples so a single corrupt bar (NaN feature, infinity in
-    // a degenerate fit) cannot poison the entire population's Sharpe/consistency.
-    let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
-    if finite.len() < 2 {
-        return (0.0, 0.0);
-    }
-    let n = finite.len() as f64;
-    let sum: f64 = finite.iter().sum();
-    let mean = sum / n;
-    let var = finite
-        .iter()
-        .map(|&v| {
-            let d = v - mean;
-            d * d
-        })
-        .sum::<f64>()
-        / (n - 1.0);
-    let std = var.max(0.0).sqrt();
+    let (mean, std) = forex_core::utils::mean_std(values);
     if !mean.is_finite() || !std.is_finite() {
         return (0.0, 0.0);
     }

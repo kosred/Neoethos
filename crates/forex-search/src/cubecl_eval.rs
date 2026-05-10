@@ -428,28 +428,10 @@ fn backtest_population_kernel(
 }
 
 fn mean_std(values: &[f64]) -> (f64, f64) {
-    if values.len() < 2 {
-        return (0.0, 0.0);
-    }
-    // Mirror the CPU `eval.rs::mean_std` — drop non-finite samples so a single
-    // NaN month_pnl can't poison the GPU fitness while leaving the CPU one
-    // untouched (would otherwise rank strategies differently CPU vs GPU).
-    let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
-    if finite.len() < 2 {
-        return (0.0, 0.0);
-    }
-    let n = finite.len() as f64;
-    let sum: f64 = finite.iter().sum();
-    let mean = sum / n;
-    let var = finite
-        .iter()
-        .map(|&v| {
-            let d = v - mean;
-            d * d
-        })
-        .sum::<f64>()
-        / (n - 1.0);
-    let std = var.max(0.0).sqrt();
+    // Phase 64 — both CPU and GPU paths now share the canonical
+    // `forex_core::utils::mean_std` so CPU/GPU rank parity cannot drift
+    // due to a math-helper divergence.
+    let (mean, std) = forex_core::utils::mean_std(values);
     if !mean.is_finite() || !std.is_finite() {
         return (0.0, 0.0);
     }

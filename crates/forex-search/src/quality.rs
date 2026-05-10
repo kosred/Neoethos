@@ -565,24 +565,7 @@ fn test_statistical_significance(returns: &[f64]) -> f64 {
     1.0 - dist.cdf(t_stat)
 }
 
-fn mean(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    values.iter().sum::<f64>() / values.len() as f64
-}
-
-fn stddev_sample(values: &[f64], mean: f64) -> f64 {
-    if values.len() < 2 {
-        return 0.0;
-    }
-    let mut sum = 0.0;
-    for v in values {
-        let d = *v - mean;
-        sum += d * d;
-    }
-    (sum / (values.len() as f64 - 1.0)).sqrt()
-}
+use forex_core::utils::{mean, stddev_sample};
 
 fn score_strategy(analyzer: &StrategyQualityAnalyzer, metrics: &mut StrategyMetrics) {
     // QA-3: Continuous scoring with diminishing returns — no cliff effects
