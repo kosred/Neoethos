@@ -531,6 +531,13 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 ## Execution log
 
 
+### 2026-05-10: Follow-on Phase 71 completed — audit coverage matrix
+
+User-requested cross-reference of every source audit under `docs/audits/` against the Phase 1-70 follow-on slice. Output landed in [`audit_coverage_matrix_2026-05-10.md`](audit_coverage_matrix_2026-05-10.md): one row per source audit (33 total) with a status column (✅ addressed / 🟡 partial / 🔴 not yet) and the phase numbers that touched it. The doc groups remaining open items into three buckets — high-leverage low-risk (CI guardrails, `allow(dead_code)` audit, indicator registry metadata), typed propagation sweeps (`BackendKind` / `RuntimeMode` / `RuntimeDegradedReason` across the remaining model surfaces), and larger deferred work (UI panel, statistical/evolution parity tests, training-model artifact producer, large-file splits). The matrix surfaces three audits previously thought ✅ that turn out 🟡 on closer reading: forex_data_functional has indicator-registry-metadata gaps Phase 7 did not cover, forex_models_functional has streaming/RL/forecasting runtime-metadata gaps Phases 26/59/67 did not reach, and gpu_first_kernel_everywhere has a `BackendKind` typing sweep that Phases 1-2 framed but never executed across all model surfaces.
+
+The Phase 1-70 contract / validation / extraction work is complete; the matrix is the working list for any future follow-on slice.
+
+
 ### 2026-05-10: Follow-on Phases 67-70 completed — dedup deferred items landed
 
 Closed the dedup audit's "deferred items" block from the Phase 66 closure note. Three additional shared modules / helpers landed and one atomic-IO unification was explicitly re-deferred with a documented reason.
