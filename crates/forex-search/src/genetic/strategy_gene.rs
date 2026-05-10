@@ -190,24 +190,46 @@ fn estimate_pip_value_per_lot(
                 .unwrap_or_else(|| pip_value_quote.max(1e-6));
         }
         // Cross pair (e.g. EURGBP on USD account). Correct formula needs the
-        // quote→account FX rate. If supplied, use it. If not, fall back to
-        // pip_value_quote (i.e. the pip in QUOTE currency) and warn — this
-        // matches the previous (silently wrong) behaviour for the symbol's
-        // own price, but flags the gap so callers can plug in a real rate.
+        // quote→account FX rate. If supplied, use it.
         if let Some(rate) = conv_rate {
             return (pip_value_quote * rate).max(1e-6);
         }
-        tracing::warn!(
+        // No rate supplied. Strict mode (`FOREX_BOT_REJECT_PIP_FALLBACK=1`)
+        // returns NaN so downstream PnL collapses to NaN and the strategy
+        // is rejected by the evaluator's existing fitness guard, surfacing
+        // the misconfiguration instead of silently shipping wrong sizing.
+        // Default mode preserves the previous lenient behaviour but logs
+        // at error level (was warn) so the gap is visible in production.
+        if reject_cross_pair_fallback() {
+            tracing::error!(
+                target: "forex_search::cost_model",
+                symbol,
+                account_currency = %account_currency,
+                "cross-pair pip_value_per_lot rejected: no quote→account FX rate \
+                 and FOREX_BOT_REJECT_PIP_FALLBACK=1; set FOREX_BOT_PROP_PIP_VALUE_PER_LOT \
+                 or supply quote_to_account_rate"
+            );
+            return f64::NAN;
+        }
+        tracing::error!(
             target: "forex_search::cost_model",
             symbol,
             account_currency = %account_currency,
-            "cross-pair pip_value_per_lot estimated without quote→account FX rate; \
-             set FOREX_BOT_PROP_PIP_VALUE_PER_LOT to override"
+            "cross-pair pip_value_per_lot fallback (silently wrong) — set \
+             FOREX_BOT_PROP_PIP_VALUE_PER_LOT or supply quote_to_account_rate; \
+             enable FOREX_BOT_REJECT_PIP_FALLBACK=1 to fail fast"
         );
         return pip_value_quote.max(1e-6);
     }
 
     pip_value_quote.max(1e-6)
+}
+
+fn reject_cross_pair_fallback() -> bool {
+    matches!(
+        std::env::var("FOREX_BOT_REJECT_PIP_FALLBACK").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
 }
 
 pub fn infer_market_cost_profile(
