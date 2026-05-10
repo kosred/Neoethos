@@ -58,7 +58,20 @@ pub struct CTraderExecutionOutcome {
     pub deal_id: Option<i64>,
     pub trade_side: Option<String>,
     pub order_type: Option<String>,
+    /// Headline lot size kept for backwards compatibility. Prefer
+    /// [`Self::requested_lot_size`] / [`Self::filled_lot_size`] when
+    /// reasoning about partial fills.
     pub lot_size: Option<f64>,
+    /// Volume the strategy asked the broker to execute, in lots
+    /// (sourced from the order payload). `Some(2.0)` on a 2-lot
+    /// market order regardless of fill outcome.
+    pub requested_lot_size: Option<f64>,
+    /// Volume the broker actually filled, in lots (sourced from the
+    /// deal payload). On a clean fill matches `requested_lot_size`;
+    /// on a partial fill it is strictly smaller; on a rejection it
+    /// is `None` or 0.0. Lets the trading loop decide whether to
+    /// scale-in the residual or cancel-and-log.
+    pub filled_lot_size: Option<f64>,
     pub execution_price: Option<f64>,
     pub gross_profit: Option<f64>,
     pub fee: Option<f64>,
@@ -817,6 +830,17 @@ fn parse_execution_event(response_json: &str) -> Result<CTraderExecutionOutcome>
                 deal.as_ref()
                     .map(|item| volume_to_units(item.filled_volume))
             }),
+        requested_lot_size: order
+            .as_ref()
+            .map(|item| volume_to_units(item.trade_data.volume))
+            .or_else(|| {
+                position
+                    .as_ref()
+                    .map(|item| volume_to_units(item.trade_data.volume))
+            }),
+        filled_lot_size: deal
+            .as_ref()
+            .map(|item| volume_to_units(item.filled_volume)),
         execution_price: deal
             .as_ref()
             .and_then(|item| item.execution_price)
@@ -864,6 +888,8 @@ fn parse_order_error_event(response_json: &str) -> Result<CTraderExecutionOutcom
         trade_side: None,
         order_type: None,
         lot_size: None,
+        requested_lot_size: None,
+        filled_lot_size: None,
         execution_price: None,
         gross_profit: None,
         fee: None,
@@ -941,12 +967,20 @@ fn validate_execution_outcome(
             .unwrap_or(false);
         if !allow_partial {
             anyhow::bail!(
-                "cTrader execution returned PartialFill (deal_id={:?}, lot_size={:?}); \
+                "cTrader execution returned PartialFill (deal_id={:?}, requested={:?}, filled={:?}); \
                  set FOREX_BOT_CTRADER_ALLOW_PARTIAL_FILL=1 to accept partial fills",
                 outcome.deal_id,
-                outcome.lot_size
+                outcome.requested_lot_size,
+                outcome.filled_lot_size
             );
         }
+        tracing::warn!(
+            target: "forex_app::ctrader",
+            deal_id = ?outcome.deal_id,
+            requested_lot_size = ?outcome.requested_lot_size,
+            filled_lot_size = ?outcome.filled_lot_size,
+            "cTrader execution accepted PartialFill; trading loop should handle residual"
+        );
     }
 
     match &request.request {
@@ -1281,6 +1315,8 @@ mod tests {
             trade_side: Some("BUY".to_string()),
             order_type: Some("MARKET".to_string()),
             lot_size: Some(1000.0),
+            requested_lot_size: Some(1000.0),
+            filled_lot_size: None,
             execution_price: None,
             gross_profit: None,
             fee: None,
