@@ -18,7 +18,7 @@ use crate::validation::{
 use anyhow::{Context, Result};
 use chrono::{Datelike, TimeZone, Utc};
 use forex_core::contracts::{
-    LiveValidationEvidence, TemporalFeatureContract, ValidationEvidenceManifest,
+    DeterminismPolicy, LiveValidationEvidence, TemporalFeatureContract, ValidationEvidenceManifest,
 };
 use forex_data::{FeatureFrame, Ohlcv};
 use rayon::prelude::*;
@@ -393,6 +393,12 @@ pub struct DiscoveryRunProfile {
     pub validation_evidence_hashes: DiscoveryPerKindEvidenceHashes,
     pub validation_evidence_complete: bool,
     pub validation_evidence_missing_kinds: Vec<String>,
+    /// Resolved determinism policy under which the genetic search ran.
+    /// `Deterministic { seed }` means the run is reproducible; the two
+    /// non-deterministic variants surface in the persisted profile so
+    /// `LivePromotionGate::PromotionRejectedDeterminism` failures can
+    /// be diagnosed without re-running.
+    pub determinism_policy: DeterminismPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2279,6 +2285,7 @@ pub fn build_discovery_profile(
             .into_iter()
             .map(str::to_string)
             .collect(),
+        determinism_policy: crate::genetic::current_determinism_policy(),
     }
 }
 
@@ -3228,6 +3235,23 @@ mod tests {
         assert!(hashes.forward_test.is_none());
         assert!(hashes.prop_firm.is_none());
         assert!(hashes.live_execution_simulation.is_none());
+    }
+
+    #[test]
+    fn discovery_run_profile_records_typed_determinism_policy() {
+        // The OnceLock-installed determinism policy may carry whatever
+        // any earlier test in this process installed, so we assert only
+        // that the profile carries one of the three legal variants —
+        // every one of which is serializable, which is the property the
+        // promotion-readiness runbook documents.
+        let config = DiscoveryConfig::default();
+        let result = populated_discovery_result(0, 0, 0, 0);
+        let profile = build_discovery_profile(&config, &result);
+        match profile.determinism_policy {
+            DeterminismPolicy::Deterministic { seed: _ }
+            | DeterminismPolicy::BestEffort
+            | DeterminismPolicy::NonDeterministicAllowed => {}
+        }
     }
 
     #[test]

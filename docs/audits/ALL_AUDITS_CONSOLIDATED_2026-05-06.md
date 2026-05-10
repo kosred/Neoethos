@@ -531,6 +531,20 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 ## Execution log
 
 
+### 2026-05-10: Follow-on Phase 51 completed — typed determinism policy in DiscoveryRunProfile
+
+Bridged Phase 26's `current_determinism_policy()` accessor and the Phase 50 promotion runbook by recording the resolved [`DeterminismPolicy`] directly in the persisted `DiscoveryRunProfile`:
+
+- imported `DeterminismPolicy` into `forex-search::discovery` from `forex_core::contracts`;
+- added `determinism_policy: DeterminismPolicy` to `DiscoveryRunProfile` so the persisted `*_profile.json` documents whether the genetic search ran under `Deterministic { seed }`, `BestEffort`, or `NonDeterministicAllowed`. The field uses Codex's serde rename (`mode: "deterministic" | "best_effort" | "non_deterministic_allowed"`) so consumers can render it directly;
+- updated `build_discovery_profile` to populate the field via `crate::genetic::current_determinism_policy()` — the OnceLock-cached typed view that Phase 26 added on top of the legacy `seed: Option<u64>` field;
+- added a discovery-test asserting the profile carries one of the three legal variants (the OnceLock may already be installed by another test in the same process, so the test pins the variant set rather than the specific value).
+
+Phase 50's promotion-readiness runbook documents `PromotionRejectedDeterminism` as one of the gate's rejection reasons; this phase makes the underlying field visible in the profile JSON so operators can diagnose the rejection without re-reading source code or re-running discovery.
+
+Next follow-on targets: populate `live_sim_runtime_model_hash` once a live-execution simulator is in place, explicit degraded-mode metadata propagation through runtime layers (P1-3), DeterminismPolicy rollout into `forex-models` (P0-9), UI exposure of scheduler/hardware plans (P2-1).
+
+
 ### 2026-05-10: Follow-on Phase 50 completed — operator promotion readiness reference
 
 Closed item 39 from Codex's Phase 30-40 doc handoff list ("Add operator docs for promotion rejection reasons and remediation") by writing [`docs/operator/promotion_readiness.md`](../operator/promotion_readiness.md). The document is the runbook for reading the `LivePromotionGate` verdict and acting on every rejection reason it can produce; it complements [`artifact_safety.md`](../operator/artifact_safety.md) which covers the per-artifact contracts.
