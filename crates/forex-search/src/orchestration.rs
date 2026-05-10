@@ -1,7 +1,8 @@
 use crate::discovery::{
-    DiscoveryConfig, ensure_non_empty_portfolio, run_discovery_cycle,
-    save_canonical_backtest_artifacts, save_discovery_profile_json, save_portfolio_json,
-    save_quality_report_json, save_trade_log_json, save_walkforward_validation_artifacts,
+    DiscoveryConfig, discovery_per_kind_evidence_hashes, ensure_non_empty_portfolio,
+    run_discovery_cycle, save_canonical_backtest_artifacts, save_discovery_profile_json,
+    save_portfolio_json, save_quality_report_json, save_trade_log_json,
+    save_walkforward_validation_artifacts,
 };
 use anyhow::Result;
 use forex_data::{
@@ -21,6 +22,13 @@ pub struct BatchDiscoverySummary {
     pub feature_failures: usize,
     pub empty_portfolios: usize,
     pub discovery_failures: usize,
+    /// Portfolios whose persisted profile reports
+    /// `validation_evidence_complete = false` because at least one of
+    /// the four producer-side validation kinds did not ship for that
+    /// run. The live-execution simulation hash is structurally absent
+    /// today, so a portfolio is counted here only when a producer-side
+    /// kind is missing — not because the simulator has not been wired.
+    pub portfolios_with_missing_producer_evidence: usize,
 }
 
 impl BatchDiscoverySummary {
@@ -157,6 +165,11 @@ impl DiscoveryOrchestrator {
                     let validation_dir = Path::new(&self.output_dir)
                         .join(format!("{}_{}_walkforward_validations", symbol, tf));
                     save_walkforward_validation_artifacts(&validation_dir, &result)?;
+                }
+                if let Ok(hashes) = discovery_per_kind_evidence_hashes(&result)
+                    && !hashes.all_producer_kinds_present()
+                {
+                    summary.portfolios_with_missing_producer_evidence += 1;
                 }
                 summary.portfolios_saved += 1;
             }
