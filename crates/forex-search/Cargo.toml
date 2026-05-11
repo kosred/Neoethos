@@ -21,6 +21,7 @@ forex-data = { path = "../forex-data" }
 forex-core = { path = "../forex-core" }
 duckdb = { version = "1.1.1", optional = true, features = ["bundled"] }
 tch = { version = "0.22.0", optional = true }
+libc = { version = "0.2", optional = true }
 
 [features]
 default = []
@@ -29,7 +30,7 @@ default = []
 # modules in this crate target older API versions and need migration
 # before they compile against the pinned cubecl 0.9 / tch 0.22 versions
 # (see docs/audits/gpu_migration_2026-05-11.md).
-gpu = ["dep:rand_distr", "dep:tch", "dep:cubecl", "dep:half"]
+gpu = ["dep:rand_distr", "dep:tch", "dep:cubecl", "dep:half", "dep:libc"]
 # `gpu-experimental`: opt-in for migrators working on the kernel
 # modules. Will not compile until the migration lands. Implies `gpu`.
 gpu-experimental = ["gpu"]

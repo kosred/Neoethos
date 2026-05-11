@@ -90,7 +90,7 @@ impl CudaReproductionBatch {
 }
 
 #[cube(launch)]
-fn blend_mutate_kernel<F: Float>(
+fn blend_mutate_kernel<F: Float + CubeElement>(
     parent_a: &Array<F>,
     parent_b: &Array<F>,
     mean: &Array<F>,
@@ -101,6 +101,7 @@ fn blend_mutate_kernel<F: Float>(
 ) {
     if ABSOLUTE_POS < output.len() {
         let pos = ABSOLUTE_POS;
+        let dim = dim as usize;
         let child = pos / dim;
         let feature = pos % dim;
         let blended = (parent_a[pos] + parent_b[pos]) * F::new(0.5);
@@ -243,7 +244,7 @@ fn execute_cuda_batch(
     Ok(flatten_rows(&flat, batch.dim))
 }
 
-pub(crate) fn try_generate_children_cuda<R: Rng + ?Sized>(
+pub(crate) fn try_generate_children_cuda<R: Rng>(
     population: &[&[f32]],
     score_vector: &[f64],
     parent_indices: &[usize],

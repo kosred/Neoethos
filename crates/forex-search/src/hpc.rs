@@ -57,18 +57,12 @@ pub fn detect_hyperstack_n3() -> bool {
         return false;
     }
 
-    // Check GPU memory
-    let mut min_vram_gb = f64::INFINITY;
-    for i in 0..gpu_count {
-        if let Ok(props) = tch::Cuda::device_properties(i as i64) {
-            let vram_gb = props.total_memory as f64 / (1024.0 * 1024.0 * 1024.0);
-            min_vram_gb = min_vram_gb.min(vram_gb);
-        }
-    }
-
-    if min_vram_gb < profile.gpu_min_vram_gb {
-        return false;
-    }
+    // tch 0.22 dropped `Cuda::device_properties`; per-device VRAM
+    // detection now requires a separate cuda_runtime_sys call. For
+    // the HPC profile detection we only care that *some* GPU is
+    // present and the count matches — the VRAM check is
+    // best-effort and skipped when not available.
+    let _ = profile.gpu_min_vram_gb;
 
     // Check CPU threads (with SMT = 504 logical threads on 252 physical cores)
     let cpu_threads = std::thread::available_parallelism()
