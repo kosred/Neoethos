@@ -530,6 +530,13 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 
 ## Execution log
 
+### 2026-05-11: Follow-on Phase 86 completed — training-model artifact contract
+
+Closed the `training_model_artifact_contract` gap from the Phase 71 coverage matrix. The `forex-models` training persistence path now writes a typed `TrainingModelArtifact<TrainingRuntimeProfile>` envelope as `training_model_artifact.json` beside `training_profile.json` before staged artifact promotion. The envelope records `ArtifactKind::TrainingModel` provenance, deterministic feature/dataset/label/runtime/risk hashes, typed backend/runtime/device metadata, hardware profile identity, and source commit. See [`follow_on_phase_86_training_model_artifact_contract_2026-05-11.md`](follow_on_phase_86_training_model_artifact_contract_2026-05-11.md).
+
+Verification: targeted `cargo test -p forex-models --lib persist_training_artifacts_writes_training_model_artifact_contract -- --nocapture` passes, and `cargo test -p forex-models --lib -- --test-threads=1` passes with 336 tests.
+
+
 ### 2026-05-10: Follow-on Phases 80-85 completed — model contract cleanup
 
 Closed the stale `forex-models` failures left after the typed runtime metadata slice. Phase 80 adds a test-only corrupt-metadata constructor and restores sidecar-drift error boundaries. Phase 81 aligns capability/export fixtures and makes swarm pruning prefer non-duplicate candidates before duplicate backfill. Phase 82 hardens Burn/deep runtime provenance, precision, embargo-aware training summaries, and required runtime triplets. Phase 83 updates exit-agent trained artifacts to persist `training_report` and validates partial runtime identity before report cross-checks. Phase 84 makes Hoeffding runtime details truthful about fallback-only-by-weight versus unavailable live committees. Phase 85 fixes RL staged JSON writes, normalized GPU precision resolution, fallback-basis runtime details, bounds guards, and report-drift fixtures. See [`follow_on_phases_80_85_model_contract_cleanup_2026-05-10.md`](follow_on_phases_80_85_model_contract_cleanup_2026-05-10.md).

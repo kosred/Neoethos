@@ -5,3 +5,4 @@ pub mod exports;
 pub mod hpo;
 pub mod prediction;
 pub mod profile;
+pub mod training_artifact;

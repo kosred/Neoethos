@@ -21,6 +21,12 @@ runtime provenance, exit-agent trained-artifact reports, streaming Hoeffding
 runtime details, and RL fallback/runtime contracts; the forex-models lib suite
 is green at 335 tests after this cleanup.
 
+Postscript 4: Phase 86 landed the training-model artifact producer. Every
+`training_orchestrator` model save now writes a typed
+`TrainingModelArtifactContract` envelope beside the runtime profile, with
+artifact provenance, dataset fingerprint, feature/label/runtime hashes, backend
+kind, runtime mode, device assignment, hardware profile id, and source commit.
+
 `✅` = addressed by the listed phase(s); `🟡` = partially addressed;
 `🔴` = not addressed yet (actionable gap).
 
@@ -56,7 +62,7 @@ is green at 335 tests after this cleanup.
 | 28 | `search_orchestration_refactor` | ✅ | 6 | — |
 | 29 | `search_portfolio_artifact_contract` | ✅ | 1, 8, 14-16 | — |
 | 30 | `search_to_live_bridge` | ✅ | 5, 27, 28, 30, 48 | — |
-| 31 | `training_model_artifact_contract` | 🟡 | 1 | training-model artifact producer wired in forex-models (the contract type exists but no producer emits a `TrainingModelArtifactContract` envelope yet) |
+| 31 | `training_model_artifact_contract` | ✅ | 1, 86 | — |
 | 32 | `unified_module_logic_architecture` | ✅ | 6 + 61-70 | — |
 | 33 | `universal_hardware_parity_requirement` | ✅ | 2, 4 | — |
 
@@ -79,11 +85,8 @@ is green at 335 tests after this cleanup.
   Phases 76-79 for `PredictionMetadata`, NEAT, CRFMNES /
   neuro-evolution, statistical linear artifacts, CUDA linear fit
   results, and swarm forecast results.
-- **Training-model artifact producer** (#31). The contract type exists;
-  the parallel_trainer / training_orchestrator paths should emit a
-  `TrainingModelArtifactContract` envelope on every model save. Same
-  shape as the discovery-side validation evidence chain (Phases 14-31)
-  but on the training side.
+- **Training-model artifact producer** (#31): landed in Phase 86 through
+  the staged `training_orchestrator` persistence path.
 - **Streaming / RL runtime metadata** (#13). The remaining model gaps are
   RL exit-agent runtime/device routing, streaming/adaptive runtime
   metadata, and the ONNX legacy boundary.
@@ -113,10 +116,10 @@ is complete. The gaps above split into three buckets:
    streaming routing and artifact producers rather than another broad
    string-to-enum sweep.
 3. **Deferred infrastructure (no phase)**: UI exposure, parity tests
-   for statistical/evolution backends, training-model artifact
-   producer, large-file splits. Each needs its own design pass before
-   landing — out of scope for a routine follow-on slice.
+   for statistical/evolution backends, model-runtime bridge wiring,
+   ONNX legacy boundary, and large-file splits. Each needs its own design
+   pass before landing — out of scope for a routine follow-on slice.
 
-The next concrete slice should be either the training-model artifact producer
-or the remaining RL / streaming runtime-routing gaps, unless the larger
-deferred infrastructure gets its own design pass first.
+The next concrete slice should be either the model-runtime artifact bridge
+or the ONNX legacy-boundary cleanup, unless the larger deferred infrastructure
+gets its own design pass first.

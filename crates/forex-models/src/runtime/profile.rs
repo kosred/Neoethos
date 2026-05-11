@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use super::capabilities::{CapabilityState, ModelFamily};
 
+pub const TRAINING_MODEL_ARTIFACT_FILE_NAME: &str = "training_model_artifact.json";
 pub const TRAINING_RUNTIME_PROFILE_FILE_NAME: &str = "training_profile.json";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -176,6 +177,73 @@ pub fn write_training_runtime_profile(path: &Path, profile: &TrainingRuntimeProf
     if backup_path.exists() {
         std::fs::remove_file(&backup_path)
             .with_context(|| format!("remove backup training profile {}", backup_path.display()))?;
+    }
+    Ok(())
+}
+
+pub fn write_training_model_artifact<T: Serialize>(
+    path: &Path,
+    artifact: &forex_core::TrainingModelArtifact<T>,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "create training model artifact contract dir {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let temp_path = path.with_extension("tmp_training_model_artifact");
+    let backup_path = path.with_extension("bak_training_model_artifact");
+    let payload = serde_json::to_vec_pretty(artifact)
+        .context("serialize training model artifact contract")?;
+    if temp_path.exists() {
+        std::fs::remove_file(&temp_path).with_context(|| {
+            format!(
+                "remove stale staged training model artifact {}",
+                temp_path.display()
+            )
+        })?;
+    }
+    if backup_path.exists() {
+        std::fs::remove_file(&backup_path).with_context(|| {
+            format!(
+                "remove stale backup training model artifact {}",
+                backup_path.display()
+            )
+        })?;
+    }
+    std::fs::write(&temp_path, payload).with_context(|| {
+        format!(
+            "write staged training model artifact to {}",
+            temp_path.display()
+        )
+    })?;
+    if path.exists() {
+        std::fs::rename(path, &backup_path).with_context(|| {
+            format!("backup current training model artifact {}", path.display())
+        })?;
+    }
+    if let Err(error) = std::fs::rename(&temp_path, path) {
+        if backup_path.exists() {
+            let _ = std::fs::rename(&backup_path, path);
+        } else if temp_path.exists() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        anyhow::bail!(
+            "write training model artifact to {} failed: {}",
+            path.display(),
+            error
+        );
+    }
+    if backup_path.exists() {
+        std::fs::remove_file(&backup_path).with_context(|| {
+            format!(
+                "remove backup training model artifact {}",
+                backup_path.display()
+            )
+        })?;
     }
     Ok(())
 }
