@@ -2,7 +2,12 @@ use core::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::runtime::capabilities::{CapabilityState, ModelFamily};
+use forex_core::{BackendKind, RuntimeDegradedReason, RuntimeMode};
+
+use crate::runtime::capabilities::{
+    CapabilityState, ModelFamily, runtime_backend_kind_from_label, runtime_mode_from_details,
+    typed_runtime_degraded_reason,
+};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PredictionMetadata {
@@ -13,6 +18,12 @@ pub struct PredictionMetadata {
     pub execution_backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_kind: Option<BackendKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_mode: Option<RuntimeMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_degraded_reason: Option<RuntimeDegradedReason>,
 }
 
 impl PredictionMetadata {
@@ -28,6 +39,9 @@ impl PredictionMetadata {
             state,
             execution_backend: None,
             degraded_reason: None,
+            backend_kind: None,
+            runtime_mode: None,
+            runtime_degraded_reason: None,
         }
     }
 
@@ -38,6 +52,11 @@ impl PredictionMetadata {
     ) -> Self {
         self.execution_backend = execution_backend.filter(|value| !value.trim().is_empty());
         self.degraded_reason = degraded_reason.filter(|value| !value.trim().is_empty());
+        self.backend_kind = runtime_backend_kind_from_label(self.execution_backend.as_deref());
+        self.runtime_mode =
+            runtime_mode_from_details(self.backend_kind, self.degraded_reason.as_deref());
+        self.runtime_degraded_reason =
+            typed_runtime_degraded_reason(self.degraded_reason.as_deref());
         self
     }
 }
@@ -150,6 +169,7 @@ impl RuntimePrediction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forex_core::{BackendKind, RuntimeMode};
 
     #[test]
     fn runtime_prediction_try_new_accepts_valid_three_class_probabilities() {
@@ -274,6 +294,40 @@ mod tests {
         assert_eq!(
             metadata.degraded_reason.as_deref(),
             Some("native booster unavailable")
+        );
+    }
+
+    #[test]
+    fn prediction_metadata_attaches_typed_runtime_contract() {
+        let canonical =
+            PredictionMetadata::new("neat", ModelFamily::Evolutionary, CapabilityState::Verified)
+                .with_runtime_details(Some("symbios_neat_cpu".to_string()), None);
+
+        assert_eq!(canonical.backend_kind, Some(BackendKind::NativeCpu));
+        assert_eq!(canonical.runtime_mode, Some(RuntimeMode::Canonical));
+        assert_eq!(canonical.runtime_degraded_reason, None);
+
+        let degraded = PredictionMetadata::new(
+            "neuro_evo",
+            ModelFamily::Evolutionary,
+            CapabilityState::Implemented,
+        )
+        .with_runtime_details(
+            Some("simple_es_restart_cpu".to_string()),
+            Some("crfmnes_backend_degraded_to_simple_es".to_string()),
+        );
+
+        assert_eq!(
+            degraded.backend_kind,
+            Some(BackendKind::LocalSurrogateFallback)
+        );
+        assert_eq!(degraded.runtime_mode, Some(RuntimeMode::Degraded));
+        assert_eq!(
+            degraded
+                .runtime_degraded_reason
+                .as_ref()
+                .map(|reason| reason.code.as_str()),
+            Some("crfmnes_backend_degraded_to_simple_es")
         );
     }
 

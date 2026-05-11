@@ -10,6 +10,8 @@ use std::path::Path;
 use symbios_genetics::Genotype;
 use symbios_neat::{Activation, CppnEvaluator, NeatConfig, NeatGenome};
 
+use forex_core::BackendKind;
+
 #[cfg(feature = "neuro-evolution-gpu")]
 use super::neat_gpu::{neat_cuda_kernel_enabled, try_population_scores_cuda};
 use crate::base::{
@@ -21,6 +23,7 @@ use crate::runtime::artifacts::{
 };
 use crate::runtime::capabilities::{
     CapabilityState, ModelFamily, append_runtime_degraded_reason, normalize_runtime_device_policy,
+    runtime_backend_kind_from_label,
 };
 use crate::runtime::prediction::RuntimePrediction;
 use crate::statistical::common::{
@@ -53,6 +56,10 @@ fn neat_cpu_fallback_reason(policy: &str, runtime_backend: Option<&str>) -> Opti
     }
 }
 
+fn neat_runtime_backend_kind(runtime_backend: &str) -> BackendKind {
+    runtime_backend_kind_from_label(Some(runtime_backend)).unwrap_or(BackendKind::Unavailable)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct NeatArtifact {
@@ -72,6 +79,8 @@ struct NeatArtifact {
     train_rows: usize,
     val_rows: usize,
     runtime_backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_backend_kind: Option<BackendKind>,
     #[serde(default = "default_neat_requested_device_policy")]
     requested_device_policy: String,
     best_fitness: f32,
@@ -105,6 +114,7 @@ impl Default for NeatArtifact {
             train_rows: 0,
             val_rows: 0,
             runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
+            runtime_backend_kind: Some(neat_runtime_backend_kind(NEAT_RUNTIME_BACKEND)),
             requested_device_policy: default_neat_requested_device_policy(),
             best_fitness: f32::NEG_INFINITY,
             best_loss: f32::INFINITY,
@@ -934,6 +944,17 @@ impl NeatExpert {
         if artifact.runtime_backend.trim().is_empty() {
             bail!("NEAT artifact must persist a runtime backend label");
         }
+        if let Some(runtime_backend_kind) = artifact.runtime_backend_kind {
+            let expected = neat_runtime_backend_kind(&artifact.runtime_backend);
+            if runtime_backend_kind != expected {
+                bail!(
+                    "NEAT artifact runtime_backend_kind {:?} does not match runtime backend label `{}` ({:?})",
+                    runtime_backend_kind,
+                    artifact.runtime_backend,
+                    expected
+                );
+            }
+        }
         if artifact.requested_device_policy.trim().is_empty() {
             bail!("NEAT artifact requested_device_policy must not be blank");
         }
@@ -1156,6 +1177,7 @@ impl ExpertModel for NeatExpert {
                 train_rows: self.train_rows,
                 val_rows: self.val_rows,
                 runtime_backend: self.runtime_backend.clone(),
+                runtime_backend_kind: Some(neat_runtime_backend_kind(&self.runtime_backend)),
                 requested_device_policy: self.requested_device_policy.clone(),
                 best_fitness: self.best_fitness,
                 best_loss: self.best_loss,
@@ -1287,6 +1309,10 @@ mod tests {
         assert_eq!(artifact.train_rows, 26);
         assert_eq!(artifact.val_rows, 6);
         assert_eq!(artifact.runtime_backend, NEAT_RUNTIME_BACKEND);
+        assert_eq!(
+            artifact.runtime_backend_kind,
+            Some(forex_core::BackendKind::NativeCpu)
+        );
 
         let _ = std::fs::remove_dir_all(&path);
         Ok(())
@@ -1303,6 +1329,14 @@ mod tests {
         assert_eq!(
             predictions[0].metadata().execution_backend.as_deref(),
             Some(NEAT_RUNTIME_BACKEND)
+        );
+        assert_eq!(
+            predictions[0].metadata().backend_kind,
+            Some(forex_core::BackendKind::NativeCpu)
+        );
+        assert_eq!(
+            predictions[0].metadata().runtime_mode,
+            Some(forex_core::RuntimeMode::Canonical)
         );
         assert_eq!(predictions[0].metadata().degraded_reason, None);
         Ok(())
@@ -1379,6 +1413,7 @@ mod tests {
             train_rows: 32,
             val_rows: 1,
             runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
+            runtime_backend_kind: Some(neat_runtime_backend_kind(NEAT_RUNTIME_BACKEND)),
             requested_device_policy: default_neat_requested_device_policy(),
             best_fitness: 0.5,
             best_loss: 1.0,
@@ -1425,6 +1460,7 @@ mod tests {
             train_rows: 26,
             val_rows: 6,
             runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
+            runtime_backend_kind: Some(neat_runtime_backend_kind(NEAT_RUNTIME_BACKEND)),
             requested_device_policy: default_neat_requested_device_policy(),
             best_fitness: 0.5,
             best_loss: 1.0,
@@ -1471,6 +1507,7 @@ mod tests {
             train_rows: 26,
             val_rows: 6,
             runtime_backend: NEAT_RUNTIME_BACKEND.to_string(),
+            runtime_backend_kind: Some(neat_runtime_backend_kind(NEAT_RUNTIME_BACKEND)),
             requested_device_policy: default_neat_requested_device_policy(),
             best_fitness: 0.5,
             best_loss: 1.0,

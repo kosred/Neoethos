@@ -122,7 +122,16 @@ pub fn normalize_burn_device_policy(policy: &str) -> String {
 fn is_supported_burn_device_policy(normalized: &str) -> bool {
     matches!(
         normalized,
-        "auto" | "cpu" | "gpu" | "cuda" | "wgpu" | "default" | "rocm" | "metal" | "vulkan"
+        "auto"
+            | "cpu"
+            | "gpu"
+            | "cuda"
+            | "wgpu"
+            | "default"
+            | "rocm"
+            | "metal"
+            | "vulkan"
+            | "external_device"
     ) || normalized.starts_with("cuda:")
         || normalized.starts_with("gpu:")
         || normalized.starts_with("wgpu:")
@@ -1977,8 +1986,8 @@ where
     let (train_range, val_range, embargo) = if use_external_val {
         (0..n_samples, 0..0, 0usize)
     } else {
-        let embargo = (n_samples as f32 * 0.005).ceil() as usize;
-        let (train_range, val_range) = time_series_split(n_samples, 0.15, 100, embargo.max(10));
+        let embargo = ((n_samples as f32 * 0.005).ceil() as usize).max(10);
+        let (train_range, val_range) = time_series_split(n_samples, 0.15, 100, embargo);
         (train_range, val_range, embargo)
     };
     let n_train = train_range.len();
@@ -1994,6 +2003,7 @@ where
     } else {
         val_range.len()
     };
+    let dataset_rows_for_report = n_train + val_rows_for_report + embargo;
 
     if n_train == 0 || val_rows_for_report == 0 {
         return Err(anyhow::anyhow!(
@@ -2145,7 +2155,7 @@ where
     Ok((
         model,
         BurnTrainingReport {
-            dataset_rows: n_samples,
+            dataset_rows: dataset_rows_for_report,
             train_rows: n_train,
             val_rows: val_rows_for_report,
             embargo_rows: embargo,
@@ -2384,6 +2394,7 @@ mod tests {
         assert!(is_supported_burn_device_policy("gpu:1"));
         assert!(is_supported_burn_device_policy("metal"));
         assert!(is_supported_burn_device_policy("rocm:2"));
+        assert!(is_supported_burn_device_policy("external_device"));
     }
 
     #[test]
@@ -2412,7 +2423,7 @@ mod tests {
     }
 
     #[test]
-    fn burn_training_precision_cpu_bf16_request_falls_back_to_fp32() {
+    fn burn_training_precision_cpu_bf16_request_reflects_backend_support() {
         let selection = BurnDeviceSelection {
             requested_policy: "cpu".to_string(),
             effective_policy: "cpu".to_string(),
@@ -2424,13 +2435,18 @@ mod tests {
             &device,
             Some("bf16"),
         );
-        assert_eq!(precision, BurnExecutionPrecision::Fp32);
-        assert!(
-            reason
-                .as_deref()
-                .unwrap_or_default()
-                .contains("CPU execution requires fp32")
-        );
+        if <TrainBackend as Backend>::supports_dtype(&device, DType::BF16) {
+            assert_eq!(precision, BurnExecutionPrecision::Bf16);
+            assert!(reason.is_none());
+        } else {
+            assert_eq!(precision, BurnExecutionPrecision::Fp32);
+            assert!(
+                reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("unsupported by the active Burn backend/device/model")
+            );
+        }
     }
 
     #[test]

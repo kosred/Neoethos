@@ -27,6 +27,9 @@ use crate::runtime::hpo::{
 use crate::runtime::profile::{
     TRAINING_RUNTIME_PROFILE_FILE_NAME, TrainingRuntimeProfile, write_training_runtime_profile,
 };
+use crate::runtime::training_artifact::{
+    write_model_runtime_artifact_contract_sidecar, write_training_model_artifact_contract_sidecar,
+};
 use crate::tree_models::config::ParamValue;
 use crate::tree_models::{CatBoostExpert, LightGBMExpert, SklearsTreeExpert, XGBoostExpert};
 use crate::{
@@ -2120,16 +2123,11 @@ fn training_runtime_profile(
     }
 }
 
-fn write_training_profile_sidecar(
-    artifact_dir: &std::path::Path,
+fn training_profile_higher_timeframes(
     settings: &forex_core::Settings,
-    config: &ModelConfig,
-    symbol: &str,
     base_tf: &str,
-    payload: &TrainingPayload,
-    row_budget_applied: Option<usize>,
-) -> Result<()> {
-    let higher_timeframes = if settings.system.multi_resolution_enabled
+) -> Vec<String> {
+    if settings.system.multi_resolution_enabled
         && !settings.system.multi_resolution_timeframes.is_empty()
     {
         settings
@@ -2138,7 +2136,7 @@ fn write_training_profile_sidecar(
             .iter()
             .filter(|tf| !tf.eq_ignore_ascii_case(base_tf))
             .cloned()
-            .collect::<Vec<_>>()
+            .collect()
     } else {
         settings
             .system
@@ -2146,9 +2144,19 @@ fn write_training_profile_sidecar(
             .iter()
             .filter(|tf| !tf.eq_ignore_ascii_case(base_tf))
             .cloned()
-            .collect::<Vec<_>>()
-    };
+            .collect()
+    }
+}
 
+fn write_training_profile_sidecar(
+    artifact_dir: &std::path::Path,
+    settings: &forex_core::Settings,
+    config: &ModelConfig,
+    symbol: &str,
+    base_tf: &str,
+    payload: &TrainingPayload,
+    row_budget_applied: Option<usize>,
+) -> Result<TrainingRuntimeProfile> {
     let profile = training_runtime_profile(
         settings,
         config,
@@ -2156,12 +2164,13 @@ fn write_training_profile_sidecar(
         base_tf,
         payload,
         row_budget_applied,
-        higher_timeframes,
+        training_profile_higher_timeframes(settings, base_tf),
     );
     write_training_runtime_profile(
         &artifact_dir.join(TRAINING_RUNTIME_PROFILE_FILE_NAME),
         &profile,
-    )
+    )?;
+    Ok(profile)
 }
 
 fn timeframe_to_minutes(base_tf: &str) -> usize {
@@ -2408,7 +2417,7 @@ where
             write_optimization_report(&staged_dir.join(OPTIMIZATION_REPORT_FILE_NAME), report)?;
         }
         write_onnx_status_sidecar(staged_dir, config, payload)?;
-        write_training_profile_sidecar(
+        let profile = write_training_profile_sidecar(
             staged_dir,
             settings,
             config,
@@ -2416,6 +2425,12 @@ where
             base_tf,
             payload,
             row_budget_applied,
+        )?;
+        write_training_model_artifact_contract_sidecar(
+            staged_dir, settings, config, payload, &profile,
+        )?;
+        write_model_runtime_artifact_contract_sidecar(
+            staged_dir, settings, config, payload, &profile,
         )?;
         Ok(())
     })
@@ -3533,6 +3548,51 @@ mod tests {
         ))
     }
 
+    fn persist_sample_tree_training_artifacts(name: &str) -> PathBuf {
+        let settings = forex_core::Settings::default();
+        let config = ModelConfig {
+            name: "lightgbm".to_string(),
+            model_type: ModelType::LightGBM,
+            capability_family: crate::runtime::capabilities::ModelFamily::Tree,
+            capability_state: CapabilityState::Verified,
+            params: HashMap::from([
+                ("__planned_backend".to_string(), "cpu".to_string()),
+                ("__planned_device".to_string(), "cpu".to_string()),
+            ]),
+        };
+        let payload = TrainingPayload::from_named_dense(
+            ndarray::arr2(&[
+                [1.0_f32, 0.1_f32],
+                [1.1_f32, 0.2_f32],
+                [1.2_f32, 0.3_f32],
+                [1.3_f32, 0.4_f32],
+            ]),
+            vec![0, 1, 0, 1],
+            vec!["return_1".to_string(), "volatility_3".to_string()],
+        )
+        .expect("build payload");
+        let artifact_dir = unique_test_dir(name);
+
+        persist_training_artifacts(
+            &artifact_dir,
+            &settings,
+            &config,
+            "EURUSD",
+            "M15",
+            &payload,
+            Some(4),
+            None,
+            |staged_dir| {
+                std::fs::write(staged_dir.join("model.bin"), b"model")
+                    .context("write model marker")?;
+                Ok(())
+            },
+        )
+        .expect("persist training artifacts");
+
+        artifact_dir
+    }
+
     #[test]
     fn create_dispatch_plan_rejects_empty_model_config() {
         let orchestrator = orchestrator_with_models(&[]);
@@ -3757,7 +3817,7 @@ mod tests {
             profile.capability_family,
             crate::runtime::capabilities::ModelFamily::Tree
         );
-        assert_eq!(profile.capability_state, CapabilityState::Implemented);
+        assert_eq!(profile.capability_state, CapabilityState::Verified);
         assert_eq!(profile.label_horizon_bars, 0);
         assert_eq!(profile.effective_label_horizon_bars, 3);
         assert_eq!(profile.meta_label_max_hold_bars, 3);
@@ -3771,7 +3831,7 @@ mod tests {
             model_type: ModelType::MLP,
             capability_family: crate::runtime::capabilities::ModelFamily::Deep,
             capability_state: CapabilityState::Implemented,
-            params: HashMap::from([("export_onnx".to_string(), "true".to_string())]),
+            params: HashMap::from([("__export_onnx".to_string(), "true".to_string())]),
         };
         let payload =
             TrainingPayload::from_dense(ndarray::Array2::<f32>::zeros((4, 2)), vec![0, 1, 2, 1])
@@ -3781,6 +3841,94 @@ mod tests {
         let err = write_onnx_status_sidecar(&artifact_dir, &config, &payload)
             .expect_err("missing artifact dir must fail");
         assert!(err.to_string().contains("without saved artifact directory"));
+    }
+
+    #[test]
+    fn persist_training_artifacts_writes_training_model_artifact_contract() {
+        let artifact_dir = persist_sample_tree_training_artifacts("training_model_contract");
+
+        let sidecar_path = artifact_dir.join("training_model_artifact.json");
+        assert!(
+            sidecar_path.is_file(),
+            "training-model contract sidecar should be written"
+        );
+        let sidecar: forex_core::TrainingModelArtifact<TrainingRuntimeProfile> =
+            serde_json::from_slice(
+                &std::fs::read(&sidecar_path).expect("read training model contract sidecar"),
+            )
+            .expect("deserialize training model contract sidecar");
+
+        assert_eq!(
+            sidecar.contract_kind(),
+            forex_core::ArtifactKind::TrainingModel
+        );
+        assert_eq!(
+            sidecar.provenance.artifact_kind,
+            forex_core::ArtifactKind::TrainingModel
+        );
+        assert_eq!(sidecar.payload.model_name, "lightgbm");
+        assert_eq!(sidecar.payload.symbol, "EURUSD");
+        assert_eq!(sidecar.payload.base_timeframe, "M15");
+        assert_eq!(sidecar.payload.feature_count, 2);
+        assert_eq!(sidecar.payload.dataset_rows, 4);
+        assert_eq!(
+            sidecar.provenance.backend_kind,
+            sidecar.provenance.device_assignment.backend
+        );
+        assert!(
+            !sidecar.provenance.training_config_hash.trim().is_empty(),
+            "training config hash should be populated"
+        );
+        assert!(
+            !sidecar.provenance.dataset_fingerprint.trim().is_empty(),
+            "dataset fingerprint should be populated"
+        );
+
+        if artifact_dir.exists() {
+            std::fs::remove_dir_all(&artifact_dir).expect("cleanup training contract dir");
+        }
+    }
+
+    #[test]
+    fn persist_training_artifacts_writes_model_runtime_artifact_contract() {
+        let artifact_dir = persist_sample_tree_training_artifacts("model_runtime_contract");
+
+        let sidecar_path = artifact_dir.join("model_runtime_artifact.json");
+        assert!(
+            sidecar_path.is_file(),
+            "model-runtime contract sidecar should be written"
+        );
+        let sidecar: forex_core::ModelRuntimeArtifact<TrainingRuntimeProfile> =
+            serde_json::from_slice(
+                &std::fs::read(&sidecar_path).expect("read model runtime contract sidecar"),
+            )
+            .expect("deserialize model runtime contract sidecar");
+
+        assert_eq!(
+            sidecar.contract_kind(),
+            forex_core::ArtifactKind::ModelRuntime
+        );
+        assert_eq!(
+            sidecar.provenance.artifact_kind,
+            forex_core::ArtifactKind::ModelRuntime
+        );
+        assert_eq!(sidecar.payload.model_name, "lightgbm");
+        assert_eq!(sidecar.payload.symbol, "EURUSD");
+        assert_eq!(sidecar.payload.base_timeframe, "M15");
+        assert_eq!(sidecar.payload.feature_count, 2);
+        assert_eq!(sidecar.payload.dataset_rows, 4);
+        assert_eq!(
+            sidecar.provenance.backend_kind,
+            sidecar.provenance.device_assignment.backend
+        );
+        assert!(
+            !sidecar.provenance.runtime_config_hash.trim().is_empty(),
+            "runtime config hash should be populated"
+        );
+
+        if artifact_dir.exists() {
+            std::fs::remove_dir_all(&artifact_dir).expect("cleanup model runtime contract dir");
+        }
     }
 
     #[test]

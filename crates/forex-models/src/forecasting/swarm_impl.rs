@@ -1,4 +1,10 @@
+use crate::runtime::capabilities::typed_runtime_degraded_reason;
 use anyhow::{Context, Result, bail};
+use forex_core::storage::json::{
+    JsonBackupWriteConfig, read_json as read_json_artifact,
+    write_json_with_backup as write_json_artifact_with_backup,
+};
+use forex_core::{BackendKind, RuntimeDegradedReason, RuntimeMode};
 use polars::prelude::{DataFrame, DataType, Series};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -93,6 +99,12 @@ pub struct SwarmForecastResult {
     pub effective_models: f32,
     pub prediction_variance: f32,
     pub models_used: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_backend_kind: Option<BackendKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_mode: Option<RuntimeMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_degraded_reason: Option<RuntimeDegradedReason>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +129,36 @@ struct SwarmForecasterArtifact {
 enum SwarmRuntimeMode {
     LocalFallback,
     ExternalSwarm,
+}
+
+impl SwarmRuntimeMode {
+    fn backend_kind(self) -> BackendKind {
+        match self {
+            Self::LocalFallback => BackendKind::LocalSurrogateFallback,
+            Self::ExternalSwarm => BackendKind::ExternalRuntime,
+        }
+    }
+
+    fn contract_runtime_mode(self, degraded_reason: Option<&str>) -> RuntimeMode {
+        if degraded_reason.is_some() || self.backend_kind().is_degraded() {
+            RuntimeMode::Degraded
+        } else {
+            RuntimeMode::Canonical
+        }
+    }
+}
+
+impl SwarmForecastResult {
+    fn with_runtime_contract(
+        mut self,
+        mode: SwarmRuntimeMode,
+        degraded_reason: Option<&str>,
+    ) -> Self {
+        self.runtime_backend_kind = Some(mode.backend_kind());
+        self.runtime_mode = Some(mode.contract_runtime_mode(degraded_reason));
+        self.runtime_degraded_reason = typed_runtime_degraded_reason(degraded_reason);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1410,7 +1452,14 @@ fn fallback_forecast_with_strategy(
             variance_sum / horizon as f32
         },
         models_used: forecasts.len(),
+        runtime_backend_kind: None,
+        runtime_mode: None,
+        runtime_degraded_reason: None,
     }
+    .with_runtime_contract(
+        SwarmRuntimeMode::LocalFallback,
+        Some("swarm_local_fallback_active"),
+    )
 }
 
 fn result_is_valid(result: &SwarmForecastResult, horizon: usize) -> bool {
@@ -1447,11 +1496,19 @@ fn select_external_or_fallback_result(
     external_result: SwarmForecastResult,
 ) -> (SwarmForecastResult, SwarmRuntimeMode, Option<String>) {
     if result_is_valid(&external_result, horizon) {
-        (external_result, SwarmRuntimeMode::ExternalSwarm, None)
+        (
+            external_result.with_runtime_contract(SwarmRuntimeMode::ExternalSwarm, None),
+            SwarmRuntimeMode::ExternalSwarm,
+            None,
+        )
     } else {
         (
             fallback_forecast_with_strategy(
                 snapshot, candidates, weights, reports, strategy, horizon,
+            )
+            .with_runtime_contract(
+                SwarmRuntimeMode::LocalFallback,
+                Some("external_swarm_result_invalid"),
             ),
             SwarmRuntimeMode::LocalFallback,
             Some("external_swarm_result_invalid".to_string()),
@@ -1665,16 +1722,25 @@ fn prune_external_candidates(
     let max_keep = if snapshot.has_seasonality { 6 } else { 5 };
 
     let mut kept = Vec::new();
+    let mut duplicate_backfill = Vec::new();
     for (_, candidate) in scored {
         let is_duplicate = kept.iter().any(|existing: &(String, ModelType, Vec<f32>)| {
             forecast_distance_ratio(&candidate.2, &existing.2, scale) <= duplicate_threshold
         });
-        if !is_duplicate || kept.len() < 2 {
+        if is_duplicate {
+            duplicate_backfill.push(candidate);
+        } else {
             kept.push(candidate);
         }
         if kept.len() >= max_keep {
             break;
         }
+    }
+    for candidate in duplicate_backfill {
+        if kept.len() >= 2 || kept.len() >= max_keep {
+            break;
+        }
+        kept.push(candidate);
     }
 
     kept
@@ -1905,62 +1971,19 @@ fn build_candidate_weight_map(reports: &[SwarmCandidateReport]) -> HashMap<Strin
         .collect()
 }
 
-fn write_swarm_artifact_atomically(artifact_path: &Path, payload: &[u8]) -> Result<()> {
-    let temp_path = artifact_path.with_extension("tmp");
-    let backup_path = artifact_path.with_extension("bak");
-
-    if temp_path.exists() {
-        std::fs::remove_file(&temp_path).with_context(|| {
-            format!(
-                "remove stale swarm forecaster temp artifact {}",
-                temp_path.display()
-            )
-        })?;
-    }
-    if backup_path.exists() {
-        std::fs::remove_file(&backup_path).with_context(|| {
-            format!(
-                "remove stale swarm forecaster backup artifact {}",
-                backup_path.display()
-            )
-        })?;
-    }
-
-    std::fs::write(&temp_path, payload).with_context(|| {
-        format!(
-            "write swarm forecaster temp artifact {}",
-            temp_path.display()
-        )
-    })?;
-
-    let replaced_existing = if artifact_path.exists() {
-        std::fs::rename(artifact_path, &backup_path).with_context(|| {
-            format!(
-                "rotate previous swarm forecaster artifact {} into {}",
-                artifact_path.display(),
-                backup_path.display()
-            )
-        })?;
-        true
-    } else {
-        false
-    };
-
-    if let Err(err) = std::fs::rename(&temp_path, artifact_path) {
-        if replaced_existing && backup_path.exists() {
-            let _ = std::fs::rename(&backup_path, artifact_path);
-        }
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(err).with_context(|| {
-            format!(
-                "rename swarm forecaster artifact into {}",
-                artifact_path.display()
-            )
-        });
-    }
-
-    let _ = std::fs::remove_file(&backup_path);
-    Ok(())
+fn write_swarm_artifact_atomically(
+    artifact_path: &Path,
+    artifact: &SwarmForecasterArtifact,
+) -> Result<()> {
+    write_json_artifact_with_backup(
+        artifact_path,
+        artifact,
+        JsonBackupWriteConfig {
+            artifact_label: "swarm forecaster artifact",
+            temp_extension: "tmp",
+            backup_extension: "bak",
+        },
+    )
 }
 
 #[allow(dead_code)]
@@ -2497,16 +2520,25 @@ fn prune_local_candidates(
     let max_keep = if snapshot.has_seasonality { 6 } else { 5 };
 
     let mut kept = Vec::new();
+    let mut duplicate_backfill = Vec::new();
     for (_, candidate) in scored {
         let is_duplicate = kept.iter().any(|existing: &(String, Vec<f32>)| {
             forecast_distance_ratio(&candidate.1, &existing.1, scale) <= duplicate_threshold
         });
-        if !is_duplicate || kept.len() < 2 {
+        if is_duplicate {
+            duplicate_backfill.push(candidate);
+        } else {
             kept.push(candidate);
         }
         if kept.len() >= max_keep {
             break;
         }
+    }
+    for candidate in duplicate_backfill {
+        if kept.len() >= 2 || kept.len() >= max_keep {
+            break;
+        }
+        kept.push(candidate);
     }
 
     kept
@@ -3090,6 +3122,9 @@ impl SwarmForecaster {
                 effective_models: ensemble_result.ensemble_metrics.effective_models,
                 prediction_variance: ensemble_result.ensemble_metrics.prediction_variance,
                 models_used: ensemble_result.models_used,
+                runtime_backend_kind: None,
+                runtime_mode: None,
+                runtime_degraded_reason: None,
             }
         };
         let fallback_candidates = candidates
@@ -3238,17 +3273,13 @@ impl SwarmForecaster {
             updated_at_unix_ms: self.updated_at_unix_ms,
             training_report: self.training_report.clone(),
         })?;
-        let payload =
-            serde_json::to_vec_pretty(&artifact).context("serialize swarm forecaster artifact")?;
         let artifact_path = path.join(SWARM_ARTIFACT_FILE_NAME);
-        write_swarm_artifact_atomically(&artifact_path, &payload)
+        write_swarm_artifact_atomically(&artifact_path, &artifact)
     }
 
     pub fn load(&mut self, path: &Path) -> Result<()> {
-        let payload = std::fs::read(path.join(SWARM_ARTIFACT_FILE_NAME))
-            .with_context(|| format!("read swarm forecaster artifact {}", path.display()))?;
         let artifact: SwarmForecasterArtifact =
-            serde_json::from_slice(&payload).context("deserialize swarm forecaster artifact")?;
+            read_json_artifact(path.join(SWARM_ARTIFACT_FILE_NAME), "swarm forecaster")?;
         let artifact = sanitize_forecaster_artifact(artifact)?;
 
         let SwarmForecasterArtifact {
@@ -3432,6 +3463,12 @@ mod tests {
             effective_models: 3.0,
             prediction_variance: 0.04,
             models_used: 3,
+            runtime_backend_kind: Some(BackendKind::LocalSurrogateFallback),
+            runtime_mode: Some(RuntimeMode::Degraded),
+            runtime_degraded_reason: Some(RuntimeDegradedReason::new(
+                "swarm_local_fallback_active",
+                "swarm_local_fallback_active",
+            )),
         };
         let candidate_reports = vec![SwarmCandidateReport {
             name: "persistence".to_string(),
@@ -3504,6 +3541,18 @@ mod tests {
             last_result.prediction_variance
         );
         assert_eq!(loaded_result.models_used, last_result.models_used);
+        assert_eq!(
+            loaded_result.runtime_backend_kind,
+            Some(BackendKind::LocalSurrogateFallback)
+        );
+        assert_eq!(loaded_result.runtime_mode, Some(RuntimeMode::Degraded));
+        assert_eq!(
+            loaded_result
+                .runtime_degraded_reason
+                .as_ref()
+                .map(|reason| reason.code.as_str()),
+            Some("swarm_local_fallback_active")
+        );
 
         assert_eq!(forecaster.candidate_reports.len(), candidate_reports.len());
         let loaded_report = &forecaster.candidate_reports[0];
@@ -3638,6 +3687,12 @@ mod tests {
                 effective_models: 1.0,
                 prediction_variance: 0.0,
                 models_used: 1,
+                runtime_backend_kind: Some(BackendKind::LocalSurrogateFallback),
+                runtime_mode: Some(RuntimeMode::Degraded),
+                runtime_degraded_reason: Some(RuntimeDegradedReason::new(
+                    "stale_external_state",
+                    "stale_external_state",
+                )),
             }),
             last_horizon: Some(12),
             candidate_reports: vec![SwarmCandidateReport {
@@ -3725,6 +3780,9 @@ mod tests {
             effective_models: 3.0,
             prediction_variance: 0.04,
             models_used: 3,
+            runtime_backend_kind: Some(BackendKind::ExternalRuntime),
+            runtime_mode: Some(RuntimeMode::Canonical),
+            runtime_degraded_reason: None,
         };
         let candidate_reports = vec![SwarmCandidateReport {
             name: "persistence".to_string(),
@@ -3858,6 +3916,9 @@ mod tests {
             effective_models: 2.0,
             prediction_variance: 0.04,
             models_used: 2,
+            runtime_backend_kind: Some(BackendKind::ExternalRuntime),
+            runtime_mode: Some(RuntimeMode::Canonical),
+            runtime_degraded_reason: None,
         };
 
         let (final_result, runtime_mode, degraded_reason) = select_external_or_fallback_result(
@@ -3876,6 +3937,18 @@ mod tests {
             Some("external_swarm_result_invalid")
         );
         assert!(result_is_valid(&final_result, 2));
+        assert_eq!(
+            final_result.runtime_backend_kind,
+            Some(BackendKind::LocalSurrogateFallback)
+        );
+        assert_eq!(final_result.runtime_mode, Some(RuntimeMode::Degraded));
+        assert_eq!(
+            final_result
+                .runtime_degraded_reason
+                .as_ref()
+                .map(|reason| reason.code.as_str()),
+            Some("external_swarm_result_invalid")
+        );
     }
 
     #[test]
@@ -3894,6 +3967,9 @@ mod tests {
             effective_models: 3.0,
             prediction_variance: 0.04,
             models_used: 3,
+            runtime_backend_kind: Some(BackendKind::ExternalRuntime),
+            runtime_mode: Some(RuntimeMode::Canonical),
+            runtime_degraded_reason: None,
         };
 
         let mut forecaster = SwarmForecaster::new(256.0);

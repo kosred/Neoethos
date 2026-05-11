@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use forex_core::{BackendKind, RuntimeDegradedReason, RuntimeMode};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModelFamily {
     Tree,
@@ -153,6 +155,101 @@ pub fn append_runtime_degraded_reason(
     }
 }
 
+pub fn runtime_backend_kind_from_label(label: Option<&str>) -> Option<BackendKind> {
+    let label = label?.trim();
+    if label.is_empty() {
+        return None;
+    }
+
+    let normalized = label.to_ascii_lowercase();
+    if normalized.contains("unknown") || normalized.contains("unavailable") {
+        return Some(BackendKind::Unavailable);
+    }
+    if normalized.contains("fallback")
+        || normalized.contains("simple_es_restart")
+        || normalized.contains("diagonal_profile")
+    {
+        return Some(BackendKind::LocalSurrogateFallback);
+    }
+    if normalized.contains("cuda_kernel") || normalized.contains("cuda_fitness") {
+        return Some(BackendKind::CudaKernel);
+    }
+    if normalized.contains("tree") && (normalized.contains("gpu") || normalized.contains("cuda")) {
+        return Some(BackendKind::NativeTreeGpu);
+    }
+    if normalized.contains("tree") && normalized.contains("cpu") {
+        return Some(BackendKind::NativeTreeCpu);
+    }
+    if normalized.contains("wgpu") {
+        return Some(BackendKind::BurnWgpu);
+    }
+    if normalized.contains("burn") && normalized.contains("cpu") {
+        return Some(BackendKind::BurnCpu);
+    }
+    if normalized.contains("cuda") || normalized.contains("gpu") {
+        return Some(BackendKind::NativeCuda);
+    }
+    if normalized.contains("cpu") {
+        return Some(BackendKind::NativeCpu);
+    }
+    if normalized.contains("external") || normalized.contains("swarm") {
+        return Some(BackendKind::ExternalRuntime);
+    }
+
+    Some(BackendKind::ExternalRuntime)
+}
+
+pub fn runtime_mode_from_details(
+    backend_kind: Option<BackendKind>,
+    degraded_reason: Option<&str>,
+) -> Option<RuntimeMode> {
+    let has_runtime_details = backend_kind.is_some() || degraded_reason.is_some();
+    if !has_runtime_details {
+        return None;
+    }
+
+    if backend_kind.is_some_and(BackendKind::is_degraded) || degraded_reason.is_some() {
+        Some(RuntimeMode::Degraded)
+    } else {
+        Some(RuntimeMode::Canonical)
+    }
+}
+
+pub fn typed_runtime_degraded_reason(reason: Option<&str>) -> Option<RuntimeDegradedReason> {
+    let reason = reason?.trim();
+    if reason.is_empty() {
+        return None;
+    }
+
+    let first_segment = reason
+        .split(';')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("runtime_degraded");
+    let mut code = first_segment
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    while code.contains("__") {
+        code = code.replace("__", "_");
+    }
+    let code = code.trim_matches('_');
+    let code = if code.is_empty() {
+        "runtime_degraded"
+    } else {
+        code
+    };
+
+    Some(RuntimeDegradedReason::new(code, reason))
+}
+
 pub fn gpu_policy_cpu_fallback_reason(model_name: &str) -> Option<String> {
     let normalized = requested_runtime_device_policy(model_name);
     if normalized == "gpu" || normalized.starts_with("gpu:") {
@@ -280,8 +377,10 @@ mod tests {
         CapabilityState, KNOWN_MODEL_NAMES, ModelCapability, ModelFamily,
         append_runtime_degraded_reason, gpu_policy_cpu_fallback_reason, model_capability,
         normalize_runtime_device_policy, normalize_training_precision_policy,
-        requested_training_precision_policy,
+        requested_training_precision_policy, runtime_backend_kind_from_label,
+        runtime_mode_from_details, typed_runtime_degraded_reason,
     };
+    use forex_core::{BackendKind, RuntimeMode};
     use std::collections::HashSet;
 
     #[test]
@@ -520,6 +619,48 @@ mod tests {
             reason.as_deref(),
             Some("requested device policy `gpu:3`; runtime currently executes on CPU")
         );
+    }
+
+    #[test]
+    fn runtime_backend_kind_from_label_maps_known_backend_families() {
+        assert_eq!(
+            runtime_backend_kind_from_label(Some("symbios_neat_cpu")),
+            Some(BackendKind::NativeCpu)
+        );
+        assert_eq!(
+            runtime_backend_kind_from_label(Some("simple_es_restart_cpu")),
+            Some(BackendKind::LocalSurrogateFallback)
+        );
+        assert_eq!(
+            runtime_backend_kind_from_label(Some("symbios_neat_cuda_fitness")),
+            Some(BackendKind::CudaKernel)
+        );
+        assert_eq!(
+            runtime_backend_kind_from_label(Some("neat_unknown")),
+            Some(BackendKind::Unavailable)
+        );
+    }
+
+    #[test]
+    fn runtime_mode_and_degraded_reason_are_typed_from_legacy_details() {
+        assert_eq!(
+            runtime_mode_from_details(Some(BackendKind::NativeCpu), None),
+            Some(RuntimeMode::Canonical)
+        );
+        assert_eq!(
+            runtime_mode_from_details(
+                Some(BackendKind::LocalSurrogateFallback),
+                Some("fallback_active")
+            ),
+            Some(RuntimeMode::Degraded)
+        );
+
+        let reason = typed_runtime_degraded_reason(Some(
+            "requested device policy `gpu:0`; runtime currently executes on CPU",
+        ))
+        .expect("typed degraded reason");
+        assert_eq!(reason.code, "requested_device_policy_gpu_0");
+        assert!(reason.message.contains("runtime currently executes on CPU"));
     }
 
     #[test]

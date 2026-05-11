@@ -530,6 +530,44 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 
 ## Execution log
 
+### 2026-05-11: Follow-on Phase 90 completed — large-file test extraction
+
+Started the large-file cleanup from the post-Phase-89 scan by extracting low-risk inline test modules before deeper production splits. `forex-app` trading tests now live in `app_services/trading_tests.rs`, and the `forex-models` ensemble test module now lives in `ensemble_tests.rs`. The slice also updated a stale `forex-app` discovery test fixture to the current `DiscoveryResult` contract fields so app verification can compile. Production-heavy files above 1500 lines remain tracked for later behavior-preserving module splits. See [`follow_on_phase_90_large_file_test_extraction_2026-05-11.md`](follow_on_phase_90_large_file_test_extraction_2026-05-11.md).
+
+Verification: `cargo test -p forex-app --bin forex-app app_services::trading -- --nocapture`, `cargo test -p forex-app --bin forex-app app_services::discovery::tests::success_snapshot_carries_candidate_and_portfolio_counters -- --nocapture`, `cargo test -p forex-models --lib ensemble:: -- --nocapture`, `cargo fmt --check`, and `git diff --check` all pass.
+
+### 2026-05-11: Follow-on Phase 89 completed — model-runtime artifact bridge
+
+Closed the remaining `model_runtime_backend_fragmentation` bridge gap in `forex-models`. The staged training persistence path now writes a typed `ModelRuntimeArtifact<TrainingRuntimeProfile>` envelope as `model_runtime_artifact.json` beside the existing training runtime profile and training-model contract. Training-model and model-runtime artifact provenance now share one builder, varying only the `ArtifactKind` and envelope type, so backend/device/runtime hashes cannot drift between the two sidecars. See [`follow_on_phase_89_model_runtime_artifact_bridge_2026-05-11.md`](follow_on_phase_89_model_runtime_artifact_bridge_2026-05-11.md).
+
+Verification: RED/GREEN `cargo test -p forex-models --lib persist_training_artifacts_writes_model_runtime_artifact_contract -- --nocapture`, `cargo test -p forex-models --lib -- --test-threads=1`, `cargo fmt --check`, and `git diff --check` all pass.
+
+### 2026-05-11: Follow-on Phase 88 completed — ONNX runtime boundary cleanup
+
+Closed the `forex_models_functional` ONNX legacy-boundary gap. `ONNXInferenceEngine` now lives in `forex_models::runtime::onnx` instead of the crate root, while `forex_models::ONNXInferenceEngine` remains available as the feature-gated public re-export for compatibility. Added a boundary regression test so `lib.rs` stays a registry/re-export file and future ONNX implementation work remains in the runtime module. See [`follow_on_phase_88_onnx_boundary_2026-05-11.md`](follow_on_phase_88_onnx_boundary_2026-05-11.md).
+
+Verification: RED/GREEN `cargo test -p forex-models runtime::tests::onnx_inference_engine_stays_out_of_crate_root --lib -- --nocapture`, `cargo check -p forex-models --features onnx`, `cargo test -p forex-models --lib -- --test-threads=1`, `cargo fmt --check`, and `git diff --check` all pass.
+
+### 2026-05-11: Follow-on Phase 87 completed — repo JSON artifact IO dedup
+
+Continued the user-requested dedup cleanup repo-wide after Phase 86 introduced a new training-model contract sidecar. Added `forex_core::storage::json` as the shared owner for atomic JSON writes, backup JSON writes, typed reads, temporary artifact paths, and stable JSON hashes. `forex-search::artifact_io` is now a compatibility re-export over the core helper, and high-confidence `forex-models` writers moved onto the shared path: runtime profiles, training-model contract envelopes, ONNX export status, optimization reports, statistical/deep/tree metadata, tree-model JSON sidecars, swarm forecaster JSON save/load, meta-model artifacts, and genetic artifacts/runtime metadata. See [`follow_on_phase_87_repo_json_io_dedup_2026-05-11.md`](follow_on_phase_87_repo_json_io_dedup_2026-05-11.md).
+
+Verification: `cargo test -p forex-core storage::json -- --nocapture`, `cargo test -p forex-core --lib`, `cargo test -p forex-search --lib`, and `cargo test -p forex-models --lib -- --test-threads=1` all pass.
+
+
+### 2026-05-11: Follow-on Phase 86 completed — training-model artifact contract
+
+Closed the `training_model_artifact_contract` gap from the Phase 71 coverage matrix. The `forex-models` training persistence path now writes a typed `TrainingModelArtifact<TrainingRuntimeProfile>` envelope as `training_model_artifact.json` beside `training_profile.json` before staged artifact promotion. The envelope records `ArtifactKind::TrainingModel` provenance, deterministic feature/dataset/label/runtime/risk hashes, typed backend/runtime/device metadata, hardware profile identity, and source commit. See [`follow_on_phase_86_training_model_artifact_contract_2026-05-11.md`](follow_on_phase_86_training_model_artifact_contract_2026-05-11.md).
+
+Verification: targeted `cargo test -p forex-models --lib persist_training_artifacts_writes_training_model_artifact_contract -- --nocapture` passes, and `cargo test -p forex-models --lib -- --test-threads=1` passes with 336 tests.
+
+
+### 2026-05-10: Follow-on Phases 80-85 completed — model contract cleanup
+
+Closed the stale `forex-models` failures left after the typed runtime metadata slice. Phase 80 adds a test-only corrupt-metadata constructor and restores sidecar-drift error boundaries. Phase 81 aligns capability/export fixtures and makes swarm pruning prefer non-duplicate candidates before duplicate backfill. Phase 82 hardens Burn/deep runtime provenance, precision, embargo-aware training summaries, and required runtime triplets. Phase 83 updates exit-agent trained artifacts to persist `training_report` and validates partial runtime identity before report cross-checks. Phase 84 makes Hoeffding runtime details truthful about fallback-only-by-weight versus unavailable live committees. Phase 85 fixes RL staged JSON writes, normalized GPU precision resolution, fallback-basis runtime details, bounds guards, and report-drift fixtures. See [`follow_on_phases_80_85_model_contract_cleanup_2026-05-10.md`](follow_on_phases_80_85_model_contract_cleanup_2026-05-10.md).
+
+Verification: `cargo test -p forex-models --lib -- --test-threads=1` now passes with 335 tests.
+
 
 ### 2026-05-10: Follow-on Phase 71 completed — audit coverage matrix
 
@@ -540,6 +578,11 @@ The Phase 1-70 contract / validation / extraction work is complete; the matrix i
 ### 2026-05-10: Follow-on Phases 72-75 completed — quick-win audit gaps
 
 Closed the high-leverage quick-win bucket identified by the Phase 71 matrix. Phase 72 adds a CI guardrail against active Python/PyO3 reintroduction outside `docs/` and `vendor/`. Phase 73 audits every active-source `allow(dead_code)` occurrence, removes the stale `SessionAccum` suppression, and records the retained generated/feature-gated/integration boundaries in [`dead_code_allowlist_2026-05-10.md`](dead_code_allowlist_2026-05-10.md). Phase 74 adds typed `forex-data` feature registry metadata for SMC, session, regime, quantitative, and VectorTA TA outputs. Phase 75 exposes `FeatureFrame::column_metadata()` / `validate_registry()` plus tests so downstream discovery/training code can reject feature-name drift through the shared registry instead of ad hoc lists.
+
+
+### 2026-05-10: Follow-on Phases 76-79 completed — typed model runtime metadata
+
+Closed the medium-risk typed propagation slice from the Phase 71 matrix without changing legacy string fields. Phase 76 adds shared typed inference helpers for model runtime backend labels, runtime modes, and degraded reasons, then attaches those fields to `PredictionMetadata`. Phase 77 propagates typed `BackendKind` into NEAT artifacts and runtime predictions. Phase 78 does the same for CRFMNES / neuro-evolution artifacts, including local surrogate fallback reasons. Phase 79 carries typed backend/runtime metadata through statistical linear artifacts, CUDA linear fit results, and swarm forecast results. See [`follow_on_phases_76_79_typed_runtime_metadata_2026-05-10.md`](follow_on_phases_76_79_typed_runtime_metadata_2026-05-10.md).
 
 
 ### 2026-05-10: Follow-on Phases 67-70 completed — dedup deferred items landed

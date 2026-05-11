@@ -316,8 +316,9 @@ fn resolve_rl_training_precision_with_capability(
         effective_backend
     };
     let effective_device_policy = normalize_rl_device_policy(device_policy);
-    let rlkit_cuda_runtime =
-        effective_backend == "rlkit_cuda" && effective_device_policy.starts_with("cuda:");
+    let rlkit_cuda_runtime = effective_backend == "rlkit_cuda"
+        && (effective_device_policy.starts_with("cuda:")
+            || effective_device_policy.starts_with("gpu:"));
     let rlkit_cpu_runtime = effective_backend == "rlkit_cpu" && effective_device_policy == "cpu";
     let bf16_available = if rlkit_cpu_runtime {
         true
@@ -409,7 +410,7 @@ fn artifact_effective_device_policy(artifact: &TradingRlArtifact) -> String {
 }
 
 fn staged_rl_file(path: &Path, file_name: &str) -> PathBuf {
-    path.join(format!("{file_name}.tmp"))
+    path.join(format!("{file_name}.staged"))
 }
 
 fn backup_rl_file(path: &Path, file_name: &str) -> PathBuf {
@@ -574,7 +575,13 @@ fn resolve_rl_runtime_metadata(
     )?;
     match read_json::<RuntimeArtifactMetadata>(&metadata_path) {
         Ok(metadata) => {
-            validate_rl_metadata(&metadata, &artifact.feature_columns, artifact.train_rows)?;
+            validate_rl_metadata(&metadata, &artifact.feature_columns, artifact.train_rows)
+                .with_context(|| {
+                    format!(
+                        "RL metadata sidecar mismatch with reconstructed runtime metadata at {}",
+                        metadata_path.display()
+                    )
+                })?;
             if metadata.model_name != reconstructed.model_name
                 || metadata.family != reconstructed.family
                 || metadata.state != reconstructed.state
@@ -2029,13 +2036,16 @@ impl TradingReinforcementLearner {
     }
 
     fn ensure_runtime_state_ready(&self) -> Result<()> {
-        let artifact = self.artifact()?;
-        Self::validate_artifact(&artifact)?;
-        if artifact.feature_columns.is_empty() {
+        if self.feature_columns.is_empty() && self.train_args.feature_columns.is_empty() {
             bail!("RL runtime feature schema is unavailable");
         }
         if self.bounds.is_none() {
             bail!("RL runtime feature bounds are unavailable; load or train the learner first");
+        }
+        let artifact = self.artifact()?;
+        Self::validate_artifact(&artifact)?;
+        if artifact.feature_columns.is_empty() {
+            bail!("RL runtime feature schema is unavailable");
         }
         if self.inference_network.is_none()
             && (self.fallback_weights.is_none() || self.fallback_bias.is_none())
@@ -2905,7 +2915,7 @@ mod tests {
     #[test]
     fn runtime_backend_details_reflect_quadratic_fallback_basis() {
         let mut learner = TradingReinforcementLearner::new();
-        learner.train_args.effective_backend = Some("linear_q_cpu".to_string());
+        learner.train_args.effective_backend = Some("quadratic_q_cpu".to_string());
         learner.train_args.fallback_basis = TradingFallbackBasis::Quadratic;
         learner.fallback_weights = Some(Array2::zeros((3, 4)));
         learner.fallback_bias = Some(Array1::zeros(3));
@@ -3216,8 +3226,8 @@ mod tests {
             effective_backend: Some("quadratic_q_cpu".to_string()),
             effective_device_policy: Some("cpu".to_string()),
             network_precision: None,
-            backend: "rlkit".to_string(),
-            device_policy: "cuda:0".to_string(),
+            backend: "quadratic_q_cpu".to_string(),
+            device_policy: "cpu".to_string(),
             parallel_envs: 1,
             eval_episodes: 8,
             rllib_num_workers: 0,
@@ -3325,7 +3335,7 @@ mod tests {
             effective_backend: Some("quadratic_q_cpu".to_string()),
             effective_device_policy: Some("cpu".to_string()),
             network_precision: None,
-            backend: "rlkit".to_string(),
+            backend: "quadratic_q_cpu".to_string(),
             device_policy: "auto".to_string(),
             parallel_envs: 1,
             eval_episodes: 8,
@@ -3365,7 +3375,8 @@ mod tests {
         learner.train_args.train_rows = 128;
         learner.train_args.effective_backend = Some("quadratic_q_cpu".to_string());
         learner.train_args.effective_device_policy = Some("cpu".to_string());
-        learner.fallback_weights = Some(Array2::zeros((3, 2)));
+        learner.train_args.fallback_basis = TradingFallbackBasis::Quadratic;
+        learner.fallback_weights = Some(Array2::zeros((3, 4)));
         learner.fallback_bias = Some(Array1::zeros(3));
         learner.training_report = None;
 
@@ -3667,7 +3678,7 @@ mod tests {
             effective_backend: Some("quadratic_q_cpu".to_string()),
             effective_device_policy: Some("cpu".to_string()),
             network_precision: None,
-            backend: "rlkit".to_string(),
+            backend: "quadratic_q_cpu".to_string(),
             device_policy: "cpu".to_string(),
             parallel_envs: 1,
             eval_episodes: 8,
@@ -3731,7 +3742,7 @@ mod tests {
             effective_backend: Some("quadratic_q_cpu".to_string()),
             effective_device_policy: Some("cpu".to_string()),
             network_precision: None,
-            backend: "rlkit".to_string(),
+            backend: "quadratic_q_cpu".to_string(),
             device_policy: "cpu".to_string(),
             parallel_envs: 1,
             eval_episodes: 8,
@@ -4102,7 +4113,37 @@ mod tests {
 
     #[test]
     fn predict_runtime_rejects_missing_bounds_before_inference() -> Result<()> {
-        let learner = TradingReinforcementLearner::new();
+        let mut learner = TradingReinforcementLearner::new();
+        learner.train_args.state_dim = 1;
+        learner.train_args.train_rows = 8;
+        learner.train_args.feature_columns = vec!["f1".to_string()];
+        learner.train_args.state_mins = vec![0.0];
+        learner.train_args.state_maxs = vec![1.0];
+        learner.train_args.backend = "linear_q_cpu".to_string();
+        learner.train_args.device_policy = "cpu".to_string();
+        learner.train_args.requested_backend = Some("linear_q_cpu".to_string());
+        learner.train_args.requested_device_policy = Some("cpu".to_string());
+        learner.train_args.effective_backend = Some("linear_q_cpu".to_string());
+        learner.train_args.effective_device_policy = Some("cpu".to_string());
+        learner.train_args.training_report = Some(TradingRlTrainingReport {
+            train_rows: 8,
+            episode_count: 1,
+            state_dim: 1,
+            reward_horizon: learner.train_args.reward_horizon,
+            episode_len: learner.train_args.episode_len,
+            backend: "linear_q_cpu".to_string(),
+            device_policy: "cpu".to_string(),
+            average_hold_reward: 0.0,
+            average_buy_reward: 0.0,
+            average_sell_reward: 0.0,
+            used_network_snapshot: false,
+            used_fallback_q: true,
+            used_feature_scaler: false,
+        });
+        learner.feature_columns = learner.train_args.feature_columns.clone();
+        learner.fallback_weights = Some(Array2::zeros((3, 1)));
+        learner.fallback_bias = Some(Array1::zeros(3));
+        learner.training_report = learner.train_args.training_report.clone();
         let df = DataFrame::new(vec![Series::new("f1".into(), vec![0.0_f64]).into()])?;
 
         let err = learner

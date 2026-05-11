@@ -20,9 +20,9 @@ use super::common::{
     build_tree_local_fallback_artifact, build_tree_runtime_predictions,
     calibrate_three_class_probabilities, dataframe_to_row_major_vec, default_training_summary,
     ensure_feature_columns_match, normalize_three_class_probabilities, predict_tree_local_fallback,
-    read_runtime_metadata, remap_labels_to_tree_targets, reshape_three_class_probabilities,
-    tree_artifact_paths, tree_runtime_metadata, validate_tree_local_fallback_artifact,
-    write_runtime_metadata,
+    read_runtime_metadata, read_tree_json_artifact, remap_labels_to_tree_targets,
+    reshape_three_class_probabilities, tree_artifact_paths, tree_runtime_metadata,
+    validate_tree_local_fallback_artifact, write_runtime_metadata, write_tree_json_artifact,
 };
 use super::config::*;
 
@@ -350,9 +350,11 @@ impl CatBoostExpert {
     fn persist_local_fallback(&self, path: &Path) -> Result<()> {
         if let Some(artifact) = self.local_fallback.as_ref() {
             validate_tree_local_fallback_artifact(artifact, &self.feature_columns)?;
-            let payload =
-                serde_json::to_vec_pretty(artifact).context("serialize CatBoost local fallback")?;
-            atomic_write(&Self::local_fallback_path(path), &payload)?;
+            write_tree_json_artifact(
+                &Self::local_fallback_path(path),
+                artifact,
+                "CatBoost local fallback",
+            )?;
         }
         Ok(())
     }
@@ -362,11 +364,7 @@ impl CatBoostExpert {
         if !fallback_path.exists() {
             return Ok(None);
         }
-        let payload = std::fs::read(&fallback_path)
-            .with_context(|| format!("read CatBoost fallback {}", fallback_path.display()))?;
-        let artifact = serde_json::from_slice(&payload).with_context(|| {
-            format!("deserialize CatBoost fallback {}", fallback_path.display())
-        })?;
+        let artifact = read_tree_json_artifact(&fallback_path, "CatBoost local fallback")?;
         Ok(Some(artifact))
     }
 
@@ -375,18 +373,7 @@ impl CatBoostExpert {
         if !runtime_path.exists() {
             return Ok(None);
         }
-        let payload = std::fs::read(&runtime_path).with_context(|| {
-            format!(
-                "read CatBoost runtime artifact from {}",
-                runtime_path.display()
-            )
-        })?;
-        let artifact = serde_json::from_slice(&payload).with_context(|| {
-            format!(
-                "deserialize CatBoost runtime artifact from {}",
-                runtime_path.display()
-            )
-        })?;
+        let artifact = read_tree_json_artifact(&runtime_path, "CatBoost runtime artifact")?;
         Ok(Some(artifact))
     }
 
@@ -1004,9 +991,11 @@ impl ExpertModel for CatBoostExpert {
             });
             validate_runtime_artifact(&runtime_artifact, self.feature_columns.len())?;
             let runtime_path = Self::runtime_artifact_path(path);
-            let runtime_bytes = serde_json::to_vec_pretty(&runtime_artifact)
-                .context("serialize CatBoost runtime artifact")?;
-            atomic_write(&runtime_path, &runtime_bytes)?;
+            write_tree_json_artifact(
+                &runtime_path,
+                &runtime_artifact,
+                "CatBoost runtime artifact",
+            )?;
             if let Some(model_bytes) = self.model_bytes.as_ref() {
                 atomic_write(&model_path, model_bytes)?;
             } else if self.local_fallback.is_none() {
@@ -1035,9 +1024,11 @@ impl ExpertModel for CatBoostExpert {
             });
             validate_runtime_artifact(&runtime_artifact, self.feature_columns.len())?;
             let runtime_path = Self::runtime_artifact_path(path);
-            let runtime_bytes = serde_json::to_vec_pretty(&runtime_artifact)
-                .context("serialize CatBoost runtime artifact")?;
-            atomic_write(&runtime_path, &runtime_bytes)?;
+            write_tree_json_artifact(
+                &runtime_path,
+                &runtime_artifact,
+                "CatBoost runtime artifact",
+            )?;
             self.persist_local_fallback(path)?;
             Ok(())
         }

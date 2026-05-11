@@ -3,6 +3,8 @@ use cubecl::cuda::{CudaDevice, CudaRuntime};
 use cubecl::prelude::*;
 use ndarray::{Array1, Array2};
 
+use forex_core::BackendKind;
+
 use super::common::normalize_statistical_device_policy;
 
 const CLASS_COUNT: usize = 3;
@@ -11,6 +13,7 @@ pub(crate) struct LinearCudaFit {
     pub weights: Array2<f32>,
     pub bias: Array1<f32>,
     pub runtime_backend: String,
+    pub runtime_backend_kind: BackendKind,
 }
 
 #[cube]
@@ -441,6 +444,7 @@ pub(crate) fn try_fit_linear_softmax_cuda(
             .context("shape statistical cuda weights")?,
         bias: Array1::from_vec(bias),
         runtime_backend: format!("{}_softmax_cuda", model_name),
+        runtime_backend_kind: BackendKind::NativeCuda,
     })
 }
 

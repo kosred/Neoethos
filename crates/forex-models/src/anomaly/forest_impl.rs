@@ -225,7 +225,13 @@ fn resolve_runtime_metadata_from_artifact(
     let metadata_path = path.join(METADATA_FILE_NAME);
     match read_json::<RuntimeArtifactMetadata>(&metadata_path) {
         Ok(metadata) => {
-            validate_runtime_metadata(&metadata, &artifact.feature_columns, artifact.dataset_rows)?;
+            validate_runtime_metadata(&metadata, &artifact.feature_columns, artifact.dataset_rows)
+                .with_context(|| {
+                    format!(
+                        "runtime metadata sidecar mismatch with embedded isolation_forest metadata at {}",
+                        metadata_path.display()
+                    )
+                })?;
             if let Some(embedded) = artifact.runtime_metadata.as_ref()
                 && (embedded.model_name != metadata.model_name
                     || embedded.family != metadata.family

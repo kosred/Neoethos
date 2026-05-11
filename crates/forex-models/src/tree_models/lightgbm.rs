@@ -13,13 +13,13 @@ use crate::runtime::capabilities::ModelFamily;
 use crate::runtime::prediction::RuntimePrediction;
 
 use super::common::{
-    LIGHTGBM_MODEL_FILE_NAME, TreeLocalFallbackArtifact, atomic_write,
-    build_tree_local_fallback_artifact, build_tree_runtime_predictions,
-    calibrate_three_class_probabilities, dataframe_to_row_major_vec, default_training_summary,
-    ensure_feature_columns_match, normalize_three_class_probabilities, predict_tree_local_fallback,
-    read_runtime_metadata, remap_labels_to_tree_targets, reshape_three_class_probabilities,
+    LIGHTGBM_MODEL_FILE_NAME, TreeLocalFallbackArtifact, build_tree_local_fallback_artifact,
+    build_tree_runtime_predictions, calibrate_three_class_probabilities,
+    dataframe_to_row_major_vec, default_training_summary, ensure_feature_columns_match,
+    normalize_three_class_probabilities, predict_tree_local_fallback, read_runtime_metadata,
+    read_tree_json_artifact, remap_labels_to_tree_targets, reshape_three_class_probabilities,
     tree_artifact_paths, tree_runtime_metadata, validate_tree_local_fallback_artifact,
-    write_runtime_metadata,
+    write_runtime_metadata, write_tree_json_artifact,
 };
 #[cfg(feature = "lightgbm")]
 use super::config::{
@@ -203,9 +203,11 @@ impl LightGBMExpert {
     fn persist_local_fallback(&self, root: &Path) -> Result<()> {
         if let Some(artifact) = self.local_fallback.as_ref() {
             validate_tree_local_fallback_artifact(artifact, &self.feature_columns)?;
-            let payload =
-                serde_json::to_vec_pretty(artifact).context("serialize LightGBM local fallback")?;
-            atomic_write(&Self::local_fallback_path(root), &payload)?;
+            write_tree_json_artifact(
+                &Self::local_fallback_path(root),
+                artifact,
+                "LightGBM local fallback",
+            )?;
         }
         Ok(())
     }
@@ -215,10 +217,7 @@ impl LightGBMExpert {
         if !path.exists() {
             return Ok(None);
         }
-        let payload = std::fs::read(&path)
-            .with_context(|| format!("read LightGBM fallback {}", path.display()))?;
-        let artifact = serde_json::from_slice(&payload)
-            .with_context(|| format!("deserialize LightGBM fallback {}", path.display()))?;
+        let artifact = read_tree_json_artifact(&path, "LightGBM local fallback")?;
         Ok(Some(artifact))
     }
 
@@ -227,14 +226,7 @@ impl LightGBMExpert {
         if !path.exists() {
             return Ok(None);
         }
-        let payload = std::fs::read(&path)
-            .with_context(|| format!("read LightGBM runtime artifact from {}", path.display()))?;
-        let profile = serde_json::from_slice(&payload).with_context(|| {
-            format!(
-                "deserialize LightGBM runtime artifact from {}",
-                path.display()
-            )
-        })?;
+        let profile = read_tree_json_artifact(&path, "LightGBM runtime artifact")?;
         Ok(Some(profile))
     }
 
@@ -705,10 +697,10 @@ impl ExpertModel for LightGBMExpert {
                 &self.feature_columns,
                 &self.stored_training_summary(),
             )?;
-            atomic_write(
+            write_tree_json_artifact(
                 &Self::runtime_profile_path(path),
-                &serde_json::to_vec_pretty(&runtime_profile)
-                    .context("serialize LightGBM runtime artifact")?,
+                &runtime_profile,
+                "LightGBM runtime artifact",
             )?;
             self.persist_local_fallback(path)?;
             Ok(())
@@ -731,10 +723,10 @@ impl ExpertModel for LightGBMExpert {
                 &self.feature_columns,
                 &self.stored_training_summary(),
             )?;
-            atomic_write(
+            write_tree_json_artifact(
                 &Self::runtime_profile_path(path),
-                &serde_json::to_vec_pretty(&runtime_profile)
-                    .context("serialize LightGBM runtime artifact")?,
+                &runtime_profile,
+                "LightGBM runtime artifact",
             )?;
             if let Some(model) = self.model.as_ref() {
                 model

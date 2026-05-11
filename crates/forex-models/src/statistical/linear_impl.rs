@@ -4,12 +4,16 @@ use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use forex_core::BackendKind;
+
 use crate::base::{
     ExpertModel, build_runtime_prediction_with_details, canonical_three_class_label_mapping,
     three_class_runtime_confidence, try_build_runtime_artifact_metadata,
 };
 use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata};
-use crate::runtime::capabilities::{CapabilityState, ModelFamily, append_runtime_degraded_reason};
+use crate::runtime::capabilities::{
+    CapabilityState, ModelFamily, append_runtime_degraded_reason, runtime_backend_kind_from_label,
+};
 use crate::runtime::prediction::RuntimePrediction;
 
 use super::common::{
@@ -33,6 +37,8 @@ struct LinearSoftmaxArtifact {
     runtime_metadata: Option<RuntimeArtifactMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     runtime_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_backend_kind: Option<BackendKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     runtime_degraded_reason: Option<String>,
     alpha: f32,
@@ -340,7 +346,14 @@ fn resolve_runtime_metadata_from_artifact(
                 model_name,
                 &artifact.feature_columns,
                 artifact.dataset_rows,
-            )?;
+            )
+            .with_context(|| {
+                format!(
+                    "runtime metadata sidecar mismatch with embedded {} metadata at {}",
+                    model_name,
+                    metadata_path.display()
+                )
+            })?;
             if let Some(embedded) = artifact.runtime_metadata.as_ref()
                 && (embedded.model_name != metadata.model_name
                     || embedded.family != metadata.family
@@ -549,6 +562,7 @@ fn fit_linear_softmax(
                     dataset_rows: rows,
                     runtime_metadata: Some(runtime_metadata),
                     runtime_backend: Some(cuda_fit.runtime_backend),
+                    runtime_backend_kind: Some(cuda_fit.runtime_backend_kind),
                     runtime_degraded_reason: None,
                     alpha,
                     l1_ratio,
@@ -650,6 +664,7 @@ fn fit_linear_softmax(
         feature_columns,
         dataset_rows: rows,
         runtime_metadata: Some(runtime_metadata),
+        runtime_backend_kind: runtime_backend_kind_from_label(runtime_backend.as_deref()),
         runtime_backend,
         runtime_degraded_reason,
         alpha,
@@ -1016,9 +1031,28 @@ mod tests {
             metadata.training_summary.train_rows + metadata.training_summary.val_rows,
             6
         );
+        assert_eq!(artifact.runtime_backend_kind, Some(BackendKind::NativeCpu));
 
         let runtime_predictions = model.predict_runtime(&df)?;
         assert_eq!(runtime_predictions.len(), 6);
+        let prediction_metadata = runtime_predictions[0].metadata();
+        assert_eq!(
+            prediction_metadata.backend_kind,
+            Some(BackendKind::NativeCpu)
+        );
+        let expected_runtime_mode = if prediction_metadata.degraded_reason.is_some() {
+            forex_core::RuntimeMode::Degraded
+        } else {
+            forex_core::RuntimeMode::Canonical
+        };
+        assert_eq!(
+            prediction_metadata.runtime_mode,
+            Some(expected_runtime_mode)
+        );
+        assert_eq!(
+            prediction_metadata.runtime_degraded_reason.is_some(),
+            prediction_metadata.degraded_reason.is_some()
+        );
         Ok(())
     }
 
@@ -1102,6 +1136,7 @@ mod tests {
             dataset_rows: 8,
             runtime_metadata: None,
             runtime_backend: Some("logistic_softmax_cpu".to_string()),
+            runtime_backend_kind: Some(BackendKind::NativeCpu),
             runtime_degraded_reason: None,
             alpha: 0.01,
             l1_ratio: 0.0,
@@ -1137,6 +1172,7 @@ mod tests {
                 .expect("build metadata"),
             ),
             runtime_backend: Some("logistic_softmax_cpu".to_string()),
+            runtime_backend_kind: Some(BackendKind::NativeCpu),
             runtime_degraded_reason: None,
             alpha: 0.01,
             l1_ratio: 0.0,
@@ -1152,14 +1188,14 @@ mod tests {
 
     #[test]
     fn validate_runtime_metadata_rejects_zero_train_rows() {
-        let metadata = runtime_metadata(
-            "logistic",
-            vec!["f1".to_string(), "f2".to_string()],
-            8,
-            0,
-            8,
-        )
-        .expect("build metadata");
+        let metadata = RuntimeArtifactMetadata {
+            model_name: "logistic".to_string(),
+            family: ModelFamily::Meta,
+            state: CapabilityState::Implemented,
+            feature_columns: vec!["f1".to_string(), "f2".to_string()],
+            label_mapping: canonical_three_class_label_mapping(),
+            training_summary: TrainingSummaryMetadata::raw_for_validation(8, 0, 8),
+        };
 
         let err = validate_runtime_metadata(
             &metadata,

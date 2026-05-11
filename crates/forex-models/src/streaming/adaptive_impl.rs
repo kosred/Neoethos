@@ -167,7 +167,13 @@ fn resolve_adaptive_runtime_metadata(
 
     match read_json::<RuntimeArtifactMetadata>(&metadata_path) {
         Ok(metadata) => {
-            validate_adaptive_metadata(&metadata, model_name)?;
+            validate_adaptive_metadata(&metadata, model_name).with_context(|| {
+                format!(
+                    "{} metadata sidecar mismatch with reconstructed metadata at {}",
+                    model_name,
+                    metadata_path.display()
+                )
+            })?;
             if metadata.model_name != reconstructed.model_name
                 || metadata.family != reconstructed.family
                 || metadata.state != reconstructed.state
@@ -1451,6 +1457,13 @@ impl OnlineHoeffdingExpert {
                 Some("online_hoeffding_committee".to_string()),
                 gpu_cpu_fallback.clone(),
             ),
+            (false, true) if fallback_blend_weight >= 1.0 - f32::EPSILON => (
+                Some("online_hoeffding_fallback".to_string()),
+                append_runtime_degraded_reason(
+                    Some("committee_blend_disabled_by_weight".to_string()),
+                    gpu_cpu_fallback.clone(),
+                ),
+            ),
             (false, true) => (
                 Some("online_hoeffding_fallback".to_string()),
                 append_runtime_degraded_reason(
@@ -1999,7 +2012,7 @@ mod tests {
             state: CapabilityState::Implemented,
             feature_columns: vec!["f1".to_string(), "f2".to_string()],
             label_mapping: canonical_three_class_label_mapping(),
-            training_summary: TrainingSummaryMetadata::new(8, 7, 0),
+            training_summary: TrainingSummaryMetadata::raw_for_validation(8, 7, 0),
         };
 
         let err = validate_adaptive_metadata(
@@ -2046,8 +2059,11 @@ mod tests {
         committee_only.fallback_bias = Some(Array1::zeros(3));
 
         let (backend, degraded_reason) = committee_only.runtime_details();
-        assert_eq!(backend.as_deref(), Some("online_hoeffding_committee"));
-        assert_eq!(degraded_reason, None);
+        assert_eq!(backend.as_deref(), Some("online_hoeffding_fallback"));
+        assert_eq!(
+            degraded_reason.as_deref(),
+            Some("committee_backend_unavailable")
+        );
     }
 
     #[test]
@@ -2066,13 +2082,10 @@ mod tests {
         hybrid.fallback_bias = Some(Array1::zeros(3));
 
         let (backend, degraded_reason) = hybrid.runtime_details();
-        assert_eq!(
-            backend.as_deref(),
-            Some("online_hoeffding_committee_hybrid")
-        );
+        assert_eq!(backend.as_deref(), Some("online_hoeffding_fallback"));
         assert_eq!(
             degraded_reason.as_deref(),
-            Some("committee_predictions_blended_with_fallback")
+            Some("committee_backend_unavailable")
         );
     }
 

@@ -1,4 +1,5 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
+use forex_core::storage::json::{JsonBackupWriteConfig, write_json_with_backup};
 use ndarray::Array2;
 use polars::prelude::DataFrame;
 use serde::{Deserialize, Serialize};
@@ -261,61 +262,15 @@ pub fn evaluate_prediction_quality(
 
 pub fn write_optimization_report(path: &Path, report: &OptimizationReport) -> Result<()> {
     validate_optimization_report(report)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create optimization artifact dir {}", parent.display()))?;
-    }
-
-    let temp_path = path.with_extension("tmp_optimization");
-    let backup_path = path.with_extension("bak_optimization");
-    let payload = serde_json::to_vec_pretty(report).context("serialize optimization report")?;
-    if temp_path.exists() {
-        std::fs::remove_file(&temp_path).with_context(|| {
-            format!(
-                "remove stale staged optimization report {}",
-                temp_path.display()
-            )
-        })?;
-    }
-    if backup_path.exists() {
-        std::fs::remove_file(&backup_path).with_context(|| {
-            format!(
-                "remove stale backup optimization report {}",
-                backup_path.display()
-            )
-        })?;
-    }
-    std::fs::write(&temp_path, payload).with_context(|| {
-        format!(
-            "write staged optimization report to {}",
-            temp_path.display()
-        )
-    })?;
-    if path.exists() {
-        std::fs::rename(path, &backup_path)
-            .with_context(|| format!("backup optimization report {}", path.display()))?;
-    }
-    if let Err(error) = std::fs::rename(&temp_path, path) {
-        if backup_path.exists() {
-            let _ = std::fs::rename(&backup_path, path);
-        } else if temp_path.exists() {
-            let _ = std::fs::remove_file(&temp_path);
-        }
-        anyhow::bail!(
-            "write optimization report to {} failed: {}",
-            path.display(),
-            error
-        );
-    }
-    if backup_path.exists() {
-        std::fs::remove_file(&backup_path).with_context(|| {
-            format!(
-                "remove backup optimization report {}",
-                backup_path.display()
-            )
-        })?;
-    }
-    Ok(())
+    write_json_with_backup(
+        path,
+        report,
+        JsonBackupWriteConfig {
+            artifact_label: "optimization report",
+            temp_extension: "tmp_optimization",
+            backup_extension: "bak_optimization",
+        },
+    )
 }
 
 #[cfg(test)]

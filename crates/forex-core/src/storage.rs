@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 
+pub mod json;
+
 // use rusqlite::{params, Connection}; // will use fully qualified or add imports as needed
 
 /// Represents a stored strategy gene (DTO for vector_taStrategyGene)

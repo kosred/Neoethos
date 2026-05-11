@@ -2,6 +2,10 @@ use anyhow::{Context, Result, bail};
 use burn::module::{AutodiffModule, Module};
 use burn::record::{DefaultFileRecorder, FullPrecisionSettings};
 use burn::tensor::DType;
+use forex_core::storage::json::{
+    JsonBackupWriteConfig, read_json as read_json_artifact,
+    write_json_with_backup as write_json_artifact_with_backup,
+};
 use ndarray::Array2;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -368,9 +372,19 @@ impl BurnDeepExpert {
                 self.model_name()
             )
         })?;
+        let expected_summary_val_rows = report
+            .dataset_rows
+            .checked_sub(report.train_rows)
+            .with_context(|| {
+                format!(
+                    "{} Burn training report train rows exceed dataset rows",
+                    self.model_name()
+                )
+            })?;
         if report.dataset_rows != summary.dataset_rows
             || report.train_rows != summary.train_rows
-            || report.val_rows != summary.val_rows
+            || expected_summary_val_rows != summary.val_rows
+            || report.val_rows > expected_summary_val_rows
         {
             bail!(
                 "{} Burn training report rows do not match persisted training summary",
@@ -839,27 +853,17 @@ impl BurnDeepExpert {
     }
 
     fn training_summary_from_report(report: &BurnTrainingReport) -> TrainingSummaryMetadata {
-        TrainingSummaryMetadata::new(report.dataset_rows, report.train_rows, report.val_rows)
+        TrainingSummaryMetadata::new(
+            report.dataset_rows,
+            report.train_rows,
+            report.dataset_rows.saturating_sub(report.train_rows),
+        )
     }
 
-    fn train_runtime_model(
-        &self,
-        input_dim: usize,
-        features: &Array2<f32>,
-        labels: &[i32],
-    ) -> Result<(
-        RuntimeDeepModel,
-        TrainingSummaryMetadata,
-        BurnDeviceSelection,
-        BurnTrainingReport,
-    )> {
-        self.train_runtime_model_with_val(input_dim, features, labels, None, None)
-    }
-
-    /// M5: same as [`train_runtime_model`] but allows the caller to supply
-    /// an explicit external validation pair (used by HPO so the early-
-    /// stopping signal matches the HPO objective). Passing `None` for both
-    /// reverts to Burn's internal time_series_split holdout.
+    /// Trains a runtime model and optionally accepts an explicit external
+    /// validation pair so the early-stopping signal can match the HPO
+    /// objective. Passing `None` for both validation inputs reverts to Burn's
+    /// internal time_series_split holdout.
     #[allow(clippy::too_many_arguments)]
     fn train_runtime_model_with_val(
         &self,
@@ -1131,30 +1135,19 @@ impl BurnDeepExpert {
     }
 
     fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create artifact directory {}", parent.display()))?;
-        }
-
-        let temp_path = path.with_extension("tmp");
-        let payload = serde_json::to_vec_pretty(value)
-            .with_context(|| format!("serialize {}", path.display()))?;
-        std::fs::write(&temp_path, payload)
-            .with_context(|| format!("write temporary artifact {}", temp_path.display()))?;
-        if path.exists() {
-            std::fs::remove_file(path)
-                .with_context(|| format!("remove previous artifact {}", path.display()))?;
-        }
-        std::fs::rename(&temp_path, path)
-            .with_context(|| format!("rename artifact into {}", path.display()))?;
-        Ok(())
+        write_json_artifact_with_backup(
+            path,
+            value,
+            JsonBackupWriteConfig {
+                artifact_label: "deep-model artifact",
+                temp_extension: "tmp",
+                backup_extension: "bak",
+            },
+        )
     }
 
     fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-        let payload = std::fs::read(path)
-            .with_context(|| format!("read deep-model artifact {}", path.display()))?;
-        serde_json::from_slice(&payload)
-            .with_context(|| format!("deserialize deep-model artifact {}", path.display()))
+        read_json_artifact(path, "deep-model")
     }
 
     fn staged_artifact_dir(path: &Path) -> PathBuf {
@@ -1265,10 +1258,17 @@ impl BurnDeepExpert {
         Self::validate_training_summary(summary)?;
         Self::validate_runtime_params(&self.params)?;
         self.validate_model_params()?;
-        let runtime_selection = Self::runtime_selection_from_params(&self.params)?;
+        let runtime_selection = Self::runtime_selection_from_params(&self.params)?.with_context(
+            || {
+                format!(
+                    "{} runtime params must persist requested_device_policy, effective_device_policy, and execution_backend together",
+                    self.model_name()
+                )
+            },
+        )?;
         self.validate_burn_training_report(
             summary,
-            runtime_selection.as_ref(),
+            Some(&runtime_selection),
             self.burn_training_report.as_ref(),
         )?;
         Ok(())
@@ -1756,7 +1756,7 @@ mod tests {
             CapabilityState::Implemented,
             vec!["rsi".to_string()],
             canonical_three_class_label_mapping(),
-            TrainingSummaryMetadata::new(10, 7, 2),
+            TrainingSummaryMetadata::raw_for_validation(10, 7, 2),
         );
 
         let err = BurnDeepExpert::validate_loaded_metadata(&metadata, "mlp")

@@ -65,11 +65,11 @@ mod tests {
 
         assert_eq!(names, vec!["lightgbm", "mlp", "patchtst"]);
         assert_eq!(plan.entries[0].family, ModelFamily::Tree);
-        assert_eq!(plan.entries[0].state, CapabilityState::Implemented);
+        assert_eq!(plan.entries[0].state, CapabilityState::Verified);
         assert_eq!(plan.entries[1].family, ModelFamily::Deep);
-        assert_eq!(plan.entries[1].state, CapabilityState::Implemented);
+        assert_eq!(plan.entries[1].state, CapabilityState::Verified);
         assert_eq!(plan.entries[2].family, ModelFamily::Deep);
-        assert_eq!(plan.entries[2].state, CapabilityState::Implemented);
+        assert_eq!(plan.entries[2].state, CapabilityState::Verified);
     }
 
     #[test]

@@ -1,9 +1,12 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
+use forex_core::storage::json::{JsonBackupWriteConfig, write_json_with_backup};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use super::capabilities::{CapabilityState, ModelFamily};
 
+pub const MODEL_RUNTIME_ARTIFACT_FILE_NAME: &str = "model_runtime_artifact.json";
+pub const TRAINING_MODEL_ARTIFACT_FILE_NAME: &str = "training_model_artifact.json";
 pub const TRAINING_RUNTIME_PROFILE_FILE_NAME: &str = "training_profile.json";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -126,58 +129,45 @@ fn validate_training_runtime_profile(profile: &TrainingRuntimeProfile) -> Result
 
 pub fn write_training_runtime_profile(path: &Path, profile: &TrainingRuntimeProfile) -> Result<()> {
     validate_training_runtime_profile(profile)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create training profile dir {}", parent.display()))?;
-    }
+    write_json_with_backup(
+        path,
+        profile,
+        JsonBackupWriteConfig {
+            artifact_label: "training runtime profile",
+            temp_extension: "tmp_training_profile",
+            backup_extension: "bak_training_profile",
+        },
+    )
+}
 
-    let temp_path = path.with_extension("tmp_training_profile");
-    let backup_path = path.with_extension("bak_training_profile");
-    let payload =
-        serde_json::to_vec_pretty(profile).context("serialize training runtime profile")?;
-    if temp_path.exists() {
-        std::fs::remove_file(&temp_path).with_context(|| {
-            format!(
-                "remove stale staged training profile {}",
-                temp_path.display()
-            )
-        })?;
-    }
-    if backup_path.exists() {
-        std::fs::remove_file(&backup_path).with_context(|| {
-            format!(
-                "remove stale backup training profile {}",
-                backup_path.display()
-            )
-        })?;
-    }
-    std::fs::write(&temp_path, payload).with_context(|| {
-        format!(
-            "write staged training runtime profile to {}",
-            temp_path.display()
-        )
-    })?;
-    if path.exists() {
-        std::fs::rename(path, &backup_path)
-            .with_context(|| format!("backup training runtime profile {}", path.display()))?;
-    }
-    if let Err(error) = std::fs::rename(&temp_path, path) {
-        if backup_path.exists() {
-            let _ = std::fs::rename(&backup_path, path);
-        } else if temp_path.exists() {
-            let _ = std::fs::remove_file(&temp_path);
-        }
-        anyhow::bail!(
-            "write training runtime profile to {} failed: {}",
-            path.display(),
-            error
-        );
-    }
-    if backup_path.exists() {
-        std::fs::remove_file(&backup_path)
-            .with_context(|| format!("remove backup training profile {}", backup_path.display()))?;
-    }
-    Ok(())
+pub fn write_training_model_artifact<T: Serialize>(
+    path: &Path,
+    artifact: &forex_core::TrainingModelArtifact<T>,
+) -> Result<()> {
+    write_json_with_backup(
+        path,
+        artifact,
+        JsonBackupWriteConfig {
+            artifact_label: "training model artifact",
+            temp_extension: "tmp_training_model_artifact",
+            backup_extension: "bak_training_model_artifact",
+        },
+    )
+}
+
+pub fn write_model_runtime_artifact<T: Serialize>(
+    path: &Path,
+    artifact: &forex_core::ModelRuntimeArtifact<T>,
+) -> Result<()> {
+    write_json_with_backup(
+        path,
+        artifact,
+        JsonBackupWriteConfig {
+            artifact_label: "model runtime artifact",
+            temp_extension: "tmp_model_runtime_artifact",
+            backup_extension: "bak_model_runtime_artifact",
+        },
+    )
 }
 
 #[cfg(test)]

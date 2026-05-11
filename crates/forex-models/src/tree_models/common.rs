@@ -1,7 +1,11 @@
 use anyhow::{Context, Result, bail};
+use forex_core::storage::json::{
+    JsonBackupWriteConfig, read_json as read_json_artifact,
+    write_json_with_backup as write_json_artifact_with_backup,
+};
 use ndarray::{Array1, Array2};
 use polars::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -287,15 +291,34 @@ pub fn tree_artifact_paths(root: &Path, model_file_name: &str) -> (PathBuf, Path
 }
 
 pub fn write_runtime_metadata(path: &Path, metadata: &RuntimeArtifactMetadata) -> Result<()> {
-    let payload = serde_json::to_vec_pretty(metadata).context("serialize runtime metadata")?;
-    atomic_write(path, &payload)
+    write_tree_json_artifact(path, metadata, "tree runtime metadata")
 }
 
 pub fn read_runtime_metadata(path: &Path) -> Result<RuntimeArtifactMetadata> {
-    let payload = std::fs::read(path)
-        .with_context(|| format!("read runtime metadata from {}", path.display()))?;
-    serde_json::from_slice(&payload)
-        .with_context(|| format!("deserialize runtime metadata from {}", path.display()))
+    read_json_artifact(path, "tree runtime metadata")
+}
+
+pub fn write_tree_json_artifact<T: Serialize + ?Sized>(
+    path: &Path,
+    value: &T,
+    artifact_label: &'static str,
+) -> Result<()> {
+    write_json_artifact_with_backup(
+        path,
+        value,
+        JsonBackupWriteConfig {
+            artifact_label,
+            temp_extension: "tmp",
+            backup_extension: "bak",
+        },
+    )
+}
+
+pub fn read_tree_json_artifact<T: DeserializeOwned>(
+    path: &Path,
+    artifact_label: &str,
+) -> Result<T> {
+    read_json_artifact(path, artifact_label)
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {

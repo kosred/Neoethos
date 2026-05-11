@@ -10,6 +10,10 @@ use crate::runtime::capabilities::{
 use crate::runtime::prediction::RuntimePrediction;
 use anyhow::{Context, Result, bail};
 use chrono::{Duration, TimeZone, Utc};
+use forex_core::storage::json::{
+    JsonBackupWriteConfig, read_json as read_json_artifact,
+    write_json_with_backup as write_json_artifact_with_backup,
+};
 use forex_data::{FeatureFrame, Ohlcv};
 use forex_search::genetic::{
     Gene, ParentSelectionPolicy, SeenSignatureMemory, SmcSearchConfig, SurvivorSelectionPolicy,
@@ -1104,26 +1108,15 @@ impl GeneticStrategyExpert {
 
     fn write_runtime_metadata(path: &Path, metadata: &RuntimeArtifactMetadata) -> Result<()> {
         let metadata_path = Self::runtime_metadata_path(path);
-        let temp_path = metadata_path.with_extension("tmp");
-        let payload = serde_json::to_vec_pretty(metadata).with_context(|| {
-            format!(
-                "serialize genetic runtime metadata {}",
-                metadata_path.display()
-            )
-        })?;
-        std::fs::write(&temp_path, payload).with_context(|| {
-            format!(
-                "write genetic temp runtime metadata {}",
-                temp_path.display()
-            )
-        })?;
-        std::fs::rename(&temp_path, &metadata_path).with_context(|| {
-            format!(
-                "rename genetic runtime metadata into {}",
-                metadata_path.display()
-            )
-        })?;
-        Ok(())
+        write_json_artifact_with_backup(
+            &metadata_path,
+            metadata,
+            JsonBackupWriteConfig {
+                artifact_label: "genetic runtime metadata",
+                temp_extension: "tmp",
+                backup_extension: "bak",
+            },
+        )
     }
 
     fn read_runtime_metadata(path: &Path) -> Result<Option<RuntimeArtifactMetadata>> {
@@ -1131,15 +1124,7 @@ impl GeneticStrategyExpert {
         if !metadata_path.exists() {
             return Ok(None);
         }
-        let payload = std::fs::read(&metadata_path).with_context(|| {
-            format!("read genetic runtime metadata {}", metadata_path.display())
-        })?;
-        let metadata = serde_json::from_slice(&payload).with_context(|| {
-            format!(
-                "deserialize genetic runtime metadata {}",
-                metadata_path.display()
-            )
-        })?;
+        let metadata = read_json_artifact(&metadata_path, "genetic runtime metadata")?;
         Ok(Some(metadata))
     }
 
@@ -1301,22 +1286,20 @@ impl GeneticStrategyExpert {
         std::fs::create_dir_all(path)
             .with_context(|| format!("create genetic artifact directory {}", path.display()))?;
         let artifact_path = Self::artifact_path(path);
-        let temp_path = artifact_path.with_extension("tmp");
-        let payload = serde_json::to_vec_pretty(artifact)
-            .with_context(|| format!("serialize genetic artifact {}", artifact_path.display()))?;
-        std::fs::write(&temp_path, payload)
-            .with_context(|| format!("write genetic temp artifact {}", temp_path.display()))?;
-        std::fs::rename(&temp_path, &artifact_path)
-            .with_context(|| format!("rename genetic artifact into {}", artifact_path.display()))?;
-        Ok(())
+        write_json_artifact_with_backup(
+            &artifact_path,
+            artifact,
+            JsonBackupWriteConfig {
+                artifact_label: "genetic artifact",
+                temp_extension: "tmp",
+                backup_extension: "bak",
+            },
+        )
     }
 
     fn read_artifact(path: &Path) -> Result<GeneticArtifact> {
         let artifact_path = Self::artifact_path(path);
-        let payload = std::fs::read(&artifact_path)
-            .with_context(|| format!("read genetic artifact {}", artifact_path.display()))?;
-        let artifact = serde_json::from_slice(&payload)
-            .with_context(|| format!("deserialize genetic artifact {}", artifact_path.display()))?;
+        let artifact: GeneticArtifact = read_json_artifact(&artifact_path, "genetic artifact")?;
         Self::validate_artifact(&artifact)?;
         Ok(artifact)
     }
