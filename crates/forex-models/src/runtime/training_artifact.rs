@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
@@ -12,6 +11,7 @@ use crate::runtime::capabilities::{
 use crate::runtime::profile::{
     TRAINING_MODEL_ARTIFACT_FILE_NAME, TrainingRuntimeProfile, write_training_model_artifact,
 };
+use forex_core::storage::json::stable_json_hash;
 use forex_core::system::HardwareProbe;
 use forex_core::utils::{fnv1a64, fnv1a64_update};
 use forex_core::{
@@ -57,37 +57,37 @@ fn build_training_model_artifact_contract(
 
     let provenance = ArtifactProvenance::new(
         ArtifactKind::TrainingModel,
-        stable_training_json_hash(&serde_json::json!({
+        stable_json_hash(&serde_json::json!({
             "feature_columns": feature_columns,
             "feature_count": payload.frame.width(),
         }))?,
         training_dataset_fingerprint(payload),
-        stable_training_json_hash(&serde_json::json!({
+        stable_json_hash(&serde_json::json!({
             "symbols": [profile.symbol.as_str()],
         }))?,
-        stable_training_json_hash(&serde_json::json!({
+        stable_json_hash(&serde_json::json!({
             "base_timeframe": profile.base_timeframe.as_str(),
             "higher_timeframes": &profile.higher_timeframes,
         }))?,
-        stable_training_json_hash(&serde_json::json!({
+        stable_json_hash(&serde_json::json!({
             "policy": "training_payload_frame_ordered_rows",
             "base_timeframe": profile.base_timeframe.as_str(),
             "dataset_rows": profile.dataset_rows,
         }))?,
-        stable_training_json_hash(&serde_json::json!({
+        stable_json_hash(&serde_json::json!({
             "multi_resolution_enabled": profile.multi_resolution_enabled,
             "base_features_prefixed": profile.base_features_prefixed,
             "base_signal_filter_enabled": profile.base_signal_filter_enabled,
             "feature_columns": feature_columns_from_dataframe(&payload.frame),
         }))?,
-        stable_training_json_hash(&serde_json::json!({
+        stable_json_hash(&serde_json::json!({
             "label_horizon_bars": profile.label_horizon_bars,
             "effective_label_horizon_bars": profile.effective_label_horizon_bars,
             "meta_label_max_hold_bars": profile.meta_label_max_hold_bars,
             "label_use_triple_barrier": profile.label_use_triple_barrier,
             "label_histogram": training_label_histogram(payload.labels.as_slice()),
         }))?,
-        stable_training_json_hash(&serde_json::json!({
+        stable_json_hash(&serde_json::json!({
             "model_name": config.name.as_str(),
             "model_type": format!("{:?}", config.model_type),
             "capability_family": config.capability_family.to_string(),
@@ -100,11 +100,11 @@ fn build_training_model_artifact_contract(
             "requested_hpo_backend": profile.requested_hpo_backend.as_str(),
             "requested_hpo_trials": profile.requested_hpo_trials,
         }))?,
-        stable_training_json_hash(&serde_json::json!({
+        stable_json_hash(&serde_json::json!({
             "scope": "not_applicable",
             "producer": "training_orchestrator",
         }))?,
-        stable_training_json_hash(&serde_json::json!({
+        stable_json_hash(&serde_json::json!({
             "backend_label": backend_label.as_str(),
             "backend_kind": format!("{:?}", backend_kind),
             "device": device_assignment.device.as_str(),
@@ -118,7 +118,7 @@ fn build_training_model_artifact_contract(
             "fsdp_enabled": profile.fsdp_enabled,
             "ddp_world_size": profile.ddp_world_size,
         }))?,
-        stable_training_json_hash(&serde_json::json!({
+        stable_json_hash(&serde_json::json!({
             "meta_label_max_hold_bars": settings.risk.meta_label_max_hold_bars,
             "triple_barrier_max_bars": settings.risk.triple_barrier_max_bars,
             "vol_horizon_bars": settings.risk.vol_horizon_bars,
@@ -137,11 +137,6 @@ fn build_training_model_artifact_contract(
 
     TrainingModelArtifact::new(provenance, profile.clone())
         .context("build training model artifact contract envelope")
-}
-
-fn stable_training_json_hash<T: Serialize + ?Sized>(value: &T) -> Result<String> {
-    let bytes = serde_json::to_vec(value).context("serialize training artifact contract hash")?;
-    Ok(format!("fnv64:{:016x}", fnv1a64(&bytes)))
 }
 
 fn sorted_training_params(params: &HashMap<String, String>) -> BTreeMap<String, String> {

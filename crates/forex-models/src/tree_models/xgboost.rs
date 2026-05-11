@@ -1,10 +1,11 @@
 use super::common::{
-    TreeLocalFallbackArtifact, XGBOOST_MODEL_FILE_NAME, atomic_write,
-    build_tree_local_fallback_artifact, build_tree_runtime_predictions,
-    calibrate_three_class_probabilities, dataframe_to_row_major_vec, default_training_summary,
-    ensure_feature_columns_match, normalize_three_class_probabilities, predict_tree_local_fallback,
-    read_runtime_metadata, remap_labels_to_tree_targets, tree_artifact_paths,
+    TreeLocalFallbackArtifact, XGBOOST_MODEL_FILE_NAME, build_tree_local_fallback_artifact,
+    build_tree_runtime_predictions, calibrate_three_class_probabilities,
+    dataframe_to_row_major_vec, default_training_summary, ensure_feature_columns_match,
+    normalize_three_class_probabilities, predict_tree_local_fallback, read_runtime_metadata,
+    read_tree_json_artifact, remap_labels_to_tree_targets, tree_artifact_paths,
     tree_runtime_metadata, validate_tree_local_fallback_artifact, write_runtime_metadata,
+    write_tree_json_artifact,
 };
 use super::config::*;
 use crate::base::ExpertModel;
@@ -298,9 +299,11 @@ impl XGBoostExpert {
     fn persist_local_runtime_artifact(&self, path: &Path) -> Result<()> {
         if let Some(artifact) = self.local_runtime_artifact() {
             validate_tree_local_fallback_artifact(&artifact, &self.feature_columns)?;
-            let payload = serde_json::to_vec_pretty(&artifact)
-                .context("serialize XGBoost local fallback artifact")?;
-            atomic_write(&path.join(XGBOOST_LOCAL_RUNTIME_FILE_NAME), &payload)?;
+            write_tree_json_artifact(
+                &path.join(XGBOOST_LOCAL_RUNTIME_FILE_NAME),
+                &artifact,
+                "XGBoost local fallback artifact",
+            )?;
         }
         Ok(())
     }
@@ -310,18 +313,7 @@ impl XGBoostExpert {
         if !artifact_path.exists() {
             return Ok(None);
         }
-        let payload = std::fs::read(&artifact_path).with_context(|| {
-            format!(
-                "read XGBoost local fallback artifact {}",
-                artifact_path.display()
-            )
-        })?;
-        let artifact = serde_json::from_slice(&payload).with_context(|| {
-            format!(
-                "deserialize XGBoost local fallback artifact {}",
-                artifact_path.display()
-            )
-        })?;
+        let artifact = read_tree_json_artifact(&artifact_path, "XGBoost local fallback artifact")?;
         Ok(Some(artifact))
     }
 
@@ -388,9 +380,11 @@ impl XGBoostExpert {
 
     #[cfg(feature = "xgboost")]
     fn persist_runtime_artifact(&self, path: &Path) -> Result<()> {
-        let payload = serde_json::to_vec_pretty(&self.runtime_artifact())
-            .context("serialize XGBoost runtime artifact")?;
-        atomic_write(&path.join(XGBOOST_RUNTIME_FILE_NAME), &payload)
+        write_tree_json_artifact(
+            &path.join(XGBOOST_RUNTIME_FILE_NAME),
+            &self.runtime_artifact(),
+            "XGBoost runtime artifact",
+        )
     }
 
     #[cfg(feature = "xgboost")]
@@ -399,15 +393,7 @@ impl XGBoostExpert {
         if !artifact_path.exists() {
             return Ok(None);
         }
-        let payload = std::fs::read(&artifact_path).with_context(|| {
-            format!("read XGBoost runtime artifact {}", artifact_path.display())
-        })?;
-        let artifact = serde_json::from_slice(&payload).with_context(|| {
-            format!(
-                "deserialize XGBoost runtime artifact {}",
-                artifact_path.display()
-            )
-        })?;
+        let artifact = read_tree_json_artifact(&artifact_path, "XGBoost runtime artifact")?;
         Ok(Some(artifact))
     }
 

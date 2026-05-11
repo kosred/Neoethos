@@ -1,4 +1,5 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
+use forex_core::storage::json::{JsonBackupWriteConfig, write_json_with_backup};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -141,54 +142,15 @@ impl OnnxExportStatus {
 
 pub fn write_onnx_export_status(path: &Path, status: &OnnxExportStatus) -> Result<()> {
     validate_onnx_export_status(status)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create ONNX export dir {}", parent.display()))?;
-    }
-
-    let temp_path = path.with_extension("tmp_onnx_status");
-    let backup_path = path.with_extension("bak_onnx_status");
-    let payload = serde_json::to_vec_pretty(status).context("serialize ONNX export status")?;
-    if temp_path.exists() {
-        std::fs::remove_file(&temp_path).with_context(|| {
-            format!(
-                "remove stale staged ONNX export status {}",
-                temp_path.display()
-            )
-        })?;
-    }
-    if backup_path.exists() {
-        std::fs::remove_file(&backup_path).with_context(|| {
-            format!(
-                "remove stale backup ONNX export status {}",
-                backup_path.display()
-            )
-        })?;
-    }
-    std::fs::write(&temp_path, payload)
-        .with_context(|| format!("write staged ONNX export status to {}", temp_path.display()))?;
-    if path.exists() {
-        std::fs::rename(path, &backup_path)
-            .with_context(|| format!("backup current ONNX export status {}", path.display()))?;
-    }
-    if let Err(error) = std::fs::rename(&temp_path, path) {
-        if backup_path.exists() {
-            let _ = std::fs::rename(&backup_path, path);
-        } else if temp_path.exists() {
-            let _ = std::fs::remove_file(&temp_path);
-        }
-        anyhow::bail!(
-            "write ONNX export status to {} failed: {}",
-            path.display(),
-            error
-        );
-    }
-    if backup_path.exists() {
-        std::fs::remove_file(&backup_path).with_context(|| {
-            format!("remove backup ONNX export status {}", backup_path.display())
-        })?;
-    }
-    Ok(())
+    write_json_with_backup(
+        path,
+        status,
+        JsonBackupWriteConfig {
+            artifact_label: "ONNX export status",
+            temp_extension: "tmp_onnx_status",
+            backup_extension: "bak_onnx_status",
+        },
+    )
 }
 
 #[cfg(test)]

@@ -1,4 +1,7 @@
 use anyhow::{Context, Result, bail};
+use forex_core::storage::json::{
+    JsonBackupWriteConfig, write_json_with_backup as write_json_artifact_with_backup,
+};
 use ndarray::Array2;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -231,14 +234,6 @@ fn backup_meta_artifact_dir(path: &Path) -> PathBuf {
     path.with_extension("bak_meta_artifact")
 }
 
-fn staged_meta_file(path: &Path) -> PathBuf {
-    path.with_extension("tmp_meta_file")
-}
-
-fn backup_meta_file(path: &Path) -> PathBuf {
-    path.with_extension("bak_meta_file")
-}
-
 fn cleanup_meta_artifact_dir(path: &Path) -> Result<()> {
     if path.exists() {
         std::fs::remove_dir_all(path)
@@ -288,51 +283,15 @@ where
 }
 
 fn write_json_with_backup<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create artifact directory {}", parent.display()))?;
-    }
-
-    let staged_path = staged_meta_file(path);
-    let backup_path = backup_meta_file(path);
-    if staged_path.exists() {
-        std::fs::remove_file(&staged_path)
-            .with_context(|| format!("remove stale staged meta file {}", staged_path.display()))?;
-    }
-    if backup_path.exists() {
-        std::fs::remove_file(&backup_path)
-            .with_context(|| format!("remove stale backup meta file {}", backup_path.display()))?;
-    }
-
-    let payload = serde_json::to_vec_pretty(value)
-        .with_context(|| format!("serialize {}", path.display()))?;
-    std::fs::write(&staged_path, payload)
-        .with_context(|| format!("write staged meta file {}", staged_path.display()))?;
-
-    if path.exists() {
-        std::fs::rename(path, &backup_path)
-            .with_context(|| format!("backup current meta file {}", path.display()))?;
-    }
-
-    if let Err(error) = std::fs::rename(&staged_path, path) {
-        if backup_path.exists() {
-            let _ = std::fs::rename(&backup_path, path);
-        } else if staged_path.exists() {
-            let _ = std::fs::remove_file(&staged_path);
-        }
-        bail!(
-            "promote staged meta file into {} failed: {}",
-            path.display(),
-            error
-        );
-    }
-
-    if backup_path.exists() {
-        std::fs::remove_file(&backup_path)
-            .with_context(|| format!("remove backup meta file {}", backup_path.display()))?;
-    }
-
-    Ok(())
+    write_json_artifact_with_backup(
+        path,
+        value,
+        JsonBackupWriteConfig {
+            artifact_label: "meta-model artifact",
+            temp_extension: "tmp_meta_file",
+            backup_extension: "bak_meta_file",
+        },
+    )
 }
 
 fn join_degraded_reasons<I>(reasons: I) -> Option<String>

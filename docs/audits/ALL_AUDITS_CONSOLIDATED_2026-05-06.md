@@ -530,6 +530,13 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 
 ## Execution log
 
+### 2026-05-11: Follow-on Phase 87 completed — repo JSON artifact IO dedup
+
+Continued the user-requested dedup cleanup repo-wide after Phase 86 introduced a new training-model contract sidecar. Added `forex_core::storage::json` as the shared owner for atomic JSON writes, backup JSON writes, typed reads, temporary artifact paths, and stable JSON hashes. `forex-search::artifact_io` is now a compatibility re-export over the core helper, and high-confidence `forex-models` writers moved onto the shared path: runtime profiles, training-model contract envelopes, ONNX export status, optimization reports, statistical/deep/tree metadata, tree-model JSON sidecars, swarm forecaster JSON save/load, meta-model artifacts, and genetic artifacts/runtime metadata. See [`follow_on_phase_87_repo_json_io_dedup_2026-05-11.md`](follow_on_phase_87_repo_json_io_dedup_2026-05-11.md).
+
+Verification: `cargo test -p forex-core storage::json -- --nocapture`, `cargo test -p forex-core --lib`, `cargo test -p forex-search --lib`, and `cargo test -p forex-models --lib -- --test-threads=1` all pass.
+
+
 ### 2026-05-11: Follow-on Phase 86 completed — training-model artifact contract
 
 Closed the `training_model_artifact_contract` gap from the Phase 71 coverage matrix. The `forex-models` training persistence path now writes a typed `TrainingModelArtifact<TrainingRuntimeProfile>` envelope as `training_model_artifact.json` beside `training_profile.json` before staged artifact promotion. The envelope records `ArtifactKind::TrainingModel` provenance, deterministic feature/dataset/label/runtime/risk hashes, typed backend/runtime/device metadata, hardware profile identity, and source commit. See [`follow_on_phase_86_training_model_artifact_contract_2026-05-11.md`](follow_on_phase_86_training_model_artifact_contract_2026-05-11.md).

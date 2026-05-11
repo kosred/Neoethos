@@ -27,12 +27,20 @@ Postscript 4: Phase 86 landed the training-model artifact producer. Every
 artifact provenance, dataset fingerprint, feature/label/runtime hashes, backend
 kind, runtime mode, device assignment, hardware profile id, and source commit.
 
+Postscript 5: Phase 87 deduplicated high-confidence repo JSON artifact IO.
+`forex_core::storage::json` now owns atomic writes, backup writes, typed reads,
+temporary artifact paths, and stable hashes; `forex-search::artifact_io` became
+a compatibility re-export and common `forex-models` metadata/artifact writers
+now use the shared helper. The same slice also moved tree-model JSON sidecars
+and swarm forecaster JSON save/load onto the core-backed helpers, leaving local
+file writers only for binary/raw payloads and test corruption fixtures.
+
 `✅` = addressed by the listed phase(s); `🟡` = partially addressed;
 `🔴` = not addressed yet (actionable gap).
 
 | # | Source audit | Status | Phases | Open items |
 |---|---|---|---|---|
-| 1 | `architecture_unification_duplicate_code_cleanup` | ✅ | 6, 12, 13, 61-70 | — |
+| 1 | `architecture_unification_duplicate_code_cleanup` | ✅ | 6, 12, 13, 61-70, 87 | — |
 | 2 | `artifact_intent_clarification_training_vs_search_resume` | ✅ | 1, 3, 8 | — |
 | 3 | `core_config_domain_modularization` | 🟡 | 6, 17-22 | training/search large-file split deeper than Phase 6 |
 | 4 | `cpu_gpu_semantic_parity_requirement` | ✅ | 4 | — |
@@ -51,7 +59,7 @@ kind, runtime mode, device assignment, hardware profile id, and source commit.
 | 17 | `gpu_first_kernel_everywhere_report` | ✅ | preserved, 76-79 | — |
 | 18 | `hardware_autodetect_config_ui_architecture` | 🟡 | 2 | UI hardware/runtime panel exposing scheduler-owned plans (P2-1) |
 | 19 | `model_runtime_backend_fragmentation` | 🟡 | 2, 76-79, 80-85 | model runtime artifact contract wired in forex-models bridge |
-| 20 | `modularization_maintainability_refactor_principle` | ✅ | 6 + 61-70 | — |
+| 20 | `modularization_maintainability_refactor_principle` | ✅ | 6 + 61-70, 87 | — |
 | 21 | `python_pyo3_legacy` | ✅ | confirmed clean, 72 | — |
 | 22 | `quality_challenge_validation_refactor` | ✅ | 25, 29-31 | — |
 | 23 | `rust_env_flags_config_debt` | ✅ | 17-22 | — |

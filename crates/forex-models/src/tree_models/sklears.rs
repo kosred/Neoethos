@@ -10,9 +10,9 @@ use crate::runtime::artifacts::TrainingSummaryMetadata;
 use crate::runtime::capabilities::ModelFamily;
 use crate::runtime::prediction::RuntimePrediction;
 use crate::tree_models::common::{
-    atomic_write, build_tree_runtime_predictions, default_training_summary,
-    ensure_feature_columns_match, read_runtime_metadata, tree_artifact_paths,
-    tree_runtime_metadata, write_runtime_metadata,
+    build_tree_runtime_predictions, default_training_summary, ensure_feature_columns_match,
+    read_runtime_metadata, read_tree_json_artifact, tree_artifact_paths, tree_runtime_metadata,
+    write_runtime_metadata, write_tree_json_artifact,
 };
 
 const MODEL_FILE_NAME: &str = "model.json";
@@ -134,18 +134,7 @@ impl SklearsTreeExpert {
         if !runtime_path.exists() {
             return Ok(None);
         }
-        let payload = std::fs::read(&runtime_path).with_context(|| {
-            format!(
-                "read sklears-tree runtime artifact {}",
-                runtime_path.display()
-            )
-        })?;
-        let artifact = serde_json::from_slice(&payload).with_context(|| {
-            format!(
-                "deserialize sklears-tree runtime artifact {}",
-                runtime_path.display()
-            )
-        })?;
+        let artifact = read_tree_json_artifact(&runtime_path, "sklears-tree runtime artifact")?;
         Ok(Some(artifact))
     }
 
@@ -463,16 +452,16 @@ impl ExpertModel for SklearsTreeExpert {
             root: root.clone(),
         };
         let (model_path, metadata_path) = tree_artifact_paths(path, MODEL_FILE_NAME);
-        let payload =
-            serde_json::to_vec_pretty(&artifact).context("serialize sklears-tree artifact")?;
-        atomic_write(&model_path, &payload)?;
+        write_tree_json_artifact(&model_path, &artifact, "sklears-tree artifact")?;
         let runtime_artifact = SklearsRuntimeArtifact {
             feature_columns: self.feature_columns.clone(),
             training_summary: self.stored_training_summary(),
         };
-        let runtime_payload = serde_json::to_vec_pretty(&runtime_artifact)
-            .context("serialize sklears-tree runtime artifact")?;
-        atomic_write(&path.join(SKLEARS_RUNTIME_FILE_NAME), &runtime_payload)?;
+        write_tree_json_artifact(
+            &path.join(SKLEARS_RUNTIME_FILE_NAME),
+            &runtime_artifact,
+            "sklears-tree runtime artifact",
+        )?;
         write_runtime_metadata(
             &metadata_path,
             &tree_runtime_metadata(
@@ -486,12 +475,8 @@ impl ExpertModel for SklearsTreeExpert {
 
     fn load(&mut self, path: &Path) -> Result<()> {
         let (model_path, metadata_path) = tree_artifact_paths(path, MODEL_FILE_NAME);
-        let payload = std::fs::read(&model_path)
-            .with_context(|| format!("read sklears-tree artifact {}", model_path.display()))?;
         let artifact: DecisionTreeArtifact =
-            serde_json::from_slice(&payload).with_context(|| {
-                format!("deserialize sklears-tree artifact {}", model_path.display())
-            })?;
+            read_tree_json_artifact(&model_path, "sklears-tree artifact")?;
         let runtime_artifact = Self::read_runtime_artifact(path)?;
         let metadata = if metadata_path.exists() {
             let metadata = read_runtime_metadata(&metadata_path)?;

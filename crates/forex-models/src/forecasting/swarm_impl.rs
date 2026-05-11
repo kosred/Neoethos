@@ -1,5 +1,9 @@
 use crate::runtime::capabilities::typed_runtime_degraded_reason;
 use anyhow::{Context, Result, bail};
+use forex_core::storage::json::{
+    JsonBackupWriteConfig, read_json as read_json_artifact,
+    write_json_with_backup as write_json_artifact_with_backup,
+};
 use forex_core::{BackendKind, RuntimeDegradedReason, RuntimeMode};
 use polars::prelude::{DataFrame, DataType, Series};
 use serde::{Deserialize, Serialize};
@@ -1967,62 +1971,19 @@ fn build_candidate_weight_map(reports: &[SwarmCandidateReport]) -> HashMap<Strin
         .collect()
 }
 
-fn write_swarm_artifact_atomically(artifact_path: &Path, payload: &[u8]) -> Result<()> {
-    let temp_path = artifact_path.with_extension("tmp");
-    let backup_path = artifact_path.with_extension("bak");
-
-    if temp_path.exists() {
-        std::fs::remove_file(&temp_path).with_context(|| {
-            format!(
-                "remove stale swarm forecaster temp artifact {}",
-                temp_path.display()
-            )
-        })?;
-    }
-    if backup_path.exists() {
-        std::fs::remove_file(&backup_path).with_context(|| {
-            format!(
-                "remove stale swarm forecaster backup artifact {}",
-                backup_path.display()
-            )
-        })?;
-    }
-
-    std::fs::write(&temp_path, payload).with_context(|| {
-        format!(
-            "write swarm forecaster temp artifact {}",
-            temp_path.display()
-        )
-    })?;
-
-    let replaced_existing = if artifact_path.exists() {
-        std::fs::rename(artifact_path, &backup_path).with_context(|| {
-            format!(
-                "rotate previous swarm forecaster artifact {} into {}",
-                artifact_path.display(),
-                backup_path.display()
-            )
-        })?;
-        true
-    } else {
-        false
-    };
-
-    if let Err(err) = std::fs::rename(&temp_path, artifact_path) {
-        if replaced_existing && backup_path.exists() {
-            let _ = std::fs::rename(&backup_path, artifact_path);
-        }
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(err).with_context(|| {
-            format!(
-                "rename swarm forecaster artifact into {}",
-                artifact_path.display()
-            )
-        });
-    }
-
-    let _ = std::fs::remove_file(&backup_path);
-    Ok(())
+fn write_swarm_artifact_atomically(
+    artifact_path: &Path,
+    artifact: &SwarmForecasterArtifact,
+) -> Result<()> {
+    write_json_artifact_with_backup(
+        artifact_path,
+        artifact,
+        JsonBackupWriteConfig {
+            artifact_label: "swarm forecaster artifact",
+            temp_extension: "tmp",
+            backup_extension: "bak",
+        },
+    )
 }
 
 #[allow(dead_code)]
@@ -3312,17 +3273,13 @@ impl SwarmForecaster {
             updated_at_unix_ms: self.updated_at_unix_ms,
             training_report: self.training_report.clone(),
         })?;
-        let payload =
-            serde_json::to_vec_pretty(&artifact).context("serialize swarm forecaster artifact")?;
         let artifact_path = path.join(SWARM_ARTIFACT_FILE_NAME);
-        write_swarm_artifact_atomically(&artifact_path, &payload)
+        write_swarm_artifact_atomically(&artifact_path, &artifact)
     }
 
     pub fn load(&mut self, path: &Path) -> Result<()> {
-        let payload = std::fs::read(path.join(SWARM_ARTIFACT_FILE_NAME))
-            .with_context(|| format!("read swarm forecaster artifact {}", path.display()))?;
         let artifact: SwarmForecasterArtifact =
-            serde_json::from_slice(&payload).context("deserialize swarm forecaster artifact")?;
+            read_json_artifact(path.join(SWARM_ARTIFACT_FILE_NAME), "swarm forecaster")?;
         let artifact = sanitize_forecaster_artifact(artifact)?;
 
         let SwarmForecasterArtifact {

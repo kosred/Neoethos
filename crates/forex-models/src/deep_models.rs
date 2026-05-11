@@ -2,6 +2,10 @@ use anyhow::{Context, Result, bail};
 use burn::module::{AutodiffModule, Module};
 use burn::record::{DefaultFileRecorder, FullPrecisionSettings};
 use burn::tensor::DType;
+use forex_core::storage::json::{
+    JsonBackupWriteConfig, read_json as read_json_artifact,
+    write_json_with_backup as write_json_artifact_with_backup,
+};
 use ndarray::Array2;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -1131,30 +1135,19 @@ impl BurnDeepExpert {
     }
 
     fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create artifact directory {}", parent.display()))?;
-        }
-
-        let temp_path = path.with_extension("tmp");
-        let payload = serde_json::to_vec_pretty(value)
-            .with_context(|| format!("serialize {}", path.display()))?;
-        std::fs::write(&temp_path, payload)
-            .with_context(|| format!("write temporary artifact {}", temp_path.display()))?;
-        if path.exists() {
-            std::fs::remove_file(path)
-                .with_context(|| format!("remove previous artifact {}", path.display()))?;
-        }
-        std::fs::rename(&temp_path, path)
-            .with_context(|| format!("rename artifact into {}", path.display()))?;
-        Ok(())
+        write_json_artifact_with_backup(
+            path,
+            value,
+            JsonBackupWriteConfig {
+                artifact_label: "deep-model artifact",
+                temp_extension: "tmp",
+                backup_extension: "bak",
+            },
+        )
     }
 
     fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-        let payload = std::fs::read(path)
-            .with_context(|| format!("read deep-model artifact {}", path.display()))?;
-        serde_json::from_slice(&payload)
-            .with_context(|| format!("deserialize deep-model artifact {}", path.display()))
+        read_json_artifact(path, "deep-model")
     }
 
     fn staged_artifact_dir(path: &Path) -> PathBuf {
