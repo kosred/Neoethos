@@ -637,7 +637,7 @@ fn evaluate_chunk_hpc(
         for t in 0..tf_count {
             let tf_data = data_slice.get(t);
             let tf_sig = tf_data.matmul(&logic_weights.transpose(0, 1));
-            let std = tf_sig.std_dim(0i64, false, Kind::Float) + 1e-6;
+            let std = tf_sig.std_dim(0i64, false, false) + 1e-6;
             let tf_sig = tf_sig / std.unsqueeze(0);
             let weight = tf_weights.select(1, t).unsqueeze(1);
             all_signals += tf_sig.transpose(0, 1) * weight;
@@ -645,8 +645,8 @@ fn evaluate_chunk_hpc(
         all_signals = all_signals.tanh();
 
         // Generate actions
-        let actions = all_signals.gt(&buy_th.unsqueeze(1)).to_kind(Kind::Float)
-            - all_signals.lt(&sell_th.unsqueeze(1)).to_kind(Kind::Float);
+        let actions = all_signals.gt_tensor(&buy_th.unsqueeze(1)).to_kind(Kind::Float)
+            - all_signals.lt_tensor(&sell_th.unsqueeze(1)).to_kind(Kind::Float);
 
         // Compute returns
         let open_p = ohlc_slice.get(0).select(1, 0);
@@ -664,7 +664,7 @@ fn evaluate_chunk_hpc(
 
         let mean_ret = batch_rets.mean_dim(1i64, false, Kind::Float);
         let downside = batch_rets.minimum(&Tensor::zeros([1], (Kind::Float, device)));
-        let downside_std = downside.pow(2).mean_dim(1i64, false, Kind::Float).sqrt() + 1e-9;
+        let downside_std = downside.pow_tensor_scalar(2).mean_dim(1i64, false, Kind::Float).sqrt() + 1e-9;
         let sortino = &mean_ret / downside_std;
 
         // Consistency metric
@@ -677,9 +677,9 @@ fn evaluate_chunk_hpc(
             Kind::Float,
         );
         let den = ((&equity - &equity_mean)
-            .pow(2)
+            .pow_tensor_scalar(2)
             .sum_dim_intlist(1i64, false, Kind::Float)
-            * (&steps - steps_mean).pow(2).sum(Kind::Float))
+            * (&steps - steps_mean).pow_tensor_scalar(2).sum(Kind::Float))
         .sqrt();
         let consistency = num / (den + 1e-9);
 
@@ -705,9 +705,9 @@ fn evaluate_chunk_hpc(
 
     let avg_fit = fitness_sum / (segment_count as f64);
     let min_pos = (segment_count as f64 * config.pos_window_fraction).ceil();
-    let pos_penalty = (Tensor::from(min_pos as f32).to_device(device) - pos_windows).clamp_min(0.0)
-        * config.pos_penalty as f32;
-    let final_fit = avg_fit + min_fitness * config.robust_weight as f32 - pos_penalty;
+    let pos_penalty = (Tensor::from(min_pos).to_device(device) - pos_windows).clamp_min(0.0)
+        * (config.pos_penalty as f64);
+    let final_fit = avg_fit + min_fitness * (config.robust_weight as f64) - pos_penalty;
 
     Ok(final_fit.to_device(Device::Cpu))
 }
