@@ -113,7 +113,8 @@ fn softmax_gradient_kernel(
         let mut grad: f32 = 0.0;
         let mut row = 0usize;
         while row < rows_us {
-            let probability = class_probability(features, weights, bias, row as u32, cols, class_idx as u32);
+            let probability =
+                class_probability(features, weights, bias, row as u32, cols, class_idx as u32);
             let label = labels[row];
             let mut target: f32 = 0.0;
             if label == class_idx as i32 {
@@ -204,8 +205,10 @@ fn softmax_predict_kernel(
         let row = ABSOLUTE_POS;
         let base = row * CLASS_COUNT;
         probabilities_out[base] = class_probability(features, weights, bias, row as u32, cols, 0);
-        probabilities_out[base + 1] = class_probability(features, weights, bias, row as u32, cols, 1);
-        probabilities_out[base + 2] = class_probability(features, weights, bias, row as u32, cols, 2);
+        probabilities_out[base + 1] =
+            class_probability(features, weights, bias, row as u32, cols, 1);
+        probabilities_out[base + 2] =
+            class_probability(features, weights, bias, row as u32, cols, 2);
     }
 }
 

@@ -634,7 +634,11 @@ fn evaluate_population_multi_gpu(
                 Device::Cpu,
                 segments,
             )?;
-            for (idx, value) in Vec::<f32>::try_from(&fitness).unwrap_or_default().into_iter().enumerate() {
+            for (idx, value) in Vec::<f32>::try_from(&fitness)
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+            {
                 results[offset + idx] = value;
             }
             offset = end;
@@ -737,15 +741,12 @@ fn evaluate_population_gpu(
     let logic_weights = genomes.narrow(1, tf_count, n_features);
     let thresholds = genomes
         .narrow(1, tf_count + n_features, 2)
-        .clamp(
-            -config.threshold_clip as f64,
-            config.threshold_clip as f64,
-        )
+        .clamp(-config.threshold_clip as f64, config.threshold_clip as f64)
         * (config.threshold_scale as f64);
-    let buy_th = thresholds.select(1, 0).maximum(&thresholds.select(1, 1))
-        + config.threshold_margin as f64;
-    let sell_th = thresholds.select(1, 0).minimum(&thresholds.select(1, 1))
-        - config.threshold_margin as f64;
+    let buy_th =
+        thresholds.select(1, 0).maximum(&thresholds.select(1, 1)) + config.threshold_margin as f64;
+    let sell_th =
+        thresholds.select(1, 0).minimum(&thresholds.select(1, 1)) - config.threshold_margin as f64;
 
     // Segments are pre-built once with a deterministic RNG by the caller — every
     // chunk and every device evaluates the SAME windows. This is required for
@@ -772,8 +773,12 @@ fn evaluate_population_gpu(
         }
         all_signals = all_signals.tanh();
 
-        let actions = all_signals.gt_tensor(&buy_th.unsqueeze(1)).to_kind(Kind::Float)
-            - all_signals.lt_tensor(&sell_th.unsqueeze(1)).to_kind(Kind::Float);
+        let actions = all_signals
+            .gt_tensor(&buy_th.unsqueeze(1))
+            .to_kind(Kind::Float)
+            - all_signals
+                .lt_tensor(&sell_th.unsqueeze(1))
+                .to_kind(Kind::Float);
 
         let open_p = ohlc_slice.get(0).select(1, 0);
         let close_p = ohlc_slice.get(0).select(1, 3);
@@ -789,7 +794,11 @@ fn evaluate_population_gpu(
 
         let mean_ret = batch_rets.mean_dim(1i64, false, Kind::Float);
         let downside = batch_rets.minimum(&Tensor::zeros([1], (Kind::Float, device)));
-        let downside_std = downside.pow_tensor_scalar(2).mean_dim(1i64, false, Kind::Float).sqrt() + 1e-9;
+        let downside_std = downside
+            .pow_tensor_scalar(2)
+            .mean_dim(1i64, false, Kind::Float)
+            .sqrt()
+            + 1e-9;
         let sortino = &mean_ret / downside_std;
 
         let steps = Tensor::arange((len - 1) as i64, (Kind::Float, device));
@@ -809,8 +818,7 @@ fn evaluate_population_gpu(
 
         let trade_count = actions.abs().sum_dim_intlist(1i64, false, Kind::Float);
         let expected = (len as f64 / 1440.0) * config.min_trades_per_day;
-        let freq_penalty = (Tensor::from(expected).to_device(device) - &trade_count)
-            .clamp_min(0.0)
+        let freq_penalty = (Tensor::from(expected).to_device(device) - &trade_count).clamp_min(0.0)
             * (config.trade_penalty as f64);
         let dd_penalty =
             (max_dd - config.dd_limit as f64).clamp_min(0.0) * (config.dd_penalty as f64);

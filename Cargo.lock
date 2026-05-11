@@ -4081,6 +4081,7 @@ dependencies = [
  "forex-data",
  "half",
  "itertools 0.14.0",
+ "libc",
  "ndarray 0.17.2",
  "rand 0.9.2",
  "rand_distr 0.5.1",
