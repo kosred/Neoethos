@@ -375,228 +375,58 @@ impl eframe::App for ForexApp {
         let mut disconnect_broker = false;
         let broker_connected = self.trading_session.is_connected();
 
+        // ─── Top bar — brand + global status only ────────────────────
+        // Engine and broker controls live in the BOTTOM action bar so
+        // the operator's eye lands on one canonical "what's running"
+        // strip without scanning four locations.
         egui::TopBottomPanel::top("top_panel")
             .frame(ui::theme::top_panel_frame(ctx.style().as_ref()))
-            .exact_height(50.0)
+            .exact_height(ui::theme::TOPBAR_HEIGHT)
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.add_space(6.0);
+                    // Brand
                     ui.label(
-                        egui::RichText::new("FOREX AI")
-                            .size(15.0)
+                        egui::RichText::new("Forex AI")
+                            .size(ui::theme::FONT_SUBTITLE + 1.0)
                             .strong()
                             .color(ui::theme::TEXT_PRIMARY),
                     );
+                    ui.add_space(ui::theme::SPACE_SM);
                     ui::theme::status_badge(ui, "PRO", ui::theme::ACCENT);
-                    ui.add(egui::Separator::default().vertical().spacing(10.0));
 
-                    // ── Navigation dropdown ──────────────────────────────
-                    egui::menu::menu_button(ui, "  Navigate ", |ui| {
-                        ui.set_min_width(160.0);
+                    ui.add_space(ui::theme::SPACE_LG);
+                    ui.add(egui::Separator::default().vertical().spacing(ui::theme::SPACE_SM));
+                    ui.add_space(ui::theme::SPACE_SM);
 
-                        ui.label(
-                            egui::RichText::new("TRADING")
-                                .size(10.0)
-                                .color(ui::theme::TEXT_MUTED)
-                                .strong(),
-                        );
-                        for (tab, label, hint) in [
-                            (WorkspaceTab::Dashboard, "Dashboard", "Overview & equity"),
-                            (WorkspaceTab::Chart, "Chart", "Price chart"),
-                            (WorkspaceTab::Watchlist, "Markets", "Watchlist"),
-                            (WorkspaceTab::Execution, "Order Ticket", "Place orders"),
-                            (WorkspaceTab::BottomStrip, "Trade Watch", "Open positions"),
-                            (WorkspaceTab::News, "News", "Filtered news feed"),
-                        ] {
-                            if ui.button(label).on_hover_text(hint).clicked() {
-                                nav_target = Some(tab);
-                                ui.close_menu();
-                            }
-                        }
-
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new("AI ENGINE")
-                                .size(10.0)
-                                .color(ui::theme::TEXT_MUTED)
-                                .strong(),
-                        );
-                        for (tab, label, hint) in [
-                            (
-                                WorkspaceTab::Discovery,
-                                "Discovery",
-                                "Genetic strategy search",
-                            ),
-                            (WorkspaceTab::Training, "Training", "Swarm model training"),
-                            (
-                                WorkspaceTab::Intelligence,
-                                "Intelligence",
-                                "AI model status",
-                            ),
-                        ] {
-                            if ui.button(label).on_hover_text(hint).clicked() {
-                                nav_target = Some(tab);
-                                ui.close_menu();
-                            }
-                        }
-
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new("SYSTEM")
-                                .size(10.0)
-                                .color(ui::theme::TEXT_MUTED)
-                                .strong(),
-                        );
-                        for (tab, label, hint) in [
-                            (
-                                WorkspaceTab::BrokerSetup,
-                                "Broker Setup",
-                                "cTrader auth & accounts",
-                            ),
-                            (WorkspaceTab::Runtime, "Runtime", "Connection & session"),
-                            (
-                                WorkspaceTab::DataBootstrap,
-                                "Data Bootstrap",
-                                "Download OHLCV history",
-                            ),
-                            (WorkspaceTab::Hardware, "Hardware", "CPU / GPU config"),
-                            (WorkspaceTab::Risk, "Risk Settings", "Drawdown & lot rules"),
-                            (WorkspaceTab::Settings, "Settings", "App configuration"),
-                        ] {
-                            if ui.button(label).on_hover_text(hint).clicked() {
-                                nav_target = Some(tab);
-                                ui.close_menu();
-                            }
-                        }
-                    });
-
-                    ui.add_space(2.0);
-
-                    // ── Engine controls dropdown ─────────────────────────
-                    egui::menu::menu_button(ui, "  Engine ", |ui| {
-                        ui.set_min_width(220.0);
-
-                        // Discovery row
-                        ui.horizontal(|ui| {
-                            ui::theme::status_dot(ui, discovery_dot, 8.0);
-                            ui.label(
-                                egui::RichText::new("Discovery")
-                                    .size(12.0)
-                                    .color(ui::theme::TEXT_PRIMARY),
-                            );
-                            ui.label(
-                                egui::RichText::new(&discovery_label)
-                                    .size(10.0)
-                                    .color(discovery_dot),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if discovery_running {
-                                        if ui
-                                            .small_button("Stop")
-                                            .on_hover_text("Cancel active discovery run")
-                                            .clicked()
-                                        {
-                                            stop_discovery = true;
-                                            ui.close_menu();
-                                        }
-                                    } else {
-                                        if ui
-                                            .small_button("Start")
-                                            .on_hover_text(
-                                                "Start discovery with current form settings",
-                                            )
-                                            .clicked()
-                                        {
-                                            start_discovery = true;
-                                            ui.close_menu();
-                                        }
-                                    }
-                                },
-                            );
-                        });
-
-                        ui.separator();
-
-                        // Training row
-                        ui.horizontal(|ui| {
-                            ui::theme::status_dot(ui, training_dot, 8.0);
-                            ui.label(
-                                egui::RichText::new("Training")
-                                    .size(12.0)
-                                    .color(ui::theme::TEXT_PRIMARY),
-                            );
-                            ui.label(
-                                egui::RichText::new(&training_label)
-                                    .size(10.0)
-                                    .color(training_dot),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if training_running {
-                                        if ui
-                                            .small_button("Stop")
-                                            .on_hover_text("Cancel active training run")
-                                            .clicked()
-                                        {
-                                            stop_training = true;
-                                            ui.close_menu();
-                                        }
-                                    } else {
-                                        if ui
-                                            .small_button("Start")
-                                            .on_hover_text(
-                                                "Start training with current symbol & TF",
-                                            )
-                                            .clicked()
-                                        {
-                                            start_training = true;
-                                            ui.close_menu();
-                                        }
-                                    }
-                                },
-                            );
-                        });
-
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new("Configure via Navigate → AI Engine panels")
-                                .size(10.0)
-                                .color(ui::theme::TEXT_MUTED),
-                        );
-                    });
-
-                    ui.add(egui::Separator::default().vertical().spacing(10.0));
-
-                    // ── Status ribbon ────────────────────────────────────
-                    ui.spacing_mut().item_spacing.x = 14.0;
+                    // Active pair / TF / data source — compact reading
                     render_ribbon_item(ui, "SYMBOL", &self.state.selected_pair, ui::theme::ACCENT);
+                    ui.add_space(ui::theme::SPACE_LG);
                     render_ribbon_item(
                         ui,
-                        "TF",
+                        "TIMEFRAME",
                         &self.state.chart_timeframe,
                         ui::theme::TEXT_PRIMARY,
                     );
+                    ui.add_space(ui::theme::SPACE_LG);
                     render_ribbon_item(
                         ui,
-                        "SRC",
+                        "SOURCE",
                         match self.state.data_source {
                             app_state::DataSource::CTrader => "cTrader",
                             app_state::DataSource::Local => "Local",
                         },
-                        ui::theme::TEXT_MUTED,
+                        ui::theme::TEXT_PRIMARY,
                     );
                     let equity = if self.state.account_equity > 0.0 {
                         self.state.account_equity
                     } else {
                         self.state.account_balance
                     };
+                    ui.add_space(ui::theme::SPACE_LG);
                     render_ribbon_item(
                         ui,
-                        "EQ",
-                        &format!("{equity:.2}"),
+                        "EQUITY",
+                        &format!("${equity:.2}"),
                         if equity > 0.0 {
                             ui::theme::SUCCESS
                         } else {
@@ -604,182 +434,96 @@ impl eframe::App for ForexApp {
                         },
                     );
 
-                    let status_color = if self.state.status_msg.contains("Connected")
-                        || self.state.status_msg.contains("Online")
-                        || self.state.status_msg.contains("Ready")
-                    {
-                        ui::theme::SUCCESS
-                    } else if self.state.status_msg.contains("Error")
-                        || self.state.status_msg.contains("Fail")
-                    {
-                        ui::theme::DANGER
-                    } else {
-                        ui::theme::WARNING
-                    };
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        ui::theme::status_dot(ui, status_color, 11.0);
-                        ui.label(
-                            egui::RichText::new(compact_status_text(&self.state.status_msg))
-                                .color(status_color)
-                                .strong()
-                                .size(12.0),
-                        );
-                    });
-
-                    ui.add(egui::Separator::default().vertical().spacing(10.0));
-
-                    // ── Quick-action engine controls (one-click) ──────────
-                    // Promote Start/Stop out of the Engine dropdown so the
-                    // operator never has to drill through a menu mid-session.
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        ui::theme::status_dot(ui, discovery_dot, 9.0);
-                        let (label, color, hover) = if discovery_running {
-                            (
-                                "Stop Disc",
-                                ui::theme::DANGER,
-                                "Cancel active discovery run",
-                            )
-                        } else {
-                            (
-                                "Start Disc",
-                                ui::theme::SUCCESS,
-                                "Start discovery with current form settings",
-                            )
-                        };
-                        if ui
-                            .add(egui::Button::new(
-                                egui::RichText::new(label).size(11.0).color(color).strong(),
-                            ))
-                            .on_hover_text(hover)
-                            .clicked()
-                        {
-                            if discovery_running {
-                                stop_discovery = true;
-                            } else {
-                                start_discovery = true;
-                            }
-                        }
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        ui::theme::status_dot(ui, training_dot, 9.0);
-                        let (label, color, hover) = if training_running {
-                            (
-                                "Stop Train",
-                                ui::theme::DANGER,
-                                "Cancel active training run",
-                            )
-                        } else {
-                            (
-                                "Start Train",
-                                ui::theme::SUCCESS,
-                                "Start training with current symbol & TF",
-                            )
-                        };
-                        if ui
-                            .add(egui::Button::new(
-                                egui::RichText::new(label).size(11.0).color(color).strong(),
-                            ))
-                            .on_hover_text(hover)
-                            .clicked()
-                        {
-                            if training_running {
-                                stop_training = true;
-                            } else {
-                                start_training = true;
-                            }
-                        }
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        let broker_dot_color = if broker_connected {
-                            ui::theme::SUCCESS
-                        } else {
-                            ui::theme::TEXT_MUTED
-                        };
-                        ui::theme::status_dot(ui, broker_dot_color, 9.0);
-                        let (label, color, hover) = if broker_connected {
-                            (
-                                "Disconnect",
-                                ui::theme::DANGER,
-                                "Disconnect from broker (cTrader / DXTrade)",
-                            )
-                        } else {
-                            (
-                                "Connect",
-                                ui::theme::SUCCESS,
-                                "Connect to broker using saved credentials",
-                            )
-                        };
-                        if ui
-                            .add(egui::Button::new(
-                                egui::RichText::new(label).size(11.0).color(color).strong(),
-                            ))
-                            .on_hover_text(hover)
-                            .clicked()
-                        {
-                            if broker_connected {
-                                disconnect_broker = true;
-                            } else {
-                                connect_broker = true;
-                            }
-                        }
-                    });
-
-                    // ── Right-aligned controls ───────────────────────────
+                    // Right-aligned: status pill, auto-trade toggle, hardware,
+                    // settings — the chrome that doesn't change mid-session.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(6.0);
                         if ui
-                            .add(egui::Button::new(
-                                egui::RichText::new("Settings")
-                                    .size(12.0)
-                                    .color(ui::theme::TEXT_MUTED),
-                            ))
-                            .on_hover_text("Open Settings panel")
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("⚙")
+                                        .size(ui::theme::FONT_SUBTITLE)
+                                        .color(ui::theme::TEXT_MUTED),
+                                )
+                                .fill(egui::Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::NONE),
+                            )
+                            .on_hover_text("Open Settings")
                             .clicked()
                         {
                             self.workspace.focus_tab(WorkspaceTab::Settings);
                         }
 
-                        ui.add(egui::Separator::default().vertical().spacing(8.0));
+                        ui.add_space(ui::theme::SPACE_SM);
 
-                        let auto_label = if self.state.auto_trade_enabled {
-                            egui::RichText::new("AUTO ON")
-                                .color(ui::theme::SUCCESS)
-                                .strong()
-                                .size(12.0)
+                        // Auto-trade toggle pill
+                        let auto_color = if self.state.auto_trade_enabled {
+                            ui::theme::SUCCESS
                         } else {
-                            egui::RichText::new("AUTO OFF")
-                                .color(ui::theme::TEXT_MUTED)
-                                .size(12.0)
+                            ui::theme::TEXT_FAINT
                         };
+                        let auto_text = if self.state.auto_trade_enabled {
+                            "AUTO ON"
+                        } else {
+                            "AUTO OFF"
+                        };
+                        let auto_button = egui::Button::new(
+                            egui::RichText::new(auto_text)
+                                .size(ui::theme::FONT_CAPTION)
+                                .color(auto_color)
+                                .strong(),
+                        )
+                        .fill(auto_color.linear_multiply(0.15))
+                        .stroke(egui::Stroke::new(1.0, auto_color.linear_multiply(0.55)))
+                        .corner_radius(egui::CornerRadius::same(ui::theme::RADIUS_SM));
                         if ui
-                            .add(egui::Button::new(auto_label))
+                            .add(auto_button)
                             .on_hover_text("Toggle automatic trade execution")
                             .clicked()
                         {
                             self.state.auto_trade_enabled = !self.state.auto_trade_enabled;
                         }
 
-                        ui.add(egui::Separator::default().vertical().spacing(8.0));
+                        ui.add_space(ui::theme::SPACE_SM);
 
+                        // Hardware indicator — read-only at a glance
                         ui.label(
                             egui::RichText::new(format!(
-                                "CPU {}  GPU {}",
+                                "{} cores  •  GPU {}",
                                 self.state.hardware.cpu_cores,
                                 if self.state.hardware.gpu_enabled {
-                                    "ON"
+                                    "on"
                                 } else {
-                                    "OFF"
+                                    "off"
                                 }
                             ))
-                            .size(11.0)
-                            .color(ui::theme::TEXT_MUTED),
+                            .size(ui::theme::FONT_CAPTION)
+                            .color(ui::theme::TEXT_FAINT),
                         );
+
+                        ui.add_space(ui::theme::SPACE_MD);
+                        ui.add(egui::Separator::default().vertical().spacing(ui::theme::SPACE_SM));
+                        ui.add_space(ui::theme::SPACE_SM);
+
+                        // Global status text — single source of truth
+                        let status_color = if self.state.status_msg.contains("Connected")
+                            || self.state.status_msg.contains("Online")
+                            || self.state.status_msg.contains("Ready")
+                        {
+                            ui::theme::SUCCESS
+                        } else if self.state.status_msg.contains("Error")
+                            || self.state.status_msg.contains("Fail")
+                        {
+                            ui::theme::DANGER
+                        } else {
+                            ui::theme::WARNING
+                        };
+                        ui.label(
+                            egui::RichText::new(compact_status_text(&self.state.status_msg))
+                                .color(status_color)
+                                .strong()
+                                .size(ui::theme::FONT_BODY),
+                        );
+                        ui::theme::status_dot(ui, status_color, ui::theme::FONT_BODY);
                     });
                 });
             });
@@ -813,67 +557,170 @@ impl eframe::App for ForexApp {
             self.trading_session.disconnect(&mut self.state);
         }
 
-        // ── Left navigation sidebar ──────────────────────────────────────
-        // Groups the 15 dock tabs into 3 collapsible sections
-        // (Trading / AI Engine / System) so the operator does not have
-        // to scan a flat egui_dock tab strip mid-session. Clicking a
-        // tab name routes through `WorkspaceState::focus_tab` and reuses
-        // the existing dock layout — the dock area still owns the panes.
+        // ─── Left sidebar — primary navigation ───────────────────────
+        // Single source of truth for "where am I" — no more competing
+        // dropdowns in the top bar. Active tab gets a left accent
+        // stripe so the eye locks on it instantly.
         let mut sidebar_target: Option<WorkspaceTab> = None;
+        let active_tab = self.workspace.active_tab();
         egui::SidePanel::left("workspace_nav")
-            .frame(ui::theme::central_panel_frame(ctx.style().as_ref()))
+            .frame(ui::theme::sidebar_frame(ctx.style().as_ref()))
             .resizable(true)
-            .default_width(190.0)
-            .min_width(160.0)
-            .max_width(260.0)
+            .default_width(ui::theme::SIDEBAR_WIDTH_DEFAULT)
+            .min_width(ui::theme::SIDEBAR_WIDTH_MIN)
+            .max_width(ui::theme::SIDEBAR_WIDTH_MAX)
             .show(ctx, |ui| {
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new("NAVIGATE")
-                        .size(11.0)
-                        .strong()
-                        .color(ui::theme::TEXT_MUTED),
-                );
-                ui.add_space(6.0);
-                ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for group in WorkspaceGroup::ordered() {
-                        ui.add_space(6.0);
-                        egui::CollapsingHeader::new(
-                            egui::RichText::new(group.title())
-                                .size(13.0)
-                                .strong()
-                                .color(ui::theme::ACCENT),
-                        )
-                        .id_salt(group.title())
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(group.description())
-                                    .size(10.0)
-                                    .italics()
-                                    .color(ui::theme::TEXT_MUTED),
-                            );
-                            ui.add_space(2.0);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let mut first_group = true;
+                        for group in WorkspaceGroup::ordered() {
+                            if !first_group {
+                                ui.add_space(ui::theme::SPACE_LG);
+                            }
+                            first_group = false;
+                            ui::theme::section_label(ui, group.title());
+                            ui.add_space(ui::theme::SPACE_XS);
                             for tab in WorkspaceTab::all_for_group(*group) {
-                                let label = egui::RichText::new(tab.title())
-                                    .size(12.0)
-                                    .color(ui::theme::TEXT_PRIMARY);
-                                if ui
-                                    .add(egui::Button::new(label).frame(false))
-                                    .on_hover_text(tab.description())
-                                    .clicked()
+                                if ui::theme::nav_item(
+                                    ui,
+                                    tab.title(),
+                                    tab.description(),
+                                    active_tab == Some(*tab),
+                                )
+                                .clicked()
                                 {
                                     sidebar_target = Some(*tab);
                                 }
                             }
-                        });
-                    }
-                });
+                        }
+                    });
             });
         if let Some(tab) = sidebar_target {
             self.workspace.focus_tab(tab);
         }
+
+        // ─── Bottom action bar — engine + broker controls ────────────
+        // The "what's running right now" strip. Discovery / Training /
+        // Broker each get a status dot + label + a single Start/Stop
+        // (or Connect/Disconnect) button. One canonical place; no menus.
+        egui::TopBottomPanel::bottom("action_bar")
+            .frame(ui::theme::action_bar_frame(ctx.style().as_ref()))
+            .exact_height(ui::theme::ACTIONBAR_HEIGHT)
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    let (disc_btn_kind, disc_btn_label, disc_hover) = if discovery_running {
+                        (
+                            ui::theme::ButtonKind::Danger,
+                            "Stop",
+                            "Cancel active discovery run",
+                        )
+                    } else {
+                        (
+                            ui::theme::ButtonKind::Success,
+                            "Start",
+                            "Start discovery with current form settings",
+                        )
+                    };
+                    render_engine_control(
+                        ui,
+                        "Discovery",
+                        &discovery_label,
+                        discovery_dot,
+                        disc_btn_label,
+                        disc_btn_kind,
+                        disc_hover,
+                        &mut start_discovery,
+                        &mut stop_discovery,
+                        discovery_running,
+                    );
+
+                    ui.add_space(ui::theme::SPACE_MD);
+                    ui.add(egui::Separator::default().vertical().spacing(ui::theme::SPACE_SM));
+                    ui.add_space(ui::theme::SPACE_MD);
+
+                    let (train_btn_kind, train_btn_label, train_hover) = if training_running {
+                        (
+                            ui::theme::ButtonKind::Danger,
+                            "Stop",
+                            "Cancel active training run",
+                        )
+                    } else {
+                        (
+                            ui::theme::ButtonKind::Success,
+                            "Start",
+                            "Start training with current symbol & TF",
+                        )
+                    };
+                    render_engine_control(
+                        ui,
+                        "Training",
+                        &training_label,
+                        training_dot,
+                        train_btn_label,
+                        train_btn_kind,
+                        train_hover,
+                        &mut start_training,
+                        &mut stop_training,
+                        training_running,
+                    );
+
+                    ui.add_space(ui::theme::SPACE_MD);
+                    ui.add(egui::Separator::default().vertical().spacing(ui::theme::SPACE_SM));
+                    ui.add_space(ui::theme::SPACE_MD);
+
+                    // Broker control
+                    let broker_dot_color = if broker_connected {
+                        ui::theme::SUCCESS
+                    } else {
+                        ui::theme::TEXT_FAINT
+                    };
+                    let broker_status_label = if broker_connected {
+                        "Connected".to_string()
+                    } else {
+                        "Offline".to_string()
+                    };
+                    let (broker_btn_kind, broker_btn_label, broker_hover) = if broker_connected {
+                        (
+                            ui::theme::ButtonKind::Danger,
+                            "Disconnect",
+                            "Disconnect from broker (cTrader / DXTrade)",
+                        )
+                    } else {
+                        (
+                            ui::theme::ButtonKind::Success,
+                            "Connect",
+                            "Connect to broker using saved credentials",
+                        )
+                    };
+                    render_engine_control(
+                        ui,
+                        "Broker",
+                        &broker_status_label,
+                        broker_dot_color,
+                        broker_btn_label,
+                        broker_btn_kind,
+                        broker_hover,
+                        &mut connect_broker,
+                        &mut disconnect_broker,
+                        broker_connected,
+                    );
+
+                    // Right side: helpful hint when nothing is running.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if !discovery_running && !training_running && !broker_connected {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Connect broker → Start Discovery → Train → Trade",
+                                )
+                                .size(ui::theme::FONT_CAPTION)
+                                .italics()
+                                .color(ui::theme::TEXT_FAINT),
+                            );
+                        }
+                    });
+                });
+            });
 
         egui::CentralPanel::default()
             .frame(ui::theme::central_panel_frame(ctx.style().as_ref()))
@@ -895,6 +742,49 @@ impl eframe::App for ForexApp {
             ctx.request_repaint();
         }
     }
+}
+
+/// Render one cell of the bottom action bar — status dot + name +
+/// substate label + a single Start/Stop (or Connect/Disconnect) button.
+#[allow(clippy::too_many_arguments)]
+fn render_engine_control(
+    ui: &mut egui::Ui,
+    name: &str,
+    substate: &str,
+    dot_color: egui::Color32,
+    button_label: &str,
+    button_kind: ui::theme::ButtonKind,
+    hover_text: &str,
+    start_intent: &mut bool,
+    stop_intent: &mut bool,
+    running: bool,
+) {
+    ui.horizontal(|ui| {
+        ui::theme::status_dot(ui, dot_color, ui::theme::FONT_BODY);
+        ui.add_space(ui::theme::SPACE_XS);
+        ui.label(
+            egui::RichText::new(name)
+                .size(ui::theme::FONT_BODY)
+                .strong()
+                .color(ui::theme::TEXT_PRIMARY),
+        );
+        ui.label(
+            egui::RichText::new(substate)
+                .size(ui::theme::FONT_CAPTION)
+                .color(ui::theme::TEXT_MUTED),
+        );
+        ui.add_space(ui::theme::SPACE_SM);
+        if ui::theme::small_button(ui, button_label, button_kind)
+            .on_hover_text(hover_text)
+            .clicked()
+        {
+            if running {
+                *stop_intent = true;
+            } else {
+                *start_intent = true;
+            }
+        }
+    });
 }
 
 pub(crate) fn app_record(
