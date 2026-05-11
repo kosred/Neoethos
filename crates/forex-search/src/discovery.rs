@@ -285,8 +285,40 @@ impl DiscoveryConfig {
     /// Opt-in helper that resolves legacy `FOREX_BOT_*` discovery env vars
     /// into the typed `runtime_overrides` field. Production callers should
     /// prefer setting `runtime_overrides` explicitly.
+    ///
+    /// Also applies the `FOREX_BOT_DISCOVERY_PERMISSIVE=1` and
+    /// `FOREX_BOT_DISCOVERY_MIN_TRADES_PER_DAY=<f64>` overrides used by
+    /// the autonomous discovery runs that need to generate large pools of
+    /// strategies for downstream model training rather than prop-firm
+    /// grade survivors.
     pub fn with_env_runtime_overrides(mut self) -> Self {
         self.runtime_overrides = DiscoveryRuntimeOverrides::from_env();
+        if let Some(value) = std::env::var("FOREX_BOT_DISCOVERY_MIN_TRADES_PER_DAY")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        {
+            self.min_trades_per_day = value;
+        }
+        let permissive = matches!(
+            std::env::var("FOREX_BOT_DISCOVERY_PERMISSIVE")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase()),
+            Some(value) if matches!(value.as_str(), "1" | "true" | "on" | "yes")
+        );
+        if permissive {
+            self.filtering.max_dd = 0.50;
+            self.filtering.min_profit = 0.0;
+            self.filtering.min_trades = 1.0;
+            self.filtering.min_sharpe = -10.0;
+            self.filtering.min_win_rate = 0.0;
+            self.filtering.min_profit_factor = 0.0;
+            self.filtering.anomaly_guard = false;
+            self.cpcv_min_phi = 0.0;
+            if std::env::var("FOREX_BOT_DISCOVERY_MIN_TRADES_PER_DAY").is_err() {
+                self.min_trades_per_day = 0.02;
+            }
+        }
         self
     }
 
