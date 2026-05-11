@@ -300,31 +300,29 @@ impl DiscoveryConfig {
         }
     }
 
-    /// Opt-in helper that resolves legacy `FOREX_BOT_*` discovery env vars
-    /// into the typed `runtime_overrides` field. Production callers should
-    /// prefer setting `runtime_overrides` explicitly.
+    /// Resolve runtime knobs. The system prefers self-tuning over
+    /// hand-rolled env vars: if the caller does not opt out via
+    /// `FOREX_BOT_DISCOVERY_MODE=strict`, discovery enters its
+    /// "smart prop-firm" mode automatically — permissive filters,
+    /// FTMO-rule scoring on N random 60-day windows, ranking-based
+    /// portfolio selection (no thresholds to tune), window count
+    /// auto-derived from dataset length.
     ///
-    /// Also applies the `FOREX_BOT_DISCOVERY_PERMISSIVE=1` and
-    /// `FOREX_BOT_DISCOVERY_MIN_TRADES_PER_DAY=<f64>` overrides used by
-    /// the autonomous discovery runs that need to generate large pools of
-    /// strategies for downstream model training rather than prop-firm
-    /// grade survivors.
+    /// Env vars are still honored as overrides for the rare cases
+    /// where the operator wants to lock in a specific value, but the
+    /// happy-path call needs none of them.
     pub fn with_env_runtime_overrides(mut self) -> Self {
         self.runtime_overrides = DiscoveryRuntimeOverrides::from_env();
-        if let Some(value) = std::env::var("FOREX_BOT_DISCOVERY_MIN_TRADES_PER_DAY")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-        {
-            self.min_trades_per_day = value;
+
+        let mode = resolve_discovery_mode();
+
+        if let Some(value) = read_env_f64("FOREX_BOT_DISCOVERY_MIN_TRADES_PER_DAY") {
+            self.min_trades_per_day = value.max(0.0);
         }
-        let permissive = matches!(
-            std::env::var("FOREX_BOT_DISCOVERY_PERMISSIVE")
-                .ok()
-                .map(|v| v.trim().to_ascii_lowercase()),
-            Some(value) if matches!(value.as_str(), "1" | "true" | "on" | "yes")
-        );
-        if permissive {
+
+        if matches!(mode, DiscoveryMode::PropFirm) {
+            // Permissive filter floor — the GA's output is judged by the
+            // prop-firm window-pass score, not by these legacy thresholds.
             self.filtering.max_dd = 0.50;
             self.filtering.min_profit = 0.0;
             self.filtering.min_trades = 1.0;
@@ -336,45 +334,53 @@ impl DiscoveryConfig {
             if std::env::var("FOREX_BOT_DISCOVERY_MIN_TRADES_PER_DAY").is_err() {
                 self.min_trades_per_day = 0.02;
             }
-        }
-        let prop_firm_enabled = matches!(
-            std::env::var("FOREX_BOT_DISCOVERY_PROP_FIRM_GATE")
-                .ok()
-                .map(|v| v.trim().to_ascii_lowercase()),
-            Some(value) if matches!(value.as_str(), "1" | "true" | "on" | "yes")
-        );
-        if prop_firm_enabled {
-            let mut rules = PropFirmRiskRules::default();
-            if let Some(v) = read_env_f64("FOREX_BOT_DISCOVERY_PROP_FIRM_MAX_DAILY_LOSS_PCT") {
-                rules.max_daily_loss_pct = v;
-            }
-            if let Some(v) = read_env_f64("FOREX_BOT_DISCOVERY_PROP_FIRM_MAX_DD_PCT") {
-                rules.max_overall_drawdown_pct = v;
-            }
-            if let Some(v) = read_env_f64("FOREX_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT") {
-                rules.min_profit_target_pct = v;
-                rules.require_profit_target = v > 0.0;
-            }
-            if let Some(v) = read_env_usize("FOREX_BOT_DISCOVERY_PROP_FIRM_MIN_TRADING_DAYS") {
-                rules.min_trading_days = v;
-            }
-            let n_windows = read_env_usize("FOREX_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS")
-                .unwrap_or(50)
-                .max(1);
-            let window_days = read_env_usize("FOREX_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS")
-                .unwrap_or(30)
-                .max(1);
-            let pass_rate = read_env_f64("FOREX_BOT_DISCOVERY_PROP_FIRM_PASS_RATE")
-                .map(|v| v.clamp(0.0, 1.0))
-                .unwrap_or(0.6);
-            self.prop_firm_gate = Some(PropFirmGateOverrides {
-                rules,
-                n_windows,
-                window_days,
-                pass_rate,
-            });
+            self.prop_firm_gate = Some(self.derive_prop_firm_gate());
         }
         self
+    }
+
+    fn derive_prop_firm_gate(&self) -> PropFirmGateOverrides {
+        // FTMO baseline; operator can override individual fields by
+        // setting the matching env var, but the defaults are the
+        // standard challenge rules so the happy-path call needs nothing.
+        let mut rules = PropFirmRiskRules::default();
+        rules.min_profit_target_pct = 0.10;
+        rules.require_profit_target = true;
+        if let Some(v) = read_env_f64("FOREX_BOT_DISCOVERY_PROP_FIRM_MAX_DAILY_LOSS_PCT") {
+            rules.max_daily_loss_pct = v;
+        }
+        if let Some(v) = read_env_f64("FOREX_BOT_DISCOVERY_PROP_FIRM_MAX_DD_PCT") {
+            rules.max_overall_drawdown_pct = v;
+        }
+        if let Some(v) = read_env_f64("FOREX_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT") {
+            rules.min_profit_target_pct = v;
+            rules.require_profit_target = v > 0.0;
+        }
+        if let Some(v) = read_env_usize("FOREX_BOT_DISCOVERY_PROP_FIRM_MIN_TRADING_DAYS") {
+            rules.min_trading_days = v;
+        }
+        // 60 days = the longest standard prop-firm phase (FTMO Phase 2);
+        // a strategy that passes a 60-day window with a 10% target also
+        // passes the easier Phase 1 rules at 30 days, so a single
+        // measurement covers both.
+        let window_days = read_env_usize("FOREX_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS")
+            .unwrap_or(60)
+            .max(1);
+        // n_windows is auto-tuned later from dataset length when this
+        // override stays at its sentinel value (0).
+        let n_windows = read_env_usize("FOREX_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS").unwrap_or(0);
+        // No hard pass-rate threshold by default — the gate ranks
+        // candidates and lets the corr-diversification step pick the
+        // top survivors. A non-zero env value still acts as a floor.
+        let pass_rate = read_env_f64("FOREX_BOT_DISCOVERY_PROP_FIRM_PASS_RATE")
+            .map(|v| v.clamp(0.0, 1.0))
+            .unwrap_or(0.0);
+        PropFirmGateOverrides {
+            rules,
+            n_windows,
+            window_days,
+            pass_rate,
+        }
     }
 
     pub fn evaluation_config(&self, price_hint: Option<f64>) -> EvaluationConfig {
@@ -1615,6 +1621,59 @@ fn read_env_usize(name: &str) -> Option<usize> {
         .and_then(|v| v.trim().parse::<usize>().ok())
 }
 
+/// Three discovery modes. The default is `PropFirm` — every other path
+/// would have to be explicitly opted into via `FOREX_BOT_DISCOVERY_MODE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoveryMode {
+    /// Production-grade strict pipeline (legacy walkforward + CPCV +
+    /// MC-perturbation gates). Use only when looking for unicorn
+    /// strategies that survive every consistency test in the codebase.
+    Strict,
+    /// Self-tuning prop-firm passing mode. Default. Permissive filter
+    /// floors + FTMO window-pass scoring + ranking-based portfolio
+    /// selection. Designed to deliver portfolios that can pass an
+    /// actual prop-firm challenge in 60 days per phase.
+    PropFirm,
+}
+
+fn resolve_discovery_mode() -> DiscoveryMode {
+    let value = std::env::var("FOREX_BOT_DISCOVERY_MODE")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase());
+    match value.as_deref() {
+        Some("strict") | Some("legacy") => DiscoveryMode::Strict,
+        // Back-compat: the older opt-in env var still selects prop-firm.
+        _ if std::env::var("FOREX_BOT_DISCOVERY_PERMISSIVE")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| matches!(v.as_str(), "0" | "false" | "off" | "no"))
+            .is_some() =>
+        {
+            DiscoveryMode::Strict
+        }
+        _ => DiscoveryMode::PropFirm,
+    }
+}
+
+/// Pick a window count that scales with how many full window-spans the
+/// dataset can offer. Lots of history → more samples; bare minimum data
+/// → at least a few samples so the score is meaningful.
+fn auto_tune_n_windows(timestamps: &[i64], window_days: usize) -> usize {
+    if timestamps.is_empty() || window_days == 0 {
+        return 50;
+    }
+    let span_ms = (timestamps[timestamps.len() - 1] - timestamps[0]).max(0);
+    let window_ms = (window_days as i64) * 86_400_000;
+    if window_ms == 0 {
+        return 50;
+    }
+    let full_spans = (span_ms / window_ms).max(0) as usize;
+    // Sample ~3× as many windows as the dataset contains non-overlapping
+    // spans (overlap is fine — we want resolution along the timeline)
+    // but cap so we don't spend the whole budget here.
+    (full_spans * 3).clamp(20, 200)
+}
+
 /// Sample roughly evenly-spaced 30-day (configurable) windows from the
 /// dataset history; for each window simulate trades and check the strategy
 /// against `compute_prop_firm_risk_summary`. Return the fraction of
@@ -1984,19 +2043,24 @@ where
         signals_map = screened_signals;
     }
 
-    // Prop-firm window-pass gate (FOREX_BOT_DISCOVERY_PROP_FIRM_GATE=1).
-    // For each surviving candidate, simulate trades on N evenly-spaced
-    // 30-day windows from history and require the strategy to pass FTMO
-    // rules on at least `pass_rate` of them. This is the canonical
-    // prop-firm passing criterion — a much more directly relevant
-    // measure than the older "every walkforward split must be
-    // profitable" gate.
+    // Prop-firm window-pass gate. Default behavior in `PropFirm` mode.
+    // For each surviving candidate, simulate trades on N 60-day windows
+    // sampled across history and check FTMO rules on each. Candidates
+    // are then SORTED by pass-rate descending — no hard threshold to
+    // tune. The downstream corr-diversification step takes the best
+    // prop-firm-grade candidates first. A non-zero `pf.pass_rate` env
+    // override still acts as a hard floor for operators who want it.
     let mut prop_firm_pass_rates: Vec<f64> = Vec::new();
-    if let Some(pf) = config.prop_firm_gate.clone() {
+    if let Some(mut pf) = config.prop_firm_gate.clone() {
+        // Auto-tune the window count if the operator left it at the
+        // sentinel value (0). Scales with available history.
+        if pf.n_windows == 0 {
+            pf.n_windows = auto_tune_n_windows(&features.timestamps, pf.window_days);
+        }
         let candidates_in: Vec<((usize, Gene), Vec<i8>)> =
             filtered.into_iter().zip(signals_map.into_iter()).collect();
         let timestamps_owned = features.timestamps.clone();
-        let scored: Vec<(((usize, Gene), Vec<i8>), f64, usize)> = candidates_in
+        let mut scored: Vec<(((usize, Gene), Vec<i8>), f64, usize)> = candidates_in
             .into_par_iter()
             .map(|(pair, sig)| {
                 let (rate, counted) = compute_prop_firm_pass_rate(
@@ -2009,8 +2073,22 @@ where
                 );
                 ((pair, sig), rate, counted)
             })
+            // Floor: candidate must have actually been measured AND, if
+            // the operator set a non-zero pass_rate floor, meet it.
             .filter(|(_, rate, counted)| *counted > 0 && *rate >= pf.pass_rate)
             .collect();
+        // Sort by pass-rate descending; ties broken by gene fitness.
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    b.0.0
+                        .1
+                        .fitness
+                        .partial_cmp(&a.0.0.1.fitness)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
         let mut next_filtered: Vec<(usize, Gene)> = Vec::with_capacity(scored.len());
         let mut next_signals: Vec<Vec<i8>> = Vec::with_capacity(scored.len());
         for ((pair, sig), rate, _) in scored {
@@ -2018,12 +2096,16 @@ where
             next_signals.push(sig);
             prop_firm_pass_rates.push(rate);
         }
+        let best_rate = prop_firm_pass_rates.first().copied().unwrap_or(0.0);
         tracing::info!(
             target: "forex_search::prop_firm",
             survivors = next_filtered.len(),
-            pass_rate_threshold = pf.pass_rate,
+            best_pass_rate = best_rate,
             window_days = pf.window_days,
             n_windows = pf.n_windows,
+            profit_target_pct = pf.rules.min_profit_target_pct,
+            max_daily_loss_pct = pf.rules.max_daily_loss_pct,
+            max_overall_drawdown_pct = pf.rules.max_overall_drawdown_pct,
             "prop-firm window-pass gate applied"
         );
         filtered = next_filtered;
@@ -2919,10 +3001,13 @@ mod tests {
 
     #[test]
     fn prop_firm_gate_env_overrides_populate_discovery_config() {
-        // SAFETY: tests that read process-wide env may race; this group
-        // is gated through serial_test or set/unset is balanced here.
+        // SAFETY: tests that read process-wide env may race. This group
+        // sets and unsets its own keys; cargo test runs lib tests in a
+        // single process so we keep the surface narrow and balanced.
+        // We also clear the mode flag at the start to avoid bleed from
+        // sibling tests.
         unsafe {
-            std::env::set_var("FOREX_BOT_DISCOVERY_PROP_FIRM_GATE", "1");
+            std::env::remove_var("FOREX_BOT_DISCOVERY_MODE");
             std::env::set_var("FOREX_BOT_DISCOVERY_PROP_FIRM_PASS_RATE", "0.42");
             std::env::set_var("FOREX_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS", "17");
             std::env::set_var("FOREX_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS", "21");
@@ -2933,7 +3018,6 @@ mod tests {
         }
         let cfg = DiscoveryConfig::default().with_env_runtime_overrides();
         unsafe {
-            std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_GATE");
             std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_PASS_RATE");
             std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS");
             std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS");
@@ -2941,12 +3025,80 @@ mod tests {
         }
         let pf = cfg
             .prop_firm_gate
-            .expect("env-enabled gate should populate prop_firm_gate");
+            .expect("default mode is PropFirm — gate must be auto-enabled");
         assert_eq!(pf.n_windows, 17);
         assert_eq!(pf.window_days, 21);
         assert!((pf.pass_rate - 0.42).abs() < 1e-9);
         assert!(pf.rules.require_profit_target);
         assert!((pf.rules.min_profit_target_pct - 0.08).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prop_firm_gate_auto_enables_with_no_env_at_all() {
+        // The whole point: zero env vars should still produce a smart,
+        // ready-to-run prop-firm config.
+        unsafe {
+            std::env::remove_var("FOREX_BOT_DISCOVERY_MODE");
+            std::env::remove_var("FOREX_BOT_DISCOVERY_PERMISSIVE");
+            std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_PASS_RATE");
+            std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS");
+            std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS");
+            std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT");
+            std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_MAX_DAILY_LOSS_PCT");
+            std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_MAX_DD_PCT");
+            std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_MIN_TRADING_DAYS");
+        }
+        let cfg = DiscoveryConfig::default().with_env_runtime_overrides();
+        let pf = cfg.prop_firm_gate.expect("default = PropFirm mode");
+        // FTMO baseline: 5%/10%/10%/5 days, 60-day window
+        assert_eq!(pf.window_days, 60);
+        assert_eq!(pf.n_windows, 0); // sentinel — auto-tuned at runtime
+        assert!((pf.pass_rate - 0.0).abs() < 1e-9); // ranking-only by default
+        assert!((pf.rules.max_daily_loss_pct - 0.05).abs() < 1e-9);
+        assert!((pf.rules.max_overall_drawdown_pct - 0.10).abs() < 1e-9);
+        assert!((pf.rules.min_profit_target_pct - 0.10).abs() < 1e-9);
+        assert!(pf.rules.require_profit_target);
+        // Permissive filter floors should be applied automatically.
+        assert!(!cfg.filtering.anomaly_guard);
+        assert!(cfg.filtering.min_sharpe < 0.0);
+    }
+
+    #[test]
+    fn prop_firm_gate_disabled_in_strict_mode() {
+        unsafe {
+            std::env::set_var("FOREX_BOT_DISCOVERY_MODE", "strict");
+        }
+        let cfg = DiscoveryConfig::default().with_env_runtime_overrides();
+        unsafe {
+            std::env::remove_var("FOREX_BOT_DISCOVERY_MODE");
+        }
+        assert!(
+            cfg.prop_firm_gate.is_none(),
+            "strict mode must NOT auto-enable the prop-firm gate"
+        );
+        // Production filter floors stay intact.
+        assert!(cfg.filtering.anomaly_guard);
+    }
+
+    #[test]
+    fn auto_tune_n_windows_scales_with_history() {
+        // Empty / degenerate input falls back to a usable default.
+        assert_eq!(auto_tune_n_windows(&[], 60), 50);
+        assert_eq!(auto_tune_n_windows(&[1, 2, 3], 0), 50);
+
+        // A two-year history with 60-day windows: 730/60 ≈ 12 spans → 36
+        // windows, but the floor pushes us to 20 minimum.
+        let day_ms: i64 = 86_400_000;
+        let two_years: Vec<i64> = (0..730).map(|d| d * day_ms).collect();
+        assert_eq!(auto_tune_n_windows(&two_years, 60), 36);
+
+        // A five-year history → 30 spans × 3 = 90 windows.
+        let five_years: Vec<i64> = (0..1_825).map(|d| d * day_ms).collect();
+        assert_eq!(auto_tune_n_windows(&five_years, 60), 90);
+
+        // A twenty-year history → would compute to 360 but caps at 200.
+        let twenty_years: Vec<i64> = (0..7_300).map(|d| d * day_ms).collect();
+        assert_eq!(auto_tune_n_windows(&twenty_years, 60), 200);
     }
 
     #[test]
