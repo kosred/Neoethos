@@ -48,11 +48,13 @@ fn class_probability(
     let mut logit0 = bias[0];
     let mut logit1 = bias[1];
     let mut logit2 = bias[2];
-    let row_base = row * cols;
-    let mut col = 0u32;
-    while col < cols {
+    let row_us = row as usize;
+    let cols_us = cols as usize;
+    let row_base = row_us * cols_us;
+    let mut col = 0usize;
+    while col < cols_us {
         let feature = features[row_base + col];
-        let weight_base = col * CLASS_COUNT as u32;
+        let weight_base = col * CLASS_COUNT;
         logit0 += feature * weights[weight_base];
         logit1 += feature * weights[weight_base + 1];
         logit2 += feature * weights[weight_base + 2];
@@ -70,13 +72,13 @@ fn class_probability(
     let e1 = (logit1 - max_logit).exp();
     let e2 = (logit2 - max_logit).exp();
     let denom = e0 + e1 + e2;
+    let mut out = e2 / denom;
     if class_idx == 0 {
-        e0 / denom
+        out = e0 / denom;
     } else if class_idx == 1 {
-        e1 / denom
-    } else {
-        e2 / denom
+        out = e1 / denom;
     }
+    out
 }
 
 #[cube(launch)]
@@ -92,29 +94,36 @@ fn softmax_gradient_kernel(
     alpha: f32,
     l1_ratio: f32,
 ) {
-    let weight_len = cols * CLASS_COUNT as u32;
-    let total_len = weight_len + CLASS_COUNT as u32;
+    let cols_us = cols as usize;
+    let rows_us = rows as usize;
+    let weight_len = cols_us * CLASS_COUNT;
+    let total_len = weight_len + CLASS_COUNT;
     if ABSOLUTE_POS < total_len {
         let pos = ABSOLUTE_POS;
         let is_bias = pos >= weight_len;
-        let class_idx = if is_bias {
-            pos - weight_len
-        } else {
-            pos % CLASS_COUNT as u32
-        };
-        let feature_idx = if is_bias { 0 } else { pos / CLASS_COUNT as u32 };
+        let mut class_idx: usize = pos % CLASS_COUNT;
+        if is_bias {
+            class_idx = pos - weight_len;
+        }
+        let mut feature_idx: usize = pos / CLASS_COUNT;
+        if is_bias {
+            feature_idx = 0;
+        }
 
-        let mut grad = 0.0f32;
-        let mut row = 0u32;
-        while row < rows {
-            let probability = class_probability(features, weights, bias, row, cols, class_idx);
+        let mut grad: f32 = 0.0;
+        let mut row = 0usize;
+        while row < rows_us {
+            let probability = class_probability(features, weights, bias, row as u32, cols, class_idx as u32);
             let label = labels[row];
-            let target = if label == class_idx as i32 { 1.0 } else { 0.0 };
+            let mut target: f32 = 0.0;
+            if label == class_idx as i32 {
+                target = 1.0;
+            }
             let error = probability - target;
             if is_bias {
                 grad += error;
             } else {
-                grad += features[row * cols + feature_idx] * error;
+                grad += features[row * cols_us + feature_idx] * error;
             }
             row += 1;
         }
@@ -140,7 +149,8 @@ fn softmax_apply_kernel(
     learning_rate: f32,
     weight_len: u32,
 ) {
-    let total_len = weight_len + CLASS_COUNT as u32;
+    let weight_len = weight_len as usize;
+    let total_len = weight_len + CLASS_COUNT;
     if ABSOLUTE_POS < total_len {
         let pos = ABSOLUTE_POS;
         if pos < weight_len {
@@ -165,14 +175,15 @@ fn softmax_loss_kernel(
     if ABSOLUTE_POS == 0 {
         if rows == 0 {
             loss_out[0] = 0.0;
-            return;
+            terminate!();
         }
 
-        let mut loss = 0.0f32;
-        let mut row = 0u32;
-        while row < rows {
+        let mut loss: f32 = 0.0;
+        let rows_us = rows as usize;
+        let mut row = 0usize;
+        while row < rows_us {
             let label = labels[row] as u32;
-            let probability = class_probability(features, weights, bias, row, cols, label);
+            let probability = class_probability(features, weights, bias, row as u32, cols, label);
             loss -= clamp_probability(probability).ln();
             row += 1;
         }
@@ -189,12 +200,12 @@ fn softmax_predict_kernel(
     rows: u32,
     cols: u32,
 ) {
-    if ABSOLUTE_POS < rows {
+    if ABSOLUTE_POS < rows as usize {
         let row = ABSOLUTE_POS;
-        let base = row * CLASS_COUNT as u32;
-        probabilities_out[base] = class_probability(features, weights, bias, row, cols, 0);
-        probabilities_out[base + 1] = class_probability(features, weights, bias, row, cols, 1);
-        probabilities_out[base + 2] = class_probability(features, weights, bias, row, cols, 2);
+        let base = row * CLASS_COUNT;
+        probabilities_out[base] = class_probability(features, weights, bias, row as u32, cols, 0);
+        probabilities_out[base + 1] = class_probability(features, weights, bias, row as u32, cols, 1);
+        probabilities_out[base + 2] = class_probability(features, weights, bias, row as u32, cols, 2);
     }
 }
 
