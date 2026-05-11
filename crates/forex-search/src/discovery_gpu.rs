@@ -634,7 +634,7 @@ fn evaluate_population_multi_gpu(
                 Device::Cpu,
                 segments,
             )?;
-            for (idx, value) in Vec::<f32>::from(&fitness).into_iter().enumerate() {
+            for (idx, value) in Vec::<f32>::try_from(&fitness).unwrap_or_default().into_iter().enumerate() {
                 results[offset + idx] = value;
             }
             offset = end;
@@ -644,8 +644,8 @@ fn evaluate_population_multi_gpu(
 
     // Keep static cubes resident per GPU to avoid repeated host->device copies per chunk.
     let mut per_device_cubes: Vec<(Device, Tensor, Tensor)> = Vec::with_capacity(device_ids.len());
-    for &device_id in device_ids {
-        let device = Device::Cuda(device_id);
+    for &device_id_i64 in device_ids {
+        let device = Device::Cuda(device_id_i64 as usize);
         let data_dev = data_cube.to_device(device).to_kind(Kind::Float);
         let ohlc_dev = ohlc_cube.to_device(device).to_kind(Kind::Float);
         per_device_cubes.push((device, data_dev, ohlc_dev));
@@ -673,7 +673,7 @@ fn evaluate_population_multi_gpu(
 
         let mut idx = offset;
         for fit in per_device {
-            let vec: Vec<f32> = Vec::<f32>::from(&fit);
+            let vec: Vec<f32> = Vec::<f32>::try_from(&fit).unwrap_or_default();
             for v in vec {
                 results[idx] = v;
                 idx += 1;
@@ -737,12 +737,15 @@ fn evaluate_population_gpu(
     let logic_weights = genomes.narrow(1, tf_count, n_features);
     let thresholds = genomes
         .narrow(1, tf_count + n_features, 2)
-        .clamp(-config.threshold_clip, config.threshold_clip)
-        * (config.threshold_scale as f32);
-    let buy_th =
-        thresholds.select(1, 0).maximum(&thresholds.select(1, 1)) + config.threshold_margin as f32;
-    let sell_th =
-        thresholds.select(1, 0).minimum(&thresholds.select(1, 1)) - config.threshold_margin as f32;
+        .clamp(
+            -config.threshold_clip as f64,
+            config.threshold_clip as f64,
+        )
+        * (config.threshold_scale as f64);
+    let buy_th = thresholds.select(1, 0).maximum(&thresholds.select(1, 1))
+        + config.threshold_margin as f64;
+    let sell_th = thresholds.select(1, 0).minimum(&thresholds.select(1, 1))
+        - config.threshold_margin as f64;
 
     // Segments are pre-built once with a deterministic RNG by the caller — every
     // chunk and every device evaluates the SAME windows. This is required for
@@ -762,55 +765,55 @@ fn evaluate_population_gpu(
         for t in 0..tf_count {
             let tf_data = data_slice.get(t);
             let tf_sig = tf_data.matmul(&logic_weights.transpose(0, 1));
-            let std = tf_sig.std_dim(&[0], false, Kind::Float) + 1e-6;
+            let std = tf_sig.std_dim(0i64, false, false) + 1e-6;
             let tf_sig = tf_sig / std.unsqueeze(0);
             let weight = tf_weights.select(1, t).unsqueeze(1);
             all_signals += tf_sig.transpose(0, 1) * weight;
         }
         all_signals = all_signals.tanh();
 
-        let actions = all_signals.gt(&buy_th.unsqueeze(1)).to_kind(Kind::Float)
-            - all_signals.lt(&sell_th.unsqueeze(1)).to_kind(Kind::Float);
+        let actions = all_signals.gt_tensor(&buy_th.unsqueeze(1)).to_kind(Kind::Float)
+            - all_signals.lt_tensor(&sell_th.unsqueeze(1)).to_kind(Kind::Float);
 
         let open_p = ohlc_slice.get(0).select(1, 0);
         let close_p = ohlc_slice.get(0).select(1, 3);
         let open_next = open_p.narrow(0, 1, (len - 1) as i64);
         let close_next = close_p.narrow(0, 1, (len - 1) as i64);
-        let rets = (close_next - open_next) / open_next.clamp_min(1e-6);
+        let rets = (close_next - &open_next) / open_next.clamp_min(1e-6);
         let actions_slice = actions.narrow(1, 0, (len - 1) as i64);
         let batch_rets = &actions_slice * rets.unsqueeze(0) - actions_slice.abs() * 0.0002;
 
         let equity = batch_rets.cumsum(1, Kind::Float);
-        let peaks = equity.cummax(1, false).0;
+        let peaks = equity.cummax(1).0;
         let max_dd = (&peaks - &equity).max_dim(1, false).0;
 
-        let mean_ret = batch_rets.mean_dim(&[1], false, Kind::Float);
+        let mean_ret = batch_rets.mean_dim(1i64, false, Kind::Float);
         let downside = batch_rets.minimum(&Tensor::zeros([1], (Kind::Float, device)));
-        let downside_std = downside.pow(2).mean_dim(&[1], false, Kind::Float).sqrt() + 1e-9;
+        let downside_std = downside.pow_tensor_scalar(2).mean_dim(1i64, false, Kind::Float).sqrt() + 1e-9;
         let sortino = &mean_ret / downside_std;
 
         let steps = Tensor::arange((len - 1) as i64, (Kind::Float, device));
-        let equity_mean = equity.mean_dim(&[1], true, Kind::Float);
+        let equity_mean = equity.mean_dim(1i64, true, Kind::Float);
         let steps_mean = steps.mean(Kind::Float);
-        let num = ((&equity - &equity_mean) * (&steps - steps_mean)).sum_dim_intlist(
-            &[1],
+        let num = ((&equity - &equity_mean) * (&steps - &steps_mean)).sum_dim_intlist(
+            1i64,
             false,
             Kind::Float,
         );
         let den = ((&equity - &equity_mean)
-            .pow(2)
-            .sum_dim_intlist(&[1], false, Kind::Float)
-            * (&steps - steps_mean).pow(2).sum(Kind::Float))
+            .pow_tensor_scalar(2)
+            .sum_dim_intlist(1i64, false, Kind::Float)
+            * (&steps - &steps_mean).pow_tensor_scalar(2).sum(Kind::Float))
         .sqrt();
         let consistency = num / (den + 1e-9);
 
-        let trade_count = actions.abs().sum_dim_intlist(&[1], false, Kind::Float);
+        let trade_count = actions.abs().sum_dim_intlist(1i64, false, Kind::Float);
         let expected = (len as f64 / 1440.0) * config.min_trades_per_day;
-        let freq_penalty = (Tensor::from(expected as f32).to_device(device) - &trade_count)
+        let freq_penalty = (Tensor::from(expected).to_device(device) - &trade_count)
             .clamp_min(0.0)
-            * config.trade_penalty as f32;
+            * (config.trade_penalty as f64);
         let dd_penalty =
-            (max_dd - config.dd_limit as f32).clamp_min(0.0) * config.dd_penalty as f32;
+            (max_dd - config.dd_limit as f64).clamp_min(0.0) * (config.dd_penalty as f64);
 
         let mut window_fit = sortino * 10.0 + consistency * 5.0 - freq_penalty - dd_penalty;
         let profit_pct = equity.select(1, (len - 2) as i64);
@@ -819,15 +822,15 @@ fn evaluate_population_gpu(
         fitness_sum += &window_fit;
         min_fitness = min_fitness.minimum(&window_fit);
 
-        let pos = profit_pct.gt(0.0) * trade_count.ge(expected as f32);
+        let pos = profit_pct.gt(0.0) * trade_count.ge(expected);
         pos_windows += pos.to_kind(Kind::Float);
     }
 
     let avg_fit = fitness_sum / (segments_owned.len() as f64);
     let min_pos = (segments_owned.len() as f64 * config.pos_window_fraction).ceil();
-    let pos_penalty = (Tensor::from(min_pos as f32).to_device(device) - pos_windows).clamp_min(0.0)
-        * config.pos_penalty as f32;
-    let final_fit = avg_fit + min_fitness * config.robust_weight as f32 - pos_penalty;
+    let pos_penalty = (Tensor::from(min_pos).to_device(device) - pos_windows).clamp_min(0.0)
+        * (config.pos_penalty as f64);
+    let final_fit = avg_fit + min_fitness * (config.robust_weight as f64) - pos_penalty;
     Ok(final_fit.to_device(Device::Cpu))
 }
 

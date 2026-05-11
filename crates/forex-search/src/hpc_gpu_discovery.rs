@@ -653,7 +653,7 @@ fn evaluate_chunk_hpc(
         let close_p = ohlc_slice.get(0).select(1, 3);
         let open_next = open_p.narrow(0, 1, (len - 1) as i64);
         let close_next = close_p.narrow(0, 1, (len - 1) as i64);
-        let rets = (close_next - open_next) / open_next.clamp_min(1e-6);
+        let rets = (close_next - &open_next) / open_next.clamp_min(1e-6);
         let actions_slice = actions.narrow(1, 0, (len - 1) as i64);
         let batch_rets = &actions_slice * rets.unsqueeze(0) - actions_slice.abs() * 0.0002;
 
@@ -671,7 +671,7 @@ fn evaluate_chunk_hpc(
         let steps = Tensor::arange((len - 1) as i64, (Kind::Float, device));
         let equity_mean = equity.mean_dim(1i64, true, Kind::Float);
         let steps_mean = steps.mean(Kind::Float);
-        let num = ((&equity - &equity_mean) * (&steps - steps_mean)).sum_dim_intlist(
+        let num = ((&equity - &equity_mean) * (&steps - &steps_mean)).sum_dim_intlist(
             1i64,
             false,
             Kind::Float,
@@ -679,7 +679,7 @@ fn evaluate_chunk_hpc(
         let den = ((&equity - &equity_mean)
             .pow_tensor_scalar(2)
             .sum_dim_intlist(1i64, false, Kind::Float)
-            * (&steps - steps_mean).pow_tensor_scalar(2).sum(Kind::Float))
+            * (&steps - &steps_mean).pow_tensor_scalar(2).sum(Kind::Float))
         .sqrt();
         let consistency = num / (den + 1e-9);
 
