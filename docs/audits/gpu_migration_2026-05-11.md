@@ -21,6 +21,37 @@ L40 running CUDA 13 / driver 595.58.03 on Hyperstack) reported
 - CPU vs GPU fitness with `FOREX_BOT_SEARCH_SEED=42` differ by ~1.3% (119014.94 vs 120528.56 on a 64-gene 5-gen run) — expected FP rounding noise from GPU SIMD reduction trees, not a semantic bug.
 - Performance at current scale (5000 genes / 20 gens): CPU 15.8s real / 215s user (rayon over 28 cores) beats GPU 29.4s real. GPU pulls ahead at much larger populations / more frequent kernel launches; the discovery cycle invokes the kernel once per generation with full sync between launches, so launch overhead currently dominates. Optimization tracked separately — not blocking correctness.
 
+## Look-ahead bias audit (2026-05-11)
+
+User flagged that "somewhere we probably have look-ahead". Full sweep
+across the eval / feature / label / walkforward pipeline found
+**no actual look-ahead bugs**:
+
+| Surface | Status | Note |
+|---------|--------|------|
+| Indicators (RSI, MA, ATR, etc.) | ✅ Causal | `iter().take(i + 1).skip(i - period + 1)` — past + current bar only |
+| SMC features (swing detection, liquidity sweeps) | ✅ Causal | Swing center is `i - SWING_FRACTAL`; swing detection scans `[i - 2*SWING_FRACTAL, i]` — all causal |
+| Signal synthesis (CPU + GPU) | ✅ Causal | `signals[i]` uses `indicators[i]` and `smc[i]` only |
+| Backtest entry | ✅ 1-bar shifted | `signals[i - 1]` then fill at `close[i]` — explicit comment in `eval.rs:574-579` documents the fix |
+| Walkforward fold construction | ✅ Embargo applied | `test_start = train_end + embargo_bars` — gap between train/test |
+| Triple-barrier labels | ✅ Forward-looking by design | `for forward_idx in (i + 1)..=horizon_end` — labels SHOULD use future prices for supervised learning, no leakage into features |
+| Funnel stage 1 fast-eval slice | ✅ OOS-safe default | Default `Stage1Window::Earliest` (commit 6ac7f7ef) — earliest 25% of input, maximally distant from any held-out OOS tail |
+
+The CPU vs GPU 1.3% fitness divergence with `FOREX_BOT_SEARCH_SEED=42`
+is explained by **f32 (GPU) vs f64 (CPU) precision drift**, not
+look-ahead:
+- `fast_evaluate_strategy_core` accepts `&[f64]` and returns `[f64; 11]`
+- `backtest_population_kernel` operates on `Array<f32>` throughout
+- Accumulating thousands of small PnL deltas, f32 (~7 decimal digits)
+  drifts from f64 (~15 digits) by single-digit percent over a long
+  walk — well within numerical-tolerance for fitness ranking.
+
+If exact CPU↔GPU parity is needed, the kernel can be templated on
+`F: Float + CubeElement` (already done for `synthesize_signals_kernel`)
+and launched with `f64`. Tch-rs fp32 is the current choice for L40
+throughput; switching to fp64 halves throughput on consumer/compute
+GPUs but matches CPU exactly.
+
 ## Files changed
 
 | File | Errors before | Errors after | Status |

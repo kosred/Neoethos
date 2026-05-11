@@ -199,8 +199,7 @@ fn backtest_population_kernel(
                     let next_ptr = month_ptr.read() + 1;
                     month_ptr.store(next_ptr);
                     if next_ptr >= 0 && next_ptr < month_capacity as i32 {
-                        monthly_pnls_out[month_base + next_ptr as usize] =
-                            current_month_pnl.read();
+                        monthly_pnls_out[month_base + next_ptr as usize] = current_month_pnl.read();
                     }
                 }
                 current_month_pnl.store(0.0);
@@ -236,7 +235,9 @@ fn backtest_population_kernel(
                     pnl_cell.store((entry_px_v - close_pips[i]) * pip_value_per_lot);
                 }
                 pnl_cell.store(
-                    pnl_cell.read() - commission_per_trade - (spread_pips * 0.5 * pip_value_per_lot),
+                    pnl_cell.read()
+                        - commission_per_trade
+                        - (spread_pips * 0.5 * pip_value_per_lot),
                 );
                 let pnl = pnl_cell.read();
                 equity.store(equity.read() + pnl);

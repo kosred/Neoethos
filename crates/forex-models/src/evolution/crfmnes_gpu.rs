@@ -58,8 +58,10 @@ fn candidate_loss_kernel(
                 }
                 let act = activation.read().tanh();
                 logit0.store(logit0.read() + act * candidates[w2_offset + hidden * CLASS_COUNT]);
-                logit1.store(logit1.read() + act * candidates[w2_offset + hidden * CLASS_COUNT + 1]);
-                logit2.store(logit2.read() + act * candidates[w2_offset + hidden * CLASS_COUNT + 2]);
+                logit1
+                    .store(logit1.read() + act * candidates[w2_offset + hidden * CLASS_COUNT + 1]);
+                logit2
+                    .store(logit2.read() + act * candidates[w2_offset + hidden * CLASS_COUNT + 2]);
             }
 
             let l0 = logit0.read();
