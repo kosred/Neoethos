@@ -25,8 +25,12 @@ fn synthesize_signals_kernel<F: Float>(
     n_samples: u32,
     gate_threshold: F,
 ) {
-    if ABSOLUTE_POS < output.len() {
-        let pos = ABSOLUTE_POS;
+    // cubecl 0.9: ABSOLUTE_POS and array.len() are usize; the rest of
+    // the kernel was written against u32. Coerce at the boundary so the
+    // existing u32 arithmetic carries through unchanged.
+    let pos = ABSOLUTE_POS as u32;
+    let out_len = output.len() as u32;
+    if pos < out_len {
         let gene = pos / n_samples;
         let sample = pos % n_samples;
 
@@ -53,7 +57,7 @@ fn synthesize_signals_kernel<F: Float>(
 
         if sig == 0 {
             output[pos] = 0;
-            return;
+            terminate!();
         }
 
         let flag_base = gene * SMC_WIDTH as u32;
@@ -69,7 +73,7 @@ fn synthesize_signals_kernel<F: Float>(
 
         if active_sum <= F::new(0.0) {
             output[pos] = sig;
-            return;
+            terminate!();
         }
 
         let gate = if active_sum < gate_threshold {
@@ -131,8 +135,12 @@ fn backtest_population_kernel(
     commission_per_trade: f32,
     pip_value_per_lot: f32,
 ) {
-    if ABSOLUTE_POS < trade_counts_out.len() {
-        let gene = ABSOLUTE_POS;
+    // cubecl 0.9: ABSOLUTE_POS and len() are usize; coerce to u32 at the
+    // boundary so the rest of the kernel's u32 arithmetic carries through.
+    let abs_pos = ABSOLUTE_POS as u32;
+    let counts_len = trade_counts_out.len() as u32;
+    if abs_pos < counts_len {
+        let gene = abs_pos;
         let signal_base = gene * n_samples;
         let month_base = gene * month_capacity;
         let metric_base = gene * BACKTEST_CORE_METRIC_WIDTH as u32;
@@ -151,7 +159,7 @@ fn backtest_population_kernel(
                 metrics_out[metric_base + j] = 0.0;
                 j += 1;
             }
-            return;
+            terminate!();
         }
 
         let sl_distance = sl_pips[gene];

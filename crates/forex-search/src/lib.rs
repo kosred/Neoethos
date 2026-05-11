@@ -1,22 +1,17 @@
 mod artifact_io;
 pub mod challenge;
 pub mod checkpoint;
-// GPU kernel modules are gated behind `gpu-experimental` because the
-// existing cubecl/tch code targets older API versions and produces 126
-// compile errors against cubecl 0.9 / tch 0.22. They are kept in-tree
-// for future migration work but excluded from the default `gpu`
-// feature so the rest of the GPU dep chain (libtorch, CUDA toolkit)
-// remains usable for the CPU-fallback discovery path. See
-// docs/audits/gpu_migration_2026-05-11.md for the migration plan.
-#[cfg(feature = "gpu-experimental")]
+// GPU kernel modules. Migration in progress against cubecl 0.9 / tch
+// 0.22 — see docs/audits/gpu_migration_2026-05-11.md for context.
+#[cfg(feature = "gpu")]
 mod cubecl_eval;
-#[cfg(feature = "gpu-experimental")]
+#[cfg(feature = "gpu")]
 mod cubecl_ga;
 pub mod discovery;
-#[cfg(feature = "gpu-experimental")]
+#[cfg(feature = "gpu")]
 pub mod discovery_gpu;
 mod scheduler_assignment;
-#[cfg(not(feature = "gpu-experimental"))]
+#[cfg(not(feature = "gpu"))]
 pub mod discovery_gpu {
     use crate::artifact_io::write_json_atomic;
     use crate::eval::{BacktestSettings, fast_evaluate_strategy_core};
@@ -901,19 +896,19 @@ pub mod discovery_gpu {
 // HPC-specific modules — gated behind `gpu-experimental` for the same
 // reason as the cubecl modules above: hpc.rs and hpc_gpu_discovery.rs
 // hold compile errors against the current tch 0.22 API surface.
-#[cfg(feature = "gpu-experimental")]
+#[cfg(feature = "gpu")]
 pub mod hpc;
-#[cfg(feature = "gpu-experimental")]
+#[cfg(feature = "gpu")]
 pub mod hpc_gpu_discovery;
 
 // Re-export HPC functions when the experimental flag is enabled.
-#[cfg(feature = "gpu-experimental")]
+#[cfg(feature = "gpu")]
 pub use hpc::{
     detect_hyperstack_n3, force_hpc_mode, get_gpu_cpu_affinity, get_optimal_chunk_size,
     get_optimal_population, get_validation_cpu_cores, is_hpc_mode, is_nvlink_pair,
     print_hpc_config, set_thread_affinity,
 };
-#[cfg(feature = "gpu-experimental")]
+#[cfg(feature = "gpu")]
 pub use hpc_gpu_discovery::{IslandConfig, run_island_model_discovery};
 
 pub mod eval;
