@@ -557,58 +557,20 @@ impl eframe::App for ForexApp {
             self.trading_session.disconnect(&mut self.state);
         }
 
-        // ─── Left sidebar — primary navigation ───────────────────────
-        // Single source of truth for "where am I" — no more competing
-        // dropdowns in the top bar. Active tab gets a left accent
-        // stripe so the eye locks on it instantly.
-        let mut sidebar_target: Option<WorkspaceTab> = None;
-        let active_tab = self.workspace.active_tab();
-        egui::SidePanel::left("workspace_nav")
-            .frame(ui::theme::sidebar_frame(ctx.style().as_ref()))
-            .resizable(true)
-            .default_width(ui::theme::SIDEBAR_WIDTH_DEFAULT)
-            .min_width(ui::theme::SIDEBAR_WIDTH_MIN)
-            .max_width(ui::theme::SIDEBAR_WIDTH_MAX)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        let mut first_group = true;
-                        for group in WorkspaceGroup::ordered() {
-                            if !first_group {
-                                ui.add_space(ui::theme::SPACE_LG);
-                            }
-                            first_group = false;
-                            ui::theme::section_label(ui, group.title());
-                            ui.add_space(ui::theme::SPACE_XS);
-                            for tab in WorkspaceTab::all_for_group(*group) {
-                                if ui::theme::nav_item(
-                                    ui,
-                                    tab.title(),
-                                    tab.description(),
-                                    active_tab == Some(*tab),
-                                )
-                                .clicked()
-                                {
-                                    sidebar_target = Some(*tab);
-                                }
-                            }
-                        }
-                    });
-            });
-        if let Some(tab) = sidebar_target {
-            self.workspace.focus_tab(tab);
-        }
-
         // ─── Bottom action bar — engine + broker controls ────────────
-        // The "what's running right now" strip. Discovery / Training /
-        // Broker each get a status dot + label + a single Start/Stop
-        // (or Connect/Disconnect) button. One canonical place; no menus.
+        // Added BEFORE the sidebar so it spans the FULL width of the
+        // window (egui panels added earlier reserve their full edge —
+        // adding the side panel first would clip the action bar to the
+        // central column only). The "what's running right now" strip:
+        // Discovery / Training / Broker each get a status dot + label +
+        // a single Start/Stop (or Connect/Disconnect) button.
         egui::TopBottomPanel::bottom("action_bar")
             .frame(ui::theme::action_bar_frame(ctx.style().as_ref()))
             .exact_height(ui::theme::ACTIONBAR_HEIGHT)
+            .resizable(false)
             .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(ui::theme::SPACE_SM);
                     let (disc_btn_kind, disc_btn_label, disc_hover) = if discovery_running {
                         (
                             ui::theme::ButtonKind::Danger,
@@ -721,6 +683,49 @@ impl eframe::App for ForexApp {
                     });
                 });
             });
+
+        // ─── Left sidebar — primary navigation ───────────────────────
+        // Single source of truth for "where am I" — no more competing
+        // dropdowns in the top bar. Active tab gets a left accent
+        // stripe so the eye locks on it instantly.
+        let mut sidebar_target: Option<WorkspaceTab> = None;
+        let active_tab = self.workspace.active_tab();
+        egui::SidePanel::left("workspace_nav")
+            .frame(ui::theme::sidebar_frame(ctx.style().as_ref()))
+            .resizable(true)
+            .default_width(ui::theme::SIDEBAR_WIDTH_DEFAULT)
+            .min_width(ui::theme::SIDEBAR_WIDTH_MIN)
+            .max_width(ui::theme::SIDEBAR_WIDTH_MAX)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let mut first_group = true;
+                        for group in WorkspaceGroup::ordered() {
+                            if !first_group {
+                                ui.add_space(ui::theme::SPACE_LG);
+                            }
+                            first_group = false;
+                            ui::theme::section_label(ui, group.title());
+                            ui.add_space(ui::theme::SPACE_XS);
+                            for tab in WorkspaceTab::all_for_group(*group) {
+                                if ui::theme::nav_item(
+                                    ui,
+                                    tab.title(),
+                                    tab.description(),
+                                    active_tab == Some(*tab),
+                                )
+                                .clicked()
+                                {
+                                    sidebar_target = Some(*tab);
+                                }
+                            }
+                        }
+                    });
+            });
+        if let Some(tab) = sidebar_target {
+            self.workspace.focus_tab(tab);
+        }
 
         egui::CentralPanel::default()
             .frame(ui::theme::central_panel_frame(ctx.style().as_ref()))

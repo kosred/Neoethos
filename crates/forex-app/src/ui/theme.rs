@@ -208,17 +208,14 @@ pub fn sidebar_frame(_style: &egui::Style) -> egui::Frame {
         })
 }
 
-/// Bottom action bar — engine + broker controls.
+/// Bottom action bar — engine + broker controls. The fill uses
+/// SURFACE_BG (one step above PANEL_BG) so the bar reads as its own
+/// surface, with a subtle top border to separate it from the dock.
 pub fn action_bar_frame(_style: &egui::Style) -> egui::Frame {
     egui::Frame::new()
-        .fill(PANEL_BG)
-        .stroke(egui::Stroke::new(1.0, BORDER))
-        .inner_margin(egui::Margin {
-            left: SPACE_LG as i8,
-            right: SPACE_LG as i8,
-            top: SPACE_SM as i8,
-            bottom: SPACE_SM as i8,
-        })
+        .fill(SURFACE_BG)
+        .stroke(egui::Stroke::new(1.0, BORDER_STRONG))
+        .inner_margin(egui::Margin::symmetric(SPACE_LG as i8, SPACE_SM as i8))
 }
 
 /// Central content area.
