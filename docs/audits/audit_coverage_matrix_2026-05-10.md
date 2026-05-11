@@ -44,6 +44,11 @@ bridge gap by wiring `forex-models` staged training persistence to emit a
 typed `ModelRuntimeArtifact<TrainingRuntimeProfile>` sidecar and by sharing
 the training/model-runtime provenance builder.
 
+Postscript 8: Phase 90 started the large-file cleanup by moving low-risk
+inline test modules out of `forex-app` trading and `forex-models` ensemble,
+and by syncing a stale app discovery test fixture with the current
+`DiscoveryResult` contract.
+
 `✅` = addressed by the listed phase(s); `🟡` = partially addressed;
 `🔴` = not addressed yet (actionable gap).
 
@@ -51,7 +56,7 @@ the training/model-runtime provenance builder.
 |---|---|---|---|---|
 | 1 | `architecture_unification_duplicate_code_cleanup` | ✅ | 6, 12, 13, 61-70, 87 | — |
 | 2 | `artifact_intent_clarification_training_vs_search_resume` | ✅ | 1, 3, 8 | — |
-| 3 | `core_config_domain_modularization` | 🟡 | 6, 17-22 | training/search large-file split deeper than Phase 6 |
+| 3 | `core_config_domain_modularization` | 🟡 | 6, 17-22, 90 | production large-file split deeper than Phase 6; test extraction started |
 | 4 | `cpu_gpu_semantic_parity_requirement` | ✅ | 4 | — |
 | 5 | `custom_cuda_kernel_preservation` | ✅ | preserved (no deletion) | — |
 | 6 | `dead_code_and_stale_artifacts` | 🟡 | 6, 9, 12, 13, 61-70, 73 | vendor-patches review; CI feature-matrix |

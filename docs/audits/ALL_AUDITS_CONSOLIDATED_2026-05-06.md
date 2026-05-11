@@ -530,6 +530,12 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 
 ## Execution log
 
+### 2026-05-11: Follow-on Phase 90 completed — large-file test extraction
+
+Started the large-file cleanup from the post-Phase-89 scan by extracting low-risk inline test modules before deeper production splits. `forex-app` trading tests now live in `app_services/trading_tests.rs`, and the `forex-models` ensemble test module now lives in `ensemble_tests.rs`. The slice also updated a stale `forex-app` discovery test fixture to the current `DiscoveryResult` contract fields so app verification can compile. Production-heavy files above 1500 lines remain tracked for later behavior-preserving module splits. See [`follow_on_phase_90_large_file_test_extraction_2026-05-11.md`](follow_on_phase_90_large_file_test_extraction_2026-05-11.md).
+
+Verification: `cargo test -p forex-app --bin forex-app app_services::trading -- --nocapture`, `cargo test -p forex-app --bin forex-app app_services::discovery::tests::success_snapshot_carries_candidate_and_portfolio_counters -- --nocapture`, `cargo test -p forex-models --lib ensemble:: -- --nocapture`, `cargo fmt --check`, and `git diff --check` all pass.
+
 ### 2026-05-11: Follow-on Phase 89 completed — model-runtime artifact bridge
 
 Closed the remaining `model_runtime_backend_fragmentation` bridge gap in `forex-models`. The staged training persistence path now writes a typed `ModelRuntimeArtifact<TrainingRuntimeProfile>` envelope as `model_runtime_artifact.json` beside the existing training runtime profile and training-model contract. Training-model and model-runtime artifact provenance now share one builder, varying only the `ArtifactKind` and envelope type, so backend/device/runtime hashes cannot drift between the two sidecars. See [`follow_on_phase_89_model_runtime_artifact_bridge_2026-05-11.md`](follow_on_phase_89_model_runtime_artifact_bridge_2026-05-11.md).

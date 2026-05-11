@@ -15,13 +15,13 @@ use forex_data::{
     prepare_multitimeframe_features,
 };
 use forex_search::{
-    DiscoveryConfig, DiscoveryProgress, DiscoveryResult, PropFirmRiskRules,
-    compute_discovery_forward_test_artifacts, compute_discovery_prop_firm_artifacts,
-    ensure_non_empty_portfolio, run_discovery_cycle_with_progress,
-    save_canonical_backtest_artifacts, save_discovery_profile_json,
-    save_forward_test_validation_artifacts, save_portfolio_json, save_promotion_summary_json,
-    save_prop_firm_validation_artifacts, save_quality_report_json, save_trade_log_json,
-    save_walkforward_validation_artifacts,
+    DiscoveryConfig, DiscoveryProgress, DiscoveryResult, DiscoveryValidationGates,
+    PropFirmRiskRules, compute_discovery_forward_test_artifacts,
+    compute_discovery_prop_firm_artifacts, ensure_non_empty_portfolio,
+    run_discovery_cycle_with_progress, save_canonical_backtest_artifacts,
+    save_discovery_profile_json, save_forward_test_validation_artifacts, save_portfolio_json,
+    save_promotion_summary_json, save_prop_firm_validation_artifacts, save_quality_report_json,
+    save_trade_log_json, save_walkforward_validation_artifacts,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -1129,6 +1129,12 @@ mod tests {
             candidates: vec![best, Gene::default(), Gene::default()],
             quality_metrics: Vec::new(),
             logged_trades: Vec::new(),
+            effective_feature_names: Vec::new(),
+            validation_gates: DiscoveryValidationGates::pending(),
+            canonical_backtest_artifacts: Vec::new(),
+            walkforward_validation_artifacts: Vec::new(),
+            forward_test_validation_artifacts: Vec::new(),
+            prop_firm_validation_artifacts: Vec::new(),
         };
 
         let snapshot = completed_snapshot(JobSnapshot::new(JobKind::Discovery), &result);
