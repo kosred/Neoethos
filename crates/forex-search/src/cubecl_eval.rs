@@ -169,11 +169,11 @@ fn backtest_population_kernel(
 
         let mut equity = initial_equity;
         let mut peak_equity = initial_equity;
-        let mut max_dd = 0.0f32;
-        let mut trade_count = 0i32;
-        let mut wins = 0i32;
-        let mut gross_profit = 0.0f32;
-        let mut gross_loss = 0.0f32;
+        let mut max_dd: f32 = 0.0;
+        let mut trade_count: i32 = 0;
+        let mut wins: i32 = 0;
+        let mut gross_profit: f32 = 0.0;
+        let mut gross_loss: f32 = 0.0;
 
         let mut last_month = -1i32;
         let mut current_month_pnl = 0.0f32;
