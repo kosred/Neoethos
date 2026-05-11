@@ -45,31 +45,46 @@ fn clamp_f32(value: f32, min_value: f32, max_value: f32) -> f32 {
 
 #[cube]
 fn apply_activation(code: i32, x: f32) -> f32 {
+    let mut out: f32 = 0.0;
     if code == 0 {
-        clamp_f32(x, -1000.0, 1000.0)
+        out = clamp_f32(x, -1000.0, 1000.0);
     } else if code == 1 {
         let clamped = clamp_f32(x, -88.0, 88.0);
-        1.0 / (1.0 + (-clamped).exp())
+        out = 1.0 / (1.0 + (-clamped).exp());
     } else if code == 2 {
-        x.tanh()
+        out = x.tanh();
     } else if code == 3 {
-        clamp_f32(x, 0.0, 1000.0)
+        out = clamp_f32(x, 0.0, 1000.0);
     } else if code == 4 {
-        x.sin()
+        out = x.sin();
     } else if code == 5 {
-        x.cos()
+        out = x.cos();
     } else if code == 6 {
         let abs_x = x.abs();
-        if abs_x > 26.0 { 0.0 } else { (-(x * x)).exp() }
+        out = (-(x * x)).exp();
+        if abs_x > 26.0 {
+            out = 0.0;
+        }
     } else if code == 7 {
         let abs_x = x.abs();
-        if abs_x > 1000.0 { 1000.0 } else { abs_x }
+        out = abs_x;
+        if abs_x > 1000.0 {
+            out = 1000.0;
+        }
     } else if code == 8 {
-        if x >= 0.0 { 1.0 } else { 0.0 }
+        if x >= 0.0 {
+            out = 1.0;
+        } else {
+            out = 0.0;
+        }
     } else {
-        let result = if x > 0.0 { x } else { 0.01 * x };
-        clamp_f32(result, -1000.0, 1000.0)
+        let mut result: f32 = 0.01 * x;
+        if x > 0.0 {
+            result = x;
+        }
+        out = clamp_f32(result, -1000.0, 1000.0);
     }
+    out
 }
 
 #[cube(launch)]
@@ -95,57 +110,60 @@ fn neat_population_metrics_kernel(
     input_dim: u32,
     max_nodes: u32,
 ) {
-    let candidate_count = metrics_out.len() / CLASS_COUNT as u32;
+    let candidate_count = metrics_out.len() / CLASS_COUNT;
     if ABSOLUTE_POS < candidate_count {
         let candidate = ABSOLUTE_POS;
-        let node_count = node_counts[candidate] as u32;
-        let node_offset = node_offsets[candidate] as u32;
-        let scratch_base = candidate * max_nodes;
-        let metric_base = candidate * CLASS_COUNT as u32;
+        let n_rows_us = n_rows as usize;
+        let input_dim_us = input_dim as usize;
+        let max_nodes_us = max_nodes as usize;
+        let node_count = node_counts[candidate] as usize;
+        let node_offset = node_offsets[candidate] as usize;
+        let scratch_base = candidate * max_nodes_us;
+        let metric_base = candidate * CLASS_COUNT;
 
         if n_rows == 0 || node_count == 0 {
             metrics_out[metric_base] = -1000000.0;
             metrics_out[metric_base + 1] = 1000000.0;
             metrics_out[metric_base + 2] = 0.0;
-            return;
+            terminate!();
         }
 
-        let mut log_loss = 0.0f32;
-        let mut correct = 0u32;
-        let mut confidence_sum = 0.0f32;
-        let mut row = 0u32;
-        while row < n_rows {
-            let mut reset_idx = 0u32;
+        let mut log_loss: f32 = 0.0;
+        let mut correct: u32 = 0;
+        let mut confidence_sum: f32 = 0.0;
+        let mut row = 0usize;
+        while row < n_rows_us {
+            let mut reset_idx = 0usize;
             while reset_idx < node_count {
                 scratch[scratch_base + reset_idx] = 0.0;
                 reset_idx += 1;
             }
 
-            let input_base = candidate * input_dim;
-            let mut input = 0u32;
-            while input < input_dim {
-                let node_idx = input_indices[input_base + input] as u32;
-                scratch[scratch_base + node_idx] = features[row * input_dim + input];
+            let input_base = candidate * input_dim_us;
+            let mut input = 0usize;
+            while input < input_dim_us {
+                let node_idx = input_indices[input_base + input] as usize;
+                scratch[scratch_base + node_idx] = features[row * input_dim_us + input];
                 input += 1;
             }
 
             let bias_idx = bias_indices[candidate];
             if bias_idx >= 0 {
-                scratch[scratch_base + bias_idx as u32] = 1.0;
+                scratch[scratch_base + bias_idx as usize] = 1.0;
             }
 
-            let eval_start = eval_offsets[candidate] as u32;
-            let eval_end = eval_offsets[candidate + 1] as u32;
+            let eval_start = eval_offsets[candidate] as usize;
+            let eval_end = eval_offsets[candidate + 1] as usize;
             let mut eval_pos = eval_start;
             while eval_pos < eval_end {
-                let node_idx = eval_indices[eval_pos] as u32;
+                let node_idx = eval_indices[eval_pos] as usize;
                 let absolute_node = node_offset + node_idx;
                 let mut sum = biases[absolute_node];
-                let edge_start = edge_offsets[absolute_node] as u32;
-                let edge_end = edge_offsets[absolute_node + 1] as u32;
+                let edge_start = edge_offsets[absolute_node] as usize;
+                let edge_end = edge_offsets[absolute_node + 1] as usize;
                 let mut edge = edge_start;
                 while edge < edge_end {
-                    let source = edge_sources[edge] as u32;
+                    let source = edge_sources[edge] as usize;
                     sum += scratch[scratch_base + source] * edge_weights[edge];
                     edge += 1;
                 }
@@ -154,10 +172,10 @@ fn neat_population_metrics_kernel(
                 eval_pos += 1;
             }
 
-            let output_base = candidate * CLASS_COUNT as u32;
-            let logit0 = scratch[scratch_base + output_indices[output_base] as u32];
-            let logit1 = scratch[scratch_base + output_indices[output_base + 1] as u32];
-            let logit2 = scratch[scratch_base + output_indices[output_base + 2] as u32];
+            let output_base = candidate * CLASS_COUNT;
+            let logit0 = scratch[scratch_base + output_indices[output_base] as usize];
+            let logit1 = scratch[scratch_base + output_indices[output_base + 1] as usize];
+            let logit2 = scratch[scratch_base + output_indices[output_base + 2] as usize];
             let mut max_logit = logit0;
             if logit1 > max_logit {
                 max_logit = logit1;

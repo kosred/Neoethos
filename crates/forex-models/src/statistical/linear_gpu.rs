@@ -15,13 +15,13 @@ pub(crate) struct LinearCudaFit {
 
 #[cube]
 fn sign_f32(value: f32) -> f32 {
+    let mut out: f32 = 0.0;
     if value > 0.0 {
-        1.0
+        out = 1.0;
     } else if value < 0.0 {
-        -1.0
-    } else {
-        0.0
+        out = -1.0;
     }
+    out
 }
 
 #[cube]
