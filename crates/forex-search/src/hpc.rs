@@ -83,9 +83,8 @@ pub fn detect_hyperstack_n3() -> bool {
     HPC_MODE_ACTIVE.store(true, Ordering::Relaxed);
 
     info!(
-        "🚀 Hyperstack N3 HPC Mode ACTIVATED: {} GPUs @ {:.1}GB+ VRAM, {} logical threads ({} physical cores), {:.1}GB RAM",
+        "🚀 Hyperstack N3 HPC Mode ACTIVATED: {} GPUs (VRAM check skipped on tch 0.22), {} logical threads ({} physical cores), {:.1}GB RAM",
         gpu_count,
-        min_vram_gb,
         cpu_threads,
         cpu_threads / 2,
         total_ram_gb

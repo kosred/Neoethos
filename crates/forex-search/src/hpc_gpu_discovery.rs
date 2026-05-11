@@ -13,6 +13,7 @@ use rand::Rng;
 use rand_distr::{Distribution, Normal};
 use std::thread;
 use tch::{Device, Kind, Tensor};
+use tracing::info;
 
 use crate::cubecl_ga::{cuda_reproduction_kernel_enabled, try_generate_children_cuda};
 use crate::discovery_gpu::{GpuDiscoveryConfig, GpuDiscoveryResult};
@@ -282,7 +283,7 @@ impl Island {
             fitness: vec![0.0; population_size],
             elites: Vec::new(),
             elite_fitness: Vec::new(),
-            device: Device::Cuda(gpu_id),
+            device: Device::Cuda(gpu_id as usize),
         }
     }
 
@@ -574,7 +575,7 @@ fn evaluate_population_hpc(
             Tensor::from_slice(&chunk_buf).reshape(&[chunk.len() as i64, chunk[0].len() as i64]);
 
         let fit = evaluate_chunk_hpc(data_cube, ohlc_cube, &chunk_tensor, config, device)?;
-        let vec: Vec<f32> = Vec::from(&fit);
+        let vec: Vec<f32> = Vec::<f32>::try_from(&fit).unwrap_or_default();
 
         for (i, v) in vec.iter().enumerate() {
             results[offset + i] = *v;
@@ -608,13 +609,16 @@ fn evaluate_chunk_hpc(
     let logic_weights = genomes.narrow(1, tf_count, n_features);
     let thresholds = genomes
         .narrow(1, tf_count + n_features, 2)
-        .clamp(-config.threshold_clip, config.threshold_clip)
-        * (config.threshold_scale as f32);
+        .clamp(
+            -config.threshold_clip as f64,
+            config.threshold_clip as f64,
+        )
+        * (config.threshold_scale as f64);
 
-    let buy_th =
-        thresholds.select(1, 0).maximum(&thresholds.select(1, 1)) + config.threshold_margin as f32;
-    let sell_th =
-        thresholds.select(1, 0).minimum(&thresholds.select(1, 1)) - config.threshold_margin as f32;
+    let buy_th = thresholds.select(1, 0).maximum(&thresholds.select(1, 1))
+        + config.threshold_margin as f64;
+    let sell_th = thresholds.select(1, 0).minimum(&thresholds.select(1, 1))
+        - config.threshold_margin as f64;
 
     // Build segments for walk-forward analysis
     let segments = build_segments_hpc(n_samples as usize, config.window_bars, config.segments);
@@ -633,7 +637,7 @@ fn evaluate_chunk_hpc(
         for t in 0..tf_count {
             let tf_data = data_slice.get(t);
             let tf_sig = tf_data.matmul(&logic_weights.transpose(0, 1));
-            let std = tf_sig.std_dim(&[0], false, Kind::Float) + 1e-6;
+            let std = tf_sig.std_dim(0i64, false, Kind::Float) + 1e-6;
             let tf_sig = tf_sig / std.unsqueeze(0);
             let weight = tf_weights.select(1, t).unsqueeze(1);
             all_signals += tf_sig.transpose(0, 1) * weight;
@@ -655,38 +659,38 @@ fn evaluate_chunk_hpc(
 
         // Compute fitness metrics
         let equity = batch_rets.cumsum(1, Kind::Float);
-        let peaks = equity.cummax(1, false).0;
+        let peaks = equity.cummax(1).0;
         let max_dd = (&peaks - &equity).max_dim(1, false).0;
 
-        let mean_ret = batch_rets.mean_dim(&[1], false, Kind::Float);
+        let mean_ret = batch_rets.mean_dim(1i64, false, Kind::Float);
         let downside = batch_rets.minimum(&Tensor::zeros([1], (Kind::Float, device)));
-        let downside_std = downside.pow(2).mean_dim(&[1], false, Kind::Float).sqrt() + 1e-9;
+        let downside_std = downside.pow(2).mean_dim(1i64, false, Kind::Float).sqrt() + 1e-9;
         let sortino = &mean_ret / downside_std;
 
         // Consistency metric
         let steps = Tensor::arange((len - 1) as i64, (Kind::Float, device));
-        let equity_mean = equity.mean_dim(&[1], true, Kind::Float);
+        let equity_mean = equity.mean_dim(1i64, true, Kind::Float);
         let steps_mean = steps.mean(Kind::Float);
         let num = ((&equity - &equity_mean) * (&steps - steps_mean)).sum_dim_intlist(
-            &[1],
+            1i64,
             false,
             Kind::Float,
         );
         let den = ((&equity - &equity_mean)
             .pow(2)
-            .sum_dim_intlist(&[1], false, Kind::Float)
+            .sum_dim_intlist(1i64, false, Kind::Float)
             * (&steps - steps_mean).pow(2).sum(Kind::Float))
         .sqrt();
         let consistency = num / (den + 1e-9);
 
         // Penalties
-        let trade_count = actions.abs().sum_dim_intlist(&[1], false, Kind::Float);
+        let trade_count = actions.abs().sum_dim_intlist(1i64, false, Kind::Float);
         let expected = (len as f64 / 1440.0) * config.min_trades_per_day;
-        let freq_penalty = (Tensor::from(expected as f32).to_device(device) - &trade_count)
+        let freq_penalty = (Tensor::from(expected).to_device(device) - &trade_count)
             .clamp_min(0.0)
-            * config.trade_penalty as f32;
+            * (config.trade_penalty as f64);
         let dd_penalty =
-            (max_dd - config.dd_limit as f32).clamp_min(0.0) * config.dd_penalty as f32;
+            (max_dd - config.dd_limit as f64).clamp_min(0.0) * (config.dd_penalty as f64);
 
         let mut window_fit = sortino * 10.0 + consistency * 5.0 - freq_penalty - dd_penalty;
         let profit_pct = equity.select(1, (len - 2) as i64);
@@ -695,7 +699,7 @@ fn evaluate_chunk_hpc(
         fitness_sum += &window_fit;
         min_fitness = min_fitness.minimum(&window_fit);
 
-        let pos = profit_pct.gt(0.0) * trade_count.ge(expected as f32);
+        let pos = profit_pct.gt(0.0) * trade_count.ge(expected);
         pos_windows += pos.to_kind(Kind::Float);
     }
 
