@@ -530,6 +530,12 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 
 ## Execution log
 
+### 2026-05-11: Follow-on Phase 88 completed — ONNX runtime boundary cleanup
+
+Closed the `forex_models_functional` ONNX legacy-boundary gap. `ONNXInferenceEngine` now lives in `forex_models::runtime::onnx` instead of the crate root, while `forex_models::ONNXInferenceEngine` remains available as the feature-gated public re-export for compatibility. Added a boundary regression test so `lib.rs` stays a registry/re-export file and future ONNX implementation work remains in the runtime module. See [`follow_on_phase_88_onnx_boundary_2026-05-11.md`](follow_on_phase_88_onnx_boundary_2026-05-11.md).
+
+Verification: RED/GREEN `cargo test -p forex-models runtime::tests::onnx_inference_engine_stays_out_of_crate_root --lib -- --nocapture`, `cargo check -p forex-models --features onnx`, `cargo test -p forex-models --lib -- --test-threads=1`, `cargo fmt --check`, and `git diff --check` all pass.
+
 ### 2026-05-11: Follow-on Phase 87 completed — repo JSON artifact IO dedup
 
 Continued the user-requested dedup cleanup repo-wide after Phase 86 introduced a new training-model contract sidecar. Added `forex_core::storage::json` as the shared owner for atomic JSON writes, backup JSON writes, typed reads, temporary artifact paths, and stable JSON hashes. `forex-search::artifact_io` is now a compatibility re-export over the core helper, and high-confidence `forex-models` writers moved onto the shared path: runtime profiles, training-model contract envelopes, ONNX export status, optimization reports, statistical/deep/tree metadata, tree-model JSON sidecars, swarm forecaster JSON save/load, meta-model artifacts, and genetic artifacts/runtime metadata. See [`follow_on_phase_87_repo_json_io_dedup_2026-05-11.md`](follow_on_phase_87_repo_json_io_dedup_2026-05-11.md).

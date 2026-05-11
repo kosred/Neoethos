@@ -35,6 +35,10 @@ now use the shared helper. The same slice also moved tree-model JSON sidecars
 and swarm forecaster JSON save/load onto the core-backed helpers, leaving local
 file writers only for binary/raw payloads and test corruption fixtures.
 
+Postscript 6: Phase 88 closed the `forex_models_functional` ONNX legacy
+boundary by moving `ONNXInferenceEngine` out of `lib.rs` into
+`runtime::onnx`, keeping only a feature-gated crate-root re-export.
+
 `✅` = addressed by the listed phase(s); `🟡` = partially addressed;
 `🔴` = not addressed yet (actionable gap).
 
@@ -52,7 +56,7 @@ file writers only for binary/raw payloads and test corruption fixtures.
 | 10 | `evolution_neat_crfmnes_gpu_first` | 🟡 | preserved kernels, 77-78 | runtime parity tests for evolution kernels |
 | 11 | `feature_timestamp_mtf_causality_deep_audit_pass5` | ✅ | 7 | — |
 | 12 | `forex_data_functional` | 🟡 | 7, 68, 74-75 | explicit candle-timestamp-policy threading inside resample / hpc_ta / quant_features / smc / parquet_migration; volume-validation surface |
-| 13 | `forex_models_functional` | 🟡 | 26, 59, 67, 76, 79, 80-85 | ONNX legacy boundary |
+| 13 | `forex_models_functional` | ✅ | 26, 59, 67, 76, 79, 80-85, 88 | — |
 | 14 | `forex_search_functional` | ✅ | 16-32, 45-51 | — |
 | 15 | `generic_scheduler_small_files_refactor_note` | ✅ | 6 | — |
 | 16 | `gpu_cuda_hpc_parity_deep_audit_pass4` | 🟡 | 4 | parity tests beyond strategy search (statistical / NEAT / CRFMNES backends) |
@@ -95,9 +99,8 @@ file writers only for binary/raw payloads and test corruption fixtures.
   results, and swarm forecast results.
 - **Training-model artifact producer** (#31): landed in Phase 86 through
   the staged `training_orchestrator` persistence path.
-- **Streaming / RL runtime metadata** (#13). The remaining model gaps are
-  RL exit-agent runtime/device routing, streaming/adaptive runtime
-  metadata, and the ONNX legacy boundary.
+- **Streaming / RL runtime metadata** (#13): landed across Phases 76,
+  79, and 80-85. Phase 88 closed the remaining ONNX legacy boundary.
 
 ### Larger / deferred
 
@@ -124,10 +127,9 @@ is complete. The gaps above split into three buckets:
    streaming routing and artifact producers rather than another broad
    string-to-enum sweep.
 3. **Deferred infrastructure (no phase)**: UI exposure, parity tests
-   for statistical/evolution backends, model-runtime bridge wiring,
-   ONNX legacy boundary, and large-file splits. Each needs its own design
-   pass before landing — out of scope for a routine follow-on slice.
+   for statistical/evolution backends, model-runtime bridge wiring, and
+   large-file splits. Each needs its own design pass before landing — out
+   of scope for a routine follow-on slice.
 
-The next concrete slice should be either the model-runtime artifact bridge
-or the ONNX legacy-boundary cleanup, unless the larger deferred infrastructure
-gets its own design pass first.
+The next concrete slice should be the model-runtime artifact bridge, unless
+the larger deferred infrastructure gets its own design pass first.
