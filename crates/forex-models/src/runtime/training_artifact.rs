@@ -9,14 +9,15 @@ use crate::runtime::capabilities::{
     typed_runtime_degraded_reason,
 };
 use crate::runtime::profile::{
-    TRAINING_MODEL_ARTIFACT_FILE_NAME, TrainingRuntimeProfile, write_training_model_artifact,
+    MODEL_RUNTIME_ARTIFACT_FILE_NAME, TRAINING_MODEL_ARTIFACT_FILE_NAME, TrainingRuntimeProfile,
+    write_model_runtime_artifact, write_training_model_artifact,
 };
 use forex_core::storage::json::stable_json_hash;
 use forex_core::system::HardwareProbe;
 use forex_core::utils::{fnv1a64, fnv1a64_update};
 use forex_core::{
     ArtifactKind, ArtifactProvenance, BackendKind, DeterminismPolicy, DeviceAssignment,
-    RuntimeMode, TrainingModelArtifact,
+    ModelRuntimeArtifact, RuntimeMode, TrainingModelArtifact,
 };
 
 pub fn write_training_model_artifact_contract_sidecar(
@@ -33,12 +34,63 @@ pub fn write_training_model_artifact_contract_sidecar(
     )
 }
 
+pub fn write_model_runtime_artifact_contract_sidecar(
+    artifact_dir: &Path,
+    settings: &forex_core::Settings,
+    config: &ModelConfig,
+    payload: &TrainingPayload,
+    profile: &TrainingRuntimeProfile,
+) -> Result<()> {
+    let artifact = build_model_runtime_artifact_contract(settings, config, payload, profile)?;
+    write_model_runtime_artifact(
+        &artifact_dir.join(MODEL_RUNTIME_ARTIFACT_FILE_NAME),
+        &artifact,
+    )
+}
+
 fn build_training_model_artifact_contract(
     settings: &forex_core::Settings,
     config: &ModelConfig,
     payload: &TrainingPayload,
     profile: &TrainingRuntimeProfile,
 ) -> Result<TrainingModelArtifact<TrainingRuntimeProfile>> {
+    let provenance = build_training_profile_provenance(
+        ArtifactKind::TrainingModel,
+        settings,
+        config,
+        payload,
+        profile,
+    )?;
+
+    TrainingModelArtifact::new(provenance, profile.clone())
+        .context("build training model artifact contract envelope")
+}
+
+fn build_model_runtime_artifact_contract(
+    settings: &forex_core::Settings,
+    config: &ModelConfig,
+    payload: &TrainingPayload,
+    profile: &TrainingRuntimeProfile,
+) -> Result<ModelRuntimeArtifact<TrainingRuntimeProfile>> {
+    let provenance = build_training_profile_provenance(
+        ArtifactKind::ModelRuntime,
+        settings,
+        config,
+        payload,
+        profile,
+    )?;
+
+    ModelRuntimeArtifact::new(provenance, profile.clone())
+        .context("build model runtime artifact contract envelope")
+}
+
+fn build_training_profile_provenance(
+    artifact_kind: ArtifactKind,
+    settings: &forex_core::Settings,
+    config: &ModelConfig,
+    payload: &TrainingPayload,
+    profile: &TrainingRuntimeProfile,
+) -> Result<ArtifactProvenance> {
     let backend_label = training_runtime_backend_label(profile, config);
     let backend_kind =
         runtime_backend_kind_from_label(Some(&backend_label)).unwrap_or(BackendKind::Unavailable);
@@ -56,7 +108,7 @@ fn build_training_model_artifact_contract(
     let feature_columns = feature_columns_from_dataframe(&payload.frame);
 
     let provenance = ArtifactProvenance::new(
-        ArtifactKind::TrainingModel,
+        artifact_kind,
         stable_json_hash(&serde_json::json!({
             "feature_columns": feature_columns,
             "feature_count": payload.frame.width(),
@@ -78,7 +130,7 @@ fn build_training_model_artifact_contract(
             "multi_resolution_enabled": profile.multi_resolution_enabled,
             "base_features_prefixed": profile.base_features_prefixed,
             "base_signal_filter_enabled": profile.base_signal_filter_enabled,
-            "feature_columns": feature_columns_from_dataframe(&payload.frame),
+            "feature_columns": &feature_columns,
         }))?,
         stable_json_hash(&serde_json::json!({
             "label_horizon_bars": profile.label_horizon_bars,
@@ -133,10 +185,9 @@ fn build_training_model_artifact_contract(
         runtime_degraded_reason,
         training_source_commit(),
     )
-    .context("build training model artifact provenance")?;
+    .context("build training profile artifact provenance")?;
 
-    TrainingModelArtifact::new(provenance, profile.clone())
-        .context("build training model artifact contract envelope")
+    Ok(provenance)
 }
 
 fn sorted_training_params(params: &HashMap<String, String>) -> BTreeMap<String, String> {

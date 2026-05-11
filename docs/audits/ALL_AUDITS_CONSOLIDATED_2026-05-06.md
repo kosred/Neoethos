@@ -530,6 +530,12 @@ The correct direction is not smaller by losing power. It is smaller by making ev
 
 ## Execution log
 
+### 2026-05-11: Follow-on Phase 89 completed — model-runtime artifact bridge
+
+Closed the remaining `model_runtime_backend_fragmentation` bridge gap in `forex-models`. The staged training persistence path now writes a typed `ModelRuntimeArtifact<TrainingRuntimeProfile>` envelope as `model_runtime_artifact.json` beside the existing training runtime profile and training-model contract. Training-model and model-runtime artifact provenance now share one builder, varying only the `ArtifactKind` and envelope type, so backend/device/runtime hashes cannot drift between the two sidecars. See [`follow_on_phase_89_model_runtime_artifact_bridge_2026-05-11.md`](follow_on_phase_89_model_runtime_artifact_bridge_2026-05-11.md).
+
+Verification: RED/GREEN `cargo test -p forex-models --lib persist_training_artifacts_writes_model_runtime_artifact_contract -- --nocapture`, `cargo test -p forex-models --lib -- --test-threads=1`, `cargo fmt --check`, and `git diff --check` all pass.
+
 ### 2026-05-11: Follow-on Phase 88 completed — ONNX runtime boundary cleanup
 
 Closed the `forex_models_functional` ONNX legacy-boundary gap. `ONNXInferenceEngine` now lives in `forex_models::runtime::onnx` instead of the crate root, while `forex_models::ONNXInferenceEngine` remains available as the feature-gated public re-export for compatibility. Added a boundary regression test so `lib.rs` stays a registry/re-export file and future ONNX implementation work remains in the runtime module. See [`follow_on_phase_88_onnx_boundary_2026-05-11.md`](follow_on_phase_88_onnx_boundary_2026-05-11.md).

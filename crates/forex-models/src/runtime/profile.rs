@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use super::capabilities::{CapabilityState, ModelFamily};
 
+pub const MODEL_RUNTIME_ARTIFACT_FILE_NAME: &str = "model_runtime_artifact.json";
 pub const TRAINING_MODEL_ARTIFACT_FILE_NAME: &str = "training_model_artifact.json";
 pub const TRAINING_RUNTIME_PROFILE_FILE_NAME: &str = "training_profile.json";
 
@@ -150,6 +151,21 @@ pub fn write_training_model_artifact<T: Serialize>(
             artifact_label: "training model artifact",
             temp_extension: "tmp_training_model_artifact",
             backup_extension: "bak_training_model_artifact",
+        },
+    )
+}
+
+pub fn write_model_runtime_artifact<T: Serialize>(
+    path: &Path,
+    artifact: &forex_core::ModelRuntimeArtifact<T>,
+) -> Result<()> {
+    write_json_with_backup(
+        path,
+        artifact,
+        JsonBackupWriteConfig {
+            artifact_label: "model runtime artifact",
+            temp_extension: "tmp_model_runtime_artifact",
+            backup_extension: "bak_model_runtime_artifact",
         },
     )
 }

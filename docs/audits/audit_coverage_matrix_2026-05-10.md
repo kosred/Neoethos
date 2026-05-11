@@ -39,6 +39,11 @@ Postscript 6: Phase 88 closed the `forex_models_functional` ONNX legacy
 boundary by moving `ONNXInferenceEngine` out of `lib.rs` into
 `runtime::onnx`, keeping only a feature-gated crate-root re-export.
 
+Postscript 7: Phase 89 closed the `model_runtime_backend_fragmentation`
+bridge gap by wiring `forex-models` staged training persistence to emit a
+typed `ModelRuntimeArtifact<TrainingRuntimeProfile>` sidecar and by sharing
+the training/model-runtime provenance builder.
+
 `✅` = addressed by the listed phase(s); `🟡` = partially addressed;
 `🔴` = not addressed yet (actionable gap).
 
@@ -62,7 +67,7 @@ boundary by moving `ONNXInferenceEngine` out of `lib.rs` into
 | 16 | `gpu_cuda_hpc_parity_deep_audit_pass4` | 🟡 | 4 | parity tests beyond strategy search (statistical / NEAT / CRFMNES backends) |
 | 17 | `gpu_first_kernel_everywhere_report` | ✅ | preserved, 76-79 | — |
 | 18 | `hardware_autodetect_config_ui_architecture` | 🟡 | 2 | UI hardware/runtime panel exposing scheduler-owned plans (P2-1) |
-| 19 | `model_runtime_backend_fragmentation` | 🟡 | 2, 76-79, 80-85 | model runtime artifact contract wired in forex-models bridge |
+| 19 | `model_runtime_backend_fragmentation` | ✅ | 2, 76-79, 80-85, 89 | — |
 | 20 | `modularization_maintainability_refactor_principle` | ✅ | 6 + 61-70, 87 | — |
 | 21 | `python_pyo3_legacy` | ✅ | confirmed clean, 72 | — |
 | 22 | `quality_challenge_validation_refactor` | ✅ | 25, 29-31 | — |
@@ -101,6 +106,9 @@ boundary by moving `ONNXInferenceEngine` out of `lib.rs` into
   the staged `training_orchestrator` persistence path.
 - **Streaming / RL runtime metadata** (#13): landed across Phases 76,
   79, and 80-85. Phase 88 closed the remaining ONNX legacy boundary.
+- **Model-runtime artifact bridge** (#19): landed in Phase 89 through
+  `model_runtime_artifact.json` sidecars emitted by staged
+  `training_orchestrator` saves.
 
 ### Larger / deferred
 
@@ -127,9 +135,9 @@ is complete. The gaps above split into three buckets:
    streaming routing and artifact producers rather than another broad
    string-to-enum sweep.
 3. **Deferred infrastructure (no phase)**: UI exposure, parity tests
-   for statistical/evolution backends, model-runtime bridge wiring, and
-   large-file splits. Each needs its own design pass before landing — out
-   of scope for a routine follow-on slice.
+   for statistical/evolution backends, CUDA discovery VRAM budget ledger,
+   and large-file splits. Each needs its own design pass before landing —
+   out of scope for a routine follow-on slice.
 
-The next concrete slice should be the model-runtime artifact bridge, unless
-the larger deferred infrastructure gets its own design pass first.
+The next concrete slice should pick one deferred infrastructure gap with a
+tight design boundary before changing behavior.
