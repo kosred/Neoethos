@@ -43,6 +43,19 @@ const ENV_OVERRIDE_VAR: &str = "FOREX_AI_BROKER_CREDENTIALS_PATH";
 /// preferred candidate (env override → config_dir → local) so the caller can
 /// create it.
 pub fn credentials_file_path() -> Result<PathBuf> {
+    // Env override is AUTHORITATIVE: when set, it bypasses both the
+    // existing-file lookup AND the fallback chain so tests can target
+    // an isolated temp path WITHOUT silently falling through to the
+    // operator's real `~/AppData/Roaming/forex-ai/broker_credentials.toml`.
+    // (That fall-through was a real bug — tests were writing to the
+    // user's live credentials file when their temp path did not yet
+    // exist.)
+    if let Ok(custom) = env::var(ENV_OVERRIDE_VAR) {
+        if !custom.trim().is_empty() {
+            return Ok(PathBuf::from(custom));
+        }
+    }
+
     let candidates = candidate_paths()?;
 
     for candidate in &candidates {
@@ -58,13 +71,7 @@ pub fn credentials_file_path() -> Result<PathBuf> {
 }
 
 fn candidate_paths() -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::with_capacity(3);
-
-    if let Ok(custom) = env::var(ENV_OVERRIDE_VAR) {
-        if !custom.trim().is_empty() {
-            paths.push(PathBuf::from(custom));
-        }
-    }
+    let mut paths = Vec::with_capacity(2);
 
     if let Some(config_dir) = dirs::config_dir() {
         paths.push(
@@ -214,18 +221,35 @@ mod tests {
     /// tests so they don't race.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// RAII guard that always restores the env even when `body` panics.
+    /// Without this guard, a panicking test left `ENV_OVERRIDE_VAR` set
+    /// AND poisoned `ENV_LOCK`, which then blew up every subsequent
+    /// env-touching test with `env lock poisoned`. Now we recover from
+    /// poison via `into_inner` and Drop runs in any path.
+    struct EnvOverrideGuard;
+    impl Drop for EnvOverrideGuard {
+        fn drop(&mut self) {
+            // SAFETY: `with_env_path` holds `ENV_LOCK` for the lifetime
+            // of this guard — no other test can be touching the env.
+            unsafe {
+                env::remove_var(ENV_OVERRIDE_VAR);
+            }
+        }
+    }
+
     fn with_env_path<F: FnOnce(&std::path::Path)>(path: &std::path::Path, body: F) {
-        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // SAFETY: the lock above ensures no concurrent env access from
-        // these tests; cargo test still parallelizes outer tests but the
-        // env-touching ones share the lock.
+        // these tests; cargo test still parallelizes outer tests but
+        // the env-touching ones share the lock.
         unsafe {
             env::set_var(ENV_OVERRIDE_VAR, path);
         }
+        let _env_guard = EnvOverrideGuard;
         body(path);
-        unsafe {
-            env::remove_var(ENV_OVERRIDE_VAR);
-        }
+        // _env_guard's Drop fires here (or on panic) — env always cleared.
     }
 
     fn populated_settings() -> BrokerSettingsState {
@@ -387,13 +411,27 @@ mod tests {
 
     #[test]
     fn malformed_toml_falls_back_to_default() {
+        use crate::app_services::embedded_credentials::EMBEDDED_CTRADER_CLIENT_ID;
+
         let dir = tempdir_or_skip();
         let path = dir.join("malformed.toml");
         fs::write(&path, "not = valid \n[unclosed").expect("write");
 
         with_env_path(&path, |_| {
             let loaded = load_broker_settings();
-            assert_eq!(loaded, BrokerSettingsState::default());
+            // Filesystem load fell back to default (good — the malformed
+            // TOML did not panic). Then the embedded fallback overlay
+            // ran, so the loaded result equals "default + embedded".
+            let mut expected = BrokerSettingsState::default();
+            apply_embedded_fallback(&mut expected);
+            assert_eq!(loaded, expected);
+            // Sanity-check that the failure path went through the
+            // default rather than parsing junk into real fields.
+            if EMBEDDED_CTRADER_CLIENT_ID.is_empty() {
+                assert_eq!(loaded.ctrader.client_id, "");
+            } else {
+                assert_eq!(loaded.ctrader.client_id, EMBEDDED_CTRADER_CLIENT_ID);
+            }
         });
     }
 
