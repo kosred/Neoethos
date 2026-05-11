@@ -28,6 +28,11 @@ fn synthesize_signals_kernel<F: Float + CubeElement>(
     // cubecl 0.9: ABSOLUTE_POS and Array::len() are `usize`, and array
     // indexing also expects `usize`. Coerce all u32 kernel parameters
     // to usize at the top of the kernel so the rest reads naturally.
+    //
+    // For mutable scalar accumulators (`combined`, `active_sum`,
+    // `score`, `sig`) we must use RuntimeCell because cubecl 0.9's
+    // `assign` and `assign_op` paths both reject const-initialized
+    // `let mut` bindings.
     let pos = ABSOLUTE_POS;
     if pos < output.len() {
         let n_samples = n_samples as usize;
@@ -36,74 +41,66 @@ fn synthesize_signals_kernel<F: Float + CubeElement>(
 
         let start = gene_offsets[gene] as usize;
         let end = gene_offsets[gene + 1] as usize;
-        // cubecl 0.9: compound assignment (`+=`) panics with
-        // "Can't have a mutable operation on a const variable" when the
-        // accumulator was initialized from a Const expression like
-        // `F::new(0.0)`. Plain `=` against a `let mut` binding goes
-        // through `assign_expand` which doesn't have the check.
-        let mut combined = F::new(0.0);
-        let mut i = start;
-        while i < end {
+        let combined = RuntimeCell::<F>::new(F::new(0.0));
+        for i in start..end {
             let idx = gene_indices[i] as usize;
             let weight = gene_weights[i];
             let indicator = indicators[idx * n_samples + sample];
-            combined = combined + weight * indicator;
-            i = i + 1;
+            combined.store(combined.read() + weight * indicator);
         }
 
         let lt = long_thr[gene];
         let st = short_thr[gene];
-        let mut sig = 0i32;
-        if combined >= lt {
-            sig = 1;
-        } else if combined <= st {
-            sig = -1;
+        let combined_val = combined.read();
+        let sig = RuntimeCell::<i32>::new(0);
+        if combined_val >= lt {
+            sig.store(1);
+        } else if combined_val <= st {
+            sig.store(-1);
         }
 
-        if sig == 0 {
+        let sig_val = sig.read();
+        if sig_val == 0 {
             output[pos] = 0;
             terminate!();
         }
 
         let flag_base = gene * SMC_WIDTH;
         let smc_base = sample * SMC_WIDTH;
-        let mut active_sum = F::new(0.0);
-        let mut j = 0usize;
-        while j < SMC_WIDTH {
+        let active_sum = RuntimeCell::<F>::new(F::new(0.0));
+        for j in 0..SMC_WIDTH {
             if gene_smc_flags[flag_base + j] != 0 {
-                active_sum = active_sum + smc_weights[j];
+                active_sum.store(active_sum.read() + smc_weights[j]);
             }
-            j = j + 1;
         }
 
-        if active_sum <= F::new(0.0) {
-            output[pos] = sig;
+        let active_sum_val = active_sum.read();
+        if active_sum_val <= F::new(0.0) {
+            output[pos] = sig_val;
             terminate!();
         }
 
-        let gate = if active_sum < gate_threshold {
-            active_sum
+        let gate = if active_sum_val < gate_threshold {
+            active_sum_val
         } else {
             gate_threshold
         };
-        let mut score = F::new(0.0);
-        let mut k = 0usize;
-        while k < SMC_WIDTH {
+        let score = RuntimeCell::<F>::new(F::new(0.0));
+        for k in 0..SMC_WIDTH {
             if gene_smc_flags[flag_base + k] != 0 {
                 let smc_value = smc_data[smc_base + k];
                 if k == 5 {
                     if smc_value == 1 {
-                        score = score + smc_weights[k];
+                        score.store(score.read() + smc_weights[k]);
                     }
-                } else if smc_value == sig {
-                    score = score + smc_weights[k];
+                } else if smc_value == sig_val {
+                    score.store(score.read() + smc_weights[k]);
                 }
             }
-            k = k + 1;
         }
 
-        if score >= gate {
-            output[pos] = sig;
+        if score.read() >= gate {
+            output[pos] = sig_val;
         } else {
             output[pos] = 0;
         }

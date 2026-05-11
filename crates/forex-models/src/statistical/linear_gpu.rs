@@ -15,13 +15,15 @@ pub(crate) struct LinearCudaFit {
 
 #[cube]
 fn sign_f32(value: f32) -> f32 {
-    let mut out: f32 = 0.0;
+    // cubecl 0.9: literal-init `let mut` panics on later assignment.
+    // RuntimeCell wraps the binding so writes go through `expand_no_check`.
+    let out = RuntimeCell::<f32>::new(0.0);
     if value > 0.0 {
-        out = 1.0;
+        out.store(1.0);
     } else if value < 0.0 {
-        out = -1.0;
+        out.store(-1.0);
     }
-    out
+    out.read()
 }
 
 #[cube]
@@ -180,16 +182,17 @@ fn softmax_loss_kernel(
             terminate!();
         }
 
-        let mut loss: f32 = 0.0;
+        // cubecl 0.9: `let mut x = literal;` produces an immutable
+        // binding; the `assign` and `assign_op` paths both panic on
+        // const lhs. Use `RuntimeCell` for runtime-mutable scalars.
+        let loss = RuntimeCell::<f32>::new(0.0);
         let rows_us = rows as usize;
-        let mut row = 0usize;
-        while row < rows_us {
+        for row in 0..rows_us {
             let label = labels[row] as u32;
             let probability = class_probability(features, weights, bias, row as u32, cols, label);
-            loss = loss - clamp_probability(probability).ln();
-            row = row + 1;
+            loss.store(loss.read() - clamp_probability(probability).ln());
         }
-        loss_out[0] = loss / rows as f32;
+        loss_out[0] = loss.read() / rows as f32;
     }
 }
 
