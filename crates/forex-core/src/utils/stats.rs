@@ -136,10 +136,10 @@ mod tests {
     fn population_vs_sample_stddev_match_known_values() {
         let values = [1.0, 2.0, 3.0, 4.0, 5.0];
         let m = mean(&values);
-        // population variance = ((1-3)^2 + ... ) / 5 = 2.0 → σ ≈ 1.4142
-        assert!((stddev(&values, m) - 1.4142135623730951).abs() < 1e-12);
-        // sample variance = 10 / 4 = 2.5 → σ ≈ 1.5811
-        assert!((stddev_sample(&values, m) - 1.5811388300841898).abs() < 1e-12);
+        // population variance = ((1-3)^2 + ... ) / 5 = 2.0 → σ = √2
+        assert!((stddev(&values, m) - std::f64::consts::SQRT_2).abs() < 1e-12);
+        // sample variance = 10 / 4 = 2.5 → σ = √2.5
+        assert!((stddev_sample(&values, m) - 2.5_f64.sqrt()).abs() < 1e-12);
     }
 
     #[test]

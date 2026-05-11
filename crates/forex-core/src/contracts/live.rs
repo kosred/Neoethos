@@ -245,14 +245,14 @@ impl LiveExecutionContract {
             &self.risk_config_hash,
         )?;
 
-        if let Some(required_backend) = self.required_backend_kind {
-            if provenance.backend_kind != required_backend {
-                return Err(ArtifactContractError::LiveRejectedMismatch {
-                    field: "backend_kind",
-                    actual: format!("{:?}", provenance.backend_kind),
-                    expected: format!("{:?}", required_backend),
-                });
-            }
+        if let Some(required_backend) = self.required_backend_kind
+            && provenance.backend_kind != required_backend
+        {
+            return Err(ArtifactContractError::LiveRejectedMismatch {
+                field: "backend_kind",
+                actual: format!("{:?}", provenance.backend_kind),
+                expected: format!("{:?}", required_backend),
+            });
         }
 
         if let Some(max_age) = self.max_artifact_age_seconds {

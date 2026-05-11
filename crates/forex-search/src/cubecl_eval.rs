@@ -547,10 +547,27 @@ fn backtest_kernel_units(client: &ComputeClient<CudaRuntime>) -> u32 {
 }
 
 fn cuda_device_id() -> usize {
-    std::env::var("FOREX_BOT_SEARCH_EVAL_CUDA_DEVICE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0)
+    match std::env::var("FOREX_BOT_SEARCH_EVAL_CUDA_DEVICE") {
+        // Not set: pick device 0 silently — the canonical default.
+        Err(_) => 0,
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(value) => value,
+            Err(_) => {
+                // The user explicitly set the env var but it did not
+                // parse as a usize ("auto", "all", "GPU0" — typos like
+                // these used to silently fall back to device 0,
+                // running the search on the wrong card without telling
+                // anyone. Now we shout, then default.
+                tracing::warn!(
+                    target: "forex_search::gpu",
+                    raw = %raw,
+                    "FOREX_BOT_SEARCH_EVAL_CUDA_DEVICE is set but not a valid \
+                     non-negative integer; falling back to device 0."
+                );
+                0
+            }
+        },
+    }
 }
 
 fn flatten_i32_rows(rows: &[SmcRow]) -> Vec<i32> {

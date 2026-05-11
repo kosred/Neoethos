@@ -496,8 +496,13 @@ impl SeenSignatureMemory {
             for v in &self.pending {
                 bytes.extend_from_slice(&v.to_le_bytes());
             }
-            if file.write_all(&bytes).is_ok() {
-                let _ = file.flush();
+            // Only clear `pending` if both the write AND the flush
+            // succeeded. Otherwise the data is still buffered and will
+            // be retried on the next call. Without the flush check,
+            // an OS-level buffer-write failure (disk full, broken
+            // file handle) would silently drop data because we'd
+            // clear pending even though nothing reached disk.
+            if file.write_all(&bytes).is_ok() && file.flush().is_ok() {
                 self.pending.clear();
             }
         }

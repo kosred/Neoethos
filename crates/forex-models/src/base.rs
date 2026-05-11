@@ -881,7 +881,11 @@ pub fn compute_psi(expected: &[f64], actual: &[f64], n_bins: usize) -> f64 {
 
     // Create bins from expected distribution
     let mut breakpoints = compute_percentiles(expected, n_bins + 1);
-    breakpoints.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // NaN-safe sort: NaNs sort to the end. We then drop them before dedup
+    // so the histogram never sees a NaN bin edge — `partial_cmp(.).unwrap()`
+    // would have panicked here on the first NaN sample from upstream.
+    breakpoints.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
+    breakpoints.retain(|x| x.is_finite());
     breakpoints.dedup();
 
     if breakpoints.len() < 2 {

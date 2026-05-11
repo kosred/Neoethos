@@ -174,14 +174,14 @@ fn emit_embedded_credentials() {
                     if client_id.is_empty() {
                         client_id = extract_toml_string_value(rest);
                     }
-                } else if let Some(rest) = line.strip_prefix("client_secret") {
-                    if client_secret.is_empty() {
-                        client_secret = extract_toml_string_value(rest);
-                    }
-                } else if let Some(rest) = line.strip_prefix("redirect_uri") {
-                    if redirect_uri.is_empty() {
-                        redirect_uri = extract_toml_string_value(rest);
-                    }
+                } else if let Some(rest) = line.strip_prefix("client_secret")
+                    && client_secret.is_empty()
+                {
+                    client_secret = extract_toml_string_value(rest);
+                } else if let Some(rest) = line.strip_prefix("redirect_uri")
+                    && redirect_uri.is_empty()
+                {
+                    redirect_uri = extract_toml_string_value(rest);
                 }
             }
         }

@@ -193,13 +193,12 @@ mod tests {
         let reloaded: SampleArtifact = read_json(&path, "sample").expect("read atomic json");
 
         assert_eq!(reloaded, artifact);
-        assert_eq!(
+        assert!(
             temporary_path(&path)
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or_default()
-                .starts_with(".artifact.json.tmp-"),
-            true
+                .starts_with(".artifact.json.tmp-")
         );
         std::fs::remove_dir_all(&dir).expect("cleanup atomic json dir");
     }

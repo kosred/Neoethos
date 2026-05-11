@@ -389,11 +389,11 @@ impl Gene {
 
         let mut merged: Vec<(usize, f32)> = Vec::with_capacity(terms.len());
         for (idx, weight) in terms {
-            if let Some((last_idx, last_weight)) = merged.last_mut() {
-                if *last_idx == idx {
-                    *last_weight += weight;
-                    continue;
-                }
+            if let Some((last_idx, last_weight)) = merged.last_mut()
+                && *last_idx == idx
+            {
+                *last_weight += weight;
+                continue;
             }
             merged.push((idx, weight));
         }
