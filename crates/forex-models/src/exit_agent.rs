@@ -1349,7 +1349,15 @@ impl ExitAgent {
         }
         if let Err(error) = std::fs::rename(staged_path, target_path) {
             if backup_path.exists() {
-                let _ = std::fs::rename(&backup_path, target_path);
+                if let Err(restore_err) = std::fs::rename(&backup_path, target_path) {
+                tracing::error!(
+                    target: "forex_models::artifact",
+                    backup = %backup_path.display(),
+                    target = %target_path.display(),
+                    error = %restore_err,
+                    "failed to restore backup after staged-rename failure;                      artifact directory may be in an inconsistent state"
+                );
+            }
             }
             anyhow::bail!(
                 "rename staged exit-agent artifact into {} failed: {}",

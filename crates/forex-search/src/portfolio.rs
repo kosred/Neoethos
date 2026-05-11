@@ -137,9 +137,22 @@ impl PortfolioOptimizer {
             let mut raw = vec![0.0; n_assets];
             for i in 0..n_assets {
                 let s = &names[i];
-                let sharpe = *sharpe_map
-                    .get(s)
-                    .expect("ranked allocation names should always resolve to sharpe metrics");
+                // The sharpe_map is built from metrics_map.get() above,
+                // so a name without metrics gets silently skipped. The
+                // previous `.expect("…always resolve…")` would panic
+                // when that happened. We treat missing metrics as a
+                // zero-sharpe allocation (effectively excluded from the
+                // ranking) which is what the downstream `.max(0.0)`
+                // already enforces.
+                let sharpe = sharpe_map.get(s).copied().unwrap_or_else(|| {
+                    tracing::warn!(
+                        target: "forex_search::portfolio",
+                        strategy = %s,
+                        "ranked allocation name has no sharpe metric; \
+                         falling back to zero-weight allocation"
+                    );
+                    0.0
+                });
                 let div_score = if avg_corr[i] >= 0.0 {
                     1.0 / (1.0 + avg_corr[i])
                 } else {
