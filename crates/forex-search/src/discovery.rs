@@ -177,6 +177,22 @@ pub struct DiscoveryConfig {
     /// Typed replacements for the legacy `FOREX_BOT_PREFILTER_*` /
     /// `FOREX_BOT_FUNNEL_STAGE1_PCT` env vars.
     pub runtime_overrides: DiscoveryRuntimeOverrides,
+    /// When `Some`, the discovery pipeline replaces its full-history
+    /// walkforward consistency gate with a "passes prop-firm rules on
+    /// N random 30-day windows ≥ pass_rate" gate. Populated from
+    /// `FOREX_BOT_DISCOVERY_PROP_FIRM_GATE=1` and friends in
+    /// `with_env_runtime_overrides`. `None` keeps the production
+    /// behavior unchanged.
+    pub prop_firm_gate: Option<PropFirmGateOverrides>,
+}
+
+/// Configuration for the prop-firm window-pass gate.
+#[derive(Debug, Clone)]
+pub struct PropFirmGateOverrides {
+    pub rules: PropFirmRiskRules,
+    pub n_windows: usize,
+    pub window_days: usize,
+    pub pass_rate: f64,
 }
 
 impl Default for DiscoveryConfig {
@@ -211,6 +227,7 @@ impl Default for DiscoveryConfig {
             max_regime_loss_pct: 3.0,
             higher_timeframes: Vec::new(),
             runtime_overrides: DiscoveryRuntimeOverrides::default(),
+            prop_firm_gate: None,
         }
     }
 }
@@ -279,6 +296,7 @@ impl DiscoveryConfig {
             max_regime_loss_pct: 3.0,
             higher_timeframes: settings.system.higher_timeframes.clone(),
             runtime_overrides: DiscoveryRuntimeOverrides::default(),
+            prop_firm_gate: None,
         }
     }
 
@@ -318,6 +336,43 @@ impl DiscoveryConfig {
             if std::env::var("FOREX_BOT_DISCOVERY_MIN_TRADES_PER_DAY").is_err() {
                 self.min_trades_per_day = 0.02;
             }
+        }
+        let prop_firm_enabled = matches!(
+            std::env::var("FOREX_BOT_DISCOVERY_PROP_FIRM_GATE")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase()),
+            Some(value) if matches!(value.as_str(), "1" | "true" | "on" | "yes")
+        );
+        if prop_firm_enabled {
+            let mut rules = PropFirmRiskRules::default();
+            if let Some(v) = read_env_f64("FOREX_BOT_DISCOVERY_PROP_FIRM_MAX_DAILY_LOSS_PCT") {
+                rules.max_daily_loss_pct = v;
+            }
+            if let Some(v) = read_env_f64("FOREX_BOT_DISCOVERY_PROP_FIRM_MAX_DD_PCT") {
+                rules.max_overall_drawdown_pct = v;
+            }
+            if let Some(v) = read_env_f64("FOREX_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT") {
+                rules.min_profit_target_pct = v;
+                rules.require_profit_target = v > 0.0;
+            }
+            if let Some(v) = read_env_usize("FOREX_BOT_DISCOVERY_PROP_FIRM_MIN_TRADING_DAYS") {
+                rules.min_trading_days = v;
+            }
+            let n_windows = read_env_usize("FOREX_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS")
+                .unwrap_or(50)
+                .max(1);
+            let window_days = read_env_usize("FOREX_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS")
+                .unwrap_or(30)
+                .max(1);
+            let pass_rate = read_env_f64("FOREX_BOT_DISCOVERY_PROP_FIRM_PASS_RATE")
+                .map(|v| v.clamp(0.0, 1.0))
+                .unwrap_or(0.6);
+            self.prop_firm_gate = Some(PropFirmGateOverrides {
+                rules,
+                n_windows,
+                window_days,
+                pass_rate,
+            });
         }
         self
     }
@@ -393,6 +448,16 @@ pub struct DiscoveryValidationGates {
     pub cpcv_fold_count: usize,
     pub cpcv_profitable_fold_ratio: f64,
     pub temporal_contract_hash: Option<String>,
+    /// Set when the prop-firm window-pass gate
+    /// (`FOREX_BOT_DISCOVERY_PROP_FIRM_GATE=1`) replaces the walkforward
+    /// + CPCV consistency gates. Each portfolio member has already passed
+    /// FTMO-style rules on at least `pass_rate` of N random 30-day
+    /// windows from the dataset; this is what an actual prop-firm
+    /// challenge measures, so the much stricter "every walkforward
+    /// split must be profitable" requirement is bypassed here.
+    pub prop_firm_window_passed: bool,
+    pub prop_firm_window_pass_rate: f64,
+    pub prop_firm_window_count: usize,
 }
 
 impl DiscoveryValidationGates {
@@ -405,11 +470,17 @@ impl DiscoveryValidationGates {
             cpcv_fold_count: 0,
             cpcv_profitable_fold_ratio: 0.0,
             temporal_contract_hash: None,
+            prop_firm_window_passed: false,
+            prop_firm_window_pass_rate: 0.0,
+            prop_firm_window_count: 0,
         }
     }
 
     pub fn is_portfolio_export_ready(&self) -> bool {
-        self.walkforward_passed && self.cpcv_passed
+        // Prop-firm window mode is the canonical export path when
+        // active — it measures exactly what a challenge measures, so
+        // the older walkforward-consistency / CPCV gates do not apply.
+        self.prop_firm_window_passed || (self.walkforward_passed && self.cpcv_passed)
     }
 }
 
@@ -1012,6 +1083,9 @@ fn build_discovery_validation_artifacts(
         cpcv_fold_count,
         cpcv_profitable_fold_ratio,
         temporal_contract_hash: Some(temporal_contract_hash),
+        prop_firm_window_passed: false,
+        prop_firm_window_pass_rate: 0.0,
+        prop_firm_window_count: 0,
     };
 
     Ok((
@@ -1528,6 +1602,98 @@ fn validate_regime_robustness(
     true
 }
 
+fn read_env_f64(name: &str) -> Option<f64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+}
+
+fn read_env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+}
+
+/// Sample roughly evenly-spaced 30-day (configurable) windows from the
+/// dataset history; for each window simulate trades and check the strategy
+/// against `compute_prop_firm_risk_summary`. Return the fraction of
+/// windows whose `all_rules_passed` flag is true.
+///
+/// This measures what an actual prop-firm challenge measures (one
+/// 30-day window, FTMO rules) — much more directly relevant than the
+/// "every walkforward split must be profitable" gate.
+fn compute_prop_firm_pass_rate(
+    gene: &Gene,
+    signals: &[i8],
+    ohlcv: &Ohlcv,
+    timestamps: &[i64],
+    config: &DiscoveryConfig,
+    overrides: &PropFirmGateOverrides,
+) -> (f64, usize) {
+    let n = signals
+        .len()
+        .min(timestamps.len())
+        .min(ohlcv.close.len())
+        .min(ohlcv.high.len())
+        .min(ohlcv.low.len());
+    if n == 0 || overrides.window_days == 0 || overrides.n_windows == 0 {
+        return (0.0, 0);
+    }
+    let window_ms: i64 = (overrides.window_days as i64) * 86_400_000;
+    let first_ts = timestamps[0];
+    let last_ts = timestamps[n - 1];
+    if last_ts - first_ts < window_ms {
+        return (0.0, 0);
+    }
+    let max_start_ts = last_ts - window_ms;
+    let span = (max_start_ts - first_ts).max(1) as f64;
+    let n_windows = overrides.n_windows.max(1);
+    let stride = if n_windows == 1 {
+        0.0
+    } else {
+        span / (n_windows as f64 - 1.0)
+    };
+
+    let settings = discovery_backtest_settings(config, gene, ohlcv.close.last().copied());
+    let initial_balance = config.initial_balance.max(1.0);
+
+    let mut passes = 0usize;
+    let mut counted = 0usize;
+    for i in 0..n_windows {
+        let start_ts = if n_windows == 1 {
+            first_ts
+        } else {
+            first_ts + stride.mul_add(i as f64, 0.0) as i64
+        };
+        let end_ts = start_ts + window_ms;
+        let start_idx = timestamps.partition_point(|&t| t < start_ts);
+        let end_idx = timestamps.partition_point(|&t| t < end_ts).min(n);
+        if end_idx <= start_idx + 1 {
+            continue;
+        }
+        let close = &ohlcv.close[start_idx..end_idx];
+        let high = &ohlcv.high[start_idx..end_idx];
+        let low = &ohlcv.low[start_idx..end_idx];
+        let ts = &timestamps[start_idx..end_idx];
+        let sig = &signals[start_idx..end_idx];
+        let trades = simulate_trades_core(close, high, low, ts, sig, &settings);
+        let summary = compute_prop_firm_risk_summary(PropFirmRiskInput {
+            trades: &trades,
+            initial_balance,
+            rules: overrides.rules,
+        });
+        if summary.all_rules_passed {
+            passes += 1;
+        }
+        counted += 1;
+    }
+    if counted == 0 {
+        return (0.0, 0);
+    }
+    (passes as f64 / counted as f64, counted)
+}
+
 fn finalize_candidates_with_progress<F>(
     candidates: Vec<Gene>,
     features: &FeatureFrame,
@@ -1818,10 +1984,57 @@ where
         signals_map = screened_signals;
     }
 
+    // Prop-firm window-pass gate (FOREX_BOT_DISCOVERY_PROP_FIRM_GATE=1).
+    // For each surviving candidate, simulate trades on N evenly-spaced
+    // 30-day windows from history and require the strategy to pass FTMO
+    // rules on at least `pass_rate` of them. This is the canonical
+    // prop-firm passing criterion — a much more directly relevant
+    // measure than the older "every walkforward split must be
+    // profitable" gate.
+    let mut prop_firm_pass_rates: Vec<f64> = Vec::new();
+    if let Some(pf) = config.prop_firm_gate.clone() {
+        let candidates_in: Vec<((usize, Gene), Vec<i8>)> =
+            filtered.into_iter().zip(signals_map.into_iter()).collect();
+        let timestamps_owned = features.timestamps.clone();
+        let scored: Vec<(((usize, Gene), Vec<i8>), f64, usize)> = candidates_in
+            .into_par_iter()
+            .map(|(pair, sig)| {
+                let (rate, counted) = compute_prop_firm_pass_rate(
+                    &pair.1,
+                    &sig,
+                    ohlcv,
+                    &timestamps_owned,
+                    config,
+                    &pf,
+                );
+                ((pair, sig), rate, counted)
+            })
+            .filter(|(_, rate, counted)| *counted > 0 && *rate >= pf.pass_rate)
+            .collect();
+        let mut next_filtered: Vec<(usize, Gene)> = Vec::with_capacity(scored.len());
+        let mut next_signals: Vec<Vec<i8>> = Vec::with_capacity(scored.len());
+        for ((pair, sig), rate, _) in scored {
+            next_filtered.push(pair);
+            next_signals.push(sig);
+            prop_firm_pass_rates.push(rate);
+        }
+        tracing::info!(
+            target: "forex_search::prop_firm",
+            survivors = next_filtered.len(),
+            pass_rate_threshold = pf.pass_rate,
+            window_days = pf.window_days,
+            n_windows = pf.n_windows,
+            "prop-firm window-pass gate applied"
+        );
+        filtered = next_filtered;
+        signals_map = next_signals;
+    }
+
     let mut portfolio = Vec::new();
     let mut portfolio_signals: Vec<Vec<i8>> = Vec::new();
     let mut rejected_by_correlation = 0usize;
-    for ((_, gene), sig) in filtered.into_iter().zip(signals_map) {
+    let mut portfolio_pass_rates: Vec<f64> = Vec::new();
+    for (idx, ((_, gene), sig)) in filtered.into_iter().zip(signals_map).enumerate() {
         if portfolio.len() >= config.portfolio_size {
             break;
         }
@@ -1840,6 +2053,9 @@ where
         if ok {
             portfolio_signals.push(sig);
             portfolio.push(gene);
+            if let Some(rate) = prop_firm_pass_rates.get(idx) {
+                portfolio_pass_rates.push(*rate);
+            }
         }
     }
     progress_fn(DiscoveryProgress::PortfolioSelected {
@@ -1847,7 +2063,7 @@ where
         rejected_by_correlation,
         target_portfolio: config.portfolio_size,
     });
-    let (validation_gates, canonical_backtest_artifacts, walkforward_validation_artifacts) =
+    let (mut validation_gates, canonical_backtest_artifacts, walkforward_validation_artifacts) =
         build_discovery_validation_artifacts(
             &portfolio,
             &portfolio_signals,
@@ -1855,6 +2071,15 @@ where
             ohlcv,
             config,
         )?;
+    if let Some(pf) = config.prop_firm_gate.as_ref() {
+        validation_gates.prop_firm_window_passed = !portfolio.is_empty();
+        validation_gates.prop_firm_window_count = pf.n_windows;
+        validation_gates.prop_firm_window_pass_rate = if portfolio_pass_rates.is_empty() {
+            0.0
+        } else {
+            portfolio_pass_rates.iter().sum::<f64>() / portfolio_pass_rates.len() as f64
+        };
+    }
     progress_fn(DiscoveryProgress::Completed {
         candidate_count: ranked_candidate_genes.len(),
         filtered_count,
@@ -2663,6 +2888,65 @@ mod tests {
             .expect_err("portfolio export must fail before validation gates pass");
         assert!(err.to_string().contains("walkforward_passed"));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn portfolio_export_succeeds_when_prop_firm_window_passed_even_without_walkforward() {
+        let mut result = DiscoveryResult {
+            portfolio: vec![profitable_gene("alpha-1")],
+            candidates: Vec::new(),
+            quality_metrics: Vec::new(),
+            logged_trades: Vec::new(),
+            effective_feature_names: vec!["signal".to_string()],
+            validation_gates: DiscoveryValidationGates::pending(),
+            canonical_backtest_artifacts: Vec::new(),
+            walkforward_validation_artifacts: Vec::new(),
+            forward_test_validation_artifacts: Vec::new(),
+            prop_firm_validation_artifacts: Vec::new(),
+        };
+        // The prop-firm window-pass gate is the canonical export path
+        // when active; walkforward and CPCV are intentionally unset.
+        result.validation_gates.prop_firm_window_passed = true;
+        result.validation_gates.prop_firm_window_count = 50;
+        result.validation_gates.prop_firm_window_pass_rate = 0.72;
+        let path = temp_path("portfolio-prop-firm-export");
+
+        save_portfolio_json(&path, &result)
+            .expect("portfolio export should pass when prop-firm gate is the active path");
+        assert!(path.exists());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn prop_firm_gate_env_overrides_populate_discovery_config() {
+        // SAFETY: tests that read process-wide env may race; this group
+        // is gated through serial_test or set/unset is balanced here.
+        unsafe {
+            std::env::set_var("FOREX_BOT_DISCOVERY_PROP_FIRM_GATE", "1");
+            std::env::set_var("FOREX_BOT_DISCOVERY_PROP_FIRM_PASS_RATE", "0.42");
+            std::env::set_var("FOREX_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS", "17");
+            std::env::set_var("FOREX_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS", "21");
+            std::env::set_var(
+                "FOREX_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT",
+                "0.08",
+            );
+        }
+        let cfg = DiscoveryConfig::default().with_env_runtime_overrides();
+        unsafe {
+            std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_GATE");
+            std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_PASS_RATE");
+            std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS");
+            std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS");
+            std::env::remove_var("FOREX_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT");
+        }
+        let pf = cfg
+            .prop_firm_gate
+            .expect("env-enabled gate should populate prop_firm_gate");
+        assert_eq!(pf.n_windows, 17);
+        assert_eq!(pf.window_days, 21);
+        assert!((pf.pass_rate - 0.42).abs() < 1e-9);
+        assert!(pf.rules.require_profit_target);
+        assert!((pf.rules.min_profit_target_pct - 0.08).abs() < 1e-9);
     }
 
     #[test]
