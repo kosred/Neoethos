@@ -11,7 +11,7 @@ const SMC_WIDTH: usize = 11;
 const BACKTEST_CORE_METRIC_WIDTH: usize = 7;
 
 #[cube(launch)]
-fn synthesize_signals_kernel<F: Float>(
+fn synthesize_signals_kernel<F: Float + CubeElement>(
     indicators: &Array<F>,
     gene_offsets: &Array<i32>,
     gene_indices: &Array<i32>,
@@ -25,21 +25,21 @@ fn synthesize_signals_kernel<F: Float>(
     n_samples: u32,
     gate_threshold: F,
 ) {
-    // cubecl 0.9: ABSOLUTE_POS and array.len() are usize; the rest of
-    // the kernel was written against u32. Coerce at the boundary so the
-    // existing u32 arithmetic carries through unchanged.
-    let pos = ABSOLUTE_POS as u32;
-    let out_len = output.len() as u32;
-    if pos < out_len {
+    // cubecl 0.9: ABSOLUTE_POS and Array::len() are `usize`, and array
+    // indexing also expects `usize`. Coerce all u32 kernel parameters
+    // to usize at the top of the kernel so the rest reads naturally.
+    let pos = ABSOLUTE_POS;
+    if pos < output.len() {
+        let n_samples = n_samples as usize;
         let gene = pos / n_samples;
         let sample = pos % n_samples;
 
-        let start = gene_offsets[gene] as u32;
-        let end = gene_offsets[gene + 1] as u32;
+        let start = gene_offsets[gene] as usize;
+        let end = gene_offsets[gene + 1] as usize;
         let mut combined = F::new(0.0);
         let mut i = start;
         while i < end {
-            let idx = gene_indices[i] as u32;
+            let idx = gene_indices[i] as usize;
             let weight = gene_weights[i];
             let indicator = indicators[idx * n_samples + sample];
             combined += weight * indicator;
@@ -60,11 +60,11 @@ fn synthesize_signals_kernel<F: Float>(
             terminate!();
         }
 
-        let flag_base = gene * SMC_WIDTH as u32;
-        let smc_base = sample * SMC_WIDTH as u32;
+        let flag_base = gene * SMC_WIDTH;
+        let smc_base = sample * SMC_WIDTH;
         let mut active_sum = F::new(0.0);
-        let mut j = 0u32;
-        while j < SMC_WIDTH as u32 {
+        let mut j = 0usize;
+        while j < SMC_WIDTH {
             if gene_smc_flags[flag_base + j] != 0 {
                 active_sum += smc_weights[j];
             }
@@ -82,8 +82,8 @@ fn synthesize_signals_kernel<F: Float>(
             gate_threshold
         };
         let mut score = F::new(0.0);
-        let mut k = 0u32;
-        while k < SMC_WIDTH as u32 {
+        let mut k = 0usize;
+        while k < SMC_WIDTH {
             if gene_smc_flags[flag_base + k] != 0 {
                 let smc_value = smc_data[smc_base + k];
                 if k == 5 {
@@ -135,17 +135,19 @@ fn backtest_population_kernel(
     commission_per_trade: f32,
     pip_value_per_lot: f32,
 ) {
-    // cubecl 0.9: ABSOLUTE_POS and len() are usize; coerce to u32 at the
-    // boundary so the rest of the kernel's u32 arithmetic carries through.
-    let abs_pos = ABSOLUTE_POS as u32;
-    let counts_len = trade_counts_out.len() as u32;
-    if abs_pos < counts_len {
-        let gene = abs_pos;
+    // cubecl 0.9: index arithmetic is usize; coerce u32 params at the top.
+    if ABSOLUTE_POS < trade_counts_out.len() {
+        let gene = ABSOLUTE_POS;
+        let n_samples = n_samples as usize;
+        let month_capacity = month_capacity as usize;
+        let max_hold_bars = max_hold_bars as usize;
+        let min_hold_bars = min_hold_bars as usize;
+        let max_trades_per_day = max_trades_per_day as usize;
         let signal_base = gene * n_samples;
         let month_base = gene * month_capacity;
-        let metric_base = gene * BACKTEST_CORE_METRIC_WIDTH as u32;
+        let metric_base = gene * BACKTEST_CORE_METRIC_WIDTH;
 
-        let mut zero_idx = 0u32;
+        let mut zero_idx = 0usize;
         while zero_idx < month_capacity {
             monthly_pnls_out[month_base + zero_idx] = 0.0;
             zero_idx += 1;
@@ -154,8 +156,8 @@ fn backtest_population_kernel(
         trade_counts_out[gene] = 0;
 
         if n_samples == 0 {
-            let mut j = 0u32;
-            while j < BACKTEST_CORE_METRIC_WIDTH as u32 {
+            let mut j = 0usize;
+            while j < BACKTEST_CORE_METRIC_WIDTH {
                 metrics_out[metric_base + j] = 0.0;
                 j += 1;
             }
@@ -181,21 +183,21 @@ fn backtest_population_kernel(
         let mut day_peak = equity;
         let mut day_low = equity;
         let mut max_daily_dd = 0.0f32;
-        let mut day_trade_count = 0u32;
+        let mut day_trade_count = 0usize;
 
         let mut in_pos = 0i32;
         let mut entry_px = 0.0f32;
         let mut entry_idx = -1i32;
         let mut trail_px = 0.0f32;
 
-        let mut i = 1u32;
+        let mut i = 1usize;
         while i < n_samples {
             let m_val = month_idx[i];
             if m_val != last_month {
                 if last_month != -1 {
                     month_ptr += 1;
                     if month_ptr >= 0 && month_ptr < month_capacity as i32 {
-                        monthly_pnls_out[month_base + month_ptr as u32] = current_month_pnl;
+                        monthly_pnls_out[month_base + month_ptr as usize] = current_month_pnl;
                     }
                 }
                 current_month_pnl = 0.0;
