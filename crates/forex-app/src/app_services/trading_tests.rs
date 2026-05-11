@@ -596,6 +596,8 @@ fn cancel_selected_order_records_ctrader_journal_and_updates_status() {
                 trade_side: Some("SELL".to_string()),
                 order_type: Some("LIMIT".to_string()),
                 lot_size: Some(15.0),
+                requested_lot_size: Some(15.0),
+                filled_lot_size: None,
                 execution_price: None,
                 gross_profit: None,
                 fee: None,

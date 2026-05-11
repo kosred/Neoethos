@@ -3,6 +3,10 @@ use egui_dock::{DockState, NodeIndex};
 
 pub struct WorkspaceState {
     dock_state: DockState<WorkspaceTab>,
+    /// Last tab the operator selected via the sidebar — used to paint
+    /// the sidebar's active-row accent stripe. Falls back to the
+    /// initial Chart tab so the sidebar always highlights something.
+    active_tab: WorkspaceTab,
 }
 
 impl WorkspaceState {
@@ -48,7 +52,10 @@ impl WorkspaceState {
             ],
         );
 
-        Self { dock_state }
+        Self {
+            dock_state,
+            active_tab: WorkspaceTab::Chart,
+        }
     }
 
     pub fn dock_state_mut(&mut self) -> &mut DockState<WorkspaceTab> {
@@ -61,7 +68,14 @@ impl WorkspaceState {
                 .set_active_tab((surface_index, node_index, tab_index));
             self.dock_state
                 .set_focused_node_and_surface((surface_index, node_index));
+            self.active_tab = tab;
         }
+    }
+
+    /// Last tab the operator selected via the sidebar — used by the
+    /// sidebar to paint the active-row accent stripe.
+    pub fn active_tab(&self) -> Option<WorkspaceTab> {
+        Some(self.active_tab)
     }
 
     #[cfg(test)]

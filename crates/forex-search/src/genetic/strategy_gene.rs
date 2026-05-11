@@ -190,24 +190,46 @@ fn estimate_pip_value_per_lot(
                 .unwrap_or_else(|| pip_value_quote.max(1e-6));
         }
         // Cross pair (e.g. EURGBP on USD account). Correct formula needs the
-        // quote→account FX rate. If supplied, use it. If not, fall back to
-        // pip_value_quote (i.e. the pip in QUOTE currency) and warn — this
-        // matches the previous (silently wrong) behaviour for the symbol's
-        // own price, but flags the gap so callers can plug in a real rate.
+        // quote→account FX rate. If supplied, use it.
         if let Some(rate) = conv_rate {
             return (pip_value_quote * rate).max(1e-6);
         }
-        tracing::warn!(
+        // No rate supplied. Strict mode (`FOREX_BOT_REJECT_PIP_FALLBACK=1`)
+        // returns NaN so downstream PnL collapses to NaN and the strategy
+        // is rejected by the evaluator's existing fitness guard, surfacing
+        // the misconfiguration instead of silently shipping wrong sizing.
+        // Default mode preserves the previous lenient behaviour but logs
+        // at error level (was warn) so the gap is visible in production.
+        if reject_cross_pair_fallback() {
+            tracing::error!(
+                target: "forex_search::cost_model",
+                symbol,
+                account_currency = %account_currency,
+                "cross-pair pip_value_per_lot rejected: no quote→account FX rate \
+                 and FOREX_BOT_REJECT_PIP_FALLBACK=1; set FOREX_BOT_PROP_PIP_VALUE_PER_LOT \
+                 or supply quote_to_account_rate"
+            );
+            return f64::NAN;
+        }
+        tracing::error!(
             target: "forex_search::cost_model",
             symbol,
             account_currency = %account_currency,
-            "cross-pair pip_value_per_lot estimated without quote→account FX rate; \
-             set FOREX_BOT_PROP_PIP_VALUE_PER_LOT to override"
+            "cross-pair pip_value_per_lot fallback (silently wrong) — set \
+             FOREX_BOT_PROP_PIP_VALUE_PER_LOT or supply quote_to_account_rate; \
+             enable FOREX_BOT_REJECT_PIP_FALLBACK=1 to fail fast"
         );
         return pip_value_quote.max(1e-6);
     }
 
     pip_value_quote.max(1e-6)
+}
+
+fn reject_cross_pair_fallback() -> bool {
+    matches!(
+        std::env::var("FOREX_BOT_REJECT_PIP_FALLBACK").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
 }
 
 pub fn infer_market_cost_profile(
@@ -279,13 +301,18 @@ impl Gene {
         let dd = self.max_drawdown;
         let ppt = if trades > 0.0 { profit / trades } else { 0.0 };
 
-        // Thresholds from evo_prop.py
+        // Anomaly thresholds calibrated for the 4-10%/mo target on a 10y window.
+        // At 6%/mo compounded on a $10K base, target equity is ~$11M; profit alone
+        // therefore cannot identify overfitting — only impossible *ratios* can.
+        // We keep the original ratio gates (DD, win_rate, PF) but raise absolute
+        // profit thresholds 50× so genuine target-hitting strategies are not
+        // discarded as "too good to be true".
         let min_trades = 120.0;
         let max_dd = 0.0025;
         let min_win_rate = 0.92;
         let min_pf = 12.0;
-        let min_profit = 200_000.0;
-        let max_ppt = 2_000.0;
+        let min_profit = 10_000_000.0;
+        let max_ppt = 100_000.0;
 
         let suspicious_combo = trades >= min_trades
             && dd <= max_dd
@@ -296,9 +323,9 @@ impl Gene {
         let suspicious_ppt = trades >= 40.0 && dd <= 0.01 && ppt >= max_ppt;
 
         let suspicious_ultra =
-            trades >= 50.0 && dd <= 0.001 && profit >= 150_000.0 && ppt >= 1_000.0;
+            trades >= 50.0 && dd <= 0.001 && profit >= 7_500_000.0 && ppt >= 50_000.0;
 
-        let suspicious_low_dd = trades >= 80.0 && dd <= 0.001 && profit >= 50_000.0;
+        let suspicious_low_dd = trades >= 80.0 && dd <= 0.001 && profit >= 2_500_000.0;
 
         suspicious_combo || suspicious_ppt || suspicious_ultra || suspicious_low_dd
     }

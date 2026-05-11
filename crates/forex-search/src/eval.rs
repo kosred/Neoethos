@@ -60,6 +60,49 @@ fn mean_std(values: &[f64]) -> (f64, f64) {
     (mean, std)
 }
 
+/// Per-session spread overrides. Values are spread in pips for each
+/// liquidity window. When attached to `BacktestSettings`, the simulator
+/// resolves the spread per bar from the bar's UTC hour-of-day instead
+/// of using the scalar `spread_pips`. `None` → fall back to
+/// `BacktestSettings::spread_pips` for backwards compatibility.
+///
+/// Buckets are intentionally coarse:
+/// - `asian_pips`: 22:00-07:00 UTC (Tokyo, lower liquidity, wider spread)
+/// - `overlap_pips`: 07:00-16:00 UTC (London + London/NY overlap, peak
+///    liquidity, tightest spread)
+/// - `late_ny_pips`: 16:00-22:00 UTC (NY tail, medium spread)
+///
+/// Real broker data is finer-grained but the 3-bucket approximation
+/// already cuts the live-vs-backtest gap meaningfully because the
+/// London/NY-overlap spread is typically 30-50% of the Asian spread.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SessionSpreadProfile {
+    pub asian_pips: f64,
+    pub overlap_pips: f64,
+    pub late_ny_pips: f64,
+}
+
+impl SessionSpreadProfile {
+    /// Resolve the bucket spread (pips) for a UTC unix-millisecond timestamp.
+    pub fn spread_pips_at(self, timestamp_ms: i64) -> f64 {
+        let hour = utc_hour_of_day(timestamp_ms);
+        if (7..16).contains(&hour) {
+            self.overlap_pips
+        } else if (16..22).contains(&hour) {
+            self.late_ny_pips
+        } else {
+            self.asian_pips
+        }
+    }
+}
+
+#[inline]
+fn utc_hour_of_day(timestamp_ms: i64) -> u32 {
+    let secs = timestamp_ms.div_euclid(1_000);
+    let hour = secs.div_euclid(3_600).rem_euclid(24);
+    hour as u32
+}
+
 #[derive(Debug, Clone)]
 pub struct BacktestSettings {
     pub sl_pips: f64,
@@ -76,6 +119,23 @@ pub struct BacktestSettings {
     pub commission_per_trade: f64,
     pub pip_value_per_lot: f64,
     pub kill_zones_enabled: bool,
+    /// Optional session-aware spread override. When `Some`, `spread_pips`
+    /// is ignored and the simulator looks up the per-bar spread from
+    /// the bar's UTC timestamp. Requires bar timestamps to be present;
+    /// falls back to `spread_pips` when timestamps are empty or zero.
+    pub session_spread_profile: Option<SessionSpreadProfile>,
+}
+
+impl BacktestSettings {
+    /// Resolve the spread in pips for a single bar. Uses the typed
+    /// session profile when set, else the scalar `spread_pips`.
+    #[inline]
+    pub fn spread_pips_for_bar(&self, timestamp_ms: i64) -> f64 {
+        match self.session_spread_profile {
+            Some(profile) if timestamp_ms > 0 => profile.spread_pips_at(timestamp_ms),
+            _ => self.spread_pips,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -159,6 +219,7 @@ impl Default for BacktestSettings {
             commission_per_trade: profile.commission_per_trade,
             pip_value_per_lot: profile.pip_value_per_lot,
             kill_zones_enabled: false,
+            session_spread_profile: None,
         }
     }
 }
@@ -295,12 +356,24 @@ pub fn fast_evaluate_strategy_core(
     } else {
         settings.pip_value
     };
-    let half_spread_px = settings.spread_pips * 0.5 * pip;
-    let half_spread_cost = settings.spread_pips * 0.5 * settings.pip_value_per_lot;
+    let scalar_half_spread_px = settings.spread_pips * 0.5 * pip;
+    let scalar_half_spread_cost = settings.spread_pips * 0.5 * settings.pip_value_per_lot;
 
     let use_timestamps = !timestamps.is_empty() && timestamps.len() == n;
+    let session_profile = settings.session_spread_profile.filter(|_| use_timestamps);
 
     for i in 1..n {
+        // Per-bar spread cost. When `session_spread_profile` is unset
+        // these collapse to the loop-invariant scalar, which the
+        // optimiser is free to hoist; the explicit per-bar form keeps
+        // the code uniform whether the profile is on or off.
+        let (half_spread_px, half_spread_cost) = match session_profile {
+            Some(profile) => {
+                let s = profile.spread_pips_at(timestamps[i]);
+                (s * 0.5 * pip, s * 0.5 * settings.pip_value_per_lot)
+            }
+            None => (scalar_half_spread_px, scalar_half_spread_cost),
+        };
         let m_val = *month_idx.get(i).unwrap_or(&last_month);
         if m_val != last_month {
             if last_month != -1 {
@@ -603,8 +676,9 @@ pub fn simulate_trades_core(
     } else {
         settings.pip_value
     };
-    let half_spread_px = settings.spread_pips * 0.5 * pip;
-    let half_spread_cost = settings.spread_pips * 0.5 * settings.pip_value_per_lot;
+    let scalar_half_spread_px = settings.spread_pips * 0.5 * pip;
+    let scalar_half_spread_cost = settings.spread_pips * 0.5 * settings.pip_value_per_lot;
+    let session_profile = settings.session_spread_profile;
 
     let mut trades = Vec::new();
     let mut in_pos = 0i8;
@@ -616,6 +690,14 @@ pub fn simulate_trades_core(
 
     for i in 1..n {
         let ts = timestamps.get(i).copied().unwrap_or_default();
+
+        let (half_spread_px, half_spread_cost) = match session_profile {
+            Some(profile) if ts > 0 => {
+                let s = profile.spread_pips_at(ts);
+                (s * 0.5 * pip, s * 0.5 * settings.pip_value_per_lot)
+            }
+            _ => (scalar_half_spread_px, scalar_half_spread_cost),
+        };
 
         // Day rollover for max_trades_per_day tracking
         let day_key = if ts > 0 { ts / 86_400_000 } else { -1 };
@@ -1039,6 +1121,47 @@ mod overrides_tests {
         let settings = BacktestSettings::default();
         assert!((settings.initial_equity() - 100_000.0).abs() < 1e-9);
         assert_eq!(settings.month_capacity(), 240);
+    }
+
+    #[test]
+    fn session_spread_profile_buckets_by_utc_hour() {
+        let profile = SessionSpreadProfile {
+            asian_pips: 1.8,
+            overlap_pips: 0.5,
+            late_ny_pips: 1.0,
+        };
+        // 02:00 UTC → Asian bucket
+        let asian = profile.spread_pips_at(2 * 3_600_000);
+        // 09:00 UTC → London/NY overlap
+        let overlap = profile.spread_pips_at(9 * 3_600_000);
+        // 18:00 UTC → late NY
+        let late_ny = profile.spread_pips_at(18 * 3_600_000);
+        // 23:30 UTC → Asian (wraps around midnight)
+        let pre_asian = profile.spread_pips_at(23 * 3_600_000 + 30 * 60_000);
+
+        assert!((asian - 1.8).abs() < 1e-9);
+        assert!((overlap - 0.5).abs() < 1e-9);
+        assert!((late_ny - 1.0).abs() < 1e-9);
+        assert!((pre_asian - 1.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn backtest_settings_spread_for_bar_uses_profile_when_present() {
+        let mut settings = BacktestSettings::default();
+        settings.spread_pips = 99.0;
+        // Without a profile, every bar uses the scalar.
+        assert!((settings.spread_pips_for_bar(0) - 99.0).abs() < 1e-9);
+        assert!((settings.spread_pips_for_bar(9 * 3_600_000) - 99.0).abs() < 1e-9);
+
+        settings.session_spread_profile = Some(SessionSpreadProfile {
+            asian_pips: 2.0,
+            overlap_pips: 0.5,
+            late_ny_pips: 1.5,
+        });
+        // With a profile, 09:00 UTC resolves to the overlap bucket.
+        assert!((settings.spread_pips_for_bar(9 * 3_600_000) - 0.5).abs() < 1e-9);
+        // Zero timestamp falls back to the scalar (no real-time signal).
+        assert!((settings.spread_pips_for_bar(0) - 99.0).abs() < 1e-9);
     }
 
     #[test]

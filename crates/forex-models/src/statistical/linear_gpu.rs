@@ -18,25 +18,30 @@ pub(crate) struct LinearCudaFit {
 
 #[cube]
 fn sign_f32(value: f32) -> f32 {
+    // cubecl 0.9: literal-init `let mut` panics on later assignment.
+    // RuntimeCell wraps the binding so writes go through `expand_no_check`.
+    let out = RuntimeCell::<f32>::new(0.0);
     if value > 0.0 {
-        1.0
+        out.store(1.0);
     } else if value < 0.0 {
-        -1.0
-    } else {
-        0.0
+        out.store(-1.0);
     }
+    out.read()
 }
 
 #[cube]
 fn clamp_probability(value: f32) -> f32 {
-    let mut out = value;
-    if out < 0.000001 {
-        out = 0.000001;
+    // cubecl 0.9: even `let mut x = param;` produces an immutable
+    // binding; reassignment goes through `assign_expand` which panics.
+    // RuntimeCell is the only path to a runtime-mutable scalar.
+    let out = RuntimeCell::<f32>::new(value);
+    if out.read() < 0.000001 {
+        out.store(0.000001);
     }
-    if out > 0.999999 {
-        out = 0.999999;
+    if out.read() > 0.999999 {
+        out.store(0.999999);
     }
-    out
+    out.read()
 }
 
 #[cube]
@@ -48,38 +53,42 @@ fn class_probability(
     cols: u32,
     class_idx: u32,
 ) -> f32 {
-    let mut logit0 = bias[0];
-    let mut logit1 = bias[1];
-    let mut logit2 = bias[2];
-    let row_base = row * cols;
-    let mut col = 0u32;
-    while col < cols {
+    let logit0 = RuntimeCell::<f32>::new(bias[0]);
+    let logit1 = RuntimeCell::<f32>::new(bias[1]);
+    let logit2 = RuntimeCell::<f32>::new(bias[2]);
+    let row_us = row as usize;
+    let cols_us = cols as usize;
+    let row_base = row_us * cols_us;
+    for col in 0..cols_us {
         let feature = features[row_base + col];
-        let weight_base = col * CLASS_COUNT as u32;
-        logit0 += feature * weights[weight_base];
-        logit1 += feature * weights[weight_base + 1];
-        logit2 += feature * weights[weight_base + 2];
-        col += 1;
+        let weight_base = col * CLASS_COUNT;
+        logit0.store(logit0.read() + feature * weights[weight_base]);
+        logit1.store(logit1.read() + feature * weights[weight_base + 1]);
+        logit2.store(logit2.read() + feature * weights[weight_base + 2]);
     }
 
-    let mut max_logit = logit0;
-    if logit1 > max_logit {
-        max_logit = logit1;
+    let l0 = logit0.read();
+    let l1 = logit1.read();
+    let l2 = logit2.read();
+    let max_logit = RuntimeCell::<f32>::new(l0);
+    if l1 > max_logit.read() {
+        max_logit.store(l1);
     }
-    if logit2 > max_logit {
-        max_logit = logit2;
+    if l2 > max_logit.read() {
+        max_logit.store(l2);
     }
-    let e0 = (logit0 - max_logit).exp();
-    let e1 = (logit1 - max_logit).exp();
-    let e2 = (logit2 - max_logit).exp();
+    let m = max_logit.read();
+    let e0 = (l0 - m).exp();
+    let e1 = (l1 - m).exp();
+    let e2 = (l2 - m).exp();
     let denom = e0 + e1 + e2;
+    let out = RuntimeCell::<f32>::new(e2 / denom);
     if class_idx == 0 {
-        e0 / denom
+        out.store(e0 / denom);
     } else if class_idx == 1 {
-        e1 / denom
-    } else {
-        e2 / denom
+        out.store(e1 / denom);
     }
+    out.read()
 }
 
 #[cube(launch)]
@@ -95,41 +104,50 @@ fn softmax_gradient_kernel(
     alpha: f32,
     l1_ratio: f32,
 ) {
-    let weight_len = cols * CLASS_COUNT as u32;
-    let total_len = weight_len + CLASS_COUNT as u32;
+    let cols_us = cols as usize;
+    let rows_us = rows as usize;
+    let weight_len = cols_us * CLASS_COUNT;
+    let total_len = weight_len + CLASS_COUNT;
     if ABSOLUTE_POS < total_len {
         let pos = ABSOLUTE_POS;
         let is_bias = pos >= weight_len;
-        let class_idx = if is_bias {
-            pos - weight_len
-        } else {
-            pos % CLASS_COUNT as u32
-        };
-        let feature_idx = if is_bias { 0 } else { pos / CLASS_COUNT as u32 };
-
-        let mut grad = 0.0f32;
-        let mut row = 0u32;
-        while row < rows {
-            let probability = class_probability(features, weights, bias, row, cols, class_idx);
-            let label = labels[row];
-            let target = if label == class_idx as i32 { 1.0 } else { 0.0 };
-            let error = probability - target;
-            if is_bias {
-                grad += error;
-            } else {
-                grad += features[row * cols + feature_idx] * error;
-            }
-            row += 1;
+        let class_idx_cell = RuntimeCell::<u32>::new((pos % CLASS_COUNT) as u32);
+        if is_bias {
+            class_idx_cell.store((pos - weight_len) as u32);
         }
-        grad = grad / rows as f32;
+        let feature_idx_cell = RuntimeCell::<u32>::new((pos / CLASS_COUNT) as u32);
+        if is_bias {
+            feature_idx_cell.store(0);
+        }
+
+        let class_idx = class_idx_cell.read() as usize;
+        let feature_idx = feature_idx_cell.read() as usize;
+
+        let grad = RuntimeCell::<f32>::new(0.0);
+        for row in 0..rows_us {
+            let probability =
+                class_probability(features, weights, bias, row as u32, cols, class_idx as u32);
+            let label = labels[row];
+            let target_cell = RuntimeCell::<f32>::new(0.0);
+            if label == class_idx as i32 {
+                target_cell.store(1.0);
+            }
+            let error = probability - target_cell.read();
+            if is_bias {
+                grad.store(grad.read() + error);
+            } else {
+                grad.store(grad.read() + features[row * cols_us + feature_idx] * error);
+            }
+        }
+        let final_grad = grad.read() / rows as f32;
 
         if is_bias {
-            grad_bias[class_idx] = grad;
+            grad_bias[class_idx] = final_grad;
         } else {
             let weight = weights[pos];
             let l2 = (1.0 - l1_ratio) * weight;
             let l1 = l1_ratio * sign_f32(weight);
-            grad_weights[pos] = grad + alpha * (l2 + l1);
+            grad_weights[pos] = final_grad + alpha * (l2 + l1);
         }
     }
 }
@@ -143,7 +161,8 @@ fn softmax_apply_kernel(
     learning_rate: f32,
     weight_len: u32,
 ) {
-    let total_len = weight_len + CLASS_COUNT as u32;
+    let weight_len = weight_len as usize;
+    let total_len = weight_len + CLASS_COUNT;
     if ABSOLUTE_POS < total_len {
         let pos = ABSOLUTE_POS;
         if pos < weight_len {
@@ -168,18 +187,20 @@ fn softmax_loss_kernel(
     if ABSOLUTE_POS == 0 {
         if rows == 0 {
             loss_out[0] = 0.0;
-            return;
+            terminate!();
         }
 
-        let mut loss = 0.0f32;
-        let mut row = 0u32;
-        while row < rows {
+        // cubecl 0.9: `let mut x = literal;` produces an immutable
+        // binding; the `assign` and `assign_op` paths both panic on
+        // const lhs. Use `RuntimeCell` for runtime-mutable scalars.
+        let loss = RuntimeCell::<f32>::new(0.0);
+        let rows_us = rows as usize;
+        for row in 0..rows_us {
             let label = labels[row] as u32;
-            let probability = class_probability(features, weights, bias, row, cols, label);
-            loss -= clamp_probability(probability).ln();
-            row += 1;
+            let probability = class_probability(features, weights, bias, row as u32, cols, label);
+            loss.store(loss.read() - clamp_probability(probability).ln());
         }
-        loss_out[0] = loss / rows as f32;
+        loss_out[0] = loss.read() / rows as f32;
     }
 }
 
@@ -192,12 +213,14 @@ fn softmax_predict_kernel(
     rows: u32,
     cols: u32,
 ) {
-    if ABSOLUTE_POS < rows {
+    if ABSOLUTE_POS < rows as usize {
         let row = ABSOLUTE_POS;
-        let base = row * CLASS_COUNT as u32;
-        probabilities_out[base] = class_probability(features, weights, bias, row, cols, 0);
-        probabilities_out[base + 1] = class_probability(features, weights, bias, row, cols, 1);
-        probabilities_out[base + 2] = class_probability(features, weights, bias, row, cols, 2);
+        let base = row * CLASS_COUNT;
+        probabilities_out[base] = class_probability(features, weights, bias, row as u32, cols, 0);
+        probabilities_out[base + 1] =
+            class_probability(features, weights, bias, row as u32, cols, 1);
+        probabilities_out[base + 2] =
+            class_probability(features, weights, bias, row as u32, cols, 2);
     }
 }
 

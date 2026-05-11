@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     emit_embedded_credentials();
+    force_link_libtorch_cuda();
 
     let protoc_path = protoc_bin_vendored::protoc_bin_path().unwrap();
     let protoc_dir = protoc_path.parent().unwrap();
@@ -236,4 +237,29 @@ fn extract_toml_string_value(after_key: &str) -> String {
         }
     }
     String::new()
+}
+
+/// When the `gpu` feature is enabled, force the linker to keep
+/// `libtorch_cuda` so `tch::Cuda::device_count()` actually returns the
+/// hardware GPU count at runtime. tch-rs only emits a plain
+/// `cargo:rustc-link-lib=torch_cuda` which the linker strips because
+/// no symbols from it are referenced — the workaround is the standard
+/// `--no-as-needed` link arg pair.
+fn force_link_libtorch_cuda() {
+    if std::env::var("CARGO_FEATURE_GPU").is_err() {
+        return;
+    }
+    if let Ok(libtorch) = std::env::var("LIBTORCH") {
+        println!("cargo:rustc-link-arg-bins=-Wl,--no-as-needed");
+        println!("cargo:rustc-link-arg-bins=-L{libtorch}/lib");
+        println!("cargo:rustc-link-arg-bins=-ltorch_cuda");
+        println!("cargo:rustc-link-arg-bins=-Wl,--as-needed");
+        println!("cargo:rerun-if-env-changed=LIBTORCH");
+    } else {
+        println!(
+            "cargo:warning=forex-app built with `gpu` feature but LIBTORCH env not set; \
+             libtorch_cuda will not be force-linked and tch::Cuda::device_count() may return 0"
+        );
+    }
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_GPU");
 }

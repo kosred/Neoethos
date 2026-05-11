@@ -58,7 +58,20 @@ pub struct CTraderExecutionOutcome {
     pub deal_id: Option<i64>,
     pub trade_side: Option<String>,
     pub order_type: Option<String>,
+    /// Headline lot size kept for backwards compatibility. Prefer
+    /// [`Self::requested_lot_size`] / [`Self::filled_lot_size`] when
+    /// reasoning about partial fills.
     pub lot_size: Option<f64>,
+    /// Volume the strategy asked the broker to execute, in lots
+    /// (sourced from the order payload). `Some(2.0)` on a 2-lot
+    /// market order regardless of fill outcome.
+    pub requested_lot_size: Option<f64>,
+    /// Volume the broker actually filled, in lots (sourced from the
+    /// deal payload). On a clean fill matches `requested_lot_size`;
+    /// on a partial fill it is strictly smaller; on a rejection it
+    /// is `None` or 0.0. Lets the trading loop decide whether to
+    /// scale-in the residual or cancel-and-log.
+    pub filled_lot_size: Option<f64>,
     pub execution_price: Option<f64>,
     pub gross_profit: Option<f64>,
     pub fee: Option<f64>,
@@ -517,8 +530,12 @@ impl ProductionCTraderExecutionBackend {
             return Ok(cached);
         }
 
+        let max_attempts = ctrader_max_attempts();
         let mut last_error = None;
-        for attempt in 0..2 {
+        for attempt in 0..max_attempts {
+            if attempt > 0 {
+                ctrader_backoff_sleep(attempt);
+            }
             if let Err(err) = Self::ensure_authenticated(&mut session, request) {
                 session.socket = None;
                 session.auth_key = None;
@@ -607,7 +624,22 @@ impl ProductionCTraderExecutionBackend {
 
 impl CTraderExecutionBackend for ProductionCTraderExecutionBackend {
     fn execute(&self, request: &CTraderExecutionRuntimeRequest) -> Result<CTraderExecutionOutcome> {
-        Self::execute_via_session(request)
+        let outcome = Self::execute_via_session(request)?;
+        let entry = crate::app_services::live_journal::LiveTradeJournalEntry::from_outcome(
+            request_action_label(&request.request),
+            request,
+            &outcome,
+        );
+        crate::app_services::live_journal::record_live_outcome_best_effort(&entry);
+        Ok(outcome)
+    }
+}
+
+fn request_action_label(request: &CTraderExecutionRequest) -> &'static str {
+    match request {
+        CTraderExecutionRequest::NewOrder(_) => "new_order",
+        CTraderExecutionRequest::CancelOrder(_) => "cancel_order",
+        CTraderExecutionRequest::ClosePosition(_) => "close_position",
     }
 }
 
@@ -639,6 +671,46 @@ impl CTraderExecutionBackend for StubCTraderExecutionBackend {
             .unwrap_or_else(|| Err("missing stub execution outcome".to_string()))
             .map_err(|err| anyhow!(err))
     }
+}
+
+/// Maximum number of attempts (initial + retries) for a single
+/// `execute_via_session` call. Tunable via `FOREX_BOT_CTRADER_MAX_ATTEMPTS`
+/// (clamped to `[1, 5]`; default 3). The default is deliberately small —
+/// retry safety relies on the broker deduping by `clientOrderId`.
+fn ctrader_max_attempts() -> u32 {
+    std::env::var("FOREX_BOT_CTRADER_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(3)
+        .clamp(1, 5)
+}
+
+/// Base backoff in ms for retries; tunable via
+/// `FOREX_BOT_CTRADER_BACKOFF_BASE_MS` (clamped to `[10, 2000]`; default 200).
+fn ctrader_backoff_base_ms() -> u64 {
+    std::env::var("FOREX_BOT_CTRADER_BACKOFF_BASE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(200)
+        .clamp(10, 2_000)
+}
+
+/// Sleep before the n-th retry attempt (n >= 1).
+/// Delay = `base * 2^(n-1)` plus 0-99ms jitter derived from the wall clock,
+/// capped at 5 seconds total. The jitter spreads simultaneous retries from
+/// concurrent workers so they do not collide on the broker.
+fn ctrader_backoff_sleep(attempt: u32) {
+    if attempt == 0 {
+        return;
+    }
+    let base = ctrader_backoff_base_ms();
+    let factor = 1u64 << (attempt - 1).min(5);
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() % 100) as u64)
+        .unwrap_or(0);
+    let delay_ms = (base.saturating_mul(factor) + jitter).min(5_000);
+    std::thread::sleep(Duration::from_millis(delay_ms));
 }
 
 fn ensure_payload_type(response_json: &str, expected_payload_type: u32) -> Result<()> {
@@ -773,6 +845,17 @@ fn parse_execution_event(response_json: &str) -> Result<CTraderExecutionOutcome>
                 deal.as_ref()
                     .map(|item| volume_to_units(item.filled_volume))
             }),
+        requested_lot_size: order
+            .as_ref()
+            .map(|item| volume_to_units(item.trade_data.volume))
+            .or_else(|| {
+                position
+                    .as_ref()
+                    .map(|item| volume_to_units(item.trade_data.volume))
+            }),
+        filled_lot_size: deal
+            .as_ref()
+            .map(|item| volume_to_units(item.filled_volume)),
         execution_price: deal
             .as_ref()
             .and_then(|item| item.execution_price)
@@ -820,6 +903,8 @@ fn parse_order_error_event(response_json: &str) -> Result<CTraderExecutionOutcom
         trade_side: None,
         order_type: None,
         lot_size: None,
+        requested_lot_size: None,
+        filled_lot_size: None,
         execution_price: None,
         gross_profit: None,
         fee: None,
@@ -897,12 +982,20 @@ fn validate_execution_outcome(
             .unwrap_or(false);
         if !allow_partial {
             anyhow::bail!(
-                "cTrader execution returned PartialFill (deal_id={:?}, lot_size={:?}); \
+                "cTrader execution returned PartialFill (deal_id={:?}, requested={:?}, filled={:?}); \
                  set FOREX_BOT_CTRADER_ALLOW_PARTIAL_FILL=1 to accept partial fills",
                 outcome.deal_id,
-                outcome.lot_size
+                outcome.requested_lot_size,
+                outcome.filled_lot_size
             );
         }
+        tracing::warn!(
+            target: "forex_app::ctrader",
+            deal_id = ?outcome.deal_id,
+            requested_lot_size = ?outcome.requested_lot_size,
+            filled_lot_size = ?outcome.filled_lot_size,
+            "cTrader execution accepted PartialFill; trading loop should handle residual"
+        );
     }
 
     match &request.request {
@@ -1237,6 +1330,8 @@ mod tests {
             trade_side: Some("BUY".to_string()),
             order_type: Some("MARKET".to_string()),
             lot_size: Some(1000.0),
+            requested_lot_size: Some(1000.0),
+            filled_lot_size: None,
             execution_price: None,
             gross_profit: None,
             fee: None,

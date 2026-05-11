@@ -303,17 +303,109 @@ impl ProductionCTraderLiveAuthBackend {
 
 impl CTraderLiveAuthBackend for ProductionCTraderLiveAuthBackend {
     fn run(&self, request: CTraderLiveAuthRequest) -> Result<CTraderLiveAuthResult> {
-        let (callback_port, listener) = self.bind_loopback_listener(&request.loopback)?;
+        // Step 1/5 — bind loopback listener
+        tracing::info!(
+            target: "forex_app::ctrader::oauth",
+            step = "bind_loopback",
+            host = %request.loopback.bind_host(),
+            scope = %request.scope,
+            "starting cTrader OAuth flow"
+        );
+        let (callback_port, listener) = self.bind_loopback_listener(&request.loopback)
+            .with_context(|| format!(
+                "OAuth step 1/5 (bind_loopback) failed — could not bind any of the allowed callback ports {:?} on host {}. \
+                 Another process is likely holding the port; close any other ForexAI instance or pick a different port range in settings.",
+                request.loopback.allowed_ports(),
+                request.loopback.bind_host(),
+            ))?;
+        tracing::info!(
+            target: "forex_app::ctrader::oauth",
+            step = "bind_loopback",
+            callback_port,
+            "loopback listener bound"
+        );
+
+        // Step 2/5 — build authorize URL
         let authorize_url = build_authorize_url(
             &request.client_id,
             &request.redirect_uri,
             callback_port,
             &request.scope,
-        )?;
-        open::that(authorize_url).context("failed to open system browser for cTrader login")?;
-        let authorization_code =
-            self.capture_authorization_code(listener, request.loopback.callback_path())?;
-        let token_bundle = self.exchange_token(&request, callback_port, &authorization_code)?;
+        )
+        .with_context(|| {
+            format!(
+                "OAuth step 2/5 (build_authorize_url) failed — the redirect_uri '{}' \
+             configured in your cTrader app must be a valid http(s) URL on the loopback host. \
+             Check the redirect URI registered in https://openapi.ctrader.com.",
+                request.redirect_uri,
+            )
+        })?;
+        tracing::info!(
+            target: "forex_app::ctrader::oauth",
+            step = "build_authorize_url",
+            client_id_prefix = %request.client_id.chars().take(6).collect::<String>(),
+            "authorize URL constructed"
+        );
+
+        // Step 3/5 — open system browser
+        tracing::info!(
+            target: "forex_app::ctrader::oauth",
+            step = "open_browser",
+            "launching system browser for cTrader login (this opens openapi.ctrader.com in your default browser)"
+        );
+        open::that(&authorize_url).with_context(|| format!(
+            "OAuth step 3/5 (open_browser) failed — could not launch a system browser to {}. \
+             On a headless server you cannot complete OAuth this way; run on a desktop session, \
+             or copy the URL above to a browser on another machine and paste the redirect back manually.",
+            authorize_url,
+        ))?;
+
+        // Step 4/5 — wait for callback
+        tracing::info!(
+            target: "forex_app::ctrader::oauth",
+            step = "wait_for_callback",
+            callback_port,
+            timeout_secs = CTRADER_CALLBACK_TIMEOUT.as_secs(),
+            "waiting for browser to redirect back to the loopback listener"
+        );
+        let authorization_code = self
+            .capture_authorization_code(listener, request.loopback.callback_path())
+            .with_context(|| format!(
+                "OAuth step 4/5 (wait_for_callback) failed — no callback received on port {} within the timeout window. \
+                 Common causes: (a) the redirect_uri registered in your cTrader app does not match http://{}:{}{} ; \
+                 (b) the browser was closed before approving; (c) firewall/AV blocked the loopback connection.",
+                callback_port,
+                request.loopback.bind_host(),
+                callback_port,
+                request.loopback.callback_path(),
+            ))?;
+        tracing::info!(
+            target: "forex_app::ctrader::oauth",
+            step = "wait_for_callback",
+            "authorization_code received"
+        );
+
+        // Step 5/5 — exchange code for token bundle
+        tracing::info!(
+            target: "forex_app::ctrader::oauth",
+            step = "exchange_token",
+            "exchanging authorization_code for access + refresh token"
+        );
+        let token_bundle = self.exchange_token(&request, callback_port, &authorization_code)
+            .with_context(|| {
+                "OAuth step 5/5 (exchange_token) failed — the cTrader token endpoint returned an error. \
+                 Check that your client_id and client_secret in settings match the cTrader app you registered, \
+                 and that the app has not been revoked at https://openapi.ctrader.com."
+                    .to_string()
+            })?;
+        tracing::info!(
+            target: "forex_app::ctrader::oauth",
+            step = "exchange_token",
+            scope = %request.scope,
+            access_token_len = token_bundle.access_token.len(),
+            refresh_token_present = !token_bundle.refresh_token.is_empty(),
+            "token bundle issued — OAuth flow complete"
+        );
         Ok(CTraderLiveAuthResult {
             callback_port,
             authorization_code,

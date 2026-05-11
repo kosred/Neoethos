@@ -135,6 +135,10 @@ pub fn render_workspace(
         .style(style)
         .show_add_buttons(false)
         .show_close_buttons(false)
+        .show_window_close_buttons(false)
+        .show_window_collapse_buttons(false)
+        .show_leaf_close_all_buttons(false)
+        .show_leaf_collapse_buttons(false)
         .show_inside(ui, viewer);
 }
 
@@ -142,28 +146,42 @@ fn trading_dock_style(style: &egui::Style) -> Style {
     let mut dock_style = Style::from_egui(style);
     dock_style.dock_area_padding = Some(egui::Margin::same(0));
     dock_style.main_surface_border_stroke = egui::Stroke::new(1.0, ui::theme::BORDER);
-    dock_style.main_surface_border_rounding = egui::CornerRadius::same(4);
+    dock_style.main_surface_border_rounding = egui::CornerRadius::same(ui::theme::RADIUS_SM);
     dock_style.separator.width = 1.0;
     dock_style.separator.extra_interact_width = 4.0;
     dock_style.separator.color_idle = ui::theme::BORDER;
     dock_style.separator.color_hovered = ui::theme::ACCENT.linear_multiply(0.65);
     dock_style.separator.color_dragged = ui::theme::ACCENT;
-    dock_style.tab_bar.bg_fill = ui::theme::APP_BG;
-    dock_style.tab_bar.height = 24.0;
+
+    // The dock's per-panel tab strip is now a quiet header — the
+    // sidebar is the primary nav, so this strip should sit lightly on
+    // top of each panel without competing for attention.
+    dock_style.tab_bar.bg_fill = ui::theme::PANEL_BG;
+    dock_style.tab_bar.height = 22.0;
     dock_style.tab_bar.corner_radius = egui::CornerRadius::ZERO;
     dock_style.tab_bar.hline_color = ui::theme::BORDER;
-    dock_style.tab.minimum_width = Some(76.0);
+    dock_style.tab_bar.show_scroll_bar_on_overflow = false;
+
+    dock_style.tab.minimum_width = Some(60.0);
+    dock_style.tab.tab_body.bg_fill = ui::theme::PANEL_BG;
+    dock_style.tab.tab_body.stroke = egui::Stroke::new(1.0, ui::theme::BORDER);
+    dock_style.tab.tab_body.corner_radius = egui::CornerRadius::same(ui::theme::RADIUS_SM);
+    dock_style.tab.tab_body.inner_margin = egui::Margin::same(ui::theme::SPACE_SM as i8);
+
+    // Inactive tabs are very quiet, hovered lifts gently, the active
+    // tab gets the violet accent so the operator can still see what
+    // panel is in focus.
     dock_style.tab.active.bg_fill = ui::theme::SURFACE_BG;
     dock_style.tab.active.text_color = ui::theme::TEXT_PRIMARY;
+    dock_style.tab.active.outline_color = ui::theme::BORDER;
     dock_style.tab.inactive.bg_fill = ui::theme::PANEL_BG;
-    dock_style.tab.inactive.text_color = ui::theme::TEXT_MUTED;
-    dock_style.tab.hovered.bg_fill = ui::theme::SURFACE_ALT;
+    dock_style.tab.inactive.text_color = ui::theme::TEXT_FAINT;
+    dock_style.tab.inactive.outline_color = egui::Color32::TRANSPARENT;
+    dock_style.tab.hovered.bg_fill = ui::theme::SURFACE_BG;
     dock_style.tab.hovered.text_color = ui::theme::TEXT_PRIMARY;
     dock_style.tab.focused.bg_fill = ui::theme::SURFACE_BG;
     dock_style.tab.focused.text_color = ui::theme::ACCENT;
-    dock_style.tab.tab_body.bg_fill = ui::theme::PANEL_BG;
-    dock_style.tab.tab_body.stroke = egui::Stroke::new(1.0, ui::theme::BORDER);
-    dock_style.tab.tab_body.corner_radius = egui::CornerRadius::same(4);
-    dock_style.tab.tab_body.inner_margin = egui::Margin::same(6);
+    dock_style.tab.focused.outline_color = ui::theme::ACCENT;
+
     dock_style
 }

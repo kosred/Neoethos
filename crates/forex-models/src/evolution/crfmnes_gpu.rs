@@ -19,79 +19,83 @@ fn candidate_loss_kernel(
 ) {
     if ABSOLUTE_POS < losses.len() {
         let candidate = ABSOLUTE_POS;
-        let param_base = candidate * param_dim;
+        let n_rows_us = n_rows as usize;
+        let input_dim_us = input_dim as usize;
+        let hidden_dim_us = hidden_dim as usize;
+        let param_dim_us = param_dim as usize;
+        let param_base = candidate * param_dim_us;
         let w1_offset = param_base;
-        let b1_offset = w1_offset + input_dim * hidden_dim;
-        let w2_offset = b1_offset + hidden_dim;
-        let b2_offset = w2_offset + hidden_dim * CLASS_COUNT as u32;
+        let b1_offset = w1_offset + input_dim_us * hidden_dim_us;
+        let w2_offset = b1_offset + hidden_dim_us;
+        let b2_offset = w2_offset + hidden_dim_us * CLASS_COUNT;
 
-        let mut l2 = 0.0f32;
-        let mut p = 0u32;
-        while p < param_dim {
+        let l2 = RuntimeCell::<f32>::new(0.0);
+        for p in 0..param_dim_us {
             let value = candidates[param_base + p];
-            l2 += value * value;
-            p += 1;
+            l2.store(l2.read() + value * value);
         }
-        l2 = l2 / param_dim as f32;
+        let l2_final = l2.read() / param_dim as f32;
 
         if n_rows == 0 {
-            losses[candidate] = L2_WEIGHT * l2;
-            return;
+            losses[candidate] = L2_WEIGHT * l2_final;
+            terminate!();
         }
 
-        let mut total_loss = 0.0f32;
-        let mut row = 0u32;
-        while row < n_rows {
-            let mut logit0 = candidates[b2_offset];
-            let mut logit1 = candidates[b2_offset + 1];
-            let mut logit2 = candidates[b2_offset + 2];
+        let total_loss = RuntimeCell::<f32>::new(0.0);
+        for row in 0..n_rows_us {
+            let logit0 = RuntimeCell::<f32>::new(candidates[b2_offset]);
+            let logit1 = RuntimeCell::<f32>::new(candidates[b2_offset + 1]);
+            let logit2 = RuntimeCell::<f32>::new(candidates[b2_offset + 2]);
 
-            let mut hidden = 0u32;
-            while hidden < hidden_dim {
-                let mut activation = candidates[b1_offset + hidden];
-                let mut feature = 0u32;
-                while feature < input_dim {
-                    activation += features[row * input_dim + feature]
-                        * candidates[w1_offset + feature * hidden_dim + hidden];
-                    feature += 1;
+            for hidden in 0..hidden_dim_us {
+                let activation = RuntimeCell::<f32>::new(candidates[b1_offset + hidden]);
+                for feature in 0..input_dim_us {
+                    activation.store(
+                        activation.read()
+                            + features[row * input_dim_us + feature]
+                                * candidates[w1_offset + feature * hidden_dim_us + hidden],
+                    );
                 }
-                activation = activation.tanh();
-                logit0 += activation * candidates[w2_offset + hidden * CLASS_COUNT as u32];
-                logit1 += activation * candidates[w2_offset + hidden * CLASS_COUNT as u32 + 1];
-                logit2 += activation * candidates[w2_offset + hidden * CLASS_COUNT as u32 + 2];
-                hidden += 1;
+                let act = activation.read().tanh();
+                logit0.store(logit0.read() + act * candidates[w2_offset + hidden * CLASS_COUNT]);
+                logit1
+                    .store(logit1.read() + act * candidates[w2_offset + hidden * CLASS_COUNT + 1]);
+                logit2
+                    .store(logit2.read() + act * candidates[w2_offset + hidden * CLASS_COUNT + 2]);
             }
 
-            let mut max_logit = logit0;
-            if logit1 > max_logit {
-                max_logit = logit1;
+            let l0 = logit0.read();
+            let l1 = logit1.read();
+            let l2v = logit2.read();
+            let max_logit = RuntimeCell::<f32>::new(l0);
+            if l1 > max_logit.read() {
+                max_logit.store(l1);
             }
-            if logit2 > max_logit {
-                max_logit = logit2;
+            if l2v > max_logit.read() {
+                max_logit.store(l2v);
             }
-            let e0 = (logit0 - max_logit).exp();
-            let e1 = (logit1 - max_logit).exp();
-            let e2 = (logit2 - max_logit).exp();
+            let m = max_logit.read();
+            let e0 = (l0 - m).exp();
+            let e1 = (l1 - m).exp();
+            let e2 = (l2v - m).exp();
             let denom = e0 + e1 + e2;
             let label = labels[row];
-            let mut probability = if label == 0 {
-                e0 / denom
+            let probability = RuntimeCell::<f32>::new(e2 / denom);
+            if label == 0 {
+                probability.store(e0 / denom);
             } else if label == 1 {
-                e1 / denom
-            } else {
-                e2 / denom
-            };
-            if probability < 1.0e-6 {
-                probability = 1.0e-6;
+                probability.store(e1 / denom);
             }
-            if probability > 0.999999 {
-                probability = 0.999999;
+            if probability.read() < 1.0e-6 {
+                probability.store(1.0e-6);
             }
-            total_loss -= probability.ln();
-            row += 1;
+            if probability.read() > 0.999999 {
+                probability.store(0.999999);
+            }
+            total_loss.store(total_loss.read() - probability.read().ln());
         }
 
-        losses[candidate] = total_loss / n_rows as f32 + L2_WEIGHT * l2;
+        losses[candidate] = total_loss.read() / n_rows as f32 + L2_WEIGHT * l2_final;
     }
 }
 

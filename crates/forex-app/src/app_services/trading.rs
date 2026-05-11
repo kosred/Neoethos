@@ -1534,10 +1534,11 @@ impl TradingSession {
             label: non_empty_option(&state.order_ticket.label),
             position_id: None,
             client_order_id: Some(format!(
-                "{}-{}-{}",
+                "{}-{}-{}-{:x}",
                 side.label().to_ascii_lowercase(),
                 state.selected_pair.to_ascii_lowercase(),
-                current_unix_seconds().unwrap_or_default()
+                current_unix_seconds().unwrap_or_default(),
+                next_client_order_seq()
             )),
             relative_stop_loss,
             relative_take_profit,
@@ -2449,6 +2450,20 @@ fn current_unix_seconds() -> anyhow::Result<i64> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| anyhow::anyhow!("system clock is before unix epoch"))?
         .as_secs() as i64)
+}
+
+/// Process-local monotonic counter for `client_order_id` uniqueness.
+/// Two distinct orders within the same wall-clock second would otherwise
+/// produce the same `client_order_id` (e.g. a scaling-in strategy firing
+/// two market orders 50ms apart) and the broker's clientOrderId-based
+/// dedup would collapse them. Pairing the second-resolution timestamp
+/// with this monotonic counter guarantees uniqueness for distinct orders
+/// AND keeps the same id stable across retries of a single order, which
+/// is what the retry-with-backoff path relies on for safe replay.
+fn next_client_order_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 pub fn panel_mode(data_source: DataSource, connected: bool) -> TradingPanelMode {

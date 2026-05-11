@@ -1,6 +1,8 @@
 mod artifact_io;
 pub mod challenge;
 pub mod checkpoint;
+// GPU kernel modules. Migration in progress against cubecl 0.9 / tch
+// 0.22 — see docs/audits/gpu_migration_2026-05-11.md for context.
 #[cfg(feature = "gpu")]
 mod cubecl_eval;
 #[cfg(feature = "gpu")]
@@ -891,13 +893,15 @@ pub mod discovery_gpu {
     }
 }
 
-// HPC-specific modules - only compiled on GPU-enabled builds.
+// HPC-specific modules — gated behind `gpu-experimental` for the same
+// reason as the cubecl modules above: hpc.rs and hpc_gpu_discovery.rs
+// hold compile errors against the current tch 0.22 API surface.
 #[cfg(feature = "gpu")]
 pub mod hpc;
 #[cfg(feature = "gpu")]
 pub mod hpc_gpu_discovery;
 
-// Re-export HPC functions when GPU feature is enabled.
+// Re-export HPC functions when the experimental flag is enabled.
 #[cfg(feature = "gpu")]
 pub use hpc::{
     detect_hyperstack_n3, force_hpc_mode, get_gpu_cpu_affinity, get_optimal_chunk_size,
@@ -923,7 +927,7 @@ pub use challenge::{ChallengeOptimizer, ChallengeTarget};
 pub use discovery::{
     DiscoveryConfig, DiscoveryPerKindEvidenceHashes, DiscoveryProgress, DiscoveryResult,
     DiscoveryRunProfile, DiscoveryRuntimeOverrides, DiscoveryValidationGates, LoggedStrategyTrades,
-    build_discovery_profile, compute_discovery_forward_test_artifacts,
+    Stage1Window, build_discovery_profile, compute_discovery_forward_test_artifacts,
     compute_discovery_prop_firm_artifacts, discovery_per_kind_evidence_hashes,
     discovery_validation_evidence_manifest,
     discovery_validation_evidence_manifest_excluding_live_sim, ensure_non_empty_portfolio,

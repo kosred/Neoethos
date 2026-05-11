@@ -11,7 +11,7 @@ const SMC_WIDTH: usize = 11;
 const BACKTEST_CORE_METRIC_WIDTH: usize = 7;
 
 #[cube(launch)]
-fn synthesize_signals_kernel<F: Float>(
+fn synthesize_signals_kernel<F: Float + CubeElement>(
     indicators: &Array<F>,
     gene_offsets: &Array<i32>,
     gene_indices: &Array<i32>,
@@ -25,76 +25,82 @@ fn synthesize_signals_kernel<F: Float>(
     n_samples: u32,
     gate_threshold: F,
 ) {
-    if ABSOLUTE_POS < output.len() {
-        let pos = ABSOLUTE_POS;
+    // cubecl 0.9: ABSOLUTE_POS and Array::len() are `usize`, and array
+    // indexing also expects `usize`. Coerce all u32 kernel parameters
+    // to usize at the top of the kernel so the rest reads naturally.
+    //
+    // For mutable scalar accumulators (`combined`, `active_sum`,
+    // `score`, `sig`) we must use RuntimeCell because cubecl 0.9's
+    // `assign` and `assign_op` paths both reject const-initialized
+    // `let mut` bindings.
+    let pos = ABSOLUTE_POS;
+    if pos < output.len() {
+        let n_samples = n_samples as usize;
         let gene = pos / n_samples;
         let sample = pos % n_samples;
 
-        let start = gene_offsets[gene] as u32;
-        let end = gene_offsets[gene + 1] as u32;
-        let mut combined = F::new(0.0);
-        let mut i = start;
-        while i < end {
-            let idx = gene_indices[i] as u32;
+        let start = gene_offsets[gene] as usize;
+        let end = gene_offsets[gene + 1] as usize;
+        let combined = RuntimeCell::<F>::new(F::new(0.0));
+        for i in start..end {
+            let idx = gene_indices[i] as usize;
             let weight = gene_weights[i];
             let indicator = indicators[idx * n_samples + sample];
-            combined += weight * indicator;
-            i += 1;
+            combined.store(combined.read() + weight * indicator);
         }
 
         let lt = long_thr[gene];
         let st = short_thr[gene];
-        let mut sig = 0i32;
-        if combined >= lt {
-            sig = 1;
-        } else if combined <= st {
-            sig = -1;
+        let combined_val = combined.read();
+        let sig = RuntimeCell::<i32>::new(0);
+        if combined_val >= lt {
+            sig.store(1);
+        } else if combined_val <= st {
+            sig.store(-1);
         }
 
-        if sig == 0 {
+        let sig_val = sig.read();
+        if sig_val == 0 {
             output[pos] = 0;
-            return;
+            terminate!();
         }
 
-        let flag_base = gene * SMC_WIDTH as u32;
-        let smc_base = sample * SMC_WIDTH as u32;
-        let mut active_sum = F::new(0.0);
-        let mut j = 0u32;
-        while j < SMC_WIDTH as u32 {
+        let flag_base = gene * SMC_WIDTH;
+        let smc_base = sample * SMC_WIDTH;
+        let active_sum = RuntimeCell::<F>::new(F::new(0.0));
+        for j in 0..SMC_WIDTH {
             if gene_smc_flags[flag_base + j] != 0 {
-                active_sum += smc_weights[j];
+                active_sum.store(active_sum.read() + smc_weights[j]);
             }
-            j += 1;
         }
 
-        if active_sum <= F::new(0.0) {
-            output[pos] = sig;
-            return;
+        let active_sum_val = active_sum.read();
+        if active_sum_val <= F::new(0.0) {
+            output[pos] = sig_val;
+            terminate!();
         }
 
-        let gate = if active_sum < gate_threshold {
-            active_sum
+        let gate = if active_sum_val < gate_threshold {
+            active_sum_val
         } else {
             gate_threshold
         };
-        let mut score = F::new(0.0);
-        let mut k = 0u32;
-        while k < SMC_WIDTH as u32 {
+        let score = RuntimeCell::<F>::new(F::new(0.0));
+        for k in 0..SMC_WIDTH {
             if gene_smc_flags[flag_base + k] != 0 {
                 let smc_value = smc_data[smc_base + k];
                 if k == 5 {
                     if smc_value == 1 {
-                        score += smc_weights[k];
+                        score.store(score.read() + smc_weights[k]);
                     }
-                } else if smc_value == sig {
-                    score += smc_weights[k];
+                } else if smc_value == sig_val {
+                    score.store(score.read() + smc_weights[k]);
                 }
             }
-            k += 1;
         }
 
-        if score >= gate {
-            output[pos] = sig;
+        if score.read() >= gate {
+            output[pos] = sig_val;
         } else {
             output[pos] = 0;
         }
@@ -131,299 +137,330 @@ fn backtest_population_kernel(
     commission_per_trade: f32,
     pip_value_per_lot: f32,
 ) {
+    // cubecl 0.9: index arithmetic is usize; coerce u32 params at the top.
+    // Every scalar accumulator that gets reassigned must use RuntimeCell —
+    // `let mut x = literal;` and `let mut x = param;` both produce
+    // immutable bindings in cubecl 0.9, and any later `=`/`+=` panics.
     if ABSOLUTE_POS < trade_counts_out.len() {
         let gene = ABSOLUTE_POS;
+        let n_samples = n_samples as usize;
+        let month_capacity = month_capacity as usize;
+        let max_hold_bars = max_hold_bars as usize;
+        let min_hold_bars = min_hold_bars as usize;
+        let max_trades_per_day = max_trades_per_day as usize;
         let signal_base = gene * n_samples;
         let month_base = gene * month_capacity;
-        let metric_base = gene * BACKTEST_CORE_METRIC_WIDTH as u32;
+        let metric_base = gene * BACKTEST_CORE_METRIC_WIDTH;
 
-        let mut zero_idx = 0u32;
-        while zero_idx < month_capacity {
+        for zero_idx in 0..month_capacity {
             monthly_pnls_out[month_base + zero_idx] = 0.0;
-            zero_idx += 1;
         }
         month_counts_out[gene] = 0;
         trade_counts_out[gene] = 0;
 
         if n_samples == 0 {
-            let mut j = 0u32;
-            while j < BACKTEST_CORE_METRIC_WIDTH as u32 {
+            for j in 0..BACKTEST_CORE_METRIC_WIDTH {
                 metrics_out[metric_base + j] = 0.0;
-                j += 1;
             }
-            return;
+            terminate!();
         }
 
         let sl_distance = sl_pips[gene];
         let tp_distance = tp_pips[gene];
 
-        let mut equity = initial_equity;
-        let mut peak_equity = initial_equity;
-        let mut max_dd = 0.0f32;
-        let mut trade_count = 0i32;
-        let mut wins = 0i32;
-        let mut gross_profit = 0.0f32;
-        let mut gross_loss = 0.0f32;
+        let equity = RuntimeCell::<f32>::new(initial_equity);
+        let peak_equity = RuntimeCell::<f32>::new(initial_equity);
+        let max_dd = RuntimeCell::<f32>::new(0.0);
+        let trade_count = RuntimeCell::<i32>::new(0);
+        let wins = RuntimeCell::<i32>::new(0);
+        let gross_profit = RuntimeCell::<f32>::new(0.0);
+        let gross_loss = RuntimeCell::<f32>::new(0.0);
 
-        let mut last_month = -1i32;
-        let mut current_month_pnl = 0.0f32;
-        let mut month_ptr = -1i32;
+        let last_month = RuntimeCell::<i32>::new(-1);
+        let current_month_pnl = RuntimeCell::<f32>::new(0.0);
+        let month_ptr = RuntimeCell::<i32>::new(-1);
 
-        let mut last_day = -1i32;
-        let mut day_peak = equity;
-        let mut day_low = equity;
-        let mut max_daily_dd = 0.0f32;
-        let mut day_trade_count = 0u32;
+        let last_day = RuntimeCell::<i32>::new(-1);
+        let day_peak = RuntimeCell::<f32>::new(initial_equity);
+        let day_low = RuntimeCell::<f32>::new(initial_equity);
+        let max_daily_dd = RuntimeCell::<f32>::new(0.0);
+        let day_trade_count = RuntimeCell::<u32>::new(0);
 
-        let mut in_pos = 0i32;
-        let mut entry_px = 0.0f32;
-        let mut entry_idx = -1i32;
-        let mut trail_px = 0.0f32;
+        let in_pos = RuntimeCell::<i32>::new(0);
+        let entry_px = RuntimeCell::<f32>::new(0.0);
+        let entry_idx = RuntimeCell::<i32>::new(-1);
+        let trail_px = RuntimeCell::<f32>::new(0.0);
 
-        let mut i = 1u32;
-        while i < n_samples {
+        for i in 1..n_samples {
             let m_val = month_idx[i];
-            if m_val != last_month {
-                if last_month != -1 {
-                    month_ptr += 1;
-                    if month_ptr >= 0 && month_ptr < month_capacity as i32 {
-                        monthly_pnls_out[month_base + month_ptr as u32] = current_month_pnl;
+            let last_month_v = last_month.read();
+            if m_val != last_month_v {
+                if last_month_v != -1 {
+                    let next_ptr = month_ptr.read() + 1;
+                    month_ptr.store(next_ptr);
+                    if next_ptr >= 0 && next_ptr < month_capacity as i32 {
+                        monthly_pnls_out[month_base + next_ptr as usize] = current_month_pnl.read();
                     }
                 }
-                current_month_pnl = 0.0;
-                last_month = m_val;
+                current_month_pnl.store(0.0);
+                last_month.store(m_val);
             }
 
             let d_val = day_idx[i];
-            if d_val != last_day {
-                if last_day != -1 && day_peak > 0.0 {
-                    let dd = (day_peak - day_low) / day_peak;
-                    if dd > max_daily_dd {
-                        max_daily_dd = dd;
+            let last_day_v = last_day.read();
+            if d_val != last_day_v {
+                if last_day_v != -1 && day_peak.read() > 0.0 {
+                    let dd = (day_peak.read() - day_low.read()) / day_peak.read();
+                    if dd > max_daily_dd.read() {
+                        max_daily_dd.store(dd);
                     }
                 }
-                last_day = d_val;
-                day_peak = equity;
-                day_low = equity;
-                day_trade_count = 0;
+                last_day.store(d_val);
+                day_peak.store(equity.read());
+                day_low.store(equity.read());
+                day_trade_count.store(0);
             }
 
-            if in_pos != 0
+            let in_pos_v = in_pos.read();
+            if in_pos_v != 0
                 && use_timestamps != 0
                 && gap_threshold_ms > 0
                 && timestamp_deltas_ms[i] >= gap_threshold_ms
             {
-                let mut pnl = if in_pos == 1 {
-                    (close_pips[i] - entry_px) * pip_value_per_lot
+                let entry_px_v = entry_px.read();
+                let pnl_cell = RuntimeCell::<f32>::new(0.0);
+                if in_pos_v == 1 {
+                    pnl_cell.store((close_pips[i] - entry_px_v) * pip_value_per_lot);
                 } else {
-                    (entry_px - close_pips[i]) * pip_value_per_lot
-                };
-                pnl -= commission_per_trade + (spread_pips * 0.5 * pip_value_per_lot);
-                equity += pnl;
-                current_month_pnl += pnl;
-                trade_count += 1;
+                    pnl_cell.store((entry_px_v - close_pips[i]) * pip_value_per_lot);
+                }
+                pnl_cell.store(
+                    pnl_cell.read()
+                        - commission_per_trade
+                        - (spread_pips * 0.5 * pip_value_per_lot),
+                );
+                let pnl = pnl_cell.read();
+                equity.store(equity.read() + pnl);
+                current_month_pnl.store(current_month_pnl.read() + pnl);
+                trade_count.store(trade_count.read() + 1);
                 if pnl > 0.0 {
-                    wins += 1;
-                    gross_profit += pnl;
+                    wins.store(wins.read() + 1);
+                    gross_profit.store(gross_profit.read() + pnl);
                 } else {
-                    gross_loss += -pnl;
+                    gross_loss.store(gross_loss.read() - pnl);
                 }
-                in_pos = 0;
-                if equity > peak_equity {
-                    peak_equity = equity;
+                in_pos.store(0);
+                let eq = equity.read();
+                if eq > peak_equity.read() {
+                    peak_equity.store(eq);
                 }
-                if equity < day_low {
-                    day_low = equity;
+                if eq < day_low.read() {
+                    day_low.store(eq);
                 }
-                let current_dd = if peak_equity > 0.0 {
-                    (peak_equity - equity) / peak_equity
-                } else {
-                    0.0
-                };
-                if current_dd > max_dd {
-                    max_dd = current_dd;
+                let pe = peak_equity.read();
+                let current_dd = RuntimeCell::<f32>::new(0.0);
+                if pe > 0.0 {
+                    current_dd.store((pe - eq) / pe);
+                }
+                if current_dd.read() > max_dd.read() {
+                    max_dd.store(current_dd.read());
                 }
             }
 
-            if in_pos != 0 {
+            let in_pos_v2 = in_pos.read();
+            if in_pos_v2 != 0 {
                 let lo = low_pips[i];
                 let hi = high_pips[i];
+                let entry_px_v = entry_px.read();
 
-                let worst_float_pnl = if in_pos == 1 {
-                    (lo - entry_px) * pip_value_per_lot
+                let worst_float_pnl = if in_pos_v2 == 1 {
+                    (lo - entry_px_v) * pip_value_per_lot
                 } else {
-                    (entry_px - hi) * pip_value_per_lot
+                    (entry_px_v - hi) * pip_value_per_lot
                 };
-                if (equity + worst_float_pnl) < day_low {
-                    day_low = equity + worst_float_pnl;
+                let eq = equity.read();
+                if (eq + worst_float_pnl) < day_low.read() {
+                    day_low.store(eq + worst_float_pnl);
                 }
 
-                let best_float_pnl = if in_pos == 1 {
-                    (hi - entry_px) * pip_value_per_lot
+                let best_float_pnl = if in_pos_v2 == 1 {
+                    (hi - entry_px_v) * pip_value_per_lot
                 } else {
-                    (entry_px - lo) * pip_value_per_lot
+                    (entry_px_v - lo) * pip_value_per_lot
                 };
-                if (equity + best_float_pnl) > peak_equity {
-                    peak_equity = equity + best_float_pnl;
+                if (eq + best_float_pnl) > peak_equity.read() {
+                    peak_equity.store(eq + best_float_pnl);
                 }
 
-                let current_dd = if peak_equity > 0.0 {
-                    (peak_equity - (equity + worst_float_pnl)) / peak_equity
-                } else {
-                    0.0
-                };
-                if current_dd > max_dd {
-                    max_dd = current_dd;
+                let pe = peak_equity.read();
+                let current_dd = RuntimeCell::<f32>::new(0.0);
+                if pe > 0.0 {
+                    current_dd.store((pe - (eq + worst_float_pnl)) / pe);
+                }
+                if current_dd.read() > max_dd.read() {
+                    max_dd.store(current_dd.read());
                 }
 
-                let mut pnl = 0.0f32;
-                let mut exit = false;
-                let bars_held = i as i32 - entry_idx;
+                let pnl_cell = RuntimeCell::<f32>::new(0.0);
+                let exit_cell = RuntimeCell::<u32>::new(0);
+                let bars_held = i as i32 - entry_idx.read();
                 let past_min_hold = min_hold_bars == 0 || bars_held >= min_hold_bars as i32;
 
-                if past_min_hold && in_pos == 1 {
-                    let mut sl = entry_px - sl_distance;
-                    let tp = entry_px + tp_distance;
+                if past_min_hold && in_pos_v2 == 1 {
+                    let sl_cell = RuntimeCell::<f32>::new(entry_px_v - sl_distance);
+                    let tp = entry_px_v + tp_distance;
                     if trailing_enabled != 0 {
-                        let mv = hi - entry_px;
+                        let mv = hi - entry_px_v;
                         if mv >= (trailing_be_trigger_r * sl_distance) {
                             let candidate = hi - (trailing_atr_multiplier * sl_distance);
-                            if trail_px == 0.0 || candidate > trail_px {
-                                trail_px = candidate;
+                            if trail_px.read() == 0.0 || candidate > trail_px.read() {
+                                trail_px.store(candidate);
                             }
-                            if trail_px > sl {
-                                sl = trail_px;
+                            if trail_px.read() > sl_cell.read() {
+                                sl_cell.store(trail_px.read());
                             }
                         }
                     }
-                    if lo <= sl {
-                        pnl = (sl - entry_px) * pip_value_per_lot;
-                        exit = true;
+                    let sl_v = sl_cell.read();
+                    if lo <= sl_v {
+                        pnl_cell.store((sl_v - entry_px_v) * pip_value_per_lot);
+                        exit_cell.store(1);
                     } else if hi >= tp {
-                        pnl = (tp - entry_px) * pip_value_per_lot;
-                        exit = true;
+                        pnl_cell.store((tp - entry_px_v) * pip_value_per_lot);
+                        exit_cell.store(1);
                     }
                 } else if past_min_hold {
-                    let mut sl = entry_px + sl_distance;
-                    let tp = entry_px - tp_distance;
+                    let sl_cell = RuntimeCell::<f32>::new(entry_px_v + sl_distance);
+                    let tp = entry_px_v - tp_distance;
                     if trailing_enabled != 0 {
-                        let mv = entry_px - lo;
+                        let mv = entry_px_v - lo;
                         if mv >= (trailing_be_trigger_r * sl_distance) {
                             let candidate = lo + (trailing_atr_multiplier * sl_distance);
-                            if trail_px == 0.0 || candidate < trail_px {
-                                trail_px = candidate;
+                            if trail_px.read() == 0.0 || candidate < trail_px.read() {
+                                trail_px.store(candidate);
                             }
-                            if trail_px < sl {
-                                sl = trail_px;
+                            if trail_px.read() < sl_cell.read() {
+                                sl_cell.store(trail_px.read());
                             }
                         }
                     }
-                    if hi >= sl {
-                        pnl = (entry_px - sl) * pip_value_per_lot;
-                        exit = true;
+                    let sl_v = sl_cell.read();
+                    if hi >= sl_v {
+                        pnl_cell.store((entry_px_v - sl_v) * pip_value_per_lot);
+                        exit_cell.store(1);
                     } else if lo <= tp {
-                        pnl = (entry_px - tp) * pip_value_per_lot;
-                        exit = true;
+                        pnl_cell.store((entry_px_v - tp) * pip_value_per_lot);
+                        exit_cell.store(1);
                     }
                 }
 
-                if !exit && past_min_hold && max_hold_bars > 0 && bars_held >= max_hold_bars as i32
+                if exit_cell.read() == 0
+                    && past_min_hold
+                    && max_hold_bars > 0
+                    && bars_held >= max_hold_bars as i32
                 {
-                    pnl = if in_pos == 1 {
-                        (close_pips[i] - entry_px) * pip_value_per_lot
+                    if in_pos_v2 == 1 {
+                        pnl_cell.store((close_pips[i] - entry_px_v) * pip_value_per_lot);
                     } else {
-                        (entry_px - close_pips[i]) * pip_value_per_lot
-                    };
-                    exit = true;
+                        pnl_cell.store((entry_px_v - close_pips[i]) * pip_value_per_lot);
+                    }
+                    exit_cell.store(1);
                 }
 
-                if exit {
-                    pnl -= commission_per_trade + (spread_pips * 0.5 * pip_value_per_lot);
-                    equity += pnl;
-                    current_month_pnl += pnl;
-                    trade_count += 1;
+                if exit_cell.read() != 0 {
+                    pnl_cell.store(
+                        pnl_cell.read()
+                            - commission_per_trade
+                            - (spread_pips * 0.5 * pip_value_per_lot),
+                    );
+                    let pnl = pnl_cell.read();
+                    equity.store(equity.read() + pnl);
+                    current_month_pnl.store(current_month_pnl.read() + pnl);
+                    trade_count.store(trade_count.read() + 1);
                     if pnl > 0.0 {
-                        wins += 1;
-                        gross_profit += pnl;
+                        wins.store(wins.read() + 1);
+                        gross_profit.store(gross_profit.read() + pnl);
                     } else {
-                        gross_loss += -pnl;
+                        gross_loss.store(gross_loss.read() - pnl);
                     }
-                    in_pos = 0;
-                    if equity > peak_equity {
-                        peak_equity = equity;
+                    in_pos.store(0);
+                    let eq2 = equity.read();
+                    if eq2 > peak_equity.read() {
+                        peak_equity.store(eq2);
                     }
-                    if equity < day_low {
-                        day_low = equity;
+                    if eq2 < day_low.read() {
+                        day_low.store(eq2);
                     }
-
-                    let current_dd = if peak_equity > 0.0 {
-                        (peak_equity - equity) / peak_equity
-                    } else {
-                        0.0
-                    };
-                    if current_dd > max_dd {
-                        max_dd = current_dd;
+                    let pe2 = peak_equity.read();
+                    let current_dd = RuntimeCell::<f32>::new(0.0);
+                    if pe2 > 0.0 {
+                        current_dd.store((pe2 - eq2) / pe2);
+                    }
+                    if current_dd.read() > max_dd.read() {
+                        max_dd.store(current_dd.read());
                     }
                 }
             } else {
-                // Causal entry: read PRIOR-bar signal, fill at CURRENT-bar
-                // close. Mirrors `eval.rs::simulate_trades_core` exactly so
-                // CUDA backtest is semantically equivalent to CPU canonical.
-                // Reading `signals_flat[signal_base + i]` (current bar) would
-                // re-introduce intra-bar look-ahead.
+                // Causal entry: read PRIOR-bar signal, fill at CURRENT-bar close.
                 let s = signals_flat[signal_base + i - 1];
                 if s != 0 {
-                    if !(max_trades_per_day > 0 && day_trade_count >= max_trades_per_day) {
-                        in_pos = s;
-                        entry_px = close_pips[i] + (s as f32) * spread_pips * 0.5;
-                        entry_idx = i as i32;
-                        trail_px = 0.0;
-                        day_trade_count += 1;
+                    if !(max_trades_per_day > 0
+                        && (day_trade_count.read() as usize) >= max_trades_per_day)
+                    {
+                        in_pos.store(s);
+                        entry_px.store(close_pips[i] + (s as f32) * spread_pips * 0.5);
+                        entry_idx.store(i as i32);
+                        trail_px.store(0.0);
+                        day_trade_count.store(day_trade_count.read() + 1);
                     }
                 }
             }
-
-            i += 1;
         }
 
-        let net_profit = equity - initial_equity;
-        let win_rate = if trade_count > 0 {
-            wins as f32 / trade_count as f32
-        } else {
-            0.0
-        };
-        let pf = if gross_loss > 0.0 {
-            (gross_profit / gross_loss).min(10.0)
-        } else if gross_profit > 0.0 {
-            10.0
-        } else {
-            0.0
-        };
-        let expectancy = if trade_count > 0 {
-            net_profit / trade_count as f32
-        } else {
-            0.0
-        };
-        let filled_months = if month_ptr >= 0 {
-            let raw = month_ptr + 1;
+        let final_equity = equity.read();
+        let final_peak = peak_equity.read();
+        let final_max_dd = max_dd.read();
+        let final_trade_count = trade_count.read();
+        let final_wins = wins.read();
+        let final_gp = gross_profit.read();
+        let final_gl = gross_loss.read();
+        let final_max_daily_dd = max_daily_dd.read();
+        let final_month_ptr = month_ptr.read();
+
+        let net_profit = final_equity - initial_equity;
+        let win_rate_cell = RuntimeCell::<f32>::new(0.0);
+        if final_trade_count > 0 {
+            win_rate_cell.store(final_wins as f32 / final_trade_count as f32);
+        }
+        let pf_cell = RuntimeCell::<f32>::new(0.0);
+        if final_gl > 0.0 {
+            pf_cell.store((final_gp / final_gl).min(10.0));
+        } else if final_gp > 0.0 {
+            pf_cell.store(10.0);
+        }
+        let expectancy_cell = RuntimeCell::<f32>::new(0.0);
+        if final_trade_count > 0 {
+            expectancy_cell.store(net_profit / final_trade_count as f32);
+        }
+        let filled_months_cell = RuntimeCell::<i32>::new(0);
+        if final_month_ptr >= 0 {
+            let raw = final_month_ptr + 1;
             if raw < month_capacity as i32 {
-                raw
+                filled_months_cell.store(raw);
             } else {
-                month_capacity as i32
+                filled_months_cell.store(month_capacity as i32);
             }
-        } else {
-            0
-        };
+        }
 
         metrics_out[metric_base] = net_profit;
-        metrics_out[metric_base + 1] = peak_equity;
-        metrics_out[metric_base + 2] = max_dd;
-        metrics_out[metric_base + 3] = win_rate;
-        metrics_out[metric_base + 4] = pf;
-        metrics_out[metric_base + 5] = expectancy;
-        metrics_out[metric_base + 6] = max_daily_dd;
-        trade_counts_out[gene] = trade_count;
-        month_counts_out[gene] = filled_months;
+        metrics_out[metric_base + 1] = final_peak;
+        metrics_out[metric_base + 2] = final_max_dd;
+        metrics_out[metric_base + 3] = win_rate_cell.read();
+        metrics_out[metric_base + 4] = pf_cell.read();
+        metrics_out[metric_base + 5] = expectancy_cell.read();
+        metrics_out[metric_base + 6] = final_max_daily_dd;
+        trade_counts_out[gene] = final_trade_count;
+        month_counts_out[gene] = filled_months_cell.read();
     }
 }
 
@@ -594,7 +631,7 @@ fn materialize_i8_rows(flat: &[i32], n_genes: usize, n_samples: usize) -> Vec<Ve
         .take(n_genes)
         .map(|row| {
             row.iter()
-                .map(|value| value.clamp(-1, 1) as i8)
+                .map(|value| (*value).clamp(-1, 1) as i8)
                 .collect::<Vec<_>>()
         })
         .collect()

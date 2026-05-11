@@ -1325,6 +1325,7 @@ mod tests {
             commission_per_trade: 0.0,
             pip_value_per_lot: 10_000.0,
             kill_zones_enabled: false,
+            session_spread_profile: None,
         }
     }
 

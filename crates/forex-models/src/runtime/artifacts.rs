@@ -29,6 +29,10 @@ pub struct TrainingSummaryMetadata {
 }
 
 impl TrainingSummaryMetadata {
+    /// Constructs a strict training-summary record. Panics on invalid
+    /// row counts to keep production callers honest. Callers that need
+    /// to construct a *deliberately* invalid summary (e.g. drift-
+    /// detection unit tests) must use [`Self::new_unchecked`].
     pub fn new(dataset_rows: usize, train_rows: usize, val_rows: usize) -> Self {
         assert!(
             dataset_rows > 0,
@@ -49,17 +53,30 @@ impl TrainingSummaryMetadata {
         }
     }
 
+    /// Escape hatch for callers that need to construct invalid summaries
+    /// without panicking. The runtime artifact validator
+    /// (`validate_runtime_metadata` in each model crate) still rejects
+    /// the result on load, so production code paths cannot smuggle
+    /// these in — only tests asserting that rejection.
+    pub fn new_unchecked(dataset_rows: usize, train_rows: usize, val_rows: usize) -> Self {
+        Self {
+            dataset_rows,
+            train_rows,
+            val_rows,
+        }
+    }
+
+    /// Test-only alias for `new_unchecked` used by intra-crate tests.
+    /// Kept for backwards compatibility with the legacy call sites in
+    /// `base.rs`, `deep_models.rs`, `streaming/adaptive_impl.rs`,
+    /// `tree_models/sklears.rs`, and `ensemble_tests.rs`.
     #[cfg(test)]
     pub(crate) fn raw_for_validation(
         dataset_rows: usize,
         train_rows: usize,
         val_rows: usize,
     ) -> Self {
-        Self {
-            dataset_rows,
-            train_rows,
-            val_rows,
-        }
+        Self::new_unchecked(dataset_rows, train_rows, val_rows)
     }
 }
 
