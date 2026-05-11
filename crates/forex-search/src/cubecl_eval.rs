@@ -36,14 +36,19 @@ fn synthesize_signals_kernel<F: Float + CubeElement>(
 
         let start = gene_offsets[gene] as usize;
         let end = gene_offsets[gene + 1] as usize;
+        // cubecl 0.9: compound assignment (`+=`) panics with
+        // "Can't have a mutable operation on a const variable" when the
+        // accumulator was initialized from a Const expression like
+        // `F::new(0.0)`. Plain `=` against a `let mut` binding goes
+        // through `assign_expand` which doesn't have the check.
         let mut combined = F::new(0.0);
         let mut i = start;
         while i < end {
             let idx = gene_indices[i] as usize;
             let weight = gene_weights[i];
             let indicator = indicators[idx * n_samples + sample];
-            combined += weight * indicator;
-            i += 1;
+            combined = combined + weight * indicator;
+            i = i + 1;
         }
 
         let lt = long_thr[gene];
@@ -66,9 +71,9 @@ fn synthesize_signals_kernel<F: Float + CubeElement>(
         let mut j = 0usize;
         while j < SMC_WIDTH {
             if gene_smc_flags[flag_base + j] != 0 {
-                active_sum += smc_weights[j];
+                active_sum = active_sum + smc_weights[j];
             }
-            j += 1;
+            j = j + 1;
         }
 
         if active_sum <= F::new(0.0) {
@@ -88,13 +93,13 @@ fn synthesize_signals_kernel<F: Float + CubeElement>(
                 let smc_value = smc_data[smc_base + k];
                 if k == 5 {
                     if smc_value == 1 {
-                        score += smc_weights[k];
+                        score = score + smc_weights[k];
                     }
                 } else if smc_value == sig {
-                    score += smc_weights[k];
+                    score = score + smc_weights[k];
                 }
             }
-            k += 1;
+            k = k + 1;
         }
 
         if score >= gate {
@@ -150,7 +155,7 @@ fn backtest_population_kernel(
         let mut zero_idx = 0usize;
         while zero_idx < month_capacity {
             monthly_pnls_out[month_base + zero_idx] = 0.0;
-            zero_idx += 1;
+            zero_idx = zero_idx + 1;
         }
         month_counts_out[gene] = 0;
         trade_counts_out[gene] = 0;
@@ -159,7 +164,7 @@ fn backtest_population_kernel(
             let mut j = 0usize;
             while j < BACKTEST_CORE_METRIC_WIDTH {
                 metrics_out[metric_base + j] = 0.0;
-                j += 1;
+                j = j + 1;
             }
             terminate!();
         }
@@ -195,7 +200,7 @@ fn backtest_population_kernel(
             let m_val = month_idx[i];
             if m_val != last_month {
                 if last_month != -1 {
-                    month_ptr += 1;
+                    month_ptr = month_ptr + 1;
                     if month_ptr >= 0 && month_ptr < month_capacity as i32 {
                         monthly_pnls_out[month_base + month_ptr as usize] = current_month_pnl;
                     }
@@ -228,15 +233,15 @@ fn backtest_population_kernel(
                 } else {
                     (entry_px - close_pips[i]) * pip_value_per_lot
                 };
-                pnl -= commission_per_trade + (spread_pips * 0.5 * pip_value_per_lot);
-                equity += pnl;
-                current_month_pnl += pnl;
-                trade_count += 1;
+                pnl = pnl - commission_per_trade - (spread_pips * 0.5 * pip_value_per_lot);
+                equity = equity + pnl;
+                current_month_pnl = current_month_pnl + pnl;
+                trade_count = trade_count + 1;
                 if pnl > 0.0 {
-                    wins += 1;
-                    gross_profit += pnl;
+                    wins = wins + 1;
+                    gross_profit = gross_profit + pnl;
                 } else {
-                    gross_loss += -pnl;
+                    gross_loss = gross_loss - pnl;
                 }
                 in_pos = 0;
                 if equity > peak_equity {
@@ -349,15 +354,15 @@ fn backtest_population_kernel(
                 }
 
                 if exit {
-                    pnl -= commission_per_trade + (spread_pips * 0.5 * pip_value_per_lot);
-                    equity += pnl;
-                    current_month_pnl += pnl;
-                    trade_count += 1;
+                    pnl = pnl - commission_per_trade - (spread_pips * 0.5 * pip_value_per_lot);
+                    equity = equity + pnl;
+                    current_month_pnl = current_month_pnl + pnl;
+                    trade_count = trade_count + 1;
                     if pnl > 0.0 {
-                        wins += 1;
-                        gross_profit += pnl;
+                        wins = wins + 1;
+                        gross_profit = gross_profit + pnl;
                     } else {
-                        gross_loss += -pnl;
+                        gross_loss = gross_loss - pnl;
                     }
                     in_pos = 0;
                     if equity > peak_equity {
@@ -388,12 +393,12 @@ fn backtest_population_kernel(
                         entry_px = close_pips[i] + (s as f32) * spread_pips * 0.5;
                         entry_idx = i as i32;
                         trail_px = 0.0;
-                        day_trade_count += 1;
+                        day_trade_count = day_trade_count + 1;
                     }
                 }
             }
 
-            i += 1;
+            i = i + 1;
         }
 
         let net_profit = equity - initial_equity;

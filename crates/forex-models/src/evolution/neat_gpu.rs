@@ -136,7 +136,7 @@ fn neat_population_metrics_kernel(
             let mut reset_idx = 0usize;
             while reset_idx < node_count {
                 scratch[scratch_base + reset_idx] = 0.0;
-                reset_idx += 1;
+                reset_idx = reset_idx + 1;
             }
 
             let input_base = candidate * input_dim_us;
@@ -144,7 +144,7 @@ fn neat_population_metrics_kernel(
             while input < input_dim_us {
                 let node_idx = input_indices[input_base + input] as usize;
                 scratch[scratch_base + node_idx] = features[row * input_dim_us + input];
-                input += 1;
+                input = input + 1;
             }
 
             let bias_idx = bias_indices[candidate];
@@ -164,12 +164,12 @@ fn neat_population_metrics_kernel(
                 let mut edge = edge_start;
                 while edge < edge_end {
                     let source = edge_sources[edge] as usize;
-                    sum += scratch[scratch_base + source] * edge_weights[edge];
-                    edge += 1;
+                    sum = sum + scratch[scratch_base + source] * edge_weights[edge];
+                    edge = edge + 1;
                 }
                 let activation = activation_codes[absolute_node];
                 scratch[scratch_base + node_idx] = apply_activation(activation, sum);
-                eval_pos += 1;
+                eval_pos = eval_pos + 1;
             }
 
             let output_base = candidate * CLASS_COUNT;
@@ -201,8 +201,8 @@ fn neat_population_metrics_kernel(
             } else if label == 1 {
                 expected_probability = p1;
             }
-            log_loss -= expected_probability.ln();
-            confidence_sum += expected_probability;
+            log_loss = log_loss - expected_probability.ln();
+            confidence_sum = confidence_sum + expected_probability;
 
             let mut best_idx = 0i32;
             let mut best_value = p0;
@@ -214,9 +214,9 @@ fn neat_population_metrics_kernel(
                 best_idx = 2;
             }
             if best_idx == label {
-                correct += 1;
+                correct = correct + 1;
             }
-            row += 1;
+            row = row + 1;
         }
 
         let rows = n_rows as f32;

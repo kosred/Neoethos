@@ -33,8 +33,9 @@ fn candidate_loss_kernel(
         let mut p = 0usize;
         while p < param_dim_us {
             let value = candidates[param_base + p];
-            l2 += value * value;
-            p += 1;
+            // cubecl 0.9: compound assign on Const-init mut bindings panics.
+            l2 = l2 + value * value;
+            p = p + 1;
         }
         l2 = l2 / param_dim as f32;
 
@@ -55,15 +56,16 @@ fn candidate_loss_kernel(
                 let mut activation = candidates[b1_offset + hidden];
                 let mut feature = 0usize;
                 while feature < input_dim_us {
-                    activation += features[row * input_dim_us + feature]
-                        * candidates[w1_offset + feature * hidden_dim_us + hidden];
-                    feature += 1;
+                    activation = activation
+                        + features[row * input_dim_us + feature]
+                            * candidates[w1_offset + feature * hidden_dim_us + hidden];
+                    feature = feature + 1;
                 }
                 activation = activation.tanh();
-                logit0 += activation * candidates[w2_offset + hidden * CLASS_COUNT];
-                logit1 += activation * candidates[w2_offset + hidden * CLASS_COUNT + 1];
-                logit2 += activation * candidates[w2_offset + hidden * CLASS_COUNT + 2];
-                hidden += 1;
+                logit0 = logit0 + activation * candidates[w2_offset + hidden * CLASS_COUNT];
+                logit1 = logit1 + activation * candidates[w2_offset + hidden * CLASS_COUNT + 1];
+                logit2 = logit2 + activation * candidates[w2_offset + hidden * CLASS_COUNT + 2];
+                hidden = hidden + 1;
             }
 
             let mut max_logit = logit0;
@@ -90,8 +92,8 @@ fn candidate_loss_kernel(
             if probability > 0.999999 {
                 probability = 0.999999;
             }
-            total_loss -= probability.ln();
-            row += 1;
+            total_loss = total_loss - probability.ln();
+            row = row + 1;
         }
 
         losses[candidate] = total_loss / n_rows as f32 + L2_WEIGHT * l2;

@@ -14,7 +14,7 @@ L40 running CUDA 13 / driver 595.58.03 on Hyperstack) reported
 ✅ `cargo build --release -p forex-cli --features gpu` succeeds end-to-end on the VM.
 ✅ `libtorch_cuda.so` properly linked into the binary via `forex-cli/build.rs` and `forex-app/build.rs` — `tch::Cuda::device_count()` correctly reports the hardware GPU at runtime.
 ✅ NVRTC finds CUDA headers via `cuda-toolkit-13-0` install.
-⚠️  cubecl JIT runtime fails on the migrated kernels with `"Can't have a mutable operation on a const variable"`. The kernels compile statically but cubecl's runtime IR rejects them. Needs cubecl-internals expertise to identify which migrated `let mut` / mut-op pair is being treated as immutable. Existing CPU fallback in `forex-search::eval` triggers transparently — discovery still completes and finds strategies, just on CPU.
+⚠️  **cubecl JIT runtime fix applied in commit after migration**: compound-assignment ops (`+=`, `-=`, etc.) on `let mut x = F::new(0.0);` accumulators trigger `"Can't have a mutable operation on a const variable. Try to use RuntimeCell."` in cubecl 0.9. The initial value `F::new(0.0)` is a Const expression; the `let mut` binding inherits that, and `assign_op_expand` panics because `lhs.is_immutable()` is true. Workaround applied: rewrite every `x += y` inside a `#[cube(...)]` body as `x = x + y` (plain assignment goes through `assign_expand` which doesn't have the immutability check). Loop counters (`i += 1` → `i = i + 1`) got the same treatment for consistency. Existing CPU fallback in `forex-search::eval` still triggers transparently if a kernel ever misbehaves.
 
 ## Files changed
 

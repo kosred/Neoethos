@@ -55,10 +55,11 @@ fn class_probability(
     while col < cols_us {
         let feature = features[row_base + col];
         let weight_base = col * CLASS_COUNT;
-        logit0 += feature * weights[weight_base];
-        logit1 += feature * weights[weight_base + 1];
-        logit2 += feature * weights[weight_base + 2];
-        col += 1;
+        // cubecl 0.9: compound assignment panics on Const-init mut bindings.
+        logit0 = logit0 + feature * weights[weight_base];
+        logit1 = logit1 + feature * weights[weight_base + 1];
+        logit2 = logit2 + feature * weights[weight_base + 2];
+        col = col + 1;
     }
 
     let mut max_logit = logit0;
@@ -122,11 +123,11 @@ fn softmax_gradient_kernel(
             }
             let error = probability - target;
             if is_bias {
-                grad += error;
+                grad = grad + error;
             } else {
-                grad += features[row * cols_us + feature_idx] * error;
+                grad = grad + features[row * cols_us + feature_idx] * error;
             }
-            row += 1;
+            row = row + 1;
         }
         grad = grad / rows as f32;
 
@@ -185,8 +186,8 @@ fn softmax_loss_kernel(
         while row < rows_us {
             let label = labels[row] as u32;
             let probability = class_probability(features, weights, bias, row as u32, cols, label);
-            loss -= clamp_probability(probability).ln();
-            row += 1;
+            loss = loss - clamp_probability(probability).ln();
+            row = row + 1;
         }
         loss_out[0] = loss / rows as f32;
     }
