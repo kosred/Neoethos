@@ -245,11 +245,13 @@ fn backtest_population_kernel(
                 if equity < day_low {
                     day_low = equity;
                 }
-                let current_dd = if peak_equity > 0.0 {
-                    (peak_equity - equity) / peak_equity
-                } else {
-                    0.0f32
-                };
+                // cubecl 0.9 if-as-expression cannot mix tracked variables
+                // and raw literals; explicit mut binding + branch assignment
+                // works around the ExpandElementTyped vs f32 mismatch.
+                let mut current_dd = 0.0f32;
+                if peak_equity > 0.0 {
+                    current_dd = (peak_equity - equity) / peak_equity;
+                }
                 if current_dd > max_dd {
                     max_dd = current_dd;
                 }
@@ -277,11 +279,10 @@ fn backtest_population_kernel(
                     peak_equity = equity + best_float_pnl;
                 }
 
-                let current_dd = if peak_equity > 0.0 {
-                    (peak_equity - (equity + worst_float_pnl)) / peak_equity
-                } else {
-                    0.0f32
-                };
+                let mut current_dd = 0.0f32;
+                if peak_equity > 0.0 {
+                    current_dd = (peak_equity - (equity + worst_float_pnl)) / peak_equity;
+                }
                 if current_dd > max_dd {
                     max_dd = current_dd;
                 }
@@ -366,11 +367,10 @@ fn backtest_population_kernel(
                         day_low = equity;
                     }
 
-                    let current_dd = if peak_equity > 0.0 {
-                        (peak_equity - equity) / peak_equity
-                    } else {
-                        0.0f32
-                    };
+                    let mut current_dd = 0.0f32;
+                    if peak_equity > 0.0 {
+                        current_dd = (peak_equity - equity) / peak_equity;
+                    }
                     if current_dd > max_dd {
                         max_dd = current_dd;
                     }
@@ -397,33 +397,29 @@ fn backtest_population_kernel(
         }
 
         let net_profit = equity - initial_equity;
-        let win_rate = if trade_count > 0 {
-            wins as f32 / trade_count as f32
-        } else {
-            0.0f32
-        };
-        let pf = if gross_loss > 0.0 {
-            (gross_profit / gross_loss).min(10.0f32)
+        let mut win_rate = 0.0f32;
+        if trade_count > 0 {
+            win_rate = wins as f32 / trade_count as f32;
+        }
+        let mut pf = 0.0f32;
+        if gross_loss > 0.0 {
+            pf = (gross_profit / gross_loss).min(10.0f32);
         } else if gross_profit > 0.0 {
-            10.0f32
-        } else {
-            0.0f32
-        };
-        let expectancy = if trade_count > 0 {
-            net_profit / trade_count as f32
-        } else {
-            0.0f32
-        };
-        let filled_months = if month_ptr >= 0 {
+            pf = 10.0f32;
+        }
+        let mut expectancy = 0.0f32;
+        if trade_count > 0 {
+            expectancy = net_profit / trade_count as f32;
+        }
+        let mut filled_months = 0i32;
+        if month_ptr >= 0 {
             let raw = month_ptr + 1;
             if raw < month_capacity as i32 {
-                raw
+                filled_months = raw;
             } else {
-                month_capacity as i32
+                filled_months = month_capacity as i32;
             }
-        } else {
-            0i32
-        };
+        }
 
         metrics_out[metric_base] = net_profit;
         metrics_out[metric_base + 1] = peak_equity;
