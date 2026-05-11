@@ -445,17 +445,7 @@ fn streaming_backoff_base_ms() -> u64 {
 }
 
 fn streaming_backoff_sleep(attempt: u32) {
-    if attempt == 0 {
-        return;
-    }
-    let base = streaming_backoff_base_ms();
-    let factor = 1u64 << (attempt - 1).min(5);
-    let jitter = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.subsec_nanos() % 100) as u64)
-        .unwrap_or(0);
-    let delay_ms = (base.saturating_mul(factor) + jitter).min(5_000);
-    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    crate::app_services::backoff::backoff_sleep(attempt, streaming_backoff_base_ms());
 }
 
 impl CTraderLiveStreamingBackend for ProductionCTraderLiveStreamingBackend {

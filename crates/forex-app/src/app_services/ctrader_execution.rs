@@ -700,17 +700,7 @@ fn ctrader_backoff_base_ms() -> u64 {
 /// capped at 5 seconds total. The jitter spreads simultaneous retries from
 /// concurrent workers so they do not collide on the broker.
 fn ctrader_backoff_sleep(attempt: u32) {
-    if attempt == 0 {
-        return;
-    }
-    let base = ctrader_backoff_base_ms();
-    let factor = 1u64 << (attempt - 1).min(5);
-    let jitter = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.subsec_nanos() % 100) as u64)
-        .unwrap_or(0);
-    let delay_ms = (base.saturating_mul(factor) + jitter).min(5_000);
-    std::thread::sleep(Duration::from_millis(delay_ms));
+    crate::app_services::backoff::backoff_sleep(attempt, ctrader_backoff_base_ms());
 }
 
 fn ensure_payload_type(response_json: &str, expected_payload_type: u32) -> Result<()> {
@@ -767,12 +757,23 @@ fn parse_execution_event(response_json: &str) -> Result<CTraderExecutionOutcome>
     let order = envelope.payload.order;
     let position = envelope.payload.position;
     let deal = envelope.payload.deal;
+    // Same defence as ctrader_account::required_money_digits — a missing
+    // money_digits field would silently scale every monetary value 100×
+    // because `10^0 = 1`. Default to 2 (typical fiat precision) and
+    // log loudly so the operator notices the protocol regression.
     let money_digits = deal
         .as_ref()
         .and_then(|item| item.close_position_detail.as_ref())
         .and_then(|detail| detail.money_digits)
         .or_else(|| deal.as_ref().and_then(|item| item.money_digits))
-        .unwrap_or(0);
+        .unwrap_or_else(|| {
+            tracing::error!(
+                target: "forex_app::ctrader",
+                "execution event omitted required money_digits; defaulting to 2 \
+                 (silent unwrap_or(0) would scale execution P&L 100×)"
+            );
+            2
+        });
 
     let gross_profit = deal.as_ref().and_then(|item| {
         item.close_position_detail

@@ -281,7 +281,7 @@ pub fn parse_trader_response(response_json: &str) -> Result<CTraderTraderSnapsho
         ));
     }
 
-    let money_digits = envelope.payload.money_digits.unwrap_or(0);
+    let money_digits = required_money_digits(envelope.payload.money_digits, "trader.money_digits");
     Ok(CTraderTraderSnapshot {
         account_id: envelope.payload.ctid_trader_account_id,
         balance: scaled_money(envelope.payload.balance, money_digits),
@@ -316,10 +316,10 @@ pub fn parse_reconcile_response(response_json: &str) -> Result<CTraderReconcileS
             .map(|position| CTraderPositionSnapshot {
                 swap: position
                     .swap
-                    .map(|raw| scaled_money(raw, position.money_digits.unwrap_or(0))),
+                    .map(|raw| scaled_money(raw, required_money_digits(position.money_digits, "position.money_digits"))),
                 commission: position
                     .commission
-                    .map(|raw| scaled_money(raw, position.money_digits.unwrap_or(0))),
+                    .map(|raw| scaled_money(raw, required_money_digits(position.money_digits, "position.money_digits"))),
                 position_id: position.position_id,
                 symbol_id: position.trade_data.symbol_id,
                 trade_side: trade_side_label(position.trade_data.trade_side),
@@ -372,19 +372,19 @@ pub fn parse_deal_list_response(response_json: &str) -> Result<Vec<CTraderDealSn
             let gross_profit = deal
                 .close_position_detail
                 .as_ref()
-                .map(|detail| scaled_money(detail.gross_profit, detail.money_digits.unwrap_or(0)));
+                .map(|detail| scaled_money(detail.gross_profit, required_money_digits(detail.money_digits, "deal.close.money_digits")));
             let fee = deal
                 .close_position_detail
                 .as_ref()
-                .map(|detail| scaled_money(detail.commission, detail.money_digits.unwrap_or(0)))
+                .map(|detail| scaled_money(detail.commission, required_money_digits(detail.money_digits, "deal.close.money_digits")))
                 .or_else(|| {
                     deal.commission
-                        .map(|commission| scaled_money(commission, deal.money_digits.unwrap_or(0)))
+                        .map(|commission| scaled_money(commission, required_money_digits(deal.money_digits, "deal.money_digits")))
                 });
             let swap = deal
                 .close_position_detail
                 .as_ref()
-                .map(|detail| scaled_money(detail.swap, detail.money_digits.unwrap_or(0)));
+                .map(|detail| scaled_money(detail.swap, required_money_digits(detail.money_digits, "deal.close.money_digits")));
             let pnl_conversion_fee = deal.close_position_detail.as_ref().and_then(|detail| {
                 detail
                     .pnl_conversion_fee
@@ -539,9 +539,37 @@ fn ensure_success_payload_type(response_json: &str, expected_payload_type: u32) 
     Ok(())
 }
 
+/// Apply the broker-side decimal precision to a raw money value.
+///
+/// `digits` is clamped to `[0, 12]` so a malformed payload cannot
+/// trigger an `f64` overflow inside `powi`. The caller is responsible
+/// for resolving `Option<u32>` to a concrete value before invoking
+/// this helper — see [`required_money_digits`].
 fn scaled_money(value: i64, digits: u32) -> f64 {
-    let factor = 10_f64.powi(digits as i32);
+    let factor = 10_f64.powi(digits.min(12) as i32);
     value as f64 / factor
+}
+
+/// Resolve `money_digits` from a broker payload. The cTrader OpenAPI
+/// schema declares this field as required; if it is somehow missing we
+/// emit a `tracing::error` (NOT a silent `unwrap_or(0)`) and fall back
+/// to a conservative scale of 2 — the de-facto default for all major
+/// fiat denominations. A silent default of `0` would have multiplied
+/// every reported balance / equity / commission by 100×, corrupting
+/// the operator's view of account state.
+fn required_money_digits(value: Option<u32>, field: &str) -> u32 {
+    match value {
+        Some(v) => v,
+        None => {
+            tracing::error!(
+                target: "forex_app::ctrader",
+                field = field,
+                "broker payload omitted required money_digits; defaulting to 2 \
+                 (silent unwrap_or(0) would scale balances 100×)"
+            );
+            2
+        }
+    }
 }
 
 fn volume_to_units(value: i64) -> f64 {

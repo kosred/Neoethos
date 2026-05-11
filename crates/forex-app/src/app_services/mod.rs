@@ -1,3 +1,4 @@
+pub mod backoff;
 pub mod bootstrap_writer;
 pub mod broker_config;
 pub mod broker_persistence;
