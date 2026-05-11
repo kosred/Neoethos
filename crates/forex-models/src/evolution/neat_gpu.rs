@@ -33,58 +33,58 @@ struct FlattenedNeatBatch {
 
 #[cube]
 fn clamp_f32(value: f32, min_value: f32, max_value: f32) -> f32 {
-    let mut out = value;
-    if out < min_value {
-        out = min_value;
+    let out = RuntimeCell::<f32>::new(value);
+    if out.read() < min_value {
+        out.store(min_value);
     }
-    if out > max_value {
-        out = max_value;
+    if out.read() > max_value {
+        out.store(max_value);
     }
-    out
+    out.read()
 }
 
 #[cube]
 fn apply_activation(code: i32, x: f32) -> f32 {
-    let mut out: f32 = 0.0;
+    let out = RuntimeCell::<f32>::new(0.0);
     if code == 0 {
-        out = clamp_f32(x, -1000.0, 1000.0);
+        out.store(clamp_f32(x, -1000.0, 1000.0));
     } else if code == 1 {
         let clamped = clamp_f32(x, -88.0, 88.0);
-        out = 1.0 / (1.0 + (-clamped).exp());
+        out.store(1.0 / (1.0 + (-clamped).exp()));
     } else if code == 2 {
-        out = x.tanh();
+        out.store(x.tanh());
     } else if code == 3 {
-        out = clamp_f32(x, 0.0, 1000.0);
+        out.store(clamp_f32(x, 0.0, 1000.0));
     } else if code == 4 {
-        out = x.sin();
+        out.store(x.sin());
     } else if code == 5 {
-        out = x.cos();
+        out.store(x.cos());
     } else if code == 6 {
         let abs_x = x.abs();
-        out = (-(x * x)).exp();
+        out.store((-(x * x)).exp());
         if abs_x > 26.0 {
-            out = 0.0;
+            out.store(0.0);
         }
     } else if code == 7 {
         let abs_x = x.abs();
-        out = abs_x;
+        out.store(abs_x);
         if abs_x > 1000.0 {
-            out = 1000.0;
+            out.store(1000.0);
         }
     } else if code == 8 {
         if x >= 0.0 {
-            out = 1.0;
+            out.store(1.0);
         } else {
-            out = 0.0;
+            out.store(0.0);
         }
     } else {
-        let mut result: f32 = 0.01 * x;
+        let result = RuntimeCell::<f32>::new(0.01 * x);
         if x > 0.0 {
-            result = x;
+            result.store(x);
         }
-        out = clamp_f32(result, -1000.0, 1000.0);
+        out.store(clamp_f32(result.read(), -1000.0, 1000.0));
     }
-    out
+    out.read()
 }
 
 #[cube(launch)]
@@ -128,23 +128,19 @@ fn neat_population_metrics_kernel(
             terminate!();
         }
 
-        let mut log_loss: f32 = 0.0;
-        let mut correct: u32 = 0;
-        let mut confidence_sum: f32 = 0.0;
-        let mut row = 0usize;
-        while row < n_rows_us {
-            let mut reset_idx = 0usize;
-            while reset_idx < node_count {
+        let log_loss = RuntimeCell::<f32>::new(0.0);
+        let correct = RuntimeCell::<u32>::new(0);
+        let confidence_sum = RuntimeCell::<f32>::new(0.0);
+
+        for row in 0..n_rows_us {
+            for reset_idx in 0..node_count {
                 scratch[scratch_base + reset_idx] = 0.0;
-                reset_idx = reset_idx + 1;
             }
 
             let input_base = candidate * input_dim_us;
-            let mut input = 0usize;
-            while input < input_dim_us {
+            for input in 0..input_dim_us {
                 let node_idx = input_indices[input_base + input] as usize;
                 scratch[scratch_base + node_idx] = features[row * input_dim_us + input];
-                input = input + 1;
             }
 
             let bias_idx = bias_indices[candidate];
@@ -154,75 +150,69 @@ fn neat_population_metrics_kernel(
 
             let eval_start = eval_offsets[candidate] as usize;
             let eval_end = eval_offsets[candidate + 1] as usize;
-            let mut eval_pos = eval_start;
-            while eval_pos < eval_end {
+            for eval_pos in eval_start..eval_end {
                 let node_idx = eval_indices[eval_pos] as usize;
                 let absolute_node = node_offset + node_idx;
-                let mut sum = biases[absolute_node];
+                let sum = RuntimeCell::<f32>::new(biases[absolute_node]);
                 let edge_start = edge_offsets[absolute_node] as usize;
                 let edge_end = edge_offsets[absolute_node + 1] as usize;
-                let mut edge = edge_start;
-                while edge < edge_end {
+                for edge in edge_start..edge_end {
                     let source = edge_sources[edge] as usize;
-                    sum = sum + scratch[scratch_base + source] * edge_weights[edge];
-                    edge = edge + 1;
+                    sum.store(sum.read() + scratch[scratch_base + source] * edge_weights[edge]);
                 }
                 let activation = activation_codes[absolute_node];
-                scratch[scratch_base + node_idx] = apply_activation(activation, sum);
-                eval_pos = eval_pos + 1;
+                scratch[scratch_base + node_idx] = apply_activation(activation, sum.read());
             }
 
             let output_base = candidate * CLASS_COUNT;
             let logit0 = scratch[scratch_base + output_indices[output_base] as usize];
             let logit1 = scratch[scratch_base + output_indices[output_base + 1] as usize];
             let logit2 = scratch[scratch_base + output_indices[output_base + 2] as usize];
-            let mut max_logit = logit0;
-            if logit1 > max_logit {
-                max_logit = logit1;
+            let max_logit = RuntimeCell::<f32>::new(logit0);
+            if logit1 > max_logit.read() {
+                max_logit.store(logit1);
             }
-            if logit2 > max_logit {
-                max_logit = logit2;
+            if logit2 > max_logit.read() {
+                max_logit.store(logit2);
             }
-            let e0 = (logit0 - max_logit).exp();
-            let e1 = (logit1 - max_logit).exp();
-            let e2 = (logit2 - max_logit).exp();
+            let m = max_logit.read();
+            let e0 = (logit0 - m).exp();
+            let e1 = (logit1 - m).exp();
+            let e2 = (logit2 - m).exp();
             let denom = e0 + e1 + e2;
             let label = labels[row];
-            let mut p0 = e0 / denom;
-            let mut p1 = e1 / denom;
-            let mut p2 = e2 / denom;
-            p0 = clamp_f32(p0, 0.000001, 0.999999);
-            p1 = clamp_f32(p1, 0.000001, 0.999999);
-            p2 = clamp_f32(p2, 0.000001, 0.999999);
+            let p0 = clamp_f32(e0 / denom, 0.000001, 0.999999);
+            let p1 = clamp_f32(e1 / denom, 0.000001, 0.999999);
+            let p2 = clamp_f32(e2 / denom, 0.000001, 0.999999);
 
-            let mut expected_probability = p2;
+            let expected = RuntimeCell::<f32>::new(p2);
             if label == 0 {
-                expected_probability = p0;
+                expected.store(p0);
             } else if label == 1 {
-                expected_probability = p1;
+                expected.store(p1);
             }
-            log_loss = log_loss - expected_probability.ln();
-            confidence_sum = confidence_sum + expected_probability;
+            let exp_v = expected.read();
+            log_loss.store(log_loss.read() - exp_v.ln());
+            confidence_sum.store(confidence_sum.read() + exp_v);
 
-            let mut best_idx = 0i32;
-            let mut best_value = p0;
-            if p1 > best_value {
-                best_value = p1;
-                best_idx = 1;
+            let best_idx = RuntimeCell::<i32>::new(0);
+            let best_value = RuntimeCell::<f32>::new(p0);
+            if p1 > best_value.read() {
+                best_value.store(p1);
+                best_idx.store(1);
             }
-            if p2 > best_value {
-                best_idx = 2;
+            if p2 > best_value.read() {
+                best_idx.store(2);
             }
-            if best_idx == label {
-                correct = correct + 1;
+            if best_idx.read() == label {
+                correct.store(correct.read() + 1);
             }
-            row = row + 1;
         }
 
         let rows = n_rows as f32;
-        let avg_loss = log_loss / rows;
-        let accuracy = correct as f32 / rows;
-        let confidence = confidence_sum / rows;
+        let avg_loss = log_loss.read() / rows;
+        let accuracy = correct.read() as f32 / rows;
+        let confidence = confidence_sum.read() / rows;
         let fitness = (accuracy * 3.0 + confidence) - avg_loss - complexity_penalties[candidate];
         metrics_out[metric_base] = fitness;
         metrics_out[metric_base + 1] = avg_loss;

@@ -28,14 +28,17 @@ fn sign_f32(value: f32) -> f32 {
 
 #[cube]
 fn clamp_probability(value: f32) -> f32 {
-    let mut out = value;
-    if out < 0.000001 {
-        out = 0.000001;
+    // cubecl 0.9: even `let mut x = param;` produces an immutable
+    // binding; reassignment goes through `assign_expand` which panics.
+    // RuntimeCell is the only path to a runtime-mutable scalar.
+    let out = RuntimeCell::<f32>::new(value);
+    if out.read() < 0.000001 {
+        out.store(0.000001);
     }
-    if out > 0.999999 {
-        out = 0.999999;
+    if out.read() > 0.999999 {
+        out.store(0.999999);
     }
-    out
+    out.read()
 }
 
 #[cube]
@@ -47,41 +50,42 @@ fn class_probability(
     cols: u32,
     class_idx: u32,
 ) -> f32 {
-    let mut logit0 = bias[0];
-    let mut logit1 = bias[1];
-    let mut logit2 = bias[2];
+    let logit0 = RuntimeCell::<f32>::new(bias[0]);
+    let logit1 = RuntimeCell::<f32>::new(bias[1]);
+    let logit2 = RuntimeCell::<f32>::new(bias[2]);
     let row_us = row as usize;
     let cols_us = cols as usize;
     let row_base = row_us * cols_us;
-    let mut col = 0usize;
-    while col < cols_us {
+    for col in 0..cols_us {
         let feature = features[row_base + col];
         let weight_base = col * CLASS_COUNT;
-        // cubecl 0.9: compound assignment panics on Const-init mut bindings.
-        logit0 = logit0 + feature * weights[weight_base];
-        logit1 = logit1 + feature * weights[weight_base + 1];
-        logit2 = logit2 + feature * weights[weight_base + 2];
-        col = col + 1;
+        logit0.store(logit0.read() + feature * weights[weight_base]);
+        logit1.store(logit1.read() + feature * weights[weight_base + 1]);
+        logit2.store(logit2.read() + feature * weights[weight_base + 2]);
     }
 
-    let mut max_logit = logit0;
-    if logit1 > max_logit {
-        max_logit = logit1;
+    let l0 = logit0.read();
+    let l1 = logit1.read();
+    let l2 = logit2.read();
+    let max_logit = RuntimeCell::<f32>::new(l0);
+    if l1 > max_logit.read() {
+        max_logit.store(l1);
     }
-    if logit2 > max_logit {
-        max_logit = logit2;
+    if l2 > max_logit.read() {
+        max_logit.store(l2);
     }
-    let e0 = (logit0 - max_logit).exp();
-    let e1 = (logit1 - max_logit).exp();
-    let e2 = (logit2 - max_logit).exp();
+    let m = max_logit.read();
+    let e0 = (l0 - m).exp();
+    let e1 = (l1 - m).exp();
+    let e2 = (l2 - m).exp();
     let denom = e0 + e1 + e2;
-    let mut out = e2 / denom;
+    let out = RuntimeCell::<f32>::new(e2 / denom);
     if class_idx == 0 {
-        out = e0 / denom;
+        out.store(e0 / denom);
     } else if class_idx == 1 {
-        out = e1 / denom;
+        out.store(e1 / denom);
     }
-    out
+    out.read()
 }
 
 #[cube(launch)]
@@ -104,42 +108,43 @@ fn softmax_gradient_kernel(
     if ABSOLUTE_POS < total_len {
         let pos = ABSOLUTE_POS;
         let is_bias = pos >= weight_len;
-        let mut class_idx: usize = pos % CLASS_COUNT;
+        let class_idx_cell = RuntimeCell::<u32>::new((pos % CLASS_COUNT) as u32);
         if is_bias {
-            class_idx = pos - weight_len;
+            class_idx_cell.store((pos - weight_len) as u32);
         }
-        let mut feature_idx: usize = pos / CLASS_COUNT;
+        let feature_idx_cell = RuntimeCell::<u32>::new((pos / CLASS_COUNT) as u32);
         if is_bias {
-            feature_idx = 0;
+            feature_idx_cell.store(0);
         }
 
-        let mut grad: f32 = 0.0;
-        let mut row = 0usize;
-        while row < rows_us {
+        let class_idx = class_idx_cell.read() as usize;
+        let feature_idx = feature_idx_cell.read() as usize;
+
+        let grad = RuntimeCell::<f32>::new(0.0);
+        for row in 0..rows_us {
             let probability =
                 class_probability(features, weights, bias, row as u32, cols, class_idx as u32);
             let label = labels[row];
-            let mut target: f32 = 0.0;
+            let target_cell = RuntimeCell::<f32>::new(0.0);
             if label == class_idx as i32 {
-                target = 1.0;
+                target_cell.store(1.0);
             }
-            let error = probability - target;
+            let error = probability - target_cell.read();
             if is_bias {
-                grad = grad + error;
+                grad.store(grad.read() + error);
             } else {
-                grad = grad + features[row * cols_us + feature_idx] * error;
+                grad.store(grad.read() + features[row * cols_us + feature_idx] * error);
             }
-            row = row + 1;
         }
-        grad = grad / rows as f32;
+        let final_grad = grad.read() / rows as f32;
 
         if is_bias {
-            grad_bias[class_idx] = grad;
+            grad_bias[class_idx] = final_grad;
         } else {
             let weight = weights[pos];
             let l2 = (1.0 - l1_ratio) * weight;
             let l1 = l1_ratio * sign_f32(weight);
-            grad_weights[pos] = grad + alpha * (l2 + l1);
+            grad_weights[pos] = final_grad + alpha * (l2 + l1);
         }
     }
 }
