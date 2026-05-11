@@ -248,7 +248,7 @@ fn backtest_population_kernel(
                 let current_dd = if peak_equity > 0.0 {
                     (peak_equity - equity) / peak_equity
                 } else {
-                    0.0
+                    0.0f32
                 };
                 if current_dd > max_dd {
                     max_dd = current_dd;
@@ -280,7 +280,7 @@ fn backtest_population_kernel(
                 let current_dd = if peak_equity > 0.0 {
                     (peak_equity - (equity + worst_float_pnl)) / peak_equity
                 } else {
-                    0.0
+                    0.0f32
                 };
                 if current_dd > max_dd {
                     max_dd = current_dd;
@@ -369,7 +369,7 @@ fn backtest_population_kernel(
                     let current_dd = if peak_equity > 0.0 {
                         (peak_equity - equity) / peak_equity
                     } else {
-                        0.0
+                        0.0f32
                     };
                     if current_dd > max_dd {
                         max_dd = current_dd;
@@ -400,19 +400,19 @@ fn backtest_population_kernel(
         let win_rate = if trade_count > 0 {
             wins as f32 / trade_count as f32
         } else {
-            0.0
+            0.0f32
         };
         let pf = if gross_loss > 0.0 {
-            (gross_profit / gross_loss).min(10.0)
+            (gross_profit / gross_loss).min(10.0f32)
         } else if gross_profit > 0.0 {
-            10.0
+            10.0f32
         } else {
-            0.0
+            0.0f32
         };
         let expectancy = if trade_count > 0 {
             net_profit / trade_count as f32
         } else {
-            0.0
+            0.0f32
         };
         let filled_months = if month_ptr >= 0 {
             let raw = month_ptr + 1;
@@ -422,7 +422,7 @@ fn backtest_population_kernel(
                 month_capacity as i32
             }
         } else {
-            0
+            0i32
         };
 
         metrics_out[metric_base] = net_profit;
@@ -604,7 +604,7 @@ fn materialize_i8_rows(flat: &[i32], n_genes: usize, n_samples: usize) -> Vec<Ve
         .take(n_genes)
         .map(|row| {
             row.iter()
-                .map(|value| value.clamp(-1, 1) as i8)
+                .map(|value| (*value).clamp(-1, 1) as i8)
                 .collect::<Vec<_>>()
         })
         .collect()
