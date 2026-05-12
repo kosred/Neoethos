@@ -564,125 +564,108 @@ impl eframe::App for ForexApp {
         // central column only). The "what's running right now" strip:
         // Discovery / Training / Broker each get a status dot + label +
         // a single Start/Stop (or Connect/Disconnect) button.
-        egui::TopBottomPanel::bottom("action_bar")
-            .frame(ui::theme::action_bar_frame(ctx.style().as_ref()))
-            .exact_height(ui::theme::ACTIONBAR_HEIGHT)
+        // ─── Bottom status bar ───────────────────────────────────────
+        // Pro convention: a slim 22-px strip at the very bottom of the
+        // window with high-density read-only state (broker connection,
+        // active engines, server time, build). The previous 48-px
+        // "action bar" tried to host engine Start/Stop buttons here,
+        // never rendered cleanly inside the egui_dock layout, and
+        // duplicated controls already reachable from the relevant
+        // sidebar tabs (Discovery → Start, Training → Start). This
+        // strip is purely informational; actions live in their tabs.
+        let status_bar_text = self.state.status_msg.clone();
+        egui::TopBottomPanel::bottom("status_bar")
+            .frame(ui::theme::status_bar_frame(ctx.style().as_ref()))
+            .exact_height(ui::theme::STATUSBAR_HEIGHT)
             .resizable(false)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.add_space(ui::theme::SPACE_SM);
-                    let (disc_btn_kind, disc_btn_label, disc_hover) = if discovery_running {
-                        (
-                            ui::theme::ButtonKind::Danger,
-                            "Stop",
-                            "Cancel active discovery run",
-                        )
+
+                    // Broker connection dot + label.
+                    let (dot, label) = if broker_connected {
+                        (ui::theme::SUCCESS, "Connected")
                     } else {
-                        (
-                            ui::theme::ButtonKind::Success,
-                            "Start",
-                            "Start discovery with current form settings",
-                        )
+                        (ui::theme::TEXT_FAINT, "Offline")
                     };
-                    render_engine_control(
-                        ui,
-                        "Discovery",
-                        &discovery_label,
-                        discovery_dot,
-                        disc_btn_label,
-                        disc_btn_kind,
-                        disc_hover,
-                        &mut start_discovery,
-                        &mut stop_discovery,
-                        discovery_running,
+                    ui::theme::status_dot(ui, dot, ui::theme::FONT_CAPTION);
+                    ui.label(
+                        egui::RichText::new(label)
+                            .size(ui::theme::FONT_CAPTION)
+                            .color(ui::theme::TEXT_PRIMARY),
                     );
 
-                    ui.add_space(ui::theme::SPACE_MD);
-                    ui.add(egui::Separator::default().vertical().spacing(ui::theme::SPACE_SM));
-                    ui.add_space(ui::theme::SPACE_MD);
+                    ui::theme::status_separator(ui);
 
-                    let (train_btn_kind, train_btn_label, train_hover) = if training_running {
-                        (
-                            ui::theme::ButtonKind::Danger,
-                            "Stop",
-                            "Cancel active training run",
-                        )
-                    } else {
-                        (
-                            ui::theme::ButtonKind::Success,
-                            "Start",
-                            "Start training with current symbol & TF",
-                        )
-                    };
-                    render_engine_control(
-                        ui,
-                        "Training",
-                        &training_label,
-                        training_dot,
-                        train_btn_label,
-                        train_btn_kind,
-                        train_hover,
-                        &mut start_training,
-                        &mut stop_training,
-                        training_running,
-                    );
-
-                    ui.add_space(ui::theme::SPACE_MD);
-                    ui.add(egui::Separator::default().vertical().spacing(ui::theme::SPACE_SM));
-                    ui.add_space(ui::theme::SPACE_MD);
-
-                    // Broker control
-                    let broker_dot_color = if broker_connected {
-                        ui::theme::SUCCESS
-                    } else {
-                        ui::theme::TEXT_FAINT
-                    };
-                    let broker_status_label = if broker_connected {
-                        "Connected".to_string()
-                    } else {
-                        "Offline".to_string()
-                    };
-                    let (broker_btn_kind, broker_btn_label, broker_hover) = if broker_connected {
-                        (
-                            ui::theme::ButtonKind::Danger,
-                            "Disconnect",
-                            "Disconnect from broker (cTrader / DXTrade)",
-                        )
-                    } else {
-                        (
-                            ui::theme::ButtonKind::Success,
-                            "Connect",
-                            "Connect to broker using saved credentials",
-                        )
-                    };
-                    render_engine_control(
-                        ui,
-                        "Broker",
-                        &broker_status_label,
-                        broker_dot_color,
-                        broker_btn_label,
-                        broker_btn_kind,
-                        broker_hover,
-                        &mut connect_broker,
-                        &mut disconnect_broker,
-                        broker_connected,
-                    );
-
-                    // Right side: helpful hint when nothing is running.
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if !discovery_running && !training_running && !broker_connected {
-                            ui.label(
-                                egui::RichText::new(
-                                    "Connect broker → Start Discovery → Train → Trade",
-                                )
+                    // Active-engine tally.
+                    let mut engines: Vec<&str> = Vec::new();
+                    if discovery_running {
+                        engines.push("Discovery");
+                    }
+                    if training_running {
+                        engines.push("Training");
+                    }
+                    if engines.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No engines running")
                                 .size(ui::theme::FONT_CAPTION)
-                                .italics()
                                 .color(ui::theme::TEXT_FAINT),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Running: {}",
+                                engines.join(", ")
+                            ))
+                            .size(ui::theme::FONT_CAPTION)
+                            .color(ui::theme::ACCENT),
+                        );
+                    }
+
+                    ui::theme::status_separator(ui);
+                    ui.label(
+                        egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                            .size(ui::theme::FONT_CAPTION)
+                            .color(ui::theme::TEXT_FAINT),
+                    );
+
+                    // Right-aligned: latest status message + UTC time.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(ui::theme::SPACE_SM);
+                        let utc_clock = format_utc_clock();
+                        ui.label(
+                            egui::RichText::new(utc_clock)
+                                .size(ui::theme::FONT_CAPTION)
+                                .color(ui::theme::TEXT_FAINT),
+                        );
+                        ui::theme::status_separator(ui);
+                        if !status_bar_text.is_empty() {
+                            ui.label(
+                                egui::RichText::new(compact_status_text(&status_bar_text))
+                                    .size(ui::theme::FONT_CAPTION)
+                                    .color(ui::theme::TEXT_MUTED),
                             );
                         }
                     });
                 });
             });
+
+        // Engine start / stop intents are still wired up by the
+        // sidebar's Discovery / Training / Settings tabs. Those
+        // mutate the `start_*` / `stop_*` / `connect_broker` /
+        // `disconnect_broker` flags via their own buttons; the
+        // dispatch logic below this block is unchanged. The status
+        // bar just observes whether they're on.
+        let _ = (
+            &start_discovery,
+            &stop_discovery,
+            &start_training,
+            &stop_training,
+            &connect_broker,
+            &disconnect_broker,
+            &discovery_label,
+            &training_label,
+        );
 
         // ─── Left sidebar — primary navigation ───────────────────────
         // Single source of truth for "where am I" — no more competing
@@ -820,6 +803,21 @@ fn system_time_string() -> String {
         .expect("system time should be after unix epoch")
         .as_secs();
     format!("unix:{seconds}")
+}
+
+/// Format the current UTC time as `HH:MM:SS UTC` for the status bar.
+/// Uses pure `std::time` so we do not have to add a `chrono` dep
+/// just for this one display string.
+fn format_utc_clock() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let day_secs = secs % 86_400;
+    let h = day_secs / 3600;
+    let m = (day_secs % 3600) / 60;
+    let s = day_secs % 60;
+    format!("{h:02}:{m:02}:{s:02} UTC")
 }
 
 fn compact_status_text(status: &str) -> String {

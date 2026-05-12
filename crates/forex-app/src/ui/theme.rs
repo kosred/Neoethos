@@ -1,63 +1,79 @@
 //! Forex-AI design system.
 //!
-//! One source of truth for the surface palette, type scale, spacing
-//! scale, and reusable UI primitives. The intent is "professional
-//! desktop trading terminal" — clean, dense-but-breathing, no random
-//! corner radii or text sizes scattered through call sites. Anything
-//! that needs styling should reach for the tokens here.
+//! Anchored to the conventions every working trader recognises:
+//! TradingView-style dark palette, teal-green long / red short,
+//! 4-pt spacing grid, four type levels, semantic colors used sparingly.
+//! See `docs/audits/ui_design_research_2026-05-12.md` for the source
+//! material (cTrader / TradingView / MT5 / Bloomberg patterns).
 //!
-//! Inspired by Linear / Vercel / Anthropic console aesthetics:
-//! warm-dark surfaces, soft borders, one distinct accent, semantic
-//! colors used sparingly.
+//! One source of truth: any new UI work should reach for the tokens
+//! here, not invent its own padding or color.
 
 use eframe::egui;
 
 // ─── Color palette ───────────────────────────────────────────────────────
 //
-// All RGB values were picked together so the contrast ratios stack:
+// Mapped from TradingView's published dark theme + the Stock Trader
+// UI Kit conventions. Buy / sell colors are TradingView's literal
+// candle defaults (#26A69A / #EF5350) so anyone who has ever looked
+// at a TV chart reads them without thinking.
+//
+// Contrast ratios:
 //   TEXT_PRIMARY on APP_BG       ≥ 15:1 (AAA)
-//   TEXT_PRIMARY on SURFACE_BG   ≥ 13:1 (AAA)
-//   TEXT_MUTED   on SURFACE_BG   ≥  4.6:1 (AA)
+//   TEXT_PRIMARY on PANEL_BG     ≥ 13:1 (AAA)
+//   TEXT_MUTED   on PANEL_BG     ≥  4.6:1 (AA)
 //   ACCENT       on APP_BG       ≥  4.5:1 (AA)
 
-/// Application root background (behind everything).
-pub const APP_BG: egui::Color32 = egui::Color32::from_rgb(13, 15, 20);
-/// Default panel background — top bar, side panel, action bar.
-pub const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(17, 20, 26);
+/// Application root background (chart canvas, gutter).
+pub const APP_BG: egui::Color32 = egui::Color32::from_rgb(0x0E, 0x11, 0x16);
+/// Default panel background — sidebars, ticket, bottom dock, top bar.
+pub const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(0x16, 0x1B, 0x22);
 /// Card / surface background — one step "above" the panel.
-pub const SURFACE_BG: egui::Color32 = egui::Color32::from_rgb(22, 26, 33);
+pub const SURFACE_BG: egui::Color32 = egui::Color32::from_rgb(0x1C, 0x22, 0x30);
 /// Elevated surface — hover, focused tab, accent callouts.
-pub const SURFACE_ALT: egui::Color32 = egui::Color32::from_rgb(28, 33, 41);
-/// Chart canvas — slightly darker than APP_BG for contrast.
-pub const CHART_BG: egui::Color32 = egui::Color32::from_rgb(10, 12, 16);
+pub const SURFACE_ALT: egui::Color32 = egui::Color32::from_rgb(0x22, 0x29, 0x3A);
+/// Chart canvas — exact match for app bg by convention.
+pub const CHART_BG: egui::Color32 = egui::Color32::from_rgb(0x0E, 0x11, 0x16);
 
 /// Subtle hairline borders.
-pub const BORDER: egui::Color32 = egui::Color32::from_rgb(38, 44, 54);
+pub const BORDER: egui::Color32 = egui::Color32::from_rgb(0x2A, 0x2F, 0x3A);
 /// Heavier borders for focus states / dividers.
-pub const BORDER_STRONG: egui::Color32 = egui::Color32::from_rgb(56, 65, 79);
+pub const BORDER_STRONG: egui::Color32 = egui::Color32::from_rgb(0x3A, 0x40, 0x4D);
 /// Chart grid lines.
-pub const GRID: egui::Color32 = egui::Color32::from_rgb(32, 39, 49);
+pub const GRID: egui::Color32 = egui::Color32::from_rgb(0x1F, 0x24, 0x30);
 
 /// Primary text.
-pub const TEXT_PRIMARY: egui::Color32 = egui::Color32::from_rgb(232, 237, 244);
+pub const TEXT_PRIMARY: egui::Color32 = egui::Color32::from_rgb(0xE6, 0xEA, 0xF2);
 /// Secondary text (labels, captions, hints).
-pub const TEXT_MUTED: egui::Color32 = egui::Color32::from_rgb(149, 162, 180);
+pub const TEXT_MUTED: egui::Color32 = egui::Color32::from_rgb(0x9A, 0xA4, 0xB2);
 /// Tertiary text (disabled, placeholders).
-pub const TEXT_FAINT: egui::Color32 = egui::Color32::from_rgb(96, 108, 124);
+pub const TEXT_FAINT: egui::Color32 = egui::Color32::from_rgb(0x5C, 0x64, 0x73);
 
-/// Primary accent — used for active nav, primary CTAs, focus rings.
-/// Soft violet-blue, more distinctive than a generic terminal cyan.
-pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(124, 137, 255);
-/// Accent at 18% alpha equivalent — for selected backgrounds.
-pub const ACCENT_MUTED: egui::Color32 = egui::Color32::from_rgb(36, 41, 73);
-/// Accent at very low alpha — for hover backgrounds on accent items.
-pub const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgb(26, 30, 52);
+/// Primary accent — TradingView blue. Used for active nav, primary
+/// CTAs, focus rings. Replaced the previous soft violet (#7C89FF)
+/// because traders read this exact blue as "interactive / selected".
+pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x29, 0x62, 0xFF);
+/// Accent on hover.
+pub const ACCENT_HOVER: egui::Color32 = egui::Color32::from_rgb(0x1E, 0x53, 0xE5);
+/// Accent at low alpha — selected row background.
+pub const ACCENT_MUTED: egui::Color32 = egui::Color32::from_rgb(0x1E, 0x2A, 0x4A);
+/// Accent at very low alpha — for hover backgrounds.
+pub const ACCENT_SOFT: egui::Color32 = egui::Color32::from_rgb(0x16, 0x1F, 0x36);
 
-/// Semantic colors. Use them ONLY for the meaning they signal.
-pub const SUCCESS: egui::Color32 = egui::Color32::from_rgb(74, 200, 142);
-pub const WARNING: egui::Color32 = egui::Color32::from_rgb(238, 172, 55);
-pub const DANGER: egui::Color32 = egui::Color32::from_rgb(239, 95, 110);
-pub const INFO: egui::Color32 = egui::Color32::from_rgb(108, 168, 230);
+/// Trading semantics — TradingView's literal candle colors.
+/// `BUY` / `LONG` is teal-green; `SELL` / `SHORT` is red.
+pub const BUY: egui::Color32 = egui::Color32::from_rgb(0x26, 0xA6, 0x9A);
+pub const BUY_STRONG: egui::Color32 = egui::Color32::from_rgb(0x00, 0xC8, 0x53);
+pub const SELL: egui::Color32 = egui::Color32::from_rgb(0xEF, 0x53, 0x50);
+pub const SELL_STRONG: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x17, 0x44);
+
+/// Status semantics. Use ONLY for the meaning they signal.
+/// `SUCCESS` = `BUY` (intentional); `DANGER` = `SELL`; warning is
+/// amber for pending/partial fills; info matches `ACCENT`.
+pub const SUCCESS: egui::Color32 = BUY;
+pub const WARNING: egui::Color32 = egui::Color32::from_rgb(0xF4, 0xB4, 0x00);
+pub const DANGER: egui::Color32 = SELL;
+pub const INFO: egui::Color32 = ACCENT;
 
 // ─── Spacing scale ──────────────────────────────────────────────────────
 //
@@ -86,14 +102,30 @@ pub const RADIUS_MD: u8 = 6;
 pub const RADIUS_LG: u8 = 8;
 
 // ─── Layout heights ─────────────────────────────────────────────────────
+//
+// Numbers chosen to match the four pro-platform survey:
+//   TradingView   top 44 px, drawing rail 32-40 px, status 22 px
+//   cTrader       header 72 px (two-row), Market Watch 280 px, ASP 320 px
+//   MT5           menu+toolbars 80 px, Market Watch 240 px, Toolbox 200 px
+//   Bloomberg     command bar 28 px, function-key strip 24 px
 
-pub const TOPBAR_HEIGHT: f32 = 56.0;
+pub const TOPBAR_HEIGHT: f32 = 44.0;
+pub const STATUSBAR_HEIGHT: f32 = 22.0;
 pub const ACTIONBAR_HEIGHT: f32 = 48.0;
+
+/// Icon-only left rail (TradingView pattern). Tooltips on hover.
+pub const SIDEBAR_RAIL_WIDTH: f32 = 56.0;
+/// Optional wider sidebar for the data-panel mode (cTrader Market
+/// Watch). Currently kept as the default until we ship the rail
+/// + secondary panel design.
 pub const SIDEBAR_WIDTH_DEFAULT: f32 = 220.0;
-pub const SIDEBAR_WIDTH_MIN: f32 = 188.0;
+pub const SIDEBAR_WIDTH_MIN: f32 = 56.0; // collapses to rail
 pub const SIDEBAR_WIDTH_MAX: f32 = 320.0;
+
 pub const BUTTON_HEIGHT: f32 = 32.0;
 pub const BUTTON_HEIGHT_SM: f32 = 24.0;
+/// Tabular row height for Positions / Orders / History / Watchlist.
+pub const TABLE_ROW_HEIGHT: f32 = 24.0;
 
 // ─── Apply global theme ─────────────────────────────────────────────────
 
@@ -216,6 +248,35 @@ pub fn action_bar_frame(_style: &egui::Style) -> egui::Frame {
         .fill(SURFACE_BG)
         .stroke(egui::Stroke::new(1.0, BORDER_STRONG))
         .inner_margin(egui::Margin::symmetric(SPACE_LG as i8, SPACE_SM as i8))
+}
+
+/// Bottom status bar — slim 22-px strip with read-only state. Pro
+/// convention is for this to be the lowest-visual-weight surface in
+/// the whole shell, so we use `PANEL_BG` (not SURFACE_BG) and a
+/// single hairline border on top.
+pub fn status_bar_frame(_style: &egui::Style) -> egui::Frame {
+    egui::Frame::new()
+        .fill(PANEL_BG)
+        .stroke(egui::Stroke::new(1.0, BORDER))
+        .inner_margin(egui::Margin {
+            left: SPACE_SM as i8,
+            right: SPACE_SM as i8,
+            top: 2,
+            bottom: 2,
+        })
+}
+
+/// Vertical hair-line separator used inside the status bar between
+/// info groups. Adds 8 px padding either side and uses BORDER so it
+/// reads as quieter than `egui::Separator::default()`.
+pub fn status_separator(ui: &mut egui::Ui) {
+    ui.add_space(SPACE_SM);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(1.0, ui.available_height() - 4.0),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, 0.0, BORDER);
+    ui.add_space(SPACE_SM);
 }
 
 /// Central content area.
