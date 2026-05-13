@@ -912,6 +912,8 @@ pub use hpc::{
 pub use hpc_gpu_discovery::{IslandConfig, run_island_model_discovery};
 
 pub mod eval;
+pub mod export_state;
+pub mod funnel_profile;
 pub mod gauntlet;
 pub mod genetic;
 pub mod orchestration;

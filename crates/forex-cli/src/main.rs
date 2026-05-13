@@ -59,6 +59,8 @@ fn main() -> Result<()> {
         "batch-discover" => cmd_batch_discover(&args[2..]),
         "migrate-data" => cmd_migrate_data(&args[2..]),
         "import" => cmd_import(&args[2..]),
+        "config" => cmd_config(&args[2..]),
+        "auto-loop" => cmd_auto_loop(&args[2..]),
         "stop-target" => cmd_stop_target(&args[2..]),
         _ => {
             print_help();
@@ -550,6 +552,216 @@ fn cmd_batch_discover(args: &[String]) -> Result<()> {
 /// `--root`. Symbol/timeframe are inferred from path components or the
 /// filename. Failed conversions are quarantined; the report is written
 /// to `<root>/import_report.json`.
+/// Print the resolved config: every setting with raw value, resolved
+/// value, source (config / sentinel-expanded / env / default), and
+/// notes. The TUI's Config page renders the same data.
+fn cmd_config(args: &[String]) -> Result<()> {
+    let settings = resolve_cli_settings(args)?.unwrap_or_else(forex_core::Settings::default);
+    let resolved = forex_core::resolved_config::ResolvedConfig::from_settings(&settings);
+
+    if has_flag(args, "--json") {
+        let text = serde_json::to_string_pretty(&resolved)
+            .map_err(|e| anyhow::anyhow!("serialize resolved config: {e}"))?;
+        println!("{}", text);
+        return Ok(());
+    }
+
+    println!("Resolved configuration");
+    println!("======================");
+    println!("{:<10} {:<28} {:<28} {:<28} {:<8}", "section", "field", "raw", "resolved", "source");
+    println!("{}", "-".repeat(110));
+    for row in resolved.display_table() {
+        println!("{:<10} {:<28} {:<28} {:<28} {:<8}", row[0], row[1], row[2], row[3], row[4]);
+    }
+    println!();
+    println!("Notes:");
+    for f in &resolved.display_fields {
+        if let Some(note) = &f.note {
+            println!("  {} / {}: {}", f.section, f.field, note);
+        }
+    }
+    Ok(())
+}
+
+/// Auto search-train loop (P9). Forward-only:
+///   import → discover → train → export → next (symbol, timeframe)
+///
+/// Controls:
+///   --symbols X,Y,Z         (default: auto-detect from data root)
+///   --timeframes M3,M5,...  (default: ResolvedConfig.timeframes.canonical_default)
+///   --skip-training         (run discover + export only)
+///   --max-jobs N            (stop after N work-units, 0 = no limit)
+///   --resume                (continue from cache/auto_loop_checkpoint.json)
+///   --stop-flag PATH        (file whose existence stops the loop after current job)
+///
+/// Persists checkpoint to cache/auto_loop_checkpoint.json — on crash,
+/// re-run with --resume to continue.
+fn cmd_auto_loop(args: &[String]) -> Result<()> {
+    let settings = resolve_cli_settings(args)?.unwrap_or_else(forex_core::Settings::default);
+    let resolved = forex_core::resolved_config::ResolvedConfig::from_settings(&settings);
+    let root = parse_root(args, Some(&settings));
+    let symbols_raw = parse_flag(args, "--symbols").unwrap_or_default();
+    let tfs_raw = parse_flag(args, "--timeframes").unwrap_or_else(|| {
+        resolved.timeframes.canonical_default.join(",")
+    });
+    let skip_training = has_flag(args, "--skip-training");
+    let max_jobs: usize = parse_flag(args, "--max-jobs")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let resume = has_flag(args, "--resume");
+    let stop_flag = parse_flag(args, "--stop-flag")
+        .unwrap_or_else(|| "cache/auto_loop_stop.flag".to_string());
+    let checkpoint_path = std::path::PathBuf::from("cache").join("auto_loop_checkpoint.json");
+
+    let symbols: Vec<String> = if symbols_raw.is_empty() {
+        forex_data::discover_symbols(&root)?
+    } else {
+        symbols_raw
+            .split(',')
+            .map(|s| s.trim().to_uppercase())
+            .collect()
+    };
+    let tfs: Vec<String> = tfs_raw
+        .split(',')
+        .map(|s| s.trim().to_uppercase())
+        .collect();
+
+    // Build the (symbol, timeframe) work queue.
+    let mut work_queue: Vec<(String, String)> = symbols
+        .iter()
+        .flat_map(|s| tfs.iter().map(move |t| (s.clone(), t.clone())))
+        .collect();
+    let total_units = work_queue.len();
+
+    // Resume support: read checkpoint and skip already-completed pairs.
+    let mut completed: Vec<(String, String)> = Vec::new();
+    if resume && checkpoint_path.exists() {
+        if let Ok(text) = std::fs::read_to_string(&checkpoint_path) {
+            if let Ok(prev) = serde_json::from_str::<AutoLoopCheckpoint>(&text) {
+                completed = prev.completed.clone();
+                work_queue.retain(|w| !completed.contains(w));
+                println!(
+                    "Resuming from checkpoint: {} already completed; {} remaining",
+                    completed.len(),
+                    work_queue.len()
+                );
+            }
+        }
+    }
+
+    let mut jobs_run = 0usize;
+    println!(
+        "Auto-loop start: {} work units ({} symbols × {} timeframes); skip_training={}; stop-flag={}",
+        work_queue.len(),
+        symbols.len(),
+        tfs.len(),
+        skip_training,
+        stop_flag
+    );
+
+    for (sym, tf) in work_queue.into_iter() {
+        if std::path::Path::new(&stop_flag).exists() {
+            println!("Stop-flag found at {} — exiting loop", stop_flag);
+            break;
+        }
+        if max_jobs > 0 && jobs_run >= max_jobs {
+            println!("Reached --max-jobs={}; exiting", max_jobs);
+            break;
+        }
+
+        println!(
+            "[{}/{}] discovering {} {}",
+            jobs_run + 1,
+            total_units,
+            sym,
+            tf
+        );
+        let discover_args: Vec<String> = vec![
+            "discover".to_string(),
+            "--symbol".to_string(),
+            sym.clone(),
+            "--base".to_string(),
+            tf.clone(),
+            "--higher".to_string(),
+            "H4".to_string(),
+            "--root".to_string(),
+            root.clone(),
+            "--population".to_string(),
+            resolved.search.population.to_string(),
+            "--generations".to_string(),
+            resolved.search.generations.to_string(),
+            "--portfolio-size".to_string(),
+            resolved.search.portfolio_size.to_string(),
+            "--out".to_string(),
+            format!("cache/auto_loop/{}_{}.json", sym, tf),
+        ];
+        match cmd_discover(&discover_args) {
+            Ok(()) => println!("  discover OK"),
+            Err(err) => {
+                eprintln!("  discover FAILED: {err:#}");
+                // Continue to next; don't bail the whole loop.
+            }
+        }
+
+        if !skip_training {
+            // Set FOREX_BOT_DATA_ROOT env so the train pipeline finds data
+            // (cmd_train doesn't honor --root yet).
+            // SAFETY: single-threaded auto-loop; no other thread reads env.
+            unsafe {
+                std::env::set_var("FOREX_BOT_DATA_ROOT", &root);
+            }
+            let train_args: Vec<String> = vec![
+                "train".to_string(),
+                "--symbol".to_string(),
+                sym.clone(),
+                "--base".to_string(),
+                tf.clone(),
+                "--models-dir".to_string(),
+                "cache/auto_loop_models".to_string(),
+            ];
+            match cmd_train(&train_args) {
+                Ok(()) => println!("  train OK"),
+                Err(err) => eprintln!("  train FAILED: {err:#}"),
+            }
+        }
+
+        completed.push((sym.clone(), tf.clone()));
+        let checkpoint = AutoLoopCheckpoint {
+            started_at: completed
+                .first()
+                .map(|_| chrono::Utc::now().to_rfc3339())
+                .unwrap_or_default(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            completed: completed.clone(),
+            remaining: total_units.saturating_sub(completed.len()),
+        };
+        if let Some(dir) = checkpoint_path.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        if let Ok(text) = serde_json::to_string_pretty(&checkpoint) {
+            let _ = std::fs::write(&checkpoint_path, text);
+        }
+
+        jobs_run += 1;
+    }
+
+    println!(
+        "Auto-loop done: {}/{} work units processed; checkpoint at {}",
+        completed.len(),
+        total_units,
+        checkpoint_path.display()
+    );
+    Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AutoLoopCheckpoint {
+    started_at: String,
+    updated_at: String,
+    completed: Vec<(String, String)>,
+    remaining: usize,
+}
+
 fn cmd_import(args: &[String]) -> Result<()> {
     let settings = resolve_cli_settings(args)?;
     let root = parse_root(args, settings.as_ref());

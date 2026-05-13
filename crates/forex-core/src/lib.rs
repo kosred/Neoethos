@@ -2,6 +2,7 @@ pub mod config;
 pub mod contracts;
 pub mod domain;
 pub mod logging;
+pub mod resolved_config;
 pub mod sectioned_log;
 pub mod storage;
 pub mod symbol_metadata;

@@ -3992,6 +3992,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "cc",
+ "chrono",
  "clap",
  "dirs 5.0.1",
  "eframe",
@@ -4025,12 +4026,15 @@ name = "forex-cli"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "crossterm 0.28.1",
  "forex-core",
  "forex-data",
  "forex-models",
  "forex-search",
  "ratatui",
+ "serde",
+ "serde_json",
  "unicode-width 0.2.0",
 ]
 

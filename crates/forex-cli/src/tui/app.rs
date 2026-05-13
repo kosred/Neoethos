@@ -211,6 +211,10 @@ impl App {
             KeyCode::Char('3') => self.current = Page::Strategies,
             KeyCode::Char('4') => self.current = Page::Symbols,
             KeyCode::Char('5') => self.current = Page::Train,
+            KeyCode::Char('6') => self.current = Page::Funnel,
+            KeyCode::Char('7') => self.current = Page::AutoLoop,
+            KeyCode::Char('8') => self.current = Page::Config,
+            KeyCode::Char('9') => self.current = Page::Logs,
             other => {
                 // Page-local: Up/Down focus, Enter to edit/launch, etc.
                 let _ = self.current.handle_key(other, &mut self.shared);

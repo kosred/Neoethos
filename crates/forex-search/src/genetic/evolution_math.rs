@@ -515,8 +515,35 @@ fn random_coarse_weight(rng: &mut impl Rng) -> f32 {
 }
 
 fn random_coarse_threshold(rng: &mut impl Rng) -> f32 {
-    let levels = [0.15, 0.25, 0.35, 0.45, 0.55];
-    levels[rng.random_range(0..levels.len())]
+    // Two distinct calibrations — one for raw indicator outputs (used
+    // when the feature pipeline emits its native magnitudes; some
+    // indicators are bounded oscillators in [0, 100], some are
+    // unbounded; weighted sums end up in roughly [0.0, 5.0]) and one
+    // for normalized features (z-scores, weighted sums in roughly
+    // [0.0, 5.0] but centred on 0 with most mass within ±3).
+    //
+    // The second set is used when `FOREX_BOT_NORMALIZE_FEATURES=1`
+    // is on — without re-calibrated levels the GA's `combined > 0.45`
+    // fires either always or never depending on the symbol's raw
+    // magnitudes, which is the empty-portfolio bug we observed on
+    // EURJPY / XAUUSD.
+    let normalized = matches!(
+        std::env::var("FOREX_BOT_NORMALIZE_FEATURES").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    );
+    if normalized {
+        // Mid-range thresholds for normalized inputs. Empirically the
+        // [0.05–0.50] range is too low (fires constantly → 1 trade
+        // forever); [0.25–2.5] is too high (rarely fires → archive
+        // collapses). [0.30–1.20] is the current best guess; full
+        // re-calibration against a real-symbol fitness landscape is
+        // a v0.4 task tracked in the spec.
+        let levels = [0.30, 0.45, 0.60, 0.80, 1.00, 1.20];
+        levels[rng.random_range(0..levels.len())]
+    } else {
+        let levels = [0.15, 0.25, 0.35, 0.45, 0.55];
+        levels[rng.random_range(0..levels.len())]
+    }
 }
 
 /// Reset every derived/financial metric on a Gene that was inherited from a

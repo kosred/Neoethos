@@ -7,8 +7,12 @@ use ratatui::{buffer::Buffer, layout::Rect};
 
 use crate::tui::app::AppShared;
 
+pub mod auto_loop;
+pub mod config_view;
 pub mod dashboard;
 pub mod discover;
+pub mod funnel;
+pub mod logs;
 pub mod strategies;
 pub mod symbols;
 pub mod train;
@@ -22,6 +26,10 @@ pub enum Page {
     Strategies,
     Symbols,
     Train,
+    Funnel,
+    AutoLoop,
+    Config,
+    Logs,
 }
 
 impl Page {
@@ -31,6 +39,10 @@ impl Page {
         Page::Strategies,
         Page::Symbols,
         Page::Train,
+        Page::Funnel,
+        Page::AutoLoop,
+        Page::Config,
+        Page::Logs,
     ];
 
     pub fn label(self) -> &'static str {
@@ -40,6 +52,10 @@ impl Page {
             Page::Strategies => "Strategies",
             Page::Symbols => "Symbols",
             Page::Train => "Train",
+            Page::Funnel => "Funnel",
+            Page::AutoLoop => "AutoLoop",
+            Page::Config => "Config",
+            Page::Logs => "Logs",
         }
     }
 
@@ -79,6 +95,24 @@ impl Page {
                 ("Tab", "page"),
                 ("Q", "quit"),
             ],
+            Page::Funnel => &[
+                ("Tab", "page"),
+                ("R", "refresh"),
+                ("Q", "quit"),
+            ],
+            Page::AutoLoop => &[
+                ("Tab", "page"),
+                ("L", "launch"),
+                ("Q", "quit"),
+            ],
+            Page::Config => &[
+                ("Tab", "page"),
+                ("Q", "quit"),
+            ],
+            Page::Logs => &[
+                ("Tab", "page"),
+                ("Q", "quit"),
+            ],
         }
     }
 
@@ -89,6 +123,10 @@ impl Page {
             Page::Strategies => strategies::draw(area, buf, shared),
             Page::Symbols => symbols::draw(area, buf, shared),
             Page::Train => train::draw(area, buf, shared),
+            Page::Funnel => funnel::draw(area, buf, shared),
+            Page::AutoLoop => auto_loop::draw(area, buf, shared),
+            Page::Config => config_view::draw(area, buf, shared),
+            Page::Logs => logs::draw(area, buf, shared),
         }
     }
 
@@ -98,6 +136,7 @@ impl Page {
         match self {
             Page::Discover => discover::handle_key(code, shared),
             Page::Train => train::handle_key(code, shared),
+            Page::AutoLoop => auto_loop::handle_key(code, shared),
             _ => false,
         }
     }
@@ -109,6 +148,7 @@ impl Page {
         match self {
             Page::Discover => discover::launch_now(shared),
             Page::Train => train::launch_now(shared),
+            Page::AutoLoop => auto_loop::launch_now(shared),
             _ => {}
         }
     }
