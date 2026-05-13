@@ -258,8 +258,33 @@ pub fn infer_market_cost_profile(
         account_currency.trim().to_string()
     };
 
-    let pip_value = cost.pip_value.unwrap_or_else(|| default_pip_size(&symbol));
+    // Symbol metadata table — disk first (cTrader-populated /
+    // operator-edited), then baked-in defaults for the majors.
+    // Replaces the old `default_pip_size` / `default_contract_size`
+    // heuristic so JPY pairs and metals get correct pip math without
+    // env-var hacks.
+    let metadata = forex_core::symbol_metadata::resolve(&symbol);
+
+    let pip_value = cost
+        .pip_value
+        .or_else(|| metadata.as_ref().map(|m| m.pip_size))
+        .unwrap_or_else(|| default_pip_size(&symbol));
     let pip_value_per_lot = cost.pip_value_per_lot.unwrap_or_else(|| {
+        if let Some(meta) = metadata.as_ref() {
+            // Use the metadata-table pip math (knows about JPY, XAU,
+            // etc. and applies the right base/quote conversion).
+            let live_or_typical = price_hint.or(meta.typical_price);
+            let v = meta.pip_value_in_account(
+                &account_currency,
+                cost.quote_to_account_rate,
+                live_or_typical,
+            );
+            if v.is_finite() && v > 0.0 {
+                return v;
+            }
+            // Cross pair with no conv-rate — fall through to the
+            // existing estimator which handles the warn/reject path.
+        }
         estimate_pip_value_per_lot(
             &symbol,
             &account_currency,

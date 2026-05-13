@@ -4,6 +4,7 @@ pub mod domain;
 pub mod logging;
 pub mod sectioned_log;
 pub mod storage;
+pub mod symbol_metadata;
 pub mod system;
 pub mod utils;
 

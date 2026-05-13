@@ -692,8 +692,9 @@ impl eframe::App for ForexApp {
                             ui::theme::section_label(ui, group.title());
                             ui.add_space(ui::theme::SPACE_XS);
                             for tab in WorkspaceTab::all_for_group(*group) {
-                                if ui::theme::nav_item(
+                                if ui::theme::nav_item_with_icon(
                                     ui,
+                                    tab.icon(),
                                     tab.title(),
                                     tab.description(),
                                     active_tab == Some(*tab),

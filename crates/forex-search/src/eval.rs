@@ -918,6 +918,13 @@ fn synthesize_signals_cpu(
         .enumerate()
         .map(|(i, &f)| if f != 0 { weights[i] } else { 0.0 })
         .sum();
+    // Hard bypass — see `signals_for_gene_full` in search_engine.rs.
+    // Lets the GA's evaluation path also skip SMC gating when set.
+    let smc_bypass = matches!(
+        std::env::var("FOREX_BOT_DISABLE_SMC_GATE").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    );
+    let active_sum = if smc_bypass { 0.0 } else { active_sum };
     let gate = gate_threshold.min(active_sum);
 
     for i in 0..n_samples {

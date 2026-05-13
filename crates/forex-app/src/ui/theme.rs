@@ -348,13 +348,40 @@ pub fn status_badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
 }
 
 /// Section/group header label. Use ABOVE a list of related items.
+///
+/// Renders as letter-spaced UPPERCASE in the muted text color, with a
+/// 1-px hairline divider below — the universal "section" pattern across
+/// Bloomberg, cTrader, Jira, Linear. The letter spacing is faked by
+/// inserting a thin space between every character (egui has no native
+/// `letter-spacing` knob).
 pub fn section_label(ui: &mut egui::Ui, text: &str) {
+    let spaced: String = text
+        .to_uppercase()
+        .chars()
+        .collect::<Vec<_>>()
+        .as_slice()
+        .iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join("\u{2009}"); // U+2009 THIN SPACE — visual letter-spacing
+    ui.add_space(SPACE_XS);
     ui.label(
-        egui::RichText::new(text.to_uppercase())
+        egui::RichText::new(spaced)
             .size(FONT_CAPTION - 1.0)
             .color(TEXT_FAINT)
             .strong(),
     );
+    // Hairline divider sits flush below the label so the eye reads the
+    // section as a contained group, not a free-floating caption.
+    let line_response = ui.allocate_response(
+        egui::vec2(ui.available_width(), 1.0),
+        egui::Sense::hover(),
+    );
+    if ui.is_rect_visible(line_response.rect) {
+        ui.painter()
+            .hline(line_response.rect.x_range(), line_response.rect.center().y, egui::Stroke::new(1.0, BORDER));
+    }
+    ui.add_space(SPACE_XS);
 }
 
 /// View-level heading + optional subtitle. Use at the top of a panel.
@@ -472,11 +499,27 @@ pub fn nav_item(
     description: &str,
     active: bool,
 ) -> egui::Response {
+    nav_item_with_icon(ui, "", label, description, active)
+}
+
+/// Sidebar nav item with a single-glyph icon prefix. The icon column is
+/// fixed-width so labels line up cleanly across the whole rail —
+/// matches Bloomberg / cTrader / TradingView sidebar conventions where
+/// the eye scans the icons first, then the labels.
+pub fn nav_item_with_icon(
+    ui: &mut egui::Ui,
+    icon: &str,
+    label: &str,
+    description: &str,
+    active: bool,
+) -> egui::Response {
     let frame_fill = if active { ACCENT_MUTED } else { egui::Color32::TRANSPARENT };
     let label_color = if active { TEXT_PRIMARY } else { TEXT_MUTED };
+    let icon_color = if active { ACCENT } else { TEXT_FAINT };
     let stripe_color = if active { ACCENT } else { egui::Color32::TRANSPARENT };
 
-    let desired_size = egui::vec2(ui.available_width(), 30.0);
+    // 28px row height — Bloomberg/cTrader sidebar density.
+    let desired_size = egui::vec2(ui.available_width(), 28.0);
     let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
 
     let hovered = response.hovered();
@@ -489,16 +532,32 @@ pub fn nav_item(
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         painter.rect_filled(rect, RADIUS_SM as f32, fill);
-        // Left accent stripe.
+        // Left accent stripe (3px wide, tall as row, only visible when active).
         let stripe_rect = egui::Rect::from_min_size(
             rect.min,
             egui::vec2(3.0, rect.height()),
         );
         painter.rect_filled(stripe_rect, 1.0, stripe_color);
 
-        let text_pos = egui::pos2(rect.min.x + SPACE_MD, rect.center().y);
+        // Icon column: fixed 22px slot starting at SPACE_SM after the
+        // stripe so all rail items have aligned glyphs.
+        let icon_x = rect.min.x + SPACE_SM + 6.0;
+        let label_x = if icon.is_empty() {
+            rect.min.x + SPACE_MD
+        } else {
+            painter.text(
+                egui::pos2(icon_x, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                icon,
+                egui::FontId::new(FONT_BODY + 1.0, egui::FontFamily::Proportional),
+                icon_color,
+            );
+            // Reserve a 22px column so labels line up across the rail.
+            icon_x + 22.0
+        };
+
         painter.text(
-            text_pos,
+            egui::pos2(label_x, rect.center().y),
             egui::Align2::LEFT_CENTER,
             label,
             egui::FontId::new(FONT_BODY, egui::FontFamily::Proportional),

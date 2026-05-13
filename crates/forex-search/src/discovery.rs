@@ -256,8 +256,14 @@ impl DiscoveryConfig {
             ..Default::default()
         };
 
+        // P2 fix: `0` now means "no artificial cap — use population *
+        // generations". Previously `0` silently became `population` which
+        // capped the archive way below what the heavy reject funnel needs.
         let candidate_count = if model_settings.prop_search_val_candidates == 0 {
-            model_settings.prop_search_population.max(50)
+            model_settings
+                .prop_search_population
+                .saturating_mul(model_settings.prop_search_generations.max(1))
+                .max(model_settings.prop_search_population.max(50))
         } else {
             model_settings.prop_search_val_candidates.max(1)
         };
@@ -270,8 +276,12 @@ impl DiscoveryConfig {
             evaluation_commission_per_trade: settings.risk.commission_per_lot.max(0.0),
             population: model_settings.prop_search_population.max(10),
             generations: model_settings.prop_search_generations.max(1),
+            // P2 fix: `0` now means "use ALL available enabled features"
+            // (sentinel value `usize::MAX` so downstream `min(n_features)`
+            // collapses to the actual feature count). Previously
+            // silently became 5, which limited search to a tiny subset.
             max_indicators: if model_settings.prop_search_max_indicators == 0 {
-                5
+                usize::MAX
             } else {
                 model_settings.prop_search_max_indicators.max(1)
             },
@@ -331,8 +341,14 @@ impl DiscoveryConfig {
             self.filtering.min_profit_factor = 0.0;
             self.filtering.anomaly_guard = false;
             self.cpcv_min_phi = 0.0;
+            // Lowered from 0.02 (~30 trades over 1500 days) to 0.001
+            // (~1.5 trades over 1500 days) — the previous floor was
+            // killing every gene whose `long_threshold` was just shy
+            // of triggering frequently, and the prop-firm window-pass
+            // gate downstream already filters out genuinely useless
+            // strategies on its own.
             if std::env::var("FOREX_BOT_DISCOVERY_MIN_TRADES_PER_DAY").is_err() {
-                self.min_trades_per_day = 0.02;
+                self.min_trades_per_day = 0.001;
             }
             self.prop_firm_gate = Some(self.derive_prop_firm_gate());
         }
@@ -1764,6 +1780,51 @@ fn finalize_candidates_with_progress<F>(
 where
     F: FnMut(DiscoveryProgress),
 {
+    // Diagnostic: summarise the feature frame so we can tell whether the
+    // GA's empty-portfolio outcome is downstream filtering vs the upstream
+    // features being broken (NaN-saturated, all-zero, wrong magnitude).
+    {
+        let total = features.data.len();
+        let mut nan = 0usize;
+        let mut zero = 0usize;
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        let mut sum_abs = 0.0_f64;
+        let mut finite_count = 0usize;
+        for &v in features.data.iter() {
+            if v.is_nan() {
+                nan += 1;
+            } else if v == 0.0 {
+                zero += 1;
+                finite_count += 1;
+            } else if v.is_finite() {
+                finite_count += 1;
+                sum_abs += v.abs() as f64;
+                if v < min_v {
+                    min_v = v;
+                }
+                if v > max_v {
+                    max_v = v;
+                }
+            }
+        }
+        let mean_abs = if finite_count > 0 {
+            sum_abs / finite_count as f64
+        } else {
+            0.0
+        };
+        tracing::info!(
+            target: "forex_search::funnel",
+            rows = features.data.nrows(),
+            cols = features.data.ncols(),
+            nan_frac = nan as f64 / total.max(1) as f64,
+            zero_frac = zero as f64 / total.max(1) as f64,
+            min_finite = if min_v.is_finite() { min_v as f64 } else { 0.0 },
+            max_finite = if max_v.is_finite() { max_v as f64 } else { 0.0 },
+            mean_abs_finite = mean_abs,
+            "feature frame summary"
+        );
+    }
     // Sort by an income-focused ranking score to find reliably profitable ones
     let mut ranked_candidates: Vec<(usize, Gene)> = candidates.into_iter().enumerate().collect();
 
@@ -1818,25 +1879,41 @@ where
         config.min_trades_per_day,
         features.data.nrows(),
     );
-    // Generate signals for all qualifying candidates in parallel — each call
-    // accumulates weighted-feature columns over n_samples bars and the work
-    // grows with the candidate count, so this scales well across cores.
+    let ranked_total = ranked_candidates.len();
+
+    // Diagnostic counter #1: `passes_filter` survivors. In permissive
+    // / prop-firm mode this gate is trivially open, so a low number
+    // here would be a strong signal that the filter floor still has
+    // a hidden constraint we missed.
     let prefiltered: Vec<(usize, Gene)> = ranked_candidates
         .iter()
         .filter(|(_, g)| g.passes_filter(&config.filtering))
         .map(|(idx, g)| (*idx, g.clone()))
         .collect();
+    let post_passes_filter = prefiltered.len();
+
     // Item 6: use the SMC-gated signal path so the post-search "min_trades"
     // filter sees the SAME trade count the evaluator scored. The previous
     // `signals_for_gene` ignored gene SMC flags; some candidates passed the
     // search archive (with their SMC-gated trade count) but were then pruned
     // here because the un-gated count was higher than min_trades.
     let eval_config_for_signals = config.evaluation_config(ohlcv.close.last().copied());
+
+    // Diagnostic counter #2: how many genes generated ANY non-zero
+    // signal at all? A gene with `long_threshold > max possible
+    // combined signal` never fires. We track this separately from
+    // the min_trades gate so we can tell "no signal" from "too few
+    // trades".
+    let nonzero_signal_count = std::sync::atomic::AtomicUsize::new(0);
     let signals_with_idx: Vec<(usize, Gene, Vec<i8>)> = prefiltered
         .into_par_iter()
         .filter_map(|(candidate_idx, gene)| {
             let sig = signals_for_gene_full(features, ohlcv, &gene, &eval_config_for_signals);
             let trade_count = sig.iter().filter(|v| **v != 0).count() as f64;
+            if trade_count > 0.0 {
+                nonzero_signal_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if trade_count >= min_trades as f64 {
                 Some((candidate_idx, gene, sig))
             } else {
@@ -1844,6 +1921,8 @@ where
             }
         })
         .collect();
+    let post_min_trades = signals_with_idx.len();
+    let post_nonzero_signal = nonzero_signal_count.load(std::sync::atomic::Ordering::Relaxed);
     let mut filtered: Vec<(usize, Gene)> = Vec::with_capacity(signals_with_idx.len());
     let mut signals_map: Vec<Vec<i8>> = Vec::with_capacity(signals_with_idx.len());
     for (idx, gene, sig) in signals_with_idx {
@@ -2050,6 +2129,7 @@ where
     // tune. The downstream corr-diversification step takes the best
     // prop-firm-grade candidates first. A non-zero `pf.pass_rate` env
     // override still acts as a hard floor for operators who want it.
+    let pre_prop_firm = filtered.len();
     let mut prop_firm_pass_rates: Vec<f64> = Vec::new();
     if let Some(mut pf) = config.prop_firm_gate.clone() {
         // Auto-tune the window count if the operator left it at the
@@ -2060,7 +2140,9 @@ where
         let candidates_in: Vec<((usize, Gene), Vec<i8>)> =
             filtered.into_iter().zip(signals_map.into_iter()).collect();
         let timestamps_owned = features.timestamps.clone();
-        let mut scored: Vec<(((usize, Gene), Vec<i8>), f64, usize)> = candidates_in
+        let candidates_in_count = candidates_in.len();
+        let pf_pass_rate_floor = pf.pass_rate;
+        let scored_all: Vec<(((usize, Gene), Vec<i8>), f64, usize)> = candidates_in
             .into_par_iter()
             .map(|(pair, sig)| {
                 let (rate, counted) = compute_prop_firm_pass_rate(
@@ -2073,8 +2155,49 @@ where
                 );
                 ((pair, sig), rate, counted)
             })
-            // Floor: candidate must have actually been measured AND, if
-            // the operator set a non-zero pass_rate floor, meet it.
+            .collect();
+        // Diagnostic: bucket what the gate did to each candidate.
+        let mut dbg_counted_zero = 0usize;
+        let mut dbg_below_pass_rate = 0usize;
+        let mut dbg_counted_sum = 0usize;
+        let mut dbg_max_rate: f64 = 0.0;
+        for (_, rate, counted) in &scored_all {
+            dbg_counted_sum += *counted;
+            if *counted == 0 {
+                dbg_counted_zero += 1;
+            } else if *rate < pf_pass_rate_floor {
+                dbg_below_pass_rate += 1;
+            }
+            if *rate > dbg_max_rate {
+                dbg_max_rate = *rate;
+            }
+        }
+        let avg_counted = if candidates_in_count > 0 {
+            dbg_counted_sum as f64 / candidates_in_count as f64
+        } else {
+            0.0
+        };
+        let ts_first = timestamps_owned.first().copied().unwrap_or(0);
+        let ts_last = timestamps_owned.last().copied().unwrap_or(0);
+        let ts_span = ts_last - ts_first;
+        let window_ms_eff = (pf.window_days as i64) * 86_400_000;
+        tracing::info!(
+            target: "forex_search::prop_firm_dbg",
+            candidates_in = candidates_in_count,
+            rejected_counted_zero = dbg_counted_zero,
+            rejected_below_pass_rate = dbg_below_pass_rate,
+            avg_counted,
+            max_rate = dbg_max_rate,
+            pass_rate_floor = pf_pass_rate_floor,
+            ts_first,
+            ts_last,
+            ts_span,
+            window_ms_eff,
+            timestamps_len = timestamps_owned.len(),
+            "prop-firm gate breakdown — why candidates were rejected"
+        );
+        let mut scored: Vec<(((usize, Gene), Vec<i8>), f64, usize)> = scored_all
+            .into_iter()
             .filter(|(_, rate, counted)| *counted > 0 && *rate >= pf.pass_rate)
             .collect();
         // Sort by pass-rate descending; ties broken by gene fitness.
@@ -2145,6 +2268,31 @@ where
         rejected_by_correlation,
         target_portfolio: config.portfolio_size,
     });
+    // Diagnostic summary: one line per (symbol, TF) work-unit showing
+    // how many candidates survived each gate. Without this, an empty
+    // portfolio just says "empty" — with it, you can pinpoint which
+    // gate is rejecting everything.
+    let post_prop_firm = if config.prop_firm_gate.is_some() {
+        // After the gate ran, `filtered` was replaced with the
+        // surviving set — its length is `prop_firm_pass_rates.len()`
+        // (we pushed one rate per survivor).
+        prop_firm_pass_rates.len()
+    } else {
+        pre_prop_firm
+    };
+    tracing::info!(
+        target: "forex_search::funnel",
+        ranked = ranked_total,
+        post_passes_filter,
+        post_nonzero_signal,
+        post_min_trades,
+        min_trades_required = min_trades,
+        pre_prop_firm,
+        post_prop_firm,
+        rejected_by_correlation,
+        portfolio_size = portfolio.len(),
+        "candidate funnel — how many genes survived each gate"
+    );
     let (mut validation_gates, canonical_backtest_artifacts, walkforward_validation_artifacts) =
         build_discovery_validation_artifacts(
             &portfolio,

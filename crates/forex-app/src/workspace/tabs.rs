@@ -91,6 +91,30 @@ impl WorkspaceTab {
         }
     }
 
+    /// Single-glyph icon for the sidebar nav item. Unicode-only (no
+    /// font dependency); chosen to be visually consistent with what
+    /// cTrader / TradingView use for the same concepts. Two characters
+    /// wide so the icon column lines up cleanly across all rows.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Dashboard => "▦",
+            Self::Chart => "📈",
+            Self::Watchlist => "≡",
+            Self::Execution => "↹",
+            Self::News => "📰",
+            Self::BottomStrip => "◫",
+            Self::Discovery => "✦",
+            Self::Training => "⊛",
+            Self::Runtime => "◉",
+            Self::BrokerSetup => "🔌",
+            Self::Intelligence => "✺",
+            Self::DataBootstrap => "⤓",
+            Self::Hardware => "▤",
+            Self::Risk => "⚠",
+            Self::Settings => "⚙",
+        }
+    }
+
     pub fn group(self) -> WorkspaceGroup {
         match self {
             Self::Dashboard

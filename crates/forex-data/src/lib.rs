@@ -281,12 +281,26 @@ fn ohlcv_to_vortex_array(ohlcv: &Ohlcv) -> Result<vortex_array::ArrayRef> {
 fn vortex_array_to_ohlcv(array: vortex_array::ArrayRef) -> Result<Ohlcv> {
     let struct_array = array.to_struct();
 
-    let timestamp = Some(extract_non_null_primitive_vec::<i64>(
+    let raw_ts = extract_non_null_primitive_vec::<i64>(
         struct_array
             .unmasked_field_by_name("timestamp")
             .context("timestamp field missing")?,
         "timestamp",
-    )?);
+    )?;
+    // Normalize timestamps to milliseconds at the load boundary. Older
+    // vortex files store nanoseconds (parquet/arrow default), while the
+    // entire downstream pipeline (discovery prop-firm gate, eval day_key
+    // aggregation, quality screen, regime labels) assumes milliseconds.
+    // Without this conversion, every "day_key" comes out wrong and the
+    // prop-firm window-pass gate degenerates to 5-second windows.
+    let timestamp = if raw_ts.is_empty() {
+        Some(raw_ts)
+    } else {
+        Some(
+            crate::core::timestamps::normalize_timestamps_to_inferred_millis(&raw_ts)
+                .context("normalize timestamps to milliseconds")?,
+        )
+    };
 
     let get_col = |names: &[&str]| -> Result<Vec<f64>> {
         for name in names {
@@ -481,6 +495,25 @@ pub fn prepare_multitimeframe_features_with_options(
             .slice_mut(ndarray::s![.., curr_col..curr_col + ncols])
             .assign(&part);
         curr_col += ncols;
+    }
+
+    // Per-column robust z-score (median + MAD * 1.4826) with NaN→0
+    // and clip to ±10. Opt-in via `FOREX_BOT_NORMALIZE_FEATURES=1`.
+    //
+    // Why opt-in: normalization is correct architecture (puts every
+    // column on the same scale, kills NaN propagation, fixes the
+    // EURJPY/XAUUSD empty-portfolio bug at the root) but the GA's
+    // `random_coarse_threshold = [0.15..0.55]` is calibrated for the
+    // un-normalized magnitude regime. Enabling normalization without
+    // re-calibrating thresholds breaks discovery for symbols that
+    // currently work (EURUSD/GBPUSD/AUDUSD). Threshold re-calibration
+    // is a follow-up; until then operators opt in per-symbol when
+    // they want to attack the JPY/XAU portfolio gap.
+    if matches!(
+        std::env::var("FOREX_BOT_NORMALIZE_FEATURES").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    ) {
+        let _norm_stats = crate::core::normalization::normalize_feature_matrix(&mut merged);
     }
 
     Ok(FeatureFrame {

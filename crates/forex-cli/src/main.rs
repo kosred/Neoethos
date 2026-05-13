@@ -4,16 +4,36 @@ use forex_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod tui;
+
 fn main() -> Result<()> {
     setup_logging(false)?;
     forex_search::install_search_runtime_overrides_from_env();
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        print_help();
+        // No subcommand → launch interactive TUI. Use `--help` for
+        // legacy bare help; explicit subcommands keep working
+        // unchanged for scripting.
         let _ = write_subsystem_record(
             SubsystemSection::Cli,
-            cli_record("help", "SUCCESS", "printed CLI help"),
+            cli_record("tui", "STARTED", "launching interactive TUI"),
         );
+        let res = tui::run_tui(None);
+        let _ = write_subsystem_record(
+            SubsystemSection::Cli,
+            cli_record(
+                "tui",
+                if res.is_ok() { "SUCCESS" } else { "FAILED" },
+                match &res {
+                    Ok(_) => "TUI session ended cleanly".to_string(),
+                    Err(err) => format!("TUI session ended with error: {err}"),
+                },
+            ),
+        );
+        return res;
+    }
+    if matches!(args[1].as_str(), "--help" | "-h" | "help") {
+        print_help();
         return Ok(());
     }
     let command = args[1].clone();
@@ -38,6 +58,7 @@ fn main() -> Result<()> {
         "discover" => cmd_discover(&args[2..]),
         "batch-discover" => cmd_batch_discover(&args[2..]),
         "migrate-data" => cmd_migrate_data(&args[2..]),
+        "import" => cmd_import(&args[2..]),
         "stop-target" => cmd_stop_target(&args[2..]),
         _ => {
             print_help();
@@ -521,6 +542,49 @@ fn cmd_batch_discover(args: &[String]) -> Result<()> {
     }
 
     result.map(|_| ())
+}
+
+/// Recursive universal data importer — converts CSV/TSV/JSON/JSONL/
+/// Parquet/Vortex files anywhere under `--source` into the canonical
+/// `data/symbol={SYM}/timeframe={TF}/data.vortex` layout under
+/// `--root`. Symbol/timeframe are inferred from path components or the
+/// filename. Failed conversions are quarantined; the report is written
+/// to `<root>/import_report.json`.
+fn cmd_import(args: &[String]) -> Result<()> {
+    let settings = resolve_cli_settings(args)?;
+    let root = parse_root(args, settings.as_ref());
+    let source = parse_flag(args, "--source").unwrap_or_else(|| root.clone());
+    let force = has_flag(args, "--force");
+
+    let report = forex_data::core::universal_importer::import_directory_recursive(
+        &source, &root, force,
+    )?;
+
+    let report_path =
+        std::path::PathBuf::from(&root).join("import_report.json");
+    report.save_to_disk(&report_path).ok();
+
+    println!(
+        "Universal import: source={} root={} files_seen={} imported={} skipped={} quarantined={} failed={}",
+        source,
+        root,
+        report.files_seen,
+        report.imported,
+        report.skipped,
+        report.quarantined,
+        report.failed
+    );
+    println!("  full report: {}", report_path.display());
+    for r in report.results.iter().take(20) {
+        println!(
+            "  [{:?}] {} -> {} rows ({})",
+            r.status, r.source, r.rows, r.message
+        );
+    }
+    if report.results.len() > 20 {
+        println!("  ... ({} more in report)", report.results.len() - 20);
+    }
+    Ok(())
 }
 
 fn cmd_migrate_data(args: &[String]) -> Result<()> {

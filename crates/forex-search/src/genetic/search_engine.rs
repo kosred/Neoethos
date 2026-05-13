@@ -254,6 +254,15 @@ pub fn signals_for_gene_full(
         .enumerate()
         .map(|(i, &f)| if f != 0 { smc_weights[i] } else { 0.0 })
         .sum();
+    // Hard bypass: when `FOREX_BOT_DISABLE_SMC_GATE=1` the gate
+    // collapses (active_sum = 0 → raw signal passes through). Lets
+    // operators isolate "SMC indicators don't trigger on this symbol"
+    // from genuine signal-generation issues without recompiling.
+    let smc_bypass = matches!(
+        std::env::var("FOREX_BOT_DISABLE_SMC_GATE").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    );
+    let active_sum = if smc_bypass { 0.0 } else { active_sum };
     let gate = config.smc_gate_threshold.min(active_sum);
 
     let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) =

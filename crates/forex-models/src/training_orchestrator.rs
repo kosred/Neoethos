@@ -63,6 +63,83 @@ fn is_supported_orchestrator_burn_device_policy(policy: &str) -> bool {
     matches!(policy, "auto" | "cpu" | "gpu") || policy.starts_with("gpu:")
 }
 
+/// Drop rows where any feature column is non-finite (NaN/Inf). Returns
+/// (cleaned_features, cleaned_labels, dropped_count). Labels are sliced
+/// in lock-step with the feature rows so order is preserved. The
+/// downstream `dataframe_to_float32_array` strict-rejects any non-finite
+/// value, so this is the canonical place to handle indicator warmup.
+/// Defensive variant — operates on a polars DataFrame after row
+/// filtering / column selection has already happened. Builds a row mask
+/// by scanning every column for non-finite values, then `frame.filter()`s
+/// once. Labels are sliced in lock-step. Returns `(clean_frame, clean_labels, dropped)`.
+fn drop_nonfinite_rows_dataframe(
+    frame: DataFrame,
+    labels: Vec<i32>,
+) -> Result<(DataFrame, Vec<i32>, usize)> {
+    use polars::prelude::DataType;
+
+    let n_rows = frame.height();
+    if n_rows == 0 || labels.len() != n_rows {
+        return Ok((frame, labels, 0));
+    }
+    let mut keep = vec![true; n_rows];
+    for col in frame.get_columns() {
+        let series_f64 = col
+            .cast(&DataType::Float64)
+            .with_context(|| format!("cast column {} to f64 for NaN scan", col.name()))?;
+        let ca = series_f64
+            .f64()
+            .with_context(|| format!("get f64 chunked array for {}", col.name()))?;
+        for (row_idx, val) in ca.into_iter().enumerate() {
+            match val {
+                None => keep[row_idx] = false,
+                Some(v) if !v.is_finite() => keep[row_idx] = false,
+                _ => {}
+            }
+        }
+    }
+    let dropped = keep.iter().filter(|k| !**k).count();
+    if dropped == 0 {
+        return Ok((frame, labels, 0));
+    }
+    let mask = BooleanChunked::from_slice("nan_drop_mask".into(), &keep);
+    let clean_frame = frame.filter(&mask).context("apply nan-drop mask")?;
+    let clean_labels = labels
+        .into_iter()
+        .zip(keep.iter())
+        .filter_map(|(l, k)| if *k { Some(l) } else { None })
+        .collect::<Vec<_>>();
+    Ok((clean_frame, clean_labels, dropped))
+}
+
+fn drop_nonfinite_rows(
+    features: ndarray::Array2<f32>,
+    labels: Vec<i32>,
+) -> (ndarray::Array2<f32>, Vec<i32>, usize) {
+    let n_rows = features.nrows();
+    debug_assert_eq!(n_rows, labels.len(), "row/label length mismatch");
+    let mut keep_idx: Vec<usize> = Vec::with_capacity(n_rows);
+    for (row_idx, row) in features.rows().into_iter().enumerate() {
+        if row.iter().all(|v| v.is_finite()) {
+            keep_idx.push(row_idx);
+        }
+    }
+    let dropped = n_rows - keep_idx.len();
+    if dropped == 0 {
+        return (features, labels, 0);
+    }
+    let n_cols = features.ncols();
+    let mut clean = ndarray::Array2::<f32>::zeros((keep_idx.len(), n_cols));
+    let mut clean_labels = Vec::with_capacity(keep_idx.len());
+    for (new_idx, &old_idx) in keep_idx.iter().enumerate() {
+        clean
+            .row_mut(new_idx)
+            .assign(&features.row(old_idx));
+        clean_labels.push(labels[old_idx]);
+    }
+    (clean, clean_labels, dropped)
+}
+
 fn burn_policy_from_workload_device(device: &str) -> String {
     let normalized = device.trim().to_ascii_lowercase();
     if normalized.is_empty() || normalized == "cpu" {
@@ -164,7 +241,21 @@ impl TrainingOrchestrator {
         let frame = prepare_multitimeframe_features_with_options(&dataset, base_tf, &opts, None)?;
         let base_ohlcv = dataset.frames.get(base_tf).context("base tf missing")?;
         let labels = self.derive_labels(base_ohlcv)?;
-        let raw_payload = TrainingPayload::from_named_dense(frame.data, labels, frame.names)?;
+        // Drop any rows whose features are non-finite (NaN/Inf). This is
+        // the warmup period for indicators like rsi_7 — the first N rows
+        // will have NaN until the lookback window fills. The downstream
+        // `dataframe_to_float32_array` strict-rejects any non-finite, so
+        // we sanitise here. Labels are sliced in lock-step.
+        let (clean_data, clean_labels, dropped) =
+            drop_nonfinite_rows(frame.data, labels);
+        if dropped > 0 {
+            info!(
+                "Dropped {} warmup/non-finite feature rows before training (kept {} rows)",
+                dropped,
+                clean_data.nrows()
+            );
+        }
+        let raw_payload = TrainingPayload::from_named_dense(clean_data, clean_labels, frame.names)?;
         let filtered_payload = if self.settings.models.filter_to_base_signal {
             let (filtered_frame, filtered_labels) = self.apply_base_signal_filter(
                 raw_payload.frame.as_ref(),
@@ -173,7 +264,21 @@ impl TrainingOrchestrator {
             if filtered_frame.height() == raw_payload.frame.height() {
                 raw_payload
             } else {
-                TrainingPayload::from_frame(filtered_frame, filtered_labels)?
+                // Belt-and-suspenders: scrub any NaN that survived the
+                // upstream Array2 drop. polars sometimes lifts NaN from
+                // a hidden f32→f64 cast and our downstream
+                // dataframe_to_float32_array strict-rejects them. This
+                // call is a no-op when there are none.
+                let (clean_frame, clean_labels, dropped) =
+                    drop_nonfinite_rows_dataframe(filtered_frame, filtered_labels)?;
+                if dropped > 0 {
+                    info!(
+                        "Dropped {} additional NaN-bearing rows after base-signal filter ({} rows remain)",
+                        dropped,
+                        clean_frame.height()
+                    );
+                }
+                TrainingPayload::from_frame(clean_frame, clean_labels)?
             }
         } else {
             raw_payload
