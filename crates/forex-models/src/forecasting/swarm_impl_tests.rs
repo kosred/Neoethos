@@ -700,6 +700,79 @@ fn learned_validation_weights_favor_lower_loss_candidates() {
 }
 
 #[test]
+fn learned_validation_weights_edge_cases() {
+    // F-MODELS9-008 fix: the ordering-only assertion above doesn't
+    // cover the boundary cases. Pin the contract for:
+    //   (a) all losses equal → all weights equal,
+    //   (b) one candidate has zero (perfect) loss → it dominates,
+    //   (c) all losses are NaN → the function falls back to uniform
+    //       (or returns Err — assert whichever the implementation
+    //       chose so the contract is locked in).
+
+    // (a) Equal losses → equal weights.
+    let mut equal_losses = HashMap::new();
+    equal_losses.insert("a".to_string(), 0.5);
+    equal_losses.insert("b".to_string(), 0.5);
+    equal_losses.insert("c".to_string(), 0.5);
+    let mut equal_support = HashMap::new();
+    equal_support.insert("a".to_string(), 3.0);
+    equal_support.insert("b".to_string(), 3.0);
+    equal_support.insert("c".to_string(), 3.0);
+    let equal_weights = derive_validation_candidate_weights(&equal_losses, &equal_support);
+    let wa = equal_weights.get("a").copied().expect("a");
+    let wb = equal_weights.get("b").copied().expect("b");
+    let wc = equal_weights.get("c").copied().expect("c");
+    assert!(
+        (wa - wb).abs() < 1e-5 && (wb - wc).abs() < 1e-5,
+        "equal losses must produce equal weights (got a={wa}, b={wb}, c={wc})"
+    );
+    let equal_total = equal_weights.values().copied().sum::<f32>();
+    assert!(
+        (equal_total - 1.0).abs() < 1e-5,
+        "equal-loss weights must still normalize to 1"
+    );
+
+    // (b) Near-zero loss for one candidate → it should dominate.
+    let mut perfect_losses = HashMap::new();
+    perfect_losses.insert("perfect".to_string(), 1e-6_f32);
+    perfect_losses.insert("bad".to_string(), 2.0);
+    let mut perfect_support = HashMap::new();
+    perfect_support.insert("perfect".to_string(), 5.0);
+    perfect_support.insert("bad".to_string(), 5.0);
+    let perfect_weights = derive_validation_candidate_weights(&perfect_losses, &perfect_support);
+    let w_perfect = perfect_weights.get("perfect").copied().expect("perfect");
+    let w_bad = perfect_weights.get("bad").copied().expect("bad");
+    assert!(
+        w_perfect > w_bad,
+        "perfect candidate must outweigh bad one (got perfect={w_perfect}, bad={w_bad})"
+    );
+
+    // (c) Document NaN-handling: if the impl returns Err on all-NaN,
+    // assert that; otherwise check the fallback distribution.
+    let mut nan_losses = HashMap::new();
+    nan_losses.insert("x".to_string(), f32::NAN);
+    nan_losses.insert("y".to_string(), f32::NAN);
+    let mut nan_support = HashMap::new();
+    nan_support.insert("x".to_string(), 3.0);
+    nan_support.insert("y".to_string(), 3.0);
+    let nan_weights = derive_validation_candidate_weights(&nan_losses, &nan_support);
+    // Implementation choice: must produce finite, normalized weights
+    // (no NaN in the result map). If the contract changes to return
+    // Err, update this assertion accordingly.
+    for (name, weight) in nan_weights.iter() {
+        assert!(
+            weight.is_finite(),
+            "weight for '{name}' must be finite even when all losses are NaN (got {weight})"
+        );
+    }
+    let nan_total = nan_weights.values().copied().sum::<f32>();
+    assert!(
+        (nan_total - 1.0).abs() < 1e-5 || nan_weights.is_empty(),
+        "NaN-loss fallback must normalize or return empty (got total {nan_total})"
+    );
+}
+
+#[test]
 fn normalize_candidate_weights_preserves_learned_validation_ordering() {
     let mut reports = vec![
         SwarmCandidateReport {
