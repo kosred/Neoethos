@@ -52,12 +52,42 @@ pub fn stddev_sample(values: &[f64], mean: f64) -> f64 {
 /// Compute mean + (sample) standard deviation in a single pass.
 /// NaN / infinite samples are dropped before the calculation so a
 /// single corrupt bar cannot poison a population's metric.
+///
+/// F-CORE2-005: prior behaviour silently returned `(0.0, 0.0)` when the
+/// filtered slice fell below 2 elements — that propagates zero variance
+/// into the risk gate. We still return zeros (the function signature is
+/// infallible and callers expect a tuple), but we emit a `warn` so the
+/// upstream feed corruption is observable. Callers in risk-critical
+/// paths should switch to `mean_std_strict` once it lands.
 pub fn mean_std(values: &[f64]) -> (f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0);
+    }
     if values.len() < 2 {
+        tracing::debug!(
+            target: "forex_core::stats",
+            len = values.len(),
+            "mean_std: fewer than 2 samples, returning (0.0, 0.0)"
+        );
         return (0.0, 0.0);
     }
     let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    let dropped = values.len().saturating_sub(finite.len());
+    if dropped > 0 {
+        tracing::warn!(
+            target: "forex_core::stats",
+            total = values.len(),
+            dropped,
+            "mean_std: dropped non-finite samples (F-CORE2-005)"
+        );
+    }
     if finite.len() < 2 {
+        tracing::warn!(
+            target: "forex_core::stats",
+            finite = finite.len(),
+            total = values.len(),
+            "mean_std: insufficient finite samples after NaN filter; returning (0.0, 0.0) (F-CORE2-005)"
+        );
         return (0.0, 0.0);
     }
     let m = mean(&finite);

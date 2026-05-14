@@ -89,9 +89,23 @@ impl SymbolMetadata {
             let price = live_price
                 .or(self.typical_price)
                 .filter(|v| v.is_finite() && *v > 0.0);
-            return price
-                .map(|v| self.pip_value_quote / v)
-                .unwrap_or(self.pip_value_quote);
+            return match price {
+                Some(v) => self.pip_value_quote / v,
+                None => {
+                    // Previously silently divided by 1.0 (i.e. returned
+                    // pip_value_quote) when no live or typical price was
+                    // available. That masks a missing-metadata bug for the
+                    // base==account case; return NaN so downstream PnL
+                    // collapses visibly and the order is refused.
+                    tracing::warn!(
+                        target: "forex_core::symbol_metadata",
+                        symbol = %self.symbol,
+                        account = %acct,
+                        "pip_value_in_account: base==account but no live or typical price; returning NaN"
+                    );
+                    f64::NAN
+                }
+            };
         }
         if let Some(rate) = quote_to_account_rate.filter(|v| v.is_finite() && *v > 0.0) {
             return self.pip_value_quote * rate;

@@ -161,7 +161,33 @@ impl PortfolioManager {
     }
 
     pub fn get_weight(&self, strategy_name: &str) -> f64 {
-        *self.strategy_weights.get(strategy_name).unwrap_or(&0.0)
+        // FIXME(silent-fallback): caller plumbing required (F-CORE2-003)
+        // Public API returns f64, so a missing strategy quietly produces 0.0.
+        // Callers placing real orders should use `try_get_weight` once added,
+        // or check `has_strategy(name)` before relying on this value.
+        match self.strategy_weights.get(strategy_name) {
+            Some(weight) => *weight,
+            None => {
+                tracing::warn!(
+                    target: "forex_core::portfolio",
+                    strategy = strategy_name,
+                    "get_weight: unknown strategy, returning 0.0 (F-CORE2-003)"
+                );
+                0.0
+            }
+        }
+    }
+
+    /// Returns `Some(weight)` if the strategy is known, otherwise `None`.
+    /// Prefer this in safety-critical paths (sizing, risk gate).
+    pub fn try_get_weight(&self, strategy_name: &str) -> Option<f64> {
+        self.strategy_weights.get(strategy_name).copied()
+    }
+
+    /// Quick membership check used by callers that need to validate a name
+    /// before sizing a position.
+    pub fn has_strategy(&self, strategy_name: &str) -> bool {
+        self.strategy_weights.contains_key(strategy_name)
     }
 }
 

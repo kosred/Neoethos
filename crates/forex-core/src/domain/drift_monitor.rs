@@ -67,14 +67,36 @@ impl ConceptDriftMonitor {
             0 => 0,
             1 => 1,
             -1 => 2,
-            _ => 0,
+            other => {
+                // F-CORE2-007: out-of-band label silently mapped to 0 previously.
+                // Surface as warn so calibration bugs don't hide.
+                warn!(
+                    target: "forex_core::drift_monitor",
+                    y_true = other,
+                    "drift_monitor.update: unexpected label, treating as 0 (F-CORE2-007)"
+                );
+                0
+            }
         };
 
+        // F-CORE2-010: empty / mismatched probability vectors used to silently
+        // contribute a perfect-error sample (1.0). Warn so upstream model bugs
+        // surface; keep the conservative fallback to avoid panicking the loop.
         let prob_correct = if y_pred_prob.is_empty() {
+            warn!(
+                target: "forex_core::drift_monitor",
+                "drift_monitor.update: y_pred_prob is empty, recording maximal error (F-CORE2-010)"
+            );
             0.0
         } else if idx < y_pred_prob.len() {
             y_pred_prob[idx]
         } else {
+            warn!(
+                target: "forex_core::drift_monitor",
+                label_idx = idx,
+                prob_len = y_pred_prob.len(),
+                "drift_monitor.update: label index out of range, falling back to index 0 (F-CORE2-010)"
+            );
             y_pred_prob[0]
         };
 

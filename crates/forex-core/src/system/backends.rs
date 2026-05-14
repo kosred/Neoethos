@@ -82,11 +82,25 @@ pub(super) fn choose_primary_backend(
         .is_empty();
     let has_wgpu = !profile.wgpu_native_devices().is_empty();
 
+    // F-CORE2-014: previously these branches silently downgraded to CPU when
+    // the user explicitly asked for a GPU backend that wasn't probed. That
+    // makes hour-long discovery runs land on CPU without any signal. Emit a
+    // structured warn at the decision site so the downgrade is visible.
+    fn warn_downgrade(requested: &str, reason: &str) {
+        tracing::warn!(
+            target: "forex_core::backends",
+            requested = requested,
+            reason = reason,
+            "GPU backend requested but unavailable; downgrading to CPU (F-CORE2-014)"
+        );
+    }
+
     match preference {
         "cuda" => {
             if has_cuda {
                 AcceleratorBackend::Cuda
             } else {
+                warn_downgrade("cuda", "no CUDA device detected by hardware probe");
                 AcceleratorBackend::Cpu
             }
         }
@@ -94,6 +108,7 @@ pub(super) fn choose_primary_backend(
             if has_rocm {
                 AcceleratorBackend::Rocm
             } else {
+                warn_downgrade("rocm", "no ROCm device detected by hardware probe");
                 AcceleratorBackend::Cpu
             }
         }
@@ -101,6 +116,7 @@ pub(super) fn choose_primary_backend(
             if has_wgpu {
                 AcceleratorBackend::Wgpu
             } else {
+                warn_downgrade("wgpu", "no wgpu-compatible device detected");
                 AcceleratorBackend::Cpu
             }
         }
@@ -108,6 +124,7 @@ pub(super) fn choose_primary_backend(
             if has_wgpu {
                 AcceleratorBackend::Vulkan
             } else {
+                warn_downgrade("vulkan", "no wgpu/Vulkan-compatible device detected");
                 AcceleratorBackend::Cpu
             }
         }
@@ -115,6 +132,7 @@ pub(super) fn choose_primary_backend(
             if has_wgpu {
                 AcceleratorBackend::Metal
             } else {
+                warn_downgrade("metal", "no wgpu/Metal-compatible device detected");
                 AcceleratorBackend::Cpu
             }
         }
@@ -122,6 +140,7 @@ pub(super) fn choose_primary_backend(
             if has_wgpu {
                 AcceleratorBackend::Dx12
             } else {
+                warn_downgrade("dx12", "no wgpu/DX12-compatible device detected");
                 AcceleratorBackend::Cpu
             }
         }
@@ -133,12 +152,31 @@ pub(super) fn choose_primary_backend(
             } else if has_wgpu {
                 AcceleratorBackend::Wgpu
             } else {
+                // "auto" / "gpu" with no GPU is the documented contract for
+                // CPU-only hosts; log at info so it's still observable.
+                tracing::info!(
+                    target: "forex_core::backends",
+                    requested = preference,
+                    "no GPU device available; using CPU backend"
+                );
                 AcceleratorBackend::Cpu
             }
         }
-        _ if has_cuda => AcceleratorBackend::Cuda,
-        _ if has_wgpu => AcceleratorBackend::Wgpu,
-        _ if has_rocm => AcceleratorBackend::Rocm,
-        _ => AcceleratorBackend::Cpu,
+        other if has_cuda => {
+            warn_downgrade(other, "unknown preference; CUDA available, falling back to it");
+            AcceleratorBackend::Cuda
+        }
+        other if has_wgpu => {
+            warn_downgrade(other, "unknown preference; wgpu available, falling back to it");
+            AcceleratorBackend::Wgpu
+        }
+        other if has_rocm => {
+            warn_downgrade(other, "unknown preference; ROCm available, falling back to it");
+            AcceleratorBackend::Rocm
+        }
+        other => {
+            warn_downgrade(other, "unknown preference and no GPU available");
+            AcceleratorBackend::Cpu
+        }
     }
 }
