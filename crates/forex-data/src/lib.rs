@@ -425,8 +425,14 @@ pub fn compute_hpc_feature_frame(ohlcv: &Ohlcv, _profile: FeatureProfile) -> Res
         }
     }
 
+    // HARD FAIL: a FeatureFrame without timestamps cannot be joined with
+    // labels, so a silent empty-Vec fallback masks an upstream loader bug.
+    let timestamps = ohlcv
+        .timestamp
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("compute_hpc_feature_frame: OHLCV is missing timestamps"))?;
     Ok(FeatureFrame {
-        timestamps: ohlcv.timestamp.clone().unwrap_or_default(),
+        timestamps,
         names,
         data,
     })

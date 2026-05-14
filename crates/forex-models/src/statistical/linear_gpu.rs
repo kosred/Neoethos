@@ -227,22 +227,14 @@ fn softmax_predict_kernel(
 pub(crate) fn statistical_cuda_kernel_enabled(model_name: &str) -> bool {
     let requested = requested_policy(model_name);
     let normalized = normalize_statistical_device_policy(&requested);
-    let requested_gpu = normalized == "gpu" || normalized.starts_with("gpu:");
-    let global_enabled = !is_disabled_env("FOREX_BOT_STATISTICAL_CUDA_KERNEL");
     let model_env = format!(
         "FOREX_BOT_{}_CUDA_KERNEL",
         model_name.trim().to_ascii_uppercase().replace('-', "_")
     );
-    requested_gpu && global_enabled && !is_disabled_env(&model_env)
-}
-
-fn is_disabled_env(name: &str) -> bool {
-    matches!(
-        std::env::var(name)
-            .ok()
-            .map(|value| value.trim().to_ascii_lowercase()),
-        Some(value) if matches!(value.as_str(), "0" | "false" | "off" | "disable" | "disabled")
-    )
+    // Two-tier gate: subsystem-wide env can disable the kernel for all
+    // statistical models, AND a per-model env can override that.
+    crate::common::cuda_kernel_enabled(&normalized, "FOREX_BOT_STATISTICAL_CUDA_KERNEL")
+        && !crate::common::is_kernel_disabled_env(&model_env)
 }
 
 fn requested_policy(model_name: &str) -> String {
@@ -260,27 +252,19 @@ fn cuda_device_id(model_name: &str) -> usize {
         "FOREX_BOT_{}_CUDA_DEVICE",
         model_name.trim().to_ascii_uppercase().replace('-', "_")
     );
-    std::env::var(&model_key)
-        .or_else(|_| std::env::var("FOREX_BOT_STATISTICAL_CUDA_DEVICE"))
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .or_else(|| {
-            normalize_statistical_device_policy(&requested_policy(model_name))
-                .strip_prefix("gpu:")
-                .and_then(|value| value.parse::<usize>().ok())
-        })
-        .unwrap_or(0)
+    let normalized = normalize_statistical_device_policy(&requested_policy(model_name));
+    crate::common::cuda_device_id_from_policy(
+        &normalized,
+        &model_key,
+        Some("FOREX_BOT_STATISTICAL_CUDA_DEVICE"),
+    )
 }
 
 fn kernel_units(client: &ComputeClient<CudaRuntime>) -> u32 {
-    let max_units = client.properties().hardware.max_units_per_cube.max(1);
-    std::env::var("FOREX_BOT_STATISTICAL_KERNEL_UNITS")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(max_units)
-        .min(max_units)
-        .max(1)
+    crate::common::cuda_kernel_units(
+        client.properties().hardware.max_units_per_cube,
+        "FOREX_BOT_STATISTICAL_KERNEL_UNITS",
+    )
 }
 
 fn flatten_features(features: &Array2<f32>, cols: usize) -> Result<Vec<f32>> {

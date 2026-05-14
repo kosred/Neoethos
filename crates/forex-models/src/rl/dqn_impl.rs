@@ -869,29 +869,14 @@ impl FeatureBounds {
 // unconditional artifact-validation helpers; must be available under all
 // feature combinations (no rlkit/candle dependency).
 fn normalize_rl_device_policy(policy: &str) -> String {
-    let normalized = policy.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        return "auto".to_string();
+    // RL adds `wgpu:` to the vendor prefix set; unrecognised tokens are
+    // forced to `auto` (strict whitelist semantics specific to RL).
+    let collapsed = crate::common::normalize_vendor_device_policy(policy, &["wgpu"]);
+    if matches!(collapsed.as_str(), "cpu" | "auto" | "gpu") || collapsed.starts_with("gpu:") {
+        collapsed
+    } else {
+        "auto".to_string()
     }
-    if matches!(
-        normalized.as_str(),
-        "nvidia" | "cuda" | "rocm" | "metal" | "vulkan"
-    ) {
-        return "gpu".to_string();
-    }
-    if let Some(index) = normalized
-        .strip_prefix("cuda:")
-        .or_else(|| normalized.strip_prefix("rocm:"))
-        .or_else(|| normalized.strip_prefix("metal:"))
-        .or_else(|| normalized.strip_prefix("vulkan:"))
-        .or_else(|| normalized.strip_prefix("wgpu:"))
-    {
-        return format!("gpu:{index}");
-    }
-    if matches!(normalized.as_str(), "cpu" | "auto" | "gpu") || normalized.starts_with("gpu:") {
-        return normalized;
-    }
-    "auto".to_string()
 }
 
 #[cfg(all(

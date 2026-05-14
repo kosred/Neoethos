@@ -1123,13 +1123,28 @@ impl TradingSession {
             return;
         };
 
+        // HARD FAIL: silently defaulting account_id to 0 here would target
+        // whichever account the broker resolves "0" to. Refuse the request
+        // instead so the operator sees a real error.
+        let account_id = match self
+            .selected_ctrader_execution_account_id()
+            .and_then(|id| id.parse::<i64>().ok())
+        {
+            Some(id) => id,
+            None => {
+                let message =
+                    "cTrader order cancel rejected: no execution account selected/parseable"
+                        .to_string();
+                state.status_msg = message.clone();
+                self.append_trade_journal(message.clone());
+                record_app_event("ctrader_cancel_order", "FAILED", message);
+                return;
+            }
+        };
         match self.execute_ctrader_request(
             state,
             CTraderExecutionRequest::CancelOrder(CTraderCancelOrderRequest {
-                account_id: self
-                    .selected_ctrader_execution_account_id()
-                    .and_then(|id| id.parse::<i64>().ok())
-                    .unwrap_or_default(),
+                account_id,
                 order_id,
             }),
             format!("Cancel order #{order_id}"),
@@ -1195,13 +1210,28 @@ impl TradingSession {
                 return;
             }
         };
+        // HARD FAIL: same reasoning as cancel_order — refusing to send a
+        // close-position request without a parseable account id is safer
+        // than letting the broker resolve account_id=0.
+        let account_id = match self
+            .selected_ctrader_execution_account_id()
+            .and_then(|id| id.parse::<i64>().ok())
+        {
+            Some(id) => id,
+            None => {
+                let message =
+                    "cTrader position close rejected: no execution account selected/parseable"
+                        .to_string();
+                state.status_msg = message.clone();
+                self.append_trade_journal(message.clone());
+                record_app_event("ctrader_close_position", "FAILED", message);
+                return;
+            }
+        };
         match self.execute_ctrader_request(
             state,
             CTraderExecutionRequest::ClosePosition(CTraderClosePositionRequest {
-                account_id: self
-                    .selected_ctrader_execution_account_id()
-                    .and_then(|id| id.parse::<i64>().ok())
-                    .unwrap_or_default(),
+                account_id,
                 position_id,
                 volume: protocol_volume,
             }),
@@ -1585,6 +1615,9 @@ impl TradingSession {
                 "{}-{}-{}-{:x}",
                 side.label().to_ascii_lowercase(),
                 state.selected_pair.to_ascii_lowercase(),
+                // DOCUMENTED-DEFAULT: timestamp is decorative; `next_client_order_seq`
+                // is the actual uniqueness guarantee. A clock-before-epoch failure
+                // would just yield "0-<seq>" which is still unique.
                 current_unix_seconds().unwrap_or_default(),
                 next_client_order_seq()
             )),

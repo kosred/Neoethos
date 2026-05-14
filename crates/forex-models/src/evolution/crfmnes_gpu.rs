@@ -100,42 +100,18 @@ fn candidate_loss_kernel(
 }
 
 pub(crate) fn neuro_evo_cuda_kernel_enabled(policy: &str) -> bool {
-    let requested_gpu = {
-        let normalized = policy.trim().to_ascii_lowercase();
-        normalized == "gpu" || normalized.starts_with("gpu:")
-    };
-    let env_enabled = !matches!(
-        std::env::var("FOREX_BOT_NEURO_EVO_CUDA_KERNEL")
-            .ok()
-            .map(|value| value.trim().to_ascii_lowercase()),
-        Some(value) if matches!(value.as_str(), "0" | "false" | "off" | "disable" | "disabled")
-    );
-    requested_gpu && env_enabled
+    crate::common::cuda_kernel_enabled(policy, "FOREX_BOT_NEURO_EVO_CUDA_KERNEL")
 }
 
 fn cuda_device_id(policy: &str) -> usize {
-    std::env::var("FOREX_BOT_NEURO_EVO_CUDA_DEVICE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .or_else(|| {
-            policy
-                .trim()
-                .to_ascii_lowercase()
-                .strip_prefix("gpu:")
-                .and_then(|value| value.parse::<usize>().ok())
-        })
-        .unwrap_or(0)
+    crate::common::cuda_device_id_from_policy(policy, "FOREX_BOT_NEURO_EVO_CUDA_DEVICE", None)
 }
 
 fn kernel_units(client: &ComputeClient<CudaRuntime>) -> u32 {
-    let max_units = client.properties().hardware.max_units_per_cube.max(1);
-    std::env::var("FOREX_BOT_NEURO_EVO_KERNEL_UNITS")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(max_units)
-        .min(max_units)
-        .max(1)
+    crate::common::cuda_kernel_units(
+        client.properties().hardware.max_units_per_cube,
+        "FOREX_BOT_NEURO_EVO_KERNEL_UNITS",
+    )
 }
 
 fn flatten_candidates(candidates: &[Vec<f64>], param_dim: usize) -> Result<Vec<f32>> {

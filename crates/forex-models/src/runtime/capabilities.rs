@@ -110,26 +110,7 @@ pub const KNOWN_MODEL_NAMES: &[&str] = &[
 ];
 
 pub fn normalize_runtime_device_policy(policy: &str) -> String {
-    let normalized = policy.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        return "auto".to_string();
-    }
-    if matches!(
-        normalized.as_str(),
-        "cuda" | "rocm" | "metal" | "vulkan" | "nvidia"
-    ) {
-        return "gpu".to_string();
-    }
-    if let Some(index) = normalized
-        .strip_prefix("cuda:")
-        .or_else(|| normalized.strip_prefix("rocm:"))
-        .or_else(|| normalized.strip_prefix("metal:"))
-        .or_else(|| normalized.strip_prefix("vulkan:"))
-        .or_else(|| normalized.strip_prefix("gpu:"))
-    {
-        return format!("gpu:{index}");
-    }
-    normalized
+    crate::common::normalize_vendor_device_policy(policy, &[])
 }
 
 pub fn requested_runtime_device_policy(model_name: &str) -> String {

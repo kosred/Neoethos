@@ -83,6 +83,8 @@ fn initialize_console_tracing(verbose: bool) -> anyhow::Result<()> {
         .with(console_layer)
         .try_init()
         .map_err(|err| anyhow::anyhow!("failed to initialize tracing subscriber: {err}"))?;
+    // DOCUMENTED-DEFAULT: TRACING_INITIALIZED is a OnceLock idempotency
+    // guard; `set` returning Err just means we initialised earlier.
     let _ = TRACING_INITIALIZED.set(());
     Ok(())
 }

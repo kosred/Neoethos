@@ -20,26 +20,7 @@ pub const METADATA_FILE_NAME: &str = "metadata.json";
 pub const MODEL_FILE_NAME: &str = "model.json";
 
 pub fn normalize_statistical_device_policy(policy: &str) -> String {
-    let normalized = policy.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        return "auto".to_string();
-    }
-    if matches!(
-        normalized.as_str(),
-        "cuda" | "rocm" | "metal" | "vulkan" | "nvidia"
-    ) {
-        return "gpu".to_string();
-    }
-    if let Some(index) = normalized
-        .strip_prefix("cuda:")
-        .or_else(|| normalized.strip_prefix("rocm:"))
-        .or_else(|| normalized.strip_prefix("metal:"))
-        .or_else(|| normalized.strip_prefix("vulkan:"))
-        .or_else(|| normalized.strip_prefix("gpu:"))
-    {
-        return format!("gpu:{index}");
-    }
-    normalized
+    crate::common::normalize_vendor_device_policy(policy, &[])
 }
 
 pub fn runtime_backend_with_gpu_fallback(

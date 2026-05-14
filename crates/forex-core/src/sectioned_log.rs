@@ -109,6 +109,9 @@ impl CanonicalSectionedLog {
             if index > 0 {
                 out.push('\n');
             }
+            // DOCUMENTED-DEFAULT: missing sections render as an empty slot
+            // (no CURRENT / no PREVIOUS), which is the rendering contract
+            // used by the dashboard.
             let slot = self.sections.get(section).cloned().unwrap_or_default();
             out.push_str(&format!("===== SECTION {} =====\n", section.as_str()));
             Self::render_slot(&mut out, "CURRENT", slot.current.as_ref());
@@ -332,7 +335,19 @@ impl LockFileGuard {
 
 impl Drop for LockFileGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        // Drop cleanup: NotFound is expected (caller may have released the
+        // lock manually); other errors are worth logging so a permission
+        // leak doesn't silently strand the lockfile.
+        if let Err(err) = fs::remove_file(&self.path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    target: "forex_core::sectioned_log",
+                    path = %self.path.display(),
+                    error = %err,
+                    "LockFileGuard::drop: failed to remove lockfile"
+                );
+            }
+        }
     }
 }
 
