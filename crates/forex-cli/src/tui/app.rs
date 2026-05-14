@@ -235,12 +235,17 @@ pub fn run_tui(data_root: Option<PathBuf>) -> Result<()> {
         .context("enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("init terminal backend")?;
+    // DOCUMENTED-DEFAULT: best-effort clear; failure here would also break
+    // the subsequent draw loop and surface there.
     terminal.clear().ok();
 
     let mut app = App::new(data_root);
     let res = event_loop(&mut terminal, &mut app);
 
-    // Terminal teardown — always runs, even if event_loop bailed.
+    // Terminal teardown — always runs, even if event_loop bailed. These
+    // are documented best-effort cleanups: at this point the program is
+    // exiting, so the only thing we could do with an error is print it,
+    // which would corrupt the now-restored terminal. Leave silent.
     disable_raw_mode().ok();
     execute!(
         terminal.backend_mut(),

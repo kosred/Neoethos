@@ -73,8 +73,25 @@ pub fn sync_news_now(state: &AppState, tx: &tokio::sync::mpsc::Sender<ServiceEve
     let mut filter_clone = state.llm_news_filter.clone();
     let tx_clone = tx.clone();
     std::thread::spawn(move || {
-        if let Ok(status) = filter_clone.poll_llm_news_sentiment(&pair) {
-            let _ = tx_clone.blocking_send(ServiceEvent::LlmNewsUpdated(status));
+        match filter_clone.poll_llm_news_sentiment(&pair) {
+            Ok(status) => {
+                if let Err(err) = tx_clone.blocking_send(ServiceEvent::LlmNewsUpdated(status)) {
+                    tracing::warn!(
+                        target: "forex_app::ui::system",
+                        pair = %pair,
+                        error = %err,
+                        "sync_news_now: receiver closed; dropping LlmNewsUpdated"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "forex_app::ui::system",
+                    pair = %pair,
+                    error = %err,
+                    "sync_news_now: poll_llm_news_sentiment failed"
+                );
+            }
         }
     });
 }

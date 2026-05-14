@@ -100,7 +100,18 @@ async fn run_headless_loop(runtime: AppRuntimeConfig) {
 
     info!("Loading configuration from: {}", runtime.config_path);
 
-    let symbols = forex_data::discover_symbols(&runtime.data_dir).unwrap_or_default();
+    let symbols = match forex_data::discover_symbols(&runtime.data_dir) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!(
+                target: "forex_app::main",
+                data_dir = %runtime.data_dir.display(),
+                error = %err,
+                "headless: discover_symbols failed; continuing with empty symbol list"
+            );
+            Vec::new()
+        }
+    };
     info!(
         "Headless: mapped {} local symbols in '{}'",
         symbols.len(),
@@ -199,7 +210,18 @@ impl ForexApp {
     ) -> Self {
         ui::theme::apply_theme(&_cc.egui_ctx);
         let (tx, rx) = mpsc::channel(10000);
-        let symbols = forex_data::discover_symbols(&runtime.data_dir).unwrap_or_default();
+        let symbols = match forex_data::discover_symbols(&runtime.data_dir) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(
+                    target: "forex_app::main",
+                    data_dir = %runtime.data_dir.display(),
+                    error = %err,
+                    "ForexApp::new: discover_symbols failed; starting with empty list"
+                );
+                Vec::new()
+            }
+        };
         let state = AppState::new(runtime.clone(), &settings, symbols);
         let _heartbeat_handle = spawn_account_heartbeat(tx.clone());
 
@@ -216,7 +238,18 @@ impl ForexApp {
 
     fn refresh_symbols(&mut self) {
         self.state.available_symbols =
-            forex_data::discover_symbols(&self.state.runtime.data_dir).unwrap_or_default();
+            match forex_data::discover_symbols(&self.state.runtime.data_dir) {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "forex_app::main",
+                        data_dir = %self.state.runtime.data_dir.display(),
+                        error = %err,
+                        "refresh_symbols: discover_symbols failed; keeping empty list"
+                    );
+                    Vec::new()
+                }
+            };
     }
 
     fn trigger_start_discovery(&mut self) {
@@ -313,7 +346,13 @@ impl ForexApp {
                 }
                 ServiceEvent::Heartbeat => {
                     if self.trading_session.is_connected() {
-                        let _ = self.trading_session.refresh_runtime(&mut self.state);
+                        if let Err(err) = self.trading_session.refresh_runtime(&mut self.state) {
+                            tracing::warn!(
+                                target: "forex_app::main",
+                                error = %err,
+                                "heartbeat refresh_runtime failed; will retry on next heartbeat"
+                            );
+                        }
                     }
                 }
                 ServiceEvent::CTraderConnectUpdated(runtime) => {

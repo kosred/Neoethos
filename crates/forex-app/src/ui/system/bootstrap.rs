@@ -71,13 +71,18 @@ pub fn render(
                         "bootstrap requires at least one symbol and one timeframe"
                     )));
                 } else {
-                    let _ = session.start_ctrader_bootstrap_batch(
+                    if let Err(err) = session.start_ctrader_bootstrap_batch(
                         state.runtime.data_dir.clone(),
                         symbols,
                         timeframes,
                         state.bootstrap_form.years,
                         tx.clone(),
-                    );
+                    ) {
+                        let msg = format!("Bootstrap launch failed: {err}");
+                        tracing::warn!(target: "forex_app::ui::system::bootstrap", "{}", msg);
+                        state.bootstrap_job =
+                            Some(failed_bootstrap_snapshot(anyhow::anyhow!(msg)));
+                    }
                 }
             }
         });
