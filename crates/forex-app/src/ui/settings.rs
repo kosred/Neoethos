@@ -389,7 +389,14 @@ fn render_intelligence_settings(
                         "API key for the configured LLM provider.",
                     );
                 });
-                let mut api_key = state.llm_news_filter.api_key.clone().unwrap_or_default();
+                // audit-fix F8: dereference the Zeroizing wrapper for the
+                // egui text-edit buffer; re-wrap on assign.
+                let mut api_key: String = state
+                    .llm_news_filter
+                    .api_key
+                    .as_deref()
+                    .cloned()
+                    .unwrap_or_default();
                 ui.add_sized(
                     [160.0, 24.0],
                     egui::TextEdit::singleline(&mut api_key).password(true),
@@ -397,7 +404,7 @@ fn render_intelligence_settings(
                 state.llm_news_filter.api_key = if api_key.trim().is_empty() {
                     None
                 } else {
-                    Some(api_key)
+                    Some(zeroize::Zeroizing::new(api_key))
                 };
                 ui.end_row();
 

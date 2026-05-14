@@ -105,7 +105,15 @@ pub fn render(
                 );
             });
 
-            let mut api_key = state.llm_news_filter.api_key.clone().unwrap_or_default();
+            // audit-fix F8: dereference the Zeroizing wrapper for the
+            // egui text-edit buffer; we re-wrap on assign so the cleared
+            // backing string is wiped on drop.
+            let mut api_key: String = state
+                .llm_news_filter
+                .api_key
+                .as_deref()
+                .cloned()
+                .unwrap_or_default();
             ui.horizontal(|ui| {
                 ui.label("API Key");
                 ui.add_sized(
@@ -116,7 +124,8 @@ pub fn render(
             if api_key.trim().is_empty() {
                 state.llm_news_filter.api_key = None;
             } else {
-                state.llm_news_filter.api_key = Some(api_key);
+                state.llm_news_filter.api_key =
+                    Some(zeroize::Zeroizing::new(api_key));
             }
 
             ui.checkbox(
