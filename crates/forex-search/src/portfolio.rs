@@ -205,6 +205,11 @@ impl PortfolioOptimizer {
         } else {
             let w = 1.0 / symbols.len().max(1) as f64;
             for s in symbols {
+                // DOCUMENTED-DEFAULT: this branch is the equal-weight
+                // fallback used when no per-symbol Sharpe is known.
+                // Sharpe is descriptive only here (allocation weights
+                // are `w`, not derived from sharpe), so 0.0 / missing
+                // is a safe display fallback.
                 let sharpe = metrics_map
                     .get(s)
                     .map(|m| m.sharpe)

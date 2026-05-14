@@ -1,4 +1,8 @@
 use super::super::FeatureFrame;
+use super::discover::DataFormat;
+use super::to_vortex::{
+    IngestionSchema, cache_dir_for, cache_path_for, convert_to_vortex,
+};
 use super::vortex_io::{read_vortex_array, write_vortex_array};
 use anyhow::{Context, Result, bail};
 use std::fs;
