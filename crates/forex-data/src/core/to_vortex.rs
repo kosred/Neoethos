@@ -220,17 +220,14 @@ fn vortex_passthrough(source: &Path, destination: &Path) -> Result<PathBuf> {
 /// Read an Arrow IPC / Feather file via polars lazy frame, project the
 /// OHLCV columns, downcast prices to the canonical layout.
 fn parse_ipc(path: &Path) -> Result<Ohlcv> {
-    let args = ScanArgsIpc {
-        n_rows: None,
-        cache: false,
-        rechunk: false,
-        row_index: None,
-        cloud_options: None,
-        hive_options: Default::default(),
-        include_file_paths: None,
-    };
+    // polars 0.52: `LazyFrame::scan_ipc(path, IpcScanOptions, UnifiedScanArgs)`.
+    // `IpcScanOptions` is a unit struct, `UnifiedScanArgs` has a sane
+    // default (no caching, no globbing of paths we explicitly passed).
     let pl_path = PlPath::new(path.to_str().context("ipc path must be utf-8")?);
-    let lf = LazyFrame::scan_ipc(pl_path, args)
+    let mut scan_args = UnifiedScanArgs::default();
+    scan_args.cache = false;
+    scan_args.glob = false;
+    let lf = LazyFrame::scan_ipc(pl_path, IpcScanOptions, scan_args)
         .with_context(|| format!("scan_ipc {}", path.display()))?;
 
     let df = lf

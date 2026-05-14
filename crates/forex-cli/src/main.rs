@@ -235,7 +235,22 @@ fn cmd_resample(args: &[String]) -> Result<()> {
 
 fn cmd_train(args: &[String]) -> Result<()> {
     let result = (|| -> Result<(String, String)> {
-        let settings = resolve_cli_settings(args)?.unwrap_or_else(forex_core::Settings::default);
+        let settings_opt = resolve_cli_settings(args)?;
+        // Folder-browse support (2026-05-14): `--data-path <folder>`
+        // scans the folder, prints a discovery summary, and (if
+        // `--dry-run` is also set) exits before training kicks off.
+        if has_flag(args, "--data-path") || has_flag(args, "--dry-run") {
+            let root = parse_root(args, settings_opt.as_ref());
+            let _ = print_dataset_discovery_summary(&root)?;
+            if has_flag(args, "--dry-run") {
+                let dry_symbol = parse_flag(args, "--symbol")
+                    .unwrap_or_else(|| default_symbol(settings_opt.as_ref()));
+                let dry_base = parse_flag(args, "--base")
+                    .unwrap_or_else(|| default_base_tf(settings_opt.as_ref()));
+                return Ok((dry_symbol, dry_base));
+            }
+        }
+        let settings = settings_opt.unwrap_or_else(forex_core::Settings::default);
         let symbol = parse_flag(args, "--symbol").unwrap_or_else(|| settings.system.symbol.clone());
         let base =
             parse_flag(args, "--base").unwrap_or_else(|| settings.system.base_timeframe.clone());
@@ -345,6 +360,19 @@ fn cmd_discover(args: &[String]) -> Result<()> {
             .map(forex_search::DiscoveryConfig::from_settings)
             .unwrap_or_default();
         let root = parse_root(args, settings.as_ref());
+        // Folder-browse support (2026-05-14): when `--data-path` or
+        // `--dry-run` are supplied, scan the folder and emit a
+        // dataset-layout summary before the GA pipeline starts.
+        if has_flag(args, "--data-path") || has_flag(args, "--dry-run") {
+            let _ = print_dataset_discovery_summary(&root)?;
+            if has_flag(args, "--dry-run") {
+                let dry_symbol = parse_flag(args, "--symbol")
+                    .unwrap_or_else(|| default_symbol(settings.as_ref()));
+                let dry_base = parse_flag(args, "--base")
+                    .unwrap_or_else(|| default_base_tf(settings.as_ref()));
+                return Ok((dry_symbol, dry_base, 0, 0));
+            }
+        }
         let symbol =
             parse_flag(args, "--symbol").unwrap_or_else(|| default_symbol(settings.as_ref()));
         let base = parse_flag(args, "--base").unwrap_or_else(|| default_base_tf(settings.as_ref()));
@@ -815,6 +843,17 @@ fn cmd_import(args: &[String]) -> Result<()> {
     let source = parse_flag(args, "--source").unwrap_or_else(|| root.clone());
     let force = has_flag(args, "--force");
 
+    // Folder-browse support (2026-05-14): when the operator points
+    // `--data-path` at a folder, scan it and print a summary so they
+    // can confirm the layout before any conversion runs. `--dry-run`
+    // exits after the summary.
+    if has_flag(args, "--data-path") || has_flag(args, "--dry-run") {
+        let _ = print_dataset_discovery_summary(&source)?;
+        if has_flag(args, "--dry-run") {
+            return Ok(());
+        }
+    }
+
     let report = forex_data::core::universal_importer::import_directory_recursive(
         &source, &root, force,
     )?;
@@ -942,11 +981,102 @@ fn cmd_stop_target(args: &[String]) -> Result<()> {
 }
 
 fn parse_root(args: &[String], settings: Option<&forex_core::Settings>) -> String {
+    // `--data-path` is the operator-facing flag added 2026-05-14 for
+    // folder-browsing workflows; `--root` remains for backwards
+    // compatibility with existing scripts. `--data-path` wins when
+    // both are supplied because it's the more explicit name.
+    if let Some(p) = parse_flag(args, "--data-path") {
+        return p;
+    }
     parse_flag(args, "--root").unwrap_or_else(|| {
         settings
             .map(|settings| settings.system.data_dir.to_string_lossy().to_string())
             .unwrap_or_else(|| "data".to_string())
     })
+}
+
+/// Run `DatasetDiscovery::scan` on the supplied root and print a
+/// human-readable summary table to stdout. Returns the report so the
+/// caller can react (e.g. honour `--dry-run`).
+///
+/// Shell-completion hint: when this codebase migrates to clap-derive,
+/// the `--data-path` argument should be annotated with
+/// `value_hint = clap::ValueHint::DirPath` so shells that respect the
+/// hint can complete directory paths. Today the CLI uses manual arg
+/// parsing, so the hint is documented here as a future-work marker.
+fn print_dataset_discovery_summary(root: &str) -> Result<forex_data::DatasetDiscovery> {
+    let report = forex_data::DatasetDiscovery::scan(root)?;
+    println!("Scanned: {}", report.root.display());
+    if report.is_empty() && report.skipped.is_empty() {
+        // Real-data only: never silently fall back to a packaged demo
+        // dataset. Surface the empty result so the operator can pick
+        // a different folder.
+        println!("  (no data files found at depth ≤ {})", forex_data::MAX_WALK_DEPTH);
+        return Ok(report);
+    }
+
+    let total = report.entries.len();
+    let format_breakdown: Vec<String> = report
+        .format_counts()
+        .into_iter()
+        .map(|(fmt, n)| format!("{}: {}", fmt.as_str(), n))
+        .collect();
+    println!(
+        "Files found:        {} ({})",
+        total,
+        format_breakdown.join(", ")
+    );
+
+    let symbols = report.symbols();
+    let symbols_preview: String = if symbols.len() > 6 {
+        format!(
+            "{}, ...",
+            symbols.iter().take(6).cloned().collect::<Vec<_>>().join(", ")
+        )
+    } else {
+        symbols.join(", ")
+    };
+    println!(
+        "Symbols detected:   {}  ({})",
+        symbols.len(),
+        symbols_preview
+    );
+
+    let tfs = report.timeframes();
+    println!("Timeframes:         {}", tfs.join(", "));
+
+    if !report.skipped.is_empty() {
+        let buckets = report.skip_counts_by_category();
+        // Per-bucket detail: e.g. "unsupported_timeframe: H2 (x4)".
+        let mut detail_parts: Vec<String> = Vec::new();
+        for (cat, count) in &buckets {
+            let example_labels: Vec<String> = report
+                .skipped
+                .iter()
+                .filter(|s| s.reason.category() == cat)
+                .filter_map(|s| match &s.reason {
+                    forex_data::SkipReason::UnsupportedTimeframe(label) => Some(label.clone()),
+                    forex_data::SkipReason::UnknownExtension(ext) => Some(format!(".{ext}")),
+                    forex_data::SkipReason::TooLarge(bytes) => {
+                        Some(format!("{} MiB", bytes / (1024 * 1024)))
+                    }
+                    forex_data::SkipReason::Unreadable(_) => None,
+                })
+                .collect();
+            let mut uniq: Vec<String> = example_labels;
+            uniq.sort();
+            uniq.dedup();
+            let labels = if uniq.is_empty() {
+                "".to_string()
+            } else {
+                format!(": {}", uniq.join(", "))
+            };
+            detail_parts.push(format!("{count} {cat}{labels}"));
+        }
+        println!("Skipped:            {}   ({})", report.skipped.len(), detail_parts.join("; "));
+    }
+
+    Ok(report)
 }
 
 fn parse_config_path(args: &[String]) -> String {
@@ -1054,6 +1184,11 @@ fn print_help() {
     );
     println!("  migrate-data --root data [--force] [--delete-source]");
     println!("  stop-target --symbol EURUSD --timeframe M1 --pip 0.0001 --signal 1 --root data");
+    println!();
+    println!("  --data-path <folder>   Browse a folder and auto-discover dataset layout");
+    println!("                         (subfolders for symbol/timeframe, Hive-style or flat).");
+    println!("                         Supported on: train, discover, import.");
+    println!("  --dry-run              With --data-path, print the discovery summary and exit.");
 }
 
 fn cli_record(operation: &str, status: &str, message: impl Into<String>) -> SectionedRunRecord {
