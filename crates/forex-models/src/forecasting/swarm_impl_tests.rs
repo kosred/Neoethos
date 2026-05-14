@@ -431,6 +431,109 @@ fn load_rebuilds_stale_fitted_artifact_diagnostics() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// F-MODELS9-013: the rebuild test above only exercises the happy path
+// where the persisted horizon (12) is feasible for the saved series
+// (96 values). It never checks what happens when an artifact is saved
+// with more horizon than data. A 12-step forecast genuinely cannot be
+// produced from 8 observations: validation_windows will be empty
+// (build_validation_windows needs >= 16 + 4 rows for horizon 12) so
+// there is no out-of-sample signal at all, and moving_average_long
+// (window=16) silently collapses onto the same 8-value mean as the
+// medium window, eliminating diversity. The correct load-path
+// behaviour is to either:
+//   (a) bail with an error about horizon-vs-history feasibility, or
+//   (b) clamp the persisted horizon down to a value supportable by the
+//       available history (e.g. values.len() / 2) and surface a
+//       degradation reason naming the clamp.
+//
+// Production currently does neither: it silently rebuilds at the
+// persisted horizon with flat moving-average candidates and zero
+// validation windows, producing a "fitted" forecaster whose
+// last_horizon == 12 from only 8 data points. This test encodes the
+// expected correct behaviour and is ignored until the impl is fixed
+// in a follow-up batch (F-MODELS9-013-impl).
+#[test]
+#[ignore = "reveals real bug F-MODELS9-013-impl: load does not check horizon vs values.len()"]
+fn load_rejects_or_downgrades_artifact_with_incompatible_horizon() {
+    let dir = test_artifact_dir("incompatible-horizon-artifact");
+    fs::create_dir_all(&dir).expect("create temp dir");
+
+    // 8 observations is the absolute minimum the local snapshot
+    // builder accepts. Pair it with a persisted horizon of 12, which
+    // is unsupportable on this history (validation requires at least
+    // ~20 rows for horizon 12).
+    let values = vec![1.0_f32; 8];
+    let timestamps = (0..values.len()).map(|idx| idx as f64).collect::<Vec<_>>();
+    let snapshot = build_local_snapshot_with_min(&values, &timestamps, 8).expect("snapshot");
+
+    let artifact = SwarmForecasterArtifact {
+        config: SwarmForecastConfig {
+            horizon: 12,
+            ..SwarmForecastConfig::default()
+        },
+        runtime_mode: SwarmRuntimeMode::LocalFallback,
+        runtime_degraded_reason: None,
+        fitted: true,
+        values: values.clone(),
+        timestamps: timestamps.clone(),
+        unique_id: "incompatible-horizon".to_string(),
+        snapshot: Some(snapshot),
+        last_result: None,
+        last_horizon: Some(12),
+        candidate_reports: Vec::new(),
+        updated_at_unix_ms: None,
+        training_report: None,
+    };
+    let payload = serde_json::to_vec_pretty(&artifact).expect("serialize artifact");
+    fs::write(dir.join(SWARM_ARTIFACT_FILE_NAME), payload).expect("write artifact");
+
+    let mut forecaster = SwarmForecaster::new(256.0);
+    let outcome = forecaster.load(&dir);
+
+    match outcome {
+        Err(err) => {
+            // Case (a): bail. The error must explicitly name the
+            // horizon-vs-history conflict rather than fail at some
+            // unrelated invariant.
+            let message = err.to_string().to_ascii_lowercase();
+            assert!(
+                message.contains("horizon") && (message.contains("history") || message.contains("observations") || message.contains("values")),
+                "expected horizon/history error, got: {err}"
+            );
+        }
+        Ok(()) => {
+            // Case (b): downgrade. The loaded forecaster must NOT
+            // claim to forecast 12 steps from 8 observations. The
+            // effective horizon must be reduced to something the
+            // history supports (at most values.len() / 2 == 4) and
+            // the degradation must be surfaced.
+            let effective_horizon = forecaster.last_horizon.expect("last_horizon set after load");
+            assert!(
+                effective_horizon <= forecaster.values.len() / 2,
+                "load must clamp horizon (got {effective_horizon}) to at most values.len()/2 ({}) when persisted horizon exceeds history",
+                forecaster.values.len() / 2
+            );
+            if let Some(result) = forecaster.last_result.as_ref() {
+                assert_eq!(
+                    result.point_forecast.len(),
+                    effective_horizon,
+                    "rebuilt forecast length must match the (clamped) effective horizon"
+                );
+            }
+            let reason = forecaster
+                .runtime_degraded_reason
+                .as_deref()
+                .expect("downgrade must surface a degradation reason");
+            assert!(
+                reason.contains("horizon"),
+                "degradation reason must name the horizon clamp, got: {reason}"
+            );
+        }
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[cfg(not(feature = "swarm-forecasting"))]
 #[test]
 fn load_downgrades_persisted_external_runtime_when_feature_is_disabled() {

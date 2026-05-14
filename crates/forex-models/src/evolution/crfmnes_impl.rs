@@ -5,7 +5,7 @@ use crfmnes::{CrfmnesOptimizer as CrfmnesBackendOptimizer, rec_lamb};
 use nalgebra::DVector;
 use ndarray::Array2;
 use polars::prelude::{DataFrame, Series};
-use rand::{Rng, SeedableRng};
+use rand::SeedableRng;
 use rand_xoshiro::Xoroshiro128PlusPlus;
 use serde::{Deserialize, Serialize};
 use std::path::Path;

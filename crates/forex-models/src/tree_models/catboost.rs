@@ -6,6 +6,12 @@ use ndarray::Array2;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+// `std::io::Write` and many of the `super::common::*` imports below are only
+// exercised when `feature = "catboost"` is enabled. When the feature is off
+// (e.g. the partial-feature builds the v0.4.1 audit added under Batch 8) the
+// unused-import lint fires; suppress it here because the imports are correct
+// for the FFI-active build.
+#[cfg(feature = "catboost")]
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -15,6 +21,7 @@ use crate::runtime::artifacts::{RuntimeArtifactMetadata, TrainingSummaryMetadata
 use crate::runtime::capabilities::ModelFamily;
 use crate::runtime::prediction::RuntimePrediction;
 
+#[allow(unused_imports)] // some entries are only used when feature = "catboost" is on
 use super::common::{
     CATBOOST_MODEL_FILE_NAME, TreeLocalFallbackArtifact, atomic_write,
     build_tree_local_fallback_artifact, build_tree_runtime_predictions,
