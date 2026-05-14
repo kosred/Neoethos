@@ -79,9 +79,22 @@ impl StrategyLedger {
                 let msg = e.to_string().to_lowercase();
                 if msg.contains("disk i/o") || msg.contains("disk io") {
                     warn!("Disk I/O error detected. cleaning up WAL/SHM files and retrying...");
-                    // Try to remove -wal and -shm files
-                    let _ = std::fs::remove_file(self.db_path.with_extension("sqlite-wal"));
-                    let _ = std::fs::remove_file(self.db_path.with_extension("sqlite-shm"));
+                    // Try to remove -wal and -shm files. NotFound is fine
+                    // (steady-state WAL may have been checkpointed). Other
+                    // errors are worth seeing.
+                    for ext in ["sqlite-wal", "sqlite-shm"] {
+                        let p = self.db_path.with_extension(ext);
+                        if let Err(rm_err) = std::fs::remove_file(&p) {
+                            if rm_err.kind() != std::io::ErrorKind::NotFound {
+                                warn!(
+                                    target: "forex_core::storage",
+                                    path = %p.display(),
+                                    error = %rm_err,
+                                    "failed to remove stale sqlite sidecar"
+                                );
+                            }
+                        }
+                    }
                     // Retry open
                     rusqlite::Connection::open(&self.db_path)?
                 } else {
@@ -201,7 +214,22 @@ impl StrategyLedger {
         let rows = stmt.query_map([], |row| {
             let symbol: String = row.get("symbol")?;
             let returns_json: String = row.get("returns_json")?;
-            let returns: Vec<f64> = serde_json::from_str(&returns_json).unwrap_or_default();
+            // `returns_json` is operator-facing metrics, not money-critical
+            // sizing data. Surface a parse error as warn rather than failing
+            // the whole iterator, so a single corrupt row doesn't hide a
+            // larger drift in writer code.
+            let returns: Vec<f64> = match serde_json::from_str(&returns_json) {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "forex_core::storage",
+                        symbol = %symbol,
+                        error = %err,
+                        "live_metrics: returns_json failed to parse; treating as empty"
+                    );
+                    Vec::new()
+                }
+            };
 
             let metrics = serde_json::json!({
                 "symbol": symbol,

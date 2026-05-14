@@ -212,10 +212,27 @@ pub fn import_one_file(
             // Quarantine the source so the user can inspect.
             let qpath = quarantine_path(data_root, path);
             if let Some(dir) = qpath.parent() {
-                fs::create_dir_all(dir).ok();
+                if let Err(mk_err) = fs::create_dir_all(dir) {
+                    tracing::warn!(
+                        target: "forex_data::universal_importer",
+                        dir = %dir.display(),
+                        error = %mk_err,
+                        "quarantine: failed to create directory"
+                    );
+                }
             }
-            // Best-effort copy; don't fail import if quarantine itself fails.
-            let _ = fs::copy(path, &qpath);
+            // Best-effort copy; don't fail import if quarantine itself fails,
+            // but surface the failure so the operator knows the source file
+            // wasn't preserved for inspection.
+            if let Err(cp_err) = fs::copy(path, &qpath) {
+                tracing::warn!(
+                    target: "forex_data::universal_importer",
+                    src = %path.display(),
+                    dst = %qpath.display(),
+                    error = %cp_err,
+                    "quarantine: failed to copy source file"
+                );
+            }
             return Ok(ImportFileResult {
                 source: path.display().to_string(),
                 symbol: symbol.clone(),

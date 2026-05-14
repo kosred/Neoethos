@@ -1,6 +1,7 @@
 syntax = "proto2";
 
 option go_package = "/openapi";
+
 option java_multiple_files = true;
 option java_generate_equals_and_hash = true;
 option java_package = "com.xtrader.protocol.proto.commons";
@@ -17,7 +18,8 @@ message ProtoMessage {
 
 /** Error response that is sent from Open API proxy when error occurs. */
 message ProtoErrorRes {
-    optional ProtoPayloadType payloadType = 1;
+    optional ProtoPayloadType payloadType = 1 [default = ERROR_RES];
+    
     required string errorCode = 2; // Contains name of ProtoErrorCode or other custom ErrorCodes (e.g. ProtoCHErrorCode).
     optional string description = 3; // Error description.
     optional uint64 maintenanceEndTimestamp = 4; // The Unix time in milliseconds of the end of the maintenance.
@@ -25,5 +27,5 @@ message ProtoErrorRes {
 
 /** Event that is sent from Open API proxy and can be used as criteria that connection is healthy when no other messages are sent by cTrader platform. Open API client can send this message when he needs to keep the connection open for a period without other messages longer than 30 seconds. */
 message ProtoHeartbeatEvent {
-    optional ProtoPayloadType payloadType = 1;
+    optional ProtoPayloadType payloadType = 1 [default = HEARTBEAT_EVENT];
 }

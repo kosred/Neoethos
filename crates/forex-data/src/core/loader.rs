@@ -48,8 +48,24 @@ impl FeatureCache {
 
         match read_vortex_array(&path).and_then(vortex_to_feature_frame) {
             Ok(frame) => Ok(Some(frame)),
-            Err(_) => {
-                let _ = fs::remove_file(&path);
+            Err(err) => {
+                // Cache corruption: log so we can correlate frequency with
+                // upstream writer bugs, then delete and re-derive. Don't
+                // bubble up; the caller treats `None` as cache-miss.
+                tracing::warn!(
+                    target: "forex_data::loader",
+                    path = %path.display(),
+                    error = %err,
+                    "feature cache entry failed to decode; deleting and re-deriving"
+                );
+                if let Err(rm_err) = fs::remove_file(&path) {
+                    tracing::warn!(
+                        target: "forex_data::loader",
+                        path = %path.display(),
+                        error = %rm_err,
+                        "feature cache: failed to delete corrupt entry"
+                    );
+                }
                 Ok(None)
             }
         }

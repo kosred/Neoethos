@@ -45,9 +45,20 @@ fn init_rayon() {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&v| v > 0);
         if let Some(n) = threads {
-            let _ = rayon::ThreadPoolBuilder::new()
+            // `build_global` errors if the global pool was already built
+            // (e.g. another crate touched rayon first); that's expected
+            // and harmless for the rest of the run.
+            if let Err(err) = rayon::ThreadPoolBuilder::new()
                 .num_threads(n)
-                .build_global();
+                .build_global()
+            {
+                tracing::debug!(
+                    target: "forex_search::eval",
+                    requested_threads = n,
+                    error = %err,
+                    "rayon global pool already initialised; thread count not overridden"
+                );
+            }
         }
     });
 }
@@ -294,6 +305,8 @@ pub fn install_backtest_runtime_overrides(
 /// Convenience wrapper that resolves the legacy `FOREX_BOT_BACKTEST_*` env
 /// vars once and installs them. Idempotent: subsequent calls are ignored.
 pub fn install_backtest_runtime_overrides_from_env() {
+    // DOCUMENTED-DEFAULT: OnceLock::set returning Err just means the first
+    // installer won (the public API documents idempotency). Nothing to log.
     let _ = BACKTEST_RUNTIME_OVERRIDES.set(BacktestRuntimeOverrides::from_env());
 }
 
@@ -697,6 +710,9 @@ pub fn simulate_trades_core(
     let mut day_trade_count = 0usize;
 
     for i in 1..n {
+        // DOCUMENTED-DEFAULT: `n` above is the min length of `timestamps`
+        // and the price slices, so `get(i)` is guaranteed Some(_). The
+        // `unwrap_or_default()` is defence-in-depth only.
         let ts = timestamps.get(i).copied().unwrap_or_default();
 
         let (half_spread_px, half_spread_cost) = match session_profile {

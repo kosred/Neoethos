@@ -14,12 +14,18 @@ fn main() -> Result<()> {
         // No subcommand → launch interactive TUI. Use `--help` for
         // legacy bare help; explicit subcommands keep working
         // unchanged for scripting.
-        let _ = write_subsystem_record(
+        if let Err(err) = write_subsystem_record(
             SubsystemSection::Cli,
             cli_record("tui", "STARTED", "launching interactive TUI"),
-        );
+        ) {
+            tracing::warn!(
+                target: "forex_cli",
+                error = %err,
+                "failed to write CLI 'tui STARTED' subsystem record"
+            );
+        }
         let res = tui::run_tui(None);
-        let _ = write_subsystem_record(
+        if let Err(err) = write_subsystem_record(
             SubsystemSection::Cli,
             cli_record(
                 "tui",
@@ -29,7 +35,14 @@ fn main() -> Result<()> {
                     Err(err) => format!("TUI session ended with error: {err}"),
                 },
             ),
-        );
+        ) {
+            tracing::warn!(
+                target: "forex_cli",
+                error = %err,
+                "failed to write CLI 'tui {}' subsystem record",
+                if res.is_ok() { "SUCCESS" } else { "FAILED" }
+            );
+        }
         return res;
     }
     if matches!(args[1].as_str(), "--help" | "-h" | "help") {
@@ -747,10 +760,33 @@ fn cmd_auto_loop(args: &[String]) -> Result<()> {
             remaining: total_units.saturating_sub(completed.len()),
         };
         if let Some(dir) = checkpoint_path.parent() {
-            std::fs::create_dir_all(dir).ok();
+            if let Err(err) = std::fs::create_dir_all(dir) {
+                tracing::warn!(
+                    target: "forex_cli",
+                    dir = %dir.display(),
+                    error = %err,
+                    "auto_loop: failed to create checkpoint directory"
+                );
+            }
         }
-        if let Ok(text) = serde_json::to_string_pretty(&checkpoint) {
-            let _ = std::fs::write(&checkpoint_path, text);
+        match serde_json::to_string_pretty(&checkpoint) {
+            Ok(text) => {
+                if let Err(err) = std::fs::write(&checkpoint_path, text) {
+                    tracing::warn!(
+                        target: "forex_cli",
+                        path = %checkpoint_path.display(),
+                        error = %err,
+                        "auto_loop: failed to write checkpoint"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "forex_cli",
+                    error = %err,
+                    "auto_loop: failed to serialize checkpoint"
+                );
+            }
         }
 
         jobs_run += 1;
@@ -785,7 +821,14 @@ fn cmd_import(args: &[String]) -> Result<()> {
 
     let report_path =
         std::path::PathBuf::from(&root).join("import_report.json");
-    report.save_to_disk(&report_path).ok();
+    if let Err(err) = report.save_to_disk(&report_path) {
+        tracing::warn!(
+            target: "forex_cli",
+            path = %report_path.display(),
+            error = %err,
+            "universal import: failed to save report"
+        );
+    }
 
     println!(
         "Universal import: source={} root={} files_seen={} imported={} skipped={} quarantined={} failed={}",

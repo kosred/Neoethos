@@ -865,7 +865,9 @@ impl FeatureBounds {
     }
 }
 
-#[cfg(feature = "reinforcement-learning")]
+// Pure string-manipulation helper used by both gated runtime code and
+// unconditional artifact-validation helpers; must be available under all
+// feature combinations (no rlkit/candle dependency).
 fn normalize_rl_device_policy(policy: &str) -> String {
     let normalized = policy.trim().to_ascii_lowercase();
     if normalized.is_empty() {

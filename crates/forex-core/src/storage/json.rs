@@ -35,7 +35,19 @@ pub fn write_json_atomic<T: Serialize + ?Sized>(path: impl AsRef<Path>, value: &
         )
     })?;
     if let Ok(dir) = File::open(parent) {
-        let _ = dir.sync_all();
+        // Directory fsync is best-effort: some filesystems (tmpfs, NFS, FAT)
+        // legitimately return EINVAL. The atomic rename above is what
+        // guarantees crash safety; the dir-sync is belt-and-braces.
+        // Log at debug so a real syscall failure on a real FS is still
+        // observable.
+        if let Err(err) = dir.sync_all() {
+            tracing::debug!(
+                target: "forex_core::storage::json",
+                dir = %parent.display(),
+                error = %err,
+                "fsync(parent_dir) failed; rename was atomic so this is non-fatal"
+            );
+        }
     }
     Ok(())
 }
@@ -111,10 +123,30 @@ pub fn write_json_with_backup<T: Serialize + ?Sized>(
         })?;
     }
     if let Err(error) = fs::rename(&temp_path, path) {
+        // Best-effort rollback. Failure of either rollback step is logged
+        // but does NOT mask the original write error — the caller still
+        // sees a `bail!` so they treat the artifact as not-written.
         if backup_path.exists() {
-            let _ = fs::rename(&backup_path, path);
+            if let Err(rb_err) = fs::rename(&backup_path, path) {
+                tracing::error!(
+                    target: "forex_core::storage::json",
+                    artifact = config.artifact_label,
+                    backup = %backup_path.display(),
+                    path = %path.display(),
+                    error = %rb_err,
+                    "failed to restore backup after write failure"
+                );
+            }
         } else if temp_path.exists() {
-            let _ = fs::remove_file(&temp_path);
+            if let Err(rb_err) = fs::remove_file(&temp_path) {
+                tracing::warn!(
+                    target: "forex_core::storage::json",
+                    artifact = config.artifact_label,
+                    temp = %temp_path.display(),
+                    error = %rb_err,
+                    "failed to remove staged temp file after write failure"
+                );
+            }
         }
         anyhow::bail!(
             "write {} to {} failed: {}",

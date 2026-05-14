@@ -112,13 +112,12 @@ message ProtoOAAsset {
 
 /** Trading symbol entity. */
 message ProtoOASymbol {
-
-required int64 symbolId = 1; // The unique identifier of the symbol in specific server environment within cTrader platform. Different servers have different IDs.
+    required int64 symbolId = 1; // The unique identifier of the symbol in specific server environment within cTrader platform. Different servers have different IDs.
     required int32 digits = 2; // Number of price digits to be displayed.
     required int32 pipPosition = 3; // Pip position on digits.
     optional bool enableShortSelling = 4; // If TRUE then the short selling with the symbol is enabled.
     optional bool guaranteedStopLoss = 5; // If TRUE then setting of guaranteedStopLoss is available for limited risk accounts.
-    optional ProtoOADayOfWeek swapRollover3Days = 6; // Day of the week when SWAP charge amount will be tripled. Doesn't impact Rollover Commission.
+    optional ProtoOADayOfWeek swapRollover3Days = 6 [default = MONDAY]; // Day of the week when SWAP charge amount will be tripled. Doesn't impact Rollover Commission.
     optional double swapLong = 7; // SWAP charge for long positions.
     optional double swapShort = 8; // SWAP charge for short positions.
     optional int64 maxVolume = 9; // Maximum allowed volume in cents for an order with a symbol.
@@ -127,28 +126,27 @@ required int64 symbolId = 1; // The unique identifier of the symbol in specific 
     optional uint64 maxExposure = 12; // Value of max exposure per symbol, per account. Blocks execution if breached.
     repeated ProtoOAInterval schedule = 13; // Symbol trading interval, specified in seconds starting from SUNDAY 00:00 in specified time zone.
     optional int64 commission = 14 [deprecated = true]; // Commission base amount. Total commission depends on commissionType. Use preciseTradingCommissionRate.
-    optional ProtoOACommissionType commissionType = 15; // Commission type. See ProtoOACommissionType for details.
+    optional ProtoOACommissionType commissionType = 15 [default = USD_PER_MILLION_USD]; // Commission type. See ProtoOACommissionType for details.
     optional uint32 slDistance = 16; // Minimum allowed distance between stop loss and current market price.
     optional uint32 tpDistance = 17; // Minimum allowed distance between take profit and current market price.
     optional uint32 gslDistance = 18; // Minimum allowed distance between guaranteed stop loss and current market price.
     optional int64 gslCharge = 19; // Guaranteed stop loss fee.
-    optional ProtoOASymbolDistanceType distanceSetIn = 20; // Unit of distance measure for slDistance, tpDistance, gslDistance.
+    optional ProtoOASymbolDistanceType distanceSetIn = 20 [default = SYMBOL_DISTANCE_IN_POINTS]; // Unit of distance measure for slDistance, tpDistance, gslDistance.
     optional int64 minCommission = 21 [deprecated = true]; // Minimum commission amount per trade. Use preciseMinCommission.
-    optional ProtoOAMinCommissionType minCommissionType = 22; // Minimum commission Type. See ProtoOAMinCommissionType for details.
-    optional string minCommissionAsset = 23; // Currency for minimum commission. (USD or quote currency).
+    optional ProtoOAMinCommissionType minCommissionType = 22 [default = CURRENCY]; // Minimum commission Type. See ProtoOAMinCommissionType for details.
+    optional string minCommissionAsset = 23 [default = "USD"]; // Currency for minimum commission. (USD or quote currency).
     optional int64 rolloverCommission = 24; // Administrative Fee, charged instead of Swaps if the Account is marked as a "Shariah Compliant (Swap Free)". The Administrative Fee is charged daily as USD per current open volume of Position in lots. The Account charged in the Deposit currency.
     optional int32 skipRolloverDays = 25; // Initial period before the first rolloverCommission will be charged on the account.
     optional string scheduleTimeZone = 26; // Time zone for the symbol trading intervals.
-    optional ProtoOATradingMode tradingMode = 27; // Rules for trading with the symbol. See ProtoOATradingMode for details.
-    optional ProtoOADayOfWeek rolloverCommission3Days = 28; // Day of the week (in UTC) when Administrative Fee charge amount will be tripled. Applied only if RolloverChargePeriod = 0 or 1.
-    optional ProtoOASwapCalculationType swapCalculationType = 29; // Specifies type of SWAP computation as PIPS (0) or PERCENTAGE (1, annual, in percent).
+    optional ProtoOATradingMode tradingMode = 27 [default = ENABLED]; // Rules for trading with the symbol. See ProtoOATradingMode for details.
+    optional ProtoOADayOfWeek rolloverCommission3Days = 28 [default = MONDAY]; // Day of the week (in UTC) when Administrative Fee charge amount will be tripled. Applied only if RolloverChargePeriod = 0 or 1.
+    optional ProtoOASwapCalculationType swapCalculationType = 29 [default = PIPS]; // Specifies type of SWAP computation as PIPS (0) or PERCENTAGE (1, annual, in percent).
     optional int64 lotSize = 30; // Lot size of the Symbol (in cents).
     optional int64 preciseTradingCommissionRate = 31; // Commission base amount. Total commission depends on commissionType: for non-percentage types it is multiplied by 10^8, for percentage of value commission type it is multiplied by 10^5.
     optional int64 preciseMinCommission = 32; // Minimum commission amount per trade multiplied by 10^8.
     repeated ProtoOAHoliday holiday = 33; // List of holidays for this symbol specified by broker.
     optional int32 pnlConversionFeeRate = 34; // Percentage (1 = 0.01%) of the realized Gross Profit, which will be paid by the Trader for any trade if the Quote Asset of the traded Symbol is not matched with the Deposit Asset.
-
-optional int64 leverageId = 35; // The unique identifier of dynamic leverage entity. https://help.ctrader.com/ctrader/trading/dynamic-leverage
+    optional int64 leverageId = 35; // The unique identifier of dynamic leverage entity. https://help.ctrader.com/ctrader/trading/dynamic-leverage
     optional int32 swapPeriod = 36; // Period of charging swaps in hours. 24 means swaps will be charged 1 time per day, 12 - every 12 hours, 8 - every 8 hours, etc.
     optional int32 swapTime = 37; // Time in minutes from 00:00 (UTC) when intraday swaps are charged for the first time.
     optional int32 skipSWAPPeriods = 38; // Count of swapPeriods before the first SWAP charge.
@@ -168,7 +166,6 @@ message ProtoOALightSymbol {
     optional double sortingNumber = 8; // The number used for sorting Symbols in the UI (lowest number should appear at the top).
 }
 
-/** Archived symbol entity. */
 message ProtoOAArchivedSymbol {
     required int64 symbolId = 1; // The unique identifier of the symbol in specific server environment within cTrader platform. Different brokers might have different IDs.
     required string name = 2; // Name of the symbol (e.g. EUR/USD).
@@ -233,8 +230,7 @@ enum ProtoOATradingMode {
 enum ProtoOASwapCalculationType {
     PIPS = 0; //Specifies type of SWAP computation as PIPS (0)
     PERCENTAGE = 1; //Specifies type of SWAP computation as PERCENTAGE (1, annual, in percent)
-
-POINTS = 2; // Specifies type of SWAP computation as POINTS (2)
+    POINTS = 2; // Specifies type of SWAP computation as POINTS (2)
 }
 
 /** Enum for specifying access right for a trader. */
@@ -267,7 +263,7 @@ message ProtoOATrader {
     optional int64 managerBonus = 4; // Amount of broker's bonus allocated to the account.
     optional int64 ibBonus = 5; // Amount of introducing broker bonus allocated to the account.
     optional int64 nonWithdrawableBonus = 6; // Broker's bonus that cannot be withdrew from the account as cash.
-    optional ProtoOAAccessRights accessRights = 7; // Access rights that an owner has to the account in cTrader platform. See ProtoOAAccessRights for details.
+    optional ProtoOAAccessRights accessRights = 7 [default = FULL_ACCESS]; // Access rights that an owner has to the account in cTrader platform. See ProtoOAAccessRights for details.
     required int64 depositAssetId = 8; // Deposit currency of the account.
     optional bool swapFree = 9; // If TRUE then account is Shariah compliant.
     optional uint32 leverageInCents = 10; // Account leverage (e.g. If leverage = 1:50 then value = 5000).
@@ -275,14 +271,14 @@ message ProtoOATrader {
     optional uint32 maxLeverage = 12; // Maximum allowed leverage for the account. Used as validation when a Trader can change leverage value.
     optional bool frenchRisk = 13 [deprecated = true]; // If TRUE then account is AMF compliant. Use isLimitedRisk and limitedRiskMarginCalculationStrategy.
     optional int64 traderLogin = 14; // ID of the account that is unique per server (Broker).
-    optional ProtoOAAccountType accountType = 15; // Account type: HEDGED, NETTED, etc.
+    optional ProtoOAAccountType accountType = 15 [default = HEDGED]; // Account type: HEDGED, NETTED, etc.
     optional string brokerName = 16; // Some whitelabel assigned to trader by broker at the moment of account creation.
     optional int64 registrationTimestamp = 17; // The Unix timestamp in milliseconds of the account registration. Should be used as minimal date in historical data requests.
     optional bool isLimitedRisk = 18; // If TRUE then account is compliant to use specific margin calculation strategy. Such accounts are require to have guaranteed stop loss on all positions.
-    optional ProtoOALimitedRiskMarginCalculationStrategy limitedRiskMarginCalculationStrategy = 19; // Special strategy used in margin calculations for this account (if account isLimitedRisk).
+    optional ProtoOALimitedRiskMarginCalculationStrategy limitedRiskMarginCalculationStrategy = 19 [default = ACCORDING_TO_LEVERAGE]; // Special strategy used in margin calculations for this account (if account isLimitedRisk).
     optional uint32 moneyDigits = 20; // Specifies the exponent of the monetary values. E.g. moneyDigits = 8 must be interpret as business value multiplied by 10^8, then real balance would be 10053099944 / 10^8 = 100.53099944. Affects balance, managerBonus, ibBonus, nonWithdrawableBonus.
     optional bool fairStopOut = 21; // If TRUE - Position is fully closed on Stop Out, if FALSE - smart (partial closing) Stop Out is applied, if unspecified  - Stop Out format is determined by Broker.
-    optional ProtoOAStopOutStrategy stopOutStrategy = 22; //The Stop Out strategy that is used for this Trader. The Trader can change the value in the cTrader UI if this option is not disabled by the Broker
+    optional ProtoOAStopOutStrategy stopOutStrategy = 22 [default = MOST_MARGIN_USED_FIRST]; //The Stop Out strategy that is used for this Trader. The Trader can change the value in the cTrader UI if this option is not disabled by the Broker
 }
 
 /** Position status ENUM. */
@@ -305,8 +301,7 @@ enum ProtoOAOrderType {
     LIMIT = 2;
     STOP = 3;
     STOP_LOSS_TAKE_PROFIT = 4;
-
-MARKET_RANGE = 5;
+    MARKET_RANGE = 5;
     STOP_LIMIT = 6;
 }
 
@@ -351,7 +346,7 @@ message ProtoOAPosition {
     optional int64 mirroringCommission = 11; // Amount of unrealized commission related to following of strategy provider.
     optional bool guaranteedStopLoss = 12; // If TRUE then position's stop loss is guaranteedStopLoss.
     optional uint64 usedMargin = 13; // Amount of margin used for the position in deposit currency.
-    optional ProtoOAOrderTriggerMethod stopLossTriggerMethod = 14; // Stop trigger method for SL/TP of the position.
+    optional ProtoOAOrderTriggerMethod stopLossTriggerMethod = 14 [default = TRADE]; // Stop trigger method for SL/TP of the position.
     optional uint32 moneyDigits = 15; // Specifies the exponent of the monetary values. E.g. moneyDigits = 8 must be interpret as business value multiplied by 10^8, then real balance would be 10053099944 / 10^8 = 100.53099944. Affects swap, commission, mirroringCommission, usedMargin.
     optional bool trailingStopLoss = 16; //If TRUE then the Trailing Stop Loss is applied.
 }
@@ -371,8 +366,7 @@ message ProtoOATradeData {
 
 /** Trade order entity. */
 message ProtoOAOrder {
-
-required int64 orderId = 1; // The unique ID of the order. Note: trader might have two orders with the same id if orders are taken from accounts from different brokers.
+    required int64 orderId = 1; // The unique ID of the order. Note: trader might have two orders with the same id if orders are taken from accounts from different brokers.
     required ProtoOATradeData tradeData = 2; // Detailed trader data.
     required ProtoOAOrderType orderType = 3; // Order type.
     required ProtoOAOrderStatus orderStatus = 4; // Order status.
@@ -388,13 +382,13 @@ required int64 orderId = 1; // The unique ID of the order. Note: trader might ha
     optional double stopLoss = 15; // Absolute stopLoss price.
     optional double takeProfit = 16; // Absolute takeProfit price.
     optional string clientOrderId = 17; // Optional ClientOrderId. Max Length = 50 chars.
-    optional ProtoOATimeInForce timeInForce = 18; // Order's time in force. Depends on order type.
+    optional ProtoOATimeInForce timeInForce = 18 [default = IMMEDIATE_OR_CANCEL]; // Order's time in force. Depends on order type.
     optional int64 positionId = 19; // ID of the position linked to the order (e.g. closing order, order that increase volume of a specific position, etc.).
     optional int64 relativeStopLoss = 20; // Relative stopLoss that can be specified instead of absolute as one. Specified in 1/100000 of unit of a price. (e.g. 123000 in protocol means 1.23, 53423782 means 534.23782) For BUY stopLoss = entryPrice - relativeStopLoss, for SELL stopLoss = entryPrice + relativeStopLoss.
     optional int64 relativeTakeProfit = 21; // Relative takeProfit that can be specified instead of absolute one. Specified in 1/100000 of unit of a price. (e.g. 123000 in protocol means 1.23, 53423782 means 534.23782) ForBUY takeProfit = entryPrice + relativeTakeProfit, for SELL takeProfit = entryPrice - relativeTakeProfit.
     optional bool isStopOut = 22; // If TRUE then order was stopped out from server side.
     optional bool trailingStopLoss = 23; // If TRUE then order is trailingStopLoss. Valid for STOP_LOSS_TAKE_PROFIT order.
-    optional ProtoOAOrderTriggerMethod stopTriggerMethod = 24; // Trigger method for the order. Valid only for STOP and STOP_LIMIT orders.
+    optional ProtoOAOrderTriggerMethod stopTriggerMethod = 24 [default = TRADE]; // Trigger method for the order. Valid only for STOP and STOP_LIMIT orders.
 }
 
 /** Execution event type ENUM. */
@@ -420,8 +414,7 @@ message ProtoOABonusDepositWithdraw {
     required int64 managerDelta = 4; // Amount of bonus deposited/withdrew by manager.
     required int64 ibBonus = 5; // Total amount of introducing broker's bonus after the operation.
     required int64 ibDelta = 6; // Amount of bonus deposited/withdrew by introducing broker.
-
-required int64 changeBonusTimestamp = 7; // The Unix time in milliseconds when the bonus operation was executed.
+    required int64 changeBonusTimestamp = 7; // The Unix time in milliseconds when the bonus operation was executed.
     optional string externalNote = 8; // Note added to operation. Visible to the trader.
     optional int64 introducingBrokerId = 9; // ID of introducing broker who deposited/withdrew bonus.
     optional uint32 moneyDigits = 10; // Specifies the exponent of the monetary values. E.g. moneyDigits = 8 must be interpret as business value multiplied by 10^8, then real balance would be 10053099944 / 10^8 = 100.53099944. Affects managerBonus, managerDelta, ibBonus, ibDelta.
@@ -478,8 +471,7 @@ enum ProtoOAChangeBalanceType {
     BALANCE_DEPOSIT_TO_SUBACCOUNT = 31; // Deposit to subaccount on creation (cTrader Copy).
     BALANCE_WITHDRAW_FROM_SUBACCOUNT = 32; // Manual user's withdraw from subaccount (cTrader Copy), to parent account.
     BALANCE_DEPOSIT_FROM_SUBACCOUNT = 33; // Manual user's deposit to subaccount (cTrader Copy), from parent account.
-
-BALANCE_WITHDRAW_COPY_FEE = 34; // Withdrawal fees to Strategy Provider.
+    BALANCE_WITHDRAW_COPY_FEE = 34; // Withdrawal fees to Strategy Provider.
     BALANCE_WITHDRAW_INACTIVITY_FEE = 35; // Withdraw of inactivity fee from the balance.
     BALANCE_DEPOSIT_TRANSFER = 36; // Deposit within the same server (from another account).
     BALANCE_WITHDRAW_TRANSFER = 37; // Withdraw within the same server (to another account).
@@ -537,8 +529,7 @@ message ProtoOAClosePositionDetail {
     optional int64 closedVolume = 7; // Closed volume in cents.
     optional int64 balanceVersion = 8; // Balance version of the account related to closing deal operation.
     optional uint32 moneyDigits = 9; // Specifies the exponent of the monetary values. E.g. moneyDigits = 8 must be interpret as business value multiplied by 10^8, then real balance would be 10053099944 / 10^8 = 100.53099944. Affects grossProfit, swap, commission, balance, pnlConversionFee.
-
-optional int64 pnlConversionFee = 10; // Fee for conversion applied to the Deal in account's ccy when trader symbol's quote asset id <> ProtoOATrader.depositAssetId.
+    optional int64 pnlConversionFee = 10; // Fee for conversion applied to the Deal in account's ccy when trader symbol's quote asset id <> ProtoOATrader.depositAssetId.
 }
 
 /** Trendbar period ENUM. */
@@ -562,7 +553,7 @@ enum ProtoOATrendbarPeriod {
 /** Historical Trendbar entity. */
 message ProtoOATrendbar {
     required int64 volume = 3; // Bar volume in ticks.
-    optional ProtoOATrendbarPeriod period = 4; // Bar period.
+    optional ProtoOATrendbarPeriod period = 4 [default = M1]; // Bar period.
     optional int64 low = 5; // Low price of the bar.
     optional uint64 deltaOpen = 6; // Delta between open and low price. open = low + deltaOpen.
     optional uint64 deltaClose = 7; // Delta between close and low price. close = low + deltaClose.
@@ -712,8 +703,7 @@ message ProtoOAHoliday {
 
 message ProtoOADynamicLeverage {
     required int64 leverageId = 1; // Unique ID of dynamic leverage.
-
-repeated ProtoOADynamicLeverageTier tiers = 2; // Tiers sorted by volume. Last tier's leverage is applied also to volume above specified.
+    repeated ProtoOADynamicLeverageTier tiers = 2; // Tiers sorted by volume. Last tier's leverage is applied also to volume above specified.
 }
 
 message ProtoOADynamicLeverageTier {

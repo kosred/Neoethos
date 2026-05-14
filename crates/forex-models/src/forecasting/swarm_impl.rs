@@ -1693,6 +1693,7 @@ fn forecast_distance_ratio(left: &[f32], right: &[f32], scale: f32) -> f32 {
     compared.iter().copied().sum::<f32>() / compared.len() as f32 / scale.max(1e-6)
 }
 
+#[cfg(feature = "swarm-forecasting")]
 fn prune_external_candidates(
     snapshot: &SwarmForecastSnapshot,
     candidates: Vec<(String, ModelType, Vec<f32>)>,

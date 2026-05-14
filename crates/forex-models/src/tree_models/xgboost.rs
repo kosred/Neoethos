@@ -273,6 +273,7 @@ impl XGBoostExpert {
         params
     }
 
+    #[cfg(feature = "xgboost")]
     fn runtime_artifact(&self) -> XGBoostRuntimeArtifact {
         XGBoostRuntimeArtifact {
             configured_params: self.config.params.clone(),
