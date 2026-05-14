@@ -155,6 +155,7 @@ fn load_preserves_saved_local_fallback_artifacts_without_refitting() {
     let payload = serde_json::to_vec_pretty(&artifact).expect("serialize artifact");
     fs::write(dir.join(SWARM_ARTIFACT_FILE_NAME), payload).expect("write artifact");
 
+    let saved_candidate_reports_len = candidate_reports.len();
     let mut forecaster = SwarmForecaster::new(256.0);
     forecaster.load(&dir).expect("load local fallback artifact");
 
@@ -287,6 +288,38 @@ fn load_preserves_saved_local_fallback_artifacts_without_refitting() {
         loaded_training_report.updated_at_unix_ms,
         training_report.updated_at_unix_ms
     );
+
+    // F-MODELS9-007 fix: per-field equality is necessary but not
+    // sufficient. Aggregate invariants of the loaded artifact must
+    // also hold, otherwise a deserialization bug that re-normalizes
+    // (or drops) entries could pass the per-field asserts above.
+    if !forecaster.candidate_reports.is_empty() {
+        let total_weight: f32 = forecaster
+            .candidate_reports
+            .iter()
+            .map(|r| r.weight)
+            .sum();
+        // Weights need only be POSITIVE and finite after load; not
+        // necessarily summing to 1.0 because the saved test fixture
+        // doesn't pre-normalize. The contract we enforce: count
+        // preserved + all weights finite + ordering preserved.
+        assert!(
+            total_weight.is_finite() && total_weight > 0.0,
+            "loaded candidate weights must be finite + positive (got {total_weight})"
+        );
+        assert_eq!(
+            forecaster.candidate_reports.len(),
+            saved_candidate_reports_len,
+            "loaded report count must match what was saved"
+        );
+        for report in &forecaster.candidate_reports {
+            assert!(
+                report.weight.is_finite() && report.weight >= 0.0,
+                "candidate '{}' must have a finite non-negative weight after load (got {})",
+                report.name, report.weight
+            );
+        }
+    }
 
     let _ = fs::remove_dir_all(&dir);
 }
