@@ -11,6 +11,10 @@ pub struct OpenAIScorer {
 
 impl OpenAIScorer {
     pub fn new() -> Result<Self> {
+        // DOCUMENTED-DEFAULT: an empty key disables this scorer (see
+        // `analyze_sentiment`, which short-circuits with a warn). We
+        // deliberately do not fail construction so the rest of the news
+        // pipeline can run without an OPENAI_API_KEY.
         let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
         Ok(Self {
             client: Client::new(),
@@ -52,7 +56,22 @@ impl OpenAIScorer {
             .as_str()
             .context("Invalid OpenAI response")?;
 
-        let score: f64 = content.trim().parse().unwrap_or(0.0);
+        let trimmed = content.trim();
+        let score: f64 = match trimmed.parse::<f64>() {
+            Ok(v) => v,
+            Err(err) => {
+                // Surface model-response drift: a non-numeric reply means the
+                // prompt contract slipped (model upgrade, content filter, etc.)
+                // and the caller deserves to know rather than getting silent 0.0.
+                warn!(
+                    target: "forex_news::openai",
+                    response = %trimmed,
+                    error = %err,
+                    "OpenAI sentiment scorer: response was not parseable as f64; returning 0.0"
+                );
+                0.0
+            }
+        };
         Ok(score.clamp(-1.0, 1.0))
     }
 }

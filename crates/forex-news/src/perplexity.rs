@@ -11,6 +11,9 @@ pub struct PerplexitySearcher {
 
 impl PerplexitySearcher {
     pub fn new() -> Result<Self> {
+        // DOCUMENTED-DEFAULT: an empty key disables this searcher (see
+        // `search_news`, which short-circuits with a warn). Construction
+        // is intentionally infallible.
         let api_key = env::var("PERPLEXITY_API_KEY").unwrap_or_default();
         Ok(Self {
             client: Client::new(),
