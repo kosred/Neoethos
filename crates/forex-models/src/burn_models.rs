@@ -96,27 +96,19 @@ pub struct BurnDeviceSelection {
 }
 
 pub fn normalize_burn_device_policy(policy: &str) -> String {
+    // Burn-specific synonym: `"default"` is the burn ecosystem's term
+    // for "let the framework pick"; map it to our `"auto"` canonical
+    // token before delegating to the shared helper.
     let normalized = policy.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        "auto".to_string()
-    } else if matches!(
-        normalized.as_str(),
-        "cuda" | "wgpu" | "rocm" | "metal" | "vulkan"
-    ) {
-        "gpu".to_string()
-    } else if normalized == "default" {
-        "auto".to_string()
-    } else if let Some(index) = normalized
-        .strip_prefix("cuda:")
-        .or_else(|| normalized.strip_prefix("wgpu:"))
-        .or_else(|| normalized.strip_prefix("rocm:"))
-        .or_else(|| normalized.strip_prefix("metal:"))
-        .or_else(|| normalized.strip_prefix("vulkan:"))
-    {
-        format!("gpu:{index}")
-    } else {
-        normalized
+    if normalized == "default" {
+        return "auto".to_string();
     }
+    // Burn also accepts the `wgpu` / `wgpu:N` form because the burn-wgpu
+    // backend exists; statistical / runtime / rl callers do not, so it
+    // goes in as an `extra_prefixes` token rather than into the shared
+    // vendor list. See Batch 9 consolidation (docs/audits/research/
+    // gpu_consolidation_audit.md) for the contract.
+    crate::common::normalize_vendor_device_policy(&normalized, &["wgpu"])
 }
 
 fn is_supported_burn_device_policy(normalized: &str) -> bool {

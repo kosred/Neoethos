@@ -160,32 +160,19 @@ impl PortfolioManager {
         Ok(())
     }
 
-    pub fn get_weight(&self, strategy_name: &str) -> f64 {
-        // FIXME(silent-fallback): caller plumbing required (F-CORE2-003)
-        // Public API returns f64, so a missing strategy quietly produces 0.0.
-        // Callers placing real orders should use `try_get_weight` once added,
-        // or check `has_strategy(name)` before relying on this value.
-        match self.strategy_weights.get(strategy_name) {
-            Some(weight) => *weight,
-            None => {
-                tracing::warn!(
-                    target: "forex_core::portfolio",
-                    strategy = strategy_name,
-                    "get_weight: unknown strategy, returning 0.0 (F-CORE2-003)"
-                );
-                0.0
-            }
-        }
-    }
-
-    /// Returns `Some(weight)` if the strategy is known, otherwise `None`.
-    /// Prefer this in safety-critical paths (sizing, risk gate).
-    pub fn try_get_weight(&self, strategy_name: &str) -> Option<f64> {
+    /// Returns the optimized weight for `strategy_name` if it exists in the
+    /// portfolio, or `None` if the strategy is unknown.
+    ///
+    /// API designed so safety-critical callers (order sizing, risk gate)
+    /// CANNOT silently see 0.0 for an absent strategy — the v0.4.1 audit
+    /// (F-CORE2-003) flagged the previous `-> f64` signature for hiding
+    /// "strategy not in portfolio" behind "strategy has zero weight".
+    /// Display / diagnostic callers can use `.unwrap_or(0.0)` explicitly.
+    pub fn get_weight(&self, strategy_name: &str) -> Option<f64> {
         self.strategy_weights.get(strategy_name).copied()
     }
 
-    /// Quick membership check used by callers that need to validate a name
-    /// before sizing a position.
+    /// Quick membership check, equivalent to `get_weight(name).is_some()`.
     pub fn has_strategy(&self, strategy_name: &str) -> bool {
         self.strategy_weights.contains_key(strategy_name)
     }
@@ -216,9 +203,15 @@ mod tests {
             .optimize_weights(&names, &returns)
             .expect("portfolio optimization should succeed");
 
-        let trend_a = manager.get_weight("trend_a");
-        let trend_b = manager.get_weight("trend_b");
-        let mean_rev = manager.get_weight("mean_rev");
+        let trend_a = manager
+            .get_weight("trend_a")
+            .expect("trend_a should be in portfolio");
+        let trend_b = manager
+            .get_weight("trend_b")
+            .expect("trend_b should be in portfolio");
+        let mean_rev = manager
+            .get_weight("mean_rev")
+            .expect("mean_rev should be in portfolio");
         assert!(trend_a > 0.0);
         assert!(trend_b > 0.0);
         assert!(mean_rev > 0.0);
@@ -230,5 +223,8 @@ mod tests {
             trend_a + trend_b < 0.95,
             "correlated strategies should not consume the entire budget"
         );
+        // New API contract: unknown strategies return None, not 0.0.
+        assert!(manager.get_weight("nonexistent").is_none());
+        assert!(!manager.has_strategy("nonexistent"));
     }
 }
