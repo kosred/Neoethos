@@ -64,6 +64,142 @@ pub fn render(
                 "Fetch missing historical bars into the local vortex cache for research and training.",
             );
 
+            // ── Data folder + browse + discovery preview (2026-05-14) ──
+            //
+            // Operator concern: "Ένα θέμα του UI και του cli είναι ότι
+            // δεν βοηθά τον χρήστη να πλοηγηθεί στα αρχεία και να δώσει
+            // πιθανό φάκελο που υπάρχουν υποφακέλους με τα δεδομένα."
+            //
+            // We surface a native folder picker so the user does not
+            // have to hand-type the data-root path, then run
+            // `DatasetDiscovery::scan` against the chosen folder and
+            // show a compact inline summary (file count by format,
+            // symbol count, timeframes, skipped count) so they can
+            // confirm before kicking off the import.
+            let mut data_dir_text = state.runtime.data_dir.display().to_string();
+            ui.horizontal(|ui| {
+                ui.label("Data Folder");
+                let edit = ui.text_edit_singleline(&mut data_dir_text);
+                if edit.changed() {
+                    state.runtime.data_dir = std::path::PathBuf::from(&data_dir_text);
+                }
+                if ui.button("Browse…").clicked() {
+                    let start_dir = if state.runtime.data_dir.is_dir() {
+                        state.runtime.data_dir.clone()
+                    } else {
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    };
+                    if let Some(folder) = rfd::FileDialog::new()
+                        .set_title("Select data folder")
+                        .set_directory(&start_dir)
+                        .pick_folder()
+                    {
+                        state.runtime.data_dir = folder.clone();
+                        // Eagerly run discovery so the preview shows
+                        // immediately after the picker closes.
+                        if let Ok(report) = forex_data::DatasetDiscovery::scan(&folder) {
+                            if let Ok(mut cache) = discovery_cache().lock() {
+                                *cache = Some((folder, report));
+                            }
+                        }
+                    }
+                }
+                if ui.button("Scan").clicked()
+                    && let Ok(report) =
+                        forex_data::DatasetDiscovery::scan(&state.runtime.data_dir)
+                {
+                    if let Ok(mut cache) = discovery_cache().lock() {
+                        *cache = Some((state.runtime.data_dir.clone(), report));
+                    }
+                }
+            });
+
+            // Inline discovery preview: a 3–4 row compact table.
+            if let Ok(guard) = discovery_cache().lock() {
+                if let Some((scanned_root, report)) = guard.as_ref() {
+                    if *scanned_root == state.runtime.data_dir {
+                        ui.add_space(4.0);
+                        theme::section_frame(ui.style()).show(ui, |ui| {
+                            ui.strong("Dataset Discovery");
+                            if report.is_empty() && report.skipped.is_empty() {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 120, 60),
+                                    format!(
+                                        "no data files found at depth ≤ {}",
+                                        forex_data::MAX_WALK_DEPTH
+                                    ),
+                                );
+                            } else {
+                                egui::Grid::new("bootstrap_discovery_grid")
+                                    .num_columns(2)
+                                    .spacing([16.0, 4.0])
+                                    .show(ui, |ui| {
+                                        let formats: Vec<String> = report
+                                            .format_counts()
+                                            .into_iter()
+                                            .map(|(f, n)| format!("{}: {}", f.as_str(), n))
+                                            .collect();
+                                        ui.label("Files");
+                                        ui.label(format!(
+                                            "{}  ({})",
+                                            report.entries.len(),
+                                            formats.join(", ")
+                                        ));
+                                        ui.end_row();
+
+                                        let symbols = report.symbols();
+                                        ui.label("Symbols");
+                                        ui.label(format!(
+                                            "{}  ({})",
+                                            symbols.len(),
+                                            if symbols.len() > 6 {
+                                                format!(
+                                                    "{}, …",
+                                                    symbols
+                                                        .iter()
+                                                        .take(6)
+                                                        .cloned()
+                                                        .collect::<Vec<_>>()
+                                                        .join(", ")
+                                                )
+                                            } else {
+                                                symbols.join(", ")
+                                            }
+                                        ));
+                                        ui.end_row();
+
+                                        ui.label("Timeframes");
+                                        ui.label(report.timeframes().join(", "));
+                                        ui.end_row();
+
+                                        if !report.skipped.is_empty() {
+                                            let summary: Vec<String> = report
+                                                .skip_counts_by_category()
+                                                .into_iter()
+                                                .map(|(cat, n)| format!("{n} {cat}"))
+                                                .collect();
+                                            ui.label("Skipped");
+                                            // Warning chip when any file
+                                            // is skipped — operator must
+                                            // see this before confirming.
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(220, 160, 40),
+                                                format!(
+                                                    "{}  ({})",
+                                                    report.skipped.len(),
+                                                    summary.join("; ")
+                                                ),
+                                            );
+                                            ui.end_row();
+                                        }
+                                    });
+                            }
+                        });
+                    }
+                }
+            }
+            ui.add_space(6.0);
+
             ui.horizontal(|ui| {
                 ui.label("Pairs");
                 ui.text_edit_singleline(&mut state.bootstrap_form.pairs_input);
