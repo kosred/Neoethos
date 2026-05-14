@@ -667,12 +667,12 @@ pub fn build_get_trendbars_request(
 pub fn trendbar_period_value(label: &str) -> Result<i32> {
     // Map our canonical timeframe labels to cTrader's wire-protocol
     // period codes. cTrader itself supports a slightly different set
-    // (M2/M4/M10 instead of our H2), but we deliberately only emit the
-    // canonical 12 to keep every subsystem (UI, training, discovery)
-    // aligned. M2/M4/M10 and any non-canonical label are rejected.
+    // (M2/M4/M10) that we deliberately omit; we only emit the canonical
+    // 11 to keep every subsystem (UI, training, discovery) aligned.
+    // M2/M4/M10 and any non-canonical label are rejected.
     //
-    // Note: H2 is in our canonical set but cTrader does not natively
-    // expose H2; that timeframe must be resampled client-side from H1.
+    // H2 is intentionally absent from the canonical set because cTrader
+    // does not natively expose `ProtoOATrendbarPeriod::H2`.
     let upper = label.trim().to_ascii_uppercase();
     if !forex_core::is_canonical_timeframe(&upper) {
         return Err(anyhow!(
@@ -692,9 +692,6 @@ pub fn trendbar_period_value(label: &str) -> Result<i32> {
         "D1" => Ok(12),
         "W1" => Ok(13),
         "MN1" => Ok(14),
-        "H2" => Err(anyhow!(
-            "cTrader has no native H2 trendbar period; resample from H1 client-side"
-        )),
         other => Err(anyhow!(
             "unsupported cTrader trendbar period label {} (canonical but unmapped)",
             other

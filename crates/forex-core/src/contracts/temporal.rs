@@ -13,8 +13,17 @@ use super::{
 /// Order is from highest resolution (M1) to lowest (MN1) and is
 /// load-bearing: callers iterate it to construct UI selectors and
 /// resample priorities.
+// Operator decision (2026-05-14, latest instruction): H2 is REMOVED
+// from the canonical timeframe list. cTrader's `ProtoOATrendbarPeriod`
+// enum does not natively expose H2 (see
+// `docs/audits/research/ctrader_api_reference.md` topic 4), and the
+// operator chose not to maintain a client-side resample path for it.
+// The canonical 11 are the timeframes that round-trip natively through
+// every supported broker backend. Do NOT re-add H2 — the resample
+// helper for it has been deleted, and discovery / training / UI all
+// derive their selectors from this list.
 pub const CANONICAL_TIMEFRAMES: &[&str] = &[
-    "M1", "M3", "M5", "M15", "M30", "H1", "H2", "H4", "H12", "D1", "W1", "MN1",
+    "M1", "M3", "M5", "M15", "M30", "H1", "H4", "H12", "D1", "W1", "MN1",
 ];
 
 /// Returns true if `tf` (case-insensitive) is one of the canonical

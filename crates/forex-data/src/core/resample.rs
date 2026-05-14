@@ -8,6 +8,9 @@ pub fn parse_timeframe_to_minutes(tf: &str) -> Result<i64> {
     }
     match tf.as_str() {
         "H1" => Ok(60),
+        // H2 is canonical (by operator requirement) but not native at
+        // cTrader; this row makes `resample_ohlcv(h1_bars, "H2")` work so
+        // we can aggregate two consecutive H1 candles into one H2 candle.
         "H2" => Ok(120),
         "H4" => Ok(240),
         "H6" => Ok(360),
