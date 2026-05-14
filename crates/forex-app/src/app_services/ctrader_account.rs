@@ -397,9 +397,19 @@ pub fn parse_deal_list_response(response_json: &str) -> Result<Vec<CTraderDealSn
                 .as_ref()
                 .map(|detail| scaled_money(detail.swap, required_money_digits(detail.money_digits, "deal.close.money_digits")));
             let pnl_conversion_fee = deal.close_position_detail.as_ref().and_then(|detail| {
-                detail
-                    .pnl_conversion_fee
-                    .map(|fee| scaled_money(fee, detail.money_digits.unwrap_or(0)))
+                detail.pnl_conversion_fee.map(|fee| {
+                    // F-CORE2 audit: previously used `unwrap_or(0)` for money_digits,
+                    // which would 10^N-inflate the fee if the broker payload omitted
+                    // the field. Use the shared helper that logs and defaults to 2
+                    // (cTrader's documented account currency digit count).
+                    scaled_money(
+                        fee,
+                        required_money_digits(
+                            detail.money_digits,
+                            "deal.close.pnl_conversion_fee.money_digits",
+                        ),
+                    )
+                })
             });
             let net_profit = gross_profit.map(|gross| {
                 gross + fee.unwrap_or(0.0) + swap.unwrap_or(0.0) + pnl_conversion_fee.unwrap_or(0.0)

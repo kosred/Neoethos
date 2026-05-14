@@ -1,4 +1,5 @@
 pub mod all_indicators;
+pub mod discover;
 pub mod feature_registry;
 pub mod features;
 pub mod hpc_ta;
@@ -13,5 +14,6 @@ pub mod session_features;
 pub mod slicing;
 pub mod smc;
 pub mod timestamps;
+pub mod to_vortex;
 pub mod universal_importer;
 pub mod vortex_io;

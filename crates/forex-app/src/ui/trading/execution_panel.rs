@@ -288,7 +288,14 @@ pub fn render(
                     response = response.on_hover_text(reason);
                 }
                 if response.clicked() {
-                    let _ = session.start_connect(tx.clone());
+                    if let Err(err) = session.start_connect(tx.clone()) {
+                        tracing::warn!(
+                            target: "forex_app::ui::trading::execution_panel",
+                            error = %err,
+                            "Connect to Broker click: session.start_connect failed"
+                        );
+                        state.status_msg = format!("Connect failed: {err}");
+                    }
                 }
             }
 

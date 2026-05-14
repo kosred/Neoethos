@@ -4112,6 +4112,7 @@ dependencies = [
  "vortex-io",
  "vortex-layout",
  "vortex-session",
+ "walkdir",
 ]
 
 [[package]]

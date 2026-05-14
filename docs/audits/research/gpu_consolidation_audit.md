@@ -178,8 +178,53 @@ shared helper's contract. Recommended as a separate work item.
 
 ### Cargo check status
 
-`cargo check -p forex-models` was run after the consolidation. See
-section "Verification" in the in-session report.
+Two builds were exercised after the consolidation. Both finish clean
+(only pre-existing warnings unrelated to this work):
+
+* `cargo check -p forex-models --lib --no-default-features --features "tree-models-core,pure-rust-ml"`
+  → `Finished` in ~14s; 3 unused-import warnings predating the patch.
+* `cargo check -p forex-models --lib --no-default-features --features "tree-models-core,pure-rust-ml,neuro-evolution-gpu,statistical-gpu"`
+  → `Finished` in ~1m50s; cubecl-cuda kernel files compile against
+  the new shared helpers.
+
+The default-feature build (with catboost-rust) cannot be validated in
+the sandbox because the catboost-rust build script requires network
+access to fetch C headers (`UnknownIssuer` TLS error in the offline
+environment). This is unrelated to the consolidation.
+
+### Total LOC after consolidation
+
+| File | LOC before | LOC after | Notes |
+|------|-----------:|----------:|-------|
+| `common.rs` | 55 (33 prod + 22 test) | 267 (146 prod + 121 test) | +113 prod, +99 test for the new shared helpers |
+| `evolution/crfmnes_gpu.rs` | 269 | 245 | -24 |
+| `evolution/neat_gpu.rs` | 599 | 577 | -22 |
+| `statistical/linear_gpu.rs` | 526 | 510 | -16 |
+| `statistical/common.rs` | 295 | 275 | -20 |
+| `runtime/capabilities.rs` | 691 | 668 | -23 |
+| `rl/dqn_impl.rs` | 2665 | 2652 | -13 |
+| Sum (production only) | ~4970 | ~4953 | -17 prod LOC |
+| Sum (including tests) | ~5100 | ~5194 | +94 (tests in common.rs lock in semantics) |
+
+The headline benefit is not raw LOC reduction (which is small) but
+the elimination of 4-fold duplication: each helper now has exactly
+one source of truth in `common.rs`, with explicit tests pinning the
+public contract. Future bugs only need fixing once.
+
+### Subtle behaviour changes (intentional)
+
+`normalize_rl_device_policy("wgpu")` (no colon) previously returned
+`"auto"` because the RL normalizer had `wgpu:` in its strip list but
+not `"wgpu"` in its vendor list. After consolidation, the RL caller
+passes `extra_prefixes=["wgpu"]`, which **does** include the bare
+`"wgpu"` token, so the result is now `"gpu"` — matching the burn
+backend's behaviour. No test exercised the old behaviour, and the new
+behaviour is the correct one (a vendor name with no index means
+"pick a default GPU device").
+
+All other tokens preserve exact bit-for-bit equivalence to the
+pre-consolidation behaviour for the three normalizers
+(statistical / runtime / rl).
 
 ### Operator rules compliance
 

@@ -420,6 +420,22 @@ fn quarantine_path(data_root: &Path, src: &Path) -> PathBuf {
 
 // ─── Format parsers ────────────────────────────────────────────────────
 
+// Public re-exports for `crate::core::to_vortex`. The conversion
+// pipeline reuses these parsers exactly so format-detection logic
+// stays in one place (see to_vortex.rs module docs).
+pub fn parse_csv_public(path: &Path, tab_separated: bool) -> Result<Ohlcv> {
+    parse_csv(path, tab_separated)
+}
+pub fn parse_json_public(path: &Path) -> Result<Ohlcv> {
+    parse_json(path)
+}
+pub fn parse_jsonl_public(path: &Path) -> Result<Ohlcv> {
+    parse_jsonl(path)
+}
+pub fn parse_parquet_public(path: &Path) -> Result<Ohlcv> {
+    parse_parquet(path)
+}
+
 /// Parse a CSV / TSV file, auto-detecting which header column maps to
 /// timestamp / open / high / low / close / volume.
 fn parse_csv(path: &Path, tab_separated: bool) -> Result<Ohlcv> {
