@@ -105,14 +105,15 @@ pub fn render(
                 );
             });
 
-            // audit-fix F8: dereference the Zeroizing wrapper for the
-            // egui text-edit buffer; we re-wrap on assign so the cleared
-            // backing string is wiped on drop.
+            // audit-fix F8: surface the secret only at the egui text-edit
+            // boundary via secrecy::ExposeSecret, then re-wrap on assign
+            // so the SecretString destructor zeroes the bytes on drop.
+            use secrecy::ExposeSecret;
             let mut api_key: String = state
                 .llm_news_filter
                 .api_key
-                .as_deref()
-                .cloned()
+                .as_ref()
+                .map(|s| s.expose_secret().to_string())
                 .unwrap_or_default();
             ui.horizontal(|ui| {
                 ui.label("API Key");
@@ -125,7 +126,7 @@ pub fn render(
                 state.llm_news_filter.api_key = None;
             } else {
                 state.llm_news_filter.api_key =
-                    Some(zeroize::Zeroizing::new(api_key));
+                    Some(secrecy::SecretString::from(api_key));
             }
 
             ui.checkbox(

@@ -1,5 +1,5 @@
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
-use zeroize::Zeroizing;
 
 #[derive(Debug, Clone)]
 pub struct NewsEvent {
@@ -11,12 +11,19 @@ pub struct NewsEvent {
 #[derive(Debug, Clone)]
 pub struct NewsFilter {
     pub enabled: bool,
-    /// SECURITY (audit-fix F8): the LLM API key is wrapped in
-    /// [`zeroize::Zeroizing`] so the secret is wiped from memory when the
-    /// `NewsFilter` is dropped or reassigned. Without this, a heap dump
-    /// of a crashed process (or a swapped-out page on disk) could leak
-    /// the operator's OpenAI/Perplexity bearer token.
-    pub api_key: Option<Zeroizing<String>>,
+    /// SECURITY: the LLM API key is wrapped in [`secrecy::SecretString`]
+    /// (a `SecretBox<str>` — a `Box<str>` that cannot reallocate, so the
+    /// secret bytes have a single fixed location in memory which is
+    /// zeroized on drop). The `Debug` impl masks the value as `[REDACTED]`
+    /// and `serde::Serialize` is opt-in, so accidental logging or
+    /// serialization cannot exfiltrate the operator's OpenAI/Perplexity
+    /// bearer token. Access the underlying string via [`ExposeSecret`].
+    ///
+    /// The zeroize upstream docs explicitly recommend `secrecy` over
+    /// `Zeroizing<String>` for string-shaped secrets because `String`'s
+    /// realloc-on-push can leave un-zeroed copies of the secret on the
+    /// heap.
+    pub api_key: Option<SecretString>,
     pub llm_provider: String, // "openai" or "perplexity"
     pub blackout_minutes_before: i64,
     pub blackout_minutes_after: i64,
@@ -39,9 +46,9 @@ impl NewsFilter {
 
     pub fn set_credentials(&mut self, provider: String, api_key: String) {
         self.llm_provider = provider;
-        // audit-fix F8: wrap in Zeroizing so the prior value (if any) is
-        // overwritten on drop rather than left on the heap.
-        self.api_key = Some(Zeroizing::new(api_key));
+        // Wrap into a `SecretString` (`SecretBox<str>`): the previous
+        // value (if any) is dropped, which zeroes the underlying buffer.
+        self.api_key = Some(SecretString::from(api_key));
     }
 
     /// Run synchronously (should be spawned in a dedicated blocking thread by the app)
@@ -53,11 +60,17 @@ impl NewsFilter {
             return Ok("SAFE".to_string());
         }
 
-        // audit-fix F8: dereference the `Zeroizing<String>` wrapper to get
-        // a `&str` view; the wrapper still owns and will wipe the bytes.
-        let api_key: &str = match self.api_key.as_deref() {
-            Some(k) if !k.trim().is_empty() => k,
-            _ => return Ok("SAFE".to_string()),
+        // `expose_secret()` is the deliberate API that surfaces the
+        // secret only at the point of use; every call-site is grep-able.
+        let api_key: &str = match self.api_key.as_ref() {
+            Some(s) => {
+                let revealed: &str = s.expose_secret();
+                if revealed.trim().is_empty() {
+                    return Ok("SAFE".to_string());
+                }
+                revealed
+            }
+            None => return Ok("SAFE".to_string()),
         };
 
         let prompt = format!(

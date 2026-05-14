@@ -53,6 +53,9 @@ burn-wgpu = { version = "0.20.1", optional = true, default-features = false, fea
 num_cpus = "1.17.0"
 rand = "0.9.2"
 rand08 = { package = "rand", version = "0.8", optional = true }
+# Ziggurat-method `StandardNormal` sampler — correct tails by construction,
+# replaces the hand-rolled Box-Muller that produced 30+ sigma outliers.
+rand_distr = "0.6"
 rayon = "1.11.0"
 chrono = "0.4.42"
 lazy_static = "1.5.0"

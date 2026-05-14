@@ -18,7 +18,9 @@ anyhow = "1.0.100"
 chrono = "0.4"
 keyring = "3.6.3"
 open = "5.3.2"
-reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# reqwest >= 0.13.3 logs only the host, not the full URL — protects client_secret from leaking to debug/trace logs.
+# In 0.13, `form`/`query` are opt-in features (per the 0.13.0 CHANGELOG).
+reqwest = { version = "0.13.3", default-features = false, features = ["blocking", "json", "rustls", "query", "form"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 toml = "0.8.20"
@@ -29,7 +31,9 @@ futures = "0.3.31"
 protobuf = "4.31.1-release"
 rand = { workspace = true }
 base64 = "0.22"
-zeroize = "1.7"
+# audit-fix F8: SecretString is the safe wrapper for string-shaped
+# secrets — see forex-core/Cargo.toml for the rationale.
+secrecy = "0.10"
 
 
 

@@ -309,16 +309,13 @@ pub fn launch_now(shared: &mut AppShared) {
     let root = form.value_for("Data root").unwrap_or("data").to_string();
     let models_dir = form.value_for("Models dir").unwrap_or("cache/models").to_string();
 
-    // train command doesn't honor --root; set FOREX_BOT_DATA_ROOT for
-    // the child. Rust 2024 marks env mutation unsafe (it's not
-    // thread-safe), but the TUI's main thread is the only place that
-    // touches env, so this is fine in practice.
-    // SAFETY: single-threaded mutation; no other thread reads env
-    // concurrently while we're setting it here.
-    unsafe {
-        std::env::set_var("FOREX_BOT_DATA_ROOT", &root);
-    }
-
+    // train command doesn't honor --root; the training_orchestrator reads
+    // FOREX_BOT_DATA_ROOT instead. We inject it on the child subprocess
+    // only (via Command::env in spawn_with_env) — NEVER on the parent TUI
+    // process. The TUI is already multi-threaded by the time this runs
+    // (tokio runtime, rayon worker pool, ratatui input thread, ...) and
+    // per std::env::set_var docs, on Linux/macOS the only safe option is
+    // to never mutate the parent env after threads have spawned.
     let args = vec![
         "train".to_string(),
         "--symbol".to_string(),
@@ -328,6 +325,7 @@ pub fn launch_now(shared: &mut AppShared) {
         "--models-dir".to_string(),
         models_dir,
     ];
-    shared.jobs.spawn("train", args);
+    let envs = vec![("FOREX_BOT_DATA_ROOT".to_string(), root)];
+    shared.jobs.spawn_with_env("train", args, envs);
     shared.status = "Spawned train".to_string();
 }

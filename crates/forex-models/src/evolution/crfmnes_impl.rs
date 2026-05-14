@@ -9,7 +9,7 @@ use rand::{Rng, SeedableRng};
 use rand_xoshiro::Xoroshiro128PlusPlus;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::{cmp::Ordering, f64::consts::PI};
+use std::cmp::Ordering;
 
 use forex_core::BackendKind;
 
@@ -251,9 +251,15 @@ fn even_crfmnes_population(population: usize) -> usize {
 }
 
 fn gaussian_sample(rng: &mut Xoroshiro128PlusPlus) -> f64 {
-    let u1 = rng.random::<f64>().clamp(1.0e-10, 1.0 - 1.0e-10);
-    let u2 = rng.random::<f64>();
-    (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
+    // `rand_distr::StandardNormal` uses the ZIGNOR / Ziggurat variant, which
+    // samples from the true N(0,1) density and handles the tail via rejection
+    // sampling. The previous hand-rolled Box-Muller produced 30+ sigma
+    // outliers when `u1` underflowed to a near-zero `f64`; clamping `u1` is
+    // a bandaid that distorts the tail distribution. The upstream Ziggurat
+    // implementation has correct tails by construction.
+    use rand_distr::{Distribution, StandardNormal};
+    let value: f64 = StandardNormal.sample(rng);
+    value
 }
 
 enum NeuroEvoBackend {

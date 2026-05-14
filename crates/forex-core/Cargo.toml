@@ -22,8 +22,14 @@ uuid = { version = "1.19.0", features = ["v4", "serde"] }
 nvml-wrapper = { version = "0.11.0", optional = true }
 ndarray = "0.17.2"
 nalgebra = "0.33.0"
-reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls-native-roots", "json", "blocking"] }
-zeroize = { version = "1.7", features = ["zeroize_derive"] }
+# reqwest >= 0.13.3 logs only the host, not the full URL — protects client_secret from leaking to debug/trace logs.
+# In 0.13, `form`/`query` are opt-in features (per the 0.13.0 CHANGELOG).
+reqwest = { version = "0.13.3", default-features = false, features = ["rustls", "json", "blocking", "query", "form"] }
+# API key wrapped in `secrecy::SecretString` (a `Box<str>` that cannot
+# reallocate, zeroized on drop). The zeroize upstream docs explicitly point
+# users to `secrecy` for string-shaped secrets because `Zeroizing<String>`
+# leaves un-zeroed reallocated buffers on the heap.
+secrecy = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.1", features = [

@@ -389,13 +389,16 @@ fn render_intelligence_settings(
                         "API key for the configured LLM provider.",
                     );
                 });
-                // audit-fix F8: dereference the Zeroizing wrapper for the
-                // egui text-edit buffer; re-wrap on assign.
+                // audit-fix F8: surface the secret only at the egui
+                // text-edit boundary via secrecy::ExposeSecret; re-wrap
+                // on assign so the SecretString destructor zeroes the
+                // bytes on drop.
+                use secrecy::ExposeSecret;
                 let mut api_key: String = state
                     .llm_news_filter
                     .api_key
-                    .as_deref()
-                    .cloned()
+                    .as_ref()
+                    .map(|s| s.expose_secret().to_string())
                     .unwrap_or_default();
                 ui.add_sized(
                     [160.0, 24.0],
@@ -404,7 +407,7 @@ fn render_intelligence_settings(
                 state.llm_news_filter.api_key = if api_key.trim().is_empty() {
                     None
                 } else {
-                    Some(zeroize::Zeroizing::new(api_key))
+                    Some(secrecy::SecretString::from(api_key))
                 };
                 ui.end_row();
 

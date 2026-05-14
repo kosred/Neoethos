@@ -600,6 +600,20 @@ fn cmd_auto_loop(args: &[String]) -> Result<()> {
     let settings = resolve_cli_settings(args)?.unwrap_or_else(forex_core::Settings::default);
     let resolved = forex_core::resolved_config::ResolvedConfig::from_settings(&settings);
     let root = parse_root(args, Some(&settings));
+
+    // Set FOREX_BOT_DATA_ROOT for the in-process training orchestrator
+    // (cmd_train doesn't honor --root yet, see training_orchestrator.rs).
+    // SAFETY: called before any thread spawn — we are still in
+    // single-threaded init here (setup_logging and the search-runtime
+    // overrides installer above only mutate tracing/global config; rayon
+    // and tokio threads are not started until cmd_discover/cmd_train run,
+    // which happen below). Per std::env::set_var docs, on Linux/macOS the
+    // ONLY safe option is to mutate env before any other thread exists;
+    // doing this inside the per-symbol loop would race with rayon worker
+    // threads spawned by the prior cmd_discover call.
+    unsafe {
+        std::env::set_var("FOREX_BOT_DATA_ROOT", &root);
+    }
     let symbols_raw = parse_flag(args, "--symbols").unwrap_or_default();
     let tfs_raw = parse_flag(args, "--timeframes").unwrap_or_else(|| {
         resolved.timeframes.canonical_default.join(",")
@@ -704,12 +718,9 @@ fn cmd_auto_loop(args: &[String]) -> Result<()> {
         }
 
         if !skip_training {
-            // Set FOREX_BOT_DATA_ROOT env so the train pipeline finds data
-            // (cmd_train doesn't honor --root yet).
-            // SAFETY: single-threaded auto-loop; no other thread reads env.
-            unsafe {
-                std::env::set_var("FOREX_BOT_DATA_ROOT", &root);
-            }
+            // FOREX_BOT_DATA_ROOT was set at the top of `cmd_auto_loop`
+            // before any thread spawned; cmd_train reads it via
+            // training_orchestrator::train_symbol.
             let train_args: Vec<String> = vec![
                 "train".to_string(),
                 "--symbol".to_string(),

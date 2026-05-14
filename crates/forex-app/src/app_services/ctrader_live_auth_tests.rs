@@ -121,13 +121,15 @@ fn callback_parser_surfaces_ctrader_denial_errors() {
 }
 
 #[test]
-fn token_exchange_request_uses_form_body_not_query_string() {
-    // audit-fix F1: client_secret must NOT appear in the URL. URL is the
-    // host + path only; everything sensitive lives in the form body.
+fn token_exchange_request_uses_documented_query_parameters() {
+    // Per help.ctrader.com/open-api/account-authentication/ the token
+    // endpoint is invoked as `GET /apps/token?...` with all credentials in
+    // the URL query string. We verify the (name, value) list we hand to
+    // `RequestBuilder::query(...)` matches Spotware's documented example.
     let url = build_token_exchange_endpoint_url("https://openapi.ctrader.com");
     assert_eq!(url, "https://openapi.ctrader.com/apps/token");
 
-    let form = build_token_exchange_form(
+    let query = build_token_exchange_form(
         "authorization_code",
         "auth-code-123",
         "http://127.0.0.1:43001/callback",
@@ -136,7 +138,7 @@ fn token_exchange_request_uses_form_body_not_query_string() {
     );
 
     assert_eq!(
-        form,
+        query,
         vec![
             ("grant_type", "authorization_code".to_string()),
             ("code", "auth-code-123".to_string()),
@@ -148,19 +150,20 @@ fn token_exchange_request_uses_form_body_not_query_string() {
 }
 
 #[test]
-fn refresh_token_request_uses_form_body_not_query_string() {
-    // audit-fix F1: refresh path mirrors exchange — secret in body, never URL.
+fn refresh_token_request_uses_documented_query_parameters() {
+    // The refresh path mirrors the exchange path: GET `/apps/token` with
+    // `grant_type=refresh_token` + credentials in the URL query string.
     let url = build_token_exchange_endpoint_url("https://openapi.ctrader.com");
     assert_eq!(url, "https://openapi.ctrader.com/apps/token");
 
-    let form = build_refresh_token_exchange_form(
+    let query = build_refresh_token_exchange_form(
         "refresh-token-123",
         "client-id",
         "secret-456",
     );
 
     assert_eq!(
-        form,
+        query,
         vec![
             ("grant_type", "refresh_token".to_string()),
             ("refresh_token", "refresh-token-123".to_string()),

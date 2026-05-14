@@ -33,7 +33,9 @@ tracing     = "0.1.42"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
 ndarray     = { version = "0.17.2", features = ["rayon"] }
 rayon       = "1.11.0"
-reqwest     = { version = "0.12.24", default-features = false, features = ["rustls-tls-native-roots", "json"] }
+# reqwest >= 0.13.3 logs only the host, not the full URL — protects client_secret from leaking to debug/trace logs.
+# In 0.13, `form`/`query` are opt-in features (per the 0.13.0 CHANGELOG).
+reqwest     = { version = "0.13.3", default-features = false, features = ["rustls", "json", "query", "form"] }
 rand        = "0.9.2"
 nalgebra    = "0.33.0"
 polars      = { version = "0.52.0", features = ["lazy", "dtype-datetime", "timezones"] }

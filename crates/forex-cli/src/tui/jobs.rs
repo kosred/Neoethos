@@ -116,6 +116,20 @@ impl JobManager {
     /// captured as the job's first log line and the job is marked Failed
     /// — never bubbled up, so the TUI keeps running.
     pub fn spawn(&mut self, label: impl Into<String>, args: Vec<String>) -> usize {
+        self.spawn_with_env(label, args, Vec::new())
+    }
+
+    /// Same as [`spawn`] but also injects env vars on the child process
+    /// only. This is the **safe** way to hand a value to a subprocess: it
+    /// uses `Command::env` and never touches the parent (TUI) process's
+    /// environment, so it cannot race with rayon/tokio threads inside the
+    /// TUI that read env (e.g. `ToSocketAddrs` DNS lookups).
+    pub fn spawn_with_env(
+        &mut self,
+        label: impl Into<String>,
+        args: Vec<String>,
+        envs: Vec<(String, String)>,
+    ) -> usize {
         let label = label.into();
         let command_summary = format!("forex-cli {}", args.join(" "));
 
@@ -131,6 +145,9 @@ impl JobManager {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (k, v) in &envs {
+            cmd.env(k, v);
+        }
 
         match cmd.spawn() {
             Ok(mut child) => {
