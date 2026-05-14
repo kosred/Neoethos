@@ -47,6 +47,13 @@ forex-models = { path = "../forex-models", features = ["tree-models", "pure-rust
 ndarray = "0.17.2"
 clap = { version = "4.6.0", features = ["derive"] }
 num_cpus = "1.17.0"
+# Native folder-picker for the "Browse..." button on the data-bootstrap
+# page (operator request 2026-05-14). Latest stable on crates.io as of
+# 2026-05-14: 0.17.2 — verified via crates.io API. Default features
+# pull GTK on Linux; if a packaged Windows build needs to drop those,
+# pin `default-features = false` once we know which file dialog
+# backend ships there.
+rfd = "0.17"
 
 [build-dependencies]
 protoc-bin-vendored = "3.2.0"

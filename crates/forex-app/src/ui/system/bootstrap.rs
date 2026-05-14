@@ -7,6 +7,20 @@ use crate::ui::system::shared::{failed_bootstrap_snapshot, parse_bootstrap_list}
 use crate::ui::theme;
 use eframe::egui;
 
+/// In-memory cache of the most recent `DatasetDiscovery` run so the
+/// preview survives across egui frames without re-walking the disk on
+/// every redraw. Held in a `OnceLock<Mutex<_>>` because egui handlers
+/// are called from a single thread but we keep the lock pattern for
+/// safety if the page is ever extracted into a worker.
+static DISCOVERY_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<Option<(std::path::PathBuf, forex_data::DatasetDiscovery)>>,
+> = std::sync::OnceLock::new();
+
+fn discovery_cache(
+) -> &'static std::sync::Mutex<Option<(std::path::PathBuf, forex_data::DatasetDiscovery)>> {
+    DISCOVERY_CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
 pub fn render(
     ui: &mut egui::Ui,
     state: &mut AppState,
