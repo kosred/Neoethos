@@ -13,6 +13,7 @@ use tracing::{info, warn};
 pub struct ONNXInferenceEngine {
     sessions: HashMap<String, Mutex<Session>>,
     model_outputs: HashMap<String, String>,
+    expected_feature_counts: HashMap<String, usize>,
 }
 
 fn map_ort_error(error: impl std::fmt::Display) -> anyhow::Error {
@@ -32,6 +33,7 @@ impl ONNXInferenceEngine {
         Ok(Self {
             sessions: HashMap::new(),
             model_outputs: HashMap::new(),
+            expected_feature_counts: HashMap::new(),
         })
     }
 
@@ -69,6 +71,15 @@ impl ONNXInferenceEngine {
     }
 
     pub fn load_model(&mut self, name: &str, path: &Path) -> Result<()> {
+        self.load_model_with_feature_count(name, path, None)
+    }
+
+    pub fn load_model_with_feature_count(
+        &mut self,
+        name: &str,
+        path: &Path,
+        expected_feature_count: Option<usize>,
+    ) -> Result<()> {
         let mut builder = Session::builder().map_err(map_ort_error)?;
         builder = builder
             .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -97,6 +108,10 @@ impl ONNXInferenceEngine {
             }
         }
 
+        if let Some(feature_count) = expected_feature_count {
+            self.expected_feature_counts
+                .insert(name.to_string(), feature_count);
+        }
         self.sessions.insert(name.to_string(), Mutex::new(session));
         self.model_outputs
             .insert(name.to_string(), proba_output_name);
@@ -105,6 +120,15 @@ impl ONNXInferenceEngine {
     }
 
     pub fn predict_proba(&self, model_name: &str, features: &Array2<f32>) -> Result<Array2<f32>> {
+        if let Some(expected_feature_count) = self.expected_feature_counts.get(model_name).copied()
+            && features.ncols() != expected_feature_count
+        {
+            anyhow::bail!(
+                "ONNX inference feature mismatch: model expects {} features, got {}",
+                expected_feature_count,
+                features.ncols()
+            );
+        }
         let output_name = self
             .model_outputs
             .get(model_name)

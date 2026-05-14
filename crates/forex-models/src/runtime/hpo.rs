@@ -132,6 +132,15 @@ pub fn time_series_holdout_split(
         return Ok(None);
     }
 
+    let embargo_adjusted_height = frame.height().saturating_sub(embargo_rows);
+    if embargo_adjusted_height < min_train_rows + min_val_rows {
+        tracing::debug!(
+            target: "hpo",
+            "embargo {embargo_rows} consumes too much of frame {}",
+            frame.height()
+        );
+        return Ok(None);
+    }
     let train_end = frame
         .height()
         .saturating_sub(val_rows)

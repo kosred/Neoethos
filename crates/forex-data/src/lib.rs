@@ -8,6 +8,9 @@ use vortex_array::arrays::{PrimitiveArray, StructArray};
 use vortex_array::dtype::NativePType;
 
 pub mod core;
+// Re-export the canonical timeframe list so callers using forex-data
+// can grab it without pulling in forex-core directly.
+pub use forex_core::{CANONICAL_TIMEFRAMES, is_canonical_timeframe};
 pub use crate::core::feature_registry::*;
 pub use crate::core::features::*;
 pub use crate::core::hpc_ta::*;

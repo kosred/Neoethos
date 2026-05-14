@@ -12,16 +12,17 @@ pub mod utils;
 pub use config::Settings;
 pub use contracts::{
     ARTIFACT_SCHEMA_VERSION, ArtifactContractError, ArtifactContractKind, ArtifactEnvelope,
-    ArtifactKind, ArtifactProvenance, BackendKind, CandleTimestampPolicy, DeterminismPolicy,
-    DeviceAssignment, FeatureAvailabilityPolicy, LiveExecutionContract, LivePromotionGate,
-    LiveReadyStrategyArtifact, LiveReadyStrategyArtifactContract, LiveValidationEvidence,
-    ModelRuntimeArtifact, ModelRuntimeArtifactContract, MultiTimeframeAvailabilityPolicy,
-    PortfolioSelectionArtifact, PortfolioSelectionArtifactContract, PromotionReadinessCheck,
-    PromotionReadinessCheckKind, PromotionReadinessReport, PromotionReadinessStatus,
-    RuntimeDegradedReason, RuntimeMode, RuntimeSafetyIssue, RuntimeSafetyReport,
-    SearchCheckpointArtifact, SearchCheckpointArtifactContract, TimestampPolicy, TimestampUnit,
-    TrainingModelArtifact, TrainingModelArtifactContract, TypedArtifactEnvelope,
-    ValidationEvidenceCheck, ValidationEvidenceKind, ValidationEvidenceManifest,
+    ArtifactKind, ArtifactProvenance, BackendKind, CANONICAL_TIMEFRAMES, CandleTimestampPolicy,
+    DeterminismPolicy, DeviceAssignment, FeatureAvailabilityPolicy, LiveExecutionContract,
+    LivePromotionGate, LiveReadyStrategyArtifact, LiveReadyStrategyArtifactContract,
+    LiveValidationEvidence, ModelRuntimeArtifact, ModelRuntimeArtifactContract,
+    MultiTimeframeAvailabilityPolicy, PortfolioSelectionArtifact,
+    PortfolioSelectionArtifactContract, PromotionReadinessCheck, PromotionReadinessCheckKind,
+    PromotionReadinessReport, PromotionReadinessStatus, RuntimeDegradedReason, RuntimeMode,
+    RuntimeSafetyIssue, RuntimeSafetyReport, SearchCheckpointArtifact,
+    SearchCheckpointArtifactContract, TimestampPolicy, TimestampUnit, TrainingModelArtifact,
+    TrainingModelArtifactContract, TypedArtifactEnvelope, ValidationEvidenceCheck,
+    ValidationEvidenceKind, ValidationEvidenceManifest, is_canonical_timeframe,
 };
 pub use system::{
     AcceleratorBackend, AcceleratorDevice, CpuBudget, GpuBudget, HardwareExecutionPlan,

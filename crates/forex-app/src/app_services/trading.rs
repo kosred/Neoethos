@@ -1301,6 +1301,7 @@ impl TradingSession {
                     self.initial_equity.unwrap_or(account_equity),
                     self.day_start_equity.unwrap_or(account_equity),
                     pip_position,
+                    &state.selected_pair,
                 ) {
                     let message = format!("Prop-firm risk gate blocked: {err}");
                     state.status_msg = message.clone();
@@ -3280,6 +3281,7 @@ fn prop_firm_pre_trade_check(
     initial_equity: f64,
     day_start_equity: f64,
     pip_position: i32,
+    symbol_name: &str,
 ) -> anyhow::Result<()> {
     if risk.require_stop_loss && order.stop_loss.is_none() {
         return Err(anyhow::anyhow!(
@@ -3324,21 +3326,63 @@ fn prop_firm_pre_trade_check(
         let pip_multiplier = 10.0_f64.powi(pip_position);
         let pip_distance = (entry_estimate - sl).abs() * pip_multiplier;
 
-        // The order references the cTrader symbol by numeric id; without a
-        // local id→string cache we let `infer_market_cost_profile` fall back
-        // to the `FOREX_BOT_PROP_SYMBOL` env override (default EURUSD) and
-        // the corresponding pip-value heuristics. Operators can also bypass
-        // the heuristic by setting `FOREX_BOT_PROP_PIP_VALUE_PER_LOT`.
-        let cost = forex_search::genetic::strategy_gene::infer_market_cost_profile(
-            "",
-            "",
+        // The risk gate refuses to size a position without authoritative
+        // per-symbol pip-value metadata. Synthesised defaults (empty
+        // symbol → EURUSD heuristic, `* 10.0` USD-per-pip assumption)
+        // are not acceptable in a prop-firm production path: a single
+        // mispriced JPY or cross pair would silently bypass the
+        // configured `risk_per_trade` ceiling. Real metadata must come
+        // from the cTrader symbol-metadata table (populated by the
+        // ctrader connector) or operator-supplied disk overrides.
+        let symbol = symbol_name.trim();
+        if symbol.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Risk gate cannot size order: symbol name was not supplied. \
+                 Refusing to fall back to synthetic pip-value defaults."
+            ));
+        }
+        let metadata = forex_core::symbol_metadata::resolve(symbol).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Risk gate cannot size order: no cTrader symbol metadata for {symbol}. \
+                 Populate data/symbol_metadata.json (or the FOREX_BOT_SYMBOL_METADATA \
+                 override) from the cTrader ProtoOASymbol records before trading."
+            )
+        })?;
+        // Pip value in account currency per standard lot. We hard-fail
+        // for cross pairs without a quote→account conversion rate
+        // rather than silently using a possibly-wrong fallback.
+        // `FOREX_BOT_PROP_ACCOUNT_CURRENCY` / `FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE`
+        // are reserved for operator overrides only — never synthesized.
+        let account_currency = std::env::var("FOREX_BOT_PROP_ACCOUNT_CURRENCY")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Risk gate cannot size order: FOREX_BOT_PROP_ACCOUNT_CURRENCY \
+                     is unset. The account currency must be supplied by the broker \
+                     (cTrader trader profile) — no synthetic default allowed."
+                )
+            })?;
+        let quote_to_account_rate = std::env::var("FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0);
+        let pip_value_per_lot = metadata.pip_value_in_account(
+            &account_currency,
+            quote_to_account_rate,
             Some(entry_estimate),
-            None,
-            None,
         );
-        // `pip_value_per_lot` is account-currency-units per pip per standard
-        // (1.0) lot. cTrader volume is in cents of a standard lot, so divide.
-        let estimated_loss = pip_distance * (order.volume as f64 / 100.0) * cost.pip_value_per_lot;
+        if !pip_value_per_lot.is_finite() || pip_value_per_lot <= 0.0 {
+            return Err(anyhow::anyhow!(
+                "Risk gate cannot size order: pip value for {symbol} in {account_currency} \
+                 is not resolvable (cross-pair without quote→account FX rate?). \
+                 Set FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE or supply a broker-sourced \
+                 conversion rate; no synthetic fallback is permitted."
+            ));
+        }
+        // cTrader volume is in cents of a standard lot, so divide.
+        let estimated_loss = pip_distance * (order.volume as f64 / 100.0) * pip_value_per_lot;
         let max_loss = risk.risk_per_trade * account_equity;
         if estimated_loss > max_loss {
             return Err(anyhow::anyhow!(

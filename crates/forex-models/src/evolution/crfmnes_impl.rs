@@ -251,7 +251,7 @@ fn even_crfmnes_population(population: usize) -> usize {
 }
 
 fn gaussian_sample(rng: &mut Xoroshiro128PlusPlus) -> f64 {
-    let u1 = rng.random::<f64>().clamp(f64::MIN_POSITIVE, 1.0);
+    let u1 = rng.random::<f64>().clamp(1.0e-10, 1.0 - 1.0e-10);
     let u2 = rng.random::<f64>();
     (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
 }

@@ -647,38 +647,46 @@ pub fn parse_callback_request(
     Ok(CTraderCallbackPayload { authorization_code })
 }
 
-pub fn build_token_exchange_url(
-    base_url: &str,
+/// URL for the cTrader token endpoint. The endpoint accepts credentials via
+/// either query string or POST body; we use POST body to keep `client_secret`
+/// out of URL logging surfaces (reqwest's debug output, proxy access logs,
+/// system browser history if the URL leaks via a redirect, etc.).
+pub fn build_token_exchange_endpoint_url(base_url: &str) -> String {
+    format!("{}/apps/token", base_url.trim_end_matches('/'))
+}
+
+/// Build the `application/x-www-form-urlencoded` form body for the
+/// authorization-code grant. The cTrader OpenAPI token endpoint accepts the
+/// same parameters in the body as it does in the query string. Keeping
+/// `client_secret` in the body prevents accidental leakage via URL logging.
+pub fn build_token_exchange_form(
     grant_type: &str,
     code: &str,
     redirect_uri: &str,
     client_id: &str,
     client_secret: &str,
-) -> String {
-    format!(
-        "{}/apps/token?grant_type={}&code={}&redirect_uri={}&client_id={}&client_secret={}",
-        base_url.trim_end_matches('/'),
-        percent_encode(grant_type),
-        percent_encode(code),
-        percent_encode(redirect_uri),
-        percent_encode(client_id),
-        percent_encode(client_secret),
-    )
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("grant_type", grant_type.to_string()),
+        ("code", code.to_string()),
+        ("redirect_uri", redirect_uri.to_string()),
+        ("client_id", client_id.to_string()),
+        ("client_secret", client_secret.to_string()),
+    ]
 }
 
-pub fn build_refresh_token_exchange_url(
-    base_url: &str,
+/// Same as [`build_token_exchange_form`] but for the `refresh_token` grant.
+pub fn build_refresh_token_exchange_form(
     refresh_token: &str,
     client_id: &str,
     client_secret: &str,
-) -> String {
-    format!(
-        "{}/apps/token?grant_type=refresh_token&refresh_token={}&client_id={}&client_secret={}",
-        base_url.trim_end_matches('/'),
-        percent_encode(refresh_token),
-        percent_encode(client_id),
-        percent_encode(client_secret),
-    )
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("grant_type", "refresh_token".to_string()),
+        ("refresh_token", refresh_token.to_string()),
+        ("client_id", client_id.to_string()),
+        ("client_secret", client_secret.to_string()),
+    ]
 }
 
 pub fn build_application_auth_json(

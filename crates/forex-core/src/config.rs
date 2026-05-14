@@ -1,6 +1,7 @@
 // Core configuration structures for Forex trading system
 // Port of src/forex_bot/core/config.py
 
+use crate::contracts::CANONICAL_TIMEFRAMES;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -78,31 +79,23 @@ impl Default for SystemConfig {
             symbols: vec!["EURUSD".to_string()],
             data_dir: PathBuf::from("data"),
             multi_resolution_enabled: true,
-            multi_resolution_timeframes: vec![
-                "M1", "M3", "M5", "M15", "M30", "H1", "H2", "H4", "D1", "W1", "MN1",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
+            multi_resolution_timeframes: CANONICAL_TIMEFRAMES
+                .iter()
+                .map(|tf| (*tf).to_string())
+                .collect(),
             multi_resolution_prefix_base: false,
             indices_path: String::new(),
             use_online_indices: false,
             base_timeframe: "M1".to_string(),
             use_volume_features: true,
-            higher_timeframes: vec![
-                "M1", "M2", "M3", "M4", "M5", "M6", "M10", "M12", "M15", "M20", "M30", "H1", "H2",
-                "H3", "H4", "H6", "H8", "H12", "D1", "W1", "MN1",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
-            required_timeframes: vec![
-                "M1", "M2", "M3", "M4", "M5", "M6", "M10", "M12", "M15", "M20", "M30", "H1", "H2",
-                "H3", "H4", "H6", "H8", "H12", "D1", "W1", "MN1",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
+            higher_timeframes: CANONICAL_TIMEFRAMES
+                .iter()
+                .map(|tf| (*tf).to_string())
+                .collect(),
+            required_timeframes: CANONICAL_TIMEFRAMES
+                .iter()
+                .map(|tf| (*tf).to_string())
+                .collect(),
             enable_level2: false,
             level2_depth_levels: 10,
             history_years: 10,

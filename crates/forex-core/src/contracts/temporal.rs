@@ -5,6 +5,25 @@ use super::{
     MultiTimeframeAvailabilityPolicy, TimestampPolicy, TimestampUnit,
 };
 
+/// Canonical list of timeframes supported across the entire forex-ai
+/// codebase. Every subsystem (config defaults, discovery, training, CLI,
+/// TUI, and cTrader integration) must agree on this list — adding or
+/// removing a timeframe means changing it here and nowhere else.
+///
+/// Order is from highest resolution (M1) to lowest (MN1) and is
+/// load-bearing: callers iterate it to construct UI selectors and
+/// resample priorities.
+pub const CANONICAL_TIMEFRAMES: &[&str] = &[
+    "M1", "M3", "M5", "M15", "M30", "H1", "H2", "H4", "H12", "D1", "W1", "MN1",
+];
+
+/// Returns true if `tf` (case-insensitive) is one of the canonical
+/// supported timeframes.
+pub fn is_canonical_timeframe(tf: &str) -> bool {
+    let upper = tf.trim().to_ascii_uppercase();
+    CANONICAL_TIMEFRAMES.iter().any(|t| *t == upper)
+}
+
 /// Canonical timestamp/feature availability boundary shared by training,
 /// search, backtest, forward-test, and live execution.
 ///

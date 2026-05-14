@@ -98,7 +98,10 @@ fn expand_hoeffding_fallback_features(values: &[f32], basis: HoeffdingFallbackBa
         HoeffdingFallbackBasis::Quadratic => {
             let mut expanded = Vec::with_capacity(values.len().saturating_mul(2));
             expanded.extend_from_slice(values);
-            expanded.extend(values.iter().map(|value| value * value));
+            expanded.extend(values.iter().map(|value| {
+                let clamped = value.clamp(-1.0e9_f32, 1.0e9_f32);
+                clamped * clamped
+            }));
             expanded
         }
     }
@@ -607,7 +610,7 @@ pub struct OnlinePassiveAggressiveExpert {
 impl OnlinePassiveAggressiveExpert {
     pub fn new(aggressiveness: f32, epochs: usize) -> Self {
         Self {
-            aggressiveness: aggressiveness.max(1e-4),
+            aggressiveness: aggressiveness.clamp(1e-4_f32, 100.0_f32),
             epochs: epochs.max(1),
             feature_columns: Vec::new(),
             dataset_rows: 0,
@@ -677,6 +680,13 @@ impl ExpertModel for OnlinePassiveAggressiveExpert {
                         + bias[class_idx];
                 }
 
+                if scores.iter().any(|s| !s.is_finite()) {
+                    tracing::warn!(
+                        target: "online_learner",
+                        "non-finite scores in argmax; skipping update"
+                    );
+                    continue;
+                }
                 let predicted_class = scores
                     .iter()
                     .enumerate()
@@ -694,6 +704,13 @@ impl ExpertModel for OnlinePassiveAggressiveExpert {
 
                 let tau = (margin * sample_weights[*target_class] / (2.0 * norm_sq))
                     .min(self.aggressiveness);
+                if !tau.is_finite() || tau < 0.0 {
+                    tracing::warn!(
+                        target: "online_learner",
+                        "OPA tau non-finite or negative ({tau}); skipping update"
+                    );
+                    continue;
+                }
                 for col in 0..n_cols {
                     weights[(*target_class, col)] += tau * x_row[col];
                     weights[(predicted_class, col)] -= tau * x_row[col];
@@ -931,6 +948,13 @@ fn fit_fallback_online_committee(
             for class_idx in 0..3 {
                 let target = if labels[row] == class_idx { 1.0 } else { 0.0 };
                 let error = (probabilities[(0, class_idx)] - target) * sample_weight;
+                if !error.is_finite() {
+                    tracing::warn!(
+                        target: "online_learner",
+                        "Hoeffding error non-finite; skipping update"
+                    );
+                    continue;
+                }
                 for col in 0..cols {
                     weights[(class_idx, col)] -=
                         lr * (error * x_row[col] + l2 * weights[(class_idx, col)]);
