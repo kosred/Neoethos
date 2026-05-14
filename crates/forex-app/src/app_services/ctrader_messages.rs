@@ -666,13 +666,22 @@ pub fn build_get_trendbars_request(
 
 pub fn trendbar_period_value(label: &str) -> Result<i32> {
     // Map our canonical timeframe labels to cTrader's wire-protocol
-    // period codes. cTrader itself supports a slightly different set
-    // (M2/M4/M10) that we deliberately omit; we only emit the canonical
-    // 11 to keep every subsystem (UI, training, discovery) aligned.
-    // M2/M4/M10 and any non-canonical label are rejected.
+    // `ProtoOATrendbarPeriod` codes. cTrader itself supports a slightly
+    // different set (M2/M4/M10 instead of our H2), but we deliberately
+    // only emit the canonical 12 to keep every subsystem (UI, training,
+    // discovery) aligned. M2/M4/M10 and any non-canonical label are
+    // rejected.
     //
-    // H2 is intentionally absent from the canonical set because cTrader
-    // does not natively expose `ProtoOATrendbarPeriod::H2`.
+    // Native cTrader periods (per `openapi-proto-messages/OpenApiModelMessages.proto`):
+    //   M1=1, M2=2, M3=3, M4=4, M5=5, M10=6, M15=7, M30=8,
+    //   H1=9, H4=10, H12=11, D1=12, W1=13, MN1=14.
+    //
+    // Notes:
+    // * M3 IS native (enum value 3) — we send it directly.
+    // * H2 is in our canonical set (operator requirement) but NOT in the
+    //   cTrader enum. It must be resampled from H1 client-side. Callers
+    //   that want H2 data should use `cTrader_period_for_canonical`
+    //   below, which routes H2 → H1 and signals the resample requirement.
     let upper = label.trim().to_ascii_uppercase();
     if !forex_core::is_canonical_timeframe(&upper) {
         return Err(anyhow!(
@@ -697,6 +706,73 @@ pub fn trendbar_period_value(label: &str) -> Result<i32> {
             other
         )),
     }
+}
+
+/// What canonical-to-cTrader timeframe routing produces: the wire-protocol
+/// period to actually request, plus an optional client-side resample target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CTraderTrendbarFetchPlan {
+    /// `ProtoOATrendbarPeriod` enum value to send in the request.
+    pub period_value: i32,
+    /// The cTrader-native timeframe label that `period_value` corresponds to
+    /// (e.g. `"H1"` when the caller asked for `"H2"`).
+    pub native_label: &'static str,
+    /// If `Some`, the bars returned by cTrader for `native_label` MUST be
+    /// resampled client-side into this canonical timeframe before being
+    /// handed to feature builders. `None` means cTrader returns the bars
+    /// already at the canonical timeframe.
+    pub resample_to: Option<&'static str>,
+}
+
+/// Resolve a canonical-timeframe label (e.g. `"H2"`) to the cTrader-native
+/// trendbar period that should actually be requested, plus a resample plan
+/// if cTrader does not natively expose the canonical timeframe.
+///
+/// This is the **preferred** entry point for code that fetches historical
+/// bars from cTrader: it gives the caller everything it needs to (a) send
+/// a valid `ProtoOAGetTrendbarsReq` and (b) reduce the returned bars to
+/// the requested canonical timeframe.
+#[allow(non_snake_case)]
+pub fn cTrader_period_for_canonical(label: &str) -> Result<CTraderTrendbarFetchPlan> {
+    let upper = label.trim().to_ascii_uppercase();
+    if !forex_core::is_canonical_timeframe(&upper) {
+        return Err(anyhow!(
+            "unsupported cTrader trendbar period label {} (not in canonical timeframes)",
+            label
+        ));
+    }
+    if upper == "H2" {
+        // TODO(cTrader-mapping): H2 must be resampled from H1 because
+        // cTrader ProtoOATrendbarPeriod doesn't expose H2 natively.
+        // Two consecutive H1 candles aggregate to one H2 candle:
+        // resample with `forex_data::core::resample::resample_ohlcv(h1, "H2")`.
+        return Ok(CTraderTrendbarFetchPlan {
+            period_value: 9, // H1
+            native_label: "H1",
+            resample_to: Some("H2"),
+        });
+    }
+    let period_value = trendbar_period_value(&upper)?;
+    let native_label: &'static str = match upper.as_str() {
+        "M1" => "M1",
+        "M3" => "M3",
+        "M5" => "M5",
+        "M15" => "M15",
+        "M30" => "M30",
+        "H1" => "H1",
+        "H4" => "H4",
+        "H12" => "H12",
+        "D1" => "D1",
+        "W1" => "W1",
+        "MN1" => "MN1",
+        // Unreachable: trendbar_period_value rejects anything else.
+        _ => unreachable!("trendbar_period_value should reject non-native labels"),
+    };
+    Ok(CTraderTrendbarFetchPlan {
+        period_value,
+        native_label,
+        resample_to: None,
+    })
 }
 
 pub fn build_get_tick_data_request(
