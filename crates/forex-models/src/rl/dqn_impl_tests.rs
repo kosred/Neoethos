@@ -80,8 +80,8 @@ fn fallback_only_artifact_round_trips_without_network_file() {
         used_fallback_q: true,
         used_feature_scaler: false,
     });
-    learner.fallback_weights = Some(weights);
-    learner.fallback_bias = Some(bias);
+    learner.fallback_weights = Some(weights.clone());
+    learner.fallback_bias = Some(bias.clone());
     learner.training_report = learner.train_args.training_report.clone();
 
     let path = unique_temp_dir("rl-fallback-only");
@@ -104,10 +104,26 @@ fn fallback_only_artifact_round_trips_without_network_file() {
         .predict_q_values(&[0.25_f32, 0.75_f32])
         .expect("fallback inference should work after load");
 
+    // F-MODELS9-001 fix: derive expected values inline from weights + bias
+    // instead of asserting hardcoded magic numbers. The forward pass is
+    // `q = W @ x + b` where W is row-major [3, 2], x is [2], b is [3].
+    // If someone refactors the fallback inference path, this test will
+    // catch the change because the formula is checked, not the result.
+    let input = [0.25_f32, 0.75_f32];
+    let expected_q = [
+        weights[(0, 0)] * input[0] + weights[(0, 1)] * input[1] + bias[0],
+        weights[(1, 0)] * input[0] + weights[(1, 1)] * input[1] + bias[1],
+        weights[(2, 0)] * input[0] + weights[(2, 1)] * input[1] + bias[2],
+    ];
     assert_eq!(q_values.len(), 3);
-    assert!((q_values[0] - 0.35).abs() < 1e-6);
-    assert!((q_values[1] - 0.95).abs() < 1e-6);
-    assert!((q_values[2] - 0.4).abs() < 1e-6);
+    for (i, expected) in expected_q.iter().enumerate() {
+        assert!(
+            (q_values[i] - expected).abs() < 1e-6,
+            "q_values[{i}] = {} but expected {} = W[{i}] @ {input:?} + b[{i}]",
+            q_values[i],
+            expected
+        );
+    }
     assert_eq!(
         loaded
             .training_report
@@ -244,12 +260,29 @@ fn validate_artifact_rejects_partial_fallback_parameters() {
 
 #[test]
 fn validate_q_values_rejects_non_finite_rows() {
+    // F-MODELS9-002 fix: previously only NaN was tested. Inf/NegInf
+    // and mixed-finite-with-non-finite also reach this validator from
+    // upstream training paths; cover the full boundary.
     let err = validate_q_values(vec![0.1, f32::NAN, 0.2])
-        .expect_err("non-finite q-values should be rejected");
-    assert!(
-        err.to_string().contains("non-finite"),
-        "unexpected error: {err}"
-    );
+        .expect_err("NaN q-values should be rejected");
+    assert!(err.to_string().contains("non-finite"), "unexpected: {err}");
+
+    let err = validate_q_values(vec![f32::INFINITY, 0.0, 0.0])
+        .expect_err("+Inf q-values should be rejected");
+    assert!(err.to_string().contains("non-finite"), "unexpected: {err}");
+
+    let err = validate_q_values(vec![0.0, f32::NEG_INFINITY, 0.0])
+        .expect_err("-Inf q-values should be rejected");
+    assert!(err.to_string().contains("non-finite"), "unexpected: {err}");
+
+    let err = validate_q_values(vec![1.0, 2.0, f32::INFINITY])
+        .expect_err("mixed finite+Inf q-values should be rejected");
+    assert!(err.to_string().contains("non-finite"), "unexpected: {err}");
+
+    // All-zeros and all-finite must PASS (the validator should not be
+    // over-eager and reject legitimate zero-policy actions).
+    validate_q_values(vec![0.0, 0.0, 0.0]).expect("all-zeros must be accepted");
+    validate_q_values(vec![0.3, -1.5, 2.7]).expect("finite values must be accepted");
 }
 
 #[test]
@@ -1445,16 +1478,62 @@ fn load_rejects_metadata_sidecar_drift_against_reconstructed_runtime_metadata() 
 
 #[test]
 fn preprocess_runtime_state_applies_persisted_feature_scaler() {
+    // F-MODELS9-005 fix: derive expected values inline from the z-score
+    // formula `z = (x - mean) / std` instead of asserting hardcoded
+    // numbers. If the scaler implementation drifts to min-max or any
+    // other transform, this test will catch it because the formula
+    // is checked, not the result.
     let mut learner = TradingReinforcementLearner::new();
+    let means = vec![1.0_f32, 2.0];
+    let stds = vec![2.0_f32, 4.0];
     learner.feature_scaler = Some(FeatureScaler {
-        means: vec![1.0, 2.0],
-        stds: vec![2.0, 4.0],
+        means: means.clone(),
+        stds: stds.clone(),
     });
 
+    let inputs = [5.0_f32, 10.0_f32];
     let scaled = learner
-        .preprocess_runtime_state(&[5.0, 10.0])
+        .preprocess_runtime_state(&inputs)
         .expect("runtime preprocessing should use persisted scaler");
-    assert_eq!(scaled, vec![2.0, 2.0]);
+    let expected: Vec<f32> = inputs
+        .iter()
+        .zip(means.iter().zip(stds.iter()))
+        .map(|(x, (mean, std))| (*x - *mean) / *std)
+        .collect();
+    assert_eq!(scaled.len(), expected.len());
+    for (i, (s, e)) in scaled.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (s - e).abs() < 1e-6,
+            "scaled[{i}] = {} but expected z-score = (x={} - mean={}) / std={} = {}",
+            s,
+            inputs[i],
+            means[i],
+            stds[i],
+            e
+        );
+    }
+
+    // Second case with non-trivial mean/std to prove the formula isn't
+    // numerically coincidental with the first case (both inputs were
+    // chosen to land on z=2.0 above; here z varies per feature).
+    let means2 = vec![0.5_f32, -1.0];
+    let stds2 = vec![0.25_f32, 3.0];
+    learner.feature_scaler = Some(FeatureScaler {
+        means: means2.clone(),
+        stds: stds2.clone(),
+    });
+    let inputs2 = [1.0_f32, 5.0_f32];
+    let scaled2 = learner
+        .preprocess_runtime_state(&inputs2)
+        .expect("second case must also work");
+    let expected2: Vec<f32> = inputs2
+        .iter()
+        .zip(means2.iter().zip(stds2.iter()))
+        .map(|(x, (mean, std))| (*x - *mean) / *std)
+        .collect();
+    for (i, (s, e)) in scaled2.iter().zip(expected2.iter()).enumerate() {
+        assert!((s - e).abs() < 1e-6, "case 2, feature {i}");
+    }
 }
 
 #[test]
