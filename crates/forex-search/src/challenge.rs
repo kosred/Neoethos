@@ -1,3 +1,5 @@
+use forex_core::domain::prop_firm::PropFirmConstraints;
+
 #[derive(Debug, Clone, Copy)]
 pub struct ChallengeTarget {
     pub total_profit_target: f64,
@@ -10,13 +12,19 @@ pub struct ChallengeTarget {
 
 impl Default for ChallengeTarget {
     fn default() -> Self {
-        let total_profit_target = 0.10;
+        // Prop-firm constraint values sourced from the canonical
+        // `PropFirmConstraints` struct per operator directive 2026-05-14.
+        let ftmo = PropFirmConstraints::FTMO_STANDARD;
+        let total_profit_target = ftmo.challenge_profit_target_pct as f64;
         Self {
             total_profit_target,
+            // FIXME(hardcoded): config-extract — challenge cycle length tunable (~20 trading days).
             daily_target: total_profit_target / 20.0,
-            max_daily_dd: 0.045,
-            max_total_dd: 0.10,
+            max_daily_dd: ftmo.max_daily_loss_pct as f64,
+            max_total_dd: ftmo.max_overall_drawdown_pct as f64,
+            // FIXME(hardcoded): config-extract — relaxed below FTMO 10-day floor for shorter cycles.
             min_trading_days: 5,
+            // FIXME(hardcoded): config-extract — challenge cycle length cap.
             max_trading_days: 60,
         }
     }

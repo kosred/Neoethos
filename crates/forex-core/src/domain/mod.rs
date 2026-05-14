@@ -7,4 +7,7 @@ pub mod drift_monitor;
 pub mod news_filter;
 pub mod order_execution;
 pub mod portfolio;
+pub mod prop_firm;
 pub mod risk;
+
+pub use prop_firm::PropFirmConstraints;

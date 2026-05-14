@@ -20,6 +20,7 @@ use chrono::{Datelike, TimeZone, Utc};
 use forex_core::contracts::{
     DeterminismPolicy, LiveValidationEvidence, TemporalFeatureContract, ValidationEvidenceManifest,
 };
+use forex_core::domain::prop_firm::PropFirmConstraints;
 use forex_data::{FeatureFrame, Ohlcv};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -360,7 +361,8 @@ impl DiscoveryConfig {
         // setting the matching env var, but the defaults are the
         // standard challenge rules so the happy-path call needs nothing.
         let mut rules = PropFirmRiskRules::default();
-        rules.min_profit_target_pct = 0.10;
+        rules.min_profit_target_pct =
+            PropFirmConstraints::FTMO_STANDARD.challenge_profit_target_pct as f64;
         rules.require_profit_target = true;
         if let Some(v) = read_env_f64("FOREX_BOT_DISCOVERY_PROP_FIRM_MAX_DAILY_LOSS_PCT") {
             rules.max_daily_loss_pct = v;

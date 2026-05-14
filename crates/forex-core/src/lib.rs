@@ -24,6 +24,7 @@ pub use contracts::{
     TrainingModelArtifactContract, TypedArtifactEnvelope, ValidationEvidenceCheck,
     ValidationEvidenceKind, ValidationEvidenceManifest, is_canonical_timeframe,
 };
+pub use domain::PropFirmConstraints;
 pub use system::{
     AcceleratorBackend, AcceleratorDevice, CpuBudget, GpuBudget, HardwareExecutionPlan,
     HardwareRuntimeOverrides, PrecisionPolicy, ResolvedWorkloadAssignment, TrainingPrecision,

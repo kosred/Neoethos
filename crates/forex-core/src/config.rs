@@ -2,6 +2,7 @@
 // Port of src/forex_bot/core/config.py
 
 use crate::contracts::CANONICAL_TIMEFRAMES;
+use crate::domain::prop_firm::PropFirmConstraints;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -257,14 +258,27 @@ impl Default for RiskConfig {
             ewma_lambda_by_timeframe.insert(tf.to_string(), lambda);
         }
 
+        let ftmo = PropFirmConstraints::FTMO_STANDARD;
         Self {
+            // FIXME(hardcoded): config-extract — account starting balance is broker-specific.
             initial_balance: 10_000.0,
-            monthly_profit_target_pct: 0.04,
+            // Operator-mandated 4% monthly profit floor (directive 2026-05-14).
+            monthly_profit_target_pct: ftmo.min_monthly_net_profit_pct as f64,
+            // FIXME(hardcoded): config-extract — strategy risk-per-trade tunables.
             min_risk_per_trade: 0.0,
+            // FIXME(hardcoded): config-extract — strategy risk-per-trade tunables.
             max_risk_per_trade: 0.030,
+            // FIXME(hardcoded): config-extract — strategy risk-per-trade tunables.
             risk_per_trade: 0.030,
+            // FIXME(hardcoded): config-extract — internal early stop below FTMO 5% prop-firm limit.
+            // Production code that needs the actual FTMO DD limit must read
+            // `PropFirmConstraints::FTMO_STANDARD.max_daily_loss_pct`.
             daily_drawdown_limit: 0.04,
+            // FIXME(hardcoded): config-extract — internal trailing total cap below FTMO 10% prop-firm limit.
+            // Production code that needs the actual FTMO DD limit must read
+            // `PropFirmConstraints::FTMO_STANDARD.max_overall_drawdown_pct`.
             total_drawdown_limit: 0.07,
+            // FIXME(hardcoded): config-extract — strategy risk-reward floor.
             min_risk_reward: 2.0,
             spread_guard_multiplier: 2.5,
             slippage_guard_multiplier: 2.0,

@@ -1,5 +1,6 @@
 use crate::eval::BacktestSettings;
 use crate::genetic::{Gene, month_day_indices, signals_for_gene};
+use forex_core::domain::prop_firm::PropFirmConstraints;
 use forex_data::{FeatureFrame, Ohlcv};
 
 #[derive(Debug, Clone)]
@@ -14,10 +15,22 @@ pub struct GauntletConfig {
 
 impl Default for GauntletConfig {
     fn default() -> Self {
+        // Prop-firm DD limits come from PropFirmConstraints per operator
+        // directive 2026-05-14; strategy quality thresholds are tunables
+        // and stay FIXME until Batch 3+ extracts them into config.
+        let _ftmo = PropFirmConstraints::FTMO_STANDARD;
         Self {
+            // FIXME(hardcoded): config-extract — strategy quality floor.
             min_win_rate: 0.55,
+            // FIXME(hardcoded): config-extract — strategy quality floor.
             min_profit_factor: 1.2,
+            // FIXME(hardcoded): config-extract — internal trailing total DD cap below FTMO 10%.
+            // Production code that needs the real FTMO ceiling must read
+            // `PropFirmConstraints::FTMO_STANDARD.max_overall_drawdown_pct`.
             max_drawdown_pct: 0.07,
+            // FIXME(hardcoded): config-extract — internal daily DD cap below FTMO 5%.
+            // Production code that needs the real FTMO daily ceiling must read
+            // `PropFirmConstraints::FTMO_STANDARD.max_daily_loss_pct`.
             max_daily_dd: 0.04,
             warn_only: false,
             backtest: BacktestSettings::default(),

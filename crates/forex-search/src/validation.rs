@@ -4,6 +4,7 @@ use crate::eval::{
 };
 use anyhow::{Result, bail};
 use forex_core::contracts::{TemporalFeatureContract, TemporalScopeHashes};
+use forex_core::domain::prop_firm::PropFirmConstraints;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -594,14 +595,20 @@ pub struct PropFirmRiskRules {
 impl Default for PropFirmRiskRules {
     fn default() -> Self {
         // FTMO-style baseline; callers should override per challenge.
+        // Numeric defaults come from `PropFirmConstraints::FTMO_STANDARD`
+        // per operator directive 2026-05-14 — they are the only
+        // hardcoded prop-firm numbers allowed in production code.
+        let ftmo = PropFirmConstraints::FTMO_STANDARD;
         Self {
-            max_daily_loss_pct: 0.05,
-            max_overall_drawdown_pct: 0.10,
+            max_daily_loss_pct: ftmo.max_daily_loss_pct as f64,
+            max_overall_drawdown_pct: ftmo.max_overall_drawdown_pct as f64,
+            // FIXME(hardcoded): config-extract — internal consistency-ratio cap.
             max_profit_consistency_ratio: 0.50,
+            // FIXME(hardcoded): config-extract — relaxed below FTMO's 10-day floor for shorter cycles.
             min_trading_days: 5,
             max_trades_per_day: 0,
             require_profit_target: false,
-            min_profit_target_pct: 0.10,
+            min_profit_target_pct: ftmo.challenge_profit_target_pct as f64,
         }
     }
 }

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::domain::prop_firm::PropFirmConstraints;
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum ChallengePhase {
     #[default]
@@ -37,19 +39,30 @@ pub struct PropFirmRules {
 
 impl Default for PropFirmRules {
     fn default() -> Self {
+        // FTMO baseline — the only hardcoded numbers allowed per operator
+        // directive 2026-05-14 are the prop-firm DD limits and the
+        // challenge profit target. Anything tunable is marked with a
+        // FIXME so Batch 3+ can lift it into a config file.
+        let ftmo = PropFirmConstraints::FTMO_STANDARD;
         Self {
-            max_daily_loss_pct: 0.045,
-            max_total_loss_pct: 0.10,
-            profit_target_pct: 0.10,
-            min_trading_days: 5,
+            max_daily_loss_pct: ftmo.max_daily_loss_pct as f64,
+            max_total_loss_pct: ftmo.max_overall_drawdown_pct as f64,
+            profit_target_pct: ftmo.challenge_profit_target_pct as f64,
+            min_trading_days: ftmo.min_trading_days as usize,
+            // FIXME(hardcoded): config-extract — challenge cycle length tunable.
             max_trading_days: 60,
+            // FIXME(hardcoded): config-extract — broker lot ceiling.
             max_lot_size: 10.0,
             news_trading_allowed: false,
             weekend_holding: false,
             scaling_enabled: true,
+            // FIXME(hardcoded): config-extract — internal early-warning band, not a prop-firm rule.
             daily_dd_warning_pct: 0.035,
+            // FIXME(hardcoded): config-extract — internal stop-trading band, not a prop-firm rule.
             daily_dd_stop_trading_pct: 0.040,
+            // FIXME(hardcoded): config-extract — internal profit-lock threshold.
             daily_profit_lock_pct: 0.03,
+            // FIXME(hardcoded): config-extract — internal trade-rate cap.
             max_trades_per_day: 15,
         }
     }
@@ -72,44 +85,72 @@ pub struct ChallengeRiskPreset {
 
 pub fn resolve_challenge_risk_preset(phase: &str) -> ChallengeRiskPreset {
     let phase_enum = ChallengePhase::from(phase);
+    // Prop-firm DD limits come from PropFirmConstraints; per-phase
+    // strategy tunables (risk_per_trade, confidence floors, etc.) are
+    // marked FIXME for Batch 3+ config-extract.
+    let ftmo = PropFirmConstraints::FTMO_STANDARD;
+    let daily_dd = ftmo.max_daily_loss_pct as f64;
+    let total_dd = ftmo.max_overall_drawdown_pct as f64;
+    let challenge_target = ftmo.challenge_profit_target_pct as f64;
+    let monthly_floor = ftmo.min_monthly_net_profit_pct as f64;
     match phase_enum {
         ChallengePhase::Phase2 => ChallengeRiskPreset {
             phase: "phase_2".to_string(),
+            // FIXME(hardcoded): config-extract — risk-per-trade is a strategy tunable.
             risk_per_trade: 0.0025,
+            // FIXME(hardcoded): config-extract — risk-per-trade cap is a strategy tunable.
             max_risk_per_trade: 0.0040,
+            // FIXME(hardcoded): config-extract — confidence floor is a strategy tunable.
             min_confidence_threshold: 0.68,
+            // FIXME(hardcoded): config-extract — daily trade cap is a strategy tunable.
             max_trades_per_day: 3,
-            daily_drawdown_limit: 0.045,
-            total_drawdown_limit: 0.10,
+            daily_drawdown_limit: daily_dd,
+            total_drawdown_limit: total_dd,
+            // FIXME(hardcoded): config-extract — internal profit-lock threshold.
             daily_profit_lock_pct: 0.012,
-            monthly_profit_target_pct: 0.05,
-            challenge_target_return_pct: 0.05,
+            // Phase 2 monthly target is the operator's 4% floor (verification).
+            monthly_profit_target_pct: monthly_floor,
+            // Phase 2 verification target is half of full challenge target.
+            challenge_target_return_pct: challenge_target / 2.0,
+            // FIXME(hardcoded): config-extract — challenge measurement window.
             challenge_target_trading_days: 22,
         },
         ChallengePhase::Funded => ChallengeRiskPreset {
             phase: "funded".to_string(),
+            // FIXME(hardcoded): config-extract — risk-per-trade is a strategy tunable.
             risk_per_trade: 0.0030,
+            // FIXME(hardcoded): config-extract — risk-per-trade cap is a strategy tunable.
             max_risk_per_trade: 0.0050,
+            // FIXME(hardcoded): config-extract — confidence floor is a strategy tunable.
             min_confidence_threshold: 0.65,
+            // FIXME(hardcoded): config-extract — daily trade cap is a strategy tunable.
             max_trades_per_day: 4,
-            daily_drawdown_limit: 0.045,
-            total_drawdown_limit: 0.10,
+            daily_drawdown_limit: daily_dd,
+            total_drawdown_limit: total_dd,
             daily_profit_lock_pct: 0.0,
-            monthly_profit_target_pct: 0.06,
-            challenge_target_return_pct: 0.06,
+            // Funded accounts target operator's 4% floor.
+            monthly_profit_target_pct: monthly_floor,
+            challenge_target_return_pct: monthly_floor,
+            // FIXME(hardcoded): config-extract — challenge measurement window.
             challenge_target_trading_days: 22,
         },
         ChallengePhase::Phase1 => ChallengeRiskPreset {
             phase: "phase_1".to_string(),
+            // FIXME(hardcoded): config-extract — risk-per-trade is a strategy tunable.
             risk_per_trade: 0.0030,
+            // FIXME(hardcoded): config-extract — risk-per-trade cap is a strategy tunable.
             max_risk_per_trade: 0.0050,
+            // FIXME(hardcoded): config-extract — confidence floor is a strategy tunable.
             min_confidence_threshold: 0.66,
+            // FIXME(hardcoded): config-extract — daily trade cap is a strategy tunable.
             max_trades_per_day: 3,
-            daily_drawdown_limit: 0.045,
-            total_drawdown_limit: 0.10,
+            daily_drawdown_limit: daily_dd,
+            total_drawdown_limit: total_dd,
+            // FIXME(hardcoded): config-extract — internal profit-lock threshold.
             daily_profit_lock_pct: 0.015,
-            monthly_profit_target_pct: 0.10,
-            challenge_target_return_pct: 0.10,
+            monthly_profit_target_pct: challenge_target,
+            challenge_target_return_pct: challenge_target,
+            // FIXME(hardcoded): config-extract — challenge measurement window.
             challenge_target_trading_days: 22,
         },
     }
@@ -350,8 +391,11 @@ impl RiskManager {
             reflection_mode: false,
             monthly_target_hit: false,
             challenge_target_hit: false,
-            monthly_profit_target_pct: 0.04,
-            challenge_target_return_pct: 0.10,
+            // Operator-mandated 4% monthly profit floor + FTMO challenge target.
+            monthly_profit_target_pct: PropFirmConstraints::FTMO_STANDARD
+                .min_monthly_net_profit_pct as f64,
+            challenge_target_return_pct: PropFirmConstraints::FTMO_STANDARD
+                .challenge_profit_target_pct as f64,
             monthly_return_pct: 0.0,
             challenge_return_pct: 0.0,
             last_session_date_id: None,
@@ -512,6 +556,9 @@ impl RiskManager {
                 format!("Total drawdown limit ({:.2}%)", total_dd * 100.0),
             );
         }
+        // FIXME(hardcoded): config-extract — internal recovery bands
+        // (5%/4%/3%/2%) live below the prop-firm hard limit and should
+        // come from strategy config rather than inlined literals.
         // Secondary recovery halt (below the hard limit but above 5%).
         if total_dd >= 0.05 {
             self.circuit_breaker_triggered = true;
@@ -661,6 +708,9 @@ impl RiskManager {
         }
 
         let max_total_loss = self.prop_rules.max_total_loss_pct.max(1e-6);
+        // FIXME(hardcoded): config-extract — internal drawdown recovery bands
+        // (5%/4%/3%/2%) sit below the prop-firm hard limit and should be
+        // lifted into the strategy config rather than inlined here.
         if total_dd_pct >= max_total_loss || total_dd_pct >= 0.05 {
             return 0.0;
         } else if total_dd_pct >= 0.04 {
