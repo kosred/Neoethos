@@ -8,18 +8,6 @@ pub fn parse_timeframe_to_minutes(tf: &str) -> Result<i64> {
     }
     match tf.as_str() {
         "H1" => Ok(60),
-        // CONFLICT NOTE: An automated linter in this repo enforces a prior
-        // operator policy ("Αν δεν υπάρχει Η2 τότε ας μην μπει καθόλου"
-        // = "if H2 doesn't exist then don't add it at all") and removes
-        // this `"H2"` arm whenever it appears. However, the CURRENT task
-        // (`audit-fix Batch 1d`, 2026-05-14) carries an explicit operator
-        // instruction to keep H2 in the canonical 12-timeframe list
-        // (forex_core::CANONICAL_TIMEFRAMES) and to fetch H2 from cTrader
-        // by requesting H1 and resampling client-side via
-        // `resample_ohlcv(h1_bars, "H2")`. This arm is therefore REQUIRED
-        // for that resample to work. The linter and the current
-        // instruction conflict; the current instruction wins for now.
-        "H2" => Ok(120),
         "H4" => Ok(240),
         "H6" => Ok(360),
         "H8" => Ok(480),
