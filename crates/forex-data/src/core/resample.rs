@@ -95,7 +95,18 @@ pub fn resample_ohlcv(src: &Ohlcv, target_tf: &str) -> Result<Ohlcv> {
     })
 }
 
+/// Subset of `forex_core::CANONICAL_TIMEFRAMES` that downstream pipelines
+/// (discovery feature build, training MTF prep) require to be present —
+/// missing timeframes will be resampled from the base timeframe.
+///
+/// This list intentionally stays small (the most commonly used six) to
+/// avoid forcing every job to materialize every canonical timeframe.
 pub const MANDATORY_TFS: &[&str] = &["M1", "M5", "M15", "H1", "H4", "D1"];
+
+/// Full canonical timeframe list, re-exported from `forex_core` for the
+/// convenience of forex-data callers that already use `MANDATORY_TFS`
+/// from this module.
+pub use forex_core::CANONICAL_TIMEFRAMES;
 
 pub fn ensure_timeframes_with_resample(
     ds: &SymbolDataset,

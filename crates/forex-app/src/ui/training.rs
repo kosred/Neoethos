@@ -45,7 +45,7 @@ pub fn render(
             });
         ui.add_space(12.0);
         ui.label("Base TF:");
-        let timeframes = ["M1", "M5", "M15", "H1", "H4", "D1"];
+        let timeframes = forex_core::CANONICAL_TIMEFRAMES;
         egui::ComboBox::from_id_salt("training_tf")
             .selected_text(&state.chart_timeframe)
             .show_ui(ui, |ui| {

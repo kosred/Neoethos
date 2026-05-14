@@ -383,30 +383,7 @@ fn looks_like_extended_symbol(s: &str) -> bool {
 }
 
 fn looks_like_timeframe(s: &str) -> bool {
-    let s = s.to_ascii_uppercase();
-    matches!(
-        s.as_str(),
-        "M1" | "M2"
-            | "M3"
-            | "M4"
-            | "M5"
-            | "M6"
-            | "M10"
-            | "M12"
-            | "M15"
-            | "M20"
-            | "M30"
-            | "H1"
-            | "H2"
-            | "H3"
-            | "H4"
-            | "H6"
-            | "H8"
-            | "H12"
-            | "D1"
-            | "W1"
-            | "MN1"
-    )
+    forex_core::is_canonical_timeframe(s)
 }
 
 fn canonical_vortex_path(data_root: &Path, symbol: &str, tf: &str) -> PathBuf {

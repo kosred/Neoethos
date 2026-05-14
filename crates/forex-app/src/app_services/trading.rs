@@ -1183,6 +1183,18 @@ impl TradingSession {
             return;
         };
 
+        // audit-fix F5: surface overflow at the caller rather than letting
+        // the silent cast through.
+        let protocol_volume = match ctrader_protocol_volume_from_units(volume) {
+            Ok(v) => v,
+            Err(err) => {
+                let message = format!("cTrader close-position rejected: {err}");
+                state.status_msg = message.clone();
+                self.append_trade_journal(message.clone());
+                record_app_event("ctrader_close_position", "FAILED", message);
+                return;
+            }
+        };
         match self.execute_ctrader_request(
             state,
             CTraderExecutionRequest::ClosePosition(CTraderClosePositionRequest {
@@ -1191,7 +1203,7 @@ impl TradingSession {
                     .and_then(|id| id.parse::<i64>().ok())
                     .unwrap_or_default(),
                 position_id,
-                volume: ctrader_protocol_volume_from_units(volume),
+                volume: protocol_volume,
             }),
             format!("Close position #{position_id}"),
         ) {
@@ -1372,6 +1384,41 @@ impl TradingSession {
                 if let Err(refresh_err) = self.force_refresh_ctrader_token_bundle() {
                     return Err(refresh_err.context(err));
                 }
+
+                // SECURITY (audit-fix F3): before resubmitting the order
+                // under the refreshed token, ask the broker whether this
+                // `client_order_id` is already present. The original
+                // attempt may have been accepted by the broker before the
+                // network connection died — in which case retrying would
+                // double the position. If reconcile fails, we do NOT
+                // retry: surface the error so the operator can decide.
+                if let Some(client_order_id) =
+                    extract_client_order_id_from_request(&request)
+                {
+                    let reconcile = self.load_ctrader_account_runtime().map_err(|reconcile_err| {
+                        anyhow::anyhow!(
+                            "cTrader retry aborted: reconcile-before-retry failed and we cannot prove the previous \
+                             attempt was not already accepted by the broker (client_order_id={client_order_id}). \
+                             Original error: {err}. Reconcile error: {reconcile_err}"
+                        )
+                    })?;
+                    if let Some(existing) =
+                        find_existing_client_order_id(&reconcile.reconcile, &client_order_id)
+                    {
+                        let message = format!(
+                            "cTrader retry skipped: broker already has client_order_id={client_order_id} ({existing}); \
+                             treating as success to avoid duplicate order"
+                        );
+                        self.append_trade_journal(message.clone());
+                        state.status_msg = message.clone();
+                        record_app_event("ctrader_retry_duplicate_skipped", "SUCCESS", message);
+                        return Ok(synthesize_idempotent_retry_outcome(
+                            &reconcile.reconcile,
+                            &client_order_id,
+                        ));
+                    }
+                }
+
                 let retry_request =
                     self.build_ctrader_execution_runtime_request(request.clone())?;
                 self.ctrader_execution_backend.execute(&retry_request)?
@@ -2464,7 +2511,13 @@ fn current_unix_seconds() -> anyhow::Result<i64> {
 fn next_client_order_seq() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
+    // SECURITY (audit-fix F4): `Relaxed` allows another thread to observe an
+    // out-of-order counter value, so two threads issuing orders within the
+    // same wall-clock second could in principle see the same `seq` and
+    // collide on `client_order_id`. `SeqCst` establishes a global total
+    // order across all threads — cheap on x86 (it lowers to LOCK XADD)
+    // and this counter is not on a hot loop.
+    COUNTER.fetch_add(1, Ordering::SeqCst)
 }
 
 pub fn panel_mode(data_source: DataSource, connected: bool) -> TradingPanelMode {
@@ -2478,32 +2531,19 @@ pub fn panel_mode(data_source: DataSource, connected: bool) -> TradingPanelMode 
 const MAX_CHART_CANDLES: usize = 96;
 
 fn supported_ctrader_chart_timeframes() -> Vec<String> {
-    [
-        "M1", "M2", "M3", "M4", "M5", "M10", "M15", "M30", "H1", "H4", "H12", "D1", "W1", "MN1",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
+    // The chart panel exposes only the canonical 12 timeframes; cTrader
+    // also accepts M2/M4/M10 but we deliberately drop them so every UI
+    // selector, training pipeline, and resample step agrees.
+    forex_core::CANONICAL_TIMEFRAMES
+        .iter()
+        .map(|tf| (*tf).to_string())
+        .collect()
 }
 
 fn chart_history_window_ms(timeframe: &str) -> Option<i64> {
-    let minutes = match timeframe.trim().to_ascii_uppercase().as_str() {
-        "M1" => 1,
-        "M2" => 2,
-        "M3" => 3,
-        "M4" => 4,
-        "M5" => 5,
-        "M10" => 10,
-        "M15" => 15,
-        "M30" => 30,
-        "H1" => 60,
-        "H4" => 240,
-        "H12" => 720,
-        "D1" => 1_440,
-        "W1" => 10_080,
-        "MN1" => 43_200,
-        _ => return None,
-    };
+    // Reuse the canonical timeframe→minutes parser so we don't drift
+    // from forex-data's resample logic.
+    let minutes = forex_data::parse_timeframe_to_minutes(timeframe).ok()?;
     Some(minutes * 60_000 * (MAX_CHART_CANDLES as i64 + 24))
 }
 
@@ -2892,6 +2932,109 @@ impl ExecutionFeedHandle<'_> {
     }
 }
 
+/// SECURITY (audit-fix F3): extract the `client_order_id` from a request
+/// shape that may carry one. Only `NewOrder` carries this field — cancel
+/// and close-position requests target an existing broker-side id, so they
+/// are not at risk of duplicate submission in the same way.
+fn extract_client_order_id_from_request(
+    request: &CTraderExecutionRequest,
+) -> Option<String> {
+    match request {
+        CTraderExecutionRequest::NewOrder(order) => order.client_order_id.clone(),
+        CTraderExecutionRequest::CancelOrder(_) | CTraderExecutionRequest::ClosePosition(_) => {
+            None
+        }
+    }
+}
+
+/// Inspect a fresh broker reconcile snapshot for a record that already
+/// carries our `client_order_id`. Returns a short description of where it
+/// was found (position vs. pending order) so the journal entry is useful.
+fn find_existing_client_order_id(
+    reconcile: &crate::app_services::ctrader_account::CTraderReconcileSnapshot,
+    client_order_id: &str,
+) -> Option<String> {
+    for position in &reconcile.positions {
+        if position.client_order_id.as_deref() == Some(client_order_id) {
+            return Some(format!("position #{}", position.position_id));
+        }
+    }
+    for order in &reconcile.pending_orders {
+        if order.client_order_id.as_deref() == Some(client_order_id) {
+            return Some(format!("pending order #{}", order.order_id));
+        }
+    }
+    None
+}
+
+/// When the reconcile-before-retry path proves the first attempt was
+/// already accepted by the broker, fabricate an "Accepted" outcome that
+/// quotes the broker-side record back to the caller. The retry path
+/// must NOT reach the websocket again, so we synthesize a minimal
+/// outcome from the reconcile snapshot.
+fn synthesize_idempotent_retry_outcome(
+    reconcile: &crate::app_services::ctrader_account::CTraderReconcileSnapshot,
+    client_order_id: &str,
+) -> CTraderExecutionOutcome {
+    let position = reconcile
+        .positions
+        .iter()
+        .find(|p| p.client_order_id.as_deref() == Some(client_order_id));
+    let order = reconcile
+        .pending_orders
+        .iter()
+        .find(|o| o.client_order_id.as_deref() == Some(client_order_id));
+
+    let (position_id, order_id, symbol_id, trade_side, lot_size, execution_price, timestamp_ms) =
+        if let Some(p) = position {
+            (
+                Some(p.position_id),
+                None,
+                Some(p.symbol_id),
+                Some(p.trade_side.clone()),
+                Some(p.volume),
+                p.price,
+                p.open_timestamp_ms,
+            )
+        } else if let Some(o) = order {
+            (
+                None,
+                Some(o.order_id),
+                Some(o.symbol_id),
+                Some(o.trade_side.clone()),
+                Some(o.volume),
+                o.limit_price.or(o.stop_price),
+                o.open_timestamp_ms,
+            )
+        } else {
+            (None, None, None, None, None, None, None)
+        };
+
+    CTraderExecutionOutcome {
+        status: CTraderExecutionStatus::Accepted,
+        account_id: reconcile.account_id,
+        symbol_id,
+        order_id,
+        position_id,
+        deal_id: None,
+        trade_side,
+        order_type: None,
+        lot_size,
+        requested_lot_size: lot_size,
+        filled_lot_size: lot_size,
+        execution_price,
+        gross_profit: None,
+        fee: None,
+        swap: None,
+        net_profit: None,
+        timestamp_ms,
+        error_code: None,
+        description: Some(format!(
+            "retry skipped: broker already had client_order_id={client_order_id}"
+        )),
+    }
+}
+
 fn format_ctrader_terminal_info(
     trader: &crate::app_services::ctrader_account::CTraderTraderSnapshot,
     environment: CTraderEnvironment,
@@ -3050,37 +3193,47 @@ fn append_ctrader_order_builder_diagnostics(
                     .map(|order| order.volume)
             })
             .unwrap_or(1.0);
-        let request = build_new_order_request(
-            &CTraderNewOrderRequest {
-                account_id,
-                symbol_id,
-                order_type: CTraderOrderType::Market,
-                trade_side: CTraderTradeSide::Buy,
-                volume: units_to_ctrader_protocol_volume(seed_volume),
-                limit_price: None,
-                stop_price: None,
-                time_in_force: Some(CTraderTimeInForce::ImmediateOrCancel),
-                expiration_timestamp_ms: None,
-                stop_loss: None,
-                take_profit: None,
-                comment: Some("preview".to_string()),
-                base_slippage_price: None,
-                slippage_in_points: Some(10),
-                label: Some("preview".to_string()),
-                position_id: None,
-                client_order_id: Some("preview-new".to_string()),
-                relative_stop_loss: None,
-                relative_take_profit: None,
-                guaranteed_stop_loss: Some(false),
-                trailing_stop_loss: Some(false),
-                stop_trigger_method: Some(CTraderOrderTriggerMethod::Trade),
-            },
-            "preview-new-order",
-        );
-        diagnostics.push(format!(
-            "New order builder ready: payload {}",
-            request.payload_type
-        ));
+        // audit-fix F5: this is a diagnostics builder; if a volume cannot
+        // be safely encoded we log it and skip the preview entry rather
+        // than crashing the panel.
+        match units_to_ctrader_protocol_volume(seed_volume) {
+            Ok(protocol_volume) => {
+                let request = build_new_order_request(
+                    &CTraderNewOrderRequest {
+                        account_id,
+                        symbol_id,
+                        order_type: CTraderOrderType::Market,
+                        trade_side: CTraderTradeSide::Buy,
+                        volume: protocol_volume,
+                        limit_price: None,
+                        stop_price: None,
+                        time_in_force: Some(CTraderTimeInForce::ImmediateOrCancel),
+                        expiration_timestamp_ms: None,
+                        stop_loss: None,
+                        take_profit: None,
+                        comment: Some("preview".to_string()),
+                        base_slippage_price: None,
+                        slippage_in_points: Some(10),
+                        label: Some("preview".to_string()),
+                        position_id: None,
+                        client_order_id: Some("preview-new".to_string()),
+                        relative_stop_loss: None,
+                        relative_take_profit: None,
+                        guaranteed_stop_loss: Some(false),
+                        trailing_stop_loss: Some(false),
+                        stop_trigger_method: Some(CTraderOrderTriggerMethod::Trade),
+                    },
+                    "preview-new-order",
+                );
+                diagnostics.push(format!(
+                    "New order builder ready: payload {}",
+                    request.payload_type
+                ));
+            }
+            Err(err) => {
+                diagnostics.push(format!("New order builder skipped: {err}"));
+            }
+        }
     }
 
     if let Some(order) = runtime.reconcile.pending_orders.first() {
@@ -3091,11 +3244,13 @@ fn append_ctrader_order_builder_diagnostics(
             },
             "preview-cancel-order",
         );
+        // audit-fix F5: same guarded conversion for the amend preview.
+        let amend_volume = units_to_ctrader_protocol_volume(order.volume).ok();
         let amend_request = build_amend_order_request(
             &CTraderAmendOrderRequest {
                 account_id,
                 order_id: order.order_id,
-                volume: Some(units_to_ctrader_protocol_volume(order.volume)),
+                volume: amend_volume,
                 limit_price: order.limit_price,
                 stop_price: order.stop_price,
                 expiration_timestamp_ms: None,
@@ -3117,11 +3272,19 @@ fn append_ctrader_order_builder_diagnostics(
     }
 
     if let Some(position) = runtime.reconcile.positions.first() {
+        // audit-fix F5: same guarded conversion for the close preview.
+        let close_volume = match units_to_ctrader_protocol_volume(position.volume) {
+            Ok(v) => v,
+            Err(err) => {
+                diagnostics.push(format!("Close-position builder skipped: {err}"));
+                return;
+            }
+        };
         let close_request = build_close_position_request(
             &CTraderClosePositionRequest {
                 account_id,
                 position_id: position.position_id,
-                volume: units_to_ctrader_protocol_volume(position.volume),
+                volume: close_volume,
             },
             "preview-close-position",
         );
@@ -3132,11 +3295,26 @@ fn append_ctrader_order_builder_diagnostics(
     }
 }
 
-fn units_to_ctrader_protocol_volume(volume: f64) -> i64 {
-    (volume * 100.0).round() as i64
+/// Convert "units" (cTrader's strategy-side unit count) to the on-wire
+/// `volume` integer (units × 100, since cTrader expresses volumes in
+/// 1/100 of a unit).
+///
+/// SECURITY (audit-fix F5): the previous `as i64` cast silently saturated
+/// to `i64::MAX` for non-finite or out-of-range inputs, so a malformed
+/// upstream value could in principle slip a max-volume order past every
+/// downstream check. We now hard-fail at the conversion boundary so the
+/// operator sees the bad input instead of a giant order.
+fn units_to_ctrader_protocol_volume(volume: f64) -> anyhow::Result<i64> {
+    let scaled = volume * 100.0;
+    if !scaled.is_finite() || scaled.abs() >= i64::MAX as f64 {
+        anyhow::bail!(
+            "cTrader protocol volume overflow converting units: volume={volume}"
+        );
+    }
+    Ok(scaled.round() as i64)
 }
 
-fn ctrader_protocol_volume_from_units(volume: f64) -> i64 {
+fn ctrader_protocol_volume_from_units(volume: f64) -> anyhow::Result<i64> {
     units_to_ctrader_protocol_volume(volume)
 }
 
@@ -3144,7 +3322,15 @@ fn ctrader_protocol_volume_from_lots(lots: f64, symbol: &CTraderSymbolInfo) -> a
     let lot_size = symbol
         .lot_size
         .ok_or_else(|| anyhow::anyhow!("cTrader symbol metadata is missing lotSize"))?;
-    Ok((lots * lot_size as f64).round() as i64)
+    // SECURITY (audit-fix F6): same overflow class as F5 — guard the
+    // product before the silent saturating cast.
+    let scaled = lots * lot_size as f64;
+    if !scaled.is_finite() || scaled.abs() >= i64::MAX as f64 {
+        anyhow::bail!(
+            "cTrader protocol volume overflow converting lots: lots={lots} lot_size={lot_size}"
+        );
+    }
+    Ok(scaled.round() as i64)
 }
 
 fn validate_and_convert_lot_size_to_ctrader_volume(
@@ -3283,6 +3469,20 @@ fn prop_firm_pre_trade_check(
     pip_position: i32,
     symbol_name: &str,
 ) -> anyhow::Result<()> {
+    // SECURITY (audit-fix F7): `10.0_f64.powi(pip_position)` returns `inf`
+    // when `pip_position >= 308` and `0.0` when `pip_position <= -308`,
+    // either of which silently breaks the risk-per-trade gate below:
+    // `pip_distance` either explodes (gate rejects every order) or
+    // collapses to zero (gate passes every order). FX pip positions are
+    // exactly 2 (JPY) or 4 (everything else), so anything outside ±10
+    // is malformed symbol metadata and must be rejected at the gate
+    // boundary rather than risk-sized.
+    if !(-10..=10).contains(&pip_position) {
+        return Err(anyhow::anyhow!(
+            "invalid pip_position {pip_position} for symbol {symbol_name}: \
+             outside supported FX range [-10, 10]; refusing to size order"
+        ));
+    }
     if risk.require_stop_loss && order.stop_loss.is_none() {
         return Err(anyhow::anyhow!(
             "Mandatory stop-loss rule violated: order missing stop_loss"

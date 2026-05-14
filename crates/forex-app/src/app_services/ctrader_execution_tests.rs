@@ -1,3 +1,9 @@
+// TODO(real-data): every hand-written JSON string fed to StubTransport
+// in this file (payloadType 2101/2103/2126 etc.) is a model of what we
+// think the cTrader server returns. Replace each with a captured
+// response from the demo Open API endpoint for the same symbol /
+// execution-type / payload-type so behaviour is asserted against real
+// broker bytes and not a hand-rolled fixture.
 use super::*;
 
 

@@ -1,5 +1,11 @@
 #![allow(clippy::field_reassign_with_default)]
 
+// TODO(real-data): every Experience / state vector / reward in this
+// file is synthetic (e.g. `vec![-10.0, 1.0, 2.0, 3.0, 4.0, 5.0]`).
+// Replace with a cTrader-sourced exit-decision sample: real
+// trade-state vectors recorded from a backtest over the target
+// symbol/timeframe so the regret / propagation paths fire on
+// realistic outcomes.
 use super::*;
 use super::{ExitAgent, ExitAgentArtifact, Experience, PendingRegret, exit_runtime_metadata};
 use crate::base::three_class_runtime_confidence;

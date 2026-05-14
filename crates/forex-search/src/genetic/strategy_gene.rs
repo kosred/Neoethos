@@ -246,14 +246,40 @@ pub fn infer_market_cost_profile(
     let cost = runtime_overrides.cost_profile;
 
     let symbol = if symbol.trim().is_empty() {
-        cost.symbol.clone().unwrap_or_else(|| "EURUSD".to_string())
+        // SYNTHETIC FALLBACK: passing an empty symbol resolves the
+        // typed runtime override, then "EURUSD" as a last-resort
+        // default. This crutch exists because several legacy
+        // `Default` impls (BacktestSettings, EvaluationConfig) have
+        // to produce a struct before any real symbol is bound. Each
+        // such call site is marked `TODO(real-data)` and should
+        // migrate to `for_symbol(...)` so the cost model is bound to
+        // the symbol the search is actually backtesting.
+        let resolved = cost.symbol.clone().unwrap_or_else(|| "EURUSD".to_string());
+        tracing::error!(
+            target: "forex_search::cost_model",
+            resolved_symbol = %resolved,
+            "infer_market_cost_profile called with empty symbol; \
+             using runtime-override or EURUSD default. This is a synthetic \
+             fallback — bind a real cTrader symbol before backtesting."
+        );
+        resolved
     } else {
         symbol.trim().to_string()
     };
     let account_currency = if account_currency.trim().is_empty() {
-        cost.account_currency
+        // SYNTHETIC FALLBACK: same story as the symbol fallback
+        // above. cTrader-supplied account currency must replace this.
+        let resolved = cost.account_currency
             .clone()
-            .unwrap_or_else(|| "USD".to_string())
+            .unwrap_or_else(|| "USD".to_string());
+        tracing::error!(
+            target: "forex_search::cost_model",
+            resolved_account_currency = %resolved,
+            "infer_market_cost_profile called with empty account_currency; \
+             using runtime-override or USD default. This is a synthetic \
+             fallback — bind a real account currency before backtesting."
+        );
+        resolved
     } else {
         account_currency.trim().to_string()
     };
@@ -293,6 +319,14 @@ pub fn infer_market_cost_profile(
         )
     });
 
+    // TODO(real-data): the spread and commission constants below are
+    // synthesized per asset-class because cTrader's
+    // ProtoOASymbolCategory does not ship those on the symbol record.
+    // Once `forex_core::symbol_metadata::SymbolMetadata` is extended
+    // with broker-supplied `typical_spread_pips` and
+    // `commission_per_lot` fields (sourced from the cTrader account /
+    // commission plan), remove these magic defaults and bail when the
+    // metadata is missing.
     let spread_pips = spread_pips_override
         .filter(|value| value.is_finite() && *value >= 0.0)
         .or(cost.spread_pips)
@@ -506,11 +540,13 @@ pub struct EvaluationConfig {
 
 impl Default for EvaluationConfig {
     fn default() -> Self {
-        // The cost profile already consults the typed
-        // `StrategyEvaluationRuntimeOverrides` boundary, so the four cost
-        // fields below come straight from the resolved profile rather
-        // than re-reading the env. SMC weights come from the typed SMC
-        // weight overrides on the same boundary.
+        // TODO(real-data): the cost-profile fields below come from the
+        // empty-symbol synthetic fallback in `infer_market_cost_profile`
+        // (currently EURUSD on USD). Callers that actually run an
+        // evaluation MUST use `EvaluationConfig::for_symbol(...)` so
+        // the cost profile is bound to the real cTrader symbol. Once
+        // every backtest entry point uses `for_symbol`, drop this
+        // synthetic default and require an explicit constructor.
         let profile = infer_market_cost_profile("", "", None, None, None);
         let smc = current_strategy_evaluation_runtime_overrides().smc_weights;
 

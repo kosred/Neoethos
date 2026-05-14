@@ -1,3 +1,10 @@
+// TODO(real-data): all `serde_json::json!({...})` blocks below build
+// synthetic cTrader auth/account-discovery responses (clientMsgId,
+// ctidTraderAccountId, broker name, balance). Replace each with a
+// captured response from the demo `connect.spotware.com` OAuth /
+// Open API endpoint so the auth-flow tests validate the real wire
+// shape — including capital-S "Status" enum values and balance
+// formatting (moneyDigits).
 use super::*;
 
 
@@ -114,9 +121,13 @@ fn callback_parser_surfaces_ctrader_denial_errors() {
 }
 
 #[test]
-fn token_exchange_request_uses_documented_query_parameters() {
-    let url = build_token_exchange_url(
-        "https://openapi.ctrader.com",
+fn token_exchange_request_uses_form_body_not_query_string() {
+    // audit-fix F1: client_secret must NOT appear in the URL. URL is the
+    // host + path only; everything sensitive lives in the form body.
+    let url = build_token_exchange_endpoint_url("https://openapi.ctrader.com");
+    assert_eq!(url, "https://openapi.ctrader.com/apps/token");
+
+    let form = build_token_exchange_form(
         "authorization_code",
         "auth-code-123",
         "http://127.0.0.1:43001/callback",
@@ -125,23 +136,37 @@ fn token_exchange_request_uses_documented_query_parameters() {
     );
 
     assert_eq!(
-        url,
-        "https://openapi.ctrader.com/apps/token?grant_type=authorization_code&code=auth-code-123&redirect_uri=http%3A%2F%2F127.0.0.1%3A43001%2Fcallback&client_id=client-id&client_secret=secret-456"
+        form,
+        vec![
+            ("grant_type", "authorization_code".to_string()),
+            ("code", "auth-code-123".to_string()),
+            ("redirect_uri", "http://127.0.0.1:43001/callback".to_string()),
+            ("client_id", "client-id".to_string()),
+            ("client_secret", "secret-456".to_string()),
+        ]
     );
 }
 
 #[test]
-fn refresh_token_request_uses_documented_query_parameters() {
-    let url = build_refresh_token_exchange_url(
-        "https://openapi.ctrader.com",
+fn refresh_token_request_uses_form_body_not_query_string() {
+    // audit-fix F1: refresh path mirrors exchange — secret in body, never URL.
+    let url = build_token_exchange_endpoint_url("https://openapi.ctrader.com");
+    assert_eq!(url, "https://openapi.ctrader.com/apps/token");
+
+    let form = build_refresh_token_exchange_form(
         "refresh-token-123",
         "client-id",
         "secret-456",
     );
 
     assert_eq!(
-        url,
-        "https://openapi.ctrader.com/apps/token?grant_type=refresh_token&refresh_token=refresh-token-123&client_id=client-id&client_secret=secret-456"
+        form,
+        vec![
+            ("grant_type", "refresh_token".to_string()),
+            ("refresh_token", "refresh-token-123".to_string()),
+            ("client_id", "client-id".to_string()),
+            ("client_secret", "secret-456".to_string()),
+        ]
     );
 }
 

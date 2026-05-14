@@ -679,13 +679,14 @@ fn trendbar_period_label(value: &Value) -> Result<String> {
     let period = value
         .as_i64()
         .context("cTrader trendbar period is missing")?;
-    Ok(match period {
+    // cTrader emits its own M2/M4/M10 codes (2/4/6), but those are
+    // outside our canonical 12-timeframe set; we reject rather than
+    // returning a label that downstream pipelines do not know how to
+    // resample, train, or evaluate against.
+    let label = match period {
         1 => "M1",
-        2 => "M2",
         3 => "M3",
-        4 => "M4",
         5 => "M5",
-        6 => "M10",
         7 => "M15",
         8 => "M30",
         9 => "H1",
@@ -694,9 +695,15 @@ fn trendbar_period_label(value: &Value) -> Result<String> {
         12 => "D1",
         13 => "W1",
         14 => "MN1",
+        2 | 4 | 6 => {
+            return Err(anyhow!(
+                "cTrader trendbar period {} (M2/M4/M10) is outside the canonical timeframe set",
+                period
+            ));
+        }
         other => return Err(anyhow!("unsupported cTrader trendbar period {}", other)),
-    }
-    .to_string())
+    };
+    Ok(label.to_string())
 }
 
 fn trading_mode_enabled(value: Option<&Value>) -> bool {

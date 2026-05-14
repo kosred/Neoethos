@@ -231,30 +231,30 @@ impl Default for RiskConfig {
         vol_ensemble_weights.insert("rogers_satchell".to_string(), 1.0);
         vol_ensemble_weights.insert("parkinson".to_string(), 1.0);
 
+        // EWMA lambdas keyed by canonical timeframe. The list MUST match
+        // `CANONICAL_TIMEFRAMES` exactly — every supported timeframe gets
+        // its own decay coefficient, and unknown timeframes must fall
+        // back to a default rather than be hard-coded here.
         let mut ewma_lambda_by_timeframe = HashMap::new();
         for (tf, lambda) in [
             ("M1", 0.90),
-            ("M2", 0.905),
             ("M3", 0.91),
-            ("M4", 0.915),
             ("M5", 0.92),
-            ("M6", 0.925),
-            ("M10", 0.935),
-            ("M12", 0.938),
             ("M15", 0.94),
-            ("M20", 0.945),
             ("M30", 0.95),
             ("H1", 0.96),
             ("H2", 0.965),
-            ("H3", 0.968),
             ("H4", 0.97),
-            ("H6", 0.974),
-            ("H8", 0.977),
             ("H12", 0.98),
             ("D1", 0.985),
             ("W1", 0.99),
             ("MN1", 0.995),
         ] {
+            debug_assert!(
+                CANONICAL_TIMEFRAMES.contains(&tf),
+                "ewma_lambda_by_timeframe key {} must be a canonical timeframe",
+                tf
+            );
             ewma_lambda_by_timeframe.insert(tf.to_string(), lambda);
         }
 

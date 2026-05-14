@@ -23,6 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::contracts::CANONICAL_TIMEFRAMES;
 use crate::Settings;
 
 /// One resolved field — captures both the operator-supplied value and
@@ -172,9 +173,12 @@ impl ResolvedConfig {
             };
 
         // Timeframes section -----------------------------------------------
-        let canonical_default: Vec<String> = ["M3", "M5", "M15", "M30", "H1", "H4", "D1"]
+        // Canonical default reused by `batch-discover` when `--timeframes`
+        // is omitted. Sourced from `CANONICAL_TIMEFRAMES` so adding /
+        // removing a supported timeframe needs a single edit.
+        let canonical_default: Vec<String> = CANONICAL_TIMEFRAMES
             .iter()
-            .map(|s| s.to_string())
+            .map(|tf| (*tf).to_string())
             .collect();
 
         // Data section -----------------------------------------------------
@@ -466,8 +470,19 @@ mod tests {
     fn canonical_default_timeframes_include_m3_and_m30() {
         let s = Settings::default();
         let r = ResolvedConfig::from_settings(&s);
-        assert!(r.timeframes.canonical_default.contains(&"M3"));
-        assert!(r.timeframes.canonical_default.contains(&"M30"));
+        assert!(r.timeframes.canonical_default.contains(&"M3".to_string()));
+        assert!(r.timeframes.canonical_default.contains(&"M30".to_string()));
+    }
+
+    #[test]
+    fn canonical_default_matches_global_canonical_timeframes() {
+        let s = Settings::default();
+        let r = ResolvedConfig::from_settings(&s);
+        let expected: Vec<String> = CANONICAL_TIMEFRAMES
+            .iter()
+            .map(|tf| (*tf).to_string())
+            .collect();
+        assert_eq!(r.timeframes.canonical_default, expected);
     }
 
     #[test]

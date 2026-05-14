@@ -1,3 +1,9 @@
+// TODO(real-data): every JSON value in this file is a hand-built
+// model (e.g. balance=123456789, brokerName="Demo Broker", price=1.10123).
+// Replace each fixture with a captured demo-account ProtoOATrader /
+// ProtoOAReconcileRes / ProtoOADealList response so the parser is
+// validated against bytes the broker actually emits — including
+// fields cTrader marks optional but our parser silently drops.
 use super::*;
 
 

@@ -58,6 +58,7 @@ pub struct CTraderPositionSnapshot {
     pub commission: Option<f64>,
     pub label: Option<String>,
     pub comment: Option<String>,
+    pub client_order_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -74,6 +75,7 @@ pub struct CTraderPendingOrderSnapshot {
     pub take_profit: Option<f64>,
     pub label: Option<String>,
     pub comment: Option<String>,
+    pub client_order_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -227,6 +229,13 @@ struct TradeDataPayload {
     open_timestamp: Option<i64>,
     label: Option<String>,
     comment: Option<String>,
+    /// Echo of `clientOrderId` that the bot sent on the original order.
+    /// SECURITY (audit-fix F3): the duplicate-order pre-retry check uses
+    /// this field to detect that a previous attempt was already accepted
+    /// by the broker before the network timeout, so retries don't double
+    /// the position.
+    #[serde(default, rename = "clientOrderId")]
+    client_order_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -330,6 +339,7 @@ pub fn parse_reconcile_response(response_json: &str) -> Result<CTraderReconcileS
                 take_profit: position.take_profit,
                 label: position.trade_data.label,
                 comment: position.trade_data.comment,
+                client_order_id: position.trade_data.client_order_id,
             })
             .collect(),
         pending_orders: envelope
@@ -349,6 +359,7 @@ pub fn parse_reconcile_response(response_json: &str) -> Result<CTraderReconcileS
                 take_profit: order.take_profit,
                 label: order.trade_data.label,
                 comment: order.trade_data.comment,
+                client_order_id: order.trade_data.client_order_id,
             })
             .collect(),
     })

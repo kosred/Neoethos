@@ -1,3 +1,8 @@
+// TODO(real-data): the calibrator/conformal fixtures and any
+// downstream DataFrame inputs in this file use synthesised
+// probabilities/qhat values. Replace with a cTrader historical sample:
+// fit calibrators on real out-of-sample meta-model predictions for the
+// target symbol/timeframe and reuse those artifacts here.
 use super::*;
 use crate::tree_models::XGBoostExpert;
 

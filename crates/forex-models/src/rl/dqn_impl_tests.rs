@@ -1,3 +1,11 @@
+// TODO(real-data): every DataFrame, weight matrix, Q-value vector and
+// feature normalisation range in this file is synthetic
+// (`vec![0.0, 0.0]`, `vec![1.0, 1.0]`, hand-written Q-value targets
+// like 0.35 / 0.95 / 0.4). Replace each fixture below with a cTrader
+// historical sample for the symbol/timeframe the DQN learner is
+// targeted at (e.g. EURUSD M15 features built from real OHLCV), so
+// asserted Q-values come from real state distributions rather than
+// algebraic identities.
 use super::*;
 
 

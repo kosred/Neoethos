@@ -619,11 +619,17 @@ impl RiskManager {
             && aw > 0.0
             && al > 0.0
         {
-            let f_star = (wr * aw - (1.0 - wr) * al) / aw;
-            if f_star > 0.0 {
-                let quarter_kelly = f_star / 4.0;
-                // Floor 0.5%, Ceiling 3% (or max_risk_cap)
-                base_risk = quarter_kelly.clamp(0.005, input.max_risk_cap.min(0.03));
+            if aw <= 1.0e-6 {
+                tracing::debug!(target: "risk", "Kelly degenerate: avg_win {aw} too small");
+            } else {
+                let f_star = (wr * aw - (1.0 - wr) * al) / aw;
+                if !f_star.is_finite() {
+                    tracing::debug!(target: "risk", "Kelly f_star non-finite; skipping");
+                } else if f_star > 0.0 {
+                    let quarter_kelly = f_star / 4.0;
+                    // Floor 0.5%, Ceiling 3% (or max_risk_cap)
+                    base_risk = quarter_kelly.clamp(0.005, input.max_risk_cap.min(0.03));
+                }
             }
         }
 

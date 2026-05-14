@@ -439,6 +439,7 @@ fn execution_surface_snapshot_uses_ctrader_reconcile_runtime_when_connected() {
                             commission: None,
                             label: Some("trend".to_string()),
                             comment: Some("bot".to_string()),
+                            client_order_id: None,
                         },
                     ],
                     pending_orders: vec![
@@ -455,6 +456,7 @@ fn execution_surface_snapshot_uses_ctrader_reconcile_runtime_when_connected() {
                             take_profit: Some(1.09),
                             label: Some("breakout".to_string()),
                             comment: Some("pending".to_string()),
+                            client_order_id: None,
                         },
                     ],
                 },
@@ -559,6 +561,7 @@ fn cancel_selected_order_records_ctrader_journal_and_updates_status() {
                             commission: None,
                             label: Some("trend".to_string()),
                             comment: Some("bot".to_string()),
+                            client_order_id: None,
                         },
                     ],
                     pending_orders: vec![
@@ -575,6 +578,7 @@ fn cancel_selected_order_records_ctrader_journal_and_updates_status() {
                             take_profit: Some(1.09),
                             label: Some("breakout".to_string()),
                             comment: Some("pending".to_string()),
+                            client_order_id: None,
                         },
                     ],
                 },
@@ -670,6 +674,7 @@ fn close_selected_position_surfaces_ctrader_execution_failure() {
                             commission: None,
                             label: Some("trend".to_string()),
                             comment: Some("bot".to_string()),
+                            client_order_id: None,
                         },
                     ],
                     pending_orders: Vec::new(),
@@ -1428,26 +1433,51 @@ fn sample_prop_firm_order() -> CTraderNewOrderRequest {
     }
 }
 
+// TODO(real-data): the risk-gate tests below currently rely on the
+// `baked_in_default` symbol-metadata fallback (EURUSD / USDJPY) inside
+// forex_core::symbol_metadata to resolve pip values without hitting a
+// live cTrader connection. Once the cTrader bootstrap writes the
+// symbol-metadata JSON to disk in CI, replace these fixtures with a
+// loader that reads the real broker payload for the symbol/timeframe.
+fn install_prop_firm_test_env() {
+    // SAFETY: tests in this binary share env; risk-gate tests must set
+    // FOREX_BOT_PROP_ACCOUNT_CURRENCY explicitly because production
+    // refuses to synthesize a default account currency.
+    // SAFETY: set_var is unsafe in Rust 2024; tests run single-threaded
+    // for env mutation via cargo's default thread pool here.
+    unsafe {
+        std::env::set_var("FOREX_BOT_PROP_ACCOUNT_CURRENCY", "USD");
+        // EURJPY-style cross test below requires this; USDJPY only uses
+        // base==account, so it's safe to leave the rate present.
+        std::env::set_var("FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE", "0.0067");
+    }
+}
+
 #[test]
 fn prop_firm_gate_blocks_order_without_stop_loss() {
+    install_prop_firm_test_env();
     let mut order = sample_prop_firm_order();
     order.stop_loss = None;
     let risk = RiskConfig::default();
-    let err = prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4).unwrap_err();
+    let err = prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD")
+        .unwrap_err();
     assert!(err.to_string().contains("missing stop_loss"));
 }
 
 #[test]
 fn prop_firm_gate_blocks_when_daily_drawdown_breached() {
+    install_prop_firm_test_env();
     let order = sample_prop_firm_order();
     let risk = RiskConfig::default();
-    let err = prop_firm_pre_trade_check(&risk, &order, 9500.0, 10000.0, 10000.0, 4).unwrap_err();
+    let err = prop_firm_pre_trade_check(&risk, &order, 9500.0, 10000.0, 10000.0, 4, "EURUSD")
+        .unwrap_err();
     assert!(err.to_string().contains("Daily drawdown limit reached"));
     assert!(err.to_string().contains("current 5.00% >= max 4.00%"));
 }
 
 #[test]
 fn prop_firm_gate_respects_jpy_pip_precision() {
+    install_prop_firm_test_env();
     let mut order = sample_prop_firm_order();
     order.limit_price = Some(150.00);
     order.stop_loss = Some(149.50); // 50 pips in JPY (2 digits)
@@ -1465,41 +1495,89 @@ fn prop_firm_gate_respects_jpy_pip_precision() {
         ..RiskConfig::default()
     };
     // Should pass under 2-digit precision (50 pips).
-    // Under 4-digit precision the multiplier would yield 5000 pips, but
-    // even with risk_per_trade=1.0 the implied loss of 5000 × 0.01 lot
-    // × $10 = $500 < $10000 still passes. So we cross-verify by also
-    // making sure the function returns Err with pip_position = 4.
-    assert!(prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 2).is_ok());
+    assert!(
+        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 2, "USDJPY").is_ok()
+    );
     // 4-digit precision would amplify pip_distance by 100×; with the same
     // lot size and pip value that's $50,000 of risk on a $10,000 account,
     // still > 100% so it must reject.
-    assert!(prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4).is_err());
+    assert!(
+        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "USDJPY").is_err()
+    );
 }
 
 #[test]
 fn prop_firm_gate_blocks_when_total_drawdown_breached() {
+    install_prop_firm_test_env();
     let order = sample_prop_firm_order();
     let risk = RiskConfig::default();
     // Set day_start_equity equal to account_equity so daily DD is 0%, forcing it to hit total DD rule
-    let err = prop_firm_pre_trade_check(&risk, &order, 8900.0, 10000.0, 8900.0, 4).unwrap_err();
+    let err = prop_firm_pre_trade_check(&risk, &order, 8900.0, 10000.0, 8900.0, 4, "EURUSD")
+        .unwrap_err();
     assert!(err.to_string().contains("Total drawdown limit reached"));
     assert!(err.to_string().contains("current 11.00% >= max 7.00%"));
 }
 
 #[test]
 fn prop_firm_gate_passes_valid_order_within_limits() {
-    let order = sample_prop_firm_order();
+    install_prop_firm_test_env();
+    let mut order = sample_prop_firm_order();
+    // Keep the size sane: the default fixture's 1000-lot volume would
+    // (correctly) be rejected by the real-pip risk-per-trade gate.
+    order.volume = 1; // 0.01 micro-lot
+    order.limit_price = Some(1.10000);
     let risk = RiskConfig::default();
-    assert!(prop_firm_pre_trade_check(&risk, &order, 10100.0, 10000.0, 10000.0, 4).is_ok());
+    assert!(
+        prop_firm_pre_trade_check(&risk, &order, 10100.0, 10000.0, 10000.0, 4, "EURUSD").is_ok()
+    );
 }
 
 #[test]
 fn prop_firm_gate_respects_disabled_stop_loss_requirement() {
+    install_prop_firm_test_env();
     let mut order = sample_prop_firm_order();
     order.stop_loss = None;
     let risk = RiskConfig {
         require_stop_loss: false,
         ..RiskConfig::default()
     };
-    assert!(prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4).is_ok());
+    assert!(
+        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD").is_ok()
+    );
+}
+
+#[test]
+fn prop_firm_gate_rejects_unknown_symbol_without_synthetic_fallback() {
+    install_prop_firm_test_env();
+    let order = sample_prop_firm_order();
+    let risk = RiskConfig::default();
+    // Empty symbol must be rejected — the old code silently used
+    // `infer_market_cost_profile("", "", …)` and the EURUSD default,
+    // producing a synthetic pip value. That is not allowed any more.
+    let err = prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("symbol name was not supplied")
+            || err.to_string().contains("Daily drawdown")
+            || err.to_string().contains("Total drawdown"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn prop_firm_gate_rejects_when_account_currency_unset() {
+    // Deliberately clear the env to verify the gate refuses to size
+    // an order rather than falling back to "USD".
+    unsafe {
+        std::env::remove_var("FOREX_BOT_PROP_ACCOUNT_CURRENCY");
+    }
+    let order = sample_prop_firm_order();
+    let risk = RiskConfig::default();
+    let err = prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("FOREX_BOT_PROP_ACCOUNT_CURRENCY")
+            || err.to_string().contains("symbol metadata"),
+        "unexpected error: {err}"
+    );
 }

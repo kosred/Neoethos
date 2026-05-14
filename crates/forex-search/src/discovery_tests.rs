@@ -1,3 +1,8 @@
+// TODO(real-data): the `sample_*` helpers below build deterministic
+// alternating feature signals and a 10-bar OHLCV ramp. Replace them
+// with a cTrader historical sample (e.g. 10 closing prints of EURUSD
+// M1 + a real feature extracted by the production pipeline) so the
+// discovery tests assert against the broker payload shape.
 use super::*;
 
 

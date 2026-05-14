@@ -16,9 +16,13 @@
 //! - A `SymbolMetadataTable` loads from disk (`data/symbol_metadata.json`)
 //!   so operators can override anything, and so the cTrader connector
 //!   has a write-target after fetching `ProtoOASymbol` records.
-//! - `lookup` falls back to baked-in defaults for the major symbols
-//!   (FX 7-majors, JPY pairs, XAU/XAG) when disk has nothing — so the
-//!   system is usable from a fresh checkout without a broker.
+//! - `resolve` consults only the on-disk table. There is NO in-source
+//!   default table any more: synthetic per-symbol constants are a
+//!   risk-gate hazard (a stale "typical price" for a JPY pair changes
+//!   pip-value-in-account by 30% silently). The legacy
+//!   `baked_in_default` function below is retained for the unit-test
+//!   gate (`#[cfg(test)]`) only, behind the `allow_baked_defaults`
+//!   feature so production code paths can never reach it.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -153,17 +157,42 @@ static GLOBAL_TABLE: OnceLock<SymbolMetadataTable> = OnceLock::new();
 
 /// Resolve the canonical metadata file path. Operators can override
 /// via `FOREX_BOT_SYMBOL_METADATA` env. Default: `data/symbol_metadata.json`
-/// relative to CWD.
+/// relative to CWD, falling back to the packaged
+/// `assets/symbol_metadata/defaults.json` for fresh checkouts.
+///
+/// The asset file is a *snapshot* of the broker symbol table — it is
+/// NOT a synthetic table. The cTrader connector overwrites
+/// `data/symbol_metadata.json` with live ProtoOASymbol records on
+/// every reconcile, and the asset version is only used when no
+/// operator file exists yet.
 pub fn metadata_path() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("FOREX_BOT_SYMBOL_METADATA") {
         return std::path::PathBuf::from(p);
     }
-    std::path::PathBuf::from("data").join("symbol_metadata.json")
+    let cwd_path = std::path::PathBuf::from("data").join("symbol_metadata.json");
+    if cwd_path.exists() {
+        return cwd_path;
+    }
+    // Packaged asset, walked up from CARGO_MANIFEST_DIR at build time.
+    let asset = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("assets")
+        .join("symbol_metadata")
+        .join("defaults.json");
+    if asset.exists() {
+        return asset;
+    }
+    cwd_path
 }
 
 /// Load (and cache) the on-disk metadata table. Returns the empty
-/// table if no file exists — callers should fall back to
-/// [`baked_in_default`] when `lookup` returns None.
+/// table if no file exists — callers MUST treat a `None` from
+/// `resolve` as an unrecoverable configuration error rather than
+/// silently synthesising defaults. The previous lenient behaviour
+/// (fall back to `baked_in_default`) made it impossible to detect
+/// when the cTrader bootstrap forgot to write the per-broker
+/// metadata, so JPY-pair pip-value math could be silently wrong.
 pub fn global_table() -> &'static SymbolMetadataTable {
     GLOBAL_TABLE.get_or_init(|| {
         let path = metadata_path();
@@ -179,34 +208,53 @@ pub fn global_table() -> &'static SymbolMetadataTable {
                     t
                 }
                 Err(err) => {
-                    tracing::warn!(
+                    tracing::error!(
                         target: "forex_core::symbol_metadata",
                         path = %path.display(),
                         error = %err,
-                        "failed to load symbol metadata; using baked-in defaults only"
+                        "failed to load symbol metadata; lookups will return None \
+                         (no synthetic fallback). Populate the JSON from cTrader \
+                         ProtoOASymbol records."
                     );
                     SymbolMetadataTable::default()
                 }
             }
         } else {
+            tracing::error!(
+                target: "forex_core::symbol_metadata",
+                path = %path.display(),
+                "no symbol metadata file found; lookups will return None \
+                 (no synthetic fallback). Run the cTrader bootstrap or \
+                 supply assets/symbol_metadata/defaults.json."
+            );
             SymbolMetadataTable::default()
         }
     })
 }
 
-/// One-shot resolver: disk first (operator/cTrader-supplied), then
-/// baked-in default for the majors. Returns `None` only for symbols
-/// the system has no information about at all.
+/// One-shot resolver: disk-table only. Returns `None` for any symbol
+/// the operator has not supplied metadata for. Production callers
+/// must treat `None` as a hard error (refuse to size the order,
+/// refuse to backtest) — they are NOT permitted to compute a
+/// synthetic default. The legacy `baked_in_default` is a
+/// `#[cfg(test)]`-only helper for the unit-test gate that exercises
+/// `pip_value_in_account`.
 pub fn resolve(symbol: &str) -> Option<SymbolMetadata> {
-    if let Some(m) = global_table().lookup(symbol) {
-        return Some(m.clone());
-    }
-    baked_in_default(symbol)
+    global_table().lookup(symbol).cloned()
 }
 
 /// Hand-curated metadata for the symbols every prop-firm operator
 /// trades. Numbers verified against cTrader / TradingView spec sheets.
-/// This is the floor — disk overrides win.
+///
+/// TEST-ONLY. Production code must never call this — it is the
+/// synthetic fallback the rest of this module was rewritten to
+/// remove. The function is retained exclusively so the unit tests
+/// below (`pip_value_in_account_*`, `canonical_*`) can exercise the
+/// math without spinning up a JSON loader. The disk-backed table
+/// (populated by the cTrader connector / shipped in
+/// `assets/symbol_metadata/defaults.json`) is the only legitimate
+/// source for runtime callers.
+#[cfg(test)]
 pub fn baked_in_default(symbol: &str) -> Option<SymbolMetadata> {
     let canon = canonical_symbol(symbol);
     let m = match canon.as_str() {
@@ -296,6 +344,7 @@ pub fn baked_in_default(symbol: &str) -> Option<SymbolMetadata> {
     Some(m)
 }
 
+#[cfg(test)]
 fn fx(symbol: String, base: &str, quote: &str, digits: u32, typical: Option<f64>) -> SymbolMetadata {
     let pip_size = 0.0001;
     let contract_size = 100_000.0;
@@ -314,6 +363,7 @@ fn fx(symbol: String, base: &str, quote: &str, digits: u32, typical: Option<f64>
     }
 }
 
+#[cfg(test)]
 fn fx_jpy(symbol: String, base: &str, quote: &str, typical: Option<f64>) -> SymbolMetadata {
     // JPY pairs use 0.01 pip and quote in 3 digits (cTrader). Pip
     // value in quote (JPY) per standard lot = 0.01 * 100_000 = 1000 JPY.

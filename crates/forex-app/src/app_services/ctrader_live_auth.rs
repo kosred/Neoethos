@@ -34,6 +34,12 @@ pub struct CTraderLoopbackConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CTraderCallbackPayload {
     pub authorization_code: String,
+    /// Opaque `state` value echoed back by the cTrader authorization server.
+    /// SECURITY (audit-fix F2): the OAuth client MUST compare this against the
+    /// `state` it generated before opening the browser; mismatch indicates a
+    /// CSRF / authorization-response-injection attempt and the callback must
+    /// be rejected without exchanging the code.
+    pub state: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,6 +218,19 @@ impl ProductionCTraderLiveAuthBackend {
         expected_path: &str,
         timeout: Duration,
     ) -> Result<String> {
+        // Back-compat: keep the pre-F2 entrypoint working for unit tests
+        // that don't exercise the state-validation path. Production
+        // `run()` always uses `..._with_state` below.
+        self.capture_authorization_code_with_state(listener, expected_path, None, timeout)
+    }
+
+    fn capture_authorization_code_with_state(
+        &self,
+        listener: TcpListener,
+        expected_path: &str,
+        expected_state: Option<&str>,
+        timeout: Duration,
+    ) -> Result<String> {
         listener
             .set_nonblocking(true)
             .context("failed to configure cTrader callback listener")?;
@@ -219,7 +238,11 @@ impl ProductionCTraderLiveAuthBackend {
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    return self.read_authorization_code_from_stream(stream, expected_path);
+                    return self.read_authorization_code_from_stream(
+                        stream,
+                        expected_path,
+                        expected_state,
+                    );
                 }
                 Err(err) if err.kind() == ErrorKind::WouldBlock => {
                     if started.elapsed() >= timeout {
@@ -239,6 +262,7 @@ impl ProductionCTraderLiveAuthBackend {
         &self,
         mut stream: TcpStream,
         expected_path: &str,
+        expected_state: Option<&str>,
     ) -> Result<String> {
         stream
             .set_nonblocking(false)
@@ -256,7 +280,13 @@ impl ProductionCTraderLiveAuthBackend {
             .split_whitespace()
             .nth(1)
             .context("cTrader callback request line was malformed")?;
-        let payload = parse_callback_request(request_target, expected_path)?;
+        // SECURITY (audit-fix F2): when a state token was issued, the
+        // callback must carry the same value or we refuse to surface the
+        // authorization code to the rest of the flow.
+        let payload = match expected_state {
+            Some(state) => parse_callback_request_with_state(request_target, expected_path, state)?,
+            None => parse_callback_request(request_target, expected_path)?,
+        };
 
         let response = concat!(
             "HTTP/1.1 200 OK\r\n",
@@ -282,15 +312,23 @@ impl ProductionCTraderLiveAuthBackend {
         authorization_code: &str,
     ) -> Result<CTraderTokenBundle> {
         let redirect_uri = rewrite_redirect_uri_port(&request.redirect_uri, callback_port)?;
-        let url = build_token_exchange_url(
-            CTRADER_TOKEN_ENDPOINT_BASE,
+        // SECURITY (audit-fix F1): keep `client_secret` out of the URL query
+        // string. The cTrader token endpoint accepts the same parameters in
+        // the POST body, and a POST body is not captured by reqwest debug
+        // logs, proxy access logs, or system error reports the way a URL is.
+        let url = build_token_exchange_endpoint_url(CTRADER_TOKEN_ENDPOINT_BASE);
+        let form = build_token_exchange_form(
             "authorization_code",
             authorization_code,
             &redirect_uri,
             &request.client_id,
             &request.client_secret,
         );
-        let response = reqwest::blocking::get(url)
+        let client = reqwest::blocking::Client::new();
+        let response = client
+            .post(&url)
+            .form(&form)
+            .send()
             .context("failed to call cTrader token endpoint")?
             .error_for_status()
             .context("cTrader token endpoint returned an error status")?;
@@ -326,11 +364,17 @@ impl CTraderLiveAuthBackend for ProductionCTraderLiveAuthBackend {
         );
 
         // Step 2/5 — build authorize URL
-        let authorize_url = build_authorize_url(
+        // SECURITY (audit-fix F2): mint a fresh CSRF-state token for this
+        // flow, embed it in the authorize URL, and pass it to the callback
+        // capture loop so the redirect-uri handler can reject any callback
+        // that doesn't echo it back.
+        let oauth_state = generate_oauth_state();
+        let authorize_url = build_authorize_url_with_state(
             &request.client_id,
             &request.redirect_uri,
             callback_port,
             &request.scope,
+            &oauth_state,
         )
         .with_context(|| {
             format!(
@@ -344,7 +388,8 @@ impl CTraderLiveAuthBackend for ProductionCTraderLiveAuthBackend {
             target: "forex_app::ctrader::oauth",
             step = "build_authorize_url",
             client_id_prefix = %request.client_id.chars().take(6).collect::<String>(),
-            "authorize URL constructed"
+            state_len = oauth_state.len(),
+            "authorize URL constructed with CSRF state"
         );
 
         // Step 3/5 — open system browser
@@ -369,11 +414,17 @@ impl CTraderLiveAuthBackend for ProductionCTraderLiveAuthBackend {
             "waiting for browser to redirect back to the loopback listener"
         );
         let authorization_code = self
-            .capture_authorization_code(listener, request.loopback.callback_path())
+            .capture_authorization_code_with_state(
+                listener,
+                request.loopback.callback_path(),
+                Some(oauth_state.as_str()),
+                CTRADER_CALLBACK_TIMEOUT,
+            )
             .with_context(|| format!(
-                "OAuth step 4/5 (wait_for_callback) failed — no callback received on port {} within the timeout window. \
+                "OAuth step 4/5 (wait_for_callback) failed — no valid callback received on port {} within the timeout window. \
                  Common causes: (a) the redirect_uri registered in your cTrader app does not match http://{}:{}{} ; \
-                 (b) the browser was closed before approving; (c) firewall/AV blocked the loopback connection.",
+                 (b) the browser was closed before approving; (c) firewall/AV blocked the loopback connection; \
+                 (d) the callback `state` did not match — possible CSRF, rejected.",
                 callback_port,
                 request.loopback.bind_host(),
                 callback_port,
@@ -417,13 +468,19 @@ impl CTraderLiveAuthBackend for ProductionCTraderLiveAuthBackend {
         &self,
         request: &CTraderTokenRefreshRequest,
     ) -> Result<CTraderTokenBundle> {
-        let url = build_refresh_token_exchange_url(
-            CTRADER_TOKEN_ENDPOINT_BASE,
+        // SECURITY (audit-fix F1): mirror the exchange_token change — POST the
+        // refresh_token + client_secret in the body, never in the URL.
+        let url = build_token_exchange_endpoint_url(CTRADER_TOKEN_ENDPOINT_BASE);
+        let form = build_refresh_token_exchange_form(
             &request.refresh_token,
             &request.client_id,
             &request.client_secret,
         );
-        let response = reqwest::blocking::get(url)
+        let client = reqwest::blocking::Client::new();
+        let response = client
+            .post(&url)
+            .form(&form)
+            .send()
             .context("failed to call cTrader refresh token endpoint")?
             .error_for_status()
             .context("cTrader refresh token endpoint returned an error status")?;
@@ -595,6 +652,9 @@ pub fn build_authorize_url(
     callback_port: u16,
     scope: &str,
 ) -> Result<String> {
+    // Back-compat shim for callers/tests that don't supply state. Real
+    // production code must use `build_authorize_url_with_state` and verify
+    // the echoed `state` on the callback. See audit-fix F2.
     let redirect_uri = rewrite_redirect_uri_port(redirect_uri, callback_port)?;
     Ok(format!(
         "https://id.ctrader.com/my/settings/openapi/grantingaccess/?client_id={}&redirect_uri={}&scope={}&product=web",
@@ -602,6 +662,59 @@ pub fn build_authorize_url(
         percent_encode(&redirect_uri),
         percent_encode(scope),
     ))
+}
+
+/// Build the cTrader authorize URL with a CSRF `state` parameter.
+///
+/// SECURITY (audit-fix F2): RFC 6749 §10.12 mandates the OAuth client both
+/// (a) include an unguessable, per-flow `state` value in the authorize
+/// request and (b) verify that the same value is echoed back on the
+/// redirect-uri callback. Without this check, an attacker who can induce
+/// the user's browser to follow a crafted callback URL can splice in their
+/// own authorization code and trick the bot into binding to the attacker's
+/// cTrader account. The token-exchange round-trip would still succeed
+/// because the broker accepts whichever code is supplied.
+///
+/// Generate `state` with [`generate_oauth_state`], pass it here, then pass
+/// the SAME string to [`parse_callback_request_with_state`].
+pub fn build_authorize_url_with_state(
+    client_id: &str,
+    redirect_uri: &str,
+    callback_port: u16,
+    scope: &str,
+    state: &str,
+) -> Result<String> {
+    if state.trim().is_empty() {
+        return Err(anyhow!("OAuth state token must not be empty"));
+    }
+    let redirect_uri = rewrite_redirect_uri_port(redirect_uri, callback_port)?;
+    Ok(format!(
+        "https://id.ctrader.com/my/settings/openapi/grantingaccess/?client_id={}&redirect_uri={}&scope={}&state={}&product=web",
+        percent_encode(client_id),
+        percent_encode(&redirect_uri),
+        percent_encode(scope),
+        percent_encode(state),
+    ))
+}
+
+/// Generate a cryptographically random, URL-safe OAuth `state` token using
+/// the OS entropy source. 32 bytes of entropy → 256-bit unguessability,
+/// which is well above the OAuth 2.0 Security Best Current Practice
+/// minimum (128 bits).
+pub fn generate_oauth_state() -> String {
+    use base64::Engine as _;
+    use rand::TryRngCore;
+    let mut bytes = [0_u8; 32];
+    // OsRng pulls from /dev/urandom on Linux and BCryptGenRandom on Windows.
+    // We tolerate a single retry if the OS RNG transiently fails — if both
+    // attempts fail the system is in a state where issuing an OAuth flow
+    // would be unsafe anyway, so we panic. The OS RNG failing twice in
+    // succession indicates a kernel-level entropy fault.
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut bytes)
+        .or_else(|_| rand::rngs::OsRng.try_fill_bytes(&mut bytes))
+        .expect("OS RNG failed to produce OAuth state entropy");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 pub fn parse_callback_request(
@@ -616,6 +729,7 @@ pub fn parse_callback_request(
     }
 
     let mut authorization_code = None;
+    let mut state = None;
     let mut denial_error = None;
     let mut denial_description = None;
 
@@ -624,6 +738,7 @@ pub fn parse_callback_request(
         let decoded_value = percent_decode(value)?;
         match key {
             "code" => authorization_code = Some(decoded_value),
+            "state" => state = Some(decoded_value),
             "error" => denial_error = Some(decoded_value),
             "error_description" => denial_description = Some(decoded_value),
             _ => {}
@@ -644,7 +759,59 @@ pub fn parse_callback_request(
         .filter(|code| !code.trim().is_empty())
         .context("missing authorization code")?;
 
-    Ok(CTraderCallbackPayload { authorization_code })
+    Ok(CTraderCallbackPayload {
+        authorization_code,
+        state,
+    })
+}
+
+/// Same as [`parse_callback_request`] but additionally enforces the OAuth
+/// `state` CSRF check (audit-fix F2). The caller passes the `state` value
+/// that was sent to the authorization server; this function rejects the
+/// callback if the echoed value is missing, empty, or doesn't match.
+///
+/// We use a length-checked equality first (cheap reject) and then a
+/// constant-time byte compare so a network-adjacent attacker can't measure
+/// timing to learn a prefix of our state.
+pub fn parse_callback_request_with_state(
+    request_target: &str,
+    expected_path: &str,
+    expected_state: &str,
+) -> Result<CTraderCallbackPayload> {
+    if expected_state.trim().is_empty() {
+        return Err(anyhow!(
+            "OAuth state validation requested but no state token was issued; refusing to accept callback"
+        ));
+    }
+    let payload = parse_callback_request(request_target, expected_path)?;
+    let received = payload
+        .state
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "cTrader callback missing `state` parameter — possible CSRF; refusing to exchange authorization code"
+            )
+        })?;
+    if !constant_time_eq(expected_state.as_bytes(), received.as_bytes()) {
+        return Err(anyhow!(
+            "cTrader callback `state` mismatch — possible CSRF or authorization-response-injection; refusing to exchange authorization code"
+        ));
+    }
+    Ok(payload)
+}
+
+/// Constant-time byte comparison. Avoids leaking the length of the matching
+/// prefix via timing side-channels.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// URL for the cTrader token endpoint. The endpoint accepts credentials via

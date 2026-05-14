@@ -255,10 +255,11 @@ impl ConceptDriftMonitor {
         let e_sum: f64 = expected_counts.iter().sum();
         let a_sum: f64 = actual_counts.iter().sum();
 
+        let smoothing = 1.0_f64 / (bins as f64).max(1.0);
         let mut psi = 0.0;
         for i in 0..bins {
-            let e_pct = (expected_counts[i] + 1e-6) / (e_sum + bins as f64 * 1e-6);
-            let a_pct = (actual_counts[i] + 1e-6) / (a_sum + bins as f64 * 1e-6);
+            let e_pct = (expected_counts[i] + smoothing) / (e_sum + bins as f64 * smoothing);
+            let a_pct = (actual_counts[i] + smoothing) / (a_sum + bins as f64 * smoothing);
             psi += (a_pct - e_pct) * (a_pct / e_pct).ln();
         }
 

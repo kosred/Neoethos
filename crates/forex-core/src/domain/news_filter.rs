@@ -1,4 +1,5 @@
 use serde_json::Value;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Clone)]
 pub struct NewsEvent {
@@ -10,7 +11,12 @@ pub struct NewsEvent {
 #[derive(Debug, Clone)]
 pub struct NewsFilter {
     pub enabled: bool,
-    pub api_key: Option<String>,
+    /// SECURITY (audit-fix F8): the LLM API key is wrapped in
+    /// [`zeroize::Zeroizing`] so the secret is wiped from memory when the
+    /// `NewsFilter` is dropped or reassigned. Without this, a heap dump
+    /// of a crashed process (or a swapped-out page on disk) could leak
+    /// the operator's OpenAI/Perplexity bearer token.
+    pub api_key: Option<Zeroizing<String>>,
     pub llm_provider: String, // "openai" or "perplexity"
     pub blackout_minutes_before: i64,
     pub blackout_minutes_after: i64,
@@ -33,7 +39,9 @@ impl NewsFilter {
 
     pub fn set_credentials(&mut self, provider: String, api_key: String) {
         self.llm_provider = provider;
-        self.api_key = Some(api_key);
+        // audit-fix F8: wrap in Zeroizing so the prior value (if any) is
+        // overwritten on drop rather than left on the heap.
+        self.api_key = Some(Zeroizing::new(api_key));
     }
 
     /// Run synchronously (should be spawned in a dedicated blocking thread by the app)
@@ -45,7 +53,9 @@ impl NewsFilter {
             return Ok("SAFE".to_string());
         }
 
-        let api_key = match &self.api_key {
+        // audit-fix F8: dereference the `Zeroizing<String>` wrapper to get
+        // a `&str` view; the wrapper still owns and will wipe the bytes.
+        let api_key: &str = match self.api_key.as_deref() {
             Some(k) if !k.trim().is_empty() => k,
             _ => return Ok("SAFE".to_string()),
         };

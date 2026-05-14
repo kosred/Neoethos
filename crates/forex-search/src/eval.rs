@@ -203,6 +203,14 @@ impl From<BacktestMetrics> for [f64; 11] {
 
 impl Default for BacktestSettings {
     fn default() -> Self {
+        // TODO(real-data): `Default::default()` synthesizes cost-profile
+        // fields (pip_value, spread, commission) using the empty-symbol
+        // fallback in `infer_market_cost_profile` — i.e. EURUSD pip math
+        // on a USD account. Every backtest entry point should pass a
+        // real symbol via `for_symbol(...)` so this default is only
+        // used by code that never actually evaluates a strategy
+        // (struct-construction in tests, etc.). Remove this synthetic
+        // fallback once all call sites have migrated.
         let profile = infer_market_cost_profile("", "", None, None, None);
         Self {
             sl_pips: 20.0,

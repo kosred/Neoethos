@@ -115,6 +115,10 @@ mod tests {
     use forex_data::{FeatureFrame, Ohlcv};
     use ndarray::arr2;
 
+    // TODO(real-data): synthetic feature/OHLCV fixture. Replace with a
+    // cTrader historical sample (e.g. EURUSD M1 12 bars from a fixed
+    // timestamp range) so parity is asserted against broker-shaped data
+    // rather than hand-tuned sequences.
     fn fixture_frame() -> FeatureFrame {
         let timestamps = (0..12)
             .map(|idx| 1_700_000_000_000_i64 + (idx as i64) * 60_000)

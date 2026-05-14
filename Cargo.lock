@@ -3991,6 +3991,7 @@ name = "forex-app"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "base64",
  "cc",
  "chrono",
  "clap",
@@ -4010,6 +4011,7 @@ dependencies = [
  "polars",
  "protobuf",
  "protoc-bin-vendored",
+ "rand 0.9.2",
  "reqwest",
  "serde",
  "serde_json",
@@ -4071,6 +4073,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "csv",
+ "forex-core",
  "futures",
  "memmap2",
  "ndarray 0.17.2",

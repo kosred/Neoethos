@@ -1,5 +1,13 @@
 //! Integration tests for the end-to-end cTrader API message flows.
 //! All tests use stub transports — no live credentials required.
+//!
+//! TODO(real-data): every JSON payload in this file is a hand-crafted
+//! string (e.g. `r#"{"clientMsgId":"app-auth-1","payloadType":2101,…}"#`).
+//! Replace each helper with a captured cTrader response recorded from
+//! the demo/live Open API endpoint for the corresponding payload type
+//! so the parser is asserted against real broker bytes — including
+//! optional fields and version-shift padding — rather than a model of
+//! what we think the response looks like.
 
 #[cfg(test)]
 mod ctrader_integration_tests {

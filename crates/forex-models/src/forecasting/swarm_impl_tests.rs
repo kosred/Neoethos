@@ -1,3 +1,9 @@
+// TODO(real-data): every dataframe / value vector in this file is
+// synthesised (linear ramps, cyclic class labels, hand-written floats).
+// Replace every fixture below with a cTrader historical sample for
+// the symbol/timeframe the swarm forecaster is intended to run on
+// (e.g. EURUSD M5 with 256 closes) so the asserted behaviour reflects
+// real broker data shape, including weekend gaps and quote noise.
 use super::*;
 
 

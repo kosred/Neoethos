@@ -410,6 +410,12 @@ pub mod discovery_gpu {
         let mut min_fitness = f32::INFINITY;
         let mut pos_windows = 0.0_f32;
 
+        // TODO(real-data): this segment evaluator is called from the
+        // genetic search hot loop and has no symbol context — it
+        // currently relies on `infer_market_cost_profile`'s empty-symbol
+        // synthetic fallback (EURUSD pip math). Thread the symbol that
+        // sourced `ohlcv` through `Self` / `EvaluationConfig` so the
+        // cost profile is bound to the symbol actually being backtested.
         let market_profile =
             infer_market_cost_profile("", "", ohlcv.close.last().copied(), None, None);
 

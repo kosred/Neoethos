@@ -1692,6 +1692,12 @@ impl Default for AdaptiveGradientBooster {
     }
 }
 
+// TODO(real-data): every Series / DataFrame / committee weight vector
+// in this test module is synthetic (zero means, unit stds, hand-picked
+// f64 sequences like vec![1.0, -1.0]). Replace each fixture with a
+// cTrader historical sample (e.g. EURUSD M15 z-scored features) and
+// run training summaries against the actual broker data shape so the
+// asserted runtime-fallback / committee paths fire on real noise.
 #[cfg(all(test, feature = "adaptive-models"))]
 mod tests {
     use super::*;
