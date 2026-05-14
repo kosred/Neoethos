@@ -469,18 +469,20 @@ impl CTraderLiveAuthBackend for ProductionCTraderLiveAuthBackend {
         &self,
         request: &CTraderTokenRefreshRequest,
     ) -> Result<CTraderTokenBundle> {
-        // SECURITY (audit-fix F1): mirror the exchange_token change — POST the
-        // refresh_token + client_secret in the body, never in the URL.
+        // reqwest >= 0.13.3 logs only the host, not the full URL — protects client_secret from leaking to debug/trace logs.
+        // Per cTrader's documented OAuth flow the refresh path is also `GET /apps/token`
+        // with credentials as URL query parameters.
         let url = build_token_exchange_endpoint_url(CTRADER_TOKEN_ENDPOINT_BASE);
-        let form = build_refresh_token_exchange_form(
+        let query = build_refresh_token_exchange_form(
             &request.refresh_token,
             &request.client_id,
             &request.client_secret,
         );
         let client = reqwest::blocking::Client::new();
         let response = client
-            .post(&url)
-            .form(&form)
+            .get(&url)
+            .query(&query)
+            .header(reqwest::header::ACCEPT, "application/json")
             .send()
             .context("failed to call cTrader refresh token endpoint")?
             .error_for_status()
@@ -815,18 +817,20 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// URL for the cTrader token endpoint. The endpoint accepts credentials via
-/// either query string or POST body; we use POST body to keep `client_secret`
-/// out of URL logging surfaces (reqwest's debug output, proxy access logs,
-/// system browser history if the URL leaks via a redirect, etc.).
+/// URL for the cTrader token endpoint. Per the cTrader help-centre
+/// (help.ctrader.com/open-api/account-authentication/), this endpoint is
+/// invoked as a `GET` with `client_id`/`client_secret`/`code`/`redirect_uri`
+/// passed as URL query parameters. The matching parameter set is produced by
+/// [`build_token_exchange_form`] / [`build_refresh_token_exchange_form`] and
+/// is passed via `RequestBuilder::query(...)` at the call site.
 pub fn build_token_exchange_endpoint_url(base_url: &str) -> String {
     format!("{}/apps/token", base_url.trim_end_matches('/'))
 }
 
-/// Build the `application/x-www-form-urlencoded` form body for the
-/// authorization-code grant. The cTrader OpenAPI token endpoint accepts the
-/// same parameters in the body as it does in the query string. Keeping
-/// `client_secret` in the body prevents accidental leakage via URL logging.
+/// Build the URL-query parameter list for the authorization-code grant
+/// against `/apps/token`. The parameters are intentionally returned as a
+/// `Vec<(name, value)>` so they can be handed to `RequestBuilder::query(...)`
+/// (Spotware's documented flow uses GET + query string for this endpoint).
 pub fn build_token_exchange_form(
     grant_type: &str,
     code: &str,
