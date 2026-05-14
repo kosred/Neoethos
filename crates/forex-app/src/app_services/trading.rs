@@ -2511,13 +2511,8 @@ fn current_unix_seconds() -> anyhow::Result<i64> {
 fn next_client_order_seq() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    // SECURITY (audit-fix F4): `Relaxed` allows another thread to observe an
-    // out-of-order counter value, so two threads issuing orders within the
-    // same wall-clock second could in principle see the same `seq` and
-    // collide on `client_order_id`. `SeqCst` establishes a global total
-    // order across all threads — cheap on x86 (it lowers to LOCK XADD)
-    // and this counter is not on a hot loop.
-    COUNTER.fetch_add(1, Ordering::SeqCst)
+    // Relaxed is sufficient — atomic ops are linearizable; Ordering only synchronizes other memory accesses (std lib uses Relaxed for similar counters).
+    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 pub fn panel_mode(data_source: DataSource, connected: bool) -> TradingPanelMode {

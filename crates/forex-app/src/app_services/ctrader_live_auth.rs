@@ -312,12 +312,12 @@ impl ProductionCTraderLiveAuthBackend {
         authorization_code: &str,
     ) -> Result<CTraderTokenBundle> {
         let redirect_uri = rewrite_redirect_uri_port(&request.redirect_uri, callback_port)?;
-        // SECURITY (audit-fix F1): keep `client_secret` out of the URL query
-        // string. The cTrader token endpoint accepts the same parameters in
-        // the POST body, and a POST body is not captured by reqwest debug
-        // logs, proxy access logs, or system error reports the way a URL is.
+        // reqwest >= 0.13.3 logs only the host, not the full URL — protects client_secret from leaking to debug/trace logs.
+        // The cTrader token endpoint is documented as a GET with credentials as URL query
+        // parameters (see help.ctrader.com/open-api/account-authentication/). Moving
+        // `client_secret` into a POST body breaks against the real broker.
         let url = build_token_exchange_endpoint_url(CTRADER_TOKEN_ENDPOINT_BASE);
-        let form = build_token_exchange_form(
+        let query = build_token_exchange_form(
             "authorization_code",
             authorization_code,
             &redirect_uri,
@@ -326,8 +326,9 @@ impl ProductionCTraderLiveAuthBackend {
         );
         let client = reqwest::blocking::Client::new();
         let response = client
-            .post(&url)
-            .form(&form)
+            .get(&url)
+            .query(&query)
+            .header(reqwest::header::ACCEPT, "application/json")
             .send()
             .context("failed to call cTrader token endpoint")?
             .error_for_status()
