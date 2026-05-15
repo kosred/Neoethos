@@ -39,6 +39,19 @@ pub const CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQUEST_PAYLOAD_TYPE: u32 = 21
 pub const CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RESPONSE_PAYLOAD_TYPE: u32 = 2150;
 pub const CTRADER_OA_SUBSCRIBE_LIVE_TRENDBAR_RESPONSE_PAYLOAD_TYPE: u32 = 2165;
 pub const CTRADER_OA_UNSUBSCRIBE_LIVE_TRENDBAR_RESPONSE_PAYLOAD_TYPE: u32 = 2166;
+/// Server-pushed event raised when the broker drops the account session.
+/// New in the 2026-05-14 upstream proto refresh (Batch 6). Until this
+/// landed we only learned about a stale session indirectly from a failed
+/// `ProtoOAErrorRes` on the next request — by then the streaming-side had
+/// usually already drifted by several heartbeat intervals. Numeric value
+/// is fixed in `OpenApiModelMessages.proto::ProtoOAPayloadType`.
+pub const CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE: u32 = 2164;
+/// Request for current per-position unrealized PnL computed on the broker.
+/// New in the 2026-05-14 upstream proto refresh (Batch 6). Used as an
+/// audit cross-check against the local PnL calculation; see
+/// `crates/forex-app/src/app_services/pnl.rs`.
+pub const CTRADER_OA_GET_POSITION_UNREALIZED_PNL_REQUEST_PAYLOAD_TYPE: u32 = 2187;
+pub const CTRADER_OA_GET_POSITION_UNREALIZED_PNL_RESPONSE_PAYLOAD_TYPE: u32 = 2188;
 pub const CTRADER_QUOTE_TYPE_BID: i32 = 1;
 pub const CTRADER_QUOTE_TYPE_ASK: i32 = 2;
 pub const CTRADER_TRADE_SIDE_BUY: i32 = 1;
@@ -542,6 +555,27 @@ pub fn build_reconcile_request(
     }
 }
 
+/// Build the JSON envelope for `ProtoOAGetPositionUnrealizedPnLReq`
+/// (payload type 2187). The proto carries only the two required fields
+/// `payloadType` (filled by the envelope's `payload_type`) and
+/// `ctidTraderAccountId`; this matches the 2026-05-14 upstream refresh.
+///
+/// Use [`crate::app_services::pnl::fetch_broker_unrealized_pnl`] for the
+/// full audit flow that compares broker values against the locally
+/// computed PnL on every reconcile tick.
+pub fn build_get_position_unrealized_pnl_request(
+    ctid_trader_account_id: i64,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_GET_POSITION_UNREALIZED_PNL_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+        }),
+    }
+}
+
 pub fn build_subscribe_spots_request(
     ctid_trader_account_id: i64,
     symbol_ids: &[i64],
@@ -774,6 +808,9 @@ pub fn expected_response_payload_type(request_payload_type: u32) -> Result<u32> 
         CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RESPONSE_PAYLOAD_TYPE)
         }
+        CTRADER_OA_GET_POSITION_UNREALIZED_PNL_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_GET_POSITION_UNREALIZED_PNL_RESPONSE_PAYLOAD_TYPE)
+        }
         CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE => Err(anyhow!(
             "cTrader spot events are push-only payloads and are not valid request messages"
         )),
@@ -831,6 +868,139 @@ pub fn parse_ctrader_error_payload_parts(payload: &Value) -> Result<(String, Str
         _ => error.error_code.clone(),
     };
     Ok((error.error_code, formatted))
+}
+
+/// Snapshot of a `ProtoOAAccountDisconnectEvent` (payload type 2164).
+///
+/// The proto carries only `ctidTraderAccountId` plus the implicit
+/// `payloadType` discriminator; future field additions are tolerated by
+/// the `#[serde(deny_unknown_fields)]` opt-out (we do not set it, so
+/// unknown fields are silently ignored, matching prost's behaviour for
+/// optional default-initialised fields).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CTraderAccountDisconnectEvent {
+    pub ctid_trader_account_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccountDisconnectEnvelope {
+    #[serde(rename = "payloadType")]
+    payload_type: u32,
+    payload: AccountDisconnectPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccountDisconnectPayload {
+    #[serde(rename = "ctidTraderAccountId")]
+    ctid_trader_account_id: i64,
+}
+
+/// Parses a `ProtoOAAccountDisconnectEvent` JSON envelope.
+///
+/// Errors if the envelope is not of type
+/// [`CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE`] so callers can
+/// reuse this on dispatch paths that also see spot events / errors.
+pub fn parse_account_disconnect_event(
+    response_json: &str,
+) -> Result<CTraderAccountDisconnectEvent> {
+    let envelope: AccountDisconnectEnvelope = serde_json::from_str(response_json)
+        .context("failed to parse cTrader account disconnect event")?;
+    if envelope.payload_type != CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE {
+        return Err(anyhow!(
+            "unexpected cTrader account disconnect payload type: {}",
+            envelope.payload_type
+        ));
+    }
+    Ok(CTraderAccountDisconnectEvent {
+        ctid_trader_account_id: envelope.payload.ctid_trader_account_id,
+    })
+}
+
+/// Per-position unrealized PnL row returned by
+/// `ProtoOAGetPositionUnrealizedPnLRes`. Values are denoted in the
+/// account deposit currency.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CTraderPositionUnrealizedPnL {
+    pub position_id: i64,
+    pub gross_unrealized_pnl: f64,
+    pub net_unrealized_pnl: f64,
+}
+
+/// Snapshot of a `ProtoOAGetPositionUnrealizedPnLRes` (payload type
+/// 2188). `money_digits` is applied to convert the raw i64 fields into
+/// account-currency f64 values.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CTraderUnrealizedPnLSnapshot {
+    pub account_id: i64,
+    pub money_digits: u32,
+    pub positions: Vec<CTraderPositionUnrealizedPnL>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UnrealizedPnLEnvelope {
+    #[serde(rename = "payloadType")]
+    payload_type: u32,
+    payload: UnrealizedPnLPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct UnrealizedPnLPayload {
+    #[serde(rename = "ctidTraderAccountId")]
+    ctid_trader_account_id: i64,
+    #[serde(rename = "moneyDigits")]
+    money_digits: Option<u32>,
+    #[serde(default, rename = "positionUnrealizedPnL")]
+    position_unrealized_pnl: Vec<UnrealizedPnLRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UnrealizedPnLRow {
+    #[serde(rename = "positionId")]
+    position_id: i64,
+    #[serde(rename = "grossUnrealizedPnL")]
+    gross_unrealized_pnl: i64,
+    #[serde(rename = "netUnrealizedPnL")]
+    net_unrealized_pnl: i64,
+}
+
+/// Parses a `ProtoOAGetPositionUnrealizedPnLRes` JSON envelope.
+///
+/// `money_digits` is required on the wire; we treat its absence as a
+/// hard error because the gross/net fields are otherwise un-scalable.
+/// This matches `parse_trader_response`'s strict policy for the same
+/// `moneyDigits` field on the trader payload.
+pub fn parse_get_position_unrealized_pnl_response(
+    response_json: &str,
+) -> Result<CTraderUnrealizedPnLSnapshot> {
+    let envelope: UnrealizedPnLEnvelope = serde_json::from_str(response_json)
+        .context("failed to parse cTrader unrealized pnl response")?;
+    if envelope.payload_type != CTRADER_OA_GET_POSITION_UNREALIZED_PNL_RESPONSE_PAYLOAD_TYPE {
+        return Err(anyhow!(
+            "unexpected cTrader unrealized pnl payload type: {}",
+            envelope.payload_type
+        ));
+    }
+    let money_digits = envelope.payload.money_digits.ok_or_else(|| {
+        anyhow!(
+            "cTrader unrealized pnl response missing required moneyDigits field; \
+             cannot scale gross/net PnL"
+        )
+    })?;
+    let factor = 10_f64.powi(money_digits as i32);
+    Ok(CTraderUnrealizedPnLSnapshot {
+        account_id: envelope.payload.ctid_trader_account_id,
+        money_digits,
+        positions: envelope
+            .payload
+            .position_unrealized_pnl
+            .into_iter()
+            .map(|row| CTraderPositionUnrealizedPnL {
+                position_id: row.position_id,
+                gross_unrealized_pnl: (row.gross_unrealized_pnl as f64) / factor,
+                net_unrealized_pnl: (row.net_unrealized_pnl as f64) / factor,
+            })
+            .collect(),
+    })
 }
 
 /// True when a cTrader Open API error code indicates the OAuth access token

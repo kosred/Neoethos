@@ -1,11 +1,12 @@
 use crate::app_services::ctrader_data::HistoricalBar;
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::{
-    CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE,
-    build_account_auth_request, build_application_auth_request,
-    build_subscribe_live_trendbar_request, build_subscribe_spots_request,
-    expected_response_payload_type, is_matching_open_api_response, parse_ctrader_error_payload,
-    parse_open_api_envelope, trendbar_period_value,
+    CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE, build_account_auth_request,
+    build_application_auth_request, build_subscribe_live_trendbar_request,
+    build_subscribe_spots_request, expected_response_payload_type, is_matching_open_api_response,
+    parse_account_disconnect_event, parse_ctrader_error_payload, parse_open_api_envelope,
+    trendbar_period_value,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -125,6 +126,13 @@ struct CTraderStreamingSession {
     responses: Vec<String>,
     socket: CTraderSocket,
 }
+
+/// Sentinel prefix surfaced through the streaming `anyhow::Error` chain
+/// when the broker emits `ProtoOAAccountDisconnectEvent`. Callers (UI /
+/// reconnect loop) match on this string to distinguish a session that
+/// the broker dropped server-side from generic transport failures.
+/// Mirrors the existing `CTRADER_TOKEN_EXPIRED_SENTINEL` pattern.
+pub const CTRADER_ACCOUNT_DISCONNECT_SENTINEL: &str = "CTRADER_ACCOUNT_DISCONNECT";
 
 static CTRADER_STREAMING_SESSION: OnceLock<Mutex<Option<CTraderStreamingSession>>> =
     OnceLock::new();
@@ -558,6 +566,17 @@ impl ProductionCTraderLiveStreamingTransport {
                                 parse_ctrader_error_payload(&envelope.payload)?
                             ));
                         }
+                        if envelope.payload_type
+                            == CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE
+                        {
+                            let reason =
+                                handle_account_disconnect_event(text.as_ref(), &mut socket);
+                            return Err(anyhow!(
+                                "{}: {}",
+                                CTRADER_ACCOUNT_DISCONNECT_SENTINEL,
+                                reason
+                            ));
+                        }
                         if is_matching_open_api_response(&envelope, message, expected_payload_type)
                         {
                             responses.push(text.to_string());
@@ -573,6 +592,16 @@ impl ProductionCTraderLiveStreamingTransport {
                             return Err(anyhow!(
                                 "cTrader streaming request failed: {}",
                                 parse_ctrader_error_payload(&envelope.payload)?
+                            ));
+                        }
+                        if envelope.payload_type
+                            == CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE
+                        {
+                            let reason = handle_account_disconnect_event(&text, &mut socket);
+                            return Err(anyhow!(
+                                "{}: {}",
+                                CTRADER_ACCOUNT_DISCONNECT_SENTINEL,
+                                reason
                             ));
                         }
                         if is_matching_open_api_response(&envelope, message, expected_payload_type)
@@ -623,6 +652,16 @@ impl ProductionCTraderLiveStreamingTransport {
                             parse_ctrader_error_payload(&envelope.payload)?
                         ));
                     }
+                    if envelope.payload_type
+                        == CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE
+                    {
+                        let reason = handle_account_disconnect_event(text.as_ref(), socket);
+                        return Err(anyhow!(
+                            "{}: {}",
+                            CTRADER_ACCOUNT_DISCONNECT_SENTINEL,
+                            reason
+                        ));
+                    }
                     if envelope.payload_type == CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE {
                         let parsed =
                             parse_spot_event(text.as_ref(), account_id, symbol_id, digits)?;
@@ -639,6 +678,16 @@ impl ProductionCTraderLiveStreamingTransport {
                         return Err(anyhow!(
                             "cTrader spot event stream failed: {}",
                             parse_ctrader_error_payload(&envelope.payload)?
+                        ));
+                    }
+                    if envelope.payload_type
+                        == CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE
+                    {
+                        let reason = handle_account_disconnect_event(&text, socket);
+                        return Err(anyhow!(
+                            "{}: {}",
+                            CTRADER_ACCOUNT_DISCONNECT_SENTINEL,
+                            reason
                         ));
                     }
                     if envelope.payload_type == CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE {
@@ -662,6 +711,44 @@ impl ProductionCTraderLiveStreamingTransport {
             }
         }
     }
+}
+
+/// Handle a `ProtoOAAccountDisconnectEvent` mid-stream: emit a `warn!`
+/// log line so operators see the disconnect in the structured log,
+/// close the socket so the cached session entry is dropped on the
+/// next call (which forces re-auth), and return a human-readable
+/// reason that the caller threads into the `anyhow::Error` chain.
+///
+/// We intentionally do NOT panic on a malformed disconnect payload;
+/// the broker dropped us regardless, so we surface a best-effort
+/// reason and let the reconnect loop take over.
+fn handle_account_disconnect_event(payload_text: &str, socket: &mut CTraderSocket) -> String {
+    let reason = match parse_account_disconnect_event(payload_text) {
+        Ok(event) => format!(
+            "account_id={} dropped by broker (session must re-auth)",
+            event.ctid_trader_account_id
+        ),
+        Err(err) => format!(
+            "account session dropped by broker (failed to parse disconnect payload: {err})"
+        ),
+    };
+    tracing::warn!(
+        target: "forex_app::ctrader",
+        reason = %reason,
+        "cTrader account disconnect event: {}",
+        reason
+    );
+    // Drop the cached session so the next `load_live_chart_update`
+    // call opens a fresh connection and re-runs the auth + subscribe
+    // sequence; this is the "needs_reconnect" signal the UI wants.
+    let _ = socket.close(None);
+    if let Ok(mut cache) = streaming_session_cache().lock() {
+        if let Some(stale) = cache.take() {
+            let mut socket = stale.socket;
+            let _ = socket.close(None);
+        }
+    }
+    reason
 }
 
 fn ensure_success_payload_type(

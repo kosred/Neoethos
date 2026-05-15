@@ -20,6 +20,7 @@ pub mod discovery;
 pub mod embedded_credentials;
 pub mod jobs;
 pub mod live_journal;
+pub mod pnl;
 pub mod secure_store;
 pub mod trading;
 pub mod training;
