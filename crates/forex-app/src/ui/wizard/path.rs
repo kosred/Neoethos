@@ -13,6 +13,7 @@
 
 use eframe::egui;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use super::{StepResult, WizardController, migration};
 use crate::ui::theme;
@@ -72,8 +73,12 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
         }
     });
 
-    // Spec §6 — surface portable-install migration banner.
-    if let Some(report) = migration::detect_portable_install() {
+    // Spec §6 — surface portable-install migration banner. Memoised
+    // because filesystem-walking the candidate roots every frame is
+    // wasteful (and racy on a network home dir).
+    static PORTABLE_REPORT: OnceLock<Option<migration::PortableMigrationReport>> = OnceLock::new();
+    let portable = PORTABLE_REPORT.get_or_init(migration::detect_portable_install);
+    if let Some(report) = portable {
         ui.separator();
         ui.label(
             egui::RichText::new("Legacy ~/.forex-ai detected")

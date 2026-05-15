@@ -182,11 +182,10 @@ mod tests {
     }
 
     #[test]
-    fn news_api_key_holder_keeps_secret_off_debug_output() {
+    fn news_api_key_holder_round_trips_secret_via_expose_only() {
         let mut holder = NewsApiKeyHolder::default();
+        assert!(!holder.is_set());
         holder.set("very-secret-key".to_string());
-        let debug = format!("{:?}", holder.is_set());
-        assert!(!debug.contains("very-secret-key"));
         assert!(holder.is_set());
         assert_eq!(holder.expose(), Some("very-secret-key"));
     }

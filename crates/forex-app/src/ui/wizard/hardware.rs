@@ -9,6 +9,7 @@
 
 use eframe::egui;
 use forex_core::system::{HardwareProbe, HardwareProfile};
+use std::sync::OnceLock;
 
 use super::{StepResult, WizardController};
 use crate::ui::theme;
@@ -22,12 +23,16 @@ pub const WIZARD_DEFAULT_BACKEND_PREFERENCE: &[&str] = &["CUDA", "ROCm", "Vulkan
 /// Actions — "writes `<data_path>/hardware_profile.json`".
 pub const WIZARD_DEFAULT_HARDWARE_PROFILE_FILENAME: &str = "hardware_profile.json";
 
-/// Cached snapshot inside the controller — lifted here to keep the
-/// state file small (the profile is written to disk separately at
-/// Step 10 Apply).
-fn detect_profile() -> HardwareProfile {
-    let mut probe = HardwareProbe::new();
-    probe.detect()
+/// Memoised snapshot — the probe spawns `nvidia-smi` / `rocminfo` and
+/// walks `sysinfo`, so re-running it every egui frame is wasteful.
+/// One-shot per process; the user re-runs the wizard for a fresh
+/// detection.
+fn cached_profile() -> &'static HardwareProfile {
+    static PROFILE: OnceLock<HardwareProfile> = OnceLock::new();
+    PROFILE.get_or_init(|| {
+        let mut probe = HardwareProbe::new();
+        probe.detect()
+    })
 }
 
 pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResult {
@@ -38,11 +43,7 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
             .color(theme::TEXT_PRIMARY),
     );
 
-    // The probe is currently re-run every frame for simplicity; a
-    // real renderer would memoise via a `controller.cached_profile`
-    // field. Kept simple here because the probe is cheap on Linux
-    // (single `sysinfo` walk).
-    let profile = detect_profile();
+    let profile = cached_profile();
 
     ui.add_space(theme::SPACE_SM);
     ui.label(
