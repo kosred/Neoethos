@@ -195,6 +195,66 @@ fn normalize_rl_device_policy_accepts_vendor_neutral_gpu_tokens() {
 }
 
 #[test]
+fn normalize_rl_device_policy_edge_cases() {
+    // Case sensitivity: lowercase, uppercase, and mixed-case spellings of
+    // the same vendor+index pair must collapse to the same canonical form.
+    // The normaliser calls `trim().to_ascii_lowercase()` first, so casing
+    // is irrelevant to the result.
+    assert_eq!(normalize_rl_device_policy("cuda:0"), "gpu:0");
+    assert_eq!(normalize_rl_device_policy("CUDA:0"), "gpu:0");
+    assert_eq!(normalize_rl_device_policy("CuDa:0"), "gpu:0");
+
+    // Bare lower-case vendor name (no colon, no index) — vendor is in
+    // the recognised set, so it collapses to the canonical "gpu" token
+    // meaning "pick a default GPU device".
+    assert_eq!(normalize_rl_device_policy("rocm"), "gpu");
+
+    // CPU pass-through: the literal "cpu" token is canonical and must
+    // survive all of: lowercase, uppercase, surrounding whitespace.
+    assert_eq!(normalize_rl_device_policy("cpu"), "cpu");
+    assert_eq!(normalize_rl_device_policy("CPU"), "cpu");
+    assert_eq!(normalize_rl_device_policy("  cpu  "), "cpu");
+
+    // Leading/trailing whitespace is stripped by `trim()` before the
+    // prefix match, so the canonical form is the same as the trimmed
+    // input.
+    assert_eq!(normalize_rl_device_policy("  cuda:0  "), "gpu:0");
+
+    // Contract: an internal space inside the vendor token ("cuda :0")
+    // is NOT a recognised form — `trim()` only removes leading/trailing
+    // whitespace, the literal "cuda :0" does not match any of the
+    // vendor prefixes, and the RL whitelist then rewrites it to "auto"
+    // (strict whitelist semantics specific to the RL normaliser).
+    assert_eq!(normalize_rl_device_policy("cuda :0"), "auto");
+
+    // Empty input defaults to "auto" — let the runtime pick a device.
+    assert_eq!(normalize_rl_device_policy(""), "auto");
+    // Whitespace-only input is treated the same as empty after `trim()`.
+    assert_eq!(normalize_rl_device_policy("   "), "auto");
+
+    // Observation (NOT a bug): the normaliser performs NO bounds-check
+    // on the index suffix. "cuda:99" yields "gpu:99" even if the host
+    // has fewer GPUs, and "cuda:" (empty index) yields the syntactically
+    // odd "gpu:". The downstream GPU dispatch layer is responsible for
+    // rejecting indices that don't map to a physical device; this
+    // normaliser only handles vendor-alias collapsing.
+    assert_eq!(normalize_rl_device_policy("cuda:99"), "gpu:99");
+    assert_eq!(normalize_rl_device_policy("cuda:"), "gpu:");
+
+    // RL-specific extension: `wgpu` (with or without index) is in the
+    // extra-prefix list passed to the shared helper, so it normalises
+    // to the canonical "gpu" / "gpu:N" form.
+    assert_eq!(normalize_rl_device_policy("wgpu"), "gpu");
+    assert_eq!(normalize_rl_device_policy("wgpu:2"), "gpu:2");
+
+    // Unknown vendor tokens are forced to "auto" by the RL whitelist
+    // (the shared helper would return them lowercased-but-unchanged,
+    // but the RL wrapper layers strict validation on top).
+    assert_eq!(normalize_rl_device_policy("tpu"), "auto");
+    assert_eq!(normalize_rl_device_policy("nonsense"), "auto");
+}
+
+#[test]
 fn validate_artifact_rejects_partial_fallback_parameters() {
     let artifact = TradingRlArtifact {
         state_dim: 2,

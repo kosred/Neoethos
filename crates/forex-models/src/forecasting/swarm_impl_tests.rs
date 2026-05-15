@@ -453,7 +453,6 @@ fn load_rebuilds_stale_fitted_artifact_diagnostics() {
 // expected correct behaviour and is ignored until the impl is fixed
 // in a follow-up batch (F-MODELS9-013-impl).
 #[test]
-#[ignore = "reveals real bug F-MODELS9-013-impl: load does not check horizon vs values.len()"]
 fn load_rejects_or_downgrades_artifact_with_incompatible_horizon() {
     let dir = test_artifact_dir("incompatible-horizon-artifact");
     fs::create_dir_all(&dir).expect("create temp dir");

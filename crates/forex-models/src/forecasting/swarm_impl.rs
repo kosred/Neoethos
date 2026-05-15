@@ -248,6 +248,27 @@ fn sanitize_forecaster_artifact(
         return Ok(artifact);
     }
 
+    // F-MODELS9-013-impl: reject artifacts whose persisted target horizon
+    // exceeds half of the available history. build_validation_windows (see
+    // line ~2662 below) requires at least `min_training_rows + validation_window`
+    // observations — i.e. roughly 2*horizon — to emit even a single
+    // out-of-sample window. Without that, candidate_forecasts_local collapses
+    // to a flat mean and the "fitted" claim is unbacked by any validation
+    // signal. Operator directive 2026-05-15 forbids silent degradation, and
+    // ruv-swarm-ml v1.0.5 (ForecastRequirements at
+    // ruv-swarm-ml-1.0.5/src/agent_forecasting/mod.rs:282) performs no such
+    // feasibility check itself, so we must enforce it here at the load
+    // boundary. See docs/audits/v0.4.1_full_repo_audit_pass3.md F-MODELS9-013.
+    let target_horizon = artifact_target_horizon(&artifact);
+    if target_horizon > artifact.values.len() / 2 {
+        bail!(
+            "swarm artifact unusable: horizon={} exceeds half of available history \
+             (values.len()={}); retrain with longer history or shorter horizon",
+            target_horizon,
+            artifact.values.len()
+        );
+    }
+
     if artifact
         .snapshot
         .as_ref()
