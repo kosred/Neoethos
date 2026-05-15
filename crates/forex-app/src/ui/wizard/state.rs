@@ -164,7 +164,11 @@ pub enum WizardStepStatus {
 
 /// Wizard-level errors — surfaces in the UI verbatim per spec §3
 /// rule 1 ("Never silently skip" — always log).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is deliberately not derived — `MonthlyTargetBelowFloor` carries
+/// `f32` floats which forbid total equality. `PartialEq` is sufficient
+/// for the tests below and for the UI render comparisons.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WizardError {
     LicenseMissing,
     PathNoWritePermission(String),

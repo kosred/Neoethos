@@ -31,5 +31,7 @@ mod jobs;
 mod pages;
 mod theme;
 mod widgets;
+pub mod wizard;
 
 pub use app::run_tui;
+pub use wizard::run_wizard_tui;

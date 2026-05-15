@@ -508,9 +508,21 @@ impl eframe::App for ForexApp {
                         },
                     );
 
-                    // Right-aligned: status pill, auto-trade toggle, hardware,
-                    // settings — the chrome that doesn't change mid-session.
+                    // Right-aligned: HALT button, status pill, auto-trade
+                    // toggle, hardware, settings — the chrome that doesn't
+                    // change mid-session. The HALT button comes FIRST in
+                    // right-to-left order so it sits at the very top-right
+                    // corner of the window, the canonical "panic button"
+                    // location (MT4/5 AutoTrading convention per
+                    // `wizard_onboarding_competitive_analysis.md` §10.4).
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui::chrome::halt_button::draw_halt_button(
+                            ui,
+                            &mut self.trading_session,
+                            &mut self.state,
+                        );
+                        ui.add_space(ui::theme::SPACE_SM);
+
                         if ui
                             .add(
                                 egui::Button::new(
@@ -526,6 +538,25 @@ impl eframe::App for ForexApp {
                         {
                             self.workspace.focus_tab(WorkspaceTab::Settings);
                         }
+
+                        ui.add_space(ui::theme::SPACE_SM);
+
+                        // Persistent Demo / Paper / Live status pill.
+                        // Always visible per
+                        // `wizard_onboarding_competitive_analysis.md` §10
+                        // (ThinkOrSwim paperMoney pattern). Sits left of
+                        // the settings cog so it lives adjacent to the
+                        // account context. The account_label is sourced
+                        // from the broker session via
+                        // `selected_ctrader_execution_account_id`; when
+                        // unavailable it falls back to an empty string
+                        // which collapses the separator in `pill_text_for`.
+                        let env = self.trading_session.trading_environment();
+                        let account_label = self
+                            .trading_session
+                            .selected_ctrader_execution_account_id_public()
+                            .unwrap_or_default();
+                        ui::chrome::status_pill::draw_status_pill(ui, env, &account_label);
 
                         ui.add_space(ui::theme::SPACE_SM);
 
@@ -601,6 +632,28 @@ impl eframe::App for ForexApp {
                     });
                 });
             });
+
+        // ── Persistent HALT banner ───────────────────────────────────────
+        // When `trip_manual_halt` has fired, surface a slim red banner
+        // flush below the top bar. The banner stays visible until the
+        // operator clicks `[Clear HALT]`, which flips the in-memory flag
+        // and removes the sentinel file under `<data-dir>`. The banner
+        // is hidden when no halt is in force.
+        if self.trading_session.is_halted() {
+            egui::TopBottomPanel::top("halt_banner")
+                .frame(
+                    egui::Frame::new()
+                        .fill(ui::theme::PANEL_BG)
+                        .inner_margin(egui::Margin::symmetric(
+                            ui::theme::SPACE_SM as i8,
+                            ui::theme::SPACE_XS as i8,
+                        )),
+                )
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui::chrome::halt_button::draw_halt_banner(ui, &mut self.trading_session);
+                });
+        }
 
         // ── Handle navigation intent ─────────────────────────────────────
         if let Some(tab) = nav_target {

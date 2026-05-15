@@ -1,4 +1,5 @@
 pub mod ai_insights;
+pub mod chrome;
 pub mod components;
 pub mod dashboard;
 pub mod discovery;

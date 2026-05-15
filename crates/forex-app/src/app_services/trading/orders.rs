@@ -100,6 +100,39 @@ impl TradingSession {
                 return;
             }
         };
+        // Server-side single-call drill-down (Appendix C item #5):
+        // before cancelling, capture the order's full details +
+        // child-deal chain via `ProtoOAOrderDetailsReq` so the journal
+        // records exactly what the broker thought was the order at
+        // cancel time. Replaces an N-call client-side scan of the
+        // reconcile snapshot + a separate deal lookup. Best-effort —
+        // failure is logged at `warn!` but does not block the cancel.
+        match self.fetch_ctrader_order_details(order_id) {
+            Ok(snapshot) => {
+                tracing::debug!(
+                    target: "forex_app::ctrader_history",
+                    order_id,
+                    deals = snapshot.deals.len(),
+                    "pre-cancel drill-down: ProtoOAOrderDetailsReq returned"
+                );
+                self.append_trade_journal(format!(
+                    "Order #{order_id} pre-cancel snapshot: type {} · {} · {:.2} · {} child deals",
+                    snapshot.order.order_type,
+                    snapshot.order.trade_side,
+                    snapshot.order.volume,
+                    snapshot.deals.len(),
+                ));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "forex_app::ctrader_history",
+                    order_id,
+                    error = %err,
+                    "pre-cancel drill-down: ProtoOAOrderDetailsReq failed; \
+                     continuing without journal enrichment"
+                );
+            }
+        }
         match self.execute_ctrader_request(
             state,
             CTraderExecutionRequest::CancelOrder(CTraderCancelOrderRequest {
@@ -187,6 +220,37 @@ impl TradingSession {
                 return;
             }
         };
+        // Server-side single-call drill-down (Appendix C item #5):
+        // before closing, capture the position's full order chain via
+        // `ProtoOAOrderListByPositionIdReq` so the journal records what
+        // happened over the position's life. Replaces an N-call
+        // client-side scan of `ProtoOAOrderListReq` filtered by
+        // `position_id`. Best-effort — failure is logged at `warn!`
+        // but does not block the close.
+        match self.fetch_ctrader_orders_for_position(position_id, None, None) {
+            Ok(orders) => {
+                tracing::debug!(
+                    target: "forex_app::ctrader_history",
+                    position_id,
+                    orders = orders.len(),
+                    "pre-close drill-down: ProtoOAOrderListByPositionIdReq returned"
+                );
+                self.append_trade_journal(format!(
+                    "Position #{position_id} pre-close snapshot: {} orders linked over the \
+                     position's life (single ProtoOAOrderListByPositionIdReq, no client-side filter)",
+                    orders.len()
+                ));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "forex_app::ctrader_history",
+                    position_id,
+                    error = %err,
+                    "pre-close drill-down: ProtoOAOrderListByPositionIdReq failed; \
+                     continuing without journal enrichment"
+                );
+            }
+        }
         match self.execute_ctrader_request(
             state,
             CTraderExecutionRequest::ClosePosition(CTraderClosePositionRequest {
@@ -214,6 +278,20 @@ impl TradingSession {
         state: &mut AppState,
         side: CTraderTradeSide,
     ) {
+        // T-Manual HALT (kill-switch §10.4 / Tier T4) sits ABOVE the
+        // per-trade and per-day gates. Reject every new order while
+        // the halt is in force; the operator must clear the sentinel
+        // via the chrome banner before trading resumes.
+        if self.is_halted() {
+            let message =
+                "T-Manual HALT in force: new orders are blocked until the operator clears the \
+                 sentinel flag from the chrome banner."
+                    .to_string();
+            state.status_msg = message.clone();
+            self.append_trade_journal(message.clone());
+            record_app_event("trading_halt", "ORDER_BLOCKED", message);
+            return;
+        }
         match self.build_ctrader_order_request(state, side) {
             Ok(order_request) => {
                 // Batch 14 authoritative-PnL path: fetch the broker's
@@ -395,6 +473,42 @@ impl TradingSession {
             self.append_trade_journal(message.clone());
             state.status_msg = message.clone();
             record_app_event("ctrader_order_execution_refresh", "DEGRADED", message);
+        }
+        // Server-side per-position drill-down (Appendix C item #5 in
+        // `docs/audits/research/ctrader_api_full_reference.md`): when the
+        // broker hands back a `position_id`, issue a single
+        // `ProtoOAOrderListByPositionIdReq` so the trade journal can
+        // record the full order chain attached to this position instead
+        // of forcing the operator to mentally cross-reference the
+        // reconcile snapshot. Failure is logged but does not affect the
+        // success outcome — diagnostics enrichment is best-effort.
+        if let Some(position_id) = outcome.position_id {
+            match self.fetch_ctrader_orders_for_position(position_id, None, None) {
+                Ok(orders) => {
+                    tracing::debug!(
+                        target: "forex_app::ctrader_history",
+                        position_id,
+                        orders = orders.len(),
+                        "post-execution drill-down: ProtoOAOrderListByPositionIdReq returned"
+                    );
+                    if !orders.is_empty() {
+                        self.append_trade_journal(format!(
+                            "Position #{position_id} order chain: {} orders linked (single \
+                             ProtoOAOrderListByPositionIdReq, no client-side filter)",
+                            orders.len()
+                        ));
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "forex_app::ctrader_history",
+                        position_id,
+                        error = %err,
+                        "post-execution drill-down: ProtoOAOrderListByPositionIdReq failed; \
+                         continuing without journal enrichment"
+                    );
+                }
+            }
         }
         self.execution_surface_cache = None;
         self.market_chart_cache = None;

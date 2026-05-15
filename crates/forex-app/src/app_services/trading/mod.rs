@@ -556,6 +556,209 @@ impl TradingSession {
     //   poll_ctrader_live_auth, restore_ctrader_session,
     //   clear_ctrader_saved_session, discover_ctrader_accounts.
 
+    /// Current trading environment classifier consumed by the
+    /// persistent status pill in the main chrome.
+    pub fn trading_environment(&self) -> TradingEnvironment {
+        self.trading_environment
+    }
+
+    /// Adjust the session's trading environment. Owned by the wizard
+    /// promotion gates (`wizard_onboarding_competitive_analysis.md`
+    /// §10.3); the chrome only renders what is already set.
+    pub fn set_trading_environment(&mut self, env: TradingEnvironment) {
+        self.trading_environment = env;
+    }
+
+    /// Read-only view of the current HALT state. Used by the chrome
+    /// to decide whether to render the "TRADING HALTED" banner.
+    pub fn halt_state(&self) -> &HaltState {
+        &self.halt_state
+    }
+
+    /// `true` once `trip_manual_halt` has set the flag and the
+    /// operator has not yet cleared it. Consulted by every order
+    /// path (T-Manual sits above T1 / T2 in §10.4 of the
+    /// competitive analysis).
+    pub fn is_halted(&self) -> bool {
+        self.halt_state.halted
+    }
+
+    /// T-Manual kill switch — the red HALT button in the chrome.
+    ///
+    /// Sequence (mirrors `wizard_onboarding_competitive_analysis.md`
+    /// §10.4 T4):
+    ///   1. Sets the `halted` flag so every subsequent order is
+    ///      rejected at the pre-trade gate.
+    ///   2. Iterates open positions and calls the existing close path
+    ///      (`close_selected_position`) for each — preserves the
+    ///      audit-logging layer; does NOT introduce a bypass.
+    ///   3. Iterates pending orders and calls the existing cancel
+    ///      path (`cancel_selected_order`) for each.
+    ///   4. (TODO once `risky_mode.rs` lands) Calls
+    ///      `risky_mode_manager.trip_manual_halt()` if Risky Mode
+    ///      is active in the session.
+    ///   5. Emits a `tracing::error!(target: "forex_app::halt", ...)`
+    ///      line carrying operator, account_id, positions_closed,
+    ///      orders_cancelled, environment.
+    ///   6. Writes a sentinel file `<data-dir>/HALTED_<unix-secs>.flag`
+    ///      that the operator must remove (or the "Clear HALT"
+    ///      banner button removes for them) before trading can resume.
+    ///
+    /// Returns the `HaltTripSummary` so callers (and tests) can
+    /// inspect what was closed.
+    pub fn trip_manual_halt(&mut self, state: &mut AppState) -> HaltTripSummary {
+        // (1) flip the gate FIRST so any concurrent order submission
+        // landing during the iteration below is rejected at the gate.
+        self.halt_state.halted = true;
+
+        // (2) snapshot the positions / orders BEFORE iterating so that
+        // close/cancel calls (which mutate `state.order_ticket`) do not
+        // perturb the list we are walking.
+        let (position_ids, order_ids) = match self.connected_ctrader_runtime() {
+            Some(runtime) => {
+                let positions: Vec<i64> = runtime
+                    .reconcile
+                    .positions
+                    .iter()
+                    .map(|p| p.position_id)
+                    .collect();
+                let orders: Vec<i64> = runtime
+                    .reconcile
+                    .pending_orders
+                    .iter()
+                    .map(|o| o.order_id)
+                    .collect();
+                (positions, orders)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+
+        let mut positions_closed = 0usize;
+        for position_id in &position_ids {
+            state.order_ticket.selected_position_id = Some(*position_id);
+            // Existing close path: hard-fails on bad account ids and
+            // routes through `execute_ctrader_request`, which is the
+            // audit-logging entry point. Re-use it verbatim per the
+            // operator constraint "HALT must use the existing
+            // close/cancel paths".
+            self.close_selected_position(state);
+            positions_closed += 1;
+        }
+
+        let mut orders_cancelled = 0usize;
+        for order_id in &order_ids {
+            state.order_ticket.selected_order_id = Some(*order_id);
+            self.cancel_selected_order(state);
+            orders_cancelled += 1;
+        }
+
+        // TODO(risky-mode-halt): wire after risky_mode.rs lands —
+        // call `risky_mode_manager.trip_manual_halt()` here if the
+        // session has Risky Mode active. The Risky Mode agent owns
+        // that module; this site is the single integration point.
+
+        let account_id = self
+            .selected_ctrader_execution_account_id()
+            .unwrap_or_default();
+        let env_label = self.trading_environment.pill_label().to_string();
+        let timestamp_unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // (5) structured error-level event for the operator log.
+        // Includes everything an auditor needs to reconstruct the
+        // HALT after the fact.
+        tracing::error!(
+            target: "forex_app::halt",
+            account_id = %account_id,
+            environment = %env_label,
+            positions_closed,
+            orders_cancelled,
+            "T-Manual HALT tripped"
+        );
+
+        // (6) sentinel file. Written under the app's data directory
+        // so the operator can `ls` it from the shell and confirm the
+        // halt is still in force. We do NOT fail the halt if the
+        // sentinel write fails — the in-memory `halted` flag is
+        // authoritative; the file is a durable record.
+        let sentinel_path = state
+            .runtime
+            .data_dir
+            .join(format!("HALTED_{timestamp_unix_secs}.flag"));
+        if let Some(parent) = sentinel_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let sentinel_body = format!(
+            "T-Manual HALT tripped\n\
+             timestamp_unix_secs={timestamp_unix_secs}\n\
+             account_id={account_id}\n\
+             environment={env_label}\n\
+             positions_closed={positions_closed}\n\
+             orders_cancelled={orders_cancelled}\n"
+        );
+        match std::fs::write(&sentinel_path, sentinel_body) {
+            Ok(()) => {
+                self.halt_state.sentinel_path = Some(sentinel_path.clone());
+            }
+            Err(err) => {
+                tracing::error!(
+                    target: "forex_app::halt",
+                    error = %err,
+                    path = %sentinel_path.display(),
+                    "HALT sentinel write failed; halt remains in force via in-memory flag"
+                );
+            }
+        }
+
+        let summary = HaltTripSummary {
+            timestamp_unix_secs,
+            positions_closed,
+            orders_cancelled,
+            account_id,
+            environment_label: env_label,
+        };
+        self.halt_state.last_trip = Some(summary.clone());
+        summary
+    }
+
+    /// Public-surface read-through of the broker session's
+    /// "currently selected execution account id". Used by the chrome
+    /// status pill so it can render `<env> · <account_id>` without
+    /// reaching into the private `broker_settings` field. Returns
+    /// `None` when no broker accounts have been discovered or the
+    /// operator has not yet flagged one for execution.
+    pub fn selected_ctrader_execution_account_id_public(&self) -> Option<String> {
+        self.selected_ctrader_execution_account_id()
+    }
+
+    /// Clear the HALT and allow new orders to flow again. Wired to
+    /// the "Clear HALT" button in the chrome banner. Removes the
+    /// sentinel file from disk so a fresh `ls <data-dir>` shows the
+    /// halt is no longer active.
+    pub fn clear_halt(&mut self) {
+        self.halt_state.halted = false;
+        if let Some(path) = self.halt_state.sentinel_path.take() {
+            // Best-effort: a missing sentinel (e.g. operator removed
+            // it manually) is fine; surface IO errors only as warn.
+            if let Err(err) = std::fs::remove_file(&path) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        target: "forex_app::halt",
+                        error = %err,
+                        path = %path.display(),
+                        "HALT sentinel remove failed during clear_halt"
+                    );
+                }
+            }
+        }
+        tracing::info!(
+            target: "forex_app::halt",
+            "T-Manual HALT cleared by operator"
+        );
+    }
+
     pub fn snapshot(&self, state: &AppState) -> ConnectionSnapshot {
         let mode = panel_mode(state.data_source, self.connected);
         let adapter_kind = self
@@ -821,6 +1024,8 @@ impl Default for TradingSession {
             ctrader_runtime_refreshed_at: None,
             connect_handle: None,
             bootstrap_handle: None,
+            trading_environment: TradingEnvironment::Demo,
+            halt_state: HaltState::default(),
         }
     }
 }

@@ -75,6 +75,7 @@ fn main() -> Result<()> {
         "config" => cmd_config(&args[2..]),
         "auto-loop" => cmd_auto_loop(&args[2..]),
         "stop-target" => cmd_stop_target(&args[2..]),
+        "wizard" => cmd_wizard(&args[2..]),
         _ => {
             print_help();
             Ok(())
@@ -980,6 +981,12 @@ fn cmd_stop_target(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `forex-cli wizard` — TUI counterpart of the desktop first-run
+/// wizard. Spec §8 (`installer_wizard_ux_spec.md`).
+fn cmd_wizard(_args: &[String]) -> Result<()> {
+    tui::run_wizard_tui()
+}
+
 fn parse_root(args: &[String], settings: Option<&forex_core::Settings>) -> String {
     // `--data-path` is the operator-facing flag added 2026-05-14 for
     // folder-browsing workflows; `--root` remains for backwards
@@ -1184,6 +1191,7 @@ fn print_help() {
     );
     println!("  migrate-data --root data [--force] [--delete-source]");
     println!("  stop-target --symbol EURUSD --timeframe M1 --pip 0.0001 --signal 1 --root data");
+    println!("  wizard                       Launch the interactive first-run wizard (TUI).");
     println!();
     println!("  --data-path <folder>   Browse a folder and auto-discover dataset layout");
     println!("                         (subfolders for symbol/timeframe, Hive-style or flat).");

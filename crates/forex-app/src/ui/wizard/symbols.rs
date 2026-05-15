@@ -9,7 +9,7 @@
 //! 11 entries, NO H2. Test below pins this.
 
 use eframe::egui;
-use forex_core::contracts::temporal::CANONICAL_TIMEFRAMES;
+use forex_core::CANONICAL_TIMEFRAMES;
 
 use super::{StepResult, SymbolTemplate, WizardController};
 use crate::ui::theme;

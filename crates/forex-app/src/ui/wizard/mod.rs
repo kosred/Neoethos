@@ -40,6 +40,7 @@ pub mod summary;
 pub mod symbols;
 pub mod welcome;
 
+#[allow(unused_imports)]
 pub use state::{
     InstallMetadata, RiskAcknowledgement, WIZARD_STATE_FILENAME, WIZARD_STATE_FILE_VERSION,
     WizardError, WizardState, WizardStateFile, WizardStepStatus,

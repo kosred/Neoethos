@@ -923,6 +923,40 @@ mod tests {
         // Placeholder — same policy as above.
     }
 
+    /// Verify the server-side per-position drill-down
+    /// (`ProtoOAOrderListByPositionIdReq`, payload 2183) — the helper
+    /// must return the broker's response verbatim with NO client-side
+    /// re-filter. The capture procedure + expected file name live in
+    /// `crates/forex-app/tests/fixtures/ctrader/order_list_by_position_id/README.md`.
+    /// Wired into:
+    /// - `trading/orders.rs::execute_ctrader_request`
+    ///   (post-execution drill-down on success).
+    /// - `trading/orders.rs::cancel_selected_order` (pre-cancel
+    ///   `fetch_order_details` lookup).
+    /// - `trading/orders.rs::close_selected_position` (pre-close
+    ///   `fetch_orders_by_position_id` lookup).
+    /// See `docs/audits/research/ctrader_api_full_reference.md`
+    /// Appendix C item #5 for the rationale.
+    #[test]
+    #[ignore = "needs cTrader fixture"]
+    fn fetch_orders_by_position_id_clamps_to_position_real_fixture() {
+        // Placeholder — same policy as the other ignored fixture-tests
+        // above (operator directive 2026-05-15: no synthetic broker
+        // data, even in tests). Body lands once the captured
+        // `position_full_chain.json` is committed under
+        // `tests/fixtures/ctrader/order_list_by_position_id/`.
+        //
+        // The expected assertions (locked in by the README):
+        // 1. `fetch_orders_by_position_id_with_transport` parses the
+        //    captured `ProtoOAOrderListByPositionIdRes` envelope.
+        // 2. Every returned order's `tradeData.positionId` matches
+        //    the requested `position_id` — proves the broker did the
+        //    filtering (no client-side re-filter).
+        // 3. The `from_timestamp_ms` / `to_timestamp_ms` clamp via
+        //    `filter_orders_to_window` keeps the broker's response
+        //    intact when the window is `None`.
+    }
+
     #[test]
     fn rejects_h2_historical_bars_request() {
         // No transport call; this should fail before any network I/O
