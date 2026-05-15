@@ -40,7 +40,21 @@ fn rollback_rl_target_removes_partial_file_without_backup() {
 }
 
 #[test]
-fn fallback_only_artifact_round_trips_without_network_file() {
+fn fallback_only_artifact_serde_roundtrip() {
+    // F-MODELS9-004 honesty note: this test ONLY asserts that the
+    // fallback-only learner artifact serialises, reloads, and the
+    // fallback inference path produces the algebraically-expected
+    // output for the hardcoded weights/bias scaffold. It does NOT
+    // validate that the per-action average rewards stored in the
+    // training report are correct for any real training dataset:
+    // the `average_buy_reward = 0.2 > average_hold_reward = 0.1 >
+    // average_sell_reward = -0.1` triplet is pre-baked into the
+    // metadata before `save()` is called, so the test would still
+    // pass if the production reward function were entirely broken.
+    // The aspirational learning test that exercises
+    // `build_reward_triplet` end-to-end on a real cTrader fixture
+    // is registered below as `#[ignore]` and tracks F-MODELS9-004
+    // until the historical-data fixture is available.
     let mut learner = TradingReinforcementLearner::new();
     learner.train_args.state_dim = 2;
     learner.train_args.train_rows = 16;
@@ -134,6 +148,35 @@ fn fallback_only_artifact_round_trips_without_network_file() {
     );
 
     let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+#[ignore = "needs real cTrader-historical fixture and a full training pass; tracks F-MODELS9-004"]
+fn trained_agent_learns_action_reward_ordering_on_real_data() {
+    // F-MODELS9-004 aspirational test.
+    //
+    // Goal: drive a full DQN training pass over a real cTrader
+    // historical sample (e.g. EURUSD M15 OHLCV) so that the
+    // production reward computation in `build_reward_triplet` is
+    // exercised end-to-end, then assert that the resulting
+    // `TradingRlTrainingReport` exhibits the expected
+    // action-reward ordering for the chosen regime
+    // (`average_buy_reward > average_hold_reward > average_sell_reward`
+    // for a bullish window, with the inequality flipped for a
+    // bearish window).
+    //
+    // This test is intentionally `#[ignore]` because the operator
+    // directive forbids synthetic broker data; it cannot be enabled
+    // until a real cTrader historical fixture is checked into the
+    // workspace and a deterministic training-pass harness is wired
+    // up to consume it. Once those are available, replace the
+    // unimplemented! below with a fixture loader + a learner
+    // `fit_*` invocation and the corresponding ordering assertions.
+    unimplemented!(
+        "F-MODELS9-004: blocked on real cTrader-historical fixture + \
+         deterministic full-training harness; do not enable with \
+         synthetic data"
+    );
 }
 
 #[cfg(feature = "reinforcement-learning")]

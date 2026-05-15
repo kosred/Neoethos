@@ -1,18 +1,67 @@
-//! Audit-only cross-check between local and broker-side unrealized PnL.
+//! Broker-side unrealized PnL: audit + authoritative paths.
 //!
 //! Wires the `ProtoOAGetPositionUnrealizedPnLReq` / `…Res` pair that
 //! Spotware added in the 2026-05-14 OpenApiMessages refresh (Batch 6).
 //!
 //! Today `forex-app` computes unrealized PnL locally from
 //! `(currentPrice - entryPrice) * volume * pipValue * direction`. The
-//! broker now exposes its own server-side value; comparing the two on
-//! every reconcile tick catches stale market data and wrong conversion
-//! FX before the figures hit the risk-management gate.
+//! broker now exposes `grossUnrealizedPnL` + `netUnrealizedPnL` in the
+//! account deposit currency, already FX-converted server-side (proto:
+//! `ProtoOAPositionUnrealizedPnL` in `OpenApiModelMessages.proto`).
 //!
-//! Audit mode only — this module does NOT replace the local PnL value
-//! used downstream. It only emits structured `debug!` lines (one per
-//! position) and a `warn!` line when the drift exceeds the configured
-//! threshold (default 0.1 % of position notional).
+//! ## Two modes
+//!
+//! **Audit mode** ([`audit_unrealized_pnl`]) — emits a `debug!` line
+//! per position and a `warn!` line when |broker_net - local| /
+//! position_notional exceeds [`DEFAULT_PNL_AUDIT_DRIFT_FRACTION`]. The
+//! local value is still authoritative for downstream consumers; this
+//! mode only flags drift for an operator to investigate.
+//!
+//! **Authoritative mode** ([`fetch_unrealized_pnl_for_all_positions`])
+//! — Batch 14 upgrade. The risk gate consumes the broker's net PnL
+//! directly per position; the local f64 computation is only consulted
+//! when the server call fails. A drift larger than
+//! [`DEFAULT_PNL_CIRCUIT_BREAKER_FRACTION`] is no longer just a `warn!`
+//! — it returns a [`PnLDriftCircuitBreaker`] error so the caller can
+//! block new orders until an operator acknowledges.
+//!
+//! ## Drift threshold rationale
+//!
+//! Per `docs/audits/research/ctrader_api_full_reference.md` §5 (and
+//! the proto comment on `ProtoOAPositionUnrealizedPnL.netUnrealizedPnL`),
+//! `netUnrealizedPnL` is the gross PnL **minus accrued swap** (it
+//! intentionally does NOT include the potential closing commission).
+//! Our local calculation is essentially a *gross* mark-to-market that
+//! does NOT subtract swap. Comparing them at the `net` field therefore
+//! always overstates the drift by ~|accrued swap|. We keep the audit
+//! comparator on `net` because:
+//!
+//! 1. The risk-gate equity formula already absorbs swap on the broker
+//!    side via `ProtoOAPosition.swap` (it lands in `position.swap` per
+//!    `parse_reconcile_response`). The net field is the operationally
+//!    relevant figure — it's what the broker would credit/debit at
+//!    immediate close.
+//! 2. Batch 13's `warn!` threshold of 0.1 % of position notional was
+//!    chosen specifically with swap absorption in mind: a 1-week-old
+//!    position with typical FX swap (~5-10 pips/yr ≈ 0.001 % of
+//!    notional/day) accumulates ~0.01 % of notional in swap, well
+//!    under the 0.1 % alarm.
+//!
+//! The 1 % authoritative-mode circuit breaker is intentionally one
+//! full order of magnitude above the audit threshold. Below 0.1 % we
+//! treat broker and local as agreeing; between 0.1 % and 1 % the
+//! audit warning fires but the gate still trades on the broker value;
+//! above 1 % we assume one side is fundamentally wrong (stale
+//! quote feed, mis-scaled `moneyDigits`, wrong FX conversion) and
+//! refuse to size further orders.
+//!
+//! ## Real-data fixtures
+//!
+//! All tests are real-data only. The captured payload lives under
+//! `crates/forex-app/tests/fixtures/ctrader/unrealized_pnl/` — see
+//! the README there for the schema and capture procedure. Synthetic
+//! broker payloads remain disallowed per the 2026-05-15 operator
+//! directive.
 
 use crate::app_services::ctrader_account::CTraderPositionSnapshot;
 use crate::app_services::ctrader_messages::{
@@ -25,6 +74,7 @@ use crate::app_services::ctrader_messages::{
     parse_get_position_unrealized_pnl_response, parse_open_api_envelope,
 };
 use anyhow::{Context, Result, anyhow};
+use std::collections::HashMap;
 
 /// Default audit drift threshold expressed as a fraction of position
 /// notional (0.001 == 0.1 %).
@@ -35,6 +85,19 @@ use anyhow::{Context, Result, anyhow};
 /// tighten or loosen the alarm without a rebuild.
 pub const DEFAULT_PNL_AUDIT_DRIFT_FRACTION: f64 = 0.001;
 
+/// Authoritative-mode circuit-breaker threshold expressed as a fraction
+/// of position notional (0.01 == 1 %).
+///
+/// When the live equity reader runs against the broker's
+/// `ProtoOAGetPositionUnrealizedPnLRes` and the per-position drift
+/// versus the local mark-to-market exceeds this fraction, the caller
+/// MUST treat the broker/local pair as fundamentally inconsistent and
+/// block further new-order submissions until an operator acknowledges.
+/// One full order of magnitude above the audit `warn!` threshold so
+/// that ordinary stale-quote noise does not trip the breaker. Tunable
+/// via `FOREX_BOT_PNL_CIRCUIT_BREAKER_FRACTION`.
+pub const DEFAULT_PNL_CIRCUIT_BREAKER_FRACTION: f64 = 0.01;
+
 /// Effective drift threshold, clamped to `[1e-5, 0.05]` to keep the
 /// alarm from going silent on zero or pathological on >5 %.
 fn pnl_audit_drift_fraction() -> f64 {
@@ -43,6 +106,18 @@ fn pnl_audit_drift_fraction() -> f64 {
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(DEFAULT_PNL_AUDIT_DRIFT_FRACTION)
         .clamp(1e-5, 0.05)
+}
+
+/// Effective circuit-breaker threshold, clamped to `[1e-4, 0.20]`. The
+/// upper bound caps the operator's "ignore drift" override at 20 % so
+/// the breaker cannot be fully disabled by a typo; the lower bound
+/// avoids tripping on float epsilon when broker and local agree.
+fn pnl_circuit_breaker_fraction() -> f64 {
+    std::env::var("FOREX_BOT_PNL_CIRCUIT_BREAKER_FRACTION")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(DEFAULT_PNL_CIRCUIT_BREAKER_FRACTION)
+        .clamp(1e-4, 0.20)
 }
 
 /// One line of the PnL audit log: pairs the broker's server-side
