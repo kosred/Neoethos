@@ -918,8 +918,22 @@ fn parse_order_error_event(response_json: &str) -> Result<CTraderExecutionOutcom
 }
 
 fn scaled_money(raw: i64, money_digits: u32) -> f64 {
-    let divisor = 10f64.powi(money_digits as i32);
-    raw as f64 / divisor
+    // Centralised cTrader spec helper (see ctrader_money.rs and
+    // docs/audits/research/ctrader_api_full_reference.md §5.14). Out-of-range
+    // `money_digits` triggers an error log + legacy fiat fallback so a single
+    // malformed broker payload cannot panic the execution event parser.
+    match crate::app_services::ctrader_money::scale_ctrader_money_int(raw, money_digits as i32) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(
+                target: "forex_app::ctrader",
+                money_digits,
+                error = %err,
+                "execution event money scaling rejected by spec helper; falling back to fiat default (2)"
+            );
+            (raw as f64) / 100.0
+        }
+    }
 }
 
 fn volume_to_units(raw: i64) -> f64 {

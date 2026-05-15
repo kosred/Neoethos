@@ -1108,20 +1108,33 @@ pub fn parse_get_position_unrealized_pnl_response(
              cannot scale gross/net PnL"
         )
     })?;
-    let factor = 10_f64.powi(money_digits as i32);
+    // Centralised cTrader spec helper (see ctrader_money.rs and
+    // docs/audits/research/ctrader_api_full_reference.md §5.14). For an
+    // unrealized-pnl response we treat an out-of-spec `moneyDigits` as a
+    // hard error (rather than the silent fallback used in display-only
+    // paths) because the gross/net values feed the risk-gate drift audit.
+    let positions = envelope
+        .payload
+        .position_unrealized_pnl
+        .into_iter()
+        .map(|row| -> Result<CTraderPositionUnrealizedPnL> {
+            Ok(CTraderPositionUnrealizedPnL {
+                position_id: row.position_id,
+                gross_unrealized_pnl: crate::app_services::ctrader_money::scale_ctrader_money_int(
+                    row.gross_unrealized_pnl,
+                    money_digits as i32,
+                )?,
+                net_unrealized_pnl: crate::app_services::ctrader_money::scale_ctrader_money_int(
+                    row.net_unrealized_pnl,
+                    money_digits as i32,
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(CTraderUnrealizedPnLSnapshot {
         account_id: envelope.payload.ctid_trader_account_id,
         money_digits,
-        positions: envelope
-            .payload
-            .position_unrealized_pnl
-            .into_iter()
-            .map(|row| CTraderPositionUnrealizedPnL {
-                position_id: row.position_id,
-                gross_unrealized_pnl: (row.gross_unrealized_pnl as f64) / factor,
-                net_unrealized_pnl: (row.net_unrealized_pnl as f64) / factor,
-            })
-            .collect(),
+        positions,
     })
 }
 

@@ -1,35 +1,40 @@
-use crate::app_record;
-use crate::app_services::ServiceEvent;
-use crate::app_services::broker_config::{
+// Imports re-exported via `pub(super) use` so the `session`, `orders`, and
+// `market_data` sibling modules can pull common types out of `super::*`
+// without each duplicating the full `crate::app_services::...` path list.
+// `pub(super)` keeps these aliases visible only inside `trading::*`, so the
+// external (`forex-app`) surface is unchanged.
+pub(super) use crate::app_record;
+pub(super) use crate::app_services::ServiceEvent;
+pub(super) use crate::app_services::broker_config::{
     AdapterReadinessSnapshot, BrokerAccountTarget, BrokerSessionState, BrokerSettingsState,
     CTraderBrokerEnvironment,
 };
-use crate::app_services::ctrader_account::{
+pub(super) use crate::app_services::ctrader_account::{
     CTraderAccountRuntimeBackend, CTraderAccountRuntimeRequest, CTraderAccountRuntimeSnapshot,
     CTraderDealSnapshot, CTraderPendingOrderSnapshot, CTraderPositionSnapshot,
     ProductionCTraderAccountRuntimeBackend,
 };
-use crate::app_services::ctrader_auth::{
+pub(super) use crate::app_services::ctrader_auth::{
     CTraderAccountSummary, CTraderAuthSession, CTraderAuthSnapshot, CTraderDiscoveredAccount,
     CTraderTokenBundle, CTraderTokenExchangeRequest,
 };
-use crate::app_services::ctrader_bootstrap::{
+pub(super) use crate::app_services::ctrader_bootstrap::{
     bootstrap_from_ctrader_history, plan_bootstrap_chunks,
 };
-use crate::app_services::ctrader_data::{
+pub(super) use crate::app_services::ctrader_data::{
     CTraderChartHistoryRequest, CTraderSymbolInfo, CTraderSymbolLookupRequest, HistoricalBar,
     load_chart_history, resolve_symbol,
 };
-use crate::app_services::ctrader_execution::{
+pub(super) use crate::app_services::ctrader_execution::{
     CTraderExecutionBackend, CTraderExecutionOutcome, CTraderExecutionRequest,
     CTraderExecutionRuntimeRequest, CTraderExecutionStatus, ProductionCTraderExecutionBackend,
 };
-use crate::app_services::ctrader_live_auth::{
+pub(super) use crate::app_services::ctrader_live_auth::{
     CTRADER_DEFAULT_SCOPE, CTraderAccountDiscoveryBackend, CTraderAccountDiscoveryRequest,
     CTraderEnvironment, CTraderLiveAuthBackend, CTraderLiveAuthRequest, CTraderLiveAuthResult,
     CTraderTokenRefreshRequest, ProductionCTraderLiveAuthBackend, build_default_loopback_config,
 };
-use crate::app_services::ctrader_messages::{
+pub(super) use crate::app_services::ctrader_messages::{
     CTRADER_TOKEN_EXPIRED_SENTINEL, CTraderAmendOrderRequest, CTraderCancelOrderRequest,
     CTraderClosePositionRequest, CTraderNewOrderRequest, CTraderOrderTriggerMethod,
     CTraderOrderType, CTraderTimeInForce, CTraderTradeSide,
@@ -37,24 +42,26 @@ use crate::app_services::ctrader_messages::{
     SUPPORTED_CTRADER_TIME_IN_FORCE, SUPPORTED_CTRADER_TRADE_SIDES, build_amend_order_request,
     build_cancel_order_request, build_close_position_request, build_new_order_request,
 };
-use crate::app_services::ctrader_streaming::{
+pub(super) use crate::app_services::ctrader_streaming::{
     CTraderLiveChartUpdate, CTraderLiveChartUpdateRequest, CTraderLiveStreamingBackend,
     ProductionCTraderLiveStreamingBackend, merge_live_spot_update_into_bars,
 };
-use crate::app_services::jobs::{JobEventLevel, JobKind, JobSnapshot, JobState, push_recent_event};
-use crate::app_services::secure_store::{
+pub(super) use crate::app_services::jobs::{
+    JobEventLevel, JobKind, JobSnapshot, JobState, push_recent_event,
+};
+pub(super) use crate::app_services::secure_store::{
     CTraderSecureStore, CTraderTokenStore, KeyringSecretStoreBackend,
 };
-use crate::app_state::{AppState, DataSource, OrderTicketState};
-use anyhow::Context;
-use forex_core::logging::write_subsystem_record;
-use forex_core::sectioned_log::SubsystemSection;
-use forex_data::{Ohlcv, discover_timeframes, load_symbol_timeframe};
-use std::path::PathBuf;
+pub(super) use crate::app_state::{AppState, DataSource, OrderTicketState};
+pub(super) use anyhow::Context;
+pub(super) use forex_core::logging::write_subsystem_record;
+pub(super) use forex_core::sectioned_log::SubsystemSection;
+pub(super) use forex_data::{Ohlcv, discover_timeframes, load_symbol_timeframe};
+pub(super) use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::error;
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
+pub(super) use tracing::error;
 
 mod client_order;
 mod diagnostics;

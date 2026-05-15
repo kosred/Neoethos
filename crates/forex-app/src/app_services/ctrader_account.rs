@@ -774,13 +774,32 @@ fn ensure_success_payload_type(response_json: &str, expected_payload_type: u32) 
 
 /// Apply the broker-side decimal precision to a raw money value.
 ///
-/// `digits` is clamped to `[0, 12]` so a malformed payload cannot
-/// trigger an `f64` overflow inside `powi`. The caller is responsible
-/// for resolving `Option<u32>` to a concrete value before invoking
-/// this helper — see [`required_money_digits`].
+/// Delegates to [`crate::app_services::ctrader_money::scale_ctrader_money_int`]
+/// — the single spec-compliant implementation per the 2026-05-15
+/// docs sweep (cTrader Open API §5.14: "Money is int64 scaled by
+/// 10^moneyDigits, per-entity"). The caller is responsible for
+/// resolving `Option<u32>` to a concrete value before invoking this
+/// helper — see [`required_money_digits`].
+///
+/// On out-of-range `digits` (the spec allows `[0, 10]`) we log an
+/// error and fall back to the legacy fiat default (2). The strict
+/// helper is what we'd want for fresh code, but this thin shim
+/// preserves the prior infallible signature used by hundreds of
+/// downstream call sites; the strict path is exposed directly via
+/// the `ctrader_money` module.
 fn scaled_money(value: i64, digits: u32) -> f64 {
-    let factor = 10_f64.powi(digits.min(12) as i32);
-    value as f64 / factor
+    match crate::app_services::ctrader_money::scale_ctrader_money_int(value, digits as i32) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(
+                target: "forex_app::ctrader",
+                money_digits = digits,
+                error = %err,
+                "cTrader money scaling rejected by spec helper; falling back to fiat default (2)"
+            );
+            (value as f64) / 100.0
+        }
+    }
 }
 
 /// Resolve `money_digits` from a broker payload. The cTrader OpenAPI

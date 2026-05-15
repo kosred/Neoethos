@@ -42,7 +42,7 @@ use super::{
     CTraderAccountRuntimeRequest, CTraderAccountRuntimeSnapshot, CTraderAccountSummary,
     CTraderAuthSession, CTraderAuthSnapshot, CTraderBootstrapContext,
     CTraderBrokerEnvironment, CTraderEnvironment, CTraderLiveAuthRequest,
-    CTraderLiveAuthResult, CTraderTokenBundle, CTraderTokenExchangeRequest,
+    CTraderTokenBundle, CTraderTokenExchangeRequest,
     CTraderTokenRefreshRequest, DataSource, JobKind, JobSnapshot, JobState, ServiceEvent,
     TaskKind, TradingAdapter, TradingAdapterKind, TradingSession, build_default_loopback_config,
     current_unix_seconds, format_ctrader_connect_error, format_ctrader_terminal_info,
@@ -286,7 +286,7 @@ impl TradingSession {
 
     pub fn poll_ctrader_live_auth(&mut self) -> Option<CTraderAuthSnapshot> {
         let receiver = self.ctrader_live_auth_rx.as_ref()?;
-        let outcome: Result<CTraderLiveAuthResult, String> = match receiver.try_recv() {
+        let outcome = match receiver.try_recv() {
             Ok(outcome) => outcome,
             Err(TryRecvError::Empty) => return None,
             Err(TryRecvError::Disconnected) => {
