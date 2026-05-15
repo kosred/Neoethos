@@ -1251,6 +1251,276 @@ impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Transport selector — JSON-WSS (port 5036, default) vs Protobuf (port 5035).
+//
+// Per cTrader exhaustive docs sweep §10 item #3
+// (`docs/audits/research/ctrader_api_full_reference.md`), the native
+// Protobuf-over-TCP transport on port 5035 saves ~3× bandwidth compared
+// to JSON-WSS and removes JSON field-name brittleness. The migration is
+// staged: v0.4.5 ships the codec + reconcile + historical-bars and
+// keeps order placement on JSON-WSS for a follow-up
+// operator-acknowledged batch (the directive treats orders as
+// money-critical).
+//
+// The opt-in is via the `FOREX_BOT_CTRADER_TRANSPORT` environment
+// variable (see `CTRADER_TRANSPORT_ENV_VAR`).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Wire format selected for the cTrader Open API transport at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CTraderTransportKind {
+    /// Port 5036 — WebSocket + TLS + JSON envelopes. Default.
+    JsonWss,
+    /// Port 5035 — raw TCP + TLS + native Protobuf framing
+    /// (4-byte big-endian length prefix + serialised `ProtoMessage`).
+    /// Migrates the reconcile and historical-bars endpoints in v0.4.5;
+    /// other endpoints fall back to JSON-WSS (the v0.4.5 batch scope).
+    Protobuf,
+}
+
+impl CTraderTransportKind {
+    /// Stable label suitable for `tracing` event fields.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::JsonWss => "json_wss",
+            Self::Protobuf => "protobuf",
+        }
+    }
+}
+
+/// Pick the cTrader transport based on `FOREX_BOT_CTRADER_TRANSPORT`.
+/// Returns `JsonWss` for unset / empty / unrecognised values (with a
+/// `tracing::warn!` for unrecognised values so the operator can spot a
+/// typo). Recognised values: `json_wss`, `protobuf` (case-insensitive,
+/// trimmed).
+pub fn select_ctrader_transport_from_env() -> CTraderTransportKind {
+    match std::env::var(CTRADER_TRANSPORT_ENV_VAR) {
+        Ok(raw) => {
+            let normalised = raw.trim().to_ascii_lowercase();
+            match normalised.as_str() {
+                "" => CTraderTransportKind::JsonWss,
+                "json_wss" | "json-wss" | "json" | "wss" => CTraderTransportKind::JsonWss,
+                "protobuf" | "proto" | "pb" => {
+                    tracing::info!(
+                        target: "forex_app::ctrader",
+                        transport = "protobuf",
+                        "Using native Protobuf-over-TCP transport (3× bandwidth vs JSON-WSS)"
+                    );
+                    CTraderTransportKind::Protobuf
+                }
+                other => {
+                    tracing::warn!(
+                        target: "forex_app::ctrader",
+                        value = other,
+                        env_var = CTRADER_TRANSPORT_ENV_VAR,
+                        "unrecognised cTrader transport value; defaulting to JSON-WSS"
+                    );
+                    CTraderTransportKind::JsonWss
+                }
+            }
+        }
+        Err(_) => CTraderTransportKind::JsonWss,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Connection entry points — public helpers exposing the per-wire-format
+// dial semantics. The high-level transport types
+// (`ProductionCTraderOpenApiTransport`, `ProductionCTraderOpenApiProtobufTransport`)
+// call into these on each `send_sequence` invocation.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build the canonical JSON-WSS endpoint URL (port 5036, TLS WebSocket).
+/// Used by [`ProductionCTraderOpenApiTransport::send_sequence`].
+pub fn ctrader_json_wss_url(endpoint_host: &str) -> String {
+    format!("wss://{}:5036", endpoint_host)
+}
+
+/// Build the canonical native-Protobuf endpoint authority (port 5035,
+/// TLS-wrapped TCP). The Protobuf transport opens a `TcpStream` to this
+/// `host:port`, runs the rustls handshake, and frames messages with the
+/// 4-byte big-endian length prefix + serialised `ProtoMessage` payload
+/// (see [`crate::app_services::ctrader_proto_messages::frame_with_length_prefix`]).
+pub fn ctrader_protobuf_tcp_authority(endpoint_host: &str) -> String {
+    format!("{}:5035", endpoint_host)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Protobuf-over-TCP transport (port 5035).
+//
+// IMPLEMENTATION NOTES
+// --------------------
+// * Only the v0.4.5 migration-batch payload types
+//   (`CTRADER_OA_RECONCILE_REQUEST_PAYLOAD_TYPE` and
+//   `CTRADER_OA_GET_TRENDBARS_REQUEST_PAYLOAD_TYPE`) are end-to-end
+//   handled on the Protobuf wire. For any other payload type the
+//   transport transparently falls back to the JSON-WSS path so the
+//   operator can opt in without breaking unrelated flows.
+// * The TLS+TCP dial code is gated behind the
+//   `ctrader-protobuf-streaming` Cargo feature. With the feature OFF
+//   the transport still exposes the codec, builders, and JSON-shape
+//   adapters (which are pure data-translation and have no network
+//   dependency); attempting an actual `send_sequence` against the
+//   Protobuf path returns a clear error directing the operator to
+//   enable the feature. This matches the directive: items 4 + 5 stay
+//   behind a feature gate for v0.4.5.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Native Protobuf-over-TCP transport (port 5035). Implements the
+/// existing [`CTraderOpenApiTransport`] trait so all current callers
+/// (`ctrader_account.rs`, `ctrader_history.rs`, …) work without a
+/// source-level change — only the bytes on the wire differ.
+///
+/// `fallback` is the JSON-WSS transport that handles payload types the
+/// v0.4.5 batch has not yet migrated (everything other than reconcile
+/// + historical bars). This keeps the migration risk strictly bounded.
+pub struct ProductionCTraderOpenApiProtobufTransport {
+    endpoint_host: String,
+    fallback: ProductionCTraderOpenApiTransport,
+}
+
+impl ProductionCTraderOpenApiProtobufTransport {
+    pub fn new(endpoint_host: impl Into<String>) -> Self {
+        let endpoint_host = endpoint_host.into();
+        let fallback = ProductionCTraderOpenApiTransport::new(endpoint_host.clone());
+        Self {
+            endpoint_host,
+            fallback,
+        }
+    }
+
+    pub fn endpoint_host(&self) -> &str {
+        &self.endpoint_host
+    }
+
+    /// Authority of the cTrader Protobuf endpoint (`host:5035`).
+    pub fn protobuf_authority(&self) -> String {
+        ctrader_protobuf_tcp_authority(&self.endpoint_host)
+    }
+}
+
+impl CTraderOpenApiTransport for ProductionCTraderOpenApiProtobufTransport {
+    fn send_sequence(&self, messages: &[CTraderOpenApiJsonMessage]) -> Result<Vec<String>> {
+        // v0.4.5 migration batch: only reconcile + trendbars travel on
+        // native Protobuf. If every message in the sequence is in that
+        // set, take the Protobuf path; otherwise (any message is out of
+        // scope) delegate the entire sequence to the JSON-WSS fallback
+        // so transactional sequences (e.g. auth → request) stay on a
+        // single wire format.
+        let all_migrated = messages.iter().all(|m| {
+            crate::app_services::ctrader_proto_messages::protobuf_transport_supports_payload_type(
+                m.payload_type,
+            )
+        });
+        if !all_migrated {
+            // Operator transparency: emit a single trace event when the
+            // Protobuf path falls back so the v0.4.5 rollout can be
+            // monitored end-to-end without surprise.
+            tracing::debug!(
+                target: "forex_app::ctrader",
+                transport = "protobuf",
+                fallback = "json_wss",
+                "Protobuf transport: sequence contains unmigrated payload types; delegating to JSON-WSS"
+            );
+            return self.fallback.send_sequence(messages);
+        }
+
+        #[cfg(feature = "ctrader-protobuf-streaming")]
+        {
+            self.send_sequence_protobuf(messages)
+        }
+        #[cfg(not(feature = "ctrader-protobuf-streaming"))]
+        {
+            // Feature gate OFF: the codec is compiled, the builders
+            // are compiled, but the actual TLS+TCP dial path is not.
+            // Operators selecting Protobuf via the env var without
+            // enabling the feature get a clear error pointing at the
+            // remediation. v0.4.5 keeps the network code behind a
+            // gate per the migration directive.
+            let _ = messages; // silence unused warning
+            Err(anyhow!(
+                "cTrader Protobuf-over-TCP transport requested but the \
+                 `ctrader-protobuf-streaming` Cargo feature is not enabled; \
+                 rebuild forex-app with `--features ctrader-protobuf-streaming` \
+                 or unset FOREX_BOT_CTRADER_TRANSPORT to use JSON-WSS."
+            ))
+        }
+    }
+}
+
+#[cfg(feature = "ctrader-protobuf-streaming")]
+impl ProductionCTraderOpenApiProtobufTransport {
+    fn send_sequence_protobuf(
+        &self,
+        messages: &[CTraderOpenApiJsonMessage],
+    ) -> Result<Vec<String>> {
+        use crate::app_services::ctrader_proto_messages::{
+            json_message_to_framed_protobuf, proto_envelope_to_json_string,
+            read_length_prefixed_frame,
+        };
+        use std::io::Write;
+
+        let authority = self.protobuf_authority();
+        let host_only = self.endpoint_host.clone();
+
+        // TLS+TCP dial. rustls 0.23 ships an aws-lc-rs-backed default
+        // provider via `CryptoProvider::install_default`; we install
+        // the ring provider once per process to keep the dep surface
+        // small (already pulled in by other workspace crates).
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let server_name = rustls::pki_types::ServerName::try_from(host_only.clone())
+            .map_err(|e| anyhow!("invalid cTrader endpoint host {}: {}", host_only, e))?;
+        let mut conn = rustls::ClientConnection::new(std::sync::Arc::new(config), server_name)
+            .context("failed to construct rustls client connection")?;
+        let mut sock = std::net::TcpStream::connect(&authority)
+            .with_context(|| format!("failed to TCP-connect to {}", authority))?;
+        sock.set_nodelay(true).ok();
+        let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+
+        let mut responses = Vec::with_capacity(messages.len());
+        for message in messages {
+            let framed = json_message_to_framed_protobuf(message).with_context(|| {
+                format!(
+                    "failed to frame cTrader Protobuf request (payload_type={})",
+                    message.payload_type
+                )
+            })?;
+            tls.write_all(&framed)
+                .context("failed to write cTrader Protobuf request frame")?;
+            tls.flush()
+                .context("failed to flush cTrader Protobuf request frame")?;
+
+            // Read frames until we get a response that matches the
+            // current request's client_msg_id (event/heartbeat frames
+            // for unrelated streams are dropped). Mirror the
+            // JSON-WSS matching policy.
+            loop {
+                let envelope_bytes = read_length_prefixed_frame(&mut tls)
+                    .context("failed to read cTrader Protobuf response frame")?;
+                let json = proto_envelope_to_json_string(&envelope_bytes)?;
+                let envelope = parse_open_api_envelope(&json)?;
+                let expected = expected_response_payload_type(message.payload_type)?;
+                if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+                    responses.push(json);
+                    return Ok(responses);
+                }
+                if is_matching_open_api_response(&envelope, message, expected) {
+                    responses.push(json);
+                    break;
+                }
+                // Otherwise discard and keep reading (e.g. an
+                // out-of-band heartbeat or push event).
+            }
+        }
+        Ok(responses)
+    }
+}
+
 #[cfg(test)]
 #[path = "ctrader_messages_tests.rs"]
 mod tests;

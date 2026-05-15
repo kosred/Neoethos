@@ -14,6 +14,16 @@ readme = "../../README.md"
 [features]
 default = []
 gpu = ["forex-search/gpu", "forex-models/neuro-evolution-gpu", "forex-models/statistical-gpu"]
+# Enable the native Protobuf-over-TCP transport (port 5035) for the cTrader
+# Open API. Wire-format only; the higher-level Rust API surface is unchanged.
+# v0.4.5 migration scope: reconcile (ProtoOAReconcileReq/Res) +
+# historical-bars (ProtoOAGetTrendbarsReq/Res). All other endpoints fall
+# back to the default JSON-WSS path. See
+# `docs/audits/research/ctrader_api_full_reference.md` §10 item #3 for
+# the bandwidth + JSON field-name-drift rationale (~3× saving).
+# Runtime opt-in is via `FOREX_BOT_CTRADER_TRANSPORT=protobuf` plus this
+# feature being enabled at build time.
+ctrader-protobuf-streaming = ["dep:rustls", "dep:webpki-roots"]
 
 [dependencies]
 eframe = "0.31.0" # UI framework (egui)
@@ -42,6 +52,17 @@ base64 = "0.22"
 # audit-fix F8: SecretString is the safe wrapper for string-shaped
 # secrets — see forex-core/Cargo.toml for the rationale.
 secrecy = "0.10"
+# rustls + webpki-roots are pulled in transitively by reqwest /
+# tokio-tungstenite already, so adding them as direct deps for the
+# native Protobuf-over-TCP transport (port 5035) does not change the
+# build artefact set. `optional = true` keeps them gated behind the
+# `ctrader-protobuf-streaming` Cargo feature so a JSON-WSS-only build
+# does not link the sync TLS stack at all. Versions pinned to the
+# values already resolved in Cargo.lock (rustls 0.23, webpki-roots 0.26)
+# — picking newer would re-resolve the lockfile and risk drift in
+# transitive deps.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "0.26", optional = true }
 
 
 
