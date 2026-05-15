@@ -310,22 +310,302 @@ fn position_notional(position: &CTraderPositionSnapshot) -> f64 {
     }
 }
 
+/// Authoritative per-position unrealized PnL pair (gross + net) used
+/// by the risk gate when the broker call succeeds. Values are in the
+/// account deposit currency; `money_digits` is captured for the call
+/// site to log alongside the figure when debugging FX-conversion
+/// drift.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BrokerPositionPnL {
+    pub position_id: i64,
+    pub gross_unrealized_pnl: f64,
+    pub net_unrealized_pnl: f64,
+    pub money_digits: u32,
+}
+
+/// Bundle returned by [`fetch_unrealized_pnl_for_all_positions`]: the
+/// per-position broker view plus the raw snapshot for callers that
+/// want to feed it back into the audit path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthoritativeUnrealizedPnL {
+    pub account_id: i64,
+    pub money_digits: u32,
+    pub by_position: HashMap<i64, BrokerPositionPnL>,
+}
+
+impl AuthoritativeUnrealizedPnL {
+    /// Sum of `netUnrealizedPnL` across every position the broker
+    /// returned. Account currency (deposit currency) is implicit —
+    /// the broker has already performed the FX conversion server-side.
+    /// This is the figure the risk gate adds to `trader.balance` for
+    /// the prop-firm equity check.
+    pub fn total_net(&self) -> f64 {
+        self.by_position
+            .values()
+            .map(|p| p.net_unrealized_pnl)
+            .sum()
+    }
+
+    /// Sum of `grossUnrealizedPnL` across every position. Held for
+    /// reporting / journaling only — the risk gate consumes `total_net`.
+    pub fn total_gross(&self) -> f64 {
+        self.by_position
+            .values()
+            .map(|p| p.gross_unrealized_pnl)
+            .sum()
+    }
+}
+
+/// Drift outcome from comparing the broker's authoritative net PnL
+/// against the local mark-to-market value for every open position.
+///
+/// `Ok` when every position is within
+/// [`pnl_circuit_breaker_fraction`]; `Tripped` when at least one
+/// position exceeds the threshold. The caller is expected to surface
+/// the tripped state as an operator-facing alert and refuse to size
+/// new orders until the inconsistency is resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PnLDriftCircuitBreaker {
+    Ok,
+    Tripped {
+        position_id: i64,
+        broker_net: f64,
+        local: f64,
+        notional: f64,
+        drift_fraction: f64,
+        threshold_fraction: f64,
+    },
+}
+
+impl PnLDriftCircuitBreaker {
+    pub fn is_ok(&self) -> bool {
+        matches!(self, PnLDriftCircuitBreaker::Ok)
+    }
+
+    pub fn is_tripped(&self) -> bool {
+        !self.is_ok()
+    }
+}
+
+/// Authoritative path: fetch the broker's per-position unrealized PnL
+/// and return it indexed by `position_id`. The proto contract is one
+/// request per `ctidTraderAccountId` returns ALL positions in a single
+/// response (`repeated ProtoOAPositionUnrealizedPnL positionUnrealizedPnL`
+/// — see `crates/forex-app/proto/OpenApiMessages.proto:790`), so we do
+/// NOT loop over `position_ids` here. The argument is retained as a
+/// presence hint: if it is empty we still issue the call (the broker
+/// might know about positions our local reconcile missed); if it is
+/// non-empty we use it to detect ghost positions on either side and
+/// emit a `debug!` line for the operator.
+///
+/// Returns the parsed bundle indexed by position id, or an error if
+/// the WebSocket round-trip / auth handshake / parse fails. The
+/// caller's fallback policy (typically: log + use the local f64
+/// computation) lives in the risk-gate code path, not here.
+pub fn fetch_unrealized_pnl_for_all_positions<T: CTraderOpenApiTransport>(
+    transport: &T,
+    client_id: &str,
+    client_secret: &str,
+    access_token: &str,
+    account_id: i64,
+    open_position_ids: &[i64],
+) -> Result<AuthoritativeUnrealizedPnL> {
+    let snapshot = fetch_broker_unrealized_pnl(
+        transport,
+        client_id,
+        client_secret,
+        access_token,
+        account_id,
+    )?;
+
+    let mut by_position: HashMap<i64, BrokerPositionPnL> =
+        HashMap::with_capacity(snapshot.positions.len());
+    for row in &snapshot.positions {
+        by_position.insert(
+            row.position_id,
+            BrokerPositionPnL {
+                position_id: row.position_id,
+                gross_unrealized_pnl: row.gross_unrealized_pnl,
+                net_unrealized_pnl: row.net_unrealized_pnl,
+                money_digits: snapshot.money_digits,
+            },
+        );
+    }
+
+    // Ghost-position diagnostics: positions the broker returned but
+    // our local reconcile snapshot did not (and vice-versa). We
+    // never silently drop or invent rows — both directions emit a
+    // `debug!` line so an operator correlating a discrepancy has the
+    // breadcrumb. Not fatal: a position can appear in one source
+    // momentarily while a reconcile is in flight.
+    if !open_position_ids.is_empty() {
+        for broker_row in &snapshot.positions {
+            if !open_position_ids.contains(&broker_row.position_id) {
+                tracing::debug!(
+                    target: "forex_app::pnl_auth",
+                    position_id = broker_row.position_id,
+                    broker_net = broker_row.net_unrealized_pnl,
+                    "authoritative pnl includes broker position not present in local reconcile snapshot"
+                );
+            }
+        }
+        for local_id in open_position_ids {
+            if !by_position.contains_key(local_id) {
+                tracing::debug!(
+                    target: "forex_app::pnl_auth",
+                    position_id = *local_id,
+                    "authoritative pnl missing broker entry for locally-reconciled position"
+                );
+            }
+        }
+    }
+
+    Ok(AuthoritativeUnrealizedPnL {
+        account_id: snapshot.account_id,
+        money_digits: snapshot.money_digits,
+        by_position,
+    })
+}
+
+/// Evaluate the authoritative drift circuit breaker. Iterates every
+/// position the broker returned, computes
+/// `(broker_net - local) / position_notional`, and returns
+/// [`PnLDriftCircuitBreaker::Tripped`] on the first position whose
+/// drift exceeds [`pnl_circuit_breaker_fraction`].
+///
+/// Positions for which the local PnL is unavailable (missing live
+/// quote) or the notional is zero are skipped — we cannot evaluate
+/// drift without a denominator, and forcing a trip on missing data
+/// would block trading on a transient quote-feed glitch. Those skips
+/// are logged at `debug!` so an operator can correlate.
+pub fn evaluate_pnl_drift_circuit_breaker(
+    authoritative: &AuthoritativeUnrealizedPnL,
+    positions: &[CTraderPositionSnapshot],
+    local_pnl_for_position: impl Fn(&CTraderPositionSnapshot) -> Option<f64>,
+) -> PnLDriftCircuitBreaker {
+    let threshold = pnl_circuit_breaker_fraction();
+    for position in positions {
+        let Some(broker) = authoritative.by_position.get(&position.position_id) else {
+            tracing::debug!(
+                target: "forex_app::pnl_circuit_breaker",
+                position_id = position.position_id,
+                "skip circuit-breaker check: broker did not return PnL for this position"
+            );
+            continue;
+        };
+        let Some(local) = local_pnl_for_position(position) else {
+            tracing::debug!(
+                target: "forex_app::pnl_circuit_breaker",
+                position_id = position.position_id,
+                broker_net = broker.net_unrealized_pnl,
+                "skip circuit-breaker check: local PnL unavailable (no live quote)"
+            );
+            continue;
+        };
+        let notional = position_notional(position);
+        if !(notional > 0.0) {
+            tracing::debug!(
+                target: "forex_app::pnl_circuit_breaker",
+                position_id = position.position_id,
+                "skip circuit-breaker check: position notional is zero or non-finite"
+            );
+            continue;
+        }
+        let drift_fraction = (broker.net_unrealized_pnl - local) / notional;
+        if drift_fraction.is_finite() && drift_fraction.abs() > threshold {
+            tracing::warn!(
+                target: "forex_app::pnl_circuit_breaker",
+                position_id = position.position_id,
+                broker_net = broker.net_unrealized_pnl,
+                local = local,
+                notional = notional,
+                drift_pct = drift_fraction * 100.0,
+                threshold_pct = threshold * 100.0,
+                "pnl_circuit_breaker TRIPPED: broker vs local exceeds 1% of notional; blocking new orders until operator ack"
+            );
+            return PnLDriftCircuitBreaker::Tripped {
+                position_id: position.position_id,
+                broker_net: broker.net_unrealized_pnl,
+                local,
+                notional,
+                drift_fraction,
+                threshold_fraction: threshold,
+            };
+        }
+    }
+    PnLDriftCircuitBreaker::Ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     #[ignore = "TODO(real-data): requires a captured ProtoOAGetPositionUnrealizedPnLRes fixture \
-                from a live cTrader account; see crates/forex-app/tests/fixtures/ (not committed)."]
+                from a live cTrader account; see \
+                crates/forex-app/tests/fixtures/ctrader/unrealized_pnl/README.md for capture steps."]
     fn audit_unrealized_pnl_warns_when_broker_value_drifts_beyond_threshold_real_fixture() {
         // Placeholder — see the #[ignore] reason. The real test would
         // load a captured response from
-        // `crates/forex-app/tests/fixtures/pnl_audit_drift.json`,
+        // `crates/forex-app/tests/fixtures/ctrader/unrealized_pnl/pnl_audit_drift.json`,
         // parse it via `parse_get_position_unrealized_pnl_response`,
         // and assert that `audit_unrealized_pnl` flags the drifted
         // position. Synthetic data is explicitly disallowed for this
-        // path (see Batch 6 integration constraints).
+        // path (see Batch 6 / Batch 14 integration constraints).
         unimplemented!("requires a real cTrader fixture not yet captured");
+    }
+
+    #[test]
+    #[ignore = "TODO(real-data): requires a captured ProtoOAGetPositionUnrealizedPnLRes fixture \
+                with at least one position whose broker/local drift > 1% of notional; see \
+                crates/forex-app/tests/fixtures/ctrader/unrealized_pnl/README.md."]
+    fn circuit_breaker_trips_when_drift_exceeds_one_percent_real_fixture() {
+        // Placeholder — see the #[ignore] reason. The real test would
+        // load a captured `pnl_circuit_breaker_trip.json` fixture (a
+        // ProtoOAGetPositionUnrealizedPnLRes from a session where the
+        // broker's net diverged from the streaming-side mark-to-market
+        // by >1% of position notional — typically reproducible by
+        // pausing the local spot feed for ~30 s while the broker side
+        // continued to repredict), then call
+        // `evaluate_pnl_drift_circuit_breaker` and assert
+        // `PnLDriftCircuitBreaker::Tripped { .. }`. Synthetic broker
+        // payloads are disallowed.
+        unimplemented!("requires a real cTrader fixture not yet captured");
+    }
+
+    #[test]
+    #[ignore = "TODO(real-data): requires a steady-state ProtoOAGetPositionUnrealizedPnLRes \
+                fixture (broker/local drift < 0.1 % of notional)."]
+    fn fetch_authoritative_returns_one_row_per_broker_position_real_fixture() {
+        // Placeholder. Real version asserts
+        // `fetch_unrealized_pnl_for_all_positions` over a mocked
+        // CTraderOpenApiTransport that replays a captured envelope
+        // sequence, then checks `by_position.len() ==
+        // snapshot.positions.len()` and every key matches a
+        // `positionId`. No synthetic broker bytes — capture from a
+        // real account.
+        unimplemented!("requires a real cTrader fixture not yet captured");
+    }
+
+    #[test]
+    fn circuit_breaker_returns_ok_when_positions_list_is_empty() {
+        // Pure-internal check (no broker payload, no parser): an
+        // authoritative snapshot with no positions cannot trip the
+        // breaker. Constructing the empty struct directly is
+        // explicitly permitted by the operator's no-synthetic-data
+        // rule (it has no fabricated price/PnL values that downstream
+        // code could mistake for real broker output).
+        let authoritative = AuthoritativeUnrealizedPnL {
+            account_id: 0,
+            money_digits: 2,
+            by_position: HashMap::new(),
+        };
+        let breaker = evaluate_pnl_drift_circuit_breaker(
+            &authoritative,
+            &[],
+            |_| None,
+        );
+        assert!(breaker.is_ok());
     }
 
     #[test]
