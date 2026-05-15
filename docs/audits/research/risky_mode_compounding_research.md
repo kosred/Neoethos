@@ -35,63 +35,37 @@ probability well below the 95 %+ figure that the canonical retail
 
 ## §0 — Scope, methodology, document rules
 
-### 0.1 What this document is
+**What this is:** a research deliverable (no code) documenting
+(a) the origin and known failure mode of the retail "20-pip
+challenge", (b) the academic and industry alternatives with
+better capital-protection mechanics, (c) a concrete design for
+a forex-ai "Risky Mode" that takes the operator's $20→$50,000
+framing seriously while keeping `FTMO_STANDARD` intact, (d) the
+math behind every claim with citations.
 
-A **research deliverable**, not code. It documents:
+**What this is not:** a promise of $20→$50,000; not a change to
+`PropFirmConstraints::FTMO_STANDARD` in
+`crates/forex-core/src/domain/prop_firm.rs:32`; not a
+synthetic-data exercise — any unavoidable hypothetical number
+is labelled `(hypothetical)`.
 
-- the origin and known failure rate of the retail
-  "20-pip challenge" compounding idea,
-- the academic and industry alternatives that ship better
-  capital-protection mechanics,
-- a concrete design for a forex-ai "Risky Mode" that takes the
-  operator's $20 → $50,000 framing seriously while keeping the
-  app's existing prop-firm machinery (`FTMO_STANDARD`) intact,
-- the math behind every claim, with citations.
+**Methodology:** WebSearch on canonical retail sources (Forex
+Factory, BabyPips, Trading Rush, Medium) for "20-pip challenge"
+rules; WebSearch on arXiv, ResearchGate, Semantic Scholar for
+Kelly criterion, Optimal-f, maximum drawdown of Brownian motion,
+path-dependent drawdown measures. The Hugging Face `paper_search`
+tool was denied in this session, so arXiv citations come through
+WebSearch + direct arXiv IDs. WebFetch was attempted on FTMO,
+the Magdon-Ismail PDF, the Berkeley "Good and Bad Properties of
+Kelly" PDF, and the Forex Factory thread — all returned HTTP 403;
+quotations come from WebSearch result excerpts and URLs are still
+cited so the operator can verify out-of-band. Internal references
+(file:line) are from the live tree.
 
-### 0.2 What this document is not
-
-- Not a promise that anyone can turn $20 into $50,000.
-- Not a change to `PropFirmConstraints::FTMO_STANDARD` in
-  `crates/forex-core/src/domain/prop_firm.rs:32` (operator rule:
-  the 4 % monthly floor and the FTMO 5 %/10 % limits stay).
-- Not a synthetic-data exercise; every numeric example labelled
-  "hypothetical" is flagged explicitly per the operator's
-  no-synthetic-data rule.
-
-### 0.3 Methodology
-
-- WebSearch on canonical retail sources (Forex Factory, BabyPips,
-  Trading Rush, Medium write-ups) for the "20-pip challenge"
-  rules and any documented outcomes.
-- WebSearch on arXiv + ResearchGate + Semantic Scholar for the
-  Kelly criterion, Optimal-f, maximum drawdown of Brownian motion,
-  and path-dependent drawdown measures. The Hugging Face
-  `paper_search` tool was denied in this session, so arXiv
-  citations come through WebSearch and direct arXiv IDs.
-- WebFetch was attempted on FTMO, the Magdon-Ismail PDF, the
-  Berkeley "Good and bad properties of Kelly" PDF, and the Forex
-  Factory thread; all returned HTTP 403. Quotations therefore come
-  from WebSearch result excerpts (the URLs are still cited so the
-  operator can verify out-of-band).
-- Internal references (file:line) come from the live tree at the
-  time of writing: `crates/forex-core/src/domain/prop_firm.rs`,
-  `crates/forex-core/src/domain/risk.rs`,
-  `crates/forex-app/src/app_services/trading/risk_gate.rs`,
-  `crates/forex-search/src/genetic/regime_labels.rs`,
-  `crates/forex-models/src/forecasting/swarm_impl.rs`.
-
-### 0.4 Operator constraints carried through
-
-- No new hardcoded numbers that could be the prop-firm floor.
-  Every Risky-Mode tunable proposed here goes into a separate
-  config struct (proposed: `RiskyModeConfig` in
-  `crates/forex-core/src/domain/risky_mode.rs`), not into
-  `PropFirmConstraints`.
-- No synthetic data even in research mockups. Where a hypothetical
-  number is unavoidable to illustrate a formula (e.g. "if
-  win-rate p = 0.55"), it is labelled `(hypothetical)`.
-- `f32` / `Ordering::Relaxed` out of scope here — this is a design
-  document, no code.
+**Operator constraints carried through:** new tunables live in
+`RiskyModeConfig` (proposed: `crates/forex-core/src/domain/risky_mode.rs`),
+not in `PropFirmConstraints`; no synthetic data; `f32` /
+`Ordering::Relaxed` out of scope (no code in this document).
 
 ---
 
@@ -780,96 +754,75 @@ backing. The canonical 20-pip challenge ships none of them.
 
 ## §5 — Kill-switch hierarchy
 
-In ascending severity, every switch documented with its
-trigger, action and re-arm condition.
+Switches listed in ascending severity with trigger, action,
+re-arm.
 
 ### 5.1 Per-trade — hard SL
 
 Every Risky-Mode order is sent with a server-side stop-loss
-(`ProtoOANewOrderReq` with `relativeStopLoss` field — see
-`docs/audits/research/ctrader_api_full_reference.md:773` for
-the message schema). No "mental stop" allowed. Rationale: if
-the strategy crashes between sending the order and computing
-the planned client-side stop, the broker's server-side stop
-still fires.
+(`ProtoOANewOrderReq` `relativeStopLoss` field; see
+`docs/audits/research/ctrader_api_full_reference.md:773`). No
+"mental stop". Rationale: if the strategy crashes between
+order-send and client-side-stop computation, the broker's
+server-side stop still fires.
 
 ### 5.2 Per-day — daily loss cap
 
-Trigger: cumulative day-PnL ≤ −(stage daily-loss cap).
-Action: flatten all open positions, refuse new orders until
-next CET daily reset. Re-arm: automatic at 00:00 CET (matches
-FTMO's reset cadence). Implementation hook:
-`RiskManager::check_trade_allowed` in
-`crates/forex-core/src/domain/risk.rs:501` — Risky Mode adds a
-new branch keyed off the stage-aware cap.
+Trigger: cumulative day-PnL ≤ −(stage daily-loss cap). Action:
+flatten + refuse new orders until next CET daily reset.
+Re-arm: automatic 00:00 CET (matches FTMO cadence).
+Implementation hook: `RiskManager::check_trade_allowed`
+(`crates/forex-core/src/domain/risk.rs:501`) — Risky Mode
+adds a stage-aware branch.
 
 ### 5.3 Per-stage — retreat path
 
-Trigger: bankroll drops below the previous stage's lower
-boundary (e.g. S6 = $640-$1,280; if equity falls below $640
-the system demotes to S5). Action: clamp `α_stage` to the
-previous stage's value; clamp `max_risk_pct` ditto; emit a UI
-event ("Risky Mode retreat: S6 → S5, $640 floor breached").
-Re-arm: bankroll re-crosses the upper boundary *and* the
-hysteresis window (5 closed trades / 24 h) expires.
-
-The retreat path is what the operator's question "μεγαλύτερη
-ασφάλεια" was asking for. The canonical 20-pip challenge has a
-similar idea ("if balance falls below the prior level's floor,
-demote") but no enforced waiting period and no equivalent
-risk-fraction clamp — Risky Mode adds both.
+Trigger: equity below previous stage's lower boundary (e.g.
+S6 = $640-$1,280; if equity < $640, demote to S5). Action:
+clamp `α_stage` and `max_risk_pct` to the previous stage; emit
+UI event. Re-arm: equity re-crosses upper boundary **and**
+hysteresis window (5 closed trades / 24 h) expires. This is the
+operator's "μεγαλύτερη ασφάλεια" requirement made concrete —
+the canonical 20-pip challenge has the demote idea but no
+enforced waiting period and no risk-fraction clamp.
 
 ### 5.4 Per-month — monthly DD cap → 7-day cooldown
 
-Trigger: month-to-date PnL ≤ −(stage monthly cap). Action:
-flatten + 7-calendar-day no-trading window. Re-arm: window
-expires *and* operator clicks "resume" in UI (manual ack
-required so an unattended bot cannot silently start a new
-month after a bad one).
+Trigger: MTD PnL ≤ −(stage monthly cap). Action: flatten +
+7-day no-trading window. Re-arm: window expires **and**
+operator clicks "resume" (manual ack required so an unattended
+bot cannot silently start a new month after a bad one).
 
 ### 5.5 Manual kill switch — operator UI
 
-The existing `RiskManager` has `circuit_breaker_triggered` and
-`kill_window_until_sec` fields
-(`crates/forex-core/src/domain/risk.rs:344,360`). Risky Mode
-exposes a one-click red "PANIC FLATTEN" button on the UI that:
-
-1. Sets `circuit_breaker_triggered = true`.
-2. Sends `ProtoOAClosePositionReq` for every open Risky-Mode
-   position (the request schema is documented in
-   `docs/audits/research/ctrader_api_full_reference.md:909`).
-3. Sets `kill_window_until_sec` to "forever" (i.e. requires
-   operator to clear it manually before the bot trades again).
-
-The kill switch must not depend on UI WebSocket availability —
-it is also exposed via the local IPC channel
-(`crates/forex-app/src/app_services/...`) so a CLI / external
-script can fire it.
+`RiskManager` already has `circuit_breaker_triggered` and
+`kill_window_until_sec` (`risk.rs:344,360`). Risky Mode wires a
+red "PANIC FLATTEN" UI button that (1) sets
+`circuit_breaker_triggered = true`, (2) sends
+`ProtoOAClosePositionReq`
+(`ctrader_api_full_reference.md:909`) for every open Risky-Mode
+position, (3) sets `kill_window_until_sec` to "forever"
+(requires manual clear). Must be reachable via local IPC, not
+only via UI WebSocket.
 
 ### 5.6 Hardware — connection-loss flatten
 
-Trigger: cTrader transport hasn't returned a heartbeat for N
-seconds (proposal: N = 30). Action: best-effort send
-`ProtoOAClosePositionReq` over whatever channel is still alive;
-if no channel is alive, queue a flatten directive into a local
-persistent file so the next-connect handshake fires it.
-
-Note: this is the *most fragile* layer and we document it
-honestly — if the entire host loses network, the broker's
-server-side stops are the only protection.
+Trigger: cTrader transport heartbeat silent for N seconds
+(proposal: N = 30). Action: best-effort
+`ProtoOAClosePositionReq` on any channel still alive; if none,
+queue a flatten directive locally for the next-connect
+handshake. Most fragile layer — if the host loses network
+entirely, broker-side server stops are the only protection.
 
 ### 5.7 Sanity — pre-broker-send size check
 
-The existing `validate_and_convert_lot_size_to_ctrader_volume`
-helper in
-`crates/forex-app/src/app_services/trading/risk_gate.rs:70`
-already rejects out-of-band sizes vs. broker min/max/step.
-Risky Mode adds a *second* check: reject any order whose
-implied risk exceeds 50 % of current bankroll, regardless of
-what stage logic computed. This is a defence-in-depth against
-a bug in our own sizing code — the kind of bug class that
-audit-fix F5/F6 in `risk_gate.rs:1-23` already protects
-against on the volume-conversion side.
+`validate_and_convert_lot_size_to_ctrader_volume` in
+`risk_gate.rs:70` already rejects out-of-band sizes vs.
+broker min/max/step. Risky Mode adds a *second* check: reject
+any order whose implied risk > 50 % of bankroll, regardless of
+stage logic. Defence-in-depth against bugs in our own sizing
+code — same bug class audit-fix F5/F6 in `risk_gate.rs:1-23`
+protects against on the volume-conversion side.
 
 ### 5.8 Switch interaction matrix
 
@@ -1504,171 +1457,72 @@ same stream.
 
 ### Academic
 
-- Kelly, J. L. Jr. (1956). "A New Interpretation of
-  Information Rate." *Bell System Technical Journal*. — Kelly
-  criterion original.
-  https://en.wikipedia.org/wiki/Kelly_criterion
-- Feller, W. (1957/1968). *An Introduction to Probability
-  Theory and Its Applications*, Vol. 1. — gambler's-ruin
-  closed-form.
-  https://en.wikipedia.org/wiki/Gambler%27s_ruin
-- Vince, R. (1992). *The Mathematics of Money Management:
-  Risk Analysis Techniques for Traders*. Wiley.
-  https://www.amazon.com/Mathematics-Money-Management-Analysis-Techniques/dp/0471547387
-  Open mirror:
-  https://dl.fxf1.com/files/books/english/MathematicsMoneyManagement.pdf
-- MacLean, L. C., Thorp, E. O., Ziemba, W. T. (2011). *The
-  Kelly Capital Growth Investment Criterion: Theory and
-  Practice*. World Scientific.
-  https://www.worldscientific.com/worldscibooks/10.1142/7598
-  Summary article:
-  https://www.caia.org/sites/default/files/AIAR_Q3_2016_05_KellyCapital.pdf
-- MacLean, L. C., Thorp, E. O., Ziemba, W. T. "Good and Bad
-  Properties of the Kelly Criterion."
-  https://www.stat.berkeley.edu/~aldous/157/Papers/Good_Bad_Kelly.pdf
-- Magdon-Ismail, M., Atiya, A. F. (2004). "On the Maximum
-  Drawdown of a Brownian Motion." *Journal of Applied
-  Probability*.
-  https://www.cs.rpi.edu/~magdon/ps/journal/drawdown_journal.pdf
-  SSRN abstract: https://papers.ssrn.com/sol3/papers.cfm?abstract_id=874069
-- Goldberg, L. R., Mahmoud, O. (2014). "Drawdown: From
-  Practice to Theory and Back Again." arXiv:1404.7493.
-  https://arxiv.org/abs/1404.7493
-- Bouchaud, J.-P. et al. (2023). "A Rational Risk Policy? Why
-  Path Dependence Matters." *Entropy* 25(2), 202.
-  https://www.mdpi.com/1099-4300/25/2/202
-  PMC mirror: https://pmc.ncbi.nlm.nih.gov/articles/PMC9955835/
-- Busseti, E., Ryu, E. K., Boyd, S. (2016). "Risk-Constrained
-  Kelly Gambling." Stanford.
-  https://web.stanford.edu/~boyd/papers/pdf/kelly.pdf
-- Carta, A., Sanna, M. (2020). "Practical Implementation of
-  the Kelly Criterion: Optimal Growth Rate, Number of Trades,
-  and Rebalancing Frequency for Equity Portfolios." *Frontiers
-  in Applied Math & Statistics* 6, 577050.
-  https://www.frontiersin.org/journals/applied-mathematics-and-statistics/articles/10.3389/fams.2020.577050/full
-- Whelan, K. (n.d.). "Ruin Probabilities for Strategies with
-  Asymmetric Risk." UCD WP 2025-03.
-  https://www.karlwhelan.com/Papers/Ruin.pdf
-  https://www.ucd.ie/economics/t4media/WP2025_03.pdf
-- Sigman, K. "Gambler's Ruin Problem." Columbia FE Notes.
-  http://www.columbia.edu/~ks20/FE-Notes/4700-07-Notes-GR.pdf
+- Kelly, J. L. Jr. (1956), "A New Interpretation of Information Rate," *Bell System Technical Journal* — https://en.wikipedia.org/wiki/Kelly_criterion
+- Feller, W. (1957/1968), *An Introduction to Probability Theory and Its Applications*, Vol. 1 (gambler's-ruin closed-form) — https://en.wikipedia.org/wiki/Gambler%27s_ruin
+- Vince, R. (1992), *The Mathematics of Money Management* (Wiley) — https://www.amazon.com/Mathematics-Money-Management-Analysis-Techniques/dp/0471547387 / open mirror https://dl.fxf1.com/files/books/english/MathematicsMoneyManagement.pdf
+- MacLean, Thorp, Ziemba (2011), *The Kelly Capital Growth Investment Criterion* (World Scientific) — https://www.worldscientific.com/worldscibooks/10.1142/7598 ; summary https://www.caia.org/sites/default/files/AIAR_Q3_2016_05_KellyCapital.pdf
+- MacLean / Thorp / Ziemba, "Good and Bad Properties of the Kelly Criterion" — https://www.stat.berkeley.edu/~aldous/157/Papers/Good_Bad_Kelly.pdf
+- Magdon-Ismail, Atiya (2004), "On the Maximum Drawdown of a Brownian Motion," *J. Appl. Prob.* — https://www.cs.rpi.edu/~magdon/ps/journal/drawdown_journal.pdf ; https://papers.ssrn.com/sol3/papers.cfm?abstract_id=874069
+- Goldberg, Mahmoud (2014), "Drawdown: From Practice to Theory and Back Again," arXiv:1404.7493 — https://arxiv.org/abs/1404.7493
+- Bouchaud et al. (2023), "A Rational Risk Policy? Why Path Dependence Matters," *Entropy* 25(2), 202 — https://www.mdpi.com/1099-4300/25/2/202 ; https://pmc.ncbi.nlm.nih.gov/articles/PMC9955835/
+- Busseti, Ryu, Boyd (2016), "Risk-Constrained Kelly Gambling" — https://web.stanford.edu/~boyd/papers/pdf/kelly.pdf
+- Carta, Sanna (2020), "Practical Implementation of the Kelly Criterion," *Frontiers in Applied Math & Stats* 6, 577050 — https://www.frontiersin.org/journals/applied-mathematics-and-statistics/articles/10.3389/fams.2020.577050/full
+- Whelan, "Ruin Probabilities for Strategies with Asymmetric Risk" — https://www.karlwhelan.com/Papers/Ruin.pdf ; UCD WP 2025-03 https://www.ucd.ie/economics/t4media/WP2025_03.pdf
+- Sigman, "Gambler's Ruin Problem," Columbia FE Notes — http://www.columbia.edu/~ks20/FE-Notes/4700-07-Notes-GR.pdf
 
-### Industry / retail sources
+### Industry / retail
 
-- Trading Rush. "Testing $20 To $52,400 Strategy 1000 Times."
-  https://tradingrush.net/testing-20-to-52400-strategy-1000-times/
-- Human×AI. "Turning $20 into $52,000." Medium.
-  https://medium.com/@HUMANxAI/the-20-to-52-000-challenge-tested-by-1-000-bots-7484da203eca
-- Forex Factory thread "20 pips Challenge — (Compounding model)."
-  https://www.forexfactory.com/thread/1306313-20-pips-challenge-compounding-model
-- BabyPips. "Data Confirms Grim Truth: 70-80 % of Retail
-  Traders are Unprofitable."
-  https://www.babypips.com/news/almost-80-percent-of-retail-traders-are-unprofitable
-- BabyPips. "Prop Firm Challenge Survival Checklist."
-  https://www.babypips.com/learn/forex/prop-firm-challenge-survival-guide
-- "ESMA brokers and trader Success Rates."
-  https://investingoal.com/esma-broker-client-success-rate-stats/
-- "Why 80% of Retail Traders Lose Money (And What the Data
-  Actually Says)."
-  https://10pmtrader.com/why-retail-traders-lose-money/
+- Trading Rush, "Testing $20 To $52,400 Strategy 1000 Times" — https://tradingrush.net/testing-20-to-52400-strategy-1000-times/
+- Human×AI, "Turning $20 into $52,000" (Medium) — https://medium.com/@HUMANxAI/the-20-to-52-000-challenge-tested-by-1-000-bots-7484da203eca
+- Forex Factory, "20 pips Challenge — (Compounding model)" — https://www.forexfactory.com/thread/1306313-20-pips-challenge-compounding-model
+- BabyPips, "70-80 % of Retail Traders are Unprofitable" — https://www.babypips.com/news/almost-80-percent-of-retail-traders-are-unprofitable
+- BabyPips, "Prop Firm Challenge Survival Checklist" — https://www.babypips.com/learn/forex/prop-firm-challenge-survival-guide
+- "ESMA brokers and trader Success Rates" — https://investingoal.com/esma-broker-client-success-rate-stats/
+- "Why 80% of Retail Traders Lose Money" — https://10pmtrader.com/why-retail-traders-lose-money/
 
 ### Prop-firm rules
 
-- FTMO Trading Objectives.
-  https://ftmo.com/en/trading-objectives/
-- FTMO Maximum Daily Loss.
-  https://academy.ftmo.com/lesson/maximum-daily-loss/
-- FTMO Maximum Loss.
-  https://academy.ftmo.com/lesson/maximum-loss/
-- FTMO Rules 2026 — Vigil.
-  https://runvigil.app/rules/ftmo
-- FTMO Prop Firm Review 2026 — LuxAlgo.
-  https://www.luxalgo.com/blog/ftmo-prop-firm-review-how-to-pass-in-2025/
-- MyForexFunds — Accelerated.
-  https://myforexfunds.com/accounts/accelerated-program/
-- MyForexFunds — Accelerated rules.
-  https://myforexfunds.com/accelerated-accounts-rules/
-- Trader's Second Brain — Prop firm comparison 2026.
-  https://traderssecondbrain.com/guides/prop-firm-comparison
-- Trader's Second Brain — Prop firm rules cheatsheet.
-  https://traderssecondbrain.com/guides/prop-firm-rules-cheatsheet
-- Trader's Second Brain — Drawdown rules: static vs trailing.
-  https://traderssecondbrain.com/guides/prop-firm-drawdown-rules
-- Alpha Futures News Trading Policy.
-  https://help.alpha-futures.com/en/articles/9492063-news-trading-policy
+- FTMO Trading Objectives — https://ftmo.com/en/trading-objectives/
+- FTMO Maximum Daily Loss — https://academy.ftmo.com/lesson/maximum-daily-loss/
+- FTMO Maximum Loss — https://academy.ftmo.com/lesson/maximum-loss/
+- FTMO Rules 2026 (Vigil) — https://runvigil.app/rules/ftmo
+- FTMO Prop Firm Review 2026 (LuxAlgo) — https://www.luxalgo.com/blog/ftmo-prop-firm-review-how-to-pass-in-2025/
+- MyForexFunds Accelerated — https://myforexfunds.com/accounts/accelerated-program/ ; rules https://myforexfunds.com/accelerated-accounts-rules/
+- Trader's Second Brain — comparison https://traderssecondbrain.com/guides/prop-firm-comparison ; cheatsheet https://traderssecondbrain.com/guides/prop-firm-rules-cheatsheet ; DD static-vs-trailing https://traderssecondbrain.com/guides/prop-firm-drawdown-rules
+- Alpha Futures News Trading Policy — https://help.alpha-futures.com/en/articles/9492063-news-trading-policy
 
 ### Broker / platform
 
-- cTrader Trading Conditions.
-  https://help.ctrader.com/trading-with-ctrader/conditions/
-- cTrader Dynamic Leverage.
-  https://help.ctrader.com/trading-with-ctrader/dynamic-leverage/
-- cTrader LeverageTier algo reference.
-  https://help.ctrader.com/ctrader-algo/references/MarketData/Symbols/LeverageTier/
-- FxPro Stop-Out Level.
-  https://www.fxpro.com/help-section/education/beginners/articles/stop-out
-- ClickAlgo — Trading Micro Lots with cTrader.
-  https://clickalgo.com/micro-lots
-- FXTM Pip Calculator.
-  https://www.fxtm.com/en/trading/tools/pip-calculator/
+- cTrader Trading Conditions — https://help.ctrader.com/trading-with-ctrader/conditions/
+- cTrader Dynamic Leverage — https://help.ctrader.com/trading-with-ctrader/dynamic-leverage/
+- cTrader LeverageTier algo ref — https://help.ctrader.com/ctrader-algo/references/MarketData/Symbols/LeverageTier/
+- FxPro Stop-Out Level — https://www.fxpro.com/help-section/education/beginners/articles/stop-out
+- ClickAlgo Micro Lots — https://clickalgo.com/micro-lots
+- FXTM Pip Calculator — https://www.fxtm.com/en/trading/tools/pip-calculator/
 
 ### Weekend / news / regime
 
-- "Hold Forex Trades Overnight or Through the Weekend?"
-  https://tradethatswing.com/hold-forex-trades-through-the-weekend-or-close-them/
-- Alphaex Capital. "Weekend gaps in forex trading."
-  https://www.alphaexcapital.com/forex/forex-trading-basics/forex-market-structure/weekend-gaps-in-forex-trading
-- TastyFX. "Gap risk: what it means and how to avoid it."
-  https://www.tastyfx.com/news/gap-risk--what-it-means-and-how-to-avoid-it-231017/
-- "What is Forex Factory — Uses, Impact levels and Step By
-  Step Guide 2026."
-  https://www.xs.com/en/blog/forex-factory-guide/
-- Maven Trading. "CPI Days Explained: Forex Trading Strategies
-  to Survive High-Impact News."
-  https://maventrading.com/blog/cpi-days-explained-forex-trading-strategies-to-survive-high-impact-news
-- QuantStart. "Market Regime Detection using Hidden Markov
-  Models in QSTrader."
-  https://www.quantstart.com/articles/market-regime-detection-using-hidden-markov-models-in-qstrader/
-- Volatility Box. "Volatility Regime Detection: From Simple
-  Rules to Machine Learning."
-  https://volatilitybox.com/research/volatility-regime-detection/
+- TradeThatSwing, weekend hold — https://tradethatswing.com/hold-forex-trades-through-the-weekend-or-close-them/
+- Alphaex Capital, weekend gaps — https://www.alphaexcapital.com/forex/forex-trading-basics/forex-market-structure/weekend-gaps-in-forex-trading
+- TastyFX, gap risk — https://www.tastyfx.com/news/gap-risk--what-it-means-and-how-to-avoid-it-231017/
+- Forex Factory guide 2026 — https://www.xs.com/en/blog/forex-factory-guide/
+- Maven Trading, CPI days — https://maventrading.com/blog/cpi-days-explained-forex-trading-strategies-to-survive-high-impact-news
+- QuantStart, HMM regime detection — https://www.quantstart.com/articles/market-regime-detection-using-hidden-markov-models-in-qstrader/
+- Volatility Box, volatility regime detection — https://volatilitybox.com/research/volatility-regime-detection/
 
-### Hedge-fund disclosed returns (sanity comparison)
+### Hedge-fund disclosed returns (sanity)
 
-- "Renaissance Technologies." Wikipedia.
-  https://en.wikipedia.org/wiki/Renaissance_Technologies
-- "Renaissance Technologies and The Medallion Fund." Quartr.
-  https://quartr.com/insights/edge/renaissance-technologies-and-the-medallion-fund
-- "Decoding the Medallion Fund Returns." QuantifiedStrategies.
-  https://www.quantifiedstrategies.com/medallion-fund-returns/
+- Renaissance Technologies (Wikipedia) — https://en.wikipedia.org/wiki/Renaissance_Technologies
+- Renaissance & Medallion (Quartr) — https://quartr.com/insights/edge/renaissance-technologies-and-the-medallion-fund
+- Medallion returns (QuantifiedStrategies) — https://www.quantifiedstrategies.com/medallion-fund-returns/
 
 ### Internal references
 
-- `crates/forex-core/src/domain/prop_firm.rs:32` —
-  `PropFirmConstraints::FTMO_STANDARD` — *unmodified*.
-- `crates/forex-core/src/domain/risk.rs:374` — `RiskManager`
-  struct — *composed by* `RiskyModeManager`, *not modified*.
-- `crates/forex-core/src/domain/risk.rs:501` —
-  `RiskManager::check_trade_allowed` — wrapped by
-  `RiskyModeManager`.
-- `crates/forex-core/src/domain/risk.rs:652` —
-  `RiskManager::calculate_position_size` — wrapped by
-  `RiskyModeManager`.
-- `crates/forex-app/src/app_services/trading/risk_gate.rs:70` —
-  `validate_and_convert_lot_size_to_ctrader_volume` — Risky
-  Mode adds `risky_mode_pre_send_sanity` next to it.
-- `crates/forex-models/src/forecasting/swarm_impl.rs` — swarm
-  confidence consumed by §4.6.1.
-- `crates/forex-search/src/genetic/regime_labels.rs:14` —
-  `RegimeWindow` consumed by §4.6.4.
-- `docs/audits/research/ctrader_api_full_reference.md:773` —
-  `ProtoOANewOrderReq` (relative SL field used by §5.1).
-- `docs/audits/research/ctrader_api_full_reference.md:909` —
-  `ProtoOAClosePositionReq` (used by §5.5 PANIC FLATTEN).
-- `docs/audits/research/ctrader_api_full_reference.md:1026` —
-  Volume unit semantics (cents) — required by any future
-  Risky Mode sizing code.
-- `docs/audits/research/installer_wizard_ux_spec.md:232-256` —
-  Step 3 layout extended by §8.
-- `docs/audits/research/ui_ux_design_spec.md:107-191` —
-  Palette and typography inherited by §7.
+- `crates/forex-core/src/domain/prop_firm.rs:32` — `PropFirmConstraints::FTMO_STANDARD` — *unmodified*.
+- `crates/forex-core/src/domain/risk.rs:374,501,652` — `RiskManager` struct / `check_trade_allowed` / `calculate_position_size` — composed by `RiskyModeManager`, not modified.
+- `crates/forex-app/src/app_services/trading/risk_gate.rs:70` — `validate_and_convert_lot_size_to_ctrader_volume`; Risky Mode adds `risky_mode_pre_send_sanity` next to it.
+- `crates/forex-models/src/forecasting/swarm_impl.rs` — swarm confidence consumed by §4.6.1.
+- `crates/forex-search/src/genetic/regime_labels.rs:14` — `RegimeWindow` consumed by §4.6.4.
+- `docs/audits/research/ctrader_api_full_reference.md:773,909,1026` — `ProtoOANewOrderReq` SL field (§5.1), `ProtoOAClosePositionReq` (§5.5), volume-unit semantics (cents).
+- `docs/audits/research/installer_wizard_ux_spec.md:232-256` — Step 3 layout extended by §8.
+- `docs/audits/research/ui_ux_design_spec.md:107-191` — palette and typography inherited by §7.
