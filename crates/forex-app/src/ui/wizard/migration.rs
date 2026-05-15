@@ -12,13 +12,12 @@
 //! ## Hashing
 //!
 //! Spec §6 names SHA-256 explicitly for the post-write verify. The
-//! `sha2` dependency is gated on the Phase 2D Browse/SHA agent
-//! landing it as a workspace dep; in the interim this module uses
-//! `forex_core::utils::fnv1a64` for content equality (sufficient to
-//! detect a torn write because we control both the read and the
-//! verify, and we re-hash the freshly-written bytes). Replacing the
-//! hasher is a one-line change once the dep lands —
-//! `FIXME(wizard-sha256)` markers tag every site.
+//! `sha2` workspace dep landed in Phase 2D (see
+//! `autonomy_risk::compute_quiz_answer_hash` for the canonical
+//! reference impl), so this module uses `sha2::Sha256` + `hex::encode`
+//! to produce a `sha256:<lowercase-hex>` content digest. The digest
+//! is recomputed on the freshly-written destination bytes; a mismatch
+//! aborts the migration so a torn write cannot land silently.
 
 use std::fs;
 use std::io::{self, Read};
@@ -26,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use forex_core::storage::json::temporary_path;
-use forex_core::utils::fnv1a64;
+use sha2::{Digest, Sha256};
 
 /// Files that, if present in a candidate directory, qualify it as a
 /// legacy portable install. Spec §6 enumerates these verbatim.
@@ -132,10 +131,9 @@ pub struct MigratedEntry {
     pub relative_path: PathBuf,
     /// Bytes successfully copied + fsynced.
     pub bytes: u64,
-    /// 64-bit content hash, expressed `fnv64:<hex>` while SHA-256 is
-    /// gated on Phase 2D. FIXME(wizard-sha256): replace the prefix
-    /// and the hasher with `sha256:` + `sha2::Sha256` once the dep
-    /// is in the workspace.
+    /// SHA-256 content digest, expressed as `sha256:<lowercase-hex>`.
+    /// The same string is recomputed on the destination bytes after
+    /// the atomic rename — a mismatch aborts the migration.
     pub content_hash: String,
 }
 
@@ -251,9 +249,10 @@ pub fn migrate_portable_install(
                 .with_context(|| format!("verify dest {}", dest_path.display()))?;
             if written_hash != source_hash || written_bytes != bytes {
                 anyhow::bail!(
-                    "post-copy hash mismatch at {} (FIXME(wizard-sha256): \
-                     using fnv64 until Phase 2D ships sha2)",
-                    dest_path.display()
+                    "post-copy sha256 mismatch at {} (source {} != dest {})",
+                    dest_path.display(),
+                    source_hash,
+                    written_hash,
                 );
             }
 
@@ -279,17 +278,18 @@ fn is_in_skip_dir(rel: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Buffered read + content hash. Returns `(bytes_read, hash)`.
-///
-/// FIXME(wizard-sha256): swap `fnv1a64` for `sha2::Sha256` once the
-/// dep is in the workspace (Phase 2D). The same swap applies to
-/// `autonomy_risk::compute_quiz_answer_hash` per operator brief.
+/// Buffered read + SHA-256 content digest. Returns
+/// `(bytes_read, "sha256:<lowercase-hex>")`. Mirrors
+/// `autonomy_risk::compute_quiz_answer_hash` (Phase 2D reference)
+/// for the hasher choice + lowercase-hex encoding.
 fn read_and_hash(path: &Path) -> io::Result<(u64, String)> {
     let mut file = fs::File::open(path)?;
     let mut buf = Vec::with_capacity(8192);
     file.read_to_end(&mut buf)?;
-    let hash = fnv1a64(&buf);
-    Ok((buf.len() as u64, format!("fnv64:{:016x}", hash)))
+    let mut hasher = Sha256::new();
+    hasher.update(&buf);
+    let digest = hex::encode(hasher.finalize());
+    Ok((buf.len() as u64, format!("sha256:{}", digest)))
 }
 
 /// Copy `source → dest` via a sibling temp file + atomic rename +
@@ -422,11 +422,7 @@ mod tests {
 
     /// `migration_copies_files_with_sha256_verify` — populate the
     /// source tempdir with portable payloads, assert copy + post-write
-    /// hash round-trip + cache directory skipped (operator brief).
-    ///
-    /// FIXME(wizard-sha256): the hash is currently `fnv64` until the
-    /// Phase 2D Browse/SHA agent lands the `sha2` workspace dep; the
-    /// round-trip semantics are identical.
+    /// SHA-256 round-trip + cache directory skipped (operator brief).
     #[test]
     fn migration_copies_files_with_sha256_verify() {
         let src = tmp_dir("copy-src");
@@ -473,7 +469,11 @@ mod tests {
             let dest_bytes = fs::read(dest.join(&entry.relative_path)).unwrap();
             assert_eq!(source_bytes, dest_bytes, "{} bytes match", entry.relative_path.display());
             assert_eq!(entry.bytes as usize, source_bytes.len());
-            assert!(entry.content_hash.starts_with("fnv64:"));
+            assert!(
+                entry.content_hash.starts_with("sha256:"),
+                "expected sha256: prefix, got {}",
+                entry.content_hash
+            );
         }
 
         // Re-run is idempotent — second pass copies nothing, skips
@@ -496,6 +496,48 @@ mod tests {
         let outcome = migrate_portable_install(&src, &dest).expect("migrate");
         assert_eq!(outcome.copied.len(), 1);
         assert_eq!(fs::read(dest.join("config.yaml")).unwrap(), b"new-content");
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// Pin that the migration runtime hashes with real SHA-256
+    /// (not the old fnv64 placeholder). Independently computes the
+    /// SHA-256 digest of a 64-byte payload and asserts the migrator
+    /// agrees byte-for-byte on the lowercase-hex encoding.
+    #[test]
+    fn migration_uses_real_sha256_not_fnv64() {
+        use sha2::{Digest, Sha256};
+
+        let src = tmp_dir("sha256-src");
+        let dest = tmp_dir("sha256-dest");
+
+        // 64 deterministic bytes — values chosen to exercise the full
+        // 0..=63 range so a length- or byte-order bug would show.
+        let payload: Vec<u8> = (0u8..64).collect();
+        fs::write(src.join("config.yaml"), &payload).unwrap();
+
+        let outcome = migrate_portable_install(&src, &dest).expect("migrate");
+        assert_eq!(outcome.copied.len(), 1);
+        let entry = &outcome.copied[0];
+        assert_eq!(entry.relative_path, PathBuf::from("config.yaml"));
+        assert_eq!(entry.bytes, 64);
+
+        // Independently compute SHA-256(payload).
+        let mut hasher = Sha256::new();
+        hasher.update(&payload);
+        let expected = format!("sha256:{}", hex::encode(hasher.finalize()));
+
+        assert_eq!(
+            entry.content_hash, expected,
+            "migration digest must equal independently-computed SHA-256"
+        );
+        // Guard against any regression to the old fnv64 prefix.
+        assert!(!entry.content_hash.starts_with("fnv64:"));
+        assert!(entry.content_hash.starts_with("sha256:"));
+        // sha256 hex is exactly 64 chars; with the "sha256:" prefix
+        // the full string is 7 + 64 = 71 chars.
+        assert_eq!(entry.content_hash.len(), 7 + 64);
+
         let _ = fs::remove_dir_all(&src);
         let _ = fs::remove_dir_all(&dest);
     }
