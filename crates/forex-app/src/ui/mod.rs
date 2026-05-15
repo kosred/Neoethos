@@ -9,3 +9,4 @@ pub mod system;
 pub mod theme;
 pub mod trading;
 pub mod training;
+pub mod wizard;

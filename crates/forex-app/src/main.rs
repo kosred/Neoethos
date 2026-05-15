@@ -38,6 +38,29 @@ struct Args {
     /// Auto-start training on launch (headless VPS/WSL2 use-case)
     #[arg(long, default_value_t = false)]
     auto_training: bool,
+
+    /// Force the first-run wizard to open on launch even if
+    /// `wizard_state.json` already exists. Spec §5.1 entry-point #2.
+    #[arg(long, default_value_t = false)]
+    wizard: bool,
+}
+
+/// Returns true when the wizard should run on this launch. Spec §1.2
+/// / §5 — fires when the wizard sentinel file is absent OR when
+/// `--wizard` is passed explicitly. The actual modal is rendered by
+/// `ui::wizard::wizard_ui`; this helper is the gate.
+pub(crate) fn should_run_wizard(force: bool, config_dir: Option<&std::path::Path>) -> bool {
+    if force {
+        return true;
+    }
+    let dir = match config_dir {
+        Some(d) => d.to_path_buf(),
+        None => match dirs::config_dir() {
+            Some(d) => d.join("forex-ai"),
+            None => return false,
+        },
+    };
+    !dir.join(ui::wizard::WIZARD_STATE_FILENAME).exists()
 }
 
 #[tokio::main]
@@ -64,6 +87,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
         ),
     )?;
+
+    // First-run wizard gate. Spec §5.1 — fires when the sentinel
+    // file is absent OR `--wizard` flag is set. The actual modal is
+    // rendered inside the egui main loop by `ui::wizard::wizard_ui`;
+    // for the skeleton we only log the gate decision here.
+    let wizard_due = should_run_wizard(args.wizard, None);
+    if wizard_due {
+        info!(
+            "First-run wizard gate triggered (--wizard={} sentinel-missing={})",
+            args.wizard, !args.wizard
+        );
+    }
 
     if args.headless {
         info!("Starting Forex AI in Headless Server Mode...");
@@ -993,5 +1028,44 @@ mod tests {
         assert_eq!(drawdown.end(), &0.20);
         assert_eq!(lot_size.start(), &0.01);
         assert_eq!(lot_size.end(), &50.0);
+    }
+
+    #[test]
+    fn should_run_wizard_when_flag_is_set() {
+        // Force-flag overrides any sentinel detection.
+        assert!(super::should_run_wizard(true, Some(std::path::Path::new("/nonexistent"))));
+    }
+
+    #[test]
+    fn should_run_wizard_when_state_file_absent() {
+        let tmp = std::env::temp_dir().join(format!(
+            "forex-ai-wizard-gate-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert!(super::should_run_wizard(false, Some(&tmp)));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn should_not_run_wizard_when_state_file_present() {
+        let tmp = std::env::temp_dir().join(format!(
+            "forex-ai-wizard-gate-present-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join(crate::ui::wizard::WIZARD_STATE_FILENAME),
+            b"{\"version\":1}",
+        )
+        .unwrap();
+        assert!(!super::should_run_wizard(false, Some(&tmp)));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

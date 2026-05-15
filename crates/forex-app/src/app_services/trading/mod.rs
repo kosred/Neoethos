@@ -246,6 +246,84 @@ pub struct ExecutionSurfaceSnapshot {
     pub ticket: ExecutionTicketSnapshot,
 }
 
+/// Trading-environment classifier used by the persistent status pill
+/// in the main chrome (`ui::chrome::status_pill`) and consulted by the
+/// HALT button to label its audit-log lines.
+///
+/// Maps verbatim to the four autonomy stages defined in
+/// `docs/audits/research/wizard_onboarding_competitive_analysis.md`
+/// §10.2 (Discovery -> Paper -> LiveSmall -> LiveFull). The wizard
+/// promotion gates (§10.3) own the transitions; the chrome only
+/// observes which mode the session currently sits in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradingEnvironment {
+    /// Historical-replay only, no broker connection. Pill: gray.
+    /// Matches §10.2 "Discovery"/Stage 1 — sweeping templates against
+    /// the historical cache with no live data.
+    Demo,
+    /// Live broker data, simulated execution. Pill: amber.
+    /// Matches §10.2 "Paper trade"/Stage 2 — forward test on live
+    /// streaming data with simulated fills (ThinkOrSwim paperMoney
+    /// pattern, competitive analysis §1.4).
+    Paper,
+    /// Real money, capped per-trade size by the promotion gate. Pill: red.
+    /// Matches §10.2 "Live small"/Stage 3 — uses real capital with the
+    /// `min_trading_days=10` + `min_monthly_net_profit_pct=0.04` gate.
+    LiveSmall,
+    /// Real money, no extra cap. Pill: red, bold.
+    /// Matches §10.2 "Live full"/Stage 4 — uncapped after 30 days at
+    /// Stage 3 with all promotion gates passed.
+    LiveFull,
+}
+
+impl TradingEnvironment {
+    /// Operator-facing label rendered inside the status pill.
+    pub fn pill_label(self) -> &'static str {
+        match self {
+            Self::Demo => "DEMO",
+            Self::Paper => "PAPER",
+            Self::LiveSmall => "LIVE SMALL",
+            Self::LiveFull => "LIVE",
+        }
+    }
+
+    /// Whether this environment ever places real orders. Used by
+    /// audit-log lines so a HALT during Demo is recorded with the
+    /// correct severity.
+    pub fn is_live_money(self) -> bool {
+        matches!(self, Self::LiveSmall | Self::LiveFull)
+    }
+}
+
+/// Per-session HALT state — the T-Manual layer in the kill-switch
+/// hierarchy from `wizard_onboarding_competitive_analysis.md` §10.4.
+///
+/// HALT sits ABOVE T1 (per-trade) and T2 (per-day) which live in
+/// `risk_gate.rs`. Once tripped, every new order is rejected at the
+/// pre-trade gate regardless of other thresholds; the only way out is
+/// the operator clearing the sentinel file via the "Clear HALT" banner.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HaltState {
+    /// `true` once `trip_manual_halt` has been called and the
+    /// `Clear HALT` banner has not yet flipped it back.
+    pub halted: bool,
+    /// Absolute path to the sentinel file written by
+    /// `trip_manual_halt` (`<data-dir>/HALTED_<unix-secs>.flag`).
+    /// `None` until a HALT has been tripped.
+    pub sentinel_path: Option<PathBuf>,
+    /// Stats from the most recent trip — for banner display and tests.
+    pub last_trip: Option<HaltTripSummary>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HaltTripSummary {
+    pub timestamp_unix_secs: u64,
+    pub positions_closed: usize,
+    pub orders_cancelled: usize,
+    pub account_id: String,
+    pub environment_label: String,
+}
+
 pub struct TradingSession {
     configured_adapter: TradingAdapterKind,
     broker_settings: BrokerSettingsState,
@@ -274,6 +352,13 @@ pub struct TradingSession {
     ctrader_runtime_refreshed_at: Option<Instant>,
     connect_handle: Option<std::thread::JoinHandle<()>>,
     bootstrap_handle: Option<std::thread::JoinHandle<()>>,
+    /// Trading environment for the session — used by the status pill
+    /// and HALT button. Defaults to Demo; the wizard / autonomy
+    /// controller (§10.3 promotion gates) is responsible for advancing
+    /// this to Paper / LiveSmall / LiveFull.
+    trading_environment: TradingEnvironment,
+    /// T-Manual kill switch (HALT). See `HaltState` docs for details.
+    halt_state: HaltState,
 }
 
 enum TradingAdapter {
@@ -396,6 +481,8 @@ impl TradingSession {
             ctrader_runtime_refreshed_at: None,
             connect_handle: None,
             bootstrap_handle: None,
+            trading_environment: TradingEnvironment::Demo,
+            halt_state: HaltState::default(),
         }
     }
 

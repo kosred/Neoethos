@@ -75,6 +75,30 @@ pub const WARNING: egui::Color32 = egui::Color32::from_rgb(0xF4, 0xB4, 0x00);
 pub const DANGER: egui::Color32 = SELL;
 pub const INFO: egui::Color32 = ACCENT;
 
+// ─── Trading-environment status-pill tokens ──────────────────────────────
+//
+// Used by the persistent Demo/Paper/Live pill in the main chrome (see
+// `ui::chrome::status_pill`). Pattern #1 of the giants-pattern gaps in
+// `docs/audits/research/wizard_onboarding_competitive_analysis.md` §10
+// (ThinkOrSwim paperMoney pill, TradingView gray-vs-red Trading Panel).
+//
+// Token mapping is anchored to the design-spec §5.1 palette:
+//   - `STATUS_DEMO`  -> `TEXT_MUTED` (`--text-muted`) — historical replay
+//   - `STATUS_PAPER` -> `WARNING`    (`--status-warning`) — sim execution
+//   - `STATUS_LIVE`  -> `DANGER`     (`--status-danger`) — real money
+//
+// We deliberately reuse `DANGER` (the `--candle-down` red) instead of
+// inventing a fourth red, so the operator's eye reads "this pill is
+// red = real money" using the same token as candle bears. The only
+// other `DANGER`-solid surface in the chrome is the HALT button (per
+// §10.6 wording: "the only `color.danger`-solid element in the entire
+// window"). The pill renders as a `status_badge` (low-alpha fill +
+// strong border + colored text) which is visually distinct from the
+// solid-red HALT button so the two co-exist without ambiguity.
+pub const STATUS_DEMO: egui::Color32 = TEXT_MUTED;
+pub const STATUS_PAPER: egui::Color32 = WARNING;
+pub const STATUS_LIVE: egui::Color32 = DANGER;
+
 // ─── Spacing scale ──────────────────────────────────────────────────────
 //
 // 4-pt grid. The names map to the use-case so call sites read like
