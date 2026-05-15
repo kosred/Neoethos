@@ -685,6 +685,90 @@ impl TradingSession {
         })
     }
 
+    /// Server-side single-call drill-down: fetch every order tied to a
+    /// `positionId` via `ProtoOAOrderListByPositionIdReq` (payload 2183).
+    /// Replaces what would otherwise be an N-call client-side scan of
+    /// `ProtoOAOrderListReq` results filtered by `position_id`. See
+    /// `docs/audits/research/ctrader_api_full_reference.md` Appendix C
+    /// item #5 for the rationale (was: 1 reconcile + iterate N pending
+    /// orders / 1 ProtoOAOrderListReq + filter the order history
+    /// client-side; now: 1 ProtoOAOrderListByPositionIdReq).
+    ///
+    /// `from_timestamp_ms` / `to_timestamp_ms` are optional per the
+    /// proto; when both are `None` the broker returns every order ever
+    /// linked to the position. The helper clamps locally to the window
+    /// before returning per `fetch_orders_by_position_id_with_transport`.
+    pub(super) fn fetch_ctrader_orders_for_position(
+        &mut self,
+        position_id: i64,
+        from_timestamp_ms: Option<i64>,
+        to_timestamp_ms: Option<i64>,
+    ) -> anyhow::Result<Vec<crate::app_services::ctrader_account::CTraderPendingOrderSnapshot>>
+    {
+        let runtime_request = self.build_ctrader_account_runtime_request()?;
+        let request = crate::app_services::ctrader_history::CTraderPositionLookupRequest {
+            client_id: runtime_request.client_id,
+            client_secret: runtime_request.client_secret,
+            access_token: runtime_request.access_token,
+            environment: runtime_request.environment,
+            account_id: runtime_request.account_id,
+            position_id,
+            from_timestamp_ms,
+            to_timestamp_ms,
+        };
+        tracing::debug!(
+            target: "forex_app::ctrader_history",
+            position_id,
+            from_ms = from_timestamp_ms,
+            to_ms = to_timestamp_ms,
+            "trading::session fetch_ctrader_orders_for_position dispatching ProtoOAOrderListByPositionIdReq"
+        );
+        let orders =
+            crate::app_services::ctrader_history::fetch_orders_by_position_id(&request)?;
+        tracing::debug!(
+            target: "forex_app::ctrader_history",
+            position_id,
+            orders = orders.len(),
+            "trading::session fetch_ctrader_orders_for_position returned"
+        );
+        Ok(orders)
+    }
+
+    /// Server-side single-call drill-down: fetch a single order plus
+    /// every child deal via `ProtoOAOrderDetailsReq` (payload 2181).
+    /// Replaces what would otherwise be a re-scan of the reconcile
+    /// snapshot for the matching `order_id` plus a separate deal lookup.
+    /// See `docs/audits/research/ctrader_api_full_reference.md` §10
+    /// item #5 (per-order detail is more granular than reconcile).
+    pub(super) fn fetch_ctrader_order_details(
+        &mut self,
+        order_id: i64,
+    ) -> anyhow::Result<crate::app_services::ctrader_account::CTraderOrderDetailsSnapshot> {
+        let runtime_request = self.build_ctrader_account_runtime_request()?;
+        let request = crate::app_services::ctrader_history::CTraderOrderDetailsRequest {
+            client_id: runtime_request.client_id,
+            client_secret: runtime_request.client_secret,
+            access_token: runtime_request.access_token,
+            environment: runtime_request.environment,
+            account_id: runtime_request.account_id,
+            order_id,
+        };
+        tracing::debug!(
+            target: "forex_app::ctrader_history",
+            order_id,
+            "trading::session fetch_ctrader_order_details dispatching ProtoOAOrderDetailsReq"
+        );
+        let snapshot =
+            crate::app_services::ctrader_history::fetch_order_details(&request)?;
+        tracing::debug!(
+            target: "forex_app::ctrader_history",
+            order_id,
+            deal_count = snapshot.deals.len(),
+            "trading::session fetch_ctrader_order_details returned"
+        );
+        Ok(snapshot)
+    }
+
     pub(super) fn background_task_running(&self, kind: TaskKind) -> bool {
         match kind {
             TaskKind::Connect => self

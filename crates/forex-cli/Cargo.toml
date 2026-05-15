@@ -30,3 +30,44 @@ serde_json = "1.0"
 ratatui = { version = "0.29", features = ["crossterm"] }
 crossterm = "0.28"
 unicode-width = "0.2"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cargo-deb metadata — produces target/debian/forex-cli_<version>_<arch>.deb
+# Spec: https://github.com/kornelski/cargo-deb
+# Strategy ref: installer_no_paid_certs_strategy.md §3 (Linux .deb path, $0).
+# ──────────────────────────────────────────────────────────────────────────────
+[package.metadata.deb]
+maintainer = "forex-ai contributors <forex-ai@users.noreply.github.com>"
+copyright = "2024-2026, forex-ai contributors; dual-licensed MIT OR Apache-2.0"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+forex-ai is an open-source quantitative trading workspace targeting \
+the cTrader Open API. It includes data ingestion, ML-driven \
+strategy search, paper / live trading orchestration, and a \
+risk-aware execution gate. This package ships the headless CLI / TUI \
+front-end."""
+section = "finance"
+priority = "optional"
+assets = [
+    ["target/release/forex-cli", "usr/bin/", "755"],
+    ["../../assets/symbol_metadata/defaults.json", "usr/share/forex-ai/symbol_metadata/", "644"],
+    ["../../LICENSE", "usr/share/doc/forex-ai/", "644"],
+    ["../../README.md", "usr/share/doc/forex-ai/", "644"],
+]
+# Opt-in autostart only via the in-app wizard — never enable the unit on
+# install. (Wizard §9: user controls autonomous-watchdog autostart.)
+systemd-units = { enable = false }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cargo-generate-rpm metadata — produces target/generate-rpm/forex-cli-*.rpm
+# Spec: https://github.com/cat-in-136/cargo-generate-rpm
+# ──────────────────────────────────────────────────────────────────────────────
+[package.metadata.generate-rpm]
+name = "forex-cli"
+license = "MIT OR Apache-2.0"
+assets = [
+    { source = "target/release/forex-cli", dest = "/usr/bin/forex-cli", mode = "0755" },
+    { source = "assets/symbol_metadata/defaults.json", dest = "/usr/share/forex-ai/symbol_metadata/defaults.json", mode = "0644" },
+    { source = "LICENSE", dest = "/usr/share/doc/forex-ai/LICENSE", mode = "0644" },
+    { source = "README.md", dest = "/usr/share/doc/forex-ai/README.md", mode = "0644" },
+]

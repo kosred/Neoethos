@@ -1,0 +1,55 @@
+{
+    "$schema": "https://raw.githubusercontent.com/ScoopInstaller/Scoop/master/schema.json",
+    "_": [
+        "Scoop App Manifest for forex-ai.",
+        "Spec: https://github.com/ScoopInstaller/Scoop/wiki/App-Manifests",
+        "Strategy ref: docs/audits/research/installer_no_paid_certs_strategy.md §1.5.3",
+        "Target bucket: ScoopInstaller/Extras (GUI app, ML-heavy). Submit via PR.",
+        "TODO(release-time): replace `url` host segment + `hash` with the values",
+        "produced by .github/workflows/release.yml after the v0.4.5 tag is pushed."
+    ],
+    "version": "0.4.5",
+    "description": "Quantitative trading workspace for the cTrader Open API.",
+    "homepage": "https://github.com/kosred/forex-ai",
+    "license": "MIT OR Apache-2.0",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/kosred/forex-ai/releases/download/v0.4.5/forex-ai-v0.4.5-windows-x86_64.tar.gz",
+            "hash": "TODO_SHA256_AT_RELEASE_TIME",
+            "extract_dir": "out"
+        }
+    },
+    "bin": [
+        "forex-app.exe",
+        "forex-cli.exe"
+    ],
+    "shortcuts": [
+        [
+            "forex-app.exe",
+            "forex-ai"
+        ]
+    ],
+    "persist": [
+        "config",
+        "data",
+        "logs"
+    ],
+    "checkver": {
+        "github": "https://github.com/kosred/forex-ai"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/kosred/forex-ai/releases/download/v$version/forex-ai-v$version-windows-x86_64.tar.gz"
+            }
+        },
+        "hash": {
+            "url": "$url.sha256"
+        }
+    },
+    "notes": [
+        "User data (config, cached candles, logs) is persisted across upgrades via",
+        "Scoop's `persist` mechanism — see installer_infrastructure_spec.md §8.2",
+        "and installer_no_paid_certs_strategy.md §1.5.3 for the canonical layout."
+    ]
+}

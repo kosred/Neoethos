@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Chocolatey package manifest for forex-ai.
+  Spec: https://docs.chocolatey.org/en-us/create/create-packages
+        https://docs.chocolatey.org/en-us/create/create-packages-quick-start
+  Strategy ref: docs/audits/research/installer_no_paid_certs_strategy.md §1.5.2
+
+  Build: `choco pack forex-ai.nuspec` from this directory.
+  Publish: `choco push forex-ai.0.4.5.nupkg --source https://push.chocolatey.org/`
+           Community moderation queue is 1-4 weeks for the first version.
+-->
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>forex-ai</id>
+    <version>0.4.5</version>
+    <packageSourceUrl>https://github.com/kosred/forex-ai/tree/main/packaging/chocolatey/forex-ai</packageSourceUrl>
+    <owners>kosred</owners>
+
+    <title>forex-ai</title>
+    <authors>forex-ai contributors</authors>
+    <projectUrl>https://github.com/kosred/forex-ai</projectUrl>
+    <iconUrl>https://raw.githubusercontent.com/kosred/forex-ai/main/packaging/appimage/forex-app.AppDir/forex-app.png</iconUrl>
+    <copyright>Copyright 2024-2026 forex-ai contributors</copyright>
+    <licenseUrl>https://github.com/kosred/forex-ai/blob/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <projectSourceUrl>https://github.com/kosred/forex-ai</projectSourceUrl>
+    <docsUrl>https://github.com/kosred/forex-ai#readme</docsUrl>
+    <bugTrackerUrl>https://github.com/kosred/forex-ai/issues</bugTrackerUrl>
+
+    <tags>forex trading quant ctrader rust admin</tags>
+    <summary>Quantitative trading workspace for the cTrader Open API.</summary>
+    <description>
+forex-ai is an open-source quantitative trading workspace targeting the
+cTrader Open API. It includes data ingestion, ML-driven strategy search,
+paper / live trading orchestration, and a risk-aware execution gate.
+
+This Chocolatey package installs the Windows x86_64 build downloaded from
+the official GitHub Releases, verified by SHA-256.
+    </description>
+    <releaseNotes>https://github.com/kosred/forex-ai/releases/tag/v0.4.5</releaseNotes>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>
