@@ -199,34 +199,26 @@ WebSearch) — sets the navigation contract for every step below.
 
 ### Step 1 — Welcome + License
 
-- **Purpose:** introduce the wizard, surface the LICENSE for legal
-  acceptance.
-- **Mockup:** centred 720×540 modal. Top: large "forex-ai" wordmark,
-  version line ("v0.5.0 — built 2026-05-15"). Body: 4–5 lines of
-  copy describing what the next nine steps will do, with an
-  estimated total time ("≈ 10 minutes on a typical broadband
-  connection"). Scrollable LICENSE pane occupies the lower 60 % of
-  the modal. Below the pane: a checkbox "I have read and accept the
-  license" (default unchecked). Footer: `[Cancel]` left, `[Continue
-  →]` right, disabled until the checkbox is ticked.
+- **Purpose:** introduce the wizard and capture LICENSE acceptance.
+- **Mockup:** centred 720×540 modal. Wordmark + version at top,
+  4–5 lines describing the upcoming nine steps with estimated total
+  time ("≈ 10 minutes"). Scrollable LICENSE pane (lower 60 %),
+  then "I have read and accept the license" checkbox, then footer
+  `[Cancel]` / `[Continue →]` (Continue disabled until checked).
 - **Inputs:** license-accepted boolean.
-- **Actions:** reads `LICENSE` from the installed
-  `<install_dir>/LICENSE` file (or from the embedded `include_str!`
-  fallback if the file is missing — operator's no-synthetic-data
-  rule does not apply to a static license text). On accept, writes
-  the LICENSE SHA-256 + acceptance timestamp to `wizard_state.json`.
-- **Skip:** **NOT ALLOWED** — the only mandatory step.
-  Cancel exits the app entirely.
-- **Back:** N/A (first step).
-- **Cancel:** confirmation modal: "Cancel installation? The wizard
-  will run again on next launch." Two buttons: `[Stay]`, `[Quit]`.
-- **Time:** ≤ 30 s (mostly waiting for the user to read).
+- **Actions:** reads `LICENSE` from `<install_dir>/LICENSE` (with
+  an `include_str!` build-time fallback). On accept, writes the
+  LICENSE SHA-256 + timestamp to `wizard_state.json`.
+- **Skip:** NOT ALLOWED — only mandatory step.
+- **Back:** N/A.
+- **Cancel:** confirm modal: "Cancel installation? The wizard
+  will run again on next launch." `[Stay]` / `[Quit]`.
+- **Time:** ≤ 30 s.
 
-Microsoft's wizard guidance specifically discourages a content-free
-welcome page: "Don't use Welcome pages — make the first page
-functional whenever possible" (Microsoft Learn UX wizards, snippet
-via WebSearch). Including the license on the same page satisfies
-this — the page is functional (capture acceptance) and welcoming.
+Microsoft Learn UX wizards: "Don't use Welcome pages — make the
+first page functional whenever possible" (snippet via WebSearch).
+Including the license on this page satisfies that — it's
+functional.
 
 ### Step 2 — Path selection
 
@@ -313,76 +305,48 @@ canonical locations but allows override.
 - **Mockup:** wider modal (900 px). Four sub-panels arranged
   vertically with a sticky "step within step" sub-progress bar at
   top showing 4.1 → 4.2 → 4.3 → 4.4:
-  - **4.1 Register app.** Plain text walkthrough: "Visit
-    <https://openapi.ctrader.com/> while signed into your cTID, then
-    *Applications → Add Application*. Set the redirect URI to
-    exactly `http://127.0.0.1:7777/ctrader/callback` (you can change
-    the port later if 7777 is busy; the wizard will try 7777, 7878,
-    8989 in order). Copy the Client ID and Client Secret here."
-    Two single-line fields ("Client ID", "Client Secret"), the
-    second masked. An "Open openapi.ctrader.com" button that opens
-    the system browser. A "Test these credentials" affordance — on
-    click, the wizard makes a quick `ProtoOAApplicationAuthReq`
-    (payloadType 2100) to `demo.ctraderapi.com:5035` to verify the
-    pair is valid (per
-    `docs/audits/research/ctrader_api_full_reference.md` §2.6). If
-    the response is `ProtoOAErrorRes` with `CH_CLIENT_AUTH_FAILURE`
-    (101) or `CH_OA_CLIENT_NOT_FOUND` (107), surface the broker's
-    error message verbatim.
-  - **4.2 Sign in with cTID.** A single primary button "Sign in with
-    cTID". Clicking it does the following sequence (all in the
-    existing `ProductionCTraderLiveAuthBackend` in
-    `crates/forex-app/src/app_services/ctrader_live_auth.rs`):
-    1. Generate a 32-byte CSRF `state` token (already wired —
-       `ctrader_live_auth.rs:38` documents "audit-fix F2").
-    2. Bind a loopback listener on the first available port from
-       `[7777, 7878, 8989]` (already wired —
-       `ProductionCTraderLiveAuthBackend::bind_loopback_listener`
-       at `ctrader_live_auth.rs:193`).
-    3. Open the system default browser to
-       `https://id.ctrader.com/my/settings/openapi/grantingaccess/?client_id={cid}&redirect_uri=http://127.0.0.1:{port}/ctrader/callback&scope=trading&product=web&state={csrf}`
-       per `ctrader_api_full_reference.md` §2.2.
-    4. Show a placeholder pane: "Waiting for browser
-       sign-in…  [Cancel]". A 5-minute timer ticks down (matches
-       the existing `CTRADER_CALLBACK_TIMEOUT: Duration =
-       Duration::from_secs(300)` at `ctrader_live_auth.rs:24`).
-    5. On callback receipt, exchange the auth code for a token
-       bundle by GET to `https://openapi.ctrader.com/apps/token`
-       (per the verbatim Spotware sample —
-       `ctrader_api_full_reference.md` §2.3).
-    Fallback: if no port in the list binds (corporate firewall),
-    surface a "Use copy-paste flow" link. The copy-paste flow shows
-    the same URL with the redirect set to `https://spotware.com`,
-    asks the user to paste the resulting redirect URL, and parses
-    the `code` and `state` parameters from it. RFC 8252 §7.3
-    mandates loopback redirect URIs for native apps — "loopback
-    redirect URIs use the 'http' scheme … constructed with the
-    loopback IP literal and whatever port the client is listening
-    on, such as 'http://127.0.0.1:{port}/{path}'" (RFC 8252 snippet
-    via WebSearch) — so the copy-paste flow is a *fallback*, not a
-    primary path.
-  - **4.3 Account picker.** After the OAuth exchange, the wizard
-    sends `ProtoOAApplicationAuthReq` (2100) +
-    `ProtoOAGetAccountListByAccessTokenReq` (2149) per
-    `ctrader_api_full_reference.md` §2.6. The response, a
-    `ProtoOAGetAccountListByAccessTokenRes` (2150), carries a
-    `repeated ProtoOACtidTraderAccount`. The picker renders one
-    row per account with columns: account label, broker name,
-    account number, currency, environment (Live/Demo), trader-side
-    `accountType`. A radio-button column lets the user pick the
-    default account. A checkbox column lets them pick *additional*
-    accounts to enable (the trading-mode selector in Step 3 decides
-    whether they are usable for live trading or only for
-    backtesting). A "I'll wire more accounts later" link is shown
-    below the table.
-  - **4.4 Account auth probe.** On the chosen primary account, the
-    wizard sends `ProtoOAAccountAuthReq` (2102) and waits for
-    `ProtoOAAccountAuthRes` (2103) — per the same §2.6. Success
-    surfaces a green tick; failure shows the broker's error verbatim
-    plus the standard remediation: "Code 2 = ACCOUNT_NOT_AUTHORIZED:
-    re-authenticate the access token." If the failure is a
-    permanent code (e.g. 106 `CH_CTID_TRADER_ACCOUNT_NOT_FOUND`), the
-    wizard offers "Pick a different account" rather than "Retry".
+  - **4.1 Register app.** Walkthrough text: "Visit
+    <https://openapi.ctrader.com/> signed into your cTID, then
+    *Applications → Add Application*. Set redirect URI to exactly
+    `http://127.0.0.1:7777/ctrader/callback`. Paste Client ID and
+    Client Secret here." Two fields (the Secret masked), an
+    "Open openapi.ctrader.com" launcher, and a "Test these
+    credentials" probe that sends `ProtoOAApplicationAuthReq` (2100)
+    to `demo.ctraderapi.com:5035` per
+    `ctrader_api_full_reference.md` §2.6. Errors
+    `CH_CLIENT_AUTH_FAILURE` (101) and `CH_OA_CLIENT_NOT_FOUND`
+    (107) are surfaced verbatim.
+  - **4.2 Sign in with cTID.** Primary button "Sign in with cTID"
+    drives the existing `ProductionCTraderLiveAuthBackend`
+    (`ctrader_live_auth.rs:120`): (1) generate CSRF state — F2
+    fix at `ctrader_live_auth.rs:38`; (2) bind loopback on first
+    free port of `[7777, 7878, 8989]` —
+    `bind_loopback_listener` at `ctrader_live_auth.rs:193`; (3)
+    open the system browser to
+    `https://id.ctrader.com/my/settings/openapi/grantingaccess/?client_id={cid}&redirect_uri=http://127.0.0.1:{port}/ctrader/callback&scope=trading&product=web&state={csrf}`
+    per `ctrader_api_full_reference.md` §2.2; (4) wait up to 300 s
+    (`CTRADER_CALLBACK_TIMEOUT` at `ctrader_live_auth.rs:24`); (5)
+    exchange the auth code via GET on
+    `https://openapi.ctrader.com/apps/token` per
+    `ctrader_api_full_reference.md` §2.3. If no port binds, fall
+    back to a copy-paste flow (redirect to `https://spotware.com`,
+    user pastes the URL back). RFC 8252 §7.3 — "loopback redirect
+    URIs use the 'http' scheme … 'http://127.0.0.1:{port}/{path}'"
+    (RFC 8252 snippet via WebSearch) — keeps copy-paste a fallback.
+  - **4.3 Account picker.** Sends `ProtoOAApplicationAuthReq` (2100)
+    + `ProtoOAGetAccountListByAccessTokenReq` (2149) (per §2.6).
+    The response (`ProtoOAGetAccountListByAccessTokenRes` 2150)
+    carries `repeated ProtoOACtidTraderAccount`. The picker renders
+    one row per account (label, broker, account number, currency,
+    Live/Demo, type). A radio column selects the default; a
+    checkbox column enables additional accounts. "I'll wire more
+    accounts later" link below.
+  - **4.4 Account auth probe.** Sends `ProtoOAAccountAuthReq` (2102)
+    on the primary account; success on `ProtoOAAccountAuthRes`
+    (2103). Failure surfaces the broker's error verbatim plus
+    remediation hint. Permanent codes (e.g. 106
+    `CH_CTID_TRADER_ACCOUNT_NOT_FOUND`) offer "Pick a different
+    account" instead of "Retry".
 - **Inputs:** `client_id`, `client_secret`,
   `selected_ctid_trader_account_id`, `additional_account_ids`,
   `environment` (Live | Demo, defaulting to whichever the primary
