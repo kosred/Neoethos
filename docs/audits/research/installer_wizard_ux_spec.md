@@ -27,39 +27,39 @@ snippet 2026-05-15.
 
 ## 0. Sources
 
-Docs-first citations used throughout this spec. Where a URL is
-listed as "snippet via WebSearch", the underlying HTML page returned
-HTTP 403 to the sandbox's WebFetch tool and the content was
-reconstructed from WebSearch result excerpts that quote the canonical
-page directly.
+Docs-first citations used throughout this spec. "snippet via
+WebSearch" means the underlying page returned HTTP 403 to the
+sandbox's WebFetch tool and content was reconstructed from
+WebSearch result excerpts quoting the canonical page directly.
 
-| # | Source | Status |
-|---|--------|--------|
-| 1 | NN/G — Wizards: Definition and Design Recommendations (<https://www.nngroup.com/articles/wizards/>) | snippet via WebSearch |
-| 2 | NN/G — Progressive Disclosure (<https://www.nngroup.com/articles/progressive-disclosure/>) | snippet via WebSearch |
-| 3 | NN/G — 8 Design Guidelines for Complex Applications | snippet via WebSearch |
-| 4 | Microsoft Learn — UX checklist for desktop applications (<https://learn.microsoft.com/en-us/windows/win32/uxguide/top-violations>) | snippet via WebSearch |
-| 5 | Microsoft Learn — Win32 Wizards (<https://learn.microsoft.com/en-us/windows/win32/uxguide/win-wizards>) | snippet via WebSearch |
-| 6 | RFC 8252 — OAuth 2.0 for Native Apps (<https://datatracker.ietf.org/doc/html/rfc8252>) | snippet via WebSearch |
-| 7 | freedesktop.org — Desktop Application Autostart Specification (<https://specifications.freedesktop.org/autostart-spec/autostart-spec-latest.html>) | snippet via WebSearch |
-| 8 | freedesktop.org — XDG Base Directory Specification | snippet via WebSearch |
-| 9 | Apple Developer — Distribution XML Reference | snippet via WebSearch |
-| 10 | Apple Developer — Packaging Mac software for distribution | snippet via WebSearch |
-| 11 | Apple Developer — Notarizing macOS software before distribution | snippet via WebSearch |
-| 12 | FireGiant — WixUI dialog library (<https://docs.firegiant.com/wix/tools/wixext/wixui/>) | snippet via WebSearch |
-| 13 | Sentry — Best Practices for GDPR Compliance (<https://sentry.io/trust/privacy/gdpr-best-practices/>) | snippet via WebSearch |
-| 14 | Lollypop — Best Practices for High-Conversion Wizard UI Design (2026/01) | snippet via WebSearch |
-| 15 | Andrew Coyle — How to Design a Form Wizard | snippet via WebSearch |
-| 16 | Eleken — Wizard UI Pattern: When to Use It | snippet via WebSearch |
-| 17 | Krystal Higgins — The design of setup wizards | listed only, 403 |
-| 18 | UXPin — Progress Tracker Design: UX Best Practices | snippet via WebSearch |
-| 19 | Internal: `docs/audits/research/ctrader_api_full_reference.md` | local |
-| 20 | Internal: `docs/audits/research/spotware_proto_new_messages.md` | local |
-| 21 | Internal: `docs/audits/research/ml_numerical_reference.md` | local |
-| 22 | Internal source: `crates/forex-app/src/app_services/ctrader_live_auth.rs` | local |
-| 23 | Internal source: `crates/forex-core/src/contracts/temporal.rs` | local |
-| 24 | Internal source: `crates/forex-core/src/domain/prop_firm.rs` | local |
-| 25 | Internal source: `crates/forex-core/src/system.rs` | local |
+External:
+
+- NN/G *Wizards* — <https://www.nngroup.com/articles/wizards/>
+- NN/G *Progressive Disclosure* — <https://www.nngroup.com/articles/progressive-disclosure/>
+- NN/G *8 Design Guidelines for Complex Applications*
+- Microsoft Learn *UX checklist for desktop applications* — <https://learn.microsoft.com/en-us/windows/win32/uxguide/top-violations>
+- Microsoft Learn *Win32 Wizards* — `…/uxguide/win-wizards`
+- RFC 8252 *OAuth 2.0 for Native Apps* — <https://datatracker.ietf.org/doc/html/rfc8252>
+- freedesktop.org *Desktop Application Autostart Specification*
+- freedesktop.org *XDG Base Directory Specification*
+- Apple Developer *Distribution XML Reference*
+- Apple Developer *Packaging Mac software for distribution*
+- Apple Developer *Notarizing macOS software before distribution*
+- FireGiant *WixUI dialog library* — <https://docs.firegiant.com/wix/tools/wixext/wixui/>
+- Sentry *GDPR Best Practices* — <https://sentry.io/trust/privacy/gdpr-best-practices/>
+- Lollypop *Wizard UI Design 2026* / Andrew Coyle *Form Wizard* /
+  Eleken *Wizard UI Pattern* / Krystal Higgins *Design of Setup
+  Wizards* (403 — listed only) / UXPin *Progress Trackers 2026*
+
+Internal:
+
+- `docs/audits/research/ctrader_api_full_reference.md`
+- `docs/audits/research/spotware_proto_new_messages.md`
+- `docs/audits/research/ml_numerical_reference.md`
+- `crates/forex-app/src/app_services/ctrader_live_auth.rs`
+- `crates/forex-core/src/contracts/temporal.rs`
+- `crates/forex-core/src/domain/prop_firm.rs`
+- `crates/forex-core/src/system.rs`
 
 ### 0.1 Dependencies on parallel deliverables
 
@@ -116,48 +116,30 @@ a guided modal wizard before showing the main UI.
 
 ### 1.2 Recommendation: Option B (in-app first-run wizard)
 
-**Choose Option B.** Justification:
+**Choose Option B.** Five reasons:
 
-1. **Linux parity.** Linux deb/rpm `postinst` scripts can launch GUI
-   programs only with workarounds (DISPLAY env-var inheritance, dbus
-   activation), and AppImage has no `postinst` at all. The
-   freedesktop.org *Autostart Specification* puts user-facing first-
-   run behaviour squarely in the application's domain, not the
-   packager's — "users can place application launchers that should be
-   run automatically upon login" in `~/.config/autostart/`
-   (freedesktop.org *Desktop Application Autostart Specification*,
-   snippet via WebSearch). An in-app wizard works identically across
-   AppImage, deb, rpm, Flatpak, and "downloaded a tarball".
-2. **Re-runnability.** Operator directive includes "Skip / re-run"
-   (§5 of the brief). A native installer wizard can only run during
-   installation; re-running it requires uninstalling and reinstalling.
-   An in-app wizard is just `forex-app --wizard`.
-3. **Notarization friction (macOS).** Apple's notarization service
-   has tightened over 2026: "Some developers reported notarization
-   rejection attempts beginning at the end of February 2026, with
-   rejections continuing through early May" (search snippet, May 2026).
-   Anything that runs **before** `forex-app` itself starts must be
-   independently signed and notarized. Putting the wizard inside
-   `forex-app` collapses the artefacts that need notarization from
-   two (installer + app) to one (app).
-4. **Microsoft UX guidance.** Microsoft Learn's *Wizards* page
-   recommends consolidating wizards rather than fragmenting them:
+1. **Linux parity.** deb/rpm `postinst` can't reliably open GUIs
+   (DISPLAY inheritance, dbus activation); AppImage has no
+   `postinst`. The freedesktop Autostart Specification puts
+   first-run behaviour in the app's domain (snippet via WebSearch).
+   An in-app wizard works identically across deb/rpm/AppImage/
+   Flatpak/tarball.
+2. **Re-runnability.** Native installer wizards can only run at
+   install time; an in-app wizard is just `forex-app --wizard`.
+3. **macOS notarization.** Apple's service has tightened in 2026
+   (multiple Feb–May rejections — search snippet). One artefact
+   (the app) vs two (installer + app) halves the notarization
+   surface.
+4. **Microsoft UX guidance.** Microsoft Learn *Win32 Wizards*:
    "Reduce the number of pages to focus on essentials and consolidate
-   related pages, taking optional pages out of the main flow"
-   (Microsoft Learn — Win32 UX wizards, snippet via WebSearch). A
-   single in-app wizard is one page-stack; an installer wizard +
-   in-app onboarding would be two, with duplication.
-5. **Operator's "automation help" rule.** Most of what this wizard
-   automates (cTrader OAuth, hardware probe, historical data
-   download) is **not knowable at install time** — the install runs
-   as root or with `sudo`, but the OAuth tokens and the trained
-   models belong to the per-user account. Per-user automation must
-   live in the per-user app.
+   related pages" (snippet via WebSearch). One stack, not two.
+5. **Operator's automation rule.** OAuth tokens / models / cached
+   history are per-user — not knowable at install time when the
+   installer often runs as root.
 
-The native installer's job, in this architecture, is reduced to:
-copy files, register the launcher, schedule autostart **if asked**
-(see §2.9 — Auto-start), and exit. Everything user-facing happens
-inside `forex-app` on first run.
+Installer's job collapses to: copy files, register launcher,
+schedule autostart **if asked** (Step 9), exit. Everything
+user-facing runs inside `forex-app` on first run.
 
 ### 1.3 Post-install hand-off
 
@@ -499,65 +481,58 @@ policy + RFC 8252 + NN/G):
 
 The error matrix:
 
-| Step | Error class | UX response | Recovery |
-|------|-------------|-------------|----------|
-| 1 — License | LICENSE file missing | Show built-in fallback license text; warn "Could not find LICENSE on disk; using embedded copy from build-time include." | Continue |
-| 2 — Path | No write permission | Inline red banner with the OS error verbatim ("Permission denied" / "Access is denied"). | Pick another path or run as admin/sudo if user insists |
-| 2 — Path | Disk space < 5 GiB | Amber banner: "Only X GiB free; historical data + checkpoints typically need 8–20 GiB. Pick another volume?" | Continue allowed; warning logged |
-| 3 — Profile | Monthly profit < 4 % | Inline validator: "Minimum 4 % per operator policy (2026-05-14). Lower values are not selectable." | Adjust slider |
-| 4.1 — Credentials | Empty or malformed Client ID/Secret | Inline validator: "Client ID must be a digit string; Client Secret must be 32+ chars." | Re-enter |
-| 4.1 — Test creds | `CH_CLIENT_AUTH_FAILURE` (101) | "The broker rejected these credentials. Verify them at openapi.ctrader.com, then re-test." | Retry / re-enter |
-| 4.1 — Test creds | `CH_OA_CLIENT_NOT_FOUND` (107) | "The broker doesn't recognise this Client ID. Did you copy it from the wrong app?" | Re-enter |
-| 4.2 — OAuth | Loopback bind fails on all ports | "Could not open the local callback server on ports 7777/7878/8989. Use the copy-paste flow?" | Switch to copy-paste flow |
-| 4.2 — OAuth | 5-minute timeout | "No browser callback in 5 minutes. Was the page closed? Sign in again?" | Retry / Skip |
-| 4.2 — OAuth | `state` mismatch | Hard refuse: "Security: the callback's state token doesn't match. Possible CSRF — refusing to proceed." (matches existing `ctrader_live_auth.rs:36–43` audit-fix F2.) | Restart 4.2 |
-| 4.2 — OAuth | Token exchange returns `errorCode` field | Surface the broker's `description` verbatim. | Retry |
-| 4.3 — Accounts | Empty account list | "Your cTID has no trading accounts registered. Open a demo account at <https://ctrader.com> then come back." | Retry / Skip |
-| 4.4 — Acct auth | `ACCOUNT_NOT_AUTHORIZED` (2) | "Token doesn't grant access to this account. Re-do the sign-in step?" | Back to 4.2 |
-| 4.4 — Acct auth | `CONNECTIONS_LIMIT_EXCEEDED` (67) | "Too many simultaneous connections from this Client ID. Close other sessions and retry." | Retry |
-| 5 — Symbols | `ProtoOASymbolsListReq` times out | "Broker took too long to return the symbol list. This sometimes happens during scheduled broker maintenance; retry in 30 s?" | Retry / Skip |
-| 6 — History | `REQUEST_FREQUENCY_EXCEEDED` (108) | Wizard's token-bucket already gates this; if the broker still returns 108 (clock drift), back off 30 s and resume. | Automatic |
-| 6 — History | Partial download on Cancel | Mark file `.partial`; banner on the main app: "EURUSD M5 download is incomplete (38 % of 6 months). Resume from `Data → Backfill`." | Resume from main app |
-| 6 — History | Disk full mid-download | Hard stop: "Disk full at `<data_path>`. Free space and click Resume." | Resume |
-| 7 — Hardware | `nvidia-smi` missing but NVIDIA card present | Card surfaces in the wgpu branch only; warning: "NVIDIA driver not detected — install the official driver to enable CUDA backend." | Continue with wgpu |
-| 7 — Hardware | No GPU at all | CPU-only card shown; no error. | Continue |
-| 8 — News | API ping fails | Surface provider's error verbatim. | Retry / Disable |
-| 9 — Autostart | Can't write `~/.config/autostart` | "Permission denied at `~/.config/autostart`. Skip auto-start?" | Skip |
-| 10 — Apply | Disk full at write | "Cannot write `<config.yaml>`. Free space and click Retry." | Retry |
-| 10 — Apply | Keychain unavailable (macOS) | "macOS keychain is locked. Fall back to file-based credential storage (less secure)?" | Continue with file |
+| Step | Error class | UX response & recovery |
+|------|-------------|------------------------|
+| 1 | LICENSE file missing | Fallback to embedded `include_str!` copy; warn-and-continue. |
+| 2 | No write permission | Red banner with OS error verbatim; pick another path. |
+| 2 | Disk < 5 GiB | Amber banner; continue allowed, warning logged. |
+| 3 | Monthly profit < 4 % | Inline validator: "Minimum 4 % per operator policy (2026-05-14)." |
+| 4.1 | Empty / malformed creds | Inline validator; re-enter. |
+| 4.1 | `CH_CLIENT_AUTH_FAILURE` (101) / `CH_OA_CLIENT_NOT_FOUND` (107) | Broker rejection surfaced verbatim; retry / re-enter. |
+| 4.2 | Loopback bind fails on all 3 ports | Offer copy-paste flow (RFC 8252 §7.3 fallback). |
+| 4.2 | 5-min callback timeout | Retry / Skip. |
+| 4.2 | `state` mismatch | Hard refuse — CSRF block per `ctrader_live_auth.rs:36–43` audit-fix F2. |
+| 4.2 | Token exchange `errorCode` field set | Surface broker's `description` verbatim; retry. |
+| 4.3 | Empty account list | "Your cTID has no trading accounts — open a demo at ctrader.com." Retry / Skip. |
+| 4.4 | `ACCOUNT_NOT_AUTHORIZED` (2) | Back to 4.2 to refresh token. |
+| 4.4 | `CONNECTIONS_LIMIT_EXCEEDED` (67) | Retry after user closes other sessions. |
+| 5 | `ProtoOASymbolsListReq` timeout | Retry / Skip (broker maintenance window?). |
+| 6 | `REQUEST_FREQUENCY_EXCEEDED` (108) | Token-bucket gates this; on bypass, 30 s backoff + resume. |
+| 6 | Cancel partway / disk full | Mark `.partial`; main app surfaces Resume affordance. |
+| 7 | `nvidia-smi` missing but NVIDIA present | Show wgpu card with "Install NVIDIA driver to enable CUDA". |
+| 7 | No GPU at all | CPU-only card shown; no error. |
+| 8 | News API ping fails | Surface provider error verbatim; Retry / Disable. |
+| 9 | Can't write autostart artefact | "Skip auto-start?" — Skip. |
+| 10 | Disk full at write | "Free space and Retry." |
+| 10 | macOS keychain locked | Offer file-based fallback with explicit warning. |
 
 ---
 
 ## §4 — Theming
 
-Design tokens are owned by `ui_ux_design_spec.md` (parallel agent).
-This wizard expects the following tokens to exist; placeholders are
-TODOs until that doc lands.
+Design tokens are owned by `ui_ux_design_spec.md` (parallel agent;
+not yet present). Until then, the wizard uses these placeholders
+flagged `TODO(ui_ux_design_spec)`:
 
-| Token | TODO placeholder | Use |
-|-------|------------------|-----|
-| `color.surface.canvas` | `#0E1117` (dark) / `#FFFFFF` (light) | Modal background |
-| `color.surface.card` | `#171A21` / `#F6F8FB` | Card / row background |
-| `color.text.primary` | `#E6E8EE` / `#101218` | Body text |
-| `color.text.muted` | `#8A93A6` / `#5F6A7E` | Helper / footnote text |
-| `color.accent` | `#2F7FF9` | Primary buttons, focus ring |
-| `color.success` | `#2EA86A` | Validation ticks |
-| `color.warning` | `#E1A227` | Warnings |
-| `color.danger` | `#D14545` | Errors |
-| `typography.heading` | Inter Semibold 20 / 24 / 28 | Step titles |
-| `typography.body` | Inter Regular 14 / 16 | Body |
-| `typography.mono` | JetBrains Mono 13 | Paths, identifiers |
-| `space.unit` | 4 px | Base spacing unit |
-| `radius.card` | 12 px | Card corner radius |
-| `focus.ring` | 2 px solid `color.accent`, 2 px offset | Keyboard focus |
+- `color.surface.canvas` `#0E1117` dark / `#FFFFFF` light (modal bg)
+- `color.surface.card` `#171A21` / `#F6F8FB` (rows / cards)
+- `color.text.primary` `#E6E8EE` / `#101218`
+- `color.text.muted` `#8A93A6` / `#5F6A7E`
+- `color.accent` `#2F7FF9` (primary buttons, focus ring)
+- `color.success` `#2EA86A` / `color.warning` `#E1A227` /
+  `color.danger` `#D14545`
+- `typography.heading` Inter Semibold 20/24/28
+- `typography.body` Inter Regular 14/16; `typography.mono`
+  JetBrains Mono 13
+- `space.unit` 4 px; `radius.card` 12 px; `focus.ring` 2 px solid
+  accent + 2 px offset
 
-The wizard is fully keyboard-navigable: `Tab` cycles fields, `Shift
-+Tab` reverses, `Space`/`Enter` activates the primary button,
-`Esc` triggers the same prompt as `[Cancel]`. The focus ring is
-mandatory for accessibility — Microsoft Learn's *UX checklist for
-desktop applications* lists missing focus indicators as a top
-violation
-(<https://learn.microsoft.com/en-us/windows/win32/uxguide/top-violations>).
+The wizard is fully keyboard-navigable: `Tab` / `Shift+Tab`,
+`Space` / `Enter`, `Esc` opens Cancel. Microsoft Learn's *UX
+checklist for desktop applications* lists missing focus indicators
+as a top violation
+(<https://learn.microsoft.com/en-us/windows/win32/uxguide/top-violations>) —
+the focus ring is mandatory.
 
 ---
 
@@ -621,73 +596,31 @@ through navigation".
 
 ## §6 — Migration from portable
 
-forex-ai pre-0.5 was a portable app: all state lived under
-`~/.forex-ai/`. The 0.5+ installer points at OS-canonical paths
-(see Step 2). The wizard detects the legacy directory and offers to
-migrate.
+forex-ai pre-0.5 was portable (all state under `~/.forex-ai/`).
+The installed-app wizard detects and migrates.
 
-### 6.1 Detection
+**Detection (on Step 2 entry):** scan `~/.forex-ai`, `~/forex-ai`,
+and `%USERPROFILE%/.forex-ai` for any of `config.yaml`,
+`broker_credentials.toml`, `checkpoints/`, `data/`, `history/`.
 
-On Step 2 entry, the wizard runs:
+**Prompt:** modal overlay on Step 2 listing detected payloads with
+sizes and checkboxes (Config, Broker credentials, Cached history,
+Model checkpoints, OAuth refresh token). Disk-free check at
+destination; post-migration radio "Keep / Delete / Leave decision
+for later"; `[Skip migration]` / `[Migrate now]`.
 
-```
-for candidate in [
-    "~/.forex-ai",
-    "~/forex-ai",
-    "%USERPROFILE%/.forex-ai",
-]:
-    if exists(candidate) and any_of(
-        "config.yaml", "broker_credentials.toml", "checkpoints/",
-        "data/", "history/"
-    ):
-        offer_migration(candidate)
-```
+**Semantics:**
 
-### 6.2 Migration prompt
+- Atomic per file — copy + verify (size + SHA-256), then remove
+  source. Failure leaves **both** dirs intact; user picks Retry /
+  Keep-both / Rollback.
+- The OAuth refresh token is reused as-is — no browser re-auth.
+- "Delete source" requires a second confirmation modal before
+  `rm -rf`.
 
-A modal overlay on Step 2:
-
-```
-We found an existing forex-ai install at /home/op/.forex-ai/.
-Migrate it to /home/op/.local/share/forex-ai/?
-
-  [✓] Config (config.yaml, 3.1 KiB)
-  [✓] Broker credentials (broker_credentials.toml, 2.4 KiB)
-  [✓] Cached history (data/history/, 4.2 GiB)
-  [✓] Model checkpoints (checkpoints/, 1.7 GiB)
-  [✓] OAuth refresh token (preserved → re-auth not required)
-
-Free space at destination: 84 GiB ✓
-
-After migration:
-  ( ) Keep the old directory
-  (•) Delete it (asked again at the end)
-  ( ) Leave the choice for later
-
-[Skip migration]  [Migrate now]
-```
-
-### 6.3 Migration semantics
-
-- Migration is **atomic per file** — every file is copied first,
-  then renamed into place; the source is removed only after the
-  target verifies (size + SHA-256).
-- The OAuth refresh token is reused as-is — no need to re-do the
-  browser flow.
-- If migration fails partway, both directories survive; the wizard
-  surfaces "Migration aborted at step X" and lets the user pick
-  "Retry", "Keep both (use the new one going forward)", or
-  "Rollback (use the old one)".
-- If migration succeeds and the user picked "Delete it" with
-  confirmation, the source directory is `rm -rf`'d *after* a
-  second confirmation modal.
-
-### 6.4 Skipping migration
-
-If the user skips, the wizard proceeds with the OS-canonical path
-and the portable directory is left untouched. The main app, on
-startup, surfaces a one-time banner: "A legacy forex-ai directory
-exists at `~/.forex-ai/`. [Migrate now] [Dismiss]".
+**Skip:** the portable directory is left alone; the main app
+surfaces a one-time banner on startup ("Legacy `~/.forex-ai/`
+detected — [Migrate now] [Dismiss]").
 
 ---
 
@@ -702,35 +635,18 @@ unsolicited network calls).
 
 ### 7.2 Optional crash reports
 
-The Summary step (10) includes a row "Crash reports — disabled
-(default)". Clicking `[edit ↑]` opens a final sub-modal:
+The Summary row "Crash reports — disabled (default)" opens a
+disclosure modal listing the two columns "What is sent" (panic
+message, stack trace, OS+version, forex-ai version, sanitised
+paths, hardware tier) and "What is NEVER sent" (OAuth secrets,
+tokens, account IDs, symbols, trading history, model checkpoints,
+API keys). `[Decline]` / `[Opt in]`.
 
-```
-Help improve forex-ai by sending crash reports?
-
-If a panic or unhandled error happens, forex-ai can send a stack
-trace, OS version, and forex-ai version to our crash-reporting
-service (Sentry). No trading data, no broker credentials, no
-account numbers, no model output is ever sent.
-
-What is sent:           What is NEVER sent:
-- Rust panic message    - OAuth client ID / secret
-- Rust stack trace      - OAuth access / refresh tokens
-- OS + version          - cTID trader account ID
-- forex-ai version      - Symbol selections
-- Sanitised file paths  - Trading history
-- Hardware tier (CPU /  - Model checkpoints
-  GPU class only)       - News API keys
-
-[Decline]   [Opt in]
-```
-
-Sentry's own GDPR guidance recommends "obtain opt-in consent for
-Sentry SDKs via your website or app consent banner" (Sentry, *Best
-Practices for GDPR Compliance*, snippet via WebSearch); the
-forex-ai wizard treats this as a hard requirement: the toggle is
-default-off, the disclosure is plain language, and the choice is
-recorded in `wizard_complete.json` as `telemetry_opt_in: bool`.
+Sentry's own GDPR guidance — "obtain opt-in consent for Sentry SDKs
+via your website or app consent banner" (Sentry *Best Practices for
+GDPR Compliance*, snippet via WebSearch) — is enforced as a hard
+default-off. The choice is recorded in `wizard_complete.json` as
+`telemetry_opt_in: bool`.
 
 ### 7.3 PII scrubbing
 
@@ -959,135 +875,92 @@ list, matching `CANONICAL_TIMEFRAMES` from
 These remain open at the time of writing. Each carries an assigned
 owner for follow-up.
 
-### 10.1 Does the wizard require admin rights on Windows for anything beyond install-path selection?
+### 10.1 Windows admin rights?
 
-**Tentative answer: no.** The default install path is
-`%LOCALAPPDATA%\forex-ai\` which is user-writeable. All wizard
-writes (`broker_credentials.toml`, `hardware_profile.json`,
-`config.yaml`, `wizard_complete.json`) are per-user. The autostart
-mechanism in Step 9 uses the per-user shortcut path / `HKCU` —
-neither needs UAC. The only path that triggers UAC is if the user
-manually overrides the install location to `C:\Program Files\` in
-Step 2, which is unusual for a per-user app.
+**No.** Default install path `%LOCALAPPDATA%\forex-ai\` is user-
+writeable; all wizard writes are per-user; autostart uses per-user
+shortcut / `HKCU` — no UAC prompt. Only triggers UAC if the user
+manually overrides Step 2 to `C:\Program Files\`. **Follow-up:**
+confirm `installer_infrastructure_spec` declares the WiX bundle
+`InstallScope="perUser"`.
 
-**Open follow-up:** confirm with `installer_infrastructure_spec`
-that the WiX bundle declares `InstallScope="perUser"`.
+### 10.2 macOS notarization on the wizard binary
 
-### 10.2 macOS notarization for an unsigned first-run-wizard binary
-
-**Answer: notarization is required for distribution, but the
-wizard is internal to the (notarized) `forex-app` binary, so this
-is a single notarization, not two.** Apple's *Notarizing macOS
-software before distribution* page (snippet via WebSearch) says
-"Apple recommends notarizing software even if you plan to
-distribute it from your own website". With the in-app wizard
-architecture chosen in §1.2, the entire binary including the
-wizard is one signed + notarized artefact.
-
-**Open follow-up:** verify the notarization service still accepts
-binaries that bind to loopback ports without an explicit
-entitlement. (As of May 2026, multiple developers report
-notarization rejections — search snippet — but those rejections
-are around entitlement misuse, not loopback binding per se.)
+Notarization is required for distribution; with the in-app wizard
+architecture from §1.2 the wizard is part of the (notarized)
+`forex-app` binary — one artefact, not two. Apple's *Notarizing
+macOS software* (snippet via WebSearch) recommends notarizing
+"even if you plan to distribute it from your own website".
+**Follow-up:** verify Apple still accepts notarization for
+binaries that bind loopback ports without an explicit entitlement
+(notarization rejections rose Feb–May 2026 — search snippet — but
+on entitlement misuse, not loopback binding per se).
 
 ### 10.3 Loopback OAuth on macOS App Sandbox
 
-**Answer: forex-ai is NOT distributed via the Mac App Store, so it
-is not constrained by the App Sandbox.** Distribution via direct
-download + notarization + Gatekeeper allows arbitrary loopback
-binding. If forex-ai is ever pushed to the App Store, the
-`com.apple.security.network.server` entitlement plus a non-Sandbox
-loopback path (LaunchAgent-mediated) would be required — out of
-scope for the current shipping path.
+forex-ai is **not** App-Store-distributed, so the App Sandbox does
+not apply. Direct download + notarization + Gatekeeper allows
+arbitrary loopback binding. If MAS distribution becomes a goal,
+the `com.apple.security.network.server` entitlement + a non-Sandbox
+LaunchAgent path would be required — out of scope.
 
-**Open follow-up:** if Mac App Store distribution becomes a goal,
-revisit this.
+### 10.4 Wizard re-run while forex-app is running
 
-### 10.4 Re-running on a partially-completed install
+If the user invokes `forex-app --wizard` with a live session,
+recommendation: reject with "wizard already running in main app
+instance" (option a in the trade-off). Option (b) — re-use live
+session as a settings editor — risks confusion with the eventual
+Settings panel. **Follow-up:** confirm with `ui_ux_design_spec`.
 
-What if the user opens the wizard via `forex-app --wizard` while
-`forex-app` is already running with a valid OAuth session? Two
-options: (a) reject "wizard already running in main app instance",
-(b) re-use the live session and treat the wizard as a settings
-editor. Recommendation: (a), simpler.
+### 10.5 Symbol-list pagination
 
-**Open follow-up:** confirm with `ui_ux_design_spec` how the
-"Settings" panel and "Wizard" should overlap. There's a real risk
-of redundancy.
+`ProtoOASymbolsListRes` (2115) is documented as a single response;
+no `hasMore`. If the broker silently truncates, Step 5 shows fewer
+symbols than reality. Operator can re-enter Step 5 to retry.
+**Follow-up:** watch `spotware_proto_freshness.md`.
 
-### 10.5 What happens if the broker symbol-list response is paginated and we time out partway?
+### 10.6 FTMO Aggressive preset
 
-Today, `ProtoOASymbolsListRes` (2115) is documented as a single
-response (no `hasMore` field in the local proto). If a broker
-returns a truncated list silently, the symbol picker shows fewer
-symbols than the broker actually offers. The wizard does not
-re-query; the operator can retry from Step 5.
+The mockup mentions an "Aggressive" preset but `prop_firm.rs` only
+exposes `FTMO_STANDARD`. Safe default: hide "Aggressive" until
+the constants exist. **Follow-up:** ask operator whether to add.
 
-**Open follow-up:** monitor `spotware_proto_freshness.md` for any
-upstream change to `ProtoOASymbolsListRes` that adds pagination.
+### 10.7 Token rotation race on re-run
 
-### 10.6 Where does the FTMO Aggressive preset come from?
-
-The preset is mentioned in Step 3's mockup but `prop_firm.rs`
-exposes only `FTMO_STANDARD`. The wizard should either (a) hide
-the "Aggressive" option until the constants exist, or (b) prompt a
-small code patch to add `FTMO_AGGRESSIVE` per FTMO's published
-rules (5 % daily / 10 % overall / 4 % min trading days). The
-operator's directive is silent on FTMO Aggressive, so option (a)
-is the safe default.
-
-**Open follow-up:** ask the operator whether to add the Aggressive
-preset.
-
-### 10.7 Token rotation behaviour during wizard re-run
-
-If the wizard is re-run after the cTrader refresh token has been
-rotated by the background daemon, the wizard's view of the token
-may be stale. Recommendation: the wizard never reads tokens
-directly — it reads only `<data_path>/broker_credentials.toml`,
-which the daemon updates atomically.
-
-**Open follow-up:** confirm `broker_persistence.rs` exposes a
-read-only "current state" API that the wizard can use without
-racing the daemon's writes.
+Recommendation: the wizard reads only
+`<data_path>/broker_credentials.toml`, which the daemon updates
+atomically. **Follow-up:** confirm `broker_persistence.rs` has a
+read-only snapshot API.
 
 ---
 
 ## §11 — Acceptance criteria
 
-For the implementation that follows this spec, the following must
-hold (these are the contract the wizard must satisfy):
+The implementation must satisfy:
 
-1. A user with zero prior knowledge of cTrader Open API can finish
-   the wizard in ≤ 15 minutes and end up with: a valid OAuth
-   refresh token persisted, a default symbol+timeframe set selected,
-   at least 1 month of historical bars for EURUSD M5 on disk, and a
-   hardware profile written.
-2. Skipping every skippable step is permitted; the wizard ends
-   with `state = "completed_with_warnings"` and the main app banners
-   exactly which steps remain.
-3. Re-running the wizard preserves every prior choice (Microsoft
-   UX *Wizards* guideline: "Preserve user selections through
-   navigation").
-4. The wizard never persists OAuth tokens until the OAuth flow has
-   completed (no half-written `broker_credentials.toml`).
-5. The wizard never transmits any value to anyone other than the
-   broker (cTrader) and, if explicitly opted in, the news provider
-   and the crash-reporting service.
-6. The TUI (`forex-cli wizard`) renders all ten steps with a
-   keyboard-only flow per §8.2.
-7. Migration from `~/.forex-ai/` is atomic and reversible until the
-   user confirms deletion of the source.
-8. The H2 timeframe is **never** offered in the timeframe selector,
-   regardless of any client-side defaults or saved presets — per
-   operator directive `temporal.rs:17–24`.
-9. The 4 % minimum monthly profit target is enforced by the
-   wizard's input validator — values below 4 % cannot be entered
-   per operator directive `prop_firm.rs:36`.
-10. No synthetic / fabricated fallback data is ever shown to the
-    user. If a broker call fails, the failure is surfaced; the
-    wizard does not invent a symbol list, account list, or
-    historical bars.
+1. A zero-prior-knowledge user finishes the wizard in ≤ 15 min and
+   ends with: OAuth refresh token persisted, default
+   symbol+timeframe set selected, ≥ 1 month EURUSD M5 history on
+   disk, hardware profile written.
+2. All non-License steps are skippable; on skip,
+   `state="completed_with_warnings"` and the main app banners
+   remaining work.
+3. Re-running preserves every prior choice (Microsoft UX wizards
+   guideline).
+4. OAuth tokens are persisted only after the flow completes — no
+   half-written `broker_credentials.toml`.
+5. The wizard never transmits any value outside the broker and (if
+   opt-in) the news provider and crash-reporting service.
+6. The TUI (`forex-cli wizard`) renders all ten steps with
+   keyboard-only navigation (§8.2).
+7. Migration from `~/.forex-ai/` is atomic and reversible until
+   source deletion is confirmed.
+8. H2 is **never** offered in the timeframe selector
+   (`temporal.rs:17–24`).
+9. The 4 % monthly profit floor cannot be reduced
+   (`prop_firm.rs:36`).
+10. No synthetic / fabricated fallback data is ever shown. Failed
+    broker calls surface as failures.
 
 ---
 
@@ -1118,23 +991,16 @@ spec:
 
 ## §13 — Methodology
 
-- All operator-policy values quoted from local source files were
-  read directly from the working copy at `/home/user/forex-ai/`.
-- All external UX guidance quotes are attributed inline to their
-  source URL; where the URL returned HTTP 403 to the sandbox's
-  WebFetch tool, "snippet via WebSearch" is noted and the WebSearch
-  result excerpt is the source of the quote.
-- cTrader payload type IDs and message names come from the audit's
-  internal canonical reference,
-  `docs/audits/research/ctrader_api_full_reference.md`, which was
-  itself built from the vendored `.proto` files at
-  `crates/forex-app/proto/`.
-- The H2 prohibition and 4 % monthly profit floor are taken from
-  the canonical-source files (`temporal.rs`, `prop_firm.rs`) where
-  the operator directives are recorded as code comments dated
-  2026-05-14.
-- No code was changed in producing this spec. The deliverable is
-  research only.
+- Operator-policy values read directly from working copy at
+  `/home/user/forex-ai/`.
+- External UX guidance attributed inline; "snippet via WebSearch"
+  indicates WebFetch 403 with WebSearch excerpt used.
+- cTrader payload IDs / names taken from
+  `docs/audits/research/ctrader_api_full_reference.md`, itself
+  built from vendored `.proto` at `crates/forex-app/proto/`.
+- H2 prohibition + 4 % floor are operator directives recorded at
+  `temporal.rs:17–24` and `prop_firm.rs:36` (both 2026-05-14).
+- No code changed — research only.
 
 ---
 
