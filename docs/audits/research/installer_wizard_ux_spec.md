@@ -1003,28 +1003,7 @@ the copy-paste flow is RFC-compliant.
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 9.2 Step 2 — Path selection
-
-```
-┌─ Step 2 / 10 · Path selection ─────────────────────────────┐
-│  Where should forex-ai store user data?                    │
-│                                                             │
-│  Binary location (set by installer)                         │
-│  /usr/local/bin/forex-app                       [read-only] │
-│                                                             │
-│  Data directory                                             │
-│  ~/.local/share/forex-ai/                       [Browse…]   │
-│  Free space: 84.2 GiB ✓                                     │
-│                                                             │
-│  ⓘ  Defaults to your OS's standard application data        │
-│     directory. Override if you want history and             │
-│     checkpoints on a different volume.                      │
-│                                                             │
-│  [← Back]              [Skip]              [Continue →]     │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 9.3 Step 4.2 — Sign in with cTID
+### 9.2 Step 4.2 — Sign in with cTID
 
 ```
 ┌─ Step 4.2 / 10 · cTrader sign-in ──────────────────────────┐
@@ -1047,7 +1026,7 @@ the copy-paste flow is RFC-compliant.
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 9.4 Step 5 — Symbol & timeframe defaults
+### 9.3 Step 5 — Symbol & timeframe defaults
 
 ```
 ┌─ Step 5 / 10 · Symbols & timeframes ───────────────────────┐
@@ -1078,7 +1057,7 @@ the copy-paste flow is RFC-compliant.
 list, matching `CANONICAL_TIMEFRAMES` from
 `crates/forex-core/src/contracts/temporal.rs:25`.)
 
-### 9.5 Step 6 — Historical data download
+### 9.4 Step 6 — Historical data download
 
 ```
 ┌─ Step 6 / 10 · Historical data ────────────────────────────┐
@@ -1102,31 +1081,7 @@ list, matching `CANONICAL_TIMEFRAMES` from
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 9.6 Step 7 — Hardware compatibility probe
-
-```
-┌─ Step 7 / 10 · Hardware probe ─────────────────────────────┐
-│  Detected hardware:                                         │
-│                                                             │
-│  ┌─ CPU ────────────────────────────────────────────────┐  │
-│  │ Intel(R) Core(TM) i7-13700K   · 16 cores             │  │
-│  │ RAM 31.2 / 32.0 GiB available                        │  │
-│  │ Backend: NdArray (CPU)  — always available           │  │
-│  └──────────────────────────────────────────────────────┘  │
-│  ┌─ GPU 0 (NVIDIA) ─────────────────────────────────────┐  │
-│  │ GeForce RTX 4070 Ti   · 12 GiB VRAM                  │  │
-│  │ Compute capability 8.9 → FP32, FP16, BF16, FP8       │  │
-│  │ Backends:  CUDA ✓   Vulkan (wgpu) ✓                  │  │
-│  │ ┌─[Recommended: CUDA] [Vulkan] [CPU only]──────────┐ │  │
-│  │ │              ●                                    │ │  │
-│  │ └───────────────────────────────────────────────────┘ │  │
-│  └──────────────────────────────────────────────────────┘  │
-│                                                             │
-│  [← Back]              [Skip]              [Continue →]     │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 9.7 Step 10 — Summary & Apply
+### 9.5 Step 10 — Summary & Apply
 
 ```
 ┌─ Step 10 / 10 · Review & Apply ────────────────────────────┐
@@ -1334,54 +1289,7 @@ spec:
 
 ---
 
-## §14 — Sources cited
-
-Every external citation in the body of this document, gathered here
-for audit:
-
-- Nielsen Norman Group, *Wizards: Definition and Design
-  Recommendations* — <https://www.nngroup.com/articles/wizards/>
-- Nielsen Norman Group, *Progressive Disclosure* —
-  <https://www.nngroup.com/articles/progressive-disclosure/>
-- Nielsen Norman Group, *8 Design Guidelines for Complex
-  Applications* —
-  <https://www.nngroup.com/articles/complex-application-design/>
-- Microsoft Learn, *UX checklist for desktop applications* —
-  <https://learn.microsoft.com/en-us/windows/win32/uxguide/top-violations>
-- Microsoft Learn, *Wizards (Win32 UX)* —
-  <https://learn.microsoft.com/en-us/windows/win32/uxguide/win-wizards>
-- IETF RFC 8252, *OAuth 2.0 for Native Apps* —
-  <https://datatracker.ietf.org/doc/html/rfc8252>
-- freedesktop.org, *Desktop Application Autostart Specification* —
-  <https://specifications.freedesktop.org/autostart-spec/autostart-spec-latest.html>
-- freedesktop.org, *XDG Base Directory Specification* —
-  <https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html>
-- Apple Developer Documentation, *Distribution XML Reference* —
-  <https://developer.apple.com/library/archive/documentation/DeveloperTools/Reference/DistributionDefinitionRef/Chapters/Distribution_XML_Ref.html>
-- Apple Developer Documentation, *Packaging Mac software for
-  distribution* —
-  <https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution>
-- Apple Developer Documentation, *Notarizing macOS software before
-  distribution* —
-  <https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution>
-- FireGiant Docs, *WixUI dialog library* —
-  <https://docs.firegiant.com/wix/tools/wixext/wixui/>
-- Sentry, *Best Practices for GDPR Compliance with Sentry* —
-  <https://sentry.io/trust/privacy/gdpr-best-practices/>
-- Sentry Docs, *Data Privacy for Mobile* —
-  <https://docs.sentry.io/security-legal-pii/security/mobile-privacy/>
-- Lollypop Design, *Best Practices for High-Conversion Wizard UI
-  Design & Examples* —
-  <https://lollypop.design/blog/2026/january/wizard-ui-design/>
-- Andrew Coyle, *How to Design a Form Wizard* —
-  <https://www.andrewcoyle.com/blog/how-to-design-a-form-wizard>
-- Eleken, *Wizard UI Pattern: When to Use It and How to Get It
-  Right* —
-  <https://www.eleken.co/blog-posts/wizard-ui-pattern-explained>
-- Krystal Higgins, *The design of setup wizards* —
-  <https://www.kryshiggins.com/the-design-of-setup-wizards/>
-- UXPin Studio Blog, *Progress Tracker Design: UX Best Practices,
-  Examples & Tips (2026)* —
-  <https://www.uxpin.com/studio/blog/design-progress-trackers/>
-
 — END —
+
+(External citations are enumerated in §0; internal identifiers in
+§12. No separate "sources cited" appendix is repeated here.)
