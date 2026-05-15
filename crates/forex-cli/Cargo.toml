@@ -23,6 +23,11 @@ anyhow = "1.0"
 chrono = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# `tracing` is consumed at every error-path in main.rs / tui/* for
+# structured logging (warn!/debug!). Pre-existing usage; the dep
+# line was inadvertently dropped during an earlier refactor and
+# v0.4.5 needs it for `cargo check` to pass.
+tracing = "0.1"
 # Interactive TUI — used by `forex-cli` when invoked with no args.
 # `crossterm` is the cross-platform terminal backend; `ratatui` is the
 # rendering library. Together they give us Bloomberg-style fixed
