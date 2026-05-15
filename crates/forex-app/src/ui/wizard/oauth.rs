@@ -2,17 +2,41 @@
 //!
 //! Spec: `installer_wizard_ux_spec.md` §2 Step 4 + §9.2 mockup.
 //!
-//! This step DOES NOT perform a live broker round-trip — the actual
-//! flow is driven by `ProductionCTraderLiveAuthBackend` in
-//! `crates/forex-app/src/app_services/ctrader_live_auth.rs`. The
-//! wizard's responsibility here is the UI plumbing + the CSRF
-//! state-machine handoff. Spec §11 acceptance criterion 4:
-//! "OAuth tokens are persisted only after the flow completes —
-//! no half-written `broker_credentials.toml`."
+//! The actual OAuth flow is driven by
+//! [`crate::app_services::ctrader_live_auth::ProductionCTraderLiveAuthBackend`].
+//! This step is responsible for:
+//!
+//! 1. (4.1) Validating that the operator typed plausibly-shaped
+//!    `client_id` + `client_secret` values.
+//! 2. (4.2) Spawning the background thread that runs the loopback
+//!    listener, opens the system browser, captures the callback with
+//!    CSRF-state validation, and exchanges the authorization code for
+//!    a token bundle.
+//! 3. (4.3) Issuing `ProtoOAGetAccountListByAccessTokenReq` (payload
+//!    2149) against the picked environment (live vs demo from the
+//!    radio at the top of the step) and rendering the returned
+//!    accounts as a dropdown.
+//! 4. (4.4) Recording the picked `ctidTraderAccountId` on
+//!    `WizardConfig`. Spec §11 acceptance criterion 4: "OAuth tokens
+//!    are persisted only after the flow completes — no half-written
+//!    `broker_credentials.toml`." The Step 10 Apply writer is what
+//!    actually serialises the credential file; the wizard just hands
+//!    it the in-memory `SecretString`s collected here.
 
 use eframe::egui;
+use secrecy::{ExposeSecret, SecretString};
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Mutex, OnceLock};
 
+use super::state::WizardError;
 use super::{CTraderEnvironment, StepResult, WizardController};
+use crate::app_services::ctrader_auth::CTraderDiscoveredAccount;
+use crate::app_services::ctrader_live_auth::{
+    CTRADER_DEFAULT_SCOPE, CTraderAccountDiscoveryRequest, CTraderAccountDiscoveryResult,
+    CTraderEnvironment as AuthCTraderEnvironment, CTraderLiveAuthBackend, CTraderLiveAuthRequest,
+    CTraderLiveAuthResult, CTraderLoopbackConfig, ProductionCTraderLiveAuthBackend,
+    discover_ctrader_accounts,
+};
 use crate::ui::theme;
 
 /// Spec §2 Step 4.2 — loopback port allocator. RFC 8252 §7.3 fallback
@@ -24,28 +48,220 @@ pub const WIZARD_DEFAULT_OAUTH_LOOPBACK_PORTS: &[u16] = &[7777, 7878, 8989];
 /// `CTRADER_CALLBACK_TIMEOUT` at `ctrader_live_auth.rs:24`).
 pub const WIZARD_DEFAULT_OAUTH_CALLBACK_TIMEOUT_SECONDS: u64 = 300;
 
+/// Loopback callback path. Must match the redirect URI registered in
+/// the operator's cTrader Open API app (spec §2 Step 4.1 mockup).
+pub const WIZARD_DEFAULT_OAUTH_CALLBACK_PATH: &str = "/ctrader/callback";
+
+/// Minimum plausible client_id length. cTrader app credentials are
+/// numeric IDs typically ≥ 5 digits — see the help-centre example
+/// `client_id=5430012` in `ctrader_api_full_reference.md` §2.3. Any
+/// shorter value would surface as broker error 101 / 107 at exchange
+/// time; we reject up-front for a cleaner UX.
+pub const WIZARD_DEFAULT_OAUTH_CLIENT_ID_MIN_LEN: usize = 4;
+
+/// Minimum plausible client_secret length. The help-centre example
+/// is `012sds23dlkjQsd` (15 chars). 8 is a safe floor that still
+/// catches an empty paste.
+pub const WIZARD_DEFAULT_OAUTH_CLIENT_SECRET_MIN_LEN: usize = 8;
+
 /// Sub-step within the OAuth screen. The wizard re-renders the same
 /// step until the user clicks "Continue" — the sub-step is internal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OAuthSubStep {
     /// 4.1 Register app — credentials text fields.
     RegisterApp,
-    /// 4.2 Sign in with cTID — browser handoff.
+    /// 4.2 Sign in with cTID — browser handoff in progress.
     SignIn,
-    /// 4.3 Account picker.
+    /// 4.3 Account picker — token bundle obtained, fetching accounts.
     PickAccount,
-    /// 4.4 Per-account auth probe.
+    /// 4.4 Per-account auth probe — account picked, ready to continue.
     AuthProbe,
+}
+
+/// Wizard-local sub-step state. Held in a process-global `OnceLock`
+/// because egui re-renders this step on every frame and the running
+/// background thread's `Receiver` cannot be re-created across frames.
+///
+/// Cleared on a fresh wizard run via [`reset_oauth_runtime`]. Tests
+/// reach the inner state via [`oauth_runtime_for_tests`].
+#[derive(Default)]
+struct OAuthRuntime {
+    sub_step: OAuthSubStep,
+    /// Held-in-memory client secret. Never lands on `WizardConfig`'s
+    /// `Debug` output. The Step 10 Apply writer reads this via
+    /// [`expose_client_secret`] and persists via `SecretString`.
+    client_secret: Option<SecretString>,
+    /// Held-in-memory access token from the OAuth exchange.
+    access_token: Option<SecretString>,
+    /// Held-in-memory refresh token from the OAuth exchange.
+    refresh_token: Option<SecretString>,
+    /// Receiver for the spawned auth worker.
+    auth_rx: Option<Receiver<Result<CTraderLiveAuthResult, String>>>,
+    /// Receiver for the spawned account-discovery worker.
+    accounts_rx: Option<Receiver<Result<CTraderAccountDiscoveryResult, String>>>,
+    /// Most-recent account list (populated on success).
+    accounts: Vec<CTraderDiscoveredAccount>,
+    /// Last error surfaced verbatim per spec §3 rule 1.
+    last_error: Option<String>,
+}
+
+impl Default for OAuthSubStep {
+    fn default() -> Self {
+        OAuthSubStep::RegisterApp
+    }
+}
+
+fn runtime_mutex() -> &'static Mutex<OAuthRuntime> {
+    static RUNTIME: OnceLock<Mutex<OAuthRuntime>> = OnceLock::new();
+    RUNTIME.get_or_init(|| Mutex::new(OAuthRuntime::default()))
+}
+
+/// Read-only access for the Apply step (Step 10). Mirrors
+/// `NewsApiKeyHolder::expose` in `news_api.rs`: the secret never lands
+/// on `WizardConfig`'s `Debug` output. Returns `None` if the operator
+/// hasn't typed a secret yet.
+pub fn expose_client_secret() -> Option<String> {
+    let runtime = runtime_mutex().lock().ok()?;
+    runtime
+        .client_secret
+        .as_ref()
+        .map(|s| s.expose_secret().to_string())
+}
+
+/// Read-only access to the access token for the Apply step.
+pub fn expose_access_token() -> Option<String> {
+    let runtime = runtime_mutex().lock().ok()?;
+    runtime
+        .access_token
+        .as_ref()
+        .map(|s| s.expose_secret().to_string())
+}
+
+/// Read-only access to the refresh token for the Apply step.
+pub fn expose_refresh_token() -> Option<String> {
+    let runtime = runtime_mutex().lock().ok()?;
+    runtime
+        .refresh_token
+        .as_ref()
+        .map(|s| s.expose_secret().to_string())
+}
+
+/// Clear the process-global runtime — call when starting a fresh
+/// wizard run (e.g. from `Settings → Wizard`).
+pub fn reset_oauth_runtime() {
+    if let Ok(mut runtime) = runtime_mutex().lock() {
+        *runtime = OAuthRuntime::default();
+    }
+}
+
+/// Translate the wizard's `CTraderEnvironment` to the auth-module
+/// equivalent. The wizard enum is part of `mod.rs` so the persisted
+/// `WizardConfig` schema does not depend on the app_services crate
+/// path; we map at the IO boundary.
+fn map_environment(env: CTraderEnvironment) -> AuthCTraderEnvironment {
+    match env {
+        CTraderEnvironment::Live => AuthCTraderEnvironment::Live,
+        CTraderEnvironment::Demo => AuthCTraderEnvironment::Demo,
+    }
+}
+
+/// Validate the client_id field shape (4.1 sub-state). Returns the
+/// trimmed value on success or a human-readable error.
+pub fn validate_client_id(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("Client ID is required".to_string());
+    }
+    if trimmed.len() < WIZARD_DEFAULT_OAUTH_CLIENT_ID_MIN_LEN {
+        return Err(format!(
+            "Client ID is too short (minimum {} characters)",
+            WIZARD_DEFAULT_OAUTH_CLIENT_ID_MIN_LEN
+        ));
+    }
+    if !trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(
+            "Client ID must contain only alphanumeric, '-' or '_' characters".to_string(),
+        );
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validate the client_secret field shape (4.1 sub-state). Returns the
+/// trimmed value on success or a human-readable error.
+pub fn validate_client_secret(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("Client Secret is required".to_string());
+    }
+    if trimmed.len() < WIZARD_DEFAULT_OAUTH_CLIENT_SECRET_MIN_LEN {
+        return Err(format!(
+            "Client Secret is too short (minimum {} characters)",
+            WIZARD_DEFAULT_OAUTH_CLIENT_SECRET_MIN_LEN
+        ));
+    }
+    // Allow any printable ASCII — Spotware does not document a strict
+    // charset and the example secret `012sds23dlkjQsd` mixes letters
+    // and digits with no separators.
+    if trimmed.bytes().any(|b| !(0x21..=0x7E).contains(&b)) {
+        return Err(
+            "Client Secret must contain only printable ASCII characters".to_string(),
+        );
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Spawn the OAuth-flow background thread. The wizard thread retains
+/// the `Receiver`; the worker drives the production backend and sends
+/// the result back. Returns the configured `Receiver` so the caller
+/// stores it on the runtime.
+fn spawn_oauth_worker(
+    backend: ProductionCTraderLiveAuthBackend,
+    request: CTraderLiveAuthRequest,
+) -> Receiver<Result<CTraderLiveAuthResult, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("wizard-oauth-worker".to_string())
+        .spawn(move || {
+            let result = backend.run(request).map_err(|err| err.to_string());
+            let _ = tx.send(result);
+        })
+        .expect("spawn wizard-oauth-worker");
+    rx
+}
+
+/// Spawn the account-discovery background thread. Issued only after
+/// the OAuth flow returns a token bundle.
+fn spawn_account_discovery_worker(
+    request: CTraderAccountDiscoveryRequest,
+) -> Receiver<Result<CTraderAccountDiscoveryResult, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("wizard-oauth-accounts-worker".to_string())
+        .spawn(move || {
+            let result = discover_ctrader_accounts(&request).map_err(|err| err.to_string());
+            let _ = tx.send(result);
+        })
+        .expect("spawn wizard-oauth-accounts-worker");
+    rx
 }
 
 pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResult {
     let mut result = StepResult::StayHere;
+    let mut runtime = runtime_mutex()
+        .lock()
+        .expect("wizard OAuth runtime mutex poisoned");
+
+    // Poll background workers. Both pollers replace the receiver with
+    // `None` after success/failure so the next frame doesn't re-fire.
+    poll_auth_worker(&mut runtime, controller);
+    poll_account_discovery_worker(&mut runtime, controller);
 
     // Live/Demo mode banner — competitive analysis §1.1 (TradingView
     // colour-codes live vs paper at login). The wizard tints the
-    // surrounding label accordingly. The actual modal-background tint
-    // is `// TODO(wizard-mode-banner)` for now; the badge surfaces
-    // the colour signal.
+    // surrounding label accordingly.
     let env_color = match controller.config.ctrader_environment {
         CTraderEnvironment::Live => theme::DANGER,
         CTraderEnvironment::Demo => theme::TEXT_MUTED,
@@ -92,43 +308,79 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
         .size(theme::FONT_CAPTION),
     );
 
+    // ─── 4.1 inline validators ────────────────────────────────────
     let mut client_id = controller.config.ctrader_client_id.clone().unwrap_or_default();
+    let mut client_id_error: Option<String> = None;
     ui.horizontal(|ui| {
         ui.label("Client ID:");
         if ui
             .add(egui::TextEdit::singleline(&mut client_id).desired_width(320.0))
             .changed()
         {
-            controller.config.ctrader_client_id = if client_id.trim().is_empty() {
-                None
-            } else {
-                Some(client_id.clone())
-            };
+            match validate_client_id(&client_id) {
+                Ok(trimmed) => {
+                    controller.config.ctrader_client_id = Some(trimmed);
+                }
+                Err(err) => {
+                    client_id_error = Some(err);
+                    controller.config.ctrader_client_id = if client_id.trim().is_empty() {
+                        None
+                    } else {
+                        Some(client_id.clone())
+                    };
+                }
+            }
         }
     });
+    if let Some(err) = client_id_error {
+        ui.label(
+            egui::RichText::new(err)
+                .color(theme::DANGER)
+                .size(theme::FONT_CAPTION),
+        );
+    }
 
-    // We do NOT persist the actual client secret on the controller —
-    // only a boolean "user filled it in". The real secret would be
-    // wrapped via `secrecy::SecretString` once Step 10 Apply fires.
-    // Spec §11 #4 — no half-written secrets.
-    let mut secret_placeholder = if controller.config.ctrader_client_secret_set {
+    // Track the actual secret in the runtime, not on `WizardConfig`.
+    let mut secret_input = if runtime.client_secret.is_some() {
         "•••••••••".to_string()
     } else {
         String::new()
     };
+    let mut client_secret_error: Option<String> = None;
     ui.horizontal(|ui| {
         ui.label("Client Secret:");
         let response = ui.add(
-            egui::TextEdit::singleline(&mut secret_placeholder)
+            egui::TextEdit::singleline(&mut secret_input)
                 .password(true)
                 .desired_width(320.0),
         );
         if response.changed() {
-            controller.config.ctrader_client_secret_set =
-                !secret_placeholder.trim().is_empty();
+            if secret_input.trim().is_empty() {
+                runtime.client_secret = None;
+                controller.config.ctrader_client_secret_set = false;
+            } else if !secret_input.chars().all(|c| c == '•') {
+                match validate_client_secret(&secret_input) {
+                    Ok(trimmed) => {
+                        runtime.client_secret = Some(SecretString::from(trimmed));
+                        controller.config.ctrader_client_secret_set = true;
+                    }
+                    Err(err) => {
+                        client_secret_error = Some(err);
+                        controller.config.ctrader_client_secret_set = false;
+                    }
+                }
+            }
         }
     });
+    if let Some(err) = client_secret_error {
+        ui.label(
+            egui::RichText::new(err)
+                .color(theme::DANGER)
+                .size(theme::FONT_CAPTION),
+        );
+    }
 
+    // ─── 4.2 Sign in with cTID ────────────────────────────────────
     ui.separator();
     ui.label(
         egui::RichText::new("4.2 Sign in with cTID")
@@ -145,22 +397,78 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
         .size(theme::FONT_CAPTION),
     );
 
-    if ui.button("Sign in with cTID").clicked() {
-        // TODO(wizard-oauth-runtime): wire this button to
-        // `ProductionCTraderLiveAuthBackend::authorize` and update
-        // `controller.config.selected_ctid_trader_account_id` on
-        // success. The state-machine plumbing (request / response /
-        // CSRF mismatch surface) lives in the controller; this button
-        // is a hook point.
+    let auth_in_flight = runtime.auth_rx.is_some();
+    let accounts_in_flight = runtime.accounts_rx.is_some();
+    let can_start_oauth = controller.config.ctrader_client_id.is_some()
+        && runtime.client_secret.is_some()
+        && !auth_in_flight
+        && !accounts_in_flight;
+    ui.horizontal(|ui| {
+        let label = if auth_in_flight {
+            "Waiting for browser callback…"
+        } else {
+            "Sign in with cTID"
+        };
+        let response = ui.add_enabled(can_start_oauth, egui::Button::new(label));
+        if response.clicked() && can_start_oauth {
+            start_oauth_flow(&mut runtime, controller);
+        }
+    });
+
+    if runtime.access_token.is_some() {
+        ui.label(
+            egui::RichText::new(
+                "Token bundle received — held in memory as SecretString until Apply.",
+            )
+            .color(theme::TEXT_PRIMARY)
+            .size(theme::FONT_CAPTION),
+        );
     }
 
+    // ─── 4.3 / 4.4 Account picker + auth probe ─────────────────────
     ui.separator();
     ui.label(
         egui::RichText::new("4.3 / 4.4 Account picker + auth probe")
             .strong()
             .color(theme::TEXT_PRIMARY),
     );
-    if let Some(account_id) = controller.config.selected_ctid_trader_account_id {
+    if accounts_in_flight {
+        ui.label(
+            egui::RichText::new("Fetching account list from broker…")
+                .color(theme::TEXT_MUTED)
+                .size(theme::FONT_CAPTION),
+        );
+    } else if !runtime.accounts.is_empty() {
+        let current = controller
+            .config
+            .selected_ctid_trader_account_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "(none)".to_string());
+        egui::ComboBox::from_id_salt("wizard_ctrader_account_picker")
+            .selected_text(current.clone())
+            .show_ui(ui, |ui| {
+                for account in &runtime.accounts {
+                    let label = format!(
+                        "#{} {} ({})",
+                        account.account_id,
+                        account.account_name,
+                        if account.is_live.unwrap_or(false) {
+                            "live"
+                        } else {
+                            "demo"
+                        }
+                    );
+                    let parsed = account.account_id.parse::<u64>().ok();
+                    let mut current_id = controller.config.selected_ctid_trader_account_id;
+                    if ui
+                        .selectable_value(&mut current_id, parsed, label)
+                        .clicked()
+                    {
+                        controller.config.selected_ctid_trader_account_id = current_id;
+                    }
+                }
+            });
+    } else if let Some(account_id) = controller.config.selected_ctid_trader_account_id {
         ui.label(format!(
             "Primary account: #{} ({})",
             account_id,
@@ -170,6 +478,15 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
         ui.label(
             egui::RichText::new("No account picked yet. Complete 4.2 to populate this list.")
                 .color(theme::TEXT_MUTED)
+                .size(theme::FONT_CAPTION),
+        );
+    }
+
+    if let Some(err) = runtime.last_error.as_ref() {
+        ui.separator();
+        ui.label(
+            egui::RichText::new(format!("OAuth error: {}", err))
+                .color(theme::DANGER)
                 .size(theme::FONT_CAPTION),
         );
     }
@@ -187,12 +504,244 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
         }
     });
 
+    // egui re-renders this step on a timer — request a repaint while
+    // background workers are running so the user sees status changes
+    // without having to nudge the mouse.
+    if auth_in_flight || accounts_in_flight {
+        ui.ctx().request_repaint();
+    }
+
     result
+}
+
+/// Issue the OAuth `run()` call on a worker thread. The wizard thread
+/// keeps the rx half on the runtime; `poll_auth_worker` consumes it.
+fn start_oauth_flow(runtime: &mut OAuthRuntime, controller: &mut WizardController) {
+    runtime.last_error = None;
+    runtime.sub_step = OAuthSubStep::SignIn;
+    let client_id = match controller.config.ctrader_client_id.as_ref() {
+        Some(id) => id.clone(),
+        None => {
+            runtime.last_error = Some("Client ID is required before signing in".to_string());
+            return;
+        }
+    };
+    let client_secret = match runtime.client_secret.as_ref() {
+        Some(secret) => secret.expose_secret().to_string(),
+        None => {
+            runtime.last_error =
+                Some("Client Secret is required before signing in".to_string());
+            return;
+        }
+    };
+    // Pick the first port out of the spec'd port list. The
+    // production backend tries each in order via
+    // `bind_loopback_listener`.
+    let primary_port = *WIZARD_DEFAULT_OAUTH_LOOPBACK_PORTS
+        .first()
+        .expect("WIZARD_DEFAULT_OAUTH_LOOPBACK_PORTS is non-empty");
+    let fallback_ports: Vec<u16> = WIZARD_DEFAULT_OAUTH_LOOPBACK_PORTS
+        .iter()
+        .skip(1)
+        .copied()
+        .collect();
+    let loopback = CTraderLoopbackConfig::new(
+        primary_port,
+        fallback_ports,
+        WIZARD_DEFAULT_OAUTH_CALLBACK_PATH,
+    );
+    let redirect_uri = format!(
+        "http://127.0.0.1:{}{}",
+        primary_port, WIZARD_DEFAULT_OAUTH_CALLBACK_PATH
+    );
+    let request = CTraderLiveAuthRequest {
+        client_id,
+        client_secret,
+        redirect_uri,
+        scope: CTRADER_DEFAULT_SCOPE.to_string(),
+        loopback,
+    };
+    let rx = spawn_oauth_worker(ProductionCTraderLiveAuthBackend, request);
+    runtime.auth_rx = Some(rx);
+    tracing::info!(
+        target: "forex_app::wizard::oauth",
+        "wizard OAuth flow spawned"
+    );
+}
+
+/// Poll the OAuth-flow worker. On success, store the token bundle and
+/// kick off the account-discovery worker. On failure, surface verbatim.
+fn poll_auth_worker(runtime: &mut OAuthRuntime, controller: &mut WizardController) {
+    let outcome = {
+        let Some(rx) = runtime.auth_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                runtime.auth_rx = None;
+                runtime.last_error =
+                    Some("OAuth worker thread disconnected before returning a result".to_string());
+                controller.last_error = Some(WizardError::OAuthTokenExchange(
+                    "worker disconnected".to_string(),
+                ));
+                return;
+            }
+        }
+    };
+    runtime.auth_rx = None;
+
+    match outcome {
+        Ok(result) => {
+            tracing::info!(
+                target: "forex_app::wizard::oauth",
+                callback_port = result.callback_port,
+                "wizard OAuth flow returned token bundle"
+            );
+            runtime.access_token = Some(SecretString::from(result.token_bundle.access_token.clone()));
+            runtime.refresh_token =
+                Some(SecretString::from(result.token_bundle.refresh_token.clone()));
+            runtime.sub_step = OAuthSubStep::PickAccount;
+            // Kick off account discovery immediately. The wizard's
+            // chosen Demo/Live radio decides the endpoint host.
+            let Some(client_id) = controller.config.ctrader_client_id.clone() else {
+                runtime.last_error =
+                    Some("Client ID disappeared from WizardConfig after OAuth".to_string());
+                return;
+            };
+            let Some(client_secret) = runtime
+                .client_secret
+                .as_ref()
+                .map(|s| s.expose_secret().to_string())
+            else {
+                runtime.last_error =
+                    Some("Client Secret disappeared from runtime after OAuth".to_string());
+                return;
+            };
+            let request = CTraderAccountDiscoveryRequest {
+                client_id,
+                client_secret,
+                access_token: result.token_bundle.access_token,
+                environment: map_environment(controller.config.ctrader_environment),
+            };
+            runtime.accounts_rx = Some(spawn_account_discovery_worker(request));
+        }
+        Err(err) => {
+            tracing::error!(
+                target: "forex_app::wizard::oauth",
+                error = %err,
+                "wizard OAuth flow failed"
+            );
+            // Categorise on substring — the production backend's
+            // anyhow chains include the step labels (e.g.
+            // "step 4/5 (wait_for_callback)" / "callback `state` did
+            // not match").
+            controller.last_error = Some(classify_oauth_failure(&err));
+            runtime.last_error = Some(err);
+        }
+    }
+}
+
+/// Map an `anyhow` string into a typed `WizardError` so the spec §3
+/// error matrix can surface the right banner copy.
+pub fn classify_oauth_failure(err: &str) -> WizardError {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("bind") && lower.contains("port") {
+        WizardError::OAuthLoopbackBindFailed {
+            tried_ports: WIZARD_DEFAULT_OAUTH_LOOPBACK_PORTS.to_vec(),
+        }
+    } else if lower.contains("timed out") && lower.contains("callback") {
+        WizardError::OAuthCallbackTimeout
+    } else if lower.contains("state") && (lower.contains("mismatch") || lower.contains("csrf")) {
+        WizardError::OAuthCsrfMismatch
+    } else if lower.contains("token") {
+        WizardError::OAuthTokenExchange(err.to_string())
+    } else {
+        WizardError::Other(err.to_string())
+    }
+}
+
+/// Poll the account-discovery worker. On success, populate the
+/// account picker; if there's exactly one account, auto-select it
+/// (spec §2 Step 4.3 mockup).
+fn poll_account_discovery_worker(
+    runtime: &mut OAuthRuntime,
+    controller: &mut WizardController,
+) {
+    let outcome = {
+        let Some(rx) = runtime.accounts_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                runtime.accounts_rx = None;
+                runtime.last_error = Some(
+                    "Account-discovery worker disconnected before returning a result".to_string(),
+                );
+                return;
+            }
+        }
+    };
+    runtime.accounts_rx = None;
+
+    match outcome {
+        Ok(result) => {
+            tracing::info!(
+                target: "forex_app::wizard::oauth",
+                account_count = result.accounts.len(),
+                "wizard account discovery returned account list"
+            );
+            // The discovery call may rotate the access token — keep
+            // the in-memory copy in sync so Apply persists the right
+            // value (Step 10).
+            runtime.access_token = Some(SecretString::from(result.access_token));
+            // If exactly one account was returned and the operator
+            // hasn't already picked, auto-select it. Spec §2 Step 4.3
+            // "auto-select if only one account".
+            if result.accounts.len() == 1
+                && controller.config.selected_ctid_trader_account_id.is_none()
+            {
+                if let Ok(id) = result.accounts[0].account_id.parse::<u64>() {
+                    controller.config.selected_ctid_trader_account_id = Some(id);
+                    runtime.sub_step = OAuthSubStep::AuthProbe;
+                }
+            }
+            runtime.accounts = result.accounts;
+            if runtime.accounts.is_empty() {
+                runtime.last_error = Some(
+                    "Your cTID has no trading accounts — open a demo at ctrader.com.".to_string(),
+                );
+            }
+        }
+        Err(err) => {
+            tracing::error!(
+                target: "forex_app::wizard::oauth",
+                error = %err,
+                "wizard account discovery failed"
+            );
+            runtime.last_error = Some(err);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn force_runtime_state_for_tests(
+    sub_step: OAuthSubStep,
+    accounts: Vec<CTraderDiscoveredAccount>,
+) {
+    if let Ok(mut runtime) = runtime_mutex().lock() {
+        runtime.sub_step = sub_step;
+        runtime.accounts = accounts;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_services::ctrader_live_auth::parse_callback_request_with_state;
     use crate::ui::wizard::{StepResult, WizardController, WizardState};
 
     #[test]
@@ -228,5 +777,132 @@ mod tests {
         c.current = WizardState::OAuth;
         c.apply(StepResult::BackRequested);
         assert_eq!(c.current, WizardState::AccountProfile);
+    }
+
+    #[test]
+    fn validate_client_id_rejects_empty() {
+        assert!(validate_client_id("").is_err());
+        assert!(validate_client_id("   ").is_err());
+    }
+
+    #[test]
+    fn validate_client_id_rejects_short() {
+        assert!(validate_client_id("ab").is_err());
+    }
+
+    #[test]
+    fn validate_client_id_rejects_non_alphanumeric() {
+        assert!(validate_client_id("abc def").is_err());
+        assert!(validate_client_id("abcd!").is_err());
+    }
+
+    #[test]
+    fn validate_client_id_accepts_real_shape() {
+        // Spotware example from `ctrader_api_full_reference.md` §2.3:
+        // client_id=5430012
+        assert_eq!(
+            validate_client_id("5430012").unwrap(),
+            "5430012".to_string()
+        );
+    }
+
+    #[test]
+    fn validate_client_secret_rejects_empty() {
+        assert!(validate_client_secret("").is_err());
+    }
+
+    #[test]
+    fn validate_client_secret_rejects_short() {
+        assert!(validate_client_secret("short").is_err());
+    }
+
+    #[test]
+    fn validate_client_secret_accepts_real_shape() {
+        // Spotware example from `ctrader_api_full_reference.md` §2.3:
+        // client_secret=012sds23dlkjQsd
+        assert_eq!(
+            validate_client_secret("012sds23dlkjQsd").unwrap(),
+            "012sds23dlkjQsd".to_string()
+        );
+    }
+
+    /// Audit-fix F2: a callback whose `state` query parameter does not
+    /// match the value issued to the authorize URL must be refused
+    /// before any token exchange. This drives the same code path the
+    /// wizard relies on at 4.2.
+    #[test]
+    fn oauth_state_csrf_rejects_mismatched_state() {
+        let issued = "issued-state-token-abc123";
+        let received = "attacker-state-token-xyz999";
+        let target = format!(
+            "/ctrader/callback?code=AUTHCODE&state={}",
+            received
+        );
+        let err = parse_callback_request_with_state(&target, "/ctrader/callback", issued)
+            .expect_err("CSRF mismatch must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("state") && msg.contains("mismatch"),
+            "expected mismatch error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn classify_oauth_failure_recognises_bind_error() {
+        let err = "OAuth step 1/5 (bind_loopback) failed — could not bind any of the allowed callback ports [7777, 7878, 8989]";
+        assert!(matches!(
+            classify_oauth_failure(err),
+            WizardError::OAuthLoopbackBindFailed { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_oauth_failure_recognises_callback_timeout() {
+        let err = "OAuth step 4/5 (wait_for_callback) failed — timed out waiting for cTrader callback";
+        assert_eq!(
+            classify_oauth_failure(err),
+            WizardError::OAuthCallbackTimeout
+        );
+    }
+
+    #[test]
+    fn classify_oauth_failure_recognises_csrf_mismatch() {
+        let err = "cTrader callback `state` mismatch — possible CSRF";
+        assert_eq!(classify_oauth_failure(err), WizardError::OAuthCsrfMismatch);
+    }
+
+    #[test]
+    fn map_environment_round_trips() {
+        assert_eq!(
+            map_environment(CTraderEnvironment::Live),
+            AuthCTraderEnvironment::Live
+        );
+        assert_eq!(
+            map_environment(CTraderEnvironment::Demo),
+            AuthCTraderEnvironment::Demo
+        );
+    }
+
+    #[test]
+    fn expose_secrets_returns_none_when_unset() {
+        reset_oauth_runtime();
+        assert_eq!(expose_client_secret(), None);
+        assert_eq!(expose_access_token(), None);
+        assert_eq!(expose_refresh_token(), None);
+    }
+
+    /// Full OAuth flow against a captured cTrader fixture. Ignored —
+    /// drives the real `ProductionCTraderLiveAuthBackend` over a live
+    /// loopback socket, which is only feasible with manual browser
+    /// interaction.
+    #[test]
+    #[ignore = "needs cTrader fixture"]
+    fn oauth_flow_with_captured_callback_url() {
+        // The intended fixture is a captured response from a real
+        // cTrader callback URL of the shape
+        // `http://127.0.0.1:7777/ctrader/callback?code=…&state=…`
+        // plus the subsequent `/apps/token` JSON response. The fixture
+        // must be re-captured per refresh-token rotation (see
+        // `ctrader_api_full_reference.md` §2.5) — not committable.
     }
 }

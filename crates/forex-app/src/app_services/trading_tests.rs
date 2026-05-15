@@ -1581,3 +1581,128 @@ fn prop_firm_gate_rejects_when_account_currency_unset() {
         "unexpected error: {err}"
     );
 }
+
+// ── Risky Mode integration (research §4–§5 + operator directive
+// 2026-05-15). These tests cover the `TradingSession` ⇄
+// `RiskyModeManager` wiring; the manager's own per-stage maths is
+// covered exhaustively by `forex_core::domain::risky_mode::tests`.
+
+#[test]
+fn risky_mode_gate_rejects_order_when_kill_switch_tripped() {
+    // Step-by-step recreation of the integration path:
+    //   1. Enable Risky Mode on the session.
+    //   2. Trip the per-day kill switch via record_trade_outcome
+    //      (exceeds the stage daily-loss cap).
+    //   3. Assert that `risky_mode_manager().check_trade_allowed`
+    //      now returns Err — the same call the production
+    //      `execute_ctrader_order` path makes before the prop-firm
+    //      gate.
+    let mut session = TradingSession::new();
+    session
+        .enable_risky_mode(forex_core::RiskyModeConfig::default(), 100.0)
+        .expect("enable_risky_mode");
+    assert!(session.risky_mode_active());
+
+    // Drive the per-day kill switch by accumulating a loss larger
+    // than the stage's `daily_loss_cap_fraction * bankroll`.
+    {
+        let rm = session.risky_mode_manager_mut().expect("manager");
+        let stage = *rm.current_stage();
+        let cap_usd = stage.daily_loss_cap_fraction * rm.current_bankroll_usd();
+        rm.record_trade_outcome(-(cap_usd + 1.0));
+    }
+
+    // Now the same gate that production calls inside
+    // execute_ctrader_order must reject every new order.
+    let rm = session.risky_mode_manager().expect("manager still set");
+    let result = rm.check_trade_allowed(0.5_f32, 10.0_f32, 30.0_f32);
+    assert_eq!(result, Err(forex_core::KillSwitchTier::PerDay));
+}
+
+#[test]
+fn halt_button_also_trips_risky_mode_kill_switch() {
+    // The operator hits the red HALT button. T-Manual must trip
+    // BOTH the session.halt_state AND (when Risky Mode is armed)
+    // the Risky Mode sticky manual halt — research §5.5.
+    let mut state = sample_state(DataSource::CTrader, "Connected");
+    let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+    session
+        .enable_risky_mode(forex_core::RiskyModeConfig::default(), 100.0)
+        .expect("enable_risky_mode");
+    assert!(
+        session
+            .risky_mode_manager()
+            .expect("manager")
+            .last_kill_switch_trip()
+            .is_none(),
+        "fresh manager must not have any kill-switch trips"
+    );
+
+    let summary = session.trip_manual_halt(&mut state);
+    // Sanity — halt machinery itself worked (no broker connected
+    // means zero positions/orders closed; the in-memory flag is
+    // authoritative).
+    assert!(session.is_halted());
+    assert_eq!(summary.positions_closed, 0);
+    assert_eq!(summary.orders_cancelled, 0);
+
+    let trip = session
+        .risky_mode_manager()
+        .expect("manager")
+        .last_kill_switch_trip();
+    let (tier, _ts) = trip.expect("HALT must propagate to Risky Mode manager");
+    assert_eq!(tier, forex_core::KillSwitchTier::Manual);
+
+    // Defence-in-depth: Risky Mode's check_trade_allowed must now
+    // reject every order, regardless of size/SL/TP — research §5.5
+    // says the manual halt is sticky until clear_halt fires.
+    let result = session
+        .risky_mode_manager()
+        .expect("manager")
+        .check_trade_allowed(0.1_f32, 10.0_f32, 30.0_f32);
+    assert_eq!(result, Err(forex_core::KillSwitchTier::Manual));
+}
+
+#[test]
+fn closed_trade_advances_risky_mode_bankroll() {
+    // The close-path realises a profit large enough to cross a
+    // stage boundary. record_trade_outcome must (a) update the
+    // bankroll and (b) re-locate the stage cursor. This is the
+    // mechanism the production `execute_ctrader_request` close-
+    // outcome hook invokes on every ClosePosition fill.
+    let mut session = TradingSession::new();
+    let cfg = forex_core::RiskyModeConfig::default();
+    // Start at the lower bound of stage 0 so we can promote after
+    // a single profitable close.
+    let stage1_lower = cfg.stages[1].bankroll_lower_usd;
+    let starting_bankroll = cfg.stages[0].bankroll_lower_usd + 0.01;
+    session
+        .enable_risky_mode(cfg.clone(), starting_bankroll)
+        .expect("enable_risky_mode");
+    let snapshot_before = session.risky_mode_state().expect("state");
+    assert_eq!(snapshot_before.current_stage_idx, 0);
+
+    // Realised PnL that lands the bankroll inside stage 1's range.
+    let pnl_to_stage1 = (stage1_lower - starting_bankroll) + 0.5;
+    {
+        let rm = session.risky_mode_manager_mut().expect("manager");
+        rm.record_trade_outcome(pnl_to_stage1);
+    }
+    let snapshot_after = session.risky_mode_state().expect("state");
+    assert!(
+        snapshot_after.current_stage_idx >= 1,
+        "expected stage advancement past S1, got {}",
+        snapshot_after.current_stage_idx
+    );
+    assert!(
+        snapshot_after.current_bankroll_usd >= stage1_lower,
+        "bankroll did not advance: {} < {}",
+        snapshot_after.current_bankroll_usd,
+        stage1_lower
+    );
+
+    // disable_risky_mode tears down cleanly.
+    session.disable_risky_mode();
+    assert!(!session.risky_mode_active());
+    assert!(session.risky_mode_state().is_none());
+}

@@ -5,6 +5,7 @@
 // external (`forex-app`) surface is unchanged.
 pub(super) use crate::app_record;
 pub(super) use crate::app_services::ServiceEvent;
+pub(super) use forex_core::{KillSwitchTier, RiskyModeConfig, RiskyModeManager};
 pub(super) use crate::app_services::broker_config::{
     AdapterReadinessSnapshot, BrokerAccountTarget, BrokerSessionState, BrokerSettingsState,
     CTraderBrokerEnvironment,
@@ -327,6 +328,42 @@ pub struct HaltTripSummary {
     pub environment_label: String,
 }
 
+/// Read-only UI snapshot of the live Risky Mode manager. Built by
+/// [`TradingSession::risky_mode_state`] when Risky Mode is active; the
+/// chrome stage-progress bar / kill-switch banner consume this via the
+/// status pill — they never touch [`RiskyModeManager`] directly.
+///
+/// Mirrors the fields required by research §7.2 (stage progress),
+/// §7.4 (kill-switch banner), and §7.5 (retreat indicator). Numeric
+/// fields are `f32` per the operator's f32-throughout-Risky-Mode rule.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RiskyModeState {
+    /// Zero-based stage index (`0 = S1`). Matches
+    /// [`forex_core::RiskyStage::stage_idx`].
+    pub current_stage_idx: u8,
+    /// Total number of stages in the configured taper. Used by the UI
+    /// to render "Stage 3 / 16".
+    pub total_stages: u8,
+    /// Live bankroll in USD, updated by `record_trade_outcome` at
+    /// every close.
+    pub current_bankroll_usd: f32,
+    /// Lower edge of the current stage's bankroll window — feeds the
+    /// stage-progress bar.
+    pub stage_bankroll_lower_usd: f32,
+    /// Upper edge of the current stage's bankroll window.
+    pub stage_bankroll_upper_usd: f32,
+    /// Cumulative daily loss in USD (positive number = loss).
+    pub daily_loss_accumulated_usd: f32,
+    /// Cumulative monthly loss in USD (positive number = loss).
+    pub monthly_loss_accumulated_usd: f32,
+    /// Last kill-switch trip — `None` when no halt has fired since
+    /// construction or the last `clear_halt`.
+    pub last_kill_switch_trip: Option<(KillSwitchTier, chrono::DateTime<chrono::Utc>)>,
+    /// Heuristic ruin-probability estimate at the current stage
+    /// (research §9.3 Brownian-motion formula).
+    pub ruin_probability_estimate: f32,
+}
+
 pub struct TradingSession {
     configured_adapter: TradingAdapterKind,
     broker_settings: BrokerSettingsState,
@@ -362,6 +399,16 @@ pub struct TradingSession {
     trading_environment: TradingEnvironment,
     /// T-Manual kill switch (HALT). See `HaltState` docs for details.
     halt_state: HaltState,
+    /// Risky Mode state machine (research §4–§5). `None` when the
+    /// session is in Standard mode; populated by
+    /// [`TradingSession::enable_risky_mode`] when the wizard's
+    /// Step 3 risk slider reaches `10` (or the operator activates
+    /// Risky Mode at runtime). When `Some(_)`, the
+    /// [`KillSwitchTier`] gate runs BEFORE
+    /// [`risk_gate::prop_firm_pre_trade_check`] inside
+    /// `execute_ctrader_order` — Risky Mode is the strictly tighter
+    /// outer layer (research §11.3, operator directive 2026-05-15).
+    risky_mode_manager: Option<RiskyModeManager>,
 }
 
 enum TradingAdapter {
@@ -486,6 +533,7 @@ impl TradingSession {
             bootstrap_handle: None,
             trading_environment: TradingEnvironment::Demo,
             halt_state: HaltState::default(),
+            risky_mode_manager: None,
         }
     }
 
@@ -597,9 +645,9 @@ impl TradingSession {
     ///      audit-logging layer; does NOT introduce a bypass.
     ///   3. Iterates pending orders and calls the existing cancel
     ///      path (`cancel_selected_order`) for each.
-    ///   4. (TODO once `risky_mode.rs` lands) Calls
-    ///      `risky_mode_manager.trip_manual_halt()` if Risky Mode
-    ///      is active in the session.
+    ///   4. Calls `risky_mode_manager.trip_manual_halt()` if Risky
+    ///      Mode is active in the session — keeps the Risky Mode
+    ///      kill-switch tier coherent with T-Manual (research §5.5).
     ///   5. Emits a `tracing::error!(target: "forex_app::halt", ...)`
     ///      line carrying operator, account_id, positions_closed,
     ///      orders_cancelled, environment.
@@ -655,10 +703,17 @@ impl TradingSession {
             orders_cancelled += 1;
         }
 
-        // TODO(risky-mode-halt): wire after risky_mode.rs lands —
-        // call `risky_mode_manager.trip_manual_halt()` here if the
-        // session has Risky Mode active. The Risky Mode agent owns
-        // that module; this site is the single integration point.
+        // (4) Risky Mode kill-switch composition. When Risky Mode is
+        // active the manual halt also trips the Risky Mode sticky
+        // halt — research §5.5 explicitly couples the operator UI
+        // panic-flatten to the per-mode kill-switch tier so a later
+        // `execute_ctrader_order` cannot slip past Risky Mode's
+        // sanity gate even if the operator clears `halt_state.halted`
+        // without re-enabling the Risky Mode side. See
+        // `forex-core/src/domain/risky_mode.rs::trip_manual_halt`.
+        if let Some(rm) = self.risky_mode_manager.as_mut() {
+            rm.trip_manual_halt();
+        }
 
         let account_id = self
             .selected_ctrader_execution_account_id()
@@ -760,6 +815,99 @@ impl TradingSession {
             target: "forex_app::halt",
             "T-Manual HALT cleared by operator"
         );
+    }
+
+    // ── Risky Mode integration (research §4–§5). The composition
+    // model is: the session holds at most one `RiskyModeManager`; when
+    // it is `Some(_)`, the `execute_ctrader_order` pipeline runs the
+    // Risky Mode `check_trade_allowed` gate BEFORE the prop-firm
+    // `prop_firm_pre_trade_check` (§11.3 — Risky Mode is the tighter
+    // outer layer, NOT a replacement for FTMO). The HALT button
+    // composes both kill switches (research §5.5). Stage advancement
+    // is driven by `record_trade_outcome` calls from the close path.
+
+    /// Activate Risky Mode for this session. Constructs a
+    /// [`RiskyModeManager`] from the supplied config + starting
+    /// bankroll and stores it on the session. Idempotent in the
+    /// sense that calling it twice replaces the existing manager
+    /// with a freshly-validated one (the operator wants to re-anchor
+    /// Risky Mode to a new bankroll).
+    ///
+    /// Returns `Err` when the supplied config fails its own
+    /// [`RiskyModeConfig::validate`] (research §10.5 hard floors) or
+    /// the bankroll is non-finite / non-positive. The session is
+    /// left unchanged on error so a wizard-side validation failure
+    /// never leaves Risky Mode in a half-armed state.
+    pub fn enable_risky_mode(
+        &mut self,
+        config: RiskyModeConfig,
+        starting_bankroll_usd: f32,
+    ) -> anyhow::Result<()> {
+        let manager = RiskyModeManager::new(config, starting_bankroll_usd)?;
+        self.risky_mode_manager = Some(manager);
+        tracing::info!(
+            target: "forex_app::risky_mode",
+            starting_bankroll_usd,
+            "Risky Mode enabled on TradingSession"
+        );
+        Ok(())
+    }
+
+    /// Disarm Risky Mode for this session — falls back to Standard
+    /// mode (the prop-firm gate continues to run as it always has).
+    /// Used by the wizard / operator UI when the risk slider is
+    /// dialed back below `10`.
+    pub fn disable_risky_mode(&mut self) {
+        if self.risky_mode_manager.is_some() {
+            tracing::info!(
+                target: "forex_app::risky_mode",
+                "Risky Mode disabled on TradingSession"
+            );
+        }
+        self.risky_mode_manager = None;
+    }
+
+    /// `true` when Risky Mode is currently armed. Consulted by the
+    /// chrome status pill so it can render the Risky Mode banner
+    /// (research §7.1).
+    pub fn risky_mode_active(&self) -> bool {
+        self.risky_mode_manager.is_some()
+    }
+
+    /// Read-only handle to the Risky Mode manager. `pub(super)` so
+    /// `orders.rs` can compose `check_trade_allowed` into the order
+    /// pipeline without re-importing the type.
+    pub(super) fn risky_mode_manager(&self) -> Option<&RiskyModeManager> {
+        self.risky_mode_manager.as_ref()
+    }
+
+    /// Mutable handle to the Risky Mode manager. `pub(super)` so the
+    /// close-path in `orders.rs` can feed realised PnL via
+    /// `record_trade_outcome`.
+    pub(super) fn risky_mode_manager_mut(&mut self) -> Option<&mut RiskyModeManager> {
+        self.risky_mode_manager.as_mut()
+    }
+
+    /// Read-only UI snapshot of Risky Mode state. Returns `None`
+    /// when Risky Mode is not active. The chrome stage-progress bar
+    /// (research §7.2), kill-switch banner (§7.4), and retreat
+    /// indicator (§7.5) consume this; the manager itself stays
+    /// behind the `pub(super)` accessor.
+    pub fn risky_mode_state(&self) -> Option<RiskyModeState> {
+        let manager = self.risky_mode_manager.as_ref()?;
+        let stage = manager.current_stage();
+        let total_stages = manager.config().stages.len();
+        Some(RiskyModeState {
+            current_stage_idx: stage.stage_idx,
+            total_stages: total_stages.min(u8::MAX as usize) as u8,
+            current_bankroll_usd: manager.current_bankroll_usd(),
+            stage_bankroll_lower_usd: stage.bankroll_lower_usd,
+            stage_bankroll_upper_usd: stage.bankroll_upper_usd,
+            daily_loss_accumulated_usd: manager.daily_loss_accumulated_usd(),
+            monthly_loss_accumulated_usd: manager.monthly_loss_accumulated_usd(),
+            last_kill_switch_trip: manager.last_kill_switch_trip(),
+            ruin_probability_estimate: manager.current_ruin_probability_estimate(),
+        })
     }
 
     pub fn snapshot(&self, state: &AppState) -> ConnectionSnapshot {
@@ -1029,6 +1177,7 @@ impl Default for TradingSession {
             bootstrap_handle: None,
             trading_environment: TradingEnvironment::Demo,
             halt_state: HaltState::default(),
+            risky_mode_manager: None,
         }
     }
 }

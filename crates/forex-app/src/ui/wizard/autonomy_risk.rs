@@ -261,44 +261,66 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
     result
 }
 
+/// SHA-256 hash of the canonical encoding of a quiz attempt. The
+/// digest is the auditable record stored in
+/// `RiskAcknowledgement::answers_sha256` (spec
+/// `installer_wizard_ux_spec.md` §5 — "SHA-256 of the concatenation
+/// of (question_id, chosen_option_id) pairs in canonical order").
+///
+/// Canonical encoding (load-bearing — the Apply-writer in Phase 2B
+/// re-computes this on a re-read and must produce the same digest):
+///   1. ASCII domain-separator `"forex-ai-risk-quiz-v"` (prevents
+///      cross-protocol collisions if some other forex-ai feature
+///      ever SHA-256-hashes a different payload).
+///   2. `quiz_version` as little-endian `u32`.
+///   3. For each answer (in slice order): index as little-endian
+///      `u32`, then the answer bytes, then a `\x00` terminator
+///      (so `"AB" + "C"` ≠ `"A" + "BC"`).
+///
+/// `hex::encode` returns lowercase hex (consistent with how the
+/// existing competitive-analysis spec quotes SHA-256 digests).
+pub fn compute_quiz_answer_hash(quiz_version: u32, answers: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"forex-ai-risk-quiz-v");
+    hasher.update(quiz_version.to_le_bytes());
+    for (i, answer) in answers.iter().enumerate() {
+        hasher.update((i as u32).to_le_bytes());
+        hasher.update(answer.as_bytes());
+        hasher.update(b"\x00");
+    }
+    hex::encode(hasher.finalize())
+}
+
 /// Build a `RiskAcknowledgement` record from quiz answers + a clock
 /// callback. Exposed for tests so we can pin determinism without
 /// touching the system clock.
+///
+/// The hash binds the (quiz_version, ordered answers) — the
+/// timestamp is recorded alongside but is NOT hashed because the
+/// Apply-writer (Phase 2B) needs to be able to re-derive the same
+/// digest from the persisted file (`risk_acknowledgement.json`)
+/// without knowing the original timestamp string.
 pub fn record_acknowledgement(
     answers: &QuizAnswers,
     iso_timestamp_utc: String,
 ) -> RiskAcknowledgement {
-    let mut hasher_input = String::new();
-    for (q, pick) in WIZARD_DEFAULT_QUIZ_QUESTIONS.iter().zip(answers.picks.iter()) {
-        hasher_input.push_str(q.id);
-        hasher_input.push(':');
-        if let Some(idx) = pick {
-            hasher_input.push_str(&idx.to_string());
-        } else {
-            hasher_input.push('_');
-        }
-        hasher_input.push(';');
-    }
-    hasher_input.push_str(&iso_timestamp_utc);
+    let encoded: Vec<String> = WIZARD_DEFAULT_QUIZ_QUESTIONS
+        .iter()
+        .zip(answers.picks.iter())
+        .map(|(q, pick)| match pick {
+            Some(idx) => format!("{}:{}", q.id, idx),
+            None => format!("{}:_", q.id),
+        })
+        .collect();
+    let borrowed: Vec<&str> = encoded.iter().map(String::as_str).collect();
 
     RiskAcknowledgement {
-        // The wizard skeleton uses a hex digest of a stable hasher;
-        // the real implementation should use SHA-256 via the
-        // `sha2` crate. Spec §5 names SHA-256 explicitly;
-        // TODO(wizard-sha256-hasher) wires `sha2::Sha256`.
-        answers_sha256: format!("placeholder-{:x}", djb2(&hasher_input)),
+        answers_sha256: compute_quiz_answer_hash(WIZARD_DEFAULT_QUIZ_VERSION, &borrowed),
         timestamp_utc: iso_timestamp_utc,
         quiz_version: WIZARD_DEFAULT_QUIZ_VERSION,
         correct_count: answers.correct_count(),
     }
-}
-
-fn djb2(bytes: &str) -> u64 {
-    let mut hash: u64 = 5381;
-    for c in bytes.bytes() {
-        hash = hash.wrapping_mul(33).wrapping_add(c as u64);
-    }
-    hash
 }
 
 #[cfg(test)]
@@ -376,5 +398,75 @@ mod tests {
     fn equity_stop_default_within_bounds() {
         assert!(WIZARD_DEFAULT_EQUITY_STOP_PCT >= WIZARD_DEFAULT_EQUITY_STOP_FLOOR_PCT);
         assert!(WIZARD_DEFAULT_EQUITY_STOP_PCT <= WIZARD_DEFAULT_EQUITY_STOP_CEILING_PCT);
+    }
+
+    #[test]
+    fn compute_quiz_answer_hash_is_deterministic() {
+        let a = compute_quiz_answer_hash(1, &["q1:1", "q2:1", "q3:1", "q4:1", "q5:1"]);
+        let b = compute_quiz_answer_hash(1, &["q1:1", "q2:1", "q3:1", "q4:1", "q5:1"]);
+        assert_eq!(a, b, "same inputs must produce same digest");
+        // SHA-256 hex is exactly 64 chars (256 bits / 4 bits per nibble).
+        assert_eq!(a.len(), 64, "sha256 hex must be 64 chars, got {}", a.len());
+        assert!(
+            a.chars().all(|c| c.is_ascii_hexdigit()),
+            "digest must be lowercase-hex, got {}",
+            a
+        );
+    }
+
+    #[test]
+    fn compute_quiz_answer_hash_changes_when_answers_change() {
+        let base = compute_quiz_answer_hash(1, &["q1:1", "q2:1", "q3:1", "q4:1", "q5:1"]);
+        // Flip the first answer.
+        let flipped = compute_quiz_answer_hash(1, &["q1:0", "q2:1", "q3:1", "q4:1", "q5:1"]);
+        assert_ne!(base, flipped, "different answers must produce different digest");
+    }
+
+    #[test]
+    fn compute_quiz_answer_hash_changes_when_version_changes() {
+        let v1 = compute_quiz_answer_hash(1, &["q1:1", "q2:1", "q3:1", "q4:1", "q5:1"]);
+        let v2 = compute_quiz_answer_hash(2, &["q1:1", "q2:1", "q3:1", "q4:1", "q5:1"]);
+        assert_ne!(v1, v2, "bumping quiz_version must produce different digest");
+    }
+
+    #[test]
+    fn compute_quiz_answer_hash_distinguishes_length_extension() {
+        // Without the `\x00` separator, ("AB", "C") and ("A", "BC")
+        // would hash to the same digest. The separator must prevent
+        // that. Pin the property here so a future refactor that
+        // drops the separator gets caught.
+        let a = compute_quiz_answer_hash(1, &["AB", "C"]);
+        let b = compute_quiz_answer_hash(1, &["A", "BC"]);
+        assert_ne!(a, b, "field separator must prevent ambiguous concat collisions");
+    }
+
+    #[test]
+    fn record_acknowledgement_uses_real_sha256_digest() {
+        let mut answers = QuizAnswers::new();
+        for (i, q) in WIZARD_DEFAULT_QUIZ_QUESTIONS.iter().enumerate() {
+            answers.picks[i] = Some(q.correct_index);
+        }
+        let ack = record_acknowledgement(&answers, "2026-05-15T20:00:00Z".to_string());
+        // Real sha256 hex is 64 chars, lowercase hex only, no
+        // "placeholder-" prefix from the old djb2 implementation.
+        assert_eq!(ack.answers_sha256.len(), 64);
+        assert!(ack.answers_sha256.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(!ack.answers_sha256.starts_with("placeholder-"));
+    }
+
+    #[test]
+    fn record_acknowledgement_hash_ignores_timestamp() {
+        // Apply-writer determinism contract: same answers + same
+        // version must produce same digest regardless of when the
+        // user clicked submit. (The timestamp lives next to the
+        // digest in `RiskAcknowledgement` but is NOT hashed.)
+        let mut answers = QuizAnswers::new();
+        for (i, q) in WIZARD_DEFAULT_QUIZ_QUESTIONS.iter().enumerate() {
+            answers.picks[i] = Some(q.correct_index);
+        }
+        let a = record_acknowledgement(&answers, "2026-05-15T20:00:00Z".to_string());
+        let b = record_acknowledgement(&answers, "2030-01-01T00:00:00Z".to_string());
+        assert_eq!(a.answers_sha256, b.answers_sha256);
+        assert_ne!(a.timestamp_utc, b.timestamp_utc);
     }
 }

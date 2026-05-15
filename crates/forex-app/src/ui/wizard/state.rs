@@ -1,5 +1,8 @@
-//! Wizard state machine — pure data, no IO. Both the egui (`mod.rs`)
-//! and the ratatui (`forex-cli`) front-ends drive this enum.
+//! Wizard state machine — pure data plus the minimal IO needed to
+//! round-trip `wizard_state.json` through the operator's atomic-write
+//! discipline (`forex_core::storage::json::write_json_atomic`,
+//! audit-cleaned at F-CORE2-018). Both the egui (`mod.rs`) and the
+//! ratatui (`forex-cli`) front-ends drive the data type.
 //!
 //! References:
 //! - `docs/audits/research/installer_wizard_ux_spec.md` §2 (10 steps),
@@ -11,6 +14,10 @@
 //! reviewer can grep `WIZARD_DEFAULT_` and audit operator-policy
 //! conformance in one pass.
 
+use std::path::{Path, PathBuf};
+
+use anyhow::Result;
+use forex_core::storage::json::{read_json, write_json_atomic};
 use serde::{Deserialize, Serialize};
 
 /// Persisted-file schema version. Bump on any breaking change to
@@ -304,6 +311,13 @@ pub struct WizardStateFile {
     /// Last write time as Unix-milliseconds, UTC.
     #[serde(default)]
     pub last_updated_utc_ms: i64,
+    /// Unix-milliseconds UTC at which Step 10 Apply succeeded; `0`
+    /// while the wizard is still in progress. Distinct from
+    /// `last_updated_utc_ms` so a re-run that updates state but does
+    /// not call Apply does not reset the original Apply timestamp.
+    /// Spec §5 — terminal-state sentinel.
+    #[serde(default)]
+    pub finished_at_utc_ms: i64,
 }
 
 impl WizardStateFile {
@@ -330,6 +344,66 @@ impl WizardStateFile {
     pub fn is_complete(&self) -> bool {
         self.completed_steps.contains(&WizardState::Summary)
     }
+
+    /// Bump `version` and stamp `last_updated_utc_ms` to the current
+    /// wall clock. Called by every persistence write to make stale
+    /// state files detectable from a concurrent `forex-app` instance.
+    ///
+    /// `version` follows operator policy "increment per wizard re-run":
+    /// each persist bumps it by one. The schema version is encoded as
+    /// `WIZARD_STATE_FILE_VERSION` (separate constant); the in-struct
+    /// `version` is the *re-run counter* — disjoint roles.
+    pub fn touch_for_write(&mut self) {
+        // Saturating-add so a deliberately-large `version` in a hand-
+        // edited file does not panic on wrap.
+        self.version = self.version.saturating_add(1);
+        self.last_updated_utc_ms = current_unix_ms();
+    }
+
+    /// Record that Step 10 Apply finished successfully. Idempotent in
+    /// the sense that re-running Apply replaces the timestamp; the
+    /// historical record is preserved through `last_updated_utc_ms`
+    /// plus the audit log of `completed_steps`.
+    pub fn mark_finished(&mut self) {
+        self.finished_at_utc_ms = current_unix_ms();
+    }
+
+    /// Read the persisted state file. Returns `Ok(None)` if the file
+    /// is absent (a fresh install). Surfaces parse / IO errors so the
+    /// wizard can decide between Resume and Fresh (per operator
+    /// no-silent-fallback rule).
+    pub fn read_from(path: &Path) -> Result<Option<Self>> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let file: WizardStateFile = read_json(path, "wizard state")?;
+        Ok(Some(file))
+    }
+
+    /// Persist the state file using `write_json_atomic` (temp file +
+    /// atomic rename + fsync). The caller is responsible for calling
+    /// `touch_for_write` first if it wants the `last_updated_utc_ms`
+    /// bumped; this method is a thin IO wrapper so it can also be
+    /// driven by unit tests that need byte-stable output.
+    pub fn write_to(&self, path: &Path) -> Result<()> {
+        write_json_atomic(path, self)
+    }
+
+    /// Canonical filename inside the operator's config directory.
+    /// Tests inject a tempdir; the runtime uses `dirs::config_dir`.
+    pub fn default_path(config_dir: &Path) -> PathBuf {
+        config_dir.join(WIZARD_STATE_FILENAME)
+    }
+}
+
+/// Current Unix epoch milliseconds, UTC. Returns `0` on systems
+/// whose clock is set before 1970 — defensive but unreachable on a
+/// real install.
+fn current_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -377,5 +451,78 @@ mod tests {
             .extend_from_slice(&[WizardState::Welcome, WizardState::Path]);
         file.skipped_steps.push(WizardState::AccountProfile);
         assert_eq!(file.first_incomplete_step(), WizardState::OAuth);
+    }
+
+    /// Helper to build a unique scratch directory per test without
+    /// pulling in `tempfile` (kept in lockstep with the existing
+    /// pattern in `broker_persistence.rs::tempdir_or_skip`).
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("forex-ai-wizard-state-{label}-{pid}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn read_from_returns_none_when_file_absent() {
+        let dir = unique_temp_dir("absent");
+        let path = WizardStateFile::default_path(&dir);
+        let loaded = WizardStateFile::read_from(&path).expect("read");
+        assert!(loaded.is_none(), "missing file → None, not error");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One of the four required tests from the operator brief:
+    /// `wizard_state_file_roundtrips_through_atomic_write` — write +
+    /// read returns identical struct.
+    #[test]
+    fn wizard_state_file_roundtrips_through_atomic_write() {
+        let dir = unique_temp_dir("roundtrip");
+        let path = WizardStateFile::default_path(&dir);
+
+        let mut original = WizardStateFile::new();
+        original
+            .completed_steps
+            .extend_from_slice(&[WizardState::Welcome, WizardState::Path]);
+        original.skipped_steps.push(WizardState::Autostart);
+        original.risk_acknowledgement = Some(RiskAcknowledgement {
+            answers_sha256: "placeholder-deadbeef".to_string(),
+            timestamp_utc: "2026-05-15T19:48:33Z".to_string(),
+            quiz_version: 1,
+            correct_count: 5,
+        });
+        original.touch_for_write();
+        original.mark_finished();
+
+        original.write_to(&path).expect("write");
+        let reloaded = WizardStateFile::read_from(&path)
+            .expect("read")
+            .expect("file present");
+        assert_eq!(reloaded, original);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn touch_for_write_increments_version_and_updates_timestamp() {
+        let mut file = WizardStateFile::new();
+        let v0 = file.version;
+        file.touch_for_write();
+        assert_eq!(file.version, v0.saturating_add(1));
+        assert!(file.last_updated_utc_ms > 0);
+        let stamp = file.last_updated_utc_ms;
+        // Run a second time to confirm monotonic-or-equal behaviour
+        // (clock skew under test could equalise the second read).
+        file.touch_for_write();
+        assert!(file.last_updated_utc_ms >= stamp);
+    }
+
+    #[test]
+    fn default_path_joins_filename_under_config_dir() {
+        let p = WizardStateFile::default_path(Path::new("/etc/forex-ai"));
+        assert_eq!(p, Path::new("/etc/forex-ai").join(WIZARD_STATE_FILENAME));
     }
 }

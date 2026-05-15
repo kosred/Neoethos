@@ -197,10 +197,23 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
                     .color(theme::DANGER)
                     .strong(),
             );
-            // TODO(risky-mode-config): wire after risky_mode.rs lands.
-            // When `forex-core/src/domain/risky_mode.rs` ships with a
-            // `RiskyModeConfig::default()`, attach it here so the
-            // summary step can pick it up.
+            // Risky Mode unlock — research §8.2 wizard branch panel.
+            // The actual `RiskyModeConfig` is constructed by the
+            // Step 10 Apply path from `RiskyModeConfig::default()`
+            // (research §4.1 — $20 → $50_000 with paper-trading
+            // default ON). Until summary.rs::apply is wired by the
+            // wizard-apply-writer agent (Phase 2B), this label is
+            // the operator-facing signal that the slider has armed
+            // the mode.
+            //
+            // FIXME(risky-mode-apply): summary.rs needs session
+            // access — gated on Agent B wizard apply writer landing.
+            // The Apply writer should call
+            // `session.enable_risky_mode(RiskyModeConfig::default(),
+            // starting_bankroll)` where `starting_bankroll` comes
+            // from the broker-reported balance at Apply time, or
+            // `RiskyModeConfig::default().starting_capital_usd` ($20)
+            // when no broker is connected yet.
         }
     });
 

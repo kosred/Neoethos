@@ -3,6 +3,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tungstenite::{Message, connect};
 
+/// Environment-variable name that selects the cTrader Open API transport
+/// at runtime. Recognised values (case-insensitive, trimmed):
+///
+/// * `json_wss` (default) → port 5036, WebSocket+TLS+JSON envelopes.
+/// * `protobuf` → port 5035, raw TCP+TLS with native Protobuf framing
+///   (length-prefix + serialised `ProtoMessage`). Migrates the reconcile
+///   + historical-bars endpoints per the v0.4.5 batch documented in
+///   `docs/audits/research/ctrader_api_full_reference.md` §10 item #3.
+///
+/// Unset → default (`json_wss`). Unknown value → JSON-WSS with a warn-
+/// level trace event (the binary stays usable even if the operator
+/// typoes the value).
+pub const CTRADER_TRANSPORT_ENV_VAR: &str = "FOREX_BOT_CTRADER_TRANSPORT";
+
 pub const CTRADER_OA_APPLICATION_AUTH_REQUEST_PAYLOAD_TYPE: u32 = 2100;
 pub const CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE: u32 = 2101;
 pub const CTRADER_OA_ACCOUNT_AUTH_REQUEST_PAYLOAD_TYPE: u32 = 2102;

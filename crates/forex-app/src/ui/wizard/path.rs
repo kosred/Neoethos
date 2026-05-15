@@ -32,6 +32,37 @@ pub fn default_data_path() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join(WIZARD_DEFAULT_DATA_FOLDER))
 }
 
+/// Test seam — when set, `pick_folder_via_rfd` returns the override
+/// instead of opening the real native dialog. Lets the unit tests
+/// drive the wiring without needing a windowing system.
+#[cfg(test)]
+fn rfd_override() -> &'static std::sync::Mutex<Option<PathBuf>> {
+    static OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<PathBuf>>> =
+        std::sync::OnceLock::new();
+    OVERRIDE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Open the native folder-picker. Sync API per `rfd 0.17.2`
+/// (`src/file_dialog.rs:132`: `pub fn pick_folder(self) -> Option<PathBuf>`).
+/// Returns `None` on user-cancel and also on platforms where rfd
+/// silently can't open a dialog (headless Linux, no-GTK build,
+/// SSH session without DISPLAY) — caller logs + falls back to the
+/// text-box flow.
+fn pick_folder_via_rfd(seed: &std::path::Path) -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        if let Ok(g) = rfd_override().lock() {
+            if let Some(p) = g.as_ref() {
+                return Some(p.clone());
+            }
+        }
+    }
+    rfd::FileDialog::new()
+        .set_title("Choose forex-ai data folder")
+        .set_directory(seed)
+        .pick_folder()
+}
+
 pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResult {
     let mut result = StepResult::StayHere;
 
@@ -65,11 +96,30 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
             };
         }
         if ui.button("Browse…").clicked() {
-            // TODO(wizard-rfd-picker): wire `rfd::FileDialog::new()
-            // .set_directory(default_data_path()).pick_folder()` and
-            // assign to `controller.config.data_path`. The skeleton
-            // leaves the textbox-only flow so the unit tests do not
-            // need a windowing system.
+            // Native folder-picker via `rfd 0.17` (verified against the
+            // crate's `src/file_dialog.rs` — sync `FileDialog::new`
+            // → `.set_title(..)` → `.set_directory(..)` →
+            // `.pick_folder() -> Option<PathBuf>`). On Linux without
+            // GTK / on headless SSH sessions rfd's `pick_folder`
+            // returns `None`; we surface a hint instead of panicking
+            // so the operator can fall back to the text box.
+            let seed = controller
+                .config
+                .data_path
+                .clone()
+                .or_else(default_data_path)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            match pick_folder_via_rfd(&seed) {
+                Some(folder) => {
+                    controller.config.data_path = Some(folder);
+                }
+                None => {
+                    tracing::info!(
+                        target: "forex_app::wizard",
+                        "rfd::pick_folder returned None (cancelled or no GUI environment)"
+                    );
+                }
+            }
         }
     });
 
@@ -162,5 +212,27 @@ mod tests {
     #[test]
     fn disk_thresholds_keep_operator_default_order() {
         assert!(WIZARD_DEFAULT_DISK_FREE_RED_GIB < WIZARD_DEFAULT_DISK_FREE_AMBER_GIB);
+    }
+
+    #[test]
+    fn rfd_picker_returns_override_in_tests() {
+        // Drive the rfd wrapper without opening a real dialog — set
+        // the test override, call the wrapper, assert it returned
+        // the seeded value. The headless CI runner has no native
+        // dialog backend, so this is the only way to keep the
+        // wiring under test.
+        let probe = std::env::temp_dir().join("forex-ai-rfd-test-path");
+        *rfd_override().lock().unwrap() = Some(probe.clone());
+        let picked = pick_folder_via_rfd(std::path::Path::new("."));
+        *rfd_override().lock().unwrap() = None;
+        assert_eq!(picked, Some(probe));
+    }
+
+    #[test]
+    fn rfd_override_unset_by_default() {
+        // Sanity — if a previous test leaks the override, this test
+        // would fail. Keeps the seam from being silently sticky.
+        let g = rfd_override().lock().unwrap();
+        assert!(g.is_none(), "test override leaked across tests");
     }
 }
