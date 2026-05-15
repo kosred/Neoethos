@@ -52,6 +52,25 @@ pub const CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE: u32 = 2164;
 /// `crates/forex-app/src/app_services/pnl.rs`.
 pub const CTRADER_OA_GET_POSITION_UNREALIZED_PNL_REQUEST_PAYLOAD_TYPE: u32 = 2187;
 pub const CTRADER_OA_GET_POSITION_UNREALIZED_PNL_RESPONSE_PAYLOAD_TYPE: u32 = 2188;
+/// `ProtoOASymbolCategoryListReq` / `…Res` (group G of the 2026-05-14
+/// upstream proto refresh — see
+/// `docs/audits/research/spotware_proto_new_messages.md`). The numeric
+/// values are fixed in
+/// `proto/OpenApiModelMessages.proto::ProtoOAPayloadType`.
+pub const CTRADER_OA_SYMBOL_CATEGORY_REQUEST_PAYLOAD_TYPE: u32 = 2160;
+pub const CTRADER_OA_SYMBOL_CATEGORY_RESPONSE_PAYLOAD_TYPE: u32 = 2161;
+/// `ProtoOADealListByPositionIdReq` / `…Res` — group D, narrow-window
+/// trade-history lookup tied to a single `positionId`.
+pub const CTRADER_OA_DEAL_LIST_BY_POSITION_ID_REQUEST_PAYLOAD_TYPE: u32 = 2179;
+pub const CTRADER_OA_DEAL_LIST_BY_POSITION_ID_RESPONSE_PAYLOAD_TYPE: u32 = 2180;
+/// `ProtoOAOrderDetailsReq` / `…Res` — group D, fetch one order plus
+/// all of its child deals by `orderId`.
+pub const CTRADER_OA_ORDER_DETAILS_REQUEST_PAYLOAD_TYPE: u32 = 2181;
+pub const CTRADER_OA_ORDER_DETAILS_RESPONSE_PAYLOAD_TYPE: u32 = 2182;
+/// `ProtoOAOrderListByPositionIdReq` / `…Res` — group D, list of orders
+/// that hit a single `positionId` over a time window.
+pub const CTRADER_OA_ORDER_LIST_BY_POSITION_ID_REQUEST_PAYLOAD_TYPE: u32 = 2183;
+pub const CTRADER_OA_ORDER_LIST_BY_POSITION_ID_RESPONSE_PAYLOAD_TYPE: u32 = 2184;
 pub const CTRADER_QUOTE_TYPE_BID: i32 = 1;
 pub const CTRADER_QUOTE_TYPE_ASK: i32 = 2;
 pub const CTRADER_TRADE_SIDE_BUY: i32 = 1;
@@ -760,6 +779,97 @@ pub fn build_get_tick_data_request(
     }
 }
 
+/// Build the JSON envelope for `ProtoOADealListByPositionIdReq`
+/// (payload type 2179). Used by
+/// [`crate::app_services::ctrader_history::fetch_deals_by_position_id`].
+/// The proto carries `ctidTraderAccountId` (required) plus
+/// `positionId` (required) and optional `fromTimestamp` / `toTimestamp`
+/// time bounds that the broker uses to slice the lookup.
+pub fn build_deal_list_by_position_id_request(
+    ctid_trader_account_id: i64,
+    position_id: i64,
+    from_timestamp_ms: Option<i64>,
+    to_timestamp_ms: Option<i64>,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    let mut payload = serde_json::json!({
+        "ctidTraderAccountId": ctid_trader_account_id,
+        "positionId": position_id,
+    });
+    if let Some(from_timestamp_ms) = from_timestamp_ms {
+        payload["fromTimestamp"] = serde_json::json!(from_timestamp_ms);
+    }
+    if let Some(to_timestamp_ms) = to_timestamp_ms {
+        payload["toTimestamp"] = serde_json::json!(to_timestamp_ms);
+    }
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_DEAL_LIST_BY_POSITION_ID_REQUEST_PAYLOAD_TYPE,
+        payload,
+    }
+}
+
+/// Build the JSON envelope for `ProtoOAOrderListByPositionIdReq`
+/// (payload type 2183). Same shape as
+/// [`build_deal_list_by_position_id_request`] but returns the orders
+/// rather than the deals tied to a `positionId`.
+pub fn build_order_list_by_position_id_request(
+    ctid_trader_account_id: i64,
+    position_id: i64,
+    from_timestamp_ms: Option<i64>,
+    to_timestamp_ms: Option<i64>,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    let mut payload = serde_json::json!({
+        "ctidTraderAccountId": ctid_trader_account_id,
+        "positionId": position_id,
+    });
+    if let Some(from_timestamp_ms) = from_timestamp_ms {
+        payload["fromTimestamp"] = serde_json::json!(from_timestamp_ms);
+    }
+    if let Some(to_timestamp_ms) = to_timestamp_ms {
+        payload["toTimestamp"] = serde_json::json!(to_timestamp_ms);
+    }
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_ORDER_LIST_BY_POSITION_ID_REQUEST_PAYLOAD_TYPE,
+        payload,
+    }
+}
+
+/// Build the JSON envelope for `ProtoOAOrderDetailsReq` (payload type
+/// 2181). Carries only the two required fields: `ctidTraderAccountId`
+/// and `orderId`.
+pub fn build_order_details_request(
+    ctid_trader_account_id: i64,
+    order_id: i64,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_ORDER_DETAILS_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+            "orderId": order_id,
+        }),
+    }
+}
+
+/// Build the JSON envelope for `ProtoOASymbolCategoryListReq`
+/// (payload type 2160). Only required field is `ctidTraderAccountId`.
+pub fn build_symbol_category_list_request(
+    ctid_trader_account_id: i64,
+    client_msg_id: impl Into<String>,
+) -> CTraderOpenApiJsonMessage {
+    CTraderOpenApiJsonMessage {
+        client_msg_id: client_msg_id.into(),
+        payload_type: CTRADER_OA_SYMBOL_CATEGORY_REQUEST_PAYLOAD_TYPE,
+        payload: serde_json::json!({
+            "ctidTraderAccountId": ctid_trader_account_id,
+        }),
+    }
+}
+
 pub fn parse_open_api_envelope(response_json: &str) -> Result<CTraderOpenApiJsonMessage> {
     serde_json::from_str(response_json).context("failed to parse cTrader JSON envelope")
 }
@@ -810,6 +920,18 @@ pub fn expected_response_payload_type(request_payload_type: u32) -> Result<u32> 
         }
         CTRADER_OA_GET_POSITION_UNREALIZED_PNL_REQUEST_PAYLOAD_TYPE => {
             Ok(CTRADER_OA_GET_POSITION_UNREALIZED_PNL_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_SYMBOL_CATEGORY_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_SYMBOL_CATEGORY_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_DEAL_LIST_BY_POSITION_ID_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_DEAL_LIST_BY_POSITION_ID_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_ORDER_LIST_BY_POSITION_ID_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_ORDER_LIST_BY_POSITION_ID_RESPONSE_PAYLOAD_TYPE)
+        }
+        CTRADER_OA_ORDER_DETAILS_REQUEST_PAYLOAD_TYPE => {
+            Ok(CTRADER_OA_ORDER_DETAILS_RESPONSE_PAYLOAD_TYPE)
         }
         CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE => Err(anyhow!(
             "cTrader spot events are push-only payloads and are not valid request messages"

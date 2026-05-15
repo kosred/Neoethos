@@ -7,6 +7,7 @@ pub mod ctrader_auth;
 pub mod ctrader_bootstrap;
 pub mod ctrader_data;
 pub mod ctrader_execution;
+pub mod ctrader_history;
 #[cfg(test)]
 mod ctrader_integration_tests;
 pub mod ctrader_live_auth;

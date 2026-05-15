@@ -1,8 +1,12 @@
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::{
     CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_DEAL_LIST_BY_POSITION_ID_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_ORDER_DETAILS_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_ORDER_LIST_BY_POSITION_ID_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_SYMBOL_CATEGORY_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_TRADER_RESPONSE_PAYLOAD_TYPE, CTraderDealListRequest, CTraderOpenApiTransport,
     ProductionCTraderOpenApiTransport, build_account_auth_request, build_application_auth_request,
     build_deal_list_request, build_reconcile_request, build_trader_request,
@@ -181,6 +185,58 @@ struct DealListEnvelope {
 struct DealListPayload {
     #[serde(default, rename = "deal")]
     deals: Vec<DealPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrderListByPositionEnvelope {
+    #[serde(rename = "payloadType")]
+    payload_type: u32,
+    payload: OrderListByPositionPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrderListByPositionPayload {
+    #[serde(default, rename = "order")]
+    orders: Vec<OrderPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrderDetailsEnvelope {
+    #[serde(rename = "payloadType")]
+    payload_type: u32,
+    payload: OrderDetailsPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrderDetailsPayload {
+    #[serde(rename = "ctidTraderAccountId")]
+    ctid_trader_account_id: i64,
+    order: OrderPayload,
+    #[serde(default, rename = "deal")]
+    deals: Vec<DealPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SymbolCategoryEnvelope {
+    #[serde(rename = "payloadType")]
+    payload_type: u32,
+    payload: SymbolCategoryPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct SymbolCategoryPayload {
+    #[serde(default, rename = "symbolCategory")]
+    symbol_category: Vec<SymbolCategoryRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SymbolCategoryRow {
+    id: i64,
+    #[serde(rename = "assetClassId")]
+    asset_class_id: i64,
+    name: String,
+    #[serde(rename = "sortingNumber")]
+    sorting_number: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -374,70 +430,226 @@ pub fn parse_deal_list_response(response_json: &str) -> Result<Vec<CTraderDealSn
             envelope.payload_type
         ));
     }
-
     Ok(envelope
         .payload
         .deals
         .into_iter()
-        .map(|deal| {
-            let gross_profit = deal
-                .close_position_detail
-                .as_ref()
-                .map(|detail| scaled_money(detail.gross_profit, required_money_digits(detail.money_digits, "deal.close.money_digits")));
-            let fee = deal
-                .close_position_detail
-                .as_ref()
-                .map(|detail| scaled_money(detail.commission, required_money_digits(detail.money_digits, "deal.close.money_digits")))
-                .or_else(|| {
-                    deal.commission
-                        .map(|commission| scaled_money(commission, required_money_digits(deal.money_digits, "deal.money_digits")))
-                });
-            let swap = deal
-                .close_position_detail
-                .as_ref()
-                .map(|detail| scaled_money(detail.swap, required_money_digits(detail.money_digits, "deal.close.money_digits")));
-            let pnl_conversion_fee = deal.close_position_detail.as_ref().and_then(|detail| {
-                detail.pnl_conversion_fee.map(|fee| {
-                    // F-CORE2 audit: previously used `unwrap_or(0)` for money_digits,
-                    // which would 10^N-inflate the fee if the broker payload omitted
-                    // the field. Use the shared helper that logs and defaults to 2
-                    // (cTrader's documented account currency digit count).
-                    scaled_money(
-                        fee,
-                        required_money_digits(
-                            detail.money_digits,
-                            "deal.close.pnl_conversion_fee.money_digits",
-                        ),
-                    )
-                })
-            });
-            let net_profit = gross_profit.map(|gross| {
-                gross + fee.unwrap_or(0.0) + swap.unwrap_or(0.0) + pnl_conversion_fee.unwrap_or(0.0)
-            });
+        .map(deal_payload_to_snapshot)
+        .collect())
+}
 
-            CTraderDealSnapshot {
-                deal_id: deal.deal_id,
-                order_id: deal.order_id,
-                position_id: deal.position_id,
-                symbol_id: deal.symbol_id,
-                trade_side: trade_side_label(deal.trade_side),
-                deal_status: deal_status_label(deal.deal_status),
-                volume: volume_to_units(deal.volume),
-                filled_volume: volume_to_units(deal.filled_volume),
-                execution_timestamp_ms: deal.execution_timestamp,
-                execution_price: deal.execution_price,
-                entry_price: deal
-                    .close_position_detail
-                    .as_ref()
-                    .and_then(|detail| detail.entry_price),
-                gross_profit,
-                fee,
-                swap,
-                pnl_conversion_fee,
-                net_profit,
-            }
+/// Parse a `ProtoOADealListByPositionIdRes` (payload type 2180).
+///
+/// Same per-deal shape as [`parse_deal_list_response`] but the broker
+/// gates the response on a single `positionId`. New in the 2026-05-14
+/// upstream proto refresh; see
+/// `docs/audits/research/spotware_proto_new_messages.md` group D.
+pub fn parse_deal_list_by_position_id_response(
+    response_json: &str,
+) -> Result<Vec<CTraderDealSnapshot>> {
+    let envelope: DealListEnvelope = serde_json::from_str(response_json)
+        .context("failed to parse cTrader deal-list-by-position response")?;
+    if envelope.payload_type != CTRADER_OA_DEAL_LIST_BY_POSITION_ID_RESPONSE_PAYLOAD_TYPE {
+        return Err(anyhow!(
+            "unexpected cTrader deal-list-by-position payload type: {}",
+            envelope.payload_type
+        ));
+    }
+    Ok(envelope
+        .payload
+        .deals
+        .into_iter()
+        .map(deal_payload_to_snapshot)
+        .collect())
+}
+
+/// Parse a `ProtoOAOrderListByPositionIdRes` (payload type 2184). The
+/// per-order shape is the same `ProtoOAOrder` carried by
+/// `ProtoOAReconcileRes`, so this reuses [`OrderPayload`] internally
+/// and emits the same [`CTraderPendingOrderSnapshot`] type.
+pub fn parse_order_list_by_position_id_response(
+    response_json: &str,
+) -> Result<Vec<CTraderPendingOrderSnapshot>> {
+    let envelope: OrderListByPositionEnvelope = serde_json::from_str(response_json)
+        .context("failed to parse cTrader order-list-by-position response")?;
+    if envelope.payload_type != CTRADER_OA_ORDER_LIST_BY_POSITION_ID_RESPONSE_PAYLOAD_TYPE {
+        return Err(anyhow!(
+            "unexpected cTrader order-list-by-position payload type: {}",
+            envelope.payload_type
+        ));
+    }
+    Ok(envelope
+        .payload
+        .orders
+        .into_iter()
+        .map(order_payload_to_snapshot)
+        .collect())
+}
+
+/// Snapshot of a `ProtoOAOrderDetailsRes` (payload type 2182). Carries
+/// the single requested order plus all of its child deals. New in the
+/// 2026-05-14 upstream proto refresh; see
+/// `docs/audits/research/spotware_proto_new_messages.md` group D.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CTraderOrderDetailsSnapshot {
+    pub account_id: i64,
+    pub order: CTraderPendingOrderSnapshot,
+    pub deals: Vec<CTraderDealSnapshot>,
+}
+
+/// Parse a `ProtoOAOrderDetailsRes` JSON envelope.
+pub fn parse_order_details_response(response_json: &str) -> Result<CTraderOrderDetailsSnapshot> {
+    let envelope: OrderDetailsEnvelope = serde_json::from_str(response_json)
+        .context("failed to parse cTrader order-details response")?;
+    if envelope.payload_type != CTRADER_OA_ORDER_DETAILS_RESPONSE_PAYLOAD_TYPE {
+        return Err(anyhow!(
+            "unexpected cTrader order-details payload type: {}",
+            envelope.payload_type
+        ));
+    }
+    Ok(CTraderOrderDetailsSnapshot {
+        account_id: envelope.payload.ctid_trader_account_id,
+        order: order_payload_to_snapshot(envelope.payload.order),
+        deals: envelope
+            .payload
+            .deals
+            .into_iter()
+            .map(deal_payload_to_snapshot)
+            .collect(),
+    })
+}
+
+/// Symbol-category row returned by `ProtoOASymbolCategoryListRes`.
+/// See `OpenApiModelMessages.proto::ProtoOASymbolCategory`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CTraderSymbolCategorySnapshot {
+    pub id: i64,
+    pub asset_class_id: i64,
+    pub name: String,
+    pub sorting_number: Option<f64>,
+}
+
+/// Parse a `ProtoOASymbolCategoryListRes` JSON envelope (payload type
+/// 2161). New in the 2026-05-14 upstream proto refresh; see
+/// `docs/audits/research/spotware_proto_new_messages.md` group G.
+pub fn parse_symbol_category_list_response(
+    response_json: &str,
+) -> Result<Vec<CTraderSymbolCategorySnapshot>> {
+    let envelope: SymbolCategoryEnvelope = serde_json::from_str(response_json)
+        .context("failed to parse cTrader symbol-category list response")?;
+    if envelope.payload_type != CTRADER_OA_SYMBOL_CATEGORY_RESPONSE_PAYLOAD_TYPE {
+        return Err(anyhow!(
+            "unexpected cTrader symbol-category payload type: {}",
+            envelope.payload_type
+        ));
+    }
+    Ok(envelope
+        .payload
+        .symbol_category
+        .into_iter()
+        .map(|category| CTraderSymbolCategorySnapshot {
+            id: category.id,
+            asset_class_id: category.asset_class_id,
+            name: category.name,
+            sorting_number: category.sorting_number,
         })
         .collect())
+}
+
+fn deal_payload_to_snapshot(deal: DealPayload) -> CTraderDealSnapshot {
+    let gross_profit = deal
+        .close_position_detail
+        .as_ref()
+        .map(|detail| {
+            scaled_money(
+                detail.gross_profit,
+                required_money_digits(detail.money_digits, "deal.close.money_digits"),
+            )
+        });
+    let fee = deal
+        .close_position_detail
+        .as_ref()
+        .map(|detail| {
+            scaled_money(
+                detail.commission,
+                required_money_digits(detail.money_digits, "deal.close.money_digits"),
+            )
+        })
+        .or_else(|| {
+            deal.commission.map(|commission| {
+                scaled_money(
+                    commission,
+                    required_money_digits(deal.money_digits, "deal.money_digits"),
+                )
+            })
+        });
+    let swap = deal
+        .close_position_detail
+        .as_ref()
+        .map(|detail| {
+            scaled_money(
+                detail.swap,
+                required_money_digits(detail.money_digits, "deal.close.money_digits"),
+            )
+        });
+    let pnl_conversion_fee = deal.close_position_detail.as_ref().and_then(|detail| {
+        detail.pnl_conversion_fee.map(|fee| {
+            // F-CORE2 audit: previously used `unwrap_or(0)` for money_digits,
+            // which would 10^N-inflate the fee if the broker payload omitted
+            // the field. Use the shared helper that logs and defaults to 2
+            // (cTrader's documented account currency digit count).
+            scaled_money(
+                fee,
+                required_money_digits(
+                    detail.money_digits,
+                    "deal.close.pnl_conversion_fee.money_digits",
+                ),
+            )
+        })
+    });
+    let net_profit = gross_profit.map(|gross| {
+        gross + fee.unwrap_or(0.0) + swap.unwrap_or(0.0) + pnl_conversion_fee.unwrap_or(0.0)
+    });
+
+    CTraderDealSnapshot {
+        deal_id: deal.deal_id,
+        order_id: deal.order_id,
+        position_id: deal.position_id,
+        symbol_id: deal.symbol_id,
+        trade_side: trade_side_label(deal.trade_side),
+        deal_status: deal_status_label(deal.deal_status),
+        volume: volume_to_units(deal.volume),
+        filled_volume: volume_to_units(deal.filled_volume),
+        execution_timestamp_ms: deal.execution_timestamp,
+        execution_price: deal.execution_price,
+        entry_price: deal
+            .close_position_detail
+            .as_ref()
+            .and_then(|detail| detail.entry_price),
+        gross_profit,
+        fee,
+        swap,
+        pnl_conversion_fee,
+        net_profit,
+    }
+}
+
+fn order_payload_to_snapshot(order: OrderPayload) -> CTraderPendingOrderSnapshot {
+    CTraderPendingOrderSnapshot {
+        order_id: order.order_id,
+        symbol_id: order.trade_data.symbol_id,
+        trade_side: trade_side_label(order.trade_data.trade_side),
+        order_type: order_type_label(order.order_type),
+        volume: volume_to_units(order.trade_data.volume),
+        open_timestamp_ms: order.trade_data.open_timestamp,
+        limit_price: order.limit_price,
+        stop_price: order.stop_price,
+        stop_loss: order.stop_loss,
+        take_profit: order.take_profit,
+        label: order.trade_data.label,
+        comment: order.trade_data.comment,
+        client_order_id: order.trade_data.client_order_id,
+    }
 }
 
 pub fn load_account_runtime_with_transport<T: CTraderOpenApiTransport>(
