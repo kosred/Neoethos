@@ -10,11 +10,12 @@
 //! - The state machine (`WizardController`) is renderer-agnostic. The
 //!   egui surface here and the ratatui surface in
 //!   `forex-cli/src/tui/wizard.rs` both drive the same controller.
-//! - All persistence (the `wizard_state.json` schema in spec §5) is
-//!   data-only, defined in `state.rs`; the actual IO is currently
-//!   left to `// TODO(wizard-persistence-io)` because the
-//!   `broker_persistence.rs` snapshot API discussion is open in
-//!   spec §10.7.
+//! - Persistence (the `wizard_state.json` schema in spec §5) is
+//!   declared in `state.rs` (`WizardStateFile::{read_from, write_to,
+//!   default_path}`) and driven by `summary.rs::run_apply` at
+//!   Step 10. The IO uses
+//!   `forex_core::storage::json::write_json_atomic` for crash
+//!   safety (audit-cleaned at F-CORE2-018).
 //!
 //! Operator invariants enforced here (NOT in step files):
 //! - 11 canonical timeframes from `forex_core::contracts::temporal`
