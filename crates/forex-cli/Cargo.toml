@@ -2,6 +2,13 @@
 name = "forex-cli"
 version = "0.2.0"
 edition.workspace = true
+# SPDX dual-license matches the repo-root LICENSE file. Required by both
+# cargo-deb (writes Debian `control` License:) and cargo-generate-rpm.
+license = "MIT OR Apache-2.0"
+description = "forex-ai headless CLI + TUI — quantitative trading workspace for the cTrader Open API."
+homepage = "https://github.com/kosred/forex-ai"
+repository = "https://github.com/kosred/forex-ai"
+readme = "../../README.md"
 
 [features]
 default = []

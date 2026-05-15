@@ -25,6 +25,9 @@ pub use contracts::{
     ValidationEvidenceKind, ValidationEvidenceManifest, is_canonical_timeframe,
 };
 pub use domain::PropFirmConstraints;
+pub use domain::{
+    KillSwitchTier, RiskyModeConfig, RiskyModeManager, RiskyStage, build_logarithmic_stages,
+};
 pub use system::{
     AcceleratorBackend, AcceleratorDevice, CpuBudget, GpuBudget, HardwareExecutionPlan,
     HardwareRuntimeOverrides, PrecisionPolicy, ResolvedWorkloadAssignment, TrainingPrecision,
