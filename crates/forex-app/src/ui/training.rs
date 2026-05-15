@@ -50,7 +50,7 @@ pub fn render(
             .selected_text(&state.chart_timeframe)
             .show_ui(ui, |ui| {
                 for tf in timeframes {
-                    ui.selectable_value(&mut state.chart_timeframe, tf.to_string(), tf);
+                    ui.selectable_value(&mut state.chart_timeframe, tf.to_string(), *tf);
                 }
             });
     });

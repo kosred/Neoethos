@@ -82,24 +82,27 @@ mod risk_gate;
 mod session;
 mod snapshots;
 
-// Sub-module re-exports kept at `pub(super)` so the new `session`, `orders`,
-// and `market_data` siblings can pull these symbols via `use super::...` —
-// the trading-public surface is unchanged because everything is still
-// `pub(super)`-or-tighter inside `trading::*`.
-pub(super) use client_order::{
+// Sub-module re-exports kept as plain (private) `use` so the source
+// items can stay `pub(super)` in their carved-out submodules. The
+// `session`, `orders`, `market_data`, `snapshots`, `risk_gate`, and
+// `diagnostics` siblings reach these names via `use super::...`;
+// private items in a parent module are visible to direct submodules,
+// so no `pub(...)` modifier is required here. The trading-public
+// surface is unchanged.
+use client_order::{
     CTRADER_TOKEN_REFRESH_WINDOW_SECS, current_unix_seconds, next_client_order_seq,
 };
-pub(super) use diagnostics::{
+use diagnostics::{
     append_ctrader_order_builder_diagnostics, extract_client_order_id_from_request,
     find_existing_client_order_id, format_ctrader_connect_error, format_ctrader_terminal_info,
     format_execution_journal_line, format_execution_outcome_status, non_empty_option,
     record_app_event, synthesize_idempotent_retry_outcome,
 };
-pub(super) use risk_gate::{
+use risk_gate::{
     ctrader_protocol_volume_from_units, prop_firm_pre_trade_check,
     validate_and_convert_lot_size_to_ctrader_volume,
 };
-pub(super) use snapshots::{
+use snapshots::{
     MAX_CHART_CANDLES, chart_history_window_ms, preferred_chart_timeframe,
     run_ctrader_bootstrap_batch_with_context, supported_ctrader_chart_timeframes,
     sync_ctrader_discovered_accounts_into_targets, sync_discovered_accounts_with_targets,
