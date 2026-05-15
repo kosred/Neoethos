@@ -4028,6 +4028,7 @@ dependencies = [
  "cc",
  "chrono",
  "clap",
+ "crossbeam-channel",
  "dirs 5.0.1",
  "eframe",
  "egui",

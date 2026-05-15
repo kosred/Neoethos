@@ -1439,23 +1439,88 @@ fn sample_prop_firm_order() -> CTraderNewOrderRequest {
 // live cTrader connection. Once the cTrader bootstrap writes the
 // symbol-metadata JSON to disk in CI, replace these fixtures with a
 // loader that reads the real broker payload for the symbol/timeframe.
-fn install_prop_firm_test_env() {
+
+// Tests that mutate `FOREX_BOT_PROP_ACCOUNT_CURRENCY` /
+// `FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE` MUST run in series — cargo
+// runs tests in a single process with a multi-threaded default pool,
+// and parallel env mutation is racy. The same `OnceLock<Mutex<()>>`
+// pattern that gates `FOREX_AI_LICENSE_PATH` in
+// `ui/wizard/welcome.rs::tests::env_lock` keeps these serial without
+// requiring the operator to set RUST_TEST_THREADS=1 or pull in a new
+// dev-dependency.
+fn prop_firm_env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// RAII guard returned by `install_prop_firm_test_env`. Holds the
+/// suite-wide env-mutation mutex AND captures the prior values of the
+/// env vars it sets, restoring them on drop. This makes each test's
+/// env mutation invisible to other tests, even when the cargo runner
+/// re-orders or interleaves them.
+struct PropFirmEnvGuard {
+    // Keeps the suite-wide env mutex held for the duration of the test.
+    // `'static` lifetime is sound because the mutex is owned by a
+    // `OnceLock`-backed singleton that lives for the whole process.
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prior_account_currency: Option<String>,
+    prior_quote_rate: Option<String>,
+}
+
+impl Drop for PropFirmEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: env mutation is gated by the mutex held in `_lock`,
+        // so no other test mutates these vars in parallel. Required
+        // because `set_var` / `remove_var` are marked unsafe in
+        // edition 2024.
+        unsafe {
+            match self.prior_account_currency.take() {
+                Some(v) => std::env::set_var("FOREX_BOT_PROP_ACCOUNT_CURRENCY", v),
+                None => std::env::remove_var("FOREX_BOT_PROP_ACCOUNT_CURRENCY"),
+            }
+            match self.prior_quote_rate.take() {
+                Some(v) => std::env::set_var("FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE", v),
+                None => std::env::remove_var("FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE"),
+            }
+        }
+    }
+}
+
+/// Acquire the env mutex, snapshot existing values, and apply the
+/// prop-firm risk-gate test fixture. The returned guard must be bound
+/// to a local (e.g. `let _guard = install_prop_firm_test_env();`) so
+/// it lives for the whole test body — dropping it eagerly would
+/// release the lock and let another thread clobber the env mid-test.
+#[must_use = "bind the returned guard to a local; dropping it eagerly releases the env mutex"]
+fn install_prop_firm_test_env() -> PropFirmEnvGuard {
+    // `.unwrap_or_else(|e| e.into_inner())` so a poisoned mutex (from
+    // a panicking sibling test) doesn't cascade-fail the rest of the
+    // suite — we still get serialized access.
+    let lock = prop_firm_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let prior_account_currency = std::env::var("FOREX_BOT_PROP_ACCOUNT_CURRENCY").ok();
+    let prior_quote_rate = std::env::var("FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE").ok();
     // SAFETY: tests in this binary share env; risk-gate tests must set
     // FOREX_BOT_PROP_ACCOUNT_CURRENCY explicitly because production
-    // refuses to synthesize a default account currency.
-    // SAFETY: set_var is unsafe in Rust 2024; tests run single-threaded
-    // for env mutation via cargo's default thread pool here.
+    // refuses to synthesize a default account currency. Mutation is
+    // gated by the mutex held in `lock` above.
     unsafe {
         std::env::set_var("FOREX_BOT_PROP_ACCOUNT_CURRENCY", "USD");
         // EURJPY-style cross test below requires this; USDJPY only uses
         // base==account, so it's safe to leave the rate present.
         std::env::set_var("FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE", "0.0067");
     }
+    PropFirmEnvGuard {
+        _lock: lock,
+        prior_account_currency,
+        prior_quote_rate,
+    }
 }
 
 #[test]
 fn prop_firm_gate_blocks_order_without_stop_loss() {
-    install_prop_firm_test_env();
+    let _guard = install_prop_firm_test_env();
     let mut order = sample_prop_firm_order();
     order.stop_loss = None;
     let risk = RiskConfig::default();
@@ -1466,7 +1531,7 @@ fn prop_firm_gate_blocks_order_without_stop_loss() {
 
 #[test]
 fn prop_firm_gate_blocks_when_daily_drawdown_breached() {
-    install_prop_firm_test_env();
+    let _guard = install_prop_firm_test_env();
     let order = sample_prop_firm_order();
     let risk = RiskConfig::default();
     let err = prop_firm_pre_trade_check(&risk, &order, 9500.0, 10000.0, 10000.0, 4, "EURUSD")
@@ -1477,7 +1542,7 @@ fn prop_firm_gate_blocks_when_daily_drawdown_breached() {
 
 #[test]
 fn prop_firm_gate_respects_jpy_pip_precision() {
-    install_prop_firm_test_env();
+    let _guard = install_prop_firm_test_env();
     let mut order = sample_prop_firm_order();
     order.limit_price = Some(150.00);
     order.stop_loss = Some(149.50); // 50 pips in JPY (2 digits)
@@ -1508,7 +1573,7 @@ fn prop_firm_gate_respects_jpy_pip_precision() {
 
 #[test]
 fn prop_firm_gate_blocks_when_total_drawdown_breached() {
-    install_prop_firm_test_env();
+    let _guard = install_prop_firm_test_env();
     let order = sample_prop_firm_order();
     let risk = RiskConfig::default();
     // Set day_start_equity equal to account_equity so daily DD is 0%, forcing it to hit total DD rule
@@ -1520,7 +1585,7 @@ fn prop_firm_gate_blocks_when_total_drawdown_breached() {
 
 #[test]
 fn prop_firm_gate_passes_valid_order_within_limits() {
-    install_prop_firm_test_env();
+    let _guard = install_prop_firm_test_env();
     let mut order = sample_prop_firm_order();
     // Keep the size sane: the default fixture's 1000-lot volume would
     // (correctly) be rejected by the real-pip risk-per-trade gate.
@@ -1534,7 +1599,7 @@ fn prop_firm_gate_passes_valid_order_within_limits() {
 
 #[test]
 fn prop_firm_gate_respects_disabled_stop_loss_requirement() {
-    install_prop_firm_test_env();
+    let _guard = install_prop_firm_test_env();
     let mut order = sample_prop_firm_order();
     order.stop_loss = None;
     let risk = RiskConfig {
@@ -1548,7 +1613,7 @@ fn prop_firm_gate_respects_disabled_stop_loss_requirement() {
 
 #[test]
 fn prop_firm_gate_rejects_unknown_symbol_without_synthetic_fallback() {
-    install_prop_firm_test_env();
+    let _guard = install_prop_firm_test_env();
     let order = sample_prop_firm_order();
     let risk = RiskConfig::default();
     // Empty symbol must be rejected — the old code silently used
@@ -1567,7 +1632,15 @@ fn prop_firm_gate_rejects_unknown_symbol_without_synthetic_fallback() {
 #[test]
 fn prop_firm_gate_rejects_when_account_currency_unset() {
     // Deliberately clear the env to verify the gate refuses to size
-    // an order rather than falling back to "USD".
+    // an order rather than falling back to "USD". Reuse the same
+    // `install_prop_firm_test_env` guard so this test takes the
+    // suite-wide env mutex — otherwise a sibling test running in
+    // parallel can re-set `FOREX_BOT_PROP_ACCOUNT_CURRENCY` to "USD"
+    // between our `remove_var` below and the gate's `env::var` read,
+    // which is the original flake. The guard's `Drop` restores
+    // whatever value (if any) was in the env before this test ran.
+    let _guard = install_prop_firm_test_env();
+    // SAFETY: env mutation is gated by the mutex held in `_guard`.
     unsafe {
         std::env::remove_var("FOREX_BOT_PROP_ACCOUNT_CURRENCY");
     }

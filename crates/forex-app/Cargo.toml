@@ -93,6 +93,17 @@ rfd = "0.17"
 # so the wizard does not depend on a transitive accident.
 sha2 = "0.10"
 hex = "0.4"
+# Bounded multi-producer/multi-consumer channel used to bridge the
+# cTrader streaming worker thread (which holds neither a `&mut
+# TradingSession` nor the egui ctx) and the main UI loop, which is the
+# only place we can call `TradingSession::trip_hardware_kill_global`.
+# Crossbeam (vs. `std::sync::mpsc`) gives us a `Sender` that is
+# `Send + Sync + Clone` without a `Mutex` wrapper, which is what the
+# `OnceLock`-backed global broker-control sink in `broker_control.rs`
+# needs so the streaming worker can write without contending with the
+# main loop's reader. Version 0.5.15 matches the transitive resolution
+# already present in `Cargo.lock` — no version drift.
+crossbeam-channel = "0.5.15"
 
 [build-dependencies]
 protoc-bin-vendored = "3.2.0"
