@@ -648,25 +648,36 @@ impl TradingSession {
         // PnL sum, no network.
         let local_equity = self.ctrader_account_equity();
 
-        let Some(runtime) = self.connected_ctrader_runtime() else {
-            // Not connected — there is no broker to consult. Local
-            // path returns 0.0 in this branch; the prop-firm gate
-            // upstream interprets equity==0 as "no information" and
-            // will already block on its own (day_start_equity > 0
-            // check). No warn-line because not-connected is already
-            // a higher-priority error surfaced elsewhere.
-            return (local_equity, None);
+        // Pull every value we need out of the immutably-borrowed
+        // runtime snapshot inside a dedicated scope so the borrow is
+        // released before we ask `self` for the mutable token-refresh
+        // path below. Without this scope the NLL analysis CAN extend
+        // the immutable borrow past the `&mut self` call.
+        let (account_id, open_position_ids, positions_snapshot, balance, position_count) = {
+            let Some(runtime) = self.connected_ctrader_runtime() else {
+                // Not connected — there is no broker to consult. Local
+                // path returns 0.0 in this branch; the prop-firm gate
+                // upstream interprets equity==0 as "no information" and
+                // will already block on its own (day_start_equity > 0
+                // check). No warn-line because not-connected is already
+                // a higher-priority error surfaced elsewhere.
+                return (local_equity, None);
+            };
+            let open_position_ids: Vec<i64> = runtime
+                .reconcile
+                .positions
+                .iter()
+                .map(|p| p.position_id)
+                .collect();
+            let position_count = open_position_ids.len();
+            (
+                runtime.trader.account_id,
+                open_position_ids,
+                runtime.reconcile.positions.clone(),
+                runtime.trader.balance,
+                position_count,
+            )
         };
-        let account_id = runtime.trader.account_id;
-        let open_position_ids: Vec<i64> = runtime
-            .reconcile
-            .positions
-            .iter()
-            .map(|p| p.position_id)
-            .collect();
-        let positions_snapshot = runtime.reconcile.positions.clone();
-        let balance = runtime.trader.balance;
-        let position_count = open_position_ids.len();
 
         // No open positions: equity == balance regardless of which
         // side we ask. Skip the network round-trip — saves latency on

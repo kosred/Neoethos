@@ -51,10 +51,14 @@ pub(super) use crate::app_services::jobs::{
 };
 // Batch 14 authoritative PnL path. Re-exported into `trading::*` so
 // `orders.rs` can reach the helpers via `super::*` without a long
-// fully-qualified path on every call site.
+// fully-qualified path on every call site. Only the symbols `orders.rs`
+// actually references are listed here — adding the rest would trigger
+// `unused_imports` because the parser/scaler types stay encapsulated
+// inside `pnl::` (callers reach them transitively via
+// `fetch_unrealized_pnl_for_all_positions`).
 pub(super) use crate::app_services::pnl::{
-    AuthoritativeUnrealizedPnL, BrokerPositionPnL, PnLDriftCircuitBreaker,
-    evaluate_pnl_drift_circuit_breaker, fetch_unrealized_pnl_for_all_positions,
+    PnLDriftCircuitBreaker, evaluate_pnl_drift_circuit_breaker,
+    fetch_unrealized_pnl_for_all_positions,
 };
 pub(super) use crate::app_services::secure_store::{
     CTraderSecureStore, CTraderTokenStore, KeyringSecretStoreBackend,

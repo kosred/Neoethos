@@ -222,76 +222,53 @@ functional.
 
 ### Step 2 — Path selection
 
-- **Purpose:** pick the install dir (binary) and the user-data dir
-  (caches, OAuth tokens, model checkpoints, downloaded history).
-- **Mockup:** two labelled text fields with `[Browse…]` buttons.
-  The first is greyed and read-only — the binary has already been
-  installed by the time the wizard runs, so this is informational.
-  The second is editable and defaults to the OS-canonical user-data
-  location per the `directories` crate:
-  - Windows: `%LOCALAPPDATA%\forex-ai\` (which resolves via
-    `SHGetKnownFolderPath(FOLDERID_LocalAppData)` per the Windows
-    Known Folder API).
+- **Purpose:** pick the install dir (binary, informational) and the
+  user-data dir (caches, OAuth tokens, checkpoints, history).
+- **Mockup:** two `[Browse…]` text fields. Binary path is read-only
+  (set by installer). Data dir defaults to OS-canonical via the
+  `directories` crate:
+  - Windows: `%LOCALAPPDATA%\forex-ai\` (Windows Known Folder API
+    `FOLDERID_LocalAppData`).
   - macOS: `~/Library/Application Support/forex-ai/`.
-  - Linux: `$XDG_DATA_HOME/forex-ai/` or `~/.local/share/forex-ai/`
-    per the XDG Base Directory Specification — "Data files store
-    supplementary data … per-user configuration should go in
-    `~/.config/appname` and caches … should go into
-    `~/.cache/appname`" (freedesktop XDG Base Directory snippet via
-    WebSearch).
-  A live disk-free indicator under each path shows the free bytes
-  on the chosen volume in red (< 5 GiB), amber (5–20 GiB), green
-  (> 20 GiB). Below: a "Validate" affordance that runs the
-  write-permission probe.
+  - Linux: `$XDG_DATA_HOME/forex-ai/` (or `~/.local/share/forex-ai/`)
+    per the freedesktop XDG Base Directory Specification — "per-user
+    configuration should go in `~/.config/appname` and caches …
+    into `~/.cache/appname`" (XDG snippet via WebSearch).
+  Live disk-free indicator: red (< 5 GiB), amber (5–20 GiB), green
+  (> 20 GiB). A "Validate" button runs the write-permission probe.
 - **Inputs:** `data_path: PathBuf`.
-- **Actions:** writes a sentinel file
-  (`<data_path>/.forex-ai-write-check`) and removes it; failure
-  surfaces an error toast inside the wizard ("Cannot write to this
-  path — check permissions or pick a different location"). On
-  success, records `data_path` in `wizard_state.json`.
+- **Actions:** sentinel-file write/delete probe; toasted errors
+  surface the OS error verbatim. On success, records `data_path`.
 - **Skip:** Allowed (defaults to OS-canonical path).
-- **Back:** returns to Step 1; license acceptance is preserved
-  (Microsoft UX guideline: "Preserve user selections through
-  navigation so that if users make changes, click Back, then Next,
-  those changes should be preserved" — Microsoft Learn UX wizards
-  snippet via WebSearch).
-- **Cancel:** as Step 1.
-- **Time:** ≤ 15 s on the default path; up to 2 min if the user
-  customises and the path doesn't exist (mkdir + permission probe).
+- **Back:** Step 1; license acceptance preserved (Microsoft UX
+  wizards: "Preserve user selections through navigation").
+- **Time:** ≤ 15 s default; up to 2 min if customised.
 
 Per `TODO(installer_infrastructure_spec)` §8: defaults to OS-
-canonical locations but allows override.
+canonical with override allowed.
 
 ### Step 3 — Account & profile
 
-- **Purpose:** capture operator identity, prop-firm preset, and the
-  monthly profit-target floor.
+- **Purpose:** operator identity, prop-firm preset, monthly target.
 - **Mockup:** four-row form.
-  Row 1 — "Operator name": single-line text, optional, used only in
-  the journal's "trader=…" tag.
-  Row 2 — "Prop-firm preset": dropdown with three entries — "FTMO
-  Standard (recommended)", "FTMO Aggressive", "Custom". FTMO
-  Standard is preselected and reads its values from
-  `PropFirmConstraints::FTMO_STANDARD`
-  (`max_daily_loss_pct=0.05`, `max_overall_drawdown_pct=0.10`,
+  Row 1 "Operator name" — optional text, journal tag.
+  Row 2 "Prop-firm preset" — dropdown: "FTMO Standard
+  (recommended)" / "FTMO Aggressive" / "Custom". Default loads
+  `PropFirmConstraints::FTMO_STANDARD` (`max_daily_loss_pct=0.05`,
+  `max_overall_drawdown_pct=0.10`,
   `challenge_profit_target_pct=0.10`,
-  `min_monthly_net_profit_pct=0.04`, `min_trading_days=10` — from
-  `crates/forex-core/src/domain/prop_firm.rs`).
-  Row 3 — "Target monthly net profit": slider 4 %–25 %, default 4 %,
-  with an inline numeric edit. The slider's **left stop is 4 %** —
-  the operator directive of 2026-05-14 is verbatim "`4%` per
-  operator directive 2026-05-14" (`prop_firm.rs:36`), so the wizard
-  enforces ≥ 4 %. An attempt to type 3 % triggers an inline
-  validator: "Minimum 4 % per operator policy (2026-05-14). Lower
-  values are not selectable."
-  Row 4 — "Trading mode": radio buttons — "Backtest only", "Forward
-  test (paper)", "Live trading (requires OAuth in next step)".
-  Default: "Forward test".
-- **Inputs:** operator_name, prop_firm_preset, monthly_profit_target,
-  trading_mode.
-- **Actions:** patches the in-memory `WizardConfig`; nothing is
-  written until the Summary step.
-- **Skip:** Allowed (defaults to FTMO Standard / 4 % / Forward).
+  `min_monthly_net_profit_pct=0.04`, `min_trading_days=10`) from
+  `crates/forex-core/src/domain/prop_firm.rs:32`.
+  Row 3 "Monthly net profit target" — slider 4 %–25 %, default 4 %.
+  **Left stop = 4 %** per operator directive 2026-05-14 verbatim at
+  `prop_firm.rs:36` ("operator directive"). Typing 3 % surfaces a
+  validator: "Minimum 4 % per operator policy."
+  Row 4 "Trading mode" — radio: Backtest / Forward test (default) /
+  Live.
+- **Inputs:** operator_name, prop_firm_preset,
+  monthly_profit_target, trading_mode.
+- **Actions:** in-memory `WizardConfig` patch; written at Summary.
+- **Skip:** Allowed (FTMO Standard / 4 % / Forward defaults).
 - **Back:** Step 2.
 - **Time:** ≤ 60 s.
 
@@ -368,231 +345,139 @@ canonical locations but allows override.
 
 ### Step 5 — Symbol & timeframe defaults
 
-- **Purpose:** pre-populate the universe selector so the operator's
-  first backtest can run without manual config.
+- **Purpose:** seed the universe selector so the first backtest is
+  one click away.
 - **Mockup:** two columns.
-  Left — symbol picker. Populated by `ProtoOASymbolsListReq` (2114)
-  → `ProtoOASymbolsListRes` (2115) against the primary account
-  picked in Step 4. A search field at top filters by symbol name.
-  Default selection: `EURUSD` (operator's preferred symbol, per the
-  brief). Multi-select with a "Top 28 majors" preset and a
-  "Custom" mode that exposes the full list.
-  Right — timeframe checkboxes from `CANONICAL_TIMEFRAMES` (11
-  entries: `M1, M3, M5, M15, M30, H1, H4, H12, D1, W1, MN1` from
-  `crates/forex-core/src/contracts/temporal.rs:25`). **`H2` is
-  deliberately absent** — verbatim from the file:
-  "Αν δεν υπάρχει Η2 τότε ας μην μπει καθόλου!!!" / "If H2 doesn't
-  exist [at cTrader] then don't add it at all." (operator directive
-  2026-05-14, recorded at `temporal.rs:17–24`). Default selection:
-  `M5, M15, H1, H4, D1`. The 11 native checkboxes are arranged in
-  a single column so the operator can see at a glance that H2 is
-  not on the list (defending against the documented
-  fabricated-comment failure mode described at `temporal.rs:22–24`).
-  Below the columns: an inline preview "You selected 6 symbols × 5
-  timeframes = 30 (symbol, timeframe) pairs; the next step will
-  download ≈ Y MiB of history."
-- **Inputs:** `selected_symbols: Vec<String>`,
-  `selected_timeframes: Vec<String>`.
-- **Actions:** fires `ProtoOASymbolsListReq` (rate-limited; this is
-  a normal 50/sec request, not the historical 5/sec class — per
-  `ctrader_api_full_reference.md` §3.2). Renders progress
-  ("Loading symbols from broker… 432 of ~600"). On completion,
-  caches the symbol list in `<data_path>/cache/symbols_<broker_id>.json`
-  to spare the next wizard run a re-fetch.
-- **Skip:** Allowed (defaults to `EURUSD` × `{M5, M15, H1, H4, D1}`).
+  Left = filterable symbol multi-select, populated by
+  `ProtoOASymbolsListReq` (2114) → `ProtoOASymbolsListRes` (2115)
+  against the primary account from Step 4. Default selection
+  `EURUSD`; preset "Top 28 majors" available.
+  Right = timeframe checkboxes from `CANONICAL_TIMEFRAMES`
+  (`crates/forex-core/src/contracts/temporal.rs:25`): `M1, M3, M5,
+  M15, M30, H1, H4, H12, D1, W1, MN1` — **11 entries, H2 deliberately
+  absent** per operator directive 2026-05-14 (verbatim "Αν δεν
+  υπάρχει Η2 τότε ας μην μπει καθόλου!!!" recorded at
+  `temporal.rs:17–24`). Default selection `M5, M15, H1, H4, D1`.
+  Inline preview: "N symbols × M timeframes = N×M pairs; ≈ Y MiB."
+- **Inputs:** `selected_symbols`, `selected_timeframes`.
+- **Actions:** `ProtoOASymbolsListReq` (50 req/s class per
+  `ctrader_api_full_reference.md` §3.2). Caches result in
+  `<data_path>/cache/symbols_<broker_id>.json`.
+- **Skip:** Allowed (defaults to `EURUSD` × `{M5,M15,H1,H4,D1}`).
 - **Back:** Step 4.
-- **Time:** 30–60 s (symbol fetch over 5035) + however long the
-  user spends choosing.
+- **Time:** 30–60 s.
 
 ### Step 6 — Historical data download
 
-- **Purpose:** seed the local Polars/Parquet cache so backtests and
-  ML training can run immediately after the wizard exits.
-- **Mockup:** a slider "Months of history to download" with marks
-  at 1, 3, 6, 12, 18, 24; default 6. Below, a forecast block: "≈ N
-  MiB total, ≈ T seconds at observed broker rate (5 req/s for
-  historical data per cTrader API limits)" — the rate limit comes
-  verbatim from `ctrader_api_full_reference.md` §3.2: "a maximum of
-  5 requests per second per connection for any historical data
-  requests". After the user clicks "Begin download", the slider is
-  replaced by a per-(symbol, timeframe) progress table:
-  ```
-  EURUSD  M5   ███████████░░░░░░░░  58 %  (2.1 MiB / 3.6 MiB)
-  EURUSD  M15  ████████████████████ 100 % ✓
-  EURUSD  H1   ████████████████████ 100 % ✓
-  GBPUSD  M5   ░░░░░░░░░░░░░░░░░░░░   0 %  queued
-  …
-  ```
-  A `[Pause]` button toggles to `[Resume]`. A `[Cancel]` button
-  stops further pulls but keeps the bars already on disk —
-  cancel-safe per the operator's no-synthetic-data rule (we never
-  fabricate filler).
+- **Purpose:** seed the local Polars/Parquet cache so the first
+  backtest and ML run are zero-extra-clicks.
+- **Mockup:** slider "Months of history" 1/3/6/12/18/24, default 6.
+  Forecast block: "≈ N MiB, ≈ T s at 5 req/s" — limit verbatim from
+  `ctrader_api_full_reference.md` §3.2 ("a maximum of 5 requests
+  per second per connection for any historical data requests").
+  On `[Begin download]`, slider becomes a per-(symbol, timeframe)
+  progress table with `[Pause]` / `[Resume]` / `[Cancel]`. Cancel
+  keeps already-downloaded bars on disk; no fabricated fill.
 - **Inputs:** `history_months: u8` (1–24).
-- **Actions:** fires `ProtoOAGetTrendbarsReq` (2137) per
-  (symbol, timeframe) pair. The server returns
-  `ProtoOAGetTrendbarsRes` (2138) with `hasMore` paging per
-  `ctrader_api_full_reference.md` §3.2. The wizard enforces the
-  5-req/s budget with a token-bucket limiter; if the broker
-  responds with `REQUEST_FREQUENCY_EXCEEDED` (108), exponential
-  backoff (no `Retry-After` header is documented). Each completed
-  bar set is written to
+- **Actions:** `ProtoOAGetTrendbarsReq` (2137) →
+  `ProtoOAGetTrendbarsRes` (2138) with `hasMore` paging. Token-
+  bucket gate at 5 req/s; on `REQUEST_FREQUENCY_EXCEEDED` (108),
+  exponential backoff. Output:
   `<data_path>/history/<broker_id>/<symbol>/<timeframe>.parquet`
-  with a sidecar `<…>.complete` sentinel file. Partial files (left
-  by a Cancel) are marked `<…>.partial` so the main app refuses to
-  treat them as complete.
-- **Skip:** Allowed (no history downloaded; main app prompts later).
-- **Back:** Step 5 — but if a download is in flight, Back is
-  disabled until the user either Pauses or Cancels.
-- **Time:** highly variable. 6 months × 6 symbols × 5 timeframes ≈
-  180 requests ≈ 36 s at 5 req/s plus parse/write overhead, call it
-  60–90 s in practice. 24 months × 28 symbols × 11 timeframes is
-  much longer — the forecast block makes this clear up-front.
+  + sidecar `.complete` (or `.partial` on Cancel).
+- **Skip:** Allowed (main app re-prompts later).
+- **Back:** Step 5; disabled while download is in flight (Pause /
+  Cancel first).
+- **Time:** ≈ 60–90 s for 6 months × 6 symbols × 5 timeframes
+  (≈ 180 requests at 5 req/s); much longer at 24 months × 28 ×11.
 
 ### Step 7 — Hardware compatibility probe
 
-- **Purpose:** detect available compute backends and pick a sensible
-  default for ML training.
-- **Mockup:** a card per detected device.
-  ```
-  ┌─ CPU ─────────────────────────────────┐
-  │  Intel(R) Core(TM) i7-13700K  · 16 cores
-  │  RAM 31.2 / 32.0 GiB available
-  │  Backend: NdArray (CPU) — always available
-  └───────────────────────────────────────┘
-  ┌─ GPU 0 (NVIDIA) ──────────────────────┐
-  │  GeForce RTX 4070 Ti  · 12 GiB VRAM
-  │  Compute capability 8.9 → FP32, FP16, BF16, FP8
-  │  Backends: CUDA ✓  Vulkan (wgpu) ✓
-  │  Recommended: CUDA
-  └───────────────────────────────────────┘
-  ```
-  Cards aggregate the output of `HardwareProbe::detect()` from
-  `crates/forex-core/src/system.rs:561`. CUDA detection uses
-  `nvidia-smi` (lines 605–685); ROCm uses `rocminfo` (lines
-  721…); Vulkan / wgpu is the fallback path (the
-  `detect_wgpu_hint_accelerators` branch). For each detected GPU
-  the wizard records the compute capability tuple (line 612) and
-  the `supported_precisions` vector (line 613). The "Recommended"
-  badge is chosen by the existing dispatch in
-  `crates/forex-core/src/system/backends.rs` (CUDA > ROCm > Vulkan
-  > CPU). The user can flip the badge to a non-recommended
-  backend manually; doing so writes a `forced_backend` override
-  into `hardware_profile.json`.
+- **Purpose:** detect compute backends and pick a sane ML default.
+- **Mockup:** one card per detected device with: model name, RAM
+  (CPU) or VRAM (GPU), compute capability, supported precisions
+  (FP32/FP16/BF16/FP8), eligible backends with ticks, and a
+  "Recommended" badge. Output aggregates
+  `HardwareProbe::detect()` (`forex-core/src/system.rs:561`): CUDA
+  via `nvidia-smi` (lines 605–685), ROCm via `rocminfo` (line 721+),
+  Vulkan/wgpu fallback (`detect_wgpu_hint_accelerators`). For
+  NVIDIA, compute capability gates the precision list (`system.rs:
+  612–626`). "Recommended" follows existing dispatch in
+  `forex-core/src/system/backends.rs` (CUDA > ROCm > Vulkan > CPU);
+  user override writes `forced_backend` into
+  `hardware_profile.json`.
 - **Inputs:** `forced_backend: Option<String>`.
-- **Actions:** writes `<data_path>/hardware_profile.json` with the
-  full probe report (cpu_cores, total_ram_gb, gpu list with name +
-  memory_gb + compute_capability + supported_precisions, platform
-  label, ISO-8601 timestamp). This file is read by the training
-  orchestrator (`crates/forex-models/src/training_orchestrator.rs:480`)
-  to gate which backends are eligible.
+- **Actions:** writes `<data_path>/hardware_profile.json` (full
+  probe). Read at training time by
+  `forex-models/src/training_orchestrator.rs:480`.
 - **Skip:** Allowed (defaults to CPU NdArray).
 - **Back:** Step 6.
-- **Time:** ≤ 5 s for the probe; the user typically spends < 30 s
-  reviewing.
+- **Time:** ≤ 5 s probe; < 30 s review.
 
 ### Step 8 — News / sentiment provider
 
-- **Purpose:** wire the `forex_core::domain::news_filter` integration
-  so the macro-event filter can suppress trading around scheduled
-  releases.
-- **Mockup:** a toggle "Enable news filter" (default off). When on,
-  reveals two fields: "Provider" (dropdown — currently a single
-  option, "OpenAI / GPT-class LLM"; placeholder for future
-  ForexFactory-style providers) and "API key" (password-masked
-  single-line input). A subtle disclosure: "The key is stored as
-  `secrecy::SecretString` and never sent anywhere except your
+- **Purpose:** wire `forex_core::domain::news_filter` so macro-event
+  releases can suppress trading.
+- **Mockup:** toggle "Enable news filter" (default off). When on,
+  reveals "Provider" dropdown and masked "API key" field, with the
+  disclosure "Stored as `secrecy::SecretString`; only sent to your
   chosen provider when the filter runs. See Privacy in Step 10."
 - **Inputs:** `news_filter_enabled: bool`, `news_filter_api_key:
   Option<SecretString>`.
-- **Actions:** if enabled, runs a single "ping" request to the
-  provider to validate the key. On failure, surfaces the
-  provider's error verbatim. The key is held in memory and only
-  written to disk after Step 10's Apply.
+- **Actions:** if enabled, ping the provider once to validate. Key
+  is held in-memory until Step 10's Apply.
 - **Skip:** Allowed; news_filter remains disabled.
 - **Back:** Step 7.
 - **Time:** ≤ 60 s.
 
 ### Step 9 — Auto-start
 
-- **Purpose:** optionally register `forex-app` for system-login
-  start so the trading daemon resumes after a reboot.
-- **Mockup:** a single labelled toggle "Start forex-app on system
-  login" with a sub-toggle (greyed unless main is on) "Start
-  minimised to system tray". A footer note explains the per-
-  platform mechanism:
-  - Windows: a per-user shortcut in `%APPDATA%\Microsoft\Windows\Start
-    Menu\Programs\Startup\` (or a `HKCU\Software\Microsoft\Windows\
-    CurrentVersion\Run` registry entry if the user is admin).
-  - macOS: a per-user `~/Library/LaunchAgents/ai.forex.app.plist`.
-  - Linux: a `~/.config/autostart/forex-app.desktop` — per the
-    freedesktop Autostart Specification, which says applications
-    "should be run automatically upon login" and that
-    "user-level: ~/.config/autostart/" is the canonical location
-    (freedesktop *Autostart Specification* snippet via WebSearch).
-    The file fields are the standard minimum: `[Desktop Entry]`,
-    `Type=Application`, `Name=forex-ai`, `Exec=<install_dir>/forex-
-    app --minimized`, `Terminal=false`.
+- **Purpose:** optionally register `forex-app` to run at login.
+- **Mockup:** toggle "Start forex-app on system login" + sub-toggle
+  (greyed unless main is on) "Start minimised to system tray".
+  Per-platform mechanism:
+  - Windows: per-user shortcut in `%APPDATA%\Microsoft\Windows\Start
+    Menu\Programs\Startup\` (or `HKCU\…\Run`).
+  - macOS: `~/Library/LaunchAgents/ai.forex.app.plist`.
+  - Linux: `~/.config/autostart/forex-app.desktop` per freedesktop
+    Autostart Specification — "user-level: `~/.config/autostart/`"
+    is the canonical location (snippet via WebSearch). Minimum
+    keys: `[Desktop Entry]`, `Type=Application`, `Name=forex-ai`,
+    `Exec=<install_dir>/forex-app --minimized`, `Terminal=false`.
 - **Inputs:** `autostart_enabled: bool`, `start_minimized: bool`.
-- **Actions:** writes / removes the per-platform autostart artefact.
-  On Linux, no elevated privileges are required (`~/.config/autostart`
-  is user-writeable). On macOS, no elevated privileges are required
-  for `~/Library/LaunchAgents`. On Windows, the user shortcut path
-  is `%APPDATA%`-scoped, not `%ProgramData%`, so no UAC prompt.
+- **Actions:** writes / removes the per-platform artefact. All
+  three paths are user-scoped — no UAC / sudo prompt.
 - **Skip:** Allowed (default off).
 - **Back:** Step 8.
 - **Time:** ≤ 10 s.
 
-Cross-reference: `TODO(installer_infrastructure_spec)` §7 owns the
-exact paths and platform conventions; this wizard step is the
-user-facing toggle that drives the same code.
+Cross-reference: `TODO(installer_infrastructure_spec)` §7 owns
+exact paths; this step is the user-facing toggle.
 
 ### Step 10 — Summary & Apply
 
-- **Purpose:** show every choice the wizard has made, let the user
-  confirm or jump back, then commit.
-- **Mockup:** a single scrollable review pane laid out as a table:
-  ```
-  License accepted          2026-05-15 19:42:11 UTC      [edit ↑]
-  Data directory            ~/.local/share/forex-ai/     [edit ↑]
-  Operator name             (blank)                      [edit ↑]
-  Prop firm                 FTMO Standard (4 % monthly)  [edit ↑]
-  Trading mode              Forward test (paper)         [edit ↑]
-  cTrader account           Demo • EURUSD broker • #12345 [edit ↑]
-  Symbols                   EURUSD, GBPUSD, USDJPY  …    [edit ↑]
-  Timeframes                M5, M15, H1, H4, D1          [edit ↑]
-  History download          6 months — 30 pairs queued   [edit ↑]
-  Hardware backend          CUDA (RTX 4070 Ti)           [edit ↑]
-  News filter               disabled                     [edit ↑]
-  Auto-start                disabled                     [edit ↑]
-  Crash reports             disabled (default)           [edit ↑]
-  ```
-  Each `[edit ↑]` link jumps back to the originating step,
+- **Purpose:** review every choice, edit-in-place, commit.
+- **Mockup:** scrollable review table (see §9 mockup). Each row
+  has an `[edit ↑]` link that jumps back to the source step
   preserving every other choice (Microsoft UX wizards: "Preserve
-  user selections through navigation"). At the bottom: `[Cancel]`,
-  `[Apply]`. `[Apply]` is the primary button (visually heavier;
-  see `TODO(ui_ux_design_spec)` for the focus-ring style).
-- **Inputs:** none beyond confirmation.
-- **Actions:** in this order —
-  1. Write `<data_path>/config.yaml` (forex-ai's main config — does
-     not exist yet for first-time installs).
-  2. Write `<data_path>/broker_credentials.toml` (per
-     `broker_persistence.rs` §, encrypted-at-rest if the OS
-     keychain is available; falls back to file with explicit
-     permission 0o600 on Unix, ACL-restricted on Windows).
+  user selections through navigation"). Footer `[Cancel]` /
+  `[Apply ✓]` (Apply is primary, heavier weight per
+  `TODO(ui_ux_design_spec)`).
+- **Actions (in order):**
+  1. Write `<data_path>/config.yaml`.
+  2. Write `<data_path>/broker_credentials.toml` (via
+     `broker_persistence.rs`; OS keychain when available, else
+     file mode 0o600 / ACL-restricted).
   3. Write `<data_path>/hardware_profile.json`.
-  4. Write `<data_path>/wizard_complete.json` with the full state.
-  5. Spawn the historical-data download into a background job (it
-     was queued in step 6 but is not blocking — Apply returns when
-     the queue is enqueued, not when the downloads finish).
-  6. Close the wizard modal; open the main app window with the
-     "Welcome — let's run your first backtest" tour active.
-- **Skip:** N/A (this is the terminal step).
-- **Back:** to any prior step via `[edit ↑]` or the standard `[←
-  Back]`.
-- **Cancel:** confirmation modal: "Discard all changes and exit?
-  Your downloaded history (if any) will be preserved." Two
-  buttons: `[Keep editing]`, `[Discard]`.
-- **Time:** ≤ 5 s for the disk writes.
+  4. Write `<data_path>/wizard_complete.json`.
+  5. Spawn the historical-data download as a background job
+     (non-blocking — Apply returns on enqueue).
+  6. Close the modal; open the main app with the "Run your first
+     backtest" tour active.
+- **Skip:** N/A (terminal).
+- **Cancel:** confirm modal "Discard changes? Downloaded history
+  (if any) preserved." `[Keep editing]` / `[Discard]`.
+- **Time:** ≤ 5 s.
 
 ---
 
