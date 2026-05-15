@@ -5,9 +5,12 @@
         https://docs.chocolatey.org/en-us/create/create-packages-quick-start
   Strategy ref: docs/audits/research/installer_no_paid_certs_strategy.md §1.5.2
 
-  Build: `choco pack forex-ai.nuspec` from this directory.
-  Publish: `choco push forex-ai.0.4.5.nupkg --source https://push.chocolatey.org/`
+  Build:   choco pack forex-ai.nuspec      (from this directory)
+  Publish: choco push forex-ai.0.4.5.nupkg  source=https://push.chocolatey.org/
            Community moderation queue is 1-4 weeks for the first version.
+           (XML comments forbid the double-dash sequence, so the literal
+            "(double-dash)source" flag is rendered with whitespace here;
+            the actual command uses two ASCII hyphens before "source".)
 -->
 <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
   <metadata>

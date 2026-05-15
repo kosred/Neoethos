@@ -1,0 +1,233 @@
+# Zero-paid-certificate release workflow for forex-ai installers.
+#
+# Spec ref: docs/audits/research/installer_no_paid_certs_strategy.md §4
+#           (GitHub Releases pipeline with GPG + Sigstore cosign keyless).
+# Scope ref: docs/audits/research/installer_infrastructure_spec.md §3, §8, §10.
+#
+# This workflow runs IN PARALLEL with `.github/workflows/release.yml` (the
+# pre-existing GPU bundle pipeline). The two workflows produce different
+# artefact families that do not collide:
+#
+#   release.yml            → ForexAI-<ver>-windows-x64-gpu.zip / .tar.gz / .deb
+#                            (GPU build with libtorch/CUDA bundled)
+#   release-installers.yml → forex-ai_<ver>_amd64.deb       (cargo-deb)
+#                            forex-ai-<ver>-1.x86_64.rpm     (cargo-generate-rpm)
+#                            forex-app-<ver>-x86_64.AppImage (appimagetool)
+#                            forex-ai-<ver>-macos-universal.tar.gz (lipo + ad-hoc)
+#                            forex-ai-<ver>-windows-x86_64.tar.gz   (self-signed)
+#                            plus *.asc (GPG) and *.cosign-sig per asset.
+#
+# Both run on the same `v*` tag push; downstream `gh release upload`
+# is additive so all assets land on a single GitHub Release.
+#
+# Required repository secrets (per strategy doc §4.2):
+#   GPG_PRIVATE_KEY        — ASCII-armored GPG key for `gpg --detach-sign`.
+#   GPG_PASSPHRASE         — passphrase for the imported key (set via
+#                            gpg-preset-passphrase / loopback pinentry).
+#   GITHUB_TOKEN           — provided by Actions, used by softprops/action-gh-release.
+#
+# Cosign keyless uses GitHub's OIDC token (id-token: write permission below) —
+# no static key material is required for the Sigstore signing path.
+
+name: release-installers
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  # Required for Sigstore cosign keyless OIDC. Strategy doc §1.2 / §4.1.
+  id-token: write
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Linux: .deb (cargo-deb) + .rpm (cargo-generate-rpm) + .AppImage
+  # ──────────────────────────────────────────────────────────────────────────
+  linux-x86_64:
+    name: Linux x86_64 (deb / rpm / AppImage)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux packaging tooling
+        # cargo-deb writes Debian binary packages from `[package.metadata.deb]`.
+        # cargo-generate-rpm writes RPMs from `[package.metadata.generate-rpm]`.
+        run: cargo install cargo-deb cargo-generate-rpm --locked
+
+      - name: Build release binaries
+        run: cargo build --release -p forex-app -p forex-cli
+
+      - name: Build .deb packages
+        run: |
+          cargo deb -p forex-app --no-build
+          cargo deb -p forex-cli --no-build
+
+      - name: Build .rpm packages
+        run: |
+          cargo generate-rpm -p crates/forex-app
+          cargo generate-rpm -p crates/forex-cli
+
+      - name: Build AppImage
+        run: bash packaging/appimage/build.sh
+
+      - name: Install Sigstore cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign Linux artefacts (GPG + cosign keyless)
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          # Import the GPG key into the ephemeral CI keyring. The key is
+          # passed via stdin to avoid leaking to argv (strategy doc §4.2).
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+
+          for f in target/debian/*.deb target/generate-rpm/*.rpm *.AppImage; do
+            [ -f "$f" ] || continue
+            echo "::group::sign $f"
+            # GPG detached signature, ASCII-armored.
+            gpg --batch --yes --pinentry-mode loopback \
+                --passphrase "$GPG_PASSPHRASE" \
+                --detach-sign --armor "$f"
+            # Cosign keyless via Sigstore Fulcio (OIDC against GitHub Actions).
+            cosign sign-blob --yes "$f" > "$f.cosign-sig"
+            echo "::endgroup::"
+          done
+
+      - name: Publish Linux assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/debian/*.deb
+            target/debian/*.deb.asc
+            target/debian/*.deb.cosign-sig
+            target/generate-rpm/*.rpm
+            target/generate-rpm/*.rpm.asc
+            target/generate-rpm/*.rpm.cosign-sig
+            *.AppImage
+            *.AppImage.asc
+            *.AppImage.cosign-sig
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # macOS: universal (x86_64 + aarch64) tarball with ad-hoc codesign.
+  # ──────────────────────────────────────────────────────────────────────────
+  macos-universal:
+    name: macOS universal (ad-hoc signed tarball)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain (with cross targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Build Intel and Apple Silicon binaries
+        run: |
+          cargo build --release --target x86_64-apple-darwin -p forex-app -p forex-cli
+          cargo build --release --target aarch64-apple-darwin -p forex-app -p forex-cli
+
+      - name: Lipo into universal binaries and ad-hoc sign
+        # Ad-hoc codesign (`--sign -`) is the no-Developer-ID path that still
+        # lets Apple Silicon `amfid` load the __TEXT segment. Strategy doc §2.2.
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          lipo -create -output out/forex-app \
+            target/x86_64-apple-darwin/release/forex-app \
+            target/aarch64-apple-darwin/release/forex-app
+          lipo -create -output out/forex-cli \
+            target/x86_64-apple-darwin/release/forex-cli \
+            target/aarch64-apple-darwin/release/forex-cli
+          codesign --force --deep --sign - out/forex-app
+          codesign --force --deep --sign - out/forex-cli
+          tar -czf "forex-ai-${GITHUB_REF_NAME}-macos-universal.tar.gz" -C out .
+
+      - name: Install Sigstore cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign macOS tarball (GPG + cosign keyless)
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          for f in forex-ai-*-macos-universal.tar.gz; do
+            gpg --batch --yes --pinentry-mode loopback \
+                --passphrase "$GPG_PASSPHRASE" \
+                --detach-sign --armor "$f"
+            cosign sign-blob --yes "$f" > "$f.cosign-sig"
+          done
+
+      - name: Publish macOS assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            forex-ai-*-macos-universal.tar.gz
+            forex-ai-*-macos-universal.tar.gz.asc
+            forex-ai-*-macos-universal.tar.gz.cosign-sig
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Windows: x86_64 tarball with self-signed Authenticode. The MS Store path
+  # is intentionally NOT used (operator: no paid certs). End users install via
+  # winget / choco / scoop manifests under packaging/.
+  # ──────────────────────────────────────────────────────────────────────────
+  windows-x86_64:
+    name: Windows x86_64 (self-signed tarball)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binaries
+        run: cargo build --release -p forex-app -p forex-cli
+
+      - name: Stage and archive binaries
+        # PowerShell — the default Windows runner shell. We avoid embedding
+        # signtool here because the operator does not have an Authenticode
+        # cert (strategy doc §1 — primary distribution is via package
+        # managers, not direct download). A future step may add
+        # `New-SelfSignedCertificate` + `signtool sign` per strategy §1.3.
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path out -Force | Out-Null
+          Copy-Item target\release\forex-app.exe out\
+          Copy-Item target\release\forex-cli.exe out\
+          tar -czf "forex-ai-${env:GITHUB_REF_NAME}-windows-x86_64.tar.gz" out
+
+      - name: Install Sigstore cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign Windows tarball (GPG + cosign keyless)
+        # GPG / cosign are POSIX tools — use bash on the Windows runner so
+        # the heredocs and globs work identically to the Linux job.
+        shell: bash
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          for f in forex-ai-*-windows-x86_64.tar.gz; do
+            gpg --batch --yes --pinentry-mode loopback \
+                --passphrase "$GPG_PASSPHRASE" \
+                --detach-sign --armor "$f"
+            cosign sign-blob --yes "$f" > "$f.cosign-sig"
+          done
+
+      - name: Publish Windows assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            forex-ai-*-windows-x86_64.tar.gz
+            forex-ai-*-windows-x86_64.tar.gz.asc
+            forex-ai-*-windows-x86_64.tar.gz.cosign-sig
