@@ -203,9 +203,7 @@ impl DatasetDiscovery {
 
             // Silently ignore docs/archives/git artifacts — they are not
             // candidates for data and would spam the skipped list.
-            if SILENTLY_IGNORED_EXTENSIONS
-                .iter()
-                .any(|e| *e == ext.as_str())
+            if SILENTLY_IGNORED_EXTENSIONS.contains(&ext.as_str())
             {
                 continue;
             }
@@ -243,8 +241,8 @@ impl DatasetDiscovery {
             // (e.g. H2) so they don't sneak into training. The
             // canonical list lives in forex-core and is the single
             // source of truth.
-            if let Some(tf_label) = timeframe_raw.as_ref() {
-                if !forex_core::is_canonical_timeframe(tf_label) {
+            if let Some(tf_label) = timeframe_raw.as_ref()
+                && !forex_core::is_canonical_timeframe(tf_label) {
                     skipped.push(SkippedFile {
                         path,
                         reason: SkipReason::UnsupportedTimeframe(
@@ -253,7 +251,6 @@ impl DatasetDiscovery {
                     });
                     continue;
                 }
-            }
 
             entries.push(DataFileEntry {
                 path,

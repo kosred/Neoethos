@@ -171,8 +171,8 @@ impl Drop for TempFileGuard {
             // Drop-cleanup: file may not exist (NotFound is fine) and we
             // can't return errors from Drop. Log other failures so a
             // permission-denied / locked-file leak surfaces.
-            if let Err(err) = fs::remove_file(&self.path) {
-                if err.kind() != std::io::ErrorKind::NotFound {
+            if let Err(err) = fs::remove_file(&self.path)
+                && err.kind() != std::io::ErrorKind::NotFound {
                     tracing::warn!(
                         target: "forex_data::vortex_io",
                         path = %self.path.display(),
@@ -180,7 +180,6 @@ impl Drop for TempFileGuard {
                         "TempFileGuard::drop: failed to remove staged file"
                     );
                 }
-            }
         }
     }
 }

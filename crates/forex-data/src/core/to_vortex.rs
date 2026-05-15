@@ -224,9 +224,11 @@ fn parse_ipc(path: &Path) -> Result<Ohlcv> {
     // `IpcScanOptions` is a unit struct, `UnifiedScanArgs` has a sane
     // default (no caching, no globbing of paths we explicitly passed).
     let pl_path = PlPath::new(path.to_str().context("ipc path must be utf-8")?);
-    let mut scan_args = UnifiedScanArgs::default();
-    scan_args.cache = false;
-    scan_args.glob = false;
+    let scan_args = UnifiedScanArgs {
+        cache: false,
+        glob: false,
+        ..Default::default()
+    };
     let lf = LazyFrame::scan_ipc(pl_path, IpcScanOptions, scan_args)
         .with_context(|| format!("scan_ipc {}", path.display()))?;
 
@@ -419,16 +421,14 @@ fn validate_implied_timeframe(
     source: &Path,
 ) -> Result<()> {
     // 1) Explicit hint.
-    if let Some(h) = hint {
-        if let Some(tf) = &h.timeframe_hint {
-            if !forex_core::is_canonical_timeframe(tf) {
+    if let Some(h) = hint
+        && let Some(tf) = &h.timeframe_hint
+            && !forex_core::is_canonical_timeframe(tf) {
                 bail!(
                     "validate: schema_hint timeframe {tf} is not canonical \
                      (forex_core::CANONICAL_TIMEFRAMES). H2 is intentionally absent."
                 );
             }
-        }
-    }
 
     // 2) Filename token (e.g. EURUSD_H2_2024.csv).
     if let Some(stem) = source.file_stem().and_then(|s| s.to_str()) {
@@ -441,8 +441,8 @@ fn validate_implied_timeframe(
             if matches!(upper.as_str(),
                 "M1" | "M2" | "M3" | "M4" | "M5" | "M6" | "M10" | "M15" | "M20" | "M30"
                 | "H1" | "H2" | "H3" | "H4" | "H6" | "H8" | "H12"
-                | "D1" | "D2" | "D3" | "W1" | "W2" | "MN1") {
-                if !forex_core::is_canonical_timeframe(&upper) {
+                | "D1" | "D2" | "D3" | "W1" | "W2" | "MN1")
+                && !forex_core::is_canonical_timeframe(&upper) {
                     bail!(
                         "validate: source filename implies non-canonical \
                          timeframe {upper} (source: {src}). H2 is intentionally \
@@ -450,7 +450,6 @@ fn validate_implied_timeframe(
                         src = source.display()
                     );
                 }
-            }
         }
     }
 

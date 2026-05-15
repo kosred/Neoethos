@@ -211,8 +211,8 @@ pub fn import_one_file(
         Err(err) => {
             // Quarantine the source so the user can inspect.
             let qpath = quarantine_path(data_root, path);
-            if let Some(dir) = qpath.parent() {
-                if let Err(mk_err) = fs::create_dir_all(dir) {
+            if let Some(dir) = qpath.parent()
+                && let Err(mk_err) = fs::create_dir_all(dir) {
                     tracing::warn!(
                         target: "forex_data::universal_importer",
                         dir = %dir.display(),
@@ -220,7 +220,6 @@ pub fn import_one_file(
                         "quarantine: failed to create directory"
                     );
                 }
-            }
             // Best-effort copy; don't fail import if quarantine itself fails,
             // but surface the failure so the operator knows the source file
             // wasn't preserved for inspection.
@@ -641,21 +640,19 @@ fn rows_to_ohlcv(rows: Vec<HashMap<String, serde_json::Value>>) -> Result<Ohlcv>
 fn extract_num(row: &HashMap<String, serde_json::Value>, keys: &[&str]) -> Option<f64> {
     for k in keys {
         for actual_key in row.keys() {
-            if actual_key.eq_ignore_ascii_case(k) {
-                if let Some(v) = row.get(actual_key) {
+            if actual_key.eq_ignore_ascii_case(k)
+                && let Some(v) = row.get(actual_key) {
                     if let Some(f) = v.as_f64() {
                         return Some(f);
                     }
-                    if let Some(s) = v.as_str() {
-                        if let Ok(f) = s.parse::<f64>() {
+                    if let Some(s) = v.as_str()
+                        && let Ok(f) = s.parse::<f64>() {
                             return Some(f);
                         }
-                    }
                     if let Some(i) = v.as_i64() {
                         return Some(i as f64);
                     }
                 }
-            }
         }
     }
     None
@@ -674,8 +671,8 @@ fn extract_ts(row: &HashMap<String, serde_json::Value>) -> Option<i64> {
         "candle_time",
     ] {
         for actual_key in row.keys() {
-            if actual_key.eq_ignore_ascii_case(k) {
-                if let Some(v) = row.get(actual_key) {
+            if actual_key.eq_ignore_ascii_case(k)
+                && let Some(v) = row.get(actual_key) {
                     if let Some(i) = v.as_i64() {
                         return Some(i);
                     }
@@ -689,7 +686,6 @@ fn extract_ts(row: &HashMap<String, serde_json::Value>) -> Option<i64> {
                         }
                     }
                 }
-            }
         }
     }
     None
