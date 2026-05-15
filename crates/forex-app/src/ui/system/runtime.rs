@@ -16,11 +16,11 @@ struct RuntimeDashboard {
 
 pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSession) -> bool {
     egui::ScrollArea::vertical().show(ui, |ui| {
-        if let Err(err) = session.poll_ctrader_live_auth() {
+        if let Some(snapshot) = session.poll_ctrader_live_auth() {
             tracing::debug!(
                 target: "forex_app::ui::system::runtime",
-                error = %err,
-                "runtime tab: poll_ctrader_live_auth failed (will retry on next paint)"
+                state = ?snapshot.state,
+                "runtime tab: cTrader live-auth snapshot refreshed"
             );
         }
         let snapshot = session.snapshot(state);
