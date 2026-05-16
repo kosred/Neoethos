@@ -12,9 +12,6 @@
 PackageIdentifier: kosred.forex-ai
 PackageVersion: 0.4.5
 
-# Per-machine install — WinGet maps "machine" to HKLM ARP entries. Wizard
-# §10 (migration / coexistence) expects machine-scoped installs.
-Scope: machine
 InstallerType: zip
 NestedInstallerType: portable
 NestedInstallerFiles:
@@ -34,8 +31,6 @@ Commands:
   - forex-cli
 
 ReleaseDate: 2026-05-15
-ReleaseNotesUrl: https://github.com/kosred/forex-ai/releases/tag/v0.4.5
-
 Installers:
   - Architecture: x64
     InstallerType: zip
@@ -44,9 +39,9 @@ Installers:
     # .github/workflows/release.yml uploads it. The URL pattern is fixed by
     # softprops/action-gh-release: <repo>/releases/download/<tag>/<file>.
     InstallerUrl: https://github.com/kosred/forex-ai/releases/download/v0.4.5/forex-ai-v0.4.5-windows-x86_64.tar.gz
-    # TODO(release-time): SHA-256 of the uploaded asset. WinGet CI rejects
-    # the manifest if this doesn't match the file on disk at install time.
-    InstallerSha256: TODO_SHA256_AT_RELEASE_TIME
+    # Release-gate local artifact hash. Refresh this if the published
+    # GitHub Release asset is rebuilt after tagging.
+    InstallerSha256: 1AD40CBC286BF58A18FE00E5C29FCD913FD775133DD2435113F5B184781B1E0E
     NestedInstallerFiles:
       - RelativeFilePath: out/forex-app.exe
         PortableCommandAlias: forex-app
