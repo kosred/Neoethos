@@ -1,10 +1,12 @@
-//! Prop firm constraint constants — the ONLY hardcoded numeric values
-//! allowed in production code per operator directive 2026-05-14.
+//! Prop firm hard constraints and local challenge/risk defaults.
 //!
 //! Source of truth: FTMO Trader Challenge rules (https://ftmo.com/en/trading-objectives/).
 //! Other prop firms (MyForexFunds, The5%ers, FundedNext) use similar
 //! limits ±0.5% — if we need per-firm customization later, this struct
 //! becomes a runtime config but the defaults stay.
+//! External prop-firm numbers belong in [`PropFirmConstraints`]. Local
+//! forex-ai policy defaults live beside it so search, validation, and live
+//! risk code do not carry duplicate literals.
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PropFirmConstraints {
@@ -36,4 +38,73 @@ impl PropFirmConstraints {
         min_monthly_net_profit_pct: 0.04, // operator directive
         min_trading_days: 10,
     };
+}
+
+/// Local operating defaults for challenge-cycle planning.
+///
+/// These are not external prop-firm rules. They are forex-ai runtime
+/// defaults that need one canonical owner because the search optimizer,
+/// validation artifacts, and live risk presets all reason about the same
+/// challenge window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PropFirmChallengeDefaults {
+    /// Denominator used to turn a full challenge profit target into a daily
+    /// pacing target.
+    pub daily_target_trading_days: u32,
+    /// Short-cycle fixture/window minimum used by local validation flows.
+    pub relaxed_min_trading_days: u32,
+    /// Planning horizon used by phase-specific risk presets.
+    pub target_trading_days: u32,
+    /// Upper bound used for challenge-cycle pacing.
+    pub max_trading_days: u32,
+}
+
+impl PropFirmChallengeDefaults {
+    pub const FTMO_STANDARD: Self = Self {
+        daily_target_trading_days: 20,
+        relaxed_min_trading_days: 5,
+        target_trading_days: 22,
+        max_trading_days: 60,
+    };
+}
+
+/// Local runtime defaults layered under the hard prop-firm constraints.
+///
+/// These numbers are guard-rail policy, not FTMO facts. Keeping them here
+/// prevents duplicated risk bands and trade caps from drifting across crates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PropFirmRuntimeDefaults {
+    pub max_lot_size: f64,
+    pub daily_dd_warning_pct: f64,
+    pub daily_dd_stop_trading_pct: f64,
+    pub daily_profit_lock_pct: f64,
+    pub max_trades_per_day: usize,
+}
+
+impl PropFirmRuntimeDefaults {
+    pub const FTMO_STANDARD: Self = Self {
+        max_lot_size: 10.0,
+        daily_dd_warning_pct: 0.035,
+        daily_dd_stop_trading_pct: 0.040,
+        daily_profit_lock_pct: 0.03,
+        max_trades_per_day: 15,
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PropFirmChallengeDefaults, PropFirmConstraints, PropFirmRuntimeDefaults};
+
+    #[test]
+    fn ftmo_runtime_defaults_stay_inside_hard_constraints() {
+        let constraints = PropFirmConstraints::FTMO_STANDARD;
+        let challenge = PropFirmChallengeDefaults::FTMO_STANDARD;
+        let runtime = PropFirmRuntimeDefaults::FTMO_STANDARD;
+
+        assert!(challenge.relaxed_min_trading_days < constraints.min_trading_days);
+        assert!(challenge.max_trading_days > constraints.min_trading_days);
+        assert!(challenge.daily_target_trading_days <= challenge.target_trading_days);
+        assert!(runtime.daily_dd_warning_pct < runtime.daily_dd_stop_trading_pct);
+        assert!(runtime.daily_dd_stop_trading_pct <= constraints.max_daily_loss_pct as f64);
+    }
 }

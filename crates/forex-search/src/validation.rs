@@ -4,7 +4,7 @@ use crate::eval::{
 };
 use anyhow::{Result, bail};
 use forex_core::contracts::{TemporalFeatureContract, TemporalScopeHashes};
-use forex_core::domain::prop_firm::PropFirmConstraints;
+use forex_core::domain::prop_firm::{PropFirmChallengeDefaults, PropFirmConstraints};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -599,13 +599,13 @@ impl Default for PropFirmRiskRules {
         // per operator directive 2026-05-14 — they are the only
         // hardcoded prop-firm numbers allowed in production code.
         let ftmo = PropFirmConstraints::FTMO_STANDARD;
+        let challenge_defaults = PropFirmChallengeDefaults::FTMO_STANDARD;
         Self {
             max_daily_loss_pct: ftmo.max_daily_loss_pct as f64,
             max_overall_drawdown_pct: ftmo.max_overall_drawdown_pct as f64,
             // FIXME(hardcoded): config-extract — internal consistency-ratio cap.
             max_profit_consistency_ratio: 0.50,
-            // FIXME(hardcoded): config-extract — relaxed below FTMO's 10-day floor for shorter cycles.
-            min_trading_days: 5,
+            min_trading_days: challenge_defaults.relaxed_min_trading_days as usize,
             max_trades_per_day: 0,
             require_profit_target: false,
             min_profit_target_pct: ftmo.challenge_profit_target_pct as f64,
@@ -1749,6 +1749,17 @@ mod tests {
         assert!(summary.all_rules_passed);
         assert!(!summary.daily_loss_breach);
         assert!(!summary.consistency_violation);
+    }
+
+    #[test]
+    fn prop_firm_risk_rules_use_shared_relaxed_minimum_window() {
+        let rules = PropFirmRiskRules::default();
+        let defaults = forex_core::domain::prop_firm::PropFirmChallengeDefaults::FTMO_STANDARD;
+
+        assert_eq!(
+            rules.min_trading_days,
+            defaults.relaxed_min_trading_days as usize
+        );
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use crate::domain::prop_firm::PropFirmConstraints;
+use crate::domain::prop_firm::{
+    PropFirmChallengeDefaults, PropFirmConstraints, PropFirmRuntimeDefaults,
+};
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum ChallengePhase {
@@ -44,26 +46,22 @@ impl Default for PropFirmRules {
         // challenge profit target. Anything tunable is marked with a
         // FIXME so Batch 3+ can lift it into a config file.
         let ftmo = PropFirmConstraints::FTMO_STANDARD;
+        let challenge_defaults = PropFirmChallengeDefaults::FTMO_STANDARD;
+        let runtime_defaults = PropFirmRuntimeDefaults::FTMO_STANDARD;
         Self {
             max_daily_loss_pct: ftmo.max_daily_loss_pct as f64,
             max_total_loss_pct: ftmo.max_overall_drawdown_pct as f64,
             profit_target_pct: ftmo.challenge_profit_target_pct as f64,
             min_trading_days: ftmo.min_trading_days as usize,
-            // FIXME(hardcoded): config-extract — challenge cycle length tunable.
-            max_trading_days: 60,
-            // FIXME(hardcoded): config-extract — broker lot ceiling.
-            max_lot_size: 10.0,
+            max_trading_days: challenge_defaults.max_trading_days as usize,
+            max_lot_size: runtime_defaults.max_lot_size,
             news_trading_allowed: false,
             weekend_holding: false,
             scaling_enabled: true,
-            // FIXME(hardcoded): config-extract — internal early-warning band, not a prop-firm rule.
-            daily_dd_warning_pct: 0.035,
-            // FIXME(hardcoded): config-extract — internal stop-trading band, not a prop-firm rule.
-            daily_dd_stop_trading_pct: 0.040,
-            // FIXME(hardcoded): config-extract — internal profit-lock threshold.
-            daily_profit_lock_pct: 0.03,
-            // FIXME(hardcoded): config-extract — internal trade-rate cap.
-            max_trades_per_day: 15,
+            daily_dd_warning_pct: runtime_defaults.daily_dd_warning_pct,
+            daily_dd_stop_trading_pct: runtime_defaults.daily_dd_stop_trading_pct,
+            daily_profit_lock_pct: runtime_defaults.daily_profit_lock_pct,
+            max_trades_per_day: runtime_defaults.max_trades_per_day,
         }
     }
 }
@@ -93,6 +91,7 @@ pub fn resolve_challenge_risk_preset(phase: &str) -> ChallengeRiskPreset {
     let total_dd = ftmo.max_overall_drawdown_pct as f64;
     let challenge_target = ftmo.challenge_profit_target_pct as f64;
     let monthly_floor = ftmo.min_monthly_net_profit_pct as f64;
+    let challenge_defaults = PropFirmChallengeDefaults::FTMO_STANDARD;
     match phase_enum {
         ChallengePhase::Phase2 => ChallengeRiskPreset {
             phase: "phase_2".to_string(),
@@ -112,8 +111,7 @@ pub fn resolve_challenge_risk_preset(phase: &str) -> ChallengeRiskPreset {
             monthly_profit_target_pct: monthly_floor,
             // Phase 2 verification target is half of full challenge target.
             challenge_target_return_pct: challenge_target / 2.0,
-            // FIXME(hardcoded): config-extract — challenge measurement window.
-            challenge_target_trading_days: 22,
+            challenge_target_trading_days: challenge_defaults.target_trading_days as usize,
         },
         ChallengePhase::Funded => ChallengeRiskPreset {
             phase: "funded".to_string(),
@@ -131,8 +129,7 @@ pub fn resolve_challenge_risk_preset(phase: &str) -> ChallengeRiskPreset {
             // Funded accounts target operator's 4% floor.
             monthly_profit_target_pct: monthly_floor,
             challenge_target_return_pct: monthly_floor,
-            // FIXME(hardcoded): config-extract — challenge measurement window.
-            challenge_target_trading_days: 22,
+            challenge_target_trading_days: challenge_defaults.target_trading_days as usize,
         },
         ChallengePhase::Phase1 => ChallengeRiskPreset {
             phase: "phase_1".to_string(),
@@ -150,8 +147,7 @@ pub fn resolve_challenge_risk_preset(phase: &str) -> ChallengeRiskPreset {
             daily_profit_lock_pct: 0.015,
             monthly_profit_target_pct: challenge_target,
             challenge_target_return_pct: challenge_target,
-            // FIXME(hardcoded): config-extract — challenge measurement window.
-            challenge_target_trading_days: 22,
+            challenge_target_trading_days: challenge_defaults.target_trading_days as usize,
         },
     }
 }
@@ -392,8 +388,8 @@ impl RiskManager {
             monthly_target_hit: false,
             challenge_target_hit: false,
             // Operator-mandated 4% monthly profit floor + FTMO challenge target.
-            monthly_profit_target_pct: PropFirmConstraints::FTMO_STANDARD
-                .min_monthly_net_profit_pct as f64,
+            monthly_profit_target_pct: PropFirmConstraints::FTMO_STANDARD.min_monthly_net_profit_pct
+                as f64,
             challenge_target_return_pct: PropFirmConstraints::FTMO_STANDARD
                 .challenge_profit_target_pct as f64,
             monthly_return_pct: 0.0,
@@ -730,6 +726,8 @@ impl RiskManager {
 
 #[cfg(test)]
 mod tests {
+    use crate::domain::prop_firm::PropFirmChallengeDefaults;
+
     use super::{PositionSizingInput, PropFirmRules, RiskManager, TradeGateInput};
 
     fn test_rules() -> PropFirmRules {
@@ -737,6 +735,19 @@ mod tests {
             max_total_loss_pct: 0.10,
             daily_dd_stop_trading_pct: 0.04,
             ..PropFirmRules::default()
+        }
+    }
+
+    #[test]
+    fn challenge_risk_presets_use_shared_target_window() {
+        let defaults = PropFirmChallengeDefaults::FTMO_STANDARD;
+
+        for phase in ["phase_1", "phase_2", "funded"] {
+            let preset = super::resolve_challenge_risk_preset(phase);
+            assert_eq!(
+                preset.challenge_target_trading_days,
+                defaults.target_trading_days as usize
+            );
         }
     }
 

@@ -11,7 +11,7 @@ pub mod prop_firm;
 pub mod risk;
 pub mod risky_mode;
 
-pub use prop_firm::PropFirmConstraints;
+pub use prop_firm::{PropFirmChallengeDefaults, PropFirmConstraints, PropFirmRuntimeDefaults};
 pub use risky_mode::{
     KillSwitchTier, RiskyModeConfig, RiskyModeManager, RiskyStage, build_logarithmic_stages,
 };
