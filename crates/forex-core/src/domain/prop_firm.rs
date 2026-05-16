@@ -79,6 +79,17 @@ pub struct PropFirmRuntimeDefaults {
     pub daily_dd_stop_trading_pct: f64,
     pub daily_profit_lock_pct: f64,
     pub max_trades_per_day: usize,
+    pub recovery_halt_drawdown_pct: f64,
+    pub recovery_top_strategy_drawdown_pct: f64,
+    pub recovery_min_sharpe_drawdown_pct: f64,
+    pub recovery_top_three_drawdown_pct: f64,
+    pub recovery_top_strategy_rank: usize,
+    pub recovery_caution_strategy_rank: usize,
+    pub recovery_max_trades_per_day: usize,
+    pub recovery_min_strategy_sharpe: f64,
+    pub recovery_mode_risk_multiplier: f64,
+    pub defensive_mode_risk_multiplier: f64,
+    pub caution_mode_risk_multiplier: f64,
 }
 
 impl PropFirmRuntimeDefaults {
@@ -88,6 +99,17 @@ impl PropFirmRuntimeDefaults {
         daily_dd_stop_trading_pct: 0.040,
         daily_profit_lock_pct: 0.03,
         max_trades_per_day: 15,
+        recovery_halt_drawdown_pct: 0.05,
+        recovery_top_strategy_drawdown_pct: 0.04,
+        recovery_min_sharpe_drawdown_pct: 0.03,
+        recovery_top_three_drawdown_pct: 0.02,
+        recovery_top_strategy_rank: 1,
+        recovery_caution_strategy_rank: 3,
+        recovery_max_trades_per_day: 2,
+        recovery_min_strategy_sharpe: 1.0,
+        recovery_mode_risk_multiplier: 0.25,
+        defensive_mode_risk_multiplier: 0.50,
+        caution_mode_risk_multiplier: 0.75,
     };
 }
 
@@ -106,5 +128,17 @@ mod tests {
         assert!(challenge.daily_target_trading_days <= challenge.target_trading_days);
         assert!(runtime.daily_dd_warning_pct < runtime.daily_dd_stop_trading_pct);
         assert!(runtime.daily_dd_stop_trading_pct <= constraints.max_daily_loss_pct as f64);
+        assert!(
+            runtime.recovery_top_three_drawdown_pct < runtime.recovery_min_sharpe_drawdown_pct
+        );
+        assert!(
+            runtime.recovery_min_sharpe_drawdown_pct
+                < runtime.recovery_top_strategy_drawdown_pct
+        );
+        assert!(runtime.recovery_top_strategy_drawdown_pct < runtime.recovery_halt_drawdown_pct);
+        assert!(runtime.recovery_halt_drawdown_pct <= constraints.max_overall_drawdown_pct as f64);
+        assert!(runtime.recovery_mode_risk_multiplier < runtime.defensive_mode_risk_multiplier);
+        assert!(runtime.defensive_mode_risk_multiplier < runtime.caution_mode_risk_multiplier);
+        assert!(runtime.caution_mode_risk_multiplier <= 1.0);
     }
 }

@@ -544,6 +544,7 @@ impl RiskManager {
 
         let (daily_dd, intraday_dd, _dd_used, _dd_limit, total_dd) =
             self.drawdown_state(input.equity);
+        let runtime_defaults = PropFirmRuntimeDefaults::FTMO_STANDARD;
         // Check the hard limit first — it is the most severe condition.
         if total_dd >= self.prop_rules.max_total_loss_pct {
             self.circuit_breaker_triggered = true;
@@ -552,49 +553,64 @@ impl RiskManager {
                 format!("Total drawdown limit ({:.2}%)", total_dd * 100.0),
             );
         }
-        // FIXME(hardcoded): config-extract — internal recovery bands
-        // (5%/4%/3%/2%) live below the prop-firm hard limit and should
-        // come from strategy config rather than inlined literals.
-        // Secondary recovery halt (below the hard limit but above 5%).
-        if total_dd >= 0.05 {
+        if total_dd >= runtime_defaults.recovery_halt_drawdown_pct {
             self.circuit_breaker_triggered = true;
             return (
                 false,
-                "Drawdown Recovery: HALT trading (DD > 5%)".to_string(),
+                format!(
+                    "Drawdown Recovery: HALT trading (DD > {:.0}%)",
+                    runtime_defaults.recovery_halt_drawdown_pct * 100.0
+                ),
             );
         }
 
-        if total_dd >= 0.04 {
+        if total_dd >= runtime_defaults.recovery_top_strategy_drawdown_pct {
             if let Some(rank) = input.strategy_rank
-                && rank > 1
+                && rank > runtime_defaults.recovery_top_strategy_rank
             {
                 return (
                     false,
-                    "Drawdown Recovery: DD > 4%, only top 1 strategy allowed".to_string(),
+                    format!(
+                        "Drawdown Recovery: DD > {:.0}%, only top {} strategy allowed",
+                        runtime_defaults.recovery_top_strategy_drawdown_pct * 100.0,
+                        runtime_defaults.recovery_top_strategy_rank
+                    ),
                 );
             }
-            if self.session_trades >= 2 {
+            if self.session_trades >= runtime_defaults.recovery_max_trades_per_day {
                 return (
                     false,
-                    "Drawdown Recovery: DD > 4%, max 2 trades/day".to_string(),
+                    format!(
+                        "Drawdown Recovery: DD > {:.0}%, max {} trades/day",
+                        runtime_defaults.recovery_top_strategy_drawdown_pct * 100.0,
+                        runtime_defaults.recovery_max_trades_per_day
+                    ),
                 );
             }
-        } else if total_dd >= 0.03 {
+        } else if total_dd >= runtime_defaults.recovery_min_sharpe_drawdown_pct {
             if let Some(sharpe) = input.strategy_sharpe
-                && sharpe <= 1.0
+                && sharpe <= runtime_defaults.recovery_min_strategy_sharpe
             {
                 return (
                     false,
-                    "Drawdown Recovery: DD > 3%, only Sharpe > 1.0 allowed".to_string(),
+                    format!(
+                        "Drawdown Recovery: DD > {:.0}%, only Sharpe > {:.1} allowed",
+                        runtime_defaults.recovery_min_sharpe_drawdown_pct * 100.0,
+                        runtime_defaults.recovery_min_strategy_sharpe
+                    ),
                 );
             }
-        } else if total_dd >= 0.02
+        } else if total_dd >= runtime_defaults.recovery_top_three_drawdown_pct
             && let Some(rank) = input.strategy_rank
-            && rank > 3
+            && rank > runtime_defaults.recovery_caution_strategy_rank
         {
             return (
                 false,
-                "Drawdown Recovery: DD > 2%, only top 3 strategies allowed".to_string(),
+                format!(
+                    "Drawdown Recovery: DD > {:.0}%, only top {} strategies allowed",
+                    runtime_defaults.recovery_top_three_drawdown_pct * 100.0,
+                    runtime_defaults.recovery_caution_strategy_rank
+                ),
             );
         }
 
@@ -704,17 +720,17 @@ impl RiskManager {
         }
 
         let max_total_loss = self.prop_rules.max_total_loss_pct.max(1e-6);
-        // FIXME(hardcoded): config-extract — internal drawdown recovery bands
-        // (5%/4%/3%/2%) sit below the prop-firm hard limit and should be
-        // lifted into the strategy config rather than inlined here.
-        if total_dd_pct >= max_total_loss || total_dd_pct >= 0.05 {
+        let runtime_defaults = PropFirmRuntimeDefaults::FTMO_STANDARD;
+        if total_dd_pct >= max_total_loss
+            || total_dd_pct >= runtime_defaults.recovery_halt_drawdown_pct
+        {
             return 0.0;
-        } else if total_dd_pct >= 0.04 {
-            risk_pct *= 0.25; // Recovery Mode
-        } else if total_dd_pct >= 0.03 {
-            risk_pct *= 0.50; // Defensive Mode
-        } else if total_dd_pct >= 0.02 {
-            risk_pct *= 0.75; // Caution Mode
+        } else if total_dd_pct >= runtime_defaults.recovery_top_strategy_drawdown_pct {
+            risk_pct *= runtime_defaults.recovery_mode_risk_multiplier;
+        } else if total_dd_pct >= runtime_defaults.recovery_min_sharpe_drawdown_pct {
+            risk_pct *= runtime_defaults.defensive_mode_risk_multiplier;
+        } else if total_dd_pct >= runtime_defaults.recovery_top_three_drawdown_pct {
+            risk_pct *= runtime_defaults.caution_mode_risk_multiplier;
         } else if total_dd_pct > 0.0 {
             let scale = 1.0 - (total_dd_pct / max_total_loss);
             risk_pct *= scale.max(0.3);
