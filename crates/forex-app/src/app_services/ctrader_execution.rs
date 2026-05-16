@@ -765,15 +765,11 @@ fn parse_execution_event(response_json: &str) -> Result<CTraderExecutionOutcome>
         .as_ref()
         .and_then(|item| item.close_position_detail.as_ref())
         .and_then(|detail| detail.money_digits)
-        .or_else(|| deal.as_ref().and_then(|item| item.money_digits))
-        .unwrap_or_else(|| {
-            tracing::error!(
-                target: "forex_app::ctrader",
-                "execution event omitted required money_digits; defaulting to 2 \
-                 (silent unwrap_or(0) would scale execution P&L 100×)"
-            );
-            2
-        });
+        .or_else(|| deal.as_ref().and_then(|item| item.money_digits));
+    let money_digits = crate::app_services::ctrader_money::required_money_digits(
+        money_digits,
+        "execution.money_digits",
+    );
 
     let gross_profit = deal.as_ref().and_then(|item| {
         item.close_position_detail

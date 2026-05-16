@@ -128,6 +128,41 @@ fn execution_event_maps_filled_outcome_with_realized_pnl() {
 }
 
 #[test]
+fn execution_event_scales_close_detail_money_digits_four_fields() {
+    let response = r#"{
+        "payloadType": 2126,
+        "payload": {
+            "ctidTraderAccountId": 712345,
+            "executionType": 3,
+            "deal": {
+                "dealId": 3001,
+                "orderId": 8001,
+                "positionId": 9001,
+                "filledVolume": 10000000,
+                "symbolId": 14,
+                "executionTimestamp": 1710000201000,
+                "executionPrice": 1.099,
+                "tradeSide": 1,
+                "closePositionDetail": {
+                    "grossProfit": 1250,
+                    "swap": -15,
+                    "commission": -40,
+                    "pnlConversionFee": -10,
+                    "moneyDigits": 4
+                }
+            }
+        }
+    }"#;
+
+    let outcome = parse_execution_outcome(response).expect("filled execution should parse");
+
+    assert_eq!(outcome.gross_profit, Some(0.125));
+    assert_eq!(outcome.fee, Some(-0.004));
+    assert_eq!(outcome.swap, Some(-0.0015));
+    assert_eq!(outcome.net_profit, Some(0.1185));
+}
+
+#[test]
 fn order_error_event_maps_failed_outcome() {
     let response = r#"{
         "payloadType": 2132,

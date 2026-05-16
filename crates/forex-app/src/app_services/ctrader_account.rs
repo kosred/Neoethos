@@ -60,6 +60,8 @@ pub struct CTraderPositionSnapshot {
     pub take_profit: Option<f64>,
     pub swap: Option<f64>,
     pub commission: Option<f64>,
+    pub mirroring_commission: Option<f64>,
+    pub used_margin: Option<f64>,
     pub label: Option<String>,
     pub comment: Option<String>,
     pub client_order_id: Option<String>,
@@ -252,6 +254,10 @@ struct PositionPayload {
     take_profit: Option<f64>,
     swap: Option<i64>,
     commission: Option<i64>,
+    #[serde(rename = "mirroringCommission")]
+    mirroring_commission: Option<i64>,
+    #[serde(rename = "usedMargin")]
+    used_margin: Option<u64>,
     #[serde(rename = "moneyDigits")]
     money_digits: Option<u32>,
 }
@@ -385,6 +391,18 @@ pub fn parse_reconcile_response(response_json: &str) -> Result<CTraderReconcileS
                 commission: position
                     .commission
                     .map(|raw| scaled_money(raw, required_money_digits(position.money_digits, "position.money_digits"))),
+                mirroring_commission: position.mirroring_commission.map(|raw| {
+                    scaled_money(
+                        raw,
+                        required_money_digits(position.money_digits, "position.money_digits"),
+                    )
+                }),
+                used_margin: position.used_margin.map(|raw| {
+                    scaled_unsigned_money(
+                        raw,
+                        required_money_digits(position.money_digits, "position.money_digits"),
+                    )
+                }),
                 position_id: position.position_id,
                 symbol_id: position.trade_data.symbol_id,
                 trade_side: trade_side_label(position.trade_data.trade_side),
@@ -802,6 +820,22 @@ fn scaled_money(value: i64, digits: u32) -> f64 {
     }
 }
 
+fn scaled_unsigned_money(value: u64, digits: u32) -> f64 {
+    match crate::app_services::ctrader_money::scale_ctrader_money_uint(value, digits as i32) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(
+                target: "forex_app::ctrader",
+                raw_value = value,
+                money_digits = digits,
+                error = %err,
+                "cTrader unsigned money scaling rejected by spec helper; falling back to fiat default (2)"
+            );
+            (value as f64) / 100.0
+        }
+    }
+}
+
 /// Resolve `money_digits` from a broker payload. The cTrader OpenAPI
 /// schema declares this field as required; if it is somehow missing we
 /// emit a `tracing::error` (NOT a silent `unwrap_or(0)`) and fall back
@@ -810,18 +844,7 @@ fn scaled_money(value: i64, digits: u32) -> f64 {
 /// every reported balance / equity / commission by 100×, corrupting
 /// the operator's view of account state.
 fn required_money_digits(value: Option<u32>, field: &str) -> u32 {
-    match value {
-        Some(v) => v,
-        None => {
-            tracing::error!(
-                target: "forex_app::ctrader",
-                field = field,
-                "broker payload omitted required money_digits; defaulting to 2 \
-                 (silent unwrap_or(0) would scale balances 100×)"
-            );
-            2
-        }
-    }
+    crate::app_services::ctrader_money::required_money_digits(value, field)
 }
 
 fn volume_to_units(value: i64) -> f64 {

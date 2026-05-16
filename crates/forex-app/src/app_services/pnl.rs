@@ -626,6 +626,8 @@ mod tests {
             take_profit: None,
             swap: None,
             commission: None,
+            mirroring_commission: None,
+            used_margin: None,
             label: None,
             comment: None,
             client_order_id: None,

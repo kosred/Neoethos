@@ -85,6 +85,30 @@ pub fn scale_ctrader_money_int(scaled: i64, money_digits: i32) -> Result<f64> {
     Ok(scaled as f64 / divisor)
 }
 
+/// Scale an unsigned cTrader monetary value, used for fields such as
+/// `ProtoOAPosition.usedMargin`.
+pub fn scale_ctrader_money_uint(scaled: u64, money_digits: i32) -> Result<f64> {
+    if scaled > i64::MAX as u64 {
+        bail!("cTrader unsigned money value exceeds supported i64 range: {scaled}");
+    }
+    scale_ctrader_money_int(scaled as i64, money_digits)
+}
+
+/// Resolve a required per-entity `moneyDigits` exponent from broker
+/// payloads. Missing values keep the legacy fiat fallback but log
+/// loudly so malformed live payloads are visible.
+pub fn required_money_digits(value: Option<u32>, field: &str) -> u32 {
+    value.unwrap_or_else(|| {
+        tracing::error!(
+            target: "forex_app::ctrader",
+            field,
+            "broker payload omitted required money_digits; defaulting to 2 \
+             (silent default to 0 would mis-scale monetary values)"
+        );
+        2
+    })
+}
+
 /// Inverse of [`scale_ctrader_money_int`] for outgoing values
 /// (e.g. when a future code path wants to emit a scaled monetary limit
 /// in the cTrader wire format).
@@ -137,6 +161,12 @@ mod tests {
         // accounts. Pin the equivalence so the migration cannot
         // regress the default-currency case.
         assert_eq!(scale_ctrader_money_int(12_345, 2).expect("in-range"), 123.45);
+    }
+
+    #[test]
+    fn scale_money_digits_four_matches_high_precision_account() {
+        assert_eq!(scale_ctrader_money_int(123_456, 4).expect("in-range"), 12.3456);
+        assert_eq!(scale_ctrader_money_uint(123_456, 4).expect("in-range"), 12.3456);
     }
 
     #[test]

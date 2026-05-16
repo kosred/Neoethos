@@ -97,6 +97,43 @@ fn reconcile_response_parses_positions_and_pending_orders() {
 }
 
 #[test]
+fn reconcile_response_scales_position_money_digits_four_fields() {
+    let response = serde_json::json!({
+        "clientMsgId": "reconcile-money-4",
+        "payloadType": 2125,
+        "payload": {
+            "ctidTraderAccountId": 712345,
+            "position": [
+                {
+                    "positionId": 9001,
+                    "tradeData": {
+                        "symbolId": 14,
+                        "volume": 2500,
+                        "tradeSide": 1,
+                        "openTimestamp": 1710000000000i64
+                    },
+                    "price": 1.10123,
+                    "swap": -1234,
+                    "commission": -5678,
+                    "mirroringCommission": -90,
+                    "usedMargin": 123456,
+                    "moneyDigits": 4
+                }
+            ],
+            "order": []
+        }
+    });
+
+    let reconcile = parse_reconcile_response(&response.to_string()).expect("reconcile");
+    let position = &reconcile.positions[0];
+
+    assert_eq!(position.swap, Some(-0.1234));
+    assert_eq!(position.commission, Some(-0.5678));
+    assert_eq!(position.mirroring_commission, Some(-0.009));
+    assert_eq!(position.used_margin, Some(12.3456));
+}
+
+#[test]
 fn deal_list_response_parses_recent_deals() {
     let response = serde_json::json!({
         "clientMsgId": "deals-1",
@@ -142,6 +179,48 @@ fn deal_list_response_parses_recent_deals() {
     assert_eq!(deals[0].execution_price, Some(1.0990));
     assert_eq!(deals[0].gross_profit, Some(12.5));
     assert_eq!(deals[0].fee, Some(-0.4));
+}
+
+#[test]
+fn deal_list_response_scales_close_detail_money_digits_four_fields() {
+    let response = serde_json::json!({
+        "clientMsgId": "deals-money-4",
+        "payloadType": 2134,
+        "payload": {
+            "ctidTraderAccountId": 712345,
+            "deal": [
+                {
+                    "dealId": 3001,
+                    "orderId": 8001,
+                    "positionId": 9001,
+                    "volume": 1500,
+                    "filledVolume": 1500,
+                    "symbolId": 14,
+                    "executionTimestamp": 1710000201000i64,
+                    "executionPrice": 1.0990,
+                    "tradeSide": 1,
+                    "dealStatus": 2,
+                    "closePositionDetail": {
+                        "entryPrice": 1.0980,
+                        "grossProfit": 1250,
+                        "swap": -15,
+                        "commission": -40,
+                        "pnlConversionFee": -10,
+                        "moneyDigits": 4
+                    }
+                }
+            ],
+            "hasMore": false
+        }
+    });
+
+    let deals = parse_deal_list_response(&response.to_string()).expect("deal list");
+
+    assert_eq!(deals[0].gross_profit, Some(0.125));
+    assert_eq!(deals[0].fee, Some(-0.004));
+    assert_eq!(deals[0].swap, Some(-0.0015));
+    assert_eq!(deals[0].pnl_conversion_fee, Some(-0.001));
+    assert_eq!(deals[0].net_profit, Some(0.1185));
 }
 
 #[test]

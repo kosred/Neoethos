@@ -3,7 +3,7 @@
 **Date:** 2026-05-16
 **Branch:** `codex/full-audit-continuation`
 **Base:** `origin/claude/v0.4.1-full-audit @ 31a218ff`
-**Method:** audit claims first, then code reality checks. No production code changes in this report.
+**Method:** audit claims first, then code reality checks. Subsequent rows record verified fixes made in this continuation branch.
 
 ## Command Evidence
 
@@ -37,7 +37,7 @@ Observed counts:
 | Hardcoded risk/config values | Roadmap says 37 `FIXME(hardcoded)` remain and mostly need config extraction. | Matches remain in `forex-core/src/config.rs`, `forex-core/src/domain/risk.rs`, `forex-search/src/challenge.rs`, and `forex-search/src/validation.rs`. Several represent duplicate challenge windows, risk bands, trade caps, and strategy tunables. | **Known duplication / config gap** | Second candidate after wizard wiring. Need a small shared config/defaults boundary, not broad refactor. |
 | Real-data fixtures | v0.5 gate requires real cTrader fixtures and unignored tests. | `TODO(real-data)` and ignored tests remain in cTrader account/execution/history/live-auth/integration tests, PnL, model tests, search tests, and data conversion. `pnl.rs` has 3 ignored tests with `unimplemented!`. | **External-data gap** | Do not synthesize fake fixtures. Convert placeholders to explicit fixture-contract tests only where local fixture files exist or user supplies captures. |
 | F-MODELS9-013 swarm horizon | v0.4.5 gate requires previously ignored horizon test green. | The test `load_rejects_or_downgrades_artifact_with_incompatible_horizon` is no longer ignored and passes with `cargo test -p forex-models load_rejects_or_downgrades_artifact_with_incompatible_horizon --locked` (1/1). | **Verified implemented** | No code change. Keep as closed unless broader model tests expose a separate failure. |
-| moneyDigits critical fix | v0.4.5 gate requires tests for moneyDigits=2 and 4 across entity money fields. | `ctrader_money.rs` has scale/unscale tests; account parsing uses per-entity `required_money_digits`. Account tests cover some moneyDigits=2 payloads; no clear moneyDigits=4 coverage for all listed entities yet. | **Partial coverage** | Add focused tests if grep confirms missing moneyDigits=4 cases for swap/commission/mirroringCommission/usedMargin/deposits/bonuses. |
+| moneyDigits critical fix | v0.4.5 gate requires tests for moneyDigits=2 and 4 across entity money fields. | This branch adds focused moneyDigits=4 coverage for currently parsed account/execution position and deal money fields: swap, commission, mirroringCommission, usedMargin, grossProfit, pnlConversionFee, fees, and net profit. Shared helpers now resolve missing `moneyDigits` consistently and scale unsigned cTrader money fields. Deposit/bonus history entities are not parsed by the current local account/execution parsers. | **Fixed for current parsers; external entity gap remains** | Treat deposits/bonuses as a separate schema/fixture expansion gap, not as duplicate local scaling logic. |
 | Installer scaffold | v0.4.5 gate requires at least one `.deb`, `.AppImage`, or `.tar.gz` on local CI plus manifest linting. | Workflow and packaging files exist. AppImage build intentionally fails if icon PNG is missing; only `forex-app.png.TODO` exists. Winget/Chocolatey/Scoop/Homebrew contain release-time TODO hashes/URLs. | **Scaffold, not ship-ready** | Keep as packaging gap. Do not fabricate icon or release hashes. Verify workflow metadata later only if packaging becomes selected scope. |
 | Diff hygiene | Branch should be mergeable without whitespace noise. | Mechanical whitespace issues from the inherited branch were fixed in `9769128a`; `git diff --check origin/master...HEAD` was green after that cleanup. | **Verified fixed** | Re-run diff check before final handoff or PR. |
 
@@ -46,7 +46,7 @@ Observed counts:
 1. Mechanical `git diff --check` failures are fixed; re-run before final handoff.
 2. GUI wizard launch wiring is fixed in this branch. Next, smoke-test `--wizard` manually when a GUI session is available.
 3. HALT/status pill and F-MODELS9-013 focused tests are green; treat those roadmap items as stale status, not code gaps.
-4. Investigate `moneyDigits` test coverage gaps and add missing tests before code changes.
+4. moneyDigits coverage is fixed for currently parsed account/execution entities; deposits/bonuses still need real schema/fixture work before local code can parse them.
 5. Triage hardcoded risk/config duplication into a small shared boundary only if tests can lock behavior first.
 
 ## Non-Actions
