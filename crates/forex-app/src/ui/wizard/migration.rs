@@ -206,6 +206,8 @@ pub fn migrate_portable_install(
             if is_in_skip_dir(&rel) {
                 if file_type.is_file() {
                     outcome.skipped_cache.push(rel);
+                } else if file_type.is_dir() {
+                    collect_skipped_files(&path, source_root, &mut outcome.skipped_cache)?;
                 }
                 continue;
             }
@@ -265,6 +267,35 @@ pub fn migrate_portable_install(
     }
 
     Ok(outcome)
+}
+
+fn collect_skipped_files(
+    dir: &Path,
+    source_root: &Path,
+    skipped: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let read = fs::read_dir(&current)
+            .with_context(|| format!("read skipped dir {}", current.display()))?;
+        for entry in read {
+            let entry = entry.with_context(|| format!("dir entry under {}", current.display()))?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("stat {}", path.display()))?;
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() {
+                let rel = path
+                    .strip_prefix(source_root)
+                    .with_context(|| format!("strip prefix for {}", path.display()))?
+                    .to_path_buf();
+                skipped.push(rel);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// True if the relative path's first component is in
