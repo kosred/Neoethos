@@ -435,6 +435,24 @@ pub struct CTraderPositionLookupRequest {
     pub to_timestamp_ms: Option<i64>,
 }
 
+pub trait CTraderPositionOrderHistoryBackend: Send + Sync {
+    fn fetch_orders_by_position_id(
+        &self,
+        request: &CTraderPositionLookupRequest,
+    ) -> Result<Vec<CTraderPendingOrderSnapshot>>;
+}
+
+#[derive(Debug, Default)]
+pub struct ProductionCTraderPositionOrderHistoryBackend;
+
+#[cfg(test)]
+pub struct StubCTraderPositionOrderHistoryBackend {
+    outcome: std::sync::Arc<
+        std::sync::Mutex<Option<std::result::Result<Vec<CTraderPendingOrderSnapshot>, String>>>,
+    >,
+    last_request: std::sync::Arc<std::sync::Mutex<Option<CTraderPositionLookupRequest>>>,
+}
+
 /// Fetch every deal tied to a single `positionId`
 /// (`ProtoOADealListByPositionIdReq`, payload type 2179). New in the
 /// 2026-05-14 upstream proto refresh.
@@ -562,6 +580,43 @@ pub fn fetch_orders_by_position_id(
 ) -> Result<Vec<CTraderPendingOrderSnapshot>> {
     let transport = ProductionCTraderOpenApiTransport::new(request.environment.endpoint_host());
     fetch_orders_by_position_id_with_transport(&transport, request)
+}
+
+impl CTraderPositionOrderHistoryBackend for ProductionCTraderPositionOrderHistoryBackend {
+    fn fetch_orders_by_position_id(
+        &self,
+        request: &CTraderPositionLookupRequest,
+    ) -> Result<Vec<CTraderPendingOrderSnapshot>> {
+        fetch_orders_by_position_id(request)
+    }
+}
+
+#[cfg(test)]
+impl StubCTraderPositionOrderHistoryBackend {
+    pub fn success(orders: Vec<CTraderPendingOrderSnapshot>) -> Self {
+        Self {
+            outcome: std::sync::Arc::new(std::sync::Mutex::new(Some(Ok(orders)))),
+            last_request: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl CTraderPositionOrderHistoryBackend for StubCTraderPositionOrderHistoryBackend {
+    fn fetch_orders_by_position_id(
+        &self,
+        request: &CTraderPositionLookupRequest,
+    ) -> Result<Vec<CTraderPendingOrderSnapshot>> {
+        *self.last_request.lock().expect("last request lock") = Some(request.clone());
+        self.outcome
+            .lock()
+            .expect("position order history outcome lock")
+            .take()
+            .unwrap_or_else(|| {
+                Err("stub cTrader position order history backend exhausted".to_string())
+            })
+            .map_err(anyhow::Error::msg)
+    }
 }
 
 /// Request shape for [`fetch_order_details`].

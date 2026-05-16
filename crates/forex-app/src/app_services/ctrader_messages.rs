@@ -1180,6 +1180,7 @@ pub const CTRADER_TOKEN_EXPIRED_SENTINEL: &str = "CTRADER_TOKEN_EXPIRED";
 
 impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
     fn send_sequence(&self, messages: &[CTraderOpenApiJsonMessage]) -> Result<Vec<String>> {
+        crate::app_services::ctrader_tls::ensure_ctrader_rustls_provider();
         let url = format!("wss://{}:5036", self.endpoint_host);
         let (mut socket, _) = connect(url.as_str())
             .with_context(|| format!("failed to connect to cTrader endpoint {url}"))?;
@@ -1464,10 +1465,10 @@ impl ProductionCTraderOpenApiProtobufTransport {
         let authority = self.protobuf_authority();
         let host_only = self.endpoint_host.clone();
 
-        // TLS+TCP dial. rustls 0.23 ships an aws-lc-rs-backed default
-        // provider via `CryptoProvider::install_default`; we install
-        // the ring provider once per process to keep the dep surface
-        // small (already pulled in by other workspace crates).
+        // TLS+TCP dial. The shared helper installs the ring rustls provider
+        // once per process before ClientConfig::builder() touches rustls'
+        // ambiguous feature-derived default.
+        crate::app_services::ctrader_tls::ensure_ctrader_rustls_provider();
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let config = rustls::ClientConfig::builder()

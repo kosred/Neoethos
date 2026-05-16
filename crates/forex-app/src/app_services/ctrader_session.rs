@@ -26,6 +26,7 @@ impl CTraderSession {
         access_token: String,
     ) -> Result<Self> {
         let url = format!("wss://{}:5036", environment.endpoint_host());
+        crate::app_services::ctrader_tls::ensure_ctrader_rustls_provider();
         let (ws_stream, _) = connect_async(url)
             .await
             .context("failed to connect to cTrader")?;

@@ -30,6 +30,9 @@ pub(super) use crate::app_services::ctrader_execution::{
     CTraderExecutionBackend, CTraderExecutionOutcome, CTraderExecutionRequest,
     CTraderExecutionRuntimeRequest, CTraderExecutionStatus, ProductionCTraderExecutionBackend,
 };
+pub(super) use crate::app_services::ctrader_history::{
+    CTraderPositionOrderHistoryBackend, ProductionCTraderPositionOrderHistoryBackend,
+};
 pub(super) use crate::app_services::ctrader_live_auth::{
     CTRADER_DEFAULT_SCOPE, CTraderAccountDiscoveryBackend, CTraderAccountDiscoveryRequest,
     CTraderEnvironment, CTraderLiveAuthBackend, CTraderLiveAuthRequest, CTraderLiveAuthResult,
@@ -372,6 +375,7 @@ pub struct TradingSession {
     ctrader_account_discovery_backend: Arc<dyn CTraderAccountDiscoveryBackend>,
     ctrader_account_runtime_backend: Arc<dyn CTraderAccountRuntimeBackend>,
     ctrader_execution_backend: Arc<dyn CTraderExecutionBackend>,
+    ctrader_position_order_history_backend: Arc<dyn CTraderPositionOrderHistoryBackend>,
     ctrader_live_streaming_backend: Arc<dyn CTraderLiveStreamingBackend>,
     ctrader_token_store: Arc<dyn CTraderTokenStore>,
     ctrader_live_auth_rx: Option<Receiver<Result<CTraderLiveAuthResult, String>>>,
@@ -511,6 +515,9 @@ impl TradingSession {
             ctrader_account_discovery_backend: Arc::new(ProductionCTraderLiveAuthBackend),
             ctrader_account_runtime_backend: Arc::new(ProductionCTraderAccountRuntimeBackend),
             ctrader_execution_backend: Arc::new(ProductionCTraderExecutionBackend),
+            ctrader_position_order_history_backend: Arc::new(
+                ProductionCTraderPositionOrderHistoryBackend,
+            ),
             ctrader_live_streaming_backend: Arc::new(ProductionCTraderLiveStreamingBackend),
             ctrader_token_store: Arc::new(CTraderSecureStore::new(
                 "forex-ai.test",
@@ -587,6 +594,14 @@ impl TradingSession {
         backend: crate::app_services::ctrader_execution::StubCTraderExecutionBackend,
     ) {
         self.ctrader_execution_backend = Arc::new(backend);
+    }
+
+    #[cfg(test)]
+    pub fn set_ctrader_position_order_history_backend_for_test(
+        &mut self,
+        backend: crate::app_services::ctrader_history::StubCTraderPositionOrderHistoryBackend,
+    ) {
+        self.ctrader_position_order_history_backend = Arc::new(backend);
     }
 
     #[cfg(test)]
@@ -1155,6 +1170,9 @@ impl Default for TradingSession {
             ctrader_account_discovery_backend: Arc::new(ProductionCTraderLiveAuthBackend),
             ctrader_account_runtime_backend: Arc::new(ProductionCTraderAccountRuntimeBackend),
             ctrader_execution_backend: Arc::new(ProductionCTraderExecutionBackend),
+            ctrader_position_order_history_backend: Arc::new(
+                ProductionCTraderPositionOrderHistoryBackend,
+            ),
             ctrader_live_streaming_backend: Arc::new(ProductionCTraderLiveStreamingBackend),
             ctrader_token_store: Arc::new(CTraderSecureStore::new(
                 "forex-ai",

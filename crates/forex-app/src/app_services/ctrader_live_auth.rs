@@ -324,6 +324,7 @@ impl ProductionCTraderLiveAuthBackend {
             &request.client_id,
             &request.client_secret,
         );
+        crate::app_services::ctrader_tls::ensure_ctrader_rustls_provider();
         let client = reqwest::blocking::Client::new();
         let response = client
             .get(&url)
@@ -478,6 +479,7 @@ impl CTraderLiveAuthBackend for ProductionCTraderLiveAuthBackend {
             &request.client_id,
             &request.client_secret,
         );
+        crate::app_services::ctrader_tls::ensure_ctrader_rustls_provider();
         let client = reqwest::blocking::Client::new();
         let response = client
             .get(&url)

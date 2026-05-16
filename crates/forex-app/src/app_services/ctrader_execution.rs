@@ -438,6 +438,7 @@ impl ProductionCTraderExecutionBackend {
 
         session.socket = None;
         let url = format!("wss://{}:5036", request.environment.endpoint_host());
+        crate::app_services::ctrader_tls::ensure_ctrader_rustls_provider();
         let (socket, _) = connect(url.as_str())
             .with_context(|| format!("failed to connect to cTrader endpoint {url}"))?;
         // M10: cap the underlying TCP read at 30s so a broker stall or a

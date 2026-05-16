@@ -590,6 +590,11 @@ fn cancel_selected_order_records_ctrader_journal_and_updates_status() {
             },
         ),
     );
+    session.set_ctrader_position_order_history_backend_for_test(
+        crate::app_services::ctrader_history::StubCTraderPositionOrderHistoryBackend::success(
+            Vec::new(),
+        ),
+    );
     session.connect(&mut state);
     state.order_ticket.selected_order_id = Some(8001);
     session.set_ctrader_execution_backend_for_test(

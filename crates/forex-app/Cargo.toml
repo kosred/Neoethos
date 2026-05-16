@@ -23,7 +23,7 @@ gpu = ["forex-search/gpu", "forex-models/neuro-evolution-gpu", "forex-models/sta
 # the bandwidth + JSON field-name-drift rationale (~3× saving).
 # Runtime opt-in is via `FOREX_BOT_CTRADER_TRANSPORT=protobuf` plus this
 # feature being enabled at build time.
-ctrader-protobuf-streaming = ["dep:rustls", "dep:webpki-roots"]
+ctrader-protobuf-streaming = ["dep:webpki-roots"]
 
 [dependencies]
 eframe = "0.31.0" # UI framework (egui)
@@ -52,16 +52,13 @@ base64 = "0.22"
 # audit-fix F8: SecretString is the safe wrapper for string-shaped
 # secrets — see forex-core/Cargo.toml for the rationale.
 secrecy = "0.10"
-# rustls + webpki-roots are pulled in transitively by reqwest /
-# tokio-tungstenite already, so adding them as direct deps for the
-# native Protobuf-over-TCP transport (port 5035) does not change the
-# build artefact set. `optional = true` keeps them gated behind the
-# `ctrader-protobuf-streaming` Cargo feature so a JSON-WSS-only build
-# does not link the sync TLS stack at all. Versions pinned to the
-# values already resolved in Cargo.lock (rustls 0.23, webpki-roots 0.26)
-# — picking newer would re-resolve the lockfile and risk drift in
-# transitive deps.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+# rustls is already pulled in transitively by reqwest / tungstenite.
+# Keep a direct edge so cTrader code can install the process-level
+# CryptoProvider before tungstenite builds a ClientConfig; without this,
+# the mixed reqwest/object_store feature graph can enable both ring and
+# aws-lc-rs and rustls 0.23 panics at runtime. webpki-roots stays gated
+# behind the native Protobuf-over-TCP transport.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = { version = "0.26", optional = true }
 
 

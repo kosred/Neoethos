@@ -540,6 +540,7 @@ impl ProductionCTraderLiveStreamingTransport {
         ];
 
         let url = format!("wss://{}:5036", self.endpoint_host);
+        crate::app_services::ctrader_tls::ensure_ctrader_rustls_provider();
         let (mut socket, _) = connect(url.as_str())
             .with_context(|| format!("failed to connect to cTrader endpoint {url}"))?;
         let mut responses = Vec::with_capacity(messages.len());

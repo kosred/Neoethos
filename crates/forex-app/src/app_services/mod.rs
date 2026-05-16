@@ -19,6 +19,7 @@ pub mod ctrader_openapi;
 pub mod ctrader_proto_messages;
 pub mod ctrader_session;
 pub mod ctrader_streaming;
+pub mod ctrader_tls;
 pub mod discovery;
 pub mod embedded_credentials;
 pub mod jobs;

@@ -723,8 +723,9 @@ impl TradingSession {
             to_ms = to_timestamp_ms,
             "trading::session fetch_ctrader_orders_for_position dispatching ProtoOAOrderListByPositionIdReq"
         );
-        let orders =
-            crate::app_services::ctrader_history::fetch_orders_by_position_id(&request)?;
+        let orders = self
+            .ctrader_position_order_history_backend
+            .fetch_orders_by_position_id(&request)?;
         tracing::debug!(
             target: "forex_app::ctrader_history",
             position_id,
