@@ -30,18 +30,17 @@ Commands:
   - forex-app
   - forex-cli
 
-ReleaseDate: 2026-05-15
+ReleaseDate: 2026-05-17
 Installers:
   - Architecture: x64
     InstallerType: zip
     NestedInstallerType: portable
-    # TODO(release-time): replace with the canonical asset URL once
-    # .github/workflows/release.yml uploads it. The URL pattern is fixed by
-    # softprops/action-gh-release: <repo>/releases/download/<tag>/<file>.
-    InstallerUrl: https://github.com/kosred/forex-ai/releases/download/v0.4.5/forex-ai-v0.4.5-windows-x86_64.tar.gz
+    # Windows package-manager asset produced by
+    # .github/workflows/release-installers.yml.
+    InstallerUrl: https://github.com/kosred/forex-ai/releases/download/v0.4.5/forex-ai-v0.4.5-windows-x86_64.zip
     # Release-gate local artifact hash. Refresh this if the published
     # GitHub Release asset is rebuilt after tagging.
-    InstallerSha256: 1AD40CBC286BF58A18FE00E5C29FCD913FD775133DD2435113F5B184781B1E0E
+    InstallerSha256: 4CA7667FC5154A12BC9C7C2C65F1575B023693E8758A5FE679F47F457A8F9B9A
     NestedInstallerFiles:
       - RelativeFilePath: out/forex-app.exe
         PortableCommandAlias: forex-app

@@ -14,7 +14,8 @@
 #                            forex-ai-<ver>-1.x86_64.rpm     (cargo-generate-rpm)
 #                            forex-app-<ver>-x86_64.AppImage (appimagetool)
 #                            forex-ai-<ver>-macos-universal.tar.gz (lipo + ad-hoc)
-#                            forex-ai-<ver>-windows-x86_64.tar.gz   (self-signed)
+#                            forex-ai-<ver>-windows-x86_64.zip      (package managers)
+#                            forex-ai-<ver>-windows-x86_64.tar.gz   (portable)
 #                            plus *.asc (GPG) and *.cosign-sig per asset.
 #
 # Both run on the same `v*` tag push; downstream `gh release upload`
@@ -202,6 +203,7 @@ jobs:
           New-Item -ItemType Directory -Path out -Force | Out-Null
           Copy-Item target\release\forex-app.exe out\
           Copy-Item target\release\forex-cli.exe out\
+          Compress-Archive -Path out -DestinationPath "forex-ai-${env:GITHUB_REF_NAME}-windows-x86_64.zip" -Force
           tar -czf "forex-ai-${env:GITHUB_REF_NAME}-windows-x86_64.tar.gz" out
 
       - name: Install Sigstore cosign
@@ -217,7 +219,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-          for f in forex-ai-*-windows-x86_64.tar.gz; do
+          for f in forex-ai-*-windows-x86_64.zip forex-ai-*-windows-x86_64.tar.gz; do
             gpg --batch --yes --pinentry-mode loopback \
                 --passphrase "$GPG_PASSPHRASE" \
                 --detach-sign --armor "$f"
@@ -231,3 +233,6 @@ jobs:
             forex-ai-*-windows-x86_64.tar.gz
             forex-ai-*-windows-x86_64.tar.gz.asc
             forex-ai-*-windows-x86_64.tar.gz.cosign-sig
+            forex-ai-*-windows-x86_64.zip
+            forex-ai-*-windows-x86_64.zip.asc
+            forex-ai-*-windows-x86_64.zip.cosign-sig

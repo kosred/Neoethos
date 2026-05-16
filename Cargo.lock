@@ -4021,7 +4021,7 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "forex-app"
-version = "0.2.0"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "base64",
@@ -4065,7 +4065,7 @@ dependencies = [
 
 [[package]]
 name = "forex-cli"
-version = "0.2.0"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4083,7 +4083,7 @@ dependencies = [
 
 [[package]]
 name = "forex-core"
-version = "0.2.0"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4110,7 +4110,7 @@ dependencies = [
 
 [[package]]
 name = "forex-data"
-version = "0.2.0"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4135,7 +4135,7 @@ dependencies = [
 
 [[package]]
 name = "forex-models"
-version = "0.2.0"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "burn",
@@ -4184,7 +4184,7 @@ dependencies = [
 
 [[package]]
 name = "forex-news"
-version = "0.2.0"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4198,7 +4198,7 @@ dependencies = [
 
 [[package]]
 name = "forex-search"
-version = "0.2.0"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "chrono",
