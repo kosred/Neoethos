@@ -4,6 +4,38 @@ All notable changes to forex-ai are documented here. The format is
 loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to semantic versioning.
 
+## [0.4.5] — 2026-05-17 — "Audit Fix Release"
+
+### Added
+
+- First-run wizard scaffold for the v0.5 onboarding surface, including
+  Welcome/License, data path, account profile, migration, CLI wizard
+  entrypoint, and resumable wizard state.
+- v0.4.5 packaging manifests for WinGet, Chocolatey, Scoop, Homebrew,
+  AppImage, and the release installer workflows.
+
+### Fixed
+
+- cTrader money scaling now propagates per-entity `moneyDigits` for
+  account, margin, commission, deposit, bonus, and mirrored commission
+  values instead of relying on unsafe defaults.
+- Tree-model local fallback loading rejects or downgrades incompatible
+  swarm-horizon artifacts.
+- Manual HALT flow now blocks new orders, writes the HALT sentinel, and
+  exposes clear/resume behavior through the app chrome.
+- Wizard portable migration records skipped cache payloads instead of
+  silently dropping skipped-file accounting.
+- WinGet `0.4.5` manifest validates cleanly with a single default-locale
+  manifest and a concrete release artifact SHA-256.
+
+### Changed
+
+- Rust workspace crate versions are aligned to `0.4.5` so app binaries
+  and generated package metadata match the release tag.
+- Audit documentation now marks live cTrader connection, strategy search,
+  and ready model workflows as future integration work while the project
+  is still pre-integration development.
+
 ## [0.2.0] — 2026-05-12 — "Smart Discovery + Production Audit"
 
 ### Added
@@ -112,6 +144,7 @@ the project adheres to semantic versioning.
   `unwrap_or(0)` patterns in cTrader payload parsing.
 - 14 dependabot security advisories (2 PRs already open on origin).
 
+[0.4.5]: https://github.com/kosred/forex-ai/releases/tag/v0.4.5
 [0.2.0]: https://github.com/kosred/forex-ai/releases/tag/v0.2.0
 [a0531c48]: https://github.com/kosred/forex-ai/commit/a0531c48
 [037ce2a7]: https://github.com/kosred/forex-ai/commit/037ce2a7
