@@ -63,6 +63,10 @@ pub(crate) fn should_run_wizard(force: bool, config_dir: Option<&std::path::Path
     !dir.join(ui::wizard::WIZARD_STATE_FILENAME).exists()
 }
 
+pub(crate) fn initial_wizard_controller(wizard_due: bool) -> Option<ui::wizard::WizardController> {
+    wizard_due.then(ui::wizard::WizardController::new)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -119,6 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cc,
                     runtime.clone(),
                     settings.clone(),
+                    wizard_due,
                 )))
             }),
         )?;
@@ -229,6 +234,7 @@ struct ForexApp {
     trading_session: TradingSession,
     workspace: WorkspaceState,
     state: AppState,
+    wizard_controller: Option<ui::wizard::WizardController>,
 
     // Message Bus
     tx: mpsc::Sender<ServiceEvent>,
@@ -242,6 +248,7 @@ impl ForexApp {
         _cc: &eframe::CreationContext<'_>,
         runtime: AppRuntimeConfig,
         settings: Settings,
+        wizard_due: bool,
     ) -> Self {
         ui::theme::apply_theme(&_cc.egui_ctx);
         let (tx, rx) = mpsc::channel(10000);
@@ -264,6 +271,7 @@ impl ForexApp {
             trading_session: TradingSession::new_with_persisted_credentials(),
             workspace: WorkspaceState::default(),
             state,
+            wizard_controller: initial_wizard_controller(wizard_due),
             tx: tx.clone(),
             rx,
             discovery_handle: None,
@@ -410,6 +418,19 @@ impl ForexApp {
 impl eframe::App for ForexApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_messages(ctx);
+
+        let wizard_finished = if let Some(controller) = &mut self.wizard_controller {
+            ui::wizard::wizard_ui(ctx, controller);
+            Some(controller.cancelled || controller.finished)
+        } else {
+            None
+        };
+        if let Some(finished) = wizard_finished {
+            if finished {
+                self.wizard_controller = None;
+            }
+            return;
+        }
 
         // --- Snapshot display state before the panel borrows begin ---
         let discovery_running = self
@@ -1120,5 +1141,19 @@ mod tests {
         .unwrap();
         assert!(!super::should_run_wizard(false, Some(&tmp)));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn wizard_due_creates_initial_controller_at_welcome() {
+        let controller = super::initial_wizard_controller(true)
+            .expect("wizard_due=true must create a controller");
+        assert_eq!(controller.current, crate::ui::wizard::WizardState::Welcome);
+        assert!(!controller.cancelled);
+        assert!(!controller.finished);
+    }
+
+    #[test]
+    fn wizard_not_due_does_not_create_controller() {
+        assert!(super::initial_wizard_controller(false).is_none());
     }
 }

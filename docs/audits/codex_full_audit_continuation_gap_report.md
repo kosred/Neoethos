@@ -29,7 +29,7 @@ Observed counts:
 
 | Area | Claim | Evidence | Status | Next action |
 | --- | --- | --- | --- | --- |
-| GUI first-run wizard | v0.4.5 gate requires wizard launches at first run and completes Step 1. `main.rs` comments say actual modal is rendered by `ui::wizard::wizard_ui`. | `crates/forex-app/src/main.rs:95` computes and logs `wizard_due`, but `ForexApp` has no wizard controller field, `ForexApp::new` does not receive `wizard_due`, and there is no call to `ui::wizard::wizard_ui`. `crates/forex-app/src/ui/wizard/mod.rs:432` defines the UI entry point. | **Missing wiring** | First code fix candidate. Add a failing test around `ForexApp`/wizard launch state if possible, then wire controller and render path. |
+| GUI first-run wizard | v0.4.5 gate requires wizard launches at first run and completes Step 1. `main.rs` comments say actual modal is rendered by `ui::wizard::wizard_ui`. | `crates/forex-app/src/main.rs` now carries `wizard_due` into `ForexApp`, creates a `WizardController` at `Welcome`, and renders `ui::wizard::wizard_ui` while active. Focused tests cover due/not-due controller creation. | **Fixed in this branch** | Follow-up is manual GUI smoke testing of `--wizard` and first-run sentinel behavior. |
 | CLI/TUI wizard parity | Spec says `forex-cli wizard` is the TUI counterpart and shares the wizard state machine. | `crates/forex-cli/src/tui/wizard.rs` explicitly says "TUI rendering not yet ported" and returns a placeholder on TTY. The state machine lives inside `forex-app`, creating a crate boundary problem. | **Partial / placeholder** | Do not implement full TUI yet. Record as larger design gap: shared wizard state likely belongs in a shared crate before ratatui pages are real. |
 | HALT button and status pill | Older roadmap text says HALT/status pill were in flight and missing, but v0.4.5 gate requires working HALT smoke test. | Later code exists: `main.rs` calls `ui::chrome::halt_button::draw_halt_button` and `status_pill::draw_status_pill`; `TradingSession::trip_manual_halt` blocks new orders and propagates to Risky Mode. | **Implemented, docs stale, needs focused tests** | Run focused `forex-app` HALT tests after baseline build. If green, update report/status only; if failing, fix with TDD. |
 | Risky Mode | Roadmap says v0.4.5 ships scaffolding/types only; v0.5 needs backtest harness gates. | `crates/forex-core/src/domain/risky_mode.rs` implements config, manager, kill switches, and unit tests; no release-gating backtest harness found. | **Partial as documented** | Keep as known v0.5 gap. Do not fake a backtest harness without a scoped design. |
@@ -44,7 +44,7 @@ Observed counts:
 ## Initial Priority
 
 1. Fix mechanical `git diff --check` failures. This is low-risk and improves mergeability.
-2. Prove and fix GUI wizard launch wiring. This directly blocks a v0.4.5 gate and is locally testable.
+2. GUI wizard launch wiring is fixed in this branch. Next, smoke-test `--wizard` manually when a GUI session is available.
 3. Run focused tests for HALT/status pill and F-MODELS9-013 to separate stale docs from real failures.
 4. Investigate `moneyDigits` test coverage gaps and add missing tests before code changes.
 5. Triage hardcoded risk/config duplication into a small shared boundary only if tests can lock behavior first.
