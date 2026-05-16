@@ -36,11 +36,17 @@ use anyhow::Result;
 /// stderr message printed when `stdin` is not a tty. Spec §8.3.
 pub const WIZARD_TUI_NO_TTY_MESSAGE: &str =
     "forex-cli wizard requires a tty; use `forex-cli init` for headless first-run setup.";
+pub const WIZARD_TUI_NOT_PORTED_MESSAGE: &str =
+    "forex-cli wizard: TUI rendering not yet ported; run `forex-app --wizard` for now.";
 
 /// Refuse-to-run guard for non-tty stdin. Returns `Err` so callers
 /// surface the message at the process-exit boundary.
 pub fn run_wizard_tui() -> Result<()> {
-    if !is_stdin_tty() {
+    run_wizard_tui_with_terminal_state(is_stdin_tty())
+}
+
+fn run_wizard_tui_with_terminal_state(stdin_is_tty: bool) -> Result<()> {
+    if !stdin_is_tty {
         eprintln!("{}", WIZARD_TUI_NO_TTY_MESSAGE);
         return Err(anyhow::anyhow!("forex-cli wizard: stdin is not a tty"));
     }
@@ -60,11 +66,8 @@ pub fn run_wizard_tui() -> Result<()> {
     //   - autonomy_risk.rs → "9.5 — Quiz + autonomy"
     //   - summary.rs   → "10 — Summary" (scrollable table)
     //
-    // For now we just print the placeholder so the subcommand is a
-    // recognised entry point without crashing.
-    println!("forex-cli wizard: TUI rendering not yet ported.");
-    println!("Run the desktop wizard via `forex-app --wizard` for now.");
-    Ok(())
+    eprintln!("{}", WIZARD_TUI_NOT_PORTED_MESSAGE);
+    Err(anyhow::anyhow!(WIZARD_TUI_NOT_PORTED_MESSAGE))
 }
 
 fn is_stdin_tty() -> bool {
@@ -87,5 +90,13 @@ mod tests {
         // The cargo test harness pipes stdin → IsTerminal is false.
         let result = run_wizard_tui();
         assert!(result.is_err(), "must refuse on non-tty stdin");
+    }
+
+    #[test]
+    fn run_wizard_returns_err_when_tui_renderer_is_not_ported() {
+        let result = run_wizard_tui_with_terminal_state(true);
+
+        let err = result.expect_err("placeholder TUI must not exit success");
+        assert!(err.to_string().contains("not yet ported"));
     }
 }
