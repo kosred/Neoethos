@@ -1013,4 +1013,3 @@ impl TradingSession {
         self.execution_surface_cache = None;
     }
 }
-

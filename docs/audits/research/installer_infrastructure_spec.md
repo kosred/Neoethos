@@ -597,12 +597,12 @@ updates" and the EU CRA "user consent for security updates" line.
 
 ```
 [Developer machine]                [CI runner]                 [End user machine]
-                                                                
+
 forex-ai/ git tag v0.5.0  ───────► GitHub Actions ──────────► download msi/dmg/deb
                                           │                          │
                                           ▼                          ▼
                                    build artifact                signed?
-                                          │                    yes (Authenticode / 
+                                          │                    yes (Authenticode /
                                           ▼                    Developer ID / dpkg-sig)
                                    signtool / codesign /              │
                                    dpkg-sig --sign                    ▼
