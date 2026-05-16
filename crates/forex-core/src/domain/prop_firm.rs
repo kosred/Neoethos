@@ -113,9 +113,52 @@ impl PropFirmRuntimeDefaults {
     };
 }
 
+/// Phase-specific strategy defaults for FTMO-style challenge operation.
+///
+/// These are local strategy tunables, not published prop-firm rules. They
+/// live beside the challenge/runtime defaults so the live risk preset builder
+/// does not carry a separate set of phase literals.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PropFirmPhaseRiskDefaults {
+    pub risk_per_trade: f64,
+    pub max_risk_per_trade: f64,
+    pub min_confidence_threshold: f64,
+    pub max_trades_per_day: usize,
+    pub daily_profit_lock_pct: f64,
+}
+
+impl PropFirmPhaseRiskDefaults {
+    pub const FTMO_PHASE_1: Self = Self {
+        risk_per_trade: 0.0030,
+        max_risk_per_trade: 0.0050,
+        min_confidence_threshold: 0.66,
+        max_trades_per_day: 3,
+        daily_profit_lock_pct: 0.015,
+    };
+
+    pub const FTMO_PHASE_2: Self = Self {
+        risk_per_trade: 0.0025,
+        max_risk_per_trade: 0.0040,
+        min_confidence_threshold: 0.68,
+        max_trades_per_day: 3,
+        daily_profit_lock_pct: 0.012,
+    };
+
+    pub const FTMO_FUNDED: Self = Self {
+        risk_per_trade: 0.0030,
+        max_risk_per_trade: 0.0050,
+        min_confidence_threshold: 0.65,
+        max_trades_per_day: 4,
+        daily_profit_lock_pct: 0.0,
+    };
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PropFirmChallengeDefaults, PropFirmConstraints, PropFirmRuntimeDefaults};
+    use super::{
+        PropFirmChallengeDefaults, PropFirmConstraints, PropFirmPhaseRiskDefaults,
+        PropFirmRuntimeDefaults,
+    };
 
     #[test]
     fn ftmo_runtime_defaults_stay_inside_hard_constraints() {
@@ -140,5 +183,18 @@ mod tests {
         assert!(runtime.recovery_mode_risk_multiplier < runtime.defensive_mode_risk_multiplier);
         assert!(runtime.defensive_mode_risk_multiplier < runtime.caution_mode_risk_multiplier);
         assert!(runtime.caution_mode_risk_multiplier <= 1.0);
+    }
+
+    #[test]
+    fn ftmo_phase_risk_defaults_preserve_phase_ordering() {
+        let phase_1 = PropFirmPhaseRiskDefaults::FTMO_PHASE_1;
+        let phase_2 = PropFirmPhaseRiskDefaults::FTMO_PHASE_2;
+        let funded = PropFirmPhaseRiskDefaults::FTMO_FUNDED;
+
+        assert!(phase_2.risk_per_trade <= phase_1.risk_per_trade);
+        assert!(phase_2.max_risk_per_trade <= phase_1.max_risk_per_trade);
+        assert!(phase_2.min_confidence_threshold > funded.min_confidence_threshold);
+        assert!(funded.max_trades_per_day >= phase_1.max_trades_per_day);
+        assert_eq!(funded.daily_profit_lock_pct, 0.0);
     }
 }

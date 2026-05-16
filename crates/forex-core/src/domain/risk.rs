@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use crate::domain::prop_firm::{
-    PropFirmChallengeDefaults, PropFirmConstraints, PropFirmRuntimeDefaults,
+    PropFirmChallengeDefaults, PropFirmConstraints, PropFirmPhaseRiskDefaults,
+    PropFirmRuntimeDefaults,
 };
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -83,9 +84,6 @@ pub struct ChallengeRiskPreset {
 
 pub fn resolve_challenge_risk_preset(phase: &str) -> ChallengeRiskPreset {
     let phase_enum = ChallengePhase::from(phase);
-    // Prop-firm DD limits come from PropFirmConstraints; per-phase
-    // strategy tunables (risk_per_trade, confidence floors, etc.) are
-    // marked FIXME for Batch 3+ config-extract.
     let ftmo = PropFirmConstraints::FTMO_STANDARD;
     let daily_dd = ftmo.max_daily_loss_pct as f64;
     let total_dd = ftmo.max_overall_drawdown_pct as f64;
@@ -93,62 +91,57 @@ pub fn resolve_challenge_risk_preset(phase: &str) -> ChallengeRiskPreset {
     let monthly_floor = ftmo.min_monthly_net_profit_pct as f64;
     let challenge_defaults = PropFirmChallengeDefaults::FTMO_STANDARD;
     match phase_enum {
-        ChallengePhase::Phase2 => ChallengeRiskPreset {
-            phase: "phase_2".to_string(),
-            // FIXME(hardcoded): config-extract — risk-per-trade is a strategy tunable.
-            risk_per_trade: 0.0025,
-            // FIXME(hardcoded): config-extract — risk-per-trade cap is a strategy tunable.
-            max_risk_per_trade: 0.0040,
-            // FIXME(hardcoded): config-extract — confidence floor is a strategy tunable.
-            min_confidence_threshold: 0.68,
-            // FIXME(hardcoded): config-extract — daily trade cap is a strategy tunable.
-            max_trades_per_day: 3,
-            daily_drawdown_limit: daily_dd,
-            total_drawdown_limit: total_dd,
-            // FIXME(hardcoded): config-extract — internal profit-lock threshold.
-            daily_profit_lock_pct: 0.012,
-            // Phase 2 monthly target is the operator's 4% floor (verification).
-            monthly_profit_target_pct: monthly_floor,
-            // Phase 2 verification target is half of full challenge target.
-            challenge_target_return_pct: challenge_target / 2.0,
-            challenge_target_trading_days: challenge_defaults.target_trading_days as usize,
-        },
-        ChallengePhase::Funded => ChallengeRiskPreset {
-            phase: "funded".to_string(),
-            // FIXME(hardcoded): config-extract — risk-per-trade is a strategy tunable.
-            risk_per_trade: 0.0030,
-            // FIXME(hardcoded): config-extract — risk-per-trade cap is a strategy tunable.
-            max_risk_per_trade: 0.0050,
-            // FIXME(hardcoded): config-extract — confidence floor is a strategy tunable.
-            min_confidence_threshold: 0.65,
-            // FIXME(hardcoded): config-extract — daily trade cap is a strategy tunable.
-            max_trades_per_day: 4,
-            daily_drawdown_limit: daily_dd,
-            total_drawdown_limit: total_dd,
-            daily_profit_lock_pct: 0.0,
-            // Funded accounts target operator's 4% floor.
-            monthly_profit_target_pct: monthly_floor,
-            challenge_target_return_pct: monthly_floor,
-            challenge_target_trading_days: challenge_defaults.target_trading_days as usize,
-        },
-        ChallengePhase::Phase1 => ChallengeRiskPreset {
-            phase: "phase_1".to_string(),
-            // FIXME(hardcoded): config-extract — risk-per-trade is a strategy tunable.
-            risk_per_trade: 0.0030,
-            // FIXME(hardcoded): config-extract — risk-per-trade cap is a strategy tunable.
-            max_risk_per_trade: 0.0050,
-            // FIXME(hardcoded): config-extract — confidence floor is a strategy tunable.
-            min_confidence_threshold: 0.66,
-            // FIXME(hardcoded): config-extract — daily trade cap is a strategy tunable.
-            max_trades_per_day: 3,
-            daily_drawdown_limit: daily_dd,
-            total_drawdown_limit: total_dd,
-            // FIXME(hardcoded): config-extract — internal profit-lock threshold.
-            daily_profit_lock_pct: 0.015,
-            monthly_profit_target_pct: challenge_target,
-            challenge_target_return_pct: challenge_target,
-            challenge_target_trading_days: challenge_defaults.target_trading_days as usize,
-        },
+        ChallengePhase::Phase2 => {
+            let phase_defaults = PropFirmPhaseRiskDefaults::FTMO_PHASE_2;
+            ChallengeRiskPreset {
+                phase: "phase_2".to_string(),
+                risk_per_trade: phase_defaults.risk_per_trade,
+                max_risk_per_trade: phase_defaults.max_risk_per_trade,
+                min_confidence_threshold: phase_defaults.min_confidence_threshold,
+                max_trades_per_day: phase_defaults.max_trades_per_day,
+                daily_drawdown_limit: daily_dd,
+                total_drawdown_limit: total_dd,
+                daily_profit_lock_pct: phase_defaults.daily_profit_lock_pct,
+                // Phase 2 monthly target is the operator's 4% floor (verification).
+                monthly_profit_target_pct: monthly_floor,
+                // Phase 2 verification target is half of full challenge target.
+                challenge_target_return_pct: challenge_target / 2.0,
+                challenge_target_trading_days: challenge_defaults.target_trading_days as usize,
+            }
+        }
+        ChallengePhase::Funded => {
+            let phase_defaults = PropFirmPhaseRiskDefaults::FTMO_FUNDED;
+            ChallengeRiskPreset {
+                phase: "funded".to_string(),
+                risk_per_trade: phase_defaults.risk_per_trade,
+                max_risk_per_trade: phase_defaults.max_risk_per_trade,
+                min_confidence_threshold: phase_defaults.min_confidence_threshold,
+                max_trades_per_day: phase_defaults.max_trades_per_day,
+                daily_drawdown_limit: daily_dd,
+                total_drawdown_limit: total_dd,
+                daily_profit_lock_pct: phase_defaults.daily_profit_lock_pct,
+                // Funded accounts target operator's 4% floor.
+                monthly_profit_target_pct: monthly_floor,
+                challenge_target_return_pct: monthly_floor,
+                challenge_target_trading_days: challenge_defaults.target_trading_days as usize,
+            }
+        }
+        ChallengePhase::Phase1 => {
+            let phase_defaults = PropFirmPhaseRiskDefaults::FTMO_PHASE_1;
+            ChallengeRiskPreset {
+                phase: "phase_1".to_string(),
+                risk_per_trade: phase_defaults.risk_per_trade,
+                max_risk_per_trade: phase_defaults.max_risk_per_trade,
+                min_confidence_threshold: phase_defaults.min_confidence_threshold,
+                max_trades_per_day: phase_defaults.max_trades_per_day,
+                daily_drawdown_limit: daily_dd,
+                total_drawdown_limit: total_dd,
+                daily_profit_lock_pct: phase_defaults.daily_profit_lock_pct,
+                monthly_profit_target_pct: challenge_target,
+                challenge_target_return_pct: challenge_target,
+                challenge_target_trading_days: challenge_defaults.target_trading_days as usize,
+            }
+        }
     }
 }
 
@@ -742,7 +735,7 @@ impl RiskManager {
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::prop_firm::PropFirmChallengeDefaults;
+    use crate::domain::prop_firm::{PropFirmChallengeDefaults, PropFirmPhaseRiskDefaults};
 
     use super::{PositionSizingInput, PropFirmRules, RiskManager, TradeGateInput};
 
@@ -764,6 +757,25 @@ mod tests {
                 preset.challenge_target_trading_days,
                 defaults.target_trading_days as usize
             );
+        }
+    }
+
+    #[test]
+    fn challenge_risk_presets_use_shared_phase_defaults() {
+        for (phase, defaults) in [
+            ("phase_1", PropFirmPhaseRiskDefaults::FTMO_PHASE_1),
+            ("phase_2", PropFirmPhaseRiskDefaults::FTMO_PHASE_2),
+            ("funded", PropFirmPhaseRiskDefaults::FTMO_FUNDED),
+        ] {
+            let preset = super::resolve_challenge_risk_preset(phase);
+            assert_eq!(preset.risk_per_trade, defaults.risk_per_trade);
+            assert_eq!(preset.max_risk_per_trade, defaults.max_risk_per_trade);
+            assert_eq!(
+                preset.min_confidence_threshold,
+                defaults.min_confidence_threshold
+            );
+            assert_eq!(preset.max_trades_per_day, defaults.max_trades_per_day);
+            assert_eq!(preset.daily_profit_lock_pct, defaults.daily_profit_lock_pct);
         }
     }
 
