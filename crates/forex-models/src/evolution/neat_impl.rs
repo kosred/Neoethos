@@ -450,6 +450,12 @@ pub struct NeatExpert {
 }
 
 impl NeatExpert {
+    /// Read-only view of the trained feature column names + ordering.
+    /// Required by the [`crate::ensemble_inference::ExpertModel`] adapter.
+    pub fn feature_columns(&self) -> &[String] {
+        &self.feature_columns
+    }
+
     pub fn new(input_dim: usize) -> Self {
         Self::with_config(input_dim, 96, 48)
     }
