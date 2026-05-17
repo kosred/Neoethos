@@ -89,11 +89,17 @@ use crate::runtime::capabilities::ModelFamily;
 //   .5 forecasting/adaptive/anomaly
 //   .6 evolutionary + exit + RL
 pub mod deep_classification_adapters;
+pub mod deep_timeseries_adapters;
 pub mod tree_adapters;
 
 pub use deep_classification_adapters::{
     register_deep_classification_loaders, KanAdapter, KanLoader, MlpAdapter, MlpLoader,
     TabNetAdapter, TabNetLoader,
+};
+pub use deep_timeseries_adapters::{
+    register_deep_timeseries_loaders, NBeatsAdapter, NBeatsLoader, NBeatsxNfAdapter,
+    NBeatsxNfLoader, PatchTstAdapter, PatchTstLoader, TiDEAdapter, TiDELoader, TiDENfAdapter,
+    TiDENfLoader, TimesNetAdapter, TimesNetLoader, TransformerAdapter, TransformerLoader,
 };
 pub use tree_adapters::{
     register_tree_loaders, CatboostAdapter, CatboostLoader, LightGbmAdapter, LightGbmLoader,
