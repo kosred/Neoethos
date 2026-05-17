@@ -10,8 +10,19 @@ mod backends;
 pub use backends::AcceleratorBackend;
 use backends::{choose_primary_backend, normalize_accelerator_preference};
 
+/// Current schema version of `hardware_profile.json`. Per D4
+/// versioning policy: bumped only when fields are removed /
+/// renamed / type-changed in a way `#[serde(default)]` can't
+/// bridge. Adding new optional fields stays at v1.
+pub const HARDWARE_PROFILE_SCHEMA_VERSION: crate::schema_version::SchemaVersion =
+    crate::schema_version::SchemaVersion::new(1);
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HardwareProfile {
+    /// On-disk schema version. Defaults to v1 (the pre-versioning
+    /// shape) for files written by older builds.
+    #[serde(default = "crate::schema_version::default_v1")]
+    pub schema_version: crate::schema_version::SchemaVersion,
     pub cpu_cores: usize,
     pub total_ram_gb: f64,
     pub available_ram_gb: f64,
@@ -22,6 +33,13 @@ pub struct HardwareProfile {
     pub accelerator_devices: Vec<AcceleratorDevice>,
     pub timestamp: String,
     pub platform_label: String,
+}
+
+impl crate::schema_version::HasSchemaVersion for HardwareProfile {
+    const CURRENT: crate::schema_version::SchemaVersion = HARDWARE_PROFILE_SCHEMA_VERSION;
+    fn schema_version(&self) -> crate::schema_version::SchemaVersion {
+        self.schema_version
+    }
 }
 
 pub struct HardwareProbe {
@@ -583,6 +601,7 @@ impl HardwareProbe {
         );
 
         HardwareProfile {
+            schema_version: HARDWARE_PROFILE_SCHEMA_VERSION,
             cpu_cores,
             total_ram_gb,
             available_ram_gb,
@@ -1093,6 +1112,7 @@ mod tests {
 
     fn profile(gpus: usize, vram_gb: f64) -> HardwareProfile {
         HardwareProfile {
+            schema_version: HARDWARE_PROFILE_SCHEMA_VERSION,
             cpu_cores: 64,
             total_ram_gb: 256.0,
             available_ram_gb: 192.0,
@@ -1253,6 +1273,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.system.enable_gpu_preference = "rocm".to_string();
         let profile = HardwareProfile {
+            schema_version: HARDWARE_PROFILE_SCHEMA_VERSION,
             cpu_cores: 64,
             total_ram_gb: 256.0,
             available_ram_gb: 192.0,
@@ -1290,6 +1311,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.system.enable_gpu_preference = "rocm".to_string();
         let profile = HardwareProfile {
+            schema_version: HARDWARE_PROFILE_SCHEMA_VERSION,
             cpu_cores: 64,
             total_ram_gb: 256.0,
             available_ram_gb: 192.0,
