@@ -91,6 +91,7 @@ use crate::runtime::capabilities::ModelFamily;
 pub mod deep_classification_adapters;
 pub mod deep_timeseries_adapters;
 pub mod meta_adapters;
+pub mod mixed_adapters;
 pub mod tree_adapters;
 
 pub use deep_classification_adapters::{
@@ -101,6 +102,10 @@ pub use deep_timeseries_adapters::{
     register_deep_timeseries_loaders, NBeatsAdapter, NBeatsLoader, NBeatsxNfAdapter,
     NBeatsxNfLoader, PatchTstAdapter, PatchTstLoader, TiDEAdapter, TiDELoader, TiDENfAdapter,
     TiDENfLoader, TimesNetAdapter, TimesNetLoader, TransformerAdapter, TransformerLoader,
+};
+pub use mixed_adapters::{
+    register_mixed_loaders, IsolationForestAdapter, IsolationForestLoader,
+    OnlineHoeffdingAdapter, OnlineHoeffdingLoader, OnlinePaAdapter, OnlinePaLoader,
 };
 pub use meta_adapters::{
     register_meta_loaders, BayesLogitAdapter, BayesLogitLoader, ConformalGateAdapter,
