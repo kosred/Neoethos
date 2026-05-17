@@ -88,6 +88,7 @@ use crate::runtime::capabilities::ModelFamily;
 //   .4 meta
 //   .5 forecasting/adaptive/anomaly
 //   .6 evolutionary + exit + RL
+pub mod bootstrap;
 pub mod deep_classification_adapters;
 pub mod deep_timeseries_adapters;
 pub mod evolutionary_adapters;
@@ -119,6 +120,10 @@ pub use meta_adapters::{
     ConformalGateLoader, ElasticNetAdapter, ElasticNetLoader, LogisticAdapter, LogisticLoader,
     MetaBlenderAdapter, MetaBlenderLoader, MetaStackAdapter, MetaStackLoader,
     ProbabilityCalibratorAdapter, ProbabilityCalibratorLoader,
+};
+pub use bootstrap::{
+    build_default_registry, build_ensemble_for_symbol, build_ensemble_for_symbol_with_config,
+    load_experts_for_symbol, DEFAULT_BOOTSTRAP_EXPERT_NAMES,
 };
 pub use rl_exit_adapters::{
     register_rl_exit_loaders, DqnAdapter, DqnLoader, ExitAgentAdapter, ExitAgentLoader,

@@ -12,9 +12,10 @@ pub mod training_orchestrator;
 pub mod tree_models;
 
 pub use ensemble_inference::{
-    EnsemblePredictor, ExpertLoadError, ExpertLoadOutcome, ExpertLoader, ExpertModel,
-    ExpertOutputKind, ExpertPrediction, ExpertRegistry, SoftVotingEnsemble,
-    SoftVotingEnsembleConfig,
+    build_default_registry, build_ensemble_for_symbol, build_ensemble_for_symbol_with_config,
+    load_experts_for_symbol, EnsemblePredictor, ExpertLoadError, ExpertLoadOutcome, ExpertLoader,
+    ExpertModel, ExpertOutputKind, ExpertPrediction, ExpertRegistry, SoftVotingEnsemble,
+    SoftVotingEnsembleConfig, DEFAULT_BOOTSTRAP_EXPERT_NAMES,
 };
 
 pub use deep_models::{

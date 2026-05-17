@@ -244,6 +244,40 @@ pub enum BotDecisionSource {
     Ai,
 }
 
+/// Lightweight summary of which experts loaded vs missed vs
+/// degraded — returned by [`TradingSession::start_auto_trade_with_ensemble`]
+/// so the chrome can render a "Running ensemble: X/32 experts
+/// active — Y missing, Z degraded" banner without holding a
+/// reference to the live ensemble (which moves into the
+/// predictor at start time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnsembleLoadSummary {
+    /// Canonical names of experts that loaded healthy and are
+    /// participating in inference.
+    pub loaded_names: Vec<String>,
+    /// Canonical names of experts whose artifact directory was
+    /// absent on disk (training never ran for them).
+    pub missing: Vec<String>,
+    /// Canonical names of experts whose artifact existed but
+    /// failed to load cleanly (corruption / version skew / backend
+    /// init failure). The reason strings live in the
+    /// EnsemblePredictor's `load_outcome().degraded` — chrome
+    /// banners can choose to render names only.
+    pub degraded_names: Vec<String>,
+}
+
+impl EnsembleLoadSummary {
+    /// Count of experts actively participating in inference.
+    pub fn loaded_count(&self) -> usize {
+        self.loaded_names.len()
+    }
+    /// `true` when at least one expert loaded successfully — the
+    /// producer can emit signals.
+    pub fn has_any_loaded(&self) -> bool {
+        !self.loaded_names.is_empty()
+    }
+}
+
 /// Identifies which call site is asking `execute_ctrader_order` to
 /// send a new order. The Risky Mode autonomous-only contract
 /// (research §7.1 / [`forex_core::RiskyModeConfig::autonomous_only_contract_accepted`])
@@ -1177,6 +1211,98 @@ impl TradingSession {
             "auto-trade producer stopped"
         );
         outcome
+    }
+
+    /// One-call end-to-end auto-trade activation.
+    ///
+    /// Convenience entry point that builds the full inference
+    /// pipeline against the operator's saved trained-model
+    /// directory and starts the producer thread:
+    ///
+    /// 1. Calls [`forex_models::build_ensemble_for_symbol`] to
+    ///    scan `<models_dir>/<symbol>/<timeframe>/`, load every
+    ///    trained expert it finds, and construct a
+    ///    SoftVotingEnsemble (genetic + neuro_evo excluded by
+    ///    default — strategy discoverers).
+    /// 2. Wraps the ensemble in an
+    ///    [`ensemble_predictor_adapter::EnsembleModelPredictor`]
+    ///    so it conforms to the producer's `ModelPredictor`
+    ///    trait.
+    /// 3. Wraps the supplied bar source + the bridge predictor
+    ///    in a [`auto_trade_producer::LiveInferenceProducerConfig`]
+    ///    for the requested symbol and starts the producer
+    ///    thread.
+    ///
+    /// Returns a load-summary so the chrome can render "Running
+    /// ensemble: X/32 experts active — Y missing, Z degraded".
+    /// The full `ExpertLoadOutcome` (with the live Box<dyn
+    /// ExpertModel> handles) is owned by the running predictor;
+    /// callers that need richer introspection should query the
+    /// predictor directly.
+    ///
+    /// Errors when:
+    /// - No experts loaded from disk (operator hasn't trained
+    ///   yet, or `models_dir` is wrong).
+    /// - A producer is already running on this session.
+    /// - The bar source backend fails to initialise.
+    pub fn start_auto_trade_with_ensemble(
+        &mut self,
+        models_dir: &std::path::Path,
+        symbol: &str,
+        timeframe: &str,
+        bar_source: Arc<dyn auto_trade_producer::LiveBarSource>,
+    ) -> anyhow::Result<EnsembleLoadSummary> {
+        if self.auto_trade_producer.is_some() {
+            anyhow::bail!(
+                "auto-trade producer is already running on this session — stop it first"
+            );
+        }
+        // Build ensemble from saved artifacts. SoftVotingEnsemble::new
+        // already rejects the no-voters case for us.
+        let ensemble = forex_models::build_ensemble_for_symbol(
+            models_dir, symbol, timeframe,
+        )
+        .with_context(|| {
+            format!(
+                "build_ensemble_for_symbol({}, {}, {}) failed",
+                models_dir.display(),
+                symbol,
+                timeframe
+            )
+        })?;
+        // Snapshot the outcome metadata BEFORE the ensemble moves
+        // into the predictor (Box<dyn ExpertModel> isn't Clone).
+        // `load_outcome` is a trait method on EnsemblePredictor;
+        // bring the trait into scope so method-call syntax works.
+        use forex_models::EnsemblePredictor as _;
+        let outcome = ensemble.load_outcome();
+        let summary = EnsembleLoadSummary {
+            loaded_names: outcome.loaded_names().into_iter().map(String::from).collect(),
+            missing: outcome.missing.clone(),
+            degraded_names: outcome
+                .degraded
+                .iter()
+                .map(|e| e.name().to_string())
+                .collect(),
+        };
+        // Wrap in the producer's ModelPredictor adapter.
+        let predictor: Arc<dyn auto_trade_producer::ModelPredictor> = Arc::new(
+            ensemble_predictor_adapter::EnsembleModelPredictor::new(Arc::new(ensemble)),
+        );
+        // Producer config with the operator's symbol.
+        let cfg = auto_trade_producer::LiveInferenceProducerConfig::for_symbol(symbol);
+        // Standard start_auto_trade_producer path.
+        self.start_auto_trade_producer(cfg, bar_source, predictor)?;
+        tracing::info!(
+            target: "forex_app::auto_trade::producer",
+            symbol,
+            timeframe,
+            loaded = summary.loaded_names.len(),
+            missing = summary.missing.len(),
+            degraded = summary.degraded_names.len(),
+            "auto-trade producer started with ensemble from disk"
+        );
+        Ok(summary)
     }
 
     /// Drain all pending auto-trade signals from the producer's

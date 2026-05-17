@@ -1859,6 +1859,65 @@ fn manual_sell_blocked_when_autonomous_only_contract_armed() {
     );
 }
 
+#[test]
+fn start_auto_trade_with_ensemble_refuses_when_no_artifacts_on_disk() {
+    use crate::app_services::trading::auto_trade_producer::LiveBarSource;
+    use anyhow::Result;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    /// Source that never returns a bar.
+    struct EmptySource;
+    impl LiveBarSource for EmptySource {
+        fn poll_latest_bar(&self) -> Result<Option<HistoricalBar>> {
+            Ok(None)
+        }
+    }
+
+    let mut session = TradingSession::new();
+    // Point at a directory that exists but has NO trained
+    // artifacts — start_auto_trade_with_ensemble must refuse
+    // because SoftVotingEnsemble::new rejects the empty case.
+    let empty_dir = std::env::temp_dir().join(format!(
+        "forex-ai-empty-ensemble-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&empty_dir).expect("mkdir");
+
+    let result = session.start_auto_trade_with_ensemble(
+        &empty_dir,
+        "EURUSD",
+        "H1",
+        Arc::new(EmptySource),
+    );
+    assert!(
+        result.is_err(),
+        "start_auto_trade_with_ensemble must reject when no artifacts are present"
+    );
+    // Producer must not have been started either.
+    assert!(!session.auto_trade_producer_running());
+}
+
+#[test]
+fn ensemble_load_summary_counts_are_consistent() {
+    let summary = EnsembleLoadSummary {
+        loaded_names: vec!["lightgbm".into(), "xgboost".into()],
+        missing: vec!["transformer".into()],
+        degraded_names: vec!["catboost".into()],
+    };
+    assert_eq!(summary.loaded_count(), 2);
+    assert!(summary.has_any_loaded());
+    let empty = EnsembleLoadSummary {
+        loaded_names: vec![],
+        missing: vec!["a".into()],
+        degraded_names: vec![],
+    };
+    assert!(!empty.has_any_loaded());
+}
+
 // ── Auto-trade producer lifecycle (Phase D1) ─────────────────────────
 
 #[test]
