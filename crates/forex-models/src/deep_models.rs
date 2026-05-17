@@ -191,6 +191,14 @@ pub struct BurnDeepExpert {
 }
 
 impl BurnDeepExpert {
+    /// Read-only view of the trained feature column names + ordering.
+    /// Required by the [`crate::ensemble_inference::ExpertModel`]
+    /// adapter so the registry / aggregator can detect column-layout
+    /// drift after a retraining session.
+    pub fn feature_columns(&self) -> &[String] {
+        &self.feature_columns
+    }
+
     pub fn new(kind: DeepModelKind, seed: u64, params: Option<HashMap<String, String>>) -> Self {
         Self {
             kind,
@@ -1684,6 +1692,13 @@ macro_rules! define_deep_expert {
 
             pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
                 self.inner.predict_runtime(x)
+            }
+
+            /// Read-only view of the trained feature column names +
+            /// ordering — proxies to the inner `BurnDeepExpert`.
+            /// Required by the inference-side `ExpertModel` adapter.
+            pub fn feature_columns(&self) -> &[String] {
+                self.inner.feature_columns()
             }
         }
 

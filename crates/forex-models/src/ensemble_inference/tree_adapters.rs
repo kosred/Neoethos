@@ -63,7 +63,11 @@ use crate::tree_models::{CatBoostExpert, LightGBMExpert, SklearsTreeExpert, XGBo
 /// caller seeing such an error knows the underlying expert has
 /// drifted out of the Classification3 contract (which is a real bug,
 /// not a recoverable runtime condition).
-fn classification3_per_row(probs: &Array2<f32>) -> Result<Vec<ExpertPrediction>> {
+///
+/// Visible to sibling adapter submodules
+/// ([`super::deep_classification_adapters`], etc.) so every
+/// Classification3 family shares the same row-validator.
+pub(super) fn classification3_per_row(probs: &Array2<f32>) -> Result<Vec<ExpertPrediction>> {
     if probs.ncols() != 3 {
         anyhow::bail!(
             "tree expert predict_proba returned {} columns; ExpertOutputKind::Classification3 \
