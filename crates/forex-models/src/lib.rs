@@ -13,7 +13,8 @@ pub mod tree_models;
 
 pub use ensemble_inference::{
     EnsemblePredictor, ExpertLoadError, ExpertLoadOutcome, ExpertLoader, ExpertModel,
-    ExpertOutputKind, ExpertPrediction, ExpertRegistry,
+    ExpertOutputKind, ExpertPrediction, ExpertRegistry, SoftVotingEnsemble,
+    SoftVotingEnsembleConfig,
 };
 
 pub use deep_models::{

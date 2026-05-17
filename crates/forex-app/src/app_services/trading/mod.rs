@@ -80,6 +80,7 @@ pub(super) use tracing::error;
 
 pub mod auto_trade;
 pub mod auto_trade_producer;
+pub mod ensemble_predictor_adapter;
 mod client_order;
 mod diagnostics;
 mod market_data;
