@@ -531,6 +531,64 @@ mod tests {
         let _ = fs::remove_dir_all(&dest);
     }
 
+    /// Ship-gate §5.1.6 — "Migration of legacy `~/.forex-ai/` data is
+    /// reversible." Reversibility means the source files are preserved
+    /// intact, so the operator can roll the migration back by simply
+    /// deleting the new destination (or pointing back at the source).
+    /// This test pins that invariant: after migration, every byte at
+    /// the source path equals the original, AND a second migration
+    /// run cannot mutate the source either.
+    #[test]
+    fn migration_preserves_source_so_rollback_is_trivial() {
+        let src = tmp_dir("reversibility-src");
+        let dest = tmp_dir("reversibility-dest");
+
+        // Two deterministic payloads in two different files exercise
+        // the recursive copy walk and any per-entry hashing.
+        let cfg_bytes = b"key: original\nvalue: 42\n".to_vec();
+        let env_bytes = (0u8..=255).collect::<Vec<u8>>();
+        fs::write(src.join("config.yaml"), &cfg_bytes).unwrap();
+        fs::write(src.join("env.bin"), &env_bytes).unwrap();
+
+        // Run migration ONCE.
+        let outcome = migrate_portable_install(&src, &dest).expect("migrate");
+        assert_eq!(outcome.copied.len(), 2, "both files must be copied");
+
+        // INVARIANT 1: source files still exist with original bytes.
+        assert!(
+            src.join("config.yaml").exists(),
+            "source config.yaml must survive — copy not move"
+        );
+        assert!(
+            src.join("env.bin").exists(),
+            "source env.bin must survive — copy not move"
+        );
+        assert_eq!(
+            fs::read(src.join("config.yaml")).unwrap(),
+            cfg_bytes,
+            "source bytes must be byte-for-byte unchanged"
+        );
+        assert_eq!(fs::read(src.join("env.bin")).unwrap(), env_bytes);
+
+        // INVARIANT 2: rollback simulation — delete the destination
+        // and the source is still usable (= a re-run can recreate it).
+        fs::remove_dir_all(&dest).expect("dest cleanup");
+        assert!(
+            src.join("config.yaml").exists(),
+            "post-rollback source must still exist"
+        );
+        let outcome2 = migrate_portable_install(&src, &dest).expect("re-migrate after rollback");
+        assert_eq!(outcome2.copied.len(), 2, "re-migration must succeed");
+        assert_eq!(fs::read(dest.join("config.yaml")).unwrap(), cfg_bytes);
+
+        // INVARIANT 3: source still intact after a SECOND migration —
+        // migrations are idempotent on the source side.
+        assert_eq!(fs::read(src.join("config.yaml")).unwrap(), cfg_bytes);
+
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
     /// Pin that the migration runtime hashes with real SHA-256
     /// (not the old fnv64 placeholder). Independently computes the
     /// SHA-256 digest of a 64-byte payload and asserts the migrator

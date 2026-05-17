@@ -223,6 +223,164 @@ fn deal_list_response_scales_close_detail_money_digits_four_fields() {
     assert_eq!(deals[0].net_profit, Some(0.1185));
 }
 
+/// §5.1.3 ship gate — balance scaling with moneyDigits=4 (high-precision
+/// account, e.g. precious-metal denomination). The earlier
+/// `trader_response_parses_balance_and_account_metadata` covers
+/// moneyDigits=2; this test pins the high-precision path so a future
+/// regression in the trader-response scaler cannot pass CI.
+#[test]
+fn trader_response_parses_balance_money_digits_four() {
+    let response = serde_json::json!({
+        "clientMsgId": "trader-md4",
+        "payloadType": 2122,
+        "payload": {
+            "ctidTraderAccountId": 712345,
+            "balance": 123_456_789i64,   // raw integer wire value
+            "moneyDigits": 4,
+            "leverageInCents": 5000,
+            "traderLogin": 998877,
+            "accountType": 1,
+            "brokerName": "High-Precision Demo"
+        }
+    });
+
+    let trader = parse_trader_response(&response.to_string()).expect("trader response");
+
+    assert_eq!(trader.money_digits, 4);
+    // 123_456_789 / 10^4 = 12_345.6789
+    assert!(
+        (trader.balance - 12_345.6789).abs() < 1e-9,
+        "balance scaling broken for moneyDigits=4: got {}",
+        trader.balance
+    );
+}
+
+/// §5.1.3 ship gate — swap / commission / mirroring commission / used
+/// margin all carry per-position `moneyDigits`. The earlier
+/// `reconcile_response_scales_position_money_digits_four_fields` covers
+/// moneyDigits=4; this pins the moneyDigits=2 (fiat default) path so the
+/// pre-fix `value / 100.0` behaviour can never silently regress.
+#[test]
+fn reconcile_response_scales_position_money_digits_two_fields() {
+    let response = serde_json::json!({
+        "clientMsgId": "reconcile-money-2",
+        "payloadType": 2125,
+        "payload": {
+            "ctidTraderAccountId": 712345,
+            "position": [
+                {
+                    "positionId": 9001,
+                    "tradeData": {
+                        "symbolId": 14,
+                        "volume": 2500,
+                        "tradeSide": 1,
+                        "openTimestamp": 1710000000000i64
+                    },
+                    "price": 1.10123,
+                    "swap": -250,                  // -2.50 USD
+                    "commission": -700,            // -7.00 USD
+                    "mirroringCommission": -50,    // -0.50 USD
+                    "usedMargin": 36_180,          // 361.80 USD
+                    "moneyDigits": 2
+                }
+            ],
+            "order": []
+        }
+    });
+
+    let reconcile = parse_reconcile_response(&response.to_string()).expect("reconcile");
+    let position = &reconcile.positions[0];
+
+    assert_eq!(position.swap, Some(-2.50));
+    assert_eq!(position.commission, Some(-7.00));
+    assert_eq!(position.mirroring_commission, Some(-0.50));
+    assert_eq!(position.used_margin, Some(361.80));
+}
+
+/// §5.1.3 ship gate — close-position-detail scaling at moneyDigits=2.
+/// `deal_list_response_scales_close_detail_money_digits_four_fields`
+/// covers moneyDigits=4; this pins the fiat path so the off-by-100
+/// pre-fix bug cannot regress on standard USD/EUR accounts.
+#[test]
+fn deal_list_close_detail_money_digits_two_fields() {
+    let response = serde_json::json!({
+        "clientMsgId": "deals-md2",
+        "payloadType": 2134,
+        "payload": {
+            "ctidTraderAccountId": 712345,
+            "deal": [
+                {
+                    "dealId": 3002,
+                    "orderId": 8002,
+                    "positionId": 9001,
+                    "volume": 1500,
+                    "filledVolume": 1500,
+                    "symbolId": 14,
+                    "executionTimestamp": 1710000201000i64,
+                    "executionPrice": 1.0990,
+                    "tradeSide": 1,
+                    "dealStatus": 2,
+                    "closePositionDetail": {
+                        "entryPrice": 1.0980,
+                        "grossProfit": 1250,        // +12.50 USD
+                        "swap": -15,                // -0.15
+                        "commission": -40,          // -0.40
+                        "pnlConversionFee": -10,    // -0.10
+                        "moneyDigits": 2
+                    }
+                }
+            ],
+            "hasMore": false
+        }
+    });
+
+    let deals = parse_deal_list_response(&response.to_string()).expect("deal list");
+    let d = &deals[0];
+    assert_eq!(d.gross_profit, Some(12.50));
+    assert_eq!(d.swap, Some(-0.15));
+    assert_eq!(d.fee, Some(-0.40));
+    assert_eq!(d.pnl_conversion_fee, Some(-0.10));
+    // net = gross + swap + fee + pnl_conversion_fee = 12.50 - 0.15 - 0.40 - 0.10 = 11.85
+    let net = d.net_profit.expect("net profit computed");
+    assert!((net - 11.85).abs() < 1e-9, "net_profit broken: {net}");
+}
+
+/// §5.1.3 catch-all — the remaining cTrader monetary entities listed in
+/// `ctrader_money.rs` are `ProtoOABonusDepositWithdraw.*` and
+/// `ProtoOADepositWithdraw.*` (top-up / withdrawal / bonus events).
+/// Their proto envelopes are not yet parsed by `parse_*_response`
+/// helpers in this module — when the parsers land in v0.5 they should
+/// use `scale_ctrader_money_int` exactly as positions / deals do. To
+/// prove the scaling primitive itself is unbiased for these entity
+/// classes, drive a representative `amount` field at both moneyDigits=2
+/// and moneyDigits=4 directly through the helper. This pins the
+/// arithmetic contract until the proto parsers wire it in.
+#[test]
+fn money_scaling_table_covers_deposit_and_bonus_entities() {
+    use crate::app_services::ctrader_money::scale_ctrader_money_int;
+
+    // Each row: (entity label, raw integer, moneyDigits, expected real value)
+    let cases: &[(&str, i64, i32, f64)] = &[
+        // Top-up of $1,234.56 USD on a fiat account.
+        ("DepositWithdraw.amount @ mD=2",      123_456,         2,  1_234.56),
+        // The same deposit on a moneyDigits=4 account: $12.3456.
+        ("DepositWithdraw.amount @ mD=4",      123_456,         4,     12.3456),
+        // Bonus credit of $50.00 on a fiat account.
+        ("BonusDepositWithdraw.amount @ mD=2", 5_000,           2,     50.00),
+        // Same bonus on a moneyDigits=4 account: $0.50.
+        ("BonusDepositWithdraw.amount @ mD=4", 5_000,           4,      0.50),
+    ];
+
+    for (label, raw, md, expected) in cases {
+        let got = scale_ctrader_money_int(*raw, *md)
+            .unwrap_or_else(|err| panic!("{label}: scaling errored: {err}"));
+        assert!(
+            (got - *expected).abs() < 1e-9,
+            "{label}: expected {expected}, got {got}"
+        );
+    }
+}
+
 #[test]
 fn account_runtime_loader_authenticates_then_loads_trader_reconcile_and_deals() {
     let transport = StubTransport::with_responses(vec![

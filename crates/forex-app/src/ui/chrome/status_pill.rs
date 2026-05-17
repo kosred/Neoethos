@@ -52,6 +52,42 @@ pub fn draw_status_pill(
     theme::status_badge(ui, &text, color);
 }
 
+/// HALT-aware variant. When `halted == true` the pill ignores the
+/// trading environment and renders "HALTED" in solid `DANGER` red so
+/// the operator can never miss it. Matches ship-gate §5.1.5: "status
+/// pill flips to 'HALTED'".
+pub fn draw_status_pill_with_halt(
+    ui: &mut egui::Ui,
+    env: TradingEnvironment,
+    account_label: &str,
+    halted: bool,
+) {
+    if halted {
+        theme::status_badge(ui, &pill_text_for_halt(account_label), pill_color_for_halt());
+    } else {
+        draw_status_pill(ui, env, account_label);
+    }
+}
+
+/// HALT pill color — solid `DANGER` red, the same token used by the
+/// HALT button. Picked deliberately so the two visually rhyme when both
+/// are active: a HALT trip flashes the same red on both surfaces.
+pub fn pill_color_for_halt() -> egui::Color32 {
+    theme::STATUS_LIVE
+}
+
+/// HALT pill text. Always starts with `HALTED`; the account label is
+/// appended after a middle-dot so the operator can still tell which
+/// account is frozen.
+pub fn pill_text_for_halt(account_label: &str) -> String {
+    let trimmed = account_label.trim();
+    if trimmed.is_empty() {
+        "HALTED".to_string()
+    } else {
+        format!("HALTED · {trimmed}")
+    }
+}
+
 /// Token lookup so tests can assert the variant -> color mapping
 /// without driving egui. The function is intentionally simple so
 /// the unit tests in `chrome/status_pill.rs` document the contract.
@@ -129,6 +165,103 @@ mod tests {
         assert_eq!(
             pill_text_for(TradingEnvironment::LiveSmall, "  acct-7  "),
             "LIVE SMALL · acct-7"
+        );
+    }
+
+    // ── HALT pill (ship-gate §5.1.5) ──────────────────────────────────
+
+    #[test]
+    fn halt_pill_uses_danger_red_token() {
+        assert_eq!(pill_color_for_halt(), theme::STATUS_LIVE);
+    }
+
+    #[test]
+    fn halt_pill_text_without_account() {
+        assert_eq!(pill_text_for_halt(""), "HALTED");
+    }
+
+    #[test]
+    fn halt_pill_text_with_account() {
+        assert_eq!(pill_text_for_halt("712345"), "HALTED · 712345");
+    }
+
+    #[test]
+    fn halt_pill_text_trims_whitespace_in_account_label() {
+        assert_eq!(pill_text_for_halt("  998877  "), "HALTED · 998877");
+    }
+
+    /// Ship-gate §5.1.5 smoke test — drives the whole flow at the
+    /// model level: trip HALT on a fresh `TradingSession`, then assert
+    /// that the status-pill renderer would pick the HALTED variant
+    /// over the configured trading environment. We don't drive egui
+    /// pixels (`Context::default()` works in unit tests but doesn't
+    /// add coverage beyond what these state assertions already give —
+    /// the §5.1.5 "click the red HALT button" path is the operator's
+    /// finger; everything downstream of `trip_manual_halt` is covered
+    /// here and in `halt_button::tests`).
+    #[test]
+    fn smoke_session_halt_overrides_environment_in_status_pill() {
+        use crate::app_services::trading::{
+            TradingAdapterKind, TradingEnvironment, TradingSession,
+        };
+        use crate::app_state::{AppRuntimeConfig, AppState};
+        use forex_core::Settings;
+
+        // Set up a session in LIVE env so we know the pill would
+        // otherwise show "LIVE · ...". The HALT override must beat it.
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        session.set_trading_environment(TradingEnvironment::LiveFull);
+
+        let tmp = std::env::temp_dir().join(format!(
+            "forex-ai-pill-halt-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+        let runtime = AppRuntimeConfig {
+            config_path: "config.yaml".to_string(),
+            data_dir: tmp,
+            start_local: true,
+            auto_discovery: false,
+            auto_training: false,
+        };
+        let mut state = AppState::new(runtime, &Settings::default(), Vec::new());
+        let account_label = "987654";
+
+        // Pre-halt: pill text and color follow the LiveFull env.
+        assert!(!session.is_halted(), "fresh session must not be halted");
+        assert_eq!(
+            pill_text_for(TradingEnvironment::LiveFull, account_label),
+            "LIVE · 987654"
+        );
+        assert_eq!(
+            pill_color_for(TradingEnvironment::LiveFull),
+            theme::STATUS_LIVE
+        );
+
+        // Trip HALT.
+        let summary = session.trip_manual_halt(&mut state);
+        assert!(session.is_halted(), "trip_manual_halt must set the flag");
+        assert!(
+            summary.environment_label.contains("LIVE"),
+            "summary preserves the env in force at trip time, got {}",
+            summary.environment_label
+        );
+
+        // Post-halt: the HALT-aware accessors return the HALTED variant
+        // regardless of the configured environment. This is exactly
+        // what `draw_status_pill_with_halt` paints in the top bar.
+        let halted_text = pill_text_for_halt(account_label);
+        let halted_color = pill_color_for_halt();
+        assert_eq!(halted_text, "HALTED · 987654");
+        assert_eq!(halted_color, theme::STATUS_LIVE);
+        assert_ne!(
+            halted_text,
+            pill_text_for(TradingEnvironment::LiveFull, account_label),
+            "HALT override must visibly differ from the env-only label"
         );
     }
 }

@@ -577,7 +577,10 @@ impl eframe::App for ForexApp {
                             .trading_session
                             .selected_ctrader_execution_account_id_public()
                             .unwrap_or_default();
-                        ui::chrome::status_pill::draw_status_pill(ui, env, &account_label);
+                        let halted = self.trading_session.is_halted();
+                        ui::chrome::status_pill::draw_status_pill_with_halt(
+                            ui, env, &account_label, halted,
+                        );
 
                         ui.add_space(ui::theme::SPACE_SM);
 

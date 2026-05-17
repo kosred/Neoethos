@@ -446,12 +446,14 @@ fn load_rebuilds_stale_fitted_artifact_diagnostics() {
 //       available history (e.g. values.len() / 2) and surface a
 //       degradation reason naming the clamp.
 //
-// Production currently does neither: it silently rebuilds at the
-// persisted horizon with flat moving-average candidates and zero
-// validation windows, producing a "fitted" forecaster whose
-// last_horizon == 12 from only 8 data points. This test encodes the
-// expected correct behaviour and is ignored until the impl is fixed
-// in a follow-up batch (F-MODELS9-013-impl).
+// F-MODELS9-013-impl SHIPPED 2026-05-15 (commit 3dce122) — the loader
+// at `swarm_impl.rs:251-270` now bails with an explicit
+// "horizon exceeds half of available history" message when a persisted
+// artifact's horizon is unsupportable on its history. This test runs
+// (no `#[ignore]`) and exercises Case (a) of the contract below;
+// Case (b) is kept in the assertion ladder so a future migration to
+// "clamp-and-degrade" semantics can swap one branch for the other
+// without churning the test.
 #[test]
 fn load_rejects_or_downgrades_artifact_with_incompatible_horizon() {
     let dir = test_artifact_dir("incompatible-horizon-artifact");
