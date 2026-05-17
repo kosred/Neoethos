@@ -1,4 +1,5 @@
 pub mod all_indicators;
+pub mod cross_pair_features;
 pub mod discover;
 pub mod feature_registry;
 pub mod features;
