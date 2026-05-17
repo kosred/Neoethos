@@ -1,10 +1,16 @@
-// Phase C3 audit: `theme.rs` is a design-system constants module by
-// definition — `pub const FONT_*` / `pub const RADIUS_*` /
-// `pub const STATUS_*` are an API surface for any future UI module,
-// so most tokens won't have a call site at any given snapshot. A
-// missing token is a real bug (renderers will fail), an unused one
-// is healthy headroom. Apply the local allow to preserve that
-// invariant; do NOT promote to a workspace lint.
+// Phase C3 audit + Flutter pivot context (2026-05-18 operator directive):
+// `theme.rs` is a design-system constants module by definition — every
+// `pub const FONT_*` / `pub const RADIUS_*` / `pub const STATUS_*` is
+// an API surface for the broader UI, so most tokens have no call site
+// at any given snapshot. A missing token is a real bug (renderers
+// fail loud); an unused one is healthy headroom.
+//
+// EGUI -> FLUTTER MIGRATION NOTE: once the Flutter rewrite ships,
+// this entire file gets replaced by Dart design tokens at the
+// Flutter side, and the Rust crate gracefully sheds it. Until then
+// the file-local `#![allow(dead_code)]` is the honest tag for
+// "transient palette during the egui sunset". NOT promoted to a
+// workspace lint. NOT silencing real bugs.
 #![allow(dead_code)]
 
 //! Forex-AI design system.

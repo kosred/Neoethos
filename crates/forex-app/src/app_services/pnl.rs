@@ -1,9 +1,15 @@
-// Phase C3 audit: server-side UnrealizedPnL scaffold. The 3 #[ignore]
-// tests are real-data gates blocked on §5.2.4 fixture capture; the
-// pub fns (`fetch_position_unrealized_pnl`, `replace_local_with_broker`,
-// `is_broker_authoritative`) are consumed by the risk_gate circuit
-// breaker (orders.rs:340-368) but a couple of helper types aren't
-// yet called outside this file. Local allow only.
+// Phase C3 audit + Flutter pivot context (2026-05-18 operator
+// directive): server-side UnrealizedPnL pipeline. The 3 #[ignore]
+// tests are real-data gates blocked on §5.2.4 fixture capture;
+// the pub fns (fetch_position_unrealized_pnl,
+// replace_local_with_broker, is_broker_authoritative) ARE
+// consumed by the risk_gate circuit breaker
+// (orders.rs:340-368) — production-wired. A handful of helper
+// types ride along for the upcoming Flutter API layer's
+// P&L-dashboard endpoint (the mobile app's "View P&L" tab needs
+// the broker-authoritative figures these types expose).
+//
+// FILE-LOCAL allow only — NOT a workspace lint override.
 #![allow(dead_code)]
 
 //! Broker-side unrealized PnL: audit + authoritative paths.

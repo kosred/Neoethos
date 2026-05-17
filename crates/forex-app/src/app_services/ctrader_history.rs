@@ -1,11 +1,15 @@
-// Phase C3 audit (audit gap clarification #3): this module is part
-// of the v0.4.5 audit scaffolding — the proto result parsers and
-// `fetch_*` entry points exposed below are the API surface the D2
-// wizard apply writer and the multi-symbol training pipeline will
-// consume in v0.5. They are intentionally pub-but-uncalled in v0.4.5
-// to keep the linker boundary stable while the consumers land. The
-// allow is FILE-LOCAL (`#![allow(dead_code)]`), NOT a workspace lint
-// override — every other file's dead-code detection stays sharp.
+// Phase C3 audit + Flutter pivot context (2026-05-18 operator
+// directive): this module is the cTrader Open API history fetcher.
+// Its proto result parsers and `fetch_*` entry points are the
+// API surface that:
+//   - the (now-deferred) egui D2 wizard apply writer would have
+//     consumed, AND
+//   - the upcoming Flutter API layer (gRPC/REST endpoints
+//     exposing position/order history to mobile + desktop
+//     clients) WILL consume.
+//
+// Until the Flutter API stage lands, the helpers stay pub-but-
+// uncalled. FILE-LOCAL allow only — NOT a workspace override.
 #![allow(dead_code)]
 
 //! High-level cTrader Open API history helpers.

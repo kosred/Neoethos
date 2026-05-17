@@ -1,3 +1,12 @@
+// Phase C3 audit + Flutter pivot context (2026-05-18 operator
+// directive): this file holds the live cTrader websocket session
+// state machine. The session orchestrator (event loop + heartbeat
+// + reconnect) is wired into production; some lifecycle helpers
+// here remain pub-but-uncalled until the Flutter API layer wires
+// them as REST/gRPC endpoints for the desktop + mobile clients
+// to query session health.
+//
+// FILE-LOCAL allow only — NOT a workspace lint override.
 #![allow(dead_code)]
 
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;

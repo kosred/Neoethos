@@ -1,9 +1,17 @@
-// Phase C3 audit: this module exposes the portable→installed
-// migration API (`detect_portable_install`, `migrate_portable_install`,
-// `PortableMigrationReport`/`Outcome`) that the wizard's Path step
-// (Step 2, D2 polish) drives in v0.5. The wizard skeleton is in place;
-// the consumer call lives in `ui/wizard/path.rs::apply` which is one
-// of the D2 wiring items. Local allow only — no workspace override.
+// Phase C3 audit + Flutter pivot context (2026-05-18 operator
+// directive): this module exposes the portable→installed migration
+// API (detect_portable_install, migrate_portable_install,
+// PortableMigrationReport/Outcome) that the wizard's Path step
+// drives. The CONSUMER target has shifted with the egui→Flutter
+// migration:
+//   - The egui wizard D2 polish that would have called these is
+//     DEFERRED — wasted egui work in light of the Flutter rewrite.
+//   - The Flutter wizard (when it ships) will call these helpers
+//     directly via the API layer (forex-server exposes the
+//     migration entry points as REST endpoints; Flutter triggers
+//     a copy-from-portable on first run).
+//
+// FILE-LOCAL allow only — NOT a workspace override.
 #![allow(dead_code)]
 
 //! Portable → installed migration detector + copy runtime.

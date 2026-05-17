@@ -1,9 +1,15 @@
-// Phase C3 audit: ctrader_messages.rs is the proto wire-format
-// surface — every `ProtoOA*` variant exists because Spotware's spec
-// requires it. Some variants (e.g. ProtoOAGetCtidProfileByTokenReq,
-// the bonus-deposit-withdraw lifecycle, the dealOffsetList request)
-// don't have a v0.4.5 caller but are needed in v0.5 when the wizard
-// and history paths consume them. Local allow only.
+// Phase C3 audit + Flutter pivot context (2026-05-18 operator
+// directive): this file is the Spotware Open API proto wire-format
+// surface. Every `ProtoOA*` variant exists because Spotware's spec
+// requires it — a missing variant breaks the protocol parser. The
+// "unused" variants (ProtoOAGetCtidProfileByTokenReq, the
+// bonus-deposit-withdraw lifecycle, dealOffsetList, etc.) are
+// SPEC-COMPLETE wire format kept for upcoming consumers:
+//   - cTrader history / account-profile RPCs that the Flutter API
+//     layer will expose
+//   - position lifecycle events the manual-trading mobile UI needs
+//
+// FILE-LOCAL allow only — NOT a workspace lint override.
 #![allow(dead_code)]
 
 use anyhow::{Context, Result, anyhow};

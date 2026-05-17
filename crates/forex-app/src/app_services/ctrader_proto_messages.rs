@@ -1,3 +1,12 @@
+// Phase C3 audit + Flutter pivot context (2026-05-18 operator
+// directive): this file is the cTrader Open API proto-builder
+// surface. Every `build_*_request` and `parse_*_response` helper
+// exists for spec parity with Spotware's published API. Consumers
+// that DO call these helpers live in `ctrader_streaming.rs`,
+// `ctrader_history.rs`, and the upcoming Flutter API layer's
+// REST/gRPC bridge to the bot's broker channel.
+//
+// FILE-LOCAL allow only — NOT a workspace lint override.
 #![allow(dead_code)]
 
 use crate::app_services::ctrader_messages::{
