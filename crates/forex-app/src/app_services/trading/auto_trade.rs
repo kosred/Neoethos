@@ -65,7 +65,7 @@ pub struct AutoTradeSignal {
     /// Confidence in `[0.0, 1.0]`. Compared against
     /// [`AUTO_TRADE_MIN_CONFIDENCE`] in the gate; signals below
     /// threshold are rejected with `GateDecision::BelowConfidence`.
-    pub confidence: f32,
+    pub confidence: f64,
     /// Display label rendered on the chart overlay marker after
     /// dispatch (`"AI BUY · 0.74"`, `"AI SELL · 0.81"`).
     pub label: String,
@@ -86,7 +86,7 @@ pub enum AutoTradeSide {
 /// Hard-coded at the spec floor — research §4.6.1 names 0.6 as the
 /// stage-0 minimum; the Risky Mode gate tightens this further per
 /// stage when active.
-pub const AUTO_TRADE_MIN_CONFIDENCE: f32 = 0.6;
+pub const AUTO_TRADE_MIN_CONFIDENCE: f64 = 0.6;
 
 /// Outcome of pushing an auto-trade signal through the gate chain.
 /// Every variant is observable from outside so the inference loop's
@@ -106,7 +106,7 @@ pub enum GateDecision {
     /// `side == AutoTradeSide::Flat` — no order to send.
     FlatSide,
     /// Confidence below [`AUTO_TRADE_MIN_CONFIDENCE`].
-    BelowConfidence { confidence: f32, minimum: f32 },
+    BelowConfidence { confidence: f64, minimum: f64 },
     /// News blackout active. Same gate that the manual path uses
     /// (`news_filter.is_blackout()`).
     NewsBlackout,
@@ -269,7 +269,7 @@ mod tests {
         s
     }
 
-    fn sample_signal(side: AutoTradeSide, confidence: f32) -> AutoTradeSignal {
+    fn sample_signal(side: AutoTradeSide, confidence: f64) -> AutoTradeSignal {
         AutoTradeSignal {
             symbol: "EURUSD".to_string(),
             side,

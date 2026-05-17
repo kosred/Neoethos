@@ -132,11 +132,13 @@ pub struct WizardConfig {
     /// wires explicitly to RiskyMode instead of relying on a stale
     /// risk-slider == 10 heuristic.
     pub risky_mode_armed: bool,
-    /// Operator-acknowledged ruin-probability ceiling (e.g. 0.5 for
-    /// 50%). `None` until the operator ticks the checkbox in the
-    /// AutonomyRisk step. Cleared when `risky_mode_armed` flips back
-    /// to false so a re-arm always re-prompts.
-    pub risky_mode_ruin_ceiling_acknowledged: Option<f32>,
+    /// Operator-acknowledged ruin-probability ceiling (e.g. 0.99 for
+    /// the operator-directive 99% S1 ruin ceiling). `None` until the
+    /// operator ticks the checkbox in the AutonomyRisk step. Cleared
+    /// when `risky_mode_armed` flips back to false so a re-arm always
+    /// re-prompts. f64 to match the rebuilt forex_core::RiskyModeConfig
+    /// numeric convention (operator directive §7.2).
+    pub risky_mode_ruin_ceiling_acknowledged: Option<f64>,
 
     // Step 10.
     pub telemetry_opt_in: bool,

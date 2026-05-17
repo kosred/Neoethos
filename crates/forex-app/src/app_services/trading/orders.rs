@@ -294,22 +294,22 @@ impl TradingSession {
         }
         match self.build_ctrader_order_request(state, side) {
             Ok(order_request) => {
-                // Risky Mode gate (research §4–§5). When Risky Mode
-                // is armed it sits IMMEDIATELY above the prop-firm
-                // gate — both run, Risky Mode is the strictly
-                // tighter outer layer (research §11.3, operator
-                // directive 2026-05-15). The gate consults the
-                // sticky manual / hardware halts, the per-day cap,
-                // the per-stage retreat trigger, the per-month cap,
-                // and the §5.7 50%-of-bankroll pre-send sanity
-                // ceiling. We pass the converted-protocol-volume
-                // (in standard-lot cents) divided by 100 as the
-                // notional-USD-at-risk proxy; the operator's f32
-                // discipline applies here.
+                // Risky Mode gate (research §4–§5 + operator directive
+                // §7.1). When Risky Mode is armed it sits IMMEDIATELY
+                // above the prop-firm gate — both run, Risky Mode is
+                // the strictly tighter outer layer (research §11.3,
+                // operator directive 2026-05-15). The gate consults the
+                // sticky manual / hardware halts, the per-day cap, the
+                // per-stage retreat trigger, the per-month cap, and the
+                // pre-send sanity ceiling (`presend_sanity_ceiling_fraction`
+                // of bankroll, default 55 %). We pass the converted-
+                // protocol-volume (in standard-lot cents) divided by
+                // 100 as the notional-USD-at-risk proxy. f64 throughout
+                // per operator directive §7.2.
                 if let Some(rm) = self.risky_mode_manager() {
-                    let size_usd = (order_request.volume as f32) / 100.0;
-                    let sl_pips = order_request.relative_stop_loss.unwrap_or(0) as f32;
-                    let tp_pips = order_request.relative_take_profit.unwrap_or(0) as f32;
+                    let size_usd = (order_request.volume as f64) / 100.0;
+                    let sl_pips = order_request.relative_stop_loss.unwrap_or(0) as f64;
+                    let tp_pips = order_request.relative_take_profit.unwrap_or(0) as f64;
                     if let Err(tier) = rm.check_trade_allowed(size_usd, sl_pips, tp_pips) {
                         let message = format!(
                             "Risky Mode kill switch tripped ({tier:?}): order rejected before prop-firm gate"
@@ -524,9 +524,10 @@ impl TradingSession {
         // retreat tracks the real bankroll. Only fires on close-
         // position outcomes (new-order fills emit `net_profit = 0`
         // before the broker has computed it; the close-position
-        // path is the canonical realised-PnL emit-point). Cast to
-        // f32 per the operator's f32-throughout-Risky-Mode rule;
-        // the broker payload itself stays f64.
+        // path is the canonical realised-PnL emit-point). Both the
+        // broker payload and the Risky Mode bankroll cursor are f64
+        // per operator directive §7.2 — the earlier f32 cast was
+        // retired with the 2026-05-17 rebaseline.
         if matches!(&request, CTraderExecutionRequest::ClosePosition(_))
             && matches!(
                 outcome.status,
@@ -535,12 +536,11 @@ impl TradingSession {
             && let Some(realized_pnl) = outcome.net_profit
             && let Some(rm) = self.risky_mode_manager_mut()
         {
-            let realized_pnl_f32 = realized_pnl as f32;
-            if realized_pnl_f32.is_finite() {
-                rm.record_trade_outcome(realized_pnl_f32);
+            if realized_pnl.is_finite() {
+                rm.record_trade_outcome(realized_pnl);
                 tracing::info!(
                     target: "forex_app::risky_mode",
-                    realized_pnl_usd = realized_pnl_f32,
+                    realized_pnl_usd = realized_pnl,
                     bankroll_usd = rm.current_bankroll_usd(),
                     stage_idx = rm.current_stage().stage_idx,
                     "Risky Mode bankroll updated from closed position"

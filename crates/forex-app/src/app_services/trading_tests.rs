@@ -1671,6 +1671,17 @@ fn prop_firm_gate_rejects_when_account_currency_unset() {
 // `RiskyModeManager` wiring; the manager's own per-stage maths is
 // covered exhaustively by `forex_core::domain::risky_mode::tests`.
 
+/// Build a default Risky Mode config with the autonomous-only contract
+/// explicitly accepted (the test-harness analogue of the operator
+/// ticking the wizard's §7.1 acknowledgement). `RiskyModeManager::new`
+/// rejects construction without this flag, so every Risky-Mode
+/// integration test in this file routes through this helper.
+fn signed_risky_mode_config() -> forex_core::RiskyModeConfig {
+    let mut cfg = forex_core::RiskyModeConfig::default();
+    cfg.autonomous_only_contract_accepted = true;
+    cfg
+}
+
 #[test]
 fn risky_mode_gate_rejects_order_when_kill_switch_tripped() {
     // Step-by-step recreation of the integration path:
@@ -1683,7 +1694,7 @@ fn risky_mode_gate_rejects_order_when_kill_switch_tripped() {
     //      gate.
     let mut session = TradingSession::new();
     session
-        .enable_risky_mode(forex_core::RiskyModeConfig::default(), 100.0)
+        .enable_risky_mode(signed_risky_mode_config(), 100.0)
         .expect("enable_risky_mode");
     assert!(session.risky_mode_active());
 
@@ -1699,7 +1710,7 @@ fn risky_mode_gate_rejects_order_when_kill_switch_tripped() {
     // Now the same gate that production calls inside
     // execute_ctrader_order must reject every new order.
     let rm = session.risky_mode_manager().expect("manager still set");
-    let result = rm.check_trade_allowed(0.5_f32, 10.0_f32, 30.0_f32);
+    let result = rm.check_trade_allowed(0.5_f64, 10.0_f64, 30.0_f64);
     assert_eq!(result, Err(forex_core::KillSwitchTier::PerDay));
 }
 
@@ -1711,7 +1722,7 @@ fn halt_button_also_trips_risky_mode_kill_switch() {
     let mut state = sample_state(DataSource::CTrader, "Connected");
     let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
     session
-        .enable_risky_mode(forex_core::RiskyModeConfig::default(), 100.0)
+        .enable_risky_mode(signed_risky_mode_config(), 100.0)
         .expect("enable_risky_mode");
     assert!(
         session
@@ -1743,7 +1754,7 @@ fn halt_button_also_trips_risky_mode_kill_switch() {
     let result = session
         .risky_mode_manager()
         .expect("manager")
-        .check_trade_allowed(0.1_f32, 10.0_f32, 30.0_f32);
+        .check_trade_allowed(0.1_f64, 10.0_f64, 30.0_f64);
     assert_eq!(result, Err(forex_core::KillSwitchTier::Manual));
 }
 
@@ -1755,7 +1766,7 @@ fn closed_trade_advances_risky_mode_bankroll() {
     // mechanism the production `execute_ctrader_request` close-
     // outcome hook invokes on every ClosePosition fill.
     let mut session = TradingSession::new();
-    let cfg = forex_core::RiskyModeConfig::default();
+    let cfg = signed_risky_mode_config();
     // Start at the lower bound of stage 0 so we can promote after
     // a single profitable close.
     let stage1_lower = cfg.stages[1].bankroll_lower_usd;

@@ -221,8 +221,10 @@ pub struct BotDecisionEntry {
     /// Where the decision came from. `Manual` for operator clicks,
     /// `Ai` for the auto-trade pipeline.
     pub source: BotDecisionSource,
-    /// Optional confidence in `[0.0, 1.0]` for AI decisions.
-    pub confidence: Option<f32>,
+    /// Optional confidence in `[0.0, 1.0]` for AI decisions. f64 per
+    /// operator directive §7.2 — matches `AutoTradeSignal::confidence`
+    /// at the boundary.
+    pub confidence: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,8 +392,10 @@ pub struct HaltTripSummary {
 /// status pill — they never touch [`RiskyModeManager`] directly.
 ///
 /// Mirrors the fields required by research §7.2 (stage progress),
-/// §7.4 (kill-switch banner), and §7.5 (retreat indicator). Numeric
-/// fields are `f32` per the operator's f32-throughout-Risky-Mode rule.
+/// §7.4 (kill-switch banner), and §7.5 (retreat indicator). All
+/// numeric fields are `f64` per operator directive §7.2 — f64 carries
+/// ~15-16 decimal digits, which keeps cents accurate at the $50,000-
+/// target scale. The earlier f32 build is retired with this snapshot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RiskyModeState {
     /// Zero-based stage index (`0 = S1`). Matches
@@ -402,22 +406,22 @@ pub struct RiskyModeState {
     pub total_stages: u8,
     /// Live bankroll in USD, updated by `record_trade_outcome` at
     /// every close.
-    pub current_bankroll_usd: f32,
+    pub current_bankroll_usd: f64,
     /// Lower edge of the current stage's bankroll window — feeds the
     /// stage-progress bar.
-    pub stage_bankroll_lower_usd: f32,
+    pub stage_bankroll_lower_usd: f64,
     /// Upper edge of the current stage's bankroll window.
-    pub stage_bankroll_upper_usd: f32,
+    pub stage_bankroll_upper_usd: f64,
     /// Cumulative daily loss in USD (positive number = loss).
-    pub daily_loss_accumulated_usd: f32,
+    pub daily_loss_accumulated_usd: f64,
     /// Cumulative monthly loss in USD (positive number = loss).
-    pub monthly_loss_accumulated_usd: f32,
+    pub monthly_loss_accumulated_usd: f64,
     /// Last kill-switch trip — `None` when no halt has fired since
     /// construction or the last `clear_halt`.
     pub last_kill_switch_trip: Option<(KillSwitchTier, chrono::DateTime<chrono::Utc>)>,
     /// Heuristic ruin-probability estimate at the current stage
     /// (research §9.3 Brownian-motion formula).
-    pub ruin_probability_estimate: f32,
+    pub ruin_probability_estimate: f64,
 }
 
 pub struct TradingSession {
@@ -988,7 +992,7 @@ impl TradingSession {
     pub fn enable_risky_mode(
         &mut self,
         config: RiskyModeConfig,
-        starting_bankroll_usd: f32,
+        starting_bankroll_usd: f64,
     ) -> anyhow::Result<()> {
         let manager = RiskyModeManager::new(config, starting_bankroll_usd)?;
         self.risky_mode_manager = Some(manager);

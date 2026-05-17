@@ -1,11 +1,3 @@
-// Phase C3 audit: this is the Step 9.5 scaffold. The renderer is
-// wired; the quiz/hash helpers (compute_quiz_answer_hash,
-// record_acknowledgement, WIZARD_DEFAULT_QUIZ_QUESTIONS) are pub
-// surface that the Apply writer (D2 polish) calls when the operator
-// finishes the step. The C2 patch added the Risky-Mode arm toggle
-// on top of this scaffold. Local allow only.
-#![allow(dead_code)]
-
 //! Step 9.5 — Autonomy & Risk Acknowledgement.
 //!
 //! NEW STEP per `wizard_onboarding_competitive_analysis.md` §9.2.
@@ -232,19 +224,23 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
     // starting_bankroll)` iff both are set. Closes audit gap
     // clarification #2.
     ui.label(
-        egui::RichText::new("⚡ Risky Mode (research §4 — high-risk compounding)")
+        egui::RichText::new("⚡ Risky Mode (operator directive §7.1 — autonomous compounding)")
             .strong()
             .color(theme::DANGER),
     );
     ui.label(
         egui::RichText::new(
-            "Aggressive logarithmic Kelly-tapered sizing from a small \
-             starting bankroll ($20 default) towards a large target \
-             ($50,000 default). Per-stage kill switches enforce daily / \
-             weekly DD caps; the operator's $20 → $50,000 framing has \
-             a research-derived initial-stage ruin probability up to 50%. \
-             Statistics: ~75-90% of retail FX attempts at this profile \
-             lose the starting bankroll within the first month.",
+            "Autonomous compounding from a small starting bankroll \
+             ($20 default) toward a large target ($50,000 default). \
+             The bot — not the operator — places every trade once armed; \
+             manual BUY/SELL is rejected at the gate. Per-trade risk is \
+             30–50 % of the current bankroll (default 40 %); the bot \
+             may scalp many times per day, targeting net profit after \
+             commission, spread and swap rather than a fixed daily pip \
+             count. Per-stage kill switches enforce daily / weekly DD \
+             caps. Initial-stage ruin probability is up to 99 % per \
+             operator directive §7.1 — the operator explicitly accepts \
+             that the starting bankroll will most likely be lost.",
         )
         .color(theme::TEXT_MUTED)
         .size(theme::FONT_CAPTION),
