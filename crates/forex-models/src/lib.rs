@@ -6,9 +6,15 @@ pub mod runtime;
 // Machine learning models
 pub mod deep_models;
 pub mod ensemble;
+pub mod ensemble_inference;
 pub mod parallel_trainer;
 pub mod training_orchestrator;
 pub mod tree_models;
+
+pub use ensemble_inference::{
+    EnsemblePredictor, ExpertLoadError, ExpertLoadOutcome, ExpertLoader, ExpertModel,
+    ExpertOutputKind, ExpertPrediction, ExpertRegistry,
+};
 
 pub use deep_models::{
     BurnDeepExpert, KANExpert, MLPExpert, NBeatsExpert, NBeatsxNfExpert, PatchTSTExpert,
