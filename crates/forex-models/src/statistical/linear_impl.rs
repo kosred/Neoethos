@@ -763,6 +763,17 @@ pub struct ElasticNetExpert {
 }
 
 impl ElasticNetExpert {
+    /// Read-only view of the trained feature column names + ordering.
+    /// Returns an empty slice when the model has not been trained
+    /// or loaded yet. Required by the
+    /// [`crate::ensemble_inference::ExpertModel`] adapter.
+    pub fn feature_columns(&self) -> &[String] {
+        match &self.model {
+            Some(m) => &m.feature_columns,
+            None => &[],
+        }
+    }
+
     pub fn new(alpha: f64, l1_ratio: f64) -> Self {
         Self {
             model: None,
@@ -899,6 +910,15 @@ impl LogisticExpert {
             alpha: 0.01,
             learning_rate: 0.05,
             epochs: 250,
+        }
+    }
+
+    /// Read-only view of the trained feature column names + ordering.
+    /// Required by the [`crate::ensemble_inference::ExpertModel`] adapter.
+    pub fn feature_columns(&self) -> &[String] {
+        match &self.model {
+            Some(m) => &m.feature_columns,
+            None => &[],
         }
     }
 }

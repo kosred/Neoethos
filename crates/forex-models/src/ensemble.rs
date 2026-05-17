@@ -1196,6 +1196,12 @@ impl ProbabilityCalibrationExpert {
         }
     }
 
+    /// Read-only view of the trained feature column names + ordering.
+    /// Required by the [`crate::ensemble_inference::ExpertModel`] adapter.
+    pub fn feature_columns(&self) -> &[String] {
+        &self.feature_columns
+    }
+
     pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
         let probabilities = self.predict_proba(x)?;
         let mut runtime_predictions = Vec::with_capacity(probabilities.nrows());
@@ -1478,6 +1484,12 @@ impl ConformalPredictionExpert {
         }
     }
 
+    /// Read-only view of the trained feature column names + ordering.
+    /// Required by the [`crate::ensemble_inference::ExpertModel`] adapter.
+    pub fn feature_columns(&self) -> &[String] {
+        &self.feature_columns
+    }
+
     pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
         let probabilities = self.predict_proba(x)?;
         let mut runtime_predictions = Vec::with_capacity(probabilities.nrows());
@@ -1647,6 +1659,12 @@ impl MetaDecisionStack {
             feature_columns: Vec::new(),
             training_rows: 0,
         }
+    }
+
+    /// Read-only view of the trained feature column names + ordering.
+    /// Required by the [`crate::ensemble_inference::ExpertModel`] adapter.
+    pub fn feature_columns(&self) -> &[String] {
+        &self.feature_columns
     }
 
     pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
