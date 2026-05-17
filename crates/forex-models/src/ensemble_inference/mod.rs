@@ -93,6 +93,7 @@ pub mod deep_timeseries_adapters;
 pub mod evolutionary_adapters;
 pub mod meta_adapters;
 pub mod mixed_adapters;
+pub mod soft_voting;
 pub mod tree_adapters;
 
 pub use deep_classification_adapters::{
@@ -118,6 +119,7 @@ pub use meta_adapters::{
     MetaBlenderAdapter, MetaBlenderLoader, MetaStackAdapter, MetaStackLoader,
     ProbabilityCalibratorAdapter, ProbabilityCalibratorLoader,
 };
+pub use soft_voting::{SoftVotingEnsemble, SoftVotingEnsembleConfig};
 pub use tree_adapters::{
     register_tree_loaders, CatboostAdapter, CatboostLoader, LightGbmAdapter, LightGbmLoader,
     SklearsTreeAdapter, SklearsTreeLoader, XgboostAdapter, XgboostLoader,
