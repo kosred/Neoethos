@@ -3,12 +3,17 @@ pub mod contracts;
 pub mod domain;
 pub mod logging;
 pub mod resolved_config;
+pub mod schema_version;
 pub mod sectioned_log;
 pub mod storage;
 pub mod symbol_metadata;
 pub mod system;
 pub mod utils;
 
+pub use schema_version::{
+    check_schema_version_readable, default_v1, ensure_schema_version_readable, HasSchemaVersion,
+    SchemaVersion, SchemaVersionError,
+};
 pub use config::Settings;
 pub use contracts::{
     ARTIFACT_SCHEMA_VERSION, ArtifactContractError, ArtifactContractKind, ArtifactEnvelope,

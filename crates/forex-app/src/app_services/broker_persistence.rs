@@ -126,7 +126,28 @@ fn load_from_filesystem() -> BrokerSettingsState {
     match fs::read_to_string(&path) {
         Ok(contents) => match toml::from_str::<BrokerSettingsState>(&contents) {
             Ok(s) => {
-                tracing::info!(path = %path.display(), "loaded broker credentials from disk");
+                // Schema version sanity check. Per Phase D4 the
+                // contract carries `schema_version: SchemaVersion`;
+                // pre-versioning files default to v1 via
+                // `#[serde(default = "default_v1")]`. We only fail
+                // loud when the file is from a NEWER build than
+                // this binary — the operator must update the app.
+                if let Err(err) = forex_core::check_schema_version_readable(
+                    &s,
+                    "broker_credentials.toml",
+                ) {
+                    tracing::error!(
+                        path = %path.display(),
+                        error = %err,
+                        "broker_credentials.toml schema version mismatch; falling back to defaults"
+                    );
+                    return BrokerSettingsState::default();
+                }
+                tracing::info!(
+                    path = %path.display(),
+                    schema_version = %s.schema_version,
+                    "loaded broker credentials from disk"
+                );
                 s
             }
             Err(err) => {
@@ -199,7 +220,15 @@ pub fn save_broker_settings(settings: &BrokerSettingsState) -> Result<()> {
         })?;
     }
 
-    let serialized = toml::to_string_pretty(settings)
+    // Always stamp the CURRENT schema version on save, regardless
+    // of what the in-memory value carries. This protects against
+    // a code path that constructed the struct manually and forgot
+    // to set schema_version — every saved file is correctly
+    // tagged with the version this build writes.
+    let mut to_write = settings.clone();
+    to_write.schema_version =
+        crate::app_services::broker_config::BROKER_CREDENTIALS_SCHEMA_VERSION;
+    let serialized = toml::to_string_pretty(&to_write)
         .context("failed to serialize broker credentials to TOML")?;
 
     fs::write(&path, serialized)
@@ -254,6 +283,8 @@ mod tests {
 
     fn populated_settings() -> BrokerSettingsState {
         BrokerSettingsState {
+            schema_version:
+                crate::app_services::broker_config::BROKER_CREDENTIALS_SCHEMA_VERSION,
             ctrader: CTraderBrokerSettings {
                 client_id: "client-123".to_string(),
                 client_secret: "secret-abc".to_string(),
@@ -406,6 +437,58 @@ mod tests {
                 loaded.ctrader.client_id, EMBEDDED_CTRADER_CLIENT_ID,
                 "embedded constant must not win when user value is present"
             );
+        });
+    }
+
+    #[test]
+    fn save_then_load_round_trips_schema_version() {
+        use crate::app_services::broker_config::BROKER_CREDENTIALS_SCHEMA_VERSION;
+        let dir = tempdir_or_skip();
+        let path = dir.join("creds.toml");
+        with_env_path(&path, |_| {
+            let original = populated_settings();
+            save_broker_settings(&original).expect("save");
+            let loaded = load_broker_settings();
+            // The save path stamps the CURRENT schema version on
+            // every write, so the loaded value must match the
+            // constant regardless of what was constructed in memory.
+            assert_eq!(loaded.schema_version, BROKER_CREDENTIALS_SCHEMA_VERSION);
+        });
+    }
+
+    #[test]
+    fn loading_pre_versioning_toml_defaults_to_v1() {
+        use forex_core::SchemaVersion;
+        let dir = tempdir_or_skip();
+        let path = dir.join("pre_v1_creds.toml");
+        // Write a TOML that LACKS the schema_version field — this
+        // is what files written by builds before Phase D4 look
+        // like. The `#[serde(default = "default_v1")]` attribute
+        // must kick in and treat it as v1.
+        let raw = "[ctrader]\nclient_id = \"old\"\n[dxtrade]\n";
+        fs::write(&path, raw).expect("write");
+        with_env_path(&path, |_| {
+            let loaded = load_broker_settings();
+            assert_eq!(loaded.schema_version, SchemaVersion::new(1));
+            assert_eq!(loaded.ctrader.client_id, "old");
+        });
+    }
+
+    #[test]
+    fn loading_too_new_schema_version_falls_back_to_default() {
+        // Simulate a TOML written by a FUTURE build whose schema
+        // version this binary doesn't understand. The loader must
+        // fail loud (log an error) and return defaults rather than
+        // silently mis-parsing potentially-incompatible data.
+        let dir = tempdir_or_skip();
+        let path = dir.join("future_creds.toml");
+        let raw = "schema_version = 999\n[ctrader]\nclient_id = \"future\"\n[dxtrade]\n";
+        fs::write(&path, raw).expect("write");
+        with_env_path(&path, |_| {
+            let loaded = load_broker_settings();
+            // Falls back to default-but-then-embedded-fallback-applied.
+            // The key invariant: it does NOT carry the "future" client_id.
+            assert_ne!(loaded.ctrader.client_id, "future");
         });
     }
 

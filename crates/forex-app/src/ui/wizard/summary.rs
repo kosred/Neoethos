@@ -349,6 +349,8 @@ pub fn write_broker_credentials(controller: &WizardController) -> Result<()> {
         accounts: account_targets_from_wizard(controller),
     };
     let settings = BrokerSettingsState {
+        schema_version:
+            crate::app_services::broker_config::BROKER_CREDENTIALS_SCHEMA_VERSION,
         ctrader,
         dxtrade: Default::default(),
     };

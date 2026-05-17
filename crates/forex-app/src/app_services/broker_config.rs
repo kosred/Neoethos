@@ -1,5 +1,17 @@
 use crate::app_services::trading::TradingAdapterKind;
+use forex_core::{default_v1, HasSchemaVersion, SchemaVersion};
 use serde::{Deserialize, Serialize};
+
+/// Current schema version of the `broker_credentials.toml` on-disk
+/// contract. Bump when fields are renamed/removed or their types
+/// change in a way that `#[serde(default)]` can't bridge.
+///
+/// v1 (current): the original layout from before Phase D4.
+/// New optional fields and field renamings within v1 are
+/// backward-compatible via `#[serde(default)]`. A future v2 is
+/// reserved for a hypothetical breaking change (e.g. moving
+/// credentials into a per-broker dictionary).
+pub const BROKER_CREDENTIALS_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrokerSessionState {
@@ -74,12 +86,35 @@ pub struct DxTradeBrokerSettings {
     pub accounts: Vec<BrokerAccountTarget>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrokerSettingsState {
+    /// Schema version of the on-disk `broker_credentials.toml`
+    /// contract. Defaults to v1 (the pre-versioning shape) when
+    /// missing, so files written by older builds load without
+    /// breaking. See [`BROKER_CREDENTIALS_SCHEMA_VERSION`].
+    #[serde(default = "default_v1")]
+    pub schema_version: SchemaVersion,
     #[serde(default)]
     pub ctrader: CTraderBrokerSettings,
     #[serde(default)]
     pub dxtrade: DxTradeBrokerSettings,
+}
+
+impl Default for BrokerSettingsState {
+    fn default() -> Self {
+        Self {
+            schema_version: BROKER_CREDENTIALS_SCHEMA_VERSION,
+            ctrader: CTraderBrokerSettings::default(),
+            dxtrade: DxTradeBrokerSettings::default(),
+        }
+    }
+}
+
+impl HasSchemaVersion for BrokerSettingsState {
+    const CURRENT: SchemaVersion = BROKER_CREDENTIALS_SCHEMA_VERSION;
+    fn schema_version(&self) -> SchemaVersion {
+        self.schema_version
+    }
 }
 
 impl BrokerSettingsState {
