@@ -17,17 +17,17 @@
 //!         │
 //!   ┌─────▼──────────────┐
 //!   │ LiveBarSource      │  trait — `poll_latest_bar`
-//!   │  ├ CTraderLive…    │  prod impl: polls
-//!   │  │                 │      CTraderLiveStreamingBackend
-//!   │  └ FakeBarSource   │  test impl: vec + cursor
+//!   │  └ CTraderLive…    │  prod impl: polls
+//!   │                    │      CTraderLiveStreamingBackend
 //!   └─────┬──────────────┘
 //!         │ HistoricalBar (newly closed)
 //!   ┌─────▼──────────────┐
 //!   │ LiveInferenceProducer │
 //!   │  ├ rolling window  │  Vec<HistoricalBar>, capacity-bounded
 //!   │  ├ ModelPredictor  │  trait — `predict(&[bars])`
-//!   │  │   ├ MovingAvgX… │  prod impl: SMA(fast) × SMA(slow)
-//!   │  │   └ Constant…   │  test impl: hard-coded side
+//!   │  │   └ Ensemble…   │  prod impl: lands in Phase D1.2 —
+//!   │  │                 │    full 33-base-expert ensemble +
+//!   │  │                 │    MetaDecisionStack stack
 //!   │  └ cancel flag     │  Arc<AtomicBool> for graceful shutdown
 //!   └─────┬──────────────┘
 //!         │ AutoTradeSignal
@@ -48,16 +48,37 @@
 //! by flipping the shared `Arc<AtomicBool>` cancel flag returned by
 //! [`LiveInferenceProducer::cancel_flag`] and joining the handle.
 //!
-//! ## What this module is NOT (yet)
+//! ## Concrete predictor — landing in Phase D1.2
 //!
-//! This commit ships the producer FRAMEWORK with one production-
-//! grade deterministic predictor ([`MovingAverageCrossPredictor`]) so
-//! the operator can drive auto-trade on a real strategy today. The
-//! ML predictor adapter (LightGBM / MetaDecisionStack loaded from
-//! disk + the `forex_data::compute_hpc_feature_frame` pipeline)
-//! lands in a focused follow-up commit (Phase D1.2). Both adapters
-//! plug into the same [`ModelPredictor`] trait — adding the ML one
-//! is a self-contained extension, not a refactor of this module.
+//! This module ships the producer **FRAMEWORK ONLY**. No concrete
+//! [`ModelPredictor`] implementation ships in production code today.
+//!
+//! Why: an earlier draft of this commit shipped a
+//! `MovingAverageCrossPredictor` (SMA-fast × SMA-slow). That was
+//! REJECTED by the operator on the 2026-05-17 directive grounds:
+//! hardcoded textbook indicators applied to live forex without
+//! cost-aware backtest validation are near-certain ruin in seconds.
+//! The bot's job is to DISCOVER strategies through the 33-model
+//! training stack (see `forex_models::runtime::capabilities::KNOWN_MODEL_NAMES`
+//! and `crates/forex-models/src/training_orchestrator.rs`); it
+//! must NOT trade on a hand-picked indicator until the ensemble has
+//! produced + validated a signal source.
+//!
+//! Phase D1.2 lands the `EnsemblePredictor` in `forex-models` that:
+//!   1. Loads all enabled base experts (15-26 depending on config)
+//!      from their saved artifact dirs.
+//!   2. On each `predict` call, runs `predict_proba` on every base
+//!      expert.
+//!   3. Stacks their outputs into the meta-feature column layout
+//!      the `meta_blender` was trained on.
+//!   4. Feeds that to `MetaDecisionStack::predict_runtime`.
+//!   5. Returns the calibrated, conformally-gated final
+//!      `RuntimePrediction` → mapped to [`PredictionOutput`].
+//!
+//! Until D1.2 lands, [`super::TradingSession::start_auto_trade_producer`]
+//! will refuse to start without an explicit predictor — the
+//! operator cannot accidentally enable auto-trade without a real
+//! model behind it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -384,195 +405,24 @@ pub enum ProducerOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// Production predictor: SMA crossover
+// REMOVED: MovingAverageCrossPredictor
 // ---------------------------------------------------------------------------
-
-/// Simple moving-average crossover trading rule.
-///
-/// Buy when the fast SMA crosses above the slow SMA on the most-
-/// recent bar; sell when the fast SMA crosses below the slow SMA;
-/// otherwise Flat. Confidence is the absolute spread between the
-/// two SMAs normalised to `[0, 1]` by the recent ATR — a wider
-/// crossover-distance / wider ATR ratio means a stronger signal.
-///
-/// This is **NOT** a placeholder: SMA crossover is a real entry
-/// rule that many bots run in production, and it makes the
-/// auto-trade pipeline emit real (if simple) signals from day one.
-/// The ML-backed predictor (LightGBM / MetaDecisionStack) lands in
-/// Phase D1.2 as a separate `ModelPredictor` implementation; the
-/// two strategies coexist and the operator picks one in Settings.
-pub struct MovingAverageCrossPredictor {
-    fast_window: usize,
-    slow_window: usize,
-    atr_window: usize,
-    /// Floor confidence — even a tiny crossover signal is emitted
-    /// at >= this confidence to keep the dispatcher's
-    /// AUTO_TRADE_MIN_CONFIDENCE filter meaningful.
-    minimum_confidence: f64,
-}
-
-impl MovingAverageCrossPredictor {
-    /// Default tuning per the operator-directive 2026-05-17 scalping
-    /// framing: fast=5, slow=20, ATR window=14. These pick up
-    /// minute-cadence crossovers well; longer-cadence operators
-    /// override via [`Self::with_windows`].
-    pub fn new() -> Self {
-        Self {
-            fast_window: 5,
-            slow_window: 20,
-            atr_window: 14,
-            minimum_confidence: 0.6,
-        }
-    }
-
-    /// Custom window sizes. Returns an error when the windows
-    /// violate the trivial sanity bounds (`fast >= 1`,
-    /// `slow > fast`, `atr >= 2`).
-    pub fn with_windows(fast: usize, slow: usize, atr: usize) -> Result<Self> {
-        if fast == 0 {
-            bail!("fast_window must be >= 1");
-        }
-        if slow <= fast {
-            bail!("slow_window ({slow}) must be > fast_window ({fast})");
-        }
-        if atr < 2 {
-            bail!("atr_window must be >= 2");
-        }
-        Ok(Self {
-            fast_window: fast,
-            slow_window: slow,
-            atr_window: atr,
-            minimum_confidence: 0.6,
-        })
-    }
-
-    /// Override the minimum confidence floor. Useful when the
-    /// operator wants every crossover to emit (set to 0.6 — the
-    /// dispatcher's default min) or to require strong crossovers
-    /// only (set to 0.9).
-    pub fn with_minimum_confidence(mut self, min: f64) -> Self {
-        self.minimum_confidence = min.clamp(0.0, 1.0);
-        self
-    }
-
-    fn sma(bars: &[HistoricalBar], window: usize) -> Option<f64> {
-        if bars.len() < window || window == 0 {
-            return None;
-        }
-        let slice = &bars[bars.len() - window..];
-        let sum: f64 = slice.iter().map(|b| b.close).sum();
-        Some(sum / window as f64)
-    }
-
-    fn atr(bars: &[HistoricalBar], window: usize) -> Option<f64> {
-        if bars.len() < window + 1 || window == 0 {
-            return None;
-        }
-        // True range over the last `window` bars; ATR uses the
-        // simple mean (Wilder's smoothing would tighten this but
-        // costs more state; SMA-ATR is plenty for confidence
-        // normalisation).
-        let mut sum = 0.0;
-        for i in (bars.len() - window)..bars.len() {
-            let curr = &bars[i];
-            let prev = &bars[i - 1];
-            let tr = (curr.high - curr.low)
-                .max((curr.high - prev.close).abs())
-                .max((curr.low - prev.close).abs());
-            sum += tr;
-        }
-        Some(sum / window as f64)
-    }
-}
-
-impl Default for MovingAverageCrossPredictor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ModelPredictor for MovingAverageCrossPredictor {
-    fn warmup_bars(&self) -> usize {
-        // Need at least slow_window + 1 bars to compute the
-        // previous-bar SMA pair (which is how we detect a *crossover*
-        // rather than just "fast > slow today").
-        self.slow_window + 1
-    }
-
-    fn predict(&self, bars: &[HistoricalBar]) -> Result<PredictionOutput> {
-        if bars.len() < self.warmup_bars() {
-            return Ok(PredictionOutput {
-                side: AutoTradeSide::Flat,
-                confidence: 0.0,
-            });
-        }
-        // Current SMA pair.
-        let fast_now = match Self::sma(bars, self.fast_window) {
-            Some(v) => v,
-            None => {
-                return Ok(PredictionOutput {
-                    side: AutoTradeSide::Flat,
-                    confidence: 0.0,
-                });
-            }
-        };
-        let slow_now = match Self::sma(bars, self.slow_window) {
-            Some(v) => v,
-            None => {
-                return Ok(PredictionOutput {
-                    side: AutoTradeSide::Flat,
-                    confidence: 0.0,
-                });
-            }
-        };
-        // Previous-bar SMA pair — drop the last bar and recompute.
-        let prev_slice = &bars[..bars.len() - 1];
-        let fast_prev = match Self::sma(prev_slice, self.fast_window) {
-            Some(v) => v,
-            None => {
-                return Ok(PredictionOutput {
-                    side: AutoTradeSide::Flat,
-                    confidence: 0.0,
-                });
-            }
-        };
-        let slow_prev = match Self::sma(prev_slice, self.slow_window) {
-            Some(v) => v,
-            None => {
-                return Ok(PredictionOutput {
-                    side: AutoTradeSide::Flat,
-                    confidence: 0.0,
-                });
-            }
-        };
-
-        let crossed_up = fast_prev <= slow_prev && fast_now > slow_now;
-        let crossed_down = fast_prev >= slow_prev && fast_now < slow_now;
-
-        let side = if crossed_up {
-            AutoTradeSide::Buy
-        } else if crossed_down {
-            AutoTradeSide::Sell
-        } else {
-            return Ok(PredictionOutput {
-                side: AutoTradeSide::Flat,
-                confidence: 0.0,
-            });
-        };
-
-        // Confidence: spread between the two SMAs normalised by ATR.
-        // Wider spread vs noise → stronger signal. Clamped to [min, 1].
-        let atr = Self::atr(bars, self.atr_window).unwrap_or(0.0);
-        let raw_confidence = if atr > 0.0 {
-            ((fast_now - slow_now).abs() / atr).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let confidence = raw_confidence.max(self.minimum_confidence).min(1.0);
-
-        Ok(PredictionOutput { side, confidence })
-    }
-}
+//
+// A previous draft of this module shipped a `MovingAverageCrossPredictor`
+// (SMA fast × SMA slow crossover with ATR-normalised confidence) and
+// presented it as the "production predictor that ships today". That
+// was wrong and the operator-directive 2026-05-17 rejected it: a
+// hardcoded textbook indicator applied to live forex without cost-
+// aware backtest validation is near-certain ruin in seconds. The
+// bot must DISCOVER strategies through the 33-model training stack;
+// it must NOT trade until that stack has produced + validated a
+// signal source.
+//
+// The struct + its tests have been deleted intentionally. The
+// `ModelPredictor` trait stays as the integration boundary; the
+// production implementation lands in Phase D1.2 as the
+// `EnsemblePredictor` that orchestrates all 33 base experts +
+// the `MetaDecisionStack` (see `crates/forex-models/`).
 
 // ---------------------------------------------------------------------------
 // Production bar source: cTrader streaming adapter
@@ -756,122 +606,6 @@ mod tests {
         let mut cfg = LiveInferenceProducerConfig::for_symbol("EURUSD");
         cfg.rolling_window = 0;
         assert!(cfg.validate().is_err());
-    }
-
-    // --- SMA crossover predictor ----------------------------------
-
-    #[test]
-    fn sma_predictor_returns_flat_when_warmup_unmet() {
-        let p = MovingAverageCrossPredictor::new();
-        let bars: Vec<_> = (0..5)
-            .map(|i| bar(i * 60_000, 1.0, 1.1, 0.9, 1.0))
-            .collect();
-        let out = p.predict(&bars).expect("predict");
-        assert_eq!(out.side, AutoTradeSide::Flat);
-    }
-
-    #[test]
-    fn sma_predictor_emits_buy_on_upward_crossover() {
-        // Construct a 25-bar series where the LAST bar is the one
-        // that triggers the crossover. Bars 0..23 are flat at 1.0,
-        // bar 24 is a single sharp uptick to 1.5 — at bar 24 the
-        // fast(5) SMA = mean(1,1,1,1,1.5)=1.1 vs slow(20)=1.025; the
-        // previous bar's fast SMA was 1.0 (= slow), so the cross
-        // happens on bar 24. The predict path looks at the newest
-        // bar's crossover state, which is what this test pins.
-        let p = MovingAverageCrossPredictor::new();
-        let mut bars: Vec<HistoricalBar> = Vec::new();
-        for i in 0..24 {
-            bars.push(bar(i * 60_000, 1.0, 1.0, 1.0, 1.0));
-        }
-        bars.push(bar(24 * 60_000, 1.0, 1.6, 1.0, 1.5));
-        let out = p.predict(&bars).expect("predict");
-        assert_eq!(
-            out.side,
-            AutoTradeSide::Buy,
-            "expected Buy on upward crossover, got {:?}",
-            out.side
-        );
-        assert!(
-            out.confidence >= 0.6,
-            "confidence must be >= minimum floor, got {}",
-            out.confidence
-        );
-        assert!((0.0..=1.0).contains(&out.confidence));
-    }
-
-    #[test]
-    fn sma_predictor_emits_sell_on_downward_crossover() {
-        // Mirror of the buy test — bars 0..23 flat at 1.5, bar 24
-        // drops sharply to 1.0 so the fast SMA crosses BELOW the
-        // slow SMA on the newest bar.
-        let p = MovingAverageCrossPredictor::new();
-        let mut bars: Vec<HistoricalBar> = Vec::new();
-        for i in 0..24 {
-            bars.push(bar(i * 60_000, 1.5, 1.5, 1.5, 1.5));
-        }
-        bars.push(bar(24 * 60_000, 1.5, 1.5, 0.9, 1.0));
-        let out = p.predict(&bars).expect("predict");
-        assert_eq!(
-            out.side,
-            AutoTradeSide::Sell,
-            "expected Sell on downward crossover, got {:?}",
-            out.side
-        );
-    }
-
-    #[test]
-    fn sma_predictor_holds_flat_when_crossover_already_happened() {
-        // After the cross has happened on a previous bar, subsequent
-        // bars must NOT keep emitting Buy/Sell — the predictor only
-        // signals on the BAR OF the cross. Pins the "no duplicate
-        // emission" property the live producer relies on.
-        let p = MovingAverageCrossPredictor::new();
-        let mut bars: Vec<HistoricalBar> = Vec::new();
-        for i in 0..24 {
-            bars.push(bar(i * 60_000, 1.0, 1.0, 1.0, 1.0));
-        }
-        // Bar 24 is the crossover bar (covered by the buy test).
-        bars.push(bar(24 * 60_000, 1.0, 1.6, 1.0, 1.5));
-        // Bars 25-29 keep climbing — fast stays well above slow.
-        for i in 25..30 {
-            bars.push(bar(i * 60_000, 1.5, 1.6, 1.4, 1.5));
-        }
-        let out = p.predict(&bars).expect("predict");
-        assert_eq!(
-            out.side,
-            AutoTradeSide::Flat,
-            "expected Flat after the crossover has already happened, got {:?}",
-            out.side
-        );
-    }
-
-    #[test]
-    fn sma_predictor_holds_flat_on_steady_trend() {
-        // No crossover — fast stays above slow the whole way.
-        let p = MovingAverageCrossPredictor::new();
-        let mut bars: Vec<HistoricalBar> = Vec::new();
-        for i in 0..40 {
-            let close = 1.0 + (i as f64) * 0.001;
-            bars.push(bar(i * 60_000, close, close + 0.01, close - 0.01, close));
-        }
-        let out = p.predict(&bars).expect("predict");
-        assert_eq!(out.side, AutoTradeSide::Flat);
-    }
-
-    #[test]
-    fn sma_predictor_with_windows_rejects_invalid_windows() {
-        assert!(MovingAverageCrossPredictor::with_windows(0, 10, 14).is_err());
-        assert!(MovingAverageCrossPredictor::with_windows(10, 5, 14).is_err());
-        assert!(MovingAverageCrossPredictor::with_windows(5, 20, 1).is_err());
-    }
-
-    #[test]
-    fn sma_predictor_with_windows_accepts_valid_windows() {
-        let p = MovingAverageCrossPredictor::with_windows(3, 7, 5).expect("valid windows");
-        assert_eq!(p.fast_window, 3);
-        assert_eq!(p.slow_window, 7);
-        assert_eq!(p.atr_window, 5);
     }
 
     // --- producer orchestrator ------------------------------------
