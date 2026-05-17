@@ -529,6 +529,14 @@ impl ExpertModel for SklearsTreeExpert {
 }
 
 impl SklearsTreeExpert {
+    /// Read-only view of the trained feature column names + ordering.
+    /// Required by the [`crate::ensemble_inference::ExpertModel`]
+    /// adapter so the registry / aggregator can detect column-layout
+    /// drift after a retraining session.
+    pub fn feature_columns(&self) -> &[String] {
+        &self.feature_columns
+    }
+
     pub fn predict_runtime(&self, x: &DataFrame) -> Result<Vec<RuntimePrediction>> {
         self.ensure_runtime_state_ready()?;
         let probabilities = self.predict_proba(x)?;

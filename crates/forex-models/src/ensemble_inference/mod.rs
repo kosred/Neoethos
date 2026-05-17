@@ -79,6 +79,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::runtime::capabilities::ModelFamily;
 
+// Per-family adapter submodules. Each one bridges the existing
+// concrete expert structs to the uniform `ExpertModel` trait
+// defined below. D1.2.x phases add one family per focused commit:
+//   .1 tree (this commit)
+//   .2 deep classification
+//   .3 deep forecasting
+//   .4 meta
+//   .5 forecasting/adaptive/anomaly
+//   .6 evolutionary + exit + RL
+pub mod tree_adapters;
+
+pub use tree_adapters::{
+    register_tree_loaders, CatboostAdapter, CatboostLoader, LightGbmAdapter, LightGbmLoader,
+    SklearsTreeAdapter, SklearsTreeLoader, XgboostAdapter, XgboostLoader,
+};
+
 // ---------------------------------------------------------------------------
 // Expert output taxonomy
 // ---------------------------------------------------------------------------

@@ -871,6 +871,14 @@ impl LightGBMExpert {
         let probabilities = self.predict_proba(x)?;
         self.runtime_predictions("lightgbm", &probabilities)
     }
+
+    /// Read-only view of the trained feature column names + ordering.
+    /// Required by the [`crate::ensemble_inference::ExpertModel`]
+    /// adapter so the registry / aggregator can detect column-layout
+    /// drift after a retraining session.
+    pub fn feature_columns(&self) -> &[String] {
+        &self.feature_columns
+    }
 }
 
 #[cfg(all(test, feature = "lightgbm"))]
