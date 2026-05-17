@@ -549,6 +549,12 @@ pub struct ExitAgent {
 }
 
 impl ExitAgent {
+    /// Read-only view of the trained feature column names + ordering.
+    /// Required by the [`crate::ensemble_inference::ExpertModel`] adapter.
+    pub fn feature_columns(&self) -> &[String] {
+        &self.feature_columns
+    }
+
     fn invalidate_trained_runtime_state(&mut self) {
         self.memory.clear();
         self.pending_regret.clear();

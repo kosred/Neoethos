@@ -93,6 +93,7 @@ pub mod deep_timeseries_adapters;
 pub mod evolutionary_adapters;
 pub mod meta_adapters;
 pub mod mixed_adapters;
+pub mod rl_exit_adapters;
 pub mod soft_voting;
 pub mod tree_adapters;
 
@@ -118,6 +119,9 @@ pub use meta_adapters::{
     ConformalGateLoader, ElasticNetAdapter, ElasticNetLoader, LogisticAdapter, LogisticLoader,
     MetaBlenderAdapter, MetaBlenderLoader, MetaStackAdapter, MetaStackLoader,
     ProbabilityCalibratorAdapter, ProbabilityCalibratorLoader,
+};
+pub use rl_exit_adapters::{
+    register_rl_exit_loaders, DqnAdapter, DqnLoader, ExitAgentAdapter, ExitAgentLoader,
 };
 pub use soft_voting::{SoftVotingEnsemble, SoftVotingEnsembleConfig};
 pub use tree_adapters::{
@@ -156,6 +160,15 @@ pub enum ExpertOutputKind {
     /// rather than a direct trading signal — high anomaly scores
     /// suggest the other experts may be unreliable.
     AnomalyScore,
+    /// 3-class probability vector `[p_hold, p_neutral, p_close]`
+    /// from the exit-side decision agent ([`crate::exit_agent::ExitAgent`]).
+    /// SHAPE-COMPATIBLE with [`Self::Classification3`] but
+    /// SEMANTICALLY DIFFERENT: this is "should I close my open
+    /// position?" not "should I open a new long/short?".
+    /// Aggregators that vote on trade DIRECTION (SoftVoting, MoE
+    /// classifier-head) ignore it; the exit-side pipeline (which
+    /// closes existing positions on signal) consumes it directly.
+    ExitDecision3,
 }
 
 impl fmt::Display for ExpertOutputKind {
@@ -165,6 +178,7 @@ impl fmt::Display for ExpertOutputKind {
             Self::ActionValues3 => "action_values_3",
             Self::Forecast1 => "forecast_1",
             Self::AnomalyScore => "anomaly_score",
+            Self::ExitDecision3 => "exit_decision_3",
         };
         f.write_str(s)
     }
@@ -179,6 +193,7 @@ impl ExpertOutputKind {
             Self::ActionValues3 => 3,
             Self::Forecast1 => 1,
             Self::AnomalyScore => 1,
+            Self::ExitDecision3 => 3,
         }
     }
 }
@@ -225,11 +240,16 @@ impl ExpertPrediction {
             }
         }
         match self.kind {
-            ExpertOutputKind::Classification3 => {
+            ExpertOutputKind::Classification3 | ExpertOutputKind::ExitDecision3 => {
+                // Same shape contract as Classification3: 3 values
+                // in [0, 1] summing to ~1.0. ExitDecision3 just
+                // carries different semantics ([p_hold, p_neutral,
+                // p_close]) but the same shape/range invariants.
                 for v in &self.values {
                     if *v < -1e-4 || *v > 1.0 + 1e-4 {
                         anyhow::bail!(
-                            "Classification3 probability out of [0, 1]: {}",
+                            "{:?} probability out of [0, 1]: {}",
+                            self.kind,
                             v
                         );
                     }
@@ -237,7 +257,8 @@ impl ExpertPrediction {
                 let sum: f32 = self.values.iter().sum();
                 if (sum - 1.0).abs() > 1e-2 {
                     anyhow::bail!(
-                        "Classification3 probabilities do not sum to 1.0: sum = {}",
+                        "{:?} probabilities do not sum to 1.0: sum = {}",
+                        self.kind,
                         sum
                     );
                 }

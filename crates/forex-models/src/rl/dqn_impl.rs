@@ -1095,6 +1095,12 @@ pub struct TradingReinforcementLearner {
 }
 
 impl TradingReinforcementLearner {
+    /// Read-only view of the trained feature column names + ordering.
+    /// Required by the [`crate::ensemble_inference::ExpertModel`] adapter.
+    pub fn feature_columns(&self) -> &[String] {
+        &self.feature_columns
+    }
+
     pub fn new() -> Self {
         let hidden_dims = vec![256, 256];
         let state_encoding = TradingStateEncoding::Normalized;
