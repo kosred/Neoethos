@@ -82,6 +82,35 @@ pub struct SoftVotingEnsembleConfig {
     /// uniform outputs as Flat). When `None`, every prediction
     /// passes through verbatim.
     pub abstain_below_confidence: Option<f32>,
+    /// Expert canonical names that must NOT participate in voting
+    /// even when present in the load outcome. Use this for
+    /// **upstream / non-voter** experts — most importantly the
+    /// strategy-discovery family (`genetic`, `neuro_evo`):
+    /// their primary role is to DISCOVER trading strategies during
+    /// training, not to vote on direction at inference time. The
+    /// discovered strategies feed into the feature pipeline that
+    /// the actual voters (tree models, deep classifiers, meta
+    /// layer) consume; aggregating the discoverers' own
+    /// `predict_proba` here would double-count their contribution.
+    ///
+    /// The default value [`default_strategy_discoverer_names`]
+    /// excludes `genetic` and `neuro_evo`. Operators wanting them
+    /// in the voting layer (e.g. to evaluate raw rule outputs as
+    /// a sanity check) can clear this field.
+    pub excluded_names: std::collections::HashSet<String>,
+}
+
+/// Canonical names of the strategy-discovery experts that
+/// [`SoftVotingEnsembleConfig::default`] excludes from voting.
+/// The user's 2026-05-17 correction: Genetic + NeuroEvo are
+/// UPSTREAM strategy discoverers — their job is to find trading
+/// strategies that then feed into the training of the actual
+/// voters, NOT to vote on trade direction themselves.
+pub fn default_strategy_discoverer_names() -> std::collections::HashSet<String> {
+    let mut s = std::collections::HashSet::new();
+    s.insert("genetic".to_string());
+    s.insert("neuro_evo".to_string());
+    s
 }
 
 impl Default for SoftVotingEnsembleConfig {
@@ -89,6 +118,7 @@ impl Default for SoftVotingEnsembleConfig {
         Self {
             expert_weights: std::collections::HashMap::new(),
             abstain_below_confidence: None,
+            excluded_names: default_strategy_discoverer_names(),
         }
     }
 }
@@ -110,24 +140,32 @@ pub struct SoftVotingEnsemble {
 
 impl SoftVotingEnsemble {
     /// Build from a load outcome + config. Errors if NO loaded
-    /// expert can contribute to voting (i.e. all loaded experts
-    /// are Forecast1 / AnomalyScore / ActionValues3 — no
-    /// Classification3 source).
+    /// expert can contribute to voting after applying both filters
+    /// (output_kind == Classification3 AND name not in excluded).
     pub fn new(outcome: ExpertLoadOutcome, config: SoftVotingEnsembleConfig) -> Result<Self> {
         let mut unused = HashSet::new();
         let mut votable = 0;
         for e in &outcome.loaded {
-            if e.output_kind() == ExpertOutputKind::Classification3 {
-                votable += 1;
+            let name = e.name();
+            // An expert is "unused" if EITHER its output kind isn't
+            // Classification3 (Forecast1, AnomalyScore, ExitDecision3,
+            // ActionValues3) OR its name is in the operator's
+            // exclusion list (strategy discoverers like genetic,
+            // neuro_evo by default).
+            let wrong_kind = e.output_kind() != ExpertOutputKind::Classification3;
+            let excluded = config.excluded_names.contains(name);
+            if wrong_kind || excluded {
+                unused.insert(name.to_string());
             } else {
-                unused.insert(e.name().to_string());
+                votable += 1;
             }
         }
         if votable == 0 {
             anyhow::bail!(
-                "SoftVotingEnsemble requires at least one Classification3 expert in the \
-                 load outcome, got {} loaded (all of which are heterogeneous output kinds — \
-                 {:?})",
+                "SoftVotingEnsemble requires at least one votable Classification3 expert in \
+                 the load outcome AFTER applying the exclusion list. Loaded {} experts, all \
+                 of which were either heterogeneous-output-kind or excluded by name. Unused: \
+                 {:?}",
                 outcome.loaded.len(),
                 unused
             );
@@ -190,6 +228,12 @@ impl EnsemblePredictor for SoftVotingEnsemble {
 
         for expert in &self.outcome.loaded {
             if expert.output_kind() != ExpertOutputKind::Classification3 {
+                continue;
+            }
+            // Skip strategy-discovery / operator-excluded experts.
+            // They're in the load outcome (so the chrome can render
+            // them) but don't contribute to the direction vote.
+            if self.config.excluded_names.contains(expert.name()) {
                 continue;
             }
             let weight = self
@@ -506,6 +550,83 @@ mod tests {
         assert_eq!(lo.loaded_count(), 1);
         assert_eq!(lo.missing_count(), 2);
         assert_eq!(lo.loaded_names(), vec!["a"]);
+    }
+
+    #[test]
+    fn default_config_excludes_strategy_discoverers() {
+        // genetic + neuro_evo are excluded by default.
+        let cfg = SoftVotingEnsembleConfig::default();
+        assert!(cfg.excluded_names.contains("genetic"));
+        assert!(cfg.excluded_names.contains("neuro_evo"));
+        assert_eq!(cfg.excluded_names.len(), 2);
+    }
+
+    #[test]
+    fn genetic_expert_is_skipped_at_voting_layer() {
+        // Construct an outcome with a regular voter + a "genetic"
+        // expert. With the default exclusion list, the genetic
+        // expert must not contribute to the average even though
+        // its output_kind is Classification3.
+        let outcome = outcome_with(vec![
+            Box::new(ConstantClassifier {
+                name: "regular".into(),
+                probs: [0.1, 0.7, 0.2],
+            }),
+            Box::new(ConstantClassifier {
+                name: "genetic".into(),
+                probs: [0.8, 0.1, 0.1],
+            }),
+        ]);
+        let ens = SoftVotingEnsemble::with_default_config(outcome).expect("ok");
+        // 2 loaded but only 1 votes — genetic excluded.
+        assert_eq!(ens.voting_expert_count(), 1);
+        assert!(ens
+            .experts_unused_for_voting()
+            .contains(&"genetic"));
+        // The output must reflect ONLY the regular expert, not an
+        // average of the two.
+        let probs = ens.predict(&small_df(1)).expect("predict");
+        let row = probs.row(0);
+        assert!((row[0] - 0.1).abs() < 1e-6);
+        assert!((row[1] - 0.7).abs() < 1e-6);
+        assert!((row[2] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn neuro_evo_expert_is_also_skipped_by_default() {
+        let outcome = outcome_with(vec![
+            Box::new(ConstantClassifier {
+                name: "voter".into(),
+                probs: [0.2, 0.6, 0.2],
+            }),
+            Box::new(ConstantClassifier {
+                name: "neuro_evo".into(),
+                probs: [0.9, 0.05, 0.05],
+            }),
+        ]);
+        let ens = SoftVotingEnsemble::with_default_config(outcome).expect("ok");
+        assert_eq!(ens.voting_expert_count(), 1);
+        let probs = ens.predict(&small_df(1)).expect("predict");
+        let row = probs.row(0);
+        assert!((row[1] - 0.6).abs() < 1e-6, "neuro_evo must not pull p_neutral toward 0.9");
+    }
+
+    #[test]
+    fn operator_can_clear_exclusion_to_include_strategy_discoverers() {
+        // Operator override: someone WANTS to vote on genetic
+        // outputs (e.g. for sanity-check during validation). They
+        // clear the exclusion list and genetic participates.
+        let outcome = outcome_with(vec![Box::new(ConstantClassifier {
+            name: "genetic".into(),
+            probs: [0.1, 0.7, 0.2],
+        })]);
+        let mut cfg = SoftVotingEnsembleConfig::default();
+        cfg.excluded_names.clear();
+        let ens = SoftVotingEnsemble::new(outcome, cfg).expect("ok");
+        assert_eq!(ens.voting_expert_count(), 1);
+        let probs = ens.predict(&small_df(1)).expect("predict");
+        let row = probs.row(0);
+        assert!((row[1] - 0.7).abs() < 1e-6);
     }
 
     #[test]
