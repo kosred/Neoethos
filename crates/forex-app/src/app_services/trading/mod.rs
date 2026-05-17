@@ -192,6 +192,58 @@ pub struct ChartOverlay {
     pub price: f64,
 }
 
+/// A single decision emitted by the bot (manual or AI-driven). Held
+/// in [`TradingSession`] as a bounded ring buffer and exposed to the
+/// chart panel as [`ChartOverlay`] markers — closing audit gap #11
+/// "bot decision overlays on chart" (`Vec::new()` → real decisions).
+///
+/// Producer sites:
+/// - Manual orders set by `execute_buy_market` / `execute_sell_market`
+///   (`source = Manual`) so the operator can see their own fills on
+///   the chart immediately.
+/// - Future auto-trade pipeline (D1) will push `source = Ai` entries
+///   with confidence + ensemble metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BotDecisionEntry {
+    /// Trading symbol the decision targets (e.g. `"EURUSD"`).
+    pub symbol: String,
+    /// Long / short / flat side.
+    pub side: BotDecisionSide,
+    /// Quoted price at the time of the decision (mid, or the fill
+    /// price when known).
+    pub price: f64,
+    /// Unix-ms timestamp of the decision — used to map the entry to
+    /// the nearest candle when building [`ChartOverlay`]s.
+    pub timestamp_ms: i64,
+    /// Short human label rendered on the chart (e.g. `"BUY 0.74"`).
+    pub label: String,
+    /// Where the decision came from. `Manual` for operator clicks,
+    /// `Ai` for the auto-trade pipeline.
+    pub source: BotDecisionSource,
+    /// Optional confidence in `[0.0, 1.0]` for AI decisions.
+    pub confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BotDecisionSide {
+    Buy,
+    Sell,
+    Flat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BotDecisionSource {
+    /// Operator clicked BUY/SELL in the UI.
+    Manual,
+    /// AI auto-trade pipeline emitted the signal.
+    Ai,
+}
+
+/// Hard cap on the decision ring buffer. 512 entries × ~120 bytes ≈
+/// 60 KB — negligible memory, but enough to keep weeks of decisions
+/// in scope at typical fill rates. Older entries get dropped FIFO.
+pub const BOT_DECISION_BUFFER_CAPACITY: usize = 512;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MarketChartSnapshot {
     pub symbol: String,
@@ -413,6 +465,12 @@ pub struct TradingSession {
     /// `execute_ctrader_order` — Risky Mode is the strictly tighter
     /// outer layer (research §11.3, operator directive 2026-05-15).
     risky_mode_manager: Option<RiskyModeManager>,
+    /// Ring buffer of recent bot decisions (manual fills + AI signals).
+    /// Mapped to [`ChartOverlay`]s by `bot_decisions_to_overlays` and
+    /// consumed by `market_data::load_*_market_chart_snapshot`. Capped
+    /// at [`BOT_DECISION_BUFFER_CAPACITY`] entries; older entries are
+    /// dropped FIFO. Closes audit gap #11.
+    bot_decisions: Vec<BotDecisionEntry>,
 }
 
 enum TradingAdapter {
@@ -541,6 +599,7 @@ impl TradingSession {
             trading_environment: TradingEnvironment::Demo,
             halt_state: HaltState::default(),
             risky_mode_manager: None,
+            bot_decisions: Vec::new(),
         }
     }
 
@@ -830,6 +889,78 @@ impl TradingSession {
             target: "forex_app::halt",
             "T-Manual HALT cleared by operator"
         );
+    }
+
+    // ── Bot decision overlays (audit gap #11) ───────────────────────────
+    //
+    // The chart panel paints `MarketChartSnapshot.overlays`. Before this
+    // patch every snapshot was built with `Vec::new()` — the type existed,
+    // the paint code existed, but no producer connected the two.
+    // `record_bot_decision` is the producer; `bot_decisions_to_overlays`
+    // converts the buffered entries into renderable markers by mapping each
+    // decision's timestamp to the nearest candle index in the visible
+    // window.
+
+    /// Push a new bot decision onto the ring buffer. Older entries are
+    /// dropped FIFO once the buffer hits
+    /// [`BOT_DECISION_BUFFER_CAPACITY`].
+    ///
+    /// Called from manual order paths (`execute_buy_market` /
+    /// `execute_sell_market` → `record_decision_for_fill`) and — when D1
+    /// lands — from the AI auto-trade pipeline. Idempotency: nothing
+    /// filters duplicates; multiple consecutive fills at the same price
+    /// produce multiple markers, which matches operator expectations.
+    pub fn record_bot_decision(&mut self, entry: BotDecisionEntry) {
+        self.bot_decisions.push(entry);
+        // Cap the buffer. `Vec::drain(..delta)` is O(N) but only
+        // executes when we cross the cap; at typical fill rates this
+        // happens days apart.
+        let len = self.bot_decisions.len();
+        if len > BOT_DECISION_BUFFER_CAPACITY {
+            let delta = len - BOT_DECISION_BUFFER_CAPACITY;
+            self.bot_decisions.drain(..delta);
+        }
+    }
+
+    /// All recorded decisions for `symbol`, oldest first. Returns
+    /// `&[]` if none — never `Option<_>` to keep the call sites flat.
+    pub fn bot_decisions_for(&self, symbol: &str) -> Vec<&BotDecisionEntry> {
+        self.bot_decisions
+            .iter()
+            .filter(|d| d.symbol == symbol)
+            .collect()
+    }
+
+    /// Convert recorded decisions for `symbol` into `ChartOverlay`
+    /// markers that align with `candles`. A decision is mapped to the
+    /// candle whose `timestamp` is closest (and not after — we never
+    /// paint a marker on a future candle that doesn't exist yet).
+    /// Decisions older than the first candle or newer than the last
+    /// are dropped silently.
+    pub fn bot_decisions_to_overlays(
+        &self,
+        symbol: &str,
+        candles: &[ChartCandle],
+    ) -> Vec<ChartOverlay> {
+        if candles.is_empty() {
+            return Vec::new();
+        }
+        let mut overlays = Vec::new();
+        for d in self.bot_decisions_for(symbol) {
+            if let Some(idx) = nearest_candle_index(candles, d.timestamp_ms) {
+                overlays.push(ChartOverlay {
+                    label: d.label.clone(),
+                    candle_index: idx,
+                    price: d.price,
+                });
+            }
+        }
+        overlays
+    }
+
+    #[cfg(test)]
+    pub fn bot_decision_buffer_len(&self) -> usize {
+        self.bot_decisions.len()
     }
 
     // ── Risky Mode integration (research §4–§5). The composition
@@ -1160,6 +1291,26 @@ impl TradingSession {
 
 }
 
+/// Find the index of the candle whose `timestamp` is the largest value
+/// <= `target_ts`. Returns `None` if all candles are newer than the
+/// target (the decision happened before the visible window) or if the
+/// candle slice is empty or has no timestamps set.
+///
+/// O(N) linear scan — typical chart windows are <500 candles so this
+/// is well below 1µs even on a worst case. A future bsearch can replace
+/// this if the chart ever holds 10k+ bars and overlay count climbs.
+pub(crate) fn nearest_candle_index(candles: &[ChartCandle], target_ts: i64) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (i, c) in candles.iter().enumerate() {
+        let Some(ts) = c.timestamp else { continue };
+        if ts > target_ts {
+            break;
+        }
+        best = Some(i);
+    }
+    best
+}
+
 impl Default for TradingSession {
     fn default() -> Self {
         Self {
@@ -1196,6 +1347,7 @@ impl Default for TradingSession {
             trading_environment: TradingEnvironment::Demo,
             halt_state: HaltState::default(),
             risky_mode_manager: None,
+            bot_decisions: Vec::new(),
         }
     }
 }

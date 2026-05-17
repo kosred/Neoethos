@@ -660,7 +660,84 @@ impl RiskyModeManager {
         let exponent = -2.0 * mu_log * log_distance / sigma_sq;
         exponent.exp().clamp(0.0, 1.0)
     }
+
+    /// Estimated trading days to reach the configured
+    /// `target_capital_usd` from the current bankroll, given the
+    /// expected per-trade log-growth at the *current stage's*
+    /// Kelly multiplier.
+    ///
+    /// Formula (research §9.3 + standard compound-growth maths):
+    /// ```text
+    /// E[per-trade log-return]  = p * ln(1 + R*f_eff) + (1-p) * ln(1 - f_eff)
+    /// trades_to_target         = ln(target / current) / E[per-trade log-return]
+    /// days_to_target           = trades_to_target / DEFAULT_RISKY_TRADES_PER_DAY
+    /// ```
+    /// Same `p = 0.55, R = 3` illustrative parameters as
+    /// `current_ruin_probability_estimate`. The estimate uses the
+    /// current stage's Kelly fraction throughout — late stages are
+    /// more conservative, so this is mildly OPTIMISTIC (i.e.
+    /// real-life will likely take longer than the number returned).
+    /// Surfaced in the wizard's AutonomyRisk step and in the operator
+    /// dashboard so the magnitude of the journey is visible alongside
+    /// the ruin probability. Audit gap #6 / mockup §20-pip challenge
+    /// calculator.
+    ///
+    /// Returns `None` when:
+    /// - `current_bankroll >= target` (already at or past the goal),
+    /// - expected per-trade log-growth is non-positive (the Kelly
+    ///   multiplier or stage caps push expected growth to zero — the
+    ///   trader cannot reach the target by compounding at all).
+    pub fn estimated_days_to_target(&self) -> Option<u32> {
+        let target = self.config.target_capital_usd;
+        let current = self.current_bankroll_usd;
+        if !current.is_finite() || !target.is_finite() {
+            return None;
+        }
+        if current >= target {
+            return Some(0);
+        }
+        let stage = self.current_stage();
+        let p: f32 = 0.55;
+        let r: f32 = 3.0;
+        let f_full_kelly = (p * r - (1.0 - p)) / r;
+        let f_eff = (stage.kelly_fraction_multiplier * f_full_kelly)
+            .min(stage.max_pair_exposure_fraction);
+        if f_eff <= 0.0 {
+            return None;
+        }
+        let up = (1.0 + r * f_eff).ln();
+        let down_arg = 1.0 - f_eff;
+        if down_arg <= 0.0 {
+            return None;
+        }
+        let down = down_arg.ln();
+        let mu_log = p * up + (1.0 - p) * down;
+        if mu_log <= 0.0 {
+            return None;
+        }
+        let log_distance = (target / current).ln();
+        let trades_to_target = log_distance / mu_log;
+        let days = (trades_to_target / DEFAULT_RISKY_TRADES_PER_DAY).ceil();
+        if !days.is_finite() || days <= 0.0 {
+            return None;
+        }
+        // Cap at u32::MAX so an absurd 1e9-day estimate from a tiny
+        // mu_log doesn't overflow — the UI shows "> 1 million days"
+        // anyway and that's already a "give up" signal.
+        let capped = days.min(u32::MAX as f32);
+        Some(capped as u32)
+    }
 }
+
+/// Default assumed trades per day for the days-to-target estimator.
+/// Operator-facing — research §4.6 frames Risky Mode entries as
+/// roughly 1-3 high-conviction trades/day at the early stages. The
+/// estimator uses the conservative `1` because:
+/// (a) it matches the wizard's competitive analysis baseline,
+/// (b) operators will read "300 days at 1 trade/day" much more
+///     accurately than "100 days at 3 trades/day", which sounds
+///     achievable but ignores the per-day kill switch.
+pub const DEFAULT_RISKY_TRADES_PER_DAY: f32 = 1.0;
 
 // ---------------------------------------------------------------------------
 // Stage-table construction (research §4.2).
@@ -978,5 +1055,69 @@ mod tests {
         // from a cTrader trade-history fixture and assert the
         // manager advances stages correctly. No synthetic data.
         let _ = &mut mgr;
+    }
+
+    // ── days_to_target estimator (audit gap #6) ──────────────────────
+
+    #[test]
+    fn days_to_target_returns_zero_when_already_at_or_past_target() {
+        let cfg = RiskyModeConfig::default();
+        let target = cfg.target_capital_usd;
+        let mgr = RiskyModeManager::new(cfg, target).expect("manager");
+        assert_eq!(mgr.estimated_days_to_target(), Some(0));
+
+        let cfg = RiskyModeConfig::default();
+        let mgr = RiskyModeManager::new(cfg, target * 1.1).expect("manager");
+        assert_eq!(mgr.estimated_days_to_target(), Some(0));
+    }
+
+    #[test]
+    fn days_to_target_finite_estimate_for_20_to_50k_default() {
+        // Operator-facing canonical case: $20 → $50,000. With p=0.55
+        // R=3 and the stage-0 Kelly multiplier this should resolve to
+        // a finite (and large) integer.
+        let cfg = RiskyModeConfig::default();
+        let mgr = RiskyModeManager::new(cfg, DEFAULT_STARTING_CAPITAL_USD).expect("manager");
+        let days = mgr.estimated_days_to_target().expect("finite estimate");
+        // Sanity bounds: the calculation should land somewhere
+        // between "many weeks" and "a few thousand days". A finer
+        // bound would over-pin the heuristic; the point is that the
+        // formula does not return None for the default inputs.
+        assert!(
+            (30..200_000).contains(&days),
+            "20→50k estimate out of expected band: {days} days"
+        );
+    }
+
+    #[test]
+    fn days_to_target_shrinks_as_bankroll_grows() {
+        let cfg = RiskyModeConfig::default();
+        let mgr_small = RiskyModeManager::new(cfg.clone(), 20.0).expect("small");
+        let mgr_mid = RiskyModeManager::new(cfg.clone(), 1_000.0).expect("mid");
+        let mgr_large = RiskyModeManager::new(cfg, 20_000.0).expect("large");
+        let d_small = mgr_small.estimated_days_to_target().expect("small");
+        let d_mid = mgr_mid.estimated_days_to_target().expect("mid");
+        let d_large = mgr_large.estimated_days_to_target().expect("large");
+        assert!(
+            d_small >= d_mid && d_mid >= d_large,
+            "days_to_target must shrink as bankroll grows: small={d_small} mid={d_mid} large={d_large}"
+        );
+    }
+
+    #[test]
+    fn days_to_target_returns_none_when_kelly_zeroed_out() {
+        // A stage whose Kelly multiplier is zero has zero expected
+        // log-growth — the trader cannot compound to the target. The
+        // estimator must signal that with `None` rather than dividing
+        // by zero or returning a meaningless number.
+        let mut cfg = RiskyModeConfig::default();
+        // We can't set kelly to literal 0.0 because validate() will
+        // reject (kelly must be in (0, 1]). Use the smallest legal
+        // value and patch max_pair_exposure_fraction to clamp f_eff.
+        for stage in cfg.stages.iter_mut() {
+            stage.max_pair_exposure_fraction = 0.0;
+        }
+        let mgr = RiskyModeManager::new(cfg, 100.0).expect("manager");
+        assert_eq!(mgr.estimated_days_to_target(), None);
     }
 }

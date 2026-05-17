@@ -98,15 +98,24 @@ impl TradingSession {
                 &state.selected_pair,
                 &timeframe,
             ) {
-                Ok(ohlcv) => build_market_chart_snapshot_from_ohlcv(
-                    &state.selected_pair,
-                    &timeframe,
-                    resolved_timeframes,
-                    &ohlcv,
-                    Vec::new(),
-                    Vec::new(),
-                )
-                .with_overlay_status(overlay_status),
+                Ok(ohlcv) => {
+                    let mut snap = build_market_chart_snapshot_from_ohlcv(
+                        &state.selected_pair,
+                        &timeframe,
+                        resolved_timeframes,
+                        &ohlcv,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .with_overlay_status(overlay_status);
+                    // Audit gap #11: populate the chart overlays from
+                    // the bot-decision ring buffer instead of leaving
+                    // `Vec::new()`. The candle list is already built
+                    // so the mapping just needs the timestamp lookup.
+                    snap.overlays =
+                        self.bot_decisions_to_overlays(&state.selected_pair, &snap.candles);
+                    snap
+                },
                 Err(err) => MarketChartSnapshot::empty_for(
                     &state.selected_pair,
                     &timeframe,
@@ -189,6 +198,13 @@ impl TradingSession {
                         warnings,
                     )
                     .with_overlay_status(overlay_status);
+                    // Audit gap #11: populate overlays from the
+                    // session-held bot decision buffer once the candle
+                    // list exists.
+                    snapshot.overlays = self.bot_decisions_to_overlays(
+                        &history.symbol.symbol_name,
+                        &snapshot.candles,
+                    );
                     if let Some(update) = live_update {
                         snapshot.bid = update.bid;
                         snapshot.ask = update.ask;

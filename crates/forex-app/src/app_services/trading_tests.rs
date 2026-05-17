@@ -1790,3 +1790,146 @@ fn closed_trade_advances_risky_mode_bankroll() {
     assert!(!session.risky_mode_active());
     assert!(session.risky_mode_state().is_none());
 }
+
+// ── Bot decision overlays (audit gap #11) ─────────────────────────────
+
+#[test]
+fn record_bot_decision_appends_to_buffer() {
+    let mut session = TradingSession::new();
+    assert_eq!(session.bot_decision_buffer_len(), 0);
+    session.record_bot_decision(BotDecisionEntry {
+        symbol: "EURUSD".to_string(),
+        side: BotDecisionSide::Buy,
+        price: 1.0843,
+        timestamp_ms: 1_700_000_000_000,
+        label: "BUY".to_string(),
+        source: BotDecisionSource::Manual,
+        confidence: None,
+    });
+    assert_eq!(session.bot_decision_buffer_len(), 1);
+}
+
+#[test]
+fn bot_decisions_for_filters_by_symbol() {
+    let mut session = TradingSession::new();
+    for sym in ["EURUSD", "GBPUSD", "EURUSD"] {
+        session.record_bot_decision(BotDecisionEntry {
+            symbol: sym.to_string(),
+            side: BotDecisionSide::Buy,
+            price: 1.0,
+            timestamp_ms: 1_700_000_000_000,
+            label: "x".to_string(),
+            source: BotDecisionSource::Manual,
+            confidence: None,
+        });
+    }
+    assert_eq!(session.bot_decisions_for("EURUSD").len(), 2);
+    assert_eq!(session.bot_decisions_for("GBPUSD").len(), 1);
+    assert_eq!(session.bot_decisions_for("USDJPY").len(), 0);
+}
+
+#[test]
+fn bot_decision_buffer_caps_at_capacity_fifo() {
+    let mut session = TradingSession::new();
+    let cap = crate::app_services::trading::BOT_DECISION_BUFFER_CAPACITY;
+    for i in 0..(cap + 5) {
+        session.record_bot_decision(BotDecisionEntry {
+            symbol: "EURUSD".to_string(),
+            side: BotDecisionSide::Buy,
+            price: 1.0 + (i as f64) * 0.0001,
+            timestamp_ms: 1_700_000_000_000 + i as i64,
+            label: format!("entry-{i}"),
+            source: BotDecisionSource::Manual,
+            confidence: None,
+        });
+    }
+    // The buffer must hold exactly the capacity and the oldest 5
+    // entries must be the ones dropped (FIFO).
+    assert_eq!(session.bot_decision_buffer_len(), cap);
+    let earliest = session.bot_decisions_for("EURUSD")[0].label.clone();
+    assert_eq!(earliest, "entry-5", "oldest 5 entries must be dropped FIFO");
+}
+
+#[test]
+fn bot_decisions_to_overlays_maps_timestamps_to_nearest_candle() {
+    use crate::app_services::trading::ChartCandle;
+    let mut session = TradingSession::new();
+
+    // 4 candles spaced 1 minute apart.
+    let candles = vec![
+        ChartCandle { timestamp: Some(1_700_000_000_000), open: 1.0, high: 1.0, low: 1.0, close: 1.0, volume: 0.0 },
+        ChartCandle { timestamp: Some(1_700_000_060_000), open: 1.0, high: 1.0, low: 1.0, close: 1.0, volume: 0.0 },
+        ChartCandle { timestamp: Some(1_700_000_120_000), open: 1.0, high: 1.0, low: 1.0, close: 1.0, volume: 0.0 },
+        ChartCandle { timestamp: Some(1_700_000_180_000), open: 1.0, high: 1.0, low: 1.0, close: 1.0, volume: 0.0 },
+    ];
+
+    // Decision at exactly candle 2's timestamp → maps to index 2.
+    session.record_bot_decision(BotDecisionEntry {
+        symbol: "EURUSD".to_string(),
+        side: BotDecisionSide::Buy,
+        price: 1.0843,
+        timestamp_ms: 1_700_000_120_000,
+        label: "BUY".to_string(),
+        source: BotDecisionSource::Manual,
+        confidence: None,
+    });
+    // Decision 30s past candle 1 → still maps to candle 1 (largest
+    // <= target; we never paint on a future candle).
+    session.record_bot_decision(BotDecisionEntry {
+        symbol: "EURUSD".to_string(),
+        side: BotDecisionSide::Sell,
+        price: 1.0855,
+        timestamp_ms: 1_700_000_090_000,
+        label: "SELL".to_string(),
+        source: BotDecisionSource::Ai,
+        confidence: Some(0.74),
+    });
+    // Decision before the first candle — must be dropped.
+    session.record_bot_decision(BotDecisionEntry {
+        symbol: "EURUSD".to_string(),
+        side: BotDecisionSide::Flat,
+        price: 1.07,
+        timestamp_ms: 1_699_999_990_000,
+        label: "OLD".to_string(),
+        source: BotDecisionSource::Manual,
+        confidence: None,
+    });
+    // Different-symbol decision — must not appear in EURUSD overlays.
+    session.record_bot_decision(BotDecisionEntry {
+        symbol: "GBPUSD".to_string(),
+        side: BotDecisionSide::Buy,
+        price: 1.2654,
+        timestamp_ms: 1_700_000_120_000,
+        label: "GBP".to_string(),
+        source: BotDecisionSource::Manual,
+        confidence: None,
+    });
+
+    let overlays = session.bot_decisions_to_overlays("EURUSD", &candles);
+    assert_eq!(
+        overlays.len(),
+        2,
+        "expected 2 EURUSD overlays (the pre-window OLD entry and the GBPUSD entry must drop)"
+    );
+
+    // Order is insertion-order (== chronological by record_bot_decision call).
+    assert_eq!(overlays[0].label, "BUY");
+    assert_eq!(overlays[0].candle_index, 2);
+    assert_eq!(overlays[1].label, "SELL");
+    assert_eq!(overlays[1].candle_index, 1); // 30s past candle 1, before candle 2
+}
+
+#[test]
+fn bot_decisions_to_overlays_returns_empty_when_no_candles() {
+    let mut session = TradingSession::new();
+    session.record_bot_decision(BotDecisionEntry {
+        symbol: "EURUSD".to_string(),
+        side: BotDecisionSide::Buy,
+        price: 1.0,
+        timestamp_ms: 0,
+        label: "x".to_string(),
+        source: BotDecisionSource::Manual,
+        confidence: None,
+    });
+    assert!(session.bot_decisions_to_overlays("EURUSD", &[]).is_empty());
+}

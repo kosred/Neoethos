@@ -51,6 +51,34 @@ impl NewsFilter {
         self.api_key = Some(SecretString::from(api_key));
     }
 
+    /// `true` iff the filter is currently in BLACKOUT and orders must
+    /// be rejected at the pre-trade gate. The check is intentionally
+    /// strict — case-insensitive equality against the literal string
+    /// `"BLACKOUT"` — because the upstream LLM prompt instructs the
+    /// model to output exactly the word `BLACKOUT` and nothing else
+    /// (see `poll_llm_news_sentiment` prompt body). A `SAFE` /
+    /// `UNKNOWN` / `<empty>` value falls through and trading is
+    /// allowed.
+    ///
+    /// Operator semantics: when the filter is `enabled=false`, this
+    /// returns `false` regardless of `current_status` so a stale
+    /// `BLACKOUT` leftover from a prior session cannot wedge the
+    /// trader off the market after they disabled the feature.
+    /// Audit gap #2 / roadmap §5.2 news-blackout pre-trade requirement.
+    pub fn is_blackout(&self) -> bool {
+        self.enabled && self.current_status.trim().eq_ignore_ascii_case("BLACKOUT")
+    }
+
+    /// Single-line status string for journalling and UI tooltips when
+    /// the blackout gate rejects an order. Mirrors `is_blackout` so
+    /// callers don't have to reach into the struct manually.
+    pub fn blackout_reason(&self) -> String {
+        format!(
+            "news-blackout gate · status='{}' · provider={} · window=-{}/+{}min",
+            self.current_status, self.llm_provider, self.blackout_minutes_before, self.blackout_minutes_after
+        )
+    }
+
     /// Run synchronously (should be spawned in a dedicated blocking thread by the app)
     pub fn poll_llm_news_sentiment(
         &mut self,
@@ -127,5 +155,87 @@ impl NewsFilter {
             return false;
         }
         self.current_status == "BLACKOUT"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn enabled_safe() -> NewsFilter {
+        NewsFilter::new(true, 15, 10)
+    }
+
+    fn enabled_blackout() -> NewsFilter {
+        let mut f = NewsFilter::new(true, 15, 10);
+        f.current_status = "BLACKOUT".to_string();
+        f
+    }
+
+    #[test]
+    fn is_blackout_false_when_status_is_safe() {
+        let f = enabled_safe();
+        assert!(!f.is_blackout());
+    }
+
+    #[test]
+    fn is_blackout_true_when_status_is_blackout_uppercase() {
+        let f = enabled_blackout();
+        assert!(f.is_blackout());
+    }
+
+    #[test]
+    fn is_blackout_case_insensitive_on_status() {
+        // Tolerate lowercase / mixed-case LLM responses — the prompt
+        // asks for exactly "BLACKOUT" but we should not silently
+        // green-light a "blackout" response.
+        let mut f = enabled_safe();
+        f.current_status = "blackout".to_string();
+        assert!(f.is_blackout());
+        f.current_status = "BlackOut".to_string();
+        assert!(f.is_blackout());
+    }
+
+    #[test]
+    fn is_blackout_trims_whitespace() {
+        let mut f = enabled_safe();
+        f.current_status = "  BLACKOUT  ".to_string();
+        assert!(f.is_blackout());
+        f.current_status = "\nBLACKOUT\n".to_string();
+        assert!(f.is_blackout());
+    }
+
+    #[test]
+    fn is_blackout_returns_false_when_filter_disabled_even_if_status_says_blackout() {
+        // The disable kill-switch must beat a stale status — otherwise
+        // a leftover BLACKOUT from a prior session keeps the operator
+        // locked out forever.
+        let mut f = enabled_blackout();
+        f.enabled = false;
+        assert!(!f.is_blackout(), "disabled filter must never block");
+    }
+
+    #[test]
+    fn is_blackout_handles_unknown_and_empty_status_as_safe() {
+        let mut f = enabled_safe();
+        f.current_status = "UNKNOWN".to_string();
+        assert!(!f.is_blackout());
+        f.current_status = "".to_string();
+        assert!(!f.is_blackout());
+        f.current_status = "   ".to_string();
+        assert!(!f.is_blackout());
+    }
+
+    #[test]
+    fn blackout_reason_includes_status_provider_and_window() {
+        let mut f = enabled_blackout();
+        f.llm_provider = "openai".to_string();
+        f.blackout_minutes_before = 30;
+        f.blackout_minutes_after = 15;
+        let reason = f.blackout_reason();
+        assert!(reason.contains("BLACKOUT"), "reason must include status: {reason}");
+        assert!(reason.contains("openai"), "reason must include provider: {reason}");
+        assert!(reason.contains("-30"), "reason must include before-window: {reason}");
+        assert!(reason.contains("+15"), "reason must include after-window: {reason}");
     }
 }

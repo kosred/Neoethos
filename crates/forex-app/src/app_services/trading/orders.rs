@@ -366,6 +366,23 @@ impl TradingSession {
                     );
                     return;
                 }
+                // News-blackout gate — runs BEFORE the prop-firm check
+                // because (a) it's the cheapest evaluation (string check,
+                // no allocation, no equity math) and (b) a blackout
+                // rejection is informationally distinct from a risk-limit
+                // breach: the operator needs to know "news event in
+                // progress" not "lot too big". Audit gap #2 / roadmap
+                // §5.2 news-blackout pre-trade requirement.
+                if state.llm_news_filter.is_blackout() {
+                    let message = format!(
+                        "News-blackout gate blocked: {}",
+                        state.llm_news_filter.blackout_reason()
+                    );
+                    state.status_msg = message.clone();
+                    self.append_trade_journal(message.clone());
+                    record_app_event("news_blackout_gate", "BLOCKED", message);
+                    return;
+                }
                 let pip_position = self
                     .ctrader_symbol_pip_position(&state.selected_pair)
                     .unwrap_or(4);

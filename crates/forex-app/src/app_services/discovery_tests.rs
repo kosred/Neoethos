@@ -235,3 +235,109 @@ fn backend_portfolio_milestone_updates_discovery_snapshot_with_live_counts() {
             .any(|entry| entry.contains("portfolio | accepted=12"))
     );
 }
+
+// ── Multi-symbol discovery fan-out (audit gap #1) ─────────────────────
+
+#[test]
+fn multi_symbol_request_validate_rejects_empty_symbol_list() {
+    let req = MultiSymbolDiscoveryRequest {
+        data_root: PathBuf::from("./data"),
+        symbols: Vec::new(),
+        base_tf: "M5".to_string(),
+        higher_tfs: vec!["M15".to_string()],
+        config: forex_search::DiscoveryConfig::default(),
+        prop_firm_rules: PropFirmRiskRules::default(),
+    };
+    let err = req.validate().expect_err("empty symbols must reject");
+    assert!(
+        err.to_string().contains("at least one symbol"),
+        "wrong error message: {err}"
+    );
+}
+
+#[test]
+fn multi_symbol_request_validate_rejects_empty_string_in_list() {
+    let req = MultiSymbolDiscoveryRequest {
+        data_root: PathBuf::from("./data"),
+        symbols: vec!["EURUSD".to_string(), "  ".to_string()],
+        base_tf: "M5".to_string(),
+        higher_tfs: vec!["M15".to_string()],
+        config: forex_search::DiscoveryConfig::default(),
+        prop_firm_rules: PropFirmRiskRules::default(),
+    };
+    let err = req.validate().expect_err("whitespace symbol must reject");
+    assert!(
+        err.to_string().contains("empty symbol"),
+        "wrong error message: {err}"
+    );
+}
+
+#[test]
+fn multi_symbol_request_validate_rejects_empty_base_tf() {
+    let req = MultiSymbolDiscoveryRequest {
+        data_root: PathBuf::from("./data"),
+        symbols: vec!["EURUSD".to_string()],
+        base_tf: "".to_string(),
+        higher_tfs: vec![],
+        config: forex_search::DiscoveryConfig::default(),
+        prop_firm_rules: PropFirmRiskRules::default(),
+    };
+    assert!(req.validate().is_err());
+}
+
+#[test]
+fn multi_symbol_request_validate_rejects_empty_data_root() {
+    let req = MultiSymbolDiscoveryRequest {
+        data_root: PathBuf::new(),
+        symbols: vec!["EURUSD".to_string()],
+        base_tf: "M5".to_string(),
+        higher_tfs: vec![],
+        config: forex_search::DiscoveryConfig::default(),
+        prop_firm_rules: PropFirmRiskRules::default(),
+    };
+    assert!(req.validate().is_err());
+}
+
+#[test]
+fn multi_symbol_into_single_symbol_requests_produces_one_per_symbol() {
+    let symbols = vec!["EURUSD".to_string(), "GBPUSD".to_string(), "XAUUSD".to_string()];
+    let req = MultiSymbolDiscoveryRequest {
+        data_root: PathBuf::from("./data"),
+        symbols: symbols.clone(),
+        base_tf: "M5".to_string(),
+        higher_tfs: vec!["M15".to_string(), "H1".to_string()],
+        config: forex_search::DiscoveryConfig::default(),
+        prop_firm_rules: PropFirmRiskRules::default(),
+    };
+    let singles = req.into_single_symbol_requests();
+    assert_eq!(singles.len(), 3, "must produce one request per symbol");
+    // Order must match input order so the UI can map result back.
+    assert_eq!(singles[0].symbol, "EURUSD");
+    assert_eq!(singles[1].symbol, "GBPUSD");
+    assert_eq!(singles[2].symbol, "XAUUSD");
+    // Shared config preserved across all clones.
+    for req in &singles {
+        assert_eq!(req.base_tf, "M5");
+        assert_eq!(req.higher_tfs, vec!["M15".to_string(), "H1".to_string()]);
+        assert_eq!(req.data_root, PathBuf::from("./data"));
+    }
+}
+
+#[test]
+fn multi_symbol_each_single_request_passes_its_own_validate() {
+    let req = MultiSymbolDiscoveryRequest {
+        data_root: PathBuf::from("./data"),
+        symbols: vec!["EURUSD".to_string(), "GBPUSD".to_string()],
+        base_tf: "M5".to_string(),
+        higher_tfs: vec![],
+        config: forex_search::DiscoveryConfig::default(),
+        prop_firm_rules: PropFirmRiskRules::default(),
+    };
+    for single in req.into_single_symbol_requests() {
+        assert!(
+            single.validate().is_ok(),
+            "fan-out child failed its own validate: {:?}",
+            single
+        );
+    }
+}
