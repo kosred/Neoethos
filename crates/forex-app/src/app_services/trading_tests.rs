@@ -1859,6 +1859,153 @@ fn manual_sell_blocked_when_autonomous_only_contract_armed() {
     );
 }
 
+// ── Auto-trade producer lifecycle (Phase D1) ─────────────────────────
+
+#[test]
+fn auto_trade_producer_starts_and_stops_cleanly() {
+    use crate::app_services::trading::auto_trade_producer::{
+        LiveBarSource, LiveInferenceProducerConfig, ModelPredictor, PredictionOutput,
+        ProducerOutcome,
+    };
+    use crate::app_services::trading::auto_trade::AutoTradeSide;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use anyhow::Result;
+
+    /// Source that returns Ok(None) forever — the producer just
+    /// polls in a loop until cancelled.
+    struct EmptySource;
+    impl LiveBarSource for EmptySource {
+        fn poll_latest_bar(&self) -> Result<Option<HistoricalBar>> {
+            Ok(None)
+        }
+    }
+
+    /// Predictor that's never called because the source emits no bars.
+    struct UnreachablePredictor;
+    impl ModelPredictor for UnreachablePredictor {
+        fn predict(&self, _bars: &[HistoricalBar]) -> Result<PredictionOutput> {
+            Ok(PredictionOutput {
+                side: AutoTradeSide::Flat,
+                confidence: 0.0,
+            })
+        }
+    }
+
+    let mut session = TradingSession::new();
+    assert!(!session.auto_trade_producer_running());
+    assert_eq!(session.auto_trade_producer_symbol(), None);
+
+    let mut cfg = LiveInferenceProducerConfig::for_symbol("EURUSD");
+    cfg.poll_interval = Duration::from_millis(1);
+    session
+        .start_auto_trade_producer(cfg, Arc::new(EmptySource), Arc::new(UnreachablePredictor))
+        .expect("start producer");
+    assert!(session.auto_trade_producer_running());
+    assert_eq!(session.auto_trade_producer_symbol(), Some("EURUSD"));
+
+    // Starting again must error — the operator has to stop first.
+    let cfg2 = LiveInferenceProducerConfig::for_symbol("GBPUSD");
+    let err = session
+        .start_auto_trade_producer(cfg2, Arc::new(EmptySource), Arc::new(UnreachablePredictor))
+        .expect_err("must reject second start");
+    assert!(
+        err.to_string().contains("already running"),
+        "wrong error: {err}"
+    );
+
+    let outcome = session.stop_auto_trade_producer().expect("outcome");
+    assert!(matches!(outcome, ProducerOutcome::Cancelled));
+    assert!(!session.auto_trade_producer_running());
+    assert_eq!(session.auto_trade_producer_symbol(), None);
+}
+
+#[test]
+fn auto_trade_producer_drain_dispatches_signals_through_gate_chain() {
+    use crate::app_services::trading::auto_trade_producer::{
+        LiveBarSource, LiveInferenceProducerConfig, ModelPredictor, PredictionOutput,
+    };
+    use crate::app_services::trading::auto_trade::AutoTradeSide;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use anyhow::Result;
+
+    /// Cursor-style source that emits a small fixed sequence.
+    struct CursorSource(Mutex<std::vec::IntoIter<HistoricalBar>>);
+    impl LiveBarSource for CursorSource {
+        fn poll_latest_bar(&self) -> Result<Option<HistoricalBar>> {
+            Ok(self.0.lock().expect("lock").next())
+        }
+    }
+    struct ConstantBuy;
+    impl ModelPredictor for ConstantBuy {
+        fn predict(&self, _bars: &[HistoricalBar]) -> Result<PredictionOutput> {
+            Ok(PredictionOutput {
+                side: AutoTradeSide::Buy,
+                confidence: 0.9,
+            })
+        }
+    }
+
+    let mut state = sample_state(DataSource::CTrader, "(producer drain)");
+    state.auto_trade_enabled = true;
+    state.selected_pair = "EURUSD".to_string();
+
+    let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+    let bars = vec![
+        HistoricalBar {
+            timestamp_ms: 1_000,
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: Some(1),
+        },
+        HistoricalBar {
+            timestamp_ms: 2_000,
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: Some(1),
+        },
+    ];
+    let source: Arc<dyn LiveBarSource> = Arc::new(CursorSource(Mutex::new(bars.into_iter())));
+    let predictor: Arc<dyn ModelPredictor> = Arc::new(ConstantBuy);
+    let mut cfg = LiveInferenceProducerConfig::for_symbol("EURUSD");
+    cfg.poll_interval = Duration::from_millis(1);
+    session
+        .start_auto_trade_producer(cfg, source, predictor)
+        .expect("start producer");
+
+    // Give the producer thread time to drain the cursor + push to
+    // the signal channel.
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Drain — the dispatcher's gate 8 (prop-firm check) will reject
+    // the order in test mode (no broker), which is fine; the
+    // property we pin here is "drain reported >= 1 signal dispatched",
+    // i.e. the producer→dispatcher wiring works end-to-end.
+    let dispatched = session.drain_auto_trade_signals(&mut state);
+    assert!(
+        dispatched >= 1,
+        "expected at least 1 dispatched signal, got {dispatched}"
+    );
+
+    let outcome = session.stop_auto_trade_producer();
+    assert!(outcome.is_some());
+}
+
+#[test]
+fn auto_trade_producer_drain_returns_zero_when_no_producer() {
+    // Sanity: drain is safe to call on a session with no producer
+    // running — it returns 0 and doesn't panic.
+    let mut state = sample_state(DataSource::CTrader, "(no producer)");
+    let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+    let dispatched = session.drain_auto_trade_signals(&mut state);
+    assert_eq!(dispatched, 0);
+}
+
 #[test]
 fn manual_buy_not_blocked_when_risky_mode_disarmed() {
     // If Risky Mode is NOT armed (no manager), the autonomous-only

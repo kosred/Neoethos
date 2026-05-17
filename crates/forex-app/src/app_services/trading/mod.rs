@@ -79,6 +79,7 @@ use std::time::{Duration, Instant};
 pub(super) use tracing::error;
 
 pub mod auto_trade;
+pub mod auto_trade_producer;
 mod client_order;
 mod diagnostics;
 mod market_data;
@@ -501,6 +502,14 @@ pub struct TradingSession {
     /// at [`BOT_DECISION_BUFFER_CAPACITY`] entries; older entries are
     /// dropped FIFO. Closes audit gap #11.
     bot_decisions: Vec<BotDecisionEntry>,
+    /// Live auto-trade producer handle. `Some(_)` when the producer
+    /// thread is running on this session — the operator started it
+    /// via `start_auto_trade_producer` and the session owns the
+    /// cancel flag + signal receiver until `stop_auto_trade_producer`
+    /// tears it down. The main app loop calls `drain_auto_trade_signals`
+    /// on every tick to forward emitted signals through the §7.1
+    /// dispatcher gate chain.
+    auto_trade_producer: Option<auto_trade_producer::AutoTradeProducerHandle>,
 }
 
 enum TradingAdapter {
@@ -630,6 +639,7 @@ impl TradingSession {
             halt_state: HaltState::default(),
             risky_mode_manager: None,
             bot_decisions: Vec::new(),
+            auto_trade_producer: None,
         }
     }
 
@@ -1086,6 +1096,113 @@ impl TradingSession {
         })
     }
 
+    // ── Auto-trade producer lifecycle ─────────────────────────────────────
+    //
+    // The producer is the second half of the auto-trade pipeline (the
+    // first half — the dispatcher gate chain — lives in `auto_trade.rs`).
+    // The session owns the producer's cancel flag + signal receiver +
+    // thread handle so a `disconnect` / `disable_auto_trade` flow can
+    // tear it down without leaking the thread.
+
+    /// Start the live-inference producer thread. The session takes
+    /// ownership of the cancel flag + signal receiver; subsequent
+    /// `drain_auto_trade_signals` calls drain the receiver into
+    /// `dispatch_auto_trade_signal`. Returns `Err` if a producer is
+    /// already running on this session (the operator must
+    /// `stop_auto_trade_producer` first to swap configs).
+    pub fn start_auto_trade_producer(
+        &mut self,
+        config: auto_trade_producer::LiveInferenceProducerConfig,
+        bar_source: Arc<dyn auto_trade_producer::LiveBarSource>,
+        predictor: Arc<dyn auto_trade_producer::ModelPredictor>,
+    ) -> anyhow::Result<()> {
+        if self.auto_trade_producer.is_some() {
+            anyhow::bail!(
+                "auto-trade producer is already running on this session — stop it first"
+            );
+        }
+        let symbol = config.symbol.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<auto_trade::AutoTradeSignal>();
+        let producer = auto_trade_producer::LiveInferenceProducer::new(
+            config, bar_source, predictor, tx,
+        )?;
+        let cancel = producer.cancel_flag();
+        let handle = producer.spawn()?;
+        self.auto_trade_producer = Some(auto_trade_producer::AutoTradeProducerHandle {
+            cancel,
+            handle: Some(handle),
+            signal_rx: rx,
+            symbol,
+        });
+        tracing::info!(
+            target: "forex_app::auto_trade::producer",
+            symbol = self
+                .auto_trade_producer
+                .as_ref()
+                .map(|h| h.symbol())
+                .unwrap_or(""),
+            "auto-trade producer started"
+        );
+        Ok(())
+    }
+
+    /// `true` when an auto-trade producer is currently running on
+    /// this session. Consulted by the chrome status pill and by the
+    /// Settings panel toggle.
+    pub fn auto_trade_producer_running(&self) -> bool {
+        self.auto_trade_producer.is_some()
+    }
+
+    /// Symbol the running producer is bound to, if any.
+    pub fn auto_trade_producer_symbol(&self) -> Option<&str> {
+        self.auto_trade_producer.as_ref().map(|h| h.symbol())
+    }
+
+    /// Stop the auto-trade producer. Flips the cancel flag and joins
+    /// the thread. Returns the [`auto_trade_producer::ProducerOutcome`]
+    /// the loop terminated with, or `None` if no producer was running.
+    pub fn stop_auto_trade_producer(
+        &mut self,
+    ) -> Option<auto_trade_producer::ProducerOutcome> {
+        let mut handle = self.auto_trade_producer.take()?;
+        handle.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let outcome = handle
+            .handle
+            .take()
+            .and_then(|jh| jh.join().ok());
+        tracing::info!(
+            target: "forex_app::auto_trade::producer",
+            outcome = ?outcome,
+            "auto-trade producer stopped"
+        );
+        outcome
+    }
+
+    /// Drain all pending auto-trade signals from the producer's
+    /// outbound channel and push each one through the §7.1
+    /// dispatcher gate chain. Returns the number of signals
+    /// dispatched (regardless of whether the dispatcher accepted
+    /// them or rejected them at a gate). Called by the main app
+    /// loop on every tick — non-blocking.
+    pub fn drain_auto_trade_signals(&mut self, state: &mut AppState) -> usize {
+        let signals: Vec<auto_trade::AutoTradeSignal> = {
+            let Some(handle) = self.auto_trade_producer.as_ref() else {
+                return 0;
+            };
+            handle.signal_rx.try_iter().collect()
+        };
+        let count = signals.len();
+        for sig in signals {
+            let decision = self.dispatch_auto_trade_signal(state, sig);
+            tracing::debug!(
+                target: "forex_app::auto_trade::producer",
+                decision = ?decision,
+                "auto-trade producer signal dispatched"
+            );
+        }
+        count
+    }
+
     pub fn snapshot(&self, state: &AppState) -> ConnectionSnapshot {
         let mode = panel_mode(state.data_source, self.connected);
         let adapter_kind = self
@@ -1378,6 +1495,7 @@ impl Default for TradingSession {
             halt_state: HaltState::default(),
             risky_mode_manager: None,
             bot_decisions: Vec::new(),
+            auto_trade_producer: None,
         }
     }
 }
