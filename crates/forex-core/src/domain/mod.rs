@@ -16,5 +16,6 @@ pub use prop_firm::{
     PropFirmRuntimeDefaults,
 };
 pub use risky_mode::{
-    KillSwitchTier, RiskyModeConfig, RiskyModeManager, RiskyStage, build_logarithmic_stages,
+    DEFAULT_RISKY_TRADES_PER_DAY, KillSwitchTier, MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY,
+    RiskyModeConfig, RiskyModeManager, RiskyStage, build_logarithmic_stages,
 };

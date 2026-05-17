@@ -1,3 +1,11 @@
+// Phase C3 audit: this module exposes the portable→installed
+// migration API (`detect_portable_install`, `migrate_portable_install`,
+// `PortableMigrationReport`/`Outcome`) that the wizard's Path step
+// (Step 2, D2 polish) drives in v0.5. The wizard skeleton is in place;
+// the consumer call lives in `ui/wizard/path.rs::apply` which is one
+// of the D2 wiring items. Local allow only — no workspace override.
+#![allow(dead_code)]
+
 //! Portable → installed migration detector + copy runtime.
 //!
 //! Spec: `installer_wizard_ux_spec.md` §6 "Migration from portable".

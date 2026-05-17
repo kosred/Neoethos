@@ -124,6 +124,19 @@ pub struct WizardConfig {
     pub equity_stop_pct: f32,
     pub capital_at_risk_disclosure: Option<f32>,
     pub risk_acknowledgement: Option<RiskAcknowledgement>,
+    /// Risky Mode arming flag (research §4 + §7.1). Set to `true`
+    /// only when the operator explicitly acknowledges the ruin-
+    /// probability ceiling. The Step 10 Apply writer reads this and
+    /// calls `session.enable_risky_mode(...)` iff `true`. Closes
+    /// audit gap clarification #2 — AutonomyRisk wizard step now
+    /// wires explicitly to RiskyMode instead of relying on a stale
+    /// risk-slider == 10 heuristic.
+    pub risky_mode_armed: bool,
+    /// Operator-acknowledged ruin-probability ceiling (e.g. 0.5 for
+    /// 50%). `None` until the operator ticks the checkbox in the
+    /// AutonomyRisk step. Cleared when `risky_mode_armed` flips back
+    /// to false so a re-arm always re-prompts.
+    pub risky_mode_ruin_ceiling_acknowledged: Option<f32>,
 
     // Step 10.
     pub telemetry_opt_in: bool,
@@ -178,6 +191,8 @@ impl Default for WizardConfig {
             autostart_enabled: autostart::WIZARD_DEFAULT_AUTOSTART_ENABLED,
             start_minimized: autostart::WIZARD_DEFAULT_START_MINIMIZED,
 
+            risky_mode_armed: false,
+            risky_mode_ruin_ceiling_acknowledged: None,
             autonomous_mode_enabled: autonomy_risk::WIZARD_DEFAULT_AUTONOMOUS_MODE_ENABLED,
             equity_stop_pct: autonomy_risk::WIZARD_DEFAULT_EQUITY_STOP_PCT,
             capital_at_risk_disclosure: None,

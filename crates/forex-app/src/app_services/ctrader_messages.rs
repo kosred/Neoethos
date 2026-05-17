@@ -1,3 +1,11 @@
+// Phase C3 audit: ctrader_messages.rs is the proto wire-format
+// surface — every `ProtoOA*` variant exists because Spotware's spec
+// requires it. Some variants (e.g. ProtoOAGetCtidProfileByTokenReq,
+// the bonus-deposit-withdraw lifecycle, the dealOffsetList request)
+// don't have a v0.4.5 caller but are needed in v0.5 when the wizard
+// and history paths consume them. Local allow only.
+#![allow(dead_code)]
+
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

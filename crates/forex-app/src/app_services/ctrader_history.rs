@@ -1,3 +1,13 @@
+// Phase C3 audit (audit gap clarification #3): this module is part
+// of the v0.4.5 audit scaffolding — the proto result parsers and
+// `fetch_*` entry points exposed below are the API surface the D2
+// wizard apply writer and the multi-symbol training pipeline will
+// consume in v0.5. They are intentionally pub-but-uncalled in v0.4.5
+// to keep the linker boundary stable while the consumers land. The
+// allow is FILE-LOCAL (`#![allow(dead_code)]`), NOT a workspace lint
+// override — every other file's dead-code detection stays sharp.
+#![allow(dead_code)]
+
 //! High-level cTrader Open API history helpers.
 //!
 //! Wires the trade-history and historical-data capabilities the user

@@ -20,8 +20,13 @@
 //!     1. Sets the `halted` flag (T-Manual rejects subsequent orders).
 //!     2. Iterates open positions and calls the existing close path.
 //!     3. Iterates pending orders and calls the existing cancel path.
-//!     4. (TODO) calls `risky_mode_manager.trip_manual_halt()` once
-//!        the Risky Mode agent ships.
+//!     4. Calls `risky_mode_manager.trip_manual_halt()` when Risky
+//!        Mode is active (research §5.5 — the sticky kill-switch
+//!        tier `KillSwitchTier::Manual` is set so a later
+//!        `execute_ctrader_order` cannot slip past Risky Mode even
+//!        if the operator clears `halt_state.halted` without
+//!        re-enabling the Risky Mode side). Covered by
+//!        `trading_tests::halt_button_also_trips_risky_mode_kill_switch`.
 //!     5. Emits `tracing::error!(target: "forex_app::halt", ...)`.
 //!     6. Writes a sentinel file under `<data-dir>/HALTED_<ts>.flag`.
 //! - After the trip, a persistent banner appears: "TRADING HALTED —

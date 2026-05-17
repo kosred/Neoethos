@@ -1,3 +1,12 @@
+// Phase C3 audit: `theme.rs` is a design-system constants module by
+// definition — `pub const FONT_*` / `pub const RADIUS_*` /
+// `pub const STATUS_*` are an API surface for any future UI module,
+// so most tokens won't have a call site at any given snapshot. A
+// missing token is a real bug (renderers will fail), an unused one
+// is healthy headroom. Apply the local allow to preserve that
+// invariant; do NOT promote to a workspace lint.
+#![allow(dead_code)]
+
 //! Forex-AI design system.
 //!
 //! Anchored to the conventions every working trader recognises:

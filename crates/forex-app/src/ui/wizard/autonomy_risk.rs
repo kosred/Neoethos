@@ -1,3 +1,11 @@
+// Phase C3 audit: this is the Step 9.5 scaffold. The renderer is
+// wired; the quiz/hash helpers (compute_quiz_answer_hash,
+// record_acknowledgement, WIZARD_DEFAULT_QUIZ_QUESTIONS) are pub
+// surface that the Apply writer (D2 polish) calls when the operator
+// finishes the step. The C2 patch added the Risky-Mode arm toggle
+// on top of this scaffold. Local allow only.
+#![allow(dead_code)]
+
 //! Step 9.5 — Autonomy & Risk Acknowledgement.
 //!
 //! NEW STEP per `wizard_onboarding_competitive_analysis.md` §9.2.
@@ -213,6 +221,97 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
         &mut controller.config.autonomous_mode_enabled,
         "Enable Autonomous Mode (discover → train → paper-trade → live with kill switches).",
     );
+
+    ui.separator();
+
+    // Card 4.5 — Risky Mode arming (research §4 + §7.1 sign-off).
+    // The mode is OFF by default; enabling it requires the operator
+    // to acknowledge the §7.1 ruin-probability ceiling. The Step 10
+    // Apply writer reads `risky_mode_armed` + `..._ruin_ceiling_*`
+    // and calls `session.enable_risky_mode(RiskyModeConfig::default(),
+    // starting_bankroll)` iff both are set. Closes audit gap
+    // clarification #2.
+    ui.label(
+        egui::RichText::new("⚡ Risky Mode (research §4 — high-risk compounding)")
+            .strong()
+            .color(theme::DANGER),
+    );
+    ui.label(
+        egui::RichText::new(
+            "Aggressive logarithmic Kelly-tapered sizing from a small \
+             starting bankroll ($20 default) towards a large target \
+             ($50,000 default). Per-stage kill switches enforce daily / \
+             weekly DD caps; the operator's $20 → $50,000 framing has \
+             a research-derived initial-stage ruin probability up to 50%. \
+             Statistics: ~75-90% of retail FX attempts at this profile \
+             lose the starting bankroll within the first month.",
+        )
+        .color(theme::TEXT_MUTED)
+        .size(theme::FONT_CAPTION),
+    );
+
+    // Acknowledgement checkbox — the operator must affirmatively
+    // tick the ruin-probability acknowledgement BEFORE the arm
+    // toggle becomes usable. This is the §7.1 informed-consent gate.
+    let mut ack_now = controller
+        .config
+        .risky_mode_ruin_ceiling_acknowledged
+        .is_some();
+    let ack_before = ack_now;
+    ui.checkbox(
+        &mut ack_now,
+        format!(
+            "I acknowledge the initial-stage ruin probability ceiling is up to {:.0}% \
+             (research §6.4 / §10.1 — operator decision §7.1).",
+            forex_core::MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY * 100.0
+        ),
+    );
+    if ack_now != ack_before {
+        controller.config.risky_mode_ruin_ceiling_acknowledged = if ack_now {
+            Some(forex_core::MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY)
+        } else {
+            None
+        };
+        // If the operator un-ticks the acknowledgement, the arm
+        // flag must also clear — they can never end up "armed
+        // without acknowledgement".
+        if !ack_now {
+            controller.config.risky_mode_armed = false;
+        }
+    }
+
+    // Arm toggle — disabled until acknowledgement is recorded.
+    let can_arm = controller
+        .config
+        .risky_mode_ruin_ceiling_acknowledged
+        .is_some();
+    ui.add_enabled_ui(can_arm, |ui| {
+        ui.checkbox(
+            &mut controller.config.risky_mode_armed,
+            "Arm Risky Mode at Apply. The Apply writer will call \
+             session.enable_risky_mode(RiskyModeConfig::default(), …).",
+        );
+    });
+    if !can_arm {
+        ui.label(
+            egui::RichText::new(
+                "  ↳ Tick the acknowledgement above first to enable the arm toggle.",
+            )
+            .color(theme::WARNING)
+            .size(theme::FONT_CAPTION),
+        );
+    }
+    if controller.config.risky_mode_armed {
+        ui.label(
+            egui::RichText::new(
+                "  ⚠ Risky Mode is armed. The full kill-switch hierarchy \
+                 (T-Manual / T-PerTrade / T-PerDay / T-PerStage / T-PerMonth / \
+                 T-Hardware / T-PreSendSanity) will be active after Apply.",
+            )
+            .color(theme::DANGER)
+            .size(theme::FONT_CAPTION),
+        );
+    }
     if controller.config.autonomous_mode_enabled {
         ui.horizontal(|ui| {
             ui.label("Equity stop:");

@@ -26,7 +26,8 @@ pub use contracts::{
 };
 pub use domain::PropFirmConstraints;
 pub use domain::{
-    KillSwitchTier, RiskyModeConfig, RiskyModeManager, RiskyStage, build_logarithmic_stages,
+    DEFAULT_RISKY_TRADES_PER_DAY, KillSwitchTier, MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY,
+    RiskyModeConfig, RiskyModeManager, RiskyStage, build_logarithmic_stages,
 };
 pub use system::{
     AcceleratorBackend, AcceleratorDevice, CpuBudget, GpuBudget, HardwareExecutionPlan,

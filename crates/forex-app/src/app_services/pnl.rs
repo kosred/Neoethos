@@ -1,3 +1,11 @@
+// Phase C3 audit: server-side UnrealizedPnL scaffold. The 3 #[ignore]
+// tests are real-data gates blocked on §5.2.4 fixture capture; the
+// pub fns (`fetch_position_unrealized_pnl`, `replace_local_with_broker`,
+// `is_broker_authoritative`) are consumed by the risk_gate circuit
+// breaker (orders.rs:340-368) but a couple of helper types aren't
+// yet called outside this file. Local allow only.
+#![allow(dead_code)]
+
 //! Broker-side unrealized PnL: audit + authoritative paths.
 //!
 //! Wires the `ProtoOAGetPositionUnrealizedPnLReq` / `…Res` pair that
