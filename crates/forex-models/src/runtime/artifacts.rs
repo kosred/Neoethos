@@ -80,14 +80,36 @@ impl TrainingSummaryMetadata {
     }
 }
 
+/// Current schema version of every per-expert artifact metadata
+/// JSON written by `crate::tree_models::*::save` /
+/// `crate::deep_models::*::save` / etc. Per D4 versioning policy:
+/// bump only on serialised-field BREAKING changes.
+///
+/// v1 (current): the pre-versioning shape. New optional fields
+/// stay backward-compatible via `#[serde(default)]`.
+pub const RUNTIME_ARTIFACT_METADATA_SCHEMA_VERSION:
+    forex_core::SchemaVersion = forex_core::SchemaVersion::new(1);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeArtifactMetadata {
+    /// On-disk schema version. Defaults to v1 (the pre-versioning
+    /// shape) for artifacts written by older builds, so existing
+    /// trained models load without breaking.
+    #[serde(default = "forex_core::default_v1")]
+    pub schema_version: forex_core::SchemaVersion,
     pub model_name: String,
     pub family: ModelFamily,
     pub state: CapabilityState,
     pub feature_columns: Vec<String>,
     pub label_mapping: Vec<LabelMapping>,
     pub training_summary: TrainingSummaryMetadata,
+}
+
+impl forex_core::HasSchemaVersion for RuntimeArtifactMetadata {
+    const CURRENT: forex_core::SchemaVersion = RUNTIME_ARTIFACT_METADATA_SCHEMA_VERSION;
+    fn schema_version(&self) -> forex_core::SchemaVersion {
+        self.schema_version
+    }
 }
 
 impl RuntimeArtifactMetadata {
@@ -113,6 +135,7 @@ impl RuntimeArtifactMetadata {
             "runtime artifact metadata requires a non-empty label mapping"
         );
         Self {
+            schema_version: RUNTIME_ARTIFACT_METADATA_SCHEMA_VERSION,
             model_name,
             family,
             state,

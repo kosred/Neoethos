@@ -908,6 +908,7 @@ mod tests {
     #[test]
     fn validate_runtime_metadata_rejects_zero_train_rows() {
         let metadata = RuntimeArtifactMetadata {
+            schema_version: crate::runtime::artifacts::RUNTIME_ARTIFACT_METADATA_SCHEMA_VERSION,
             model_name: "bayes_logit".to_string(),
             family: ModelFamily::Meta,
             state: CapabilityState::Implemented,

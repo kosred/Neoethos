@@ -2041,6 +2041,7 @@ mod tests {
     #[test]
     fn validate_adaptive_metadata_rejects_inconsistent_training_summary() {
         let metadata = RuntimeArtifactMetadata {
+            schema_version: crate::runtime::artifacts::RUNTIME_ARTIFACT_METADATA_SCHEMA_VERSION,
             model_name: AdaptiveModelKind::PassiveAggressive
                 .model_name()
                 .to_string(),

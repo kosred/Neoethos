@@ -115,12 +115,37 @@ impl SymbolMetadata {
 }
 
 /// Disk-backed table. Loaded once per process; subsequent lookups are
+/// Current schema version of `symbol_metadata.json`. Per D4
+/// versioning policy.
+pub const SYMBOL_METADATA_SCHEMA_VERSION: crate::schema_version::SchemaVersion =
+    crate::schema_version::SchemaVersion::new(1);
+
 /// in-memory. Reload with `reload()` after the cTrader connector
 /// writes new entries.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolMetadataTable {
+    /// On-disk schema version. Defaults to v1 (the pre-versioning
+    /// shape) for files written by older builds.
+    #[serde(default = "crate::schema_version::default_v1")]
+    pub schema_version: crate::schema_version::SchemaVersion,
     /// Map keyed by canonical (uppercase, no-separator) symbol.
     pub entries: HashMap<String, SymbolMetadata>,
+}
+
+impl Default for SymbolMetadataTable {
+    fn default() -> Self {
+        Self {
+            schema_version: SYMBOL_METADATA_SCHEMA_VERSION,
+            entries: HashMap::new(),
+        }
+    }
+}
+
+impl crate::schema_version::HasSchemaVersion for SymbolMetadataTable {
+    const CURRENT: crate::schema_version::SchemaVersion = SYMBOL_METADATA_SCHEMA_VERSION;
+    fn schema_version(&self) -> crate::schema_version::SchemaVersion {
+        self.schema_version
+    }
 }
 
 impl SymbolMetadataTable {
@@ -130,6 +155,12 @@ impl SymbolMetadataTable {
             .with_context(|| format!("read symbol metadata at {}", path.display()))?;
         let table: SymbolMetadataTable = serde_json::from_str(&text)
             .with_context(|| format!("parse symbol metadata at {}", path.display()))?;
+        // Reject too-new schema versions loud — caller falls back
+        // to defaults (per the D4 contract).
+        crate::schema_version::ensure_schema_version_readable(
+            &table,
+            "symbol_metadata.json",
+        )?;
         Ok(table)
     }
 
@@ -138,7 +169,13 @@ impl SymbolMetadataTable {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).ok();
         }
-        let text = serde_json::to_string_pretty(self)
+        // Stamp current schema version on every save — defends
+        // against in-memory construction paths that forgot to set
+        // it. Cloning is cheap since `entries` is references-by-value
+        // and the version field is a u32 newtype.
+        let mut to_write = self.clone();
+        to_write.schema_version = SYMBOL_METADATA_SCHEMA_VERSION;
+        let text = serde_json::to_string_pretty(&to_write)
             .context("serialize symbol metadata")?;
         std::fs::write(path, text)
             .with_context(|| format!("write symbol metadata to {}", path.display()))
