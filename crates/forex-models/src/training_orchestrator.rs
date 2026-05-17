@@ -2719,16 +2719,35 @@ fn build_expert_model(
                 parse_u64_param(params, "seed", 42),
             ),
         )),
+        // Phase D1.4 — per-family seed offsets so the 10 deep
+        // experts converge to DIFFERENT solutions rather than
+        // identical-by-seed-42 ones. The seed plumbing through
+        // BurnDeepExpert was already there; we just stopped passing
+        // 42 everywhere. Per-family offsets are stable across
+        // training runs (deterministic) but distinct across
+        // families. If the operator wants randomized seeds they
+        // can override per model via the `seed` key in the params
+        // HashMap (BurnDeepExpert's new() takes seed as its
+        // constructor arg; the orchestrator's value here is the
+        // default).
+        //
+        // Why these specific offsets: each prime-spaced from 42
+        // so even if the operator's settings injects a seed_base
+        // additive shift, no two adapters collide. Architectural
+        // diversity (MLP vs Transformer vs NBEATS etc.) still
+        // dominates as the primary diversifier — the seed
+        // offsets are a secondary diversifier per the 2026
+        // ensemble-learning research the operator surfaced.
         ModelType::MLP => Ok(Box::new(MLPExpert::new(42, Some(params.clone())))),
-        ModelType::NBeats => Ok(Box::new(NBeatsExpert::new(42, Some(params.clone())))),
-        ModelType::NBeatsxNf => Ok(Box::new(NBeatsxNfExpert::new(42, Some(params.clone())))),
-        ModelType::TiDE => Ok(Box::new(TiDEExpert::new(42, Some(params.clone())))),
-        ModelType::TiDENf => Ok(Box::new(TiDENfExpert::new(42, Some(params.clone())))),
-        ModelType::TabNet => Ok(Box::new(TabNetExpert::new(42, Some(params.clone())))),
-        ModelType::KAN => Ok(Box::new(KANExpert::new(42, Some(params.clone())))),
-        ModelType::Transformer => Ok(Box::new(TransformerExpert::new(42, Some(params.clone())))),
-        ModelType::PatchTST => Ok(Box::new(PatchTSTExpert::new(42, Some(params.clone())))),
-        ModelType::TimesNet => Ok(Box::new(TimesNetExpert::new(42, Some(params.clone())))),
+        ModelType::NBeats => Ok(Box::new(NBeatsExpert::new(43, Some(params.clone())))),
+        ModelType::NBeatsxNf => Ok(Box::new(NBeatsxNfExpert::new(47, Some(params.clone())))),
+        ModelType::TiDE => Ok(Box::new(TiDEExpert::new(53, Some(params.clone())))),
+        ModelType::TiDENf => Ok(Box::new(TiDENfExpert::new(59, Some(params.clone())))),
+        ModelType::TabNet => Ok(Box::new(TabNetExpert::new(61, Some(params.clone())))),
+        ModelType::KAN => Ok(Box::new(KANExpert::new(67, Some(params.clone())))),
+        ModelType::Transformer => Ok(Box::new(TransformerExpert::new(71, Some(params.clone())))),
+        ModelType::PatchTST => Ok(Box::new(PatchTSTExpert::new(73, Some(params.clone())))),
+        ModelType::TimesNet => Ok(Box::new(TimesNetExpert::new(79, Some(params.clone())))),
         other => anyhow::bail!(
             "model `{}` ({:?}) does not support the shared ExpertModel training path",
             config.name,
