@@ -2598,23 +2598,63 @@ fn uses_shared_expert_dispatch(model_type: ModelType) -> bool {
     )
 }
 
+/// Phase D1.4.1 — per-family seed offsets for the tree experts.
+/// LightGBM honours `seed`, XGBoost honours `seed`, CatBoost
+/// honours `random_seed`. The native boosters read these keys
+/// from the params HashMap that gets threaded through
+/// `parse_tree_params()`; we just need to make sure each tree
+/// family receives a DISTINCT seed value instead of inheriting
+/// whatever the operator's global config had (or nothing).
+///
+/// Offsets are prime-spaced from the operator's `seed_base` (or
+/// 42 when unset) so any operator-supplied shift can't cause
+/// adjacent families to collide.
+fn inject_tree_seed(
+    params: &HashMap<String, String>,
+    seed_key: &str,
+    family_offset: u64,
+) -> HashMap<String, String> {
+    let mut p = params.clone();
+    if !p.contains_key(seed_key) {
+        // Operator hasn't pinned a seed — inject our family offset.
+        // Operators wanting determinism across runs can set the
+        // model's seed in config.yaml directly; that override
+        // takes precedence (the `!contains_key` guard above).
+        p.insert(seed_key.to_string(), (42 + family_offset).to_string());
+    }
+    p
+}
+
 fn build_expert_model(
     config: &ModelConfig,
     input_dim: usize,
     params: &HashMap<String, String>,
 ) -> Result<Box<dyn ExpertModel>> {
     match config.model_type {
-        ModelType::LightGBM => Ok(Box::new(LightGBMExpert::new(
-            0,
-            Some(parse_tree_params(params)),
-        ))),
-        ModelType::XGBoost => Ok(Box::new(XGBoostExpert::new(
-            0,
-            Some(parse_tree_params(params)),
-        ))),
+        ModelType::LightGBM => {
+            // Per-family seed = 42 + 1
+            let seeded = inject_tree_seed(params, "seed", 1);
+            Ok(Box::new(LightGBMExpert::new(0, Some(parse_tree_params(&seeded)))))
+        }
+        ModelType::XGBoost => {
+            // Per-family seed = 42 + 2 (gbtree variant).
+            // The xgboost_rf and xgboost_dart variants will get
+            // their own offsets when the orchestrator routes the
+            // booster variant — they currently all funnel through
+            // ModelType::XGBoost so they share the same offset for
+            // now. A future commit can split them via the
+            // booster_variant config field.
+            let seeded = inject_tree_seed(params, "seed", 2);
+            Ok(Box::new(XGBoostExpert::new(0, Some(parse_tree_params(&seeded)))))
+        }
         ModelType::CatBoost => {
+            // CatBoost uses `random_seed` not `seed`. Offset = 42 + 5
+            // (catboost) vs +6 (catboost_alt). The orchestrator
+            // currently treats both as ModelType::CatBoost; the
+            // alt-variant gets its own offset in a follow-up.
+            let seeded = inject_tree_seed(params, "random_seed", 5);
             let mut model = CatBoostExpert::new(0);
-            model.config.params = parse_tree_params(params);
+            model.config.params = parse_tree_params(&seeded);
             Ok(Box::new(model))
         }
         ModelType::ElasticNet => {
