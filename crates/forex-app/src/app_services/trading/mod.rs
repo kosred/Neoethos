@@ -78,6 +78,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 pub(super) use tracing::error;
 
+pub mod auto_trade;
 mod client_order;
 mod diagnostics;
 mod market_data;
