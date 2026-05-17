@@ -232,11 +232,16 @@ impl TradingSession {
             confidence: Some(signal.confidence),
         });
 
-        // Gates 1-7 all passed. Hand off to the broker fill path,
-        // which runs gate 8 (prop-firm check, PnL circuit breaker,
-        // size validation) and either fills or rejects with a
+        // Gates 1-7 all passed. Hand off to the broker fill path
+        // with `OrderSource::Ai` so the autonomous-only contract
+        // gate (research §7.1) sees the AI provenance and allows
+        // the order through. Manual UI clicks pass `OrderSource::
+        // Manual` instead and are REJECTED at that gate when
+        // Risky Mode is armed. The broker fill path still runs
+        // gate 8 (prop-firm check, PnL circuit breaker, size
+        // validation) and either fills or rejects with a
         // structured app_event the operator can audit.
-        self.execute_ctrader_order(state, side);
+        self.execute_ctrader_order(state, side, super::OrderSource::Ai);
         GateDecision::Dispatched
     }
 }
@@ -370,5 +375,84 @@ mod tests {
         let decision =
             session.dispatch_auto_trade_signal(&mut state, sample_signal(AutoTradeSide::Buy, 0.9));
         assert_eq!(decision, GateDecision::Halted);
+    }
+
+    /// Build the test-harness default Risky Mode config with the
+    /// autonomous-only contract explicitly accepted (the gate at
+    /// `RiskyModeManager::new` rejects construction without it).
+    fn signed_risky_mode_config() -> forex_core::RiskyModeConfig {
+        let mut cfg = forex_core::RiskyModeConfig::default();
+        cfg.autonomous_only_contract_accepted = true;
+        cfg
+    }
+
+    #[test]
+    fn ai_signal_passes_autonomous_only_gate_when_risky_mode_armed() {
+        // The autonomous-only gate (operator directive §7.1) rejects
+        // OrderSource::Manual but PASSES OrderSource::Ai when Risky
+        // Mode is armed. Pin that property by arming Risky Mode and
+        // dispatching an AI signal that clears every other gate —
+        // the call must reach `execute_ctrader_order` (Dispatched)
+        // rather than short-circuiting on the autonomous-only check.
+        let mut state = test_state();
+        state.auto_trade_enabled = true;
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        session
+            .enable_risky_mode(signed_risky_mode_config(), 100.0)
+            .expect("enable_risky_mode");
+        assert!(
+            session
+                .risky_mode_manager()
+                .expect("manager")
+                .rejects_manual_orders(),
+            "signed config must reject manual orders"
+        );
+
+        let decision = session
+            .dispatch_auto_trade_signal(&mut state, sample_signal(AutoTradeSide::Buy, 0.9));
+
+        // `Dispatched` proves the autonomous-only gate did NOT
+        // short-circuit the AI path. The downstream broker fill
+        // path may still surface status_msg errors (no broker is
+        // wired in tests) but that is independent of the gate.
+        assert_eq!(
+            decision,
+            GateDecision::Dispatched,
+            "AI signal must pass through the autonomous-only gate"
+        );
+    }
+
+    #[test]
+    fn ai_signal_still_blocked_when_risky_mode_kill_switch_tripped() {
+        // The autonomous-only gate is ONE of the seven kill-switch
+        // tiers. The other six (manual-halt, hardware, per-trade,
+        // per-day, per-stage, per-month, pre-send-sanity) still
+        // apply to AI orders. Trip the manual-halt tier on the
+        // Risky Mode manager and confirm the dispatcher catches it
+        // at gate 7 (RiskyModeKillSwitch) — the AI provenance does
+        // NOT bypass the other tiers.
+        let mut state = test_state();
+        state.auto_trade_enabled = true;
+        let mut session =
+            TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+        session
+            .enable_risky_mode(signed_risky_mode_config(), 100.0)
+            .expect("enable_risky_mode");
+        // Trip the sticky manual-halt tier on the Risky Mode manager
+        // directly so the dispatcher's pre-check (gate 7) catches it.
+        session
+            .risky_mode_manager_mut()
+            .expect("manager")
+            .trip_manual_halt();
+
+        let decision = session
+            .dispatch_auto_trade_signal(&mut state, sample_signal(AutoTradeSide::Buy, 0.9));
+
+        assert_eq!(
+            decision,
+            GateDecision::RiskyModeKillSwitch,
+            "AI signal must STILL be rejected when a non-autonomous-only Risky Mode tier trips"
+        );
     }
 }

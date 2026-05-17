@@ -58,11 +58,11 @@ use std::time::Instant;
 
 impl TradingSession {
     pub fn execute_buy_market(&mut self, state: &mut AppState) {
-        self.execute_ctrader_order(state, CTraderTradeSide::Buy);
+        self.execute_ctrader_order(state, CTraderTradeSide::Buy, super::OrderSource::Manual);
     }
 
     pub fn execute_sell_market(&mut self, state: &mut AppState) {
-        self.execute_ctrader_order(state, CTraderTradeSide::Sell);
+        self.execute_ctrader_order(state, CTraderTradeSide::Sell, super::OrderSource::Manual);
     }
 
     pub fn cancel_selected_order(&mut self, state: &mut AppState) {
@@ -277,6 +277,7 @@ impl TradingSession {
         &mut self,
         state: &mut AppState,
         side: CTraderTradeSide,
+        source: super::OrderSource,
     ) {
         // T-Manual HALT (kill-switch §10.4 / Tier T4) sits ABOVE the
         // per-trade and per-day gates. Reject every new order while
@@ -290,6 +291,38 @@ impl TradingSession {
             state.status_msg = message.clone();
             self.append_trade_journal(message.clone());
             record_app_event("trading_halt", "ORDER_BLOCKED", message);
+            return;
+        }
+        // Autonomous-only contract gate (research §7.1 / operator
+        // directive 2026-05-17). When Risky Mode is armed AND the
+        // operator signed `autonomous_only_contract_accepted` in the
+        // wizard, the manager OWNS every order — manual BUY/SELL
+        // clicks are rejected at the source. AI signals from the
+        // auto-trade dispatcher are allowed through this gate and
+        // proceed to the rest of the Risky Mode tier hierarchy.
+        // This sits ABOVE `check_trade_allowed` so the rejection
+        // doesn't depend on having already built the order request
+        // (which would itself burn cycles + might bubble up real
+        // errors that confuse the journal).
+        if matches!(source, super::OrderSource::Manual)
+            && let Some(rm) = self.risky_mode_manager()
+            && rm.rejects_manual_orders()
+        {
+            let tier = forex_core::KillSwitchTier::ManualOrderWhileAutonomousOnly;
+            let message = format!(
+                "Risky Mode kill switch tripped ({tier:?}): manual BUY/SELL is forbidden \
+                 while the autonomous-only contract is armed (research §7.1). \
+                 Disarm Risky Mode in the Autonomy wizard step or wait for the AI \
+                 auto-trade dispatcher."
+            );
+            tracing::warn!(
+                target: "forex_app::risky_mode",
+                tier = ?tier,
+                "Risky Mode rejected manual order via autonomous-only contract"
+            );
+            state.status_msg = message.clone();
+            self.append_trade_journal(message.clone());
+            record_app_event("risky_mode_gate", "MANUAL_BLOCKED", message);
             return;
         }
         match self.build_ctrader_order_request(state, side) {

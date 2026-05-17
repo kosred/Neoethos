@@ -242,6 +242,31 @@ pub enum BotDecisionSource {
     Ai,
 }
 
+/// Identifies which call site is asking `execute_ctrader_order` to
+/// send a new order. The Risky Mode autonomous-only contract
+/// (research §7.1 / [`forex_core::RiskyModeConfig::autonomous_only_contract_accepted`])
+/// rejects every [`Self::Manual`] order when armed; AI signals from
+/// the auto-trade dispatcher carry [`Self::Ai`] and bypass that
+/// gate. Both still go through the rest of the Risky Mode tier
+/// hierarchy + the prop-firm gate.
+///
+/// This is the v0.4.5 finish on the §7.1 autonomous-only invariant:
+/// the operator's wizard acknowledgement isn't merely a config flag
+/// — it actively blocks manual BUY/SELL while Risky Mode is armed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderSource {
+    /// UI button click (`execute_buy_market` / `execute_sell_market`)
+    /// or any human-driven order entry. Rejected by Risky Mode when
+    /// [`forex_core::RiskyModeManager::rejects_manual_orders`] is
+    /// true (autonomous-only contract signed).
+    Manual,
+    /// AI auto-trade dispatcher emit. Passes the manual-order
+    /// rejection gate; still subject to every other Risky Mode tier
+    /// (per-trade, per-day, per-stage, per-month, manual-halt,
+    /// hardware-halt, pre-send sanity) and the prop-firm gate.
+    Ai,
+}
+
 /// Hard cap on the decision ring buffer. 512 entries × ~120 bytes ≈
 /// 60 KB — negligible memory, but enough to keep weeks of decisions
 /// in scope at typical fill rates. Older entries get dropped FIFO.

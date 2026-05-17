@@ -1802,6 +1802,83 @@ fn closed_trade_advances_risky_mode_bankroll() {
     assert!(session.risky_mode_state().is_none());
 }
 
+#[test]
+fn manual_buy_blocked_when_autonomous_only_contract_armed() {
+    // Operator signed the §7.1 autonomous-only contract via the
+    // wizard's AutonomyRisk step → `rejects_manual_orders()` is
+    // true → `execute_ctrader_order(... Manual)` must short-circuit
+    // before building the order request. We observe the rejection
+    // via the journal message + status_msg + the
+    // `risky_mode_gate=MANUAL_BLOCKED` app event.
+    let mut state = sample_state(DataSource::CTrader, "(test setup)");
+    let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+    session
+        .enable_risky_mode(signed_risky_mode_config(), 100.0)
+        .expect("enable_risky_mode");
+    assert!(
+        session
+            .risky_mode_manager()
+            .expect("manager")
+            .rejects_manual_orders(),
+        "signed config must reject manual orders"
+    );
+
+    // Trip the manual-order gate. `execute_buy_market` is the UI
+    // entry point that wraps `execute_ctrader_order(..., Manual)`.
+    session.execute_buy_market(&mut state);
+
+    assert!(
+        state.status_msg.contains("ManualOrderWhileAutonomousOnly"),
+        "expected ManualOrderWhileAutonomousOnly tier in status_msg, got: {}",
+        state.status_msg
+    );
+    assert!(
+        state.status_msg.contains("autonomous-only contract"),
+        "expected operator-facing autonomous-only language, got: {}",
+        state.status_msg
+    );
+}
+
+#[test]
+fn manual_sell_blocked_when_autonomous_only_contract_armed() {
+    // Same property as the buy-side test but for SELL. The gate is
+    // side-agnostic — both sides route through `execute_ctrader_order`
+    // with `OrderSource::Manual`.
+    let mut state = sample_state(DataSource::CTrader, "(test setup)");
+    let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+    session
+        .enable_risky_mode(signed_risky_mode_config(), 100.0)
+        .expect("enable_risky_mode");
+
+    session.execute_sell_market(&mut state);
+
+    assert!(
+        state.status_msg.contains("ManualOrderWhileAutonomousOnly"),
+        "expected ManualOrderWhileAutonomousOnly tier in status_msg, got: {}",
+        state.status_msg
+    );
+}
+
+#[test]
+fn manual_buy_not_blocked_when_risky_mode_disarmed() {
+    // If Risky Mode is NOT armed (no manager), the autonomous-only
+    // gate must not fire — `execute_buy_market` proceeds past the
+    // gate. We don't try to assert a fill (no broker is wired up
+    // for tests) — we just assert that the status_msg does NOT
+    // contain the autonomous-only rejection string.
+    let mut state = sample_state(DataSource::CTrader, "(test setup)");
+    let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
+    assert!(!session.risky_mode_active(), "fresh session must be disarmed");
+
+    session.execute_buy_market(&mut state);
+
+    assert!(
+        !state.status_msg.contains("ManualOrderWhileAutonomousOnly"),
+        "no autonomous-only gate should fire when Risky Mode is disarmed; status_msg: {}",
+        state.status_msg
+    );
+}
+
 // ── Bot decision overlays (audit gap #11) ─────────────────────────────
 
 #[test]
