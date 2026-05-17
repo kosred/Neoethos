@@ -475,15 +475,27 @@ fn start_download(runtime: &mut HistoricalRuntime, controller: &mut WizardContro
         return;
     };
     let account_id = account_id_u64.to_string();
-    let Some(client_id) = controller.config.ctrader_client_id.clone() else {
-        runtime.last_error =
-            Some("No cTrader Client ID configured — finish Step 4 first".to_string());
+    // 2026-05-17 operator-directive correction: the cTrader app
+    // credentials are the developer's, not the user's — they live
+    // in the embedded constants and are surfaced via
+    // `oauth::expose_client_id` / `oauth::expose_client_secret`. If
+    // either is missing, the binary was built without them and
+    // history download cannot proceed.
+    let Some(client_id) = oauth::expose_client_id() else {
+        runtime.last_error = Some(
+            "cTrader app client_id missing from the binary's embedded credentials — \
+             rebuild with FOREX_AI_EMBED_CTRADER_CLIENT_ID set"
+                .to_string(),
+        );
         runtime.running = false;
         return;
     };
     let Some(client_secret) = oauth::expose_client_secret() else {
-        runtime.last_error =
-            Some("Client Secret missing — finish Step 4 sign-in first".to_string());
+        runtime.last_error = Some(
+            "cTrader app client_secret missing from the binary's embedded credentials — \
+             rebuild with FOREX_AI_EMBED_CTRADER_CLIENT_SECRET set"
+                .to_string(),
+        );
         runtime.running = false;
         return;
     };

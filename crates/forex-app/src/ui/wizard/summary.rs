@@ -45,6 +45,12 @@ use forex_core::PropFirmConstraints;
 use forex_core::Settings;
 use forex_core::storage::json::write_json_atomic;
 use forex_core::system::{HardwareProbe, HardwareProfile};
+// The writer no longer touches the cTrader client_secret directly —
+// the binary's embedded constant is the source of truth, populated
+// at runtime by `broker_persistence::apply_embedded_fallback`. The
+// `secrecy` import is retained for the news API key holder + future
+// non-cTrader broker credentials when D3 lands.
+#[allow(unused_imports)]
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
@@ -311,30 +317,32 @@ pub fn wizard_config_to_settings(data_path: &Path, controller: &WizardController
 
 /// Action 2 — write `<data-path>/broker_credentials.toml`.
 ///
-/// The wizard's `WizardConfig.ctrader_client_secret_set` is a bare
-/// boolean — the renderer never stores the plaintext secret on the
-/// controller (spec §11 #4 — "no half-written secrets"). The actual
-/// secret bytes live in the same OAuth runtime that populates
-/// `WizardConfig.ctrader_client_id`; the OAuth/history Phase 2C
-/// agent fills them in. Until then this writer persists the
-/// non-secret fields (client_id, redirect_uri, environment, account
-/// list) and leaves `client_secret` empty so the existing four-level
-/// resolver in `broker_persistence::load_broker_settings` can fall
-/// back to the embedded constant.
-///
-/// IMPORTANT: we deliberately move client_secret through a
-/// [`SecretString`] so a future inadvertent `Debug` print does not
-/// leak its bytes. Spec §11 #4.
+/// 2026-05-17 operator-directive correction: the wizard no longer
+/// asks the user for cTrader app `client_id` / `client_secret` —
+/// those are *developer* credentials, baked into the binary at build
+/// time (see `crates/forex-app/build.rs::emit_embedded_credentials`).
+/// This writer therefore persists only the **non-app-credential**
+/// fields the operator actually chose: environment (Demo/Live) and
+/// the picked account list. The `client_id` / `client_secret` /
+/// `redirect_uri` fields on `CTraderBrokerSettings` are deliberately
+/// written as empty strings so the four-level resolver in
+/// `broker_persistence::load_broker_settings` falls through to the
+/// embedded constants at runtime.
 pub fn write_broker_credentials(controller: &WizardController) -> Result<()> {
     let cfg = &controller.config;
     let env = match cfg.ctrader_environment {
         WizCTraderEnvironment::Live => CTraderBrokerEnvironment::Live,
         WizCTraderEnvironment::Demo => CTraderBrokerEnvironment::Demo,
     };
-    let secret = SecretString::new(String::new().into_boxed_str());
     let ctrader = CTraderBrokerSettings {
-        client_id: cfg.ctrader_client_id.clone().unwrap_or_default(),
-        client_secret: secret.expose_secret().to_string(),
+        // Empty on purpose — see the function doc. The runtime
+        // resolver will populate these from the embedded constants
+        // via `apply_embedded_fallback`. A future hand-edit of the
+        // TOML by an operator that wants to override the embedded
+        // values still works through the same resolver — that's the
+        // four-level lookup the persistence layer documents.
+        client_id: String::new(),
+        client_secret: String::new(),
         redirect_uri: String::new(),
         authorization_code_input: String::new(),
         environment: env,

@@ -90,9 +90,16 @@ pub struct WizardConfig {
     pub per_trade_max_risk_pct: f32,
     pub daily_loss_reset_timezone: String,
 
-    // Step 4.
-    pub ctrader_client_id: Option<String>,
-    pub ctrader_client_secret_set: bool,
+    // Step 4 — cTrader broker sign-in.
+    //
+    // 2026-05-17 operator directive: the legacy `ctrader_client_id`
+    // and `ctrader_client_secret_set` fields were retired. The
+    // bot's cTrader Open API app credentials are baked into the
+    // binary at build time (see crates/forex-app/build.rs::
+    // emit_embedded_credentials + crates/forex-app/src/app_services/
+    // embedded_credentials.rs), so the WizardConfig only carries
+    // the operator's *environment* and *picked accounts* now — not
+    // any app credentials.
     pub ctrader_environment: CTraderEnvironment,
     pub selected_ctid_trader_account_id: Option<u64>,
     pub additional_account_ids: Vec<u64>,
@@ -164,8 +171,6 @@ impl Default for WizardConfig {
             per_trade_max_risk_pct: account_profile::WIZARD_DEFAULT_PER_TRADE_RISK_PCT,
             daily_loss_reset_timezone: account_profile::WIZARD_DEFAULT_DLL_RESET_TZ.to_string(),
 
-            ctrader_client_id: None,
-            ctrader_client_secret_set: false,
             ctrader_environment: CTraderEnvironment::Demo,
             selected_ctid_trader_account_id: None,
             additional_account_ids: Vec::new(),

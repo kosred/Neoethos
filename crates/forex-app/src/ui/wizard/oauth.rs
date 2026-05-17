@@ -1,30 +1,52 @@
-//! Step 4 — cTrader OAuth onboarding (4.1 register → 4.4 account probe).
+//! Step 4 — cTrader broker sign-in (operator OAuth → account picker).
 //!
-//! Spec: `installer_wizard_ux_spec.md` §2 Step 4 + §9.2 mockup.
+//! Spec: `installer_wizard_ux_spec.md` §2 Step 4 + §9.2 mockup, with
+//! the **2026-05-17 operator-directive correction**:
+//!
+//! > "Το wizard installer ζητάει user για ctrader api id ενώ αυτό
+//! > είναι developer credentials" / "the wizard installer asks the
+//! > user for the cTrader API id when those are developer credentials,
+//! > not user credentials."
+//!
+//! cTrader Open API uses a *registered-application* OAuth model: the
+//! `client_id` + `client_secret` identify the **bot binary** (one app
+//! registered once on connect.spotware.com by the developer who built
+//! the binary), and the OAuth flow lets each end-user authorise that
+//! app against their own broker account. Asking the end-user to type
+//! the app credentials was a misread of the spec. This module now
+//! reads the embedded developer credentials baked into the binary at
+//! build time by `crates/forex-app/build.rs` /
+//! [`crate::app_services::embedded_credentials`] and only asks the
+//! end-user to:
+//!
+//! 1. Pick environment (Demo vs Live).
+//! 2. Click "Sign in to your broker" → OAuth.
+//! 3. Pick which `ctidTraderAccountId` to use.
 //!
 //! The actual OAuth flow is driven by
 //! [`crate::app_services::ctrader_live_auth::ProductionCTraderLiveAuthBackend`].
 //! This step is responsible for:
 //!
-//! 1. (4.1) Validating that the operator typed plausibly-shaped
-//!    `client_id` + `client_secret` values.
-//! 2. (4.2) Spawning the background thread that runs the loopback
-//!    listener, opens the system browser, captures the callback with
-//!    CSRF-state validation, and exchanges the authorization code for
-//!    a token bundle.
-//! 3. (4.3) Issuing `ProtoOAGetAccountListByAccessTokenReq` (payload
-//!    2149) against the picked environment (live vs demo from the
-//!    radio at the top of the step) and rendering the returned
+//! 1. Resolving the embedded `client_id` + `client_secret`. If the
+//!    binary was built without them (developer building from source
+//!    without setting `FOREX_AI_EMBED_CTRADER_CLIENT_ID` /
+//!    `_CLIENT_SECRET`), the step renders an explanatory diagnostic
+//!    banner with the env-var names — there's no operator-facing
+//!    text field for this.
+//! 2. Spawning the background thread that runs the loopback listener,
+//!    opens the system browser, captures the callback with CSRF-state
+//!    validation, and exchanges the authorization code for a token
+//!    bundle.
+//! 3. Issuing `ProtoOAGetAccountListByAccessTokenReq` (payload 2149)
+//!    against the picked environment and rendering the returned
 //!    accounts as a dropdown.
-//! 4. (4.4) Recording the picked `ctidTraderAccountId` on
-//!    `WizardConfig`. Spec §11 acceptance criterion 4: "OAuth tokens
-//!    are persisted only after the flow completes — no half-written
-//!    `broker_credentials.toml`." The Step 10 Apply writer is what
-//!    actually serialises the credential file; the wizard just hands
-//!    it the in-memory `SecretString`s collected here.
+//! 4. Recording the picked `ctidTraderAccountId` on `WizardConfig`.
+//!    Spec §11 acceptance criterion 4: "OAuth tokens are persisted
+//!    only after the flow completes — no half-written
+//!    `broker_credentials.toml`."
 
 use eframe::egui;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Mutex, OnceLock};
 
@@ -37,7 +59,20 @@ use crate::app_services::ctrader_live_auth::{
     CTraderLiveAuthResult, CTraderLoopbackConfig, ProductionCTraderLiveAuthBackend,
     discover_ctrader_accounts,
 };
+use crate::app_services::embedded_credentials::{
+    EMBEDDED_CTRADER_CLIENT_ID, EMBEDDED_CTRADER_CLIENT_SECRET,
+};
 use crate::ui::theme;
+
+/// Env-var name the developer sets at build time to bake the cTrader
+/// app `client_id` into the binary. Spec mirror of
+/// `crates/forex-app/build.rs::emit_embedded_credentials`. Surfaced
+/// in the developer-setup banner when the embedded constant is empty.
+pub const BUILD_ENV_CLIENT_ID: &str = "FOREX_AI_EMBED_CTRADER_CLIENT_ID";
+
+/// Env-var name the developer sets at build time to bake the cTrader
+/// app `client_secret` into the binary.
+pub const BUILD_ENV_CLIENT_SECRET: &str = "FOREX_AI_EMBED_CTRADER_CLIENT_SECRET";
 
 /// Spec §2 Step 4.2 — loopback port allocator. RFC 8252 §7.3 fallback
 /// list. Must match `CTraderLoopbackConfig` at
@@ -52,29 +87,29 @@ pub const WIZARD_DEFAULT_OAUTH_CALLBACK_TIMEOUT_SECONDS: u64 = 300;
 /// the operator's cTrader Open API app (spec §2 Step 4.1 mockup).
 pub const WIZARD_DEFAULT_OAUTH_CALLBACK_PATH: &str = "/ctrader/callback";
 
-/// Minimum plausible client_id length. cTrader app credentials are
-/// numeric IDs typically ≥ 5 digits — see the help-centre example
-/// `client_id=5430012` in `ctrader_api_full_reference.md` §2.3. Any
-/// shorter value would surface as broker error 101 / 107 at exchange
-/// time; we reject up-front for a cleaner UX.
-pub const WIZARD_DEFAULT_OAUTH_CLIENT_ID_MIN_LEN: usize = 4;
-
-/// Minimum plausible client_secret length. The help-centre example
-/// is `012sds23dlkjQsd` (15 chars). 8 is a safe floor that still
-/// catches an empty paste.
-pub const WIZARD_DEFAULT_OAUTH_CLIENT_SECRET_MIN_LEN: usize = 8;
+// Earlier builds exposed WIZARD_DEFAULT_OAUTH_CLIENT_ID_MIN_LEN /
+// WIZARD_DEFAULT_OAUTH_CLIENT_SECRET_MIN_LEN as validation bounds for
+// the operator-facing text fields in sub-step 4.1. Those fields were
+// retired by the 2026-05-17 directive — the embedded credentials are
+// the only source — so the constants are no longer surfaced. If a
+// future build-time sanity check needs them, re-introduce as crate-
+// local items in `build.rs` rather than this module.
 
 /// Sub-step within the OAuth screen. The wizard re-renders the same
 /// step until the user clicks "Continue" — the sub-step is internal.
+///
+/// The legacy `RegisterApp` sub-step (where the operator typed
+/// `client_id`/`client_secret`) was retired by the 2026-05-17
+/// directive; the binary now reads those values from the embedded
+/// constants and the operator only sees the OAuth handoff, account
+/// picker, and probe sub-steps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OAuthSubStep {
-    /// 4.1 Register app — credentials text fields.
-    RegisterApp,
-    /// 4.2 Sign in with cTID — browser handoff in progress.
+    /// Sign in with cTID — browser handoff in progress.
     SignIn,
-    /// 4.3 Account picker — token bundle obtained, fetching accounts.
+    /// Account picker — token bundle obtained, fetching accounts.
     PickAccount,
-    /// 4.4 Per-account auth probe — account picked, ready to continue.
+    /// Per-account auth probe — account picked, ready to continue.
     AuthProbe,
 }
 
@@ -83,14 +118,10 @@ pub enum OAuthSubStep {
 /// background thread's `Receiver` cannot be re-created across frames.
 ///
 /// Cleared on a fresh wizard run via [`reset_oauth_runtime`]. Tests
-/// reach the inner state via [`oauth_runtime_for_tests`].
+/// reach the inner state via [`force_runtime_state_for_tests`].
 #[derive(Default)]
 struct OAuthRuntime {
     sub_step: OAuthSubStep,
-    /// Held-in-memory client secret. Never lands on `WizardConfig`'s
-    /// `Debug` output. The Step 10 Apply writer reads this via
-    /// [`expose_client_secret`] and persists via `SecretString`.
-    client_secret: Option<SecretString>,
     /// Held-in-memory access token from the OAuth exchange.
     access_token: Option<SecretString>,
     /// Held-in-memory refresh token from the OAuth exchange.
@@ -107,7 +138,7 @@ struct OAuthRuntime {
 
 impl Default for OAuthSubStep {
     fn default() -> Self {
-        OAuthSubStep::RegisterApp
+        OAuthSubStep::SignIn
     }
 }
 
@@ -116,21 +147,39 @@ fn runtime_mutex() -> &'static Mutex<OAuthRuntime> {
     RUNTIME.get_or_init(|| Mutex::new(OAuthRuntime::default()))
 }
 
-/// Read-only access for the Apply step (Step 10). Mirrors
-/// `NewsApiKeyHolder::expose` in `news_api.rs`: the secret never lands
-/// on `WizardConfig`'s `Debug` output. Returns `None` if the operator
-/// hasn't typed a secret yet.
+/// Read-only access to the developer-embedded cTrader app
+/// `client_id` for the Apply step (Step 10) and the history step.
+/// Returns `None` when the binary was built without the embedded
+/// credentials (developer-build mode); callers must then either
+/// abort or surface the developer-setup banner.
+pub fn expose_client_id() -> Option<String> {
+    let trimmed = EMBEDDED_CTRADER_CLIENT_ID.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Read-only access to the developer-embedded cTrader app
+/// `client_secret`. Mirrors [`expose_client_id`]. The secret is held
+/// as a `&'static str` from the compile-time include, which is the
+/// best we can do for a value the linker bakes into the binary —
+/// every consumer copies it into a [`SecretString`] at the boundary
+/// before any logging or persistence.
 pub fn expose_client_secret() -> Option<String> {
-    let runtime = runtime_mutex().lock().ok()?;
-    runtime
-        .client_secret
-        .as_ref()
-        .map(|s| s.expose_secret().to_string())
+    let trimmed = EMBEDDED_CTRADER_CLIENT_SECRET.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// Read-only access to the access token for the Apply step.
 pub fn expose_access_token() -> Option<String> {
     let runtime = runtime_mutex().lock().ok()?;
+    use secrecy::ExposeSecret;
     runtime
         .access_token
         .as_ref()
@@ -140,10 +189,18 @@ pub fn expose_access_token() -> Option<String> {
 /// Read-only access to the refresh token for the Apply step.
 pub fn expose_refresh_token() -> Option<String> {
     let runtime = runtime_mutex().lock().ok()?;
+    use secrecy::ExposeSecret;
     runtime
         .refresh_token
         .as_ref()
         .map(|s| s.expose_secret().to_string())
+}
+
+/// `true` iff the binary was built with non-empty embedded cTrader
+/// app credentials. The wizard's Step 4 renders the OAuth flow when
+/// this is `true` and the developer-setup banner when it isn't.
+pub fn embedded_credentials_present() -> bool {
+    expose_client_id().is_some() && expose_client_secret().is_some()
 }
 
 /// Clear the process-global runtime — call when starting a fresh
@@ -163,54 +220,6 @@ fn map_environment(env: CTraderEnvironment) -> AuthCTraderEnvironment {
         CTraderEnvironment::Live => AuthCTraderEnvironment::Live,
         CTraderEnvironment::Demo => AuthCTraderEnvironment::Demo,
     }
-}
-
-/// Validate the client_id field shape (4.1 sub-state). Returns the
-/// trimmed value on success or a human-readable error.
-pub fn validate_client_id(value: &str) -> Result<String, String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err("Client ID is required".to_string());
-    }
-    if trimmed.len() < WIZARD_DEFAULT_OAUTH_CLIENT_ID_MIN_LEN {
-        return Err(format!(
-            "Client ID is too short (minimum {} characters)",
-            WIZARD_DEFAULT_OAUTH_CLIENT_ID_MIN_LEN
-        ));
-    }
-    if !trimmed
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        return Err(
-            "Client ID must contain only alphanumeric, '-' or '_' characters".to_string(),
-        );
-    }
-    Ok(trimmed.to_string())
-}
-
-/// Validate the client_secret field shape (4.1 sub-state). Returns the
-/// trimmed value on success or a human-readable error.
-pub fn validate_client_secret(value: &str) -> Result<String, String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err("Client Secret is required".to_string());
-    }
-    if trimmed.len() < WIZARD_DEFAULT_OAUTH_CLIENT_SECRET_MIN_LEN {
-        return Err(format!(
-            "Client Secret is too short (minimum {} characters)",
-            WIZARD_DEFAULT_OAUTH_CLIENT_SECRET_MIN_LEN
-        ));
-    }
-    // Allow any printable ASCII — Spotware does not document a strict
-    // charset and the example secret `012sds23dlkjQsd` mixes letters
-    // and digits with no separators.
-    if trimmed.bytes().any(|b| !(0x21..=0x7E).contains(&b)) {
-        return Err(
-            "Client Secret must contain only printable ASCII characters".to_string(),
-        );
-    }
-    Ok(trimmed.to_string())
 }
 
 /// Spawn the OAuth-flow background thread. The wizard thread retains
@@ -294,120 +303,64 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
     });
 
     ui.separator();
-    ui.label(
-        egui::RichText::new("4.1 Register your application at openapi.ctrader.com")
-            .strong()
-            .color(theme::TEXT_PRIMARY),
-    );
-    ui.label(
-        egui::RichText::new(
-            "Sign in to your cTID → Applications → Add Application. Set redirect URI to \
-             http://127.0.0.1:7777/ctrader/callback (or 7878 / 8989). Paste the IDs below.",
-        )
-        .color(theme::TEXT_MUTED)
-        .size(theme::FONT_CAPTION),
-    );
-
-    // ─── 4.1 inline validators ────────────────────────────────────
-    let mut client_id = controller.config.ctrader_client_id.clone().unwrap_or_default();
-    let mut client_id_error: Option<String> = None;
-    ui.horizontal(|ui| {
-        ui.label("Client ID:");
-        if ui
-            .add(egui::TextEdit::singleline(&mut client_id).desired_width(320.0))
-            .changed()
-        {
-            match validate_client_id(&client_id) {
-                Ok(trimmed) => {
-                    controller.config.ctrader_client_id = Some(trimmed);
-                }
-                Err(err) => {
-                    client_id_error = Some(err);
-                    controller.config.ctrader_client_id = if client_id.trim().is_empty() {
-                        None
-                    } else {
-                        Some(client_id.clone())
-                    };
-                }
-            }
-        }
-    });
-    if let Some(err) = client_id_error {
+    let embedded_present = embedded_credentials_present();
+    if !embedded_present {
+        // Developer-build diagnostic. End users on a release binary
+        // never see this — the release build pipeline always sets the
+        // embed env vars / writes the workspace `.local` TOML. If
+        // they DO see it, the binary was built from source without
+        // the dev's app credentials and the OAuth flow cannot proceed.
         ui.label(
-            egui::RichText::new(err)
-                .color(theme::DANGER)
-                .size(theme::FONT_CAPTION),
+            egui::RichText::new("Developer build: cTrader app credentials not embedded")
+                .strong()
+                .color(theme::DANGER),
         );
-    }
-
-    // Track the actual secret in the runtime, not on `WizardConfig`.
-    let mut secret_input = if runtime.client_secret.is_some() {
-        "•••••••••".to_string()
+        ui.label(
+            egui::RichText::new(format!(
+                "This binary was built without the cTrader Open API \
+                 app credentials baked in. Re-build with the two \
+                 environment variables set:\n\
+                 \u{00A0}\u{00A0}{}=<your app client_id>\n\
+                 \u{00A0}\u{00A0}{}=<your app client_secret>\n\
+                 or place a TOML at .local/forex-ai/broker_credentials.toml \
+                 with [ctrader] client_id / client_secret keys, then \
+                 run cargo build again. End users never see this banner \
+                 — they receive a binary that already has them baked in.",
+                BUILD_ENV_CLIENT_ID, BUILD_ENV_CLIENT_SECRET,
+            ))
+            .color(theme::TEXT_MUTED)
+            .size(theme::FONT_CAPTION),
+        );
     } else {
-        String::new()
-    };
-    let mut client_secret_error: Option<String> = None;
-    ui.horizontal(|ui| {
-        ui.label("Client Secret:");
-        let response = ui.add(
-            egui::TextEdit::singleline(&mut secret_input)
-                .password(true)
-                .desired_width(320.0),
-        );
-        if response.changed() {
-            if secret_input.trim().is_empty() {
-                runtime.client_secret = None;
-                controller.config.ctrader_client_secret_set = false;
-            } else if !secret_input.chars().all(|c| c == '•') {
-                match validate_client_secret(&secret_input) {
-                    Ok(trimmed) => {
-                        runtime.client_secret = Some(SecretString::from(trimmed));
-                        controller.config.ctrader_client_secret_set = true;
-                    }
-                    Err(err) => {
-                        client_secret_error = Some(err);
-                        controller.config.ctrader_client_secret_set = false;
-                    }
-                }
-            }
-        }
-    });
-    if let Some(err) = client_secret_error {
         ui.label(
-            egui::RichText::new(err)
-                .color(theme::DANGER)
-                .size(theme::FONT_CAPTION),
+            egui::RichText::new("Sign in to your broker")
+                .strong()
+                .color(theme::TEXT_PRIMARY),
+        );
+        ui.label(
+            egui::RichText::new(format!(
+                "The wizard will bind a loopback listener on the first \
+                 free port of {:?} and open your system browser at the \
+                 cTrader authorize page. You'll sign in with your \
+                 broker cTID — the bot's app credentials are baked in \
+                 to the binary, so there is nothing else for you to \
+                 type here. Callback timeout: {} s.",
+                WIZARD_DEFAULT_OAUTH_LOOPBACK_PORTS,
+                WIZARD_DEFAULT_OAUTH_CALLBACK_TIMEOUT_SECONDS
+            ))
+            .color(theme::TEXT_MUTED)
+            .size(theme::FONT_CAPTION),
         );
     }
-
-    // ─── 4.2 Sign in with cTID ────────────────────────────────────
-    ui.separator();
-    ui.label(
-        egui::RichText::new("4.2 Sign in with cTID")
-            .strong()
-            .color(theme::TEXT_PRIMARY),
-    );
-    ui.label(
-        egui::RichText::new(format!(
-            "The wizard will bind a loopback listener on the first free port of {:?} and open \
-             the system browser. Callback timeout: {} s.",
-            WIZARD_DEFAULT_OAUTH_LOOPBACK_PORTS, WIZARD_DEFAULT_OAUTH_CALLBACK_TIMEOUT_SECONDS
-        ))
-        .color(theme::TEXT_MUTED)
-        .size(theme::FONT_CAPTION),
-    );
 
     let auth_in_flight = runtime.auth_rx.is_some();
     let accounts_in_flight = runtime.accounts_rx.is_some();
-    let can_start_oauth = controller.config.ctrader_client_id.is_some()
-        && runtime.client_secret.is_some()
-        && !auth_in_flight
-        && !accounts_in_flight;
+    let can_start_oauth = embedded_present && !auth_in_flight && !accounts_in_flight;
     ui.horizontal(|ui| {
         let label = if auth_in_flight {
             "Waiting for browser callback…"
         } else {
-            "Sign in with cTID"
+            "Sign in to your broker"
         };
         let response = ui.add_enabled(can_start_oauth, egui::Button::new(label));
         if response.clicked() && can_start_oauth {
@@ -516,21 +469,35 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
 
 /// Issue the OAuth `run()` call on a worker thread. The wizard thread
 /// keeps the rx half on the runtime; `poll_auth_worker` consumes it.
+///
+/// Pulls the developer-embedded `client_id` + `client_secret` from
+/// the compile-time constants (`crates/forex-app/build.rs` writes
+/// these via `emit_embedded_credentials`). The end user never sees
+/// or supplies these values — that was the 2026-05-17 directive fix.
 fn start_oauth_flow(runtime: &mut OAuthRuntime, controller: &mut WizardController) {
+    let _ = controller; // controller is unused in this function now;
+                        // every legacy ctrader_client_id read was retired.
     runtime.last_error = None;
     runtime.sub_step = OAuthSubStep::SignIn;
-    let client_id = match controller.config.ctrader_client_id.as_ref() {
-        Some(id) => id.clone(),
+    let client_id = match expose_client_id() {
+        Some(id) => id,
         None => {
-            runtime.last_error = Some("Client ID is required before signing in".to_string());
+            runtime.last_error = Some(format!(
+                "Binary was built without the embedded cTrader app client_id \
+                 (build-time env {}). Cannot start OAuth.",
+                BUILD_ENV_CLIENT_ID
+            ));
             return;
         }
     };
-    let client_secret = match runtime.client_secret.as_ref() {
-        Some(secret) => secret.expose_secret().to_string(),
+    let client_secret = match expose_client_secret() {
+        Some(secret) => secret,
         None => {
-            runtime.last_error =
-                Some("Client Secret is required before signing in".to_string());
+            runtime.last_error = Some(format!(
+                "Binary was built without the embedded cTrader app client_secret \
+                 (build-time env {}). Cannot start OAuth.",
+                BUILD_ENV_CLIENT_SECRET
+            ));
             return;
         }
     };
@@ -604,19 +571,23 @@ fn poll_auth_worker(runtime: &mut OAuthRuntime, controller: &mut WizardControlle
                 Some(SecretString::from(result.token_bundle.refresh_token.clone()));
             runtime.sub_step = OAuthSubStep::PickAccount;
             // Kick off account discovery immediately. The wizard's
-            // chosen Demo/Live radio decides the endpoint host.
-            let Some(client_id) = controller.config.ctrader_client_id.clone() else {
-                runtime.last_error =
-                    Some("Client ID disappeared from WizardConfig after OAuth".to_string());
+            // chosen Demo/Live radio decides the endpoint host. The
+            // app credentials come from the embedded constants — the
+            // operator never sees them.
+            let Some(client_id) = expose_client_id() else {
+                runtime.last_error = Some(
+                    "Embedded cTrader client_id missing after OAuth — \
+                     binary appears to have been rebuilt without it"
+                        .to_string(),
+                );
                 return;
             };
-            let Some(client_secret) = runtime
-                .client_secret
-                .as_ref()
-                .map(|s| s.expose_secret().to_string())
-            else {
-                runtime.last_error =
-                    Some("Client Secret disappeared from runtime after OAuth".to_string());
+            let Some(client_secret) = expose_client_secret() else {
+                runtime.last_error = Some(
+                    "Embedded cTrader client_secret missing after OAuth — \
+                     binary appears to have been rebuilt without it"
+                        .to_string(),
+                );
                 return;
             };
             let request = CTraderAccountDiscoveryRequest {
@@ -780,50 +751,36 @@ mod tests {
     }
 
     #[test]
-    fn validate_client_id_rejects_empty() {
-        assert!(validate_client_id("").is_err());
-        assert!(validate_client_id("   ").is_err());
+    fn embedded_credentials_present_matches_constant_state() {
+        // The function under test exists to drive the Step 4 UI
+        // branch. With non-empty embedded constants it returns true;
+        // with empty constants it returns false. We pin the
+        // round-trip rather than the specific value because the
+        // build pipeline decides what to embed and tests must work
+        // in both modes (developer source-build and release CI).
+        let expected = !EMBEDDED_CTRADER_CLIENT_ID.trim().is_empty()
+            && !EMBEDDED_CTRADER_CLIENT_SECRET.trim().is_empty();
+        assert_eq!(embedded_credentials_present(), expected);
     }
 
     #[test]
-    fn validate_client_id_rejects_short() {
-        assert!(validate_client_id("ab").is_err());
+    fn expose_client_id_returns_none_iff_embedded_is_empty() {
+        let trimmed = EMBEDDED_CTRADER_CLIENT_ID.trim();
+        if trimmed.is_empty() {
+            assert_eq!(expose_client_id(), None);
+        } else {
+            assert_eq!(expose_client_id(), Some(trimmed.to_string()));
+        }
     }
 
     #[test]
-    fn validate_client_id_rejects_non_alphanumeric() {
-        assert!(validate_client_id("abc def").is_err());
-        assert!(validate_client_id("abcd!").is_err());
-    }
-
-    #[test]
-    fn validate_client_id_accepts_real_shape() {
-        // Spotware example from `ctrader_api_full_reference.md` §2.3:
-        // client_id=5430012
-        assert_eq!(
-            validate_client_id("5430012").unwrap(),
-            "5430012".to_string()
-        );
-    }
-
-    #[test]
-    fn validate_client_secret_rejects_empty() {
-        assert!(validate_client_secret("").is_err());
-    }
-
-    #[test]
-    fn validate_client_secret_rejects_short() {
-        assert!(validate_client_secret("short").is_err());
-    }
-
-    #[test]
-    fn validate_client_secret_accepts_real_shape() {
-        // Spotware example from `ctrader_api_full_reference.md` §2.3:
-        // client_secret=012sds23dlkjQsd
-        assert_eq!(
-            validate_client_secret("012sds23dlkjQsd").unwrap(),
-            "012sds23dlkjQsd".to_string()
-        );
+    fn expose_client_secret_returns_none_iff_embedded_is_empty() {
+        let trimmed = EMBEDDED_CTRADER_CLIENT_SECRET.trim();
+        if trimmed.is_empty() {
+            assert_eq!(expose_client_secret(), None);
+        } else {
+            assert_eq!(expose_client_secret(), Some(trimmed.to_string()));
+        }
     }
 
     /// Audit-fix F2: a callback whose `state` query parameter does not
@@ -884,9 +841,12 @@ mod tests {
     }
 
     #[test]
-    fn expose_secrets_returns_none_when_unset() {
+    fn expose_tokens_return_none_when_runtime_is_fresh() {
+        // access/refresh tokens live in the in-memory runtime (they
+        // come back from OAuth). client_secret is sourced from the
+        // embedded constant and is covered by a separate test —
+        // `expose_client_secret_returns_none_iff_embedded_is_empty`.
         reset_oauth_runtime();
-        assert_eq!(expose_client_secret(), None);
         assert_eq!(expose_access_token(), None);
         assert_eq!(expose_refresh_token(), None);
     }
