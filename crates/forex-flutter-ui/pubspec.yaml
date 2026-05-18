@@ -1,0 +1,59 @@
+name: forex_flutter_ui
+description: >
+  Flutter desktop/mobile front-end for the forex-ai trading bot.
+  Talks to the Rust backend (forex-app + forex-gemma) over REST + SSE.
+  Mirrors the layout / design tokens of mockups/ui_mockup.html.
+publish_to: 'none'
+version: 0.4.5+1
+
+environment:
+  sdk: '>=3.4.0 <4.0.0'
+  flutter: '>=3.22.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # State management — Riverpod chosen over BLoC because the screen
+  # graph is small (14 panels) and Riverpod's compile-time-safe
+  # providers fit the "thin client over a Rust backend" model.
+  flutter_riverpod: ^2.5.1
+
+  # REST + SSE
+  dio: ^5.5.0          # HTTP client
+  http: ^1.2.1         # fallback simple HTTP for SSE bootstrap
+  sse_channel: ^0.0.5  # Server-Sent Events parser for /gemma/chat
+
+  # Routing — go_router for declarative side-bar driven nav.
+  go_router: ^14.2.0
+
+  # Charts — fl_chart for the Dashboard equity sparkline and the
+  # Chart panel placeholder. Will swap to candlestick rendering in
+  # a follow-up (the Rust backend already provides OHLC data).
+  fl_chart: ^0.68.0
+
+  # Date / time formatting + duration helpers.
+  intl: ^0.19.0
+
+  # Logging — flow into the same forex-app log stream eventually.
+  logger: ^2.4.0
+
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  mocktail: ^1.0.4
+
+flutter:
+  uses-material-design: true
+  # Asset folders for future use (icons, custom fonts).
+  # assets:
+  #   - assets/icons/
+  # fonts:
+  #   - family: Inter
+  #     fonts:
+  #       - asset: assets/fonts/Inter-Regular.ttf
+  #       - asset: assets/fonts/Inter-Bold.ttf
+  #         weight: 700

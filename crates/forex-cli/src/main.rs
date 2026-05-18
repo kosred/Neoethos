@@ -610,10 +610,16 @@ fn cmd_config(args: &[String]) -> Result<()> {
 
     println!("Resolved configuration");
     println!("======================");
-    println!("{:<10} {:<28} {:<28} {:<28} {:<8}", "section", "field", "raw", "resolved", "source");
+    println!(
+        "{:<10} {:<28} {:<28} {:<28} {:<8}",
+        "section", "field", "raw", "resolved", "source"
+    );
     println!("{}", "-".repeat(110));
     for row in resolved.display_table() {
-        println!("{:<10} {:<28} {:<28} {:<28} {:<8}", row[0], row[1], row[2], row[3], row[4]);
+        println!(
+            "{:<10} {:<28} {:<28} {:<28} {:<8}",
+            row[0], row[1], row[2], row[3], row[4]
+        );
     }
     println!();
     println!("Notes:");
@@ -657,16 +663,15 @@ fn cmd_auto_loop(args: &[String]) -> Result<()> {
         std::env::set_var("FOREX_BOT_DATA_ROOT", &root);
     }
     let symbols_raw = parse_flag(args, "--symbols").unwrap_or_default();
-    let tfs_raw = parse_flag(args, "--timeframes").unwrap_or_else(|| {
-        resolved.timeframes.canonical_default.join(",")
-    });
+    let tfs_raw = parse_flag(args, "--timeframes")
+        .unwrap_or_else(|| resolved.timeframes.canonical_default.join(","));
     let skip_training = has_flag(args, "--skip-training");
     let max_jobs: usize = parse_flag(args, "--max-jobs")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let resume = has_flag(args, "--resume");
-    let stop_flag = parse_flag(args, "--stop-flag")
-        .unwrap_or_else(|| "cache/auto_loop_stop.flag".to_string());
+    let stop_flag =
+        parse_flag(args, "--stop-flag").unwrap_or_else(|| "cache/auto_loop_stop.flag".to_string());
     let checkpoint_path = std::path::PathBuf::from("cache").join("auto_loop_checkpoint.json");
 
     let symbols: Vec<String> = if symbols_raw.is_empty() {
@@ -855,12 +860,10 @@ fn cmd_import(args: &[String]) -> Result<()> {
         }
     }
 
-    let report = forex_data::core::universal_importer::import_directory_recursive(
-        &source, &root, force,
-    )?;
+    let report =
+        forex_data::core::universal_importer::import_directory_recursive(&source, &root, force)?;
 
-    let report_path =
-        std::path::PathBuf::from(&root).join("import_report.json");
+    let report_path = std::path::PathBuf::from(&root).join("import_report.json");
     if let Err(err) = report.save_to_disk(&report_path) {
         tracing::warn!(
             target: "forex_cli",
@@ -1018,7 +1021,10 @@ fn print_dataset_discovery_summary(root: &str) -> Result<forex_data::DatasetDisc
         // Real-data only: never silently fall back to a packaged demo
         // dataset. Surface the empty result so the operator can pick
         // a different folder.
-        println!("  (no data files found at depth ≤ {})", forex_data::MAX_WALK_DEPTH);
+        println!(
+            "  (no data files found at depth ≤ {})",
+            forex_data::MAX_WALK_DEPTH
+        );
         return Ok(report);
     }
 
@@ -1038,7 +1044,12 @@ fn print_dataset_discovery_summary(root: &str) -> Result<forex_data::DatasetDisc
     let symbols_preview: String = if symbols.len() > 6 {
         format!(
             "{}, ...",
-            symbols.iter().take(6).cloned().collect::<Vec<_>>().join(", ")
+            symbols
+                .iter()
+                .take(6)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     } else {
         symbols.join(", ")
@@ -1080,7 +1091,11 @@ fn print_dataset_discovery_summary(root: &str) -> Result<forex_data::DatasetDisc
             };
             detail_parts.push(format!("{count} {cat}{labels}"));
         }
-        println!("Skipped:            {}   ({})", report.skipped.len(), detail_parts.join("; "));
+        println!(
+            "Skipped:            {}   ({})",
+            report.skipped.len(),
+            detail_parts.join("; ")
+        );
     }
 
     Ok(report)

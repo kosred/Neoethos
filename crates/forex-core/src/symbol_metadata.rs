@@ -157,10 +157,7 @@ impl SymbolMetadataTable {
             .with_context(|| format!("parse symbol metadata at {}", path.display()))?;
         // Reject too-new schema versions loud — caller falls back
         // to defaults (per the D4 contract).
-        crate::schema_version::ensure_schema_version_readable(
-            &table,
-            "symbol_metadata.json",
-        )?;
+        crate::schema_version::ensure_schema_version_readable(&table, "symbol_metadata.json")?;
         Ok(table)
     }
 
@@ -175,8 +172,7 @@ impl SymbolMetadataTable {
         // and the version field is a u32 newtype.
         let mut to_write = self.clone();
         to_write.schema_version = SYMBOL_METADATA_SCHEMA_VERSION;
-        let text = serde_json::to_string_pretty(&to_write)
-            .context("serialize symbol metadata")?;
+        let text = serde_json::to_string_pretty(&to_write).context("serialize symbol metadata")?;
         std::fs::write(path, text)
             .with_context(|| format!("write symbol metadata to {}", path.display()))
     }
@@ -396,7 +392,13 @@ pub fn baked_in_default(symbol: &str) -> Option<SymbolMetadata> {
 }
 
 #[cfg(test)]
-fn fx(symbol: String, base: &str, quote: &str, digits: u32, typical: Option<f64>) -> SymbolMetadata {
+fn fx(
+    symbol: String,
+    base: &str,
+    quote: &str,
+    digits: u32,
+    typical: Option<f64>,
+) -> SymbolMetadata {
     let pip_size = 0.0001;
     let contract_size = 100_000.0;
     SymbolMetadata {

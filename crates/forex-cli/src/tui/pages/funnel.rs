@@ -42,21 +42,28 @@ fn render_run_list(area: Rect, buf: &mut Buffer) {
             Line::raw(""),
             Line::styled("  No funnel JSONs found.", theme::muted_style()),
             Line::raw(""),
-            Line::styled("  Run discover/batch-discover; each work-unit", theme::muted_style()),
-            Line::styled("  saves <symbol>_<tf>_funnel.json next to its", theme::muted_style()),
-            Line::styled("  portfolio JSON. They show every gate that", theme::muted_style()),
-            Line::styled("  rejected candidates and the bottleneck stage.", theme::muted_style()),
+            Line::styled(
+                "  Run discover/batch-discover; each work-unit",
+                theme::muted_style(),
+            ),
+            Line::styled(
+                "  saves <symbol>_<tf>_funnel.json next to its",
+                theme::muted_style(),
+            ),
+            Line::styled(
+                "  portfolio JSON. They show every gate that",
+                theme::muted_style(),
+            ),
+            Line::styled(
+                "  rejected candidates and the bottleneck stage.",
+                theme::muted_style(),
+            ),
         ]
     } else {
         funnels
             .iter()
             .take(20)
-            .map(|f| {
-                Line::styled(
-                    format!("  · {}", f.display()),
-                    theme::primary_style(),
-                )
-            })
+            .map(|f| Line::styled(format!("  · {}", f.display()), theme::primary_style()))
             .collect()
     };
     Paragraph::new(lines).render(inner, buf);
@@ -112,7 +119,9 @@ fn render_funnel_value(v: &serde_json::Value, path: &std::path::Path) -> Vec<Lin
     out.push(Line::from(vec![
         Span::styled(
             format!("  {} {} ", symbol, tf),
-            Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("· outcome={} ", outcome),
@@ -123,7 +132,10 @@ fn render_funnel_value(v: &serde_json::Value, path: &std::path::Path) -> Vec<Lin
             }),
         ),
         Span::styled(
-            format!("· bottleneck={} ({} rejected)", bottleneck, bottleneck_rejected),
+            format!(
+                "· bottleneck={} ({} rejected)",
+                bottleneck, bottleneck_rejected
+            ),
             theme::muted_style(),
         ),
     ]));
@@ -136,7 +148,9 @@ fn render_funnel_value(v: &serde_json::Value, path: &std::path::Path) -> Vec<Lin
             let cout = s.get("count_out").and_then(|n| n.as_u64()).unwrap_or(0);
             let rej = s.get("rejected").and_then(|n| n.as_u64()).unwrap_or(0);
             let style = if rej == bottleneck_rejected && rej > 0 {
-                Style::default().fg(theme::SELL).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(theme::SELL)
+                    .add_modifier(Modifier::BOLD)
             } else if cout > 0 && cin > 0 && cout == cin {
                 Style::default().fg(theme::BUY)
             } else if cin == 0 {

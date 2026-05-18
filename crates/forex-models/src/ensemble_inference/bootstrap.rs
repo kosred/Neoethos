@@ -59,14 +59,12 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use super::{
+    ExpertLoadOutcome, ExpertRegistry, SoftVotingEnsemble, SoftVotingEnsembleConfig,
     deep_classification_adapters::register_deep_classification_loaders,
     deep_timeseries_adapters::register_deep_timeseries_loaders,
-    evolutionary_adapters::register_evolutionary_loaders,
-    meta_adapters::register_meta_loaders,
-    mixed_adapters::register_mixed_loaders,
-    rl_exit_adapters::register_rl_exit_loaders,
+    evolutionary_adapters::register_evolutionary_loaders, meta_adapters::register_meta_loaders,
+    mixed_adapters::register_mixed_loaders, rl_exit_adapters::register_rl_exit_loaders,
     tree_adapters::register_tree_loaders,
-    ExpertLoadOutcome, ExpertRegistry, SoftVotingEnsemble, SoftVotingEnsembleConfig,
 };
 
 /// Canonical list of expert names the bootstrap tries to load.
@@ -129,12 +127,10 @@ pub fn build_default_registry() -> Result<ExpertRegistry> {
     register_tree_loaders(&mut registry).context("register tree loaders")?;
     register_deep_classification_loaders(&mut registry)
         .context("register deep classification loaders")?;
-    register_deep_timeseries_loaders(&mut registry)
-        .context("register deep time-series loaders")?;
+    register_deep_timeseries_loaders(&mut registry).context("register deep time-series loaders")?;
     register_meta_loaders(&mut registry).context("register meta loaders")?;
     register_mixed_loaders(&mut registry).context("register mixed loaders")?;
-    register_evolutionary_loaders(&mut registry)
-        .context("register evolutionary loaders")?;
+    register_evolutionary_loaders(&mut registry).context("register evolutionary loaders")?;
     register_rl_exit_loaders(&mut registry).context("register rl+exit loaders")?;
     debug_assert_eq!(
         registry.registered_names().len(),
@@ -230,7 +226,14 @@ mod tests {
             "swarm_forecaster is intentionally absent (D1.2.7 deferral)"
         );
         // Sample required canonical names.
-        for required in ["lightgbm", "xgboost", "transformer", "meta_stack", "dqn", "neat"] {
+        for required in [
+            "lightgbm",
+            "xgboost",
+            "transformer",
+            "meta_stack",
+            "dqn",
+            "neat",
+        ] {
             assert!(names.contains(required), "missing '{required}'");
         }
     }

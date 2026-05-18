@@ -83,8 +83,7 @@ fn all_packaging_shell_scripts_have_valid_bash_syntax() {
         }
     };
     let scripts = collect_files(&packaging_dir(), |p| {
-        p.extension().is_some_and(|e| e == "sh")
-            || p.file_name().is_some_and(|n| n == "AppRun")
+        p.extension().is_some_and(|e| e == "sh") || p.file_name().is_some_and(|n| n == "AppRun")
     });
     assert!(
         !scripts.is_empty(),
@@ -193,7 +192,9 @@ fn scoop_manifest_is_valid_json() {
     let body = fs::read_to_string(&manifest).expect("read scoop manifest");
     let parsed: serde_json::Value =
         serde_json::from_str(&body).expect("scoop manifest must be valid JSON");
-    let obj = parsed.as_object().expect("scoop manifest must be a JSON object");
+    let obj = parsed
+        .as_object()
+        .expect("scoop manifest must be a JSON object");
     // Spec: every Scoop manifest needs `version` and `url` at minimum.
     assert!(
         obj.contains_key("version"),
@@ -220,8 +221,8 @@ fn appimage_appdir_has_required_files() {
         );
     }
     // Icon is optional during scaffolding (a TODO placeholder is fine).
-    let icon_present = appdir.join("forex-app.png").exists()
-        || appdir.join("forex-app.png.TODO").exists();
+    let icon_present =
+        appdir.join("forex-app.png").exists() || appdir.join("forex-app.png.TODO").exists();
     assert!(
         icon_present,
         "AppImage .AppDir must carry forex-app.png OR a TODO marker file"
@@ -251,4 +252,3 @@ fn collect_files<F: Fn(&Path) -> bool>(root: &Path, pred: F) -> Vec<PathBuf> {
     }
     out
 }
-

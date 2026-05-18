@@ -62,11 +62,7 @@ impl Page {
     /// Bottom-of-screen keyboard hints, contextual to the page.
     pub fn key_hints(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            Page::Dashboard => &[
-                ("Tab", "next page"),
-                ("R", "refresh"),
-                ("Q", "quit"),
-            ],
+            Page::Dashboard => &[("Tab", "next page"), ("R", "refresh"), ("Q", "quit")],
             Page::Discover => &[
                 ("↑↓", "focus field"),
                 ("Enter", "edit"),
@@ -82,11 +78,7 @@ impl Page {
                 ("Enter", "details"),
                 ("Q", "quit"),
             ],
-            Page::Symbols => &[
-                ("Tab", "next page"),
-                ("↑↓", "select"),
-                ("Q", "quit"),
-            ],
+            Page::Symbols => &[("Tab", "next page"), ("↑↓", "select"), ("Q", "quit")],
             Page::Train => &[
                 ("↑↓", "focus field"),
                 ("Enter", "edit"),
@@ -95,24 +87,10 @@ impl Page {
                 ("Tab", "page"),
                 ("Q", "quit"),
             ],
-            Page::Funnel => &[
-                ("Tab", "page"),
-                ("R", "refresh"),
-                ("Q", "quit"),
-            ],
-            Page::AutoLoop => &[
-                ("Tab", "page"),
-                ("L", "launch"),
-                ("Q", "quit"),
-            ],
-            Page::Config => &[
-                ("Tab", "page"),
-                ("Q", "quit"),
-            ],
-            Page::Logs => &[
-                ("Tab", "page"),
-                ("Q", "quit"),
-            ],
+            Page::Funnel => &[("Tab", "page"), ("R", "refresh"), ("Q", "quit")],
+            Page::AutoLoop => &[("Tab", "page"), ("L", "launch"), ("Q", "quit")],
+            Page::Config => &[("Tab", "page"), ("Q", "quit")],
+            Page::Logs => &[("Tab", "page"), ("Q", "quit")],
         }
     }
 

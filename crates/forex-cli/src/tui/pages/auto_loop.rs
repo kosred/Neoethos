@@ -55,10 +55,7 @@ fn render_controls(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
         ]),
         Line::from(vec![
             Span::styled("  Checkpoint: ", theme::caption_style()),
-            Span::styled(
-                "cache/auto_loop_checkpoint.json",
-                theme::primary_style(),
-            ),
+            Span::styled("cache/auto_loop_checkpoint.json", theme::primary_style()),
         ]),
         Line::from(vec![
             Span::styled("  Stop flag: ", theme::caption_style()),
@@ -204,11 +201,7 @@ pub fn launch_now(shared: &mut AppShared) {
         return;
     }
     let root = shared.data_root.display().to_string();
-    let args = vec![
-        "auto-loop".to_string(),
-        "--root".to_string(),
-        root,
-    ];
+    let args = vec!["auto-loop".to_string(), "--root".to_string(), root];
     shared.jobs.spawn("auto-loop", args);
     shared.status = "Spawned auto-loop".to_string();
 }

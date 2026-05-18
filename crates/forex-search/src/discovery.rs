@@ -1913,8 +1913,7 @@ where
             let sig = signals_for_gene_full(features, ohlcv, &gene, &eval_config_for_signals);
             let trade_count = sig.iter().filter(|v| **v != 0).count() as f64;
             if trade_count > 0.0 {
-                nonzero_signal_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                nonzero_signal_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             if trade_count >= min_trades as f64 {
                 Some((candidate_idx, gene, sig))

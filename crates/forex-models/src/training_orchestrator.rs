@@ -132,9 +132,7 @@ fn drop_nonfinite_rows(
     let mut clean = ndarray::Array2::<f32>::zeros((keep_idx.len(), n_cols));
     let mut clean_labels = Vec::with_capacity(keep_idx.len());
     for (new_idx, &old_idx) in keep_idx.iter().enumerate() {
-        clean
-            .row_mut(new_idx)
-            .assign(&features.row(old_idx));
+        clean.row_mut(new_idx).assign(&features.row(old_idx));
         clean_labels.push(labels[old_idx]);
     }
     (clean, clean_labels, dropped)
@@ -246,8 +244,7 @@ impl TrainingOrchestrator {
         // will have NaN until the lookback window fills. The downstream
         // `dataframe_to_float32_array` strict-rejects any non-finite, so
         // we sanitise here. Labels are sliced in lock-step.
-        let (clean_data, clean_labels, dropped) =
-            drop_nonfinite_rows(frame.data, labels);
+        let (clean_data, clean_labels, dropped) = drop_nonfinite_rows(frame.data, labels);
         if dropped > 0 {
             info!(
                 "Dropped {} warmup/non-finite feature rows before training (kept {} rows)",
@@ -2634,7 +2631,10 @@ fn build_expert_model(
         ModelType::LightGBM => {
             // Per-family seed = 42 + 1
             let seeded = inject_tree_seed(params, "seed", 1);
-            Ok(Box::new(LightGBMExpert::new(0, Some(parse_tree_params(&seeded)))))
+            Ok(Box::new(LightGBMExpert::new(
+                0,
+                Some(parse_tree_params(&seeded)),
+            )))
         }
         ModelType::XGBoost => {
             // Per-family seed = 42 + 2 (gbtree variant).
@@ -2645,7 +2645,10 @@ fn build_expert_model(
             // now. A future commit can split them via the
             // booster_variant config field.
             let seeded = inject_tree_seed(params, "seed", 2);
-            Ok(Box::new(XGBoostExpert::new(0, Some(parse_tree_params(&seeded)))))
+            Ok(Box::new(XGBoostExpert::new(
+                0,
+                Some(parse_tree_params(&seeded)),
+            )))
         }
         ModelType::CatBoost => {
             // CatBoost uses `random_seed` not `seed`. Offset = 42 + 5

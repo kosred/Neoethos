@@ -5,7 +5,6 @@
 // discovery tests assert against the broker payload shape.
 use super::*;
 
-
 use crate::FilteringConfig;
 use ndarray::Array2;
 
@@ -123,8 +122,7 @@ fn non_empty_portfolio_is_accepted() {
         prop_firm_validation_artifacts: Vec::new(),
     };
 
-    ensure_non_empty_portfolio(&result, "EURUSD M1")
-        .expect("expected non-empty portfolio to pass");
+    ensure_non_empty_portfolio(&result, "EURUSD M1").expect("expected non-empty portfolio to pass");
 }
 
 #[test]
@@ -268,10 +266,7 @@ fn prop_firm_gate_env_overrides_populate_discovery_config() {
         std::env::set_var("FOREX_BOT_DISCOVERY_PROP_FIRM_PASS_RATE", "0.42");
         std::env::set_var("FOREX_BOT_DISCOVERY_PROP_FIRM_N_WINDOWS", "17");
         std::env::set_var("FOREX_BOT_DISCOVERY_PROP_FIRM_WINDOW_DAYS", "21");
-        std::env::set_var(
-            "FOREX_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT",
-            "0.08",
-        );
+        std::env::set_var("FOREX_BOT_DISCOVERY_PROP_FIRM_PROFIT_TARGET_PCT", "0.08");
     }
     let cfg = DiscoveryConfig::default().with_env_runtime_overrides();
     unsafe {
@@ -455,12 +450,8 @@ fn sample_walkforward_validation_artifact(
     strategy_hash: &str,
 ) -> WalkforwardValidationArtifactFile {
     let contract = sample_temporal_contract();
-    let scope = WalkforwardValidationScope::for_strategy(
-        "dataset",
-        "evaluation",
-        strategy_hash,
-        &contract,
-    );
+    let scope =
+        WalkforwardValidationScope::for_strategy("dataset", "evaluation", strategy_hash, &contract);
     WalkforwardValidationArtifactFile::new(scope, sample_walkforward_summary())
 }
 
@@ -638,14 +629,9 @@ fn compute_discovery_forward_test_artifacts_returns_empty_for_empty_portfolio() 
     let config = DiscoveryConfig::default();
     let features = sample_feature_frame();
     let ohlcv = sample_ohlcv();
-    let artifacts = compute_discovery_forward_test_artifacts(
-        &[],
-        &features.names,
-        &features,
-        &ohlcv,
-        &config,
-    )
-    .expect("empty portfolio should produce zero artifacts");
+    let artifacts =
+        compute_discovery_forward_test_artifacts(&[], &features.names, &features, &ohlcv, &config)
+            .expect("empty portfolio should produce zero artifacts");
     assert!(artifacts.is_empty());
 }
 
@@ -986,10 +972,7 @@ fn save_prop_firm_validation_artifacts_writes_one_file_per_strategy() {
         canonical_backtest_artifacts: Vec::new(),
         walkforward_validation_artifacts: Vec::new(),
         forward_test_validation_artifacts: Vec::new(),
-        prop_firm_validation_artifacts: vec![prop_firm_artifact_with_pass_flag(
-            "fnv64:abc",
-            true,
-        )],
+        prop_firm_validation_artifacts: vec![prop_firm_artifact_with_pass_flag("fnv64:abc", true)],
     };
 
     let written = save_prop_firm_validation_artifacts(&dir, &result)

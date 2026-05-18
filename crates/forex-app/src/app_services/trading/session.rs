@@ -40,11 +40,10 @@ use super::{
     AdapterReadinessSnapshot, AppState, BrokerSessionState, BrokerSettingsState,
     CTRADER_DEFAULT_SCOPE, CTRADER_TOKEN_REFRESH_WINDOW_SECS, CTraderAccountDiscoveryRequest,
     CTraderAccountRuntimeRequest, CTraderAccountRuntimeSnapshot, CTraderAccountSummary,
-    CTraderAuthSession, CTraderAuthSnapshot, CTraderBootstrapContext,
-    CTraderBrokerEnvironment, CTraderEnvironment, CTraderLiveAuthRequest,
-    CTraderTokenBundle, CTraderTokenExchangeRequest,
-    CTraderTokenRefreshRequest, DataSource, JobKind, JobSnapshot, JobState, ServiceEvent,
-    TaskKind, TradingAdapter, TradingAdapterKind, TradingSession, build_default_loopback_config,
+    CTraderAuthSession, CTraderAuthSnapshot, CTraderBootstrapContext, CTraderBrokerEnvironment,
+    CTraderEnvironment, CTraderLiveAuthRequest, CTraderTokenBundle, CTraderTokenExchangeRequest,
+    CTraderTokenRefreshRequest, DataSource, JobKind, JobSnapshot, JobState, ServiceEvent, TaskKind,
+    TradingAdapter, TradingAdapterKind, TradingSession, build_default_loopback_config,
     current_unix_seconds, format_ctrader_connect_error, format_ctrader_terminal_info,
     record_app_event, run_ctrader_bootstrap_batch_with_context,
     sync_ctrader_discovered_accounts_into_targets, sync_discovered_accounts_with_targets,
@@ -759,8 +758,7 @@ impl TradingSession {
             order_id,
             "trading::session fetch_ctrader_order_details dispatching ProtoOAOrderDetailsReq"
         );
-        let snapshot =
-            crate::app_services::ctrader_history::fetch_order_details(&request)?;
+        let snapshot = crate::app_services::ctrader_history::fetch_order_details(&request)?;
         tracing::debug!(
             target: "forex_app::ctrader_history",
             order_id,

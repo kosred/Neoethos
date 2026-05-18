@@ -14,7 +14,7 @@
 # All TODO(release-time) markers populated by .github/workflows/release.yml.
 
 cask "forex-ai" do
-  version "0.4.5"
+  version "0.4.7"
   # TODO(release-time): SHA-256 of the uploaded universal tarball. Brew CI
   # rejects the cask if the file on disk does not match this checksum.
   sha256 "TODO_SHA256_AT_RELEASE_TIME"

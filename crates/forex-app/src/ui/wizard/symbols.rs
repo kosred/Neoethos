@@ -26,12 +26,10 @@ pub const WIZARD_DEFAULT_TIMEFRAMES: &[&str] = &["M5", "M15", "H1", "H4", "D1"];
 /// "Preset: Top 28 ▼".  Conservative subset; the actual top-28 list
 /// is `// TODO(symbol-universe-canon)` until the operator pins it.
 pub const WIZARD_DEFAULT_TOP_28_PRESET: &[&str] = &[
-    "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD",
-    "EURGBP", "EURJPY", "EURCHF", "EURAUD", "EURCAD", "EURNZD",
-    "GBPJPY", "GBPCHF", "GBPAUD", "GBPCAD", "GBPNZD",
-    "AUDJPY", "AUDCHF", "AUDCAD", "AUDNZD",
-    "NZDJPY", "NZDCHF", "NZDCAD",
-    "CADJPY", "CADCHF", "CHFJPY",
+    "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD", "EURGBP", "EURJPY",
+    "EURCHF", "EURAUD", "EURCAD", "EURNZD", "GBPJPY", "GBPCHF", "GBPAUD", "GBPCAD", "GBPNZD",
+    "AUDJPY", "AUDCHF", "AUDCAD", "AUDNZD", "NZDJPY", "NZDCHF", "NZDCAD", "CADJPY", "CADCHF",
+    "CHFJPY",
 ];
 
 /// Top-7 majors used by the Scalping-majors-M5 template.
@@ -62,11 +60,7 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
         if ui
             .selectable_label(
                 selected,
-                format!(
-                    "{} (risk {} / 10)",
-                    template.label(),
-                    template.risk_score()
-                ),
+                format!("{} (risk {} / 10)", template.label(), template.risk_score()),
             )
             .clicked()
         {
@@ -82,8 +76,10 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
             .color(theme::TEXT_PRIMARY),
     );
     if ui.button("Apply Top 28 majors").clicked() {
-        controller.config.selected_symbols =
-            WIZARD_DEFAULT_TOP_28_PRESET.iter().map(|s| (*s).to_string()).collect();
+        controller.config.selected_symbols = WIZARD_DEFAULT_TOP_28_PRESET
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         controller.config.selected_template = SymbolTemplate::Custom;
     }
 
@@ -107,10 +103,7 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
                             .selected_symbols
                             .push((*symbol).to_string());
                     } else {
-                        controller
-                            .config
-                            .selected_symbols
-                            .retain(|s| s != *symbol);
+                        controller.config.selected_symbols.retain(|s| s != *symbol);
                     }
                 }
             }
@@ -186,10 +179,8 @@ pub fn apply_template(template: SymbolTemplate, controller: &mut WizardControlle
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect();
-            controller.config.selected_timeframes = vec!["M5", "M15"]
-                .into_iter()
-                .map(String::from)
-                .collect();
+            controller.config.selected_timeframes =
+                vec!["M5", "M15"].into_iter().map(String::from).collect();
         }
         SymbolTemplate::SwingD1Majors => {
             controller.config.selected_symbols = WIZARD_DEFAULT_TOP_7_MAJORS
@@ -206,10 +197,8 @@ pub fn apply_template(template: SymbolTemplate, controller: &mut WizardControlle
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect();
-            controller.config.selected_timeframes = vec!["H1", "H4"]
-                .into_iter()
-                .map(String::from)
-                .collect();
+            controller.config.selected_timeframes =
+                vec!["H1", "H4"].into_iter().map(String::from).collect();
         }
         SymbolTemplate::MeanReversionH1Majors => {
             controller.config.selected_symbols = WIZARD_DEFAULT_TOP_7_MAJORS

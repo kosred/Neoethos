@@ -385,12 +385,18 @@ pub fn parse_reconcile_response(response_json: &str) -> Result<CTraderReconcileS
             .positions
             .into_iter()
             .map(|position| CTraderPositionSnapshot {
-                swap: position
-                    .swap
-                    .map(|raw| scaled_money(raw, required_money_digits(position.money_digits, "position.money_digits"))),
-                commission: position
-                    .commission
-                    .map(|raw| scaled_money(raw, required_money_digits(position.money_digits, "position.money_digits"))),
+                swap: position.swap.map(|raw| {
+                    scaled_money(
+                        raw,
+                        required_money_digits(position.money_digits, "position.money_digits"),
+                    )
+                }),
+                commission: position.commission.map(|raw| {
+                    scaled_money(
+                        raw,
+                        required_money_digits(position.money_digits, "position.money_digits"),
+                    )
+                }),
                 mirroring_commission: position.mirroring_commission.map(|raw| {
                     scaled_money(
                         raw,
@@ -575,15 +581,12 @@ pub fn parse_symbol_category_list_response(
 }
 
 fn deal_payload_to_snapshot(deal: DealPayload) -> CTraderDealSnapshot {
-    let gross_profit = deal
-        .close_position_detail
-        .as_ref()
-        .map(|detail| {
-            scaled_money(
-                detail.gross_profit,
-                required_money_digits(detail.money_digits, "deal.close.money_digits"),
-            )
-        });
+    let gross_profit = deal.close_position_detail.as_ref().map(|detail| {
+        scaled_money(
+            detail.gross_profit,
+            required_money_digits(detail.money_digits, "deal.close.money_digits"),
+        )
+    });
     let fee = deal
         .close_position_detail
         .as_ref()
@@ -601,15 +604,12 @@ fn deal_payload_to_snapshot(deal: DealPayload) -> CTraderDealSnapshot {
                 )
             })
         });
-    let swap = deal
-        .close_position_detail
-        .as_ref()
-        .map(|detail| {
-            scaled_money(
-                detail.swap,
-                required_money_digits(detail.money_digits, "deal.close.money_digits"),
-            )
-        });
+    let swap = deal.close_position_detail.as_ref().map(|detail| {
+        scaled_money(
+            detail.swap,
+            required_money_digits(detail.money_digits, "deal.close.money_digits"),
+        )
+    });
     let pnl_conversion_fee = deal.close_position_detail.as_ref().and_then(|detail| {
         detail.pnl_conversion_fee.map(|fee| {
             // F-CORE2 audit: previously used `unwrap_or(0)` for money_digits,

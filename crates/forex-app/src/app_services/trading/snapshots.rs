@@ -30,8 +30,8 @@ use forex_data::Ohlcv;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::diagnostics::{
-    append_ctrader_order_builder_diagnostics, format_ctrader_deal_line,
-    format_ctrader_history_row, format_ctrader_pending_order_line, format_ctrader_position_line,
+    append_ctrader_order_builder_diagnostics, format_ctrader_deal_line, format_ctrader_history_row,
+    format_ctrader_pending_order_line, format_ctrader_position_line,
 };
 use super::{
     AppExecutionRuntimeSnapshot, ChartCandle, ChartOverlay, ConnectionSnapshot, ExecutionAction,
@@ -381,7 +381,10 @@ pub fn build_execution_surface_snapshot_with_runtime(
     }
 }
 
-pub(super) fn preferred_chart_timeframe(available_timeframes: &[String], requested: &str) -> String {
+pub(super) fn preferred_chart_timeframe(
+    available_timeframes: &[String],
+    requested: &str,
+) -> String {
     if available_timeframes.iter().any(|tf| tf == requested) {
         return requested.to_string();
     }

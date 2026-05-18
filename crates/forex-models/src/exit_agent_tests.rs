@@ -396,14 +396,12 @@ fn predict_runtime_uses_shared_three_class_confidence_gate() -> Result<()> {
         [0.0_f32; 16],
         &device,
     )));
-    agent.model.fc2.weight =
-        Param::from_tensor(Tensor::from_data([[0.0_f32; 16]; 16], &device));
+    agent.model.fc2.weight = Param::from_tensor(Tensor::from_data([[0.0_f32; 16]; 16], &device));
     agent.model.fc2.bias = Some(Param::from_tensor(Tensor::from_data(
         [0.0_f32; 16],
         &device,
     )));
-    agent.model.output.weight =
-        Param::from_tensor(Tensor::from_data([[0.0_f32; 2]; 16], &device));
+    agent.model.output.weight = Param::from_tensor(Tensor::from_data([[0.0_f32; 2]; 16], &device));
     agent.model.output.bias = Some(Param::from_tensor(Tensor::from_data(
         [0.84729785_f32, 0.0],
         &device,
@@ -642,8 +640,7 @@ fn validate_exit_artifact_rejects_training_report_warmup_mismatch() {
         execution_backend: "burn_ndarray".to_string(),
     });
 
-    let err =
-        super::validate_exit_artifact(&artifact).expect_err("warmup mismatch should fail");
+    let err = super::validate_exit_artifact(&artifact).expect_err("warmup mismatch should fail");
     assert!(err.to_string().contains("warmup_steps"));
 }
 
@@ -728,8 +725,8 @@ fn validate_exit_artifact_rejects_replay_memory_size_drift() {
     artifact.effective_device_policy = Some("cpu".to_string());
     artifact.execution_backend = Some("burn_ndarray".to_string());
 
-    let err = super::validate_exit_artifact(&artifact)
-        .expect_err("replay memory size drift should fail");
+    let err =
+        super::validate_exit_artifact(&artifact).expect_err("replay memory size drift should fail");
     assert!(err.to_string().contains("trained_memory_size"));
 }
 

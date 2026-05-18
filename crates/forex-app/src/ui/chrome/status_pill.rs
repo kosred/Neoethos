@@ -38,11 +38,7 @@ use eframe::egui;
 /// is shown after a middle-dot separator; pass `""` to suppress it
 /// (e.g. when the broker session has not discovered any accounts
 /// yet).
-pub fn draw_status_pill(
-    ui: &mut egui::Ui,
-    env: TradingEnvironment,
-    account_label: &str,
-) {
+pub fn draw_status_pill(ui: &mut egui::Ui, env: TradingEnvironment, account_label: &str) {
     let color = pill_color_for(env);
     let text = pill_text_for(env, account_label);
     // `status_badge` is the canonical "compact colored pill" primitive
@@ -63,7 +59,11 @@ pub fn draw_status_pill_with_halt(
     halted: bool,
 ) {
     if halted {
-        theme::status_badge(ui, &pill_text_for_halt(account_label), pill_color_for_halt());
+        theme::status_badge(
+            ui,
+            &pill_text_for_halt(account_label),
+            pill_color_for_halt(),
+        );
     } else {
         draw_status_pill(ui, env, account_label);
     }

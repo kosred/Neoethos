@@ -269,7 +269,8 @@ pub fn infer_market_cost_profile(
     let account_currency = if account_currency.trim().is_empty() {
         // SYNTHETIC FALLBACK: same story as the symbol fallback
         // above. cTrader-supplied account currency must replace this.
-        let resolved = cost.account_currency
+        let resolved = cost
+            .account_currency
             .clone()
             .unwrap_or_else(|| "USD".to_string());
         tracing::error!(

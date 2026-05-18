@@ -337,8 +337,7 @@ mod tests {
     fn register_deep_timeseries_loaders_rejects_double_registration() {
         let mut reg = ExpertRegistry::new();
         register_deep_timeseries_loaders(&mut reg).expect("first call");
-        let err = register_deep_timeseries_loaders(&mut reg)
-            .expect_err("second call must error");
+        let err = register_deep_timeseries_loaders(&mut reg).expect_err("second call must error");
         assert!(err.to_string().contains("already registered"));
     }
 
@@ -352,10 +351,8 @@ mod tests {
     fn all_seventeen_tree_and_deep_loaders_coexist() {
         let mut reg = ExpertRegistry::new();
         super::super::tree_adapters::register_tree_loaders(&mut reg).expect("trees");
-        super::super::deep_classification_adapters::register_deep_classification_loaders(
-            &mut reg,
-        )
-        .expect("deep-cls");
+        super::super::deep_classification_adapters::register_deep_classification_loaders(&mut reg)
+            .expect("deep-cls");
         register_deep_timeseries_loaders(&mut reg).expect("deep-ts");
 
         let names = reg.registered_names();

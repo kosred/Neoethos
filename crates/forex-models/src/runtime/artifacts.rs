@@ -87,8 +87,8 @@ impl TrainingSummaryMetadata {
 ///
 /// v1 (current): the pre-versioning shape. New optional fields
 /// stay backward-compatible via `#[serde(default)]`.
-pub const RUNTIME_ARTIFACT_METADATA_SCHEMA_VERSION:
-    forex_core::SchemaVersion = forex_core::SchemaVersion::new(1);
+pub const RUNTIME_ARTIFACT_METADATA_SCHEMA_VERSION: forex_core::SchemaVersion =
+    forex_core::SchemaVersion::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeArtifactMetadata {

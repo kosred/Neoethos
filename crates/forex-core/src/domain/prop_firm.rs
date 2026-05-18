@@ -171,12 +171,9 @@ mod tests {
         assert!(challenge.daily_target_trading_days <= challenge.target_trading_days);
         assert!(runtime.daily_dd_warning_pct < runtime.daily_dd_stop_trading_pct);
         assert!(runtime.daily_dd_stop_trading_pct <= constraints.max_daily_loss_pct as f64);
+        assert!(runtime.recovery_top_three_drawdown_pct < runtime.recovery_min_sharpe_drawdown_pct);
         assert!(
-            runtime.recovery_top_three_drawdown_pct < runtime.recovery_min_sharpe_drawdown_pct
-        );
-        assert!(
-            runtime.recovery_min_sharpe_drawdown_pct
-                < runtime.recovery_top_strategy_drawdown_pct
+            runtime.recovery_min_sharpe_drawdown_pct < runtime.recovery_top_strategy_drawdown_pct
         );
         assert!(runtime.recovery_top_strategy_drawdown_pct < runtime.recovery_halt_drawdown_pct);
         assert!(runtime.recovery_halt_drawdown_pct <= constraints.max_overall_drawdown_pct as f64);

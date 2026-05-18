@@ -98,40 +98,40 @@ pub mod rl_exit_adapters;
 pub mod soft_voting;
 pub mod tree_adapters;
 
+pub use bootstrap::{
+    DEFAULT_BOOTSTRAP_EXPERT_NAMES, build_default_registry, build_ensemble_for_symbol,
+    build_ensemble_for_symbol_with_config, load_experts_for_symbol,
+};
 pub use deep_classification_adapters::{
-    register_deep_classification_loaders, KanAdapter, KanLoader, MlpAdapter, MlpLoader,
-    TabNetAdapter, TabNetLoader,
+    KanAdapter, KanLoader, MlpAdapter, MlpLoader, TabNetAdapter, TabNetLoader,
+    register_deep_classification_loaders,
 };
 pub use deep_timeseries_adapters::{
-    register_deep_timeseries_loaders, NBeatsAdapter, NBeatsLoader, NBeatsxNfAdapter,
-    NBeatsxNfLoader, PatchTstAdapter, PatchTstLoader, TiDEAdapter, TiDELoader, TiDENfAdapter,
-    TiDENfLoader, TimesNetAdapter, TimesNetLoader, TransformerAdapter, TransformerLoader,
+    NBeatsAdapter, NBeatsLoader, NBeatsxNfAdapter, NBeatsxNfLoader, PatchTstAdapter,
+    PatchTstLoader, TiDEAdapter, TiDELoader, TiDENfAdapter, TiDENfLoader, TimesNetAdapter,
+    TimesNetLoader, TransformerAdapter, TransformerLoader, register_deep_timeseries_loaders,
 };
 pub use evolutionary_adapters::{
-    register_evolutionary_loaders, GeneticAdapter, GeneticLoader, NeatAdapter, NeatLoader,
-    NeuroEvoAdapter, NeuroEvoLoader,
-};
-pub use mixed_adapters::{
-    register_mixed_loaders, IsolationForestAdapter, IsolationForestLoader,
-    OnlineHoeffdingAdapter, OnlineHoeffdingLoader, OnlinePaAdapter, OnlinePaLoader,
+    GeneticAdapter, GeneticLoader, NeatAdapter, NeatLoader, NeuroEvoAdapter, NeuroEvoLoader,
+    register_evolutionary_loaders,
 };
 pub use meta_adapters::{
-    register_meta_loaders, BayesLogitAdapter, BayesLogitLoader, ConformalGateAdapter,
-    ConformalGateLoader, ElasticNetAdapter, ElasticNetLoader, LogisticAdapter, LogisticLoader,
-    MetaBlenderAdapter, MetaBlenderLoader, MetaStackAdapter, MetaStackLoader,
-    ProbabilityCalibratorAdapter, ProbabilityCalibratorLoader,
+    BayesLogitAdapter, BayesLogitLoader, ConformalGateAdapter, ConformalGateLoader,
+    ElasticNetAdapter, ElasticNetLoader, LogisticAdapter, LogisticLoader, MetaBlenderAdapter,
+    MetaBlenderLoader, MetaStackAdapter, MetaStackLoader, ProbabilityCalibratorAdapter,
+    ProbabilityCalibratorLoader, register_meta_loaders,
 };
-pub use bootstrap::{
-    build_default_registry, build_ensemble_for_symbol, build_ensemble_for_symbol_with_config,
-    load_experts_for_symbol, DEFAULT_BOOTSTRAP_EXPERT_NAMES,
+pub use mixed_adapters::{
+    IsolationForestAdapter, IsolationForestLoader, OnlineHoeffdingAdapter, OnlineHoeffdingLoader,
+    OnlinePaAdapter, OnlinePaLoader, register_mixed_loaders,
 };
 pub use rl_exit_adapters::{
-    register_rl_exit_loaders, DqnAdapter, DqnLoader, ExitAgentAdapter, ExitAgentLoader,
+    DqnAdapter, DqnLoader, ExitAgentAdapter, ExitAgentLoader, register_rl_exit_loaders,
 };
 pub use soft_voting::{SoftVotingEnsemble, SoftVotingEnsembleConfig};
 pub use tree_adapters::{
-    register_tree_loaders, CatboostAdapter, CatboostLoader, LightGbmAdapter, LightGbmLoader,
-    SklearsTreeAdapter, SklearsTreeLoader, XgboostAdapter, XgboostLoader,
+    CatboostAdapter, CatboostLoader, LightGbmAdapter, LightGbmLoader, SklearsTreeAdapter,
+    SklearsTreeLoader, XgboostAdapter, XgboostLoader, register_tree_loaders,
 };
 
 // ---------------------------------------------------------------------------
@@ -252,11 +252,7 @@ impl ExpertPrediction {
                 // p_close]) but the same shape/range invariants.
                 for v in &self.values {
                     if *v < -1e-4 || *v > 1.0 + 1e-4 {
-                        anyhow::bail!(
-                            "{:?} probability out of [0, 1]: {}",
-                            self.kind,
-                            v
-                        );
+                        anyhow::bail!("{:?} probability out of [0, 1]: {}", self.kind, v);
                     }
                 }
                 let sum: f32 = self.values.iter().sum();
@@ -968,10 +964,8 @@ mod tests {
         }))
         .expect("register");
 
-        let outcome = reg.load_with_partial(
-            &root,
-            &["a_io", "a_backend", "a_version", "a_invalid"],
-        );
+        let outcome =
+            reg.load_with_partial(&root, &["a_io", "a_backend", "a_version", "a_invalid"]);
         assert_eq!(outcome.loaded_count(), 0);
         assert_eq!(outcome.missing_count(), 0);
         assert_eq!(outcome.degraded_count(), 4);
@@ -981,7 +975,10 @@ mod tests {
         for d in &outcome.degraded {
             by_name.insert(d.name(), d);
         }
-        assert!(matches!(by_name.get("a_io"), Some(ExpertLoadError::Io { .. })));
+        assert!(matches!(
+            by_name.get("a_io"),
+            Some(ExpertLoadError::Io { .. })
+        ));
         assert!(matches!(
             by_name.get("a_backend"),
             Some(ExpertLoadError::Backend { .. })

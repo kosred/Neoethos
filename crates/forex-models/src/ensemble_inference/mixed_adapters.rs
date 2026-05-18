@@ -47,8 +47,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use polars::prelude::DataFrame;
 
-use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction};
 use super::tree_adapters::classification3_per_row;
+use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction};
 use crate::anomaly::IsolationForestExpert;
 use crate::base::ExpertModel as BaseExpertModel;
 use crate::runtime::capabilities::ModelFamily;
@@ -303,17 +303,18 @@ mod tests {
         register_mixed_loaders(&mut reg).expect("register");
         let mut names = reg.registered_names();
         names.sort_unstable();
-        assert_eq!(names, vec!["isolation_forest", "online_hoeffding", "online_pa"]);
+        assert_eq!(
+            names,
+            vec!["isolation_forest", "online_hoeffding", "online_pa"]
+        );
     }
 
     #[test]
     fn full_27_loaders_coexist() {
         let mut reg = ExpertRegistry::new();
         super::super::tree_adapters::register_tree_loaders(&mut reg).expect("trees");
-        super::super::deep_classification_adapters::register_deep_classification_loaders(
-            &mut reg,
-        )
-        .expect("deep-cls");
+        super::super::deep_classification_adapters::register_deep_classification_loaders(&mut reg)
+            .expect("deep-cls");
         super::super::deep_timeseries_adapters::register_deep_timeseries_loaders(&mut reg)
             .expect("deep-ts");
         super::super::meta_adapters::register_meta_loaders(&mut reg).expect("meta");

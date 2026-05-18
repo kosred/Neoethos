@@ -31,7 +31,9 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::Ohlcv;
-use crate::core::timestamps::{TimestampUnit, infer_timestamp_unit, normalize_timestamps_to_millis};
+use crate::core::timestamps::{
+    TimestampUnit, infer_timestamp_unit, normalize_timestamps_to_millis,
+};
 
 /// Per-file outcome of an import attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,8 +74,7 @@ impl ImportReport {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).ok();
         }
-        let text = serde_json::to_string_pretty(self)
-            .context("serialize import report")?;
+        let text = serde_json::to_string_pretty(self).context("serialize import report")?;
         fs::write(path, text)
             .with_context(|| format!("write import report to {}", path.display()))?;
         Ok(())
@@ -166,8 +167,7 @@ pub fn import_one_file(
         });
     }
 
-    let (symbol, timeframe) = infer_symbol_and_timeframe(path, source_root)
-        .unwrap_or((None, None));
+    let (symbol, timeframe) = infer_symbol_and_timeframe(path, source_root).unwrap_or((None, None));
 
     // Skip writing if this file IS the canonical Vortex output for
     // its (symbol, tf) pair — avoid recursive re-import.
@@ -212,14 +212,15 @@ pub fn import_one_file(
             // Quarantine the source so the user can inspect.
             let qpath = quarantine_path(data_root, path);
             if let Some(dir) = qpath.parent()
-                && let Err(mk_err) = fs::create_dir_all(dir) {
-                    tracing::warn!(
-                        target: "forex_data::universal_importer",
-                        dir = %dir.display(),
-                        error = %mk_err,
-                        "quarantine: failed to create directory"
-                    );
-                }
+                && let Err(mk_err) = fs::create_dir_all(dir)
+            {
+                tracing::warn!(
+                    target: "forex_data::universal_importer",
+                    dir = %dir.display(),
+                    error = %mk_err,
+                    "quarantine: failed to create directory"
+                );
+            }
             // Best-effort copy; don't fail import if quarantine itself fails,
             // but surface the failure so the operator knows the source file
             // wasn't preserved for inspection.
@@ -315,8 +316,9 @@ fn detect_format(path: &Path) -> String {
         "vortex" | "vtx" => "vortex".into(),
         // Common files we want to ignore silently.
         "md" | "txt" | "rst" | "log" | "yml" | "yaml" | "toml" | "lock" | "gitignore"
-        | "gitattributes" | "sha256" | "sha1" | "asc" | "zip" | "gz" | "tar" | "bz2"
-        | "xz" => "ignored".into(),
+        | "gitattributes" | "sha256" | "sha1" | "asc" | "zip" | "gz" | "tar" | "bz2" | "xz" => {
+            "ignored".into()
+        }
         _ => "unknown".into(),
     }
 }
@@ -344,9 +346,7 @@ fn infer_symbol_and_timeframe(
         }
 
         // Heuristics for non-prefixed paths:
-        if symbol.is_none()
-            && (looks_like_symbol(&s) || looks_like_extended_symbol(&s))
-        {
+        if symbol.is_none() && (looks_like_symbol(&s) || looks_like_extended_symbol(&s)) {
             symbol = Some(canonical_symbol(&s));
             continue;
         }
@@ -490,7 +490,11 @@ fn parse_csv(path: &Path, tab_separated: bool) -> Result<Ohlcv> {
         high,
         low,
         close,
-        volume: if volume.is_empty() { None } else { Some(volume) },
+        volume: if volume.is_empty() {
+            None
+        } else {
+            Some(volume)
+        },
     })
 }
 
@@ -499,21 +503,16 @@ fn parse_csv(path: &Path, tab_separated: bool) -> Result<Ohlcv> {
 fn build_column_map<'a, I: Iterator<Item = &'a str>>(headers: I) -> HashMap<String, usize> {
     let mut out = HashMap::new();
     for (i, h) in headers.enumerate() {
-        let normalised = h
-            .trim()
-            .to_ascii_lowercase()
-            .replace([' ', '.', '-'], "_");
+        let normalised = h.trim().to_ascii_lowercase().replace([' ', '.', '-'], "_");
         // Keep first occurrence per canonical name.
         let canonical = match normalised.as_str() {
-            "ts" | "time" | "date" | "datetime" | "timestamp" | "unix" | "unix_time"
-            | "epoch" | "open_time" | "candle_time" => Some("timestamp"),
+            "ts" | "time" | "date" | "datetime" | "timestamp" | "unix" | "unix_time" | "epoch"
+            | "open_time" | "candle_time" => Some("timestamp"),
             "o" | "open" | "price_open" | "openprice" => Some("open"),
             "h" | "high" | "price_high" | "highprice" => Some("high"),
             "l" | "low" | "price_low" | "lowprice" => Some("low"),
             "c" | "close" | "price_close" | "closeprice" | "last" => Some("close"),
-            "v" | "vol" | "volume" | "tickvol" | "tickvolume" | "tick_volume" => {
-                Some("volume")
-            }
+            "v" | "vol" | "volume" | "tickvol" | "tickvolume" | "tick_volume" => Some("volume"),
             _ => None,
         };
         if let Some(name) = canonical {
@@ -568,8 +567,7 @@ fn parse_timestamp_cell(s: &str) -> i64 {
 
 /// JSON: array of objects with the same column names.
 fn parse_json(path: &Path) -> Result<Ohlcv> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("read json {}", path.display()))?;
+    let text = fs::read_to_string(path).with_context(|| format!("read json {}", path.display()))?;
     let value: serde_json::Value = serde_json::from_str(&text).context("parse json")?;
     let arr = value.as_array().context("json root must be an array")?;
     let rows: Vec<HashMap<String, serde_json::Value>> = arr
@@ -581,8 +579,8 @@ fn parse_json(path: &Path) -> Result<Ohlcv> {
 
 /// JSON-Lines / NDJSON: one object per line.
 fn parse_jsonl(path: &Path) -> Result<Ohlcv> {
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("read jsonl {}", path.display()))?;
+    let text =
+        fs::read_to_string(path).with_context(|| format!("read jsonl {}", path.display()))?;
     let rows: Vec<HashMap<String, serde_json::Value>> = text
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -633,7 +631,11 @@ fn rows_to_ohlcv(rows: Vec<HashMap<String, serde_json::Value>>) -> Result<Ohlcv>
         high,
         low,
         close,
-        volume: if volume.is_empty() { None } else { Some(volume) },
+        volume: if volume.is_empty() {
+            None
+        } else {
+            Some(volume)
+        },
     })
 }
 
@@ -641,18 +643,20 @@ fn extract_num(row: &HashMap<String, serde_json::Value>, keys: &[&str]) -> Optio
     for k in keys {
         for actual_key in row.keys() {
             if actual_key.eq_ignore_ascii_case(k)
-                && let Some(v) = row.get(actual_key) {
-                    if let Some(f) = v.as_f64() {
-                        return Some(f);
-                    }
-                    if let Some(s) = v.as_str()
-                        && let Ok(f) = s.parse::<f64>() {
-                            return Some(f);
-                        }
-                    if let Some(i) = v.as_i64() {
-                        return Some(i as f64);
-                    }
+                && let Some(v) = row.get(actual_key)
+            {
+                if let Some(f) = v.as_f64() {
+                    return Some(f);
                 }
+                if let Some(s) = v.as_str()
+                    && let Ok(f) = s.parse::<f64>()
+                {
+                    return Some(f);
+                }
+                if let Some(i) = v.as_i64() {
+                    return Some(i as f64);
+                }
+            }
         }
     }
     None
@@ -672,20 +676,21 @@ fn extract_ts(row: &HashMap<String, serde_json::Value>) -> Option<i64> {
     ] {
         for actual_key in row.keys() {
             if actual_key.eq_ignore_ascii_case(k)
-                && let Some(v) = row.get(actual_key) {
-                    if let Some(i) = v.as_i64() {
-                        return Some(i);
-                    }
-                    if let Some(f) = v.as_f64() {
-                        return Some(f as i64);
-                    }
-                    if let Some(s) = v.as_str() {
-                        let parsed = parse_timestamp_cell(s);
-                        if parsed != 0 {
-                            return Some(parsed);
-                        }
+                && let Some(v) = row.get(actual_key)
+            {
+                if let Some(i) = v.as_i64() {
+                    return Some(i);
+                }
+                if let Some(f) = v.as_f64() {
+                    return Some(f as i64);
+                }
+                if let Some(s) = v.as_str() {
+                    let parsed = parse_timestamp_cell(s);
+                    if parsed != 0 {
+                        return Some(parsed);
                     }
                 }
+            }
         }
     }
     None
@@ -709,26 +714,11 @@ mod tests {
 
     #[test]
     fn detect_known_extensions() {
-        assert_eq!(
-            detect_format(Path::new("EURUSD_M5.csv")),
-            "csv"
-        );
-        assert_eq!(
-            detect_format(Path::new("EURUSD_M5.parquet")),
-            "parquet"
-        );
-        assert_eq!(
-            detect_format(Path::new("EURUSD_M5.json")),
-            "json"
-        );
-        assert_eq!(
-            detect_format(Path::new("EURUSD_M5.jsonl")),
-            "jsonl"
-        );
-        assert_eq!(
-            detect_format(Path::new("data.vortex")),
-            "vortex"
-        );
+        assert_eq!(detect_format(Path::new("EURUSD_M5.csv")), "csv");
+        assert_eq!(detect_format(Path::new("EURUSD_M5.parquet")), "parquet");
+        assert_eq!(detect_format(Path::new("EURUSD_M5.json")), "json");
+        assert_eq!(detect_format(Path::new("EURUSD_M5.jsonl")), "jsonl");
+        assert_eq!(detect_format(Path::new("data.vortex")), "vortex");
         assert_eq!(detect_format(Path::new("README.md")), "ignored");
         assert_eq!(detect_format(Path::new("blob.bin")), "unknown");
     }
@@ -736,11 +726,9 @@ mod tests {
     #[test]
     fn infer_symbol_from_hive_path() {
         let tmp = std::env::temp_dir().join("forex_ai_importer_test_hive");
-        let result = infer_symbol_and_timeframe(
-            &tmp.join("symbol=EURUSD/timeframe=M5/data.csv"),
-            &tmp,
-        )
-        .unwrap();
+        let result =
+            infer_symbol_and_timeframe(&tmp.join("symbol=EURUSD/timeframe=M5/data.csv"), &tmp)
+                .unwrap();
         assert_eq!(result.0.as_deref(), Some("EURUSD"));
         assert_eq!(result.1.as_deref(), Some("M5"));
     }
@@ -748,8 +736,7 @@ mod tests {
     #[test]
     fn infer_symbol_from_filename_token() {
         let tmp = std::env::temp_dir().join("forex_ai_importer_test_filename");
-        let result =
-            infer_symbol_and_timeframe(&tmp.join("EURUSD_M5_2024.csv"), &tmp).unwrap();
+        let result = infer_symbol_and_timeframe(&tmp.join("EURUSD_M5_2024.csv"), &tmp).unwrap();
         assert_eq!(result.0.as_deref(), Some("EURUSD"));
         assert_eq!(result.1.as_deref(), Some("M5"));
     }
@@ -774,9 +761,6 @@ mod tests {
         let ohlcv = parse_csv(&tmp, false).unwrap();
         assert_eq!(ohlcv.open, vec![1.10, 1.105]);
         assert_eq!(ohlcv.close, vec![1.105, 1.11]);
-        assert_eq!(
-            ohlcv.timestamp.as_ref().unwrap()[0],
-            1_700_000_000_000
-        );
+        assert_eq!(ohlcv.timestamp.as_ref().unwrap()[0], 1_700_000_000_000);
     }
 }

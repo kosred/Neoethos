@@ -154,13 +154,37 @@ impl FormState {
 
 pub fn make_discover_form(default_root: &str) -> FormState {
     FormState::new(vec![
-        Field::new("Symbols", "", "Comma-separated. Empty = auto-detect from data root."),
-        Field::new("Timeframes", "M30,H1,H4,D1", "Comma-separated. Default: M30,H1,H4,D1"),
-        Field::new("Population", "1000", "GA population per generation. Default: 1000"),
+        Field::new(
+            "Symbols",
+            "",
+            "Comma-separated. Empty = auto-detect from data root.",
+        ),
+        Field::new(
+            "Timeframes",
+            "M30,H1,H4,D1",
+            "Comma-separated. Default: M30,H1,H4,D1",
+        ),
+        Field::new(
+            "Population",
+            "1000",
+            "GA population per generation. Default: 1000",
+        ),
         Field::new("Generations", "10", "GA generations. Default: 10"),
-        Field::new("Portfolio size", "2000", "Max portfolio size per work-unit. Default: 2000"),
-        Field::new("Data root", default_root, "Path to data/ directory containing symbol=*/timeframe=*/"),
-        Field::new("Out dir", "cache/discovery", "Where portfolio JSONs are written"),
+        Field::new(
+            "Portfolio size",
+            "2000",
+            "Max portfolio size per work-unit. Default: 2000",
+        ),
+        Field::new(
+            "Data root",
+            default_root,
+            "Path to data/ directory containing symbol=*/timeframe=*/",
+        ),
+        Field::new(
+            "Out dir",
+            "cache/discovery",
+            "Where portfolio JSONs are written",
+        ),
     ])
 }
 
@@ -168,10 +192,18 @@ pub fn make_discover_form(default_root: &str) -> FormState {
 
 pub fn make_train_form(default_root: &str) -> FormState {
     FormState::new(vec![
-        Field::new("Symbol", "EURUSD", "Single symbol to train. Pick from Symbols page."),
+        Field::new(
+            "Symbol",
+            "EURUSD",
+            "Single symbol to train. Pick from Symbols page.",
+        ),
         Field::new("Base TF", "M30", "Base timeframe. Default: M30"),
         Field::new("Data root", default_root, "Path to data/ directory"),
-        Field::new("Models dir", "cache/models", "Where trained model artifacts are written"),
+        Field::new(
+            "Models dir",
+            "cache/models",
+            "Where trained model artifacts are written",
+        ),
     ])
 }
 

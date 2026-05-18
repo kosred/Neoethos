@@ -80,7 +80,9 @@ fn render_form(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
         let line = Line::from(vec![
             Span::styled(
                 format!(" {} ", marker),
-                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("{:>14}  ", field.label),
@@ -92,11 +94,21 @@ fn render_form(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
             ),
         ]);
         Paragraph::new(line).render(
-            Rect { x: inner.x, y, width: inner.width, height: 1 },
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            },
             buf,
         );
         shared.hits.push(Hit {
-            rect: Rect { x: inner.x, y, width: inner.width, height: 1 },
+            rect: Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            },
             action: HitAction::FocusField {
                 page: crate::tui::pages::Page::Train,
                 index: idx,
@@ -108,7 +120,12 @@ fn render_form(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
                 Span::styled(field.hint, theme::caption_style()),
             ]))
             .render(
-                Rect { x: inner.x, y: y + 1, width: inner.width, height: 1 },
+                Rect {
+                    x: inner.x,
+                    y: y + 1,
+                    width: inner.width,
+                    height: 1,
+                },
                 buf,
             );
         }
@@ -142,12 +159,22 @@ fn render_form(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
             Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
         )]);
         Paragraph::new(line).render(
-            Rect { x: inner.x, y, width: inner.width, height: 1 },
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            },
             buf,
         );
         if !job_alive {
             shared.hits.push(Hit {
-                rect: Rect { x: inner.x, y, width: inner.width, height: 1 },
+                rect: Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
                 action: HitAction::Activate,
             });
         }
@@ -184,7 +211,10 @@ fn render_live_log(area: Rect, buf: &mut Buffer, shared: &AppShared) {
         job.tail(visible)
             .map(|l| {
                 let lower = l.to_lowercase();
-                let style = if lower.contains("error") || lower.contains("panic") || lower.contains("failed") {
+                let style = if lower.contains("error")
+                    || lower.contains("panic")
+                    || lower.contains("failed")
+                {
                     theme::sell_style()
                 } else if lower.contains("complete") || lower.contains("saved") {
                     theme::buy_style()
@@ -225,10 +255,19 @@ fn render_registry(area: Rect, buf: &mut Buffer) {
     let lines: Vec<Line> = if entries.is_empty() {
         vec![
             Line::raw(""),
-            Line::styled("  No trained models in cache/models/ yet.", theme::muted_style()),
+            Line::styled(
+                "  No trained models in cache/models/ yet.",
+                theme::muted_style(),
+            ),
             Line::raw(""),
-            Line::styled("  Set Symbol/Base TF on the left, then press l", theme::muted_style()),
-            Line::styled("  (or click [ Launch ]) to start training.", theme::muted_style()),
+            Line::styled(
+                "  Set Symbol/Base TF on the left, then press l",
+                theme::muted_style(),
+            ),
+            Line::styled(
+                "  (or click [ Launch ]) to start training.",
+                theme::muted_style(),
+            ),
         ]
     } else {
         entries
@@ -307,7 +346,10 @@ pub fn launch_now(shared: &mut AppShared) {
     let symbol = form.value_for("Symbol").unwrap_or("EURUSD").to_string();
     let base = form.value_for("Base TF").unwrap_or("M30").to_string();
     let root = form.value_for("Data root").unwrap_or("data").to_string();
-    let models_dir = form.value_for("Models dir").unwrap_or("cache/models").to_string();
+    let models_dir = form
+        .value_for("Models dir")
+        .unwrap_or("cache/models")
+        .to_string();
 
     // train command doesn't honor --root; the training_orchestrator reads
     // FOREX_BOT_DATA_ROOT instead. We inject it on the child subprocess

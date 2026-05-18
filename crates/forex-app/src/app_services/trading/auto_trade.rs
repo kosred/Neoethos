@@ -298,7 +298,8 @@ mod tests {
         state.auto_trade_enabled = false;
         let mut session =
             TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
-        let decision = session.dispatch_auto_trade_signal(&mut state, sample_signal(AutoTradeSide::Buy, 0.8));
+        let decision =
+            session.dispatch_auto_trade_signal(&mut state, sample_signal(AutoTradeSide::Buy, 0.8));
         assert_eq!(decision, GateDecision::AutoTradeOff);
         // Buffer should remain empty — no decision recorded for a
         // gate-1 reject.
@@ -344,7 +345,10 @@ mod tests {
         let decision =
             session.dispatch_auto_trade_signal(&mut state, sample_signal(AutoTradeSide::Buy, 0.5));
         match decision {
-            GateDecision::BelowConfidence { confidence, minimum } => {
+            GateDecision::BelowConfidence {
+                confidence,
+                minimum,
+            } => {
                 assert!((confidence - 0.5).abs() < 1e-6);
                 assert!((minimum - AUTO_TRADE_MIN_CONFIDENCE).abs() < 1e-6);
             }
@@ -409,8 +413,8 @@ mod tests {
             "signed config must reject manual orders"
         );
 
-        let decision = session
-            .dispatch_auto_trade_signal(&mut state, sample_signal(AutoTradeSide::Buy, 0.9));
+        let decision =
+            session.dispatch_auto_trade_signal(&mut state, sample_signal(AutoTradeSide::Buy, 0.9));
 
         // `Dispatched` proves the autonomous-only gate did NOT
         // short-circuit the AI path. The downstream broker fill
@@ -446,8 +450,8 @@ mod tests {
             .expect("manager")
             .trip_manual_halt();
 
-        let decision = session
-            .dispatch_auto_trade_signal(&mut state, sample_signal(AutoTradeSide::Buy, 0.9));
+        let decision =
+            session.dispatch_auto_trade_signal(&mut state, sample_signal(AutoTradeSide::Buy, 0.9));
 
         assert_eq!(
             decision,

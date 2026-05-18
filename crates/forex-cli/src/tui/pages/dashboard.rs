@@ -41,11 +41,7 @@ pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
 
     let active = active_job_count();
     Kpi::new("Active jobs", active.to_string())
-        .sub(if active == 0 {
-            "Idle"
-        } else {
-            "Running"
-        })
+        .sub(if active == 0 { "Idle" } else { "Running" })
         .value_style(if active == 0 {
             theme::muted_style().add_modifier(Modifier::BOLD)
         } else {
@@ -119,39 +115,35 @@ fn render_quick_start(area: Rect, buf: &mut Buffer) {
     let lines = vec![
         Line::styled(
             "1.  Symbols (4)",
-            Style::default().fg(theme::TEXT_PRIMARY).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::TEXT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
         ),
-        Line::styled(
-            "    inspect dataset inventory",
-            theme::muted_style(),
-        ),
+        Line::styled("    inspect dataset inventory", theme::muted_style()),
         Line::raw(""),
         Line::styled(
             "2.  Discover (2)",
-            Style::default().fg(theme::TEXT_PRIMARY).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::TEXT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
         ),
-        Line::styled(
-            "    search for strategies",
-            theme::muted_style(),
-        ),
+        Line::styled("    search for strategies", theme::muted_style()),
         Line::raw(""),
         Line::styled(
             "3.  Strategies (3)",
-            Style::default().fg(theme::TEXT_PRIMARY).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::TEXT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
         ),
-        Line::styled(
-            "    browse + rank discovered",
-            theme::muted_style(),
-        ),
+        Line::styled("    browse + rank discovered", theme::muted_style()),
         Line::raw(""),
         Line::styled(
             "4.  Train (5)",
-            Style::default().fg(theme::TEXT_PRIMARY).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::TEXT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
         ),
-        Line::styled(
-            "    train models on a portfolio",
-            theme::muted_style(),
-        ),
+        Line::styled("    train models on a portfolio", theme::muted_style()),
     ];
     Paragraph::new(lines).render(inner, buf);
 }
@@ -171,11 +163,7 @@ fn dataset_summary(shared: &AppShared) -> (usize, usize) {
                 .map(|inner| {
                     inner
                         .flatten()
-                        .filter(|e| {
-                            e.file_name()
-                                .to_string_lossy()
-                                .starts_with("timeframe=")
-                        })
+                        .filter(|e| e.file_name().to_string_lossy().starts_with("timeframe="))
                         .count()
                 })
                 .unwrap_or(0);
@@ -201,7 +189,11 @@ fn portfolio_count(shared: &AppShared) -> usize {
     let mut total = 0;
     for candidate in [
         std::path::PathBuf::from("cache").join("discovery"),
-        shared.data_root.parent().map(|p| p.join("cache")).unwrap_or_default(),
+        shared
+            .data_root
+            .parent()
+            .map(|p| p.join("cache"))
+            .unwrap_or_default(),
     ] {
         if let Ok(read) = std::fs::read_dir(&candidate) {
             for entry in read.flatten() {

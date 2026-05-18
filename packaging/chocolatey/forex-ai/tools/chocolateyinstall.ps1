@@ -14,8 +14,8 @@ $toolsDir = "$(Split-Path -parent $MyInvocation.MyCommand.Definition)"
 $packageArgs = @{
     packageName    = 'forex-ai'
     unzipLocation  = $toolsDir
-    url64bit       = 'https://github.com/kosred/forex-ai/releases/download/v0.4.5/forex-ai-v0.4.5-windows-x86_64.zip'
-    checksum64     = '4CA7667FC5154A12BC9C7C2C65F1575B023693E8758A5FE679F47F457A8F9B9A'
+    url64bit       = 'https://github.com/kosred/forex-ai/releases/download/v0.4.7/forex-ai-v0.4.7-windows-x86_64.zip'
+    checksum64     = 'TODO_SHA256_AT_RELEASE_TIME'
     checksumType64 = 'sha256'
 }
 

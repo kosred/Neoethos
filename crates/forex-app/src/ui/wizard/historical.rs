@@ -33,9 +33,7 @@ use std::time::{Duration, Instant};
 
 use super::oauth;
 use super::{StepResult, WizardController};
-use crate::app_services::ctrader_history::{
-    CTraderHistoricalBarsRequest, fetch_historical_bars,
-};
+use crate::app_services::ctrader_history::{CTraderHistoricalBarsRequest, fetch_historical_bars};
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::ui::theme;
 use forex_data::{Ohlcv, write_symbol_timeframe_vortex};
@@ -119,7 +117,10 @@ struct HistoricalRuntime {
 
 #[derive(Debug, Clone)]
 enum HistoryProgressMessage {
-    JobUpdate { index: usize, state: HistoryJobState },
+    JobUpdate {
+        index: usize,
+        state: HistoryJobState,
+    },
     AllDone,
 }
 
@@ -188,11 +189,7 @@ pub fn replace_partial_with_complete(vortex_path: &Path) -> std::io::Result<Path
 
 /// Split a request window into ~monthly chunks. Each chunk is bounded
 /// inclusively by the operator-requested window.
-pub fn split_window_into_chunks(
-    from_ms: i64,
-    to_ms: i64,
-    chunk_ms: i64,
-) -> Vec<(i64, i64)> {
+pub fn split_window_into_chunks(from_ms: i64, to_ms: i64, chunk_ms: i64) -> Vec<(i64, i64)> {
     assert!(chunk_ms > 0, "chunk_ms must be positive");
     let mut chunks = Vec::new();
     let mut cursor = from_ms;
@@ -363,9 +360,7 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
         }
         if runtime.running {
             if ui.button("Cancel download").clicked() {
-                runtime
-                    .cancel_flag
-                    .store(true, Ordering::Relaxed);
+                runtime.cancel_flag.store(true, Ordering::Relaxed);
             }
         } else {
             let can_begin = controller.config.data_path.is_some()
@@ -451,9 +446,8 @@ fn start_download(runtime: &mut HistoricalRuntime, controller: &mut WizardContro
         &controller.config.selected_timeframes,
     );
     if jobs.is_empty() {
-        runtime.last_error = Some(
-            "No (symbol, timeframe) pairs selected — go back to Step 5".to_string(),
-        );
+        runtime.last_error =
+            Some("No (symbol, timeframe) pairs selected — go back to Step 5".to_string());
         return;
     }
     runtime.jobs = jobs.clone();
@@ -500,8 +494,7 @@ fn start_download(runtime: &mut HistoricalRuntime, controller: &mut WizardContro
         return;
     };
     let Some(access_token) = oauth::expose_access_token() else {
-        runtime.last_error =
-            Some("Access token missing — finish Step 4 sign-in first".to_string());
+        runtime.last_error = Some("Access token missing — finish Step 4 sign-in first".to_string());
         runtime.running = false;
         return;
     };
@@ -559,8 +552,7 @@ fn run_history_jobs(
             });
             continue;
         }
-        let vortex_path =
-            canonical_vortex_path(&context.data_path, &job.symbol, &job.timeframe);
+        let vortex_path = canonical_vortex_path(&context.data_path, &job.symbol, &job.timeframe);
         // Cancel-safety: write `.partial` BEFORE any broker call.
         if let Err(err) = write_partial_sentinel(&vortex_path) {
             let _ = tx.send(HistoryProgressMessage::JobUpdate {
@@ -644,12 +636,7 @@ fn run_history_jobs(
                         .close
                         .extend(result.bars.iter().map(|b| b.close));
                     if let Some(vols) = accumulated.volume.as_mut() {
-                        vols.extend(
-                            result
-                                .bars
-                                .iter()
-                                .map(|b| b.volume.unwrap_or(0) as f64),
-                        );
+                        vols.extend(result.bars.iter().map(|b| b.volume.unwrap_or(0) as f64));
                     }
                 }
                 Err(err) => {
@@ -663,9 +650,7 @@ fn run_history_jobs(
                             },
                         });
                         sleep_with_cancel(
-                            Duration::from_secs(
-                                WIZARD_DEFAULT_HISTORY_BACKOFF_SECONDS as u64,
-                            ),
+                            Duration::from_secs(WIZARD_DEFAULT_HISTORY_BACKOFF_SECONDS as u64),
                             &cancel_flag,
                         );
                         if cancel_flag.load(Ordering::Relaxed) {
@@ -809,7 +794,10 @@ mod tests {
     fn rate_limit_matches_ctrader_api_documentation() {
         // ctrader_api_full_reference.md §3.2 — 5 req/s per connection.
         assert_eq!(WIZARD_DEFAULT_HISTORY_RATE_LIMIT_RPS, 5);
-        assert_eq!(WIZARD_DEFAULT_HISTORY_BUCKET_INTERVAL, Duration::from_millis(200));
+        assert_eq!(
+            WIZARD_DEFAULT_HISTORY_BUCKET_INTERVAL,
+            Duration::from_millis(200)
+        );
     }
 
     #[test]
@@ -825,12 +813,19 @@ mod tests {
         let mut c = WizardController::new();
         c.current = WizardState::Historical;
         c.apply(StepResult::SkipRequested);
-        assert!(c.state_file.skipped_steps.contains(&WizardState::Historical));
+        assert!(
+            c.state_file
+                .skipped_steps
+                .contains(&WizardState::Historical)
+        );
     }
 
     #[test]
     fn sentinel_suffixes_are_distinguishable() {
-        assert_ne!(WIZARD_PARTIAL_SENTINEL_SUFFIX, WIZARD_COMPLETE_SENTINEL_SUFFIX);
+        assert_ne!(
+            WIZARD_PARTIAL_SENTINEL_SUFFIX,
+            WIZARD_COMPLETE_SENTINEL_SUFFIX
+        );
     }
 
     #[test]
@@ -840,16 +835,20 @@ mod tests {
         let complete = complete_sentinel_path(&path);
         assert_eq!(partial.parent(), path.parent());
         assert_eq!(complete.parent(), path.parent());
-        assert!(partial
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .ends_with(".partial"));
-        assert!(complete
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .ends_with(".complete"));
+        assert!(
+            partial
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(".partial")
+        );
+        assert!(
+            complete
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(".complete")
+        );
     }
 
     #[test]
@@ -945,8 +944,7 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let pid = std::process::id();
-        let path =
-            std::env::temp_dir().join(format!("forex-ai-wizard-history-{pid}-{nanos}"));
+        let path = std::env::temp_dir().join(format!("forex-ai-wizard-history-{pid}-{nanos}"));
         std::fs::create_dir_all(&path).expect("temp dir should be creatable");
         path
     }
@@ -978,8 +976,8 @@ mod tests {
         let dir = wizard_tempdir();
         let vortex_path = canonical_vortex_path(&dir, "EURUSD", "M1");
         let _ = write_partial_sentinel(&vortex_path).expect("write_partial_sentinel");
-        let complete = replace_partial_with_complete(&vortex_path)
-            .expect("replace_partial_with_complete");
+        let complete =
+            replace_partial_with_complete(&vortex_path).expect("replace_partial_with_complete");
         assert!(complete.exists());
         assert!(!partial_sentinel_path(&vortex_path).exists());
         let _ = std::fs::remove_dir_all(&dir);

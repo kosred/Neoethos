@@ -23,8 +23,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::contracts::CANONICAL_TIMEFRAMES;
 use crate::Settings;
+use crate::contracts::CANONICAL_TIMEFRAMES;
 
 /// One resolved field — captures both the operator-supplied value and
 /// the value the system will actually use, plus where the resolution
@@ -169,7 +169,14 @@ impl ResolvedConfig {
                 // Strict mode uses crate::genetic::FilteringConfig::default()
                 // values; we mirror them here for display (the actual values
                 // are still applied in forex-search).
-                (0.0_f64, s.models.prop_min_trades.max(1) as f64, 0.20_f64, 0.5_f64, 0.45_f64, 1.2_f64)
+                (
+                    0.0_f64,
+                    s.models.prop_min_trades.max(1) as f64,
+                    0.20_f64,
+                    0.5_f64,
+                    0.45_f64,
+                    1.2_f64,
+                )
             };
 
         // Timeframes section -----------------------------------------------
@@ -490,7 +497,9 @@ mod tests {
         let s = Settings::default();
         let r = ResolvedConfig::from_settings(&s);
         assert!(
-            r.display_fields.iter().any(|f| f.field == "min_fitness_score"),
+            r.display_fields
+                .iter()
+                .any(|f| f.field == "min_fitness_score"),
             "expected min_fitness_score row in display_fields"
         );
     }

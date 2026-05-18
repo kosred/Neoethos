@@ -267,9 +267,7 @@ impl ExpertLoader for TabNetLoader {
 /// [`super::tree_adapters::register_tree_loaders`] convenience helper
 /// — the forex-app bootstrap will call this once per session
 /// alongside its tree-family counterpart.
-pub fn register_deep_classification_loaders(
-    registry: &mut super::ExpertRegistry,
-) -> Result<()> {
+pub fn register_deep_classification_loaders(registry: &mut super::ExpertRegistry) -> Result<()> {
     registry.register(Box::new(MlpLoader))?;
     registry.register(Box::new(KanLoader))?;
     registry.register(Box::new(TabNetLoader))?;
@@ -338,8 +336,8 @@ mod tests {
     fn register_deep_classification_loaders_rejects_double_registration() {
         let mut reg = ExpertRegistry::new();
         register_deep_classification_loaders(&mut reg).expect("first call");
-        let err = register_deep_classification_loaders(&mut reg)
-            .expect_err("second call must error");
+        let err =
+            register_deep_classification_loaders(&mut reg).expect_err("second call must error");
         assert!(err.to_string().contains("already registered"));
     }
 

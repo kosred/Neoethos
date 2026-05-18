@@ -52,13 +52,13 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use forex_data::{compute_hpc_feature_frame, FeatureFrame, FeatureProfile, Ohlcv};
+use forex_data::{FeatureFrame, FeatureProfile, Ohlcv, compute_hpc_feature_frame};
 use forex_models::EnsemblePredictor;
 use polars::prelude::{Column, DataFrame, NamedFrom, Series};
 
+use super::HistoricalBar;
 use super::auto_trade::AutoTradeSide;
 use super::auto_trade_producer::{ModelPredictor, PredictionOutput};
-use super::HistoricalBar;
 
 /// Minimum rolling-window length the ensemble adapter requires
 /// before it will emit a non-Flat prediction. 200 bars covers the
@@ -234,11 +234,7 @@ impl ModelPredictor for EnsembleModelPredictor {
         // The LATEST bar's prediction is on the LAST row of the
         // result matrix.
         let last = probs.nrows() - 1;
-        let row = [
-            probs[(last, 0)],
-            probs[(last, 1)],
-            probs[(last, 2)],
-        ];
+        let row = [probs[(last, 0)], probs[(last, 1)], probs[(last, 2)]];
         Ok(row_to_prediction(row))
     }
 }
@@ -250,10 +246,10 @@ impl ModelPredictor for EnsembleModelPredictor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forex_models::SoftVotingEnsemble;
     use forex_models::ensemble_inference::{
         ExpertLoadOutcome, ExpertModel, ExpertOutputKind, ExpertPrediction,
     };
-    use forex_models::SoftVotingEnsemble;
     use forex_models::runtime::capabilities::ModelFamily;
 
     fn bar(timestamp_ms: i64, close: f64) -> HistoricalBar {
@@ -380,7 +376,10 @@ mod tests {
     fn bars_to_ohlcv_preserves_chronological_order() {
         let bars = vec![bar(1_000, 1.0), bar(2_000, 1.1), bar(3_000, 1.2)];
         let ohlcv = bars_to_ohlcv(&bars);
-        assert_eq!(ohlcv.timestamp.as_ref().unwrap(), &vec![1_000, 2_000, 3_000]);
+        assert_eq!(
+            ohlcv.timestamp.as_ref().unwrap(),
+            &vec![1_000, 2_000, 3_000]
+        );
         assert_eq!(ohlcv.close, vec![1.0, 1.1, 1.2]);
         assert_eq!(ohlcv.volume.as_ref().unwrap(), &vec![1.0, 1.0, 1.0]);
     }

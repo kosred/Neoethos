@@ -1,8 +1,6 @@
 use super::super::FeatureFrame;
 use super::discover::DataFormat;
-use super::to_vortex::{
-    IngestionSchema, cache_dir_for, cache_path_for, convert_to_vortex,
-};
+use super::to_vortex::{IngestionSchema, cache_dir_for, cache_path_for, convert_to_vortex};
 use super::vortex_io::{read_vortex_array, write_vortex_array};
 use anyhow::{Context, Result, bail};
 use std::fs;
@@ -200,21 +198,20 @@ pub fn resolve_path_to_vortex(
     schema_hint: Option<&IngestionSchema>,
 ) -> Result<PathBuf> {
     if !source.exists() {
-        bail!("resolve_path_to_vortex: source missing: {}", source.display());
+        bail!(
+            "resolve_path_to_vortex: source missing: {}",
+            source.display()
+        );
     }
 
-    let format = DataFormat::from_extension(
-        source
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or(""),
-    )
-    .with_context(|| {
-        format!(
-            "resolve_path_to_vortex: unsupported extension on {}",
-            source.display()
-        )
-    })?;
+    let format =
+        DataFormat::from_extension(source.extension().and_then(|e| e.to_str()).unwrap_or(""))
+            .with_context(|| {
+                format!(
+                    "resolve_path_to_vortex: unsupported extension on {}",
+                    source.display()
+                )
+            })?;
 
     // Fast path: already Vortex on disk.
     if format == DataFormat::Vortex {
@@ -265,14 +262,13 @@ pub fn resolve_path_to_vortex(
         })?;
     }
 
-    convert_to_vortex(source, format, &cache_path, schema_hint)
-        .with_context(|| {
-            format!(
-                "resolve_path_to_vortex: convert {} -> {}",
-                source.display(),
-                cache_path.display()
-            )
-        })?;
+    convert_to_vortex(source, format, &cache_path, schema_hint).with_context(|| {
+        format!(
+            "resolve_path_to_vortex: convert {} -> {}",
+            source.display(),
+            cache_path.display()
+        )
+    })?;
 
     tracing::info!(
         target: "forex_data::loader",

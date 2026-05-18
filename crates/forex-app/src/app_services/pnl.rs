@@ -80,8 +80,7 @@
 use crate::app_services::ctrader_account::CTraderPositionSnapshot;
 use crate::app_services::ctrader_messages::{
     CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_GET_POSITION_UNREALIZED_PNL_RESPONSE_PAYLOAD_TYPE, CTraderOpenApiTransport,
     CTraderUnrealizedPnLSnapshot, build_account_auth_request, build_application_auth_request,
     build_get_position_unrealized_pnl_request, parse_ctrader_error_payload,
@@ -614,11 +613,7 @@ mod tests {
             money_digits: 2,
             by_position: HashMap::new(),
         };
-        let breaker = evaluate_pnl_drift_circuit_breaker(
-            &authoritative,
-            &[],
-            |_| None,
-        );
+        let breaker = evaluate_pnl_drift_circuit_breaker(&authoritative, &[], |_| None);
         assert!(breaker.is_ok());
     }
 

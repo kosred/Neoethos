@@ -138,8 +138,9 @@ pub fn convert_to_vortex(
             .with_context(|| format!("parse jsonl {}", source.display()))?,
         // `Arrow` covers .arrow, .feather, and .ipc in
         // `discover::DataFormat::from_extension`.
-        DataFormat::Arrow => parse_ipc(source)
-            .with_context(|| format!("parse ipc {}", source.display()))?,
+        DataFormat::Arrow => {
+            parse_ipc(source).with_context(|| format!("parse ipc {}", source.display()))?
+        }
     };
 
     // Validation suite — every gate bails rather than silently filling.
@@ -149,12 +150,8 @@ pub fn convert_to_vortex(
     validate_implied_timeframe(&ohlcv, schema_hint, source)?;
 
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "create destination parent dir {}",
-                parent.display()
-            )
-        })?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create destination parent dir {}", parent.display()))?;
     }
 
     // f64 required: the canonical OHLCV Vortex schema in `lib.rs`
@@ -194,9 +191,8 @@ fn vortex_passthrough(source: &Path, destination: &Path) -> Result<PathBuf> {
     }
 
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("create destination parent dir {}", parent.display())
-        })?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create destination parent dir {}", parent.display()))?;
     }
 
     // Re-write through the canonical writer so that the destination
@@ -328,10 +324,7 @@ fn validate_required_columns(ohlcv: &Ohlcv, hint: Option<&IngestionSchema>) -> R
         bail!("ingestion: source produced zero rows");
     }
     let len = ohlcv.open.len();
-    if ohlcv.high.len() != len
-        || ohlcv.low.len() != len
-        || ohlcv.close.len() != len
-    {
+    if ohlcv.high.len() != len || ohlcv.low.len() != len || ohlcv.close.len() != len {
         bail!("ingestion: OHLC column length mismatch");
     }
     let ts = ohlcv
@@ -391,8 +384,10 @@ fn validate_timestamp_monotonic_utc(ohlcv: &Ohlcv) -> Result<()> {
     }
     let mut prev = ts[0];
     if prev <= 0 {
-        bail!("validate: timestamp[0] = {prev} is non-positive — \
-              not a valid UTC epoch value");
+        bail!(
+            "validate: timestamp[0] = {prev} is non-positive — \
+              not a valid UTC epoch value"
+        );
     }
     for (i, &t) in ts.iter().enumerate().skip(1) {
         if t < prev {
@@ -423,33 +418,59 @@ fn validate_implied_timeframe(
     // 1) Explicit hint.
     if let Some(h) = hint
         && let Some(tf) = &h.timeframe_hint
-            && !forex_core::is_canonical_timeframe(tf) {
-                bail!(
-                    "validate: schema_hint timeframe {tf} is not canonical \
+        && !forex_core::is_canonical_timeframe(tf)
+    {
+        bail!(
+            "validate: schema_hint timeframe {tf} is not canonical \
                      (forex_core::CANONICAL_TIMEFRAMES). H2 is intentionally absent."
-                );
-            }
+        );
+    }
 
     // 2) Filename token (e.g. EURUSD_H2_2024.csv).
     if let Some(stem) = source.file_stem().and_then(|s| s.to_str()) {
         for token in stem.split(['_', '-', '.', ' ']) {
             let upper = token.to_ascii_uppercase();
             // Cheap pre-filter: looks like a timeframe code at all?
-            if !upper.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+            if !upper
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic())
+            {
                 continue;
             }
-            if matches!(upper.as_str(),
-                "M1" | "M2" | "M3" | "M4" | "M5" | "M6" | "M10" | "M15" | "M20" | "M30"
-                | "H1" | "H2" | "H3" | "H4" | "H6" | "H8" | "H12"
-                | "D1" | "D2" | "D3" | "W1" | "W2" | "MN1")
-                && !forex_core::is_canonical_timeframe(&upper) {
-                    bail!(
-                        "validate: source filename implies non-canonical \
+            if matches!(
+                upper.as_str(),
+                "M1" | "M2"
+                    | "M3"
+                    | "M4"
+                    | "M5"
+                    | "M6"
+                    | "M10"
+                    | "M15"
+                    | "M20"
+                    | "M30"
+                    | "H1"
+                    | "H2"
+                    | "H3"
+                    | "H4"
+                    | "H6"
+                    | "H8"
+                    | "H12"
+                    | "D1"
+                    | "D2"
+                    | "D3"
+                    | "W1"
+                    | "W2"
+                    | "MN1"
+            ) && !forex_core::is_canonical_timeframe(&upper)
+            {
+                bail!(
+                    "validate: source filename implies non-canonical \
                          timeframe {upper} (source: {src}). H2 is intentionally \
                          absent from CANONICAL_TIMEFRAMES.",
-                        src = source.display()
-                    );
-                }
+                    src = source.display()
+                );
+            }
         }
     }
 
@@ -499,8 +520,7 @@ pub fn cache_filename_for(source: &Path) -> Result<String> {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let canonical = fs::canonicalize(source)
-        .unwrap_or_else(|_| source.to_path_buf());
+    let canonical = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
 
     // Cheap stable hash — we just need uniqueness per (path, mtime,
     // size), not cryptographic strength.
@@ -570,12 +590,8 @@ mod tests {
             close: vec![1.11, 1.12],
             volume: None,
         };
-        let err = validate_implied_timeframe(
-            &ohlcv,
-            None,
-            Path::new("/tmp/EURUSD_H2_2024.csv"),
-        )
-        .unwrap_err();
+        let err = validate_implied_timeframe(&ohlcv, None, Path::new("/tmp/EURUSD_H2_2024.csv"))
+            .unwrap_err();
         assert!(err.to_string().contains("H2"), "unexpected error: {err}");
     }
 
@@ -583,19 +599,19 @@ mod tests {
     fn h2_row_spacing_rejected() {
         // Two timestamps exactly 2 hours apart in ms.
         let ohlcv = Ohlcv {
-            timestamp: Some(vec![1_700_000_000_000, 1_700_007_200_000, 1_700_014_400_000]),
+            timestamp: Some(vec![
+                1_700_000_000_000,
+                1_700_007_200_000,
+                1_700_014_400_000,
+            ]),
             open: vec![1.10, 1.11, 1.12],
             high: vec![1.12, 1.13, 1.14],
             low: vec![1.09, 1.10, 1.11],
             close: vec![1.11, 1.12, 1.13],
             volume: None,
         };
-        let err = validate_implied_timeframe(
-            &ohlcv,
-            None,
-            Path::new("/tmp/some_data.csv"),
-        )
-        .unwrap_err();
+        let err =
+            validate_implied_timeframe(&ohlcv, None, Path::new("/tmp/some_data.csv")).unwrap_err();
         assert!(err.to_string().contains("H2"), "unexpected error: {err}");
     }
 
@@ -656,13 +672,8 @@ mod tests {
             optional: vec!["volume".to_string()],
             timeframe_hint: Some("M5".to_string()),
         };
-        let written = convert_to_vortex(
-            &fixture,
-            DataFormat::Csv,
-            &tmp,
-            Some(&hint),
-        )
-        .expect("convert real CSV → Vortex");
+        let written = convert_to_vortex(&fixture, DataFormat::Csv, &tmp, Some(&hint))
+            .expect("convert real CSV → Vortex");
         assert_eq!(written, tmp);
 
         let reloaded = crate::load_vortex(&tmp).expect("reload converted Vortex");

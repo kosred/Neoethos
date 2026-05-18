@@ -1,0 +1,20 @@
+# Lints για forex-flutter-ui.
+# Ακολουθεί τα Flutter team defaults + λίγες στρικτότητες.
+
+include: package:flutter_lints/flutter.yaml
+
+linter:
+  rules:
+    prefer_const_constructors: true
+    prefer_const_literals_to_create_immutables: true
+    avoid_print: false # allowed in main entry / dev tooling
+    sort_pub_dependencies: false
+    use_super_parameters: true
+
+analyzer:
+  errors:
+    invalid_annotation_target: ignore
+  exclude:
+    - build/**
+    - "**/*.g.dart"
+    - "**/*.freezed.dart"

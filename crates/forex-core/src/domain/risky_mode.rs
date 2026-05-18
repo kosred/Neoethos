@@ -409,8 +409,7 @@ impl RiskyModeConfig {
                 );
             }
             // 30 %–50 % per-trade band per operator directive §7.1.
-            if !(RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION
-                ..=RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION)
+            if !(RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION..=RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION)
                 .contains(&stage.risk_per_trade_fraction)
             {
                 bail!(
@@ -684,8 +683,7 @@ impl RiskyModeManager {
         }
 
         // Pre-send sanity ceiling (research §5.7).
-        let ceiling_usd = self.current_bankroll_usd
-            * self.config.presend_sanity_ceiling_fraction;
+        let ceiling_usd = self.current_bankroll_usd * self.config.presend_sanity_ceiling_fraction;
         if size_usd >= ceiling_usd {
             return Err(KillSwitchTier::PreSendSanity);
         }
@@ -755,8 +753,7 @@ impl RiskyModeManager {
         } else {
             self.consecutive_losses = 0;
         }
-        self.current_stage_idx =
-            locate_stage_idx(&self.config.stages, self.current_bankroll_usd);
+        self.current_stage_idx = locate_stage_idx(&self.config.stages, self.current_bankroll_usd);
     }
 
     /// Reset the daily-loss accumulator (caller decides when —
@@ -777,14 +774,12 @@ impl RiskyModeManager {
 
     /// Manual operator kill-switch.
     pub fn trip_manual_halt(&mut self) {
-        self.last_kill_switch_trip =
-            Some((KillSwitchTier::Manual, chrono::Utc::now()));
+        self.last_kill_switch_trip = Some((KillSwitchTier::Manual, chrono::Utc::now()));
     }
 
     /// Hardware/connection-loss flatten signal.
     pub fn trip_hardware_kill(&mut self) {
-        self.last_kill_switch_trip =
-            Some((KillSwitchTier::HardwareConnLoss, chrono::Utc::now()));
+        self.last_kill_switch_trip = Some((KillSwitchTier::HardwareConnLoss, chrono::Utc::now()));
     }
 
     /// Clear a sticky halt.
@@ -957,8 +952,7 @@ pub fn build_logarithmic_stages(
         // Per-trade risk: 0.50 -> 0.30 linear across stages.
         let risk_per_trade = RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION
             - taper_t
-                * (RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION
-                    - RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION);
+                * (RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION - RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION);
 
         // Daily loss cap: 0.80 -> 0.50 linear taper.
         let daily_cap = 0.80 - taper_t * (0.80 - 0.50);
@@ -1056,8 +1050,7 @@ mod tests {
         // Risk fraction tapers DOWN across stages and stays in band.
         for stage in &cfg.stages {
             assert!(
-                (RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION
-                    ..=RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION)
+                (RISKY_MODE_MIN_RISK_PER_TRADE_FRACTION..=RISKY_MODE_MAX_RISK_PER_TRADE_FRACTION)
                     .contains(&stage.risk_per_trade_fraction),
                 "stage {} risk_per_trade out of band: {}",
                 stage.stage_idx,
@@ -1075,10 +1068,11 @@ mod tests {
     #[test]
     fn new_rejects_when_autonomous_contract_unsigned() {
         let cfg = RiskyModeConfig::default(); // autonomous_only_contract_accepted = false
-        let err = RiskyModeManager::new(cfg, 20.0)
-            .expect_err("must reject without autonomous contract");
+        let err =
+            RiskyModeManager::new(cfg, 20.0).expect_err("must reject without autonomous contract");
         assert!(
-            err.to_string().contains("autonomous_only_contract_accepted"),
+            err.to_string()
+                .contains("autonomous_only_contract_accepted"),
             "wrong error: {err}"
         );
     }
@@ -1301,9 +1295,8 @@ mod tests {
         // refuse to invent a "days to target" number in that regime
         // (research §10.5 — don't surface optimistic projections
         // when the math says target is unreachable in expectation).
-        let mgr =
-            RiskyModeManager::new(signed_default_config(), DEFAULT_STARTING_CAPITAL_USD)
-                .expect("manager");
+        let mgr = RiskyModeManager::new(signed_default_config(), DEFAULT_STARTING_CAPITAL_USD)
+            .expect("manager");
         assert!(
             mgr.estimated_days_to_target().is_none(),
             "estimator must return None when expected log-growth is non-positive"
@@ -1322,7 +1315,9 @@ mod tests {
         cfg.expected_win_rate = 0.60;
         cfg.expected_reward_to_risk = 2.0;
         let mgr = RiskyModeManager::new(cfg, DEFAULT_STARTING_CAPITAL_USD).expect("manager");
-        let days = mgr.estimated_days_to_target().expect("finite estimate with edge");
+        let days = mgr
+            .estimated_days_to_target()
+            .expect("finite estimate with edge");
         assert!(
             (1..100_000).contains(&days),
             "20->50k estimate out of plausible band: {days}"

@@ -16,8 +16,8 @@ static DISCOVERY_CACHE: std::sync::OnceLock<
     std::sync::Mutex<Option<(std::path::PathBuf, forex_data::DatasetDiscovery)>>,
 > = std::sync::OnceLock::new();
 
-fn discovery_cache(
-) -> &'static std::sync::Mutex<Option<(std::path::PathBuf, forex_data::DatasetDiscovery)>> {
+fn discovery_cache()
+-> &'static std::sync::Mutex<Option<(std::path::PathBuf, forex_data::DatasetDiscovery)>> {
     DISCOVERY_CACHE.get_or_init(|| std::sync::Mutex::new(None))
 }
 

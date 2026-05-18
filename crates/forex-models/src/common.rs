@@ -69,7 +69,11 @@ pub fn cuda_device_id_from_policy(
     device_env_name: &str,
     fallback_env_name: Option<&str>,
 ) -> usize {
-    let read = |key: &str| std::env::var(key).ok().and_then(|v| v.parse::<usize>().ok());
+    let read = |key: &str| {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+    };
     if let Some(id) = read(device_env_name) {
         return id;
     }
@@ -183,17 +187,11 @@ mod tests {
         unsafe {
             std::env::set_var("FOREX_BOT_TEST_DISABLE_KERNEL", "false");
         }
-        assert!(!cuda_kernel_enabled(
-            "gpu",
-            "FOREX_BOT_TEST_DISABLE_KERNEL"
-        ));
+        assert!(!cuda_kernel_enabled("gpu", "FOREX_BOT_TEST_DISABLE_KERNEL"));
         unsafe {
             std::env::set_var("FOREX_BOT_TEST_DISABLE_KERNEL", "1");
         }
-        assert!(cuda_kernel_enabled(
-            "gpu",
-            "FOREX_BOT_TEST_DISABLE_KERNEL"
-        ));
+        assert!(cuda_kernel_enabled("gpu", "FOREX_BOT_TEST_DISABLE_KERNEL"));
         unsafe {
             std::env::remove_var("FOREX_BOT_TEST_DISABLE_KERNEL");
         }
@@ -258,10 +256,7 @@ mod tests {
 
     #[test]
     fn normalize_vendor_device_policy_respects_extras() {
-        assert_eq!(
-            normalize_vendor_device_policy("wgpu:2", &["wgpu"]),
-            "gpu:2"
-        );
+        assert_eq!(normalize_vendor_device_policy("wgpu:2", &["wgpu"]), "gpu:2");
         assert_eq!(normalize_vendor_device_policy("wgpu", &["wgpu"]), "gpu");
     }
 }

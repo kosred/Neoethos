@@ -71,12 +71,9 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
         for (idx, name) in profile.gpu_names.iter().enumerate() {
             let mem = profile.gpu_mem_gb.get(idx).copied().unwrap_or(0.0);
             ui.label(
-                egui::RichText::new(format!(
-                    "  · {} ({:.1} GiB VRAM)",
-                    name, mem
-                ))
-                .color(theme::TEXT_MUTED)
-                .size(theme::FONT_CAPTION),
+                egui::RichText::new(format!("  · {} ({:.1} GiB VRAM)", name, mem))
+                    .color(theme::TEXT_MUTED)
+                    .size(theme::FONT_CAPTION),
             );
         }
     }
@@ -104,11 +101,7 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
                 }
                 for backend in WIZARD_DEFAULT_BACKEND_PREFERENCE {
                     if ui
-                        .selectable_value(
-                            &mut forced,
-                            (*backend).to_string(),
-                            *backend,
-                        )
+                        .selectable_value(&mut forced, (*backend).to_string(), *backend)
                         .clicked()
                     {
                         controller.config.forced_backend = Some((*backend).to_string());
@@ -118,13 +111,15 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
     });
 
     // Vendor-specific remediation hints.
-    if profile.gpu_names.iter().any(|n| n.to_lowercase().contains("nvidia")) {
+    if profile
+        .gpu_names
+        .iter()
+        .any(|n| n.to_lowercase().contains("nvidia"))
+    {
         ui.label(
-            egui::RichText::new(
-                "Tip: install the NVIDIA driver to enable CUDA precisions.",
-            )
-            .color(theme::TEXT_MUTED)
-            .size(theme::FONT_CAPTION),
+            egui::RichText::new("Tip: install the NVIDIA driver to enable CUDA precisions.")
+                .color(theme::TEXT_MUTED)
+                .size(theme::FONT_CAPTION),
         );
     }
     if profile.gpu_names.iter().any(|n| {

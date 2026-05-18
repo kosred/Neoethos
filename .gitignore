@@ -72,3 +72,38 @@ xgboost.dll
 # not source). Added 2026-05-15 when HALT-button tests started
 # producing HALTED_<timestamp>.flag in crates/forex-app/data/.
 crates/forex-app/data/
+
+# Phase G — bundled Gemma GGUF (huge binary; downloaded by installer-prep)
+/resources/models/*.gguf
+/resources/models/*.gguf.tmp
+
+# Phase Flutter UI scaffold — build artefacts
+crates/forex-flutter-ui/build/
+crates/forex-flutter-ui/.dart_tool/
+crates/forex-flutter-ui/.flutter-plugins
+crates/forex-flutter-ui/.flutter-plugins-dependencies
+crates/forex-flutter-ui/.metadata
+crates/forex-flutter-ui/pubspec.lock
+crates/forex-flutter-ui/windows/runner/
+crates/forex-flutter-ui/linux/runner/
+crates/forex-flutter-ui/macos/runner/
+
+# God-file split drafts (2026-05-18 cleanup pass).
+# These directories hold draft re-organisations of large source files
+# (dxtrade.rs, burn_models.rs, training_orchestrator.rs, dqn_impl.rs,
+# swarm_impl.rs, deep_models.rs). The active source files remain
+# unchanged in the parent module; the drafts are activated one-at-a-time
+# with a `Move-Item` after running `cargo check` per the docs/qa/
+# `*_split_draft.md` activation recipes. Until activated they MUST NOT
+# be tracked in git — they would shadow the real sources with double-
+# compiled modules and break the build.
+**/dxtrade_split_draft/
+**/burn_models_split_draft/
+**/training_orchestrator_split_draft/
+**/dqn_impl_split_draft/
+**/swarm_impl_split_draft/
+**/deep_models_split_draft/
+
+# Zero-byte sed-pipeline staging artifacts produced during the split
+# extraction (see docs/qa/*-split-draft.md for context).
+**/_section_*.body

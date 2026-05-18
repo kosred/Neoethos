@@ -40,8 +40,7 @@ pub const NEUTRAL_SENTIMENT_SCORE: f64 = 0.0;
 
 /// OpenAI Chat Completions endpoint. Centralised so swapping it for
 /// the Azure-OpenAI variant in v0.5 is a single-line change.
-pub const OPENAI_CHAT_COMPLETIONS_ENDPOINT: &str =
-    "https://api.openai.com/v1/chat/completions";
+pub const OPENAI_CHAT_COMPLETIONS_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
 
 /// Default model. The operator can override via the
 /// `openai_model` config field; this default is the cost-optimised
@@ -206,22 +205,24 @@ mod tests {
 
     #[test]
     fn empty_model_falls_back_to_default() {
-        let s = OpenAIScorer::new(Some(SecretString::from("sk-test")), "")
-            .expect("constructor");
+        let s = OpenAIScorer::new(Some(SecretString::from("sk-test")), "").expect("constructor");
         assert_eq!(s.model, DEFAULT_OPENAI_MODEL);
     }
 
     #[test]
     fn custom_model_is_preserved() {
-        let s = OpenAIScorer::new(Some(SecretString::from("sk-test")), "gpt-4o")
-            .expect("constructor");
+        let s =
+            OpenAIScorer::new(Some(SecretString::from("sk-test")), "gpt-4o").expect("constructor");
         assert_eq!(s.model, "gpt-4o");
     }
 
     #[tokio::test]
     async fn disabled_scorer_returns_neutral_score_without_network() {
         let s = OpenAIScorer::disabled();
-        let score = s.analyze_sentiment("anything").await.expect("must not error");
+        let score = s
+            .analyze_sentiment("anything")
+            .await
+            .expect("must not error");
         assert!((score - NEUTRAL_SENTIMENT_SCORE).abs() < f64::EPSILON);
     }
 }

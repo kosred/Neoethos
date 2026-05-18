@@ -6,7 +6,6 @@
 // broker bytes and not a hand-rolled fixture.
 use super::*;
 
-
 use crate::app_services::ctrader_messages::{
     CTraderClosePositionRequest, CTraderOrderType, CTraderTimeInForce,
 };
@@ -218,9 +217,8 @@ fn production_backend_authenticates_then_executes_market_order() {
         },
     )));
 
-    let outcome =
-        ProductionCTraderExecutionBackend::execute_with_transport(&transport, &request)
-            .expect("execution should succeed");
+    let outcome = ProductionCTraderExecutionBackend::execute_with_transport(&transport, &request)
+        .expect("execution should succeed");
 
     let sent_batches = transport.sent_batches();
     assert_eq!(sent_batches.len(), 1);
@@ -248,9 +246,8 @@ fn production_backend_maps_cancelled_close_position_outcome() {
         },
     ));
 
-    let outcome =
-        ProductionCTraderExecutionBackend::execute_with_transport(&transport, &request)
-            .expect("close position should succeed");
+    let outcome = ProductionCTraderExecutionBackend::execute_with_transport(&transport, &request)
+        .expect("close position should succeed");
 
     assert_eq!(outcome.status, CTraderExecutionStatus::Cancelled);
     assert_eq!(outcome.position_id, Some(9001));

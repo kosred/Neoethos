@@ -57,9 +57,25 @@ pub const MAX_FILE_SIZE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// These don't appear in `skipped` because they're not data candidates
 /// in the first place — including them would spam the UI summary.
 const SILENTLY_IGNORED_EXTENSIONS: &[&str] = &[
-    "md", "txt", "rst", "log", "yml", "yaml", "toml", "lock",
-    "gitignore", "gitattributes", "sha256", "sha1", "asc",
-    "zip", "gz", "tar", "bz2", "xz", "7z",
+    "md",
+    "txt",
+    "rst",
+    "log",
+    "yml",
+    "yaml",
+    "toml",
+    "lock",
+    "gitignore",
+    "gitattributes",
+    "sha256",
+    "sha1",
+    "asc",
+    "zip",
+    "gz",
+    "tar",
+    "bz2",
+    "xz",
+    "7z",
 ];
 
 /// Classification of a single discovered data file.
@@ -203,18 +219,14 @@ impl DatasetDiscovery {
 
             // Silently ignore docs/archives/git artifacts — they are not
             // candidates for data and would spam the skipped list.
-            if SILENTLY_IGNORED_EXTENSIONS.contains(&ext.as_str())
-            {
+            if SILENTLY_IGNORED_EXTENSIONS.contains(&ext.as_str()) {
                 continue;
             }
 
             // Size check before format check — a 10 GiB file is "too
             // large" regardless of whether its extension is one we
             // recognise.
-            let size_bytes = dir_entry
-                .metadata()
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let size_bytes = dir_entry.metadata().map(|m| m.len()).unwrap_or(0);
             if size_bytes > MAX_FILE_SIZE_BYTES {
                 skipped.push(SkippedFile {
                     path,
@@ -234,23 +246,21 @@ impl DatasetDiscovery {
                 }
             };
 
-            let (symbol, timeframe_raw) =
-                infer_symbol_and_timeframe(&path, &root_buf);
+            let (symbol, timeframe_raw) = infer_symbol_and_timeframe(&path, &root_buf);
 
             // Reject filenames that imply a NON-canonical timeframe
             // (e.g. H2) so they don't sneak into training. The
             // canonical list lives in forex-core and is the single
             // source of truth.
             if let Some(tf_label) = timeframe_raw.as_ref()
-                && !forex_core::is_canonical_timeframe(tf_label) {
-                    skipped.push(SkippedFile {
-                        path,
-                        reason: SkipReason::UnsupportedTimeframe(
-                            tf_label.clone(),
-                        ),
-                    });
-                    continue;
-                }
+                && !forex_core::is_canonical_timeframe(tf_label)
+            {
+                skipped.push(SkippedFile {
+                    path,
+                    reason: SkipReason::UnsupportedTimeframe(tf_label.clone()),
+                });
+                continue;
+            }
 
             entries.push(DataFileEntry {
                 path,
@@ -325,10 +335,7 @@ impl DatasetDiscovery {
             .map(|fmt| {
                 (
                     *fmt,
-                    self.entries
-                        .iter()
-                        .filter(|e| e.format == *fmt)
-                        .count(),
+                    self.entries.iter().filter(|e| e.format == *fmt).count(),
                 )
             })
             .filter(|(_, n)| *n > 0)
@@ -358,10 +365,7 @@ impl DatasetDiscovery {
 // classified as `(EURUSD, M5)` by discovery is the same `(EURUSD, M5)`
 // the importer would assign — keeping the two views consistent.
 
-fn infer_symbol_and_timeframe(
-    path: &Path,
-    root: &Path,
-) -> (Option<String>, Option<String>) {
+fn infer_symbol_and_timeframe(path: &Path, root: &Path) -> (Option<String>, Option<String>) {
     let rel = path.strip_prefix(root).unwrap_or(path);
     let mut symbol: Option<String> = None;
     let mut timeframe: Option<String> = None;
@@ -493,10 +497,7 @@ mod tests {
             DataFormat::from_extension("vortex"),
             Some(DataFormat::Vortex)
         );
-        assert_eq!(
-            DataFormat::from_extension("arrow"),
-            Some(DataFormat::Arrow)
-        );
+        assert_eq!(DataFormat::from_extension("arrow"), Some(DataFormat::Arrow));
         assert_eq!(
             DataFormat::from_extension("feather"),
             Some(DataFormat::Arrow)
@@ -533,14 +534,8 @@ mod tests {
     #[test]
     fn scan_picks_up_hive_partitioned_layout() {
         let root = unique_root("hive");
-        touch(
-            &root.join("symbol=EURUSD/timeframe=M5/2024.parquet"),
-            b"",
-        );
-        touch(
-            &root.join("symbol=EURUSD/timeframe=H1/2024.parquet"),
-            b"",
-        );
+        touch(&root.join("symbol=EURUSD/timeframe=M5/2024.parquet"), b"");
+        touch(&root.join("symbol=EURUSD/timeframe=H1/2024.parquet"), b"");
 
         let report = DatasetDiscovery::scan(&root).unwrap();
         assert_eq!(report.entries.len(), 2);

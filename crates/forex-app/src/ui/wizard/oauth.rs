@@ -345,8 +345,7 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
                  broker cTID — the bot's app credentials are baked in \
                  to the binary, so there is nothing else for you to \
                  type here. Callback timeout: {} s.",
-                WIZARD_DEFAULT_OAUTH_LOOPBACK_PORTS,
-                WIZARD_DEFAULT_OAUTH_CALLBACK_TIMEOUT_SECONDS
+                WIZARD_DEFAULT_OAUTH_LOOPBACK_PORTS, WIZARD_DEFAULT_OAUTH_CALLBACK_TIMEOUT_SECONDS
             ))
             .color(theme::TEXT_MUTED)
             .size(theme::FONT_CAPTION),
@@ -476,7 +475,7 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
 /// or supplies these values — that was the 2026-05-17 directive fix.
 fn start_oauth_flow(runtime: &mut OAuthRuntime, controller: &mut WizardController) {
     let _ = controller; // controller is unused in this function now;
-                        // every legacy ctrader_client_id read was retired.
+    // every legacy ctrader_client_id read was retired.
     runtime.last_error = None;
     runtime.sub_step = OAuthSubStep::SignIn;
     let client_id = match expose_client_id() {
@@ -566,9 +565,11 @@ fn poll_auth_worker(runtime: &mut OAuthRuntime, controller: &mut WizardControlle
                 callback_port = result.callback_port,
                 "wizard OAuth flow returned token bundle"
             );
-            runtime.access_token = Some(SecretString::from(result.token_bundle.access_token.clone()));
-            runtime.refresh_token =
-                Some(SecretString::from(result.token_bundle.refresh_token.clone()));
+            runtime.access_token =
+                Some(SecretString::from(result.token_bundle.access_token.clone()));
+            runtime.refresh_token = Some(SecretString::from(
+                result.token_bundle.refresh_token.clone(),
+            ));
             runtime.sub_step = OAuthSubStep::PickAccount;
             // Kick off account discovery immediately. The wizard's
             // chosen Demo/Live radio decides the endpoint host. The
@@ -636,10 +637,7 @@ pub fn classify_oauth_failure(err: &str) -> WizardError {
 /// Poll the account-discovery worker. On success, populate the
 /// account picker; if there's exactly one account, auto-select it
 /// (spec §2 Step 4.3 mockup).
-fn poll_account_discovery_worker(
-    runtime: &mut OAuthRuntime,
-    controller: &mut WizardController,
-) {
+fn poll_account_discovery_worker(runtime: &mut OAuthRuntime, controller: &mut WizardController) {
     let outcome = {
         let Some(rx) = runtime.accounts_rx.as_ref() else {
             return;
@@ -791,10 +789,7 @@ mod tests {
     fn oauth_state_csrf_rejects_mismatched_state() {
         let issued = "issued-state-token-abc123";
         let received = "attacker-state-token-xyz999";
-        let target = format!(
-            "/ctrader/callback?code=AUTHCODE&state={}",
-            received
-        );
+        let target = format!("/ctrader/callback?code=AUTHCODE&state={}", received);
         let err = parse_callback_request_with_state(&target, "/ctrader/callback", issued)
             .expect_err("CSRF mismatch must error");
         let msg = err.to_string();
@@ -815,7 +810,8 @@ mod tests {
 
     #[test]
     fn classify_oauth_failure_recognises_callback_timeout() {
-        let err = "OAuth step 4/5 (wait_for_callback) failed — timed out waiting for cTrader callback";
+        let err =
+            "OAuth step 4/5 (wait_for_callback) failed — timed out waiting for cTrader callback";
         assert_eq!(
             classify_oauth_failure(err),
             WizardError::OAuthCallbackTimeout

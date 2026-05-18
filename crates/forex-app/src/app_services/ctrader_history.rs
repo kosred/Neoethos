@@ -58,13 +58,13 @@ use crate::app_services::ctrader_messages::{
     CTRADER_OA_GET_TICK_DATA_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_GET_TRENDBARS_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_ORDER_DETAILS_RESPONSE_PAYLOAD_TYPE,
     CTRADER_OA_ORDER_LIST_BY_POSITION_ID_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_SYMBOL_CATEGORY_RESPONSE_PAYLOAD_TYPE, CTRADER_QUOTE_TYPE_ASK, CTRADER_QUOTE_TYPE_BID,
-    CTraderDealListRequest, CTraderOpenApiTransport, ProductionCTraderOpenApiTransport,
-    build_account_auth_request, build_application_auth_request, build_deal_list_by_position_id_request,
-    build_deal_list_request, build_get_tick_data_request, build_get_trendbars_request,
-    build_order_details_request, build_order_list_by_position_id_request,
-    build_symbol_category_list_request, parse_ctrader_error_payload, parse_open_api_envelope,
-    trendbar_period_value,
+    CTRADER_OA_SYMBOL_CATEGORY_RESPONSE_PAYLOAD_TYPE, CTRADER_QUOTE_TYPE_ASK,
+    CTRADER_QUOTE_TYPE_BID, CTraderDealListRequest, CTraderOpenApiTransport,
+    ProductionCTraderOpenApiTransport, build_account_auth_request, build_application_auth_request,
+    build_deal_list_by_position_id_request, build_deal_list_request, build_get_tick_data_request,
+    build_get_trendbars_request, build_order_details_request,
+    build_order_list_by_position_id_request, build_symbol_category_list_request,
+    parse_ctrader_error_payload, parse_open_api_envelope, trendbar_period_value,
 };
 use anyhow::{Context, Result, anyhow};
 
@@ -156,7 +156,9 @@ pub fn fetch_deal_history_with_transport<T: CTraderOpenApiTransport>(
         .account_id
         .parse::<i64>()
         .context("cTrader account id must be numeric")?;
-    let max_rows = request.max_rows.unwrap_or(DEFAULT_DEAL_HISTORY_PAGE_MAX_ROWS);
+    let max_rows = request
+        .max_rows
+        .unwrap_or(DEFAULT_DEAL_HISTORY_PAGE_MAX_ROWS);
     tracing::info!(
         target: "forex_app::ctrader_history",
         account_id,
@@ -167,7 +169,11 @@ pub fn fetch_deal_history_with_transport<T: CTraderOpenApiTransport>(
     );
 
     let responses = transport.send_sequence(&[
-        build_application_auth_request(&request.client_id, &request.client_secret, "history-app-auth-1"),
+        build_application_auth_request(
+            &request.client_id,
+            &request.client_secret,
+            "history-app-auth-1",
+        ),
         build_account_auth_request(account_id, &request.access_token, "history-account-auth-1"),
         build_deal_list_request(
             &CTraderDealListRequest {
@@ -213,7 +219,9 @@ pub fn fetch_deal_history_with_transport<T: CTraderOpenApiTransport>(
 /// Convenience wrapper that opens a `ProductionCTraderOpenApiTransport`
 /// against the request's environment and delegates to
 /// [`fetch_deal_history_with_transport`].
-pub fn fetch_deal_history(request: &CTraderDealHistoryRequest) -> Result<CTraderDealHistorySnapshot> {
+pub fn fetch_deal_history(
+    request: &CTraderDealHistoryRequest,
+) -> Result<CTraderDealHistorySnapshot> {
     let transport = ProductionCTraderOpenApiTransport::new(request.environment.endpoint_host());
     fetch_deal_history_with_transport(&transport, request)
 }
@@ -302,7 +310,10 @@ pub fn fetch_historical_bars_with_transport<T: CTraderOpenApiTransport>(
             responses.len()
         ));
     }
-    ensure_success_payload_type(&responses[0], CTRADER_OA_GET_TRENDBARS_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[0],
+        CTRADER_OA_GET_TRENDBARS_RESPONSE_PAYLOAD_TYPE,
+    )?;
     let mut bars = parse_trendbars_response(&responses[0], &resolved.symbol)?;
 
     let warnings = clamp_bars_to_window(
@@ -317,7 +328,9 @@ pub fn fetch_historical_bars_with_transport<T: CTraderOpenApiTransport>(
 }
 
 /// Production wrapper for [`fetch_historical_bars_with_transport`].
-pub fn fetch_historical_bars(request: &CTraderHistoricalBarsRequest) -> Result<HistoricalBarsResult> {
+pub fn fetch_historical_bars(
+    request: &CTraderHistoricalBarsRequest,
+) -> Result<HistoricalBarsResult> {
     let transport = ProductionCTraderOpenApiTransport::new(request.environment.endpoint_host());
     fetch_historical_bars_with_transport(&transport, request)
 }
@@ -407,7 +420,10 @@ pub fn fetch_tick_data_with_transport<T: CTraderOpenApiTransport>(
             responses.len()
         ));
     }
-    ensure_success_payload_type(&responses[0], CTRADER_OA_GET_TICK_DATA_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[0],
+        CTRADER_OA_GET_TICK_DATA_RESPONSE_PAYLOAD_TYPE,
+    )?;
     let result = parse_tick_data_response(&responses[0], &resolved.symbol)?;
     validate_tick_window(
         &result,
@@ -429,9 +445,7 @@ pub fn fetch_tick_data(request: &CTraderTickDataRequest) -> Result<HistoricalTic
 ///
 /// Re-exported helper so the trading-side modules don't have to depend
 /// on `ctrader_data` directly.
-pub fn resolve_symbol(
-    request: &CTraderSymbolLookupRequest,
-) -> Result<CTraderResolvedSymbol> {
+pub fn resolve_symbol(request: &CTraderSymbolLookupRequest) -> Result<CTraderResolvedSymbol> {
     let transport = ProductionCTraderOpenApiTransport::new(request.environment.endpoint_host());
     resolve_symbol_with_transport(&transport, request)
 }
@@ -487,8 +501,16 @@ pub fn fetch_deals_by_position_id_with_transport<T: CTraderOpenApiTransport>(
         "ctrader_history fetch_deals_by_position_id requesting ProtoOADealListByPositionIdReq"
     );
     let responses = transport.send_sequence(&[
-        build_application_auth_request(&request.client_id, &request.client_secret, "pos-deals-app-auth-1"),
-        build_account_auth_request(account_id, &request.access_token, "pos-deals-account-auth-1"),
+        build_application_auth_request(
+            &request.client_id,
+            &request.client_secret,
+            "pos-deals-app-auth-1",
+        ),
+        build_account_auth_request(
+            account_id,
+            &request.access_token,
+            "pos-deals-account-auth-1",
+        ),
         build_deal_list_by_position_id_request(
             account_id,
             request.position_id,
@@ -503,7 +525,10 @@ pub fn fetch_deals_by_position_id_with_transport<T: CTraderOpenApiTransport>(
             responses.len()
         ));
     }
-    ensure_success_payload_type(&responses[0], CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[0],
+        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    )?;
     ensure_success_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
     ensure_success_payload_type(
         &responses[2],
@@ -558,8 +583,16 @@ pub fn fetch_orders_by_position_id_with_transport<T: CTraderOpenApiTransport>(
         "ctrader_history fetch_orders_by_position_id requesting ProtoOAOrderListByPositionIdReq"
     );
     let responses = transport.send_sequence(&[
-        build_application_auth_request(&request.client_id, &request.client_secret, "pos-orders-app-auth-1"),
-        build_account_auth_request(account_id, &request.access_token, "pos-orders-account-auth-1"),
+        build_application_auth_request(
+            &request.client_id,
+            &request.client_secret,
+            "pos-orders-app-auth-1",
+        ),
+        build_account_auth_request(
+            account_id,
+            &request.access_token,
+            "pos-orders-account-auth-1",
+        ),
         build_order_list_by_position_id_request(
             account_id,
             request.position_id,
@@ -574,7 +607,10 @@ pub fn fetch_orders_by_position_id_with_transport<T: CTraderOpenApiTransport>(
             responses.len()
         ));
     }
-    ensure_success_payload_type(&responses[0], CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[0],
+        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    )?;
     ensure_success_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
     ensure_success_payload_type(
         &responses[2],
@@ -662,8 +698,16 @@ pub fn fetch_order_details_with_transport<T: CTraderOpenApiTransport>(
         "ctrader_history fetch_order_details requesting ProtoOAOrderDetailsReq"
     );
     let responses = transport.send_sequence(&[
-        build_application_auth_request(&request.client_id, &request.client_secret, "order-details-app-auth-1"),
-        build_account_auth_request(account_id, &request.access_token, "order-details-account-auth-1"),
+        build_application_auth_request(
+            &request.client_id,
+            &request.client_secret,
+            "order-details-app-auth-1",
+        ),
+        build_account_auth_request(
+            account_id,
+            &request.access_token,
+            "order-details-account-auth-1",
+        ),
         build_order_details_request(account_id, request.order_id, "order-details-1"),
     ])?;
     if responses.len() != 3 {
@@ -672,9 +716,15 @@ pub fn fetch_order_details_with_transport<T: CTraderOpenApiTransport>(
             responses.len()
         ));
     }
-    ensure_success_payload_type(&responses[0], CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[0],
+        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    )?;
     ensure_success_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
-    ensure_success_payload_type(&responses[2], CTRADER_OA_ORDER_DETAILS_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[2],
+        CTRADER_OA_ORDER_DETAILS_RESPONSE_PAYLOAD_TYPE,
+    )?;
     parse_order_details_response(&responses[2])
 }
 
@@ -712,8 +762,16 @@ pub fn fetch_symbol_categories_with_transport<T: CTraderOpenApiTransport>(
         "ctrader_history fetch_symbol_categories requesting ProtoOASymbolCategoryListReq"
     );
     let responses = transport.send_sequence(&[
-        build_application_auth_request(&request.client_id, &request.client_secret, "categories-app-auth-1"),
-        build_account_auth_request(account_id, &request.access_token, "categories-account-auth-1"),
+        build_application_auth_request(
+            &request.client_id,
+            &request.client_secret,
+            "categories-app-auth-1",
+        ),
+        build_account_auth_request(
+            account_id,
+            &request.access_token,
+            "categories-account-auth-1",
+        ),
         build_symbol_category_list_request(account_id, "categories-1"),
     ])?;
     if responses.len() != 3 {
@@ -722,9 +780,15 @@ pub fn fetch_symbol_categories_with_transport<T: CTraderOpenApiTransport>(
             responses.len()
         ));
     }
-    ensure_success_payload_type(&responses[0], CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[0],
+        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    )?;
     ensure_success_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
-    ensure_success_payload_type(&responses[2], CTRADER_OA_SYMBOL_CATEGORY_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[2],
+        CTRADER_OA_SYMBOL_CATEGORY_RESPONSE_PAYLOAD_TYPE,
+    )?;
     parse_symbol_category_list_response(&responses[2])
 }
 
@@ -878,12 +942,7 @@ fn clamp_bars_to_window(
     warnings
 }
 
-fn validate_tick_window(
-    result: &HistoricalTicksResult,
-    from_ms: i64,
-    to_ms: i64,
-    symbol: &str,
-) {
+fn validate_tick_window(result: &HistoricalTicksResult, from_ms: i64, to_ms: i64, symbol: &str) {
     for tick in &result.ticks {
         if tick.timestamp_ms < from_ms || tick.timestamp_ms > to_ms {
             tracing::warn!(

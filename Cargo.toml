@@ -8,6 +8,7 @@ members = [
   "crates/forex-core",
   "crates/forex-app",
   "crates/forex-news",
+  "crates/forex-gemma",
 ]
 default-members = [
   "crates/forex-search",
@@ -17,6 +18,7 @@ default-members = [
   "crates/forex-core",
   "crates/forex-app",
   "crates/forex-news",
+  "crates/forex-gemma",
 ]
 
 [workspace.package]

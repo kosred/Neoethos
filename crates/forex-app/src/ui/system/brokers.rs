@@ -303,6 +303,14 @@ fn render_adapter_configuration(
             let settings = &mut session.broker_settings_mut().dxtrade;
             labeled_text_edit(ui, "Platform URL", &mut settings.platform_url);
             labeled_text_edit(ui, "Username", &mut settings.username);
+            // Phase D3.1 (2026-05-18): the official DXtrade
+            // `POST /dxsca-web/login` endpoint requires a `domain`
+            // field alongside username + password. Brokers
+            // typically configure this to a fixed string per
+            // environment (often `default`); the wizard surfaces
+            // it as an editable row so the operator can match
+            // whatever their broker assigned.
+            labeled_text_edit(ui, "Domain", &mut settings.domain);
             labeled_text_edit(ui, "Password", &mut settings.password);
             render_account_targets(ui, &mut settings.accounts, "DXtrade Account");
         }

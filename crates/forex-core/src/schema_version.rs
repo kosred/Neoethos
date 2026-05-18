@@ -279,8 +279,8 @@ mod tests {
             schema_version: SchemaVersion::new(99),
             payload: "from future".to_string(),
         };
-        let err = check_schema_version_readable(&dc, "DummyContract")
-            .expect_err("must reject too-new");
+        let err =
+            check_schema_version_readable(&dc, "DummyContract").expect_err("must reject too-new");
         match err {
             SchemaVersionError::TooNew {
                 contract,
@@ -303,8 +303,8 @@ mod tests {
             schema_version: SchemaVersion::new(0),
             payload: "ancient".to_string(),
         };
-        let err = check_schema_version_readable(&dc, "DummyContract")
-            .expect_err("must reject too-old");
+        let err =
+            check_schema_version_readable(&dc, "DummyContract").expect_err("must reject too-old");
         match err {
             SchemaVersionError::UnsupportedOldVersion { found, .. } => {
                 assert_eq!(found, SchemaVersion::new(0));

@@ -179,9 +179,17 @@ pub enum WizardStepStatus {
 pub enum WizardError {
     LicenseMissing,
     PathNoWritePermission(String),
-    PathLowDisk { free_gib: u64, threshold_gib: u64 },
-    MonthlyTargetBelowFloor { requested: f32, floor: f32 },
-    OAuthLoopbackBindFailed { tried_ports: Vec<u16> },
+    PathLowDisk {
+        free_gib: u64,
+        threshold_gib: u64,
+    },
+    MonthlyTargetBelowFloor {
+        requested: f32,
+        floor: f32,
+    },
+    OAuthLoopbackBindFailed {
+        tried_ports: Vec<u16>,
+    },
     OAuthCallbackTimeout,
     OAuthCsrfMismatch,
     OAuthTokenExchange(String),
@@ -433,7 +441,11 @@ mod tests {
         assert!(!WizardState::Summary.is_skippable_default());
         for other in WizardState::ordered() {
             if !matches!(other, WizardState::Welcome | WizardState::Summary) {
-                assert!(other.is_skippable_default(), "{:?} should be skippable", other);
+                assert!(
+                    other.is_skippable_default(),
+                    "{:?} should be skippable",
+                    other
+                );
             }
         }
     }

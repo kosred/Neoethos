@@ -57,9 +57,7 @@ use anyhow::Result;
 use ndarray::Array2;
 use polars::prelude::DataFrame;
 
-use super::{
-    EnsemblePredictor, ExpertLoadOutcome, ExpertOutputKind, ExpertPrediction,
-};
+use super::{EnsemblePredictor, ExpertLoadOutcome, ExpertOutputKind, ExpertPrediction};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -187,10 +185,7 @@ impl SoftVotingEnsemble {
     /// chrome can list them) but the soft-voting layer doesn't use
     /// their predictions. The MoE will (D1.5+).
     pub fn experts_unused_for_voting(&self) -> Vec<&str> {
-        self.unused_for_voting
-            .iter()
-            .map(String::as_str)
-            .collect()
+        self.unused_for_voting.iter().map(String::as_str).collect()
     }
 
     /// Count of experts that actually participate in voting.
@@ -580,9 +575,7 @@ mod tests {
         let ens = SoftVotingEnsemble::with_default_config(outcome).expect("ok");
         // 2 loaded but only 1 votes — genetic excluded.
         assert_eq!(ens.voting_expert_count(), 1);
-        assert!(ens
-            .experts_unused_for_voting()
-            .contains(&"genetic"));
+        assert!(ens.experts_unused_for_voting().contains(&"genetic"));
         // The output must reflect ONLY the regular expert, not an
         // average of the two.
         let probs = ens.predict(&small_df(1)).expect("predict");
@@ -608,7 +601,10 @@ mod tests {
         assert_eq!(ens.voting_expert_count(), 1);
         let probs = ens.predict(&small_df(1)).expect("predict");
         let row = probs.row(0);
-        assert!((row[1] - 0.6).abs() < 1e-6, "neuro_evo must not pull p_neutral toward 0.9");
+        assert!(
+            (row[1] - 0.6).abs() < 1e-6,
+            "neuro_evo must not pull p_neutral toward 0.9"
+        );
     }
 
     #[test]

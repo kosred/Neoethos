@@ -41,9 +41,7 @@ pub(super) fn extract_client_order_id_from_request(
 ) -> Option<String> {
     match request {
         CTraderExecutionRequest::NewOrder(order) => order.client_order_id.clone(),
-        CTraderExecutionRequest::CancelOrder(_) | CTraderExecutionRequest::ClosePosition(_) => {
-            None
-        }
+        CTraderExecutionRequest::CancelOrder(_) | CTraderExecutionRequest::ClosePosition(_) => None,
     }
 }
 

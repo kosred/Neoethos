@@ -6,7 +6,6 @@
 // fields cTrader marks optional but our parser silently drops.
 use super::*;
 
-
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::CTraderOpenApiJsonMessage;
 
@@ -362,13 +361,13 @@ fn money_scaling_table_covers_deposit_and_bonus_entities() {
     // Each row: (entity label, raw integer, moneyDigits, expected real value)
     let cases: &[(&str, i64, i32, f64)] = &[
         // Top-up of $1,234.56 USD on a fiat account.
-        ("DepositWithdraw.amount @ mD=2",      123_456,         2,  1_234.56),
+        ("DepositWithdraw.amount @ mD=2", 123_456, 2, 1_234.56),
         // The same deposit on a moneyDigits=4 account: $12.3456.
-        ("DepositWithdraw.amount @ mD=4",      123_456,         4,     12.3456),
+        ("DepositWithdraw.amount @ mD=4", 123_456, 4, 12.3456),
         // Bonus credit of $50.00 on a fiat account.
-        ("BonusDepositWithdraw.amount @ mD=2", 5_000,           2,     50.00),
+        ("BonusDepositWithdraw.amount @ mD=2", 5_000, 2, 50.00),
         // Same bonus on a moneyDigits=4 account: $0.50.
-        ("BonusDepositWithdraw.amount @ mD=4", 5_000,           4,      0.50),
+        ("BonusDepositWithdraw.amount @ mD=4", 5_000, 4, 0.50),
     ];
 
     for (label, raw, md, expected) in cases {
@@ -449,10 +448,7 @@ impl StubTransport {
 }
 
 impl crate::app_services::ctrader_messages::CTraderOpenApiTransport for StubTransport {
-    fn send_sequence(
-        &self,
-        messages: &[CTraderOpenApiJsonMessage],
-    ) -> anyhow::Result<Vec<String>> {
+    fn send_sequence(&self, messages: &[CTraderOpenApiJsonMessage]) -> anyhow::Result<Vec<String>> {
         self.sent
             .lock()
             .expect("sent lock")

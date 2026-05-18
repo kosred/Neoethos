@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 use std::time::Instant;
 
@@ -106,9 +106,10 @@ impl JobManager {
     }
 
     pub fn has_running(&self, prefix: &str) -> bool {
-        self.jobs
-            .iter()
-            .any(|j| j.status == JobStatus::Running && j.label.to_lowercase().starts_with(&prefix.to_lowercase()))
+        self.jobs.iter().any(|j| {
+            j.status == JobStatus::Running
+                && j.label.to_lowercase().starts_with(&prefix.to_lowercase())
+        })
     }
 
     /// Spawn `forex-cli <args>`. Returns the new job's index in
@@ -181,18 +182,16 @@ impl JobManager {
                 // TUI loop never blocks on it.
                 let waiter_tx = tx.clone();
                 let mut child = child;
-                thread::spawn(move || {
-                    match child.wait() {
-                        Ok(status) => {
-                            let _ = if status.success() {
-                                waiter_tx.send(LogLine::ExitOk)
-                            } else {
-                                waiter_tx.send(LogLine::ExitFail(status.code().unwrap_or(-1)))
-                            };
-                        }
-                        Err(_) => {
-                            let _ = waiter_tx.send(LogLine::ExitFail(-1));
-                        }
+                thread::spawn(move || match child.wait() {
+                    Ok(status) => {
+                        let _ = if status.success() {
+                            waiter_tx.send(LogLine::ExitOk)
+                        } else {
+                            waiter_tx.send(LogLine::ExitFail(status.code().unwrap_or(-1)))
+                        };
+                    }
+                    Err(_) => {
+                        let _ = waiter_tx.send(LogLine::ExitFail(-1));
                     }
                 });
 

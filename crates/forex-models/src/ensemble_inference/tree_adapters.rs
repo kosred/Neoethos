@@ -441,10 +441,7 @@ impl ExpertLoader for SklearsTreeLoader {
     fn load(&self, artifact_dir: &Path) -> Result<Box<dyn ExpertModel>> {
         let mut inner = SklearsTreeExpert::new();
         inner.load(artifact_dir).with_context(|| {
-            format!(
-                "SklearsTreeExpert::load({}) failed",
-                artifact_dir.display()
-            )
+            format!("SklearsTreeExpert::load({}) failed", artifact_dir.display())
         })?;
         Ok(Box::new(SklearsTreeAdapter::new(inner)))
     }
@@ -514,10 +511,7 @@ mod tests {
             let adapter = XgboostAdapter::new(inner, name).expect("accept");
             assert_eq!(adapter.name(), name);
             assert_eq!(adapter.family(), ModelFamily::Tree);
-            assert_eq!(
-                adapter.output_kind(),
-                ExpertOutputKind::Classification3
-            );
+            assert_eq!(adapter.output_kind(), ExpertOutputKind::Classification3);
         }
     }
 
@@ -615,11 +609,7 @@ mod tests {
 
     #[test]
     fn classification3_per_row_accepts_well_formed_matrix() {
-        let probs = ndarray::array![
-            [0.2_f32, 0.5, 0.3],
-            [0.7, 0.2, 0.1],
-            [0.1, 0.1, 0.8]
-        ];
+        let probs = ndarray::array![[0.2_f32, 0.5, 0.3], [0.7, 0.2, 0.1], [0.1, 0.1, 0.8]];
         let preds = classification3_per_row(&probs).expect("ok");
         assert_eq!(preds.len(), 3);
         assert_eq!(preds[0].values, vec![0.2, 0.5, 0.3]);

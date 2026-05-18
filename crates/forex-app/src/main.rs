@@ -490,7 +490,11 @@ impl eframe::App for ForexApp {
                     ui::theme::status_badge(ui, "PRO", ui::theme::ACCENT);
 
                     ui.add_space(ui::theme::SPACE_LG);
-                    ui.add(egui::Separator::default().vertical().spacing(ui::theme::SPACE_SM));
+                    ui.add(
+                        egui::Separator::default()
+                            .vertical()
+                            .spacing(ui::theme::SPACE_SM),
+                    );
                     ui.add_space(ui::theme::SPACE_SM);
 
                     // Active pair / TF / data source — compact reading
@@ -579,7 +583,10 @@ impl eframe::App for ForexApp {
                             .unwrap_or_default();
                         let halted = self.trading_session.is_halted();
                         ui::chrome::status_pill::draw_status_pill_with_halt(
-                            ui, env, &account_label, halted,
+                            ui,
+                            env,
+                            &account_label,
+                            halted,
                         );
 
                         ui.add_space(ui::theme::SPACE_SM);
@@ -630,7 +637,11 @@ impl eframe::App for ForexApp {
                         );
 
                         ui.add_space(ui::theme::SPACE_MD);
-                        ui.add(egui::Separator::default().vertical().spacing(ui::theme::SPACE_SM));
+                        ui.add(
+                            egui::Separator::default()
+                                .vertical()
+                                .spacing(ui::theme::SPACE_SM),
+                        );
                         ui.add_space(ui::theme::SPACE_SM);
 
                         // Global status text — single source of truth
@@ -665,14 +676,9 @@ impl eframe::App for ForexApp {
         // is hidden when no halt is in force.
         if self.trading_session.is_halted() {
             egui::TopBottomPanel::top("halt_banner")
-                .frame(
-                    egui::Frame::new()
-                        .fill(ui::theme::PANEL_BG)
-                        .inner_margin(egui::Margin::symmetric(
-                            ui::theme::SPACE_SM as i8,
-                            ui::theme::SPACE_XS as i8,
-                        )),
-                )
+                .frame(egui::Frame::new().fill(ui::theme::PANEL_BG).inner_margin(
+                    egui::Margin::symmetric(ui::theme::SPACE_SM as i8, ui::theme::SPACE_XS as i8),
+                ))
                 .resizable(false)
                 .show(ctx, |ui| {
                     ui::chrome::halt_button::draw_halt_banner(ui, &mut self.trading_session);
@@ -764,12 +770,9 @@ impl eframe::App for ForexApp {
                         );
                     } else {
                         ui.label(
-                            egui::RichText::new(format!(
-                                "Running: {}",
-                                engines.join(", ")
-                            ))
-                            .size(ui::theme::FONT_CAPTION)
-                            .color(ui::theme::ACCENT),
+                            egui::RichText::new(format!("Running: {}", engines.join(", ")))
+                                .size(ui::theme::FONT_CAPTION)
+                                .color(ui::theme::ACCENT),
                         );
                     }
 
@@ -1110,7 +1113,10 @@ mod tests {
     #[test]
     fn should_run_wizard_when_flag_is_set() {
         // Force-flag overrides any sentinel detection.
-        assert!(super::should_run_wizard(true, Some(std::path::Path::new("/nonexistent"))));
+        assert!(super::should_run_wizard(
+            true,
+            Some(std::path::Path::new("/nonexistent"))
+        ));
     }
 
     #[test]

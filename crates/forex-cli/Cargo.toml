@@ -1,6 +1,6 @@
 [package]
 name = "forex-cli"
-version = "0.4.5"
+version = "0.4.7"
 edition.workspace = true
 # SPDX dual-license matches the repo-root LICENSE file. Required by both
 # cargo-deb (writes Debian `control` License:) and cargo-generate-rpm.

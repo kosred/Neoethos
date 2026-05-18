@@ -1,7 +1,5 @@
 use super::*;
 
-
-
 #[test]
 fn application_auth_request_uses_documented_payload_type() {
     let message = build_application_auth_request("client-id", "secret-456", "cm-id-2");
@@ -674,7 +672,10 @@ fn protobuf_transport_length_prefix_round_trips_for_reconcile_request() {
     let envelope =
         parse_proto_message(&envelope_bytes).expect("envelope bytes must parse as ProtoMessage");
     let view = envelope.as_view();
-    assert_eq!(view.payloadType(), CTRADER_OA_RECONCILE_REQUEST_PAYLOAD_TYPE);
+    assert_eq!(
+        view.payloadType(),
+        CTRADER_OA_RECONCILE_REQUEST_PAYLOAD_TYPE
+    );
     assert_eq!(
         view.clientMsgId().to_string(),
         "reconcile-codec-roundtrip-1"

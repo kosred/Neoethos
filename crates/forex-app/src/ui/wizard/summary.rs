@@ -27,7 +27,8 @@
 //!    in place.
 //! 5. `<data-path>/risk_acknowledgement.json` — append-only ledger of
 //!    Step 9.5 quiz acknowledgements (SHA-256 of answers + version +
-//!    timestamp; FIXME(wizard-sha256) until Phase 2D lands `sha2`).
+//!    timestamp; `sha2 = "0.10"` is now a direct dep of `forex-app`
+//!    so the answer hash is computed locally — see `risk_quiz.rs`).
 //! 6. `<data-path>/wizard_state.json` — schema in §5 of the spec.
 //!
 //! Each write uses temp-file + atomic rename + fsync via
@@ -128,8 +129,7 @@ pub struct ApplyFailure {
 
 impl ApplyOutcome {
     pub fn is_fully_complete(&self) -> bool {
-        self.failed.is_none()
-            && self.completed.len() + self.skipped_with_warning.len() == 6
+        self.failed.is_none() && self.completed.len() + self.skipped_with_warning.len() == 6
     }
 
     /// Index of the next action to run. The writer iterates over the
@@ -349,8 +349,7 @@ pub fn write_broker_credentials(controller: &WizardController) -> Result<()> {
         accounts: account_targets_from_wizard(controller),
     };
     let settings = BrokerSettingsState {
-        schema_version:
-            crate::app_services::broker_config::BROKER_CREDENTIALS_SCHEMA_VERSION,
+        schema_version: crate::app_services::broker_config::BROKER_CREDENTIALS_SCHEMA_VERSION,
         ctrader,
         dxtrade: Default::default(),
     };
@@ -389,7 +388,7 @@ pub fn write_hardware_profile(data_path: &Path, profile: &HardwareProfile) -> Re
 
 /// Action 4 — write `<data-path>/symbol_metadata/defaults.json`
 /// **only** if Step 5 actually ran a fresh symbol discovery. Until
-/// the OAuth/symbol runtime (Phase 2C) wires
+/// the OAuth/symbol runtime wires
 /// `WizardController::symbol_metadata_snapshot`, this is a no-op for
 /// fresh installs and leaves the packaged `assets/symbol_metadata/
 /// defaults.json` in place. Spec §2 Step 10 Action 4.
@@ -398,11 +397,12 @@ pub fn write_symbol_metadata_snapshot(
     _controller: &WizardController,
 ) -> Result<()> {
     // No fresh discovery snapshot is attached to the controller yet;
-    // Phase 2C populates `WizardConfig.symbol_metadata_snapshot` when
-    // Step 5 contacts the broker. Until then we MUST NOT overwrite
-    // the packaged snapshot — that would silently drop the operator's
-    // shipped defaults. Per spec §2 Step 10 Action 4: "only if it
-    // ran; else leave the packaged snapshot in place."
+    // the OAuth/symbol runtime populates
+    // `WizardConfig.symbol_metadata_snapshot` when Step 5 contacts
+    // the broker. Until then we MUST NOT overwrite the packaged
+    // snapshot — that would silently drop the operator's shipped
+    // defaults. Per spec §2 Step 10 Action 4: "only if it ran; else
+    // leave the packaged snapshot in place."
     let dir = data_path.join(WIZARD_SYMBOL_METADATA_DIR);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("ensure symbol metadata dir {}", dir.display()))?;
@@ -448,12 +448,28 @@ pub fn write_risk_acknowledgement_ledger(
 /// controller's view into the schema declared in `state.rs`. The
 /// `mark_finished` call happens in `run_apply` *after* all six
 /// actions have succeeded.
+///
+/// Side-write: this action also persists the Risky Mode arm state to
+/// `<config_dir>/forex-ai/risky_mode_state.json` (sibling file, not
+/// inside `data_path`) so `TradingSession::new_with_persisted_credentials`
+/// can auto-arm at session boot. The Risky Mode contract is a runtime
+/// signal, distinct from wizard-session bookkeeping — it lives next
+/// to `broker_credentials.toml`, not next to `wizard_state.json`. The
+/// side-write is performed BEFORE the wizard_state.json write so a
+/// failure surfaces under `ApplyAction::WizardState` with the same
+/// retry semantics the existing six-action contract provides — no
+/// new ApplyAction enum variant or count change is required. Closes
+/// `TODO(risky-mode-boot-wire)`.
 pub fn write_wizard_state(data_path: &Path, controller: &mut WizardController) -> Result<()> {
+    // Risky Mode side-write — fails the action if persistence errors
+    // so the operator sees the failure in the Apply summary screen
+    // rather than discovering at next boot that the arm was lost.
+    write_risky_mode_state(controller)?;
+
     // Sync the controller's WizardConfig snapshot into the on-disk
     // state-file fields it needs. `completed_steps`/`skipped_steps`
     // are already maintained by `WizardController::advance`/`skip`.
-    controller.state_file.risk_acknowledgement =
-        controller.config.risk_acknowledgement.clone();
+    controller.state_file.risk_acknowledgement = controller.config.risk_acknowledgement.clone();
     controller.state_file.install_metadata = controller.config.install_metadata.clone();
     controller.state_file.touch_for_write();
 
@@ -462,6 +478,38 @@ pub fn write_wizard_state(data_path: &Path, controller: &mut WizardController) -
         .state_file
         .write_to(&path)
         .with_context(|| format!("write wizard_state to {}", path.display()))
+}
+
+/// Project the wizard's in-memory Risky Mode flags onto the
+/// `risky_mode_state.json` sibling file. Read at session boot by
+/// `TradingSession::new_with_persisted_credentials` to auto-arm
+/// Risky Mode without operator intervention.
+///
+/// Operator invariants:
+///
+/// - The on-disk `armed` flag mirrors `WizardConfig::risky_mode_armed`
+///   verbatim. If the operator disarmed in this wizard run, the file
+///   is rewritten with `armed = false` (it is NOT deleted — keeping
+///   the file lets us preserve the acknowledgement across re-runs).
+/// - `autonomous_only_contract_accepted` mirrors the wizard's
+///   `autonomous_mode_enabled` checkbox. `RiskyModeConfig::validate`
+///   requires this to be `true` before auto-arming will succeed.
+/// - `starting_capital_usd` is `None` at the wizard stage; the
+///   reader will default to `RiskyModeConfig::default()
+///   .starting_capital_usd` per research §4.1.
+pub fn write_risky_mode_state(controller: &WizardController) -> Result<()> {
+    let cfg = &controller.config;
+    let state = crate::app_services::risky_mode_persistence::RiskyModeStateFile {
+        schema_version:
+            crate::app_services::risky_mode_persistence::RISKY_MODE_STATE_SCHEMA_VERSION,
+        armed: cfg.risky_mode_armed,
+        ruin_ceiling_acknowledged: cfg.risky_mode_ruin_ceiling_acknowledged,
+        starting_capital_usd: None,
+        autonomous_only_contract_accepted: cfg.autonomous_mode_enabled,
+        last_updated_utc_ms: 0,
+    };
+    crate::app_services::risky_mode_persistence::save_risky_mode_state(&state)
+        .context("write risky_mode_state.json")
 }
 
 /// Convenience for the renderer — the path Apply will write the
@@ -479,8 +527,7 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
     let mut result = StepResult::StayHere;
 
     ui.label(
-        egui::RichText::new("Review your selections, then click Apply.")
-            .color(theme::TEXT_PRIMARY),
+        egui::RichText::new("Review your selections, then click Apply.").color(theme::TEXT_PRIMARY),
     );
     ui.add_space(theme::SPACE_SM);
 
@@ -535,7 +582,11 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
             ui.end_row();
 
             ui.label("Stop Loss required");
-            ui.label(if controller.config.require_stop_loss { "yes" } else { "no" });
+            ui.label(if controller.config.require_stop_loss {
+                "yes"
+            } else {
+                "no"
+            });
             ui.end_row();
 
             ui.label("cTrader account");
@@ -543,7 +594,13 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
                 controller
                     .config
                     .selected_ctid_trader_account_id
-                    .map(|id| format!("#{} ({})", id, controller.config.ctrader_environment.as_str()))
+                    .map(|id| {
+                        format!(
+                            "#{} ({})",
+                            id,
+                            controller.config.ctrader_environment.as_str()
+                        )
+                    })
                     .unwrap_or_else(|| "(not configured)".to_string()),
             );
             ui.end_row();
@@ -786,6 +843,14 @@ mod tests {
         dir
     }
 
+    /// Serialise the three risky-mode boot-wire tests below so they
+    /// don't race on the process-wide
+    /// `FOREX_AI_RISKY_MODE_STATE_PATH` env var. Without the lock,
+    /// the armed test's env-var set leaks into the disarmed test's
+    /// `TradingSession::new_with_persisted_credentials()` call and
+    /// flips the expected assertion.
+    static RISKY_MODE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Required test from operator brief —
     /// `apply_writer_writes_six_artefacts_idempotently`. Idempotency
     /// here = a second Apply call from a fresh `ApplyOutcome::default()`
@@ -794,6 +859,7 @@ mod tests {
     /// (no duplicate entries).
     #[test]
     fn apply_writer_writes_six_artefacts_idempotently() {
+        let _guard = RISKY_MODE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp_dir("idempotent");
         let mut controller = WizardController::new();
         controller.config.data_path = Some(dir.clone());
@@ -809,11 +875,17 @@ mod tests {
         // Pre-write a per-file env override so the broker writer
         // doesn't touch the operator's real $XDG_CONFIG_HOME.
         let broker_creds_path = dir.join("broker_credentials.toml");
+        // Same isolation for the Risky Mode state side-write that
+        // `write_wizard_state` now performs — without this override
+        // the test would write `risky_mode_state.json` into the
+        // operator's real config dir.
+        let risky_mode_state_path = dir.join("risky_mode_state.json");
         // SAFETY: tests are serialised through the broker_persistence
         // ENV_LOCK; here we just need to point at the scratch dir for
         // this process.
         unsafe {
             std::env::set_var("FOREX_AI_BROKER_CREDENTIALS_PATH", &broker_creds_path);
+            std::env::set_var("FOREX_AI_RISKY_MODE_STATE_PATH", &risky_mode_state_path);
         }
 
         let first = run_apply(&mut controller, ApplyOutcome::default());
@@ -824,18 +896,102 @@ mod tests {
         assert!(dir.join("symbol_metadata").is_dir());
         assert!(dir.join("risk_acknowledgement.json").is_file());
         assert!(dir.join("wizard_state.json").is_file());
+        // Side-write — risky_mode_state.json is written by the
+        // wizard_state action even when armed=false (mirrors the
+        // controller's in-memory flag). Closes
+        // TODO(risky-mode-boot-wire).
+        assert!(risky_mode_state_path.is_file());
 
         // Second Apply must succeed and must NOT duplicate ledger entries.
         let second = run_apply(&mut controller, ApplyOutcome::default());
         assert!(second.is_fully_complete(), "second apply: {second:#?}");
-        let ledger: RiskAcknowledgementLedger = serde_json::from_slice(
-            &std::fs::read(dir.join("risk_acknowledgement.json")).unwrap(),
-        )
-        .unwrap();
+        let ledger: RiskAcknowledgementLedger =
+            serde_json::from_slice(&std::fs::read(dir.join("risk_acknowledgement.json")).unwrap())
+                .unwrap();
         assert_eq!(ledger.entries.len(), 1, "duplicate ack must be de-duped");
 
         // Cleanup
         unsafe {
+            std::env::remove_var("FOREX_AI_BROKER_CREDENTIALS_PATH");
+            std::env::remove_var("FOREX_AI_RISKY_MODE_STATE_PATH");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Boot-wire round-trip: wizard apply persists `risky_mode_armed`
+    /// = true → `TradingSession::new_with_persisted_credentials`
+    /// reads the file and auto-arms Risky Mode at session
+    /// construction. Closes the gap that the 2026-05-18 cleanup
+    /// pass flagged.
+    ///
+    /// Both env vars (broker + risky_mode) are pointed at the test's
+    /// scratch dir so this test never touches the operator's real
+    /// $XDG_CONFIG_HOME or races with broker_persistence tests.
+    #[test]
+    fn risky_mode_arm_persists_and_auto_arms_at_session_boot() {
+        let _guard = RISKY_MODE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::app_services::trading::TradingSession;
+        let dir = unique_temp_dir("risky-mode-boot");
+        let risky_mode_state_path = dir.join("risky_mode_state.json");
+        let broker_creds_path = dir.join("broker_credentials.toml");
+        unsafe {
+            std::env::set_var("FOREX_AI_RISKY_MODE_STATE_PATH", &risky_mode_state_path);
+            std::env::set_var("FOREX_AI_BROKER_CREDENTIALS_PATH", &broker_creds_path);
+        }
+
+        let mut controller = WizardController::new();
+        controller.config.data_path = Some(dir.clone());
+        controller.config.risky_mode_armed = true;
+        controller.config.risky_mode_ruin_ceiling_acknowledged = Some(0.99);
+        controller.config.autonomous_mode_enabled = true;
+
+        write_risky_mode_state(&controller).expect("write");
+        assert!(
+            risky_mode_state_path.is_file(),
+            "write_risky_mode_state must create the file"
+        );
+
+        let session = TradingSession::new_with_persisted_credentials();
+        assert!(
+            session.risky_mode_active(),
+            "Risky Mode must auto-arm at session boot when the persisted file is armed"
+        );
+
+        unsafe {
+            std::env::remove_var("FOREX_AI_RISKY_MODE_STATE_PATH");
+            std::env::remove_var("FOREX_AI_BROKER_CREDENTIALS_PATH");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Negative path: persisted file is disarmed → session boots
+    /// with Risky Mode OFF (the safe default).
+    #[test]
+    fn risky_mode_disarmed_file_leaves_session_disabled() {
+        let _guard = RISKY_MODE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::app_services::trading::TradingSession;
+        let dir = unique_temp_dir("risky-mode-disarmed");
+        let risky_mode_state_path = dir.join("risky_mode_state.json");
+        let broker_creds_path = dir.join("broker_credentials.toml");
+        unsafe {
+            std::env::set_var("FOREX_AI_RISKY_MODE_STATE_PATH", &risky_mode_state_path);
+            std::env::set_var("FOREX_AI_BROKER_CREDENTIALS_PATH", &broker_creds_path);
+        }
+
+        let mut controller = WizardController::new();
+        controller.config.data_path = Some(dir.clone());
+        controller.config.risky_mode_armed = false;
+        controller.config.autonomous_mode_enabled = false;
+
+        write_risky_mode_state(&controller).expect("write");
+        let session = TradingSession::new_with_persisted_credentials();
+        assert!(
+            !session.risky_mode_active(),
+            "Risky Mode must stay disabled when the persisted file is disarmed"
+        );
+
+        unsafe {
+            std::env::remove_var("FOREX_AI_RISKY_MODE_STATE_PATH");
             std::env::remove_var("FOREX_AI_BROKER_CREDENTIALS_PATH");
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -894,9 +1050,24 @@ mod tests {
         // the canonical entry must reach Settings.
         c.config.selected_timeframes = vec!["H2".to_string(), "H1".to_string(), "D1".to_string()];
         let s = wizard_config_to_settings(&dir, &c);
-        assert!(!s.system.multi_resolution_timeframes.iter().any(|t| t == "H2"));
-        assert!(s.system.multi_resolution_timeframes.iter().any(|t| t == "H1"));
-        assert!(s.system.multi_resolution_timeframes.iter().any(|t| t == "D1"));
+        assert!(
+            !s.system
+                .multi_resolution_timeframes
+                .iter()
+                .any(|t| t == "H2")
+        );
+        assert!(
+            s.system
+                .multi_resolution_timeframes
+                .iter()
+                .any(|t| t == "H1")
+        );
+        assert!(
+            s.system
+                .multi_resolution_timeframes
+                .iter()
+                .any(|t| t == "D1")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -931,7 +1102,10 @@ mod tests {
         let mut c = WizardController::new();
         c.current = WizardState::Summary;
         c.apply(StepResult::NextRequested);
-        assert!(c.finished, "advancing past Summary marks the wizard finished");
+        assert!(
+            c.finished,
+            "advancing past Summary marks the wizard finished"
+        );
     }
 
     #[test]

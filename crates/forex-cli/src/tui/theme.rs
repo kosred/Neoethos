@@ -42,9 +42,7 @@ pub fn title_style() -> Style {
 
 /// UPPERCASE letter-spaced caption — pro-trading convention.
 pub fn caption_style() -> Style {
-    Style::default()
-        .fg(TEXT_MUTED)
-        .add_modifier(Modifier::DIM)
+    Style::default().fg(TEXT_MUTED).add_modifier(Modifier::DIM)
 }
 
 pub fn muted_style() -> Style {
@@ -56,21 +54,15 @@ pub fn primary_style() -> Style {
 }
 
 pub fn accent_style() -> Style {
-    Style::default()
-        .fg(ACCENT)
-        .add_modifier(Modifier::BOLD)
+    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
 }
 
 pub fn buy_style() -> Style {
-    Style::default()
-        .fg(BUY)
-        .add_modifier(Modifier::BOLD)
+    Style::default().fg(BUY).add_modifier(Modifier::BOLD)
 }
 
 pub fn sell_style() -> Style {
-    Style::default()
-        .fg(SELL)
-        .add_modifier(Modifier::BOLD)
+    Style::default().fg(SELL).add_modifier(Modifier::BOLD)
 }
 
 pub fn warn_style() -> Style {

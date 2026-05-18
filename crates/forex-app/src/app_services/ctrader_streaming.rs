@@ -2,11 +2,10 @@ use crate::app_services::ctrader_data::HistoricalBar;
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::{
     CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE, build_account_auth_request,
-    build_application_auth_request, build_subscribe_live_trendbar_request,
-    build_subscribe_spots_request, expected_response_payload_type, is_matching_open_api_response,
-    parse_account_disconnect_event, parse_ctrader_error_payload, parse_open_api_envelope,
-    trendbar_period_value,
+    CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE, build_account_auth_request, build_application_auth_request,
+    build_subscribe_live_trendbar_request, build_subscribe_spots_request,
+    expected_response_payload_type, is_matching_open_api_response, parse_account_disconnect_event,
+    parse_ctrader_error_payload, parse_open_api_envelope, trendbar_period_value,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -567,8 +566,7 @@ impl ProductionCTraderLiveStreamingTransport {
                                 parse_ctrader_error_payload(&envelope.payload)?
                             ));
                         }
-                        if envelope.payload_type
-                            == CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE
+                        if envelope.payload_type == CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE
                         {
                             let reason =
                                 handle_account_disconnect_event(text.as_ref(), &mut socket);
@@ -595,8 +593,7 @@ impl ProductionCTraderLiveStreamingTransport {
                                 parse_ctrader_error_payload(&envelope.payload)?
                             ));
                         }
-                        if envelope.payload_type
-                            == CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE
+                        if envelope.payload_type == CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE
                         {
                             let reason = handle_account_disconnect_event(&text, &mut socket);
                             return Err(anyhow!(
@@ -653,9 +650,7 @@ impl ProductionCTraderLiveStreamingTransport {
                             parse_ctrader_error_payload(&envelope.payload)?
                         ));
                     }
-                    if envelope.payload_type
-                        == CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE
-                    {
+                    if envelope.payload_type == CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE {
                         let reason = handle_account_disconnect_event(text.as_ref(), socket);
                         return Err(anyhow!(
                             "{}: {}",
@@ -681,9 +676,7 @@ impl ProductionCTraderLiveStreamingTransport {
                             parse_ctrader_error_payload(&envelope.payload)?
                         ));
                     }
-                    if envelope.payload_type
-                        == CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE
-                    {
+                    if envelope.payload_type == CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE {
                         let reason = handle_account_disconnect_event(&text, socket);
                         return Err(anyhow!(
                             "{}: {}",
@@ -729,9 +722,9 @@ fn handle_account_disconnect_event(payload_text: &str, socket: &mut CTraderSocke
             "account_id={} dropped by broker (session must re-auth)",
             event.ctid_trader_account_id
         ),
-        Err(err) => format!(
-            "account session dropped by broker (failed to parse disconnect payload: {err})"
-        ),
+        Err(err) => {
+            format!("account session dropped by broker (failed to parse disconnect payload: {err})")
+        }
     };
     tracing::warn!(
         target: "forex_app::ctrader",

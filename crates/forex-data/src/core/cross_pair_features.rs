@@ -106,8 +106,7 @@ pub fn compute_cross_pair_features(
         // 1. Rolling Pearson correlation of log returns.
         for &win in windows {
             let col_name = format!("xcorr_{}_{}", sanitized, win);
-            let values =
-                rolling_pearson_correlation(&base_log_returns, &aligned_log_returns, win);
+            let values = rolling_pearson_correlation(&base_log_returns, &aligned_log_returns, win);
             columns.push((col_name, values));
         }
 
@@ -184,8 +183,7 @@ fn log_returns(closes: &[f64]) -> Vec<f64> {
 fn align_related_to_base_index(base: &Ohlcv, related: &Ohlcv) -> Vec<f64> {
     let base_len = base.len();
     let mut out = vec![f64::NAN; base_len];
-    let (Some(base_ts), Some(rel_ts)) =
-        (base.timestamp.as_ref(), related.timestamp.as_ref())
+    let (Some(base_ts), Some(rel_ts)) = (base.timestamp.as_ref(), related.timestamp.as_ref())
     else {
         // No timestamps available — fall back to index-by-index
         // alignment for as far as both vectors go.
@@ -509,11 +507,8 @@ mod tests {
     fn output_columns_match_base_length() {
         let base = ohlcv(vec![1.0; 50], (0..50).collect());
         let related = ohlcv(vec![1.0; 50], (0..50).collect());
-        let cols = compute_cross_pair_features(
-            &base,
-            &[("USDJPY".to_string(), &related)],
-            &[10, 20],
-        );
+        let cols =
+            compute_cross_pair_features(&base, &[("USDJPY".to_string(), &related)], &[10, 20]);
         for (name, values) in &cols {
             assert_eq!(values.len(), 50, "column {name} has wrong length");
         }
@@ -527,11 +522,7 @@ mod tests {
         let timestamps: Vec<i64> = (0..50).collect();
         let base = ohlcv(prices.clone(), timestamps.clone());
         let related = ohlcv(prices.clone(), timestamps.clone());
-        let cols = compute_cross_pair_features(
-            &base,
-            &[("PERFECT".to_string(), &related)],
-            &[10],
-        );
+        let cols = compute_cross_pair_features(&base, &[("PERFECT".to_string(), &related)], &[10]);
         let xcorr = cols
             .iter()
             .find(|(n, _)| n == "xcorr_PERFECT_10")
@@ -549,10 +540,7 @@ mod tests {
         let r2 = ohlcv(vec![1.0; 30], (0..30).collect());
         let cols = compute_cross_pair_features(
             &base,
-            &[
-                ("GBPUSD".to_string(), &r1),
-                ("USDJPY".to_string(), &r2),
-            ],
+            &[("GBPUSD".to_string(), &r1), ("USDJPY".to_string(), &r2)],
             &[10],
         );
         let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();

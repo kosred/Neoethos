@@ -132,10 +132,9 @@ fn load_from_filesystem() -> BrokerSettingsState {
                 // `#[serde(default = "default_v1")]`. We only fail
                 // loud when the file is from a NEWER build than
                 // this binary — the operator must update the app.
-                if let Err(err) = forex_core::check_schema_version_readable(
-                    &s,
-                    "broker_credentials.toml",
-                ) {
+                if let Err(err) =
+                    forex_core::check_schema_version_readable(&s, "broker_credentials.toml")
+                {
                     tracing::error!(
                         path = %path.display(),
                         error = %err,
@@ -226,8 +225,7 @@ pub fn save_broker_settings(settings: &BrokerSettingsState) -> Result<()> {
     // to set schema_version — every saved file is correctly
     // tagged with the version this build writes.
     let mut to_write = settings.clone();
-    to_write.schema_version =
-        crate::app_services::broker_config::BROKER_CREDENTIALS_SCHEMA_VERSION;
+    to_write.schema_version = crate::app_services::broker_config::BROKER_CREDENTIALS_SCHEMA_VERSION;
     let serialized = toml::to_string_pretty(&to_write)
         .context("failed to serialize broker credentials to TOML")?;
 
@@ -283,8 +281,7 @@ mod tests {
 
     fn populated_settings() -> BrokerSettingsState {
         BrokerSettingsState {
-            schema_version:
-                crate::app_services::broker_config::BROKER_CREDENTIALS_SCHEMA_VERSION,
+            schema_version: crate::app_services::broker_config::BROKER_CREDENTIALS_SCHEMA_VERSION,
             ctrader: CTraderBrokerSettings {
                 client_id: "client-123".to_string(),
                 client_secret: "secret-abc".to_string(),
@@ -300,6 +297,7 @@ mod tests {
             dxtrade: DxTradeBrokerSettings {
                 platform_url: "https://demo.dx.example".to_string(),
                 username: "user42".to_string(),
+                domain: "default".to_string(),
                 password: "should-not-persist-either".to_string(),
                 accounts: vec![],
             },

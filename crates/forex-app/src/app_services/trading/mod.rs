@@ -5,7 +5,6 @@
 // external (`forex-app`) surface is unchanged.
 pub(super) use crate::app_record;
 pub(super) use crate::app_services::ServiceEvent;
-pub(super) use forex_core::{KillSwitchTier, RiskyModeConfig, RiskyModeManager};
 pub(super) use crate::app_services::broker_config::{
     AdapterReadinessSnapshot, BrokerAccountTarget, BrokerSessionState, BrokerSettingsState,
     CTraderBrokerEnvironment,
@@ -53,6 +52,7 @@ pub(super) use crate::app_services::ctrader_streaming::{
 pub(super) use crate::app_services::jobs::{
     JobEventLevel, JobKind, JobSnapshot, JobState, push_recent_event,
 };
+pub(super) use forex_core::{KillSwitchTier, RiskyModeConfig, RiskyModeManager};
 // Batch 14 authoritative PnL path. Re-exported into `trading::*` so
 // `orders.rs` can reach the helpers via `super::*` without a long
 // fully-qualified path on every call site. Only the symbols `orders.rs`
@@ -80,9 +80,9 @@ pub(super) use tracing::error;
 
 pub mod auto_trade;
 pub mod auto_trade_producer;
-pub mod ensemble_predictor_adapter;
 mod client_order;
 mod diagnostics;
+pub mod ensemble_predictor_adapter;
 mod market_data;
 mod orders;
 mod risk_gate;
@@ -301,6 +301,24 @@ pub enum OrderSource {
     /// (per-trade, per-day, per-stage, per-month, manual-halt,
     /// hardware-halt, pre-send sanity) and the prop-firm gate.
     Ai,
+    /// Gemma-suggested trade that the user explicitly **Approved**
+    /// via the conversational helper (Phase G6b — see
+    /// `forex_gemma::PendingSuggestion`). Distinct from
+    /// [`Self::Ai`] so the audit log can slice "Gemma-initiated
+    /// trades" cleanly from autonomous-ensemble trades. Passes
+    /// the same gates as `Ai` — every Risky Mode tier + the
+    /// prop-firm gate still applies. NEVER set without an
+    /// explicit user-click Approve through the chat UI.
+    AiSuggested,
+}
+
+impl OrderSource {
+    /// `true` when the source is AI-originated (autonomous OR
+    /// user-approved Gemma suggestion). Risky Mode treats both
+    /// the same way for the manual-rejection gate.
+    pub fn is_ai_originated(self) -> bool {
+        matches!(self, Self::Ai | Self::AiSuggested)
+    }
 }
 
 /// Hard cap on the decision ring buffer. 512 entries × ~120 bytes ≈
@@ -625,7 +643,15 @@ impl TradingSession {
 
     /// Construct a session with broker settings pre-loaded from the
     /// per-user credentials TOML file (see
-    /// [`crate::app_services::broker_persistence::load_broker_settings`]).
+    /// [`crate::app_services::broker_persistence::load_broker_settings`])
+    /// AND Risky Mode auto-armed from
+    /// [`crate::app_services::risky_mode_persistence::load_risky_mode_state`]
+    /// when the wizard previously persisted an armed state. The
+    /// auto-arm uses `RiskyModeConfig::default()` (research §4.1
+    /// $20 → $50_000 logarithmic stage table) with `starting_capital_usd`
+    /// from the persisted file falling back to the config default.
+    /// Closes `TODO(risky-mode-boot-wire)` — the wizard's
+    /// `risky_mode_armed` flag is now load-bearing across restarts.
     ///
     /// Used by `main.rs` so the production app starts with credentials the
     /// user has already saved. Tests should keep using [`Self::new`] /
@@ -634,7 +660,71 @@ impl TradingSession {
     pub fn new_with_persisted_credentials() -> Self {
         let mut session = Self::default();
         session.broker_settings = crate::app_services::broker_persistence::load_broker_settings();
+        session.auto_arm_risky_mode_from_persisted_state();
         session
+    }
+
+    /// Internal helper used by [`Self::new_with_persisted_credentials`]
+    /// to apply the wizard's persisted Risky Mode arm decision at
+    /// session boot. Idempotent: a re-call when no file is on disk is
+    /// a no-op. Safe: when the persisted config fails
+    /// `RiskyModeConfig::validate` (e.g. autonomous-only contract not
+    /// accepted), the call logs an error and leaves Risky Mode
+    /// disabled rather than panicking — a half-armed session is
+    /// always worse than a disabled one.
+    fn auto_arm_risky_mode_from_persisted_state(&mut self) {
+        use crate::app_services::risky_mode_persistence::load_risky_mode_state;
+        let state = match load_risky_mode_state() {
+            Ok(Some(s)) => s,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::error!(
+                    target: "forex_app::risky_mode",
+                    error = %err,
+                    "failed to load risky_mode_state.json at session boot; \
+                     Risky Mode will stay disabled until the wizard re-runs"
+                );
+                return;
+            }
+        };
+
+        if !state.armed {
+            tracing::debug!(
+                target: "forex_app::risky_mode",
+                "persisted risky_mode_state.json present but disarmed; \
+                 skipping auto-arm"
+            );
+            return;
+        }
+
+        let mut config = RiskyModeConfig::default();
+        config.autonomous_only_contract_accepted = state.autonomous_only_contract_accepted;
+        if let Some(ack) = state.ruin_ceiling_acknowledged {
+            config.acknowledged_ruin_probability_ceiling = ack;
+        }
+        let starting_bankroll = state
+            .starting_capital_usd
+            .unwrap_or(config.starting_capital_usd);
+
+        match self.enable_risky_mode(config, starting_bankroll) {
+            Ok(()) => {
+                tracing::info!(
+                    target: "forex_app::risky_mode",
+                    starting_bankroll,
+                    "Risky Mode auto-armed from persisted state"
+                );
+            }
+            Err(err) => {
+                tracing::error!(
+                    target: "forex_app::risky_mode",
+                    error = %err,
+                    "persisted risky_mode_state.json was armed but \
+                     enable_risky_mode rejected the config; \
+                     Risky Mode stays disabled. Re-run the wizard's \
+                     AutonomyRisk step to fix the config."
+                );
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1152,15 +1242,12 @@ impl TradingSession {
         predictor: Arc<dyn auto_trade_producer::ModelPredictor>,
     ) -> anyhow::Result<()> {
         if self.auto_trade_producer.is_some() {
-            anyhow::bail!(
-                "auto-trade producer is already running on this session — stop it first"
-            );
+            anyhow::bail!("auto-trade producer is already running on this session — stop it first");
         }
         let symbol = config.symbol.clone();
         let (tx, rx) = std::sync::mpsc::channel::<auto_trade::AutoTradeSignal>();
-        let producer = auto_trade_producer::LiveInferenceProducer::new(
-            config, bar_source, predictor, tx,
-        )?;
+        let producer =
+            auto_trade_producer::LiveInferenceProducer::new(config, bar_source, predictor, tx)?;
         let cancel = producer.cancel_flag();
         let handle = producer.spawn()?;
         self.auto_trade_producer = Some(auto_trade_producer::AutoTradeProducerHandle {
@@ -1196,15 +1283,12 @@ impl TradingSession {
     /// Stop the auto-trade producer. Flips the cancel flag and joins
     /// the thread. Returns the [`auto_trade_producer::ProducerOutcome`]
     /// the loop terminated with, or `None` if no producer was running.
-    pub fn stop_auto_trade_producer(
-        &mut self,
-    ) -> Option<auto_trade_producer::ProducerOutcome> {
+    pub fn stop_auto_trade_producer(&mut self) -> Option<auto_trade_producer::ProducerOutcome> {
         let mut handle = self.auto_trade_producer.take()?;
-        handle.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-        let outcome = handle
-            .handle
-            .take()
-            .and_then(|jh| jh.join().ok());
+        handle
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let outcome = handle.handle.take().and_then(|jh| jh.join().ok());
         tracing::info!(
             target: "forex_app::auto_trade::producer",
             outcome = ?outcome,
@@ -1253,23 +1337,19 @@ impl TradingSession {
         bar_source: Arc<dyn auto_trade_producer::LiveBarSource>,
     ) -> anyhow::Result<EnsembleLoadSummary> {
         if self.auto_trade_producer.is_some() {
-            anyhow::bail!(
-                "auto-trade producer is already running on this session — stop it first"
-            );
+            anyhow::bail!("auto-trade producer is already running on this session — stop it first");
         }
         // Build ensemble from saved artifacts. SoftVotingEnsemble::new
         // already rejects the no-voters case for us.
-        let ensemble = forex_models::build_ensemble_for_symbol(
-            models_dir, symbol, timeframe,
-        )
-        .with_context(|| {
-            format!(
-                "build_ensemble_for_symbol({}, {}, {}) failed",
-                models_dir.display(),
-                symbol,
-                timeframe
-            )
-        })?;
+        let ensemble = forex_models::build_ensemble_for_symbol(models_dir, symbol, timeframe)
+            .with_context(|| {
+                format!(
+                    "build_ensemble_for_symbol({}, {}, {}) failed",
+                    models_dir.display(),
+                    symbol,
+                    timeframe
+                )
+            })?;
         // Snapshot the outcome metadata BEFORE the ensemble moves
         // into the predictor (Box<dyn ExpertModel> isn't Clone).
         // `load_outcome` is a trait method on EnsemblePredictor;
@@ -1277,7 +1357,11 @@ impl TradingSession {
         use forex_models::EnsemblePredictor as _;
         let outcome = ensemble.load_outcome();
         let summary = EnsembleLoadSummary {
-            loaded_names: outcome.loaded_names().into_iter().map(String::from).collect(),
+            loaded_names: outcome
+                .loaded_names()
+                .into_iter()
+                .map(String::from)
+                .collect(),
             missing: outcome.missing.clone(),
             degraded_names: outcome
                 .degraded
@@ -1473,7 +1557,6 @@ impl TradingSession {
     // `resolve_selected_ctrader_symbol`, `ctrader_account_equity`,
     // `ctrader_symbol_pip_position`) moved to `orders.rs`.
 
-
     /// Reset the per-day risk-tracking counters when the broker calendar
     /// day advances. Called from the periodic runtime refresh path; until
     /// this fires the daily-DD check would otherwise treat the entire
@@ -1562,7 +1645,6 @@ impl TradingSession {
             .sum();
         runtime.trader.balance + accrued
     }
-
 }
 
 /// Find the index of the candle whose `timestamp` is the largest value

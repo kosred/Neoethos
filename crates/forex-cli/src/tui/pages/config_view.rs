@@ -64,7 +64,9 @@ pub fn draw(area: Rect, buf: &mut Buffer, _shared: &AppShared) {
             Span::styled(format!(" {:<10} ", f.section), theme::muted_style()),
             Span::styled(
                 format!("{:<24} ", f.field),
-                Style::default().fg(theme::TEXT_PRIMARY).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::TEXT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!("{:<22} ", f.raw), theme::muted_style()),
             Span::styled(

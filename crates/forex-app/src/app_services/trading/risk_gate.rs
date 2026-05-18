@@ -38,9 +38,7 @@ use crate::app_state::OrderTicketState;
 pub(super) fn units_to_ctrader_protocol_volume(volume: f64) -> anyhow::Result<i64> {
     let scaled = volume * 100.0;
     if !scaled.is_finite() || scaled.abs() >= i64::MAX as f64 {
-        anyhow::bail!(
-            "cTrader protocol volume overflow converting units: volume={volume}"
-        );
+        anyhow::bail!("cTrader protocol volume overflow converting units: volume={volume}");
     }
     Ok(scaled.round() as i64)
 }

@@ -48,11 +48,11 @@ use super::{
     CTraderExecutionRequest, CTraderExecutionRuntimeRequest, CTraderExecutionStatus,
     CTraderNewOrderRequest, CTraderOrderType, CTraderSymbolLookupRequest, CTraderTimeInForce,
     CTraderTradeSide, TradingAdapter, TradingAdapterKind, TradingSession,
-    ctrader_protocol_volume_from_units, current_unix_seconds,
-    extract_client_order_id_from_request, find_existing_client_order_id,
-    format_execution_journal_line, format_execution_outcome_status, next_client_order_seq,
-    non_empty_option, prop_firm_pre_trade_check, record_app_event, resolve_symbol,
-    synthesize_idempotent_retry_outcome, validate_and_convert_lot_size_to_ctrader_volume,
+    ctrader_protocol_volume_from_units, current_unix_seconds, extract_client_order_id_from_request,
+    find_existing_client_order_id, format_execution_journal_line, format_execution_outcome_status,
+    next_client_order_seq, non_empty_option, prop_firm_pre_trade_check, record_app_event,
+    resolve_symbol, synthesize_idempotent_retry_outcome,
+    validate_and_convert_lot_size_to_ctrader_volume,
 };
 use std::time::Instant;
 
@@ -370,8 +370,7 @@ impl TradingSession {
                 // `warn!` so an operator can correlate. On a circuit-
                 // breaker trip (broker vs local drift > 1 % of
                 // notional) we BLOCK the order.
-                let (account_equity, breaker) =
-                    self.ctrader_account_equity_authoritative();
+                let (account_equity, breaker) = self.ctrader_account_equity_authoritative();
                 if let Some(super::PnLDriftCircuitBreaker::Tripped {
                     position_id,
                     broker_net,
@@ -392,11 +391,7 @@ impl TradingSession {
                     );
                     state.status_msg = message.clone();
                     self.append_trade_journal(message.clone());
-                    record_app_event(
-                        "prop_firm_risk_gate",
-                        "BLOCKED_CIRCUIT_BREAKER",
-                        message,
-                    );
+                    record_app_event("prop_firm_risk_gate", "BLOCKED_CIRCUIT_BREAKER", message);
                     return;
                 }
                 // News-blackout gate — runs BEFORE the prop-firm check
@@ -505,9 +500,7 @@ impl TradingSession {
                 // network connection died — in which case retrying would
                 // double the position. If reconcile fails, we do NOT
                 // retry: surface the error so the operator can decide.
-                if let Some(client_order_id) =
-                    extract_client_order_id_from_request(&request)
-                {
+                if let Some(client_order_id) = extract_client_order_id_from_request(&request) {
                     let reconcile = self.load_ctrader_account_runtime().map_err(|reconcile_err| {
                         anyhow::anyhow!(
                             "cTrader retry aborted: reconcile-before-retry failed and we cannot prove the previous \
@@ -911,10 +904,7 @@ impl TradingSession {
         // the most common path and avoids the fallback warn-line
         // firing on a healthy session.
         if open_position_ids.is_empty() {
-            return (
-                balance,
-                Some(super::PnLDriftCircuitBreaker::Ok),
-            );
+            return (balance, Some(super::PnLDriftCircuitBreaker::Ok));
         }
 
         // Gather auth + transport without mutating the trade journal
@@ -937,9 +927,9 @@ impl TradingSession {
             return (local_equity, None);
         }
 
-        let access_token = match self
-            .ensure_fresh_ctrader_token_bundle("authoritative PnL fetch requires a stored token bundle")
-        {
+        let access_token = match self.ensure_fresh_ctrader_token_bundle(
+            "authoritative PnL fetch requires a stored token bundle",
+        ) {
             Ok(bundle) => bundle.access_token,
             Err(err) => {
                 tracing::warn!(
@@ -954,9 +944,10 @@ impl TradingSession {
         };
 
         let environment = self.selected_ctrader_environment();
-        let transport = crate::app_services::ctrader_messages::ProductionCTraderOpenApiTransport::new(
-            environment.endpoint_host(),
-        );
+        let transport =
+            crate::app_services::ctrader_messages::ProductionCTraderOpenApiTransport::new(
+                environment.endpoint_host(),
+            );
         let authoritative = match super::fetch_unrealized_pnl_for_all_positions(
             &transport,
             &client_id,

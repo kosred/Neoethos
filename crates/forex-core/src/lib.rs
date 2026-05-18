@@ -10,10 +10,6 @@ pub mod symbol_metadata;
 pub mod system;
 pub mod utils;
 
-pub use schema_version::{
-    check_schema_version_readable, default_v1, ensure_schema_version_readable, HasSchemaVersion,
-    SchemaVersion, SchemaVersionError,
-};
 pub use config::Settings;
 pub use contracts::{
     ARTIFACT_SCHEMA_VERSION, ArtifactContractError, ArtifactContractKind, ArtifactEnvelope,
@@ -33,6 +29,10 @@ pub use domain::PropFirmConstraints;
 pub use domain::{
     DEFAULT_RISKY_TRADES_PER_DAY, KillSwitchTier, MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY,
     RiskyModeConfig, RiskyModeManager, RiskyStage, build_logarithmic_stages,
+};
+pub use schema_version::{
+    HasSchemaVersion, SchemaVersion, SchemaVersionError, check_schema_version_readable, default_v1,
+    ensure_schema_version_readable,
 };
 pub use system::{
     AcceleratorBackend, AcceleratorDevice, CpuBudget, GpuBudget, HardwareExecutionPlan,

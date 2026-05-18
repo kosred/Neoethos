@@ -88,7 +88,12 @@ fn render_form(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
             theme::PANEL_BG
         };
         let line = Line::from(vec![
-            Span::styled(format!(" {} ", marker), Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" {} ", marker),
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 format!("{:>14}  ", field.label),
                 Style::default().fg(label_color),
@@ -99,14 +104,24 @@ fn render_form(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
             ),
         ]);
         Paragraph::new(line).render(
-            Rect { x: inner.x, y, width: inner.width, height: 1 },
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            },
             buf,
         );
 
         // Click hit-rect for the field — clicking focuses (and starts
         // editing if already focused).
         shared.hits.push(Hit {
-            rect: Rect { x: inner.x, y, width: inner.width, height: 1 },
+            rect: Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            },
             action: HitAction::FocusField {
                 page: crate::tui::pages::Page::Discover,
                 index: idx,
@@ -120,7 +135,12 @@ fn render_form(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
                 Span::styled(field.hint, theme::caption_style()),
             ]));
             hint.render(
-                Rect { x: inner.x, y: y + 1, width: inner.width, height: 1 },
+                Rect {
+                    x: inner.x,
+                    y: y + 1,
+                    width: inner.width,
+                    height: 1,
+                },
                 buf,
             );
         }
@@ -137,7 +157,12 @@ fn render_form(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
                 theme::sell_style(),
             )]))
             .render(
-                Rect { x: inner.x, y, width: inner.width, height: 1 },
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
                 buf,
             );
             y += 2;
@@ -172,12 +197,22 @@ fn render_form(area: Rect, buf: &mut Buffer, shared: &mut AppShared) {
             Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
         )]);
         Paragraph::new(launch_line).render(
-            Rect { x: inner.x, y, width: inner.width, height: 1 },
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            },
             buf,
         );
         if !job_alive {
             shared.hits.push(Hit {
-                rect: Rect { x: inner.x, y, width: inner.width, height: 1 },
+                rect: Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
                 action: HitAction::Activate,
             });
         }
@@ -214,9 +249,15 @@ fn render_status(area: Rect, buf: &mut Buffer, shared: &AppShared) {
         job.tail(visible)
             .map(|l| {
                 let lower = l.to_lowercase();
-                let style = if lower.contains("error") || lower.contains("panic") || lower.contains("failed") {
+                let style = if lower.contains("error")
+                    || lower.contains("panic")
+                    || lower.contains("failed")
+                {
                     theme::sell_style()
-                } else if lower.contains("portfolio_size=") || lower.contains("found ") || lower.contains("complete") {
+                } else if lower.contains("portfolio_size=")
+                    || lower.contains("found ")
+                    || lower.contains("complete")
+                {
                     theme::buy_style()
                 } else if lower.contains("processing symbol") || lower.contains("timeframe:") {
                     theme::accent_style()
@@ -313,9 +354,15 @@ pub fn launch_now(shared: &mut AppShared) {
     }
     let form = &shared.discover_form;
     let symbols = form.value_for("Symbols").unwrap_or("").to_string();
-    let timeframes = form.value_for("Timeframes").unwrap_or("M30,H1,H4,D1").to_string();
+    let timeframes = form
+        .value_for("Timeframes")
+        .unwrap_or("M30,H1,H4,D1")
+        .to_string();
     let root = form.value_for("Data root").unwrap_or("data").to_string();
-    let out_dir = form.value_for("Out dir").unwrap_or("cache/discovery").to_string();
+    let out_dir = form
+        .value_for("Out dir")
+        .unwrap_or("cache/discovery")
+        .to_string();
 
     let mut args = vec![
         "batch-discover".to_string(),

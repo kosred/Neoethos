@@ -68,7 +68,7 @@ impl ExportState {
         }
         if passed_filter > 0 {
             return Self::PortfolioSelected; // candidates exist past filter but
-                                            // didn't survive prop-firm/corr gate
+            // didn't survive prop-firm/corr gate
         }
         if ranked > 0 {
             return Self::FiltersFailed;

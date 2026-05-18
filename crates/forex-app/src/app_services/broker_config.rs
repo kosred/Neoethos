@@ -1,5 +1,5 @@
 use crate::app_services::trading::TradingAdapterKind;
-use forex_core::{default_v1, HasSchemaVersion, SchemaVersion};
+use forex_core::{HasSchemaVersion, SchemaVersion, default_v1};
 use serde::{Deserialize, Serialize};
 
 /// Current schema version of the `broker_credentials.toml` on-disk
@@ -75,10 +75,21 @@ pub struct CTraderBrokerSettings {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct DxTradeBrokerSettings {
+    /// Base URL of the DXtrade platform, e.g. `https://demo.dx.trade`
+    /// or `https://trade.broker.example`. The auth endpoint is
+    /// always `{platform_url}/dxsca-web/login` per the official
+    /// DXtrade REST API spec.
     #[serde(default)]
     pub platform_url: String,
     #[serde(default)]
     pub username: String,
+    /// DXtrade login domain. Required by `POST /dxsca-web/login`
+    /// alongside username + password — see the "Create Session
+    /// Token" endpoint in the DXtrade Developer Portal. Brokers
+    /// typically configure this to a fixed string per environment
+    /// (e.g. `default` for the demo realm).
+    #[serde(default)]
+    pub domain: String,
     /// NEVER persisted to disk. The user enters this each session.
     #[serde(skip_serializing, skip_deserializing, default)]
     pub password: String,
@@ -141,6 +152,7 @@ impl BrokerSettingsState {
                 let missing_fields = required_missing_fields(&[
                     ("platform_url", &self.dxtrade.platform_url),
                     ("username", &self.dxtrade.username),
+                    ("domain", &self.dxtrade.domain),
                     ("password", &self.dxtrade.password),
                 ]);
                 build_remote_readiness(
@@ -259,6 +271,7 @@ mod tests {
             vec![
                 "platform_url".to_string(),
                 "username".to_string(),
+                "domain".to_string(),
                 "password".to_string()
             ]
         );
@@ -266,6 +279,7 @@ mod tests {
 
         settings.dxtrade.platform_url = "https://broker.example/specs".to_string();
         settings.dxtrade.username = "ops-user".to_string();
+        settings.dxtrade.domain = "default".to_string();
         settings.dxtrade.password = "ops-pass".to_string();
 
         let ready = settings.readiness(TradingAdapterKind::DxTrade);

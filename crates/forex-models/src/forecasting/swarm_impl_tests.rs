@@ -6,7 +6,6 @@
 // real broker data shape, including weekend gaps and quote noise.
 use super::*;
 
-
 use polars::prelude::NamedFrom;
 use std::fs;
 use std::path::PathBuf;
@@ -294,11 +293,7 @@ fn load_preserves_saved_local_fallback_artifacts_without_refitting() {
     // also hold, otherwise a deserialization bug that re-normalizes
     // (or drops) entries could pass the per-field asserts above.
     if !forecaster.candidate_reports.is_empty() {
-        let total_weight: f32 = forecaster
-            .candidate_reports
-            .iter()
-            .map(|r| r.weight)
-            .sum();
+        let total_weight: f32 = forecaster.candidate_reports.iter().map(|r| r.weight).sum();
         // Weights need only be POSITIVE and finite after load; not
         // necessarily summing to 1.0 because the saved test fixture
         // doesn't pre-normalize. The contract we enforce: count
@@ -316,7 +311,8 @@ fn load_preserves_saved_local_fallback_artifacts_without_refitting() {
             assert!(
                 report.weight.is_finite() && report.weight >= 0.0,
                 "candidate '{}' must have a finite non-negative weight after load (got {})",
-                report.name, report.weight
+                report.name,
+                report.weight
             );
         }
     }
@@ -498,7 +494,10 @@ fn load_rejects_or_downgrades_artifact_with_incompatible_horizon() {
             // unrelated invariant.
             let message = err.to_string().to_ascii_lowercase();
             assert!(
-                message.contains("horizon") && (message.contains("history") || message.contains("observations") || message.contains("values")),
+                message.contains("horizon")
+                    && (message.contains("history")
+                        || message.contains("observations")
+                        || message.contains("values")),
                 "expected horizon/history error, got: {err}"
             );
         }
@@ -508,7 +507,9 @@ fn load_rejects_or_downgrades_artifact_with_incompatible_horizon() {
             // effective horizon must be reduced to something the
             // history supports (at most values.len() / 2 == 4) and
             // the degradation must be surfaced.
-            let effective_horizon = forecaster.last_horizon.expect("last_horizon set after load");
+            let effective_horizon = forecaster
+                .last_horizon
+                .expect("last_horizon set after load");
             assert!(
                 effective_horizon <= forecaster.values.len() / 2,
                 "load must clamp horizon (got {effective_horizon}) to at most values.len()/2 ({}) when persisted horizon exceeds history",
@@ -787,8 +788,7 @@ fn save_strips_stale_forecast_state_from_unfitted_artifacts() {
     });
 
     forecaster.save(&dir).expect("save should succeed");
-    let payload =
-        fs::read(dir.join(SWARM_ARTIFACT_FILE_NAME)).expect("read saved swarm artifact");
+    let payload = fs::read(dir.join(SWARM_ARTIFACT_FILE_NAME)).expect("read saved swarm artifact");
     let artifact: SwarmForecasterArtifact =
         serde_json::from_slice(&payload).expect("deserialize saved artifact");
 
@@ -988,8 +988,7 @@ fn normalize_candidate_weights_preserves_learned_validation_ordering() {
 #[test]
 fn validation_weight_blend_ratio_scales_with_support() {
     let low_support = HashMap::from([("a".to_string(), 1.0_f32), ("b".to_string(), 1.0_f32)]);
-    let high_support =
-        HashMap::from([("a".to_string(), 24.0_f32), ("b".to_string(), 24.0_f32)]);
+    let high_support = HashMap::from([("a".to_string(), 24.0_f32), ("b".to_string(), 24.0_f32)]);
 
     let low_ratio = validation_weight_blend_ratio(&low_support, 2);
     let high_ratio = validation_weight_blend_ratio(&high_support, 2);
@@ -1359,8 +1358,7 @@ fn calibrated_interval_spread_widens_when_validation_coverage_is_weak() {
     let strong_refs = strong.iter().collect::<Vec<_>>();
     let weak_refs = weak.iter().collect::<Vec<_>>();
 
-    let strong_spread =
-        calibrated_interval_spread(1.015, &step_values, &strong_refs, &snapshot);
+    let strong_spread = calibrated_interval_spread(1.015, &step_values, &strong_refs, &snapshot);
     let weak_spread = calibrated_interval_spread(1.015, &step_values, &weak_refs, &snapshot);
 
     assert!(weak_spread > strong_spread);

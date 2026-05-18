@@ -13,9 +13,7 @@
 
 use eframe::egui;
 
-use crate::app_services::ctrader_state_machine::{
-    CTraderStateMachine, CTraderStepStatus,
-};
+use crate::app_services::ctrader_state_machine::{CTraderStateMachine, CTraderStepStatus};
 use crate::ui::theme;
 
 pub fn render(ui: &mut egui::Ui, sm: &mut CTraderStateMachine) {

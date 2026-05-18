@@ -38,17 +38,18 @@ pub fn draw(area: Rect, buf: &mut Buffer, _shared: &AppShared) {
         .rev()
         .map(|l| {
             let lower = l.to_lowercase();
-            let style = if lower.contains("error") || lower.contains("failed") || lower.contains("panic") {
-                theme::sell_style()
-            } else if lower.contains("status=success") || lower.contains("complete") {
-                theme::buy_style()
-            } else if lower.contains("operation=") || lower.contains("====") {
-                theme::accent_style()
-            } else if lower.contains("subsystem=") {
-                theme::primary_style()
-            } else {
-                theme::muted_style()
-            };
+            let style =
+                if lower.contains("error") || lower.contains("failed") || lower.contains("panic") {
+                    theme::sell_style()
+                } else if lower.contains("status=success") || lower.contains("complete") {
+                    theme::buy_style()
+                } else if lower.contains("operation=") || lower.contains("====") {
+                    theme::accent_style()
+                } else if lower.contains("subsystem=") {
+                    theme::primary_style()
+                } else {
+                    theme::muted_style()
+                };
             Line::styled(l.to_string(), style)
         })
         .collect();

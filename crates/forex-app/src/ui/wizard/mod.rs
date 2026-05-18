@@ -43,7 +43,7 @@ pub mod welcome;
 
 #[allow(unused_imports)]
 pub use state::{
-    InstallMetadata, RiskAcknowledgement, WIZARD_STATE_FILENAME, WIZARD_STATE_FILE_VERSION,
+    InstallMetadata, RiskAcknowledgement, WIZARD_STATE_FILE_VERSION, WIZARD_STATE_FILENAME,
     WizardError, WizardState, WizardStateFile, WizardStepStatus,
 };
 
@@ -85,7 +85,7 @@ pub struct WizardConfig {
     pub monthly_profit_target: f32,
     pub trading_mode: TradingMode,
     pub interface_mode: InterfaceMode,
-    pub risk_profile_slider: u8,        // 1..=10
+    pub risk_profile_slider: u8, // 1..=10
     pub require_stop_loss: bool,
     pub per_trade_max_risk_pct: f32,
     pub daily_loss_reset_timezone: String,
@@ -415,7 +415,9 @@ impl WizardController {
             // forwards re-marks it (spec §5 — "Preserve user selections
             // through navigation" — selections survive, completion
             // status does not).
-            self.state_file.completed_steps.retain(|s| *s != self.current);
+            self.state_file
+                .completed_steps
+                .retain(|s| *s != self.current);
             self.current = prev;
         }
     }
@@ -539,7 +541,11 @@ mod tests {
         let mut c = WizardController::new();
         assert!(!c.is_skippable());
         c.apply(StepResult::SkipRequested);
-        assert_eq!(c.current, WizardState::Welcome, "skip on Welcome is a no-op");
+        assert_eq!(
+            c.current,
+            WizardState::Welcome,
+            "skip on Welcome is a no-op"
+        );
     }
 
     #[test]

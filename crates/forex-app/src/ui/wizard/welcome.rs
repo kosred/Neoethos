@@ -202,10 +202,7 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
     // user has scrolled the inner content within ~4 px of the
     // bottom; egui's `ScrollAreaOutput.state` exposes the offset +
     // viewport.
-    let mut scrolled_to_end_latched = scrolled_to_end_flag()
-        .lock()
-        .map(|g| *g)
-        .unwrap_or(false);
+    let mut scrolled_to_end_latched = scrolled_to_end_flag().lock().map(|g| *g).unwrap_or(false);
     let content_height = scroll_output.content_size.y;
     let viewport_height = scroll_output.inner_rect.height();
     let offset_y = scroll_output.state.offset.y;

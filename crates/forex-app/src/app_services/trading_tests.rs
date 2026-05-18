@@ -1588,8 +1588,8 @@ fn prop_firm_gate_blocks_when_total_drawdown_breached() {
     let order = sample_prop_firm_order();
     let risk = RiskConfig::default();
     // Set day_start_equity equal to account_equity so daily DD is 0%, forcing it to hit total DD rule
-    let err = prop_firm_pre_trade_check(&risk, &order, 8900.0, 10000.0, 8900.0, 4, "EURUSD")
-        .unwrap_err();
+    let err =
+        prop_firm_pre_trade_check(&risk, &order, 8900.0, 10000.0, 8900.0, 4, "EURUSD").unwrap_err();
     assert!(err.to_string().contains("Total drawdown limit reached"));
     assert!(err.to_string().contains("current 11.00% >= max 7.00%"));
 }
@@ -1630,8 +1630,8 @@ fn prop_firm_gate_rejects_unknown_symbol_without_synthetic_fallback() {
     // Empty symbol must be rejected — the old code silently used
     // `infer_market_cost_profile("", "", …)` and the EURUSD default,
     // producing a synthetic pip value. That is not allowed any more.
-    let err = prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "")
-        .unwrap_err();
+    let err =
+        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "").unwrap_err();
     assert!(
         err.to_string().contains("symbol name was not supplied")
             || err.to_string().contains("Daily drawdown")
@@ -1887,12 +1887,8 @@ fn start_auto_trade_with_ensemble_refuses_when_no_artifacts_on_disk() {
     ));
     std::fs::create_dir_all(&empty_dir).expect("mkdir");
 
-    let result = session.start_auto_trade_with_ensemble(
-        &empty_dir,
-        "EURUSD",
-        "H1",
-        Arc::new(EmptySource),
-    );
+    let result =
+        session.start_auto_trade_with_ensemble(&empty_dir, "EURUSD", "H1", Arc::new(EmptySource));
     assert!(
         result.is_err(),
         "start_auto_trade_with_ensemble must reject when no artifacts are present"
@@ -1922,14 +1918,14 @@ fn ensemble_load_summary_counts_are_consistent() {
 
 #[test]
 fn auto_trade_producer_starts_and_stops_cleanly() {
+    use crate::app_services::trading::auto_trade::AutoTradeSide;
     use crate::app_services::trading::auto_trade_producer::{
         LiveBarSource, LiveInferenceProducerConfig, ModelPredictor, PredictionOutput,
         ProducerOutcome,
     };
-    use crate::app_services::trading::auto_trade::AutoTradeSide;
+    use anyhow::Result;
     use std::sync::Arc;
     use std::time::Duration;
-    use anyhow::Result;
 
     /// Source that returns Ok(None) forever — the producer just
     /// polls in a loop until cancelled.
@@ -1981,13 +1977,13 @@ fn auto_trade_producer_starts_and_stops_cleanly() {
 
 #[test]
 fn auto_trade_producer_drain_dispatches_signals_through_gate_chain() {
+    use crate::app_services::trading::auto_trade::AutoTradeSide;
     use crate::app_services::trading::auto_trade_producer::{
         LiveBarSource, LiveInferenceProducerConfig, ModelPredictor, PredictionOutput,
     };
-    use crate::app_services::trading::auto_trade::AutoTradeSide;
+    use anyhow::Result;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    use anyhow::Result;
 
     /// Cursor-style source that emits a small fixed sequence.
     struct CursorSource(Mutex<std::vec::IntoIter<HistoricalBar>>);
@@ -2074,7 +2070,10 @@ fn manual_buy_not_blocked_when_risky_mode_disarmed() {
     // contain the autonomous-only rejection string.
     let mut state = sample_state(DataSource::CTrader, "(test setup)");
     let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
-    assert!(!session.risky_mode_active(), "fresh session must be disarmed");
+    assert!(
+        !session.risky_mode_active(),
+        "fresh session must be disarmed"
+    );
 
     session.execute_buy_market(&mut state);
 
@@ -2151,10 +2150,38 @@ fn bot_decisions_to_overlays_maps_timestamps_to_nearest_candle() {
 
     // 4 candles spaced 1 minute apart.
     let candles = vec![
-        ChartCandle { timestamp: Some(1_700_000_000_000), open: 1.0, high: 1.0, low: 1.0, close: 1.0, volume: 0.0 },
-        ChartCandle { timestamp: Some(1_700_000_060_000), open: 1.0, high: 1.0, low: 1.0, close: 1.0, volume: 0.0 },
-        ChartCandle { timestamp: Some(1_700_000_120_000), open: 1.0, high: 1.0, low: 1.0, close: 1.0, volume: 0.0 },
-        ChartCandle { timestamp: Some(1_700_000_180_000), open: 1.0, high: 1.0, low: 1.0, close: 1.0, volume: 0.0 },
+        ChartCandle {
+            timestamp: Some(1_700_000_000_000),
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: 0.0,
+        },
+        ChartCandle {
+            timestamp: Some(1_700_000_060_000),
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: 0.0,
+        },
+        ChartCandle {
+            timestamp: Some(1_700_000_120_000),
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: 0.0,
+        },
+        ChartCandle {
+            timestamp: Some(1_700_000_180_000),
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: 0.0,
+        },
     ];
 
     // Decision at exactly candle 2's timestamp → maps to index 2.

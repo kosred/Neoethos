@@ -103,12 +103,7 @@ impl FunnelProfile {
 
     /// Add a reject-reason bucket to a stage's top-reasons list. The
     /// caller is responsible for keeping the list bounded.
-    pub fn add_reject_reason(
-        &mut self,
-        stage_name: &str,
-        reason: impl Into<String>,
-        count: usize,
-    ) {
+    pub fn add_reject_reason(&mut self, stage_name: &str, reason: impl Into<String>, count: usize) {
         if let Some(s) = self.stages.iter_mut().find(|s| s.name == stage_name) {
             s.top_reasons.push((reason.into(), count));
             // Keep only the top 10, descending by count.
@@ -201,7 +196,11 @@ mod tests {
     fn record_stage_updates_counts_and_rejected() {
         let mut f = FunnelProfile::new("EURJPY", "D1");
         f.record_stage("passed_base_filter", 100, 25);
-        let s = f.stages.iter().find(|s| s.name == "passed_base_filter").unwrap();
+        let s = f
+            .stages
+            .iter()
+            .find(|s| s.name == "passed_base_filter")
+            .unwrap();
         assert_eq!(s.count_in, 100);
         assert_eq!(s.count_out, 25);
         assert_eq!(s.rejected, 75);
@@ -210,8 +209,8 @@ mod tests {
     #[test]
     fn finalize_picks_bottleneck() {
         let mut f = FunnelProfile::new("EURJPY", "D1");
-        f.record_stage("passed_base_filter", 100, 25);  // 75 rejected
-        f.record_stage("nonzero_signals", 25, 10);      // 15 rejected
+        f.record_stage("passed_base_filter", 100, 25); // 75 rejected
+        f.record_stage("nonzero_signals", 25, 10); // 15 rejected
         f.record_stage("passed_quality", 10, 10);
         f.finalize("no_candidates");
         assert_eq!(f.bottleneck_stage, "passed_base_filter");
@@ -225,7 +224,11 @@ mod tests {
         for i in 0..20 {
             f.add_reject_reason("passed_base_filter", format!("reason_{}", i), i);
         }
-        let s = f.stages.iter().find(|s| s.name == "passed_base_filter").unwrap();
+        let s = f
+            .stages
+            .iter()
+            .find(|s| s.name == "passed_base_filter")
+            .unwrap();
         assert_eq!(s.top_reasons.len(), 10);
         // First entry = highest count.
         assert!(s.top_reasons[0].1 >= s.top_reasons[9].1);

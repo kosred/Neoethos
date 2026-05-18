@@ -79,11 +79,7 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
     ui.add_space(theme::SPACE_SM);
 
     // Operator name.
-    let mut name = controller
-        .config
-        .operator_name
-        .clone()
-        .unwrap_or_default();
+    let mut name = controller.config.operator_name.clone().unwrap_or_default();
     ui.horizontal(|ui| {
         ui.label("Operator name (optional):");
         if ui
@@ -185,35 +181,29 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
     // Risk-profile slider 1–10 — competitive analysis §8.3.
     ui.horizontal(|ui| {
         ui.label("Risk profile (1–10):");
-        ui.add(
-            egui::Slider::new(
-                &mut controller.config.risk_profile_slider,
-                WIZARD_DEFAULT_RISK_PROFILE_MIN..=WIZARD_DEFAULT_RISK_PROFILE_MAX,
-            ),
-        );
+        ui.add(egui::Slider::new(
+            &mut controller.config.risk_profile_slider,
+            WIZARD_DEFAULT_RISK_PROFILE_MIN..=WIZARD_DEFAULT_RISK_PROFILE_MAX,
+        ));
         if controller.config.risk_profile_slider == WIZARD_DEFAULT_RISK_PROFILE_MAX {
             ui.label(
                 egui::RichText::new("Risky Mode")
                     .color(theme::DANGER)
                     .strong(),
             );
-            // Risky Mode unlock — research §8.2 wizard branch panel.
-            // The actual `RiskyModeConfig` is constructed by the
-            // Step 10 Apply path from `RiskyModeConfig::default()`
-            // (research §4.1 — $20 → $50_000 with paper-trading
-            // default ON). Until summary.rs::apply is wired by the
-            // wizard-apply-writer agent (Phase 2B), this label is
-            // the operator-facing signal that the slider has armed
-            // the mode.
-            //
-            // FIXME(risky-mode-apply): summary.rs needs session
-            // access — gated on Agent B wizard apply writer landing.
-            // The Apply writer should call
-            // `session.enable_risky_mode(RiskyModeConfig::default(),
-            // starting_bankroll)` where `starting_bankroll` comes
-            // from the broker-reported balance at Apply time, or
-            // `RiskyModeConfig::default().starting_capital_usd` ($20)
-            // when no broker is connected yet.
+            // Risky Mode label — surfaces that the slider is at the
+            // ceiling. The actual Risky Mode arm/disarm toggle lives
+            // in the AutonomyRisk step (Card 4.5), which captures
+            // both `risky_mode_armed` and the §7.1 ruin-probability
+            // acknowledgement. Persistence + boot-time wire-up is
+            // landed: `summary.rs::write_risky_mode_state` persists
+            // the flags into `risky_mode_state.json` (sibling to
+            // `broker_credentials.toml`), and
+            // `TradingSession::new_with_persisted_credentials`
+            // auto-arms via
+            // `auto_arm_risky_mode_from_persisted_state`.
+            // — `app_services::risky_mode_persistence` (closed
+            // TODO(risky-mode-boot-wire), 2026-05-18 cleanup pass).
         }
     });
 

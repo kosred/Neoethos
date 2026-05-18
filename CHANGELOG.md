@@ -4,6 +4,87 @@ All notable changes to forex-ai are documented here. The format is
 loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to semantic versioning.
 
+## [0.4.7] — 2026-05-18 — "Cleanup + Boot-Wire Release"
+
+> Shipping early to surface integration-level bugs that the unit
+> tests do not catch — particularly first-run wizard end-to-end,
+> Risky Mode boot-time arming, and DXtrade live-session behaviour.
+
+### Added
+
+- **Risky Mode boot-time wire-up.** The wizard's `risky_mode_armed`
+  flag is now persisted to `<config_dir>/forex-ai/risky_mode_state.json`
+  by `summary.rs::write_risky_mode_state`. At app boot,
+  `TradingSession::new_with_persisted_credentials` calls a new
+  `auto_arm_risky_mode_from_persisted_state` helper that loads the
+  file and calls `enable_risky_mode(RiskyModeConfig::default(),
+  starting_bankroll)` when armed. Schema-versioned via the existing
+  `HasSchemaVersion` Phase-D4 contract; safe-fallback to disabled
+  on every error path (no half-armed sessions).
+- New `crates/forex-app/src/app_services/risky_mode_persistence.rs`
+  module with 5 unit tests (round-trip, missing-file → None,
+  pre-versioning serde compat, malformed-JSON error path,
+  future-schema-version fallback).
+
+### Refactored — god-file splits prepared as drafts
+
+A code-health round carved the six largest god files into focused
+sibling modules. Each split lives in a `*_split_draft/` directory
+next to the active source; the operator activates each one with a
+single `Move-Item` after running `cargo check`. Activation docs
+in `docs/qa/2026-05-18-*-split-draft.md`.
+
+| File | Pre | Post (max file) | Reduction |
+|---|---|---|---|
+| `dxtrade.rs` | 2787 | 1369 | 51% |
+| `burn_models.rs` | 2634 | 965 | 63% |
+| `training_orchestrator.rs` | 4137 | 1946 | 53% |
+| `dqn_impl.rs` | 2659 | 1941 | 27% |
+| `swarm_impl.rs` | 3397 | 2749 | 19% |
+| `deep_models.rs` | 2263 | 1770 | 22% |
+
+### Fixed
+
+- Stale `FIXME(risky-mode-apply)` and `FIXME(wizard-sha256)` comments
+  in the wizard now reflect the landed wiring + the existing `sha2`
+  workspace dep; references to obsolete "Phase 2B / 2C / 2D" /
+  "Agent A / B" scaffolding labels removed from `account_profile.rs`,
+  `autonomy_risk.rs`, `summary.rs`, and `migration.rs`.
+- Phase C3 dead-code allow-list re-audited: all seven file-level
+  `#![allow(dead_code)]` annotations carry current 2026-05-18
+  operator-directive justifications (Flutter API consumers pending,
+  real-data fixtures pending, spec-complete proto wire format).
+
+### Changed
+
+- Rust workspace crate versions aligned to `0.4.7` so app binaries
+  and generated package metadata match the release tag.
+- Packaging manifests (chocolatey, scoop, homebrew, portable build
+  script) bumped to `0.4.7`. WinGet manifest directory rename
+  (`packaging/winget/manifests/k/kosred/forex-ai/0.4.6/`) is the
+  one packaging step that has to happen manually on the Windows
+  side — the WinGet schema embeds the version in the directory
+  path.
+
+### Known issues — to surface via 0.4.7 installation testing
+
+- **Wizard Steps 2-10 + 9.5 end-to-end (task #15)** — individual
+  step renderers + the apply writer landed in 0.4.5; the full
+  end-to-end Live-mode walk-through is best validated in real use.
+- **Full forex-app GUI computer-use smoke test (task #49)** —
+  blocked while the operator was away from the machine during the
+  prior session; ready to run post-install.
+- **God-file splits (six drafts)** — not yet activated; each
+  activation needs ~5 min with live `cargo check` per file. The
+  active source files remain unchanged so the 0.4.7 binary builds
+  as-is from the pre-split layout.
+
+## [0.4.6] — 2026-05-17 — internal bump (no public release)
+
+- Internal version-counter bump after the 0.4.5 audit-fix release.
+  No publicly-published packaging artifacts. Folded into 0.4.7 for
+  the next public ship.
+
 ## [0.4.5] — 2026-05-17 — "Audit Fix Release"
 
 ### Added

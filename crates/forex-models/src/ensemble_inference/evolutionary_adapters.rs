@@ -48,8 +48,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use polars::prelude::DataFrame;
 
-use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction};
 use super::tree_adapters::classification3_per_row;
+use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction};
 use crate::base::ExpertModel as BaseExpertModel;
 use crate::evolution::{NeatExpert, NeuroEvoExpert};
 use crate::genetic::GeneticStrategyExpert;
@@ -164,9 +164,9 @@ impl ExpertLoader for NeuroEvoLoader {
     fn load(&self, artifact_dir: &Path) -> Result<Box<dyn ExpertModel>> {
         // input_dim is irrelevant — load() rebuilds from disk.
         let mut inner = NeuroEvoExpert::new(1);
-        inner.load(artifact_dir).with_context(|| {
-            format!("NeuroEvoExpert::load({}) failed", artifact_dir.display())
-        })?;
+        inner
+            .load(artifact_dir)
+            .with_context(|| format!("NeuroEvoExpert::load({}) failed", artifact_dir.display()))?;
         Ok(Box::new(NeuroEvoAdapter::new(inner)))
     }
 }
@@ -219,9 +219,9 @@ impl ExpertLoader for NeatLoader {
     }
     fn load(&self, artifact_dir: &Path) -> Result<Box<dyn ExpertModel>> {
         let mut inner = NeatExpert::new(1);
-        inner.load(artifact_dir).with_context(|| {
-            format!("NeatExpert::load({}) failed", artifact_dir.display())
-        })?;
+        inner
+            .load(artifact_dir)
+            .with_context(|| format!("NeatExpert::load({}) failed", artifact_dir.display()))?;
         Ok(Box::new(NeatAdapter::new(inner)))
     }
 }
@@ -294,10 +294,8 @@ mod tests {
     fn full_30_loaders_coexist() {
         let mut reg = ExpertRegistry::new();
         super::super::tree_adapters::register_tree_loaders(&mut reg).expect("trees");
-        super::super::deep_classification_adapters::register_deep_classification_loaders(
-            &mut reg,
-        )
-        .expect("deep-cls");
+        super::super::deep_classification_adapters::register_deep_classification_loaders(&mut reg)
+            .expect("deep-cls");
         super::super::deep_timeseries_adapters::register_deep_timeseries_loaders(&mut reg)
             .expect("deep-ts");
         super::super::meta_adapters::register_meta_loaders(&mut reg).expect("meta");

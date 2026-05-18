@@ -24,7 +24,10 @@ pub fn backoff_sleep(attempt: u32, base_ms: u64) {
     }
     let factor = 1u64 << (attempt - 1).min(MAX_FACTOR_SHIFT);
     let jitter = jitter_ms();
-    let delay_ms = base_ms.saturating_mul(factor).saturating_add(jitter).min(MAX_DELAY_MS);
+    let delay_ms = base_ms
+        .saturating_mul(factor)
+        .saturating_add(jitter)
+        .min(MAX_DELAY_MS);
     std::thread::sleep(Duration::from_millis(delay_ms));
 }
 

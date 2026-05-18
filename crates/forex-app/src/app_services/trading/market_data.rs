@@ -115,7 +115,7 @@ impl TradingSession {
                     snap.overlays =
                         self.bot_decisions_to_overlays(&state.selected_pair, &snap.candles);
                     snap
-                },
+                }
                 Err(err) => MarketChartSnapshot::empty_for(
                     &state.selected_pair,
                     &timeframe,
@@ -201,10 +201,8 @@ impl TradingSession {
                     // Audit gap #11: populate overlays from the
                     // session-held bot decision buffer once the candle
                     // list exists.
-                    snapshot.overlays = self.bot_decisions_to_overlays(
-                        &history.symbol.symbol_name,
-                        &snapshot.candles,
-                    );
+                    snapshot.overlays = self
+                        .bot_decisions_to_overlays(&history.symbol.symbol_name, &snapshot.candles);
                     if let Some(update) = live_update {
                         snapshot.bid = update.bid;
                         snapshot.ask = update.ask;

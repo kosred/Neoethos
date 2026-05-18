@@ -8,7 +8,6 @@
 // algebraic identities.
 use super::*;
 
-
 use ndarray::{Array1, Array2};
 use polars::prelude::NamedFrom;
 use std::path::PathBuf;
@@ -366,8 +365,8 @@ fn validate_q_values_rejects_non_finite_rows() {
     // F-MODELS9-002 fix: previously only NaN was tested. Inf/NegInf
     // and mixed-finite-with-non-finite also reach this validator from
     // upstream training paths; cover the full boundary.
-    let err = validate_q_values(vec![0.1, f32::NAN, 0.2])
-        .expect_err("NaN q-values should be rejected");
+    let err =
+        validate_q_values(vec![0.1, f32::NAN, 0.2]).expect_err("NaN q-values should be rejected");
     assert!(err.to_string().contains("non-finite"), "unexpected: {err}");
 
     let err = validate_q_values(vec![f32::INFINITY, 0.0, 0.0])
@@ -457,12 +456,8 @@ fn rl_precision_resolution_uses_bf16_on_supported_cuda_runtime() {
 
 #[test]
 fn rl_precision_resolution_uses_bf16_on_cpu_runtime() {
-    let (effective_precision, degraded_reason) = resolve_rl_training_precision_with_capability(
-        Some("bf16"),
-        "rlkit_cpu",
-        "cpu",
-        Some(true),
-    );
+    let (effective_precision, degraded_reason) =
+        resolve_rl_training_precision_with_capability(Some("bf16"), "rlkit_cpu", "cpu", Some(true));
 
     assert_eq!(effective_precision, "bf16");
     assert!(degraded_reason.is_none());
@@ -470,12 +465,8 @@ fn rl_precision_resolution_uses_bf16_on_cpu_runtime() {
 
 #[test]
 fn rl_precision_resolution_explains_cpu_backend_limit() {
-    let (effective_precision, degraded_reason) = resolve_rl_training_precision_with_capability(
-        Some("bf16"),
-        "quadratic_q_cpu",
-        "cpu",
-        None,
-    );
+    let (effective_precision, degraded_reason) =
+        resolve_rl_training_precision_with_capability(Some("bf16"), "quadratic_q_cpu", "cpu", None);
 
     assert_eq!(effective_precision, "fp32");
     let degraded_reason = degraded_reason.expect("bf16 request should degrade");

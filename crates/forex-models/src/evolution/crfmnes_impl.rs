@@ -8,8 +8,8 @@ use polars::prelude::{DataFrame, Series};
 use rand::SeedableRng;
 use rand_xoshiro::Xoroshiro128PlusPlus;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::cmp::Ordering;
+use std::path::Path;
 
 use forex_core::BackendKind;
 

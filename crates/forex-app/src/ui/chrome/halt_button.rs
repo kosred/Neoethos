@@ -59,16 +59,10 @@ fn modal_open_id() -> egui::Id {
 /// the operator confirms the modal. `state` is required because the
 /// trip iterates `state.order_ticket` to drive the existing close /
 /// cancel paths.
-pub fn draw_halt_button(
-    ui: &mut egui::Ui,
-    session: &mut TradingSession,
-    state: &mut AppState,
-) {
+pub fn draw_halt_button(ui: &mut egui::Ui, session: &mut TradingSession, state: &mut AppState) {
     let ctx = ui.ctx().clone();
     let modal_id = modal_open_id();
-    let mut modal_open = ctx
-        .data(|d| d.get_temp::<bool>(modal_id))
-        .unwrap_or(false);
+    let mut modal_open = ctx.data(|d| d.get_temp::<bool>(modal_id)).unwrap_or(false);
 
     // The button itself — solid red, bold uppercase `HALT`. We do not
     // route through `theme::button(ButtonKind::Danger)` because that
@@ -188,20 +182,17 @@ pub fn draw_halt_banner(ui: &mut egui::Ui, session: &mut TradingSession) -> bool
                         .size(theme::FONT_CAPTION)
                         .color(theme::TEXT_PRIMARY),
                 );
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        if theme::small_button(ui, "Clear HALT", theme::ButtonKind::Secondary)
-                            .on_hover_text(
-                                "Remove the HALT sentinel and allow new orders to flow again.",
-                            )
-                            .clicked()
-                        {
-                            session.clear_halt();
-                            cleared = true;
-                        }
-                    },
-                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::small_button(ui, "Clear HALT", theme::ButtonKind::Secondary)
+                        .on_hover_text(
+                            "Remove the HALT sentinel and allow new orders to flow again.",
+                        )
+                        .clicked()
+                    {
+                        session.clear_halt();
+                        cleared = true;
+                    }
+                });
             });
         });
     cleared

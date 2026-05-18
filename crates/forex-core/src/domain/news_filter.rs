@@ -75,7 +75,10 @@ impl NewsFilter {
     pub fn blackout_reason(&self) -> String {
         format!(
             "news-blackout gate · status='{}' · provider={} · window=-{}/+{}min",
-            self.current_status, self.llm_provider, self.blackout_minutes_before, self.blackout_minutes_after
+            self.current_status,
+            self.llm_provider,
+            self.blackout_minutes_before,
+            self.blackout_minutes_after
         )
     }
 
@@ -233,9 +236,21 @@ mod tests {
         f.blackout_minutes_before = 30;
         f.blackout_minutes_after = 15;
         let reason = f.blackout_reason();
-        assert!(reason.contains("BLACKOUT"), "reason must include status: {reason}");
-        assert!(reason.contains("openai"), "reason must include provider: {reason}");
-        assert!(reason.contains("-30"), "reason must include before-window: {reason}");
-        assert!(reason.contains("+15"), "reason must include after-window: {reason}");
+        assert!(
+            reason.contains("BLACKOUT"),
+            "reason must include status: {reason}"
+        );
+        assert!(
+            reason.contains("openai"),
+            "reason must include provider: {reason}"
+        );
+        assert!(
+            reason.contains("-30"),
+            "reason must include before-window: {reason}"
+        );
+        assert!(
+            reason.contains("+15"),
+            "reason must include after-window: {reason}"
+        );
     }
 }

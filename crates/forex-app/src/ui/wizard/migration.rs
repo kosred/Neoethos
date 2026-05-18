@@ -28,7 +28,7 @@
 //! ## Hashing
 //!
 //! Spec §6 names SHA-256 explicitly for the post-write verify. The
-//! `sha2` workspace dep landed in Phase 2D (see
+//! `sha2` workspace dep is already in tree (see
 //! `autonomy_risk::compute_quiz_answer_hash` for the canonical
 //! reference impl), so this module uses `sha2::Sha256` + `hex::encode`
 //! to produce a `sha256:<lowercase-hex>` content digest. The digest
@@ -45,10 +45,7 @@ use sha2::{Digest, Sha256};
 
 /// Files that, if present in a candidate directory, qualify it as a
 /// legacy portable install. Spec §6 enumerates these verbatim.
-pub const WIZARD_PORTABLE_SENTINEL_FILES: &[&str] = &[
-    "config.yaml",
-    "broker_credentials.toml",
-];
+pub const WIZARD_PORTABLE_SENTINEL_FILES: &[&str] = &["config.yaml", "broker_credentials.toml"];
 
 /// Directories that count as legacy payloads.
 pub const WIZARD_PORTABLE_SENTINEL_DIRS: &[&str] = &["checkpoints", "data", "history"];
@@ -169,9 +166,7 @@ impl PortableMigrationOutcome {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.copied.is_empty()
-            && self.skipped_identical.is_empty()
-            && self.skipped_cache.is_empty()
+        self.copied.is_empty() && self.skipped_identical.is_empty() && self.skipped_cache.is_empty()
     }
 }
 
@@ -203,8 +198,7 @@ pub fn migrate_portable_install(
 
     let mut stack: Vec<PathBuf> = vec![source_root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let read = fs::read_dir(&dir)
-            .with_context(|| format!("read_dir {}", dir.display()))?;
+        let read = fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))?;
         for entry in read {
             let entry = entry.with_context(|| format!("dir entry under {}", dir.display()))?;
             let path = entry.path();
@@ -246,8 +240,8 @@ pub fn migrate_portable_install(
             }
 
             // Hash + copy + verify.
-            let (bytes, source_hash) = read_and_hash(&path)
-                .with_context(|| format!("hash source {}", path.display()))?;
+            let (bytes, source_hash) =
+                read_and_hash(&path).with_context(|| format!("hash source {}", path.display()))?;
 
             // Idempotency check — if the destination already holds
             // the same bytes we skip without re-writing.
@@ -285,11 +279,7 @@ pub fn migrate_portable_install(
     Ok(outcome)
 }
 
-fn collect_skipped_files(
-    dir: &Path,
-    source_root: &Path,
-    skipped: &mut Vec<PathBuf>,
-) -> Result<()> {
+fn collect_skipped_files(dir: &Path, source_root: &Path, skipped: &mut Vec<PathBuf>) -> Result<()> {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
         let read = fs::read_dir(&current)
@@ -327,8 +317,8 @@ fn is_in_skip_dir(rel: &Path) -> bool {
 
 /// Buffered read + SHA-256 content digest. Returns
 /// `(bytes_read, "sha256:<lowercase-hex>")`. Mirrors
-/// `autonomy_risk::compute_quiz_answer_hash` (Phase 2D reference)
-/// for the hasher choice + lowercase-hex encoding.
+/// `autonomy_risk::compute_quiz_answer_hash` for the hasher choice +
+/// lowercase-hex encoding.
 fn read_and_hash(path: &Path) -> io::Result<(u64, String)> {
     let mut file = fs::File::open(path)?;
     let mut buf = Vec::with_capacity(8192);
@@ -344,14 +334,13 @@ fn read_and_hash(path: &Path) -> io::Result<(u64, String)> {
 /// `forex_core::storage::json::write_json_atomic` so the operator's
 /// no-torn-write policy holds for portable migration too.
 fn atomic_copy(source: &Path, dest: &Path) -> Result<()> {
-    let payload = fs::read(source)
-        .with_context(|| format!("read source {}", source.display()))?;
+    let payload = fs::read(source).with_context(|| format!("read source {}", source.display()))?;
 
     let tmp = temporary_path(dest);
     {
         use std::io::Write;
-        let mut handle = fs::File::create(&tmp)
-            .with_context(|| format!("create temp {}", tmp.display()))?;
+        let mut handle =
+            fs::File::create(&tmp).with_context(|| format!("create temp {}", tmp.display()))?;
         handle
             .write_all(&payload)
             .with_context(|| format!("write temp {}", tmp.display()))?;
@@ -359,13 +348,8 @@ fn atomic_copy(source: &Path, dest: &Path) -> Result<()> {
             .sync_all()
             .with_context(|| format!("fsync temp {}", tmp.display()))?;
     }
-    fs::rename(&tmp, dest).with_context(|| {
-        format!(
-            "atomic rename {} → {}",
-            tmp.display(),
-            dest.display()
-        )
-    })?;
+    fs::rename(&tmp, dest)
+        .with_context(|| format!("atomic rename {} → {}", tmp.display(), dest.display()))?;
     // Best-effort directory fsync to match the json-atomic writer.
     if let Some(parent) = dest.parent() {
         if let Ok(d) = fs::File::open(parent) {
@@ -477,7 +461,11 @@ mod tests {
 
         // Populate a realistic-ish portable tree.
         fs::write(src.join("config.yaml"), b"system:\n  symbol: EURUSD\n").unwrap();
-        fs::write(src.join("broker_credentials.toml"), b"[ctrader]\nclient_id = \"x\"\n").unwrap();
+        fs::write(
+            src.join("broker_credentials.toml"),
+            b"[ctrader]\nclient_id = \"x\"\n",
+        )
+        .unwrap();
         fs::create_dir_all(src.join("history")).unwrap();
         fs::write(src.join("history/EURUSD_M1.parquet"), b"PAR1XXX").unwrap();
         fs::create_dir_all(src.join("checkpoints")).unwrap();
@@ -490,7 +478,10 @@ mod tests {
 
         // Cache directory's payload must be in skipped_cache, not copied.
         assert_eq!(outcome.skipped_cache.len(), 1);
-        assert_eq!(outcome.skipped_cache[0], PathBuf::from("cache/transient.bin"));
+        assert_eq!(
+            outcome.skipped_cache[0],
+            PathBuf::from("cache/transient.bin")
+        );
         assert!(!dest.join("cache/transient.bin").exists());
 
         // Every non-cache file must be copied + present + hashed.
@@ -514,7 +505,12 @@ mod tests {
         for entry in &outcome.copied {
             let source_bytes = fs::read(src.join(&entry.relative_path)).unwrap();
             let dest_bytes = fs::read(dest.join(&entry.relative_path)).unwrap();
-            assert_eq!(source_bytes, dest_bytes, "{} bytes match", entry.relative_path.display());
+            assert_eq!(
+                source_bytes,
+                dest_bytes,
+                "{} bytes match",
+                entry.relative_path.display()
+            );
             assert_eq!(entry.bytes as usize, source_bytes.len());
             assert!(
                 entry.content_hash.starts_with("sha256:"),

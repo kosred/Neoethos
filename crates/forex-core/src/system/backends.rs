@@ -163,15 +163,24 @@ pub(super) fn choose_primary_backend(
             }
         }
         other if has_cuda => {
-            warn_downgrade(other, "unknown preference; CUDA available, falling back to it");
+            warn_downgrade(
+                other,
+                "unknown preference; CUDA available, falling back to it",
+            );
             AcceleratorBackend::Cuda
         }
         other if has_wgpu => {
-            warn_downgrade(other, "unknown preference; wgpu available, falling back to it");
+            warn_downgrade(
+                other,
+                "unknown preference; wgpu available, falling back to it",
+            );
             AcceleratorBackend::Wgpu
         }
         other if has_rocm => {
-            warn_downgrade(other, "unknown preference; ROCm available, falling back to it");
+            warn_downgrade(
+                other,
+                "unknown preference; ROCm available, falling back to it",
+            );
             AcceleratorBackend::Rocm
         }
         other => {

@@ -160,13 +160,22 @@ mod tests {
         // which is exactly `scale_ctrader_money_int(_, 2)` for fiat
         // accounts. Pin the equivalence so the migration cannot
         // regress the default-currency case.
-        assert_eq!(scale_ctrader_money_int(12_345, 2).expect("in-range"), 123.45);
+        assert_eq!(
+            scale_ctrader_money_int(12_345, 2).expect("in-range"),
+            123.45
+        );
     }
 
     #[test]
     fn scale_money_digits_four_matches_high_precision_account() {
-        assert_eq!(scale_ctrader_money_int(123_456, 4).expect("in-range"), 12.3456);
-        assert_eq!(scale_ctrader_money_uint(123_456, 4).expect("in-range"), 12.3456);
+        assert_eq!(
+            scale_ctrader_money_int(123_456, 4).expect("in-range"),
+            12.3456
+        );
+        assert_eq!(
+            scale_ctrader_money_uint(123_456, 4).expect("in-range"),
+            12.3456
+        );
     }
 
     #[test]

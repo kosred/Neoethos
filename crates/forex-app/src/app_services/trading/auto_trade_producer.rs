@@ -618,8 +618,7 @@ mod tests {
         let mut cfg = LiveInferenceProducerConfig::for_symbol("EURUSD");
         cfg.poll_interval = Duration::from_millis(1); // fast tests
         let source: Arc<dyn LiveBarSource> = Arc::new(CursorBarSource::new(bars));
-        let producer =
-            LiveInferenceProducer::new(cfg, source, predictor, tx).expect("producer");
+        let producer = LiveInferenceProducer::new(cfg, source, predictor, tx).expect("producer");
         (producer, rx)
     }
 

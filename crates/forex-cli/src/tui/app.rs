@@ -9,17 +9,20 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
-use ratatui::Terminal;
 
 use crate::tui::form::{FormState, make_discover_form, make_train_form};
 use crate::tui::jobs::JobManager;
@@ -168,16 +171,10 @@ impl App {
                 if form.focused == index {
                     // Second click on the already-focused field → edit.
                     form.start_editing();
-                    self.shared.status = format!(
-                        "Editing {}",
-                        form.fields[index].label
-                    );
+                    self.shared.status = format!("Editing {}", form.fields[index].label);
                 } else {
                     form.focus(index);
-                    self.shared.status = format!(
-                        "Focused {}",
-                        form.fields[index].label
-                    );
+                    self.shared.status = format!("Focused {}", form.fields[index].label);
                 }
             }
         }
@@ -195,8 +192,7 @@ impl App {
         // mid-symbol-name. Esc breaks out of edit mode (handled by the
         // page); Tab still cycles fields (handled by the page);
         // outside edit mode the global shortcuts apply.
-        let editing = self.shared.discover_form.editing
-            || self.shared.train_form.editing;
+        let editing = self.shared.discover_form.editing || self.shared.train_form.editing;
         if editing {
             let _ = self.current.handle_key(code, &mut self.shared);
             return;
@@ -231,8 +227,7 @@ pub fn run_tui(data_root: Option<PathBuf>) -> Result<()> {
     // Terminal setup.
     enable_raw_mode().context("enable raw terminal mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .context("enter alternate screen")?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("init terminal backend")?;
     // DOCUMENTED-DEFAULT: best-effort clear; failure here would also break
@@ -410,11 +405,7 @@ fn render_top_bar(area: Rect, buf: &mut ratatui::buffer::Buffer, app: &mut App) 
 
 fn render_status_bar(area: Rect, buf: &mut ratatui::buffer::Buffer, app: &App) {
     // (status bar is read-only: takes &App not &mut)
-    let block = Block::default().style(
-        Style::default()
-            .bg(theme::PANEL_BG)
-            .fg(theme::TEXT_MUTED),
-    );
+    let block = Block::default().style(Style::default().bg(theme::PANEL_BG).fg(theme::TEXT_MUTED));
     let inner = block.inner(area);
     block.render(area, buf);
 

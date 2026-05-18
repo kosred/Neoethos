@@ -144,10 +144,7 @@ impl ExpertModel for DqnAdapter {
                 );
             }
             // Softmax → 3-class probability distribution.
-            let max_q = q_values
-                .iter()
-                .copied()
-                .fold(f32::NEG_INFINITY, f32::max);
+            let max_q = q_values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let exp_q: Vec<f32> = q_values.iter().map(|q| (q - max_q).exp()).collect();
             let sum: f32 = exp_q.iter().sum();
             let probs: Vec<f32> = if sum > 0.0 {
@@ -325,31 +322,50 @@ mod tests {
     fn full_32_loaders_coexist() {
         let mut reg = ExpertRegistry::new();
         super::super::tree_adapters::register_tree_loaders(&mut reg).expect("trees");
-        super::super::deep_classification_adapters::register_deep_classification_loaders(
-            &mut reg,
-        )
-        .expect("deep-cls");
+        super::super::deep_classification_adapters::register_deep_classification_loaders(&mut reg)
+            .expect("deep-cls");
         super::super::deep_timeseries_adapters::register_deep_timeseries_loaders(&mut reg)
             .expect("deep-ts");
         super::super::meta_adapters::register_meta_loaders(&mut reg).expect("meta");
         super::super::mixed_adapters::register_mixed_loaders(&mut reg).expect("mixed");
-        super::super::evolutionary_adapters::register_evolutionary_loaders(&mut reg)
-            .expect("evo");
+        super::super::evolutionary_adapters::register_evolutionary_loaders(&mut reg).expect("evo");
         register_rl_exit_loaders(&mut reg).expect("rl-exit");
         // 7 tree + 3 deep-cls + 7 deep-ts + 7 meta + 3 mixed + 3 evo + 2 rl/exit = 32
         // (33rd = swarm_forecaster, deferred to D1.2.8)
         assert_eq!(reg.registered_names().len(), 32);
         for required in [
-            "lightgbm", "xgboost", "xgboost_rf", "xgboost_dart", "catboost",
-            "catboost_alt", "sklears_tree",
-            "mlp", "kan", "tabnet",
-            "nbeats", "nbeatsx_nf", "tide", "tide_nf",
-            "transformer", "patchtst", "timesnet",
-            "elasticnet", "logistic", "bayes_logit", "meta_blender",
-            "probability_calibrator", "conformal_gate", "meta_stack",
-            "online_pa", "online_hoeffding", "isolation_forest",
-            "genetic", "neuro_evo", "neat",
-            "dqn", "exit_agent",
+            "lightgbm",
+            "xgboost",
+            "xgboost_rf",
+            "xgboost_dart",
+            "catboost",
+            "catboost_alt",
+            "sklears_tree",
+            "mlp",
+            "kan",
+            "tabnet",
+            "nbeats",
+            "nbeatsx_nf",
+            "tide",
+            "tide_nf",
+            "transformer",
+            "patchtst",
+            "timesnet",
+            "elasticnet",
+            "logistic",
+            "bayes_logit",
+            "meta_blender",
+            "probability_calibrator",
+            "conformal_gate",
+            "meta_stack",
+            "online_pa",
+            "online_hoeffding",
+            "isolation_forest",
+            "genetic",
+            "neuro_evo",
+            "neat",
+            "dqn",
+            "exit_agent",
         ] {
             assert!(
                 reg.has_loader(required),

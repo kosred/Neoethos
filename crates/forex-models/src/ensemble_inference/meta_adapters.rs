@@ -28,8 +28,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use polars::prelude::DataFrame;
 
-use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction};
 use super::tree_adapters::classification3_per_row;
+use super::{ExpertLoader, ExpertModel, ExpertOutputKind, ExpertPrediction};
 use crate::base::ExpertModel as BaseExpertModel;
 use crate::ensemble::{
     CalibrationMethod, ConformalPredictionExpert, MetaBlender, MetaDecisionStack,
@@ -158,9 +158,9 @@ impl ExpertLoader for LogisticLoader {
     }
     fn load(&self, artifact_dir: &Path) -> Result<Box<dyn ExpertModel>> {
         let mut inner = LogisticExpert::new();
-        inner.load(artifact_dir).with_context(|| {
-            format!("LogisticExpert::load({}) failed", artifact_dir.display())
-        })?;
+        inner
+            .load(artifact_dir)
+            .with_context(|| format!("LogisticExpert::load({}) failed", artifact_dir.display()))?;
         Ok(Box::new(LogisticAdapter::new(inner)))
     }
 }
@@ -280,9 +280,9 @@ impl ExpertLoader for MetaBlenderLoader {
     }
     fn load(&self, artifact_dir: &Path) -> Result<Box<dyn ExpertModel>> {
         let mut inner = MetaBlender::new();
-        inner.load(artifact_dir).with_context(|| {
-            format!("MetaBlender::load({}) failed", artifact_dir.display())
-        })?;
+        inner
+            .load(artifact_dir)
+            .with_context(|| format!("MetaBlender::load({}) failed", artifact_dir.display()))?;
         Ok(Box::new(MetaBlenderAdapter::new(inner)))
     }
 }
@@ -475,10 +475,7 @@ impl ExpertLoader for MetaStackLoader {
             DEFAULT_LOAD_CONFORMAL_ALPHA,
         );
         inner.load(artifact_dir).with_context(|| {
-            format!(
-                "MetaDecisionStack::load({}) failed",
-                artifact_dir.display()
-            )
+            format!("MetaDecisionStack::load({}) failed", artifact_dir.display())
         })?;
         Ok(Box::new(MetaStackAdapter::new(inner)))
     }
@@ -516,12 +513,18 @@ mod tests {
                 Box::new(ElasticNetAdapter::new(ElasticNetExpert::new(0.01, 0.5))),
                 "elasticnet",
             ),
-            (Box::new(LogisticAdapter::new(LogisticExpert::new())), "logistic"),
+            (
+                Box::new(LogisticAdapter::new(LogisticExpert::new())),
+                "logistic",
+            ),
             (
                 Box::new(BayesLogitAdapter::new(BayesianLogitExpert::new())),
                 "bayes_logit",
             ),
-            (Box::new(MetaBlenderAdapter::new(MetaBlender::new())), "meta_blender"),
+            (
+                Box::new(MetaBlenderAdapter::new(MetaBlender::new())),
+                "meta_blender",
+            ),
             (
                 Box::new(ProbabilityCalibratorAdapter::new(
                     ProbabilityCalibrationExpert::new(DEFAULT_LOAD_CALIBRATION_METHOD),
@@ -592,10 +595,8 @@ mod tests {
     fn full_24_tree_deep_meta_loaders_coexist() {
         let mut reg = ExpertRegistry::new();
         super::super::tree_adapters::register_tree_loaders(&mut reg).expect("trees");
-        super::super::deep_classification_adapters::register_deep_classification_loaders(
-            &mut reg,
-        )
-        .expect("deep-cls");
+        super::super::deep_classification_adapters::register_deep_classification_loaders(&mut reg)
+            .expect("deep-cls");
         super::super::deep_timeseries_adapters::register_deep_timeseries_loaders(&mut reg)
             .expect("deep-ts");
         register_meta_loaders(&mut reg).expect("meta");

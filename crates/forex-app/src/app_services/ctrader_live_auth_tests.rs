@@ -7,8 +7,6 @@
 // formatting (moneyDigits).
 use super::*;
 
-
-
 #[test]
 fn authorize_url_uses_selected_callback_port() {
     let config = CTraderLoopbackConfig::new(43001, vec![43002, 43003], "/callback");
@@ -68,9 +66,7 @@ fn authorize_url_rewrites_ipv6_loopback_port() {
         build_authorize_url("client-id", "http://[::1]:43001/callback", 43002, "trading")
             .expect("IPv6 authorize url should build");
 
-    assert!(
-        authorize_url.contains("redirect_uri=http%3A%2F%2F%5B%3A%3A1%5D%3A43002%2Fcallback")
-    );
+    assert!(authorize_url.contains("redirect_uri=http%3A%2F%2F%5B%3A%3A1%5D%3A43002%2Fcallback"));
 }
 
 #[test]
@@ -142,7 +138,10 @@ fn token_exchange_request_uses_documented_query_parameters() {
         vec![
             ("grant_type", "authorization_code".to_string()),
             ("code", "auth-code-123".to_string()),
-            ("redirect_uri", "http://127.0.0.1:43001/callback".to_string()),
+            (
+                "redirect_uri",
+                "http://127.0.0.1:43001/callback".to_string()
+            ),
             ("client_id", "client-id".to_string()),
             ("client_secret", "secret-456".to_string()),
         ]
@@ -156,11 +155,7 @@ fn refresh_token_request_uses_documented_query_parameters() {
     let url = build_token_exchange_endpoint_url("https://openapi.ctrader.com");
     assert_eq!(url, "https://openapi.ctrader.com/apps/token");
 
-    let query = build_refresh_token_exchange_form(
-        "refresh-token-123",
-        "client-id",
-        "secret-456",
-    );
+    let query = build_refresh_token_exchange_form("refresh-token-123", "client-id", "secret-456");
 
     assert_eq!(
         query,

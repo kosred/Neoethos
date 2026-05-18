@@ -67,10 +67,8 @@ pub fn normalize_feature_matrix(data: &mut Array2<f32>) -> Vec<(f32, f32)> {
             finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let median = finite[finite.len() / 2];
             // MAD = median(|x - median|).
-            let mut deviations: Vec<f32> =
-                finite.iter().map(|x| (*x - median).abs()).collect();
-            deviations
-                .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let mut deviations: Vec<f32> = finite.iter().map(|x| (*x - median).abs()).collect();
+            deviations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let mad = deviations[deviations.len() / 2];
             let scale = (mad * MAD_TO_SIGMA).max(1e-9);
             (median, scale)
@@ -108,11 +106,9 @@ mod tests {
 
     #[test]
     fn nan_cells_become_zero() {
-        let mut m = Array2::from_shape_vec(
-            (3, 2),
-            vec![1.0, f32::NAN, 2.0, 3.0, f32::INFINITY, 4.0],
-        )
-        .unwrap();
+        let mut m =
+            Array2::from_shape_vec((3, 2), vec![1.0, f32::NAN, 2.0, 3.0, f32::INFINITY, 4.0])
+                .unwrap();
         normalize_feature_matrix(&mut m);
         // Column 0: NaN → 0
         assert_eq!(m[(0, 0)], 0.0);
@@ -136,7 +132,11 @@ mod tests {
             assert!(m[(r, 0)].abs() <= Z_CLIP);
         }
         // Min/max should approach ±Z_CLIP (some clipping, some not).
-        let max = m.column(0).iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let max = m
+            .column(0)
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
         let min = m.column(0).iter().cloned().fold(f32::INFINITY, f32::min);
         assert!(max > 1.0 && max <= Z_CLIP);
         assert!(min < -1.0 && min >= -Z_CLIP);
@@ -157,7 +157,10 @@ mod tests {
             v.dedup();
             v
         };
-        assert!(unique.len() >= 1, "binary col should still have distinct values");
+        assert!(
+            unique.len() >= 1,
+            "binary col should still have distinct values"
+        );
     }
 
     #[test]

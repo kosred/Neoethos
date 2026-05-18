@@ -1030,7 +1030,10 @@ mod tests {
             assert_eq!(r.config_path, "config.yaml");
             assert_eq!(r.base_tf, "M5");
             assert_eq!(r.models_dir, PathBuf::from("models"));
-            assert!(r.validate().is_ok(), "fan-out child failed its own validate");
+            assert!(
+                r.validate().is_ok(),
+                "fan-out child failed its own validate"
+            );
         }
     }
 }

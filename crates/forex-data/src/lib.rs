@@ -10,7 +10,6 @@ use vortex_array::dtype::NativePType;
 pub mod core;
 // Re-export the canonical timeframe list so callers using forex-data
 // can grab it without pulling in forex-core directly.
-pub use forex_core::{CANONICAL_TIMEFRAMES, is_canonical_timeframe};
 pub use crate::core::discover::{
     DataFileEntry, DataFormat, DatasetDiscovery, MAX_FILE_SIZE_BYTES, MAX_WALK_DEPTH, SkipReason,
     SkippedFile,
@@ -29,6 +28,7 @@ pub use crate::core::slicing::slice_ohlcv;
 pub use crate::core::smc::*;
 pub use crate::core::timestamps::*;
 pub use crate::core::vortex_io::*;
+pub use forex_core::{CANONICAL_TIMEFRAMES, is_canonical_timeframe};
 
 #[derive(Debug, Clone)]
 pub struct Ohlcv {

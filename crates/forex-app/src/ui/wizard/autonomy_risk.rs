@@ -145,7 +145,11 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
             TradingMode::Forward => 1,
             TradingMode::Live => 2,
         };
-        let badge = if idx == current_stage_idx { " ← current" } else { "" };
+        let badge = if idx == current_stage_idx {
+            " ← current"
+        } else {
+            ""
+        };
         ui.label(
             egui::RichText::new(format!("  {}{}", label, badge))
                 .color(if idx == current_stage_idx {
@@ -218,11 +222,18 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
 
     // Card 4.5 — Risky Mode arming (research §4 + §7.1 sign-off).
     // The mode is OFF by default; enabling it requires the operator
-    // to acknowledge the §7.1 ruin-probability ceiling. The Step 10
-    // Apply writer reads `risky_mode_armed` + `..._ruin_ceiling_*`
-    // and calls `session.enable_risky_mode(RiskyModeConfig::default(),
-    // starting_bankroll)` iff both are set. Closes audit gap
-    // clarification #2.
+    // to acknowledge the §7.1 ruin-probability ceiling.
+    //
+    // Persistence + boot-time wire-up is LIVE (2026-05-18 cleanup
+    // pass — closed TODO(risky-mode-boot-wire)). On Apply,
+    // `summary.rs::write_risky_mode_state` writes the flags below
+    // to `<config_dir>/forex-ai/risky_mode_state.json`. At next app
+    // launch, `TradingSession::new_with_persisted_credentials`
+    // reads that file and calls `session.enable_risky_mode(
+    // RiskyModeConfig::default(), starting_bankroll)` when armed.
+    // `autonomous_mode_enabled` below controls
+    // `autonomous_only_contract_accepted` in the persisted config,
+    // which `RiskyModeConfig::validate` requires before auto-arming.
     ui.label(
         egui::RichText::new("⚡ Risky Mode (operator directive §7.1 — autonomous compounding)")
             .strong()
@@ -343,9 +354,11 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
             }
         } else {
             ui.label(
-                egui::RichText::new("Skip disabled — Live or Autonomous Mode requires acknowledgement.")
-                    .color(theme::WARNING)
-                    .size(theme::FONT_CAPTION),
+                egui::RichText::new(
+                    "Skip disabled — Live or Autonomous Mode requires acknowledgement.",
+                )
+                .color(theme::WARNING)
+                .size(theme::FONT_CAPTION),
             );
         }
         if ui.button("Continue →").clicked() {
@@ -362,7 +375,7 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
 /// `installer_wizard_ux_spec.md` §5 — "SHA-256 of the concatenation
 /// of (question_id, chosen_option_id) pairs in canonical order").
 ///
-/// Canonical encoding (load-bearing — the Apply-writer in Phase 2B
+/// Canonical encoding (load-bearing — the Apply-writer
 /// re-computes this on a re-read and must produce the same digest):
 ///   1. ASCII domain-separator `"forex-ai-risk-quiz-v"` (prevents
 ///      cross-protocol collisions if some other forex-ai feature
@@ -393,9 +406,9 @@ pub fn compute_quiz_answer_hash(quiz_version: u32, answers: &[&str]) -> String {
 ///
 /// The hash binds the (quiz_version, ordered answers) — the
 /// timestamp is recorded alongside but is NOT hashed because the
-/// Apply-writer (Phase 2B) needs to be able to re-derive the same
-/// digest from the persisted file (`risk_acknowledgement.json`)
-/// without knowing the original timestamp string.
+/// Apply-writer needs to be able to re-derive the same digest
+/// from the persisted file (`risk_acknowledgement.json`) without
+/// knowing the original timestamp string.
 pub fn record_acknowledgement(
     answers: &QuizAnswers,
     iso_timestamp_utc: String,
@@ -427,7 +440,12 @@ mod tests {
     fn quiz_has_five_questions_each_with_four_options() {
         assert_eq!(WIZARD_DEFAULT_QUIZ_QUESTIONS.len(), 5);
         for q in WIZARD_DEFAULT_QUIZ_QUESTIONS {
-            assert_eq!(q.options.len(), 4, "question {} should have 4 options", q.id);
+            assert_eq!(
+                q.options.len(),
+                4,
+                "question {} should have 4 options",
+                q.id
+            );
             assert!(q.correct_index < q.options.len());
         }
     }
@@ -514,7 +532,10 @@ mod tests {
         let base = compute_quiz_answer_hash(1, &["q1:1", "q2:1", "q3:1", "q4:1", "q5:1"]);
         // Flip the first answer.
         let flipped = compute_quiz_answer_hash(1, &["q1:0", "q2:1", "q3:1", "q4:1", "q5:1"]);
-        assert_ne!(base, flipped, "different answers must produce different digest");
+        assert_ne!(
+            base, flipped,
+            "different answers must produce different digest"
+        );
     }
 
     #[test]
@@ -532,7 +553,10 @@ mod tests {
         // drops the separator gets caught.
         let a = compute_quiz_answer_hash(1, &["AB", "C"]);
         let b = compute_quiz_answer_hash(1, &["A", "BC"]);
-        assert_ne!(a, b, "field separator must prevent ambiguous concat collisions");
+        assert_ne!(
+            a, b,
+            "field separator must prevent ambiguous concat collisions"
+        );
     }
 
     #[test]

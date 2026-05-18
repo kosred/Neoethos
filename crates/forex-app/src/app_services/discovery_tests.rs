@@ -1,6 +1,5 @@
 use super::*;
 
-
 use crate::app_services::{
     ServiceEvent,
     jobs::{JobKind, JobSnapshot, JobState},
@@ -300,7 +299,11 @@ fn multi_symbol_request_validate_rejects_empty_data_root() {
 
 #[test]
 fn multi_symbol_into_single_symbol_requests_produces_one_per_symbol() {
-    let symbols = vec!["EURUSD".to_string(), "GBPUSD".to_string(), "XAUUSD".to_string()];
+    let symbols = vec![
+        "EURUSD".to_string(),
+        "GBPUSD".to_string(),
+        "XAUUSD".to_string(),
+    ];
     let req = MultiSymbolDiscoveryRequest {
         data_root: PathBuf::from("./data"),
         symbols: symbols.clone(),

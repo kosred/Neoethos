@@ -412,13 +412,14 @@ pub fn section_label(ui: &mut egui::Ui, text: &str) {
     );
     // Hairline divider sits flush below the label so the eye reads the
     // section as a contained group, not a free-floating caption.
-    let line_response = ui.allocate_response(
-        egui::vec2(ui.available_width(), 1.0),
-        egui::Sense::hover(),
-    );
+    let line_response =
+        ui.allocate_response(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
     if ui.is_rect_visible(line_response.rect) {
-        ui.painter()
-            .hline(line_response.rect.x_range(), line_response.rect.center().y, egui::Stroke::new(1.0, BORDER));
+        ui.painter().hline(
+            line_response.rect.x_range(),
+            line_response.rect.center().y,
+            egui::Stroke::new(1.0, BORDER),
+        );
     }
     ui.add_space(SPACE_XS);
 }
@@ -462,12 +463,12 @@ pub enum ButtonKind {
 /// Render a styled button. Returns the egui Response.
 pub fn button(ui: &mut egui::Ui, label: &str, kind: ButtonKind) -> egui::Response {
     let (fill, stroke, text) = match kind {
-        ButtonKind::Ghost => (
-            egui::Color32::TRANSPARENT,
-            egui::Stroke::NONE,
-            TEXT_MUTED,
+        ButtonKind::Ghost => (egui::Color32::TRANSPARENT, egui::Stroke::NONE, TEXT_MUTED),
+        ButtonKind::Secondary => (
+            SURFACE_BG,
+            egui::Stroke::new(1.0, BORDER_STRONG),
+            TEXT_PRIMARY,
         ),
-        ButtonKind::Secondary => (SURFACE_BG, egui::Stroke::new(1.0, BORDER_STRONG), TEXT_PRIMARY),
         ButtonKind::Primary => (ACCENT, egui::Stroke::new(1.0, ACCENT), egui::Color32::WHITE),
         ButtonKind::Success => (
             SUCCESS.linear_multiply(0.18),
@@ -496,12 +497,12 @@ pub fn button(ui: &mut egui::Ui, label: &str, kind: ButtonKind) -> egui::Respons
 /// Same as `button` but compact — for inline contexts (dock tab bar, lists).
 pub fn small_button(ui: &mut egui::Ui, label: &str, kind: ButtonKind) -> egui::Response {
     let (fill, stroke, text) = match kind {
-        ButtonKind::Ghost => (
-            egui::Color32::TRANSPARENT,
-            egui::Stroke::NONE,
-            TEXT_MUTED,
+        ButtonKind::Ghost => (egui::Color32::TRANSPARENT, egui::Stroke::NONE, TEXT_MUTED),
+        ButtonKind::Secondary => (
+            SURFACE_BG,
+            egui::Stroke::new(1.0, BORDER_STRONG),
+            TEXT_PRIMARY,
         ),
-        ButtonKind::Secondary => (SURFACE_BG, egui::Stroke::new(1.0, BORDER_STRONG), TEXT_PRIMARY),
         ButtonKind::Primary => (ACCENT, egui::Stroke::new(1.0, ACCENT), egui::Color32::WHITE),
         ButtonKind::Success => (
             SUCCESS.linear_multiply(0.18),
@@ -532,12 +533,7 @@ pub fn small_button(ui: &mut egui::Ui, label: &str, kind: ButtonKind) -> egui::R
 /// Render a sidebar navigation row. Returns true when clicked.
 /// Picks the right hover/active style and uses a left accent stripe for
 /// the active row so the eye locks on the selected view instantly.
-pub fn nav_item(
-    ui: &mut egui::Ui,
-    label: &str,
-    description: &str,
-    active: bool,
-) -> egui::Response {
+pub fn nav_item(ui: &mut egui::Ui, label: &str, description: &str, active: bool) -> egui::Response {
     nav_item_with_icon(ui, "", label, description, active)
 }
 
@@ -552,10 +548,18 @@ pub fn nav_item_with_icon(
     description: &str,
     active: bool,
 ) -> egui::Response {
-    let frame_fill = if active { ACCENT_MUTED } else { egui::Color32::TRANSPARENT };
+    let frame_fill = if active {
+        ACCENT_MUTED
+    } else {
+        egui::Color32::TRANSPARENT
+    };
     let label_color = if active { TEXT_PRIMARY } else { TEXT_MUTED };
     let icon_color = if active { ACCENT } else { TEXT_FAINT };
-    let stripe_color = if active { ACCENT } else { egui::Color32::TRANSPARENT };
+    let stripe_color = if active {
+        ACCENT
+    } else {
+        egui::Color32::TRANSPARENT
+    };
 
     // 28px row height — Bloomberg/cTrader sidebar density.
     let desired_size = egui::vec2(ui.available_width(), 28.0);
@@ -572,10 +576,7 @@ pub fn nav_item_with_icon(
         let painter = ui.painter();
         painter.rect_filled(rect, RADIUS_SM as f32, fill);
         // Left accent stripe (3px wide, tall as row, only visible when active).
-        let stripe_rect = egui::Rect::from_min_size(
-            rect.min,
-            egui::vec2(3.0, rect.height()),
-        );
+        let stripe_rect = egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height()));
         painter.rect_filled(stripe_rect, 1.0, stripe_color);
 
         // Icon column: fixed 22px slot starting at SPACE_SM after the

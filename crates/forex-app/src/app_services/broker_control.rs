@@ -187,7 +187,8 @@ mod tests {
     #[test]
     fn connection_restored_round_trips_through_test_channel() {
         let (tx, rx) = make_broker_control_channel_for_test();
-        tx.send(BrokerControlSignal::ConnectionRestored).expect("send");
+        tx.send(BrokerControlSignal::ConnectionRestored)
+            .expect("send");
         assert_eq!(
             try_recv_broker_control(&rx),
             Some(BrokerControlSignal::ConnectionRestored)
