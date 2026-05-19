@@ -4,6 +4,96 @@ All notable changes to forex-ai are documented here. The format is
 loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to semantic versioning.
 
+## [0.5.0] — 2026-05-19 — "egui Single-GUI Ship + cTrader OAuth + Risky Mode"
+
+> First minor-version bump in two months. Consolidates 9 patch
+> releases shipped earlier the same day (v0.4.10 → v0.4.18) into a
+> single ship-ready state for end-users, plus three structural
+> decisions: (1) egui is the only supported GUI surface for the
+> Windows desktop binary; (2) the Flutter scaffold is parked under
+> `experiments/forex-flutter-ui/` and is not built or shipped; (3)
+> the cTrader OAuth + wizard + workspace handoff are all live-tested
+> against the demo.ctraderapi.com endpoint.
+
+### Picked: egui-only GUI
+
+- The `crates/forex-flutter-ui/` Dart/Flutter scaffold from the
+  2026-05-18 spike is **moved to `experiments/forex-flutter-ui/`**
+  and is not built by `cargo build --workspace`, not bundled by
+  `cargo packager`, and not part of the GitHub Release asset.
+- The egui UI (`crates/forex-app`) is the single supported GUI for
+  the Windows desktop binary. It has been live-verified against the
+  cTrader Open API and the FTMO Demo account on 2026-05-19, ships
+  via `cargo packager --release`, and is what end users install via
+  the NSIS installer.
+- `experiments/README.md` explains the parking decision so a future
+  contributor doesn't accidentally bring the Flutter UI back without
+  the v0.5.0+ deliberate re-introduction process.
+
+### Consolidates 9 prior patch releases
+
+v0.5.0 contains every fix from the v0.4.10 → v0.4.18 chain:
+
+| Layer | Fix |
+|---|---|
+| Installer payload (v0.4.10) | DLLs + LICENSE + README + Gemma fetch script actually bundled |
+| OAuth credentials (v0.4.11) | `EMBEDDED_CTRADER_CLIENT_ID/SECRET` baked from workspace TOML |
+| OAuth redirect (v0.4.12) | Wizard loopback advertises `:43001/callback` to match the cTrader app dashboard |
+| Heartbeat envelope (v0.4.13) | `parse_open_api_envelope` tolerates `{"payloadType":51}` frames |
+| Account-list types (v0.4.14) | `accessToken` Optional, `permissionScope` accepts string or proto-enum number |
+| Wizard scroll (v0.4.15) | `ScrollArea` wrap keeps Back/Skip/Continue reachable on small/taskbar-clipped displays |
+| Picker label (v0.4.16) | Friendly `#<id> <broker> <traderLogin> (demo\|live)` label + discovery telemetry |
+| Token persist (v0.4.17) | Wizard Apply writes the OAuth token bundle to the platform secret store |
+| Restore reload (v0.4.18) | `restore_ctrader_session` reloads `broker_settings` from disk before the empty-check |
+
+### v0.5.0-specific changes
+
+- **`Cargo.toml` workspace cleanup.** Confirms `forex-flutter-ui` is
+  absent from `[workspace] members` and `default-members`. The
+  members list is now exactly the 8 Rust crates that ship as part of
+  the binary: `forex-search` / `forex-cli` / `forex-data` /
+  `forex-models` / `forex-core` / `forex-app` / `forex-news` /
+  `forex-gemma`.
+- **Raw cTrader account-list debug log** at DEBUG level —
+  `parse_account_list_by_access_token_json` now emits the first
+  4 KB of the raw response body so a future N-vs-M missing-account
+  investigation can read the wire payload from the operator log
+  with `RUST_LOG=ctrader.auth=debug` (no extra build or debugger).
+- **`trader_logins` field on the existing INFO-level telemetry** so
+  the 6-vs-7 investigation can correlate `ctidTraderAccountId`s to
+  the broker-visible `traderLogin` numbers (e.g. `17111418` vs
+  `17102270`) without a re-run.
+
+### Known gaps (deferred to v0.5.x)
+
+- **The 6 of 7 accounts** observation from the 2026-05-19
+  walkthrough remains an open investigation — FTMO Platform
+  `17111418` (10K USD) is the missing one; `17102270` (100K USD) is
+  visible. v0.5.0 ships the debug-level dump so an operator running
+  with `RUST_LOG=ctrader.auth=debug` can capture the raw response and
+  decide whether the parser dropped a row or the broker omitted it.
+- **Live discovery + training kickoff**, **Gemma chat through a
+  real GGUF**, and **DxTrade panel render check** all rely on the
+  workspace being connected to a real session. v0.5.0 makes that
+  path real (wizard Apply persists token bundle, workspace's restore
+  path reads it back), so these test sequences can run on the v0.5.0
+  binary without code changes.
+
+### Pre-ship gates
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo build --release -p forex-app` — 0 errors (53.71 s
+  incremental from v0.4.18).
+- `cargo packager --release` — produced
+  `forex-app_0.5.0_x64-setup.exe` (25.95 MB).
+
+### Artifact
+
+- `forex-app_0.5.0_x64-setup.exe` — 25.95 MB
+  - SHA-256: `613C5927DAD066748A3F81DB424B51832CAD38CDE3F81CD68F989AE2E205105C`
+
+---
+
 ## [0.4.18] — 2026-05-19 — "Restore Saved Session Picks Up Wizard Writes"
 
 > Critical workspace-handoff fix #2. After v0.4.17 the wizard's

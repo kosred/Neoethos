@@ -999,12 +999,30 @@ pub fn parse_account_list_by_access_token_json(
         .iter()
         .map(|a: &crate::app_services::ctrader_auth::CTraderDiscoveredAccount| a.account_id.clone())
         .collect();
+    let trader_logins: Vec<i64> = accounts.iter().filter_map(|a| a.trader_login).collect();
     tracing::info!(
         target: "ctrader.auth",
         count = accounts.len(),
         ids = ?account_ids,
+        trader_logins = ?trader_logins,
         "cTrader account-list response parsed"
     );
+
+    // v0.5.0 — DEBUG-level dump of the raw response head so a future
+    // N-vs-M missing-account investigation can read the raw wire
+    // payload from the log. Truncated to 4 KB to avoid blowing up the
+    // log on a 1000-account discovery response. Run with
+    // `RUST_LOG=ctrader.auth=debug` to enable.
+    if tracing::enabled!(target: "ctrader.auth", tracing::Level::DEBUG) {
+        let total = response_json.len();
+        let head: String = response_json.chars().take(4096).collect();
+        tracing::debug!(
+            target: "ctrader.auth",
+            len = total,
+            head = %head,
+            "cTrader account-list raw response head"
+        );
+    }
 
     Ok(CTraderAccountDiscoveryResult {
         access_token,
