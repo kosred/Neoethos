@@ -84,9 +84,9 @@ crates/forex-flutter-ui/.flutter-plugins
 crates/forex-flutter-ui/.flutter-plugins-dependencies
 crates/forex-flutter-ui/.metadata
 crates/forex-flutter-ui/pubspec.lock
-crates/forex-flutter-ui/windows/runner/
-crates/forex-flutter-ui/linux/runner/
-crates/forex-flutter-ui/macos/runner/
+crates/forex-flutter-ui/windows/
+crates/forex-flutter-ui/linux/
+crates/forex-flutter-ui/macos/
 
 # God-file split drafts (2026-05-18 cleanup pass).
 # These directories hold draft re-organisations of large source files

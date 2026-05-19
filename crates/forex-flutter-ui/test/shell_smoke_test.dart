@@ -16,8 +16,19 @@ Widget _harness() => ProviderScope(
       ),
     );
 
+/// The shell is designed for a 1440x900+ desktop viewport. The
+/// default flutter_test surface (800x600) is too narrow for the
+/// TopBar ribbon + the sidebar's icon-and-label rows, so layout
+/// overflows trip as exceptions. Pump the surface up to the size
+/// the design assumes before every desktop-shell test.
+Future<void> _withDesktopSize(WidgetTester tester) async {
+  await tester.binding.setSurfaceSize(const Size(1440, 900));
+  addTearDown(() => tester.binding.setSurfaceSize(null));
+}
+
 void main() {
   testWidgets('shell renders all four grid areas', (tester) async {
+    await _withDesktopSize(tester);
     await tester.pumpWidget(_harness());
     // TopBar brand
     expect(find.text('forex-ai'), findsOneWidget);
@@ -30,6 +41,7 @@ void main() {
   });
 
   testWidgets('sidebar lists all 14 panels', (tester) async {
+    await _withDesktopSize(tester);
     await tester.pumpWidget(_harness());
     for (final tab in kNavTabs) {
       expect(
@@ -42,6 +54,7 @@ void main() {
 
   testWidgets('clicking a sidebar item swaps the dock view',
       (tester) async {
+    await _withDesktopSize(tester);
     await tester.pumpWidget(_harness());
     // Click "Broker Setup" in the sidebar.
     await tester.tap(find.text('Broker Setup').first);
@@ -56,6 +69,7 @@ void main() {
 
   testWidgets('all 14 screens load without throwing',
       (tester) async {
+    await _withDesktopSize(tester);
     await tester.pumpWidget(_harness());
     for (final tab in kNavTabs) {
       await tester.tap(find.text(tab.title).first);

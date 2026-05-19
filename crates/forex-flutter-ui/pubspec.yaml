@@ -4,7 +4,7 @@ description: >
   Talks to the Rust backend (forex-app + forex-gemma) over REST + SSE.
   Mirrors the layout / design tokens of mockups/ui_mockup.html.
 publish_to: 'none'
-version: 0.4.5+1
+version: 0.4.7+1
 
 environment:
   sdk: '>=3.4.0 <4.0.0'
@@ -22,7 +22,7 @@ dependencies:
   # REST + SSE
   dio: ^5.5.0          # HTTP client
   http: ^1.2.1         # fallback simple HTTP for SSE bootstrap
-  sse_channel: ^0.0.5  # Server-Sent Events parser for /gemma/chat
+  sse_channel: ^0.2.2  # Server-Sent Events parser for /gemma/chat
 
   # Routing — go_router for declarative side-bar driven nav.
   go_router: ^14.2.0

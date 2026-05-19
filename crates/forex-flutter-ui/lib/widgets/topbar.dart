@@ -12,14 +12,22 @@ class TopBar extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       height: ForexAiTokens.topbarHeight,
-      color: ForexAiTokens.panelBg,
       padding: const EdgeInsets.symmetric(horizontal: ForexAiTokens.spLg),
       decoration: const BoxDecoration(
+        // The earlier scaffold set `color:` directly on the Container
+        // AND a `BoxDecoration` — Flutter 3.44+ trips an assert because
+        // `color` is shorthand for `BoxDecoration(color: …)` and the
+        // two can't coexist. Fold the panel background into the
+        // decoration so the bottom-border stays + the bg colour stays.
         color: ForexAiTokens.panelBg,
         border: Border(
           bottom: BorderSide(color: ForexAiTokens.border),
         ),
       ),
+      // Three-zone Row: brand + badges on the left, ribbon items in
+      // the middle (horizontally scrollable so they don't push the
+      // right zone off-screen on narrow viewports), action pills +
+      // icons on the right.
       child: Row(
         children: [
           const Text(
@@ -37,16 +45,26 @@ class TopBar extends StatelessWidget {
           const _VSep(),
           // Ribbon — placeholder values. Wired to provider in
           // a follow-up commit; for now they read the same
-          // mockup figures.
-          const _RibbonItem(label: 'Balance', value: '\$10,000.00'),
-          const _RibbonItem(
-            label: 'Equity',
-            value: '\$10,243.55',
-            valueAccent: _ValueAccent.success,
+          // mockup figures. Wrapped in Expanded + horizontal
+          // SingleChildScrollView so the ribbon shrinks gracefully
+          // on narrow viewports without overflowing.
+          Expanded(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: const [
+                  _RibbonItem(label: 'Balance', value: '\$10,000.00'),
+                  _RibbonItem(
+                    label: 'Equity',
+                    value: '\$10,243.55',
+                    valueAccent: _ValueAccent.success,
+                  ),
+                  _RibbonItem(label: 'Free Margin', value: '\$9,762.40'),
+                ],
+              ),
+            ),
           ),
-          const _RibbonItem(label: 'Free Margin', value: '\$9,762.40'),
-          const Spacer(),
-          // Right-side actions
+          // Right-side actions (fixed width, pinned to right).
           const _AutoPill(label: 'Auto-Discover', on: true),
           const SizedBox(width: ForexAiTokens.spXs),
           const _AutoPill(label: 'Auto-Train', on: false),

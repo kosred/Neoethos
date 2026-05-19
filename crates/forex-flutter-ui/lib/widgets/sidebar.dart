@@ -119,13 +119,20 @@ class _NavItem extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 8),
-              Text(
-                tab.title,
-                style: TextStyle(
-                  fontSize: ForexAiTokens.fsBody,
-                  color: active
-                      ? ForexAiTokens.textPrimary
-                      : ForexAiTokens.textMuted,
+              // Wrap the title in Expanded so it occupies the
+              // remaining width and ellipsises when the sidebar is
+              // narrow (kept the icon at fixed 20px so the label
+              // alignment stays consistent across all 14 tabs).
+              Expanded(
+                child: Text(
+                  tab.title,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: ForexAiTokens.fsBody,
+                    color: active
+                        ? ForexAiTokens.textPrimary
+                        : ForexAiTokens.textMuted,
+                  ),
                 ),
               ),
             ],

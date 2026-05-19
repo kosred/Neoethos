@@ -32,14 +32,17 @@ class _StatRow extends StatelessWidget {
   const _StatRow();
   @override
   Widget build(BuildContext context) {
-    return const GridView.count(
+    // `GridView.count` is not a `const` constructor in Flutter 3.44+
+    // (the underlying `SliverChildListDelegate.fixed` is non-const).
+    // Drop the `const` keyword — the children themselves stay const.
+    return GridView.count(
       crossAxisCount: 4,
       crossAxisSpacing: 8,
       mainAxisSpacing: 8,
       childAspectRatio: 3.2,
       shrinkWrap: true,
-      physics: NeverScrollableScrollPhysics(),
-      children: [
+      physics: const NeverScrollableScrollPhysics(),
+      children: const [
         StatCard(label: 'Balance', value: '\$10,000.00'),
         StatCard(
           label: 'Equity',

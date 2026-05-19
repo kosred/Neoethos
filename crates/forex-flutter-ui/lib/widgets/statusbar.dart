@@ -12,8 +12,9 @@ class StatusBar extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       height: ForexAiTokens.statusbarHeight,
-      color: ForexAiTokens.panelBg,
       decoration: const BoxDecoration(
+        // Same fix as TopBar: Container.color + BoxDecoration is an
+        // assert in Flutter 3.44+. Fold the bg into the decoration.
         color: ForexAiTokens.panelBg,
         border: Border(top: BorderSide(color: ForexAiTokens.border)),
       ),
