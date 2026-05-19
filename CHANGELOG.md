@@ -4,6 +4,46 @@ All notable changes to forex-ai are documented here. The format is
 loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to semantic versioning.
 
+## [0.4.11] — 2026-05-19 — "cTrader Credentials Actually Embedded"
+
+> Patch release after a Phase X1 wizard walkthrough on the v0.4.10
+> binary caught a red banner at Step 4 (cTrader Sign-in):
+> "Developer build: cTrader app credentials not embedded".
+> Phase 0c (2026-05-17) had marked credential embedding as complete,
+> but the workspace `.local/forex-ai/broker_credentials.toml` that
+> `build.rs` reads at compile time still had empty strings — so the
+> v0.4.10 release binary was shipping `EMBEDDED_CTRADER_CLIENT_ID = ""`
+> and the OAuth flow could not start. The real values were only in
+> `%APPDATA%\forex-ai\broker_credentials.toml` (runtime), which the
+> build script does not consult.
+
+### Fixed
+
+- **`.local/forex-ai/broker_credentials.toml` populated with the real
+  cTrader Open API app credentials** so `build.rs::emit_embedded_credentials()`
+  bakes them into the `EMBEDDED_CTRADER_CLIENT_ID` /
+  `EMBEDDED_CTRADER_CLIENT_SECRET` constants. The TOML is `.gitignore`-d
+  (`.local/` + `**/broker_credentials.toml`) so the secrets do not leak
+  into git history.
+- **Wizard Step 4 banner clears on the v0.4.11 binary** —
+  `embedded_credentials_present()` returns `true`, the "Sign in to
+  your broker" button is wired to a real OAuth flow, and the
+  developer-build diagnostic is suppressed.
+
+### Pre-ship gates
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo build --release -p forex-app` — 0 errors (3m 33s).
+- `cargo packager --release` — produced
+  `forex-app_0.4.11_x64-setup.exe` (25.96 MB).
+
+### Artifact
+
+- `forex-app_0.4.11_x64-setup.exe` — 25.96 MB
+  - SHA-256: `456809E6AF1ADA460971244FCD33CCA0F1A375B3281030D7A0EBFEE1A256CEBF`
+
+---
+
 ## [0.4.10] — 2026-05-19 — "Installer Payload Repair + Gemma Bundle Strategy"
 
 > Patch release after a v0.4.9 binary-walkthrough audit caught the
