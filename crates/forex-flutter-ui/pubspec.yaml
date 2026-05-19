@@ -4,7 +4,7 @@ description: >
   Talks to the Rust backend (forex-app + forex-gemma) over REST + SSE.
   Mirrors the layout / design tokens of mockups/ui_mockup.html.
 publish_to: 'none'
-version: 0.4.8+1
+version: 0.4.9+1
 
 environment:
   sdk: '>=3.4.0 <4.0.0'

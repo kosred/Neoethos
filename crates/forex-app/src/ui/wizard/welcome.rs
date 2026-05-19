@@ -175,9 +175,11 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
 
     ui.separator();
     ui.label(
-        egui::RichText::new("Apache License v2.0 / MIT (dual)")
-            .strong()
-            .color(theme::TEXT_PRIMARY),
+        egui::RichText::new(
+            "Proprietary — © 2024-2026 Konstantinos Kokkinos. All rights reserved.",
+        )
+        .strong()
+        .color(theme::TEXT_PRIMARY),
     );
 
     // LICENSE pane — scrollable monospace, real file read with
@@ -326,13 +328,19 @@ mod tests {
         unsafe {
             std::env::remove_var(WIZARD_LICENSE_PATH_ENV);
         }
-        // Bundled LICENSE is the repo-root file — non-empty + has
-        // the expected dual-license header so we can't accidentally
-        // pass with an empty include_str!().
+        // Bundled LICENSE is the repo-root file — non-empty + carries
+        // the expected proprietary-license header so an accidental
+        // empty include_str!() does not silently pass.
         assert!(!text.is_empty(), "fallback text must be non-empty");
-        // The repo LICENSE is Apache 2.0 + MIT; pick a stable token.
+        // The repo LICENSE is proprietary (v0.4.8 switched from the
+        // prior MIT-OR-Apache-2.0 dual grant); the test still accepts
+        // the legacy tokens so older release branches can run the same
+        // suite.
         assert!(
-            text.contains("Apache") || text.contains("MIT") || text.contains("LICENSE"),
+            text.contains("PROPRIETARY")
+                || text.contains("Apache")
+                || text.contains("MIT")
+                || text.contains("LICENSE"),
             "bundled LICENSE should look like a real license, got: {}",
             text.chars().take(120).collect::<String>()
         );

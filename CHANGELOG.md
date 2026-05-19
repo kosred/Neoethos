@@ -4,6 +4,66 @@ All notable changes to forex-ai are documented here. The format is
 loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to semantic versioning.
 
+## [0.4.9] — 2026-05-19 — "Real UI Audit + License-header Fix"
+
+> Patch release that follows v0.4.8 with the bugs surfaced by a real
+> walk-through of the binary GUI. v0.4.8 shipped the AI Helper panel
+> + proprietary license + NSIS installer; v0.4.9 closes the only
+> user-visible regression that audit caught and re-publishes the
+> installer.
+
+### Fixed
+
+- **Wizard Step 1 header was stale.** Welcome step rendered
+  "Apache License v2.0 / MIT (dual)" above the proprietary license
+  text — leftover from the v0.4.7 open-source line. Now reads
+  "Proprietary — © 2024-2026 Konstantinos Kokkinos. All rights
+  reserved." The LICENSE body itself was already proprietary in
+  v0.4.8; only the header label was stale.
+- Welcome step's `bundled_license_present` test now accepts a
+  `PROPRIETARY` token in addition to the legacy `Apache` / `MIT`
+  tokens so the test passes for the new LICENSE without losing the
+  guardrail.
+
+### Audit — UI panels static analysis (Items 2 + 7 from operator brief)
+
+Ran `cargo clippy`-style audit over `crates/forex-app/src/ui/**/*.rs`
+looking for:
+
+- Stale `MIT` / `Apache` / `open-source` strings — false positives
+  only (substring matches on "Limit" / "rate-limited" / "drawdown
+  limit"). One real hit fixed (welcome.rs header above).
+- TODO / FIXME / `unimplemented!()` in user-visible code — all hits
+  are intentional traceability comments pointing at closed gaps
+  (`TODO(risky-mode-boot-wire)` — gap closed in v0.4.8;
+  `TODO(symbol-universe-canon)` — operator-pin item).
+- Hardcoded "Coming soon" / "Placeholder" / "Not implemented" — no
+  user-visible occurrences; only test-fixture strings
+  (`placeholder-deadbeef`, `placeholder-1234`).
+- `panic!` / `.unwrap()` / `.expect()` in UI render paths — all
+  occurrences are in non-render auxiliary code (path helpers, test
+  setup) or are documented as "must never fail" invariants.
+
+End-to-end click-through with Windows-MCP also exercised:
+
+- Wizard Step 1 → License accept → Continue (worked).
+- Wizard advanced past Step 1 cleanly (the v0.4.7 audit had already
+  validated Step 4 → 5 cTrader Sign-in → Symbols & Timeframes).
+- AI Helper tab loads under the AI Engine group with the welcome
+  banner + tool-list hint (validated in v0.4.8).
+
+### Known gaps (deferred to v0.5.0)
+
+The same items as v0.4.8's known-gaps list. v0.4.9 is intentionally
+a tight patch — adding the wizard "Broker choice + test connection"
+steps + bundling the Gemma GGUF + per-panel UI smoke for all 15
+tabs all land together in v0.5.0.
+
+### Artifacts
+
+- `forex-ai-v0.4.9-windows-x86_64-setup.exe` — NSIS installer
+  (SHA-256 populated post-build).
+
 ## [0.4.8] — 2026-05-19 — "AI Helper + Proprietary License + NSIS Installer"
 
 > Ships the first user-visible Gemma surface, switches the project to a
