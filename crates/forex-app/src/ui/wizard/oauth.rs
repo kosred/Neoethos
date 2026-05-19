@@ -77,7 +77,15 @@ pub const BUILD_ENV_CLIENT_SECRET: &str = "FOREX_AI_EMBED_CTRADER_CLIENT_SECRET"
 /// Spec §2 Step 4.2 — loopback port allocator. RFC 8252 §7.3 fallback
 /// list. Must match `CTraderLoopbackConfig` at
 /// `app_services/ctrader_live_auth.rs:28`.
-pub const WIZARD_DEFAULT_OAUTH_LOOPBACK_PORTS: &[u16] = &[7777, 7878, 8989];
+// v0.4.12 — was [7777, 7878, 8989] (RFC 8252 §7.3 fallback list). Wired
+// walkthrough on 2026-05-19 confirmed cTrader rejected the OAuth request
+// with "Application does not contain provided URI" because the
+// developer-registered cTrader Open API app has only
+// `http://127.0.0.1:43001/callback` in its allowed-redirect list. The
+// wizard's fallback list now leads with 43001 to match what the app
+// dashboard has registered; the legacy ports remain as alternates in
+// case the operator re-registers them on a forked dev app.
+pub const WIZARD_DEFAULT_OAUTH_LOOPBACK_PORTS: &[u16] = &[43001, 7777, 7878, 8989];
 
 /// Spec §2 Step 4.2 — browser callback timeout (matches
 /// `CTRADER_CALLBACK_TIMEOUT` at `ctrader_live_auth.rs:24`).
@@ -85,7 +93,12 @@ pub const WIZARD_DEFAULT_OAUTH_CALLBACK_TIMEOUT_SECONDS: u64 = 300;
 
 /// Loopback callback path. Must match the redirect URI registered in
 /// the operator's cTrader Open API app (spec §2 Step 4.1 mockup).
-pub const WIZARD_DEFAULT_OAUTH_CALLBACK_PATH: &str = "/ctrader/callback";
+// v0.4.12 — was "/ctrader/callback". Same root cause as the port-list
+// change above: the registered redirect URI in the cTrader Open API
+// app is `http://127.0.0.1:43001/callback`, so the wizard's loopback
+// listener must answer the bare `/callback` path or the OAuth exchange
+// 404s out before reaching the token-exchange leg.
+pub const WIZARD_DEFAULT_OAUTH_CALLBACK_PATH: &str = "/callback";
 
 // Earlier builds exposed WIZARD_DEFAULT_OAUTH_CLIENT_ID_MIN_LEN /
 // WIZARD_DEFAULT_OAUTH_CLIENT_SECRET_MIN_LEN as validation bounds for
@@ -714,8 +727,14 @@ mod tests {
     use crate::ui::wizard::{StepResult, WizardController, WizardState};
 
     #[test]
-    fn default_loopback_ports_match_rfc8252_three_port_fallback() {
-        assert_eq!(WIZARD_DEFAULT_OAUTH_LOOPBACK_PORTS.len(), 3);
+    fn default_loopback_ports_lead_with_registered_redirect_port() {
+        // v0.4.12 — the cTrader Open API app dashboard has only port
+        // 43001 in its allowed-redirect list, so the primary port has
+        // to be 43001. The legacy [7777, 7878, 8989] from the
+        // RFC 8252 §7.3 three-port fallback list stays as the tail so
+        // a fork that re-registers them still works.
+        assert!(!WIZARD_DEFAULT_OAUTH_LOOPBACK_PORTS.is_empty());
+        assert_eq!(WIZARD_DEFAULT_OAUTH_LOOPBACK_PORTS[0], 43001);
     }
 
     #[test]

@@ -4,6 +4,45 @@ All notable changes to forex-ai are documented here. The format is
 loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to semantic versioning.
 
+## [0.4.12] — 2026-05-19 — "Wizard OAuth redirect_uri Matches the cTrader App"
+
+> Patch release after the v0.4.11 wizard walkthrough finally got to
+> the cTrader consent page and clicked "Allow access" — only to be
+> rejected by id.ctrader.com with the toast
+> *"Application authentication failed. Provided application does not
+> contain provided URI."* The wizard was advertising
+> `http://127.0.0.1:7777/ctrader/callback` as the redirect URI, but
+> the developer-registered Open API app on connect.spotware.com has
+> only `http://127.0.0.1:43001/callback` in its allowed-redirect list.
+> v0.4.12 makes the wizard match the registered URI so the OAuth
+> exchange can complete.
+
+### Fixed
+
+- **`WIZARD_DEFAULT_OAUTH_LOOPBACK_PORTS`** now leads with `43001`
+  (was `[7777, 7878, 8989]`). The legacy ports remain as fallbacks so
+  a fork that re-registers them on a different OAuth app still works.
+- **`WIZARD_DEFAULT_OAUTH_CALLBACK_PATH`** is now `/callback` (was
+  `/ctrader/callback`). Matches the path the cTrader app dashboard has
+  registered.
+- `default_loopback_ports_match_rfc8252_three_port_fallback` test
+  renamed to `default_loopback_ports_lead_with_registered_redirect_port`
+  and asserts that index 0 is `43001`.
+
+### Pre-ship gates
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo build --release -p forex-app` — 0 errors (4m 03s).
+- `cargo packager --release` — produced
+  `forex-app_0.4.12_x64-setup.exe` (25.97 MB).
+
+### Artifact
+
+- `forex-app_0.4.12_x64-setup.exe` — 25.97 MB
+  - SHA-256: `7062E4E8B9EDDA08B2CBBC10F410CD84E80E25B2D9EBB90304BB170676FAC193`
+
+---
+
 ## [0.4.11] — 2026-05-19 — "cTrader Credentials Actually Embedded"
 
 > Patch release after a Phase X1 wizard walkthrough on the v0.4.10
