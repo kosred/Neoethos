@@ -15,7 +15,7 @@ $packageArgs = @{
     packageName    = 'forex-ai'
     unzipLocation  = $toolsDir
     url64bit       = 'https://github.com/kosred/forex-ai/releases/download/v0.4.7/forex-ai-v0.4.7-windows-x86_64.zip'
-    checksum64     = 'TODO_SHA256_AT_RELEASE_TIME'
+    checksum64     = 'D5F7D90F17D9CF1BC9FFA73B069363F04BF6FA24481A797CCD769C24BF1C3F5B'
     checksumType64 = 'sha256'
 }
 

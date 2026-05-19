@@ -40,7 +40,7 @@ Installers:
     InstallerUrl: https://github.com/kosred/forex-ai/releases/download/v0.4.7/forex-ai-v0.4.7-windows-x86_64.zip
     # Release-gate local artifact hash. Refresh this if the published
     # GitHub Release asset is rebuilt after tagging.
-    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000  # POST-BUILD: replace with actual SHA-256 of forex-ai-v0.4.7-windows-x86_64.zip
+    InstallerSha256: D5F7D90F17D9CF1BC9FFA73B069363F04BF6FA24481A797CCD769C24BF1C3F5B
     NestedInstallerFiles:
       - RelativeFilePath: out/forex-app.exe
         PortableCommandAlias: forex-app
@@ -49,3 +49,4 @@ Installers:
 
 ManifestType: installer
 ManifestVersion: 1.6.0
+
