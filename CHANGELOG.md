@@ -4,6 +4,47 @@ All notable changes to forex-ai are documented here. The format is
 loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to semantic versioning.
 
+## [0.4.17] — 2026-05-19 — "Wizard Apply Persists OAuth Token Bundle"
+
+> Critical workspace-handoff fix. The wizard's OAuth flow exchanged
+> the authorization code for an access/refresh token bundle and held
+> it inside its in-memory `OAuthRuntime` mutex — but the Apply step
+> never wrote the bundle to the platform's secret store. When the
+> workspace booted, the trading session's `restore_saved_session`
+> call hit an empty keyring entry and surfaced "No saved cTrader
+> session found", even though the operator had clicked through Step
+> 4 successfully five seconds earlier. v0.4.17 makes Apply persist
+> the bundle so the workspace can reuse it without re-running OAuth.
+
+### Fixed
+
+- `OAuthRuntime` now retains the full `CTraderTokenBundle`
+  (`access_token` + `refresh_token` + `token_type` + `expires_in` +
+  `scope` + `created_at_unix`) — previously it dropped everything
+  except the two raw token strings.
+- New `pub fn expose_token_bundle()` in
+  `crates/forex-app/src/ui/wizard/oauth.rs` returns the stored bundle.
+- `write_broker_credentials` in `summary.rs` now calls
+  `CTraderSecureStore::new("forex-ai.test", "ctrader.account",
+  KeyringSecretStoreBackend).save_token_bundle(&bundle)` after the
+  broker_credentials.toml write. Service/user constants match the
+  `TradingSession::new()` pair so the workspace's
+  `restore_saved_session` reads the same entry the wizard writes.
+
+### Pre-ship gates
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo build --release -p forex-app` — 0 errors (3m 49s).
+- `cargo packager --release` — produced
+  `forex-app_0.4.17_x64-setup.exe` (25.94 MB).
+
+### Artifact
+
+- `forex-app_0.4.17_x64-setup.exe` — 25.94 MB
+  - SHA-256: `86E87E08E1B24839B16A56089C5CD0C113A3E597D570FAB0314BB1E8DA782D10`
+
+---
+
 ## [0.4.16] — 2026-05-19 — "Account Picker Label + Discovery Telemetry"
 
 > Patch release that polishes the cTrader account picker and adds the

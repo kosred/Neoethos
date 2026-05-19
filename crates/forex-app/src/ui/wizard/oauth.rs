@@ -139,6 +139,14 @@ struct OAuthRuntime {
     access_token: Option<SecretString>,
     /// Held-in-memory refresh token from the OAuth exchange.
     refresh_token: Option<SecretString>,
+    /// v0.4.17 — the full token bundle stays in memory until Apply
+    /// writes it to the secure store. The standalone `access_token`
+    /// and `refresh_token` fields stay for backwards-compat with the
+    /// older `expose_access_token` / `expose_refresh_token` getters
+    /// that take secret-string copies; the bundle here is the
+    /// authoritative source for `expose_token_bundle` which the Apply
+    /// step calls to persist tokens across app restarts.
+    token_bundle: Option<crate::app_services::ctrader_auth::CTraderTokenBundle>,
     /// Receiver for the spawned auth worker.
     auth_rx: Option<Receiver<Result<CTraderLiveAuthResult, String>>>,
     /// Receiver for the spawned account-discovery worker.
@@ -197,6 +205,18 @@ pub fn expose_access_token() -> Option<String> {
         .access_token
         .as_ref()
         .map(|s| s.expose_secret().to_string())
+}
+
+/// v0.4.17 — Read-only access to the full token bundle for the Apply
+/// step. Returns `None` until the OAuth exchange in Step 4 succeeds.
+/// The bundle carries every field the secure-store needs
+/// (`access_token`, `refresh_token`, `token_type`, `expires_in`,
+/// `scope`, `created_at_unix`) so the Apply writer can persist a
+/// fully-formed `CTraderTokenBundle` directly to the keyring without
+/// reconstructing the missing fields from defaults.
+pub fn expose_token_bundle() -> Option<crate::app_services::ctrader_auth::CTraderTokenBundle> {
+    let runtime = runtime_mutex().lock().ok()?;
+    runtime.token_bundle.clone()
 }
 
 /// Read-only access to the refresh token for the Apply step.
@@ -629,6 +649,12 @@ fn poll_auth_worker(runtime: &mut OAuthRuntime, controller: &mut WizardControlle
             runtime.refresh_token = Some(SecretString::from(
                 result.token_bundle.refresh_token.clone(),
             ));
+            // v0.4.17 — stash the full bundle for the Apply-step
+            // persist call. Cloning the inner String here is fine —
+            // the bundle is small, and copying it lets the discovery
+            // request below take ownership of access_token without
+            // moving the value out of the runtime.
+            runtime.token_bundle = Some(result.token_bundle.clone());
             runtime.sub_step = OAuthSubStep::PickAccount;
             // Kick off account discovery immediately. The wizard's
             // chosen Demo/Live radio decides the endpoint host. The

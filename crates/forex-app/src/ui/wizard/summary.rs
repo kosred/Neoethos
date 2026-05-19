@@ -353,7 +353,40 @@ pub fn write_broker_credentials(controller: &WizardController) -> Result<()> {
         ctrader,
         dxtrade: Default::default(),
     };
-    save_broker_settings(&settings).context("save broker_credentials.toml")
+    save_broker_settings(&settings).context("save broker_credentials.toml")?;
+
+    // v0.4.17 — persist the OAuth token bundle to the platform's
+    // secret store (Windows Credential Manager / macOS Keychain /
+    // Linux Secret Service) so the workspace can reuse the session
+    // across app restarts and across the wizard → main UI hand-off.
+    // Before this change, the wizard's OAuth flow filled an in-memory
+    // bundle that was lost the moment the wizard exited; the workspace
+    // then said "No saved cTrader session found" on first launch even
+    // though the operator had just clicked through Step 4 and selected
+    // an account. We tolerate a `None` bundle here (operator hit "Skip
+    // cTrader") so the apply path stays idempotent for non-broker runs.
+    if let Some(bundle) = crate::ui::wizard::oauth::expose_token_bundle() {
+        // The service/user pair MUST match the constants
+        // `TradingSession::new()` uses at
+        // `crates/forex-app/src/app_services/trading/mod.rs` (currently
+        // "forex-ai.test" / "ctrader.account"), otherwise the
+        // workspace's `restore_saved_session` reads a different
+        // keyring entry than the wizard writes.
+        let store = crate::app_services::secure_store::CTraderSecureStore::new(
+            "forex-ai.test",
+            "ctrader.account",
+            crate::app_services::secure_store::KeyringSecretStoreBackend,
+        );
+        store
+            .save_token_bundle(&bundle)
+            .context("save cTrader token bundle to secure store")?;
+        tracing::info!(
+            target: "forex_app::wizard::apply",
+            "cTrader OAuth token bundle persisted to secure store"
+        );
+    }
+
+    Ok(())
 }
 
 fn account_targets_from_wizard(
