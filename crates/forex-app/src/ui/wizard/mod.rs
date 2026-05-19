@@ -470,19 +470,34 @@ pub fn wizard_ui(ctx: &egui::Context, controller: &mut WizardController) {
         ));
         ui.separator();
 
-        let result = match controller.current {
-            WizardState::Welcome => welcome::render(ui, controller),
-            WizardState::Path => path::render(ui, controller),
-            WizardState::AccountProfile => account_profile::render(ui, controller),
-            WizardState::OAuth => oauth::render(ui, controller),
-            WizardState::Symbols => symbols::render(ui, controller),
-            WizardState::Historical => historical::render(ui, controller),
-            WizardState::Hardware => hardware::render(ui, controller),
-            WizardState::NewsApi => news_api::render(ui, controller),
-            WizardState::Autostart => autostart::render(ui, controller),
-            WizardState::AutonomyRisk => autonomy_risk::render(ui, controller),
-            WizardState::Summary => summary::render(ui, controller),
-        };
+        // v0.4.15 — wrap the per-step body in a vertical ScrollArea so
+        // the Back / Skip / Continue button row is always reachable,
+        // even when the window height is clipped by the Windows
+        // taskbar on a maximized launch. The previous layout let the
+        // step content + nav buttons overflow the visible area on
+        // small displays / maximized-with-taskbar — Phase X1 on
+        // 2026-05-19 caught this with the Step 5 "Symbols &
+        // Timeframes" page where the button row sat at y≈783 px on a
+        // 1080 px screen but the taskbar started at y≈770. The
+        // operator could not click Continue without manually resizing
+        // the window. With a scrollable body the same content stays
+        // accessible at any window height.
+        let result = egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| match controller.current {
+                WizardState::Welcome => welcome::render(ui, controller),
+                WizardState::Path => path::render(ui, controller),
+                WizardState::AccountProfile => account_profile::render(ui, controller),
+                WizardState::OAuth => oauth::render(ui, controller),
+                WizardState::Symbols => symbols::render(ui, controller),
+                WizardState::Historical => historical::render(ui, controller),
+                WizardState::Hardware => hardware::render(ui, controller),
+                WizardState::NewsApi => news_api::render(ui, controller),
+                WizardState::Autostart => autostart::render(ui, controller),
+                WizardState::AutonomyRisk => autonomy_risk::render(ui, controller),
+                WizardState::Summary => summary::render(ui, controller),
+            })
+            .inner;
         controller.apply(result);
     });
 }

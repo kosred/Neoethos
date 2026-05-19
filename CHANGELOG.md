@@ -4,6 +4,40 @@ All notable changes to forex-ai are documented here. The format is
 loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to semantic versioning.
 
+## [0.4.15] — 2026-05-19 — "Wizard Body Scrolls So Nav Buttons Stay Reachable"
+
+> Patch release that closes the last UI blocker on the wizard. The
+> Step 5 / Step 7 / Step 8 navigation row (Back / Skip / Continue)
+> rendered at the bottom of the CentralPanel — when the wizard window
+> got maximized on a 1080 px screen with the Windows taskbar pinned
+> at the bottom (default Windows 11 setup), the button row sat at
+> y ≈ 783 px while the taskbar started at y ≈ 770 px and ate the
+> click. The operator could only advance the wizard by manually
+> resizing the window. Annoying for the test runner today; broken UX
+> for any end-user on a packed display.
+
+### Fixed
+
+- `wizard_ui` in `crates/forex-app/src/ui/wizard/mod.rs` now wraps the
+  per-step body in `egui::ScrollArea::vertical().auto_shrink([false,
+  false])`. Any clipping from the taskbar (or a small display) shows
+  a scrollbar instead of swallowing controls, and the
+  Back / Skip / Continue row is always reachable.
+
+### Pre-ship gates
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo build --release -p forex-app` — 0 errors (3m 25s).
+- `cargo packager --release` — produced
+  `forex-app_0.4.15_x64-setup.exe` (25.96 MB).
+
+### Artifact
+
+- `forex-app_0.4.15_x64-setup.exe` — 25.96 MB
+  - SHA-256: `7D35AA9AF8F36F62B39FC034B17091E3F2D29ACCB1F7872031E6391FB0027411`
+
+---
+
 ## [0.4.14] — 2026-05-19 — "Account-List Parser Permissive Types"
 
 > Patch release that unblocks the post-token-exchange leg. After the
