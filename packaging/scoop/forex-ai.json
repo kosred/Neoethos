@@ -15,7 +15,7 @@
     "architecture": {
         "64bit": {
             "url": "https://github.com/kosred/forex-ai/releases/download/v0.4.8/forex-ai-v0.4.8-windows-x86_64.zip",
-            "hash": "D5F7D90F17D9CF1BC9FFA73B069363F04BF6FA24481A797CCD769C24BF1C3F5B",
+            "hash": "E759C4BA7E124250A22D34AD1757403E39ECDF4EF011A5B47C1C8BA138198090",
             "extract_dir": "out"
         }
     },
@@ -53,3 +53,4 @@
         "and installer_no_paid_certs_strategy.md §1.5.3 for the canonical layout."
     ]
 }
+

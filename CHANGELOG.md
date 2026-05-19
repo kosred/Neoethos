@@ -4,6 +4,76 @@ All notable changes to forex-ai are documented here. The format is
 loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to semantic versioning.
 
+## [0.4.8] — 2026-05-19 — "AI Helper + Proprietary License + NSIS Installer"
+
+> Ships the first user-visible Gemma surface, switches the project to a
+> proprietary license, and replaces the .zip artifact with a real NSIS
+> .exe installer.
+
+### Added
+
+- **AI Helper panel** in the egui workspace under WorkspaceGroup::AiEngine.
+  Natural-language read-only console wired to `forex-gemma`:
+  - Topic-gate stack (jailbreak-regex via `JailbreakRegexGate`) refuses
+    off-topic / injection attempts before Gemma sees them.
+  - Keyword router (English + Greek) maps the prompt to one of 10
+    read-only `BotTool`s (positions, orders, quote, balance,
+    predictions, explain, risk, news, health, log).
+  - Result is rendered with a 🛠 prefix; refusals in red ⛔; prose
+    fallback through `StubGemmaRuntime` (the real mistral.rs runtime
+    lights up in G1 behind the `mistralrs-runtime` feature).
+  - Chat scrollback survives tab switches.
+  - "Live orders cannot be placed from chat" guardrail visible in the
+    panel footer.
+- **NSIS Windows installer** via `cargo packager`. The release artifact
+  is now `forex-ai-v0.4.8-windows-x86_64-setup.exe` — installs into
+  Program Files, registers in Apps & Features for clean uninstall,
+  creates Start Menu shortcut. The .zip path is dropped.
+
+### Changed
+
+- **License → Proprietary.** All rights reserved by Konstantinos
+  Kokkinos. Personal + demo use OK (subject to the LICENSE terms);
+  no redistribution / modification / commercial use without written
+  agreement; Greek governing law; commercial-licensing contact
+  konstantinoskokkinos1982@gmail.com. The prior MIT-OR-Apache-2.0
+  dual grant is **revoked retroactive to v0.4.8**. v0.4.7 and earlier
+  binaries remain under MIT-OR-Apache-2.0 per their published LICENSE.
+  All Cargo.toml `license` fields updated to `"LicenseRef-Proprietary"`.
+- Workspace + Flutter front-end versions bumped to 0.4.8.
+- Chocolatey + Scoop + WinGet packaging manifests updated to point at
+  the .exe artifact + carry the v0.4.8 SHA-256.
+
+### Verified — pre-ship gates
+
+- `cargo check -p forex-app`: 0 errors (1m 53s)
+- `cargo build --release -p forex-app`: 0 errors (3m 18s)
+- `cargo fmt --all -- --check`: clean
+- `cargo packager --release`: produced `forex-app_0.4.8_x64-setup.exe`
+  (20.94 MB)
+- GUI smoke: AI Helper tab visible under AI Engine group, 💬 icon,
+  chat panel renders with the welcome banner + tool-list hint.
+
+### Known gaps (deferred to v0.4.9)
+
+- The real Gemma runtime (`mistralrs-runtime` feature) — stub returns
+  a helpful fallback for now; the GGUF bundling is in the installer
+  resources list but the model file itself is fetched separately via
+  `scripts/fetch-gemma-model.ps1`.
+- Dedicated wizard "Test connection" step (cTrader + DxTrade probe).
+- DxTrade panel has the data fields but the dedicated "Test
+  connection" button is not yet wired.
+- Full Greek translation for every wizard step (currently mixed).
+- Comprehensive UI smoke for all 15 workspace tabs (we exercised the
+  wizard Steps 1→4→5 + AI Helper + ran Flutter widget tests; the
+  per-panel button audit ships in v0.4.9 alongside Flutter parity).
+
+### Artifacts
+
+- `forex-ai-v0.4.8-windows-x86_64-setup.exe` — 20.94 MB
+  - SHA-256:
+    `E759C4BA7E124250A22D34AD1757403E39ECDF4EF011A5B47C1C8BA138198090`
+
 ## [0.4.7] — 2026-05-18 — "Cleanup + Boot-Wire Release"
 
 > Shipping early to surface integration-level bugs that the unit

@@ -14,8 +14,8 @@ $toolsDir = "$(Split-Path -parent $MyInvocation.MyCommand.Definition)"
 $packageArgs = @{
     packageName    = 'forex-ai'
     unzipLocation  = $toolsDir
-    url64bit       = 'https://github.com/kosred/forex-ai/releases/download/v0.4.8/forex-ai-v0.4.8-windows-x86_64.zip'
-    checksum64     = 'D5F7D90F17D9CF1BC9FFA73B069363F04BF6FA24481A797CCD769C24BF1C3F5B'
+    url64bit       = 'https://github.com/kosred/forex-ai/releases/download/v0.4.8/forex-ai-v0.4.8-windows-x86_64-setup.exe'
+    checksum64     = 'E759C4BA7E124250A22D34AD1757403E39ECDF4EF011A5B47C1C8BA138198090'
     checksumType64 = 'sha256'
 }
 
@@ -26,3 +26,4 @@ Install-ChocolateyZipPackage @packageArgs
 # Optional: register an Add/Remove Programs entry pointing at the bin dir.
 # Chocolatey ships its own ARP entry for the package itself, so this is
 # usually unnecessary; left as a no-op stub for future use.
+
