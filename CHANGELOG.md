@@ -4,6 +4,102 @@ All notable changes to forex-ai are documented here. The format is
 loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to semantic versioning.
 
+## [0.4.10] — 2026-05-19 — "Installer Payload Repair + Gemma Bundle Strategy"
+
+> Patch release after a v0.4.9 binary-walkthrough audit caught the
+> installer shipping only the .exe — none of the runtime DLLs, no
+> LICENSE, no README, no Gemma-fetch helper. The root cause was the
+> `[package.metadata.packager].resources` paths being bare filenames
+> instead of crate-relative paths; cargo-packager silently skipped
+> every entry that didn't resolve. v0.4.10 repairs the payload, ships
+> the user-side AI Helper banner that detects whether the Gemma model
+> file is present on disk, and bundles the PowerShell fetcher next to
+> the binary so the operator can pull the 5 GB GGUF in one click after
+> install instead of cloning the repo.
+
+### Fixed
+
+- **Installer was 20.93 MB and missing 34 MB of payload.** The v0.4.9
+  installer carried only `forex-app.exe`. The `resources` array in
+  `crates/forex-app/Cargo.toml` listed bare filenames
+  (`catboostmodel.dll`, `xgboost.dll`, `config.yaml`) that
+  cargo-packager resolves relative to the crate manifest dir — none
+  resolved, every entry was silently skipped. v0.4.10 rewrites the
+  paths with explicit `../../` prefixes (`../../config.yaml`,
+  `../../target/release/catboostmodel.dll`, etc.). Silent-install
+  verification confirms the new installer carries:
+  `forex-app.exe` (108.9 MB), `catboostmodel.dll` (16.5 MB),
+  `xgboost.dll` (18.4 MB), `config.yaml`, `LICENSE`, `README.md`,
+  `fetch-gemma-model.ps1`, `uninstall.exe`. Compressed installer:
+  **25.96 MB** (was 20.93 MB).
+
+### Added
+
+- **AI Helper panel — "Gemma model not found" banner.** When the
+  helper boots and `resolve_or_suggest_model_path()` returns `None`,
+  the chat panel now renders a warning frame with the approximate
+  model size, the canonical filename, the HuggingFace direct-LFS URL
+  and three buttons:
+  1. **Copy download URL** — drops the URL into the clipboard.
+  2. **Open save folder** — opens `<dirs::data_dir>/forex-ai/models/`
+     in Explorer so the operator can drop the GGUF in by hand.
+  3. **Run fetch-gemma-model.ps1** — spawns the bundled PowerShell
+     helper that streams the GGUF from HuggingFace with a progress
+     readout and a disk-space sanity check. The script is shipped
+     next to `forex-app.exe` via the installer's `resources`.
+- **Bundled `scripts/fetch-gemma-model.ps1`.** Reachable both from the
+  in-app button and directly from the Start-menu install dir.
+- **`forex-gemma` public constants** for the bundled-model anchors
+  (`MODEL_PATH_ENV_VAR`, `BUNDLED_MODEL_FILENAME`,
+  `BUNDLED_MODEL_DOWNLOAD_URL`, `BUNDLED_MODEL_APPROX_BYTES`) so the
+  UI and the fetch script cannot drift. Pinned alongside the script
+  for the lifetime of this minor version.
+
+### Strategy: bundle-vs-download for Gemma
+
+We considered three options for shipping the ~5 GB Gemma 4 E4B
+Uncensored GGUF:
+
+1. **Bundle directly in the installer** — installer balloons to
+   ~5–6 GB. Hard on the GitHub release asset cap, hostile for users
+   on capped connections, painful for every patch release. Rejected.
+2. **Download in installer's "post-install" hook** — pulls the file
+   during NSIS, blocks the install dialog for ~10 min on a typical
+   home connection, and there is no good way to show streaming
+   progress from an NSIS macro. Rejected.
+3. **Ship a fetch script next to the binary + an in-app banner that
+   surfaces it.** Operator runs the install in <30 sec, opens the
+   app, sees the banner, clicks "Run fetch-gemma-model.ps1", watches
+   PowerShell stream the download with progress. **Selected.** The
+   AI Helper panel still works as a chat surface even without the
+   model — the topic gate, the read-only tool registry, and the
+   audit log are all independent of Gemma's inference path.
+
+### Pre-ship gates
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo build --release -p forex-app` — 0 errors, 184 warnings
+  (mostly unused-imports from the in-progress trading-mod cleanup),
+  52.26 s.
+- `cargo packager --release` — produced
+  `forex-app_0.4.10_x64-setup.exe`, 25.96 MB.
+- Silent-install (`/S /D=<tmp>`) verified all 8 expected files
+  present in install dir.
+
+### Known gaps — deferred to v0.5.0
+
+Same as v0.4.9. v0.4.10 is intentionally a payload-fix patch — the
+wizard "Broker choice + test connection" steps, the per-panel UI
+smoke for all 15 tabs, and full Greek translation all land together
+in v0.5.0.
+
+### Artifact
+
+- `forex-app_0.4.10_x64-setup.exe` — 25.96 MB
+  - SHA-256: `6737A5FA11FF2CE483E96996F53F82547AE4539C595925137DA59D91901B3046`
+
+---
+
 ## [0.4.9] — 2026-05-19 — "Real UI Audit + License-header Fix"
 
 > Patch release that follows v0.4.8 with the bugs surfaced by a real

@@ -30,9 +30,11 @@
 
 use eframe::egui;
 use forex_gemma::{
-    GemmaRuntime, JailbreakRegexGate, LanguageHint, StubGemmaRuntime, ToolContext, ToolRegistry,
-    TopicCheck, TopicGate, register_all_g3,
+    BUNDLED_MODEL_APPROX_BYTES, BUNDLED_MODEL_DOWNLOAD_URL, BUNDLED_MODEL_FILENAME, GemmaRuntime,
+    JailbreakRegexGate, LanguageHint, MODEL_PATH_ENV_VAR, StubGemmaRuntime, ToolContext,
+    ToolRegistry, TopicCheck, TopicGate, register_all_g3,
 };
+use std::path::PathBuf;
 
 use crate::ui::theme;
 
@@ -80,8 +82,46 @@ impl AiHelperState {
     }
 }
 
+/// Resolve the on-disk Gemma model path candidates, returning the
+/// first that exists (`Some`) or the preferred user-data target
+/// (`None`, with the path the operator should drop the GGUF into).
+fn resolve_or_suggest_model_path() -> (Option<PathBuf>, PathBuf) {
+    // 1. Env override (operator can swap quants without re-installing).
+    if let Ok(custom) = std::env::var(MODEL_PATH_ENV_VAR) {
+        let p = PathBuf::from(&custom);
+        if p.is_file() {
+            return (Some(p), PathBuf::from(custom));
+        }
+    }
+    // 2. Bundled with the installer next to forex-app.exe.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let bundled = dir
+                .join("resources")
+                .join("models")
+                .join(BUNDLED_MODEL_FILENAME);
+            if bundled.is_file() {
+                return (Some(bundled.clone()), bundled);
+            }
+        }
+    }
+    // 3. User-data dir (where fetch-gemma-model.ps1 writes by default).
+    let user_data = dirs::data_dir()
+        .map(|d| {
+            d.join("forex-ai")
+                .join("models")
+                .join(BUNDLED_MODEL_FILENAME)
+        })
+        .unwrap_or_else(|| PathBuf::from(BUNDLED_MODEL_FILENAME));
+    if user_data.is_file() {
+        return (Some(user_data.clone()), user_data);
+    }
+    (None, user_data)
+}
+
 /// Render the AI Helper view inside the workspace dock.
 pub fn render(ui: &mut egui::Ui, state: &mut AiHelperState) {
+    let (model_path, suggested_path) = resolve_or_suggest_model_path();
     let runtime = StubGemmaRuntime::with_model_id(
         "Gemma-4-E4B-Uncensored (stub — wire G1 mistral.rs runtime)",
     );
@@ -113,6 +153,91 @@ pub fn render(ui: &mut egui::Ui, state: &mut AiHelperState) {
             .small()
             .color(theme::TEXT_MUTED),
         );
+
+        // Model-presence banner. v0.4.10: the GGUF is NOT bundled in
+        // the installer (the file is 5 GB — too big for a Windows
+        // setup.exe). Instead the installer ships
+        // `fetch-gemma-model.ps1` next to forex-app.exe; running it
+        // downloads the model into the user-data dir. Tool calls keep
+        // working without the model (deterministic keyword router →
+        // ToolRegistry); only the prose-fallback path through Gemma
+        // is gated on the file being present.
+        if model_path.is_none() {
+            let gb = (BUNDLED_MODEL_APPROX_BYTES as f64) / (1024.0 * 1024.0 * 1024.0);
+            ui.add_space(theme::SPACE_XS);
+            egui::Frame::new()
+                .fill(theme::SURFACE_BG)
+                .stroke(egui::Stroke::new(1.0, theme::WARNING))
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .corner_radius(egui::CornerRadius::same(4))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("⚠ Gemma model not found on disk")
+                            .strong()
+                            .color(theme::WARNING),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Tool calls (positions, orders, quotes, risk, …) work \
+                             without the model — the keyword router dispatches \
+                             them deterministically. Prose replies need the GGUF.\n\n\
+                             To enable prose replies, download {:.1} GB from:\n\
+                             {url}\n\
+                             and save it as:\n\
+                             {dest}",
+                            gb,
+                            url = BUNDLED_MODEL_DOWNLOAD_URL,
+                            dest = suggested_path.display(),
+                        ))
+                        .small()
+                        .color(theme::TEXT_MUTED),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Copy download URL").clicked() {
+                            ui.output_mut(|o| {
+                                o.copied_text = BUNDLED_MODEL_DOWNLOAD_URL.to_string();
+                            });
+                        }
+                        if ui.button("Open save folder").clicked() {
+                            if let Some(parent) = suggested_path.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                                let _ = open::that(parent);
+                            }
+                        }
+                        if ui
+                            .button("Run fetch-gemma-model.ps1 (next to forex-app.exe)")
+                            .clicked()
+                        {
+                            if let Ok(exe) = std::env::current_exe() {
+                                if let Some(dir) = exe.parent() {
+                                    let script = dir.join("fetch-gemma-model.ps1");
+                                    if script.is_file() {
+                                        let _ = std::process::Command::new("powershell.exe")
+                                            .args([
+                                                "-NoProfile",
+                                                "-ExecutionPolicy",
+                                                "Bypass",
+                                                "-File",
+                                            ])
+                                            .arg(&script)
+                                            .spawn();
+                                    }
+                                }
+                            }
+                        }
+                    });
+                });
+        } else {
+            ui.label(
+                egui::RichText::new(format!(
+                    "✓ Model loaded from: {}",
+                    model_path.as_ref().unwrap().display()
+                ))
+                .small()
+                .color(theme::BUY),
+            );
+        }
+
         ui.separator();
 
         // Scrollback — bottom-up so the newest turn is always visible.

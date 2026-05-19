@@ -6,7 +6,7 @@
   Strategy ref: docs/audits/research/installer_no_paid_certs_strategy.md §1.5.2
 
   Build:   choco pack forex-ai.nuspec      (from this directory)
-  Publish: choco push forex-ai.0.4.9.nupkg  source=https://push.chocolatey.org/
+  Publish: choco push forex-ai.0.4.10.nupkg  source=https://push.chocolatey.org/
            Community moderation queue is 1-4 weeks for the first version.
            (XML comments forbid the double-dash sequence, so the literal
             "(double-dash)source" flag is rendered with whitespace here;
@@ -15,7 +15,7 @@
 <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
   <metadata>
     <id>forex-ai</id>
-    <version>0.4.9</version>
+    <version>0.4.10</version>
     <packageSourceUrl>https://github.com/kosred/forex-ai/tree/main/packaging/chocolatey/forex-ai</packageSourceUrl>
     <owners>kosred</owners>
 
@@ -40,7 +40,7 @@ paper / live trading orchestration, and a risk-aware execution gate.
 This Chocolatey package installs the Windows x86_64 build downloaded from
 the official GitHub Releases, verified by SHA-256.
     </description>
-    <releaseNotes>https://github.com/kosred/forex-ai/releases/tag/v0.4.9</releaseNotes>
+    <releaseNotes>https://github.com/kosred/forex-ai/releases/tag/v0.4.10</releaseNotes>
   </metadata>
   <files>
     <file src="tools\**" target="tools" />

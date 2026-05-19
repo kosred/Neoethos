@@ -1,6 +1,6 @@
 [package]
 name = "forex-app"
-version = "0.4.9"
+version = "0.4.10"
 edition.workspace = true
 # SPDX dual-license matches the repo-root LICENSE file. Required by both
 # cargo-deb (which prefers `license` over `license-file` when generating
@@ -119,7 +119,26 @@ identifier = "com.forexai.app"
 authors = ["Konstantinos Red"]
 description = "Advanced Algorithmic Forex Terminal with ML and Live Execution"
 formats = ["nsis"]
-resources = ["config.yaml", "catboostmodel.dll", "xgboost.dll"]
+# Paths are resolved relative to this Cargo.toml. v0.4.10 fixed the
+# resource paths after the v0.4.9 audit revealed the installer was
+# shipping only the .exe — catboost / xgboost / config.yaml were
+# silently skipped because the bare names didn't resolve from the
+# crate directory. After this change the .exe installer correctly
+# carries the 34 MB of runtime DLLs every ML inference path needs
+# + a copy of the default config.yaml.
+resources = [
+    "../../config.yaml",
+    "../../target/release/catboostmodel.dll",
+    "../../target/release/xgboost.dll",
+    "../../LICENSE",
+    "../../README.md",
+    # v0.4.10: ship the Gemma GGUF fetcher next to the .exe so the
+    # AI Helper panel's "Run fetch-gemma-model.ps1" button can spawn
+    # it without the operator having to clone the repo. The script
+    # itself does the HuggingFace download + disk-safety check +
+    # writes to the canonical user-data dir.
+    "../../scripts/fetch-gemma-model.ps1",
+]
 
 [[package.metadata.packager.binaries]]
 path = "forex-app"

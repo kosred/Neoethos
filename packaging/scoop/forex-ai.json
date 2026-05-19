@@ -8,16 +8,27 @@
         "Windows package-manager installs use the zip asset produced by",
         ".github/workflows/release-installers.yml."
     ],
-    "version": "0.4.9",
+    "version": "0.4.10",
     "description": "Quantitative trading workspace for the cTrader Open API.",
     "homepage": "https://github.com/kosred/forex-ai",
-    "license": "MIT OR Apache-2.0",
+    "license": "LicenseRef-Proprietary",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/kosred/forex-ai/releases/download/v0.4.9/forex-ai-v0.4.9-windows-x86_64.zip",
-            "hash": "043C59F818B8282ED08A3E57222E5A7F5D89CC32393250A6A7A413529FD578CE",
-            "extract_dir": "out"
+            "url": "https://github.com/kosred/forex-ai/releases/download/v0.4.10/forex-app_0.4.10_x64-setup.exe",
+            "hash": "6737A5FA11FF2CE483E96996F53F82547AE4539C595925137DA59D91901B3046"
         }
+    },
+    "installer": {
+        "script": [
+            "$installer_path = \"$dir\\$fname\"",
+            "Start-Process -FilePath $installer_path -ArgumentList '/S',\"/D=$dir\" -Wait",
+            "Remove-Item -Path $installer_path -Force"
+        ]
+    },
+    "uninstaller": {
+        "script": [
+            "Start-Process -FilePath \"$dir\\uninstall.exe\" -ArgumentList '/S' -Wait"
+        ]
     },
     "bin": [
         "forex-app.exe",
@@ -40,7 +51,7 @@
     "autoupdate": {
         "architecture": {
             "64bit": {
-                "url": "https://github.com/kosred/forex-ai/releases/download/v$version/forex-ai-v$version-windows-x86_64.zip"
+                "url": "https://github.com/kosred/forex-ai/releases/download/v$version/forex-app_$version_x64-setup.exe"
             }
         },
         "hash": {
@@ -53,6 +64,7 @@
         "and installer_no_paid_certs_strategy.md §1.5.3 for the canonical layout."
     ]
 }
+
 
 
 

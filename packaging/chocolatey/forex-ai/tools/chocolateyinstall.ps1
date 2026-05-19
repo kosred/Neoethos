@@ -13,19 +13,22 @@ $toolsDir = "$(Split-Path -parent $MyInvocation.MyCommand.Definition)"
 
 $packageArgs = @{
     packageName    = 'forex-ai'
-    unzipLocation  = $toolsDir
-    url64bit       = 'https://github.com/kosred/forex-ai/releases/download/v0.4.9/forex-ai-v0.4.9-windows-x86_64-setup.exe'
-    checksum64     = '043C59F818B8282ED08A3E57222E5A7F5D89CC32393250A6A7A413529FD578CE'
+    fileType       = 'exe'
+    url64bit       = 'https://github.com/kosred/forex-ai/releases/download/v0.4.10/forex-app_0.4.10_x64-setup.exe'
+    checksum64     = '6737A5FA11FF2CE483E96996F53F82547AE4539C595925137DA59D91901B3046'
     checksumType64 = 'sha256'
+    silentArgs     = '/S'
+    validExitCodes = @(0)
 }
 
-# Install-ChocolateyZipPackage handles download + SHA-256 verification +
-# extraction in one call. If the checksum does not match it aborts.
-Install-ChocolateyZipPackage @packageArgs
+# Install-ChocolateyPackage downloads the NSIS installer, verifies SHA-256,
+# and runs it silently. Aborts on checksum mismatch.
+Install-ChocolateyPackage @packageArgs
 
 # Optional: register an Add/Remove Programs entry pointing at the bin dir.
 # Chocolatey ships its own ARP entry for the package itself, so this is
 # usually unnecessary; left as a no-op stub for future use.
+
 
 
 

@@ -4,7 +4,7 @@
 //! See `README.md` for the full architecture and the two-role
 //! separation (ensemble expert + conversational suggester).
 
-#![doc(html_root_url = "https://docs.rs/forex-gemma/0.4.9")]
+#![doc(html_root_url = "https://docs.rs/forex-gemma/0.4.10")]
 
 pub mod anchors;
 pub mod api;
@@ -55,6 +55,41 @@ pub use suggestions::{
     SuggestionResolution, SuggestionSide, compute_expiry,
 };
 pub use tools::{BotTool, ToolCategory, ToolContext, ToolRegistry};
+
+// ── Bundled model constants (referenced by the desktop UI + fetch script) ──
+//
+// These are the canonical values for the Gemma 4 E4B Uncensored GGUF model
+// shipped via the `scripts/fetch-gemma-model.ps1` helper next to the
+// installer binary. They live here (not in `config.rs`) because:
+//   * `config.rs` describes RUNTIME options (quantization, paths the user
+//     can override) — these are BUILD-time anchors that the AI Helper
+//     panel and the fetch script must agree on.
+//   * Both `forex-app` (UI banner) and the future installer "fetch on
+//     first run" path read these directly; centralizing avoids drift.
+//
+// v0.4.10 — pinned alongside `scripts/fetch-gemma-model.ps1`.
+
+/// Environment variable the operator can set to point the runtime at an
+/// already-downloaded GGUF file. Trumps every other resolution candidate.
+pub const MODEL_PATH_ENV_VAR: &str = "FOREX_AI_GEMMA_MODEL_PATH";
+
+/// Canonical on-disk filename of the Gemma 4 E4B Uncensored GGUF.
+/// Used by:
+///   * `<exe_dir>/resources/models/<filename>` — installer bundle slot
+///   * `<dirs::data_dir>/forex-ai/models/<filename>` — fetched-at-runtime slot
+pub const BUNDLED_MODEL_FILENAME: &str = "gemma-3-4b-it-q4_k_m.gguf";
+
+/// Public download URL that `fetch-gemma-model.ps1` pulls from.
+/// HuggingFace direct LFS resolve URL — survives the HF redirect chain
+/// without the script needing an auth token.
+pub const BUNDLED_MODEL_DOWNLOAD_URL: &str = "https://huggingface.co/HauhauCS/gemma-3-4b-it-uncensored-Q4_K_M-GGUF/resolve/main/gemma-3-4b-it-q4_k_m.gguf";
+
+/// Approximate on-disk size of the bundled GGUF, in bytes. Used by the
+/// "Gemma model not found" banner to warn the user before they kick a
+/// ~5 GB download. The number is a soft anchor — the file may shift by a
+/// few hundred MB between HuggingFace re-uploads; the banner copy says
+/// "approximately" so a small drift is fine.
+pub const BUNDLED_MODEL_APPROX_BYTES: u64 = 5_200_000_000;
 
 /// Build the production G2 topic-gate stack:
 /// jailbreak-regex + embedding-similarity (fake-provider
