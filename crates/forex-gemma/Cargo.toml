@@ -1,6 +1,6 @@
 [package]
 name = "forex-gemma"
-version = "0.4.12"
+version = "0.4.13"
 edition.workspace = true
 description = "Local on-device LLM helper for the forex-ai trading bot — ensemble expert + conversational suggester."
 license = "LicenseRef-Proprietary"

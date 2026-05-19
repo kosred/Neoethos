@@ -31,6 +31,15 @@ use tungstenite::{Message, connect};
 /// typoes the value).
 pub const CTRADER_TRANSPORT_ENV_VAR: &str = "FOREX_BOT_CTRADER_TRANSPORT";
 
+/// `ProtoHeartbeatEvent` — sent every ~30 s by the cTrader Open API
+/// server (and by the client to keep the socket alive). Carries no
+/// `clientMsgId` and an empty `payload`. v0.4.13 — the WSS transport
+/// must skip these envelopes silently in the inner read loop, which
+/// is the existing `is_matching_open_api_response` behavior; this
+/// constant exists so that consumers reasoning about the wire format
+/// can name the type instead of comparing against the magic number.
+pub const CTRADER_OA_HEARTBEAT_PAYLOAD_TYPE: u32 = 51;
+
 pub const CTRADER_OA_APPLICATION_AUTH_REQUEST_PAYLOAD_TYPE: u32 = 2100;
 pub const CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE: u32 = 2101;
 pub const CTRADER_OA_ACCOUNT_AUTH_REQUEST_PAYLOAD_TYPE: u32 = 2102;
@@ -119,12 +128,31 @@ pub const CTRADER_ORDER_TRIGGER_METHOD_OPPOSITE: i32 = 2;
 pub const CTRADER_ORDER_TRIGGER_METHOD_DOUBLE_TRADE: i32 = 3;
 pub const CTRADER_ORDER_TRIGGER_METHOD_DOUBLE_OPPOSITE: i32 = 4;
 
+// v0.4.13 — `clientMsgId` and `payload` are now defaultable so the
+// production WSS transport can parse out-of-band envelopes that the
+// cTrader Open API server sends without correlation IDs (heartbeat
+// payloadType 51, unsolicited push events like ProtoExecutionEvent
+// with `clientMsgId` absent because there was no client request to
+// correlate to). Before this change, a heartbeat arriving between
+// the application-auth response and the account-list response would
+// fail `parse_open_api_envelope` with the generic "failed to parse
+// cTrader JSON envelope" error, and the wizard's account-discovery
+// leg would abort. Phase X1 walkthrough on 2026-05-19 caught this:
+// even though the OAuth token bundle was received, the next message
+// off the wire was a heartbeat-shaped frame the parser couldn't
+// accept, and the wizard reported "OAuth error: failed to parse
+// cTrader JSON envelope". With #[serde(default)] both fields fall
+// back to "" / Value::Null on absence, the heartbeat-skip loop in
+// the transport (`is_matching_open_api_response`) gets a chance to
+// fire, and the genuine account-list response is read on the next
+// iteration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CTraderOpenApiJsonMessage {
-    #[serde(rename = "clientMsgId")]
+    #[serde(rename = "clientMsgId", default)]
     pub client_msg_id: String,
     #[serde(rename = "payloadType")]
     pub payload_type: u32,
+    #[serde(default)]
     pub payload: Value,
 }
 
@@ -899,7 +927,18 @@ pub fn build_symbol_category_list_request(
 }
 
 pub fn parse_open_api_envelope(response_json: &str) -> Result<CTraderOpenApiJsonMessage> {
-    serde_json::from_str(response_json).context("failed to parse cTrader JSON envelope")
+    serde_json::from_str(response_json).with_context(|| {
+        // v0.4.13 — include the head of the offending body and total
+        // length so the wizard's "OAuth error: …" surface has enough
+        // signal to tell heartbeat-shaped frames apart from genuine
+        // schema drifts. We cap at 200 chars to avoid leaking long
+        // access tokens; cTrader access tokens are ~512 chars, so a
+        // 200-char head still shows the envelope shape without ever
+        // including the full token string.
+        let total = response_json.len();
+        let head: String = response_json.chars().take(200).collect();
+        format!("failed to parse cTrader JSON envelope (len={total}, head={head:?})")
+    })
 }
 
 pub fn expected_response_payload_type(request_payload_type: u32) -> Result<u32> {

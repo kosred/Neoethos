@@ -4,6 +4,59 @@ All notable changes to forex-ai are documented here. The format is
 loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to semantic versioning.
 
+## [0.4.13] — 2026-05-19 — "cTrader JSON Envelope Tolerates Heartbeats"
+
+> Patch release that closes the last blocker on the cTrader account
+> discovery leg. After v0.4.12's OAuth fix the wizard reached the
+> consent page, exchanged the authorization code for a token bundle
+> and held it in memory — but the next message off the WebSocket
+> hit `parse_open_api_envelope` with `"failed to parse cTrader JSON
+> envelope"`. Root cause: the parser required `clientMsgId` and
+> `payload` to be present on every envelope, but the cTrader Open
+> API server emits `ProtoHeartbeatEvent` frames (payloadType 51)
+> with neither field populated. A heartbeat racing the
+> application-auth response aborted the whole discovery sequence.
+
+### Fixed
+
+- **`CTraderOpenApiJsonMessage` deserialiser tolerates heartbeats.**
+  `client_msg_id` and `payload` are now `#[serde(default)]` so a
+  frame like `{"payloadType":51}` parses into an envelope with
+  `client_msg_id = ""` and `payload = Value::Null`. The existing
+  `is_matching_open_api_response` check then rejects the heartbeat
+  by `payload_type` mismatch and the read loop keeps consuming
+  frames until the real response arrives.
+- **`parse_open_api_envelope` error includes a 200-char head of the
+  offending body and the total length.** Future schema drifts will
+  show up in the wizard's `OAuth error:` surface with enough
+  diagnostic signal to triage without extra logs.
+- **`CTRADER_OA_HEARTBEAT_PAYLOAD_TYPE = 51` named constant.** So
+  call-sites that reason about the wire format can use a name
+  instead of the magic number.
+
+### Tests
+
+- `parse_open_api_envelope_tolerates_heartbeat_without_client_msg_id`
+  — regression guard for the exact wire frame that broke v0.4.12.
+- `parse_open_api_envelope_error_includes_response_head_for_diagnosis`
+  — locks in the head-of-body + length error format.
+
+### Pre-ship gates
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo build --release -p forex-app` — 0 errors (3m 42s).
+- `cargo test -p forex-app --bin forex-app ctrader_messages` — 27
+  passed, 0 failed, 1 ignored, 527 filtered out.
+- `cargo packager --release` — produced
+  `forex-app_0.4.13_x64-setup.exe` (25.97 MB).
+
+### Artifact
+
+- `forex-app_0.4.13_x64-setup.exe` — 25.97 MB
+  - SHA-256: `03BCC6ECC9867891722C0186EADC85CCAB92128D1A5A5912CCE90C95D974F244`
+
+---
+
 ## [0.4.12] — 2026-05-19 — "Wizard OAuth redirect_uri Matches the cTrader App"
 
 > Patch release after the v0.4.11 wizard walkthrough finally got to
