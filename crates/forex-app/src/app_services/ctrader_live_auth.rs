@@ -878,9 +878,25 @@ pub fn build_account_list_by_access_token_json(
     build_account_list_by_access_token_request(&request.access_token, client_msg_id)
 }
 
+// v0.4.13 — the wire format from the live `demo.ctraderapi.com:5036`
+// endpoint differs from the integration-test fixture in two ways that
+// blew up the strict struct shape that previously lived here:
+//
+//   * `accessToken` is not always echoed back on the account-list
+//     response — the server already returned it on the token-exchange
+//     leg and treats the re-echo as optional. The strict `String`
+//     field rejected envelopes without it.
+//   * `permissionScope` arrives as the proto enum's numeric value
+//     (`SCOPE_TRADE` → `2`, `SCOPE_VIEW` → `1`) in JSON-over-WSS
+//     responses from production, even though the older fixtures used
+//     the string spelling. A typed `String` field rejected the int.
+//
+// The struct is now permissive: both fields are `Option<Value>` and
+// the post-parse handler treats absence as "no extra metadata,
+// proceed with the account list".
 #[derive(Debug, Deserialize)]
 struct CTraderAccountListResponseEnvelope {
-    #[serde(rename = "clientMsgId")]
+    #[serde(rename = "clientMsgId", default)]
     _client_msg_id: Option<String>,
     #[serde(rename = "payloadType")]
     payload_type: u32,
@@ -889,11 +905,11 @@ struct CTraderAccountListResponseEnvelope {
 
 #[derive(Debug, Deserialize)]
 struct CTraderAccountListResponsePayload {
-    #[serde(rename = "accessToken")]
-    access_token: String,
-    #[serde(rename = "permissionScope")]
-    permission_scope: String,
-    #[serde(rename = "ctidTraderAccount")]
+    #[serde(rename = "accessToken", default)]
+    access_token: Option<String>,
+    #[serde(rename = "permissionScope", default)]
+    permission_scope: Option<Value>,
+    #[serde(rename = "ctidTraderAccount", default)]
     accounts: Vec<CTraderCtidTraderAccount>,
 }
 
@@ -913,7 +929,18 @@ pub fn parse_account_list_by_access_token_json(
     response_json: &str,
 ) -> Result<CTraderAccountDiscoveryResult> {
     let envelope: CTraderAccountListResponseEnvelope = serde_json::from_str(response_json)
-        .context("failed to parse cTrader account list response")?;
+        .with_context(|| {
+            // v0.4.13 — include the head of the offending body and the
+            // total length so the wizard's "OAuth error: …" surface has
+            // enough signal to triage a future schema drift without
+            // extra logs. Same diagnostic shape as `parse_open_api_envelope`.
+            let total = response_json.len();
+            let head: String = response_json.chars().take(200).collect();
+            format!(
+                "failed to parse cTrader account list response \
+                 (len={total}, head={head:?})"
+            )
+        })?;
     if envelope.payload_type != CTRADER_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RESPONSE_PAYLOAD_TYPE {
         return Err(anyhow!(
             "unexpected cTrader account list payload type: {}",
@@ -947,9 +974,24 @@ pub fn parse_account_list_by_access_token_json(
         })
         .collect();
 
+    // v0.4.13 — both fields are now `Option`. The `access_token` flows
+    // back to the wizard so it can be re-applied if missing on subsequent
+    // legs; empty-string fallback matches the pre-change contract for
+    // downstream consumers that read it via direct field access.
+    // `permission_scope` is reduced to its display form: a number arrives
+    // as the proto enum value (e.g. "2" for SCOPE_TRADE), a string echoes
+    // through verbatim; either way the result is human-readable.
+    let access_token = envelope.payload.access_token.unwrap_or_default();
+    let permission_scope = match envelope.payload.permission_scope {
+        Some(Value::String(s)) => s,
+        Some(Value::Number(n)) => n.to_string(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    };
+
     Ok(CTraderAccountDiscoveryResult {
-        access_token: envelope.payload.access_token,
-        permission_scope: envelope.payload.permission_scope,
+        access_token,
+        permission_scope,
         accounts,
     })
 }

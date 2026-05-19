@@ -8,14 +8,14 @@
         "Windows package-manager installs use the zip asset produced by",
         ".github/workflows/release-installers.yml."
     ],
-    "version": "0.4.13",
+    "version": "0.4.14",
     "description": "Quantitative trading workspace for the cTrader Open API.",
     "homepage": "https://github.com/kosred/forex-ai",
     "license": "LicenseRef-Proprietary",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/kosred/forex-ai/releases/download/v0.4.13/forex-app_0.4.13_x64-setup.exe",
-            "hash": "03BCC6ECC9867891722C0186EADC85CCAB92128D1A5A5912CCE90C95D974F244"
+            "url": "https://github.com/kosred/forex-ai/releases/download/v0.4.14/forex-app_0.4.14_x64-setup.exe",
+            "hash": "DB83A13345AD653501F9C66C894C1B7C8A0D477AA2FBFE4C119BCD442DC8E834"
         }
     },
     "installer": {

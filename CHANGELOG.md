@@ -4,6 +4,55 @@ All notable changes to forex-ai are documented here. The format is
 loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to semantic versioning.
 
+## [0.4.14] — 2026-05-19 — "Account-List Parser Permissive Types"
+
+> Patch release that unblocks the post-token-exchange leg. After the
+> v0.4.13 heartbeat-tolerant generic parser landed, the wizard moved
+> past the first envelope and got a real `ProtoOAGetAccountListByAccessTokenRes`
+> back — but the strict typed struct for the payload rejected the wire
+> shape. `accessToken` is not always echoed back (treated as optional
+> by the server), and `permissionScope` arrives as the proto enum's
+> numeric value (`SCOPE_TRADE → 2`) in JSON-over-WSS from production,
+> not as the string spelling our fixtures used.
+
+### Fixed
+
+- `CTraderAccountListResponsePayload.access_token` is now
+  `Option<String>` (server omits it on the account-list leg because it
+  was already supplied on the token-exchange leg).
+- `CTraderAccountListResponsePayload.permission_scope` is now
+  `Option<Value>` with a post-parse step that accepts string spellings
+  (`"SCOPE_TRADE"`), proto-enum numbers (`2`), or any other JSON type
+  via `Value::to_string`. The downstream `permission_scope` String
+  surface is preserved.
+- `CTraderAccountListResponseEnvelope.client_msg_id` is now
+  `#[serde(default)]` to match the generic-envelope policy from v0.4.13.
+- `parse_account_list_by_access_token_json` error context now includes
+  a 200-char head and total length, matching `parse_open_api_envelope`'s
+  diagnostic shape.
+
+### Tests
+
+- All 23 `ctrader_live_auth` tests pass (existing
+  `account_list_response_parses_discovered_accounts` confirms the
+  string-spelling fixtures still parse).
+
+### Pre-ship gates
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo build --release -p forex-app` — 0 errors (3m 45s).
+- `cargo test -p forex-app --bin forex-app ctrader_live_auth` — 23
+  passed.
+- `cargo packager --release` — produced
+  `forex-app_0.4.14_x64-setup.exe` (25.97 MB).
+
+### Artifact
+
+- `forex-app_0.4.14_x64-setup.exe` — 25.97 MB
+  - SHA-256: `DB83A13345AD653501F9C66C894C1B7C8A0D477AA2FBFE4C119BCD442DC8E834`
+
+---
+
 ## [0.4.13] — 2026-05-19 — "cTrader JSON Envelope Tolerates Heartbeats"
 
 > Patch release that closes the last blocker on the cTrader account
