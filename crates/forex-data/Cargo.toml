@@ -1,6 +1,6 @@
 [package]
 name = "forex-data"
-version = "0.4.17"
+version = "0.4.18"
 edition.workspace = true
 
 [dependencies]

@@ -1,6 +1,6 @@
 [package]
 name = "forex-app"
-version = "0.4.17"
+version = "0.4.18"
 edition.workspace = true
 # SPDX dual-license matches the repo-root LICENSE file. Required by both
 # cargo-deb (which prefers `license` over `license-file` when generating

@@ -1,0 +1,35 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+# Mirrors `kosred.forex-ai.locale.en-US.yaml` — WinGet treats the
+# default-locale manifest separately to make sure every package has at least
+# one human-readable description even if no localised variants ship.
+# Spec: https://learn.microsoft.com/en-us/windows/package-manager/package/manifest
+
+PackageIdentifier: kosred.forex-ai
+PackageVersion: 0.4.18
+PackageLocale: en-US
+Publisher: kosred
+PublisherUrl: https://github.com/kosred
+PublisherSupportUrl: https://github.com/kosred/forex-ai/issues
+PackageName: forex-ai
+PackageUrl: https://github.com/kosred/forex-ai
+License: MIT OR Apache-2.0
+LicenseUrl: https://github.com/kosred/forex-ai/blob/main/LICENSE
+Copyright: Copyright 2024-2026 forex-ai contributors
+ShortDescription: Quantitative trading workspace for the cTrader Open API.
+Description: |
+  forex-ai is an open-source quantitative trading workspace targeting the
+  cTrader Open API. It includes data ingestion, ML-driven strategy search,
+  paper / live trading orchestration, and a risk-aware execution gate.
+Moniker: forex-ai
+Tags:
+  - forex
+  - trading
+  - quant
+  - ctrader
+  - rust
+ReleaseNotesUrl: https://github.com/kosred/forex-ai/releases/tag/v0.4.18
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0
+
+
+

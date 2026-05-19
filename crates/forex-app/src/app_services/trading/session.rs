@@ -347,6 +347,17 @@ impl TradingSession {
     }
 
     pub fn restore_ctrader_session(&mut self) -> anyhow::Result<Option<CTraderAuthSnapshot>> {
+        // v0.4.18 — refresh broker_settings from disk before the
+        // empty-check below so the wizard's Apply path (which writes
+        // empty client_id / redirect_uri on the assumption that the
+        // runtime resolver fills from embedded constants) doesn't
+        // accidentally short-circuit `restore_ctrader_session` to an
+        // `Ok(None)` "No saved cTrader session found" surface when
+        // the in-memory broker_settings was loaded BEFORE the wizard
+        // overwrote the file. The hot reload also picks up any
+        // hand-edits the operator made between session boot and this
+        // click.
+        self.broker_settings = crate::app_services::broker_persistence::load_broker_settings();
         let client_id = self.broker_settings.ctrader.client_id.trim().to_string();
         let redirect_uri = self.broker_settings.ctrader.redirect_uri.trim().to_string();
         if client_id.is_empty() || redirect_uri.is_empty() {

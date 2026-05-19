@@ -4,6 +4,48 @@ All notable changes to forex-ai are documented here. The format is
 loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to semantic versioning.
 
+## [0.4.18] — 2026-05-19 — "Restore Saved Session Picks Up Wizard Writes"
+
+> Critical workspace-handoff fix #2. After v0.4.17 the wizard's
+> Apply step persisted the OAuth token bundle to the keyring — but
+> the workspace's "Restore Saved Session" button still surfaced
+> "No saved cTrader session found". Root cause:
+> `restore_ctrader_session` early-returned `Ok(None)` if the
+> in-memory `broker_settings.ctrader.client_id` or `redirect_uri`
+> was empty, without ever consulting the keyring. The wizard's
+> Apply path writes EMPTY strings to those fields on purpose —
+> the runtime resolver fills them from embedded constants — but
+> the trading session's in-memory copy of broker_settings was
+> loaded at app startup and never refreshed when the wizard wrote
+> the file. So when the workspace booted before the wizard
+> finished, in-memory `client_id` could be empty even though the
+> on-disk + embedded resolution would have produced a non-empty
+> value. The empty-check then short-circuited before `load_token_bundle()`
+> got a chance to run.
+
+### Fixed
+
+- `TradingSession::restore_ctrader_session` now reloads
+  `self.broker_settings` from disk via
+  `crate::app_services::broker_persistence::load_broker_settings()`
+  before the `client_id`/`redirect_uri` empty-check. The hot
+  reload also picks up any hand-edits the operator made to
+  `broker_credentials.toml` between session boot and the click.
+
+### Pre-ship gates
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo build --release -p forex-app` — 0 errors (3m 49s).
+- `cargo packager --release` — produced
+  `forex-app_0.4.18_x64-setup.exe` (25.98 MB).
+
+### Artifact
+
+- `forex-app_0.4.18_x64-setup.exe` — 25.98 MB
+  - SHA-256: `397AE7BAE6EDEA19BBD75349E1E68530B340AC975511E09790610D500DD2B47F`
+
+---
+
 ## [0.4.17] — 2026-05-19 — "Wizard Apply Persists OAuth Token Bundle"
 
 > Critical workspace-handoff fix. The wizard's OAuth flow exchanged
