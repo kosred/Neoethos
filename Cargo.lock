@@ -4011,6 +4011,7 @@ dependencies = [
  "egui_dock",
  "forex-core",
  "forex-data",
+ "forex-gemma",
  "forex-models",
  "forex-search",
  "futures",

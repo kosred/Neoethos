@@ -1,11 +1,11 @@
 [package]
 name = "forex-app"
-version = "0.4.7"
+version = "0.4.8"
 edition.workspace = true
 # SPDX dual-license matches the repo-root LICENSE file. Required by both
 # cargo-deb (which prefers `license` over `license-file` when generating
 # `debian/control`) and cargo-generate-rpm. Standard Rust ecosystem choice.
-license = "MIT OR Apache-2.0"
+license = "LicenseRef-Proprietary"
 description = "forex-ai desktop GUI — quantitative trading workspace for the cTrader Open API."
 homepage = "https://github.com/kosred/forex-ai"
 repository = "https://github.com/kosred/forex-ai"
@@ -70,6 +70,12 @@ forex-core = { path = "../forex-core" }
 forex-data = { path = "../forex-data" }
 forex-search = { path = "../forex-search" }
 forex-models = { path = "../forex-models", features = ["tree-models", "pure-rust-ml"] }
+# v0.4.8: on-device LLM helper (Gemma) — wired into the egui AI Helper
+# panel + the workspace `ToolRegistry` for chat-driven read-only tool
+# invocation. The stub runtime is always available so the desktop
+# binary builds without a GGUF file on disk; `mistralrs-runtime`
+# feature lights up the real inference path when G1 lands.
+forex-gemma = { path = "../forex-gemma" }
 ndarray = "0.17.2"
 clap = { version = "4.6.0", features = ["derive"] }
 num_cpus = "1.17.0"
@@ -128,7 +134,7 @@ main = true
 maintainer = "forex-ai contributors <forex-ai@users.noreply.github.com>"
 # SPDX expression mirrored from `package.license` above. cargo-deb writes this
 # into the Debian `control` file's `License:` line via the license-file route.
-copyright = "2024-2026, forex-ai contributors; dual-licensed MIT OR Apache-2.0"
+copyright = "2024-2026, forex-ai contributors; proprietary; all rights reserved"
 license-file = ["../../LICENSE", "0"]
 extended-description = """\
 forex-ai is an open-source quantitative trading workspace targeting \
@@ -154,10 +160,11 @@ systemd-units = { enable = false }
 [package.metadata.generate-rpm]
 name = "forex-ai"
 # Mirrors the SPDX expression in `package.license`.
-license = "MIT OR Apache-2.0"
+license = "LicenseRef-Proprietary"
 assets = [
     { source = "target/release/forex-app", dest = "/usr/bin/forex-app", mode = "0755" },
     { source = "assets/symbol_metadata/defaults.json", dest = "/usr/share/forex-ai/symbol_metadata/defaults.json", mode = "0644" },
     { source = "LICENSE", dest = "/usr/share/doc/forex-ai/LICENSE", mode = "0644" },
     { source = "README.md", dest = "/usr/share/doc/forex-ai/README.md", mode = "0644" },
 ]
+

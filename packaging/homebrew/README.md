@@ -54,7 +54,7 @@ Setup steps (one-time):
 1. Create `https://github.com/kosred/homebrew-forex-ai` (public, empty).
 2. Copy `Casks/forex-ai.rb` into the new repo at `Casks/forex-ai.rb`.
 3. Tag releases in the new repo to match `forex-ai` versions
-   (`v0.4.7`, `v0.4.6`, ...).
+   (`v0.4.8`, `v0.4.6`, ...).
 4. The CI workflow `.github/workflows/release.yml` job
    `publish-homebrew-tap` automates the bump on every tagged release.
 
@@ -65,7 +65,7 @@ Releases page exposes the same `forex-ai-X.Y.Z-macos-universal.tar.gz`
 artefact. Users extract it and remove the quarantine attribute manually:
 
 ```sh
-tar -xzf forex-ai-0.4.7-macos-universal.tar.gz
+tar -xzf forex-ai-0.4.8-macos-universal.tar.gz
 xattr -dr com.apple.quarantine forex-app forex-cli
 ./forex-app
 ```

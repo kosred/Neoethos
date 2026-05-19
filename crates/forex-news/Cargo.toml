@@ -1,6 +1,6 @@
 [package]
 name = "forex-news"
-version = "0.4.7"
+version = "0.4.8"
 edition.workspace = true
 
 [dependencies]
@@ -16,3 +16,4 @@ forex-core = { path = "../forex-core" }
 
 [dev-dependencies]
 tokio = { version = "1.43.0", features = ["macros", "rt"] }
+

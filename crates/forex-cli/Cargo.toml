@@ -1,10 +1,10 @@
 [package]
 name = "forex-cli"
-version = "0.4.7"
+version = "0.4.8"
 edition.workspace = true
 # SPDX dual-license matches the repo-root LICENSE file. Required by both
 # cargo-deb (writes Debian `control` License:) and cargo-generate-rpm.
-license = "MIT OR Apache-2.0"
+license = "LicenseRef-Proprietary"
 description = "forex-ai headless CLI + TUI — quantitative trading workspace for the cTrader Open API."
 homepage = "https://github.com/kosred/forex-ai"
 repository = "https://github.com/kosred/forex-ai"
@@ -43,7 +43,7 @@ unicode-width = "0.2"
 # ──────────────────────────────────────────────────────────────────────────────
 [package.metadata.deb]
 maintainer = "forex-ai contributors <forex-ai@users.noreply.github.com>"
-copyright = "2024-2026, forex-ai contributors; dual-licensed MIT OR Apache-2.0"
+copyright = "2024-2026, forex-ai contributors; proprietary; all rights reserved"
 license-file = ["../../LICENSE", "0"]
 extended-description = """\
 forex-ai is an open-source quantitative trading workspace targeting \
@@ -69,10 +69,11 @@ systemd-units = { enable = false }
 # ──────────────────────────────────────────────────────────────────────────────
 [package.metadata.generate-rpm]
 name = "forex-cli"
-license = "MIT OR Apache-2.0"
+license = "LicenseRef-Proprietary"
 assets = [
     { source = "target/release/forex-cli", dest = "/usr/bin/forex-cli", mode = "0755" },
     { source = "assets/symbol_metadata/defaults.json", dest = "/usr/share/forex-ai/symbol_metadata/defaults.json", mode = "0644" },
     { source = "LICENSE", dest = "/usr/share/doc/forex-ai/LICENSE", mode = "0644" },
     { source = "README.md", dest = "/usr/share/doc/forex-ai/README.md", mode = "0644" },
 ]
+

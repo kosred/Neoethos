@@ -859,7 +859,9 @@ mod tests {
     /// (no duplicate entries).
     #[test]
     fn apply_writer_writes_six_artefacts_idempotently() {
-        let _guard = RISKY_MODE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = RISKY_MODE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = unique_temp_dir("idempotent");
         let mut controller = WizardController::new();
         controller.config.data_path = Some(dir.clone());
@@ -929,7 +931,9 @@ mod tests {
     /// $XDG_CONFIG_HOME or races with broker_persistence tests.
     #[test]
     fn risky_mode_arm_persists_and_auto_arms_at_session_boot() {
-        let _guard = RISKY_MODE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = RISKY_MODE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use crate::app_services::trading::TradingSession;
         let dir = unique_temp_dir("risky-mode-boot");
         let risky_mode_state_path = dir.join("risky_mode_state.json");
@@ -968,7 +972,9 @@ mod tests {
     /// with Risky Mode OFF (the safe default).
     #[test]
     fn risky_mode_disarmed_file_leaves_session_disabled() {
-        let _guard = RISKY_MODE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = RISKY_MODE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use crate::app_services::trading::TradingSession;
         let dir = unique_temp_dir("risky-mode-disarmed");
         let risky_mode_state_path = dir.join("risky_mode_state.json");

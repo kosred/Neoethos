@@ -56,6 +56,13 @@ pub struct AppState {
     pub risk: forex_core::config::RiskConfig,
     pub dashboard_panel: crate::ui::dashboard::DashboardPanel,
     pub ai_insights_panel: crate::ui::ai_insights::AiInsightsPanel,
+    /// v0.4.8 — chat scrollback + input for the AI Helper panel. Lives
+    /// in `AppState` so the conversation survives tab switches and is
+    /// re-rendered on every frame without losing the operator's
+    /// in-progress prompt. The chat is in-memory only by design — no
+    /// persistence to disk until the audit log (G7 / disk-backed
+    /// JsonlAuditLog) is wired in.
+    pub ai_helper_panel: crate::ui::ai_helper::AiHelperState,
     pub llm_news_filter: forex_core::domain::news_filter::NewsFilter,
     pub discovery_form: DiscoveryFormState,
     pub auto_trade_enabled: bool,
@@ -111,6 +118,7 @@ impl AppState {
             risk: settings.risk.clone(),
             dashboard_panel: crate::ui::dashboard::DashboardPanel::new(),
             ai_insights_panel: crate::ui::ai_insights::AiInsightsPanel::new(),
+            ai_helper_panel: crate::ui::ai_helper::AiHelperState::new(),
             llm_news_filter,
             discovery_form: DiscoveryFormState::from_settings(settings),
             auto_trade_enabled: false,

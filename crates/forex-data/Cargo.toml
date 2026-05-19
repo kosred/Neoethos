@@ -1,6 +1,6 @@
 [package]
 name = "forex-data"
-version = "0.4.7"
+version = "0.4.8"
 edition.workspace = true
 
 [dependencies]
@@ -25,3 +25,4 @@ vortex-file = "0.67.0"
 vortex-io = "0.67.0"
 vortex-layout = "0.67.0"
 vortex-session = "0.67.0"
+

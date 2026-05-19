@@ -1,6 +1,6 @@
 [package]
 name = "forex-core"
-version = "0.4.7"
+version = "0.4.8"
 edition.workspace = true
 
 [dependencies]
@@ -37,3 +37,4 @@ windows = { version = "0.62.1", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
 ] }
+

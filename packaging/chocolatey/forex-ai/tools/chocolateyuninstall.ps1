@@ -18,7 +18,7 @@ $packageArgs = @{
     packageName = 'forex-ai'
     # Must match the URL used in chocolateyinstall.ps1 so Chocolatey can map
     # the package back to its extracted contents.
-    zipFileName = 'forex-ai-v0.4.7-windows-x86_64.zip'
+    zipFileName = 'forex-ai-v0.4.8-windows-x86_64.zip'
 }
 
 Uninstall-ChocolateyZipPackage @packageArgs

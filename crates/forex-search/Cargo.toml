@@ -1,6 +1,6 @@
 [package]
 name = "forex-search"
-version = "0.4.7"
+version = "0.4.8"
 edition.workspace = true
 
 [dependencies]
@@ -35,3 +35,4 @@ gpu = ["dep:rand_distr", "dep:tch", "dep:cubecl", "dep:half", "dep:libc"]
 # modules. Will not compile until the migration lands. Implies `gpu`.
 gpu-experimental = ["gpu"]
 strategy-db = ["dep:duckdb"]
+

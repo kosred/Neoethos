@@ -3,7 +3,7 @@
 #
 # The lowest-friction shippable artifact: a plain portable tarball that
 # unpacks anywhere and runs. Zero packaging tooling required beyond
-# `cargo` and `tar` — used as the v0.4.7 ship-gate §5.1.7 "at least
+# `cargo` and `tar` — used as the v0.4.8 ship-gate §5.1.7 "at least
 # one of (.deb, .AppImage, .tar.gz)" check, and as the fallback path
 # when AppImage / cargo-deb tooling is unavailable.
 #

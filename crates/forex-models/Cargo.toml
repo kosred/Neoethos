@@ -1,6 +1,6 @@
 [package]
 name = "forex-models"
-version = "0.4.7"
+version = "0.4.8"
 edition.workspace = true
 
 [dependencies]
@@ -97,3 +97,4 @@ anomaly-detection = ["dep:extended-isolation-forest"]
 burn-wgpu-backend = ["dep:burn-wgpu"]
 burn-backend = []
 pure-rust-ml = ["neuro-evolution", "reinforcement-learning", "adaptive-models", "swarm-forecasting", "burn-backend", "statistical-models", "anomaly-detection"]
+

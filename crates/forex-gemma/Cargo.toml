@@ -1,9 +1,9 @@
 [package]
 name = "forex-gemma"
-version = "0.4.7"
+version = "0.4.8"
 edition.workspace = true
 description = "Local on-device LLM helper for the forex-ai trading bot — ensemble expert + conversational suggester."
-license = "Apache-2.0"
+license = "LicenseRef-Proprietary"
 
 [dependencies]
 anyhow.workspace = true
@@ -20,3 +20,4 @@ default = []
 # available so the rest of the workspace compiles even when the
 # real backend is not wired in.
 mistralrs-runtime = []
+

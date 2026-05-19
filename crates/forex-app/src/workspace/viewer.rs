@@ -101,6 +101,9 @@ impl TabViewer for WorkspaceViewer<'_> {
             WorkspaceTab::Intelligence => {
                 ui::system::intelligence::render(ui, self.state, self.tx);
             }
+            WorkspaceTab::AiHelper => {
+                ui::ai_helper::render(ui, &mut self.state.ai_helper_panel);
+            }
             WorkspaceTab::DataBootstrap => {
                 ui::system::bootstrap::render(ui, self.state, self.trading_session, self.tx);
             }

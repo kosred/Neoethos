@@ -1,3 +1,4 @@
+pub mod ai_helper;
 pub mod ai_insights;
 pub mod chrome;
 pub mod components;

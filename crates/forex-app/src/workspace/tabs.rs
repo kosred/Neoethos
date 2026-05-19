@@ -11,6 +11,9 @@ pub enum WorkspaceTab {
     Runtime,
     BrokerSetup,
     Intelligence,
+    /// AI Helper — Gemma-backed natural-language read-only console.
+    /// Added in v0.4.8 alongside the `forex-gemma` UI wiring.
+    AiHelper,
     DataBootstrap,
     Hardware,
     Risk,
@@ -63,6 +66,7 @@ impl WorkspaceTab {
             Self::Runtime => "Runtime",
             Self::BrokerSetup => "Broker Setup",
             Self::Intelligence => "Intelligence",
+            Self::AiHelper => "AI Helper",
             Self::DataBootstrap => "Data Bootstrap",
             Self::Hardware => "Hardware",
             Self::Risk => "Risk Settings",
@@ -84,6 +88,7 @@ impl WorkspaceTab {
             Self::Runtime => "Connection & session diagnostics",
             Self::BrokerSetup => "cTrader / DXTrade credentials & OAuth",
             Self::Intelligence => "AI model insights & explainability",
+            Self::AiHelper => "Chat with the bot — natural language tools console",
             Self::DataBootstrap => "Historical data download / migration",
             Self::Hardware => "CPU / GPU / RAM detection & overrides",
             Self::Risk => "Prop-firm risk rules & guard-rails",
@@ -108,6 +113,7 @@ impl WorkspaceTab {
             Self::Runtime => "◉",
             Self::BrokerSetup => "🔌",
             Self::Intelligence => "✺",
+            Self::AiHelper => "💬",
             Self::DataBootstrap => "⤓",
             Self::Hardware => "▤",
             Self::Risk => "⚠",
@@ -123,7 +129,9 @@ impl WorkspaceTab {
             | Self::Execution
             | Self::News
             | Self::BottomStrip => WorkspaceGroup::Trading,
-            Self::Discovery | Self::Training | Self::Intelligence => WorkspaceGroup::AiEngine,
+            Self::Discovery | Self::Training | Self::Intelligence | Self::AiHelper => {
+                WorkspaceGroup::AiEngine
+            }
             Self::Runtime
             | Self::BrokerSetup
             | Self::DataBootstrap
@@ -144,7 +152,12 @@ impl WorkspaceTab {
                 Self::News,
                 Self::BottomStrip,
             ],
-            WorkspaceGroup::AiEngine => &[Self::Discovery, Self::Training, Self::Intelligence],
+            WorkspaceGroup::AiEngine => &[
+                Self::Discovery,
+                Self::Training,
+                Self::Intelligence,
+                Self::AiHelper,
+            ],
             WorkspaceGroup::System => &[
                 Self::Runtime,
                 Self::BrokerSetup,
