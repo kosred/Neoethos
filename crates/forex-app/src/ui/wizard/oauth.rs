@@ -216,6 +216,43 @@ pub fn embedded_credentials_present() -> bool {
     expose_client_id().is_some() && expose_client_secret().is_some()
 }
 
+/// v0.4.16 — build a stable picker label for one discovered account.
+/// Format: `#<ctidTraderAccountId> <broker title or traderLogin> (demo|live)`.
+/// Mirrors the format used by the dropdown options so the
+/// `selected_text` displayed after a pick is identical to the option
+/// the operator chose. Falls back to the raw account_id when neither
+/// broker_title nor trader_login is populated.
+fn account_picker_label(
+    account: &crate::app_services::ctrader_auth::CTraderDiscoveredAccount,
+) -> String {
+    let trader_login_or_id = account
+        .trader_login
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| account.account_id.clone());
+    let display_name = if account.broker_title.trim().is_empty() {
+        // Empty broker_title is what we saw on the live FTMO account
+        // in the 2026-05-19 walkthrough — fall back to traderLogin so
+        // the operator still sees a recognisable number.
+        trader_login_or_id.clone()
+    } else if account.broker_title.trim() == trader_login_or_id {
+        // Avoid stutter when both fields happen to carry the same
+        // string ("17111418 17111418").
+        account.broker_title.clone()
+    } else {
+        format!("{} {}", account.broker_title, trader_login_or_id)
+    };
+    format!(
+        "#{} {} ({})",
+        account.account_id,
+        display_name,
+        if account.is_live.unwrap_or(false) {
+            "live"
+        } else {
+            "demo"
+        }
+    )
+}
+
 /// Clear the process-global runtime — call when starting a fresh
 /// wizard run (e.g. from `Settings → Wizard`).
 pub fn reset_oauth_runtime() {
@@ -404,25 +441,34 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
                 .size(theme::FONT_CAPTION),
         );
     } else if !runtime.accounts.is_empty() {
+        // v0.4.16 — the dropdown's `selected_text` previously rendered
+        // just the bare `ctidTraderAccountId` (e.g. "47149192"), which
+        // looked like a raw integer floating in the UI. Surface the
+        // same "#id broker_title (demo|live)" formatting the dropdown
+        // options use so the operator sees something legible even
+        // after selecting an account.
         let current = controller
             .config
             .selected_ctid_trader_account_id
-            .map(|id| id.to_string())
+            .and_then(|id| {
+                runtime
+                    .accounts
+                    .iter()
+                    .find(|a| a.account_id == id.to_string())
+                    .map(|a| account_picker_label(a))
+            })
+            .or_else(|| {
+                controller
+                    .config
+                    .selected_ctid_trader_account_id
+                    .map(|id| format!("#{id}"))
+            })
             .unwrap_or_else(|| "(none)".to_string());
         egui::ComboBox::from_id_salt("wizard_ctrader_account_picker")
             .selected_text(current.clone())
             .show_ui(ui, |ui| {
                 for account in &runtime.accounts {
-                    let label = format!(
-                        "#{} {} ({})",
-                        account.account_id,
-                        account.account_name,
-                        if account.is_live.unwrap_or(false) {
-                            "live"
-                        } else {
-                            "demo"
-                        }
-                    );
+                    let label = account_picker_label(account);
                     let parsed = account.account_id.parse::<u64>().ok();
                     let mut current_id = controller.config.selected_ctid_trader_account_id;
                     if ui

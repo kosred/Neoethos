@@ -948,7 +948,7 @@ pub fn parse_account_list_by_access_token_json(
         ));
     }
 
-    let accounts = envelope
+    let accounts: Vec<crate::app_services::ctrader_auth::CTraderDiscoveredAccount> = envelope
         .payload
         .accounts
         .into_iter()
@@ -988,6 +988,23 @@ pub fn parse_account_list_by_access_token_json(
         Some(other) => other.to_string(),
         None => String::new(),
     };
+
+    // v0.4.16 — log how many accounts the broker returned, so the
+    // 6-of-7 missing-account observation from the 2026-05-19
+    // walkthrough is debuggable from the operator's log without
+    // re-running the wizard with a debugger attached. We log the IDs
+    // only (no tokens, no permissionScope) so the line is safe to
+    // ship at INFO level.
+    let account_ids: Vec<String> = accounts
+        .iter()
+        .map(|a: &crate::app_services::ctrader_auth::CTraderDiscoveredAccount| a.account_id.clone())
+        .collect();
+    tracing::info!(
+        target: "ctrader.auth",
+        count = accounts.len(),
+        ids = ?account_ids,
+        "cTrader account-list response parsed"
+    );
 
     Ok(CTraderAccountDiscoveryResult {
         access_token,

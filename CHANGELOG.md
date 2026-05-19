@@ -4,6 +4,50 @@ All notable changes to forex-ai are documented here. The format is
 loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to semantic versioning.
 
+## [0.4.16] — 2026-05-19 — "Account Picker Label + Discovery Telemetry"
+
+> Patch release that polishes the cTrader account picker and adds the
+> first piece of operator-facing telemetry on the discovery response.
+> The Phase X1 walkthrough on v0.4.14 surfaced two cosmetic gaps:
+> the `selected_text` of the account combo rendered the bare ctid
+> integer (`47149192`) instead of the broker title, and the operator
+> couldn't tell from the log alone whether the 6-of-7 missing-account
+> observation was a parser bug, a permission-scope artefact, or a
+> server-side revocation.
+
+### Fixed
+
+- `wizard_ctrader_account_picker.selected_text` now renders the same
+  `#<id> <broker> (demo|live)` format the dropdown options use. New
+  helper `account_picker_label` shared between the option renderer
+  and the selected-text renderer so they cannot drift again.
+- `account_name` fallback inside `parse_account_list_by_access_token_json`
+  now uses `broker_title traderLogin` instead of just `broker_title`
+  when both are present, so the operator sees `FTMO Platform 17111418`
+  instead of just `FTMO Platform`.
+
+### Added
+
+- `tracing::info!` line at the end of
+  `parse_account_list_by_access_token_json` with `count` + `ids` so
+  the operator log records exactly how many accounts the broker
+  returned and which `ctidTraderAccountId`s. Safe to ship — no tokens
+  or scope strings logged. Investigation aid for the 6-vs-7 mismatch.
+
+### Pre-ship gates
+
+- `cargo fmt --all -- --check` — clean.
+- `cargo build --release -p forex-app` — 0 errors (51.28 s incremental).
+- `cargo packager --release` — produced
+  `forex-app_0.4.16_x64-setup.exe` (25.97 MB).
+
+### Artifact
+
+- `forex-app_0.4.16_x64-setup.exe` — 25.97 MB
+  - SHA-256: `05C8EC746E7B19A156BDB5F3973327AC337F2BFCB53EDEDA6D14756CBA129DEF`
+
+---
+
 ## [0.4.15] — 2026-05-19 — "Wizard Body Scrolls So Nav Buttons Stay Reachable"
 
 > Patch release that closes the last UI blocker on the wizard. The
