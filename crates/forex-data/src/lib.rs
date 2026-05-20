@@ -80,6 +80,29 @@ pub fn discover_symbols(root: impl AsRef<Path>) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Dedupe state for `discover_timeframes` warnings — fires the
+/// "non-canonical timeframe folder" warning AT MOST ONCE per
+/// `(symbol, timeframe)` per process lifetime.
+///
+/// Pre-fix: the warning ran inside the per-render scan loop, so a UI
+/// frame rate of 60 Hz × 10 stale folders × N symbols produced
+/// hundreds of identical log lines per second and drowned every other
+/// trace. The dedupe set survives until the process exits — restart
+/// the app to see the warning again (which is also what you'd want
+/// since after a restart the stale folders may have been cleaned up).
+static DISCOVER_TIMEFRAMES_WARNED: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+> = std::sync::OnceLock::new();
+
+fn warned_once_for(symbol: &str, tf: &str) -> bool {
+    let lock = DISCOVER_TIMEFRAMES_WARNED.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
+    let mut set = match lock.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    !set.insert((symbol.to_string(), tf.to_string()))
+}
+
 pub fn discover_timeframes(root: impl AsRef<Path>, symbol: &str) -> Result<Vec<String>> {
     let path = PathBuf::from(root.as_ref()).join(format!("symbol={}", symbol));
     if !path.exists() {
@@ -105,12 +128,15 @@ pub fn discover_timeframes(root: impl AsRef<Path>, symbol: &str) -> Result<Vec<S
                 .any(|canonical| canonical.eq_ignore_ascii_case(&tf))
             {
                 tfs.insert(tf);
-            } else {
+            } else if !warned_once_for(symbol, &tf) {
+                // First time we see this (symbol, tf) since process start.
+                // Subsequent calls with the same pair stay silent so the
+                // UI's per-frame render loop doesn't flood the log.
                 tracing::warn!(
                     target: "forex_data::discover_timeframes",
                     symbol = symbol,
                     timeframe = %tf,
-                    "ignoring non-canonical timeframe folder; not in CANONICAL_TIMEFRAMES"
+                    "ignoring non-canonical timeframe folder; not in CANONICAL_TIMEFRAMES (warning is deduplicated; restart process to see again)"
                 );
             }
         }
