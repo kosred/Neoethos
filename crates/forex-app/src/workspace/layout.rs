@@ -34,6 +34,13 @@ impl WorkspaceState {
                 WorkspaceTab::BrokerSetup,
                 WorkspaceTab::Runtime,
                 WorkspaceTab::Intelligence,
+                // V0.4 audit Task #17 — AiHelper was enumerated in
+                // `tabs.rs::WorkspaceTab` and listed in the sidebar's
+                // `all_for_group(AiEngine)`, but missing here meant
+                // clicking it in the sidebar did nothing (`find_tab`
+                // returned None → silent no-op). Adding it to the
+                // bottom-right system stack so it has a real home.
+                WorkspaceTab::AiHelper,
                 WorkspaceTab::DataBootstrap,
                 WorkspaceTab::Hardware,
                 WorkspaceTab::Risk,
@@ -135,6 +142,9 @@ mod tests {
         assert!(tabs.contains(&"Hardware".to_string()));
         assert!(tabs.contains(&"Risk Settings".to_string()));
         assert!(tabs.contains(&"Settings".to_string()));
+        // Task #17 regression — AiHelper must be in the layout so the
+        // sidebar nav can actually focus it.
+        assert!(tabs.contains(&"AI Helper".to_string()));
     }
 
     #[test]

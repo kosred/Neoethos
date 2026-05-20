@@ -42,4 +42,17 @@ pub enum ServiceEvent {
     CTraderConnectUpdated(crate::app_services::ctrader_account::CTraderAccountRuntimeSnapshot),
     BootstrapUpdated(JobSnapshot),
     ConnectOutcome(Result<String, String>),
+    /// Background chart-data fetch completed. The UI should refresh the
+    /// chart panel without blocking the render thread on WebSocket I/O.
+    ChartDataUpdated(Box<crate::app_services::trading::MarketChartSnapshot>),
+    /// A background OS thread spawned via
+    /// `app_services::trading::background::spawn_background_task` panicked.
+    /// The panic was caught inside the worker so the process is not killed,
+    /// but the operator MUST see it — previously a panic in (e.g.) the chart
+    /// fetcher left the UI showing "Running…" forever because the join
+    /// handle was simply discarded.
+    BackgroundTaskPanic {
+        task: String,
+        message: String,
+    },
 }

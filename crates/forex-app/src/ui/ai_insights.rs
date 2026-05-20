@@ -1,5 +1,22 @@
 use egui::{Color32, RichText, Ui, widgets::ProgressBar};
 
+/// Dashboard widget that surfaces the active ensemble's prediction
+/// probabilities and the news / consistency / rate-limit compliance
+/// status of the model runtime.
+///
+/// V0.4 audit Task #34 — every field intentionally defaults to `None`
+/// and the renderer shows an "Unavailable" placeholder for each one
+/// until a producer wires real data in. The producer is the live
+/// inference loop (Task #7 — `auto_trade_producer`) which currently
+/// runs only as a stub. Once that producer is alive it MUST update
+/// these fields on every closed-bar prediction so the operator can see
+/// the AI's actual confidence (not a default 0.0 that looks like a
+/// false signal).
+///
+/// **Do not add a `Default` that pre-fills these to dummy values.**
+/// The whole point of `Option<f32>` here is "we have no data" vs
+/// "the data is exactly 0%". A hardcoded default would erase that
+/// distinction and let stale defaults look like real signals.
 #[derive(Default, Clone, Debug)]
 pub struct AiInsightsPanel {
     pub prob_buy: Option<f32>,

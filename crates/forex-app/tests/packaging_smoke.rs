@@ -71,6 +71,14 @@ fn portable_build_script_is_present_and_executable() {
     );
 }
 
+// Gated to Unix-like targets only. On Windows, Git Bash / WSL bash IS
+// usually on PATH, but Windows-style paths (`C:\Users\...`) passed to a
+// Unix-style bash get mangled to `/c/Users/...` or `C:Users...` (depending
+// on the bash flavour), producing spurious "No such file or directory"
+// failures even when the .sh script is syntactically valid. The release
+// pipeline that actually invokes these scripts runs on Ubuntu in CI, so
+// the syntax check belongs on the same target.
+#[cfg(not(windows))]
 #[test]
 fn all_packaging_shell_scripts_have_valid_bash_syntax() {
     // bash -n parses a script without executing it — exactly the
@@ -229,6 +237,47 @@ fn appimage_appdir_has_required_files() {
     );
 }
 
+#[test]
+fn windows_release_binary_does_not_import_debug_vc_runtime() {
+    let release_dir = workspace_root().join("target").join("release");
+    let exe = release_dir.join("forex-app.exe");
+    if !exe.is_file() {
+        eprintln!(
+            "[packaging_smoke] {} not present; skipping Windows release import check",
+            exe.display()
+        );
+        return;
+    }
+
+    let mut checked = Vec::new();
+    let mut stack = vec![exe];
+    while let Some(path) = stack.pop() {
+        if checked.iter().any(|seen: &PathBuf| same_path(seen, &path)) {
+            continue;
+        }
+        let imports = pe_imports(&path).unwrap_or_else(|err| {
+            panic!("failed to read PE imports for {}: {err}", path.display())
+        });
+        let debug_runtime = imports.iter().find(|name| {
+            let lower = name.to_ascii_lowercase();
+            lower.ends_with("d.dll") && (lower.contains("vcomp") || lower.contains("vcruntime"))
+        });
+        assert!(
+            debug_runtime.is_none(),
+            "{} imports debug VC runtime {}; clean Windows machines will not have this DLL",
+            path.display(),
+            debug_runtime.unwrap()
+        );
+        for import in imports {
+            let local = release_dir.join(&import);
+            if local.is_file() {
+                stack.push(local);
+            }
+        }
+        checked.push(path);
+    }
+}
+
 /// Walk `root` recursively and return every file matching `pred`.
 fn collect_files<F: Fn(&Path) -> bool>(root: &Path, pred: F) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -251,4 +300,98 @@ fn collect_files<F: Fn(&Path) -> bool>(root: &Path, pred: F) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
+fn pe_imports(path: &Path) -> std::io::Result<Vec<String>> {
+    let bytes = fs::read(path)?;
+    if bytes.get(0..2) != Some(b"MZ") {
+        return Ok(Vec::new());
+    }
+    let pe_offset = read_u32(&bytes, 0x3c)? as usize;
+    if bytes.get(pe_offset..pe_offset + 4) != Some(b"PE\0\0") {
+        return Ok(Vec::new());
+    }
+
+    let coff = pe_offset + 4;
+    let section_count = read_u16(&bytes, coff + 2)? as usize;
+    let optional_header_size = read_u16(&bytes, coff + 16)? as usize;
+    let optional = coff + 20;
+    let magic = read_u16(&bytes, optional)?;
+    let data_directory = match magic {
+        0x10b => optional + 96,
+        0x20b => optional + 112,
+        _ => return Ok(Vec::new()),
+    };
+    let import_rva = read_u32(&bytes, data_directory + 8)?;
+    if import_rva == 0 {
+        return Ok(Vec::new());
+    }
+
+    let section_table = optional + optional_header_size;
+    let mut sections = Vec::new();
+    for idx in 0..section_count {
+        let off = section_table + idx * 40;
+        let virtual_size = read_u32(&bytes, off + 8)?;
+        let virtual_address = read_u32(&bytes, off + 12)?;
+        let raw_size = read_u32(&bytes, off + 16)?;
+        let raw_ptr = read_u32(&bytes, off + 20)?;
+        sections.push((virtual_address, virtual_size.max(raw_size), raw_ptr));
+    }
+
+    let mut imports = Vec::new();
+    let mut descriptor = rva_to_offset(import_rva, &sections)? as usize;
+    loop {
+        let original_first_thunk = read_u32(&bytes, descriptor)?;
+        let time_date_stamp = read_u32(&bytes, descriptor + 4)?;
+        let forwarder_chain = read_u32(&bytes, descriptor + 8)?;
+        let name_rva = read_u32(&bytes, descriptor + 12)?;
+        let first_thunk = read_u32(&bytes, descriptor + 16)?;
+        if original_first_thunk == 0
+            && time_date_stamp == 0
+            && forwarder_chain == 0
+            && name_rva == 0
+            && first_thunk == 0
+        {
+            break;
+        }
+        let name_offset = rva_to_offset(name_rva, &sections)? as usize;
+        let end = bytes[name_offset..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|pos| name_offset + pos)
+            .ok_or_else(|| std::io::Error::other("unterminated import name"))?;
+        imports.push(String::from_utf8_lossy(&bytes[name_offset..end]).to_string());
+        descriptor += 20;
+    }
+    Ok(imports)
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> std::io::Result<u16> {
+    let slice = bytes
+        .get(offset..offset + 2)
+        .ok_or_else(|| std::io::Error::other("PE read out of bounds"))?;
+    Ok(u16::from_le_bytes([slice[0], slice[1]]))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> std::io::Result<u32> {
+    let slice = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| std::io::Error::other("PE read out of bounds"))?;
+    Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn rva_to_offset(rva: u32, sections: &[(u32, u32, u32)]) -> std::io::Result<u32> {
+    for (virtual_address, size, raw_ptr) in sections {
+        if *virtual_address <= rva && rva < virtual_address.saturating_add(*size) {
+            return Ok(raw_ptr.saturating_add(rva - virtual_address));
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "RVA {rva:#x} outside PE sections"
+    )))
 }

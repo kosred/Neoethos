@@ -4,6 +4,138 @@ All notable changes to forex-ai are documented here. The format is
 loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to semantic versioning.
 
+## [0.4.19] — 2026-05-20 — "V0.4 stabilisation: critical safety + cleanup"
+
+> Operator directive (2026-05-19): "We won't leave V0.4 until everything
+> works correctly in the UI." The previous v0.5.0 tag was rolled back to
+> the v0.4 line; all crate versions are pinned at 0.4.19 until the V0.4
+> audit punch list (`docs/qa/` + tracked tasks) is fully resolved. The
+> CHANGELOG entries for 0.5.0 below remain as historical reference for
+> the work that landed under that version banner.
+>
+> This release closes 18 audit items from the V0.4 punch list spanning
+> critical safety, dead-code removal, and ~33 MB of orphan binary
+> cleanup. See `docs/qa/2026-05-19-ui-integration-test.md` for the
+> exhaustive list; highlights below.
+
+### Critical safety
+- **Risk gate hole — Market orders without entry estimate.** The
+  prop-firm risk-per-trade check used to silently skip its
+  pip-distance computation when a Market order had a stop-loss but no
+  `limit_price`/`stop_price`, because the inner `if let (Some(sl),
+  Some(entry))` pattern was always `(Some, None)` for Market orders. The
+  gate now accepts a `market_price_for_entry: Option<f64>` from the
+  caller (mid of the latest cTrader spot quote), uses it as the entry
+  estimate, and HARD-FAILS if `stop_loss` is set but no estimate of any
+  kind is available. Two new regression tests
+  (`prop_firm_gate_rejects_market_with_sl_but_no_entry_estimate` +
+  `prop_firm_gate_accepts_market_with_sl_when_mid_price_supplied`).
+- **Background-task panic visibility.** Every `std::thread::spawn(...)`
+  worker in `TradingSession` now routes through
+  `app_services/trading/background.rs::spawn_background_task`, which
+  wraps the worker in `catch_unwind` and emits a new
+  `ServiceEvent::BackgroundTaskPanic { task, message }` on panic.
+  `main.rs::process_messages` surfaces it as a status-bar error and
+  flips the relevant `JobSnapshot` to `Failed`. Previously a panicked
+  worker left the UI showing "Running…" forever.
+- **Mutex poisoning on the wizard OAuth render thread.** Replaced the
+  `.expect("wizard OAuth runtime mutex poisoned")` on the render path
+  with a recover-and-log path so a panicked background worker can no
+  longer bring down the entire wizard frame.
+- **Order-ticket numeric input bounds.** `target_price` DragValue is
+  now `range(0.0..=1_000_000.0)` (the previous unbounded field
+  accepted negative numbers and infinity via typed text). Downstream
+  `build_ctrader_order_request` also hard-fails for Limit/Stop orders
+  with non-finite or non-positive prices.
+- **u32/usize overflow on Protobuf outbound frames.** New explicit
+  bounds check in `frame_with_length_prefix` (signature changed to
+  `Result<Vec<u8>>`) refuses to send a length prefix that would
+  silently truncate via `as u32`.
+- **Vortex write-path timestamp asymmetry.** `normalize_ohlcv` now
+  folds nanosecond / microsecond / second inputs to the canonical
+  milliseconds unit at the WRITE boundary, matching the READ-side
+  normalisation. Pre-fix, a caller passing `NormalizedBar.timestamp_ns`
+  produced files that read back as milliseconds — losing the original
+  unit and breaking every consumer that expected round-trip identity.
+- **Vortex parser panics on corrupt files.** `read_vortex_array` now
+  wraps the body in `catch_unwind` so a bit-flipped column header
+  produces `Err("corrupt vortex file …")` instead of bringing down the
+  background loader thread.
+- **Connect re-entrancy race.** `TradingSession::start_connect` now
+  uses an `AtomicBool::compare_exchange(false, true, AcqRel, Acquire)`
+  guard with a `Drop`-based reset, closing the race where two rapid
+  clicks could both pass the `is_finished()` check before the first
+  worker was scheduled.
+- **Buy/Sell button OrderType dispatch.** Investigation showed
+  `build_ctrader_order_request` already routed Limit/Stop correctly;
+  the legacy method names `execute_buy_market`/`execute_sell_market`
+  were misleading. Renamed to `execute_buy_order`/`execute_sell_order`
+  with a doc-comment explaining the dispatch contract. Button labels
+  now show "BUY STOP"/"SELL STOP" instead of "BUY LIMIT"/"SELL LIMIT"
+  for `OrderType::Stop`.
+- **Cancel/Close adapter gating.** Replaced the `snapshot.adapter_name
+  == "cTrader"` hardcode with `TradingAdapterKind::supports_order_cancellation()` /
+  `supports_position_close()` capability flags so DXtrade and any
+  future adapter can opt in without UI-code changes.
+
+### Dead code + cleanup
+- **~33 MB + ~295k LOC removed:** orphan `_split_draft/` directories
+  (dxtrade_split_draft + 5 in forex-models), Python `.pyd` binary in
+  `crates/forex-bindings/` (34 MB), `ucrtbased.dll`, leftover
+  `__pycache__/*.pyc`, the obsolete `forex-bot.service` systemd unit
+  that referenced an ancient Python module, and 7 dead intent flags
+  + 2 dead helper methods in `main.rs`.
+- **Strengthened `check_no_python_legacy.sh`** to also reject `.pyc`,
+  `.pyd`, `__pycache__/` directories, and stale `PYTHONPATH=` / `python
+  -m forex_bot` / `pip install` / `/venv/` references in systemd unit
+  files and shell scripts.
+- **Tautology test replaced** in `news_panel.rs`
+  (`panel.filter_status.is_empty() || !panel.filter_status.is_empty()`
+  became three meaningful assertions about empty items, populated
+  provider, no blackout).
+- **Packaging smoke test gated to `cfg(not(windows))`** — the
+  `bash -n` syntax check failed on Windows Git Bash due to path
+  translation issues; the release pipeline that actually invokes those
+  scripts runs on Ubuntu.
+
+### Diagnostics / observability
+- **0-accounts after OAuth** now shows a four-bullet diagnostic
+  explaining the likely causes (wrong env Demo/Live, Open API not
+  enabled, missing scope, no account exists yet) with a one-click
+  suggestion to switch to the opposite environment.
+- **`cubecl_eval::saturating_i32`** now emits a `tracing::warn!` on
+  actual saturation so the operator can detect kernel-input clamps.
+- **`system_time_string`** no longer panics on a clock set before
+  1970; falls back to `"unix:pre-1970"` and logs a warning.
+- **`discover_timeframes`** rejects non-canonical (e.g. `H2`)
+  timeframe folders that the cTrader API does not support and would
+  silently lie to the UI about availability.
+
+### Architecture
+- New shared module `app_services/trading/background.rs` consolidating
+  the spawn-background-thread + panic-handling pattern previously
+  duplicated across 3 callsites in `session.rs`.
+- `AppState::ai_helper` tab is now reachable from the sidebar — was
+  enumerated but missing from the dock layout.
+- `cTraderCreateDemoAccountUrl`/`CTRADER_CREATE_LIVE_ACCOUNT_URL`
+  extracted to `broker_config.rs` so white-label brokers can patch a
+  single constant.
+
+### Config / docs
+- **`openai_model`** default changed from the dated snapshot
+  `gpt-5-nano-2025-08-07` (which OpenAI deprecates ~3 months after
+  release) to the family `gpt-5-nano` (resolved to current stable).
+- **README** now points to the actual `docs/` layout (audits / plans /
+  qa) instead of three non-existent files referenced from before the
+  V0.4 reorg.
+
+### Tests
+- Binary test count: **548 → 553** (3 new background-task tests + 2
+  new prop-firm regression tests).
+- All binary tests pass; pre-existing `forex-data` failures
+  (`nan_cells_become_zero`, `f32_precision_gate_rejects_high_precision_f64`)
+  are confirmed unrelated and tracked as Task #63 for follow-up.
+
 ## [0.5.0] — 2026-05-19 — "egui Single-GUI Ship + cTrader OAuth + Risky Mode"
 
 > First minor-version bump in two months. Consolidates 9 patch

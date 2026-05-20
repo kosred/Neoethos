@@ -301,5 +301,9 @@ news:
   news_backfill_days: 0  # 0 = full data span
   enable_llm_helper: true
   llm_helper_enabled: true
-  openai_model: "gpt-5-nano-2025-08-07"
+  # Defaults to the model FAMILY rather than a dated snapshot — OpenAI
+  # deprecates dated snapshots ~3 months after release and pinning to one
+  # makes every fresh install break until manually edited (V0.4 audit
+  # Task #59). Pin to a specific date here if you need reproducibility.
+  openai_model: "gpt-5-nano"
   openai_max_tokens: 1000

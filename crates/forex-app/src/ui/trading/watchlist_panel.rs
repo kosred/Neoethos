@@ -1,7 +1,9 @@
 use crate::app_services::trading::TradingSession;
+use crate::app_services::ServiceEvent;
 use crate::app_state::AppState;
 use crate::ui::theme;
 use eframe::egui;
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchlistPanel {
@@ -21,9 +23,14 @@ pub fn build_watchlist_panel(state: &AppState, session: &TradingSession) -> Watc
     }
 }
 
-pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSession) {
+pub fn render(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    session: &mut TradingSession,
+    tx: &mpsc::Sender<ServiceEvent>,
+) {
     let panel = build_watchlist_panel(state, session);
-    let chart_snapshot = session.market_chart_snapshot(state);
+    let chart_snapshot = session.market_chart_snapshot(state, Some(tx));
     let exec_snapshot = session.execution_surface_snapshot(state);
     let is_online = panel.runtime_status != "Offline" && !panel.runtime_status.is_empty();
 

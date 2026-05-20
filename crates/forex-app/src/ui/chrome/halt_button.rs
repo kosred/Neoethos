@@ -254,9 +254,9 @@ mod tests {
             TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
         let mut state = test_state();
         session.trip_manual_halt(&mut state);
-        // execute_buy_market routes through execute_ctrader_order
-        // which now hard-rejects when halted.
-        session.execute_buy_market(&mut state);
+        // execute_buy_order routes through execute_ctrader_order which
+        // hard-rejects when halted, regardless of the ticket's order type.
+        session.execute_buy_order(&mut state);
         assert!(state.status_msg.contains("HALT in force"));
     }
 

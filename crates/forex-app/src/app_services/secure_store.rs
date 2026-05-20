@@ -16,8 +16,14 @@ pub trait SecretStoreBackend: Clone {
 pub trait CTraderTokenStore: Send + Sync {
     fn save_token_bundle(&self, bundle: &CTraderTokenBundle) -> Result<()>;
     fn load_token_bundle(&self) -> Result<Option<CTraderTokenBundle>>;
+    fn load_token_bundle_with_legacy_fallback(&self) -> Result<Option<CTraderTokenBundle>>;
     fn clear_token_bundle(&self) -> Result<()>;
 }
+
+pub const CTRADER_TOKEN_STORE_SERVICE: &str = "forex-ai";
+pub const CTRADER_TOKEN_STORE_USER: &str = "ctrader.default";
+pub const LEGACY_CTRADER_TOKEN_STORE_SERVICE: &str = "forex-ai.test";
+pub const LEGACY_CTRADER_TOKEN_STORE_USER: &str = "ctrader.account";
 
 #[derive(Clone, Default)]
 pub struct KeyringSecretStoreBackend;
@@ -126,21 +132,30 @@ impl<B: SecretStoreBackend> CTraderSecureStore<B> {
             return Ok(None);
         };
 
-        let value: serde_json::Value =
-            serde_json::from_str(&secret).context("failed to parse stored cTrader token bundle")?;
-        let required_fields = ["access_token", "refresh_token", "token_type", "scope"];
-        if required_fields.iter().any(|field| {
-            value
-                .get(field)
-                .and_then(serde_json::Value::as_str)
-                .map(|value| value.trim().is_empty())
-                .unwrap_or(true)
-        }) {
-            return Err(anyhow!("incomplete cTrader token bundle in secure storage"));
-        }
-        let bundle: CTraderTokenBundle = serde_json::from_value(value)
-            .context("failed to decode stored cTrader token bundle")?;
+        decode_token_bundle(&secret).map(Some)
+    }
 
+    pub fn load_token_bundle_with_legacy_fallback(&self) -> Result<Option<CTraderTokenBundle>> {
+        if let Some(bundle) = self.load_token_bundle()? {
+            return Ok(Some(bundle));
+        }
+        if self.service != CTRADER_TOKEN_STORE_SERVICE || self.user != CTRADER_TOKEN_STORE_USER {
+            return Ok(None);
+        }
+
+        let Some(secret) = self
+            .backend
+            .get_secret(
+                LEGACY_CTRADER_TOKEN_STORE_SERVICE,
+                LEGACY_CTRADER_TOKEN_STORE_USER,
+            )
+            .context("failed to load legacy cTrader token bundle")?
+        else {
+            return Ok(None);
+        };
+        let bundle = decode_token_bundle(&secret)?;
+        self.save_token_bundle(&bundle)
+            .context("failed to migrate legacy cTrader token bundle")?;
         Ok(Some(bundle))
     }
 
@@ -149,6 +164,30 @@ impl<B: SecretStoreBackend> CTraderSecureStore<B> {
             .delete_secret(&self.service, &self.user)
             .context("failed to clear cTrader token bundle")
     }
+}
+
+pub fn production_ctrader_token_store() -> CTraderSecureStore<KeyringSecretStoreBackend> {
+    CTraderSecureStore::new(
+        CTRADER_TOKEN_STORE_SERVICE,
+        CTRADER_TOKEN_STORE_USER,
+        KeyringSecretStoreBackend,
+    )
+}
+
+fn decode_token_bundle(secret: &str) -> Result<CTraderTokenBundle> {
+    let value: serde_json::Value =
+        serde_json::from_str(secret).context("failed to parse stored cTrader token bundle")?;
+    let required_fields = ["access_token", "refresh_token", "token_type", "scope"];
+    if required_fields.iter().any(|field| {
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(|value| value.trim().is_empty())
+            .unwrap_or(true)
+    }) {
+        return Err(anyhow!("incomplete cTrader token bundle in secure storage"));
+    }
+    serde_json::from_value(value).context("failed to decode stored cTrader token bundle")
 }
 
 impl<B> CTraderTokenStore for CTraderSecureStore<B>
@@ -163,6 +202,10 @@ where
         CTraderSecureStore::load_token_bundle(self)
     }
 
+    fn load_token_bundle_with_legacy_fallback(&self) -> Result<Option<CTraderTokenBundle>> {
+        CTraderSecureStore::load_token_bundle_with_legacy_fallback(self)
+    }
+
     fn clear_token_bundle(&self) -> Result<()> {
         CTraderSecureStore::clear_token_bundle(self)
     }
@@ -173,9 +216,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn production_ctrader_token_store_identity_is_not_test_scoped() {
+        assert_eq!(CTRADER_TOKEN_STORE_SERVICE, "forex-ai");
+        assert_eq!(CTRADER_TOKEN_STORE_USER, "ctrader.default");
+        assert!(!CTRADER_TOKEN_STORE_SERVICE.contains(".test"));
+    }
+
+    #[test]
     fn secure_store_round_trip_saves_loads_and_clears_bundle() {
         let backend = MemorySecretStoreBackend::default();
-        let store = CTraderSecureStore::new("forex-ai.test", "ctrader.account", backend.clone());
+        let store = CTraderSecureStore::new(
+            CTRADER_TOKEN_STORE_SERVICE,
+            CTRADER_TOKEN_STORE_USER,
+            backend.clone(),
+        );
         let bundle = CTraderTokenBundle {
             access_token: "access".to_string(),
             refresh_token: "refresh".to_string(),
@@ -195,6 +249,44 @@ mod tests {
         assert_eq!(
             store.load_token_bundle().expect("load should succeed"),
             None
+        );
+    }
+
+    #[test]
+    fn production_store_migrates_legacy_test_scoped_bundle() {
+        let backend = MemorySecretStoreBackend::default();
+        let production_store = CTraderSecureStore::new(
+            CTRADER_TOKEN_STORE_SERVICE,
+            CTRADER_TOKEN_STORE_USER,
+            backend.clone(),
+        );
+        let legacy_store = CTraderSecureStore::new(
+            LEGACY_CTRADER_TOKEN_STORE_SERVICE,
+            LEGACY_CTRADER_TOKEN_STORE_USER,
+            backend,
+        );
+        let bundle = CTraderTokenBundle {
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            token_type: "bearer".to_string(),
+            expires_in: 3600,
+            scope: "trading".to_string(),
+            created_at_unix: 1_774_147_200,
+        };
+
+        legacy_store
+            .save_token_bundle(&bundle)
+            .expect("save legacy bundle should succeed");
+        let restored = production_store
+            .load_token_bundle_with_legacy_fallback()
+            .expect("legacy fallback should load");
+
+        assert_eq!(restored, Some(bundle.clone()));
+        assert_eq!(
+            production_store
+                .load_token_bundle()
+                .expect("production load should succeed"),
+            Some(bundle)
         );
     }
 

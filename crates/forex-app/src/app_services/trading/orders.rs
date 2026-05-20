@@ -2,7 +2,7 @@
 //! path, and order error handling.
 //!
 //! Carved out of `trading/mod.rs` (Batch 5 follow-up). This module owns:
-//! - The public UI entry points (`execute_buy_market`, `execute_sell_market`,
+//! - The public UI entry points (`execute_buy_order`, `execute_sell_order`,
 //!   `cancel_selected_order`, `close_selected_position`).
 //! - The internal pipeline (`execute_ctrader_order`,
 //!   `execute_ctrader_request`, `build_ctrader_execution_runtime_request`,
@@ -29,7 +29,7 @@
 //!   replays of a single logical order keep the same id while distinct
 //!   orders within the same wall-clock second still get unique ids. The
 //!   atomic-counter rationale lives in `client_order.rs`.
-//! - `execute_buy_market` / `execute_sell_market` / `execute_ctrader_order`
+//! - `execute_buy_order` / `execute_sell_order` / `execute_ctrader_order`
 //!   run `prop_firm_pre_trade_check` BEFORE submitting the order. The gate
 //!   itself (and its `pip_position` clamp + symbol-name hard fail) lives
 //!   in `risk_gate.rs`; this module only routes the equity/pip-position
@@ -57,11 +57,25 @@ use super::{
 use std::time::Instant;
 
 impl TradingSession {
-    pub fn execute_buy_market(&mut self, state: &mut AppState) {
+    /// Submit a BUY order for the currently-selected symbol.
+    ///
+    /// The order type (Market / Limit / Stop) comes from
+    /// `state.order_ticket.order_type` — this method does NOT hardcode
+    /// Market. The legacy name `execute_buy_market` was renamed in v0.4 to
+    /// remove that misconception (the inner builder
+    /// `build_ctrader_order_request` has always read `order_type` and the
+    /// corresponding `target_price` correctly).
+    ///
+    /// For Limit / Stop the `target_price` field of the order ticket is
+    /// surfaced as `limit_price` / `stop_price` respectively in the cTrader
+    /// `ProtoOANewOrderReq`.
+    pub fn execute_buy_order(&mut self, state: &mut AppState) {
         self.execute_ctrader_order(state, CTraderTradeSide::Buy, super::OrderSource::Manual);
     }
 
-    pub fn execute_sell_market(&mut self, state: &mut AppState) {
+    /// Submit a SELL order for the currently-selected symbol. See
+    /// [`Self::execute_buy_order`] for the order-type dispatch contract.
+    pub fn execute_sell_order(&mut self, state: &mut AppState) {
         self.execute_ctrader_order(state, CTraderTradeSide::Sell, super::OrderSource::Manual);
     }
 
@@ -414,6 +428,14 @@ impl TradingSession {
                 let pip_position = self
                     .ctrader_symbol_pip_position(&state.selected_pair)
                     .unwrap_or(4);
+                // V0.4 audit Task #1: pass a live mid-market price to the
+                // risk gate so Market orders (which carry no limit/stop
+                // price) still get a per-trade risk-size check. The gate
+                // hard-fails if `stop_loss` is set but neither the order
+                // nor this fallback provides an entry estimate — refusing
+                // to bypass the risk-per-trade ceiling.
+                let market_price_for_entry =
+                    self.ctrader_live_mid_price_for_symbol(order_request.symbol_id);
                 if let Err(err) = prop_firm_pre_trade_check(
                     &state.risk,
                     &order_request,
@@ -422,6 +444,7 @@ impl TradingSession {
                     self.day_start_equity.unwrap_or(account_equity),
                     pip_position,
                     &state.selected_pair,
+                    market_price_for_entry,
                 ) {
                     let message = format!("Prop-firm risk gate blocked: {err}");
                     state.status_msg = message.clone();
@@ -732,10 +755,30 @@ impl TradingSession {
             crate::app_state::OrderType::Stop => CTraderOrderType::Stop,
         };
 
+        // V0.4 audit Task #18: defence-in-depth against malformed
+        // target_price. The UI clamps to `0.0..=1_000_000.0`, but state can
+        // also be mutated programmatically (auto-trade producer, restored
+        // wizard config, etc.). Reject explicitly if a Limit/Stop order
+        // arrives with target_price <= 0 or non-finite — refusing to send a
+        // garbage price to the broker is safer than letting the broker
+        // reject it after the WSS round-trip.
+        let target_price = state.order_ticket.target_price;
+        if matches!(
+            order_type,
+            CTraderOrderType::Limit | CTraderOrderType::Stop
+        ) && (!target_price.is_finite() || target_price <= 0.0)
+        {
+            anyhow::bail!(
+                "Order ticket target_price is not a positive finite price ({target_price}); \
+                 refusing to send a Limit/Stop order to the broker. Pick a real price in the \
+                 execution panel."
+            );
+        }
+
         let (limit_price, stop_price) = match order_type {
             CTraderOrderType::Market => (None, None),
-            CTraderOrderType::Limit => (Some(state.order_ticket.target_price), None),
-            CTraderOrderType::Stop => (None, Some(state.order_ticket.target_price)),
+            CTraderOrderType::Limit => (Some(target_price), None),
+            CTraderOrderType::Stop => (None, Some(target_price)),
             _ => (None, None),
         };
 

@@ -1,6 +1,6 @@
 [package]
 name = "forex-search"
-version = "0.5.0"
+version = "0.4.19"
 edition.workspace = true
 
 [dependencies]

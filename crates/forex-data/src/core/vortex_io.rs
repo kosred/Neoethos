@@ -37,6 +37,50 @@ pub fn vortex_session() -> &'static VortexSession {
 
 pub fn read_vortex_array(path: impl AsRef<Path>) -> Result<ArrayRef> {
     let path = path.as_ref();
+    // V0.4 audit Task #50 — convert in-library panics on corrupt vortex
+    // files into clean `Err` results. The on-disk format has its own
+    // structural validity (mmap framing, encoding headers), but bit-rot
+    // inside a column's raw payload — a flipped exponent in an f64, a
+    // negative i64 length-prefix inside a variable-length string — can
+    // make vortex internals panic instead of returning a structured
+    // error. A panic in the read path would (pre-fix) bring down the
+    // background loader thread; with the V0.4 background helper
+    // (`app_services/trading/background.rs`) it now becomes a
+    // `BackgroundTaskPanic` event, but that still leaves the operator
+    // with a cryptic panic message. Wrap the body in `catch_unwind` so
+    // corrupt data surfaces as `Err("corrupt vortex file ...")` and the
+    // bootstrap pipeline can re-fetch from cTrader instead of refusing
+    // to start.
+    let path_owned = path.to_path_buf();
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read_vortex_array_inner(path)));
+    match result {
+        Ok(Ok(arr)) => Ok(arr),
+        Ok(Err(err)) => Err(err),
+        Err(panic_payload) => {
+            let message = if let Some(s) = panic_payload.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
+                (*s).to_string()
+            } else {
+                "<non-string panic payload>".to_string()
+            };
+            tracing::error!(
+                target: "forex_data::vortex_io",
+                path = %path_owned.display(),
+                panic = %message,
+                "vortex parser panicked on read; treating file as corrupt"
+            );
+            Err(anyhow::anyhow!(
+                "corrupt vortex file {}: parser panicked ({}). Delete or re-fetch.",
+                path_owned.display(),
+                message
+            ))
+        }
+    }
+}
+
+fn read_vortex_array_inner(path: &Path) -> Result<ArrayRef> {
     let file = fs::File::open(path)
         .with_context(|| format!("failed to open vortex file {}", path.display()))?;
     let mmap = unsafe { Mmap::map(&file) }

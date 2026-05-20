@@ -13,6 +13,20 @@ use serde::{Deserialize, Serialize};
 /// credentials into a per-broker dictionary).
 pub const BROKER_CREDENTIALS_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
 
+/// Spotware's canonical cTrader demo-account sign-up page.
+///
+/// V0.4 audit Task #26 — promoted from a hardcoded literal inside
+/// `ui/system/brokers.rs` so white-label brokers running the cTrader
+/// platform under their own domain can patch a single constant
+/// instead of editing the UI. (DXtrade has no equivalent — its
+/// adapter uses operator-supplied platform_url + creds.)
+pub const CTRADER_CREATE_DEMO_ACCOUNT_URL: &str = "https://app.ctrader.com/accounts/create-demo";
+
+/// Spotware's canonical cTrader live-account sign-up page. See
+/// [`CTRADER_CREATE_DEMO_ACCOUNT_URL`] for the rationale behind moving
+/// these out of UI code.
+pub const CTRADER_CREATE_LIVE_ACCOUNT_URL: &str = "https://app.ctrader.com/accounts/create-live";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrokerSessionState {
     Disconnected,

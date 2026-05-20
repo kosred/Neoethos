@@ -89,8 +89,30 @@ pub fn discover_timeframes(root: impl AsRef<Path>, symbol: &str) -> Result<Vec<S
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with("timeframe=") {
-            tfs.insert(name.replace("timeframe=", "").to_uppercase());
+        if let Some(raw) = name.strip_prefix("timeframe=") {
+            let tf = raw.to_uppercase();
+            // V0.4 audit Task #51 — gate against non-canonical timeframes
+            // and path-traversal segments. Pre-fix, a stray
+            // `timeframe=H2/` folder (cTrader has no H2 — see
+            // `ctrader_api_reference.md` §4) was reported to the UI as
+            // available, and a hostile/buggy `timeframe=../etc/passwd`
+            // would have been accepted at this layer. We now compare
+            // against `forex_core::CANONICAL_TIMEFRAMES`, which is the
+            // single source of truth used by every other consumer (chart
+            // panel, bootstrap, training).
+            if forex_core::CANONICAL_TIMEFRAMES
+                .iter()
+                .any(|canonical| canonical.eq_ignore_ascii_case(&tf))
+            {
+                tfs.insert(tf);
+            } else {
+                tracing::warn!(
+                    target: "forex_data::discover_timeframes",
+                    symbol = symbol,
+                    timeframe = %tf,
+                    "ignoring non-canonical timeframe folder; not in CANONICAL_TIMEFRAMES"
+                );
+            }
         }
     }
     let mut out: Vec<String> = tfs.into_iter().collect();
@@ -182,10 +204,31 @@ pub fn load_vortex(path: impl AsRef<Path>) -> Result<Ohlcv> {
 }
 
 pub fn normalize_ohlcv(ohlcv: &Ohlcv) -> Result<Ohlcv> {
-    let timestamps = ohlcv
+    let raw_timestamps = ohlcv
         .timestamp
         .as_ref()
         .context("OHLCV dataset has no timestamps")?;
+    // V0.4 audit Task #39 — write-path timestamp unit normalisation.
+    //
+    // The READ path (`vortex_array_to_ohlcv`) calls
+    // `normalize_timestamps_to_inferred_millis` to detect ns/μs/ms/s by
+    // magnitude and convert to milliseconds. Until v0.4 the WRITE path
+    // did NOT do this, so a caller passing nanoseconds (e.g. the
+    // `BootstrapVortexWriter`, which writes `NormalizedBar.timestamp_ns`
+    // directly) produced files that READ back as milliseconds — losing
+    // the original unit and breaking every consumer that expected the
+    // round-trip to be identity. Symmetric normalisation closes that
+    // hole: ns / μs / s inputs are folded to ms here too, so the
+    // canonical on-disk unit is always milliseconds. (See
+    // `crates/forex-app/src/app_services/ctrader_bootstrap.rs` for the
+    // coverage code that depends on this contract.)
+    let normalized_ts = if raw_timestamps.is_empty() {
+        raw_timestamps.clone()
+    } else {
+        crate::core::timestamps::normalize_timestamps_to_inferred_millis(raw_timestamps)
+            .context("normalize OHLCV timestamps to milliseconds on write")?
+    };
+    let timestamps = &normalized_ts;
     let volume = ohlcv.volume.as_ref();
     let expected_len = timestamps.len();
 
@@ -571,6 +614,11 @@ mod tests {
 
     #[test]
     fn normalize_ohlcv_sorts_deduplicates_and_validates_rows() -> Result<()> {
+        // V0.4 audit Task #39: `normalize_ohlcv` now folds timestamps to the
+        // canonical milliseconds unit at the write boundary (mirrors the
+        // read-side `vortex_array_to_ohlcv` call). Tiny integers like
+        // `[3, 1, 1, 2]` are inferred as Seconds by magnitude and multiplied
+        // by 1000 → `[1000, 2000, 3000]` ms after sort+dedup.
         let normalized = normalize_ohlcv(&Ohlcv {
             timestamp: Some(vec![3, 1, 1, 2]),
             open: vec![1.3, 1.1, 9.9, 1.2],
@@ -580,7 +628,7 @@ mod tests {
             volume: Some(vec![2.0, 1.0, 9.9, 1.5]),
         })?;
 
-        assert_eq!(normalized.timestamp, Some(vec![1, 2, 3]));
+        assert_eq!(normalized.timestamp, Some(vec![1000, 2000, 3000]));
         assert_eq!(normalized.open, vec![1.1, 1.2, 1.3]);
         assert_eq!(normalized.volume, Some(vec![1.0, 1.5, 2.0]));
         Ok(())

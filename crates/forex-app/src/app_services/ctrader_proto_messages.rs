@@ -119,12 +119,33 @@ pub const CTRADER_PROTOBUF_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// Prepend the 4-byte big-endian length prefix to a serialised
 /// `ProtoMessage` envelope. Output is suitable for direct write to the
 /// raw-TCP socket.
-pub fn frame_with_length_prefix(serialized_proto_message: &[u8]) -> Vec<u8> {
-    let len = serialized_proto_message.len() as u32;
-    let mut out = Vec::with_capacity(4 + serialized_proto_message.len());
+///
+/// V0.4 audit Task #36 — defence-in-depth bounds check on the WRITE
+/// side. The length prefix is u32, so any payload ≥ 4 GiB would
+/// silently truncate via `len as u32` and the broker would receive a
+/// length that does not match the actual payload, corrupting the
+/// session stream. Our outgoing messages are tiny (auth ~200 B, orders
+/// ~300 B, requests ~50–500 B), but we still verify against
+/// [`CTRADER_PROTOBUF_MAX_FRAME_BYTES`] to surface a real error rather
+/// than a silent overflow if a future caller accidentally constructs a
+/// pathological message.
+pub fn frame_with_length_prefix(serialized_proto_message: &[u8]) -> Result<Vec<u8>> {
+    let raw_len = serialized_proto_message.len();
+    if raw_len > CTRADER_PROTOBUF_MAX_FRAME_BYTES {
+        return Err(anyhow!(
+            "cTrader Protobuf outbound frame payload {} bytes exceeds bound {}; \
+             refusing to send a length-prefix that would either truncate to u32 \
+             or be rejected by the broker",
+            raw_len,
+            CTRADER_PROTOBUF_MAX_FRAME_BYTES
+        ));
+    }
+    // Safe: bounded above by 16 MB, well under u32::MAX (~4 GB).
+    let len = raw_len as u32;
+    let mut out = Vec::with_capacity(4 + raw_len);
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(serialized_proto_message);
-    out
+    Ok(out)
 }
 
 /// Read one length-prefixed `ProtoMessage` envelope from a synchronous
@@ -185,7 +206,7 @@ pub fn build_reconcile_req_proto(
         &req,
         client_msg_id,
     )?;
-    Ok(frame_with_length_prefix(&serialized))
+    frame_with_length_prefix(&serialized)
 }
 
 /// Build a framed `ProtoOAGetTrendbarsReq` (payload type 2137) ready for
@@ -225,7 +246,7 @@ pub fn build_get_trendbars_req_proto(
         &req,
         client_msg_id,
     )?;
-    Ok(frame_with_length_prefix(&serialized))
+    frame_with_length_prefix(&serialized)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

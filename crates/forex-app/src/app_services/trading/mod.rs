@@ -64,8 +64,13 @@ pub(super) use crate::app_services::pnl::{
     PnLDriftCircuitBreaker, evaluate_pnl_drift_circuit_breaker,
     fetch_unrealized_pnl_for_all_positions,
 };
+#[cfg(test)]
 pub(super) use crate::app_services::secure_store::{
-    CTraderSecureStore, CTraderTokenStore, KeyringSecretStoreBackend,
+    CTRADER_TOKEN_STORE_SERVICE, CTRADER_TOKEN_STORE_USER, CTraderSecureStore,
+    KeyringSecretStoreBackend, LEGACY_CTRADER_TOKEN_STORE_SERVICE, LEGACY_CTRADER_TOKEN_STORE_USER,
+};
+pub(super) use crate::app_services::secure_store::{
+    CTraderTokenStore, production_ctrader_token_store,
 };
 pub(super) use crate::app_state::{AppState, DataSource, OrderTicketState};
 pub(super) use anyhow::Context;
@@ -74,12 +79,14 @@ pub(super) use forex_core::sectioned_log::SubsystemSection;
 pub(super) use forex_data::{Ohlcv, discover_timeframes, load_symbol_timeframe};
 pub(super) use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 pub(super) use tracing::error;
 
 pub mod auto_trade;
 pub mod auto_trade_producer;
+mod background;
 mod client_order;
 mod diagnostics;
 pub mod ensemble_predictor_adapter;
@@ -153,6 +160,36 @@ impl TradingAdapterKind {
     pub fn supports_live_orders(self) -> bool {
         true
     }
+
+    /// True if the broker adapter implements `Cancel Pending Order` /
+    /// `Close Open Position` round-trips. V0.4 audit Task #19 — the UI
+    /// used to do `snapshot.adapter_name == "cTrader"` for these
+    /// buttons, which permanently locked DXtrade (or any future
+    /// adapter) out even if its execution backend handled the
+    /// operations. Capability flags are the right abstraction.
+    ///
+    /// Today only cTrader has the wired backends (`CancelOrder` /
+    /// `ClosePosition` via the cTrader Open API); DXtrade's draft
+    /// backend does not yet implement them. Flip the DXtrade arm to
+    /// `true` once `dxtrade.rs::cancel_order`/`close_position` ship.
+    pub fn supports_order_cancellation(self) -> bool {
+        match self {
+            Self::CTrader => true,
+            Self::DxTrade => false,
+        }
+    }
+
+    /// True if the broker adapter implements `Close Open Position`.
+    /// Separated from `supports_order_cancellation` because the two
+    /// capabilities CAN diverge per broker (e.g. an adapter that
+    /// supports cancelling resting orders but only flattens positions
+    /// via a counter-trade rather than a dedicated Close call).
+    pub fn supports_position_close(self) -> bool {
+        match self {
+            Self::CTrader => true,
+            Self::DxTrade => false,
+        }
+    }
 }
 
 pub const SUPPORTED_TRADING_ADAPTERS: [TradingAdapterKind; 2] =
@@ -201,7 +238,7 @@ pub struct ChartOverlay {
 /// "bot decision overlays on chart" (`Vec::new()` → real decisions).
 ///
 /// Producer sites:
-/// - Manual orders set by `execute_buy_market` / `execute_sell_market`
+/// - Manual orders set by `execute_buy_order` / `execute_sell_order`
 ///   (`source = Manual`) so the operator can see their own fills on
 ///   the chart immediately.
 /// - Future auto-trade pipeline (D1) will push `source = Ai` entries
@@ -291,7 +328,7 @@ impl EnsembleLoadSummary {
 /// — it actively blocks manual BUY/SELL while Risky Mode is armed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderSource {
-    /// UI button click (`execute_buy_market` / `execute_sell_market`)
+    /// UI button click (`execute_buy_order` / `execute_sell_order`)
     /// or any human-driven order entry. Rejected by Risky Mode when
     /// [`forex_core::RiskyModeManager::rejects_manual_orders`] is
     /// true (autonomous-only contract signed).
@@ -531,7 +568,26 @@ pub struct TradingSession {
     last_observed_day_id: Option<i64>,
     ctrader_runtime_refreshed_at: Option<Instant>,
     connect_handle: Option<std::thread::JoinHandle<()>>,
+    /// V0.4 audit Task #15 — atomic re-entrancy guard for `start_connect`.
+    /// The previous design relied on `background_task_running(Connect)`,
+    /// which races against the very brief window between
+    /// `std::thread::spawn` and the OS scheduling the worker thread: two
+    /// rapid clicks could both see `is_finished() == false` (because no
+    /// thread had been scheduled yet) and BOTH spawn. The atomic flag
+    /// closes the race — `compare_exchange(false, true)` only succeeds
+    /// for one caller. Reset by the spawn closure's RAII guard.
+    connect_in_flight: Arc<AtomicBool>,
     bootstrap_handle: Option<std::thread::JoinHandle<()>>,
+    /// Background handle for the cTrader chart-data fetch. A live
+    /// connection opens a fresh WSS socket per call, so this is run
+    /// off the render thread to avoid blocking egui.
+    chart_fetch_handle: Option<std::thread::JoinHandle<()>>,
+    /// Completed chart snapshot waiting to be promoted into the regular
+    /// `market_chart_cache`. Set by `apply_chart_data_update` (called
+    /// from `process_messages` when `ServiceEvent::ChartDataUpdated`
+    /// arrives); consumed by the next render-thread call to
+    /// `market_chart_snapshot`.
+    pending_ctrader_chart: Option<MarketChartSnapshot>,
     /// Trading environment for the session — used by the status pill
     /// and HALT button. Defaults to Demo; the wizard / autonomy
     /// controller (§10.3 promotion gates) is responsible for advancing
@@ -742,8 +798,8 @@ impl TradingSession {
             ),
             ctrader_live_streaming_backend: Arc::new(ProductionCTraderLiveStreamingBackend),
             ctrader_token_store: Arc::new(CTraderSecureStore::new(
-                "forex-ai.test",
-                "ctrader.account",
+                LEGACY_CTRADER_TOKEN_STORE_SERVICE,
+                LEGACY_CTRADER_TOKEN_STORE_USER,
                 KeyringSecretStoreBackend,
             )),
             ctrader_live_auth_rx: None,
@@ -759,7 +815,10 @@ impl TradingSession {
             last_observed_day_id: None,
             ctrader_runtime_refreshed_at: None,
             connect_handle: None,
+            connect_in_flight: Arc::new(AtomicBool::new(false)),
             bootstrap_handle: None,
+            chart_fetch_handle: None,
+            pending_ctrader_chart: None,
             trading_environment: TradingEnvironment::Demo,
             halt_state: HaltState::default(),
             risky_mode_manager: None,
@@ -774,8 +833,8 @@ impl TradingSession {
         backend: crate::app_services::secure_store::MemorySecretStoreBackend,
     ) {
         self.ctrader_token_store = Arc::new(CTraderSecureStore::new(
-            "forex-ai.test",
-            "ctrader.account",
+            CTRADER_TOKEN_STORE_SERVICE,
+            CTRADER_TOKEN_STORE_USER,
             backend,
         ));
     }
@@ -1070,8 +1129,8 @@ impl TradingSession {
     /// dropped FIFO once the buffer hits
     /// [`BOT_DECISION_BUFFER_CAPACITY`].
     ///
-    /// Called from manual order paths (`execute_buy_market` /
-    /// `execute_sell_market` → `record_decision_for_fill`) and — when D1
+    /// Called from manual order paths (`execute_buy_order` /
+    /// `execute_sell_order` → `record_decision_for_fill`) and — when D1
     /// lands — from the AI auto-trade pipeline. Idempotency: nothing
     /// filters duplicates; multiple consecutive fills at the same price
     /// produce multiple markers, which matches operator expectations.
@@ -1499,8 +1558,8 @@ impl TradingSession {
 
     // Connect / disconnect (`start_connect`, `handle_ctrader_connect_result`,
     // `connect`, `disconnect`) moved to `session.rs` (Batch 6). The new-/
-    // cancel-/close-order entry points (`execute_buy_market`,
-    // `execute_sell_market`, `cancel_selected_order`,
+    // cancel-/close-order entry points (`execute_buy_order`,
+    // `execute_sell_order`, `cancel_selected_order`,
     // `close_selected_position`) moved to `orders.rs`.
 
     // `select_adapter` moved to `session.rs` (Batch 6).
@@ -1525,7 +1584,11 @@ impl TradingSession {
         }
     }
 
-    pub(super) fn active_adapter_kind(&self) -> TradingAdapterKind {
+    /// Currently-active broker adapter kind. V0.4 audit Task #19 promoted
+    /// this from `pub(super)` to `pub` so UI code (`execution_panel`) can
+    /// gate capability-sensitive controls on the actual adapter rather
+    /// than a string-equality check on `adapter_name`.
+    pub fn active_adapter_kind(&self) -> TradingAdapterKind {
         self.adapter
             .as_ref()
             .map(TradingAdapter::kind)
@@ -1681,11 +1744,7 @@ impl Default for TradingSession {
                 ProductionCTraderPositionOrderHistoryBackend,
             ),
             ctrader_live_streaming_backend: Arc::new(ProductionCTraderLiveStreamingBackend),
-            ctrader_token_store: Arc::new(CTraderSecureStore::new(
-                "forex-ai",
-                "ctrader.default",
-                KeyringSecretStoreBackend,
-            )),
+            ctrader_token_store: Arc::new(production_ctrader_token_store()),
             ctrader_live_auth_rx: None,
             adapter: None,
             connected: false,
@@ -1699,7 +1758,10 @@ impl Default for TradingSession {
             last_observed_day_id: None,
             ctrader_runtime_refreshed_at: None,
             connect_handle: None,
+            connect_in_flight: Arc::new(AtomicBool::new(false)),
             bootstrap_handle: None,
+            chart_fetch_handle: None,
+            pending_ctrader_chart: None,
             trading_environment: TradingEnvironment::Demo,
             halt_state: HaltState::default(),
             risky_mode_manager: None,

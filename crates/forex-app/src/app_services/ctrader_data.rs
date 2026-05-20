@@ -574,9 +574,29 @@ pub fn resolve_symbol_with_transport<T: CTraderOpenApiTransport>(
     ])?;
 
     if auth_responses.len() < 3 {
-        if let Some(first) = auth_responses.first() {
-            ensure_success_payload_type(first, CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+        // `send_sequence` early-exits the moment it sees an
+        // `ERROR_RESPONSE` envelope (so the rest of the messages in
+        // the batch never get sent). The partial set we got back
+        // therefore carries the cTrader error code in its last
+        // envelope. Walk the partial set and surface the first
+        // error we find verbatim — otherwise the operator only ever
+        // sees the un-actionable "received N" count and the actual
+        // error code (e.g. `CH_ACCESS_TOKEN_INVALID`,
+        // `ACCOUNT_NOT_AUTHORIZED`) stays trapped in the wire log.
+        for response in &auth_responses {
+            let envelope = parse_open_api_envelope(response)?;
+            if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+                return Err(anyhow!(
+                    "cTrader auth/symbol failed (step {}): {}",
+                    auth_responses.len(),
+                    parse_ctrader_error_payload(&envelope.payload)?
+                ));
+            }
         }
+        // Fall back to the count mismatch if none of the partial
+        // responses was an error envelope (would mean the socket
+        // closed cleanly mid-sequence, which is itself worth
+        // surfacing).
         return Err(anyhow!(
             "expected 3 cTrader auth/symbol responses, received {}",
             auth_responses.len()
@@ -605,19 +625,45 @@ pub fn resolve_symbol_with_transport<T: CTraderOpenApiTransport>(
             )
         })?;
 
-    let detail_responses = transport.send_sequence(&[build_symbol_by_id_request(
-        account_id,
-        &[light_symbol.symbol_id],
-        "symbol-by-id-1",
-    )])?;
-    if detail_responses.len() != 1 {
+    // v0.5.1.1 — `ProductionCTraderOpenApiTransport::send_sequence`
+    // opens a fresh WSS connection on every call. cTrader Open API
+    // requires `ProtoOAApplicationAuthReq` + `ProtoOAAccountAuthReq`
+    // on every connection before any data-bearing request, otherwise
+    // the next request comes back as `ProtoOAErrorRes` (payloadType
+    // 2142). Re-authenticate at the head of this sequence so the
+    // symbol-by-id call lands on an authenticated socket. Same fix
+    // applies to the trendbars sequence in `ctrader_history.rs`.
+    let detail_responses = transport.send_sequence(&[
+        build_application_auth_request(&request.client_id, &request.client_secret, "app-auth-2"),
+        build_account_auth_request(account_id, &request.access_token, "account-auth-2"),
+        build_symbol_by_id_request(account_id, &[light_symbol.symbol_id], "symbol-by-id-1"),
+    ])?;
+    if detail_responses.len() < 3 {
+        for response in &detail_responses {
+            let envelope = parse_open_api_envelope(response)?;
+            if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+                return Err(anyhow!(
+                    "cTrader symbol-by-id sequence failed (step {}): {}",
+                    detail_responses.len(),
+                    parse_ctrader_error_payload(&envelope.payload)?
+                ));
+            }
+        }
         return Err(anyhow!(
-            "expected 1 cTrader symbol-by-id response, received {}",
+            "expected 3 cTrader symbol-by-id auth/data responses, received {}",
             detail_responses.len()
         ));
     }
+    ensure_success_payload_type(
+        &detail_responses[0],
+        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    )?;
+    ensure_success_payload_type(
+        &detail_responses[1],
+        CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
+    )?;
 
-    let mut symbol = parse_symbol_by_id_response(&detail_responses[0])?
+    let mut symbol = parse_symbol_by_id_response(&detail_responses[2])?
         .into_iter()
         .find(|symbol| symbol.symbol_id == light_symbol.symbol_id)
         .ok_or_else(|| {
@@ -967,10 +1013,17 @@ mod tests {
 
     #[test]
     fn chart_history_backend_loads_symbol_metadata_then_historical_bars_and_ticks() {
+        // After symbol resolution the v0.5.1.1 fix re-auths before fetching
+        // symbol-by-id and trendbars (fresh WSS connection per call), so the
+        // full sequence is 9 messages: initial auth (2) + symbols-list (1) +
+        // re-auth (2) + symbol-by-id (1) + trendbars (1) + ticks×2 (2).
         let transport = StubTransport::with_responses(vec![
             Ok(r#"{"clientMsgId":"app-auth-1","payloadType":2101,"payload":{}}"#.to_string()),
             Ok(r#"{"clientMsgId":"account-auth-1","payloadType":2103,"payload":{"ctidTraderAccountId":712345}}"#.to_string()),
             Ok(r#"{"clientMsgId":"symbols-1","payloadType":2115,"payload":{"ctidTraderAccountId":712345,"symbol":[{"symbolId":14,"symbolName":"EURUSD","enabled":true,"description":"Euro vs Dollar"}]}}"#.to_string()),
+            // Re-auth on the second WSS connection (before symbol-by-id):
+            Ok(r#"{"clientMsgId":"app-auth-2","payloadType":2101,"payload":{}}"#.to_string()),
+            Ok(r#"{"clientMsgId":"account-auth-2","payloadType":2103,"payload":{"ctidTraderAccountId":712345}}"#.to_string()),
             Ok(r#"{"clientMsgId":"symbol-by-id-1","payloadType":2117,"payload":{"symbol":[{"symbolId":14,"digits":5,"pipPosition":4,"tradingMode":"ENABLED"}]}}"#.to_string()),
             Ok(r#"{"clientMsgId":"trendbars-1","payloadType":2138,"payload":{"period":"M5","symbolId":14,"trendbar":[{"volume":9,"low":109950,"deltaOpen":50,"deltaClose":125,"deltaHigh":225,"utcTimestampInMinutes":28500000}],"hasMore":false}}"#.to_string()),
             Ok(r#"{"clientMsgId":"ticks-bid-1","payloadType":2146,"payload":{"symbolId":14,"hasMore":false,"tickData":[{"timestamp":1710000000000,"tick":109990},{"timestamp":200,"tick":109970}]}}"#.to_string()),
@@ -1018,7 +1071,7 @@ mod tests {
             result.live_subscription_plan.unsubscribe_trendbars.payload_type,
             crate::app_services::ctrader_messages::CTRADER_OA_UNSUBSCRIBE_LIVE_TRENDBAR_REQUEST_PAYLOAD_TYPE
         );
-        assert_eq!(transport.sent_len(), 7);
+        assert_eq!(transport.sent_len(), 9);
     }
 
     #[test]
@@ -1054,10 +1107,17 @@ mod tests {
 
     #[test]
     fn bars_only_backend_loads_symbol_metadata_then_trendbars_without_ticks() {
+        // After symbol resolution the v0.5.1.1 fix re-auths before fetching
+        // symbol-by-id and trendbars (fresh WSS connection per call), so the
+        // full sequence is 7 messages: initial auth (2) + symbols-list (1) +
+        // re-auth (2) + symbol-by-id (1) + trendbars (1).
         let transport = StubTransport::with_responses(vec![
             Ok(r#"{"clientMsgId":"app-auth-1","payloadType":2101,"payload":{}}"#.to_string()),
             Ok(r#"{"clientMsgId":"account-auth-1","payloadType":2103,"payload":{"ctidTraderAccountId":712345}}"#.to_string()),
             Ok(r#"{"clientMsgId":"symbols-1","payloadType":2115,"payload":{"ctidTraderAccountId":712345,"symbol":[{"symbolId":14,"symbolName":"EURUSD","enabled":true,"description":"Euro vs Dollar"}]}}"#.to_string()),
+            // Re-auth on the second WSS connection (before symbol-by-id):
+            Ok(r#"{"clientMsgId":"app-auth-2","payloadType":2101,"payload":{}}"#.to_string()),
+            Ok(r#"{"clientMsgId":"account-auth-2","payloadType":2103,"payload":{"ctidTraderAccountId":712345}}"#.to_string()),
             Ok(r#"{"clientMsgId":"symbol-by-id-1","payloadType":2117,"payload":{"symbol":[{"symbolId":14,"digits":5,"pipPosition":4,"tradingMode":"ENABLED"}]}}"#.to_string()),
             Ok(r#"{"clientMsgId":"trendbars-1","payloadType":2138,"payload":{"period":"M15","symbolId":14,"trendbar":[{"volume":9,"low":109950,"deltaOpen":50,"deltaClose":125,"deltaHigh":225,"utcTimestampInMinutes":28500000}],"hasMore":false}}"#.to_string()),
         ]);
@@ -1083,6 +1143,6 @@ mod tests {
         assert_eq!(result.bars.len(), 1);
         assert_eq!(result.bars[0].close, 1.10075);
         assert!(!result.has_more);
-        assert_eq!(transport.sent_len(), 5);
+        assert_eq!(transport.sent_len(), 7);
     }
 }

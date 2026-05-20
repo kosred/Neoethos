@@ -1,0 +1,2342 @@
+[
+  {
+    "index": 0,
+    "name": "Forex AI",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      274,
+      97,
+      57,
+      18
+    ]
+  },
+  {
+    "index": 1,
+    "name": "PRO",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      356,
+      99,
+      21,
+      13
+    ]
+  },
+  {
+    "index": 2,
+    "name": "SYMBOL",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      435,
+      92,
+      41,
+      13
+    ]
+  },
+  {
+    "index": 3,
+    "name": "EURUSD",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      435,
+      106,
+      49,
+      15
+    ]
+  },
+  {
+    "index": 4,
+    "name": "TIMEFRAME",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      508,
+      92,
+      58,
+      13
+    ]
+  },
+  {
+    "index": 5,
+    "name": "M1",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      508,
+      106,
+      19,
+      15
+    ]
+  },
+  {
+    "index": 6,
+    "name": "SOURCE",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      591,
+      92,
+      40,
+      13
+    ]
+  },
+  {
+    "index": 7,
+    "name": "cTrader",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      591,
+      106,
+      45,
+      15
+    ]
+  },
+  {
+    "index": 8,
+    "name": "EQUITY",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      660,
+      92,
+      36,
+      13
+    ]
+  },
+  {
+    "index": 9,
+    "name": "$0.00",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      660,
+      106,
+      34,
+      15
+    ]
+  },
+  {
+    "index": 10,
+    "name": "HALT",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      1376,
+      92,
+      64,
+      32
+    ]
+  },
+  {
+    "index": 11,
+    "name": "⚙",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      1322,
+      92,
+      38,
+      32
+    ]
+  },
+  {
+    "index": 12,
+    "name": "DEMO · 47297953",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1210,
+      101,
+      86,
+      13
+    ]
+  },
+  {
+    "index": 13,
+    "name": "AUTO OFF",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      1112,
+      92,
+      73,
+      32
+    ]
+  },
+  {
+    "index": 14,
+    "name": "12 cores  •  GPU on",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1010,
+      101,
+      86,
+      13
+    ]
+  },
+  {
+    "index": 15,
+    "name": "Connect failed: cTrader con...",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      795,
+      100,
+      171,
+      15
+    ]
+  },
+  {
+    "index": 16,
+    "name": "Offline",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      293,
+      873,
+      33,
+      13
+    ]
+  },
+  {
+    "index": 17,
+    "name": "No engines running",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      359,
+      873,
+      93,
+      13
+    ]
+  },
+  {
+    "index": 18,
+    "name": "v0.5.1",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      486,
+      873,
+      29,
+      13
+    ]
+  },
+  {
+    "index": 19,
+    "name": "16:22:26 UTC",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1376,
+      873,
+      63,
+      13
+    ]
+  },
+  {
+    "index": 20,
+    "name": "Connect failed: cTrader con...",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1205,
+      873,
+      137,
+      13
+    ]
+  },
+  {
+    "index": 21,
+    "name": "T R A D I N G",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      266,
+      150,
+      45,
+      11
+    ]
+  },
+  {
+    "index": 22,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      266,
+      178,
+      202,
+      28
+    ]
+  },
+  {
+    "index": 23,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      266,
+      210,
+      202,
+      28
+    ]
+  },
+  {
+    "index": 24,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      266,
+      242,
+      202,
+      28
+    ]
+  },
+  {
+    "index": 25,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      266,
+      274,
+      202,
+      28
+    ]
+  },
+  {
+    "index": 26,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      266,
+      306,
+      202,
+      28
+    ]
+  },
+  {
+    "index": 27,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      266,
+      338,
+      202,
+      28
+    ]
+  },
+  {
+    "index": 28,
+    "name": "A I   E N G I N E",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      266,
+      390,
+      50,
+      11
+    ]
+  },
+  {
+    "index": 29,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      266,
+      418,
+      202,
+      28
+    ]
+  },
+  {
+    "index": 30,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      266,
+      450,
+      202,
+      28
+    ]
+  },
+  {
+    "index": 31,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      266,
+      482,
+      202,
+      28
+    ]
+  },
+  {
+    "index": 32,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      266,
+      514,
+      202,
+      28
+    ]
+  },
+  {
+    "index": 33,
+    "name": "S Y S T E M",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      266,
+      566,
+      39,
+      11
+    ]
+  },
+  {
+    "index": 34,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      266,
+      594,
+      202,
+      28
+    ]
+  },
+  {
+    "index": 35,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      266,
+      626,
+      202,
+      28
+    ]
+  },
+  {
+    "index": 36,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      266,
+      658,
+      202,
+      28
+    ]
+  },
+  {
+    "index": 37,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      266,
+      690,
+      202,
+      28
+    ]
+  },
+  {
+    "index": 38,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      266,
+      722,
+      202,
+      28
+    ]
+  },
+  {
+    "index": 39,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      266,
+      754,
+      202,
+      28
+    ]
+  },
+  {
+    "index": 40,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      472,
+      133,
+      10,
+      728
+    ]
+  },
+  {
+    "index": 41,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      485,
+      141,
+      64,
+      22
+    ]
+  },
+  {
+    "index": 42,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      550,
+      141,
+      81,
+      22
+    ]
+  },
+  {
+    "index": 43,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      485,
+      163,
+      149,
+      689
+    ]
+  },
+  {
+    "index": 44,
+    "name": "Markets",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      493,
+      180,
+      48,
+      15
+    ]
+  },
+  {
+    "index": 45,
+    "name": "OFFLINE",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      576,
+      181,
+      41,
+      13
+    ]
+  },
+  {
+    "index": 46,
+    "name": "cTrader",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      493,
+      207,
+      36,
+      13
+    ]
+  },
+  {
+    "index": 47,
+    "name": "SYMBOL",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      493,
+      239,
+      37,
+      11
+    ]
+  },
+  {
+    "index": 48,
+    "name": "BID",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      541,
+      239,
+      14,
+      11
+    ]
+  },
+  {
+    "index": 49,
+    "name": "ASK",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      589,
+      239,
+      16,
+      11
+    ]
+  },
+  {
+    "index": 50,
+    "name": "CHG",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      637,
+      239,
+      19,
+      11
+    ]
+  },
+  {
+    "index": 51,
+    "name": "AI Signal - EURUSD",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      506,
+      287,
+      88,
+      13
+    ]
+  },
+  {
+    "index": 52,
+    "name": "No model signal active",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      506,
+      308,
+      105,
+      13
+    ]
+  },
+  {
+    "index": 53,
+    "name": "Exposure",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      506,
+      357,
+      43,
+      13
+    ]
+  },
+  {
+    "index": 54,
+    "name": "No open positions or orders",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      506,
+      378,
+      130,
+      13
+    ]
+  },
+  {
+    "index": 55,
+    "name": "Automation Tape",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      506,
+      427,
+      80,
+      13
+    ]
+  },
+  {
+    "index": 56,
+    "name": "No bot decisions yet",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      506,
+      448,
+      96,
+      13
+    ]
+  },
+  {
+    "index": 57,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      485,
+      850,
+      149,
+      2
+    ]
+  },
+  {
+    "index": 58,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      636,
+      141,
+      60,
+      22
+    ]
+  },
+  {
+    "index": 59,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      636,
+      163,
+      377,
+      133
+    ]
+  },
+  {
+    "index": 60,
+    "name": "EURUSD",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      644,
+      179,
+      54,
+      16
+    ]
+  },
+  {
+    "index": 61,
+    "name": "No data — connect or load local",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      704,
+      181,
+      146,
+      13
+    ]
+  },
+  {
+    "index": 62,
+    "name": "M1",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      644,
+      218,
+      32,
+      32
+    ]
+  },
+  {
+    "index": 63,
+    "name": "M3",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      678,
+      222,
+      32,
+      32
+    ]
+  },
+  {
+    "index": 64,
+    "name": "M5",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      712,
+      223,
+      32,
+      32
+    ]
+  },
+  {
+    "index": 65,
+    "name": "M15",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      746,
+      224,
+      35,
+      32
+    ]
+  },
+  {
+    "index": 66,
+    "name": "M30",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      783,
+      225,
+      35,
+      32
+    ]
+  },
+  {
+    "index": 67,
+    "name": "H1",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      820,
+      225,
+      32,
+      32
+    ]
+  },
+  {
+    "index": 68,
+    "name": "H4",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      854,
+      225,
+      32,
+      32
+    ]
+  },
+  {
+    "index": 69,
+    "name": "H12",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      888,
+      225,
+      33,
+      32
+    ]
+  },
+  {
+    "index": 70,
+    "name": "D1",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      923,
+      225,
+      32,
+      32
+    ]
+  },
+  {
+    "index": 71,
+    "name": "W1",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      957,
+      225,
+      32,
+      32
+    ]
+  },
+  {
+    "index": 72,
+    "name": "MN1",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      991,
+      225,
+      37,
+      32
+    ]
+  },
+  {
+    "index": 73,
+    "name": "No cTrader market data loaded for EURUSD M1",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      811,
+      228,
+      219,
+      13
+    ]
+  },
+  {
+    "index": 74,
+    "name": "cTrader chart history is unavailable for EURUSD M1: cTrader chart history requires a stored token bundle",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      644,
+      467,
+      384,
+      26
+    ]
+  },
+  {
+    "index": 75,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      636,
+      295,
+      377,
+      2
+    ]
+  },
+  {
+    "index": 76,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      1011,
+      163,
+      2,
+      133
+    ]
+  },
+  {
+    "index": 77,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      636,
+      298,
+      90,
+      22
+    ]
+  },
+  {
+    "index": 78,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      726,
+      298,
+      72,
+      22
+    ]
+  },
+  {
+    "index": 79,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      798,
+      298,
+      64,
+      22
+    ]
+  },
+  {
+    "index": 80,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      636,
+      320,
+      377,
+      532
+    ]
+  },
+  {
+    "index": 81,
+    "name": "Strategy Discovery Engine",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      644,
+      214,
+      224,
+      23
+    ]
+  },
+  {
+    "index": 82,
+    "name": "Search, rank, and assemble tradable strategy portfolios from the active symbol universe.",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      644,
+      241,
+      331,
+      30
+    ]
+  },
+  {
+    "index": 83,
+    "name": "Target Pair:",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      644,
+      294,
+      68,
+      15
+    ]
+  },
+  {
+    "index": 84,
+    "name": "",
+    "type": "ComboBox",
+    "enabled": true,
+    "rect": [
+      720,
+      285,
+      100,
+      32
+    ]
+  },
+  {
+    "index": 85,
+    "name": "",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  {
+    "index": 86,
+    "name": "🚀 Discovery Parameters",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      644,
+      321,
+      171,
+      32
+    ]
+  },
+  {
+    "index": 87,
+    "name": "Base Timeframe:",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      660,
+      366,
+      99,
+      15
+    ]
+  },
+  {
+    "index": 88,
+    "name": "",
+    "type": "Edit",
+    "enabled": true,
+    "rect": [
+      767,
+      364,
+      237,
+      19
+    ]
+  },
+  {
+    "index": 89,
+    "name": "Higher Timeframes (CSV):",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      660,
+      402,
+      151,
+      15
+    ]
+  },
+  {
+    "index": 90,
+    "name": "",
+    "type": "Edit",
+    "enabled": true,
+    "rect": [
+      819,
+      400,
+      185,
+      19
+    ]
+  },
+  {
+    "index": 91,
+    "name": "Max Indicators",
+    "type": "Slider",
+    "enabled": true,
+    "rect": [
+      660,
+      429,
+      100,
+      32
+    ]
+  },
+  {
+    "index": 92,
+    "name": "Max Indicators",
+    "type": "Spinner",
+    "enabled": true,
+    "rect": [
+      768,
+      429,
+      40,
+      32
+    ]
+  },
+  {
+    "index": 93,
+    "name": "Max Indicators",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      816,
+      438,
+      87,
+      15
+    ]
+  },
+  {
+    "index": 94,
+    "name": "Population",
+    "type": "Slider",
+    "enabled": true,
+    "rect": [
+      660,
+      465,
+      100,
+      32
+    ]
+  },
+  {
+    "index": 95,
+    "name": "Population",
+    "type": "Spinner",
+    "enabled": true,
+    "rect": [
+      768,
+      465,
+      47,
+      32
+    ]
+  },
+  {
+    "index": 96,
+    "name": "Population",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      823,
+      474,
+      65,
+      15
+    ]
+  },
+  {
+    "index": 97,
+    "name": "Generations",
+    "type": "Slider",
+    "enabled": true,
+    "rect": [
+      660,
+      501,
+      100,
+      32
+    ]
+  },
+  {
+    "index": 98,
+    "name": "Generations",
+    "type": "Spinner",
+    "enabled": true,
+    "rect": [
+      768,
+      501,
+      40,
+      32
+    ]
+  },
+  {
+    "index": 99,
+    "name": "Generations",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      816,
+      510,
+      72,
+      15
+    ]
+  },
+  {
+    "index": 100,
+    "name": "Target Candidates",
+    "type": "Slider",
+    "enabled": true,
+    "rect": [
+      660,
+      537,
+      100,
+      32
+    ]
+  },
+  {
+    "index": 101,
+    "name": "Target Candidates",
+    "type": "Spinner",
+    "enabled": true,
+    "rect": [
+      768,
+      537,
+      55,
+      32
+    ]
+  },
+  {
+    "index": 102,
+    "name": "Target Candidates",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      831,
+      546,
+      108,
+      15
+    ]
+  },
+  {
+    "index": 103,
+    "name": "Portfolio Size",
+    "type": "Slider",
+    "enabled": true,
+    "rect": [
+      660,
+      573,
+      100,
+      32
+    ]
+  },
+  {
+    "index": 104,
+    "name": "Portfolio Size",
+    "type": "Spinner",
+    "enabled": true,
+    "rect": [
+      768,
+      573,
+      40,
+      32
+    ]
+  },
+  {
+    "index": 105,
+    "name": "Portfolio Size",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      816,
+      582,
+      79,
+      15
+    ]
+  },
+  {
+    "index": 106,
+    "name": "Correlation Threshold",
+    "type": "Slider",
+    "enabled": true,
+    "rect": [
+      660,
+      609,
+      100,
+      32
+    ]
+  },
+  {
+    "index": 107,
+    "name": "Correlation Threshold",
+    "type": "Spinner",
+    "enabled": true,
+    "rect": [
+      768,
+      609,
+      50,
+      32
+    ]
+  },
+  {
+    "index": 108,
+    "name": "Correlation Threshold",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      826,
+      618,
+      129,
+      15
+    ]
+  },
+  {
+    "index": 109,
+    "name": "Min Trades/Day",
+    "type": "Slider",
+    "enabled": true,
+    "rect": [
+      660,
+      645,
+      100,
+      32
+    ]
+  },
+  {
+    "index": 110,
+    "name": "Min Trades/Day",
+    "type": "Spinner",
+    "enabled": true,
+    "rect": [
+      768,
+      645,
+      42,
+      32
+    ]
+  },
+  {
+    "index": 111,
+    "name": "Min Trades/Day",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      818,
+      654,
+      93,
+      15
+    ]
+  },
+  {
+    "index": 112,
+    "name": "Discovery: Failed",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      661,
+      698,
+      96,
+      15
+    ]
+  },
+  {
+    "index": 113,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      644,
+      734,
+      406,
+      64
+    ]
+  },
+  {
+    "index": 114,
+    "name": "Discovery Overview",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      644,
+      471,
+      113,
+      15
+    ]
+  },
+  {
+    "index": 115,
+    "name": "State",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      661,
+      507,
+      24,
+      68
+    ]
+  },
+  {
+    "index": 116,
+    "name": "Failed",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      693,
+      507,
+      34,
+      68
+    ]
+  },
+  {
+    "index": 117,
+    "name": "Stage",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      868,
+      507,
+      26,
+      68
+    ]
+  },
+  {
+    "index": 118,
+    "name": "preparing_features",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      902,
+      507,
+      115,
+      68
+    ]
+  },
+  {
+    "index": 119,
+    "name": "Detailed Report & Events",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      644,
+      596,
+      174,
+      32
+    ]
+  },
+  {
+    "index": 120,
+    "name": "preparing_features",
+    "type": "ProgressBar",
+    "enabled": true,
+    "rect": [
+      660,
+      632,
+      390,
+      32
+    ]
+  },
+  {
+    "index": 121,
+    "name": "preparing multi-timeframe features for EURUSD",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      660,
+      668,
+      286,
+      15
+    ]
+  },
+  {
+    "index": 122,
+    "name": "Summary",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      660,
+      697,
+      57,
+      15
+    ]
+  },
+  {
+    "index": 123,
+    "name": "base timeframe M1 not found",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      660,
+      716,
+      180,
+      15
+    ]
+  },
+  {
+    "index": 124,
+    "name": "Live Events",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      660,
+      745,
+      64,
+      15
+    ]
+  },
+  {
+    "index": 125,
+    "name": "• discovery failed: base timeframe M1 not found",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      660,
+      764,
+      285,
+      15
+    ]
+  },
+  {
+    "index": 126,
+    "name": "• loaded 0 timeframe frame(s) for EURUSD",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      660,
+      783,
+      252,
+      15
+    ]
+  },
+  {
+    "index": 127,
+    "name": "• planned discovery for EURUSD M1 with population=100, generations=20, candidate_count=1000, portfolio_size=4",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      660,
+      802,
+      347,
+      30
+    ]
+  },
+  {
+    "index": 128,
+    "name": "Errors",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      660,
+      846,
+      35,
+      15
+    ]
+  },
+  {
+    "index": 129,
+    "name": "base timeframe M1 not found",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      660,
+      865,
+      180,
+      15
+    ]
+  },
+  {
+    "index": 130,
+    "name": "Log: logs\\forex-ai.log",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      660,
+      894,
+      126,
+      15
+    ]
+  },
+  {
+    "index": 131,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      1011,
+      734,
+      2,
+      64
+    ]
+  },
+  {
+    "index": 132,
+    "name": "🔥 Start Genetic Discovery",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      644,
+      812,
+      176,
+      32
+    ]
+  },
+  {
+    "index": 133,
+    "name": "Open Log",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      828,
+      812,
+      82,
+      32
+    ]
+  },
+  {
+    "index": 134,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      636,
+      850,
+      377,
+      2
+    ]
+  },
+  {
+    "index": 135,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      1011,
+      320,
+      2,
+      532
+    ]
+  },
+  {
+    "index": 136,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      1014,
+      141,
+      89,
+      22
+    ]
+  },
+  {
+    "index": 137,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      1103,
+      141,
+      60,
+      22
+    ]
+  },
+  {
+    "index": 138,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      1022,
+      171,
+      418,
+      317
+    ]
+  },
+  {
+    "index": 139,
+    "name": "Market News & Events",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1022,
+      180,
+      131,
+      15
+    ]
+  },
+  {
+    "index": 140,
+    "name": "CLEAR",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1399,
+      181,
+      31,
+      13
+    ]
+  },
+  {
+    "index": 141,
+    "name": "Filter: SAFE",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1022,
+      217,
+      55,
+      13
+    ]
+  },
+  {
+    "index": 142,
+    "name": "· via openai",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1085,
+      217,
+      51,
+      13
+    ]
+  },
+  {
+    "index": 143,
+    "name": "No news events loaded.\nConnect to broker and enable LLM news filter in Settings.",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1022,
+      263,
+      418,
+      225
+    ]
+  },
+  {
+    "index": 144,
+    "name": "News events are fetched via LLM filter. Configure provider in Settings → Intelligence.",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1022,
+      511,
+      371,
+      11
+    ]
+  },
+  {
+    "index": 145,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      1438,
+      171,
+      2,
+      317
+    ]
+  },
+  {
+    "index": 146,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      1014,
+      498,
+      93,
+      22
+    ]
+  },
+  {
+    "index": 147,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      1107,
+      498,
+      67,
+      22
+    ]
+  },
+  {
+    "index": 148,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      1175,
+      498,
+      84,
+      22
+    ]
+  },
+  {
+    "index": 149,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      1259,
+      498,
+      106,
+      22
+    ]
+  },
+  {
+    "index": 150,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      1366,
+      498,
+      74,
+      22
+    ]
+  },
+  {
+    "index": 151,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      1440,
+      498,
+      91,
+      22
+    ]
+  },
+  {
+    "index": 152,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      1532,
+      498,
+      64,
+      22
+    ]
+  },
+  {
+    "index": 153,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      1014,
+      520,
+      434,
+      332
+    ]
+  },
+  {
+    "index": 154,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      1022,
+      528,
+      1014,
+      316
+    ]
+  },
+  {
+    "index": 155,
+    "name": "Data Bootstrap",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1022,
+      248,
+      132,
+      23
+    ]
+  },
+  {
+    "index": 156,
+    "name": "Prepare local vortex data without mixing broker setup or intelligence controls into the same page.",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1022,
+      275,
+      412,
+      30
+    ]
+  },
+  {
+    "index": 157,
+    "name": "Bootstrap Snapshot",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1022,
+      329,
+      120,
+      15
+    ]
+  },
+  {
+    "index": 158,
+    "name": "Data Root",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1039,
+      365,
+      47,
+      68
+    ]
+  },
+  {
+    "index": 159,
+    "name": "C:\\Users\\konst\\development\\forex-ai\\data\\symbol=EURGBP",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1039,
+      365,
+      359,
+      83
+    ]
+  },
+  {
+    "index": 160,
+    "name": "Pairs",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1440,
+      365,
+      22,
+      83
+    ]
+  },
+  {
+    "index": 161,
+    "name": "EURUSD",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1471,
+      365,
+      49,
+      83
+    ]
+  },
+  {
+    "index": 162,
+    "name": "Timeframes",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1647,
+      365,
+      56,
+      83
+    ]
+  },
+  {
+    "index": 163,
+    "name": "M1,M5,M15,H1",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1712,
+      365,
+      92,
+      83
+    ]
+  },
+  {
+    "index": 164,
+    "name": "Years",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1854,
+      365,
+      25,
+      83
+    ]
+  },
+  {
+    "index": 165,
+    "name": "1",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1888,
+      365,
+      7,
+      83
+    ]
+  },
+  {
+    "index": 166,
+    "name": "Bootstrap: Idle",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1052,
+      509,
+      87,
+      15
+    ]
+  },
+  {
+    "index": 167,
+    "name": "Historical Data Import",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1035,
+      553,
+      130,
+      15
+    ]
+  },
+  {
+    "index": 168,
+    "name": "Fetch missing historical bars into the local vortex cache for research and training.",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1035,
+      572,
+      480,
+      15
+    ]
+  },
+  {
+    "index": 169,
+    "name": "Data Folder",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1035,
+      600,
+      69,
+      15
+    ]
+  },
+  {
+    "index": 170,
+    "name": "",
+    "type": "Edit",
+    "enabled": true,
+    "rect": [
+      1112,
+      598,
+      288,
+      19
+    ]
+  },
+  {
+    "index": 171,
+    "name": "Browse…",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      1408,
+      591,
+      81,
+      32
+    ]
+  },
+  {
+    "index": 172,
+    "name": "Scan",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      1497,
+      591,
+      51,
+      32
+    ]
+  },
+  {
+    "index": 173,
+    "name": "Dataset Discovery",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1048,
+      644,
+      105,
+      15
+    ]
+  },
+  {
+    "index": 174,
+    "name": "Files",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1048,
+      672,
+      25,
+      15
+    ]
+  },
+  {
+    "index": 175,
+    "name": "22  (Vortex: 11, Parquet: 11)",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1134,
+      672,
+      168,
+      15
+    ]
+  },
+  {
+    "index": 176,
+    "name": "Symbols",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1048,
+      708,
+      49,
+      15
+    ]
+  },
+  {
+    "index": 177,
+    "name": "0  ()",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1134,
+      708,
+      22,
+      15
+    ]
+  },
+  {
+    "index": 178,
+    "name": "Timeframes",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1048,
+      744,
+      70,
+      15
+    ]
+  },
+  {
+    "index": 179,
+    "name": "M1, M3, M5, M15, M30, H1, H4, H12, D1, W1, MN1",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1134,
+      744,
+      300,
+      15
+    ]
+  },
+  {
+    "index": 180,
+    "name": "Skipped",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1048,
+      780,
+      47,
+      15
+    ]
+  },
+  {
+    "index": 181,
+    "name": "20  (20 unsupported_timeframe)",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1134,
+      780,
+      198,
+      15
+    ]
+  },
+  {
+    "index": 182,
+    "name": "Pairs",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1035,
+      835,
+      28,
+      15
+    ]
+  },
+  {
+    "index": 183,
+    "name": "",
+    "type": "Edit",
+    "enabled": true,
+    "rect": [
+      1071,
+      833,
+      288,
+      19
+    ]
+  },
+  {
+    "index": 184,
+    "name": "Timeframes",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1035,
+      871,
+      70,
+      15
+    ]
+  },
+  {
+    "index": 185,
+    "name": "",
+    "type": "Edit",
+    "enabled": true,
+    "rect": [
+      1113,
+      869,
+      288,
+      19
+    ]
+  },
+  {
+    "index": 186,
+    "name": "Years",
+    "type": "Text",
+    "enabled": true,
+    "rect": [
+      1035,
+      907,
+      32,
+      15
+    ]
+  },
+  {
+    "index": 187,
+    "name": "",
+    "type": "Spinner",
+    "enabled": true,
+    "rect": [
+      1075,
+      898,
+      40,
+      32
+    ]
+  },
+  {
+    "index": 188,
+    "name": "Start cTrader Bootstrap",
+    "type": "Button",
+    "enabled": true,
+    "rect": [
+      1035,
+      934,
+      163,
+      32
+    ]
+  },
+  {
+    "index": 189,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      1446,
+      528,
+      2,
+      316
+    ]
+  },
+  {
+    "index": 190,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      1014,
+      850,
+      434,
+      2
+    ]
+  },
+  {
+    "index": 191,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      633,
+      141,
+      5,
+      711
+    ]
+  },
+  {
+    "index": 192,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      1010,
+      141,
+      5,
+      711
+    ]
+  },
+  {
+    "index": 193,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      636,
+      295,
+      377,
+      5
+    ]
+  },
+  {
+    "index": 194,
+    "name": "",
+    "type": "Custom",
+    "enabled": true,
+    "rect": [
+      1014,
+      494,
+      434,
+      5
+    ]
+  }
+]

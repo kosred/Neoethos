@@ -295,26 +295,50 @@ pub fn fetch_historical_bars_with_transport<T: CTraderOpenApiTransport>(
         },
     )?;
     let period = trendbar_period_value(&request.timeframe)?;
-    let responses = transport.send_sequence(&[build_get_trendbars_request(
-        resolved.account_id,
-        resolved.light_symbol.symbol_id,
-        period,
-        request.from_timestamp_ms,
-        request.to_timestamp_ms,
-        request.count,
-        "history-bars-1",
-    )])?;
-    if responses.len() != 1 {
+    // v0.5.1.1 — re-authenticate on this fresh WSS connection before
+    // the trendbars request. `send_sequence` opens a brand-new socket
+    // each call so the previous app/account auth from `resolve_symbol`
+    // does not carry over; without re-auth here cTrader returns
+    // `ProtoOAErrorRes` (payloadType 2142) for the trendbars request.
+    let responses = transport.send_sequence(&[
+        build_application_auth_request(&request.client_id, &request.client_secret, "app-auth-3"),
+        build_account_auth_request(resolved.account_id, &request.access_token, "account-auth-3"),
+        build_get_trendbars_request(
+            resolved.account_id,
+            resolved.light_symbol.symbol_id,
+            period,
+            request.from_timestamp_ms,
+            request.to_timestamp_ms,
+            request.count,
+            "history-bars-1",
+        ),
+    ])?;
+    if responses.len() < 3 {
+        for response in &responses {
+            let envelope = parse_open_api_envelope(response)?;
+            if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+                return Err(anyhow!(
+                    "cTrader trendbars sequence failed (step {}): {}",
+                    responses.len(),
+                    parse_ctrader_error_payload(&envelope.payload)?
+                ));
+            }
+        }
         return Err(anyhow!(
-            "expected 1 cTrader trendbars response, received {}",
+            "expected 3 cTrader trendbars auth/data responses, received {}",
             responses.len()
         ));
     }
     ensure_success_payload_type(
         &responses[0],
+        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    )?;
+    ensure_success_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[2],
         CTRADER_OA_GET_TRENDBARS_RESPONSE_PAYLOAD_TYPE,
     )?;
-    let mut bars = parse_trendbars_response(&responses[0], &resolved.symbol)?;
+    let mut bars = parse_trendbars_response(&responses[2], &resolved.symbol)?;
 
     let warnings = clamp_bars_to_window(
         &mut bars.bars,

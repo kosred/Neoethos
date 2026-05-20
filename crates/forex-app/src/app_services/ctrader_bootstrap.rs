@@ -132,7 +132,17 @@ pub fn inspect_local_bar_coverage(
     let step_ns = timeframe_step_ns(timeframe)?;
     let ohlcv = load_symbol_timeframe(data_root, symbol, timeframe)
         .with_context(|| format!("failed to load local coverage dataset {symbol} {timeframe}"))?;
-    let mut timestamps = ohlcv.timestamp.context("local dataset has no timestamps")?;
+    // `vortex_array_to_ohlcv` normalises stored timestamps to milliseconds at
+    // the load boundary (via `normalize_timestamps_to_inferred_millis`). The
+    // bootstrap coverage pipeline works throughout in nanoseconds: step_ns,
+    // is_fx_trading_timestamp, and CoverageSegment fields are all nanosecond
+    // quantities. Multiply back to nanoseconds so the rest of the function is
+    // unit-consistent with the NormalizedBar timestamps written by the writer.
+    let raw_ms = ohlcv.timestamp.context("local dataset has no timestamps")?;
+    let mut timestamps: Vec<i64> = raw_ms
+        .into_iter()
+        .map(|ms| ms.saturating_mul(1_000_000))
+        .collect();
     timestamps.sort_unstable();
     timestamps.dedup();
 
@@ -487,17 +497,25 @@ fn load_existing_normalized_bars(
             .unwrap_or_default()
             .into_iter()
             .enumerate()
-            .map(|(idx, timestamp_ns)| NormalizedBar {
-                timestamp_ns,
-                open: ohlcv.open[idx],
-                high: ohlcv.high[idx],
-                low: ohlcv.low[idx],
-                close: ohlcv.close[idx],
-                volume: ohlcv
-                    .volume
-                    .as_ref()
-                    .and_then(|values| values.get(idx).copied())
-                    .unwrap_or_default(),
+            .map(|(idx, timestamp_ms)| {
+                // `load_symbol_timeframe` normalises timestamps to milliseconds at
+                // the vortex-load boundary (via `normalize_timestamps_to_inferred_millis`).
+                // `NormalizedBar.timestamp_ns` is a nanosecond field; multiply back so
+                // the merge step, `clean_normalized_bars`, and the subsequent
+                // `inspect_local_bar_coverage` call all operate on a consistent unit.
+                let timestamp_ns = timestamp_ms.saturating_mul(1_000_000);
+                NormalizedBar {
+                    timestamp_ns,
+                    open: ohlcv.open[idx],
+                    high: ohlcv.high[idx],
+                    low: ohlcv.low[idx],
+                    close: ohlcv.close[idx],
+                    volume: ohlcv
+                        .volume
+                        .as_ref()
+                        .and_then(|values| values.get(idx).copied())
+                        .unwrap_or_default(),
+                }
             })
             .collect()),
         Err(err) if looks_like_missing_local_dataset(&err) => Ok(Vec::new()),

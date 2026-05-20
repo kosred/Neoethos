@@ -99,8 +99,22 @@ pub fn render(
                 if state.order_ticket.order_type != OrderType::Market {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Price").color(theme::TEXT_MUTED));
+                        // V0.4 audit Task #18: clamp `target_price` to a sane
+                        // range. Pre-fix, the DragValue had no bounds so the
+                        // operator could type a negative number, NaN, or
+                        // infinity via the inline text editor, and that value
+                        // propagated unchecked into `limit_price`/`stop_price`
+                        // on the cTrader wire. egui's `.range(R)` clamps both
+                        // drag AND typed input (rejecting NaN/Inf), so this
+                        // single call closes the hole. The bounds are
+                        // generous on purpose — any FX pair, gold (~3000),
+                        // index, or crypto (~100k) fits. The build-step
+                        // validator below enforces "must be > 0" so the
+                        // default 0.0 cannot reach the broker as a Limit
+                        // order without an explicit price.
                         ui.add(
                             egui::DragValue::new(&mut state.order_ticket.target_price)
+                                .range(0.0..=1_000_000.0)
                                 .speed(0.0001),
                         );
                     });
@@ -237,9 +251,15 @@ pub fn render(
             if !snapshot.position_choices.is_empty() || !snapshot.pending_order_choices.is_empty() {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
+                    // V0.4 audit Task #19 — gate Cancel/Close on the
+                    // adapter's CAPABILITY, not on a string equality check
+                    // against "cTrader". The previous hardcode locked
+                    // DXtrade (and any future adapter) out even when its
+                    // execution backend would have handled the operations.
+                    let adapter_kind = session.active_adapter_kind();
                     let cancel_enabled = session.is_connected()
                         && !snapshot.pending_order_choices.is_empty()
-                        && snapshot.adapter_name == "cTrader";
+                        && adapter_kind.supports_order_cancellation();
                     if ui
                         .add_enabled(cancel_enabled, egui::Button::new("Cancel Order"))
                         .clicked()
@@ -248,7 +268,7 @@ pub fn render(
                     }
                     let close_enabled = session.is_connected()
                         && !snapshot.position_choices.is_empty()
-                        && snapshot.adapter_name == "cTrader";
+                        && adapter_kind.supports_position_close();
                     if ui
                         .add_enabled(close_enabled, egui::Button::new("Close Position"))
                         .clicked()
@@ -402,10 +422,10 @@ fn render_buy_sell(
             .get(1)
             .map(|a| a.enabled)
             .unwrap_or(false);
-        let sell_label = if state.order_ticket.order_type == OrderType::Market {
-            "SELL"
-        } else {
-            "SELL LIMIT"
+        let sell_label = match state.order_ticket.order_type {
+            OrderType::Market => "SELL",
+            OrderType::Limit => "SELL LIMIT",
+            OrderType::Stop => "SELL STOP",
         };
         let sell = ui.add_enabled(
             sell_enabled,
@@ -424,7 +444,7 @@ fn render_buy_sell(
             sell.clone().on_hover_text(reason);
         }
         if sell.clicked() {
-            session.execute_sell_market(state);
+            session.execute_sell_order(state);
         }
 
         let buy_enabled = snapshot
@@ -432,10 +452,10 @@ fn render_buy_sell(
             .first()
             .map(|a| a.enabled)
             .unwrap_or(false);
-        let buy_label = if state.order_ticket.order_type == OrderType::Market {
-            "BUY"
-        } else {
-            "BUY LIMIT"
+        let buy_label = match state.order_ticket.order_type {
+            OrderType::Market => "BUY",
+            OrderType::Limit => "BUY LIMIT",
+            OrderType::Stop => "BUY STOP",
         };
         let buy = ui.add_enabled(
             buy_enabled,
@@ -454,7 +474,7 @@ fn render_buy_sell(
             buy.clone().on_hover_text(reason);
         }
         if buy.clicked() {
-            session.execute_buy_market(state);
+            session.execute_buy_order(state);
         }
     });
 

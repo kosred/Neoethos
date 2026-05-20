@@ -39,7 +39,11 @@ use super::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 impl TradingSession {
-    pub fn market_chart_snapshot(&mut self, state: &AppState) -> MarketChartSnapshot {
+    pub fn market_chart_snapshot(
+        &mut self,
+        state: &AppState,
+        tx: Option<&tokio::sync::mpsc::Sender<super::ServiceEvent>>,
+    ) -> MarketChartSnapshot {
         let adapter_kind = self.active_adapter_kind();
         let available_timeframes = if matches!(state.data_source, DataSource::Local) {
             discover_timeframes(&state.runtime.data_dir, &state.selected_pair).unwrap_or_default()
@@ -86,13 +90,53 @@ impl TradingSession {
             available_timeframes.clone()
         };
         let snapshot = match (state.data_source, adapter_kind) {
-            (DataSource::CTrader, TradingAdapterKind::CTrader) => self
-                .load_ctrader_market_chart_snapshot(
+            (DataSource::CTrader, TradingAdapterKind::CTrader) => {
+                // Promote any completed background fetch that is waiting.
+                if let Some(pending) = self.pending_ctrader_chart.take() {
+                    if pending.symbol == state.selected_pair && pending.timeframe == timeframe {
+                        self.market_chart_cache = Some(CachedMarketSnapshot {
+                            key: cache_key,
+                            refreshed_at: Instant::now(),
+                            snapshot: pending.clone(),
+                        });
+                        return pending;
+                    }
+                    // Symbol/timeframe changed while the fetch was in flight —
+                    // discard the stale result; a fresh fetch will be started below.
+                }
+
+                // Kick off a background fetch if one is not already running and
+                // a sender is available. Return the stale cache (or a placeholder)
+                // immediately so the render thread is never blocked on I/O.
+                if let Some(tx) = tx {
+                    self.start_ctrader_chart_fetch(
+                        &state.selected_pair,
+                        &timeframe,
+                        resolved_timeframes.clone(),
+                        overlay_status.clone(),
+                        tx.clone(),
+                    );
+                }
+                // Return whatever the cache holds right now (may be stale /
+                // empty). When the background thread finishes it sends
+                // ServiceEvent::ChartDataUpdated, which updates the cache and
+                // triggers an egui repaint.
+                if let Some(cache) = &self.market_chart_cache {
+                    return cache.snapshot.clone();
+                }
+                MarketChartSnapshot::empty_for(
                     &state.selected_pair,
                     &timeframe,
                     resolved_timeframes,
+                    if self.chart_fetch_is_running() {
+                        "Loading cTrader chart data…".to_string()
+                    } else {
+                        format!("No cTrader data for {} {}", state.selected_pair, timeframe)
+                    },
                     overlay_status,
-                ),
+                    Vec::new(),
+                )
+            }
             _ => match load_symbol_timeframe(
                 &state.runtime.data_dir,
                 &state.selected_pair,
@@ -143,6 +187,14 @@ impl TradingSession {
             snapshot: snapshot.clone(),
         });
         snapshot
+    }
+
+    /// Called from `main.rs::process_messages` when
+    /// `ServiceEvent::ChartDataUpdated` arrives. Stores the completed
+    /// snapshot so the next render-thread call to `market_chart_snapshot`
+    /// can promote it into the regular cache without any I/O.
+    pub fn apply_chart_data_update(&mut self, snapshot: MarketChartSnapshot) {
+        self.pending_ctrader_chart = Some(snapshot);
     }
 
     pub(super) fn load_ctrader_market_chart_snapshot(
@@ -243,6 +295,42 @@ impl TradingSession {
                     symbol, timeframe, err
                 )],
             ),
+        }
+    }
+
+    /// Latest mid-market price for `symbol_id` from the cached cTrader spot
+    /// stream, or `None` if no fresh quote is available.
+    ///
+    /// Used by the risk gate (V0.4 audit Task #1) as the entry-price
+    /// fallback for Market orders that carry no `limit_price`/`stop_price`.
+    /// Refusing to size such an order without a quote is the safe behavior;
+    /// the previous gate silently bypassed the risk-per-trade check.
+    ///
+    /// The cache holds only the most recent update, keyed on
+    /// `(env, account, symbol, timeframe)`. We accept a symbol-id-only match
+    /// because the price for a given symbol is identical across timeframes —
+    /// the live spot stream is independent of the trendbar timeframe the
+    /// chart panel happens to be showing.
+    pub(super) fn ctrader_live_mid_price_for_symbol(&self, symbol_id: i64) -> Option<f64> {
+        let cache = self.ctrader_live_spot_cache.as_ref()?;
+        if cache.key.symbol_id != symbol_id {
+            return None;
+        }
+        // Treat anything older than 30 s as stale — a market quote that old
+        // is not safe as an entry-price estimate for sizing an order.
+        if cache.refreshed_at.elapsed() > Duration::from_secs(30) {
+            return None;
+        }
+        match (cache.update.bid, cache.update.ask) {
+            (Some(bid), Some(ask)) if bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0 => {
+                Some((bid + ask) / 2.0)
+            }
+            // Fall back to the side we have if only one is present. A
+            // half-quote is still better than no entry estimate at all,
+            // since the gate uses `(entry - sl).abs()` symmetrically.
+            (Some(bid), None) if bid.is_finite() && bid > 0.0 => Some(bid),
+            (None, Some(ask)) if ask.is_finite() && ask > 0.0 => Some(ask),
+            _ => None,
         }
     }
 

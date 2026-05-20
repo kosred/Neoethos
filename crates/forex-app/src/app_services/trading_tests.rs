@@ -201,7 +201,9 @@ fn market_chart_snapshot_reports_ctrader_requirements_instead_of_fake_fallback()
     session.broker_settings_mut().ctrader.client_id = "client".to_string();
     session.broker_settings_mut().ctrader.client_secret = "secret".to_string();
 
-    let snapshot = session.market_chart_snapshot(&state);
+    // tx=None: background fetch cannot be started, so the function returns an
+    // empty placeholder immediately (no warnings, no blocking I/O).
+    let snapshot = session.market_chart_snapshot(&state, None);
 
     assert!(snapshot.candles.is_empty());
     assert_eq!(snapshot.timeframe, "M1");
@@ -209,13 +211,15 @@ fn market_chart_snapshot_reports_ctrader_requirements_instead_of_fake_fallback()
         snapshot.available_timeframes.first().map(String::as_str),
         Some("M1")
     );
+    // No background fetch started → no warnings; headline describes the
+    // "no data" state for the current pair/timeframe.
+    assert!(snapshot.warnings.is_empty());
     assert!(
-        snapshot
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("stored token bundle"))
+        snapshot.headline.contains("No cTrader data for")
+            || snapshot.headline.contains("EURUSD"),
+        "unexpected headline: {}",
+        snapshot.headline
     );
-    assert!(snapshot.headline.contains("No cTrader market data loaded"));
 }
 
 #[test]
@@ -1535,7 +1539,7 @@ fn prop_firm_gate_blocks_order_without_stop_loss() {
     let mut order = sample_prop_firm_order();
     order.stop_loss = None;
     let risk = RiskConfig::default();
-    let err = prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD")
+    let err = prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None)
         .unwrap_err();
     assert!(err.to_string().contains("missing stop_loss"));
 }
@@ -1545,7 +1549,7 @@ fn prop_firm_gate_blocks_when_daily_drawdown_breached() {
     let _guard = install_prop_firm_test_env();
     let order = sample_prop_firm_order();
     let risk = RiskConfig::default();
-    let err = prop_firm_pre_trade_check(&risk, &order, 9500.0, 10000.0, 10000.0, 4, "EURUSD")
+    let err = prop_firm_pre_trade_check(&risk, &order, 9500.0, 10000.0, 10000.0, 4, "EURUSD", None)
         .unwrap_err();
     assert!(err.to_string().contains("Daily drawdown limit reached"));
     assert!(err.to_string().contains("current 5.00% >= max 4.00%"));
@@ -1572,13 +1576,13 @@ fn prop_firm_gate_respects_jpy_pip_precision() {
     };
     // Should pass under 2-digit precision (50 pips).
     assert!(
-        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 2, "USDJPY").is_ok()
+        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 2, "USDJPY", None).is_ok()
     );
     // 4-digit precision would amplify pip_distance by 100×; with the same
     // lot size and pip value that's $50,000 of risk on a $10,000 account,
     // still > 100% so it must reject.
     assert!(
-        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "USDJPY").is_err()
+        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "USDJPY", None).is_err()
     );
 }
 
@@ -1589,7 +1593,7 @@ fn prop_firm_gate_blocks_when_total_drawdown_breached() {
     let risk = RiskConfig::default();
     // Set day_start_equity equal to account_equity so daily DD is 0%, forcing it to hit total DD rule
     let err =
-        prop_firm_pre_trade_check(&risk, &order, 8900.0, 10000.0, 8900.0, 4, "EURUSD").unwrap_err();
+        prop_firm_pre_trade_check(&risk, &order, 8900.0, 10000.0, 8900.0, 4, "EURUSD", None).unwrap_err();
     assert!(err.to_string().contains("Total drawdown limit reached"));
     assert!(err.to_string().contains("current 11.00% >= max 7.00%"));
 }
@@ -1604,7 +1608,61 @@ fn prop_firm_gate_passes_valid_order_within_limits() {
     order.limit_price = Some(1.10000);
     let risk = RiskConfig::default();
     assert!(
-        prop_firm_pre_trade_check(&risk, &order, 10100.0, 10000.0, 10000.0, 4, "EURUSD").is_ok()
+        prop_firm_pre_trade_check(&risk, &order, 10100.0, 10000.0, 10000.0, 4, "EURUSD", None).is_ok()
+    );
+}
+
+#[test]
+fn prop_firm_gate_rejects_market_with_sl_but_no_entry_estimate() {
+    // V0.4 audit Task #1 regression: a Market order carries no
+    // `limit_price`/`stop_price`, so the gate's risk-per-trade pip-distance
+    // computation has no entry-price to work with. Pre-fix, the gate
+    // silently SKIPPED that computation and let the order through. With
+    // the fix, the gate hard-fails unless the caller supplies a live
+    // mid-market quote via the new 8th parameter.
+    let _guard = install_prop_firm_test_env();
+    let order = sample_prop_firm_order(); // Market, SL set, no limit/stop.
+    let risk = RiskConfig::default();
+    // Pass None for the market-price fallback — simulates the cold-start
+    // case where no live spot quote is available for the symbol yet.
+    let err = prop_firm_pre_trade_check(
+        &risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("no entry-price estimate")
+            || err
+                .to_string()
+                .contains("Refusing to bypass the risk-per-trade gate"),
+        "expected the new entry-estimate hard-fail, got: {err}"
+    );
+}
+
+#[test]
+fn prop_firm_gate_accepts_market_with_sl_when_mid_price_supplied() {
+    // Mirror of the previous test — when the caller DOES supply a live
+    // mid-market quote, the gate can compute pip-distance and either
+    // accept or reject on size. With a tight stop and a tiny lot, the
+    // sized order must pass.
+    let _guard = install_prop_firm_test_env();
+    let mut order = sample_prop_firm_order(); // Market, SL=1.05000.
+    order.volume = 1; // 0.01 micro-lot.
+    let risk = RiskConfig::default();
+    // Mid-price 1.10000 vs SL 1.05000 = 500 pips. Even at 500 pips, a
+    // 0.01-lot trade is well under the 2% per-trade ceiling.
+    assert!(
+        prop_firm_pre_trade_check(
+            &risk,
+            &order,
+            10000.0,
+            10000.0,
+            10000.0,
+            4,
+            "EURUSD",
+            Some(1.10000),
+        )
+        .is_ok(),
+        "Market order with SL and live mid-price must pass the sized risk gate"
     );
 }
 
@@ -1618,7 +1676,7 @@ fn prop_firm_gate_respects_disabled_stop_loss_requirement() {
         ..RiskConfig::default()
     };
     assert!(
-        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD").is_ok()
+        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None).is_ok()
     );
 }
 
@@ -1631,7 +1689,7 @@ fn prop_firm_gate_rejects_unknown_symbol_without_synthetic_fallback() {
     // `infer_market_cost_profile("", "", …)` and the EURUSD default,
     // producing a synthetic pip value. That is not allowed any more.
     let err =
-        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "").unwrap_err();
+        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "", None).unwrap_err();
     assert!(
         err.to_string().contains("symbol name was not supplied")
             || err.to_string().contains("Daily drawdown")
@@ -1657,7 +1715,7 @@ fn prop_firm_gate_rejects_when_account_currency_unset() {
     }
     let order = sample_prop_firm_order();
     let risk = RiskConfig::default();
-    let err = prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD")
+    let err = prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None)
         .unwrap_err();
     assert!(
         err.to_string().contains("FOREX_BOT_PROP_ACCOUNT_CURRENCY")
@@ -1823,9 +1881,10 @@ fn manual_buy_blocked_when_autonomous_only_contract_armed() {
         "signed config must reject manual orders"
     );
 
-    // Trip the manual-order gate. `execute_buy_market` is the UI
-    // entry point that wraps `execute_ctrader_order(..., Manual)`.
-    session.execute_buy_market(&mut state);
+    // Trip the manual-order gate. `execute_buy_order` is the UI
+    // entry point that wraps `execute_ctrader_order(..., Manual)`. The
+    // gate fires regardless of `order_ticket.order_type` (Market/Limit/Stop).
+    session.execute_buy_order(&mut state);
 
     assert!(
         state.status_msg.contains("ManualOrderWhileAutonomousOnly"),
@@ -1850,7 +1909,7 @@ fn manual_sell_blocked_when_autonomous_only_contract_armed() {
         .enable_risky_mode(signed_risky_mode_config(), 100.0)
         .expect("enable_risky_mode");
 
-    session.execute_sell_market(&mut state);
+    session.execute_sell_order(&mut state);
 
     assert!(
         state.status_msg.contains("ManualOrderWhileAutonomousOnly"),
@@ -2064,7 +2123,7 @@ fn auto_trade_producer_drain_returns_zero_when_no_producer() {
 #[test]
 fn manual_buy_not_blocked_when_risky_mode_disarmed() {
     // If Risky Mode is NOT armed (no manager), the autonomous-only
-    // gate must not fire — `execute_buy_market` proceeds past the
+    // gate must not fire — `execute_buy_order` proceeds past the
     // gate. We don't try to assert a fill (no broker is wired up
     // for tests) — we just assert that the status_msg does NOT
     // contain the autonomous-only rejection string.
@@ -2075,7 +2134,7 @@ fn manual_buy_not_blocked_when_risky_mode_disarmed() {
         "fresh session must be disarmed"
     );
 
-    session.execute_buy_market(&mut state);
+    session.execute_buy_order(&mut state);
 
     assert!(
         !state.status_msg.contains("ManualOrderWhileAutonomousOnly"),

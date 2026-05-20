@@ -1,6 +1,6 @@
 [package]
 name = "forex-app"
-version = "0.5.0"
+version = "0.4.19"
 edition.workspace = true
 # SPDX dual-license matches the repo-root LICENSE file. Required by both
 # cargo-deb (which prefers `license` over `license-file` when generating
@@ -14,6 +14,7 @@ readme = "../../README.md"
 [features]
 default = []
 gpu = ["forex-search/gpu", "forex-models/neuro-evolution-gpu", "forex-models/statistical-gpu"]
+native-tree-models = ["forex-models/tree-models"]
 # Enable the native Protobuf-over-TCP transport (port 5035) for the cTrader
 # Open API. Wire-format only; the higher-level Rust API surface is unchanged.
 # v0.4.5 migration scope: reconcile (ProtoOAReconcileReq/Res) +
@@ -69,7 +70,7 @@ polars = { version = "0.52.0", features = ["lazy", "dtype-full", "temporal", "ti
 forex-core = { path = "../forex-core" }
 forex-data = { path = "../forex-data" }
 forex-search = { path = "../forex-search" }
-forex-models = { path = "../forex-models", features = ["tree-models", "pure-rust-ml"] }
+forex-models = { path = "../forex-models", default-features = false, features = ["pure-rust-ml"] }
 # v0.4.8: on-device LLM helper (Gemma) — wired into the egui AI Helper
 # panel + the workspace `ToolRegistry` for chat-driven read-only tool
 # invocation. The stub runtime is always available so the desktop
@@ -119,17 +120,12 @@ identifier = "com.forexai.app"
 authors = ["Konstantinos Red"]
 description = "Advanced Algorithmic Forex Terminal with ML and Live Execution"
 formats = ["nsis"]
-# Paths are resolved relative to this Cargo.toml. v0.4.10 fixed the
-# resource paths after the v0.4.9 audit revealed the installer was
-# shipping only the .exe — catboost / xgboost / config.yaml were
-# silently skipped because the bare names didn't resolve from the
-# crate directory. After this change the .exe installer correctly
-# carries the 34 MB of runtime DLLs every ML inference path needs
-# + a copy of the default config.yaml.
+# Paths are resolved relative to this Cargo.toml. The default GUI build
+# intentionally ships without native tree-model DLLs; those are gated behind
+# the `native-tree-models` feature so a clean Windows install is not blocked by
+# Visual C++ debug/runtime DLLs at process startup.
 resources = [
     "../../config.yaml",
-    "../../target/release/catboostmodel.dll",
-    "../../target/release/xgboost.dll",
     "../../LICENSE",
     "../../README.md",
     # v0.4.10: ship the Gemma GGUF fetcher next to the .exe so the

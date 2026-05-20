@@ -237,11 +237,15 @@ pub fn embedded_credentials_present() -> bool {
 }
 
 /// v0.4.16 — build a stable picker label for one discovered account.
-/// Format: `#<ctidTraderAccountId> <broker title or traderLogin> (demo|live)`.
-/// Mirrors the format used by the dropdown options so the
-/// `selected_text` displayed after a pick is identical to the option
-/// the operator chose. Falls back to the raw account_id when neither
-/// broker_title nor trader_login is populated.
+/// Format: `<traderLogin> · <broker> (Live|Demo) · ctid #<ctidTraderAccountId>`.
+///
+/// v0.5.1.1 — the operator should be able to match the picker entry
+/// 1-to-1 with what cTrader's consent page shows. The consent page
+/// uses `<broker> · <Type> · <traderLogin>` as its line shape (e.g.
+/// "FTMO Platform • Live • 17111418"), so we lead with the
+/// `traderLogin` to keep visual parity. The `ctidTraderAccountId` is
+/// kept at the tail (after a `·`) so the wire-protocol identifier is
+/// still readable for debugging without taking over the line.
 fn account_picker_label(
     account: &crate::app_services::ctrader_auth::CTraderDiscoveredAccount,
 ) -> String {
@@ -249,27 +253,19 @@ fn account_picker_label(
         .trader_login
         .map(|n| n.to_string())
         .unwrap_or_else(|| account.account_id.clone());
-    let display_name = if account.broker_title.trim().is_empty() {
-        // Empty broker_title is what we saw on the live FTMO account
-        // in the 2026-05-19 walkthrough — fall back to traderLogin so
-        // the operator still sees a recognisable number.
-        trader_login_or_id.clone()
-    } else if account.broker_title.trim() == trader_login_or_id {
-        // Avoid stutter when both fields happen to carry the same
-        // string ("17111418 17111418").
-        account.broker_title.clone()
+    let broker = if account.broker_title.trim().is_empty() {
+        "(broker unknown)".to_string()
     } else {
-        format!("{} {}", account.broker_title, trader_login_or_id)
+        account.broker_title.clone()
+    };
+    let env_label = match account.is_live {
+        Some(true) => "Live",
+        Some(false) => "Demo",
+        None => "Unknown",
     };
     format!(
-        "#{} {} ({})",
-        account.account_id,
-        display_name,
-        if account.is_live.unwrap_or(false) {
-            "live"
-        } else {
-            "demo"
-        }
+        "{} · {} ({}) · ctid #{}",
+        trader_login_or_id, broker, env_label, account.account_id,
     )
 }
 
@@ -329,9 +325,23 @@ fn spawn_account_discovery_worker(
 
 pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResult {
     let mut result = StepResult::StayHere;
-    let mut runtime = runtime_mutex()
-        .lock()
-        .expect("wizard OAuth runtime mutex poisoned");
+    // V0.4 audit Task #29 — recover from a poisoned mutex instead of
+    // panicking the render thread. A panic inside an OAuth background
+    // worker (e.g. inside `poll_auth_worker` chain) used to poison this
+    // global mutex, and the next wizard frame would `.expect()` and bring
+    // down the entire UI. We now log and continue with the inner guard so
+    // the operator can at least see the error banner + retry.
+    let mut runtime = match runtime_mutex().lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            tracing::error!(
+                target: "forex_app::wizard::oauth",
+                "OAuth runtime mutex was poisoned (a background worker panicked while \
+                 holding it); recovering inner guard so the render thread can continue"
+            );
+            poisoned.into_inner()
+        }
+    };
 
     // Poll background workers. Both pollers replace the receiver with
     // `None` after success/failure so the next frame doesn't re-fire.
@@ -461,6 +471,34 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
                 .size(theme::FONT_CAPTION),
         );
     } else if !runtime.accounts.is_empty() {
+        // v0.5.1.1 — show how many accounts came back so the operator
+        // can compare with cTrader's consent page at a glance. If a
+        // newly-activated account (e.g. an FTMO Free Trial moved from
+        // "Ready" to "Active") is missing, the fix is a fresh OAuth
+        // round — the broker only includes activated accounts in
+        // `ProtoOAGetAccountListByAccessTokenRes`.
+        let live_count = runtime
+            .accounts
+            .iter()
+            .filter(|a| a.is_live == Some(true))
+            .count();
+        let demo_count = runtime
+            .accounts
+            .iter()
+            .filter(|a| a.is_live == Some(false))
+            .count();
+        ui.label(
+            egui::RichText::new(format!(
+                "{} accounts returned by broker · {} Live · {} Demo. \
+                 Missing one? Re-run \"Sign in\" after activating it on \
+                 the broker portal.",
+                runtime.accounts.len(),
+                live_count,
+                demo_count,
+            ))
+            .color(theme::TEXT_MUTED)
+            .size(theme::FONT_CAPTION),
+        );
         // v0.4.16 — the dropdown's `selected_text` previously rendered
         // just the bare `ctidTraderAccountId` (e.g. "47149192"), which
         // looked like a raw integer floating in the UI. Surface the
@@ -496,6 +534,29 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
                         .clicked()
                     {
                         controller.config.selected_ctid_trader_account_id = current_id;
+                        // v0.5.1 — every cTrader account is routed by
+                        // the broker pool to either `demo.ctraderapi.com`
+                        // or `live.ctraderapi.com`. Sending app/account
+                        // auth for a Live account to the demo endpoint
+                        // (or vice versa) gets rejected with
+                        // `CANT_ROUTE_REQUEST: Cannot route request`.
+                        // Auto-sync the wizard's `ctrader_environment`
+                        // to the picked account's `is_live` flag so the
+                        // workspace, the historical-bars bootstrap, and
+                        // every later session call land on the right
+                        // endpoint without the operator having to flip
+                        // a toggle they didn't know existed.
+                        match account.is_live {
+                            Some(true) => {
+                                controller.config.ctrader_environment =
+                                    super::CTraderEnvironment::Live;
+                            }
+                            Some(false) => {
+                                controller.config.ctrader_environment =
+                                    super::CTraderEnvironment::Demo;
+                            }
+                            None => {}
+                        }
                     }
                 }
             });
@@ -760,14 +821,60 @@ fn poll_account_discovery_worker(runtime: &mut OAuthRuntime, controller: &mut Wi
             {
                 if let Ok(id) = result.accounts[0].account_id.parse::<u64>() {
                     controller.config.selected_ctid_trader_account_id = Some(id);
+                    // v0.5.1 — auto-select also has to sync the
+                    // routing environment to the account's
+                    // `is_live` flag; otherwise the demo default
+                    // sends a Live account into the wrong endpoint
+                    // (CANT_ROUTE_REQUEST). Mirrors the picker
+                    // dropdown handler above.
+                    match result.accounts[0].is_live {
+                        Some(true) => {
+                            controller.config.ctrader_environment = super::CTraderEnvironment::Live;
+                        }
+                        Some(false) => {
+                            controller.config.ctrader_environment = super::CTraderEnvironment::Demo;
+                        }
+                        None => {}
+                    }
                     runtime.sub_step = OAuthSubStep::AuthProbe;
                 }
             }
             runtime.accounts = result.accounts;
             if runtime.accounts.is_empty() {
-                runtime.last_error = Some(
-                    "Your cTID has no trading accounts — open a demo at ctrader.com.".to_string(),
-                );
+                // The cTrader Open API discovery endpoint succeeded but
+                // returned zero accounts. Common, distinct causes:
+                //
+                // 1. **Wrong environment** — the user picked Demo above but
+                //    the account is Live (or vice versa). The endpoint is
+                //    environment-scoped, so a Live account is invisible to
+                //    the Demo discovery URL even with a valid token.
+                // 2. **Open API not enabled on the broker side** — the
+                //    operator must visit ctrader.com → Account → API and
+                //    flip the "Open API" toggle. Without it, ANY discovery
+                //    call returns zero accounts.
+                // 3. **Token scope missing `accounts`** — the bot always
+                //    requests the right scope, but a token rotated by hand
+                //    or pulled from another tool may lack it.
+                // 4. **No account exists at all** — fresh cTID with no
+                //    demo provisioned yet.
+                //
+                // We surface all four because the user has no way to
+                // distinguish them from the symptom alone.
+                let other_env = match controller.config.ctrader_environment {
+                    super::CTraderEnvironment::Demo => "Live",
+                    super::CTraderEnvironment::Live => "Demo",
+                };
+                runtime.last_error = Some(format!(
+                    "Sign-in succeeded but the broker returned 0 trading accounts. \
+                     Try one of:\n\
+                     • Switch the environment toggle above to {} and click Sign in again \
+                     (this is the most common cause — accounts are environment-scoped).\n\
+                     • At ctrader.com → Account → API, confirm that 'Open API' access is \
+                     enabled for the account you signed in with.\n\
+                     • If you do not yet have a demo account, open one for free at \
+                     https://ctrader.com and retry."
+                    , other_env
+                ));
             }
         }
         Err(err) => {

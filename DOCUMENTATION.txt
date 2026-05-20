@@ -46,5 +46,5 @@ Open API over OAuth/WebSocket and FIX gateways) — no embedded Python runtime
 or MetaTrader 5 Python package is required at runtime any more.
 
 =========================================
-STATUS: STABLE | VERSION: 2.0 (PURE RUST)
+STATUS: V0.4 STABILISATION | See CHANGELOG.md for canonical version.
 =========================================

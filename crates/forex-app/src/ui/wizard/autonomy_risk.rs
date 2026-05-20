@@ -330,15 +330,25 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
                 .suffix(" %"),
             );
         });
+        // V0.4 audit Task #27 — preserve decimal precision in the
+        // capital-at-risk text edit. Pre-fix, the re-render used `{:.0}`
+        // (zero decimals) so a user-typed `12345.67` round-tripped as
+        // `12346` and the in-memory value was silently rounded to int.
+        // Use two decimals on display and parse as f64 (wider mantissa)
+        // so currency amounts up to ~$9e15 are exactly representable.
         let mut capital_str = controller
             .config
             .capital_at_risk_disclosure
-            .map(|c| format!("{:.0}", c))
+            .map(|c| format!("{:.2}", c))
             .unwrap_or_default();
         ui.horizontal(|ui| {
             ui.label("Capital you can afford to lose (account currency, optional):");
             if ui.text_edit_singleline(&mut capital_str).changed() {
-                controller.config.capital_at_risk_disclosure = capital_str.parse::<f32>().ok();
+                // Keep the field type (f32 or f64) consistent with the
+                // controller struct; just route through parse so empty /
+                // garbage input clears the value instead of rounding it.
+                controller.config.capital_at_risk_disclosure =
+                    capital_str.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0);
             }
         });
     }

@@ -295,66 +295,6 @@ impl ForexApp {
             };
     }
 
-    fn trigger_start_discovery(&mut self) {
-        use app_services::discovery::{DiscoveryRequest, failed_snapshot, start_discovery_job};
-        let higher_tfs: Vec<String> = self
-            .state
-            .discovery_form
-            .higher_tfs
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        let request = DiscoveryRequest {
-            data_root: self.state.runtime.data_dir.clone(),
-            symbol: self.state.selected_pair.clone(),
-            base_tf: self.state.discovery_form.base_tf.clone(),
-            higher_tfs,
-            config: forex_search::DiscoveryConfig {
-                timeframe_label: self.state.discovery_form.base_tf.clone(),
-                population: self.state.discovery_form.population as usize,
-                generations: self.state.discovery_form.generations as usize,
-                max_indicators: self.state.discovery_form.max_indicators as usize,
-                candidate_count: self.state.discovery_form.target_candidates as usize,
-                portfolio_size: self.state.discovery_form.portfolio_size as usize,
-                corr_threshold: self.state.discovery_form.correlation_threshold as f64,
-                min_trades_per_day: self.state.discovery_form.min_trades_per_day as f64,
-                ..forex_search::DiscoveryConfig::default()
-            },
-            prop_firm_rules: forex_search::PropFirmRiskRules::default(),
-        };
-        match start_discovery_job(request, self.tx.clone()) {
-            Ok(handle) => {
-                self.state.discovery_job = Some(handle.snapshot.clone());
-                self.discovery_handle = Some(handle);
-            }
-            Err(err) => {
-                self.state.discovery_job =
-                    Some(failed_snapshot(app_services::jobs::JobKind::Discovery, err));
-            }
-        }
-    }
-
-    fn trigger_start_training(&mut self) {
-        use app_services::training::{TrainingRequest, failed_snapshot, start_training_job};
-        use std::path::PathBuf;
-        let request = TrainingRequest {
-            config_path: self.state.runtime.config_path.clone(),
-            models_dir: PathBuf::from("models"),
-            symbol: self.state.selected_pair.clone(),
-            base_tf: self.state.chart_timeframe.clone(),
-        };
-        match start_training_job(request, self.tx.clone()) {
-            Ok(handle) => {
-                self.state.training_job = Some(handle.snapshot.clone());
-                self.training_handle = Some(handle);
-            }
-            Err(err) => {
-                self.state.training_job = Some(failed_snapshot(err));
-            }
-        }
-    }
-
     fn process_messages(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
@@ -409,6 +349,44 @@ impl ForexApp {
                     Ok(msg) => self.state.status_msg = msg,
                     Err(err) => self.state.status_msg = format!("Connect Error: {}", err),
                 },
+                ServiceEvent::ChartDataUpdated(snapshot) => {
+                    self.trading_session.apply_chart_data_update(*snapshot);
+                }
+                ServiceEvent::BackgroundTaskPanic { task, message } => {
+                    // A background worker panicked. The panic was caught
+                    // inside the spawn wrapper (see
+                    // `app_services/trading/background.rs`) so the process
+                    // is alive, but the operator MUST see this — otherwise
+                    // the relevant job snapshot stays "Running" forever.
+                    // Surface it through the same status-msg channel that
+                    // connection errors use, and mark the corresponding job
+                    // (if any) as Failed so the UI dot turns red.
+                    tracing::error!(
+                        target: "forex_app::main",
+                        task = %task,
+                        panic = %message,
+                        "background task panicked; see ServiceEvent::BackgroundTaskPanic"
+                    );
+                    self.state.status_msg =
+                        format!("Background task '{task}' panicked: {message}");
+                    match task.as_str() {
+                        "bootstrap" => {
+                            if let Some(snap) = self.state.bootstrap_job.as_mut() {
+                                snap.state = app_services::jobs::JobState::Failed;
+                                snap.progress.stage = "bootstrap_panicked".to_string();
+                                snap.progress.message = format!("Panic: {message}");
+                                snap.report.errors.push(format!("panic: {message}"));
+                            }
+                        }
+                        "connect" | "chart_fetch" => {
+                            // Connect/chart panics don't have a long-lived
+                            // job snapshot — the status_msg above is the
+                            // operator's signal. The cache will be re-built
+                            // on the next render frame.
+                        }
+                        _ => {}
+                    }
+                }
             }
             ctx.request_repaint();
         }
@@ -460,14 +438,11 @@ impl eframe::App for ForexApp {
         let discovery_label = engine_short_label(self.state.discovery_job.as_ref());
         let training_label = engine_short_label(self.state.training_job.as_ref());
 
-        // Intent variables — set inside closures, acted on after
-        let mut nav_target: Option<WorkspaceTab> = None;
-        let mut start_discovery = false;
-        let mut stop_discovery = false;
-        let mut start_training = false;
-        let mut stop_training = false;
-        let mut connect_broker = false;
-        let mut disconnect_broker = false;
+        // Engine and broker controls live in the sidebar tabs (Discovery /
+        // Training / Brokers). The previous nav_target / start_*/ stop_* /
+        // connect_broker / disconnect_broker intent flags here were declared
+        // but never set by any button — see `sidebar_target` below for the
+        // single live nav-intent channel.
         let broker_connected = self.trading_session.is_connected();
 
         // ─── Top bar — brand + global status only ────────────────────
@@ -685,34 +660,6 @@ impl eframe::App for ForexApp {
                 });
         }
 
-        // ── Handle navigation intent ─────────────────────────────────────
-        if let Some(tab) = nav_target {
-            self.workspace.focus_tab(tab);
-        }
-
-        // ── Handle engine start/stop intents ─────────────────────────────
-        if start_discovery {
-            self.trigger_start_discovery();
-        }
-        if stop_discovery {
-            if let Some(handle) = &self.discovery_handle {
-                handle.cancel.request();
-            }
-        }
-        if start_training {
-            self.trigger_start_training();
-        }
-        if stop_training {
-            if let Some(handle) = &self.training_handle {
-                handle.cancel.request();
-            }
-        }
-        if connect_broker {
-            self.trading_session.connect(&mut self.state);
-        }
-        if disconnect_broker {
-            self.trading_session.disconnect(&mut self.state);
-        }
 
         // ─── Bottom action bar — engine + broker controls ────────────
         // Added BEFORE the sidebar so it spans the FULL width of the
@@ -804,22 +751,9 @@ impl eframe::App for ForexApp {
                 });
             });
 
-        // Engine start / stop intents are still wired up by the
-        // sidebar's Discovery / Training / Settings tabs. Those
-        // mutate the `start_*` / `stop_*` / `connect_broker` /
-        // `disconnect_broker` flags via their own buttons; the
-        // dispatch logic below this block is unchanged. The status
-        // bar just observes whether they're on.
-        let _ = (
-            &start_discovery,
-            &stop_discovery,
-            &start_training,
-            &stop_training,
-            &connect_broker,
-            &disconnect_broker,
-            &discovery_label,
-            &training_label,
-        );
+        // Engine / broker controls live in the sidebar tabs (Discovery /
+        // Training / Brokers). The bottom status strip below is read-only.
+        let _ = (&discovery_label, &training_label);
 
         // ─── Left sidebar — primary navigation ───────────────────────
         // Single source of truth for "where am I" — no more competing
@@ -953,11 +887,22 @@ pub(crate) fn app_record(
 }
 
 fn system_time_string() -> String {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_secs();
-    format!("unix:{seconds}")
+    // V0.4 audit Task #38 — graceful fallback when the host clock is set
+    // before 1970 (corrupt RTC, fresh VM pre-NTP-sync, deliberately
+    // wound-back system clock for testing). Pre-fix, `.expect()` would
+    // bring down the entire UI on first render. Now we log and emit a
+    // sentinel string so the status strip stays alive.
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => format!("unix:{}", d.as_secs()),
+        Err(err) => {
+            tracing::warn!(
+                target: "forex_app::main",
+                error = %err,
+                "system clock is before UNIX epoch; falling back to sentinel"
+            );
+            "unix:pre-1970".to_string()
+        }
+    }
 }
 
 /// Format the current UTC time as `HH:MM:SS UTC` for the status bar.

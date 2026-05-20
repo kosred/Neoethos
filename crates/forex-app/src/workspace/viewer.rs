@@ -71,10 +71,15 @@ impl TabViewer for WorkspaceViewer<'_> {
                 );
             }
             WorkspaceTab::Chart => {
-                ui::trading::chart_panel::render(ui, self.state, self.trading_session)
+                ui::trading::chart_panel::render(ui, self.state, self.trading_session, self.tx)
             }
             WorkspaceTab::Watchlist => {
-                ui::trading::watchlist_panel::render(ui, self.state, self.trading_session);
+                ui::trading::watchlist_panel::render(
+                    ui,
+                    self.state,
+                    self.trading_session,
+                    self.tx,
+                );
             }
             WorkspaceTab::Execution => {
                 ui::trading::execution_panel::render(ui, self.state, self.trading_session, self.tx)

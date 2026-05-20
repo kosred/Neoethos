@@ -159,10 +159,16 @@ mod ctrader_integration_tests {
 
     #[test]
     fn symbol_resolution_sends_auth_then_symbols_list_then_detail() {
+        // v0.5.1.1: resolve_symbol_with_transport opens two WSS connections
+        // (one per send_sequence call) and must re-authenticate on each.
+        // Batch 1: app-auth + account-auth + symbols-list (3 messages)
+        // Batch 2: app-auth + account-auth + symbol-by-id (3 messages)
         let transport = SequenceTransport::with(vec![
             Ok(app_auth_ok()),
             Ok(account_auth_ok(712345)),
             Ok(symbols_list_ok(712345, &[("EURUSD", 14)])),
+            Ok(app_auth_ok()),
+            Ok(account_auth_ok(712345)),
             Ok(symbol_by_id_ok(14, 5)),
         ]);
 
@@ -182,9 +188,13 @@ mod ctrader_integration_tests {
         assert_eq!(result.account_id, 712345);
         assert_eq!(result.light_symbol.symbol_id, 14);
         assert_eq!(result.symbol.digits, 5);
-        assert_eq!(transport.sent_count(), 4);
-        // Expected: app-auth(2100), account-auth(2102), symbols-list(2114), symbol-by-id(2116)
-        assert_eq!(transport.sent_payload_types(), vec![2100, 2102, 2114, 2116]);
+        assert_eq!(transport.sent_count(), 6);
+        // Expected: app-auth(2100), account-auth(2102), symbols-list(2114),
+        //           app-auth(2100), account-auth(2102), symbol-by-id(2116)
+        assert_eq!(
+            transport.sent_payload_types(),
+            vec![2100, 2102, 2114, 2100, 2102, 2116]
+        );
     }
 
     #[test]
@@ -193,6 +203,8 @@ mod ctrader_integration_tests {
             Ok(app_auth_ok()),
             Ok(account_auth_ok(712345)),
             Ok(symbols_list_ok(712345, &[("EUR/USD", 14)])),
+            Ok(app_auth_ok()),
+            Ok(account_auth_ok(712345)),
             Ok(symbol_by_id_ok(14, 5)),
         ]);
 
@@ -263,10 +275,14 @@ mod ctrader_integration_tests {
 
     #[test]
     fn bars_only_flow_sends_5_messages_and_returns_bar() {
+        // v0.5.1.1: resolve_symbol uses two send_sequence calls (re-auth on
+        // each), so the full sequence is now 7 messages not 5.
         let transport = SequenceTransport::with(vec![
             Ok(app_auth_ok()),
             Ok(account_auth_ok(712345)),
             Ok(symbols_list_ok(712345, &[("EURUSD", 14)])),
+            Ok(app_auth_ok()),
+            Ok(account_auth_ok(712345)),
             Ok(symbol_by_id_ok(14, 5)),
             Ok(trendbars_ok(14, "M15")),
         ]);
@@ -288,7 +304,7 @@ mod ctrader_integration_tests {
         )
         .expect("bars-only fetch should succeed");
 
-        assert_eq!(transport.sent_count(), 5);
+        assert_eq!(transport.sent_count(), 7);
         assert_eq!(result.bars.len(), 1);
         assert!(!result.has_more);
         assert!((result.bars[0].low - 1.10000).abs() < 1e-9);
@@ -297,10 +313,14 @@ mod ctrader_integration_tests {
 
     #[test]
     fn full_chart_history_flow_sends_7_messages_and_returns_bars_and_ticks() {
+        // v0.5.1.1: resolve_symbol uses two send_sequence calls (re-auth on
+        // each, 6 messages), plus 3 data messages = 9 total.
         let transport = SequenceTransport::with(vec![
             Ok(app_auth_ok()),
             Ok(account_auth_ok(712345)),
             Ok(symbols_list_ok(712345, &[("EURUSD", 14)])),
+            Ok(app_auth_ok()),
+            Ok(account_auth_ok(712345)),
             Ok(symbol_by_id_ok(14, 5)),
             Ok(trendbars_ok(14, "M5")),
             Ok(ticks_ok(14)),
@@ -324,7 +344,7 @@ mod ctrader_integration_tests {
         )
         .expect("full chart history should succeed");
 
-        assert_eq!(transport.sent_count(), 7);
+        assert_eq!(transport.sent_count(), 9);
         assert_eq!(result.bars.len(), 1);
         assert_eq!(result.bid_ticks.len(), 2);
         assert_eq!(result.ask_ticks.len(), 2);

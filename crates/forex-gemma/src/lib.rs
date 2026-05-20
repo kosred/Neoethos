@@ -4,7 +4,7 @@
 //! See `README.md` for the full architecture and the two-role
 //! separation (ensemble expert + conversational suggester).
 
-#![doc(html_root_url = "https://docs.rs/forex-gemma/0.5.0")]
+#![doc(html_root_url = "https://docs.rs/forex-gemma/0.5.1")]
 
 pub mod anchors;
 pub mod api;

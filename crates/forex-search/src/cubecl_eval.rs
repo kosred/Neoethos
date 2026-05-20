@@ -798,6 +798,23 @@ pub(crate) fn try_generate_signal_rows_cuda(
 }
 
 fn saturating_i32(value: i64) -> i32 {
+    // V0.4 audit Task #57 — emit a one-line WARN when we actually saturate
+    // so the operator can detect it (was previously silent). The four
+    // callsites (timestamp deltas, gap-threshold config, month/day idx)
+    // all expect values that comfortably fit in i32 for normal trading
+    // data; if we ever DO saturate, the kernel result is wrong and we
+    // want it in the log. The cost (one branch per element on the rare
+    // path) is negligible vs. the cost of debugging a silent wrong-
+    // result later.
+    if value > i32::MAX as i64 || value < i32::MIN as i64 {
+        tracing::warn!(
+            target: "forex_search::cubecl_eval",
+            value = value,
+            "i64 → i32 saturation in cubecl_eval kernel input: value clamped — \
+             check upstream data magnitudes (timestamp delta > 24.8 days? \
+             gap_threshold_ms > i32::MAX? month/day idx out of range?)"
+        );
+    }
     value.clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 

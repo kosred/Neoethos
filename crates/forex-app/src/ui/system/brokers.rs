@@ -275,15 +275,17 @@ fn render_adapter_configuration(
                 );
             }
             if create_demo_account {
-                state.status_msg = match open::that("https://app.ctrader.com/accounts/create-demo")
-                {
+                state.status_msg = match open::that(
+                    crate::app_services::broker_config::CTRADER_CREATE_DEMO_ACCOUNT_URL,
+                ) {
                     Ok(()) => "Opened cTrader demo account page.".to_string(),
                     Err(err) => format!("Failed to open cTrader demo account page: {err}"),
                 };
             }
             if create_live_account {
-                state.status_msg = match open::that("https://app.ctrader.com/accounts/create-live")
-                {
+                state.status_msg = match open::that(
+                    crate::app_services::broker_config::CTRADER_CREATE_LIVE_ACCOUNT_URL,
+                ) {
                     Ok(()) => "Opened cTrader live account page.".to_string(),
                     Err(err) => format!("Failed to open cTrader live account page: {err}"),
                 };

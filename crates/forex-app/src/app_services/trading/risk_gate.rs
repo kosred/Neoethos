@@ -119,6 +119,13 @@ pub(super) fn prop_firm_pre_trade_check(
     day_start_equity: f64,
     pip_position: i32,
     symbol_name: &str,
+    // Latest mid-market price (e.g. `(bid + ask) / 2`) supplied by the caller
+    // from the broker's live spot stream. Used as the entry-price estimate
+    // for Market orders (which carry neither `limit_price` nor `stop_price`).
+    // `None` is acceptable for Market orders without stop-loss (the
+    // risk-per-trade gate is N/A); for Market orders WITH stop-loss the
+    // gate hard-fails (see the new branch below) — V0.4 audit Task #1.
+    market_price_for_entry: Option<f64>,
 ) -> anyhow::Result<()> {
     // SECURITY (audit-fix F7): `10.0_f64.powi(pip_position)` returns `inf`
     // when `pip_position >= 308` and `0.0` when `pip_position <= -308`,
@@ -163,6 +170,38 @@ pub(super) fn prop_firm_pre_trade_check(
         }
     }
 
+    // Pre-condition checks that must run regardless of order type.
+    // An empty symbol name must be rejected unconditionally — we must
+    // not fall through to a synthetic EURUSD pip-value default in any
+    // prop-firm code path.
+    let symbol = symbol_name.trim();
+    if symbol.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Risk gate cannot size order: symbol name was not supplied. \
+             Refusing to fall back to synthetic pip-value defaults."
+        ));
+    }
+
+    // When a stop-loss is present the operator expects risk sizing to
+    // happen. Require the account currency now (before the entry-price
+    // check below) so a misconfigured environment is surfaced even for
+    // market orders that carry a stop-loss but no explicit entry price.
+    if order.stop_loss.is_some() {
+        std::env::var("FOREX_BOT_PROP_ACCOUNT_CURRENCY")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Risk gate cannot size order: FOREX_BOT_PROP_ACCOUNT_CURRENCY \
+                     is unset. The account currency must be supplied by the broker \
+                     (cTrader trader profile) — no synthetic default allowed."
+                )
+            })?;
+        // The full pip-value computation runs inside the entry-price block
+        // below; we only validate presence here.
+    }
+
     // HARD risk-per-trade gate (D4+D5). Previously this was a `tracing::warn`
     // that did not block the order, and the loss estimate used `* 10.0` —
     // i.e. it assumed every pip is worth $10/std-lot. Wrong for non-USD
@@ -171,9 +210,35 @@ pub(super) fn prop_firm_pre_trade_check(
     // cost model and reject the order if it would exceed the configured
     // `risk_per_trade` percentage. Override the live FX rate the model
     // needs for cross pairs via `FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE`.
-    if let (Some(sl), Some(entry_estimate)) =
-        (order.stop_loss, order.limit_price.or(order.stop_price))
-    {
+    //
+    // V0.4 audit Task #1 — entry-estimate fallback for Market orders.
+    // Pre-fix: a Market order carries neither `limit_price` nor `stop_price`,
+    // so the original `(Some(sl), Some(entry))` if-let pattern was always
+    // `(Some(sl), None)` for Market orders → the entire risk-per-trade
+    // computation was SKIPPED even when a stop-loss was set. That meant a
+    // 100-lot Market BUY with a wide SL passed the gate silently. We now:
+    //   (a) accept an optional `market_price_for_entry` from the caller
+    //       (typically the mid of the latest cTrader spot quote);
+    //   (b) use it as the entry estimate when the order itself carries no
+    //       limit/stop price;
+    //   (c) hard-fail if `stop_loss` is set but NO entry estimate of any
+    //       kind is available — refusing to size an order without an
+    //       authoritative entry price is the safe choice in a prop-firm
+    //       production path.
+    let entry_estimate = order
+        .limit_price
+        .or(order.stop_price)
+        .or(market_price_for_entry);
+    if order.stop_loss.is_some() && entry_estimate.is_none() {
+        return Err(anyhow::anyhow!(
+            "Risk gate cannot size order: stop_loss is set but no entry-price \
+             estimate is available (Market order with no `limit_price`/`stop_price` \
+             and no live mid-market quote). Wait for the broker to deliver a fresh \
+             bid/ask spot update before retrying, or switch to a Limit order with \
+             an explicit target_price. Refusing to bypass the risk-per-trade gate."
+        ));
+    }
+    if let (Some(sl), Some(entry_estimate)) = (order.stop_loss, entry_estimate) {
         let pip_multiplier = 10.0_f64.powi(pip_position);
         let pip_distance = (entry_estimate - sl).abs() * pip_multiplier;
 
@@ -185,13 +250,7 @@ pub(super) fn prop_firm_pre_trade_check(
         // configured `risk_per_trade` ceiling. Real metadata must come
         // from the cTrader symbol-metadata table (populated by the
         // ctrader connector) or operator-supplied disk overrides.
-        let symbol = symbol_name.trim();
-        if symbol.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Risk gate cannot size order: symbol name was not supplied. \
-                 Refusing to fall back to synthetic pip-value defaults."
-            ));
-        }
+        // (symbol emptiness already checked above; no need to re-check)
         let metadata = forex_core::symbol_metadata::resolve(symbol).ok_or_else(|| {
             anyhow::anyhow!(
                 "Risk gate cannot size order: no cTrader symbol metadata for {symbol}. \

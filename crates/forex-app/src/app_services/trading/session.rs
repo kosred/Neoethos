@@ -49,6 +49,7 @@ use super::{
     sync_ctrader_discovered_accounts_into_targets, sync_discovered_accounts_with_targets,
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::Instant;
 
@@ -128,7 +129,7 @@ impl TradingSession {
         let tx_clone = tx.clone();
         let _ = tx.blocking_send(ServiceEvent::BootstrapUpdated(snapshot.clone()));
 
-        let handle = std::thread::spawn(move || {
+        let handle = super::background::spawn_background_task("bootstrap", tx_clone.clone(), move || {
             let mut running_snapshot = snapshot;
             running_snapshot.state = JobState::Running;
             running_snapshot.progress.stage = "bootstrap_running".to_string();
@@ -347,24 +348,30 @@ impl TradingSession {
     }
 
     pub fn restore_ctrader_session(&mut self) -> anyhow::Result<Option<CTraderAuthSnapshot>> {
-        // v0.4.18 — refresh broker_settings from disk before the
-        // empty-check below so the wizard's Apply path (which writes
+        // v0.4.18 — refresh broker_settings from disk only when the
+        // in-memory client_id is empty. The wizard's Apply path writes
         // empty client_id / redirect_uri on the assumption that the
-        // runtime resolver fills from embedded constants) doesn't
-        // accidentally short-circuit `restore_ctrader_session` to an
-        // `Ok(None)` "No saved cTrader session found" surface when
-        // the in-memory broker_settings was loaded BEFORE the wizard
-        // overwrote the file. The hot reload also picks up any
-        // hand-edits the operator made between session boot and this
-        // click.
-        self.broker_settings = crate::app_services::broker_persistence::load_broker_settings();
+        // runtime resolver fills from embedded constants; without this
+        // reload such a wizard session would short-circuit to
+        // `Ok(None)` "No saved cTrader session found". When client_id
+        // is already populated (e.g. in tests or after a successful
+        // previous session) we keep the in-memory state so test-set
+        // values (environment, accounts, credentials) are not
+        // overwritten by whatever is on disk.
+        if self.broker_settings.ctrader.client_id.trim().is_empty() {
+            self.broker_settings =
+                crate::app_services::broker_persistence::load_broker_settings();
+        }
         let client_id = self.broker_settings.ctrader.client_id.trim().to_string();
         let redirect_uri = self.broker_settings.ctrader.redirect_uri.trim().to_string();
         if client_id.is_empty() || redirect_uri.is_empty() {
             return Ok(None);
         }
 
-        let Some(bundle) = self.ctrader_token_store.load_token_bundle()? else {
+        let Some(bundle) = self
+            .ctrader_token_store
+            .load_token_bundle_with_legacy_fallback()?
+        else {
             self.ctrader_auth = None;
             return Ok(None);
         };
@@ -437,26 +444,67 @@ impl TradingSession {
         tx: tokio::sync::mpsc::Sender<ServiceEvent>,
     ) -> anyhow::Result<()> {
         self.reap_finished_background_tasks();
-        if self.background_task_running(TaskKind::Connect) {
+        // V0.4 audit Task #15 — atomic re-entrancy guard.
+        //
+        // The previous guard `background_task_running(Connect)` checks
+        // `connect_handle.is_finished()`. Between `std::thread::spawn(...)`
+        // and the OS scheduling the worker, `is_finished()` returns `false`
+        // BUT the previous click hasn't actually settled either; a second
+        // click in the same render frame could see no running task and
+        // spawn a duplicate. The atomic flag closes that race: only one
+        // caller can flip `false → true`, all subsequent callers see
+        // `true` and bail.
+        if self
+            .connect_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return Err(anyhow::anyhow!("connection attempt already in progress"));
         }
+        // From here we MUST clear the flag on every exit path. The
+        // ResetGuard handles the spawn-failure case below; the spawned
+        // closure handles the success/network-error case via its own
+        // guard around the work.
         match self.configured_adapter {
             TradingAdapterKind::CTrader => {
                 let request = self.build_ctrader_account_runtime_request()?;
                 let backend = Arc::clone(&self.ctrader_account_runtime_backend);
-                let handle =
-                    std::thread::spawn(move || match backend.load_account_runtime(&request) {
-                        Ok(runtime) => {
-                            let _ = tx.blocking_send(ServiceEvent::CTraderConnectUpdated(runtime));
+                let in_flight = Arc::clone(&self.connect_in_flight);
+                let handle = super::background::spawn_background_task(
+                    "connect",
+                    tx.clone(),
+                    move || {
+                        // RAII guard — flips the flag back to false when the
+                        // worker exits, whether by success, network error,
+                        // or panic. The `background` helper wraps us in
+                        // `catch_unwind` so the panic case still drops the
+                        // local stack and runs this Drop.
+                        struct ResetGuard(Arc<AtomicBool>);
+                        impl Drop for ResetGuard {
+                            fn drop(&mut self) {
+                                self.0.store(false, Ordering::Release);
+                            }
                         }
-                        Err(err) => {
-                            let _ = tx
-                                .blocking_send(ServiceEvent::ConnectOutcome(Err(err.to_string())));
+                        let _reset = ResetGuard(in_flight);
+                        match backend.load_account_runtime(&request) {
+                            Ok(runtime) => {
+                                let _ = tx
+                                    .blocking_send(ServiceEvent::CTraderConnectUpdated(runtime));
+                            }
+                            Err(err) => {
+                                let _ = tx.blocking_send(ServiceEvent::ConnectOutcome(Err(
+                                    err.to_string(),
+                                )));
+                            }
                         }
-                    });
+                    },
+                );
                 self.connect_handle = Some(handle);
             }
             _ => {
+                // Synchronous early-return — release the flag before exit
+                // so the operator can re-click after fixing the config.
+                self.connect_in_flight.store(false, Ordering::Release);
                 let _ = tx.blocking_send(ServiceEvent::ConnectOutcome(Err(format!(
                     "Adapter {:?} not implemented",
                     self.configured_adapter
@@ -809,6 +857,84 @@ impl TradingSession {
         {
             let _ = handle.join();
         }
+        if self
+            .chart_fetch_handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+            && let Some(handle) = self.chart_fetch_handle.take()
+        {
+            let _ = handle.join();
+        }
+    }
+
+    /// Returns `true` if a background cTrader chart-data fetch is currently
+    /// in progress. Call `reap_finished_background_tasks` first so stale
+    /// handles are cleaned up before the check.
+    pub fn chart_fetch_is_running(&self) -> bool {
+        self.chart_fetch_handle
+            .as_ref()
+            .is_some_and(|h| !h.is_finished())
+    }
+
+    /// Spawns a background thread that fetches cTrader chart history and sends
+    /// a `ServiceEvent::ChartDataUpdated` on completion. Returns `true` if the
+    /// thread was started, `false` if a fetch is already in progress or if the
+    /// required session state (credentials, account) is not available.
+    pub fn start_ctrader_chart_fetch(
+        &mut self,
+        symbol: &str,
+        timeframe: &str,
+        available_timeframes: Vec<String>,
+        overlay_status: String,
+        tx: tokio::sync::mpsc::Sender<crate::app_services::ServiceEvent>,
+    ) -> bool {
+        self.reap_finished_background_tasks();
+        if self.chart_fetch_is_running() {
+            return false;
+        }
+        let request = match self.build_ctrader_chart_history_request(symbol, timeframe) {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        let handle = super::background::spawn_background_task("chart_fetch", tx.clone(), move || {
+            use crate::app_services::trading::{
+                build_market_chart_snapshot_from_historical_bars, load_chart_history,
+                merge_live_spot_update_into_bars,
+            };
+            let snapshot = match load_chart_history(&request) {
+                Ok(history) => {
+                    let bars = merge_live_spot_update_into_bars(&history.bars, None);
+                    build_market_chart_snapshot_from_historical_bars(
+                        &history.symbol.symbol_name,
+                        &request.timeframe,
+                        available_timeframes,
+                        &bars,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .with_overlay_status(overlay_status)
+                }
+                Err(err) => crate::app_services::trading::MarketChartSnapshot::empty_for(
+                    &request.symbol_name,
+                    &request.timeframe,
+                    available_timeframes,
+                    format!(
+                        "cTrader chart unavailable for {} {}",
+                        request.symbol_name, request.timeframe
+                    ),
+                    overlay_status,
+                    vec![format!(
+                        "Failed to load cTrader {} chart for {}: {}",
+                        request.timeframe, request.symbol_name, err
+                    )],
+                ),
+            };
+            let _ = tx.blocking_send(crate::app_services::ServiceEvent::ChartDataUpdated(
+                Box::new(snapshot),
+            ));
+        });
+        self.chart_fetch_handle = Some(handle);
+        true
     }
 
     pub(super) fn selected_ctrader_execution_account_id(&self) -> Option<String> {
@@ -840,7 +966,7 @@ impl TradingSession {
 
         let bundle = self
             .ctrader_token_store
-            .load_token_bundle()?
+            .load_token_bundle_with_legacy_fallback()?
             .ok_or_else(|| anyhow::anyhow!(missing_bundle_message.to_string()))?;
         let now_unix = current_unix_seconds()?;
         if !bundle.needs_refresh_at(now_unix, CTRADER_TOKEN_REFRESH_WINDOW_SECS) {
@@ -871,7 +997,7 @@ impl TradingSession {
         }
         let bundle = self
             .ctrader_token_store
-            .load_token_bundle()?
+            .load_token_bundle_with_legacy_fallback()?
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "cTrader force-refresh requires a stored token bundle with a refresh token"

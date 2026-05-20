@@ -186,9 +186,24 @@ mod tests {
     fn news_panel_groups_market_brief_and_upcoming_events() {
         let panel = build_news_panel(&sample_state());
 
-        // Without live data, items should be empty and status set
-        assert!(panel.filter_status.is_empty() || !panel.filter_status.is_empty());
-        assert!(!panel.provider.is_empty());
+        // Without live news events, the items list MUST be empty (the panel
+        // should never invent placeholder items). The provider label MUST be
+        // populated so the operator can see which backend is wired in.
+        // Blackout is only triggered when `current_status` contains "BLACKOUT"
+        // (see the dedicated `news_panel_blackout_detection` test).
+        assert!(
+            panel.items.is_empty(),
+            "items must be empty when no live news events are loaded; got {} items",
+            panel.items.len()
+        );
+        assert!(
+            !panel.provider.is_empty(),
+            "provider label must be populated for the operator to identify the news backend"
+        );
+        assert!(
+            !panel.blackout_active,
+            "blackout should not trigger on a default state with empty filter_status"
+        );
     }
 
     #[test]

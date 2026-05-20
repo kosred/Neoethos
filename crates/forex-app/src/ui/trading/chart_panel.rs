@@ -1,13 +1,20 @@
 use crate::app_services::trading::{MarketChartSnapshot, TradingSession};
+use crate::app_services::ServiceEvent;
 use crate::app_state::AppState;
 use crate::ui::theme;
 use eframe::egui;
+use tokio::sync::mpsc;
 
 const PRICE_AXIS_WIDTH: f32 = 72.0;
 const VOLUME_PANEL_RATIO: f32 = 0.18; // volume takes bottom 18% of chart area
 
-pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSession) {
-    let mut snapshot = session.market_chart_snapshot(state);
+pub fn render(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    session: &mut TradingSession,
+    tx: &mpsc::Sender<ServiceEvent>,
+) {
+    let mut snapshot = session.market_chart_snapshot(state, Some(tx));
     if snapshot.timeframe != state.chart_timeframe {
         state.chart_timeframe = snapshot.timeframe.clone();
     }
@@ -34,7 +41,7 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSess
                     .corner_radius(egui::CornerRadius::same(3));
                 if ui.add_sized([32.0, 18.0], btn).clicked() {
                     state.chart_timeframe = timeframe.clone();
-                    snapshot = session.market_chart_snapshot(state);
+                    snapshot = session.market_chart_snapshot(state, Some(tx));
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

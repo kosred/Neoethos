@@ -808,7 +808,15 @@ impl Default for NewsConfig {
             news_backfill_enabled: true,
             news_backfill_days: 30,
             news_local_glob: String::new(),
-            openai_model: "gpt-5-nano-2025-08-07".to_string(),
+            // V0.4 audit Task #59 — hardcoded snapshot dates rot fast.
+            // OpenAI deprecates specific dated snapshots ~3 months after
+            // release; pinning to one means every fresh install eventually
+            // hits "model not found" until the operator hand-edits the
+            // YAML. Default to the family ("gpt-5-nano") which OpenAI
+            // resolves to the current stable snapshot. Operators who need
+            // reproducibility can still pin a dated snapshot in their
+            // config.yaml — the field is preserved.
+            openai_model: "gpt-5-nano".to_string(),
             openai_api_key_env: "OPENAI_API_KEY".to_string(),
             openai_max_tokens: 256,
             openai_max_events_per_fetch: 50,

@@ -366,17 +366,7 @@ pub fn write_broker_credentials(controller: &WizardController) -> Result<()> {
     // an account. We tolerate a `None` bundle here (operator hit "Skip
     // cTrader") so the apply path stays idempotent for non-broker runs.
     if let Some(bundle) = crate::ui::wizard::oauth::expose_token_bundle() {
-        // The service/user pair MUST match the constants
-        // `TradingSession::new()` uses at
-        // `crates/forex-app/src/app_services/trading/mod.rs` (currently
-        // "forex-ai.test" / "ctrader.account"), otherwise the
-        // workspace's `restore_saved_session` reads a different
-        // keyring entry than the wizard writes.
-        let store = crate::app_services::secure_store::CTraderSecureStore::new(
-            "forex-ai.test",
-            "ctrader.account",
-            crate::app_services::secure_store::KeyringSecretStoreBackend,
-        );
+        let store = crate::app_services::secure_store::production_ctrader_token_store();
         store
             .save_token_bundle(&bundle)
             .context("save cTrader token bundle to secure store")?;
