@@ -43,6 +43,39 @@ struct Args {
     /// `wizard_state.json` already exists. Spec §5.1 entry-point #2.
     #[arg(long, default_value_t = false)]
     wizard: bool,
+
+    /// Run the live cTrader API test harness instead of launching the
+    /// GUI or headless trading loop. Walks through 23 integration flows
+    /// (auth, accounts, symbols, history, streaming, orders) against
+    /// the demo environment using the OAuth token already saved by the
+    /// wizard, and writes a structured JSON report to `--api-test-output`.
+    ///
+    /// Order-execution flows use a hardcoded 0.01-lot size on EURUSD and
+    /// auto-clean up positions / pending orders before exiting, so a
+    /// successful run leaves the demo account in the state it started.
+    #[arg(long, default_value_t = false)]
+    api_test: bool,
+
+    /// Output path for the api-test JSON report. Defaults to
+    /// `./api-test-report.json` in the current working directory.
+    #[arg(long, default_value = "api-test-report.json")]
+    api_test_output: String,
+
+    /// Add a 1-second pause between api-test flows. Use when you suspect
+    /// the broker's rate limiter is interfering with the failure
+    /// classification (cTrader caps historical-data requests at 5 / s
+    /// per session, but ordering / streaming flows have no documented
+    /// rate cap).
+    #[arg(long, default_value_t = false)]
+    api_test_slow: bool,
+
+    /// Restrict the api-test run to flows whose `name` matches this
+    /// glob pattern. Examples: `--api-test-only "orders.*"`,
+    /// `--api-test-only "streaming.spot.sub"`. When unset, all 23 flows
+    /// run. Useful for re-running a single failing flow without
+    /// re-walking the entire suite.
+    #[arg(long)]
+    api_test_only: Option<String>,
 }
 
 /// Returns true when the wizard should run on this launch. Spec §1.2
@@ -102,6 +135,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "First-run wizard gate triggered (--wizard={} sentinel-missing={})",
             args.wizard, !args.wizard
         );
+    }
+
+    if args.api_test {
+        info!("Starting forex-app in API-TEST mode (cTrader demo)...");
+        let cfg = app_services::api_test::ApiTestConfig {
+            environment: app_services::api_test::ApiTestEnvironment::Demo,
+            output_path: std::path::PathBuf::from(&args.api_test_output),
+            slow: args.api_test_slow,
+            only_filter: args.api_test_only.clone(),
+        };
+        app_services::api_test::run_api_test_suite(cfg).await?;
+        return Ok(());
     }
 
     if args.headless {

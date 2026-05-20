@@ -1,3 +1,4 @@
+pub mod api_test;
 pub mod backoff;
 pub mod bootstrap_writer;
 pub mod broker_config;

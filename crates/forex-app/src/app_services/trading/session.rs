@@ -980,6 +980,17 @@ impl TradingSession {
     /// Used when the broker rejects the current `access_token` mid-session
     /// (e.g. server-side revocation, clock skew). Returns the new bundle so
     /// the next execution request rebuilds with a valid token.
+    /// Public wrapper used by the api-test harness to exercise the
+    /// refresh path explicitly. Production code paths go through
+    /// `ensure_fresh_ctrader_token_bundle` which only refreshes near
+    /// expiry — the harness always refreshes so the network call is
+    /// the test.
+    pub fn refresh_ctrader_token_bundle_for_test(
+        &mut self,
+    ) -> anyhow::Result<CTraderTokenBundle> {
+        self.force_refresh_ctrader_token_bundle()
+    }
+
     pub(super) fn force_refresh_ctrader_token_bundle(
         &mut self,
     ) -> anyhow::Result<CTraderTokenBundle> {
