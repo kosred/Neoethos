@@ -1,5 +1,85 @@
 use crate::workspace::WorkspaceTab;
 use egui_dock::{DockState, NodeIndex};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+/// V0.4 audit Task #24 — minimal workspace persistence.
+///
+/// We persist the LAST ACTIVE TAB across restarts so the operator
+/// reopens the app on the panel they were last using. The full dock
+/// layout (panel splits, sizes, floating windows) is intentionally
+/// NOT persisted in V0.4 — egui_dock's `DockState` serialisation
+/// requires the `serde` feature and round-trip is fragile when the
+/// tab enum changes between releases (which it has, every patch).
+/// V0.5 follow-up: gate full layout persistence behind a feature flag
+/// once the tab set has stabilised.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceStateFile {
+    pub last_active_tab: WorkspaceTab,
+}
+
+impl WorkspaceStateFile {
+    /// Path the persistence file lives at, mirroring the wizard's
+    /// pattern: `<data_path>/forex-ai/workspace_state.json`. Returns
+    /// `None` if the data path is empty (e.g. wizard not finished).
+    pub fn path(data_path: &Path) -> Option<PathBuf> {
+        if data_path.as_os_str().is_empty() {
+            return None;
+        }
+        Some(data_path.join("forex-ai").join("workspace_state.json"))
+    }
+
+    /// Load if it exists; return `None` on missing / unreadable /
+    /// corrupt files so the caller can fall back to defaults rather
+    /// than crashing on a malformed state file.
+    pub fn load_if_present(data_path: &Path) -> Option<Self> {
+        let path = Self::path(data_path)?;
+        let body = std::fs::read_to_string(&path).ok()?;
+        match serde_json::from_str(&body) {
+            Ok(v) => Some(v),
+            Err(err) => {
+                tracing::warn!(
+                    target: "forex_app::workspace",
+                    path = %path.display(),
+                    error = %err,
+                    "workspace_state.json could not be parsed; ignoring"
+                );
+                None
+            }
+        }
+    }
+
+    /// Save best-effort — log on failure but don't crash the shutdown
+    /// path. Atomic write via temp + rename so a crash mid-write
+    /// doesn't leave an unparseable file (load_if_present logs and
+    /// ignores corruption, but atomicity avoids the corrupt state in
+    /// the first place).
+    pub fn save_best_effort(&self, data_path: &Path) {
+        let Some(path) = Self::path(data_path) else {
+            return;
+        };
+        if let Some(parent) = path.parent()
+            && std::fs::create_dir_all(parent).is_err()
+        {
+            return;
+        }
+        let Ok(body) = serde_json::to_string_pretty(self) else {
+            return;
+        };
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &body).is_err() {
+            return;
+        }
+        if let Err(err) = std::fs::rename(&tmp, &path) {
+            tracing::warn!(
+                target: "forex_app::workspace",
+                path = %path.display(),
+                error = %err,
+                "workspace_state.json atomic-rename failed; state will not persist"
+            );
+        }
+    }
+}
 
 pub struct WorkspaceState {
     dock_state: DockState<WorkspaceTab>,

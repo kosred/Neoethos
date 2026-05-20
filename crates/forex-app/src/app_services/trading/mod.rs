@@ -1699,6 +1699,78 @@ impl TradingSession {
         }
     }
 
+    /// Non-blocking variant of [`Self::refresh_runtime`] for the
+    /// 5-second heartbeat loop. V0.4 audit Task #22 — the synchronous
+    /// `refresh_runtime` calls `load_ctrader_account_runtime` which
+    /// opens a fresh WSS socket each time (~200-500 ms on a healthy
+    /// network, longer when the broker is slow). Running it on the
+    /// render thread visibly stalled the UI every 30 s.
+    ///
+    /// This variant:
+    ///   - Respects the same 30 s cooldown (no point hammering the
+    ///     broker — `ctrader_runtime_refreshed_at` is the single source
+    ///     of truth for "when did we last refresh?").
+    ///   - Returns `true` if it spawned a fetch, `false` if it
+    ///     short-circuited on the cooldown.
+    ///   - Routes the worker through `background::spawn_background_task`
+    ///     so panics surface via `ServiceEvent::BackgroundTaskPanic`
+    ///     (Task #2) and re-uses the same `ServiceEvent::CTraderConnectUpdated`
+    ///     handler the connect flow already wires.
+    pub fn start_runtime_refresh_in_background(
+        &mut self,
+        tx: tokio::sync::mpsc::Sender<crate::app_services::ServiceEvent>,
+    ) -> bool {
+        if !self.connected {
+            return false;
+        }
+        if !matches!(self.adapter, Some(TradingAdapter::CTrader(_))) {
+            return false;
+        }
+        if self
+            .ctrader_runtime_refreshed_at
+            .is_some_and(|refreshed_at| refreshed_at.elapsed() < Duration::from_secs(30))
+        {
+            return false;
+        }
+        // Build the request on the main thread (it needs &self for
+        // broker_settings + adapter state). Note: this also calls
+        // `refresh_ctrader_token_bundle` synchronously if the token is
+        // about to expire — that's fast (<10ms) and avoids racing the
+        // worker against a token rotation. The expensive bit (the
+        // ProtoOAReconcileReq round-trip) is what we offload.
+        let Ok(request) = self.build_ctrader_account_runtime_request() else {
+            return false;
+        };
+        // Reserve the cooldown window NOW so a slow worker doesn't get
+        // double-scheduled by the next heartbeat.
+        self.ctrader_runtime_refreshed_at = Some(Instant::now());
+        let backend = std::sync::Arc::clone(&self.ctrader_account_runtime_backend);
+        background::spawn_background_task("runtime_refresh", tx.clone(), move || {
+            match backend.load_account_runtime(&request) {
+                Ok(runtime) => {
+                    let _ = tx.blocking_send(
+                        crate::app_services::ServiceEvent::CTraderConnectUpdated(runtime),
+                    );
+                }
+                Err(err) => {
+                    // Refresh failures during the heartbeat are
+                    // expected during transient network blips — log
+                    // and surface to the status strip rather than
+                    // tearing down the session.
+                    tracing::warn!(
+                        target: "forex_app::heartbeat",
+                        error = %err,
+                        "background runtime refresh failed; will retry on next heartbeat"
+                    );
+                    let _ = tx.blocking_send(crate::app_services::ServiceEvent::ConnectOutcome(
+                        Err(format!("Heartbeat refresh: {err}")),
+                    ));
+                }
+            }
+        });
+        true
+    }
+
     fn calculate_equity_from_runtime(&self, runtime: &CTraderAccountRuntimeSnapshot) -> f64 {
         let accrued: f64 = runtime
             .reconcile

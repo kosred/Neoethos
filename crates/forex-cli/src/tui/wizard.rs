@@ -34,10 +34,24 @@
 use anyhow::Result;
 
 /// stderr message printed when `stdin` is not a tty. Spec §8.3.
+///
+/// V0.4 audit Task #41 — message updated to reflect actual options.
+/// There is no `forex-cli init` subcommand yet (planned), so we point
+/// users at the documented headless-config path instead.
 pub const WIZARD_TUI_NO_TTY_MESSAGE: &str =
-    "forex-cli wizard requires a tty; use `forex-cli init` for headless first-run setup.";
+    "forex-cli wizard requires a TTY. For headless setup, hand-edit \
+     ~/.local/share/forex-ai/broker_credentials.toml (Linux/macOS) or \
+     %APPDATA%\\forex-ai\\broker_credentials.toml (Windows) — see \
+     docs/audits/research/installer_wizard_ux_spec.md §6 for the schema. \
+     If you have a desktop session, run the GUI wizard via `forex-app`.";
 pub const WIZARD_TUI_NOT_PORTED_MESSAGE: &str =
-    "forex-cli wizard: TUI rendering not yet ported; run `forex-app --wizard` for now.";
+    "forex-cli wizard: TUI rendering not yet ported (tracked under V0.5 \
+     follow-up). The desktop GUI wizard is fully functional — run \
+     `forex-app` to open it. For scripted/headless onboarding, \
+     hand-edit the broker_credentials.toml under your platform's \
+     data dir (see docs/audits/research/installer_wizard_ux_spec.md §6 \
+     for the schema, including OAuth bundle, selected_account_id, and \
+     allowlisted symbols).";
 
 /// Refuse-to-run guard for non-tty stdin. Returns `Err` so callers
 /// surface the message at the process-exit boundary.
@@ -80,9 +94,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn no_tty_message_mentions_init_subcommand() {
-        // §8.3 — verbatim message must point users at `forex-cli init`.
-        assert!(WIZARD_TUI_NO_TTY_MESSAGE.contains("forex-cli init"));
+    fn no_tty_message_points_user_at_a_headless_alternative() {
+        // V0.4 audit Task #41 — message must give the operator an
+        // ACTIONABLE alternative (the headless config path) since
+        // there is no `forex-cli init` subcommand yet. Either the
+        // hand-edit path or the GUI wizard is acceptable as a pointer.
+        assert!(
+            WIZARD_TUI_NO_TTY_MESSAGE.contains("broker_credentials.toml")
+                || WIZARD_TUI_NO_TTY_MESSAGE.contains("forex-app"),
+            "no-TTY message must point at a real alternative, got: {}",
+            WIZARD_TUI_NO_TTY_MESSAGE
+        );
     }
 
     #[test]

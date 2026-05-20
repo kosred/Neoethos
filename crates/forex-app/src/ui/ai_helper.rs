@@ -208,20 +208,49 @@ pub fn render(ui: &mut egui::Ui, state: &mut AiHelperState) {
                             .button("Run fetch-gemma-model.ps1 (next to forex-app.exe)")
                             .clicked()
                         {
-                            if let Ok(exe) = std::env::current_exe() {
-                                if let Some(dir) = exe.parent() {
-                                    let script = dir.join("fetch-gemma-model.ps1");
-                                    if script.is_file() {
-                                        let _ = std::process::Command::new("powershell.exe")
-                                            .args([
-                                                "-NoProfile",
-                                                "-ExecutionPolicy",
-                                                "Bypass",
-                                                "-File",
-                                            ])
-                                            .arg(&script)
-                                            .spawn();
-                                    }
+                            // V0.4 audit Task #23 — move the PowerShell spawn
+                            // off the render thread. Even a successful spawn
+                            // takes ~100 ms on Windows (process creation +
+                            // PowerShell startup) and was blocking the
+                            // current egui frame. Now we spawn via
+                            // `std::thread::spawn` so the click returns
+                            // immediately; the PowerShell process detaches
+                            // and runs independently. Errors are logged but
+                            // not surfaced — the user knows whether the
+                            // model fetch worked by the model-loaded check
+                            // on the next frame.
+                            if let Ok(exe) = std::env::current_exe()
+                                && let Some(dir) = exe.parent()
+                            {
+                                let script = dir.join("fetch-gemma-model.ps1");
+                                if script.is_file() {
+                                    std::thread::Builder::new()
+                                        .name("forex-bg-gemma-fetch".to_string())
+                                        .spawn(move || {
+                                            match std::process::Command::new("powershell.exe")
+                                                .args([
+                                                    "-NoProfile",
+                                                    "-ExecutionPolicy",
+                                                    "Bypass",
+                                                    "-File",
+                                                ])
+                                                .arg(&script)
+                                                .spawn()
+                                            {
+                                                Ok(mut child) => {
+                                                    let _ = child.wait();
+                                                }
+                                                Err(err) => {
+                                                    tracing::error!(
+                                                        target: "forex_app::ai_helper",
+                                                        error = %err,
+                                                        script = %script.display(),
+                                                        "PowerShell spawn failed for Gemma model fetch"
+                                                    );
+                                                }
+                                            }
+                                        })
+                                        .ok();
                                 }
                             }
                         }

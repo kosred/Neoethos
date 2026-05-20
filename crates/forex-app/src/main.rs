@@ -241,6 +241,19 @@ struct ForexApp {
     rx: mpsc::Receiver<ServiceEvent>,
     discovery_handle: Option<DiscoveryJobHandle>,
     training_handle: Option<TrainingJobHandle>,
+
+    // V0.4 audit Task #25 — graceful shutdown wiring.
+    //
+    // `heartbeat_handle` keeps a handle to the tokio task that fires
+    // `ServiceEvent::Heartbeat` every 5 s; previously this was shadowed
+    // into `_heartbeat_handle` (dropped immediately) and the task ran
+    // detached forever. `shutdown_flag` is checked by the heartbeat
+    // loop so the task can exit cleanly. `Drop for ForexApp` signals
+    // shutdown + cancels discovery/training before the process
+    // teardown so background workers don't leave half-written vortex
+    // files or half-open WSS sockets.
+    heartbeat_handle: Option<tokio::task::JoinHandle<()>>,
+    shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ForexApp {
@@ -265,17 +278,34 @@ impl ForexApp {
             }
         };
         let state = AppState::new(runtime.clone(), &settings, symbols);
-        let _heartbeat_handle = spawn_account_heartbeat(tx.clone());
+        let shutdown_flag =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let heartbeat_handle =
+            spawn_account_heartbeat(tx.clone(), std::sync::Arc::clone(&shutdown_flag));
+
+        // V0.4 audit Task #24 — restore the last-active tab from disk if
+        // we have a saved workspace_state.json. The dock layout itself
+        // is rebuilt from defaults each launch; only the focused tab is
+        // persisted in V0.4 (full layout persistence requires the
+        // egui_dock serde feature and is deferred to V0.5).
+        let mut workspace = WorkspaceState::default();
+        if let Some(saved) =
+            crate::workspace::layout::WorkspaceStateFile::load_if_present(&state.runtime.data_dir)
+        {
+            workspace.focus_tab(saved.last_active_tab);
+        }
 
         Self {
             trading_session: TradingSession::new_with_persisted_credentials(),
-            workspace: WorkspaceState::default(),
+            workspace,
             state,
             wizard_controller: initial_wizard_controller(wizard_due),
             tx: tx.clone(),
             rx,
             discovery_handle: None,
             training_handle: None,
+            heartbeat_handle: Some(heartbeat_handle),
+            shutdown_flag,
         }
     }
 
@@ -328,14 +358,17 @@ impl ForexApp {
                     self.state.llm_news_filter.current_status = status;
                 }
                 ServiceEvent::Heartbeat => {
+                    // V0.4 audit Task #22 — kick the refresh into a
+                    // background worker instead of running WSS I/O on
+                    // the render thread. The worker emits a
+                    // `CTraderConnectUpdated` event on success (handled
+                    // below) or a `ConnectOutcome(Err)` on failure.
+                    // The 30 s cooldown inside the helper means the
+                    // actual network call happens at most every 30 s
+                    // even though the heartbeat ticks every 5 s.
                     if self.trading_session.is_connected() {
-                        if let Err(err) = self.trading_session.refresh_runtime(&mut self.state) {
-                            tracing::warn!(
-                                target: "forex_app::main",
-                                error = %err,
-                                "heartbeat refresh_runtime failed; will retry on next heartbeat"
-                            );
-                        }
+                        self.trading_session
+                            .start_runtime_refresh_in_background(self.tx.clone());
                     }
                 }
                 ServiceEvent::CTraderConnectUpdated(runtime) => {
@@ -390,6 +423,55 @@ impl ForexApp {
             }
             ctx.request_repaint();
         }
+    }
+}
+
+impl Drop for ForexApp {
+    fn drop(&mut self) {
+        // V0.4 audit Task #25 — graceful shutdown. Signal background
+        // workers to wind down BEFORE the tokio runtime is dropped from
+        // under them. Order:
+        //   1. Flip the shutdown flag so the heartbeat loop exits its
+        //      `interval.tick().await` on the next iteration (at most
+        //      5 s after this point).
+        //   2. Cancel discovery + training cooperatively via their
+        //      `CancellationFlag`s. These jobs check the flag at the
+        //      top of each iteration so they stop cleanly without
+        //      losing the partial vortex writes that DO happen between
+        //      checks.
+        //   3. The heartbeat tokio task and any `std::thread::spawn`
+        //      workers (connect / chart_fetch / bootstrap) are dropped
+        //      naturally; they own everything they need by move so a
+        //      forced drop is safe (the worker either completed and
+        //      already sent its `ServiceEvent`, or it was about to and
+        //      the receiver going away just silently drops the event).
+        tracing::info!(
+            target: "forex_app::main",
+            "ForexApp::drop — signalling shutdown to background workers"
+        );
+        self.shutdown_flag
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(handle) = &self.discovery_handle {
+            handle.cancel.request();
+        }
+        if let Some(handle) = &self.training_handle {
+            handle.cancel.request();
+        }
+        // V0.4 audit Task #24 — best-effort persist of the workspace
+        // state (last active tab). Best-effort because Drop can't
+        // surface errors; the helper logs on atomic-rename failure.
+        if let Some(tab) = self.workspace.active_tab() {
+            crate::workspace::layout::WorkspaceStateFile {
+                last_active_tab: tab,
+            }
+            .save_best_effort(&self.state.runtime.data_dir);
+        }
+        // We do NOT block on `heartbeat_handle.join()` here because
+        // (a) Drop must not block (egui's process-exit path expects a
+        // quick teardown) and (b) tokio runtime drop will await any
+        // remaining tasks naturally as long as they observe the
+        // shutdown flag, which the heartbeat now does.
+        let _ = self.heartbeat_handle.take();
     }
 }
 
@@ -677,7 +759,16 @@ impl eframe::App for ForexApp {
         // duplicated controls already reachable from the relevant
         // sidebar tabs (Discovery → Start, Training → Start). This
         // strip is purely informational; actions live in their tabs.
-        let status_bar_text = self.state.status_msg.clone();
+        //
+        // V0.4 audit Task #31 — avoid the per-frame `String::clone` of
+        // `status_msg`. The status panel closure only reads the text,
+        // so a `&str` borrow is sufficient. We need the borrow to
+        // outlive the `egui` closure but NOT outlive any mutation of
+        // `self.state` — and since the panel closure runs strictly
+        // BEFORE we re-take `&mut self`, the borrow is sound. Saves
+        // one heap allocation per render frame (egui repaints at 60 Hz
+        // when active, so this matters under continuous chart updates).
+        let status_bar_text: &str = self.state.status_msg.as_str();
         egui::TopBottomPanel::bottom("status_bar")
             .frame(ui::theme::status_bar_frame(ctx.style().as_ref()))
             .exact_height(ui::theme::STATUSBAR_HEIGHT)
@@ -965,11 +1056,24 @@ fn engine_short_label(job: Option<&app_services::jobs::JobSnapshot>) -> String {
     }
 }
 
-fn spawn_account_heartbeat(tx: mpsc::Sender<ServiceEvent>) -> tokio::task::JoinHandle<()> {
+fn spawn_account_heartbeat(
+    tx: mpsc::Sender<ServiceEvent>,
+    shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             interval.tick().await;
+            // V0.4 audit Task #25 — exit cleanly when the app is shutting
+            // down so the tokio runtime can drain. Pre-fix the task was
+            // detached and tokio would forcibly cancel it on runtime drop.
+            if shutdown_flag.load(std::sync::atomic::Ordering::Acquire) {
+                tracing::info!(
+                    target: "forex_app::heartbeat",
+                    "shutdown flag set; heartbeat loop exiting"
+                );
+                break;
+            }
             if tx.send(ServiceEvent::Heartbeat).await.is_err() {
                 break;
             }
