@@ -1,0 +1,100 @@
+[package]
+name = "forex-models"
+version = "0.4.19"
+edition.workspace = true
+
+[dependencies]
+forex-data = { path = "../forex-data" }
+forex-core = { path = "../forex-core" }
+forex-search = { path = "../forex-search" }
+ndarray = { version = "0.17.2", features = ["rayon", "serde"] }
+tch = { version = "0.22.0", optional = true }
+ort = { version = "2.0.0-rc.10", optional = true, features = ["cuda", "copy-dylibs"] }
+tracing = "0.1.42"
+anyhow = "1.0.100"
+thiserror = "2.0.16"
+
+# Tree model dependencies
+polars = { version = "0.52.0", features = ["lazy", "dtype-datetime", "rolling_window", "timezones"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+seq-macro = "0.3.6"
+
+# Tree model FFI bindings
+lightgbm3 = { version = "1.0.8", optional = true }
+xgb = { version = "3.0.5", optional = true }
+catboost-rust = { version = "0.3.6", optional = true, features = ["gpu"] }
+sklears = { version = "0.1.0-rc.1", optional = true, features = ["tree"] }
+candle-core = { version = "0.9.1", optional = true }
+cubecl = { version = "0.9.0", optional = true, default-features = false, features = ["std", "cuda"] }
+
+# Pure Rust Evolutionary & Reinforcement Learning
+crfmnes = { version = "1.0.0", optional = true }
+rlkit = { version = "0.0.3", optional = true }
+irithyll = { version = "6.3.0", optional = true }
+ruv-swarm-ml = { version = "1.0.5", optional = true }
+symbios-neat = "0.1.2"
+symbios-genetics = "0.1.3"
+
+# Statistical & Anomaly Detection
+linfa = { version = "0.7.0", optional = true }
+linfa-linear = { version = "0.7.0", optional = true }
+linfa-logistic = { version = "0.7.0", optional = true }
+linfa-clustering = { version = "0.7.0", optional = true }
+variational-regression = { version = "0.1.0", optional = true }
+extended-isolation-forest = { version = "0.2.0", optional = true, features = ["serde"] }
+
+# Burn framework — use autodiff only (no train/dataset to avoid rusqlite conflict)
+# burn-nn is always included in burn-core, no extra dep needed
+burn = { version = "0.20", default-features = false, features = ["autodiff", "std"] }
+burn-ndarray = { version = "0.20", default-features = false, features = ["std"] }
+burn-wgpu = { version = "0.20.1", optional = true, default-features = false, features = ["std", "vulkan", "fusion"] }
+
+num_cpus = "1.17.0"
+rand = "0.9.2"
+rand08 = { package = "rand", version = "0.8", optional = true }
+# Ziggurat-method `StandardNormal` sampler — correct tails by construction,
+# replaces the hand-rolled Box-Muller that produced 30+ sigma outliers.
+# MUST stay on 0.5.x: rand_distr 0.6.0 requires `rand 0.10::Rng` trait,
+# but `rand_xoshiro 0.7.0` (transitively pulled by argmin → scirs2-optimize)
+# does not yet impl `rand 0.10::Rng` for `Xoroshiro128PlusPlus`. Compile
+# breaks with E0277 ("the trait bound `Xoroshiro128PlusPlus: scirs2_core::Rng`
+# is not satisfied") if 0.6 is selected. Revisit once rand_xoshiro publishes
+# a 0.7.1+ that targets rand 0.10. (ML research agent suggested 0.6 without
+# checking this dep chain — exactly the kind of stale-info bug the user
+# warned about.)
+rand_distr = "0.5"
+rayon = "1.11.0"
+chrono = "0.4.42"
+lazy_static = "1.5.0"
+rand_xoshiro = "0.7.0"
+nalgebra = "0.33.0"
+
+[features]
+default = ["tree-models", "pure-rust-ml"]
+onnx = ["dep:ort"]
+tch = ["dep:tch"]
+lightgbm = ["dep:lightgbm3"]
+lightgbm-gpu = ["lightgbm", "lightgbm3/gpu", "lightgbm3/cuda"]
+xgboost = ["dep:xgb"]
+catboost = ["dep:catboost-rust"]
+sklears-tree = ["dep:sklears"]
+tree-models-core = ["lightgbm", "xgboost", "sklears-tree"]
+tree-models = ["tree-models-core", "catboost"]
+
+# Pure Rust ML features
+neuro-evolution = ["dep:crfmnes", "dep:rand08"]
+neuro-evolution-gpu = ["neuro-evolution", "dep:cubecl"]
+reinforcement-learning = ["dep:rlkit", "dep:candle-core"]
+reinforcement-learning-cuda = ["reinforcement-learning", "rlkit/cuda", "candle-core/cuda"]
+adaptive-models = ["dep:irithyll"]
+swarm-forecasting = ["dep:ruv-swarm-ml"]
+statistical-models = ["dep:linfa", "dep:linfa-linear", "dep:linfa-logistic", "dep:linfa-clustering", "dep:variational-regression"]
+statistical-gpu = ["statistical-models", "dep:cubecl"]
+anomaly-detection = ["dep:extended-isolation-forest"]
+
+# Burn pure-Rust deep learning (production backend)
+burn-wgpu-backend = ["dep:burn-wgpu"]
+burn-backend = []
+pure-rust-ml = ["neuro-evolution", "reinforcement-learning", "adaptive-models", "swarm-forecasting", "burn-backend", "statistical-models", "anomaly-detection"]
+

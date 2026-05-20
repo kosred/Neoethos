@@ -1,0 +1,125 @@
+name: CI
+
+# Manual-only by design.
+#
+# The repository is in an active strategy-search/refactor phase. Running CI on
+# every small push creates noisy failed notifications before related changes are
+# complete. Start this workflow manually from the Actions tab when you want a
+# full repository health check.
+on:
+  workflow_dispatch:
+    inputs:
+      run_default_features:
+        description: "Also run workspace checks with default features"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  BINDGEN_EXTRA_CLANG_ARGS: "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+
+jobs:
+  workspace-linux:
+    name: Workspace check/test (Linux)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard against Python/PyO3 reintroduction
+        run: bash scripts/check_no_python_legacy.sh
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake pkg-config \
+            libasound2-dev libudev-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libx11-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: linux-workspace-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-workspace-ci-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Cargo check workspace without default features
+        run: cargo check --workspace --all-targets --no-default-features
+
+      - name: Run workspace tests without default features
+        run: cargo test --workspace --no-default-features
+
+      - name: Cargo check workspace with default features
+        if: ${{ inputs.run_default_features == 'true' }}
+        run: cargo check --workspace --all-targets
+
+      - name: Run workspace tests with default features
+        if: ${{ inputs.run_default_features == 'true' }}
+        run: cargo test --workspace
+
+  # V0.4 audit Task #46 — extend CI beyond Linux so the cfg(windows) /
+  # cfg(macos) paths get exercised on every dispatch. The codebase has
+  # Windows-specific autostart code, file-system path quirks, and a
+  # `packaging_smoke` test gated `cfg(not(windows))` for Git Bash path
+  # translation issues; running `cargo check --workspace` (NOT the full
+  # test matrix, to keep CI cost bounded) on each target catches the
+  # most common cross-platform regressions before they reach the
+  # release pipeline.
+  workspace-windows:
+    name: Workspace check (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: windows-workspace-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: windows-workspace-ci-
+      - name: Cargo check workspace without default features
+        run: cargo check --workspace --all-targets --no-default-features
+
+  workspace-macos:
+    name: Workspace check (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: macos-workspace-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-workspace-ci-
+      - name: Cargo check workspace without default features
+        run: cargo check --workspace --all-targets --no-default-features

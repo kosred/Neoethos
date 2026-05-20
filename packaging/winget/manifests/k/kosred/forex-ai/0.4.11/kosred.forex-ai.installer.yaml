@@ -1,0 +1,38 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+# Installer manifest — points at the GitHub Releases NSIS .exe asset built
+# by `cargo packager --release` and uploaded by .github/workflows/release.yml.
+#
+# Spec: https://learn.microsoft.com/en-us/windows/package-manager/package/manifest
+# Strategy ref: docs/audits/research/installer_no_paid_certs_strategy.md §1.5.1
+#   "WinGet runs the actual installer binary on the user's machine (it does
+#   not re-sign)" — we ship the self-signed-or-unsigned binary, WinGet
+#   marks-of-the-web it but suppresses the interactive `Run anyway?` modal
+#   when launched via `winget install`.
+
+PackageIdentifier: kosred.forex-ai
+PackageVersion: 0.4.11
+
+InstallerType: nullsoft
+
+InstallModes:
+  - interactive
+  - silent
+  - silentWithProgress
+
+UpgradeBehavior: install
+Commands:
+  - forex-app
+
+ReleaseDate: 2026-05-19
+Installers:
+  - Architecture: x64
+    InstallerType: nullsoft
+    Scope: user
+    InstallerUrl: https://github.com/kosred/forex-ai/releases/download/v0.4.11/forex-app_0.4.11_x64-setup.exe
+    InstallerSha256: 456809E6AF1ADA460971244FCD33CCA0F1A375B3281030D7A0EBFEE1A256CEBF
+    InstallerSwitches:
+      Silent: /S
+      SilentWithProgress: /S
+
+ManifestType: installer
+ManifestVersion: 1.6.0

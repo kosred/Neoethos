@@ -1,0 +1,166 @@
+FOREX-AI PROPRIETARY LICENSE
+=============================
+
+Copyright (c) 2024-2026 Konstantinos Kokkinos ("kosred"). All rights
+reserved.
+
+This software, its source code, compiled binaries, documentation, machine-
+learning models, configuration files, and accompanying assets (collectively,
+the "Software") are the proprietary property of Konstantinos Kokkinos and
+are made available subject to the terms below. No part of the Software is
+released under an open-source license; the prior dual MIT/Apache-2.0 grant
+is hereby revoked, retroactive to the v0.4.8 release, except for the
+limited rights expressly granted in Section 2.
+
+
+1. DEFINITIONS
+
+   "Author" means Konstantinos Kokkinos (kosred), the sole copyright
+   holder.
+
+   "Software" has the meaning given above.
+
+   "Personal Use" means installation and use of the Software by a single
+   identifiable natural person on hardware they personally own or
+   exclusively control, solely for that person's own informational,
+   educational, or non-revenue-generating purposes.
+
+   "Demo Use" means installation and use of the Software in a non-
+   production environment for the purpose of evaluating its features,
+   provided that no real-money trading orders are routed through the
+   Software during the evaluation.
+
+   "Commercial Use" means any use of the Software, in whole or in part,
+   that directly or indirectly generates revenue, fees, commissions,
+   trading profits, fund-management income, advisory income, software-as-
+   a-service fees, or any other monetary or in-kind compensation, whether
+   to the user, the user's employer, or any third party. Routing real-
+   money trading orders through the Software is Commercial Use.
+
+
+2. LIMITED GRANT — PERSONAL & DEMO USE
+
+   Subject to your continuous compliance with this License, the Author
+   grants you a personal, non-exclusive, non-transferable, revocable,
+   royalty-free license to install and execute the Software on hardware
+   you personally own or exclusively control, solely for Personal Use or
+   Demo Use, for so long as the Author makes binaries publicly available
+   on the official GitHub release page (https://github.com/kosred/forex-ai).
+
+   This grant DOES NOT include:
+
+   (a) the right to redistribute the Software, in source or binary form,
+       to any third party;
+   (b) the right to publish, mirror, fork, rehost, or sublicense the
+       Software or any portion of it;
+   (c) the right to create derivative works, modifications, ports, or
+       adaptations of the Software;
+   (d) the right to use the Software for Commercial Use; or
+   (e) the right to reverse-engineer, decompile, disassemble, or
+       otherwise attempt to derive the source code of any compiled
+       portion of the Software, except to the minimum extent expressly
+       permitted by applicable mandatory law.
+
+
+3. COMMERCIAL USE REQUIRES A SEPARATE WRITTEN LICENSE
+
+   Any Commercial Use of the Software is strictly prohibited without a
+   separate written license agreement signed by the Author. To inquire
+   about a commercial license, contact: konstantinoskokkinos1982@gmail.com.
+
+
+4. NO TRADING ADVICE; NO WARRANTIES
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+   The Software is NOT financial, investment, tax, legal, or trading
+   advice. The Author is not a registered investment adviser, broker,
+   dealer, commodity-pool operator, or fund manager in any jurisdiction.
+   Decisions to place, modify, or cancel real-money trades are exclusively
+   the user's. Trading foreign-exchange, contracts-for-difference, futures,
+   options, and other leveraged instruments carries a substantial risk of
+   total loss of capital and may not be suitable for every investor. Past
+   performance, simulated or actual, does not guarantee future results.
+
+
+5. LIMITATION OF LIABILITY
+
+   IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+   INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+   WITHOUT LIMITATION, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+   OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+   TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
+   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
+   DAMAGE.
+
+   Specifically, the Author is not liable for trading losses, missed
+   opportunities, slippage, broker rejection, network outages, model
+   drift, parameter mis-configuration, regulatory violations, or any
+   other adverse outcome that may result from using the Software.
+
+
+6. THIRD-PARTY COMPONENTS
+
+   The Software incorporates open-source components governed by their
+   own licenses (e.g., the Apache-2.0 Rust standard library, the egui
+   immediate-mode GUI library, the Burn deep-learning framework, the
+   tokio async runtime). Those third-party components remain licensed
+   under their respective terms. A non-exhaustive list ships in the
+   build artifact under THIRD_PARTY_LICENSES.md. Nothing in this License
+   restricts your rights under those third-party licenses with respect
+   to those components only.
+
+
+7. TRADEMARKS
+
+   "forex-ai", "ForexAI", and any associated logos and marks are
+   trademarks of the Author. This License does not grant any right to
+   use those marks, except for the limited factual reference necessary
+   to identify the Software in good-faith Personal Use.
+
+
+8. TERMINATION
+
+   This License terminates automatically and immediately, without notice
+   from the Author, upon any breach of its terms by you. Upon termination,
+   you must cease all use of the Software, uninstall all copies, and
+   destroy any extracted artifacts. The Author may also terminate this
+   License at any time for any reason by ceasing to publish public
+   binaries; sections 4, 5, 7, and 8 survive termination.
+
+
+9. EXPORT AND SANCTIONS
+
+   You represent that you are not located in, under the control of, or a
+   national or resident of any country or region currently subject to
+   trade or financial sanctions by the European Union, the United
+   Kingdom, the United States, the United Nations, or any other body
+   whose sanctions apply to you. You agree not to use the Software in
+   violation of any such sanctions or applicable export control laws.
+
+
+10. GOVERNING LAW
+
+    This License is governed by the laws of the Hellenic Republic
+    (Greece), without regard to its conflict-of-laws principles. Any
+    dispute arising out of or relating to this License shall be subject
+    to the exclusive jurisdiction of the competent courts of Athens,
+    Greece.
+
+
+11. ENTIRE AGREEMENT
+
+    This License constitutes the entire agreement between you and the
+    Author concerning the Software and supersedes all prior or
+    contemporaneous oral or written communications, proposals, and
+    representations with respect to the Software, including the prior
+    dual MIT/Apache-2.0 grant published in v0.4.7 and earlier.
+
+
+    For commercial licensing inquiries:
+    konstantinoskokkinos1982@gmail.com
+
+    Last updated: 2026-05-19

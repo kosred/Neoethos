@@ -1,0 +1,70 @@
+{
+    "$schema": "https://raw.githubusercontent.com/ScoopInstaller/Scoop/master/schema.json",
+    "_": [
+        "Scoop App Manifest for forex-ai.",
+        "Spec: https://github.com/ScoopInstaller/Scoop/wiki/App-Manifests",
+        "Strategy ref: docs/audits/research/installer_no_paid_certs_strategy.md §1.5.3",
+        "Target bucket: ScoopInstaller/Extras (GUI app, ML-heavy). Submit via PR.",
+        "Windows package-manager installs use the zip asset produced by",
+        ".github/workflows/release-installers.yml."
+    ],
+    "version": "0.5.0",
+    "description": "Quantitative trading workspace for the cTrader Open API.",
+    "homepage": "https://github.com/kosred/forex-ai",
+    "license": "LicenseRef-Proprietary",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/kosred/forex-ai/releases/download/v0.5.0/forex-app_0.5.0_x64-setup.exe",
+            "hash": "613C5927DAD066748A3F81DB424B51832CAD38CDE3F81CD68F989AE2E205105C"
+        }
+    },
+    "installer": {
+        "script": [
+            "$installer_path = \"$dir\\$fname\"",
+            "Start-Process -FilePath $installer_path -ArgumentList '/S',\"/D=$dir\" -Wait",
+            "Remove-Item -Path $installer_path -Force"
+        ]
+    },
+    "uninstaller": {
+        "script": [
+            "Start-Process -FilePath \"$dir\\uninstall.exe\" -ArgumentList '/S' -Wait"
+        ]
+    },
+    "bin": [
+        "forex-app.exe",
+        "forex-cli.exe"
+    ],
+    "shortcuts": [
+        [
+            "forex-app.exe",
+            "forex-ai"
+        ]
+    ],
+    "persist": [
+        "config",
+        "data",
+        "logs"
+    ],
+    "checkver": {
+        "github": "https://github.com/kosred/forex-ai"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/kosred/forex-ai/releases/download/v$version/forex-app_$version_x64-setup.exe"
+            }
+        },
+        "hash": {
+            "url": "$url.sha256"
+        }
+    },
+    "notes": [
+        "User data (config, cached candles, logs) is persisted across upgrades via",
+        "Scoop's `persist` mechanism — see installer_infrastructure_spec.md §8.2",
+        "and installer_no_paid_certs_strategy.md §1.5.3 for the canonical layout."
+    ]
+}
+
+
+
+

@@ -1,0 +1,601 @@
+<!doctype html>
+<html lang="el">
+<head>
+<meta charset="utf-8" />
+<title>Forex AI — TUI mockup (ratatui-style)</title>
+<style>
+/* ──────────────────────────────────────────────────────────────────────
+   TUI mockup — emulates a terminal running the Rust ratatui frontend.
+   Designed for SSH / headless server access. Keyboard-driven.
+   ────────────────────────────────────────────────────────────────────── */
+:root {
+  --term-bg:        #0b0e14;   /* terminal black */
+  --term-fg:        #c5c8c6;   /* default text */
+  --term-bright:    #ffffff;
+  --term-dim:       #5c6370;
+  --term-faint:     #3b4047;
+  --ansi-red:       #ef5350;
+  --ansi-green:     #26a69a;
+  --ansi-yellow:    #f4b400;
+  --ansi-blue:      #2962ff;
+  --ansi-cyan:      #00bcd4;
+  --ansi-magenta:   #9c27b0;
+  --ansi-white:     #e6eaf2;
+  --ansi-bg-active: #1c2230;
+  --border-active:  #2962ff;
+  --border-idle:    #3a404d;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin:0; padding:0; width:100%; height:100%;
+  background: #000;
+  color: var(--term-fg);
+  font-family: "Cascadia Mono","Cascadia Code","SF Mono","Consolas","Courier New",monospace;
+  font-size: 13px;
+  line-height: 1.35;
+  overflow: hidden;
+  letter-spacing: 0;
+}
+
+.term-window {
+  background: var(--term-bg);
+  height: 100vh; width: 100vw;
+  display:flex; flex-direction:column;
+  padding: 4px 6px;
+}
+
+/* fake titlebar so it looks like a terminal app window */
+.term-titlebar {
+  background:#1f2228; color:#9c9c9c;
+  padding:3px 10px; font-size:11px;
+  display:flex; gap:8px; align-items:center;
+  border-radius:4px 4px 0 0;
+  border-bottom:1px solid #000;
+  font-family: -apple-system,BlinkMacSystemFont,sans-serif;
+}
+.term-titlebar .dot { width:10px; height:10px; border-radius:50%; }
+.term-titlebar .dot.r { background:#ff5f56; }
+.term-titlebar .dot.y { background:#ffbd2e; }
+.term-titlebar .dot.g { background:#27c93f; }
+.term-titlebar .prompt { color:#9c9c9c; margin-left:8px; font-family:monospace; font-size:11px;}
+.term-titlebar .right { margin-left:auto; color:#666; font-size:11px;}
+
+/* full TUI area */
+.tui {
+  flex:1;
+  white-space: pre;
+  font-variant-ligatures: none;
+  overflow: hidden;
+  padding: 4px 0;
+}
+
+/* color classes used as inline spans */
+.r{color:var(--ansi-red);} .g{color:var(--ansi-green);} .y{color:var(--ansi-yellow);}
+.b{color:var(--ansi-blue);} .c{color:var(--ansi-cyan);} .m{color:var(--ansi-magenta);}
+.w{color:var(--ansi-white);} .dim{color:var(--term-dim);} .faint{color:var(--term-faint);}
+.bold{font-weight:bold;}
+.inv{background:var(--ansi-blue); color:#fff;}
+.invG{background:var(--ansi-green); color:#000;}
+.invR{background:var(--ansi-red); color:#fff;}
+.invY{background:var(--ansi-yellow); color:#000;}
+.bg-sel{background:#1c2230;}
+.bg-blue-dim{background:#0d2746;}
+
+/* tab row */
+.tab { padding:0 4px; cursor:pointer; }
+.tab.active { background:var(--ansi-blue); color:#fff; font-weight:bold; }
+.tab:hover { background:#1c2230; }
+
+/* status hint bar */
+.tui-hint {
+  background:#1c2230; color:#9aa4b2; font-size:11px;
+  padding:2px 8px; border-top:1px solid #2a2f3a;
+  font-family:"Cascadia Mono",monospace;
+}
+.tui-hint .kbd {
+  background:#3a404d; color:#fff; padding:0 5px; border-radius:2px;
+  margin:0 2px; font-size:10px;
+}
+
+.scrolly { overflow:auto; max-height:calc(100vh - 32px); }
+</style>
+</head>
+<body>
+<div class="term-window">
+  <!-- Fake terminal titlebar so it feels like a real terminal session -->
+  <div class="term-titlebar">
+    <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+    <span>ssh kostas@vps01.example.com — forex-ai-tui</span>
+    <span class="prompt">~/forex-ai $ ./forex-ai --tui --config config.yaml</span>
+    <span class="right">80×30 · vt100 · UTF-8</span>
+  </div>
+
+  <div class="tui scrolly" id="tuiContent"></div>
+
+  <!-- Bottom keyboard hint bar (always visible) -->
+  <div class="tui-hint" id="tuiHint">
+    <span class="kbd">F1</span>–<span class="kbd">F12</span> Tabs ·
+    <span class="kbd">Tab</span> Next pane ·
+    <span class="kbd">↑↓</span> Select ·
+    <span class="kbd">Enter</span> Activate ·
+    <span class="kbd">/</span> Search ·
+    <span class="kbd">F</span> Buy · <span class="kbd">G</span> Sell ·
+    <span class="kbd">A</span> Auto-trade ·
+    <span class="kbd">Q</span> Quit
+  </div>
+</div>
+
+<script>
+/* ════════════════════════════════════════════════════════════════════════════
+   TUI mockup — same data model as the GUI but rendered as monospace ASCII.
+   Uses Unicode box-drawing characters to emulate ratatui's Block widget.
+   ════════════════════════════════════════════════════════════════════════════ */
+const TABS = [
+  { k:'F1',  id:'dash',  title:'Dashboard'   },
+  { k:'F2',  id:'chart', title:'Chart'       },
+  { k:'F3',  id:'mkts',  title:'Markets'     },
+  { k:'F4',  id:'order', title:'Order'       },
+  { k:'F5',  id:'news',  title:'News'        },
+  { k:'F6',  id:'watch', title:'Trade Watch' },
+  { k:'F7',  id:'disc',  title:'Discovery'   },
+  { k:'F8',  id:'train', title:'Training'    },
+  { k:'F9',  id:'intel', title:'Intelligence'},
+  { k:'F10', id:'brkr',  title:'Broker'      },
+  { k:'F11', id:'risk',  title:'Risk'        },
+  { k:'F12', id:'set',   title:'Settings'    },
+];
+
+let activeTab = 'chart';
+let activeSym = 'EURUSD';
+let activeTf  = 'M5';
+let autoTrade = true;
+const equity = 10243.55, balance = 10000;
+const positions = [{ sym:'EURUSD', side:'LONG',  size:0.10, pips:24.5, pnl:23.65 }];
+const orders    = [{ sym:'EURUSD', type:'BUY STOP', size:0.05, price:1.08750 }];
+const log = [
+  ['18:41', 'INFO',  'g', 'bot.signal: BUY EURUSD confidence=0.74'],
+  ['18:36', 'INFO',  'c', 'filter.atr: passed (ATR > threshold)'],
+  ['18:35', 'INFO',  'w', 'risk: pre-trade checks OK · lot=0.10 dd=1.2%'],
+  ['17:12', 'INFO',  'g', 'broker: position closed · +18.2p · +$17.50'],
+  ['16:48', 'WARN',  'y', 'broker: slippage 0.3p on GBPUSD entry'],
+  ['16:32', 'ERROR', 'r', 'feed: ws reconnect (-1006) — recovered in 1.2s'],
+];
+
+/* ── Helpers for ASCII box drawing ── */
+const w = 142;   // total width — fits 80x30 but goes wider for modern terminals
+function hr(n=w, ch='─') { return ch.repeat(n); }
+function row(content, width=w) {
+  // content can contain HTML spans; we pad based on stripped text length
+  const txt = content.replace(/<[^>]+>/g,'');
+  const pad = Math.max(0, width - txt.length);
+  return content + ' '.repeat(pad);
+}
+function pad(text, len, side='left') {
+  const txt = String(text).replace(/<[^>]+>/g,'');
+  const need = Math.max(0, len - txt.length);
+  return side === 'right' ? ' '.repeat(need) + text : text + ' '.repeat(need);
+}
+function center(text, len) {
+  const txt = String(text).replace(/<[^>]+>/g,'');
+  const need = Math.max(0, len - txt.length);
+  const l = Math.floor(need/2);
+  return ' '.repeat(l) + text + ' '.repeat(need - l);
+}
+
+/* ── Top banner + tab bar ── */
+function renderHeader() {
+  const tabs = TABS.map(t => {
+    const isActive = t.id === activeTab;
+    const cls = isActive ? 'tab active' : 'tab';
+    return `<span class="${cls}" data-tab="${t.id}">${t.k} ${t.title.slice(0,8)}</span>`;
+  }).join('<span class="dim">│</span>');
+  const symbolLine =
+    `<span class="bold w">EURUSD</span> ${activeTf} <span class="c">cTrader</span> ` +
+    `· <span class="g">●</span> Live #987654 ` +
+    `· <span class="g">$${equity.toFixed(2)}</span> ` +
+    `· ${autoTrade ? '<span class="invR"> AUTO ON </span>' : '<span class="dim">AUTO OFF</span>'} ` +
+    `· <span class="dim">16 cores GPU on</span>`;
+  return [
+    '<span class="c">' + '╔' + hr(w-2,'═') + '╗</span>',
+    '<span class="c">║</span> ' + row('<span class="bold w">Forex AI v0.2.0-tui</span>  <span class="dim">' + symbolLine + '</span>', w-3) + '<span class="c">║</span>',
+    '<span class="c">╟' + hr(w-2,'─') + '╢</span>',
+    '<span class="c">║</span> ' + row(tabs, w-3) + '<span class="c">║</span>',
+    '<span class="c">╚' + hr(w-2,'═') + '╝</span>',
+    '',
+  ].join('\n');
+}
+
+/* ── Panel renderer with title + content lines ── */
+function panel(title, content, width, active=false) {
+  const tl = active ? '╔' : '┌';
+  const tr = active ? '╗' : '┐';
+  const bl = active ? '╚' : '└';
+  const br = active ? '╝' : '┘';
+  const h  = active ? '═' : '─';
+  const v  = active ? '║' : '│';
+  const cl = active ? 'b' : 'dim';
+  const titleColored = active ? `<span class="b bold">[ ${title} ]</span>` : `<span class="dim">[ ${title} ]</span>`;
+  const top = `<span class="${cl}">${tl}${h.repeat(2)}</span>${titleColored}<span class="${cl}">${h.repeat(width - titleColored.replace(/<[^>]+>/g,'').length - 3)}${tr}</span>`;
+  const body = content.split('\n').map(line => `<span class="${cl}">${v}</span> ${pad(line, width-3)}<span class="${cl}">${v}</span>`).join('\n');
+  const bottom = `<span class="${cl}">${bl}${h.repeat(width-2)}${br}</span>`;
+  return top + '\n' + body + '\n' + bottom;
+}
+
+/* ── ASCII candlestick chart ── */
+function asciiChart() {
+  // 5-row sparkline-like representation using block characters
+  const rows = [
+    '1.0850 ─                          ▂▂   ▆▆        ',
+    '1.0843 ─       ▂▂      ▄▄ ▆▆ █▆      ▆▆          ',
+    '1.0835 ─    ▂▂   ▂▆ ██     ▆▆         ▆▆▄▄ ▆▆    ',
+    '1.0828 ─ ▂▆▆   ██     ▆▆           ▄▄    ▆▆ ▆▆▂▂ ',
+    '1.0820 ─                                         ▆',
+    '       └─────────────────────────────────────────',
+    '       60m  50m  40m  30m  20m  10m  now          ',
+  ];
+  // Add BOT BUY marker
+  return [
+    '<span class="dim">EURUSD M5</span>  <span class="bold w">1.08530</span> <span class="g">+0.18%</span>   <span class="dim">O 1.08510  H 1.08530  L 1.08510  C 1.08530</span>',
+    '',
+    rows.map((r,i) => {
+      if (i === 0) return `<span class="dim">${r}</span>`;
+      if (i === 5) return `<span class="dim">${r}</span>`;
+      if (i === 6) return `<span class="dim">${r}</span>`;
+      return `<span class="g">${r}</span>`;
+    }).join('\n'),
+    '',
+    '<span class="dim">         spread 2.0p · 120 candles · </span><span class="g">AI ✓ 4 TFs trained</span>',
+    '',
+    '<span class="b">BOT BUY @ 1.08510  confidence 0.74</span>',
+  ].join('\n');
+}
+
+/* ── Tab-specific content ── */
+function renderTab() {
+  if (activeTab === 'chart') return renderChartTab();
+  if (activeTab === 'dash') return renderDashTab();
+  if (activeTab === 'mkts') return renderMarketsTab();
+  if (activeTab === 'order') return renderOrderTab();
+  if (activeTab === 'news') return renderNewsTab();
+  if (activeTab === 'watch') return renderWatchTab();
+  if (activeTab === 'disc') return renderDiscoveryTab();
+  if (activeTab === 'train') return renderTrainingTab();
+  if (activeTab === 'intel') return renderIntelTab();
+  if (activeTab === 'brkr') return renderBrokerTab();
+  if (activeTab === 'risk') return renderRiskTab();
+  if (activeTab === 'set') return renderSettingsTab();
+  return '';
+}
+
+function renderChartTab() {
+  // Three columns: Watchlist | Chart | Order
+  const wlW = 26, chW = 80, orW = w - wlW - chW - 4;
+  const wl = [
+    '<span class="y">★</span> EURUSD  <span class="bold w">1.0853</span> <span class="g">+0.18%</span>',
+    '  GBPUSD  <span class="dim">  ----  --</span>',
+    '  USDJPY  <span class="dim">  ----  --</span>',
+    '<span class="y">★</span> XAUUSD  <span class="dim">  ----  --</span>',
+    '  BTCUSD  <span class="dim">  ----  --</span>',
+    '',
+    '<span class="dim">─── AI signal ───</span>',
+    'Buy   <span class="g">██████████░░</span> 62%',
+    'Sell  <span class="r">███░░░░░░░░░</span> 18%',
+    'Hold  <span class="dim">████░░░░░░░░</span> 20%',
+    '',
+    '<span class="dim">─── Exposure ───</span>',
+    '<span class="g">EURUSD L 0.10 +24.5p</span>',
+    '<span class="y">EURUSD STOP @1.0875</span>',
+  ].join('\n');
+
+  const ch = asciiChart();
+
+  const order = [
+    'Type:  <span class="inv"> Market </span> Limit  Stop',
+    'Lots:  <span class="w">0.10</span>           ',
+    'Slip:  10 pts',
+    'SL:    25 pips (ATR)',
+    'TP:    50 pips (RR 1:2)',
+    '',
+    'Risk:  <span class="r">-$25.61</span>',
+    'Reward:<span class="g">+$51.22</span>',
+    '',
+    '<span class="invG bold"> [F] BUY  </span><span class="invR bold"> [G] SELL </span>',
+    '',
+    '<span class="dim">[B] basket  [C] close all</span>',
+    '<span class="dim">[L] lock SL  [T] trail</span>',
+  ].join('\n');
+
+  return [
+    panel('Watchlist · F3', wl, wlW, false),
+    panel('Chart · EURUSD M5 · F2', ch, chW, true),
+    panel('Order Ticket · F4', order, orW, false),
+  ].map(p => p.split('\n')).reduce((acc, lines) => {
+    // Horizontal concat: take each line from each panel and join
+    if (acc.length === 0) return lines;
+    return acc.map((l,i) => l + (lines[i] || ''.padEnd(lines[0].replace(/<[^>]+>/g,'').length)));
+  }, []).join('\n');
+}
+
+function renderDashTab() {
+  const stats =
+`<span class="dim">┌─ Operator overview ───────────────────────────────────────────────────────┐</span>
+<span class="dim">│</span>  <span class="bold w">Account</span>                  <span class="bold w">Equity</span>           <span class="bold w">Jobs</span>            <span class="bold w">Risk</span>             <span class="dim">│</span>
+<span class="dim">│</span>  Live #987654             <span class="g">$10,243.55</span>       Discovery: Idle  DD daily: <span class="y">3.2%</span>    <span class="dim">│</span>
+<span class="dim">│</span>  Demo #123456             Bal $10,000.00   Training:  Idle  DD total: <span class="y">5.8%</span>    <span class="dim">│</span>
+<span class="dim">│</span>  Live #998877             <span class="g">+2.43% today</span>     Bootstrap: Idle  AUTO:     <span class="r">ARMED</span>    <span class="dim">│</span>
+<span class="dim">└───────────────────────────────────────────────────────────────────────────┘</span>`;
+
+  const equityCurve =
+`<span class="dim">┌─ Equity curve · 30d ──────────────────────────────────────────────────────┐</span>
+<span class="dim">│</span> 10500 ┤                                              <span class="g">▂▄▆█</span>            <span class="dim">│</span>
+<span class="dim">│</span> 10200 ┤                        <span class="g">▂▂▄▄</span>      <span class="g">▂▆▆██▆▆██</span>                <span class="dim">│</span>
+<span class="dim">│</span> 9900  ┤   <span class="r">▆▆▄▄</span>   <span class="g">▂▂▆▆</span>██████<span class="g">██████</span>                                  <span class="dim">│</span>
+<span class="dim">│</span> 9600  ┤<span class="r">██</span>     <span class="r">▆▆</span>                                                       <span class="dim">│</span>
+<span class="dim">│</span>       └──────────────────────────────────────────────────────────────       <span class="dim">│</span>
+<span class="dim">│</span>        May1   May8   May15   May22   May29   Jun5    Jun12                <span class="dim">│</span>
+<span class="dim">└───────────────────────────────────────────────────────────────────────────┘</span>`;
+
+  const exposure =
+`<span class="dim">┌─ Open positions (1) ──────────────────────────────┐</span> <span class="dim">┌─ Pending (1) ────────────┐</span>
+<span class="dim">│</span> #42102  <span class="g">EURUSD LONG</span>  0.10  <span class="g">+24.5p</span>  <span class="g">+$23.65</span>  <span class="dim">│</span> <span class="dim">│</span> <span class="y">EURUSD BUY STOP</span>          <span class="dim">│</span>
+<span class="dim">│</span>                                                  <span class="dim">│</span> <span class="dim">│</span> <span class="y">0.05 lots @ 1.08750</span>     <span class="dim">│</span>
+<span class="dim">└──────────────────────────────────────────────────┘</span> <span class="dim">└──────────────────────────┘</span>`;
+
+  return stats + '\n\n' + equityCurve + '\n\n' + exposure;
+}
+
+function renderMarketsTab() {
+  const data = [
+    ['★','EURUSD','Euro/USD',         '1.08412','1.08428','+0.18','g'],
+    [' ','GBPUSD','Pound/USD',        '1.26540','1.26554','-0.04','r'],
+    [' ','USDJPY','USD/Yen',          '155.832','155.846','+0.32','g'],
+    [' ','USDCHF','USD/Franc',        '0.90750','0.90766','+0.07','g'],
+    [' ','AUDUSD','Aussie/USD',       '0.66120','0.66134','-0.21','r'],
+    ['★','XAUUSD','Gold',             '2358.40','2358.80','+0.43','g'],
+    [' ','XAGUSD','Silver',           '30.120 ','30.140 ','+0.18','g'],
+    [' ','BTCUSD','Bitcoin',          '67215.5','67280.0','+1.24','g'],
+    [' ','ETHUSD','Ethereum',         '3128.40','3130.20','+0.86','g'],
+    [' ','US30',  'Dow Jones',        '39872.5','39880.0','+0.12','g'],
+    [' ','SPX500','S&P 500',          '5301.40','5301.60','+0.08','g'],
+    [' ','NAS100','Nasdaq',           '18650.2','18653.4','+0.22','g'],
+  ];
+  const header = `<span class="dim bold">  SYMBOL   NAME             BID       ASK      24h%   SPARK</span>`;
+  const rows = data.map(([star,sym,nm,bid,ask,chg,col]) =>
+    `<span class="y">${star}</span> <span class="bold w">${sym.padEnd(8)}</span> <span class="dim">${nm.padEnd(16)}</span> ${bid} ${ask}  <span class="${col}">${chg.padStart(5)}%</span>  <span class="${col}">▃▄▅▆▇▆▅▆▇</span>`
+  );
+  return panel('Markets · F3 · / to search', [header, '<span class="dim">' + hr(80, '─') + '</span>', ...rows].join('\n'), w-2, true);
+}
+
+function renderOrderTab() {
+  return panel('Order Ticket · F4', [
+    '<span class="bold w">EURUSD</span> · <span class="c">cTrader Live</span>',
+    'Bid <span class="r">1.08510</span>    Ask <span class="g">1.08530</span>    Spread 2.0p',
+    '',
+    '┌─ Type ────────────────┐',
+    '│ <span class="inv">[ Market ]</span> Limit  Stop │',
+    '└───────────────────────┘',
+    '',
+    'Lots:    <span class="w">0.10</span>     ←/→ adjust    Max ' + '<span class="dim">10.00</span>',
+    'Slip:    10 pts',
+    'SL:      25 pips    <span class="dim">1.08285</span>    (ATR)',
+    'TP:      50 pips    <span class="dim">1.08780</span>    (RR 1:2)',
+    'Label:   manual',
+    '',
+    '<span class="dim">┌─ Pre-trade preview ───────────────────────┐</span>',
+    '<span class="dim">│</span> Risk @ SL    <span class="r">-$25.61</span>  (1.0% equity)   <span class="dim">│</span>',
+    '<span class="dim">│</span> Reward @ TP  <span class="g">+$51.22</span>  (R:R 1:2.0)     <span class="dim">│</span>',
+    '<span class="dim">│</span> Margin used  $36.18  (free $9,994.45)   <span class="dim">│</span>',
+    '<span class="dim">└───────────────────────────────────────────┘</span>',
+    '',
+    '<span class="invG bold">  [F] BUY  </span>    <span class="invR bold">  [G] SELL  </span>',
+    '',
+    '<span class="dim">[Tab] next field · [Enter] confirm · [Esc] cancel</span>',
+  ].join('\n'), w-2, true);
+}
+
+function renderNewsTab() {
+  return panel('News & Events · F5 · Status: ' + '<span class="g">CLEAR</span>', [
+    '<span class="dim bold">  IMPACT  TIME (UTC)        CCY  EVENT                                          </span>',
+    '<span class="dim">' + hr(80, '─') + '</span>',
+    '<span class="invR"> HIGH </span>   2026-05-16 12:30  USD  Non-Farm Payrolls (forecast +200k)',
+    '<span class="invY"> MED  </span>   2026-05-16 14:00  EUR  ECB Lagarde speech',
+    '<span class="invY"> MED  </span>   2026-05-17 06:00  GBP  UK Retail Sales m/m',
+    '<span class="dim"> LOW  </span>   2026-05-17 23:30  JPY  BoJ Core CPI',
+    '<span class="invR"> HIGH </span>   2026-05-18 14:00  USD  Fed Powell Testimony',
+    '',
+    'LLM filter: <span class="c">openai</span> · 6 recent events processed · Blackout windows enforced',
+    '',
+    '<span class="dim">[S] sync now · [/] filter · [F]orce blackout (test)</span>',
+  ].join('\n'), w-2, true);
+}
+
+function renderWatchTab() {
+  return panel('Trade Watch · F6', [
+    '<span class="dim bold">  TIME    LVL    MESSAGE                                                      </span>',
+    '<span class="dim">' + hr(80, '─') + '</span>',
+    ...log.map(([t,lvl,col,msg]) => `  <span class="dim">${t}</span>   <span class="${col}">${lvl.padEnd(5)}</span>  ${msg}`),
+    '',
+    '<span class="dim">─── Positions / Orders ───</span>',
+    '<span class="g">#42102 EURUSD LONG 0.10 +24.5p +$23.65</span>',
+    '<span class="y">#42201 EURUSD BUY STOP 0.05 @ 1.08750</span>',
+    '',
+    '<span class="dim">─── Diagnostics ───</span>',
+    '<span class="c">adapter: cTrader · ws: connected · last hb 2s</span>',
+    '<span class="c">central broker loop: alive · 5s heartbeat</span>',
+    '',
+    '<span class="dim">[/] filter · [c]lear · [e]xport to journal.csv</span>',
+  ].join('\n'), w-2, true);
+}
+
+function renderDiscoveryTab() {
+  return panel('Strategy Discovery · F7', [
+    '<span class="dim">Status:</span> <span class="g">▶ Running</span>    <span class="dim">Stage:</span> search_generations    <span class="dim">Progress:</span> <span class="b">[████████░░░░░░░░░░░░] 38%</span>',
+    '',
+    '<span class="bold w">Targets:</span>  EURUSD GBPUSD XAUUSD              <span class="bold w">TFs:</span>  M5 M15 H1',
+    '<span class="bold w">Config:</span>   pop=100  gen=20  max-ind=8  pf=25  corr≤0.6  min-trades/d=1.0',
+    '',
+    '┌─ Counters ──────────────────────┐  ┌─ Best candidate ─────────────────┐',
+    '│ Generation:      <span class="w">8</span>  / 20            │  │ Strategy: <span class="b">trend-breakout-7</span>      │',
+    '│ Archived:        <span class="g">42</span> profitable      │  │ Sharpe:   <span class="g">1.94</span>                   │',
+    '│ Filtered:        17                │  │ Win rate: <span class="g">0.62</span>                   │',
+    '│ Portfolio:       <span class="c">8</span>  / 25            │  │ Trades/d: 2.4                    │',
+    '└────────────────────────────────┘  └──────────────────────────────────┘',
+    '',
+    '<span class="bold w">Live output:</span>',
+    '<span class="dim">[20:14:02]</span> <span class="g">✓</span> gen-7 best fitness 1.84 (was 1.71)',
+    '<span class="dim">[20:14:18]</span> <span class="g">✓</span> archived 4 strategies passing all filters',
+    '<span class="dim">[20:14:30]</span> <span class="c">→</span> generation 8 starting (crossover + mutation)',
+    '',
+    '<span class="dim">[Space] pause · [s]top · [a]uto wizard · [v]iew best portfolio</span>',
+  ].join('\n'), w-2, true);
+}
+
+function renderTrainingTab() {
+  return panel('Model Swarm Training · F8 · Mode: ' + '<span class="g">Simple</span>', [
+    '<span class="bold w">Symbols:</span>  EURUSD GBPUSD XAUUSD',
+    '<span class="bold w">TFs:</span>      M5 M15 H1',
+    '<span class="bold w">Models:</span>   xgboost lightgbm catboost  <span class="dim">(simple mode · 3 robust defaults)</span>',
+    '<span class="bold w">Valid:</span>    walk-forward (6 windows) · HP: random / 25 trials',
+    '',
+    '<span class="dim">Status:</span> <span class="g">▶ Running</span>   <span class="dim">Stage:</span> training_xgboost·EURUSD·M15   <span class="b">[████████████░░░░░░] 67%</span>',
+    '',
+    '┌─ Models (9 runs total) ─────────────────────────────────────────────────────────────────────────┐',
+    '│  <span class="g">✓</span> xgboost·EURUSD·M5    completed   val_auc 0.687  sharpe 1.42                          │',
+    '│  <span class="g">✓</span> xgboost·EURUSD·M15   completed   val_auc 0.701  sharpe 1.55                          │',
+    '│  <span class="b">▶</span> xgboost·EURUSD·H1    training... epoch 8/20                                          │',
+    '│  <span class="dim">○</span> lightgbm·EURUSD·M5   queued                                                          │',
+    '│  <span class="dim">○</span> lightgbm·EURUSD·M15  queued                                                          │',
+    '│  <span class="dim">○</span> ... (4 more queued)                                                                  │',
+    '└─────────────────────────────────────────────────────────────────────────────────────────────────┘',
+    '',
+    '<span class="bold w">Live output:</span>',
+    '<span class="dim">[20:14:02]</span> Training session started — 3 symbols × 3 TFs × 3 models',
+    '<span class="dim">[20:14:18]</span> <span class="g">✓</span> xgboost·EURUSD·M5 completed — val_auc 0.687 · sharpe 1.42',
+    '<span class="dim">[20:14:45]</span> <span class="g">✓</span> xgboost·EURUSD·M15 completed — val_auc 0.701 · sharpe 1.55',
+    '<span class="dim">[20:15:03]</span> <span class="c">→</span> Starting xgboost·EURUSD·H1 (3/9)...',
+    '',
+    '<span class="dim">Est. time remaining: 14m · ETA 20:29 UTC · RAM 3.1 GB · CPU 78%</span>',
+    '',
+    '<span class="dim">[a] advanced mode · [w]izard · [s]top · [↑↓] scroll log · [/] filter</span>',
+  ].join('\n'), w-2, true);
+}
+
+function renderIntelTab() {
+  return panel('Intelligence · F9', [
+    '<span class="bold w">AI Auto-Trade:</span> ' + (autoTrade ? '<span class="invR"> ARMED </span>' : '<span class="dim"> Manual-safe </span>'),
+    '<span class="bold w">News gate:</span>     <span class="g">CLEAR</span>     <span class="dim">(LLM: openai · 6 recent events)</span>',
+    '<span class="bold w">Consistency:</span>   <span class="g">passing</span>   <span class="dim">(blocks streaks of 5+ losses)</span>',
+    '<span class="bold w">Rate limit:</span>    14ms      <span class="dim">latency / signal</span>',
+    '',
+    '┌─ Ensemble signals · EURUSD M5 ──────────────────────────────────────────────────┐',
+    '│  Buy   <span class="g">████████████████████████░░░░░░░░░░</span>  62%  (xgb 0.71, lgb 0.65, cat 0.58) │',
+    '│  Sell  <span class="r">████████░░░░░░░░░░░░░░░░░░░░░░░░░░</span>  18%                                  │',
+    '│  Hold  <span class="dim">████████░░░░░░░░░░░░░░░░░░░░░░░░░░</span>  20%                                  │',
+    '└─────────────────────────────────────────────────────────────────────────────────┘',
+    '',
+    '<span class="bold w">Model artifacts:</span>',
+    '  <span class="g">●</span> EURUSD/M5/xgboost-2026-05-15.bin     val_auc 0.687  · loaded',
+    '  <span class="g">●</span> EURUSD/M15/lightgbm-2026-05-15.bin   val_auc 0.701  · loaded',
+    '  <span class="g">●</span> EURUSD/H1/catboost-2026-05-15.bin    val_auc 0.722  · loaded',
+    '  <span class="dim">○</span> GBPUSD/H4/xgboost-2026-05-14.bin     val_auc 0.654  · disabled',
+    '',
+    '<span class="dim">[a] toggle auto · [r] reload models · [l] inspect last decision</span>',
+  ].join('\n'), w-2, true);
+}
+
+function renderBrokerTab() {
+  return panel('Broker Setup · F10', [
+    '<span class="bold w">Connection:</span>  <span class="g">●</span> Connected — cTrader Live · token valid until 2026-08-12',
+    '<span class="bold w">Trading as:</span>  Live #987654 · Balance $10,000 · Equity <span class="g">$10,243.55</span> · Leverage 1:30',
+    '',
+    '┌─ Adapter & environment ──────────────────────┐  ┌─ Saved sessions ─────────────────┐',
+    '│  Adapter:     <span class="inv">[ cTrader ]</span>   DXtrade        │  │  cTrader Live (current)         │',
+    '│  Environment: <span class="invR">[ Live ]</span>     Demo           │  │  cTrader Demo                   │',
+    '│  Source:      <span class="inv">[ Broker ]</span>   Local           │  │  DXtrade demo (offline)         │',
+    '└──────────────────────────────────────────────┘  └──────────────────────────────────┘',
+    '',
+    '<span class="bold w">Discovered accounts:</span>',
+    '  Demo #123456    USD    $50,000  · idle',
+    '  Live #987654    USD    $10,000  · <span class="g">active</span>',
+    '  Live #998877    USD    $25,000  · idle',
+    '',
+    '<span class="dim">[L] login · [D] discover · [S] save creds · [R] restore session · [X] clear · [O] open broker app</span>',
+  ].join('\n'), w-2, true);
+}
+
+function renderRiskTab() {
+  return panel('Risk Management · F11', [
+    '<span class="bold w">Profile:</span>  <span class="invY"> 🏆 Prop firm challenge </span>   <span class="dim">(F2 standard · F3 prop · F4 high-risk)</span>',
+    '',
+    '┌─ Hard limits ─────────────────────────────────────────────────────────────────┐',
+    '│  Daily DD limit:    <span class="y">4.0%</span>    <span class="dim">[████░░░░░░░░░░░░░░░░] used 3.2%</span>          │',
+    '│  Total DD limit:    <span class="y">7.0%</span>    <span class="dim">[████████░░░░░░░░░░░░] used 5.8%</span>          │',
+    '│  Risk per trade:    <span class="g">1.0%</span>    <span class="dim">($102.43 at current equity)</span>            │',
+    '│  Max lot size:      <span class="g">5.00</span>    <span class="dim">lots</span>                                    │',
+    '│  Stop loss:         <span class="g">required</span>  <span class="dim">on every trade</span>                          │',
+    '└───────────────────────────────────────────────────────────────────────────────┘',
+    '',
+    '<span class="dim">─── 20-pip Challenge calculator (high-risk mode only) ───</span>',
+    '  Start $20  →  Target $50,000   pips/day 20   risk 5%   win% 60   trades/d 1',
+    '  <span class="y">Days to target: 786</span>   Daily expected: 1.00%   Ruin prob: <span class="r">42%</span>   Mult: 2500×',
+    '',
+    '<span class="dim">[1/2/3] switch profile · [a] apply · [r] reset to defaults · [c] open challenge calc</span>',
+  ].join('\n'), w-2, true);
+}
+
+function renderSettingsTab() {
+  return panel('Settings · F12', [
+    '<span class="bold w">Language:</span>   <span class="inv">[ Ελληνικά ]</span>  English',
+    '<span class="bold w">Theme:</span>      Dark (default)  Light  High-contrast',
+    '<span class="bold w">Hardware:</span>',
+    '  CPU cores allocated: <span class="w">16</span>  / 24 detected',
+    '  GPU (CUDA):          <span class="g">enabled</span>',
+    '',
+    '<span class="bold w">Intelligence:</span>',
+    '  LLM provider:        openai',
+    '  API key:             <span class="dim">sk-•••••8a92</span>',
+    '  News kill-switch:    <span class="g">enabled</span>',
+    '  Blackout before:     15 min',
+    '  Blackout after:      10 min',
+    '',
+    '<span class="bold w">Data:</span>',
+    '  Data root:           <span class="dim">./data</span>',
+    '  Cache size:          2.3 GB',
+    '  Last bootstrap:      2026-05-14 18:00 UTC',
+    '',
+    '<span class="dim">[Tab] next field · [Enter] edit · [s] save · [r] revert · [F1] docs</span>',
+  ].join('\n'), w-2, true);
+}
+
+/* ── Footer / status bar ── */
+function renderFooter() {
+  return [
+    '',
+    '<span class="dim">' + hr(w,'─') + '</span>',
+    `<span class="g">●</span> <span class="w">Connected</span>  <span class="dim">·</span>  cTrader Live  <span class="dim">·</span>  16 cores · GPU on  <span class="dim">·</span>  ${autoTrade?'<span class="r">AUTO ON</span>':'<span class="dim">AUTO OFF</span>'}  <span class="dim">·</span>  v0.2.0-tui  <span class="dim">·</span>  No engines running  <span class="dim">·</span>  21:50:42 UTC`,
+  ].join('\n');
+}
+
+function render() {
+  document.getElementById('tuiContent').innerHTML = renderHeader() + renderTab() + renderFooter();
+  // Wire tab clicks
+  document.querySelectorAll('[data-tab]').forEach(el => el.onclick = () => {
+    activeTab = el.dataset.tab; render();
+  });
+}
+
+/* Keyboard navigation */
+const keymap = { F1:'dash', F2:'chart', F3:'mkts', F4:'order', F5:'news', F6:'watch',
+                 F7:'disc', F8:'train', F9:'intel', F10:'brkr', F11:'risk', F12:'set' };
+document.addEventListener('keydown', e => {
+  if (keymap[e.key]) { e.preventDefault(); activeTab = keymap[e.key]; render(); return; }
+  if (e.key.toLowerCase() === 'a') { autoTrade = !autoTrade; render(); }
+  if (e.key.toLowerCase() === 'q') { /* would quit */ alert('Press Ctrl+C in a real terminal to quit'); }
+});
+
+/* Live clock update */
+setInterval(render, 1000);
+render();
+</script>
+</body>
+</html>

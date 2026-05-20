@@ -1,0 +1,10 @@
+[env]
+# Fix bindgen parsing against latest MSVC STL headers on Windows.
+# Without this, `lightgbm3-sys` can fail with:
+# "error STL1000: Unexpected compiler version..."
+BINDGEN_EXTRA_CLANG_ARGS = "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+# NOTE: do NOT enable +crt-static here — lightgbm3-sys' prebuilt C++
+# objects are compiled against the dynamic CRT and the linker fails
+# with unresolved __imp_fsetpos / __imp_fseeki64 / __imp_ungetc / etc.
+# The runtime UCRT DLLs (api-ms-win-crt-*.dll) ship with VS C++
+# Redistributable; if missing, copy them alongside forex-cli.exe.

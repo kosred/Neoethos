@@ -1,0 +1,79 @@
+[package]
+name = "forex-cli"
+version = "0.4.19"
+edition.workspace = true
+# SPDX dual-license matches the repo-root LICENSE file. Required by both
+# cargo-deb (writes Debian `control` License:) and cargo-generate-rpm.
+license = "LicenseRef-Proprietary"
+description = "forex-ai headless CLI + TUI — quantitative trading workspace for the cTrader Open API."
+homepage = "https://github.com/kosred/forex-ai"
+repository = "https://github.com/kosred/forex-ai"
+readme = "../../README.md"
+
+[features]
+default = []
+gpu = ["forex-search/gpu", "forex-models/neuro-evolution-gpu", "forex-models/statistical-gpu"]
+
+[dependencies]
+forex-core = { path = "../forex-core" }
+forex-data = { path = "../forex-data" }
+forex-models = { path = "../forex-models", features = ["tree-models", "pure-rust-ml"] }
+forex-search = { path = "../forex-search" }
+anyhow = "1.0"
+chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# `tracing` is consumed at every error-path in main.rs / tui/* for
+# structured logging (warn!/debug!). Pre-existing usage; the dep
+# line was inadvertently dropped during an earlier refactor and
+# v0.4.5 needs it for `cargo check` to pass.
+tracing = "0.1"
+# Interactive TUI — used by `forex-cli` when invoked with no args.
+# `crossterm` is the cross-platform terminal backend; `ratatui` is the
+# rendering library. Together they give us Bloomberg-style fixed
+# layouts with live progress + keyboard nav.
+ratatui = { version = "0.29", features = ["crossterm"] }
+crossterm = "0.28"
+unicode-width = "0.2"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cargo-deb metadata — produces target/debian/forex-cli_<version>_<arch>.deb
+# Spec: https://github.com/kornelski/cargo-deb
+# Strategy ref: installer_no_paid_certs_strategy.md §3 (Linux .deb path, $0).
+# ──────────────────────────────────────────────────────────────────────────────
+[package.metadata.deb]
+maintainer = "forex-ai contributors <forex-ai@users.noreply.github.com>"
+copyright = "2024-2026, forex-ai contributors; proprietary; all rights reserved"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+forex-ai is an open-source quantitative trading workspace targeting \
+the cTrader Open API. It includes data ingestion, ML-driven \
+strategy search, paper / live trading orchestration, and a \
+risk-aware execution gate. This package ships the headless CLI / TUI \
+front-end."""
+section = "finance"
+priority = "optional"
+assets = [
+    ["target/release/forex-cli", "usr/bin/", "755"],
+    ["../../assets/symbol_metadata/defaults.json", "usr/share/forex-ai/symbol_metadata/", "644"],
+    ["../../LICENSE", "usr/share/doc/forex-ai/", "644"],
+    ["../../README.md", "usr/share/doc/forex-ai/", "644"],
+]
+# Opt-in autostart only via the in-app wizard — never enable the unit on
+# install. (Wizard §9: user controls autonomous-watchdog autostart.)
+systemd-units = { enable = false }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cargo-generate-rpm metadata — produces target/generate-rpm/forex-cli-*.rpm
+# Spec: https://github.com/cat-in-136/cargo-generate-rpm
+# ──────────────────────────────────────────────────────────────────────────────
+[package.metadata.generate-rpm]
+name = "forex-cli"
+license = "LicenseRef-Proprietary"
+assets = [
+    { source = "target/release/forex-cli", dest = "/usr/bin/forex-cli", mode = "0755" },
+    { source = "assets/symbol_metadata/defaults.json", dest = "/usr/share/forex-ai/symbol_metadata/defaults.json", mode = "0644" },
+    { source = "LICENSE", dest = "/usr/share/doc/forex-ai/LICENSE", mode = "0644" },
+    { source = "README.md", dest = "/usr/share/doc/forex-ai/README.md", mode = "0644" },
+]
+

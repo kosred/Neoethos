@@ -1,0 +1,49 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/forex-search",
+  "crates/forex-cli",
+  "crates/forex-data",
+  "crates/forex-models",
+  "crates/forex-core",
+  "crates/forex-app",
+  "crates/forex-news",
+  "crates/forex-gemma",
+]
+default-members = [
+  "crates/forex-search",
+  "crates/forex-cli",
+  "crates/forex-data",
+  "crates/forex-models",
+  "crates/forex-core",
+  "crates/forex-app",
+  "crates/forex-news",
+  "crates/forex-gemma",
+]
+
+[workspace.package]
+edition = "2024"
+
+# ── Shared dependency versions (pinned once for the whole workspace) ──────────
+[workspace.dependencies]
+anyhow      = "1.0.100"
+chrono      = { version = "0.4.42", features = ["serde"] }
+serde       = { version = "1.0.228", features = ["derive"] }
+serde_json  = "1.0.149"
+tokio       = { version = "1.49.0", features = ["full"] }
+tracing     = "0.1.42"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
+ndarray     = { version = "0.17.2", features = ["rayon"] }
+rayon       = "1.11.0"
+# reqwest >= 0.13.3 logs only the host, not the full URL — protects client_secret from leaking to debug/trace logs.
+# In 0.13, `form`/`query` are opt-in features (per the 0.13.0 CHANGELOG).
+reqwest     = { version = "0.13.3", default-features = false, features = ["rustls", "json", "query", "form"] }
+rand        = "0.9.2"
+nalgebra    = "0.33.0"
+polars      = { version = "0.52.0", features = ["lazy", "dtype-datetime", "timezones"] }
+thiserror   = "2.0.16"
+
+[patch.crates-io]
+lightgbm3-sys = { path = "vendor/lightgbm3-sys" }
+sklears-core = { path = "vendor/sklears-core" }
+rlkit = { path = "vendor/rlkit" }

@@ -1,0 +1,510 @@
+use anyhow::{Context, Result, bail};
+use cubecl::cuda::{CudaDevice, CudaRuntime};
+use cubecl::prelude::*;
+use ndarray::{Array1, Array2};
+
+use forex_core::BackendKind;
+
+use super::common::normalize_statistical_device_policy;
+
+const CLASS_COUNT: usize = 3;
+
+pub(crate) struct LinearCudaFit {
+    pub weights: Array2<f32>,
+    pub bias: Array1<f32>,
+    pub runtime_backend: String,
+    pub runtime_backend_kind: BackendKind,
+}
+
+#[cube]
+fn sign_f32(value: f32) -> f32 {
+    // cubecl 0.9: literal-init `let mut` panics on later assignment.
+    // RuntimeCell wraps the binding so writes go through `expand_no_check`.
+    let out = RuntimeCell::<f32>::new(0.0);
+    if value > 0.0 {
+        out.store(1.0);
+    } else if value < 0.0 {
+        out.store(-1.0);
+    }
+    out.read()
+}
+
+#[cube]
+fn clamp_probability(value: f32) -> f32 {
+    // cubecl 0.9: even `let mut x = param;` produces an immutable
+    // binding; reassignment goes through `assign_expand` which panics.
+    // RuntimeCell is the only path to a runtime-mutable scalar.
+    let out = RuntimeCell::<f32>::new(value);
+    if out.read() < 0.000001 {
+        out.store(0.000001);
+    }
+    if out.read() > 0.999999 {
+        out.store(0.999999);
+    }
+    out.read()
+}
+
+#[cube]
+fn class_probability(
+    features: &Array<f32>,
+    weights: &Array<f32>,
+    bias: &Array<f32>,
+    row: u32,
+    cols: u32,
+    class_idx: u32,
+) -> f32 {
+    let logit0 = RuntimeCell::<f32>::new(bias[0]);
+    let logit1 = RuntimeCell::<f32>::new(bias[1]);
+    let logit2 = RuntimeCell::<f32>::new(bias[2]);
+    let row_us = row as usize;
+    let cols_us = cols as usize;
+    let row_base = row_us * cols_us;
+    for col in 0..cols_us {
+        let feature = features[row_base + col];
+        let weight_base = col * CLASS_COUNT;
+        logit0.store(logit0.read() + feature * weights[weight_base]);
+        logit1.store(logit1.read() + feature * weights[weight_base + 1]);
+        logit2.store(logit2.read() + feature * weights[weight_base + 2]);
+    }
+
+    let l0 = logit0.read();
+    let l1 = logit1.read();
+    let l2 = logit2.read();
+    let max_logit = RuntimeCell::<f32>::new(l0);
+    if l1 > max_logit.read() {
+        max_logit.store(l1);
+    }
+    if l2 > max_logit.read() {
+        max_logit.store(l2);
+    }
+    let m = max_logit.read();
+    let e0 = (l0 - m).exp();
+    let e1 = (l1 - m).exp();
+    let e2 = (l2 - m).exp();
+    let denom = e0 + e1 + e2;
+    let out = RuntimeCell::<f32>::new(e2 / denom);
+    if class_idx == 0 {
+        out.store(e0 / denom);
+    } else if class_idx == 1 {
+        out.store(e1 / denom);
+    }
+    out.read()
+}
+
+#[cube(launch)]
+fn softmax_gradient_kernel(
+    features: &Array<f32>,
+    labels: &Array<i32>,
+    weights: &Array<f32>,
+    bias: &Array<f32>,
+    grad_weights: &mut Array<f32>,
+    grad_bias: &mut Array<f32>,
+    rows: u32,
+    cols: u32,
+    alpha: f32,
+    l1_ratio: f32,
+) {
+    let cols_us = cols as usize;
+    let rows_us = rows as usize;
+    let weight_len = cols_us * CLASS_COUNT;
+    let total_len = weight_len + CLASS_COUNT;
+    if ABSOLUTE_POS < total_len {
+        let pos = ABSOLUTE_POS;
+        let is_bias = pos >= weight_len;
+        let class_idx_cell = RuntimeCell::<u32>::new((pos % CLASS_COUNT) as u32);
+        if is_bias {
+            class_idx_cell.store((pos - weight_len) as u32);
+        }
+        let feature_idx_cell = RuntimeCell::<u32>::new((pos / CLASS_COUNT) as u32);
+        if is_bias {
+            feature_idx_cell.store(0);
+        }
+
+        let class_idx = class_idx_cell.read() as usize;
+        let feature_idx = feature_idx_cell.read() as usize;
+
+        let grad = RuntimeCell::<f32>::new(0.0);
+        for row in 0..rows_us {
+            let probability =
+                class_probability(features, weights, bias, row as u32, cols, class_idx as u32);
+            let label = labels[row];
+            let target_cell = RuntimeCell::<f32>::new(0.0);
+            if label == class_idx as i32 {
+                target_cell.store(1.0);
+            }
+            let error = probability - target_cell.read();
+            if is_bias {
+                grad.store(grad.read() + error);
+            } else {
+                grad.store(grad.read() + features[row * cols_us + feature_idx] * error);
+            }
+        }
+        let final_grad = grad.read() / rows as f32;
+
+        if is_bias {
+            grad_bias[class_idx] = final_grad;
+        } else {
+            let weight = weights[pos];
+            let l2 = (1.0 - l1_ratio) * weight;
+            let l1 = l1_ratio * sign_f32(weight);
+            grad_weights[pos] = final_grad + alpha * (l2 + l1);
+        }
+    }
+}
+
+#[cube(launch)]
+fn softmax_apply_kernel(
+    weights: &mut Array<f32>,
+    bias: &mut Array<f32>,
+    grad_weights: &Array<f32>,
+    grad_bias: &Array<f32>,
+    learning_rate: f32,
+    weight_len: u32,
+) {
+    let weight_len = weight_len as usize;
+    let total_len = weight_len + CLASS_COUNT;
+    if ABSOLUTE_POS < total_len {
+        let pos = ABSOLUTE_POS;
+        if pos < weight_len {
+            weights[pos] -= learning_rate * grad_weights[pos];
+        } else {
+            let class_idx = pos - weight_len;
+            bias[class_idx] -= learning_rate * grad_bias[class_idx];
+        }
+    }
+}
+
+#[cube(launch)]
+fn softmax_loss_kernel(
+    features: &Array<f32>,
+    labels: &Array<i32>,
+    weights: &Array<f32>,
+    bias: &Array<f32>,
+    loss_out: &mut Array<f32>,
+    rows: u32,
+    cols: u32,
+) {
+    if ABSOLUTE_POS == 0 {
+        if rows == 0 {
+            loss_out[0] = 0.0;
+            terminate!();
+        }
+
+        // cubecl 0.9: `let mut x = literal;` produces an immutable
+        // binding; the `assign` and `assign_op` paths both panic on
+        // const lhs. Use `RuntimeCell` for runtime-mutable scalars.
+        let loss = RuntimeCell::<f32>::new(0.0);
+        let rows_us = rows as usize;
+        for row in 0..rows_us {
+            let label = labels[row] as u32;
+            let probability = class_probability(features, weights, bias, row as u32, cols, label);
+            loss.store(loss.read() - clamp_probability(probability).ln());
+        }
+        loss_out[0] = loss.read() / rows as f32;
+    }
+}
+
+#[cube(launch)]
+fn softmax_predict_kernel(
+    features: &Array<f32>,
+    weights: &Array<f32>,
+    bias: &Array<f32>,
+    probabilities_out: &mut Array<f32>,
+    rows: u32,
+    cols: u32,
+) {
+    if ABSOLUTE_POS < rows as usize {
+        let row = ABSOLUTE_POS;
+        let base = row * CLASS_COUNT;
+        probabilities_out[base] = class_probability(features, weights, bias, row as u32, cols, 0);
+        probabilities_out[base + 1] =
+            class_probability(features, weights, bias, row as u32, cols, 1);
+        probabilities_out[base + 2] =
+            class_probability(features, weights, bias, row as u32, cols, 2);
+    }
+}
+
+pub(crate) fn statistical_cuda_kernel_enabled(model_name: &str) -> bool {
+    let requested = requested_policy(model_name);
+    let normalized = normalize_statistical_device_policy(&requested);
+    let model_env = format!(
+        "FOREX_BOT_{}_CUDA_KERNEL",
+        model_name.trim().to_ascii_uppercase().replace('-', "_")
+    );
+    // Two-tier gate: subsystem-wide env can disable the kernel for all
+    // statistical models, AND a per-model env can override that.
+    crate::common::cuda_kernel_enabled(&normalized, "FOREX_BOT_STATISTICAL_CUDA_KERNEL")
+        && !crate::common::is_kernel_disabled_env(&model_env)
+}
+
+fn requested_policy(model_name: &str) -> String {
+    let model_key = format!(
+        "FOREX_BOT_{}_DEVICE",
+        model_name.trim().to_ascii_uppercase().replace('-', "_")
+    );
+    std::env::var(&model_key)
+        .or_else(|_| std::env::var("FOREX_BOT_META_DEVICE"))
+        .unwrap_or_else(|_| "auto".to_string())
+}
+
+fn cuda_device_id(model_name: &str) -> usize {
+    let model_key = format!(
+        "FOREX_BOT_{}_CUDA_DEVICE",
+        model_name.trim().to_ascii_uppercase().replace('-', "_")
+    );
+    let normalized = normalize_statistical_device_policy(&requested_policy(model_name));
+    crate::common::cuda_device_id_from_policy(
+        &normalized,
+        &model_key,
+        Some("FOREX_BOT_STATISTICAL_CUDA_DEVICE"),
+    )
+}
+
+fn kernel_units(client: &ComputeClient<CudaRuntime>) -> u32 {
+    crate::common::cuda_kernel_units(
+        client.properties().hardware.max_units_per_cube,
+        "FOREX_BOT_STATISTICAL_KERNEL_UNITS",
+    )
+}
+
+fn flatten_features(features: &Array2<f32>, cols: usize) -> Result<Vec<f32>> {
+    let flat = crate::common::cuda_flatten_features(features, cols, "statistical")?;
+    if flat.iter().any(|value| !value.is_finite()) {
+        bail!("statistical cuda feature matrix contains non-finite values");
+    }
+    Ok(flat)
+}
+
+fn flatten_labels(labels: &[usize], rows: usize) -> Result<Vec<i32>> {
+    if labels.len() != rows {
+        bail!(
+            "statistical cuda label mismatch: {} labels for {} feature rows",
+            labels.len(),
+            rows
+        );
+    }
+    if labels.iter().any(|label| *label >= CLASS_COUNT) {
+        bail!("statistical cuda labels must be in 0..3");
+    }
+    Ok(labels.iter().map(|label| *label as i32).collect())
+}
+
+fn read_f32_buffer(
+    client: &ComputeClient<CudaRuntime>,
+    handle: cubecl::server::Handle,
+) -> Vec<f32> {
+    let bytes = client.read_one(handle);
+    f32::from_bytes(&bytes).to_vec()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_fit_linear_softmax_cuda(
+    model_name: &str,
+    train_features: &Array2<f32>,
+    train_labels: &[usize],
+    val_features: Option<&Array2<f32>>,
+    val_labels: &[usize],
+    alpha: f32,
+    l1_ratio: f32,
+    learning_rate: f32,
+    epochs: usize,
+) -> Result<LinearCudaFit> {
+    let rows = train_features.nrows();
+    let cols = train_features.ncols();
+    if rows == 0 || cols == 0 {
+        bail!("statistical cuda training requires a non-empty feature matrix");
+    }
+    if val_features.is_none() && !val_labels.is_empty() {
+        bail!("statistical cuda validation labels were provided without validation features");
+    }
+
+    let device = CudaDevice::new(cuda_device_id(model_name));
+    let client = CudaRuntime::client(&device);
+    let units = kernel_units(&client);
+
+    let features_flat = flatten_features(train_features, cols)?;
+    let labels_flat = flatten_labels(train_labels, rows)?;
+    let features_handle = client.create_from_slice(f32::as_bytes(&features_flat));
+    let labels_handle = client.create_from_slice(i32::as_bytes(&labels_flat));
+
+    let weight_len = cols.saturating_mul(CLASS_COUNT);
+    let initial_weights = vec![0.0f32; weight_len];
+    let initial_bias = vec![0.0f32; CLASS_COUNT];
+    let weights_handle = client.create_from_slice(f32::as_bytes(&initial_weights));
+    let bias_handle = client.create_from_slice(f32::as_bytes(&initial_bias));
+    let grad_weights_handle = client.empty(weight_len.saturating_mul(std::mem::size_of::<f32>()));
+    let grad_bias_handle = client.empty(CLASS_COUNT.saturating_mul(std::mem::size_of::<f32>()));
+
+    let validation = if let Some(val_features) = val_features {
+        let val_rows = val_features.nrows();
+        let val_features_flat = flatten_features(val_features, cols)?;
+        let val_labels_flat = flatten_labels(val_labels, val_rows)?;
+        Some((
+            val_rows,
+            client.create_from_slice(f32::as_bytes(&val_features_flat)),
+            client.create_from_slice(i32::as_bytes(&val_labels_flat)),
+        ))
+    } else {
+        None
+    };
+    let loss_handle = client.empty(std::mem::size_of::<f32>());
+
+    let mut best_weights = Vec::<f32>::new();
+    let mut best_bias = Vec::<f32>::new();
+    let mut best_val_loss = f32::INFINITY;
+    let mut stale_epochs = 0usize;
+    let patience = 25usize;
+    let total_params = weight_len + CLASS_COUNT;
+    let grad_cubes = (total_params as u32).div_ceil(units);
+
+    for _ in 0..epochs.max(1) {
+        softmax_gradient_kernel::launch::<CudaRuntime>(
+            &client,
+            CubeCount::Static(grad_cubes, 1, 1),
+            CubeDim::new_1d(units),
+            unsafe { ArrayArg::from_raw_parts::<f32>(&features_handle, features_flat.len(), 1) },
+            unsafe { ArrayArg::from_raw_parts::<i32>(&labels_handle, labels_flat.len(), 1) },
+            unsafe { ArrayArg::from_raw_parts::<f32>(&weights_handle, weight_len, 1) },
+            unsafe { ArrayArg::from_raw_parts::<f32>(&bias_handle, CLASS_COUNT, 1) },
+            unsafe { ArrayArg::from_raw_parts::<f32>(&grad_weights_handle, weight_len, 1) },
+            unsafe { ArrayArg::from_raw_parts::<f32>(&grad_bias_handle, CLASS_COUNT, 1) },
+            ScalarArg::new(rows as u32),
+            ScalarArg::new(cols as u32),
+            ScalarArg::new(alpha),
+            ScalarArg::new(l1_ratio),
+        )
+        .context("launch statistical cuda softmax gradient kernel")?;
+
+        softmax_apply_kernel::launch::<CudaRuntime>(
+            &client,
+            CubeCount::Static(grad_cubes, 1, 1),
+            CubeDim::new_1d(units),
+            unsafe { ArrayArg::from_raw_parts::<f32>(&weights_handle, weight_len, 1) },
+            unsafe { ArrayArg::from_raw_parts::<f32>(&bias_handle, CLASS_COUNT, 1) },
+            unsafe { ArrayArg::from_raw_parts::<f32>(&grad_weights_handle, weight_len, 1) },
+            unsafe { ArrayArg::from_raw_parts::<f32>(&grad_bias_handle, CLASS_COUNT, 1) },
+            ScalarArg::new(learning_rate),
+            ScalarArg::new(weight_len as u32),
+        )
+        .context("launch statistical cuda softmax apply kernel")?;
+
+        if let Some((val_rows, val_features_handle, val_labels_handle)) = validation.as_ref() {
+            softmax_loss_kernel::launch::<CudaRuntime>(
+                &client,
+                CubeCount::Static(1, 1, 1),
+                CubeDim::new_1d(1),
+                unsafe {
+                    ArrayArg::from_raw_parts::<f32>(
+                        val_features_handle,
+                        val_rows.saturating_mul(cols),
+                        1,
+                    )
+                },
+                unsafe { ArrayArg::from_raw_parts::<i32>(val_labels_handle, *val_rows, 1) },
+                unsafe { ArrayArg::from_raw_parts::<f32>(&weights_handle, weight_len, 1) },
+                unsafe { ArrayArg::from_raw_parts::<f32>(&bias_handle, CLASS_COUNT, 1) },
+                unsafe { ArrayArg::from_raw_parts::<f32>(&loss_handle, 1, 1) },
+                ScalarArg::new(*val_rows as u32),
+                ScalarArg::new(cols as u32),
+            )
+            .context("launch statistical cuda softmax validation loss kernel")?;
+            let loss = read_f32_buffer(&client, loss_handle.clone())
+                .into_iter()
+                .next()
+                .context("statistical cuda validation loss missing")?;
+            if loss + 1e-6 < best_val_loss {
+                best_val_loss = loss;
+                best_weights = read_f32_buffer(&client, weights_handle.clone());
+                best_bias = read_f32_buffer(&client, bias_handle.clone());
+                stale_epochs = 0;
+            } else {
+                stale_epochs += 1;
+                if stale_epochs >= patience {
+                    break;
+                }
+            }
+        }
+    }
+
+    let weights = if best_val_loss.is_finite() {
+        best_weights
+    } else {
+        read_f32_buffer(&client, weights_handle)
+    };
+    let bias = if best_val_loss.is_finite() {
+        best_bias
+    } else {
+        read_f32_buffer(&client, bias_handle)
+    };
+    if weights.len() != weight_len || bias.len() != CLASS_COUNT {
+        bail!(
+            "statistical cuda parameter length mismatch: weights {} vs {}, bias {} vs {}",
+            weights.len(),
+            weight_len,
+            bias.len(),
+            CLASS_COUNT
+        );
+    }
+
+    Ok(LinearCudaFit {
+        weights: Array2::from_shape_vec((cols, CLASS_COUNT), weights)
+            .context("shape statistical cuda weights")?,
+        bias: Array1::from_vec(bias),
+        runtime_backend: format!("{}_softmax_cuda", model_name),
+        runtime_backend_kind: BackendKind::NativeCuda,
+    })
+}
+
+pub(crate) fn try_predict_linear_softmax_cuda(
+    model_name: &str,
+    features: &Array2<f32>,
+    weights: &Array2<f32>,
+    bias: &Array1<f32>,
+) -> Result<Array2<f32>> {
+    let rows = features.nrows();
+    let cols = features.ncols();
+    if rows == 0 {
+        return Ok(Array2::<f32>::zeros((0, CLASS_COUNT)));
+    }
+    if weights.nrows() != cols || weights.ncols() != CLASS_COUNT || bias.len() != CLASS_COUNT {
+        bail!("statistical cuda prediction received inconsistent model dimensions");
+    }
+
+    let device = CudaDevice::new(cuda_device_id(model_name));
+    let client = CudaRuntime::client(&device);
+    let units = kernel_units(&client);
+    let features_flat = flatten_features(features, cols)?;
+    let weights_flat = weights.iter().copied().collect::<Vec<_>>();
+    let bias_flat = bias.iter().copied().collect::<Vec<_>>();
+
+    let features_handle = client.create_from_slice(f32::as_bytes(&features_flat));
+    let weights_handle = client.create_from_slice(f32::as_bytes(&weights_flat));
+    let bias_handle = client.create_from_slice(f32::as_bytes(&bias_flat));
+    let output_len = rows.saturating_mul(CLASS_COUNT);
+    let output_handle = client.empty(output_len.saturating_mul(std::mem::size_of::<f32>()));
+    let cubes = (rows as u32).div_ceil(units);
+
+    softmax_predict_kernel::launch::<CudaRuntime>(
+        &client,
+        CubeCount::Static(cubes, 1, 1),
+        CubeDim::new_1d(units),
+        unsafe { ArrayArg::from_raw_parts::<f32>(&features_handle, features_flat.len(), 1) },
+        unsafe { ArrayArg::from_raw_parts::<f32>(&weights_handle, weights_flat.len(), 1) },
+        unsafe { ArrayArg::from_raw_parts::<f32>(&bias_handle, bias_flat.len(), 1) },
+        unsafe { ArrayArg::from_raw_parts::<f32>(&output_handle, output_len, 1) },
+        ScalarArg::new(rows as u32),
+        ScalarArg::new(cols as u32),
+    )
+    .context("launch statistical cuda softmax prediction kernel")?;
+
+    let probabilities = read_f32_buffer(&client, output_handle);
+    if probabilities.len() != output_len {
+        bail!(
+            "statistical cuda prediction length mismatch: expected {}, received {}",
+            output_len,
+            probabilities.len()
+        );
+    }
+    Array2::from_shape_vec((rows, CLASS_COUNT), probabilities)
+        .context("shape statistical cuda predictions")
+}
