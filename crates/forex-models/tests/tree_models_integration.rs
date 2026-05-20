@@ -164,17 +164,25 @@ mod lightgbm_tests {
         use forex_models::tree_models::reorder_to_neutral_buy_sell;
         use ndarray::Array2;
 
-        // Test binary classification (2 classes)
+        // Binary classification (2 classes — Buy / Sell, no Neutral).
+        // The production contract for the 2-column case is: there is no
+        // neutral signal at all, so the safe projection into the
+        // (Neutral, Buy, Sell) 3-column shape is `col_0 = 1.0` (max
+        // neutral) and the input columns are deliberately discarded.
+        // That is what the matching unit test in `tree_models/common.rs`
+        // (`reorder_to_neutral_buy_sell_two_columns_returns_neutral_rows`)
+        // asserts, and it is what the live trading path consumes: a
+        // binary model does NOT have authority to fire a directional
+        // signal in a 3-class consumer, so the consumer sees neutral.
         let probs_binary =
             Array2::from_shape_vec((3, 2), vec![0.7, 0.3, 0.6, 0.4, 0.8, 0.2]).unwrap();
-
         let reordered = reorder_to_neutral_buy_sell(probs_binary, None);
         assert_eq!(reordered.shape(), &[3, 3]);
-
-        // Binary: col 0 -> Neutral, col 1 -> Buy, col 2 -> 0.0 (Sell)
-        assert_eq!(reordered[[0, 0]], 0.7); // Neutral
-        assert_eq!(reordered[[0, 1]], 0.3); // Buy
-        assert_eq!(reordered[[0, 2]], 0.0); // Sell (zero for binary)
+        for row in 0..3 {
+            assert_eq!(reordered[[row, 0]], 1.0, "row {row}: neutral");
+            assert_eq!(reordered[[row, 1]], 0.0, "row {row}: buy");
+            assert_eq!(reordered[[row, 2]], 0.0, "row {row}: sell");
+        }
 
         // Test multiclass (3 classes) with known class order
         let probs_multi =

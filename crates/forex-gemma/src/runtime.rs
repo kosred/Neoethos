@@ -412,7 +412,17 @@ mod tests {
         assert!(msg.contains(BUNDLED_MODEL_FILENAME));
         assert!(msg.contains(MODEL_PATH_ENV_VAR));
         assert!(msg.contains("HauhauCS")); // download URL hint
-        assert!(msg.contains("/app/resources/models"));
+        // PathBuf display uses the platform's native separator.
+        // On Windows the rendered path is `/app\resources\models\…`,
+        // on POSIX it is `/app/resources/models/…`. Build the expected
+        // fragment with the same separator the platform actually uses
+        // so this test passes on every CI matrix slot.
+        let sep = std::path::MAIN_SEPARATOR_STR;
+        let expected = format!("/app{sep}resources{sep}models");
+        assert!(
+            msg.contains(&expected),
+            "error message did not mention the exe_dir path. expected to contain `{expected}`, got: {msg}"
+        );
     }
 
     #[test]
