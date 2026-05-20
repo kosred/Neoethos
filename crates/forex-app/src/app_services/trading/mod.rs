@@ -162,7 +162,7 @@ impl TradingAdapterKind {
     }
 
     /// True if the broker adapter implements `Cancel Pending Order` /
-    /// `Close Open Position` round-trips. V0.4 audit Task #19 — the UI
+    /// `Close Open Position` round-trips. Note — the UI
     /// used to do `snapshot.adapter_name == "cTrader"` for these
     /// buttons, which permanently locked DXtrade (or any future
     /// adapter) out even if its execution backend handled the
@@ -568,7 +568,7 @@ pub struct TradingSession {
     last_observed_day_id: Option<i64>,
     ctrader_runtime_refreshed_at: Option<Instant>,
     connect_handle: Option<std::thread::JoinHandle<()>>,
-    /// V0.4 audit Task #15 — atomic re-entrancy guard for `start_connect`.
+    /// Note — atomic re-entrancy guard for `start_connect`.
     /// The previous design relied on `background_task_running(Connect)`,
     /// which races against the very brief window between
     /// `std::thread::spawn` and the OS scheduling the worker thread: two
@@ -1584,7 +1584,7 @@ impl TradingSession {
         }
     }
 
-    /// Currently-active broker adapter kind. V0.4 audit Task #19 promoted
+    /// Currently-active broker adapter kind. Note promoted
     /// this from `pub(super)` to `pub` so UI code (`execution_panel`) can
     /// gate capability-sensitive controls on the actual adapter rather
     /// than a string-equality check on `adapter_name`.
@@ -1700,7 +1700,7 @@ impl TradingSession {
     }
 
     /// Non-blocking variant of [`Self::refresh_runtime`] for the
-    /// 5-second heartbeat loop. V0.4 audit Task #22 — the synchronous
+    /// 5-second heartbeat loop. Note — the synchronous
     /// `refresh_runtime` calls `load_ctrader_account_runtime` which
     /// opens a fresh WSS socket each time (~200-500 ms on a healthy
     /// network, longer when the broker is slow). Running it on the

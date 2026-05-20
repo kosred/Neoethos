@@ -242,7 +242,7 @@ struct ForexApp {
     discovery_handle: Option<DiscoveryJobHandle>,
     training_handle: Option<TrainingJobHandle>,
 
-    // V0.4 audit Task #25 — graceful shutdown wiring.
+    // Note — graceful shutdown wiring.
     //
     // `heartbeat_handle` keeps a handle to the tokio task that fires
     // `ServiceEvent::Heartbeat` every 5 s; previously this was shadowed
@@ -283,7 +283,7 @@ impl ForexApp {
         let heartbeat_handle =
             spawn_account_heartbeat(tx.clone(), std::sync::Arc::clone(&shutdown_flag));
 
-        // V0.4 audit Task #24 — restore the last-active tab from disk if
+        // Note — restore the last-active tab from disk if
         // we have a saved workspace_state.json. The dock layout itself
         // is rebuilt from defaults each launch; only the focused tab is
         // persisted in V0.4 (full layout persistence requires the
@@ -358,7 +358,7 @@ impl ForexApp {
                     self.state.llm_news_filter.current_status = status;
                 }
                 ServiceEvent::Heartbeat => {
-                    // V0.4 audit Task #22 — kick the refresh into a
+                    // Note — kick the refresh into a
                     // background worker instead of running WSS I/O on
                     // the render thread. The worker emits a
                     // `CTraderConnectUpdated` event on success (handled
@@ -428,7 +428,7 @@ impl ForexApp {
 
 impl Drop for ForexApp {
     fn drop(&mut self) {
-        // V0.4 audit Task #25 — graceful shutdown. Signal background
+        // Note — graceful shutdown. Signal background
         // workers to wind down BEFORE the tokio runtime is dropped from
         // under them. Order:
         //   1. Flip the shutdown flag so the heartbeat loop exits its
@@ -457,7 +457,7 @@ impl Drop for ForexApp {
         if let Some(handle) = &self.training_handle {
             handle.cancel.request();
         }
-        // V0.4 audit Task #24 — best-effort persist of the workspace
+        // Note — best-effort persist of the workspace
         // state (last active tab). Best-effort because Drop can't
         // surface errors; the helper logs on atomic-rename failure.
         if let Some(tab) = self.workspace.active_tab() {
@@ -760,7 +760,7 @@ impl eframe::App for ForexApp {
         // sidebar tabs (Discovery → Start, Training → Start). This
         // strip is purely informational; actions live in their tabs.
         //
-        // V0.4 audit Task #31 — avoid the per-frame `String::clone` of
+        // Note — avoid the per-frame `String::clone` of
         // `status_msg`. The status panel closure only reads the text,
         // so a `&str` borrow is sufficient. We need the borrow to
         // outlive the `egui` closure but NOT outlive any mutation of
@@ -978,7 +978,7 @@ pub(crate) fn app_record(
 }
 
 fn system_time_string() -> String {
-    // V0.4 audit Task #38 — graceful fallback when the host clock is set
+    // Note — graceful fallback when the host clock is set
     // before 1970 (corrupt RTC, fresh VM pre-NTP-sync, deliberately
     // wound-back system clock for testing). Pre-fix, `.expect()` would
     // bring down the entire UI on first render. Now we log and emit a
@@ -1064,7 +1064,7 @@ fn spawn_account_heartbeat(
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             interval.tick().await;
-            // V0.4 audit Task #25 — exit cleanly when the app is shutting
+            // Note — exit cleanly when the app is shutting
             // down so the tokio runtime can drain. Pre-fix the task was
             // detached and tokio would forcibly cancel it on runtime drop.
             if shutdown_flag.load(std::sync::atomic::Ordering::Acquire) {

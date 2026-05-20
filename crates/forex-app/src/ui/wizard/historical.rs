@@ -439,7 +439,7 @@ fn poll_progress_messages(runtime: &mut HistoricalRuntime) {
 }
 
 fn start_download(runtime: &mut HistoricalRuntime, controller: &mut WizardController) {
-    // V0.4 audit Task #32 — defence-in-depth re-entrancy guard. Today
+    // Note — defence-in-depth re-entrancy guard. Today
     // the click handler in `render()` only calls us when
     // `runtime.running == false`, and the outer runtime_mutex() serialises
     // every frame so two rapid clicks in the SAME frame are deduplicated

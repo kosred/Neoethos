@@ -325,7 +325,7 @@ fn spawn_account_discovery_worker(
 
 pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResult {
     let mut result = StepResult::StayHere;
-    // V0.4 audit Task #29 — recover from a poisoned mutex instead of
+    // Note — recover from a poisoned mutex instead of
     // panicking the render thread. A panic inside an OAuth background
     // worker (e.g. inside `poll_auth_worker` chain) used to poison this
     // global mutex, and the next wizard frame would `.expect()` and bring

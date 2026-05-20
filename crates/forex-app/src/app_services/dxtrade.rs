@@ -16,13 +16,12 @@
 //!
 //! ## Why DXtrade matters
 //!
-//! cTrader's Open API is excellent for OAuth-supported brokers but
-//! a large slice of the retail forex market is on platforms that
-//! either use DXtrade's own REST/WebSocket API or only expose
-//! MT4/MT5 (Phase D3.5 — hidden behind a DXtrade-shaped facade
-//! per the operator's 2026-05-18 directive: "the end user will
-//! never see that is using mt, or mt5 but only our bot for
-//! everything").
+//! cTrader's Open API is excellent for the brokers that support it,
+//! but a large slice of the retail forex market sits on platforms
+//! that expose DXtrade's own REST + WebSocket API instead. DXtrade
+//! is the second supported broker in this codebase; it is still in
+//! active development (D3.1 — D3.4 below) and cTrader remains the
+//! primary live target.
 //!
 //! ## Subphase roadmap
 //!
@@ -60,11 +59,6 @@
 //!   receiver, matching the cTrader streaming worker pattern.
 //! - **D3.4** `DxTradePositionBackend`: position list, history,
 //!   close-by-id, modify-stop-loss / take-profit.
-//! - **D3.5** MT4/MT5 facade — wraps the DXtrade trait set
-//!   behind a translation layer that talks to an MT4/MT5 terminal
-//!   (or a hidden Wine-hosted instance on Linux). The operator
-//!   directive is explicit: the user never sees "MT4/5", only
-//!   "our bot". Pure Rust per directive — no Python embedded.
 //!
 //! Each subphase ships as its own focused commit with full tests
 //! against a captured-fixture transport, mirroring the cTrader

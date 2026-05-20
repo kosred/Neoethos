@@ -279,7 +279,7 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
         } else {
             None
         };
-        // V0.4 audit Task #28 — clarify the destructive-clear behavior.
+        // Note — clarify the destructive-clear behavior.
         // The operator can never end up "armed without acknowledgement",
         // so un-ticking the ack box ALWAYS clears the arm flag. We do
         // NOT restore the prior armed state when the ack is re-ticked
@@ -355,7 +355,7 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
                 .suffix(" %"),
             );
         });
-        // V0.4 audit Task #27 — preserve decimal precision in the
+        // Note — preserve decimal precision in the
         // capital-at-risk text edit. Pre-fix, the re-render used `{:.0}`
         // (zero decimals) so a user-typed `12345.67` round-tripped as
         // `12346` and the in-memory value was silently rounded to int.

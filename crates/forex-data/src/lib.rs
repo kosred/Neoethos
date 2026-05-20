@@ -91,7 +91,7 @@ pub fn discover_timeframes(root: impl AsRef<Path>, symbol: &str) -> Result<Vec<S
         let name = entry.file_name().to_string_lossy().to_string();
         if let Some(raw) = name.strip_prefix("timeframe=") {
             let tf = raw.to_uppercase();
-            // V0.4 audit Task #51 — gate against non-canonical timeframes
+            // Note — gate against non-canonical timeframes
             // and path-traversal segments. Pre-fix, a stray
             // `timeframe=H2/` folder (cTrader has no H2 — see
             // `ctrader_api_reference.md` §4) was reported to the UI as
@@ -208,7 +208,7 @@ pub fn normalize_ohlcv(ohlcv: &Ohlcv) -> Result<Ohlcv> {
         .timestamp
         .as_ref()
         .context("OHLCV dataset has no timestamps")?;
-    // V0.4 audit Task #39 — write-path timestamp unit normalisation.
+    // Note — write-path timestamp unit normalisation.
     //
     // The READ path (`vortex_array_to_ohlcv`) calls
     // `normalize_timestamps_to_inferred_millis` to detect ns/μs/ms/s by
@@ -466,7 +466,7 @@ pub fn compute_hpc_feature_frame(ohlcv: &Ohlcv, _profile: FeatureProfile) -> Res
     let n_rows = ohlcv.len();
     let n_cols = columns.len();
     let mut data = Array2::zeros((n_rows, n_cols));
-    // V0.4 audit Task #60 — explicit f64 → f32 narrowing at the feature-cube
+    // Note — explicit f64 → f32 narrowing at the feature-cube
     // boundary. The downstream consumers (forex-models tree models, the
     // genetic backtest kernel via cubecl) all expect f32 to halve memory
     // (~5 GB of features for a 5-year EURUSD M1 cube doubles to 10 GB if
@@ -632,7 +632,7 @@ mod tests {
 
     #[test]
     fn normalize_ohlcv_sorts_deduplicates_and_validates_rows() -> Result<()> {
-        // V0.4 audit Task #39: `normalize_ohlcv` now folds timestamps to the
+        // Note: `normalize_ohlcv` now folds timestamps to the
         // canonical milliseconds unit at the write boundary (mirrors the
         // read-side `vortex_array_to_ohlcv` call). Tiny integers like
         // `[3, 1, 1, 2]` are inferred as Seconds by magnitude and multiplied

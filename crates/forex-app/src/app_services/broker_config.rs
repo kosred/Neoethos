@@ -15,7 +15,7 @@ pub const BROKER_CREDENTIALS_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(
 
 /// Spotware's canonical cTrader demo-account sign-up page.
 ///
-/// V0.4 audit Task #26 — promoted from a hardcoded literal inside
+/// Note — promoted from a hardcoded literal inside
 /// `ui/system/brokers.rs` so white-label brokers running the cTrader
 /// platform under their own domain can patch a single constant
 /// instead of editing the UI. (DXtrade has no equivalent — its

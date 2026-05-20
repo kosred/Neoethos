@@ -444,7 +444,7 @@ impl TradingSession {
         tx: tokio::sync::mpsc::Sender<ServiceEvent>,
     ) -> anyhow::Result<()> {
         self.reap_finished_background_tasks();
-        // V0.4 audit Task #15 — atomic re-entrancy guard.
+        // Note — atomic re-entrancy guard.
         //
         // The previous guard `background_task_running(Connect)` checks
         // `connect_handle.is_finished()`. Between `std::thread::spawn(...)`

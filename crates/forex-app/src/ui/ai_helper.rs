@@ -208,7 +208,7 @@ pub fn render(ui: &mut egui::Ui, state: &mut AiHelperState) {
                             .button("Run fetch-gemma-model.ps1 (next to forex-app.exe)")
                             .clicked()
                         {
-                            // V0.4 audit Task #23 — move the PowerShell spawn
+                            // Note — move the PowerShell spawn
                             // off the render thread. Even a successful spawn
                             // takes ~100 ms on Windows (process creation +
                             // PowerShell startup) and was blocking the

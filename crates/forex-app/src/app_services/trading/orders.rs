@@ -428,7 +428,7 @@ impl TradingSession {
                 let pip_position = self
                     .ctrader_symbol_pip_position(&state.selected_pair)
                     .unwrap_or(4);
-                // V0.4 audit Task #1: pass a live mid-market price to the
+                // Note: pass a live mid-market price to the
                 // risk gate so Market orders (which carry no limit/stop
                 // price) still get a per-trade risk-size check. The gate
                 // hard-fails if `stop_loss` is set but neither the order
@@ -755,7 +755,7 @@ impl TradingSession {
             crate::app_state::OrderType::Stop => CTraderOrderType::Stop,
         };
 
-        // V0.4 audit Task #18: defence-in-depth against malformed
+        // Note: defence-in-depth against malformed
         // target_price. The UI clamps to `0.0..=1_000_000.0`, but state can
         // also be mutated programmatically (auto-trade producer, restored
         // wizard config, etc.). Reject explicitly if a Limit/Stop order

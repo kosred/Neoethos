@@ -65,7 +65,7 @@ pub fn focus_broker_terminal() -> bool {
                     let title = OsString::from_wide(&buffer[..length as usize]);
                     let title_lossy = title.to_string_lossy();
 
-                    if title_lossy.contains("MetaTrader 5") || title_lossy.contains("cTrader") {
+                    if title_lossy.contains("cTrader") {
                         *found_ptr = Some(hwnd);
                         return BOOL(0);
                     }

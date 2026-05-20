@@ -10,7 +10,7 @@ pub struct PerplexitySearcher {
 }
 
 impl PerplexitySearcher {
-    /// V0.4 audit Task #42 — explicit `SecretString` constructor.
+    /// Note — explicit `SecretString` constructor.
     ///
     /// The legacy `new()` (preserved below for back-compat with code that
     /// hasn't migrated) read `PERPLEXITY_API_KEY` from `std::env`, which
@@ -30,7 +30,7 @@ impl PerplexitySearcher {
     /// **Deprecated** — reads `PERPLEXITY_API_KEY` from the environment.
     /// Prefer [`Self::with_api_key`] which requires the operator to
     /// supply the key explicitly (closes the silent-activation hole
-    /// flagged by V0.4 audit Task #42). Retained as a compatibility
+    /// flagged by Note). Retained as a compatibility
     /// shim for code that hasn't been migrated yet; callers must
     /// understand that an env-preset key activates the searcher
     /// without UI confirmation.

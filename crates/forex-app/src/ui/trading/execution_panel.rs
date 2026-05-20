@@ -99,7 +99,7 @@ pub fn render(
                 if state.order_ticket.order_type != OrderType::Market {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Price").color(theme::TEXT_MUTED));
-                        // V0.4 audit Task #18: clamp `target_price` to a sane
+                        // Note: clamp `target_price` to a sane
                         // range. Pre-fix, the DragValue had no bounds so the
                         // operator could type a negative number, NaN, or
                         // infinity via the inline text editor, and that value
@@ -251,7 +251,7 @@ pub fn render(
             if !snapshot.position_choices.is_empty() || !snapshot.pending_order_choices.is_empty() {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    // V0.4 audit Task #19 — gate Cancel/Close on the
+                    // Note — gate Cancel/Close on the
                     // adapter's CAPABILITY, not on a string equality check
                     // against "cTrader". The previous hardcode locked
                     // DXtrade (and any future adapter) out even when its

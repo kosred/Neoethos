@@ -631,7 +631,7 @@ mod tests {
 
     #[test]
     fn f32_precision_gate_rejects_high_precision_f64() {
-        // V0.4 audit Task #63 — fixed pre-existing test that picked a
+        // Note — fixed pre-existing test that picked a
         // value BELOW the gate's tolerance, so the gate (correctly)
         // accepted it but the test asserted rejection.
         //

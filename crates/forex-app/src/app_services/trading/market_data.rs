@@ -301,7 +301,7 @@ impl TradingSession {
     /// Latest mid-market price for `symbol_id` from the cached cTrader spot
     /// stream, or `None` if no fresh quote is available.
     ///
-    /// Used by the risk gate (V0.4 audit Task #1) as the entry-price
+    /// Used by the risk gate (Note) as the entry-price
     /// fallback for Market orders that carry no `limit_price`/`stop_price`.
     /// Refusing to size such an order without a quote is the safe behavior;
     /// the previous gate silently bypassed the risk-per-trade check.

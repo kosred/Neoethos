@@ -1,4 +1,4 @@
-// V0.4 audit Task #24 — `serde::{Serialize, Deserialize}` so the active
+// Note — `serde::{Serialize, Deserialize}` so the active
 // tab can round-trip through `workspace_state.json` between launches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum WorkspaceTab {

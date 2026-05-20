@@ -1,6 +1,4 @@
-// Hardware detection and device selection utilities
-// Derived from src/forex_bot/models/device.py
-// NO SIMPLIFICATION - Preserves all hardware profiling logic
+// Hardware / accelerator capability detection (CPU features, CUDA devices, Metal).
 // REMOVES: legacy multiprocessing, GIL-related threading workarounds
 
 use std::env;

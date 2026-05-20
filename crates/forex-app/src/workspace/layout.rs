@@ -3,7 +3,7 @@ use egui_dock::{DockState, NodeIndex};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// V0.4 audit Task #24 — minimal workspace persistence.
+/// Note — minimal workspace persistence.
 ///
 /// We persist the LAST ACTIVE TAB across restarts so the operator
 /// reopens the app on the panel they were last using. The full dock
@@ -114,7 +114,7 @@ impl WorkspaceState {
                 WorkspaceTab::BrokerSetup,
                 WorkspaceTab::Runtime,
                 WorkspaceTab::Intelligence,
-                // V0.4 audit Task #17 — AiHelper was enumerated in
+                // Note — AiHelper was enumerated in
                 // `tabs.rs::WorkspaceTab` and listed in the sidebar's
                 // `all_for_group(AiEngine)`, but missing here meant
                 // clicking it in the sidebar did nothing (`find_tab`

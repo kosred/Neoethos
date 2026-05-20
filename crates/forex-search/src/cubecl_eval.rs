@@ -798,7 +798,7 @@ pub(crate) fn try_generate_signal_rows_cuda(
 }
 
 fn saturating_i32(value: i64) -> i32 {
-    // V0.4 audit Task #57 — emit a one-line WARN when we actually saturate
+    // Note — emit a one-line WARN when we actually saturate
     // so the operator can detect it (was previously silent). The four
     // callsites (timestamp deltas, gap-threshold config, month/day idx)
     // all expect values that comfortably fit in i32 for normal trading

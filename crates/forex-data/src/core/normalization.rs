@@ -106,7 +106,7 @@ mod tests {
 
     #[test]
     fn nan_cells_become_zero() {
-        // V0.4 audit Task #63 — fixed pre-existing test logic error.
+        // Note — fixed pre-existing test logic error.
         //
         // ndarray::from_shape_vec is ROW-MAJOR, so the input vector
         // `[1.0, NaN, 2.0, 3.0, Inf, 4.0]` lays out as:

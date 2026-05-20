@@ -38,11 +38,9 @@ cargo build --release -p forex-app
   ```
 
 ## 📊 Documentation
-Detailed analysis, audits, plans, and QA reports live under `docs/`:
-- [`docs/audits/`](docs/audits/) — research-driven audit notes (cTrader API, prop-firm gates, system safety)
-- [`docs/plans/`](docs/plans/) — implementation plans (current + historical)
-- [`docs/qa/`](docs/qa/) — release QA reports, screenshots, and integration test logs
-- [`docs/v0.5_roadmap.md`](docs/v0.5_roadmap.md) — current release roadmap
+
+The CHANGELOG records every release. Per-crate behaviour is documented
+inline in the source — start at each crate's `src/lib.rs` or `src/main.rs`.
 
 ## ⚖️ License
 Proprietary.

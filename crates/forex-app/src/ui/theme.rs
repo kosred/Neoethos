@@ -18,8 +18,6 @@
 //! Anchored to the conventions every working trader recognises:
 //! TradingView-style dark palette, teal-green long / red short,
 //! 4-pt spacing grid, four type levels, semantic colors used sparingly.
-//! See `docs/audits/ui_design_research_2026-05-12.md` for the source
-//! material (cTrader / TradingView / MT5 / Bloomberg patterns).
 //!
 //! One source of truth: any new UI work should reach for the tokens
 //! here, not invent its own padding or color.
@@ -142,10 +140,9 @@ pub const RADIUS_LG: u8 = 8;
 
 // ─── Layout heights ─────────────────────────────────────────────────────
 //
-// Numbers chosen to match the four pro-platform survey:
+// Numbers chosen to match the pro-platform survey:
 //   TradingView   top 44 px, drawing rail 32-40 px, status 22 px
 //   cTrader       header 72 px (two-row), Market Watch 280 px, ASP 320 px
-//   MT5           menu+toolbars 80 px, Market Watch 240 px, Toolbox 200 px
 //   Bloomberg     command bar 28 px, function-key strip 24 px
 
 pub const TOPBAR_HEIGHT: f32 = 44.0;

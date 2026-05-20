@@ -1,5 +1,5 @@
 // Core configuration structures for Forex trading system
-// Port of src/forex_bot/core/config.py
+// Project configuration loader.
 
 use crate::contracts::CANONICAL_TIMEFRAMES;
 use crate::domain::prop_firm::PropFirmConstraints;
@@ -808,7 +808,7 @@ impl Default for NewsConfig {
             news_backfill_enabled: true,
             news_backfill_days: 30,
             news_local_glob: String::new(),
-            // V0.4 audit Task #59 — hardcoded snapshot dates rot fast.
+            // Note — hardcoded snapshot dates rot fast.
             // OpenAI deprecates specific dated snapshots ~3 months after
             // release; pinning to one means every fresh install eventually
             // hits "model not found" until the operator hand-edits the

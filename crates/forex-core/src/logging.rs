@@ -1,5 +1,4 @@
-// Logging setup for Forex trading system
-// Port of src/forex_bot/core/logging.py
+// Structured logging facade.
 
 use crate::sectioned_log::{
     CanonicalSectionedLog, SectionedRunRecord, SubsystemSection, update_section_file,

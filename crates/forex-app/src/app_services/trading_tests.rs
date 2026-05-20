@@ -1614,7 +1614,7 @@ fn prop_firm_gate_passes_valid_order_within_limits() {
 
 #[test]
 fn prop_firm_gate_rejects_market_with_sl_but_no_entry_estimate() {
-    // V0.4 audit Task #1 regression: a Market order carries no
+    // Note regression: a Market order carries no
     // `limit_price`/`stop_price`, so the gate's risk-per-trade pip-distance
     // computation has no entry-price to work with. Pre-fix, the gate
     // silently SKIPPED that computation and let the order through. With

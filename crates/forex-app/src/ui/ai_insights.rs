@@ -4,7 +4,7 @@ use egui::{Color32, RichText, Ui, widgets::ProgressBar};
 /// probabilities and the news / consistency / rate-limit compliance
 /// status of the model runtime.
 ///
-/// V0.4 audit Task #34 — every field intentionally defaults to `None`
+/// Note — every field intentionally defaults to `None`
 /// and the renderer shows an "Unavailable" placeholder for each one
 /// until a producer wires real data in. The producer is the live
 /// inference loop (Task #7 — `auto_trade_producer`) which currently

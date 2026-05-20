@@ -37,7 +37,7 @@ pub fn vortex_session() -> &'static VortexSession {
 
 pub fn read_vortex_array(path: impl AsRef<Path>) -> Result<ArrayRef> {
     let path = path.as_ref();
-    // V0.4 audit Task #50 — convert in-library panics on corrupt vortex
+    // Note — convert in-library panics on corrupt vortex
     // files into clean `Err` results. The on-disk format has its own
     // structural validity (mmap framing, encoding headers), but bit-rot
     // inside a column's raw payload — a flipped exponent in an f64, a

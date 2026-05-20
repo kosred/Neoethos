@@ -1,5 +1,4 @@
-// Exit Agent - Pure Rust Burn RL-Based Trade Exit Expert
-// Derived from src/forex_bot/models/exit_agent.py
+// Exit-agent policy: Burn-based RL expert that decides when to flatten / move stops on an open position.
 //
 // Lightweight RL Network for Trade Exit Decisions.
 // Learns to balance Greed (Holding for TP) vs Fear (Cutting Loss/Stall).

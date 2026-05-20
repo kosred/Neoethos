@@ -120,7 +120,7 @@ pub const CTRADER_PROTOBUF_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// `ProtoMessage` envelope. Output is suitable for direct write to the
 /// raw-TCP socket.
 ///
-/// V0.4 audit Task #36 — defence-in-depth bounds check on the WRITE
+/// Note — defence-in-depth bounds check on the WRITE
 /// side. The length prefix is u32, so any payload ≥ 4 GiB would
 /// silently truncate via `len as u32` and the broker would receive a
 /// length that does not match the actual payload, corrupting the

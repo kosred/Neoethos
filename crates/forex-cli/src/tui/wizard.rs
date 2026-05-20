@@ -35,7 +35,7 @@ use anyhow::Result;
 
 /// stderr message printed when `stdin` is not a tty. Spec §8.3.
 ///
-/// V0.4 audit Task #41 — message updated to reflect actual options.
+/// Note — message updated to reflect actual options.
 /// There is no `forex-cli init` subcommand yet (planned), so we point
 /// users at the documented headless-config path instead.
 pub const WIZARD_TUI_NO_TTY_MESSAGE: &str =
@@ -95,7 +95,7 @@ mod tests {
 
     #[test]
     fn no_tty_message_points_user_at_a_headless_alternative() {
-        // V0.4 audit Task #41 — message must give the operator an
+        // Note — message must give the operator an
         // ACTIONABLE alternative (the headless config path) since
         // there is no `forex-cli init` subcommand yet. Either the
         // hand-edit path or the GUI wizard is acceptable as a pointer.

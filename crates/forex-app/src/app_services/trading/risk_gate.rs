@@ -124,7 +124,7 @@ pub(super) fn prop_firm_pre_trade_check(
     // for Market orders (which carry neither `limit_price` nor `stop_price`).
     // `None` is acceptable for Market orders without stop-loss (the
     // risk-per-trade gate is N/A); for Market orders WITH stop-loss the
-    // gate hard-fails (see the new branch below) — V0.4 audit Task #1.
+    // gate hard-fails (see the new branch below) — Note.
     market_price_for_entry: Option<f64>,
 ) -> anyhow::Result<()> {
     // SECURITY (audit-fix F7): `10.0_f64.powi(pip_position)` returns `inf`
@@ -211,7 +211,7 @@ pub(super) fn prop_firm_pre_trade_check(
     // `risk_per_trade` percentage. Override the live FX rate the model
     // needs for cross pairs via `FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE`.
     //
-    // V0.4 audit Task #1 — entry-estimate fallback for Market orders.
+    // Note — entry-estimate fallback for Market orders.
     // Pre-fix: a Market order carries neither `limit_price` nor `stop_price`,
     // so the original `(Some(sl), Some(entry))` if-let pattern was always
     // `(Some(sl), None)` for Market orders → the entire risk-per-trade
