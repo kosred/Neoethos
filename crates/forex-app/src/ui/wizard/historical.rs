@@ -439,6 +439,22 @@ fn poll_progress_messages(runtime: &mut HistoricalRuntime) {
 }
 
 fn start_download(runtime: &mut HistoricalRuntime, controller: &mut WizardController) {
+    // V0.4 audit Task #32 — defence-in-depth re-entrancy guard. Today
+    // the click handler in `render()` only calls us when
+    // `runtime.running == false`, and the outer runtime_mutex() serialises
+    // every frame so two rapid clicks in the SAME frame are deduplicated
+    // by egui. Belt-and-braces: if a future caller ever invokes
+    // `start_download` from another code path (e.g. an auto-pipeline
+    // trigger from the Apply step, Task #10), this guard prevents a
+    // duplicate job from being scheduled before the existing one
+    // settles.
+    if runtime.running {
+        tracing::warn!(
+            target: "forex_app::wizard::historical",
+            "start_download called while a download is already in flight; ignoring"
+        );
+        return;
+    }
     runtime.last_error = None;
     runtime.finished = false;
     let jobs = build_job_list(

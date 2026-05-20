@@ -106,15 +106,36 @@ mod tests {
 
     #[test]
     fn nan_cells_become_zero() {
+        // V0.4 audit Task #63 — fixed pre-existing test logic error.
+        //
+        // ndarray::from_shape_vec is ROW-MAJOR, so the input vector
+        // `[1.0, NaN, 2.0, 3.0, Inf, 4.0]` lays out as:
+        //   row 0: [1.0, NaN]
+        //   row 1: [2.0, 3.0]
+        //   row 2: [Inf, 4.0]
+        // The old test asserted `m[(0,0)] == 0.0` — but `m[(0,0)]` was
+        // `1.0` (finite), so after z-score normalisation it became
+        // `-0.674…`, not zero. The function correctly zeros ONLY the
+        // NaN / Inf cells (see `normalize_feature_matrix` body — the
+        // `if v.is_finite() else 0.0` branch at line ~82). Update the
+        // assertions to target the cells that were actually non-finite.
         let mut m =
             Array2::from_shape_vec((3, 2), vec![1.0, f32::NAN, 2.0, 3.0, f32::INFINITY, 4.0])
                 .unwrap();
         normalize_feature_matrix(&mut m);
-        // Column 0: NaN → 0
-        assert_eq!(m[(0, 0)], 0.0);
-        // Column 1: NaN → 0 (the [0,1] cell was NaN), Inf → 0
-        // (our MAD-based scale is finite so the surviving 3.0/4.0 stay finite).
-        assert!(m[(0, 1)].abs() < 1e-9 || m[(0, 1)] == 0.0);
+        // Cell (0, 1) was NaN → must be exactly 0.0.
+        assert_eq!(m[(0, 1)], 0.0, "NaN cell must be zeroed");
+        // Cell (2, 0) was Inf → must be exactly 0.0.
+        assert_eq!(m[(2, 0)], 0.0, "Inf cell must be zeroed");
+        // Finite survivor cells go through the MAD-based z-score; they
+        // may NOT be zero but MUST be finite and bounded by [-Z_CLIP, +Z_CLIP].
+        for (r, c) in [(0, 0), (1, 0), (1, 1), (2, 1)] {
+            assert!(
+                m[(r, c)].is_finite() && m[(r, c)].abs() <= Z_CLIP,
+                "finite cell ({r},{c}) must stay finite and clipped, got {}",
+                m[(r, c)]
+            );
+        }
     }
 
     #[test]

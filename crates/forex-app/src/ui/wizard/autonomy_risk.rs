@@ -279,12 +279,37 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
         } else {
             None
         };
-        // If the operator un-ticks the acknowledgement, the arm
-        // flag must also clear — they can never end up "armed
-        // without acknowledgement".
-        if !ack_now {
+        // V0.4 audit Task #28 — clarify the destructive-clear behavior.
+        // The operator can never end up "armed without acknowledgement",
+        // so un-ticking the ack box ALWAYS clears the arm flag. We do
+        // NOT restore the prior armed state when the ack is re-ticked
+        // (the audit suggested this, but auto-restoration could re-arm
+        // a Risky Mode the operator forgot they had toggled — safer to
+        // require an explicit re-arm). The wizard label below this
+        // checkbox surfaces the side-effect so the operator sees what
+        // happened.
+        if !ack_now && controller.config.risky_mode_armed {
             controller.config.risky_mode_armed = false;
+            // Stash the side-effect so the renderer can call it out.
+            // (Renderer logic uses the absence of the ack to label the
+            // arm checkbox as cleared — see `can_arm` block below.)
         }
+    }
+    // Surface the destructive-clear side-effect so the operator notices.
+    if !ack_now
+        && controller
+            .config
+            .risky_mode_ruin_ceiling_acknowledged
+            .is_none()
+    {
+        ui.label(
+            egui::RichText::new(
+                "Un-ticking the acknowledgement also disarms Risky Mode. \
+                 Re-arming requires re-ticking both boxes.",
+            )
+            .small()
+            .color(theme::WARNING),
+        );
     }
 
     // Arm toggle — disabled until acknowledgement is recorded.

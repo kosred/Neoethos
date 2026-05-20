@@ -466,6 +466,24 @@ pub fn compute_hpc_feature_frame(ohlcv: &Ohlcv, _profile: FeatureProfile) -> Res
     let n_rows = ohlcv.len();
     let n_cols = columns.len();
     let mut data = Array2::zeros((n_rows, n_cols));
+    // V0.4 audit Task #60 — explicit f64 → f32 narrowing at the feature-cube
+    // boundary. The downstream consumers (forex-models tree models, the
+    // genetic backtest kernel via cubecl) all expect f32 to halve memory
+    // (~5 GB of features for a 5-year EURUSD M1 cube doubles to 10 GB if
+    // stored as f64) and to map cleanly onto GPU tensor cores. The loss
+    // is bounded by the source feature engineering: indicators sit in
+    // [-1, 1] after normalisation, and absolute values rarely exceed
+    // 1e6 (price-scaled). f32's mantissa (24 bits) preserves ~7
+    // significant decimals, well above the noise floor of any FX
+    // feature we emit. Acceptable trade-off — DO NOT promote to f64
+    // without auditing the cube memory budget and the cubecl kernel
+    // signatures.
+    //
+    // (We do NOT warn on truncation here because the trade-off was made
+    // intentionally — flooding logs with "f64 → f32 narrowing at
+    // n_rows*n_cols cells" would drown out real diagnostics. A unit
+    // test that asserts feature magnitudes stay below f32::MAX would be
+    // the right regression guard; tracked under follow-up audit.)
     for (c, col) in columns.iter().enumerate() {
         for (r, &val) in col.iter().enumerate() {
             data[(r, c)] = val as f32;

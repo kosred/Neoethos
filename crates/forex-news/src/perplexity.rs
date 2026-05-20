@@ -1,20 +1,45 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
-use std::env;
 use tracing::warn;
 
 pub struct PerplexitySearcher {
     client: Client,
-    api_key: String,
+    api_key: SecretString,
 }
 
 impl PerplexitySearcher {
+    /// V0.4 audit Task #42 — explicit `SecretString` constructor.
+    ///
+    /// The legacy `new()` (preserved below for back-compat with code that
+    /// hasn't migrated) read `PERPLEXITY_API_KEY` from `std::env`, which
+    /// silently activated the news searcher on any dev machine that
+    /// happened to have the env var preset — bypassing the wizard's
+    /// explicit opt-in for paid API keys. Mirror the
+    /// `OpenAIScorer::new(SecretString, ...)` pattern: callers must pass
+    /// the key explicitly. The wizard's NewsApi step is the canonical
+    /// source.
+    pub fn with_api_key(api_key: SecretString) -> Self {
+        Self {
+            client: Client::new(),
+            api_key,
+        }
+    }
+
+    /// **Deprecated** — reads `PERPLEXITY_API_KEY` from the environment.
+    /// Prefer [`Self::with_api_key`] which requires the operator to
+    /// supply the key explicitly (closes the silent-activation hole
+    /// flagged by V0.4 audit Task #42). Retained as a compatibility
+    /// shim for code that hasn't been migrated yet; callers must
+    /// understand that an env-preset key activates the searcher
+    /// without UI confirmation.
+    #[deprecated(
+        since = "0.4.19",
+        note = "prefer with_api_key(SecretString) — env reads silently activate paid APIs"
+    )]
     pub fn new() -> Result<Self> {
-        // DOCUMENTED-DEFAULT: an empty key disables this searcher (see
-        // `search_news`, which short-circuits with a warn). Construction
-        // is intentionally infallible.
-        let api_key = env::var("PERPLEXITY_API_KEY").unwrap_or_default();
+        let api_key = SecretString::from(std::env::var("PERPLEXITY_API_KEY").unwrap_or_default());
         Ok(Self {
             client: Client::new(),
             api_key,
@@ -22,8 +47,8 @@ impl PerplexitySearcher {
     }
 
     pub async fn search_news(&self, symbol: &str) -> Result<String> {
-        if self.api_key.is_empty() {
-            warn!("PERPLEXITY_API_KEY not set, skipping search.");
+        if self.api_key.expose_secret().is_empty() {
+            warn!("Perplexity API key not configured (wizard NewsApi step), skipping search.");
             return Ok(String::new());
         }
 
@@ -44,7 +69,10 @@ impl PerplexitySearcher {
         let resp = self
             .client
             .post("https://api.perplexity.ai/chat/completions")
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.api_key.expose_secret()),
+            )
             .json(&body)
             .send()
             .await?

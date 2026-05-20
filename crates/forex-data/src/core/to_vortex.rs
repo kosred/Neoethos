@@ -631,9 +631,29 @@ mod tests {
 
     #[test]
     fn f32_precision_gate_rejects_high_precision_f64() {
-        // Pick a value with mantissa bits f32 cannot hold:
-        // 1.0 + 1e-9 round-trips badly through f32.
-        let bad = 1.0_f64 + 1.0e-9;
+        // V0.4 audit Task #63 — fixed pre-existing test that picked a
+        // value BELOW the gate's tolerance, so the gate (correctly)
+        // accepted it but the test asserted rejection.
+        //
+        // `F32_DOWNCAST_TOLERANCE = 1.0e-7`. The previous fixture
+        // `1.0 + 1e-9` round-trips through f32 with a loss of ~1e-9,
+        // which is < tolerance → gate ACCEPTS → unwrap_err() panicked.
+        //
+        // To genuinely exercise the rejection path we need a value
+        // whose f32 round-trip loss EXCEEDS 1e-7. A large price with
+        // a non-representable low-order digit does the trick:
+        // `1_000_000.123_456_789` is well outside the f32 mantissa,
+        // so `(v as f32 as f64) - v` is ~0.1 — far above 1e-7.
+        let bad = 1_000_000.123_456_789_f64;
+        // Sanity-check the test fixture itself: confirm the f32 round-trip
+        // really does lose more than the tolerance before we assert that
+        // the gate notices.
+        let rt_loss = (bad as f32 as f64 - bad).abs();
+        assert!(
+            rt_loss > F32_DOWNCAST_TOLERANCE,
+            "test fixture is broken: f32 round-trip loss {rt_loss} is within tolerance \
+             {F32_DOWNCAST_TOLERANCE} — pick a different fixture value"
+        );
         let ohlcv = Ohlcv {
             timestamp: Some(vec![1, 2]),
             open: vec![bad, bad],
