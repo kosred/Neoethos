@@ -4179,7 +4179,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "forex-core",
- "reqwest 0.12.28",
+ "reqwest 0.13.3",
  "secrecy",
  "serde",
  "serde_json",

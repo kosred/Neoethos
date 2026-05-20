@@ -4,16 +4,23 @@ version = "0.4.19"
 edition.workspace = true
 
 [dependencies]
-anyhow = "1.0.100"
-reqwest = { version = "0.12.2", features = ["json"] }
+# All shared deps go through the workspace pins so a single
+# `reqwest = "0.13.3"` / `tokio = "1.49.0"` etc. is in the graph.
+# Pre-fix this crate had reqwest 0.12, which forced cargo to compile
+# BOTH 0.12 and 0.13 side-by-side (the rest of the workspace is on
+# 0.13.3). The other 0.12 in the graph still comes from
+# `object_store` transitively through polars 0.52 — that one will
+# disappear when polars is upgraded to 0.53+.
+anyhow.workspace = true
+reqwest.workspace = true
 secrecy = "0.10.3"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-tokio = { version = "1.43.0", features = ["full"] }
-chrono = { version = "0.4.38", features = ["serde"] }
-tracing = "0.1.41"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+tracing.workspace = true
 forex-core = { path = "../forex-core" }
 
 [dev-dependencies]
-tokio = { version = "1.43.0", features = ["macros", "rt"] }
+tokio.workspace = true
 
