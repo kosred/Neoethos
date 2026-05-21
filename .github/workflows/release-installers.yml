@@ -1,4 +1,4 @@
-# Zero-paid-certificate release workflow for forex-ai installers.
+# Zero-paid-certificate release workflow for neoethos installers.
 #
 # Spec ref: docs/audits/research/installer_no_paid_certs_strategy.md §4
 #           (GitHub Releases pipeline with GPG + Sigstore cosign keyless).
@@ -8,14 +8,14 @@
 # pre-existing GPU bundle pipeline). The two workflows produce different
 # artefact families that do not collide:
 #
-#   release.yml            → ForexAI-<ver>-windows-x64-gpu.zip / .tar.gz / .deb
+#   release.yml            → NeoEthos-<ver>-windows-x64-gpu.zip / .tar.gz / .deb
 #                            (GPU build with libtorch/CUDA bundled)
-#   release-installers.yml → forex-ai_<ver>_amd64.deb       (cargo-deb)
-#                            forex-ai-<ver>-1.x86_64.rpm     (cargo-generate-rpm)
-#                            forex-app-<ver>-x86_64.AppImage (appimagetool)
-#                            forex-ai-<ver>-macos-universal.tar.gz (lipo + ad-hoc)
-#                            forex-ai-<ver>-windows-x86_64.zip      (package managers)
-#                            forex-ai-<ver>-windows-x86_64.tar.gz   (portable)
+#   release-installers.yml → neoethos_<ver>_amd64.deb       (cargo-deb)
+#                            neoethos-<ver>-1.x86_64.rpm     (cargo-generate-rpm)
+#                            neoethos-app-<ver>-x86_64.AppImage (appimagetool)
+#                            neoethos-<ver>-macos-universal.tar.gz (lipo + ad-hoc)
+#                            neoethos-<ver>-windows-x86_64.zip      (package managers)
+#                            neoethos-<ver>-windows-x86_64.tar.gz   (portable)
 #                            plus *.asc (GPG) and *.cosign-sig per asset.
 #
 # Both run on the same `v*` tag push; downstream `gh release upload`
@@ -61,17 +61,17 @@ jobs:
         run: cargo install cargo-deb cargo-generate-rpm --locked
 
       - name: Build release binaries
-        run: cargo build --release -p forex-app -p forex-cli
+        run: cargo build --release -p neoethos-app -p neoethos-cli
 
       - name: Build .deb packages
         run: |
-          cargo deb -p forex-app --no-build
-          cargo deb -p forex-cli --no-build
+          cargo deb -p neoethos-app --no-build
+          cargo deb -p neoethos-cli --no-build
 
       - name: Build .rpm packages
         run: |
-          cargo generate-rpm -p crates/forex-app
-          cargo generate-rpm -p crates/forex-cli
+          cargo generate-rpm -p crates/neoethos-app
+          cargo generate-rpm -p crates/neoethos-cli
 
       - name: Build AppImage
         run: bash packaging/appimage/build.sh
@@ -131,8 +131,8 @@ jobs:
 
       - name: Build Intel and Apple Silicon binaries
         run: |
-          cargo build --release --target x86_64-apple-darwin -p forex-app -p forex-cli
-          cargo build --release --target aarch64-apple-darwin -p forex-app -p forex-cli
+          cargo build --release --target x86_64-apple-darwin -p neoethos-app -p neoethos-cli
+          cargo build --release --target aarch64-apple-darwin -p neoethos-app -p neoethos-cli
 
       - name: Lipo into universal binaries and ad-hoc sign
         # Ad-hoc codesign (`--sign -`) is the no-Developer-ID path that still
@@ -140,15 +140,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          lipo -create -output out/forex-app \
-            target/x86_64-apple-darwin/release/forex-app \
-            target/aarch64-apple-darwin/release/forex-app
-          lipo -create -output out/forex-cli \
-            target/x86_64-apple-darwin/release/forex-cli \
-            target/aarch64-apple-darwin/release/forex-cli
-          codesign --force --deep --sign - out/forex-app
-          codesign --force --deep --sign - out/forex-cli
-          tar -czf "forex-ai-${GITHUB_REF_NAME}-macos-universal.tar.gz" -C out .
+          lipo -create -output out/neoethos-app \
+            target/x86_64-apple-darwin/release/neoethos-app \
+            target/aarch64-apple-darwin/release/neoethos-app
+          lipo -create -output out/neoethos-cli \
+            target/x86_64-apple-darwin/release/neoethos-cli \
+            target/aarch64-apple-darwin/release/neoethos-cli
+          codesign --force --deep --sign - out/neoethos-app
+          codesign --force --deep --sign - out/neoethos-cli
+          tar -czf "neoethos-${GITHUB_REF_NAME}-macos-universal.tar.gz" -C out .
 
       - name: Install Sigstore cosign
         uses: sigstore/cosign-installer@v3
@@ -160,7 +160,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-          for f in forex-ai-*-macos-universal.tar.gz; do
+          for f in neoethos-*-macos-universal.tar.gz; do
             gpg --batch --yes --pinentry-mode loopback \
                 --passphrase "$GPG_PASSPHRASE" \
                 --detach-sign --armor "$f"
@@ -171,9 +171,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            forex-ai-*-macos-universal.tar.gz
-            forex-ai-*-macos-universal.tar.gz.asc
-            forex-ai-*-macos-universal.tar.gz.cosign-sig
+            neoethos-*-macos-universal.tar.gz
+            neoethos-*-macos-universal.tar.gz.asc
+            neoethos-*-macos-universal.tar.gz.cosign-sig
 
   # ──────────────────────────────────────────────────────────────────────────
   # Windows: x86_64 tarball with self-signed Authenticode. The MS Store path
@@ -190,7 +190,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binaries
-        run: cargo build --release -p forex-app -p forex-cli
+        run: cargo build --release -p neoethos-app -p neoethos-cli
 
       - name: Stage and archive binaries
         # PowerShell — the default Windows runner shell. We avoid embedding
@@ -201,10 +201,10 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path out -Force | Out-Null
-          Copy-Item target\release\forex-app.exe out\
-          Copy-Item target\release\forex-cli.exe out\
-          Compress-Archive -Path out -DestinationPath "forex-ai-${env:GITHUB_REF_NAME}-windows-x86_64.zip" -Force
-          tar -czf "forex-ai-${env:GITHUB_REF_NAME}-windows-x86_64.tar.gz" out
+          Copy-Item target\release\neoethos-app.exe out\
+          Copy-Item target\release\neoethos-cli.exe out\
+          Compress-Archive -Path out -DestinationPath "neoethos-${env:GITHUB_REF_NAME}-windows-x86_64.zip" -Force
+          tar -czf "neoethos-${env:GITHUB_REF_NAME}-windows-x86_64.tar.gz" out
 
       - name: Install Sigstore cosign
         uses: sigstore/cosign-installer@v3
@@ -219,7 +219,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-          for f in forex-ai-*-windows-x86_64.zip forex-ai-*-windows-x86_64.tar.gz; do
+          for f in neoethos-*-windows-x86_64.zip neoethos-*-windows-x86_64.tar.gz; do
             gpg --batch --yes --pinentry-mode loopback \
                 --passphrase "$GPG_PASSPHRASE" \
                 --detach-sign --armor "$f"
@@ -230,9 +230,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            forex-ai-*-windows-x86_64.tar.gz
-            forex-ai-*-windows-x86_64.tar.gz.asc
-            forex-ai-*-windows-x86_64.tar.gz.cosign-sig
-            forex-ai-*-windows-x86_64.zip
-            forex-ai-*-windows-x86_64.zip.asc
-            forex-ai-*-windows-x86_64.zip.cosign-sig
+            neoethos-*-windows-x86_64.tar.gz
+            neoethos-*-windows-x86_64.tar.gz.asc
+            neoethos-*-windows-x86_64.tar.gz.cosign-sig
+            neoethos-*-windows-x86_64.zip
+            neoethos-*-windows-x86_64.zip.asc
+            neoethos-*-windows-x86_64.zip.cosign-sig

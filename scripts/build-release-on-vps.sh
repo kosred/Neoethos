@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # build-release-on-vps.sh
 #
-# Runs on the Hyperstack L40 VM. Pulls the latest forex-ai source,
+# Runs on the Hyperstack L40 VM. Pulls the latest neoethos source,
 # builds Linux release binaries with GPU features, sanity-tests
 # the cubecl JIT runtime, and packages the result into a tarball
-# at $HOME/forex-ai-linux-x86_64-<DATE>.tar.gz.
+# at $HOME/neoethos-linux-x86_64-<DATE>.tar.gz.
 #
 # Designed to be invoked via SSH from the Windows-side orchestrator
 # (`scripts/release-on-vps.ps1`).
@@ -15,15 +15,15 @@
 set -euo pipefail
 
 DATE="${RELEASE_DATE:-$(date +%Y-%m-%d)}"
-REPO_URL="${REPO_URL:-https://github.com/kosred/forex-ai.git}"
-REPO_ROOT="${REPO_ROOT:-$HOME/forex-ai}"
+REPO_URL="${REPO_URL:-https://github.com/kosred/neoethos.git}"
+REPO_ROOT="${REPO_ROOT:-$HOME/neoethos}"
 BRANCH="${BRANCH:-master}"
-TARBALL="$HOME/forex-ai-linux-x86_64-${DATE}.tar.gz"
+TARBALL="$HOME/neoethos-linux-x86_64-${DATE}.tar.gz"
 STAGING="$HOME/release-${DATE}"
 
 log() { echo "[$(date -u +%H:%M:%SZ)] $*"; }
 
-log "=== forex-ai release build · $DATE ==="
+log "=== neoethos release build · $DATE ==="
 log "Repo:    $REPO_ROOT"
 log "Branch:  $BRANCH"
 log "Tarball: $TARBALL"
@@ -64,32 +64,32 @@ fi
 log "HEAD: $(git rev-parse --short HEAD) — $(git log -1 --format=%s)"
 
 # 4. Optional system setup (CUDA libs etc.) — only if marker missing
-if [ ! -f "$HOME/.forex-ai-vps-setup-done" ] && [ -f "$REPO_ROOT/scripts/setup-vps-cuda13.sh" ]; then
+if [ ! -f "$HOME/.neoethos-vps-setup-done" ] && [ -f "$REPO_ROOT/scripts/setup-vps-cuda13.sh" ]; then
     log "--- System setup (one-time) ---"
     bash "$REPO_ROOT/scripts/setup-vps-cuda13.sh"
-    touch "$HOME/.forex-ai-vps-setup-done"
+    touch "$HOME/.neoethos-vps-setup-done"
 fi
 
 # 5. Build
-log "--- cargo build --release (forex-cli with GPU features) ---"
+log "--- cargo build --release (neoethos-cli with GPU features) ---"
 cd "$REPO_ROOT"
-cargo build --release -p forex-cli \
-    --features "forex-search/gpu forex-models/neuro-evolution-gpu forex-models/statistical-gpu" \
+cargo build --release -p neoethos-cli \
+    --features "neoethos-search/gpu neoethos-models/neuro-evolution-gpu neoethos-models/statistical-gpu" \
     2>&1 | tail -20
 
-log "--- cargo build --release (forex-app, headless-capable) ---"
-cargo build --release -p forex-app 2>&1 | tail -10
+log "--- cargo build --release (neoethos-app, headless-capable) ---"
+cargo build --release -p neoethos-app 2>&1 | tail -10
 
 # 6. Binary sanity
 log "--- Binaries ---"
-ls -lh "$REPO_ROOT/target/release/forex-app" "$REPO_ROOT/target/release/forex-cli" 2>&1
+ls -lh "$REPO_ROOT/target/release/neoethos-app" "$REPO_ROOT/target/release/neoethos-cli" 2>&1
 
 # 7. GPU smoke test — short genetic-search run to exercise cubecl JIT
 log "--- GPU smoke test (search · 32 genes · 3 generations) ---"
 cd "$REPO_ROOT/target/release"
 mkdir -p "$HOME/data"
 set +e
-timeout 180 ./forex-cli search \
+timeout 180 ./neoethos-cli search \
     --symbol EURUSD --base H4 --higher D1 \
     --genes 32 --generations 3 \
     --root "$HOME/data" \
@@ -105,11 +105,11 @@ fi
 log "--- Packaging ---"
 rm -rf "$STAGING"
 mkdir -p "$STAGING"
-cp "$REPO_ROOT/target/release/forex-app" "$STAGING/"
-cp "$REPO_ROOT/target/release/forex-cli" "$STAGING/"
+cp "$REPO_ROOT/target/release/neoethos-app" "$STAGING/"
+cp "$REPO_ROOT/target/release/neoethos-cli" "$STAGING/"
 # Strip symbols to keep the tarball small (keeps debug info next to binaries
 # would balloon it from ~110 MB to ~700 MB each).
-strip "$STAGING/forex-app" "$STAGING/forex-cli" 2>/dev/null || true
+strip "$STAGING/neoethos-app" "$STAGING/neoethos-cli" 2>/dev/null || true
 
 # Include essential runtime resources
 [ -f "$REPO_ROOT/config.yaml" ] && cp "$REPO_ROOT/config.yaml" "$STAGING/"
@@ -119,7 +119,7 @@ strip "$STAGING/forex-app" "$STAGING/forex-cli" 2>/dev/null || true
 
 # Build info
 cat > "$STAGING/BUILD-INFO.txt" <<EOF
-forex-ai Linux x86_64 release · $DATE
+neoethos Linux x86_64 release · $DATE
 Built on: $(uname -srvmo)
 GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
 Commit: $(cd "$REPO_ROOT" && git rev-parse HEAD)

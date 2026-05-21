@@ -1,0 +1,211 @@
+[package]
+name = "neoethos-app"
+version = "0.4.20"
+edition.workspace = true
+# SPDX dual-license matches the repo-root LICENSE file. Required by both
+# cargo-deb (which prefers `license` over `license-file` when generating
+# `debian/control`) and cargo-generate-rpm. Standard Rust ecosystem choice.
+license = "LicenseRef-Proprietary"
+description = "NeoEthos desktop GUI — a disciplined multi-model ML engine for FX strategy research and risk-aware execution."
+homepage = "https://github.com/kosred/neoethos"
+repository = "https://github.com/kosred/neoethos"
+readme = "../../README.md"
+
+[features]
+default = []
+gpu = ["neoethos-search/gpu", "neoethos-models/neuro-evolution-gpu", "neoethos-models/statistical-gpu"]
+native-tree-models = ["neoethos-models/tree-models"]
+# Enable the native Protobuf-over-TCP transport (port 5035) for the cTrader
+# Open API. Wire-format only; the higher-level Rust API surface is unchanged.
+# v0.4.5 migration scope: reconcile (ProtoOAReconcileReq/Res) +
+# historical-bars (ProtoOAGetTrendbarsReq/Res). All other endpoints fall
+# back to the default JSON-WSS path. See
+# `docs/audits/research/ctrader_api_full_reference.md` §10 item #3 for
+# the bandwidth + JSON field-name-drift rationale (~3× saving).
+# Runtime opt-in is via `FOREX_BOT_CTRADER_TRANSPORT=protobuf` plus this
+# feature being enabled at build time.
+ctrader-protobuf-streaming = ["dep:webpki-roots"]
+# G1 LLM backend — wire the real llama.cpp runtime into the AI Helper panel.
+# Requires cmake + a C/C++ compiler and a ~5 GB GGUF on disk.
+# Download the GGUF via: `powershell -File scripts/fetch-gemma-model.ps1`
+# The feature is OFF by default so the app builds cleanly without them.
+gemma-backend = ["neoethos-gemma/mistralrs-runtime"]
+
+[dependencies]
+eframe = "0.31.0" # UI framework (egui)
+egui = "0.31.0"
+egui_dock = "0.16.0"
+tokio = { version = "1.49.0", features = ["full", "rt-multi-thread"] }
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
+anyhow = "1.0.100"
+chrono = "0.4"
+# keyring 3.6.3 — backend is OPT-IN per platform feature flag. Without these
+# features the crate falls back to an in-memory MockCredential that does not
+# persist anything (verified 2026-05-20 via --api-test on Windows: tokens
+# were saved to a mock store, then "lost" on the next process start, which
+# cascaded into "No saved cTrader session" + every downstream button reading
+# "UNAVAILABLE"). The fix is target-conditional so we never pull macOS-only
+# `security-framework` or Linux-only `linux-keyutils` into the wrong build.
+open = "5.3.2"
+# reqwest >= 0.13.3 logs only the host, not the full URL — protects client_secret from leaking to debug/trace logs.
+# In 0.13, `form`/`query` are opt-in features (per the 0.13.0 CHANGELOG).
+reqwest = { version = "0.13.3", default-features = false, features = ["blocking", "json", "rustls", "query", "form"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+toml = "0.8.20"
+dirs = "5.0.1"
+tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.26.1", features = ["rustls-tls-native-roots"] }
+futures = "0.3.31"
+protobuf = "4.31.1-release"
+rand = { workspace = true }
+base64 = "0.22"
+# audit-fix F8: SecretString is the safe wrapper for string-shaped
+# secrets — see neoethos-core/Cargo.toml for the rationale.
+secrecy = "0.10"
+# rustls is already pulled in transitively by reqwest / tungstenite.
+# Keep a direct edge so cTrader code can install the process-level
+# CryptoProvider before tungstenite builds a ClientConfig; without this,
+# the mixed reqwest/object_store feature graph can enable both ring and
+# aws-lc-rs and rustls 0.23 panics at runtime. webpki-roots stays gated
+# behind the native Protobuf-over-TCP transport.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = { version = "0.26", optional = true }
+
+
+
+polars = { version = "0.52.0", features = ["lazy", "dtype-full", "temporal", "timezones"] }
+
+# Our internal core engines
+neoethos-core = { path = "../neoethos-core" }
+neoethos-data = { path = "../neoethos-data" }
+neoethos-search = { path = "../neoethos-search" }
+neoethos-models = { path = "../neoethos-models", default-features = false, features = ["pure-rust-ml"] }
+# v0.4.8: on-device LLM helper (Gemma) — wired into the egui AI Helper
+# panel + the workspace `ToolRegistry` for chat-driven read-only tool
+# invocation. The stub runtime is always available so the desktop
+# binary builds without a GGUF file on disk; `mistralrs-runtime`
+# feature lights up the real inference path when G1 lands.
+neoethos-gemma = { path = "../neoethos-gemma" }
+ndarray = "0.17.2"
+clap = { version = "4.6.0", features = ["derive"] }
+num_cpus = "1.17.0"
+# Native folder-picker for the "Browse..." button on the data-bootstrap
+# page (operator request 2026-05-14). Latest stable on crates.io as of
+# 2026-05-14: 0.17.2 — verified via crates.io API. Default features
+# pull GTK on Linux; if a packaged Windows build needs to drop those,
+# pin `default-features = false` once we know which file dialog
+# backend ships there.
+rfd = "0.17"
+# Wizard Step 9.5 — risk-quiz answer hash. Spec
+# `installer_wizard_ux_spec.md` §5 names SHA-256 explicitly for the
+# `answers_sha256` field, replacing the placeholder djb2 hasher
+# (collision-prone, see competitive analysis §11.8). RustCrypto
+# `sha2` 0.10.x is the canonical pure-Rust impl; `hex` 0.4.x is the
+# minimal lowercase-hex encoder. Both already in the workspace
+# lockfile via transitive deps — pinning here gives a direct edge
+# so the wizard does not depend on a transitive accident.
+sha2 = "0.10"
+hex = "0.4"
+# Bounded multi-producer/multi-consumer channel used to bridge the
+# cTrader streaming worker thread (which holds neither a `&mut
+# TradingSession` nor the egui ctx) and the main UI loop, which is the
+# only place we can call `TradingSession::trip_hardware_kill_global`.
+# Crossbeam (vs. `std::sync::mpsc`) gives us a `Sender` that is
+# `Send + Sync + Clone` without a `Mutex` wrapper, which is what the
+# `OnceLock`-backed global broker-control sink in `broker_control.rs`
+# needs so the streaming worker can write without contending with the
+# main loop's reader. Version 0.5.15 matches the transitive resolution
+# already present in `Cargo.lock` — no version drift.
+crossbeam-channel = "0.5.15"
+
+# keyring per-platform backend — see comment next to the original `keyring = ...`
+# pin removal above. Each feature is the minimum needed to bind to the OS
+# secret store: Credential Manager (Windows), Keychain (macOS), Secret
+# Service + kernel keyutils (Linux). `default-features = false` keeps the
+# mock/sample store out of the binary so a misconfigured platform fails
+# loudly instead of silently dropping tokens.
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["linux-native-sync-persistent"] }
+
+[build-dependencies]
+protoc-bin-vendored = "3.2.0"
+cc = "1.2.14"
+
+
+[package.metadata.packager]
+product_name = "NeoEthos"
+identifier = "com.neoethos.app"
+authors = ["Konstantinos Red"]
+description = "NeoEthos — a disciplined multi-model ML engine for FX strategy research and risk-aware execution."
+formats = ["nsis"]
+# Paths are resolved relative to this Cargo.toml. The default GUI build
+# intentionally ships without native tree-model DLLs; those are gated behind
+# the `native-tree-models` feature so a clean Windows install is not blocked by
+# Visual C++ debug/runtime DLLs at process startup.
+resources = [
+    "../../config.yaml",
+    "../../LICENSE",
+    "../../README.md",
+    # v0.4.10: ship the Gemma GGUF fetcher next to the .exe so the
+    # AI Helper panel's "Run fetch-gemma-model.ps1" button can spawn
+    # it without the operator having to clone the repo. The script
+    # itself does the HuggingFace download + disk-safety check +
+    # writes to the canonical user-data dir.
+    "../../scripts/fetch-gemma-model.ps1",
+]
+
+[[package.metadata.packager.binaries]]
+path = "neoethos-app"
+main = true
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cargo-deb metadata — produces target/debian/neoethos-app_<version>_<arch>.deb
+# Spec: https://github.com/kornelski/cargo-deb
+# Strategy ref: installer_no_paid_certs_strategy.md §3 (Linux .deb path, $0).
+# ──────────────────────────────────────────────────────────────────────────────
+[package.metadata.deb]
+maintainer = "neoethos contributors <neoethos@users.noreply.github.com>"
+# SPDX expression mirrored from `package.license` above. cargo-deb writes this
+# into the Debian `control` file's `License:` line via the license-file route.
+copyright = "2024-2026, neoethos contributors; proprietary; all rights reserved"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+neoethos is an open-source quantitative trading workspace targeting \
+the cTrader Open API. It includes data ingestion, ML-driven \
+strategy search, paper / live trading orchestration, and a \
+risk-aware execution gate."""
+section = "finance"
+priority = "optional"
+assets = [
+    ["target/release/neoethos-app", "usr/bin/", "755"],
+    ["../../assets/symbol_metadata/defaults.json", "usr/share/neoethos/symbol_metadata/", "644"],
+    ["../../LICENSE", "usr/share/doc/neoethos/", "644"],
+    ["../../README.md", "usr/share/doc/neoethos/", "644"],
+]
+# Opt-in autostart only via the in-app wizard — never enable the unit on
+# install. (Wizard §9: user controls autonomous-watchdog autostart.)
+systemd-units = { enable = false }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cargo-generate-rpm metadata — produces target/generate-rpm/neoethos-app-*.rpm
+# Spec: https://github.com/cat-in-136/cargo-generate-rpm
+# ──────────────────────────────────────────────────────────────────────────────
+[package.metadata.generate-rpm]
+name = "neoethos"
+# Mirrors the SPDX expression in `package.license`.
+license = "LicenseRef-Proprietary"
+assets = [
+    { source = "target/release/neoethos-app", dest = "/usr/bin/neoethos-app", mode = "0755" },
+    { source = "assets/symbol_metadata/defaults.json", dest = "/usr/share/neoethos/symbol_metadata/defaults.json", mode = "0644" },
+    { source = "LICENSE", dest = "/usr/share/doc/neoethos/LICENSE", mode = "0644" },
+    { source = "README.md", dest = "/usr/share/doc/neoethos/README.md", mode = "0644" },
+]
+

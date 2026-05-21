@@ -4026,220 +4026,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
-name = "forex-app"
-version = "0.4.20"
-dependencies = [
- "anyhow",
- "base64",
- "cc",
- "chrono",
- "clap",
- "crossbeam-channel",
- "dirs 5.0.1",
- "eframe",
- "egui",
- "egui_dock",
- "forex-core",
- "forex-data",
- "forex-gemma",
- "forex-models",
- "forex-search",
- "futures",
- "hex",
- "keyring",
- "ndarray 0.17.2",
- "num_cpus",
- "open",
- "polars",
- "protobuf",
- "protoc-bin-vendored",
- "rand 0.9.4",
- "reqwest 0.13.3",
- "rfd",
- "rustls",
- "secrecy",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tokio-tungstenite",
- "toml 0.8.23",
- "tracing",
- "tracing-subscriber",
- "tungstenite 0.28.0",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
-name = "forex-cli"
-version = "0.4.19"
-dependencies = [
- "anyhow",
- "chrono",
- "crossterm 0.28.1",
- "dirs 5.0.1",
- "forex-core",
- "forex-data",
- "forex-models",
- "forex-search",
- "ratatui",
- "serde",
- "serde_json",
- "tracing",
-]
-
-[[package]]
-name = "forex-core"
-version = "0.4.19"
-dependencies = [
- "anyhow",
- "chrono",
- "config",
- "dirs 5.0.1",
- "ndarray 0.17.2",
- "reqwest 0.13.3",
- "rusqlite",
- "secrecy",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sysinfo 0.37.2",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "uuid",
- "windows 0.62.2",
-]
-
-[[package]]
-name = "forex-data"
-version = "0.4.19"
-dependencies = [
- "anyhow",
- "chrono",
- "csv",
- "forex-core",
- "memmap2",
- "ndarray 0.17.2",
- "polars",
- "serde",
- "serde_json",
- "tracing",
- "vector-ta",
- "vortex-array",
- "vortex-buffer",
- "vortex-file",
- "vortex-io",
- "vortex-layout",
- "vortex-session",
- "walkdir",
-]
-
-[[package]]
-name = "forex-gemma"
-version = "0.4.20"
-dependencies = [
- "anyhow",
- "chrono",
- "encoding_rs",
- "forex-core",
- "llama-cpp-2",
- "regex",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "forex-models"
-version = "0.4.19"
-dependencies = [
- "anyhow",
- "burn",
- "burn-ndarray",
- "burn-wgpu",
- "candle-core",
- "catboost-rust",
- "chrono",
- "crfmnes",
- "cubecl",
- "extended-isolation-forest",
- "forex-core",
- "forex-data",
- "forex-search",
- "irithyll",
- "lightgbm3",
- "linfa",
- "linfa-clustering",
- "linfa-linear",
- "linfa-logistic",
- "nalgebra 0.33.3",
- "ndarray 0.17.2",
- "num_cpus",
- "ort",
- "polars",
- "rand 0.8.6",
- "rand 0.9.4",
- "rand_distr 0.5.1",
- "rand_xoshiro 0.7.0",
- "rayon",
- "rlkit",
- "ruv-swarm-ml",
- "seq-macro",
- "serde",
- "serde_json",
- "sklears",
- "symbios-genetics",
- "symbios-neat",
- "tch",
- "tracing",
- "variational-regression",
- "xgb",
-]
-
-[[package]]
-name = "forex-news"
-version = "0.4.19"
-dependencies = [
- "anyhow",
- "chrono",
- "forex-core",
- "reqwest 0.13.3",
- "secrecy",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "forex-search"
-version = "0.4.19"
-dependencies = [
- "anyhow",
- "chrono",
- "cubecl",
- "duckdb",
- "forex-core",
- "forex-data",
- "half",
- "itertools 0.14.0",
- "libc",
- "ndarray 0.17.2",
- "rand 0.9.4",
- "rand_distr 0.5.1",
- "rayon",
- "serde",
- "serde_json",
- "statrs",
- "tch",
- "tracing",
-]
-
-[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6583,6 +6369,220 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
+]
+
+[[package]]
+name = "neoethos-app"
+version = "0.4.20"
+dependencies = [
+ "anyhow",
+ "base64",
+ "cc",
+ "chrono",
+ "clap",
+ "crossbeam-channel",
+ "dirs 5.0.1",
+ "eframe",
+ "egui",
+ "egui_dock",
+ "futures",
+ "hex",
+ "keyring",
+ "ndarray 0.17.2",
+ "neoethos-core",
+ "neoethos-data",
+ "neoethos-gemma",
+ "neoethos-models",
+ "neoethos-search",
+ "num_cpus",
+ "open",
+ "polars",
+ "protobuf",
+ "protoc-bin-vendored",
+ "rand 0.9.4",
+ "reqwest 0.13.3",
+ "rfd",
+ "rustls",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-tungstenite",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+ "tungstenite 0.28.0",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "neoethos-cli"
+version = "0.4.19"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "crossterm 0.28.1",
+ "dirs 5.0.1",
+ "neoethos-core",
+ "neoethos-data",
+ "neoethos-models",
+ "neoethos-search",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "neoethos-core"
+version = "0.4.19"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "config",
+ "dirs 5.0.1",
+ "ndarray 0.17.2",
+ "reqwest 0.13.3",
+ "rusqlite",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sysinfo 0.37.2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "uuid",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "neoethos-data"
+version = "0.4.19"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "csv",
+ "memmap2",
+ "ndarray 0.17.2",
+ "neoethos-core",
+ "polars",
+ "serde",
+ "serde_json",
+ "tracing",
+ "vector-ta",
+ "vortex-array",
+ "vortex-buffer",
+ "vortex-file",
+ "vortex-io",
+ "vortex-layout",
+ "vortex-session",
+ "walkdir",
+]
+
+[[package]]
+name = "neoethos-gemma"
+version = "0.4.20"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "encoding_rs",
+ "llama-cpp-2",
+ "neoethos-core",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "neoethos-models"
+version = "0.4.19"
+dependencies = [
+ "anyhow",
+ "burn",
+ "burn-ndarray",
+ "burn-wgpu",
+ "candle-core",
+ "catboost-rust",
+ "chrono",
+ "crfmnes",
+ "cubecl",
+ "extended-isolation-forest",
+ "irithyll",
+ "lightgbm3",
+ "linfa",
+ "linfa-clustering",
+ "linfa-linear",
+ "linfa-logistic",
+ "nalgebra 0.33.3",
+ "ndarray 0.17.2",
+ "neoethos-core",
+ "neoethos-data",
+ "neoethos-search",
+ "num_cpus",
+ "ort",
+ "polars",
+ "rand 0.8.6",
+ "rand 0.9.4",
+ "rand_distr 0.5.1",
+ "rand_xoshiro 0.7.0",
+ "rayon",
+ "rlkit",
+ "ruv-swarm-ml",
+ "seq-macro",
+ "serde",
+ "serde_json",
+ "sklears",
+ "symbios-genetics",
+ "symbios-neat",
+ "tch",
+ "tracing",
+ "variational-regression",
+ "xgb",
+]
+
+[[package]]
+name = "neoethos-news"
+version = "0.4.19"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "neoethos-core",
+ "reqwest 0.13.3",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "neoethos-search"
+version = "0.4.19"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "cubecl",
+ "duckdb",
+ "half",
+ "itertools 0.14.0",
+ "libc",
+ "ndarray 0.17.2",
+ "neoethos-core",
+ "neoethos-data",
+ "rand 0.9.4",
+ "rand_distr 0.5.1",
+ "rayon",
+ "serde",
+ "serde_json",
+ "statrs",
+ "tch",
+ "tracing",
 ]
 
 [[package]]

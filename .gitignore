@@ -70,8 +70,8 @@ xgboost.dll
 
 # HALT button sentinel + per-crate test scratch (run-time artefacts,
 # not source). Added 2026-05-15 when HALT-button tests started
-# producing HALTED_<timestamp>.flag in crates/forex-app/data/.
-crates/forex-app/data/
+# producing HALTED_<timestamp>.flag in crates/neoethos-app/data/.
+crates/neoethos-app/data/
 
 # Phase G — bundled Gemma GGUF (huge binary; downloaded by installer-prep)
 /resources/models/*.gguf

@@ -1,0 +1,36 @@
+[package]
+name = "neoethos-gemma"
+version = "0.4.20"
+edition.workspace = true
+description = "Local on-device LLM helper for NeoEthos — ensemble expert + conversational suggester."
+license = "LicenseRef-Proprietary"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+neoethos-core = { path = "../neoethos-core" }
+regex = "1.11"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# ── G1: llama.cpp-backed inference (optional) ─────────────────────────────────
+# `llama-cpp-2` (by utilityai) provides safe Rust bindings to llama.cpp.
+# It loads GGUF files directly — the tokenizer is embedded in the GGUF so
+# no separate HuggingFace download is required at runtime.
+# Requires cmake + a C/C++ compiler (MSVC on Windows, clang/gcc on POSIX).
+# Both deps are gated behind `mistralrs-runtime` so the crate compiles with
+# zero native overhead for operators who have not yet downloaded the GGUF.
+llama-cpp-2 = { version = "0.1", optional = true }
+encoding_rs = { version = "0.8", optional = true }
+
+[features]
+default = []
+# G1 milestone: llama.cpp-backed runtime behind a cargo feature flag.
+# Stub runtime is always available so the rest of the workspace compiles
+# even when the real backend is not wired in (no GGUF on disk / no cmake).
+# Activation path:
+#   cargo build -p neoethos-gemma --features mistralrs-runtime
+#   (or via neoethos-app's `gemma-backend` convenience feature)
+mistralrs-runtime = ["dep:llama-cpp-2", "dep:encoding_rs"]
+

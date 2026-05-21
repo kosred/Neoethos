@@ -2,7 +2,7 @@
 <html lang="el">
 <head>
 <meta charset="utf-8" />
-<title>Forex AI — TUI mockup (ratatui-style)</title>
+<title>NeoEthos — TUI mockup (ratatui-style)</title>
 <style>
 /* ──────────────────────────────────────────────────────────────────────
    TUI mockup — emulates a terminal running the Rust ratatui frontend.
@@ -105,8 +105,8 @@ html, body {
   <!-- Fake terminal titlebar so it feels like a real terminal session -->
   <div class="term-titlebar">
     <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-    <span>ssh kostas@vps01.example.com — forex-ai-tui</span>
-    <span class="prompt">~/forex-ai $ ./forex-ai --tui --config config.yaml</span>
+    <span>ssh kostas@vps01.example.com — neoethos-tui</span>
+    <span class="prompt">~/neoethos $ ./neoethos --tui --config config.yaml</span>
     <span class="right">80×30 · vt100 · UTF-8</span>
   </div>
 
@@ -197,7 +197,7 @@ function renderHeader() {
     `· <span class="dim">16 cores GPU on</span>`;
   return [
     '<span class="c">' + '╔' + hr(w-2,'═') + '╗</span>',
-    '<span class="c">║</span> ' + row('<span class="bold w">Forex AI v0.2.0-tui</span>  <span class="dim">' + symbolLine + '</span>', w-3) + '<span class="c">║</span>',
+    '<span class="c">║</span> ' + row('<span class="bold w">NeoEthos v0.2.0-tui</span>  <span class="dim">' + symbolLine + '</span>', w-3) + '<span class="c">║</span>',
     '<span class="c">╟' + hr(w-2,'─') + '╢</span>',
     '<span class="c">║</span> ' + row(tabs, w-3) + '<span class="c">║</span>',
     '<span class="c">╚' + hr(w-2,'═') + '╝</span>',

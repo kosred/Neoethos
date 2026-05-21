@@ -35,7 +35,7 @@ env:
   CUDA_TOOLKIT_VERSION: "13.2.0"
 
   # Cargo features enabled in the release. Keep in sync with the
-  # forex-app Cargo.toml `gpu` feature definition.
+  # neoethos-app Cargo.toml `gpu` feature definition.
   RELEASE_FEATURES: "gpu"
 
 jobs:
@@ -97,13 +97,13 @@ jobs:
       - name: Build release binary (GPU)
         # TORCH_CUDA_VERSION tells tch-rs's build.rs to look for the
         # CUDA-enabled libtorch we just downloaded; the build.rs in
-        # crates/forex-app then emits the linker flags needed to keep
+        # crates/neoethos-app then emits the linker flags needed to keep
         # `libtorch_cuda` in the final binary so `tch::Cuda` sees the GPU.
         shell: pwsh
         env:
           TORCH_CUDA_VERSION: cu130
         run: |
-          cargo build -p forex-app --release --no-default-features --features "${env:RELEASE_FEATURES}"
+          cargo build -p neoethos-app --release --no-default-features --features "${env:RELEASE_FEATURES}"
 
       - name: Stage native runtime DLLs
         # Stages every native runtime dependency next to the binary so the
@@ -116,20 +116,20 @@ jobs:
           # Tree-model bindings
           Copy-Item "$release\deps\xgboost.dll" "$release\xgboost.dll" -Force -ErrorAction SilentlyContinue
           if (Test-Path "$release\catboostmodel.dll") {
-              Copy-Item "$release\catboostmodel.dll" "crates\forex-app\catboostmodel.dll" -Force
+              Copy-Item "$release\catboostmodel.dll" "crates\neoethos-app\catboostmodel.dll" -Force
           }
           if (Test-Path "$release\xgboost.dll") {
-              Copy-Item "$release\xgboost.dll" "crates\forex-app\xgboost.dll" -Force
+              Copy-Item "$release\xgboost.dll" "crates\neoethos-app\xgboost.dll" -Force
           }
           # libtorch DLLs
           New-Item -ItemType Directory -Path "$release\libtorch" -Force | Out-Null
           Copy-Item "${env:LIBTORCH}\lib\*.dll" "$release\" -Force
-          Copy-Item "${env:LIBTORCH}\lib\*.dll" "crates\forex-app\" -Force
+          Copy-Item "${env:LIBTORCH}\lib\*.dll" "crates\neoethos-app\" -Force
 
       - name: Update packager resources to include libtorch
         shell: pwsh
         run: |
-          $cargoToml = "crates\forex-app\Cargo.toml"
+          $cargoToml = "crates\neoethos-app\Cargo.toml"
           $content = Get-Content $cargoToml -Raw
           # Replace the `resources = [...]` line to bundle every libtorch DLL too
           $libtorchDlls = (Get-ChildItem "${env:LIBTORCH}\lib\*.dll" | ForEach-Object { "`"$($_.Name)`"" }) -join ", "
@@ -138,33 +138,33 @@ jobs:
           Set-Content $cargoToml $content -NoNewline
 
       - name: Package NSIS installer
-        run: cargo packager --release -p forex-app --formats nsis
+        run: cargo packager --release -p neoethos-app --formats nsis
         env:
           NSIS_PLUGINS: "${{ runner.tool_cache }}\\nsis"
 
       - name: Cleanup staged DLLs from crate root
         shell: pwsh
         run: |
-          Remove-Item "crates\forex-app\catboostmodel.dll" -ErrorAction SilentlyContinue
-          Remove-Item "crates\forex-app\xgboost.dll"       -ErrorAction SilentlyContinue
-          Remove-Item "crates\forex-app\*.dll"             -ErrorAction SilentlyContinue
+          Remove-Item "crates\neoethos-app\catboostmodel.dll" -ErrorAction SilentlyContinue
+          Remove-Item "crates\neoethos-app\xgboost.dll"       -ErrorAction SilentlyContinue
+          Remove-Item "crates\neoethos-app\*.dll"             -ErrorAction SilentlyContinue
           # Restore unmodified Cargo.toml so the cache key stays stable
-          git checkout -- "crates\forex-app\Cargo.toml"
+          git checkout -- "crates\neoethos-app\Cargo.toml"
 
       - name: Create portable zip
         shell: pwsh
         run: |
           $version = "${{ github.ref_name || inputs.version }}"
-          $outDir = "dist\ForexAI-windows-x64-gpu"
+          $outDir = "dist\NeoEthos-windows-x64-gpu"
           New-Item -ItemType Directory -Path $outDir -Force | Out-Null
-          Copy-Item "target\release\forex-app.exe" "$outDir\ForexAI.exe"
+          Copy-Item "target\release\neoethos-app.exe" "$outDir\NeoEthos.exe"
           Copy-Item "target\release\catboostmodel.dll" "$outDir\catboostmodel.dll" -ErrorAction SilentlyContinue
           Copy-Item "target\release\xgboost.dll"       "$outDir\xgboost.dll"       -ErrorAction SilentlyContinue
           Copy-Item "target\release\*.dll"             "$outDir\" -Force
           Copy-Item "config.yaml"                      "$outDir\config.yaml"
           # Drop a README so end users know what's bundled
           @"
-          ForexAI $version (Windows, GPU)
+          NeoEthos $version (Windows, GPU)
           ================================
 
           Runtime requirements:
@@ -173,13 +173,13 @@ jobs:
             - The CUDA runtime DLLs bundled here cover libtorch; you do NOT
               need to install the CUDA toolkit separately.
 
-          To run: just double-click ForexAI.exe (or run from a terminal
+          To run: just double-click NeoEthos.exe (or run from a terminal
           for log output).
 
           Bundled libtorch: $(${env:LIBTORCH_VERSION})
           Bundled CUDA target: $(${env:LIBTORCH_CUDA})
           "@ | Set-Content "$outDir\README.txt"
-          Compress-Archive -Path $outDir -DestinationPath "dist\ForexAI-$version-windows-x64-gpu.zip" -Force
+          Compress-Archive -Path $outDir -DestinationPath "dist\NeoEthos-$version-windows-x64-gpu.zip" -Force
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
@@ -263,40 +263,40 @@ jobs:
 
       - name: Build release binary (GPU)
         # TORCH_CUDA_VERSION tells tch-rs's build.rs to look for the
-        # CUDA-enabled libtorch we just downloaded. forex-app/build.rs
+        # CUDA-enabled libtorch we just downloaded. neoethos-app/build.rs
         # then emits the `--no-as-needed -ltorch_cuda` linker args so
         # `tch::Cuda::device_count()` actually sees the GPU at runtime.
         env:
           TORCH_CUDA_VERSION: cu130
-        run: cargo build -p forex-app --release --no-default-features --features "${RELEASE_FEATURES}"
+        run: cargo build -p neoethos-app --release --no-default-features --features "${RELEASE_FEATURES}"
 
       - name: Create portable tar.gz with libtorch
         run: |
           VERSION="${{ github.ref_name || inputs.version }}"
-          OUTDIR="dist/ForexAI-${VERSION}-linux-x64-gpu"
+          OUTDIR="dist/NeoEthos-${VERSION}-linux-x64-gpu"
           mkdir -p "$OUTDIR/lib"
 
           # Binary
-          cp target/release/forex-app "$OUTDIR/ForexAI"
-          chmod +x "$OUTDIR/ForexAI"
+          cp target/release/neoethos-app "$OUTDIR/NeoEthos"
+          chmod +x "$OUTDIR/NeoEthos"
 
           # Bundle libtorch shared libraries
           cp -P "$LIBTORCH"/lib/*.so* "$OUTDIR/lib/" 2>/dev/null || true
 
           # Config + launcher
           cp config.yaml "$OUTDIR/config.yaml"
-          cat > "$OUTDIR/run-forexai.sh" <<'SH'
+          cat > "$OUTDIR/run-neoethos.sh" <<'SH'
           #!/usr/bin/env bash
           # Launcher that points the dynamic linker at the bundled libtorch
           DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
           export LD_LIBRARY_PATH="$DIR/lib:${LD_LIBRARY_PATH:-}"
-          exec "$DIR/ForexAI" "$@"
+          exec "$DIR/NeoEthos" "$@"
           SH
-          chmod +x "$OUTDIR/run-forexai.sh"
+          chmod +x "$OUTDIR/run-neoethos.sh"
 
           # README
           cat > "$OUTDIR/README.txt" <<EOF
-          ForexAI $VERSION (Linux, GPU)
+          NeoEthos $VERSION (Linux, GPU)
           =============================
 
           Runtime requirements:
@@ -305,21 +305,21 @@ jobs:
             - The CUDA runtime libs bundled in lib/ cover libtorch; you do
               NOT need to install the CUDA toolkit separately.
 
-          To run: ./run-forexai.sh   (the wrapper sets LD_LIBRARY_PATH)
+          To run: ./run-neoethos.sh   (the wrapper sets LD_LIBRARY_PATH)
           Or run directly with:
-              LD_LIBRARY_PATH=\$(pwd)/lib ./ForexAI
+              LD_LIBRARY_PATH=\$(pwd)/lib ./NeoEthos
 
           Bundled libtorch: ${LIBTORCH_VERSION}
           Bundled CUDA target: ${LIBTORCH_CUDA}
           EOF
 
-          tar -czf "dist/ForexAI-${VERSION}-linux-x64-gpu.tar.gz" -C dist "ForexAI-${VERSION}-linux-x64-gpu"
+          tar -czf "dist/NeoEthos-${VERSION}-linux-x64-gpu.tar.gz" -C dist "NeoEthos-${VERSION}-linux-x64-gpu"
 
       - name: Package .deb (optional, CPU layout)
         # The .deb does not bundle libtorch (would push it past the
         # ~50 MB Debian package threshold). It depends on the system
         # libtorch install — useful for ops that prefer apt/dpkg.
-        run: cargo packager --release -p forex-app --formats deb || true
+        run: cargo packager --release -p neoethos-app --formats deb || true
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
@@ -352,18 +352,18 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name || inputs.version }}
-          name: "ForexAI ${{ github.ref_name || inputs.version }}"
+          name: "NeoEthos ${{ github.ref_name || inputs.version }}"
           draft: true
           prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
           body: |
-            ## ForexAI ${{ github.ref_name || inputs.version }} — GPU release
+            ## NeoEthos ${{ github.ref_name || inputs.version }} — GPU release
 
             ### Downloads
             | Platform | File | Notes |
             |----------|------|-------|
-            | Windows installer | `ForexAI-*-setup.exe` | NSIS installer; libtorch + tree-model DLLs bundled |
-            | Windows portable  | `ForexAI-*-windows-x64-gpu.zip` | Unzip and run `ForexAI.exe` |
-            | Linux portable    | `ForexAI-*-linux-x64-gpu.tar.gz` | Untar and run `./run-forexai.sh` |
+            | Windows installer | `NeoEthos-*-setup.exe` | NSIS installer; libtorch + tree-model DLLs bundled |
+            | Windows portable  | `NeoEthos-*-windows-x64-gpu.zip` | Unzip and run `NeoEthos.exe` |
+            | Linux portable    | `NeoEthos-*-linux-x64-gpu.tar.gz` | Untar and run `./run-neoethos.sh` |
             | Linux .deb        | `*.deb` | System libtorch required (apt install) |
 
             ### Runtime requirements

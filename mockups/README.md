@@ -1,16 +1,16 @@
 # mockups/
 
-Static HTML design references for the forex-ai trading UI.
+Static HTML design references for the neoethos trading UI.
 
 ## Status (V0.4.19)
 
 **Authoritative visual reference** for the egui implementation under
-`crates/forex-app/src/ui/`. The two HTML files in this directory describe
+`crates/neoethos-app/src/ui/`. The two HTML files in this directory describe
 the target look-and-feel of the desktop GUI; the egui code mirrors them
 panel-by-panel.
 
 These files are **not** built or shipped — they are design artefacts
-only. The actual UI is rendered by `forex-app` (egui/eframe) at runtime.
+only. The actual UI is rendered by `neoethos-app` (egui/eframe) at runtime.
 
 ## Files
 
@@ -24,7 +24,7 @@ panel borders.
 
 ### `tui_mockup.html` (~36 KB)
 Stripped-down terminal-style variant intended as a future reference for
-a headless / VPS-friendly TUI shell. The current `forex-cli` is a batch
+a headless / VPS-friendly TUI shell. The current `neoethos-cli` is a batch
 tool — the TUI port (Task #41 in the V0.4 audit) is not yet implemented.
 
 ## Workflow

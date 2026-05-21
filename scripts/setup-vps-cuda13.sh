@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-shot VPS bootstrap for forex-ai on Ubuntu 22.04 with NVIDIA L40 / A100 / RTX-A6000 / H100.
+# One-shot VPS bootstrap for neoethos on Ubuntu 22.04 with NVIDIA L40 / A100 / RTX-A6000 / H100.
 #
 # What this does (in order):
 #   1. Full system update (apt update + dist-upgrade)
@@ -17,15 +17,15 @@
 # Re-run safe: every step is idempotent — it'll skip what's already installed.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/kosred/forex-ai/master/scripts/setup-vps-cuda13.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/kosred/neoethos/master/scripts/setup-vps-cuda13.sh | bash
 # OR clone first then:
 #   bash scripts/setup-vps-cuda13.sh
 
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-https://github.com/kosred/forex-ai.git}"
+REPO_URL="${REPO_URL:-https://github.com/kosred/neoethos.git}"
 REPO_BRANCH="${REPO_BRANCH:-claude/happy-gould-23d649}"
-DATA_RELEASE_URL="${DATA_RELEASE_URL:-https://github.com/kosred/forex-ai/releases/download/dataset-v1/data.zip}"
+DATA_RELEASE_URL="${DATA_RELEASE_URL:-https://github.com/kosred/neoethos/releases/download/dataset-v1/data.zip}"
 LIBTORCH_VERSION="${LIBTORCH_VERSION:-2.9.0}"
 LIBTORCH_CUDA="${LIBTORCH_CUDA:-cu130}"
 NVIDIA_DRIVER_PKG="${NVIDIA_DRIVER_PKG:-nvidia-driver-595-server-open}"
@@ -34,7 +34,7 @@ CUDA_TOOLKIT_PKG="${CUDA_TOOLKIT_PKG:-cuda-toolkit-13-0}"
 HOME_DIR="$HOME"
 LIBTORCH_DIR="$HOME_DIR/libtorch"
 DATA_DIR="$HOME_DIR/data"
-REPO_DIR="$HOME_DIR/forex-ai"
+REPO_DIR="$HOME_DIR/neoethos"
 
 REBOOT_NEEDED=0
 
@@ -123,7 +123,7 @@ else
   log "  $DATA_DIR already populated, skipping download."
 fi
 
-log "Step 7/9 — clone forex-ai @ $REPO_BRANCH"
+log "Step 7/9 — clone neoethos @ $REPO_BRANCH"
 if [[ ! -d "$REPO_DIR/.git" ]]; then
   git clone --branch "$REPO_BRANCH" --depth 1 "$REPO_URL" "$REPO_DIR"
 else
@@ -134,7 +134,7 @@ else
 fi
 
 log "Step 8/9 — persist env vars in ~/.bashrc"
-SETUP_MARK="# --- forex-ai vps env (managed by setup-vps-cuda13.sh) ---"
+SETUP_MARK="# --- neoethos vps env (managed by setup-vps-cuda13.sh) ---"
 if ! grep -qF "$SETUP_MARK" "$HOME/.bashrc"; then
   cat >> "$HOME/.bashrc" <<EOF
 
@@ -142,13 +142,13 @@ $SETUP_MARK
 export LIBTORCH="$LIBTORCH_DIR"
 export TORCH_CUDA_VERSION=$LIBTORCH_CUDA
 export PATH="\$HOME/.local/bin:/usr/local/cuda-${CUDA_TOOLKIT_PKG##*-}.0/bin:\$PATH"
-export LD_LIBRARY_PATH="\$LIBTORCH/lib:/usr/local/cuda-${CUDA_TOOLKIT_PKG##*-}.0/lib64:\$HOME/forex-ai/target/release:\$HOME/forex-ai/target/release/deps:\${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="\$LIBTORCH/lib:/usr/local/cuda-${CUDA_TOOLKIT_PKG##*-}.0/lib64:\$HOME/neoethos/target/release:\$HOME/neoethos/target/release/deps:\${LD_LIBRARY_PATH:-}"
 export FOREX_BOT_DATA_ROOT="$DATA_DIR"
-# --- end forex-ai vps env ---
+# --- end neoethos vps env ---
 EOF
   log "  Appended env block to ~/.bashrc"
 else
-  log "  ~/.bashrc already contains the forex-ai env block."
+  log "  ~/.bashrc already contains the neoethos env block."
 fi
 
 log "Step 9/9 — done"
@@ -165,9 +165,9 @@ Driver:       \$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/
 Next steps:
   source ~/.bashrc           # load env vars in this shell
   cd $REPO_DIR
-  cargo build --release -p forex-cli --features "forex-search/gpu forex-models/neuro-evolution-gpu forex-models/statistical-gpu"
-  ./target/release/forex-cli migrate-data --root \$FOREX_BOT_DATA_ROOT
-  ./target/release/forex-cli search --symbol EURUSD --base H4 --higher D1 --genes 64 --generations 5 --root \$FOREX_BOT_DATA_ROOT
+  cargo build --release -p neoethos-cli --features "neoethos-search/gpu neoethos-models/neuro-evolution-gpu neoethos-models/statistical-gpu"
+  ./target/release/neoethos-cli migrate-data --root \$FOREX_BOT_DATA_ROOT
+  ./target/release/neoethos-cli search --symbol EURUSD --base H4 --higher D1 --genes 64 --generations 5 --root \$FOREX_BOT_DATA_ROOT
 
 EOF
 

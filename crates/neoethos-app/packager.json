@@ -1,0 +1,14 @@
+{
+  "product_name": "NeoEthos",
+  "identifier": "com.konst.neoethos",
+  "version": "0.1.0",
+  "authors": ["NeoEthos Developers"],
+  "description": "Advanced Algorithmic Forex Terminal",
+  "binaries": [
+    {
+      "path": "neoethos-app",
+      "main": true
+    }
+  ],
+  "formats": ["nsis"]
+}

@@ -155,7 +155,7 @@ Push-Location $flutterUi
 try {
     if (-not (Test-Path 'windows')) {
         Info "Running flutter create . --platforms windows..."
-        flutter create . --platforms windows --org com.forexai 2>&1 | Out-Host
+        flutter create . --platforms windows --org com.neoethos 2>&1 | Out-Host
     }
     Info "flutter pub get..."
     flutter pub get 2>&1 | Out-Host

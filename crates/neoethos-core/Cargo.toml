@@ -1,0 +1,44 @@
+[package]
+name = "neoethos-core"
+version = "0.4.19"
+edition.workspace = true
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+serde_yaml_ng = "0.10.0"
+config = "0.15.19"
+tracing = "0.1.42"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
+# tracing-appender: daily-rotating file logger. Wired into `logging::setup_logging`
+# alongside the console layer so each session writes to
+# `<user-data-dir>/neoethos/logs/neoethos.YYYY-MM-DD.log`. Old files (> 7 days)
+# are deleted at startup to keep the directory clean — the user explicitly
+# requested "logs of today, not garbage from days/months ago".
+tracing-appender = "0.2.4"
+# Platform-correct user-data dir for log storage. Same version as neoethos-app.
+dirs = "5.0.1"
+tokio = { version = "1.49.0", features = ["full"] }
+sysinfo = "0.37.2"
+anyhow = "1.0.100"
+thiserror = "2.0.16"
+rusqlite = { version = "0.38.0", features = ["bundled", "chrono"] }
+chrono = { version = "0.4.44", features = ["serde"] }
+uuid = { version = "1.19.0", features = ["v4", "serde"] }
+ndarray = "0.17.2"
+# reqwest >= 0.13.3 logs only the host, not the full URL — protects client_secret from leaking to debug/trace logs.
+# In 0.13, `form`/`query` are opt-in features (per the 0.13.0 CHANGELOG).
+reqwest = { version = "0.13.3", default-features = false, features = ["rustls", "json", "blocking", "query", "form"] }
+# API key wrapped in `secrecy::SecretString` (a `Box<str>` that cannot
+# reallocate, zeroized on drop). The zeroize upstream docs explicitly point
+# users to `secrecy` for string-shaped secrets because `Zeroizing<String>`
+# leaves un-zeroed reallocated buffers on the heap.
+secrecy = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.1", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+

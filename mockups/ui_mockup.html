@@ -2,11 +2,11 @@
 <html lang="el">
 <head>
 <meta charset="utf-8" />
-<title>Forex AI — Interactive UI Mockup</title>
+<title>NeoEthos — Interactive UI Mockup</title>
 <meta name="viewport" content="width=1280" />
 <style>
 /* ──────────────────────────────────────────────────────────────────────
-   Design tokens — mirror του crates/forex-app/src/ui/theme.rs
+   Design tokens — mirror του crates/neoethos-app/src/ui/theme.rs
    ────────────────────────────────────────────────────────────────────── */
 :root {
   --app-bg:        #0E1116;
@@ -735,7 +735,7 @@ button.btn.sm { min-height:24px; padding:3px 10px; font-size:12px; }
 <div class="app">
   <!-- TOP BAR -->
   <div class="topbar">
-    <span class="brand">Forex AI</span>
+    <span class="brand">NeoEthos</span>
     <span class="badge badge--pro">PRO</span>
     <div class="vsep"></div>
     <div class="ribbon-item"><span class="lbl">Symbol</span><span class="val accent" id="topSym">EURUSD</span></div>
@@ -835,7 +835,7 @@ button.btn.sm { min-height:24px; padding:3px 10px; font-size:12px; }
 
 <script>
 /* ════════════════════════════════════════════════════════════════════════════
-   App state — mimics crates/forex-app/src/app_state.rs (απλοποιημένο)
+   App state — mimics crates/neoethos-app/src/app_state.rs (απλοποιημένο)
    ════════════════════════════════════════════════════════════════════════════ */
 const S = {
   activeTab: 'Chart',
@@ -1004,7 +1004,7 @@ const S = {
 };
 
 /* ════════════════════════════════════════════════════════════════════════════
-   Tabs catalog — mirror του crates/forex-app/src/workspace/tabs.rs
+   Tabs catalog — mirror του crates/neoethos-app/src/workspace/tabs.rs
    ════════════════════════════════════════════════════════════════════════════ */
 const TABS = [
   // Trading
@@ -2941,7 +2941,7 @@ VIEWS.Discovery.afterRender = function() {
   const fullAutoBtn = document.getElementById('discFullAutoBtn'); if (fullAutoBtn) fullAutoBtn.onclick = () => openAutoWizard('discovery');
   const startBtn = document.getElementById('discStartBtn'); if (startBtn) startBtn.onclick = () => startDiscovery();
   const stopBtn  = document.getElementById('discStopBtn');  if (stopBtn)  stopBtn.onclick  = () => stopDiscovery();
-  document.getElementById('discOpenLogBtn').onclick = () => toast('Log opened','Tail of forex-ai.log streaming...','');
+  document.getElementById('discOpenLogBtn').onclick = () => toast('Log opened','Tail of neoethos.log streaming...','');
 };
 
 let discoveryTimer = null;
@@ -4530,8 +4530,8 @@ document.addEventListener('click', e => {
 const DOCS = {
   el: {
     welcome: { title:'Καλωσήρθες', body:`
-      <h3>Forex AI — Σύντομη περιγραφή</h3>
-      <p>Το Forex AI είναι ένα Rust trading terminal με ενσωματωμένο σύστημα τεχνητής νοημοσύνης. Συνδέεται με broker (cTrader ή DXtrade), προσφέρει χειροκίνητες συναλλαγές με indicators και drawing tools, και έχει δύο AI engines: <strong>Discovery</strong> (γενετική αναζήτηση στρατηγικών) και <strong>Training</strong> (ensemble ML training).</p>
+      <h3>NeoEthos — Σύντομη περιγραφή</h3>
+      <p>Το NeoEthos είναι ένα Rust trading terminal με ενσωματωμένο σύστημα τεχνητής νοημοσύνης. Συνδέεται με broker (cTrader ή DXtrade), προσφέρει χειροκίνητες συναλλαγές με indicators και drawing tools, και έχει δύο AI engines: <strong>Discovery</strong> (γενετική αναζήτηση στρατηγικών) και <strong>Training</strong> (ensemble ML training).</p>
       <h4>Προτεινόμενη ροή για νέους χρήστες:</h4>
       <ol style="line-height:1.7;">
         <li><strong>Άνοιξε λογαριασμό Demo</strong> σε έναν cTrader broker (Pepperstone, IC Markets, FxPro, Vantage, Axi)</li>
@@ -4611,8 +4611,8 @@ const DOCS = {
   },
   en: {
     welcome: { title:'Welcome', body:`
-      <h3>Forex AI — Quick overview</h3>
-      <p>Forex AI is a Rust-based trading terminal with built-in AI. It connects to a broker (cTrader or DXtrade), supports manual trading with indicators and drawing tools, and has two AI engines: <strong>Discovery</strong> (genetic strategy search) and <strong>Training</strong> (ensemble ML training).</p>
+      <h3>NeoEthos — Quick overview</h3>
+      <p>NeoEthos is a Rust-based trading terminal with built-in AI. It connects to a broker (cTrader or DXtrade), supports manual trading with indicators and drawing tools, and has two AI engines: <strong>Discovery</strong> (genetic strategy search) and <strong>Training</strong> (ensemble ML training).</p>
       <h4>Recommended flow for new users:</h4>
       <ol style="line-height:1.7;">
         <li><strong>Open a Demo account</strong> at a cTrader broker (Pepperstone, IC Markets, FxPro, Vantage, Axi)</li>

@@ -34,7 +34,7 @@ delivering any user-facing capability the egui UI doesn't already.
 
 If a future ticket revisits the Flutter UI it should:
 
-1. Re-validate against the current `forex-app` REST + SSE surface
+1. Re-validate against the current `neoethos-app` REST + SSE surface
    (which has shifted since the 2026-05-18 scaffold).
 2. Decide whether to keep `flutter_riverpod` + `go_router` or migrate
    to whatever the Flutter ecosystem standard is at that future date.

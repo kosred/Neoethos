@@ -15,7 +15,7 @@
 #   - SSH key configured for the VM user (default: ubuntu)
 #   - GitHub auth (HTTPS PAT or SSH key)
 #
-# Run from repo root: cd C:\Users\konst\development\forex-ai
+# Run from repo root: cd C:\Users\konst\development\neoethos
 #                     .\scripts\release-on-vps.ps1
 
 [CmdletBinding()]
@@ -23,7 +23,7 @@ param(
     [string]$VmId         = $env:HYPERSTACK_VM_ID,
     [string]$VmUser       = ${env:HYPERSTACK_VM_USER}    ?? 'ubuntu',
     [string]$VmIp         = $env:HYPERSTACK_VM_IP,
-    [string]$Branch       = 'feature/forex-gemma-g0',
+    [string]$Branch       = 'feature/neoethos-gemma-g0',
     [string]$MergeInto    = 'master',
     [switch]$SkipGitPush,
     [switch]$SkipVpsBuild,
@@ -34,7 +34,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $DateStamp = (Get-Date -Format 'yyyy-MM-dd')
 $RepoRoot  = (Get-Item $PSScriptRoot).Parent.FullName
-$Tarball   = "forex-ai-linux-x86_64-$DateStamp.tar.gz"
+$Tarball   = "neoethos-linux-x86_64-$DateStamp.tar.gz"
 $LocalDest = Join-Path $env:USERPROFILE 'Downloads\releases'
 $LocalTar  = Join-Path $LocalDest $Tarball
 $Started   = Get-Date
@@ -87,7 +87,7 @@ if (-not $SkipGitPush) {
             $msg = @"
 Phase G + D3.1 follow-ups + Flutter scaffold · 2026-05-18
 
-Round 1: forex-gemma crate (G0 scaffold + G2 topic gate w/ embedding
+Round 1: neoethos-gemma crate (G0 scaffold + G2 topic gate w/ embedding
 gate + 40+40 anchor corpus + G3 read-only tools + G1 prep w/
 bundled-model path resolver + G6a expert wiring). 144 tests pass.
 
