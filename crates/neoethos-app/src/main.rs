@@ -104,6 +104,21 @@ struct Args {
     /// 1 of the Flutter migration (task #87).
     #[arg(long, default_value_t = false)]
     server: bool,
+
+    /// Headless cTrader OAuth flow. Opens the system browser to the
+    /// Spotware consent page, captures the redirect on the loopback
+    /// port, exchanges the authorization code for a fresh token
+    /// bundle, and writes the bundle to the OS keyring under
+    /// `service=neoethos, user=ctrader.default`. After it returns,
+    /// `--server` (and the legacy egui GUI) picks up the new token
+    /// automatically on the next refresh tick.
+    ///
+    /// Use this when `--server` logs `RET_ACCOUNT_DISABLED` /
+    /// "Authentication failed" — that's the cTrader server saying
+    /// the cached access token is expired or scoped wrong, and a
+    /// fresh OAuth flow is the canonical recovery.
+    #[arg(long, default_value_t = false)]
+    reauth: bool,
 }
 
 /// Returns true when the wizard should run on this launch. Spec §1.2
@@ -174,6 +189,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             only_filter: args.api_test_only.clone(),
         };
         app_services::api_test::run_api_test_suite(cfg).await?;
+        return Ok(());
+    }
+
+    if args.reauth {
+        // Headless OAuth refresh. Mirrors what the wizard's Step 4 used
+        // to do, but without any UI — opens the browser, waits for the
+        // loopback callback, swaps the auth-code for a token bundle,
+        // saves it to the keyring, exits. Run this once whenever
+        // `--server` reports `RET_ACCOUNT_DISABLED`.
+        info!("Running cTrader OAuth flow (browser will open)...");
+        use app_services::ctrader_live_auth::{
+            CTraderLiveAuthBackend, CTraderLiveAuthRequest, CTraderLoopbackConfig,
+            ProductionCTraderLiveAuthBackend,
+        };
+        use app_services::secure_store::production_ctrader_token_store;
+
+        let settings = app_services::broker_persistence::load_broker_settings();
+        let ct = &settings.ctrader;
+        if ct.client_id.is_empty() || ct.client_secret.is_empty() {
+            error!(
+                "cTrader client_id / client_secret are empty — set them in \
+                 .local/neoethos/broker_credentials.toml (or via \
+                 NEOETHOS_EMBED_CTRADER_CLIENT_ID / _SECRET env vars at \
+                 build time) before re-authing"
+            );
+            std::process::exit(2);
+        }
+
+        // Primary callback port 43001 matches what's registered on the
+        // Spotware portal; fallbacks 43002 / 43003 cover the case where
+        // another process holds 43001. Keep this in lock-step with what
+        // `ctrader_live_auth.rs::CTRADER_DEFAULT_LOOPBACK_PORTS` uses.
+        let loopback = CTraderLoopbackConfig::new(43001, vec![43002, 43003], "/callback");
+
+        let request = CTraderLiveAuthRequest {
+            client_id: ct.client_id.clone(),
+            client_secret: ct.client_secret.clone(),
+            redirect_uri: ct.redirect_uri.clone(),
+            // `trading` (not `accounts`) is the scope ProtoOAAccountAuthReq
+            // requires. The earlier session's token had `accounts` scope
+            // only — account-list worked but account-auth failed with
+            // RET_ACCOUNT_DISABLED. Hard-code `trading` here so this
+            // never regresses.
+            scope: "trading".to_string(),
+            loopback,
+        };
+
+        // `backend.run()` performs synchronous filesystem + reqwest::blocking
+        // I/O internally (the token-exchange POST uses blocking HTTP). We're
+        // inside a `#[tokio::main]` runtime here, so calling it on the async
+        // task directly panics on drop with "Cannot drop a runtime in a
+        // context where blocking is not allowed" (tokio reactor refuses to
+        // host a nested blocking runtime). spawn_blocking moves the whole
+        // OAuth flow onto a dedicated worker thread where blocking I/O is
+        // first-class.
+        let result = tokio::task::spawn_blocking(move || {
+            let backend = ProductionCTraderLiveAuthBackend;
+            backend.run(request)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("OAuth blocking task panicked: {e}"))?
+        .map_err(|e| anyhow::anyhow!("OAuth flow failed: {e}"))?;
+
+        info!(
+            callback_port = result.callback_port,
+            access_token_len = result.token_bundle.access_token.len(),
+            refresh_token_present = !result.token_bundle.refresh_token.is_empty(),
+            "OAuth flow complete; saving token bundle to keyring"
+        );
+        production_ctrader_token_store()
+            .save_token_bundle(&result.token_bundle)
+            .map_err(|e| anyhow::anyhow!("save_token_bundle failed: {e}"))?;
+
+        info!("Token bundle saved. You can now run: neoethos-app --server");
         return Ok(());
     }
 
