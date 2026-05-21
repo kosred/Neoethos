@@ -1243,6 +1243,16 @@ impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
             let expected_payload_type = expected_response_payload_type(message.payload_type)?;
             let serialized = serde_json::to_string(message)
                 .context("failed to serialize cTrader open api message")?;
+            // DIAG: stamp request shape so we can see exactly what was sent
+            // before we hit the response-count mismatch in the bridge.
+            // Remove this block once the protocol-flow bug is closed.
+            tracing::info!(
+                target: "neoethos_app::ctrader_transport",
+                request_msg_id = %message.client_msg_id,
+                request_payload_type = message.payload_type,
+                expected_response_payload_type = expected_payload_type,
+                "send_sequence → ctrader"
+            );
             socket
                 .send(Message::Text(serialized.into()))
                 .context("failed to send cTrader open api message")?;
@@ -1257,6 +1267,19 @@ impl CTraderOpenApiTransport for ProductionCTraderOpenApiTransport {
                             return Err(anyhow!("empty cTrader open api response"));
                         }
                         let envelope = parse_open_api_envelope(text.as_ref())?;
+                        // DIAG (remove with the trace above): log every incoming
+                        // envelope so we can see whether non-matching responses
+                        // are spot ticks, errors, or correctly-targeted replies
+                        // with mismatched client_msg_id.
+                        tracing::info!(
+                            target: "neoethos_app::ctrader_transport",
+                            recv_payload_type = envelope.payload_type,
+                            recv_msg_id = %envelope.client_msg_id,
+                            awaiting_payload_type = expected_payload_type,
+                            awaiting_msg_id = %message.client_msg_id,
+                            body_preview = %text.chars().take(220).collect::<String>(),
+                            "send_sequence ← ctrader"
+                        );
                         if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
                             responses.push(text.to_string());
                             let _ = socket.close(None);
