@@ -45,5 +45,10 @@ thiserror   = "2.0.16"
 
 [patch.crates-io]
 lightgbm3-sys = { path = "vendor/lightgbm3-sys" }
-sklears-core = { path = "vendor/sklears-core" }
+# sklears-core patch removed 2026-05-21 (task #84) — the vendored copy
+# was the stale v0.1.0 release and got bypassed once sklears upstream
+# published 0.1.1 (which lifts the scirs2 stack to v0.4.4). Cargo was
+# warning every build that the patch was not used. If we ever need to
+# patch sklears-core again, regenerate the vendor copy at the version
+# the crate graph actually resolves to.
 rlkit = { path = "vendor/rlkit" }

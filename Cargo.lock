@@ -14228,7 +14228,3 @@ dependencies = [
  "quote",
  "syn 2.0.117",
 ]
-
-[[patch.unused]]
-name = "sklears-core"
-version = "0.1.0"
