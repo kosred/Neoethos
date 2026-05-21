@@ -1,5 +1,6 @@
 mod app_services;
 mod app_state;
+mod server;
 mod ui;
 mod workspace;
 
@@ -18,6 +19,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 use workspace::{WorkspaceGroup, WorkspaceState, WorkspaceTab, WorkspaceViewer, render_workspace};
+
+const NEOETHOS_ICON_PNG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/branding/neoethos-icon.png"
+));
+
+fn neoethos_icon_data() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(NEOETHOS_ICON_PNG)
+        .expect("embedded NeoEthos icon PNG must decode")
+}
+
+fn load_neoethos_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    let icon = neoethos_icon_data();
+    ctx.load_texture(
+        "neoethos-brand-icon",
+        egui::ColorImage::from(&icon),
+        egui::TextureOptions::LINEAR,
+    )
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -76,6 +96,14 @@ struct Args {
     /// re-walking the entire suite.
     #[arg(long)]
     api_test_only: Option<String>,
+
+    /// Run as a headless HTTP API server on port 7423 (override with
+    /// `NEOETHOS_SERVER_BIND=host:port`). The Flutter UI prototype at
+    /// `experiments/forex-flutter-ui/` consumes this surface. This
+    /// mode is the eventual replacement for the egui GUI loop — Phase
+    /// 1 of the Flutter migration (task #87).
+    #[arg(long, default_value_t = false)]
+    server: bool,
 }
 
 /// Returns true when the wizard should run on this launch. Spec §1.2
@@ -149,6 +177,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if args.server {
+        // Headless API server mode — the Flutter front-end's backend.
+        //
+        // No canned/seed data: the only state we hold is what the
+        // `bridge` task pulls live from cTrader. Until the first poll
+        // completes (~5 seconds) the `/account/snapshot` route returns
+        // 503, which the Flutter side renders as a "connecting…"
+        // placeholder. As soon as the cTrader account-runtime call
+        // succeeds the dashboard switches to real numbers.
+        info!("Starting NeoEthos in HTTP server mode (Flutter front-end backend)...");
+        let state = server::state::AppApiState::new();
+        server::bridge::spawn(state.clone());
+        server::serve(state).await?;
+        return Ok(());
+    }
+
     if args.headless {
         info!("Starting NeoEthos in Headless Server Mode...");
         run_headless_loop(runtime).await;
@@ -156,7 +200,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         info!("Starting NeoEthos in GUI Mode...");
         let options = eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 800.0]),
+            viewport: egui::ViewportBuilder::default()
+                .with_inner_size([1200.0, 800.0])
+                .with_icon(neoethos_icon_data()),
             ..Default::default()
         };
 
@@ -280,6 +326,7 @@ struct ForexApp {
     workspace: WorkspaceState,
     state: AppState,
     wizard_controller: Option<ui::wizard::WizardController>,
+    brand_texture: egui::TextureHandle,
 
     // Message Bus
     tx: mpsc::Sender<ServiceEvent>,
@@ -303,12 +350,13 @@ struct ForexApp {
 
 impl ForexApp {
     fn new(
-        _cc: &eframe::CreationContext<'_>,
+        cc: &eframe::CreationContext<'_>,
         runtime: AppRuntimeConfig,
         settings: Settings,
         wizard_due: bool,
     ) -> Self {
-        ui::theme::apply_theme(&_cc.egui_ctx);
+        ui::theme::apply_theme(&cc.egui_ctx);
+        let brand_texture = load_neoethos_texture(&cc.egui_ctx);
         let (tx, rx) = mpsc::channel(10000);
         let symbols = match neoethos_data::discover_symbols(&runtime.data_dir) {
             Ok(s) => s,
@@ -345,6 +393,7 @@ impl ForexApp {
             workspace,
             state,
             wizard_controller: initial_wizard_controller(wizard_due),
+            brand_texture,
             tx: tx.clone(),
             rx,
             discovery_handle: None,
@@ -602,6 +651,11 @@ impl eframe::App for ForexApp {
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     // Brand
+                    ui.add(egui::Image::from_texture((
+                        self.brand_texture.id(),
+                        egui::vec2(28.0, 28.0),
+                    )));
+                    ui.add_space(ui::theme::SPACE_XS);
                     ui.label(
                         egui::RichText::new("NeoEthos")
                             .size(ui::theme::FONT_SUBTITLE + 1.0)

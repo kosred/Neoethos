@@ -73,6 +73,16 @@ secrecy = "0.10"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = { version = "0.26", optional = true }
 
+# ── Flutter migration (Phase 1) ─────────────────────────────────────────────
+# axum is the HTTP layer the Flutter front-end talks to. Latest stable 0.8.x
+# as of 2026-05; uses the same tokio runtime the rest of the app uses, so no
+# extra reactor. `tower-http` provides ready-made middleware — we use `cors`
+# (Flutter is a separate process, same machine, but the browser preflight
+# rules still kick in when running flutter run -d chrome for debugging) and
+# `trace` (request/response logs piped through our existing tracing setup).
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
 
 
 polars = { version = "0.52.0", features = ["lazy", "dtype-full", "temporal", "timezones"] }
