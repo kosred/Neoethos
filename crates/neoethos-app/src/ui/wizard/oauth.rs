@@ -29,7 +29,7 @@
 //!
 //! 1. Resolving the embedded `client_id` + `client_secret`. If the
 //!    binary was built without them (developer building from source
-//!    without setting `FOREX_AI_EMBED_CTRADER_CLIENT_ID` /
+//!    without setting `NEOETHOS_EMBED_CTRADER_CLIENT_ID` /
 //!    `_CLIENT_SECRET`), the step renders an explanatory diagnostic
 //!    banner with the env-var names — there's no operator-facing
 //!    text field for this.
@@ -68,11 +68,11 @@ use crate::ui::theme;
 /// app `client_id` into the binary. Spec mirror of
 /// `crates/neoethos-app/build.rs::emit_embedded_credentials`. Surfaced
 /// in the developer-setup banner when the embedded constant is empty.
-pub const BUILD_ENV_CLIENT_ID: &str = "FOREX_AI_EMBED_CTRADER_CLIENT_ID";
+pub const BUILD_ENV_CLIENT_ID: &str = "NEOETHOS_EMBED_CTRADER_CLIENT_ID";
 
 /// Env-var name the developer sets at build time to bake the cTrader
 /// app `client_secret` into the binary.
-pub const BUILD_ENV_CLIENT_SECRET: &str = "FOREX_AI_EMBED_CTRADER_CLIENT_SECRET";
+pub const BUILD_ENV_CLIENT_SECRET: &str = "NEOETHOS_EMBED_CTRADER_CLIENT_SECRET";
 
 /// Spec §2 Step 4.2 — loopback port allocator. RFC 8252 §7.3 fallback
 /// list. Must match `CTraderLoopbackConfig` at

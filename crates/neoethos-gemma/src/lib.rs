@@ -73,7 +73,7 @@ pub use tools::{BotTool, ToolCategory, ToolContext, ToolRegistry};
 
 /// Environment variable the operator can set to point the runtime at an
 /// already-downloaded GGUF file. Trumps every other resolution candidate.
-pub const MODEL_PATH_ENV_VAR: &str = "FOREX_AI_GEMMA_MODEL_PATH";
+pub const MODEL_PATH_ENV_VAR: &str = "NEOETHOS_GEMMA_MODEL_PATH";
 
 /// Canonical on-disk filename of the Gemma 4 E4B Uncensored GGUF.
 /// Used by:

@@ -1062,7 +1062,7 @@ fn canonical_user_config_dir() -> std::path::PathBuf {
     // Test-seam env var: matches `BROKER_CREDENTIALS_PATH_ENV_VAR` in
     // neoethos-app so an operator running a sandboxed CLI session sees
     // the same override path the GUI does.
-    if let Ok(custom) = std::env::var("FOREX_AI_BROKER_CREDENTIALS_PATH")
+    if let Ok(custom) = std::env::var("NEOETHOS_BROKER_CREDENTIALS_PATH")
         && !custom.trim().is_empty()
         && let Some(parent) = std::path::Path::new(&custom).parent()
     {

@@ -8,7 +8,7 @@
 //!
 //! # Resolution order (highest priority first)
 //!
-//! 1. `$FOREX_AI_BROKER_CREDENTIALS_PATH` (runtime env override)
+//! 1. `$NEOETHOS_BROKER_CREDENTIALS_PATH` (runtime env override)
 //! 2. `%APPDATA%\neoethos\broker_credentials.toml` (per-user persistent file)
 //! 3. `<cwd>\.local\neoethos\broker_credentials.toml` (dev fallback)
 //! 4. **These constants** (compile-time embedded — this module)

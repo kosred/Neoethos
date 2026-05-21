@@ -325,7 +325,7 @@ fn training_hardware_profile_id() -> String {
 }
 
 fn training_source_commit() -> String {
-    std::env::var("FOREX_AI_SOURCE_COMMIT")
+    std::env::var("NEOETHOS_SOURCE_COMMIT")
         .or_else(|_| std::env::var("GIT_COMMIT_HASH"))
         .or_else(|_| std::env::var("GITHUB_SHA"))
         .map(|value| value.trim().to_string())

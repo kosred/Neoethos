@@ -7,7 +7,7 @@
 //!
 //! # Lookup order (highest priority first)
 //!
-//! 1. `$FOREX_AI_BROKER_CREDENTIALS_PATH` runtime env var (tests / CI).
+//! 1. `$NEOETHOS_BROKER_CREDENTIALS_PATH` runtime env var (tests / CI).
 //! 2. `<dirs::config_dir>/neoethos/broker_credentials.toml` — `%APPDATA%` on
 //!    Windows, `$XDG_CONFIG_HOME` on Linux, `~/Library/Application Support` on
 //!    macOS.
@@ -30,12 +30,12 @@ use std::{env, fs};
 
 const APP_CONFIG_SUBDIR: &str = "neoethos";
 const CREDENTIALS_FILENAME: &str = "broker_credentials.toml";
-const ENV_OVERRIDE_VAR: &str = "FOREX_AI_BROKER_CREDENTIALS_PATH";
+const ENV_OVERRIDE_VAR: &str = "NEOETHOS_BROKER_CREDENTIALS_PATH";
 
 /// Resolves the path to the broker credentials TOML file.
 ///
 /// Order of resolution:
-/// 1. `$FOREX_AI_BROKER_CREDENTIALS_PATH` if non-empty
+/// 1. `$NEOETHOS_BROKER_CREDENTIALS_PATH` if non-empty
 /// 2. `<dirs::config_dir>/neoethos/broker_credentials.toml`
 /// 3. `<cwd>/.local/neoethos/broker_credentials.toml`
 ///

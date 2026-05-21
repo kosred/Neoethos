@@ -898,7 +898,7 @@ mod tests {
 
     /// Serialise the three risky-mode boot-wire tests below so they
     /// don't race on the process-wide
-    /// `FOREX_AI_RISKY_MODE_STATE_PATH` env var. Without the lock,
+    /// `NEOETHOS_RISKY_MODE_STATE_PATH` env var. Without the lock,
     /// the armed test's env-var set leaks into the disarmed test's
     /// `TradingSession::new_with_persisted_credentials()` call and
     /// flips the expected assertion.
@@ -939,8 +939,8 @@ mod tests {
         // ENV_LOCK; here we just need to point at the scratch dir for
         // this process.
         unsafe {
-            std::env::set_var("FOREX_AI_BROKER_CREDENTIALS_PATH", &broker_creds_path);
-            std::env::set_var("FOREX_AI_RISKY_MODE_STATE_PATH", &risky_mode_state_path);
+            std::env::set_var("NEOETHOS_BROKER_CREDENTIALS_PATH", &broker_creds_path);
+            std::env::set_var("NEOETHOS_RISKY_MODE_STATE_PATH", &risky_mode_state_path);
         }
 
         let first = run_apply(&mut controller, ApplyOutcome::default());
@@ -967,8 +967,8 @@ mod tests {
 
         // Cleanup
         unsafe {
-            std::env::remove_var("FOREX_AI_BROKER_CREDENTIALS_PATH");
-            std::env::remove_var("FOREX_AI_RISKY_MODE_STATE_PATH");
+            std::env::remove_var("NEOETHOS_BROKER_CREDENTIALS_PATH");
+            std::env::remove_var("NEOETHOS_RISKY_MODE_STATE_PATH");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -992,8 +992,8 @@ mod tests {
         let risky_mode_state_path = dir.join("risky_mode_state.json");
         let broker_creds_path = dir.join("broker_credentials.toml");
         unsafe {
-            std::env::set_var("FOREX_AI_RISKY_MODE_STATE_PATH", &risky_mode_state_path);
-            std::env::set_var("FOREX_AI_BROKER_CREDENTIALS_PATH", &broker_creds_path);
+            std::env::set_var("NEOETHOS_RISKY_MODE_STATE_PATH", &risky_mode_state_path);
+            std::env::set_var("NEOETHOS_BROKER_CREDENTIALS_PATH", &broker_creds_path);
         }
 
         let mut controller = WizardController::new();
@@ -1015,8 +1015,8 @@ mod tests {
         );
 
         unsafe {
-            std::env::remove_var("FOREX_AI_RISKY_MODE_STATE_PATH");
-            std::env::remove_var("FOREX_AI_BROKER_CREDENTIALS_PATH");
+            std::env::remove_var("NEOETHOS_RISKY_MODE_STATE_PATH");
+            std::env::remove_var("NEOETHOS_BROKER_CREDENTIALS_PATH");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1033,8 +1033,8 @@ mod tests {
         let risky_mode_state_path = dir.join("risky_mode_state.json");
         let broker_creds_path = dir.join("broker_credentials.toml");
         unsafe {
-            std::env::set_var("FOREX_AI_RISKY_MODE_STATE_PATH", &risky_mode_state_path);
-            std::env::set_var("FOREX_AI_BROKER_CREDENTIALS_PATH", &broker_creds_path);
+            std::env::set_var("NEOETHOS_RISKY_MODE_STATE_PATH", &risky_mode_state_path);
+            std::env::set_var("NEOETHOS_BROKER_CREDENTIALS_PATH", &broker_creds_path);
         }
 
         let mut controller = WizardController::new();
@@ -1050,8 +1050,8 @@ mod tests {
         );
 
         unsafe {
-            std::env::remove_var("FOREX_AI_RISKY_MODE_STATE_PATH");
-            std::env::remove_var("FOREX_AI_BROKER_CREDENTIALS_PATH");
+            std::env::remove_var("NEOETHOS_RISKY_MODE_STATE_PATH");
+            std::env::remove_var("NEOETHOS_BROKER_CREDENTIALS_PATH");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

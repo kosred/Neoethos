@@ -14,7 +14,7 @@
 //! its own). At runtime we look for the model file in this
 //! order:
 //!
-//! 1. `FOREX_AI_GEMMA_MODEL_PATH` env override — dev convenience.
+//! 1. `NEOETHOS_GEMMA_MODEL_PATH` env override — dev convenience.
 //! 2. `<exe_dir>/resources/models/*.gguf` — installed bundle.
 //! 3. `<project_root>/resources/models/*.gguf` — dev tree fallback
 //!    (when running `cargo run` from the repo).
@@ -103,7 +103,7 @@ pub const BUNDLED_MODEL_FILENAME: &str = "Gemma-4-E4B-Uncensored-HauhauCS-Aggres
 
 /// Env-var name the dev / operator can set to override the
 /// resolver entirely.
-pub const MODEL_PATH_ENV_VAR: &str = "FOREX_AI_GEMMA_MODEL_PATH";
+pub const MODEL_PATH_ENV_VAR: &str = "NEOETHOS_GEMMA_MODEL_PATH";
 
 /// HuggingFace download URL for the default bundled quant —
 /// used by the installer-prep script (`scripts/fetch-gemma-model.ps1`)

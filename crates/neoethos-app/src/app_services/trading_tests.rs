@@ -1460,7 +1460,7 @@ fn sample_prop_firm_order() -> CTraderNewOrderRequest {
 // `FOREX_BOT_PROP_QUOTE_TO_ACCOUNT_RATE` MUST run in series — cargo
 // runs tests in a single process with a multi-threaded default pool,
 // and parallel env mutation is racy. The same `OnceLock<Mutex<()>>`
-// pattern that gates `FOREX_AI_LICENSE_PATH` in
+// pattern that gates `NEOETHOS_LICENSE_PATH` in
 // `ui/wizard/welcome.rs::tests::env_lock` keeps these serial without
 // requiring the operator to set RUST_TEST_THREADS=1 or pull in a new
 // dev-dependency.

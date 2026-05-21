@@ -31,7 +31,7 @@ pub const WIZARD_TOTAL_BUDGET_MINUTES: u32 = 10;
 /// (`/usr/share/neoethos/LICENSE` on Linux, `Contents/Resources/LICENSE`
 /// on macOS, `<install_dir>\LICENSE` on Windows — per
 /// `installer_infrastructure_spec.md` §8). Test hook too.
-pub const WIZARD_LICENSE_PATH_ENV: &str = "FOREX_AI_LICENSE_PATH";
+pub const WIZARD_LICENSE_PATH_ENV: &str = "NEOETHOS_LICENSE_PATH";
 
 /// Compile-time fallback so the wizard always shows *something* even
 /// if the on-disk LICENSE was deleted (the "LICENSE missing" error
@@ -43,7 +43,7 @@ const BUNDLED_LICENSE: &str = include_str!("../../../../../LICENSE");
 /// Read the LICENSE file from disk, falling back to the bundled
 /// `include_str!` copy on miss. Lookup order (spec §2 Step 1 Actions
 /// + `installer_infrastructure_spec.md` §8):
-///   1. `FOREX_AI_LICENSE_PATH` env var (installer / test hook).
+///   1. `NEOETHOS_LICENSE_PATH` env var (installer / test hook).
 ///   2. Platform-canonical install paths next to the running binary.
 ///   3. Compile-time bundled copy (warned, never silent — spec §3
 ///      rule 1 "Never silently skip").
@@ -70,7 +70,7 @@ fn read_from_env() -> Option<String> {
                 target: "neoethos_app::wizard",
                 path = %path,
                 error = %err,
-                "FOREX_AI_LICENSE_PATH set but unreadable; continuing lookup"
+                "NEOETHOS_LICENSE_PATH set but unreadable; continuing lookup"
             );
             None
         }
@@ -264,7 +264,7 @@ mod tests {
     use crate::ui::wizard::WizardState;
     use std::io::Write;
 
-    // Tests that mutate `FOREX_AI_LICENSE_PATH` MUST run in series —
+    // Tests that mutate `NEOETHOS_LICENSE_PATH` MUST run in series —
     // cargo runs tests in a single process by default, and parallel
     // env mutation is racy. A per-suite mutex keeps them serial
     // without requiring the operator to set RUST_TEST_THREADS=1.

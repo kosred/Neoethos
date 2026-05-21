@@ -166,7 +166,7 @@ quantization, ~5.0 GB on disk) bundled inside the packager resources.
 The runtime resolves the file at startup via the chain in
 `runtime::resolve_bundled_model_path`:
 
-1. `FOREX_AI_GEMMA_MODEL_PATH` env override — dev convenience.
+1. `NEOETHOS_GEMMA_MODEL_PATH` env override — dev convenience.
 2. `<exe_dir>/resources/models/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf`
    — installed bundle path.
 3. `<repo_root>/resources/models/<filename>` — dev tree fallback.

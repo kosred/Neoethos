@@ -501,7 +501,7 @@ fn start_download(runtime: &mut HistoricalRuntime, controller: &mut WizardContro
     let Some(client_id) = oauth::expose_client_id() else {
         runtime.last_error = Some(
             "cTrader app client_id missing from the binary's embedded credentials — \
-             rebuild with FOREX_AI_EMBED_CTRADER_CLIENT_ID set"
+             rebuild with NEOETHOS_EMBED_CTRADER_CLIENT_ID set"
                 .to_string(),
         );
         runtime.running = false;
@@ -510,7 +510,7 @@ fn start_download(runtime: &mut HistoricalRuntime, controller: &mut WizardContro
     let Some(client_secret) = oauth::expose_client_secret() else {
         runtime.last_error = Some(
             "cTrader app client_secret missing from the binary's embedded credentials — \
-             rebuild with FOREX_AI_EMBED_CTRADER_CLIENT_SECRET set"
+             rebuild with NEOETHOS_EMBED_CTRADER_CLIENT_SECRET set"
                 .to_string(),
         );
         runtime.running = false;

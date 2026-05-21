@@ -129,7 +129,7 @@ fn generated_c_file(gen_dir: &Path, proto_file: &str) -> PathBuf {
 /// Open API credentials that are baked into the binary for distribution.
 ///
 /// Resolution order (first non-empty value wins for each field):
-/// 1. `FOREX_AI_EMBED_CTRADER_CLIENT_ID` / `_CLIENT_SECRET` / `_REDIRECT_URI`
+/// 1. `NEOETHOS_EMBED_CTRADER_CLIENT_ID` / `_CLIENT_SECRET` / `_REDIRECT_URI`
 ///    environment variables (CI / explicit override).
 /// 2. `.local/neoethos/broker_credentials.toml` in the crate root (dev
 ///    machine fallback — the same file used by the runtime persistence layer).
@@ -144,22 +144,22 @@ fn emit_embedded_credentials() {
         .unwrap_or_else(|| manifest_dir.clone());
 
     // Tell Cargo when to re-run this step.
-    println!("cargo:rerun-if-env-changed=FOREX_AI_EMBED_CTRADER_CLIENT_ID");
-    println!("cargo:rerun-if-env-changed=FOREX_AI_EMBED_CTRADER_CLIENT_SECRET");
-    println!("cargo:rerun-if-env-changed=FOREX_AI_EMBED_CTRADER_REDIRECT_URI");
+    println!("cargo:rerun-if-env-changed=NEOETHOS_EMBED_CTRADER_CLIENT_ID");
+    println!("cargo:rerun-if-env-changed=NEOETHOS_EMBED_CTRADER_CLIENT_SECRET");
+    println!("cargo:rerun-if-env-changed=NEOETHOS_EMBED_CTRADER_REDIRECT_URI");
     let local_toml = workspace_root.join(".local/neoethos/broker_credentials.toml");
     println!("cargo:rerun-if-changed={}", local_toml.display());
 
     // --- Step 1: env vars ---
-    let mut client_id = std::env::var("FOREX_AI_EMBED_CTRADER_CLIENT_ID")
+    let mut client_id = std::env::var("NEOETHOS_EMBED_CTRADER_CLIENT_ID")
         .unwrap_or_default()
         .trim()
         .to_string();
-    let mut client_secret = std::env::var("FOREX_AI_EMBED_CTRADER_CLIENT_SECRET")
+    let mut client_secret = std::env::var("NEOETHOS_EMBED_CTRADER_CLIENT_SECRET")
         .unwrap_or_default()
         .trim()
         .to_string();
-    let mut redirect_uri = std::env::var("FOREX_AI_EMBED_CTRADER_REDIRECT_URI")
+    let mut redirect_uri = std::env::var("NEOETHOS_EMBED_CTRADER_REDIRECT_URI")
         .unwrap_or_default()
         .trim()
         .to_string();
@@ -203,8 +203,8 @@ fn emit_embedded_credentials() {
     // L4: previously printed `cargo:warning=Embedded cTrader client_id (N chars) ...`,
     // which surfaced credential length in CI logs. Suppressed; the embed
     // status is still observable via the file written to OUT_DIR. Set
-    // `FOREX_AI_BUILD_VERBOSE=1` to re-enable for local debugging.
-    let verbose = std::env::var("FOREX_AI_BUILD_VERBOSE")
+    // `NEOETHOS_BUILD_VERBOSE=1` to re-enable for local debugging.
+    let verbose = std::env::var("NEOETHOS_BUILD_VERBOSE")
         .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
         .unwrap_or(false);
     if verbose {

@@ -11,7 +11,7 @@
 //!
 //! # Lookup order (highest priority first)
 //!
-//! 1. `$FOREX_AI_RISKY_MODE_STATE_PATH` runtime env var (tests / CI).
+//! 1. `$NEOETHOS_RISKY_MODE_STATE_PATH` runtime env var (tests / CI).
 //! 2. `<dirs::config_dir>/neoethos/risky_mode_state.json` — `%APPDATA%`
 //!    on Windows, `$XDG_CONFIG_HOME` on Linux, `~/Library/Application
 //!    Support` on macOS.
@@ -53,7 +53,7 @@ pub const RISKY_MODE_STATE_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1)
 
 const APP_CONFIG_SUBDIR: &str = "neoethos";
 const STATE_FILENAME: &str = "risky_mode_state.json";
-const ENV_OVERRIDE_VAR: &str = "FOREX_AI_RISKY_MODE_STATE_PATH";
+const ENV_OVERRIDE_VAR: &str = "NEOETHOS_RISKY_MODE_STATE_PATH";
 
 /// On-disk representation of the operator's Risky Mode arm decision.
 ///
@@ -126,7 +126,7 @@ impl HasSchemaVersion for RiskyModeStateFile {
 /// Resolves the path to the Risky Mode state JSON file.
 ///
 /// Order of resolution:
-/// 1. `$FOREX_AI_RISKY_MODE_STATE_PATH` if non-empty (authoritative)
+/// 1. `$NEOETHOS_RISKY_MODE_STATE_PATH` if non-empty (authoritative)
 /// 2. `<dirs::config_dir>/neoethos/risky_mode_state.json`
 /// 3. `<cwd>/.local/neoethos/risky_mode_state.json`
 ///
@@ -272,7 +272,7 @@ mod tests {
 
     /// Tests are serialised via this lock because `state_file_path`
     /// reads a process-wide env var. Without the lock, parallel test
-    /// runs would race on `$FOREX_AI_RISKY_MODE_STATE_PATH`.
+    /// runs would race on `$NEOETHOS_RISKY_MODE_STATE_PATH`.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn unique_temp_state_path(label: &str) -> PathBuf {
@@ -289,7 +289,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         let path = unique_temp_state_path("roundtrip");
         // SAFETY: tests are serialised through ENV_LOCK; this is the
-        // only block that touches `$FOREX_AI_RISKY_MODE_STATE_PATH`
+        // only block that touches `$NEOETHOS_RISKY_MODE_STATE_PATH`
         // during the test's lifetime.
         unsafe {
             std::env::set_var(ENV_OVERRIDE_VAR, &path);
