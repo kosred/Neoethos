@@ -1,6 +1,6 @@
 [package]
 name = "forex-app"
-version = "0.4.19"
+version = "0.4.20"
 edition.workspace = true
 # SPDX dual-license matches the repo-root LICENSE file. Required by both
 # cargo-deb (which prefers `license` over `license-file` when generating
@@ -25,6 +25,11 @@ native-tree-models = ["forex-models/tree-models"]
 # Runtime opt-in is via `FOREX_BOT_CTRADER_TRANSPORT=protobuf` plus this
 # feature being enabled at build time.
 ctrader-protobuf-streaming = ["dep:webpki-roots"]
+# G1 LLM backend — wire the real llama.cpp runtime into the AI Helper panel.
+# Requires cmake + a C/C++ compiler and a ~5 GB GGUF on disk.
+# Download the GGUF via: `powershell -File scripts/fetch-gemma-model.ps1`
+# The feature is OFF by default so the app builds cleanly without them.
+gemma-backend = ["forex-gemma/mistralrs-runtime"]
 
 [dependencies]
 eframe = "0.31.0" # UI framework (egui)
@@ -35,7 +40,13 @@ tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 anyhow = "1.0.100"
 chrono = "0.4"
-keyring = "3.6.3"
+# keyring 3.6.3 — backend is OPT-IN per platform feature flag. Without these
+# features the crate falls back to an in-memory MockCredential that does not
+# persist anything (verified 2026-05-20 via --api-test on Windows: tokens
+# were saved to a mock store, then "lost" on the next process start, which
+# cascaded into "No saved cTrader session" + every downstream button reading
+# "UNAVAILABLE"). The fix is target-conditional so we never pull macOS-only
+# `security-framework` or Linux-only `linux-keyutils` into the wrong build.
 open = "5.3.2"
 # reqwest >= 0.13.3 logs only the host, not the full URL — protects client_secret from leaking to debug/trace logs.
 # In 0.13, `form`/`query` are opt-in features (per the 0.13.0 CHANGELOG).
@@ -108,6 +119,21 @@ hex = "0.4"
 # main loop's reader. Version 0.5.15 matches the transitive resolution
 # already present in `Cargo.lock` — no version drift.
 crossbeam-channel = "0.5.15"
+
+# keyring per-platform backend — see comment next to the original `keyring = ...`
+# pin removal above. Each feature is the minimum needed to bind to the OS
+# secret store: Credential Manager (Windows), Keychain (macOS), Secret
+# Service + kernel keyutils (Linux). `default-features = false` keeps the
+# mock/sample store out of the binary so a misconfigured platform fails
+# loudly instead of silently dropping tokens.
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["linux-native-sync-persistent"] }
 
 [build-dependencies]
 protoc-bin-vendored = "3.2.0"

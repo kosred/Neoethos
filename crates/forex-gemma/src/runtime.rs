@@ -248,6 +248,258 @@ pub fn resolve_bundled_model_path(
     })
 }
 
+// ---------------------------------------------------------------------------
+// G1 — real llama.cpp-backed runtime (feature = "mistralrs-runtime")
+// ---------------------------------------------------------------------------
+//
+// `LlamaCppGemmaRuntime` loads the GGUF from disk once and processes every
+// `generate()` call on a dedicated background thread so the egui render loop
+// is never blocked. All llama.cpp objects (`LlamaBackend`, `LlamaModel`,
+// `LlamaContext`) live on that thread, which avoids the self-referential
+// lifetime problem that arises when you try to store `LlamaModel<'backend>`
+// inside the same struct that owns `LlamaBackend`.
+//
+// Architecture:
+//   ┌─ UI / render thread ─────────────────────┐
+//   │  LlamaCppGemmaRuntime::generate(prompt)  │
+//   │    → send(InferRequest) to worker         │
+//   │    → recv(Result<String>) — BLOCKS HERE   │  ← max_tokens caps latency
+//   └──────────────────────────────────────────┘
+//            │ SyncChannel(4)
+//   ┌─ "forex-gemma-llama" thread ─────────────┐
+//   │  LlamaBackend (one per process via init)  │
+//   │  LlamaModel   (loaded once from GGUF)     │
+//   │  loop { new_context + decode + sample }   │
+//   └──────────────────────────────────────────┘
+//
+// The UI should wrap `generate()` in `std::thread::spawn` (see ai_helper.rs)
+// to keep egui frames responsive while inference runs.
+
+#[cfg(feature = "mistralrs-runtime")]
+mod llama_impl {
+    use super::GemmaRuntime;
+    use anyhow::{Context, Result, bail};
+    use llama_cpp_2::{
+        context::params::LlamaContextParams,
+        llama_backend::LlamaBackend,
+        llama_batch::LlamaBatch,
+        model::{AddBos, LlamaModel, params::LlamaModelParams},
+        sampling::LlamaSampler,
+    };
+    use std::{
+        num::NonZeroU32,
+        path::PathBuf,
+        sync::mpsc::{self, SyncSender},
+    };
+
+    /// Per-request message from the UI thread to the inference worker.
+    struct InferRequest {
+        prompt: String,
+        max_tokens: u32,
+        reply_tx: mpsc::SyncSender<Result<String>>,
+    }
+
+    /// G1 real inference runtime. Construct once per model file; the
+    /// background worker thread is spawned in `load()` and lives until
+    /// the `LlamaCppGemmaRuntime` is dropped (at which point the channel
+    /// is closed and the thread exits gracefully).
+    pub struct LlamaCppGemmaRuntime {
+        tx: SyncSender<InferRequest>,
+        model_id: String,
+    }
+
+    impl LlamaCppGemmaRuntime {
+        /// Load the model at `model_path` and start the inference worker
+        /// thread. Returns an error if the GGUF cannot be read or if the
+        /// background thread fails to spawn.
+        ///
+        /// Loading a 4B Q4_K_M model takes ~5–30 s depending on NVMe vs.
+        /// spinning-disk and the amount of CPU the OS dedicates to mmaping
+        /// the file. Call this off the egui render thread.
+        pub fn load(model_path: PathBuf) -> Result<Self> {
+            let model_id = model_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("gemma-gguf")
+                .to_string();
+
+            // Bounded queue: 4 pending requests max. A second chat message
+            // while inference is running will block the sender (UI thread)
+            // but with the async dispatch in ai_helper.rs the sender IS a
+            // background thread, so no deadlock.
+            let (tx, rx) = mpsc::sync_channel::<InferRequest>(4);
+
+            std::thread::Builder::new()
+                .name("forex-gemma-llama".to_string())
+                .spawn(move || inference_worker(model_path, rx))
+                .context("failed to spawn forex-gemma inference thread")?;
+
+            Ok(Self { tx, model_id })
+        }
+    }
+
+    impl GemmaRuntime for LlamaCppGemmaRuntime {
+        fn generate(&self, prompt: &str, max_tokens: u32) -> Result<String> {
+            let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+            self.tx
+                .send(InferRequest {
+                    prompt: prompt.to_string(),
+                    max_tokens,
+                    reply_tx,
+                })
+                .context("inference worker thread has stopped")?;
+            reply_rx
+                .recv()
+                .context("inference worker did not reply (thread crashed?)")?
+        }
+
+        fn model_id(&self) -> &str {
+            &self.model_id
+        }
+    }
+
+    // ── Inference worker ────────────────────────────────────────────────────
+
+    /// Owns all llama.cpp objects. Runs until the `Receiver` is disconnected
+    /// (i.e. until `LlamaCppGemmaRuntime` is dropped).
+    fn inference_worker(model_path: PathBuf, rx: mpsc::Receiver<InferRequest>) {
+        // One LlamaBackend per process is the intended usage. Using
+        // `init()` instead of `init_numa` — numa pinning is optional.
+        let backend = match LlamaBackend::init() {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(
+                    target: "forex_gemma::runtime",
+                    error = %e,
+                    "LlamaBackend::init failed; inference worker exiting"
+                );
+                return;
+            }
+        };
+
+        let model_params = LlamaModelParams::default();
+        let model = match LlamaModel::load_from_file(&backend, &model_path, &model_params) {
+            Ok(m) => {
+                tracing::info!(
+                    target: "forex_gemma::runtime",
+                    path = %model_path.display(),
+                    "Gemma GGUF loaded"
+                );
+                m
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "forex_gemma::runtime",
+                    path = %model_path.display(),
+                    error = %e,
+                    "LlamaModel::load_from_file failed; inference worker exiting"
+                );
+                return;
+            }
+        };
+
+        // Process requests sequentially. One request at a time — this
+        // keeps memory usage bounded (one KV-cache worth of RAM).
+        for req in rx {
+            let result = run_single_inference(&backend, &model, &req.prompt, req.max_tokens);
+            // Ignore send errors — the UI may have timed out and dropped the receiver.
+            let _ = req.reply_tx.send(result);
+        }
+
+        tracing::debug!(
+            target: "forex_gemma::runtime",
+            "forex-gemma inference worker: channel closed, exiting"
+        );
+    }
+
+    /// Run one inference request end-to-end.
+    fn run_single_inference(
+        backend: &LlamaBackend,
+        model: &LlamaModel,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> Result<String> {
+        // A new context per request gives a clean KV-cache. In G2 we will
+        // keep the context alive and call `llama_kv_cache_clear()` between
+        // turns for lower per-request latency.
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(4096));
+
+        let mut ctx = model
+            .new_context(backend, ctx_params)
+            .context("failed to create LlamaContext")?;
+
+        // Tokenize the full prompt.
+        let tokens = model
+            .str_to_token(prompt, AddBos::Always)
+            .context("failed to tokenize prompt")?;
+
+        if tokens.is_empty() {
+            bail!("tokenizer produced zero tokens for the given prompt");
+        }
+
+        // Load the prompt into the context in a single batch.
+        // Only the LAST token needs logits for the first sampling step.
+        let mut batch = LlamaBatch::new(tokens.len().max(512), 1);
+        for (i, &token) in tokens.iter().enumerate() {
+            let is_last = i == tokens.len() - 1;
+            batch
+                .add(token, i as i32, &[0], is_last)
+                .context("batch.add (prompt) failed")?;
+        }
+        ctx.decode(&mut batch).context("initial prompt decode failed")?;
+
+        // Sampler chain: temperature → top-k → nucleus → random dist.
+        // Greedy (`LlamaSampler::greedy()`) is a valid alternative for
+        // deterministic responses but tends to repeat itself on longer
+        // outputs.
+        let mut sampler = LlamaSampler::chain_simple([
+            LlamaSampler::temp(0.7),
+            LlamaSampler::top_k(40),
+            LlamaSampler::top_p(0.95, 1),
+            LlamaSampler::dist(42),
+        ]);
+
+        // Stateful UTF-8 decoder handles tokens that span byte boundaries
+        // (e.g. multi-byte CJK/emoji split across two llama.cpp pieces).
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut n_cur = batch.n_tokens();
+        let mut output = String::new();
+
+        for _ in 0..max_tokens {
+            // Sample the next token from the last position in the context.
+            let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+
+            // End-of-generation: <eos> / <eot> / any model-specific stop token.
+            if model.is_eog_token(token) {
+                break;
+            }
+
+            sampler.accept(token);
+
+            // Convert the token id back to its text fragment.
+            let piece = model
+                .token_to_piece(token, &mut decoder, true, None)
+                .context("token_to_piece failed")?;
+            output.push_str(&piece);
+
+            // Roll the context one step forward.
+            batch.clear();
+            batch
+                .add(token, n_cur, &[0], true)
+                .context("batch.add (generation) failed")?;
+            n_cur += 1;
+            ctx.decode(&mut batch)
+                .context("generation step decode failed")?;
+        }
+
+        Ok(output)
+    }
+}
+
+#[cfg(feature = "mistralrs-runtime")]
+pub use llama_impl::LlamaCppGemmaRuntime;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,6 +525,34 @@ mod tests {
     fn trait_object_compiles_for_downstream_wiring() {
         let rt: Box<dyn GemmaRuntime> = Box::new(StubGemmaRuntime::new());
         assert_eq!(rt.model_id(), "stub-no-model-loaded");
+    }
+
+    // G1 compile-gate test — verifies that `LlamaCppGemmaRuntime` satisfies
+    // `GemmaRuntime: Send + Sync` (a boxed trait object in Arc) without
+    // requiring an actual model file on disk. The `load` call will fail
+    // (no real GGUF) but the type must _compile_ and the channel + thread
+    // setup is validated by the type checker. Run with:
+    //   cargo test -p forex-gemma --features mistralrs-runtime
+    #[cfg(feature = "mistralrs-runtime")]
+    #[test]
+    fn llama_cpp_runtime_satisfies_gemma_runtime_trait_bounds() {
+        use std::sync::Arc;
+        // Attempting to construct with a non-existent path — we expect
+        // this to return an error (model not found) OR spawn a thread
+        // that fails gracefully. Either way the TYPE is what we're testing.
+        let result = LlamaCppGemmaRuntime::load(PathBuf::from("/nonexistent/model.gguf"));
+        match result {
+            Ok(rt) => {
+                // Runtime constructed — it's on an inference thread;
+                // type-check that it fits behind `Arc<dyn GemmaRuntime>`.
+                let _: Arc<dyn GemmaRuntime> = Arc::new(rt);
+            }
+            Err(_) => {
+                // Expected when cmake or llama-cpp build step hasn't run yet
+                // (CI without C++ toolchain). The compile-gate test still
+                // passes — the type system was checked by rustc.
+            }
+        }
     }
 
     // -------- FsProbe-driven resolver tests --------

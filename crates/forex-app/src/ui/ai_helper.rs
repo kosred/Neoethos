@@ -35,8 +35,63 @@ use forex_gemma::{
     ToolRegistry, TopicCheck, TopicGate, register_all_g3,
 };
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::ui::theme;
+
+// ── Cached runtime ───────────────────────────────────────────────────────────
+//
+// The runtime is loaded once and then reused across every render frame and
+// every `process_prompt` call. Storing it in a `OnceLock` avoids threading
+// `Arc` through the entire state chain while keeping model-load costs bounded
+// to a single startup hit.
+//
+// Initialisation order:
+//   1. First render frame with a valid model path → real `LlamaCppGemmaRuntime`
+//      (only when built with the `gemma-backend` feature).
+//   2. Any other path → `StubGemmaRuntime` (compile-time default).
+//
+// A restart is required to pick up a newly downloaded model file — acceptable
+// for v0.4.20 (add a "Reload model" button in the next UX iteration).
+static GEMMA_RUNTIME: OnceLock<Arc<dyn GemmaRuntime>> = OnceLock::new();
+
+// Suppress the "unused variable" lint: `_model_path` is only consumed
+// inside the `#[cfg(feature = "gemma-backend")]` block; the underscore
+// prefix silences the warning for the default (stub-only) build while
+// remaining accessible when the feature is on.
+#[allow(unused_variables)]
+fn get_or_init_runtime(_model_path: Option<&std::path::Path>) -> Arc<dyn GemmaRuntime> {
+    GEMMA_RUNTIME
+        .get_or_init(|| {
+            // G1: try to load the real llama.cpp backend if the feature is
+            // enabled AND the GGUF is already on disk.
+            #[cfg(feature = "gemma-backend")]
+            if let Some(path) = _model_path {
+                match forex_gemma::LlamaCppGemmaRuntime::load(path.to_path_buf()) {
+                    Ok(rt) => {
+                        tracing::info!(
+                            target: "forex_app::ai_helper",
+                            path = %path.display(),
+                            "Gemma G1 runtime loaded"
+                        );
+                        return Arc::new(rt) as Arc<dyn GemmaRuntime>;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "forex_app::ai_helper",
+                            error = %e,
+                            "Gemma G1 load failed; falling back to stub"
+                        );
+                    }
+                }
+            }
+            // Fallback: stub that returns a "not yet loaded" message.
+            Arc::new(StubGemmaRuntime::with_model_id(
+                "Gemma-4-E4B-Uncensored (stub — model not loaded)",
+            )) as Arc<dyn GemmaRuntime>
+        })
+        .clone()
+}
 
 /// One turn in the chat scrollback.
 #[derive(Debug, Clone)]
@@ -56,6 +111,16 @@ pub enum ChatTurn {
 
 /// Persistent state for the AI Helper panel. Held inside `AppState` so
 /// the scrollback survives across frames + tab switches.
+///
+/// ## Async inference design
+///
+/// `generate()` on the real runtime blocks its caller (it waits on the
+/// inference worker thread's reply channel). To keep egui frames at 60 Hz
+/// while a 4B model is generating, `process_prompt` spawns a
+/// `std::thread::spawn` worker that calls `generate()` and writes the
+/// result into `pending_result`. On every render frame we call `try_lock()`
+/// on that `Arc<Mutex<…>>`; when a result arrives we drain it into `history`
+/// and clear the pending slot.
 #[derive(Debug, Clone, Default)]
 pub struct AiHelperState {
     /// What the user is currently typing.
@@ -65,6 +130,18 @@ pub struct AiHelperState {
     pub history: Vec<ChatTurn>,
     /// Last-known model id from the runtime (for the header strip).
     pub model_id: String,
+    /// True while an inference is running in the background thread.
+    pub is_inferring: bool,
+    /// Shared slot between UI thread and the inference dispatch thread.
+    /// `None` when idle; `Some(Arc)` while inference is in flight.
+    /// Inner `Option` starts as `None`; the dispatch thread sets it to
+    /// `Some(Ok(text))` or `Some(Err(msg))` when done.
+    ///
+    /// `Arc<Mutex<…>>` is `Clone` (cheap Arc refcount) and `Debug`
+    /// (Mutex<Option<_>> is Debug when the inner type is), so the
+    /// containing struct can still derive both.
+    #[allow(clippy::type_complexity)]
+    pub pending_result: Option<Arc<Mutex<Option<Result<String, String>>>>>,
 }
 
 impl AiHelperState {
@@ -78,6 +155,8 @@ impl AiHelperState {
                     .to_string(),
             )],
             model_id: String::new(),
+            is_inferring: false,
+            pending_result: None,
         }
     }
 }
@@ -122,10 +201,36 @@ fn resolve_or_suggest_model_path() -> (Option<PathBuf>, PathBuf) {
 /// Render the AI Helper view inside the workspace dock.
 pub fn render(ui: &mut egui::Ui, state: &mut AiHelperState) {
     let (model_path, suggested_path) = resolve_or_suggest_model_path();
-    let runtime = StubGemmaRuntime::with_model_id(
-        "Gemma-4-E4B-Uncensored (stub — wire G1 mistral.rs runtime)",
-    );
+
+    // Lazy-init + cache the runtime.
+    let runtime = get_or_init_runtime(model_path.as_deref());
     state.model_id = runtime.model_id().to_string();
+
+    // ── Poll for completed background inference ──────────────────────────
+    // This runs on every frame (cheap: just a `try_lock`). When the
+    // dispatch thread completes, we drain the result into history and
+    // clear the pending slot.
+    if let Some(pending_arc) = state.pending_result.clone() {
+        if let Ok(mut guard) = pending_arc.try_lock() {
+            if let Some(outcome) = guard.take() {
+                state.is_inferring = false;
+                state.pending_result = None;
+                match outcome {
+                    Ok(text) => state.history.push(ChatTurn::System(text)),
+                    Err(err_msg) => state.history.push(ChatTurn::System(format!(
+                        "Gemma error: {err_msg}. Try a tool-shaped question \
+                         like \"show my positions\" or \"what's the EURUSD quote?\"."
+                    ))),
+                }
+                ui.ctx().request_repaint(); // flush the result turn to screen immediately
+            } else {
+                // Inference still running — request a repaint in 100 ms so we
+                // keep polling without burning a full 60 Hz render budget.
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
+    }
 
     ui.vertical(|ui| {
         // Header strip — title + model id pill.
@@ -194,9 +299,10 @@ pub fn render(ui: &mut egui::Ui, state: &mut AiHelperState) {
                     );
                     ui.horizontal(|ui| {
                         if ui.button("Copy download URL").clicked() {
-                            ui.output_mut(|o| {
-                                o.copied_text = BUNDLED_MODEL_DOWNLOAD_URL.to_string();
-                            });
+                            // egui 0.31 migration: `PlatformOutput::copied_text`
+                            // is deprecated in favor of `Context::copy_text`,
+                            // which routes through the new commands queue.
+                            ui.ctx().copy_text(BUNDLED_MODEL_DOWNLOAD_URL.to_string());
                         }
                         if ui.button("Open save folder").clicked() {
                             if let Some(parent) = suggested_path.parent() {
@@ -284,20 +390,24 @@ pub fn render(ui: &mut egui::Ui, state: &mut AiHelperState) {
         ui.separator();
 
         // Input row — text field + Send button. Enter also submits.
+        // The Send button and text field are disabled while inference is running.
+        let is_busy = state.is_inferring;
         let response = ui.horizontal(|ui| {
             let text_edit = egui::TextEdit::singleline(&mut state.input)
-                .desired_width(ui.available_width() - 90.0)
-                .hint_text("Ask the bot…");
-            let resp = ui.add(text_edit);
-            let send_clicked = ui.button("Send").clicked();
-            let enter_pressed = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                .desired_width(ui.available_width() - 110.0)
+                .hint_text(if is_busy { "⏳ Generating…" } else { "Ask the bot…" });
+            let resp = ui.add_enabled(!is_busy, text_edit);
+            let send_clicked = ui.add_enabled(!is_busy, egui::Button::new("Send")).clicked();
+            let enter_pressed = !is_busy
+                && resp.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter));
             send_clicked || enter_pressed
         });
         if response.inner {
             let prompt = state.input.trim().to_string();
             if !prompt.is_empty() {
                 state.input.clear();
-                process_prompt(&prompt, state, &runtime);
+                process_prompt(&prompt, state, runtime);
             }
         }
 
@@ -351,17 +461,23 @@ fn render_turn(ui: &mut egui::Ui, turn: &ChatTurn) {
 }
 
 /// Run one prompt through the gate → keyword router → tool registry
-/// → runtime fallback chain. v0.4.8 implements the keyword router
-/// (deterministic mapping of natural-language phrases to BotTool
-/// names) so the panel is useful before the real Gemma runtime lands.
-/// Real Gemma replaces the keyword router with model-driven tool
-/// selection in G6.
-fn process_prompt(prompt: &str, state: &mut AiHelperState, runtime: &StubGemmaRuntime) {
+/// → runtime fallback chain.
+///
+/// ## Non-blocking inference
+///
+/// When no keyword-routed tool matches, the prompt is dispatched to the
+/// Gemma runtime. If the runtime is the real llama.cpp backend, inference
+/// can take 5–30 s. To keep the UI responsive we:
+///   1. Immediately push a "⏳ Generating…" placeholder.
+///   2. Spawn a `std::thread::spawn` worker that calls `runtime.generate()`.
+///   3. Store an `Arc<Mutex<Option<Result>>>` in `state.pending_result`.
+///   4. On every render frame, `render()` calls `try_lock()` and drains
+///      the result when ready, replacing the placeholder.
+fn process_prompt(prompt: &str, state: &mut AiHelperState, runtime: Arc<dyn GemmaRuntime>) {
     state.history.push(ChatTurn::User(prompt.to_string()));
 
-    // 1. Topic gate — only the cheapest layer (jailbreak regex) is
-    //    run here; the full embedding gate needs the candle backend
-    //    which doesn't ship with v0.4.8.
+    // 1. Topic gate — cheapest layer first (jailbreak regex). The full
+    //    embedding gate needs the candle backend (G2.1, not yet shipped).
     let gate = JailbreakRegexGate::with_defaults();
     let verdict = gate.check_input(prompt, LanguageHint::Unknown);
     if let TopicCheck::Refuse {
@@ -378,20 +494,15 @@ fn process_prompt(prompt: &str, state: &mut AiHelperState, runtime: &StubGemmaRu
         state
             .history
             .push(ChatTurn::System(format!("(gate soft-warning: {reason})")));
-        // continue — soft warnings don't block
+        // soft warnings don't block
     }
 
-    // 2. Keyword router — map the prompt to a concrete BotTool.
+    // 2. Keyword router — deterministic English + Greek phrase matching.
     let tool_name = route_to_tool(prompt);
 
-    // 3. Tool execution — registry-backed.
+    // 3. Tool execution — registry-backed, synchronous (all tools are O(1)).
     if let Some(tool) = tool_name {
         let registry = registry_with_g3_tools_safe();
-        // v0.4.8 builds a minimal `ToolContext` per request. G6 will
-        // pull the real account_id + look-ahead cutoff from the
-        // running `TradingSession`; until then we pass an empty
-        // account and `now` for the cutoff so the read-only tools
-        // don't filter out current state.
         let ctx = ToolContext {
             past_data_cutoff_unix_ms: i64::MAX,
             account_id: String::new(),
@@ -416,17 +527,33 @@ fn process_prompt(prompt: &str, state: &mut AiHelperState, runtime: &StubGemmaRu
         }
     }
 
-    // 4. Runtime fallback — no tool matched, ask Gemma directly. The
-    //    stub returns "G1 mistral.rs inference runtime: not yet wired",
-    //    which is the correct user-facing signal until the real model
-    //    is bundled.
-    match runtime.generate(prompt, 256) {
-        Ok(reply) => state.history.push(ChatTurn::System(reply)),
-        Err(err) => state.history.push(ChatTurn::System(format!(
-            "Gemma not available: {err}. Try a tool-shaped question \
-             like \"show my positions\" or \"what's the EURUSD quote?\"."
-        ))),
-    }
+    // 4. Runtime fallback — no tool matched, route to Gemma.
+    //
+    //    Dispatch is non-blocking: a background thread calls `generate()`
+    //    while the UI stays responsive. The shared `Arc<Mutex<…>>` lets
+    //    `render()` poll for the result on every frame.
+    let prompt_owned = prompt.to_string();
+    let result_slot: Arc<Mutex<Option<Result<String, String>>>> = Arc::new(Mutex::new(None));
+    let result_slot_bg = Arc::clone(&result_slot);
+
+    std::thread::Builder::new()
+        .name("forex-gemma-dispatch".to_string())
+        .spawn(move || {
+            let outcome = runtime
+                .generate(&prompt_owned, 256)
+                .map_err(|e| e.to_string());
+            if let Ok(mut guard) = result_slot_bg.lock() {
+                *guard = Some(outcome);
+            }
+        })
+        .ok(); // spawn failure is non-fatal; render() will notice pending never resolves
+
+    state.is_inferring = true;
+    state.pending_result = Some(result_slot);
+    // Push a visible placeholder so the operator knows inference is running.
+    state
+        .history
+        .push(ChatTurn::System("⏳ Generating response…".to_string()));
 }
 
 /// Build the v0.4.8 tool registry. Wrapping
