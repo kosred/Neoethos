@@ -3462,9 +3462,9 @@ dependencies = [
 
 [[package]]
 name = "either"
-version = "1.15.0"
+version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
+checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "ellip"
@@ -3624,9 +3624,9 @@ dependencies = [
 
 [[package]]
 name = "enumset"
-version = "1.1.12"
+version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f96a4a12fe60ac746ae295a1a4ecb5bb02debc20856506c8635288065f142de"
+checksum = "839c4174b41e75c8f7306110b2c51996a293b8d1d850edd529011841d9fede7d"
 dependencies = [
  "enumset_derive",
  "serde",
@@ -4027,7 +4027,7 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "forex-app"
-version = "0.4.19"
+version = "0.4.20"
 dependencies = [
  "anyhow",
  "base64",
@@ -4086,7 +4086,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
- "unicode-width 0.2.0",
 ]
 
 [[package]]
@@ -4095,11 +4094,9 @@ version = "0.4.19"
 dependencies = [
  "anyhow",
  "chrono",
- "colored",
  "config",
- "nalgebra 0.33.3",
+ "dirs 5.0.1",
  "ndarray 0.17.2",
- "nvml-wrapper",
  "reqwest 0.13.3",
  "rusqlite",
  "secrecy",
@@ -4124,7 +4121,6 @@ dependencies = [
  "chrono",
  "csv",
  "forex-core",
- "futures",
  "memmap2",
  "ndarray 0.17.2",
  "polars",
@@ -4143,7 +4139,7 @@ dependencies = [
 
 [[package]]
 name = "forex-gemma"
-version = "0.4.19"
+version = "0.4.20"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4175,7 +4171,6 @@ dependencies = [
  "forex-data",
  "forex-search",
  "irithyll",
- "lazy_static",
  "lightgbm3",
  "linfa",
  "linfa-clustering",
@@ -4200,7 +4195,6 @@ dependencies = [
  "symbios-genetics",
  "symbios-neat",
  "tch",
- "thiserror 2.0.18",
  "tracing",
  "variational-regression",
  "xgb",
@@ -6814,29 +6808,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nvml-wrapper"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d5c6c0ef9702176a570f06ad94f3198bc29c524c8b498f1b9346e1b1bdcbb3a"
-dependencies = [
- "bitflags 2.11.1",
- "libloading 0.8.9",
- "nvml-wrapper-sys",
- "static_assertions",
- "thiserror 1.0.69",
- "wrapcenum-derive",
-]
-
-[[package]]
-name = "nvml-wrapper-sys"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b4d594420fcda43b1c2c4bd44d48974aa3c7a9ab2cbf10dc18e35265767bf0b"
-dependencies = [
- "libloading 0.8.9",
-]
-
-[[package]]
 name = "objc"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9275,9 +9246,9 @@ dependencies = [
 
 [[package]]
 name = "rsqlite-vfs"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8a1f2315036ef6b1fbacd1972e8ee7688030b0a2121edfc2a6550febd41574d"
+checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
 dependencies = [
  "hashbrown 0.16.1",
  "thiserror 2.0.18",
@@ -10522,9 +10493,9 @@ dependencies = [
 
 [[package]]
 name = "sqlite-wasm-rs"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b2c760607300407ddeaee518acf28c795661b7108c75421303dbefb237d3a36"
+checksum = "cdd578e94101503d97e2b286bbf8db2135035ca24b2ce4cbf3f9e2fb2bbf1eee"
 dependencies = [
  "cc",
  "js-sys",
@@ -13697,18 +13668,6 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
-]
-
-[[package]]
-name = "wrapcenum-derive"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a76ff259533532054cfbaefb115c613203c73707017459206380f03b3b3f266e"
-dependencies = [
- "darling 0.20.11",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]

@@ -12,7 +12,6 @@ tch = { version = "0.22.0", optional = true }
 ort = { version = "2.0.0-rc.10", optional = true, features = ["cuda", "copy-dylibs"] }
 tracing = "0.1.42"
 anyhow = "1.0.100"
-thiserror = "2.0.16"
 
 # Tree model dependencies
 polars = { version = "0.52.0", features = ["lazy", "dtype-datetime", "rolling_window", "timezones"] }
@@ -65,8 +64,7 @@ rand08 = { package = "rand", version = "0.8", optional = true }
 # warned about.)
 rand_distr = "0.5"
 rayon = "1.11.0"
-chrono = "0.4.42"
-lazy_static = "1.5.0"
+chrono = "0.4.44"
 rand_xoshiro = "0.7.0"
 nalgebra = "0.33.0"
 

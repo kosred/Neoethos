@@ -10,18 +10,22 @@ serde_yaml_ng = "0.10.0"
 config = "0.15.19"
 tracing = "0.1.42"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
+# tracing-appender: daily-rotating file logger. Wired into `logging::setup_logging`
+# alongside the console layer so each session writes to
+# `<user-data-dir>/forex-ai/logs/forex-ai.YYYY-MM-DD.log`. Old files (> 7 days)
+# are deleted at startup to keep the directory clean — the user explicitly
+# requested "logs of today, not garbage from days/months ago".
 tracing-appender = "0.2.4"
+# Platform-correct user-data dir for log storage. Same version as forex-app.
+dirs = "5.0.1"
 tokio = { version = "1.49.0", features = ["full"] }
 sysinfo = "0.37.2"
-colored = "3.0.0"
 anyhow = "1.0.100"
 thiserror = "2.0.16"
 rusqlite = { version = "0.38.0", features = ["bundled", "chrono"] }
-chrono = { version = "0.4.42", features = ["serde"] }
+chrono = { version = "0.4.44", features = ["serde"] }
 uuid = { version = "1.19.0", features = ["v4", "serde"] }
-nvml-wrapper = { version = "0.11.0", optional = true }
 ndarray = "0.17.2"
-nalgebra = "0.33.0"
 # reqwest >= 0.13.3 logs only the host, not the full URL — protects client_secret from leaking to debug/trace logs.
 # In 0.13, `form`/`query` are opt-in features (per the 0.13.0 CHANGELOG).
 reqwest = { version = "0.13.3", default-features = false, features = ["rustls", "json", "blocking", "query", "form"] }
