@@ -2,6 +2,13 @@
 // tab can round-trip through `workspace_state.json` between launches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum WorkspaceTab {
+    /// First-run / onboarding home — 4 task cards (Connect broker /
+    /// Pick data / Set risk / Run first training) that route the
+    /// operator into the existing tabs. Replaces the modal wizard
+    /// (task #8). Persistent, non-blocking; an operator can dismiss
+    /// the cards once everything is set up but the tab itself stays
+    /// accessible from the sidebar.
+    Welcome,
     Dashboard,
     Chart,
     Watchlist,
@@ -62,6 +69,7 @@ impl WorkspaceGroup {
 impl WorkspaceTab {
     pub fn title(self) -> &'static str {
         match self {
+            Self::Welcome => "Welcome",
             Self::Dashboard => "Dashboard",
             Self::Chart => "Chart",
             Self::Watchlist => "Markets",
@@ -84,6 +92,7 @@ impl WorkspaceTab {
     /// Short hover description shown next to the title in the sidebar.
     pub fn description(self) -> &'static str {
         match self {
+            Self::Welcome => "Onboarding checklist — broker, data, risk, training",
             Self::Dashboard => "Account equity, open positions, engine status",
             Self::Chart => "TradingView-style price chart with bid/ask",
             Self::Watchlist => "Symbol list with live quotes",
@@ -109,6 +118,7 @@ impl WorkspaceTab {
     /// wide so the icon column lines up cleanly across all rows.
     pub fn icon(self) -> &'static str {
         match self {
+            Self::Welcome => "★",
             Self::Dashboard => "▦",
             Self::Chart => "📈",
             Self::Watchlist => "≡",
@@ -135,7 +145,8 @@ impl WorkspaceTab {
     #[allow(dead_code)] // reverse lookup; see `all_for_group` for forward
     pub fn group(self) -> WorkspaceGroup {
         match self {
-            Self::Dashboard
+            Self::Welcome
+            | Self::Dashboard
             | Self::Chart
             | Self::Watchlist
             | Self::Execution
@@ -157,6 +168,7 @@ impl WorkspaceTab {
     pub fn all_for_group(group: WorkspaceGroup) -> &'static [Self] {
         match group {
             WorkspaceGroup::Trading => &[
+                Self::Welcome,
                 Self::Dashboard,
                 Self::Chart,
                 Self::Watchlist,

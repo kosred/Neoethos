@@ -16,6 +16,11 @@ pub struct WorkspaceViewer<'a> {
     pub discovery_handle: &'a mut Option<DiscoveryJobHandle>,
     pub training_handle: &'a mut Option<TrainingJobHandle>,
     refresh_requested: bool,
+    /// Tab the operator clicked into from a deep-link surface (today
+    /// just the Welcome cards). The dock applies this in
+    /// `WorkspaceState::focus_tab` after `render_workspace` returns.
+    /// Same one-shot pattern as `refresh_requested`.
+    requested_tab: Option<WorkspaceTab>,
 }
 
 impl<'a> WorkspaceViewer<'a> {
@@ -33,11 +38,18 @@ impl<'a> WorkspaceViewer<'a> {
             discovery_handle,
             training_handle,
             refresh_requested: false,
+            requested_tab: None,
         }
     }
 
     pub fn refresh_requested(&self) -> bool {
         self.refresh_requested
+    }
+
+    /// Tab requested by a card click this frame; `None` means no
+    /// navigation event happened.
+    pub fn requested_tab(&self) -> Option<WorkspaceTab> {
+        self.requested_tab
     }
 }
 
@@ -50,6 +62,12 @@ impl TabViewer for WorkspaceViewer<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         match tab {
+            WorkspaceTab::Welcome => {
+                let action = ui::welcome::render(ui, self.state, self.trading_session);
+                if let Some(target) = action.requested_tab {
+                    self.requested_tab = Some(target);
+                }
+            }
             WorkspaceTab::Dashboard => {
                 let auto_trade = self.state.auto_trade_enabled;
                 let balance = self.state.account_balance;

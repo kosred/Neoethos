@@ -91,7 +91,12 @@ pub struct WorkspaceState {
 
 impl WorkspaceState {
     pub fn new() -> Self {
-        let mut dock_state = DockState::new(vec![WorkspaceTab::Chart]);
+        // Welcome is the *first* tab in the centre panel so a fresh
+        // launch lands on the onboarding cards. Existing operators
+        // who closed the app on a different tab last time have their
+        // selection restored by `WorkspaceStateFile::load_if_present`
+        // (the persistence layer overrides this default at boot).
+        let mut dock_state = DockState::new(vec![WorkspaceTab::Welcome, WorkspaceTab::Chart]);
         let surface = dock_state.main_surface_mut();
 
         // Left panel: core trading monitors only — nav dropdown handles the rest

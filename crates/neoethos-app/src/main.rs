@@ -1019,8 +1019,20 @@ impl eframe::App for ForexApp {
                     &mut self.training_handle,
                 );
                 render_workspace(ui, &mut self.workspace, &mut viewer);
-                if viewer.refresh_requested() {
+                // Extract both one-shot signals from the viewer up-front
+                // so subsequent `&mut self` calls (refresh_symbols /
+                // focus_tab) don't trip the borrow checker against the
+                // viewer's still-live references to `self.state` etc.
+                let needs_refresh = viewer.refresh_requested();
+                let requested_tab = viewer.requested_tab();
+                if needs_refresh {
                     self.refresh_symbols();
+                }
+                // Deep-link from the Welcome cards: if a card was
+                // clicked this frame the viewer parked the target tab
+                // here. Apply it now so the dock actually navigates.
+                if let Some(target) = requested_tab {
+                    self.workspace.focus_tab(target);
                 }
             });
 
