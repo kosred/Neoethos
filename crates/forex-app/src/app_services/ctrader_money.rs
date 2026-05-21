@@ -117,6 +117,12 @@ pub fn required_money_digits(value: Option<u32>, field: &str) -> u32 {
 /// - `money_digits` is outside `[0, 10]`,
 /// - `actual` is non-finite (NaN / ±inf),
 /// - the scaled product cannot fit in an `i64`.
+///
+/// `#[allow(dead_code)]`: inverse of the scaled→display path that
+/// IS hot. Today the SDK receives prices and never sends, but the
+/// inverse will be reached when order-submission paths start quoting
+/// in display units. Tests below pin every numeric edge case.
+#[allow(dead_code)]
 pub fn unscale_to_ctrader_money_int(actual: f64, money_digits: i32) -> Result<i64> {
     if !(0..=MAX_CTRADER_MONEY_DIGITS).contains(&money_digits) {
         bail!(

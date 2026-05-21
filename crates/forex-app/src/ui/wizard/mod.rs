@@ -354,6 +354,10 @@ impl WizardController {
 
     /// Resume an existing wizard from a previously-persisted file.
     /// Spec §5.2 — start at the first incomplete step.
+    #[allow(dead_code)] // wizard "Resume" entry point not yet wired
+                        // into the UI (currently the first-launch sentinel
+                        // file gates the wizard binarily). Kept on the
+                        // public API for Task #10 (auto-trigger).
     pub fn resume_from(state_file: WizardStateFile) -> Self {
         let current = state_file.first_incomplete_step();
         Self {

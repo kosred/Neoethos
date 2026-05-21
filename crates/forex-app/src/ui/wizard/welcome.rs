@@ -4,6 +4,11 @@
 //! - NOT skippable (the only mandatory step).
 //! - `[Continue →]` disabled until license-accepted checkbox is on.
 //! - On accept, records LICENSE SHA-256 + timestamp in `wizard_state.json`.
+//!
+//! Wizard Step 1 scaffolding allow: `WIZARD_STEP_WELCOME_BUDGET_SECONDS`
+//! is a policy constant referenced from the spec and from the `forex-cli`
+//! mirror; the egui front-end uses a hardcoded literal in copy today.
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

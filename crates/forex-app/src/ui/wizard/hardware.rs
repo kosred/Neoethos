@@ -6,6 +6,14 @@
 //! one card per accelerator device with vendor-specific remediation
 //! copy when a backend is detected-but-unavailable (NVIDIA driver
 //! missing, ROCm package not installed, Vulkan SDK absent).
+//!
+//! Wizard Step 7 scaffolding allow: `WIZARD_DEFAULT_HARDWARE_PROFILE_FILENAME`
+//! is the contract filename for the persisted-state JSON; the Apply
+//! writer references it via the wizard module re-export, which the
+//! compiler can't follow from a release build. Task #8 (wizard simplify)
+//! will wire the constant explicitly. Sibling consts are kept public
+//! for the same packaging-script reason as `wizard/autostart.rs`.
+#![allow(dead_code)]
 
 use eframe::egui;
 use forex_core::system::{HardwareProbe, HardwareProfile};

@@ -120,6 +120,11 @@ impl FlowResult {
         self
     }
 
+    #[allow(dead_code)] // wired into each flow as it un-stubs from the
+                        // api-test harness — keep public so flow
+                        // implementations can attach broker payloads
+                        // to the FlowResult without re-deriving the
+                        // 2 KB clip + mojibake-safe re-encode below.
     pub fn with_wire_excerpt(mut self, raw: &str) -> Self {
         // Trim to 2 KB so a giant reconcile dump doesn't dominate the
         // report. Replace control bytes / non-utf8 with `?` so a

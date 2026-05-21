@@ -1,3 +1,11 @@
+// Tree-models LightGBM expert. Some helpers from `super::common`
+// are imported for symmetry with the XGBoost variant — they're
+// reached via the trait-object path so the compiler can't see the
+// direct call sites. Gated `unused_imports` here keeps the import
+// list aligned with the XGBoost sibling so a diff between the two
+// is a substantive diff, not import noise.
+#![allow(unused_imports)]
+
 use anyhow::{Context, Result, bail};
 #[cfg(feature = "lightgbm")]
 use lightgbm3;

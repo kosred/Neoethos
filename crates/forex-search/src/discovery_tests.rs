@@ -5,6 +5,26 @@
 // discovery tests assert against the broker payload shape.
 use super::*;
 
+/// Task #66 — env-var tests in this file mutate process-global
+/// `FOREX_BOT_DISCOVERY_*` variables. Cargo runs tests in parallel by
+/// default, so two tests can read each other's writes and the
+/// `prop_firm_gate_auto_enables_with_no_env_at_all` test flakes
+/// intermittently in CI. Every test that touches env vars MUST take
+/// this mutex for the duration of its `set_var`/`remove_var` calls +
+/// the `with_env_runtime_overrides()` read.
+///
+/// We do NOT introduce `serial_test` as a dep — a plain
+/// `Mutex<()>` is sufficient and keeps the dependency surface flat.
+/// `PoisonError` is unwrapped via `into_inner` so a panic in one test
+/// doesn't take out the rest of the suite.
+static ENV_VAR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn env_var_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_VAR_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
 use crate::FilteringConfig;
 use ndarray::Array2;
 
@@ -256,11 +276,11 @@ fn portfolio_export_succeeds_when_prop_firm_window_passed_even_without_walkforwa
 
 #[test]
 fn prop_firm_gate_env_overrides_populate_discovery_config() {
-    // SAFETY: tests that read process-wide env may race. This group
-    // sets and unsets its own keys; cargo test runs lib tests in a
-    // single process so we keep the surface narrow and balanced.
-    // We also clear the mode flag at the start to avoid bleed from
-    // sibling tests.
+    let _env_guard = env_var_test_lock();
+    // SAFETY: tests that read process-wide env may race. The
+    // `env_var_test_lock` above serialises every test in this file
+    // that touches `FOREX_BOT_DISCOVERY_*` so the set / read / unset
+    // sequence is atomic from the test's point of view.
     unsafe {
         std::env::remove_var("FOREX_BOT_DISCOVERY_MODE");
         std::env::set_var("FOREX_BOT_DISCOVERY_PROP_FIRM_PASS_RATE", "0.42");
@@ -287,6 +307,7 @@ fn prop_firm_gate_env_overrides_populate_discovery_config() {
 
 #[test]
 fn prop_firm_gate_auto_enables_with_no_env_at_all() {
+    let _env_guard = env_var_test_lock();
     // The whole point: zero env vars should still produce a smart,
     // ready-to-run prop-firm config.
     unsafe {
@@ -306,9 +327,17 @@ fn prop_firm_gate_auto_enables_with_no_env_at_all() {
     assert_eq!(pf.window_days, 60);
     assert_eq!(pf.n_windows, 0); // sentinel — auto-tuned at runtime
     assert!((pf.pass_rate - 0.0).abs() < 1e-9); // ranking-only by default
-    assert!((pf.rules.max_daily_loss_pct - 0.05).abs() < 1e-9);
-    assert!((pf.rules.max_overall_drawdown_pct - 0.10).abs() < 1e-9);
-    assert!((pf.rules.min_profit_target_pct - 0.10).abs() < 1e-9);
+    // Task #66 follow-up — these constants come from
+    // `PropFirmConstraints::FTMO_STANDARD` which is declared as `f32`
+    // (per the prop_firm.rs domain module). Casting through `as f64`
+    // introduces ~1.5e-9 rounding for values like 0.10 that aren't
+    // exactly representable in f32. The previous 1e-9 tolerance
+    // happened to pass for 0.05 (~7e-10 error) but failed for 0.10
+    // (~1.5e-9 error). 1e-6 is well within "FTMO didn't change the
+    // rules on us" semantics and survives the f32 round-trip.
+    assert!((pf.rules.max_daily_loss_pct - 0.05).abs() < 1e-6);
+    assert!((pf.rules.max_overall_drawdown_pct - 0.10).abs() < 1e-6);
+    assert!((pf.rules.min_profit_target_pct - 0.10).abs() < 1e-6);
     assert!(pf.rules.require_profit_target);
     // Permissive filter floors should be applied automatically.
     assert!(!cfg.filtering.anomaly_guard);
@@ -317,6 +346,7 @@ fn prop_firm_gate_auto_enables_with_no_env_at_all() {
 
 #[test]
 fn prop_firm_gate_disabled_in_strict_mode() {
+    let _env_guard = env_var_test_lock();
     unsafe {
         std::env::set_var("FOREX_BOT_DISCOVERY_MODE", "strict");
     }

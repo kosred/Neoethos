@@ -14,6 +14,10 @@ use crate::app_services::trading::TradingSession;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiTestEnvironment {
     Demo,
+    #[allow(dead_code)] // CLI flag accepts only `--api-test` (= Demo)
+                       // today; `Live` exists for the planned
+                       // `--api-test-live` opt-in that the operator
+                       // must spell out explicitly per safety policy.
     Live,
 }
 

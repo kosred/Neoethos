@@ -22,9 +22,15 @@ pub const WIZARD_DEFAULT_AUTOSTART_ENABLED: bool = false;
 pub const WIZARD_DEFAULT_START_MINIMIZED: bool = false;
 
 /// Linux .desktop filename. Spec §2 Step 9.
+/// `#[allow(dead_code)]`: Linux build of the Apply writer + packaging
+/// metadata in `Cargo.toml [package.metadata.deb]` reads this name; the
+/// Rust compiler in a cross-platform release build can't see those
+/// non-Rust call sites.
+#[allow(dead_code)]
 pub const WIZARD_DEFAULT_LINUX_AUTOSTART_FILENAME: &str = "forex-app.desktop";
 
 /// macOS plist filename. Spec §2 Step 9.
+#[allow(dead_code)] // macOS-only — see Linux sibling const above
 pub const WIZARD_DEFAULT_MACOS_LAUNCHAGENT_FILENAME: &str = "ai.forex.app.plist";
 
 /// Windows shortcut filename inside the per-user Startup folder.

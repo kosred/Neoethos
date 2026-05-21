@@ -91,6 +91,13 @@ impl EnsembleModelPredictor {
     /// Override the feature profile (e.g. `Full` for HPC training
     /// runs that include extra microstructure columns). Returns
     /// `self` for builder-style chaining.
+    ///
+    /// `#[allow(dead_code)]` 2026-05-21: AUTO ON (Task #7) calls
+    /// `new()` with the default profile today; the builder chain
+    /// stays public for the operator-config UI that's queued behind
+    /// Task #30 (AppState split). Drop the allow once the chain is
+    /// wired from the Settings tab.
+    #[allow(dead_code)]
     pub fn with_feature_profile(mut self, profile: FeatureProfile) -> Self {
         self.feature_profile = profile;
         self
@@ -100,6 +107,7 @@ impl EnsembleModelPredictor {
     /// configurations (e.g. shorter-lookback feature subsets) may
     /// lower this. Below 50 the bar-feature builder cannot produce
     /// stable indicator values; the validator floors at 50.
+    #[allow(dead_code)] // see `with_feature_profile` above
     pub fn with_warmup_bars(mut self, bars: usize) -> Self {
         self.warmup_bars = bars.max(50);
         self
@@ -108,6 +116,8 @@ impl EnsembleModelPredictor {
     /// Read-only handle to the inner ensemble — useful for
     /// rendering the operator-facing "X/Y experts active" banner
     /// without re-querying the registry.
+    #[allow(dead_code)] // chrome banner widget not yet wired —
+                        // status_msg string carries the count today
     pub fn ensemble(&self) -> &dyn EnsemblePredictor {
         self.ensemble.as_ref()
     }

@@ -44,6 +44,14 @@ pub fn render(ui: &mut egui::Ui, state: &mut AppState, session: &mut TradingSess
             refresh_requested = true;
         }
 
+        // 14-step cTrader connection state machine — derives its state
+        // from existing session signals (token bundle, connected flag,
+        // discovered accounts, chart cache, live-spot cache). Renders
+        // progressively as the operator goes through the connect flow,
+        // so a stuck broker session is immediately visible.
+        let mut derived_sm = session.derive_ctrader_state_machine();
+        crate::ui::system::ctrader_state_view::render(ui, &mut derived_sm);
+
         refresh_requested
     })
     .inner

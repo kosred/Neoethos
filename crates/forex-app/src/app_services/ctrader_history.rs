@@ -45,8 +45,7 @@ use crate::app_services::ctrader_account::{
     parse_order_list_by_position_id_response, parse_symbol_category_list_response,
 };
 use crate::app_services::ctrader_data::{
-    CTraderResolvedSymbol, CTraderSymbolLookupRequest, HistoricalBar, HistoricalBarsResult,
-    HistoricalTick, HistoricalTicksResult, parse_tick_data_response, parse_trendbars_response,
+    CTraderResolvedSymbol, CTraderSymbolLookupRequest, HistoricalBar, HistoricalBarsResult, HistoricalTicksResult, parse_tick_data_response, parse_trendbars_response,
     resolve_symbol_with_transport,
 };
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;

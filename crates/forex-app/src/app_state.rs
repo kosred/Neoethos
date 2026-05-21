@@ -185,6 +185,13 @@ pub struct BootstrapFormState {
     pub pairs_input: String,
     pub timeframes_input: String,
     pub years: u32,
+    /// Task #9 — additional source folders the operator wants to
+    /// scan and import alongside the primary `state.runtime.data_dir`.
+    /// Each path is run through `forex_data::DatasetDiscovery::scan`
+    /// independently so the format auto-detection works per-source
+    /// (an MT4 export folder + a Spotware Parquet dump + a CSV
+    /// archive can all live in the import set simultaneously).
+    pub external_sources: Vec<std::path::PathBuf>,
 }
 
 impl BootstrapFormState {
@@ -193,6 +200,7 @@ impl BootstrapFormState {
             pairs_input: symbol.to_string(),
             timeframes_input: "M1,M5,M15,H1".to_string(),
             years: 1,
+            external_sources: Vec::new(),
         }
     }
 }

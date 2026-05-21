@@ -76,6 +76,7 @@ fn main() -> Result<()> {
         "auto-loop" => cmd_auto_loop(&args[2..]),
         "stop-target" => cmd_stop_target(&args[2..]),
         "wizard" => cmd_wizard(&args[2..]),
+        "setup" => cmd_setup(&args[2..]),
         _ => {
             print_help();
             Ok(())
@@ -990,6 +991,183 @@ fn cmd_wizard(_args: &[String]) -> Result<()> {
     tui::run_wizard_tui()
 }
 
+/// `forex-cli setup` — Task #61 headless setup helper. Closes the
+/// CLI parity gap: prints canonical credentials paths, shows which
+/// config files exist on disk, and emits ready-to-paste TOML / JSON
+/// templates for the operator to scp into place on a headless host.
+///
+/// Sub-modes:
+///   `forex-cli setup`             — same as `setup show`
+///   `forex-cli setup show`        — list expected paths + existence
+///   `forex-cli setup ctrader`     — print broker_credentials.toml template
+///   `forex-cli setup news`        — print news API key template
+///   `forex-cli setup paths`       — print just the canonical directories
+///
+/// We intentionally do NOT write binary state here — the on-disk
+/// schemas live in `forex-app::app_services` which the CLI crate
+/// can't depend on (creates a cycle). Operators paste the template
+/// into the canonical path manually OR drive the egui wizard once
+/// on a desktop and `scp` the resulting `broker_credentials.toml`
+/// to the headless host.
+fn cmd_setup(args: &[String]) -> Result<()> {
+    let mode = args.first().map(String::as_str).unwrap_or("show");
+    match mode {
+        "show" => setup_show(),
+        "ctrader" => setup_ctrader_template(),
+        "news" => setup_news_template(),
+        "paths" => setup_paths(),
+        "--help" | "-h" | "help" => {
+            setup_help();
+            Ok(())
+        }
+        other => {
+            eprintln!(
+                "forex-cli setup: unknown sub-mode '{other}'. \
+                 Try 'forex-cli setup --help'."
+            );
+            setup_help();
+            Ok(())
+        }
+    }
+}
+
+fn setup_help() {
+    println!("forex-cli setup — headless credentials helper");
+    println!();
+    println!("USAGE:");
+    println!("    forex-cli setup [SUBCOMMAND]");
+    println!();
+    println!("SUBCOMMANDS:");
+    println!("    show       List expected config paths + which already exist (default)");
+    println!("    paths      Print just the canonical directories, one per line (scripting)");
+    println!("    ctrader    Emit a broker_credentials.toml template for the cTrader broker");
+    println!("    news       Emit a TOML snippet for the news API key");
+    println!();
+    println!(
+        "    The CLI does NOT write binary state — paste the template into the canonical"
+    );
+    println!(
+        "    path printed by `setup paths`. Drive the egui wizard once on a desktop if you"
+    );
+    println!(
+        "    prefer a graphical flow, then `scp` the resulting `broker_credentials.toml`."
+    );
+}
+
+/// Canonical user-config directory — matches the resolution in
+/// `forex-app::broker_persistence::credentials_file_path` exactly so
+/// `forex-cli setup` prints the same paths the GUI writes to.
+/// Order: env override → `dirs::config_dir()/forex-ai` → `.local/forex-ai`.
+fn canonical_user_config_dir() -> std::path::PathBuf {
+    // Test-seam env var: matches `BROKER_CREDENTIALS_PATH_ENV_VAR` in
+    // forex-app so an operator running a sandboxed CLI session sees
+    // the same override path the GUI does.
+    if let Ok(custom) = std::env::var("FOREX_AI_BROKER_CREDENTIALS_PATH")
+        && !custom.trim().is_empty()
+        && let Some(parent) = std::path::Path::new(&custom).parent()
+    {
+        return parent.to_path_buf();
+    }
+    if let Some(config_dir) = dirs::config_dir() {
+        return config_dir.join("forex-ai");
+    }
+    // Last-resort dev-machine fallback — mirrors the third candidate
+    // in `forex-app::broker_persistence::candidate_paths`.
+    std::path::PathBuf::from(".local/forex-ai")
+}
+
+fn setup_show() -> Result<()> {
+    let config_dir = canonical_user_config_dir();
+    println!("Forex AI headless setup status");
+    println!("==============================");
+    println!();
+    println!("Canonical config directory:");
+    println!("  {}", config_dir.display());
+    if !config_dir.exists() {
+        println!("    ! directory does not exist yet — `mkdir -p` it before pasting templates");
+    }
+    println!();
+    let entries: &[(&str, &str)] = &[
+        (
+            "broker_credentials.toml",
+            "cTrader OAuth credentials (client_id, redirect_uri, accounts, environment)",
+        ),
+        (
+            "risky_mode_state.json",
+            "Risky Mode arm + ack ledger (written by the desktop wizard's Apply step)",
+        ),
+        (
+            "wizard_state.json",
+            "Wizard completion sentinel + per-step status (resume-from-disk hint)",
+        ),
+        (
+            "risk_acknowledgement.json",
+            "Append-only ledger of the 5-question risk-quiz acknowledgements (Task #68)",
+        ),
+    ];
+    println!("Expected files:");
+    for (name, description) in entries {
+        let path = config_dir.join(name);
+        let mark = if path.exists() { "✓" } else { "·" };
+        println!("  [{}] {}", mark, path.display());
+        println!("      {}", description);
+    }
+    println!();
+    println!("Run `forex-cli setup ctrader` for a paste-ready cTrader template.");
+    println!("Run `forex-cli setup news` for the news API key snippet.");
+    Ok(())
+}
+
+fn setup_paths() -> Result<()> {
+    let dir = canonical_user_config_dir();
+    println!("{}", dir.display());
+    Ok(())
+}
+
+fn setup_ctrader_template() -> Result<()> {
+    let dir = canonical_user_config_dir();
+    let path = dir.join("broker_credentials.toml");
+    println!("# Paste this into:");
+    println!("#   {}", path.display());
+    println!("# Replace the placeholder values with the credentials from the cTrader Open API");
+    println!("# Developer Portal (https://openapi.ctrader.com). For accounts with");
+    println!("# `enabled_for_execution = true`, the bot will route orders. Leaving the");
+    println!("# array empty is fine — the GUI's account-discovery step populates it.");
+    println!();
+    println!("schema_version = 1");
+    println!();
+    println!("[ctrader]");
+    println!(
+        "environment = \"Demo\"  # or \"Live\" — match the cTrader account's tier"
+    );
+    println!("client_id = \"<your cTrader app client_id>\"");
+    println!("client_secret = \"<your cTrader app client_secret>\"");
+    println!("redirect_uri = \"http://127.0.0.1:43001/callback\"");
+    println!("accounts = []");
+    println!();
+    println!("[dxtrade]");
+    println!("platform_url = \"\"");
+    println!("username = \"\"");
+    println!("password = \"\"");
+    println!("domain = \"default\"");
+    println!("accounts = []");
+    Ok(())
+}
+
+fn setup_news_template() -> Result<()> {
+    let dir = canonical_user_config_dir();
+    let path = dir.join("news_api.toml");
+    println!("# Paste this into:");
+    println!("#   {}", path.display());
+    println!("# The news API key drives Step 8 of the wizard (LLM-curated news +");
+    println!("# blackout filter). Perplexity is the default provider; keep the key");
+    println!("# OUT of shell history — `chmod 600` the file after pasting.");
+    println!();
+    println!("provider = \"perplexity\"");
+    println!("api_key = \"<your Perplexity API key>\"");
+    Ok(())
+}
+
 fn parse_root(args: &[String], settings: Option<&forex_core::Settings>) -> String {
     // `--data-path` is the operator-facing flag added 2026-05-14 for
     // folder-browsing workflows; `--root` remains for backwards
@@ -1207,6 +1385,8 @@ fn print_help() {
     println!("  migrate-data --root data [--force] [--delete-source]");
     println!("  stop-target --symbol EURUSD --timeframe M1 --pip 0.0001 --signal 1 --root data");
     println!("  wizard                       Launch the interactive first-run wizard (TUI).");
+    println!("  setup [show|paths|ctrader|news]  Headless credentials helper (Task #61).");
+    println!("                               Prints canonical paths + ready-to-paste templates.");
     println!();
     println!("  --data-path <folder>   Browse a folder and auto-discover dataset layout");
     println!("                         (subfolders for symbol/timeframe, Hive-style or flat).");

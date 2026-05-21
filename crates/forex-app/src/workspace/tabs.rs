@@ -41,6 +41,11 @@ impl WorkspaceGroup {
         }
     }
 
+    /// Hover-tooltip text for sidebar group headers. The current
+    /// sidebar layout shows only the group title; the description is
+    /// wired in but not yet rendered — restore the tooltip wiring in
+    /// the next sidebar polish pass.
+    #[allow(dead_code)] // tooltip wire-up pending
     pub fn description(self) -> &'static str {
         match self {
             Self::Trading => "Live execution, charts, order entry, news",
@@ -123,6 +128,11 @@ impl WorkspaceTab {
         }
     }
 
+    /// Reverse-lookup helper: tab → group. The sidebar renderer uses
+    /// `all_for_group(group)` (group → tabs), so this direction is
+    /// only called by tests and by the planned "open this tab" deep
+    /// link handler. Kept on the public API for symmetry.
+    #[allow(dead_code)] // reverse lookup; see `all_for_group` for forward
     pub fn group(self) -> WorkspaceGroup {
         match self {
             Self::Dashboard

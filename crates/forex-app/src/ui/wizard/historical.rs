@@ -23,6 +23,13 @@
 //!   and exits — the `.partial` sentinel stays in place for resume.
 //! - On disk-full or any other terminal error, the job is marked
 //!   failed and the worker proceeds to the next (symbol, timeframe).
+//!
+//! Wizard Step 6 scaffolding allow: `CompletionSentinel` +
+//! `reset_historical_runtime` are part of the cancel-safety contract
+//! described above but only the egui runtime's reset path is wired in
+//! the current build; the `forex-cli` mirror will call them when its
+//! Step 6 lands (Task #9, multi-folder picker).
+#![allow(dead_code)]
 
 use eframe::egui;
 use std::path::{Path, PathBuf};

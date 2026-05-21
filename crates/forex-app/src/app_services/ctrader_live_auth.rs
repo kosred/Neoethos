@@ -200,6 +200,11 @@ impl ProductionCTraderLiveAuthBackend {
         Err(anyhow!("failed to bind any cTrader callback port"))
     }
 
+    /// Back-compat entry point: same as `capture_authorization_code_with_timeout`
+    /// but uses the default `CTRADER_CALLBACK_TIMEOUT`. Kept for
+    /// pre-F2 unit tests that don't exercise the state-validation
+    /// path. Production `run()` always uses `..._with_state` below.
+    #[allow(dead_code)] // see comment — used by historical unit tests
     fn capture_authorization_code(
         &self,
         listener: TcpListener,
@@ -212,15 +217,16 @@ impl ProductionCTraderLiveAuthBackend {
         )
     }
 
+    /// Back-compat: keep the pre-F2 entrypoint working for unit tests
+    /// that don't exercise the state-validation path. Production
+    /// `run()` always uses `..._with_state` below.
+    #[allow(dead_code)] // see capture_authorization_code above
     fn capture_authorization_code_with_timeout(
         &self,
         listener: TcpListener,
         expected_path: &str,
         timeout: Duration,
     ) -> Result<String> {
-        // Back-compat: keep the pre-F2 entrypoint working for unit tests
-        // that don't exercise the state-validation path. Production
-        // `run()` always uses `..._with_state` below.
         self.capture_authorization_code_with_state(listener, expected_path, None, timeout)
     }
 
@@ -235,9 +241,21 @@ impl ProductionCTraderLiveAuthBackend {
             .set_nonblocking(true)
             .context("failed to configure cTrader callback listener")?;
         let started = Instant::now();
+        // DIAGNOSTIC (Task #72): count how many TCP connections we accept
+        // before declaring success/failure. If browsers issue a speculative
+        // pre-connect, we'll see accept_count >= 2 here.
+        let mut accept_count: u32 = 0;
         loop {
             match listener.accept() {
-                Ok((stream, _)) => {
+                Ok((stream, peer)) => {
+                    accept_count += 1;
+                    tracing::info!(
+                        target: "forex_app::ctrader::oauth",
+                        step = "accept",
+                        accept_count,
+                        peer = %peer,
+                        "TCP connection accepted on loopback listener"
+                    );
                     return self.read_authorization_code_from_stream(
                         stream,
                         expected_path,
@@ -271,6 +289,16 @@ impl ProductionCTraderLiveAuthBackend {
         let bytes_read = stream
             .read(&mut buffer)
             .context("failed to read cTrader callback request")?;
+        // DIAGNOSTIC (Task #72): how many bytes did the first read return?
+        // If 0 → speculative pre-connect (browser opened TCP but didn't
+        // write). If < ~200 → likely a partial read on a fragmented packet
+        // and we'd be parsing a truncated request line.
+        tracing::info!(
+            target: "forex_app::ctrader::oauth",
+            step = "read_stream",
+            bytes_read,
+            "first read() returned"
+        );
         let request = String::from_utf8_lossy(&buffer[..bytes_read]);
         let request_line = request
             .lines()
@@ -280,6 +308,28 @@ impl ProductionCTraderLiveAuthBackend {
             .split_whitespace()
             .nth(1)
             .context("cTrader callback request line was malformed")?;
+        // DIAGNOSTIC (Task #72): log the raw request target (URL after the
+        // HTTP method). We strip the `code=` value so the authorization code
+        // doesn't leak to logs — we only log its presence and length.
+        let target_has_code = request_target.contains("code=");
+        let target_has_state = request_target.contains("state=");
+        let target_path_only = request_target
+            .split_once('?')
+            .map(|(p, _)| p)
+            .unwrap_or(request_target);
+        let target_query_len = request_target
+            .split_once('?')
+            .map(|(_, q)| q.len())
+            .unwrap_or(0);
+        tracing::info!(
+            target: "forex_app::ctrader::oauth",
+            step = "parse_request",
+            path = %target_path_only,
+            query_len = target_query_len,
+            target_has_code,
+            target_has_state,
+            "request target parsed from request line"
+        );
         // SECURITY (audit-fix F2): when a state token was issued, the
         // callback must carry the same value or we refuse to surface the
         // authorization code to the rest of the flow.
@@ -288,13 +338,38 @@ impl ProductionCTraderLiveAuthBackend {
             None => parse_callback_request(request_target, expected_path)?,
         };
 
-        let response = concat!(
-            "HTTP/1.1 200 OK\r\n",
-            "Content-Type: text/html; charset=utf-8\r\n",
-            "Content-Length: 74\r\n",
-            "Connection: close\r\n",
-            "\r\n",
-            "<html><body><h1>cTrader login received.</h1>You can close this tab.</body></html>",
+        // Task #73 — branded callback page. Auto-closes the tab after
+        // 2 s so the operator doesn't have to manually go back to the
+        // desktop app. We also surface a "return to Forex AI" message
+        // in case the browser blocks `window.close()` (Chrome blocks it
+        // for tabs not opened by JavaScript) — at least the operator
+        // sees who's talking.
+        const CALLBACK_HTML: &str = "<!doctype html><html lang=\"en\"><head>\
+<meta charset=\"utf-8\">\
+<title>Forex AI - cTrader login received</title>\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<style>\
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f1419;color:#e7e9ea;display:flex;align-items:center;justify-content:center;min-height:100vh}\
+.card{max-width:480px;padding:48px 40px;background:#16191e;border:1px solid #2a2f37;border-radius:12px;text-align:center;box-shadow:0 8px 40px rgba(0,0,0,.4)}\
+.check{font-size:48px;color:#26a69a;margin-bottom:12px;line-height:1}\
+h1{font-size:20px;font-weight:600;margin:0 0 8px;color:#e7e9ea}\
+p{font-size:14px;color:#8b929c;margin:8px 0;line-height:1.5}\
+.brand{margin-top:24px;font-size:11px;color:#5a6068;letter-spacing:1px;text-transform:uppercase}\
+</style></head><body>\
+<div class=\"card\">\
+<div class=\"check\">&#10003;</div>\
+<h1>cTrader login received</h1>\
+<p>The desktop app has captured your authorization code.</p>\
+<p>Return to <strong>Forex AI</strong> to continue.</p>\
+<p style=\"color:#5a6068\">This tab will close automatically.</p>\
+<div class=\"brand\">Forex AI &middot; Pure Rust Terminal</div>\
+</div>\
+<script>setTimeout(function(){try{window.close();}catch(e){}},2000);</script>\
+</body></html>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            CALLBACK_HTML.len(),
+            CALLBACK_HTML,
         );
         stream
             .write_all(response.as_bytes())
@@ -651,6 +726,7 @@ fn is_loopback_redirect_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
+#[allow(dead_code)] // back-compat shim — see comment below
 pub fn build_authorize_url(
     client_id: &str,
     redirect_uri: &str,

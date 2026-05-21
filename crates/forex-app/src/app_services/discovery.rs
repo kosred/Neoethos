@@ -5,7 +5,7 @@ use crate::app_services::{
         push_recent_event,
     },
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use forex_core::{
     logging::{canonical_log_path, write_subsystem_record},
     sectioned_log::{SectionedRunRecord, SubsystemSection},
@@ -14,8 +14,15 @@ use forex_data::{
     FeatureCache, MANDATORY_TFS, ensure_timeframes_with_resample, load_symbol_dataset,
     prepare_multitimeframe_features,
 };
+// `DiscoveryValidationGates` is used by the sibling tests file
+// (`discovery_tests.rs::success_snapshot_carries_candidate_and_portfolio_counters`),
+// not by anything in this module. Importing it gated on `#[cfg(test)]`
+// keeps the release build clean while staying visible to tests via
+// `use super::*;`.
+#[cfg(test)]
+use forex_search::DiscoveryValidationGates;
 use forex_search::{
-    DiscoveryConfig, DiscoveryProgress, DiscoveryResult, DiscoveryValidationGates,
+    DiscoveryConfig, DiscoveryProgress, DiscoveryResult,
     PropFirmRiskRules, compute_discovery_forward_test_artifacts,
     compute_discovery_prop_firm_artifacts, ensure_non_empty_portfolio,
     run_discovery_cycle_with_progress, save_canonical_backtest_artifacts,
@@ -581,6 +588,10 @@ fn cancelled_snapshot_from(mut snapshot: JobSnapshot, message: impl Into<String>
 ///
 /// Audit gap #1: closes the multi-symbol DiscoveryRequest entry point
 /// requirement.
+#[allow(dead_code)] // scaffolding for "All Majors" / "EUR pairs" preset
+                    // buttons — wiring tracked in the operator notes;
+                    // tests below exercise validate/lower paths so
+                    // contract regressions still get caught.
 #[derive(Debug, Clone)]
 pub struct MultiSymbolDiscoveryRequest {
     /// Shared data root for every symbol in the batch.
@@ -593,6 +604,7 @@ pub struct MultiSymbolDiscoveryRequest {
     pub prop_firm_rules: PropFirmRiskRules,
 }
 
+#[allow(dead_code)] // pairs with the struct allow above
 impl MultiSymbolDiscoveryRequest {
     pub fn validate(&self) -> Result<()> {
         if self.symbols.is_empty() {
@@ -646,6 +658,8 @@ impl MultiSymbolDiscoveryRequest {
 /// can cancel any subset by symbol position. If `start_discovery_job`
 /// fails for any individual symbol the corresponding slot returns
 /// the failed snapshot from `failed_snapshot`; the rest still run.
+#[allow(dead_code)] // entry point for the preset-button wiring; see
+                    // MultiSymbolDiscoveryRequest above
 pub fn start_multi_symbol_discovery_job(
     request: MultiSymbolDiscoveryRequest,
     tx: mpsc::Sender<ServiceEvent>,
@@ -1112,6 +1126,21 @@ pub fn start_discovery_job(
             .map(|snapshot| snapshot.clone())
             .unwrap_or(snapshot);
         let completed = completed_snapshot(base_snapshot, &result);
+        // Task #6 — write `model_targets.json` so the training step
+        // (Task #10's auto-trigger, or any operator-driven "Load
+        // discovered targets" button in the Training panel) has a
+        // stable on-disk hand-off from the discovery output. The
+        // write is best-effort: a write failure logs a warning but
+        // does NOT fail the discovery job, because the in-memory
+        // snapshot we just emitted is the authoritative result.
+        if let Err(err) = write_model_targets_for_discovery(&request, &result) {
+            tracing::warn!(
+                target: "forex_app::discovery::targets",
+                error = %err,
+                symbol = %request.symbol,
+                "failed to write model_targets.json — operator can still inspect the discovery snapshot in-memory"
+            );
+        }
         send_event(&tx, ServiceEvent::DiscoveryUpdated(completed.clone()));
         log_discovery_event(
             "ui_discovery_job",
@@ -1121,6 +1150,102 @@ pub fn start_discovery_job(
     });
 
     Ok(handle)
+}
+
+/// On-disk contract between Discovery output and Training input.
+/// Written by `start_discovery_job` after each successful job.
+/// Filename: `<data_root>/discovery_targets/<symbol>_<base_tf>_model_targets.json`.
+///
+/// The schema is intentionally small — Training only needs to know
+/// (a) which symbol/timeframe the portfolio targets and (b) which
+/// strategies were accepted (so the operator can pick an ensemble
+/// configuration around them). Quality metrics, candidates list,
+/// and trade logs stay in the in-memory `DiscoveryResult` /
+/// JobSnapshot path; this file is the minimal hand-off only.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ModelTargetsFile {
+    /// Bump this whenever the schema changes incompatibly. Readers
+    /// that see a version they don't recognise should refuse the
+    /// file (NOT silently fall back).
+    pub schema_version: u32,
+    pub symbol: String,
+    pub base_tf: String,
+    pub higher_tfs: Vec<String>,
+    /// ISO-8601 UTC at the moment the file was written.
+    pub discovered_at_utc: String,
+    pub portfolio: Vec<ModelTargetEntry>,
+}
+
+/// One accepted strategy from the portfolio.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ModelTargetEntry {
+    pub strategy_id: String,
+    pub fitness: f64,
+    pub sharpe_ratio: f64,
+    pub win_rate: f64,
+    pub trades_count: u64,
+}
+
+/// Current `ModelTargetsFile::schema_version`. Bump when the schema
+/// changes; the reader on the Training side asserts on this.
+pub const MODEL_TARGETS_SCHEMA_VERSION: u32 = 1;
+
+/// `discovery_targets/<symbol>_<base_tf>_model_targets.json` path
+/// resolver. Public so Training can read the same path Discovery
+/// writes (Task #10's job).
+pub fn model_targets_path_for(
+    data_root: &std::path::Path,
+    symbol: &str,
+    base_tf: &str,
+) -> std::path::PathBuf {
+    data_root
+        .join("discovery_targets")
+        .join(format!("{symbol}_{base_tf}_model_targets.json"))
+}
+
+/// Write the model-targets file using forex_core's atomic-rename
+/// helper (no partial files, no half-fsync risks).
+fn write_model_targets_for_discovery(
+    request: &DiscoveryRequest,
+    result: &forex_search::DiscoveryResult,
+) -> Result<()> {
+    use forex_core::storage::json::write_json_atomic;
+    let path = model_targets_path_for(&request.data_root, &request.symbol, &request.base_tf);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create discovery_targets dir at {}", parent.display()))?;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let portfolio: Vec<ModelTargetEntry> = result
+        .portfolio
+        .iter()
+        .map(|gene| ModelTargetEntry {
+            strategy_id: gene.strategy_id.clone(),
+            fitness: gene.fitness,
+            sharpe_ratio: gene.sharpe_ratio,
+            win_rate: gene.win_rate,
+            trades_count: gene.trades_count as u64,
+        })
+        .collect();
+    let file = ModelTargetsFile {
+        schema_version: MODEL_TARGETS_SCHEMA_VERSION,
+        symbol: request.symbol.clone(),
+        base_tf: request.base_tf.clone(),
+        higher_tfs: request.higher_tfs.clone(),
+        discovered_at_utc: now,
+        portfolio,
+    };
+    write_json_atomic(&path, &file)
+        .with_context(|| format!("write model_targets.json at {}", path.display()))?;
+    tracing::info!(
+        target: "forex_app::discovery::targets",
+        path = %path.display(),
+        portfolio_size = file.portfolio.len(),
+        symbol = %file.symbol,
+        base_tf = %file.base_tf,
+        "wrote model_targets.json"
+    );
+    Ok(())
 }
 
 fn send_event(tx: &mpsc::Sender<ServiceEvent>, event: ServiceEvent) {

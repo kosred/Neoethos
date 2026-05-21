@@ -3,26 +3,21 @@
 // without each duplicating the full `crate::app_services::...` path list.
 // `pub(super)` keeps these aliases visible only inside `trading::*`, so the
 // external (`forex-app`) surface is unchanged.
-pub(super) use crate::app_record;
 pub(super) use crate::app_services::ServiceEvent;
 pub(super) use crate::app_services::broker_config::{
-    AdapterReadinessSnapshot, BrokerAccountTarget, BrokerSessionState, BrokerSettingsState,
+    AdapterReadinessSnapshot, BrokerSessionState, BrokerSettingsState,
     CTraderBrokerEnvironment,
 };
 pub(super) use crate::app_services::ctrader_account::{
     CTraderAccountRuntimeBackend, CTraderAccountRuntimeRequest, CTraderAccountRuntimeSnapshot,
-    CTraderDealSnapshot, CTraderPendingOrderSnapshot, CTraderPositionSnapshot,
     ProductionCTraderAccountRuntimeBackend,
 };
 pub(super) use crate::app_services::ctrader_auth::{
-    CTraderAccountSummary, CTraderAuthSession, CTraderAuthSnapshot, CTraderDiscoveredAccount,
+    CTraderAccountSummary, CTraderAuthSession, CTraderAuthSnapshot,
     CTraderTokenBundle, CTraderTokenExchangeRequest,
 };
-pub(super) use crate::app_services::ctrader_bootstrap::{
-    bootstrap_from_ctrader_history, plan_bootstrap_chunks,
-};
 pub(super) use crate::app_services::ctrader_data::{
-    CTraderChartHistoryRequest, CTraderSymbolInfo, CTraderSymbolLookupRequest, HistoricalBar,
+    CTraderChartHistoryRequest, CTraderSymbolLookupRequest, HistoricalBar,
     load_chart_history, resolve_symbol,
 };
 pub(super) use crate::app_services::ctrader_execution::{
@@ -38,19 +33,16 @@ pub(super) use crate::app_services::ctrader_live_auth::{
     CTraderTokenRefreshRequest, ProductionCTraderLiveAuthBackend, build_default_loopback_config,
 };
 pub(super) use crate::app_services::ctrader_messages::{
-    CTRADER_TOKEN_EXPIRED_SENTINEL, CTraderAmendOrderRequest, CTraderCancelOrderRequest,
-    CTraderClosePositionRequest, CTraderNewOrderRequest, CTraderOrderTriggerMethod,
+    CTRADER_TOKEN_EXPIRED_SENTINEL, CTraderCancelOrderRequest,
+    CTraderClosePositionRequest, CTraderNewOrderRequest,
     CTraderOrderType, CTraderTimeInForce, CTraderTradeSide,
-    SUPPORTED_CTRADER_ORDER_TRIGGER_METHODS, SUPPORTED_CTRADER_ORDER_TYPES,
-    SUPPORTED_CTRADER_TIME_IN_FORCE, SUPPORTED_CTRADER_TRADE_SIDES, build_amend_order_request,
-    build_cancel_order_request, build_close_position_request, build_new_order_request,
 };
 pub(super) use crate::app_services::ctrader_streaming::{
     CTraderLiveChartUpdate, CTraderLiveChartUpdateRequest, CTraderLiveStreamingBackend,
     ProductionCTraderLiveStreamingBackend, merge_live_spot_update_into_bars,
 };
 pub(super) use crate::app_services::jobs::{
-    JobEventLevel, JobKind, JobSnapshot, JobState, push_recent_event,
+    JobKind, JobSnapshot, JobState,
 };
 pub(super) use forex_core::{KillSwitchTier, RiskyModeConfig, RiskyModeManager};
 // Batch 14 authoritative PnL path. Re-exported into `trading::*` so
@@ -72,17 +64,14 @@ pub(super) use crate::app_services::secure_store::{
 pub(super) use crate::app_services::secure_store::{
     CTraderTokenStore, production_ctrader_token_store,
 };
-pub(super) use crate::app_state::{AppState, DataSource, OrderTicketState};
+pub(super) use crate::app_state::{AppState, DataSource};
 pub(super) use anyhow::Context;
-pub(super) use forex_core::logging::write_subsystem_record;
-pub(super) use forex_core::sectioned_log::SubsystemSection;
-pub(super) use forex_data::{Ohlcv, discover_timeframes, load_symbol_timeframe};
+pub(super) use forex_data::{discover_timeframes, load_symbol_timeframe};
 pub(super) use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
-pub(super) use tracing::error;
 
 pub mod auto_trade;
 pub mod auto_trade_producer;
@@ -107,7 +96,7 @@ use client_order::{
     CTRADER_TOKEN_REFRESH_WINDOW_SECS, current_unix_seconds, next_client_order_seq,
 };
 use diagnostics::{
-    append_ctrader_order_builder_diagnostics, extract_client_order_id_from_request,
+    extract_client_order_id_from_request,
     find_existing_client_order_id, format_ctrader_connect_error, format_ctrader_terminal_info,
     format_execution_journal_line, format_execution_outcome_status, non_empty_option,
     record_app_event, synthesize_idempotent_retry_outcome,
@@ -273,6 +262,8 @@ pub enum BotDecisionSide {
     Flat,
 }
 
+#[allow(dead_code)] // `Manual` variant scaffolded for the operator-
+                    // origin path; only `Ai` is currently emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BotDecisionSource {
     /// Operator clicked BUY/SELL in the UI.
@@ -303,6 +294,11 @@ pub struct EnsembleLoadSummary {
     pub degraded_names: Vec<String>,
 }
 
+#[allow(dead_code)] // chrome banner helpers ("X/Y experts active")
+                    // — wired into the AUTO ON status_msg as a
+                    // string today; will be replaced with these
+                    // accessors when the banner gains its own
+                    // dedicated widget.
 impl EnsembleLoadSummary {
     /// Count of experts actively participating in inference.
     pub fn loaded_count(&self) -> usize {
@@ -346,9 +342,14 @@ pub enum OrderSource {
     /// the same gates as `Ai` — every Risky Mode tier + the
     /// prop-firm gate still applies. NEVER set without an
     /// explicit user-click Approve through the chat UI.
+    #[allow(dead_code)] // Gemma Approve-flow not yet wired (Task #40)
     AiSuggested,
 }
 
+#[allow(dead_code)] // `is_ai_originated` is used by the Risky Mode
+                    // manual-rejection gate, which fires only when
+                    // Risky Mode is armed (off by default). Kept
+                    // public for the gate tests in trading_tests.rs.
 impl OrderSource {
     /// `true` when the source is AI-originated (autonomous OR
     /// user-approved Gemma suggestion). Risky Mode treats both
@@ -433,6 +434,12 @@ pub struct ExecutionSurfaceSnapshot {
 /// §10.2 (Discovery -> Paper -> LiveSmall -> LiveFull). The wizard
 /// promotion gates (§10.3) own the transitions; the chrome only
 /// observes which mode the session currently sits in.
+///
+/// `Paper`/`LiveSmall`/`LiveFull` are scaffolded for the §10.3
+/// promotion ladder (Discovery → Paper → LiveSmall → LiveFull) but
+/// the chrome only emits `Demo` / `Live` today; the additional
+/// variants will be set by the auto-promotion code that's queued
+/// behind Task #10 (auto-trigger after wizard Apply).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradingEnvironment {
     /// Historical-replay only, no broker connection. Pill: gray.
@@ -443,17 +450,23 @@ pub enum TradingEnvironment {
     /// Matches §10.2 "Paper trade"/Stage 2 — forward test on live
     /// streaming data with simulated fills (ThinkOrSwim paperMoney
     /// pattern, competitive analysis §1.4).
+    #[allow(dead_code)] // §10.3 promotion ladder not yet wired
     Paper,
     /// Real money, capped per-trade size by the promotion gate. Pill: red.
     /// Matches §10.2 "Live small"/Stage 3 — uses real capital with the
     /// `min_trading_days=10` + `min_monthly_net_profit_pct=0.04` gate.
+    #[allow(dead_code)]
     LiveSmall,
     /// Real money, no extra cap. Pill: red, bold.
     /// Matches §10.2 "Live full"/Stage 4 — uncapped after 30 days at
     /// Stage 3 with all promotion gates passed.
+    #[allow(dead_code)]
     LiveFull,
 }
 
+#[allow(dead_code)] // `is_live_money` is consumed by the audit-log
+                    // severity classifier, which is wired but only
+                    // fires on environments that don't exist yet.
 impl TradingEnvironment {
     /// Operator-facing label rendered inside the status pill.
     pub fn pill_label(self) -> &'static str {
@@ -692,6 +705,21 @@ pub enum AppExecutionRuntimeSnapshot {
     CTrader(CTraderAccountRuntimeSnapshot),
 }
 
+// `#[allow(dead_code)]` covers the items the audit (2026-05-20)
+// flagged as "never used" on this big public surface:
+//   - `new` (callers use `new_with_persisted_credentials` after first
+//     launch, but tests still construct via `new` so the symbol stays)
+//   - environment / halt-state / risky-mode accessor + mutator family
+//     (auto-armed at boot, no UI toggle wired)
+//   - bot-decision recording + auto-trade-producer lifecycle helpers
+//     (the wired AUTO ON toggle hits the `_for_state` convenience
+//     above; the lower-level methods stay public for tests)
+//   - `refresh_runtime` (sync variant; the heartbeat uses the async
+//     `start_runtime_refresh_in_background` instead)
+// Annotated at the impl level instead of deleting because every item
+// has live test coverage AND constitutes the documented public API of
+// TradingSession.
+#[allow(dead_code)]
 impl TradingSession {
     pub fn new() -> Self {
         Self::default()
@@ -1448,6 +1476,101 @@ impl TradingSession {
         Ok(summary)
     }
 
+    /// Top-of-chrome AUTO ON entry point — builds the live-inference
+    /// pipeline against the currently-selected symbol/timeframe and
+    /// kicks off the producer.
+    ///
+    /// What it bundles (previously the chrome toggle was a cosmetic
+    /// flag — see audit 2026-05-20, task #7):
+    /// 1. Resolves `state.selected_pair` against the broker to get
+    ///    `(symbol_id, digits)` so the live spot subscribe request is
+    ///    well-formed. This is a synchronous network call — the
+    ///    operator is clicking a button, so the brief block is OK.
+    /// 2. Mints a `CTraderLiveChartUpdateRequest` with fresh credentials
+    ///    + access token + the discovered account.
+    /// 3. Wraps the session's shared `ctrader_live_streaming_backend` in
+    ///    a [`auto_trade_producer::CTraderLiveBarSource`] adapter so the
+    ///    producer can poll it for closed trendbars.
+    /// 4. Delegates to [`Self::start_auto_trade_with_ensemble`] which
+    ///    scans `<data_dir>/models/<symbol>/<timeframe>/`, loads every
+    ///    trained expert it finds, wraps the ensemble in a
+    ///    `ModelPredictor` adapter, and spawns the inference thread.
+    ///
+    /// Errors propagate verbatim so the chrome handler can surface
+    /// "AUTO ON failed: <reason>" to the operator without flipping the
+    /// flag. Typical failures: no trained ensemble on disk yet, the
+    /// selected symbol can't be resolved against the broker, no
+    /// discovered account, missing token bundle.
+    pub fn start_auto_trade_for_state(
+        &mut self,
+        state: &AppState,
+    ) -> anyhow::Result<EnsembleLoadSummary> {
+        use crate::app_services::ctrader_streaming::CTraderLiveChartUpdateRequest;
+        let symbol = state.selected_pair.clone();
+        let timeframe = state.chart_timeframe.clone();
+        if symbol.trim().is_empty() {
+            anyhow::bail!("AUTO ON requires a selected symbol — none is active");
+        }
+        if timeframe.trim().is_empty() {
+            anyhow::bail!("AUTO ON requires a selected chart timeframe — none is active");
+        }
+
+        // 1. Resolve symbol against the broker so we have symbol_id + digits.
+        let resolved = self
+            .resolve_selected_ctrader_symbol(&symbol)
+            .with_context(|| {
+                format!("AUTO ON failed to resolve cTrader symbol {symbol} against the broker")
+            })?;
+
+        // 2. Build the live-spot subscribe request.
+        let client_id = self.broker_settings.ctrader.client_id.trim().to_string();
+        let client_secret = self
+            .broker_settings
+            .ctrader
+            .client_secret
+            .trim()
+            .to_string();
+        if client_id.is_empty() || client_secret.is_empty() {
+            anyhow::bail!(
+                "AUTO ON requires configured cTrader client_id and client_secret"
+            );
+        }
+        let access_token = self
+            .ensure_fresh_ctrader_token_bundle(
+                "AUTO ON requires a stored cTrader token bundle",
+            )?
+            .access_token;
+        let account_id =
+            self.selected_ctrader_execution_account_id().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "AUTO ON requires a discovered cTrader account to bind execution to"
+                )
+            })?;
+
+        let live_request = CTraderLiveChartUpdateRequest {
+            client_id,
+            client_secret,
+            access_token,
+            environment: self.selected_ctrader_environment(),
+            account_id,
+            symbol_id: resolved.symbol.symbol_id,
+            digits: resolved.symbol.digits,
+            timeframe: timeframe.clone(),
+            subscribe_to_spot_timestamp: false,
+        };
+
+        // 3. Build the bar source against the shared streaming backend.
+        let bar_source: std::sync::Arc<dyn auto_trade_producer::LiveBarSource> =
+            std::sync::Arc::new(auto_trade_producer::CTraderLiveBarSource::new(
+                std::sync::Arc::clone(&self.ctrader_live_streaming_backend),
+                live_request,
+            ));
+
+        // 4. Delegate to the canonical "load ensemble + spawn producer" path.
+        let models_dir = state.runtime.data_dir.join("models");
+        self.start_auto_trade_with_ensemble(&models_dir, &symbol, &timeframe, bar_source)
+    }
+
     /// Drain all pending auto-trade signals from the producer's
     /// outbound channel and push each one through the §7.1
     /// dispatcher gate chain. Returns the number of signals
@@ -1845,6 +1968,12 @@ impl Default for TradingSession {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskKind {
+    #[allow(dead_code)] // re-entrancy guard taxonomy: `Connect` is
+                       // checked by `background_task_running` but the
+                       // current connect path uses an explicit
+                       // AtomicBool (`connect_in_flight`) instead.
+                       // Kept on the enum because the taxonomy is
+                       // exposed to the trace target.
     Connect,
     Bootstrap,
 }

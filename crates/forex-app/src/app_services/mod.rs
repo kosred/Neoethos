@@ -2,6 +2,14 @@ pub mod api_test;
 pub mod backoff;
 pub mod bootstrap_writer;
 pub mod broker_config;
+// `broker_control` — RESTORED 2026-05-21. Same wrongful-delete fix
+// as `dxtrade` above. The global OnceLock crossbeam channel is the
+// designed-but-not-yet-installed bridge between the streaming worker
+// and the UI loop for HardwareKill / ConnectionRestored signals.
+// Streaming Task #3 today routes via `ServiceEvent` instead, but the
+// broker_control path stays available for cases where a Send-Sync
+// global is preferable to a tokio mpsc (e.g. a panic-safe HALT path
+// from a non-async worker).
 pub mod broker_control;
 pub mod broker_persistence;
 pub mod ctrader_account;
@@ -22,6 +30,15 @@ pub mod ctrader_state_machine;
 pub mod ctrader_streaming;
 pub mod ctrader_tls;
 pub mod discovery;
+// `dxtrade` — RESTORED 2026-05-21 after a wrongful deletion the same
+// day. The operator directive is explicit: DXtrade is planned to
+// become a fully-wired adapter alongside cTrader. The module owns the
+// REST + WebSocket client, OAuth-style session token handshake, order
+// REST API, and streaming Push API (Phases D3.1–D3.3 in the module
+// docs). Audit 2026-05-20 noted zero UI callers TODAY, but that's a
+// wiring-pending state, not an abandonment. When TradingSession
+// starts dispatching DxTrade through the runtime adapter trait, the
+// allow below comes off.
 pub mod dxtrade;
 pub mod embedded_credentials;
 pub mod jobs;

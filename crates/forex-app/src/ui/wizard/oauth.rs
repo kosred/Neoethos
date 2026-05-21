@@ -220,6 +220,11 @@ pub fn expose_token_bundle() -> Option<crate::app_services::ctrader_auth::CTrade
 }
 
 /// Read-only access to the refresh token for the Apply step.
+#[allow(dead_code)] // restored 2026-05-21 — the wizard rerun + Apply
+                    // path still needs this when the operator chooses
+                    // to persist only the refresh token (e.g. for a
+                    // CLI-driven later authorization). Pairs with
+                    // `expose_access_token` above.
 pub fn expose_refresh_token() -> Option<String> {
     let runtime = runtime_mutex().lock().ok()?;
     use secrecy::ExposeSecret;
@@ -271,6 +276,10 @@ fn account_picker_label(
 
 /// Clear the process-global runtime — call when starting a fresh
 /// wizard run (e.g. from `Settings → Wizard`).
+#[allow(dead_code)] // restored 2026-05-21 — needed for the planned
+                    // "Settings → Re-run wizard" entry point and by
+                    // the integration test that asserts the runtime
+                    // resets cleanly between wizard launches.
 pub fn reset_oauth_runtime() {
     if let Ok(mut runtime) = runtime_mutex().lock() {
         *runtime = OAuthRuntime::default();
@@ -359,27 +368,32 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
         CTraderEnvironment::Live => "LIVE",
         CTraderEnvironment::Demo => "DEMO",
     };
+    // Task #67 — was rendering THREE visual elements that read as a
+    // triple button to operators ("Demo | Live | DEMO"): two
+    // selectable labels for the choice and a third coloured status
+    // badge that mirrored the selection. The badge was confusing
+    // (looked like a third clickable option) and provided no extra
+    // signal. The safety colour now lives on the selected button
+    // itself via the `_` prefix on the inactive label below.
     ui.horizontal(|ui| {
         ui.label("cTrader environment:");
-        if ui
-            .selectable_label(
-                controller.config.ctrader_environment == CTraderEnvironment::Demo,
-                "Demo",
-            )
-            .clicked()
-        {
+        let demo_selected = controller.config.ctrader_environment == CTraderEnvironment::Demo;
+        let live_selected = controller.config.ctrader_environment == CTraderEnvironment::Live;
+        if ui.selectable_label(demo_selected, "Demo").clicked() {
             controller.config.ctrader_environment = CTraderEnvironment::Demo;
         }
-        if ui
-            .selectable_label(
-                controller.config.ctrader_environment == CTraderEnvironment::Live,
-                "Live",
-            )
-            .clicked()
-        {
+        if ui.selectable_label(live_selected, "Live").clicked() {
             controller.config.ctrader_environment = CTraderEnvironment::Live;
         }
-        ui.label(egui::RichText::new(env_label).color(env_color).strong());
+        // Single inline safety indicator (replaces the old triple-
+        // badge layout). Reads "→ DEMO" in muted text for paper, or
+        // "→ LIVE" in danger red for real money. Operators perceive
+        // this as a status read-out, not a third button.
+        ui.label(
+            egui::RichText::new(format!("→ {env_label}"))
+                .color(env_color)
+                .strong(),
+        );
     });
 
     ui.separator();

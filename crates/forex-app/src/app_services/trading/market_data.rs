@@ -197,6 +197,19 @@ impl TradingSession {
         self.pending_ctrader_chart = Some(snapshot);
     }
 
+    /// Synchronous all-in-one chart fetcher. The production chart
+    /// path is the asynchronous `start_ctrader_chart_fetch` worker
+    /// in `session.rs` (Task #3 wired live spot into it). This sync
+    /// variant stays for the sake of operator workflows that want a
+    /// blocking refresh (e.g. CLI `--api-test` flows or the planned
+    /// "Refresh now" button on the Chart panel header).
+    ///
+    /// `#[allow(dead_code)]` 2026-05-21: no production caller today;
+    /// flow tests in `trading_tests.rs` exercise the inner helpers
+    /// (`load_ctrader_live_chart_update_cached`,
+    /// `build_ctrader_live_chart_update_request`) so the contract
+    /// stays locked even while the entry point sleeps.
+    #[allow(dead_code)]
     pub(super) fn load_ctrader_market_chart_snapshot(
         &mut self,
         symbol: &str,
@@ -334,6 +347,12 @@ impl TradingSession {
         }
     }
 
+    /// Cached live-spot fetch with a 1 s dedupe window so the chart
+    /// panel's per-frame render doesn't slam the streaming socket.
+    /// `#[allow(dead_code)]`: see the parent
+    /// `load_ctrader_market_chart_snapshot` doc — wired into the
+    /// orphan synchronous path, exercised by trading_tests.rs.
+    #[allow(dead_code)]
     pub(super) fn load_ctrader_live_chart_update_cached(
         &mut self,
         request: &CTraderLiveChartUpdateRequest,
@@ -412,6 +431,13 @@ impl TradingSession {
         })
     }
 
+    /// Build a `CTraderLiveChartUpdateRequest` from an already-built
+    /// chart-history request (re-uses credentials + access token +
+    /// environment + account). `#[allow(dead_code)]`: only the orphan
+    /// `load_ctrader_market_chart_snapshot` path calls this; the
+    /// wired chart-fetch worker in `session.rs` constructs the
+    /// request inline.
+    #[allow(dead_code)]
     pub(super) fn build_ctrader_live_chart_update_request(
         &self,
         history_request: &CTraderChartHistoryRequest,

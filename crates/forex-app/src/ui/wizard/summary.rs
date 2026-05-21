@@ -36,6 +36,14 @@
 //! F-CORE2-018). On failure the summary screen surfaces the specific
 //! action that failed and offers Retry / Skip-with-warning / Cancel
 //! per operator no-silent-fallback policy.
+//!
+//! Wizard Step 10 scaffolding allow: `WIZARD_DEFAULT_COMPLETED_FILENAME`,
+//! `WIZARD_SYMBOL_METADATA_FILENAME`, and `wizard_state_path` are the
+//! filename + path-derivation contract for the persisted-state JSONs
+//! listed in this docblock. The Apply writer uses inline literals in
+//! the current build; the consts are public so the `forex-cli` mirror
+//! and integration tests can pin against the same names.
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 
@@ -554,6 +562,28 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
     );
     ui.add_space(theme::SPACE_SM);
 
+    // Tasks #69 + #70 — render the toggles BEFORE the summary grid so a
+    // click reflects in the read-out within the same frame. Previously
+    // the checkbox sat below the grid and the grid rendered the value
+    // captured one frame earlier, which read as a mismatch ("opt-in"
+    // label vs unchecked box). Showing the autonomous-mode toggle here
+    // too lets the operator flip it without bouncing back to Step 10.
+    ui.horizontal(|ui| {
+        ui.checkbox(
+            &mut controller.config.autonomous_mode_enabled,
+            "Autonomous mode (auto-trade with kill switches)",
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(
+            &mut controller.config.telemetry_opt_in,
+            "Send anonymised crash reports (default off)",
+        );
+    });
+    ui.add_space(theme::SPACE_SM);
+    ui.separator();
+    ui.add_space(theme::SPACE_XS);
+
     egui::Grid::new("wizard_summary_grid")
         .num_columns(2)
         .spacing([24.0, 6.0])
@@ -702,11 +732,11 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
             ui.end_row();
         });
 
-    ui.separator();
-    ui.checkbox(
-        &mut controller.config.telemetry_opt_in,
-        "Send anonymised crash reports (default off).",
-    );
+    // Tasks #69 + #70 — telemetry + autonomous-mode toggles were moved
+    // ABOVE the grid (see top of `render`) so the read-out always
+    // reflects the post-click value within the same frame. The
+    // checkbox previously lived here and trailed the grid by one
+    // frame, which read as a mismatch on the screen.
 
     // Live-mode typed-signature gate.
     let live_gate_required = controller.config.trading_mode == TradingMode::Live;

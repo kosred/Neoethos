@@ -21,6 +21,24 @@ fn discovery_cache()
     DISCOVERY_CACHE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+/// Task #9 — per-source `DatasetDiscovery` cache for the
+/// `external_sources` list. Keyed by `PathBuf` so each source's
+/// preview is independent (an MT4 dump that has 12 CSVs and a
+/// Parquet archive that has 400 files don't have to be re-walked
+/// together every time the user adds a new source). A
+/// `HashMap<PathBuf, DatasetDiscovery>` keeps memory bounded —
+/// scan results are cheap (just file metadata + classification).
+static EXTERNAL_SOURCE_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, forex_data::DatasetDiscovery>>,
+> = std::sync::OnceLock::new();
+
+fn external_source_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<std::path::PathBuf, forex_data::DatasetDiscovery>,
+> {
+    EXTERNAL_SOURCE_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 pub fn render(
     ui: &mut egui::Ui,
     state: &mut AppState,
@@ -193,6 +211,67 @@ pub fn render(
                                             ui.end_row();
                                         }
                                     });
+
+                                // Task #74 — show ACTUAL skipped paths in a
+                                // collapsible section, grouped by reason
+                                // category, with a per-bucket sample cap so
+                                // a 1000-file dataset doesn't blow up the
+                                // panel. Operators previously saw only
+                                // "Skipped 229 (89 unknown_extension; 140
+                                // unsupported_timeframe)" without any way
+                                // to learn WHICH files were missed.
+                                if !report.skipped.is_empty() {
+                                    egui::CollapsingHeader::new(
+                                        format!(
+                                            "Why were {} files skipped?",
+                                            report.skipped.len()
+                                        ),
+                                    )
+                                    .id_salt("bootstrap_skipped_details")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        const SAMPLE_PER_BUCKET: usize = 15;
+                                        use std::collections::BTreeMap;
+                                        let mut buckets: BTreeMap<&'static str, Vec<&forex_data::SkippedFile>> = BTreeMap::new();
+                                        for entry in &report.skipped {
+                                            buckets
+                                                .entry(entry.reason.category())
+                                                .or_default()
+                                                .push(entry);
+                                        }
+                                        for (category, files) in buckets {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "▸ {} ({})",
+                                                    category,
+                                                    files.len()
+                                                ))
+                                                .strong(),
+                                            );
+                                            for skipped in files.iter().take(SAMPLE_PER_BUCKET) {
+                                                let detail = match &skipped.reason {
+                                                    forex_data::SkipReason::UnknownExtension(ext) => format!("ext={ext}"),
+                                                    forex_data::SkipReason::UnsupportedTimeframe(tf) => format!("tf={tf}"),
+                                                    forex_data::SkipReason::TooLarge(n) => format!("size={n}B"),
+                                                    forex_data::SkipReason::Unreadable(err) => format!("read err: {err}"),
+                                                };
+                                                ui.small(format!(
+                                                    "    {}    [{detail}]",
+                                                    skipped.path.display(),
+                                                ));
+                                            }
+                                            if files.len() > SAMPLE_PER_BUCKET {
+                                                ui.small(
+                                                    egui::RichText::new(format!(
+                                                        "    … and {} more in this bucket",
+                                                        files.len() - SAMPLE_PER_BUCKET
+                                                    ))
+                                                    .italics(),
+                                                );
+                                            }
+                                        }
+                                    });
+                                }
                             }
                         });
                     }
@@ -200,6 +279,126 @@ pub fn render(
             }
             ui.add_space(6.0);
 
+            // ── Task #9: additional source folders ────────────────
+            // Operator can list more than one source folder (e.g. an
+            // MT4 history dump + a Spotware Parquet archive). Each
+            // source gets its own format-auto-detected discovery
+            // preview so the operator can confirm before importing.
+            theme::section_frame(ui.style()).show(ui, |ui| {
+                ui.strong("Additional Source Folders");
+                ui.label(
+                    egui::RichText::new(
+                        "Add MT4 exports, Spotware Parquet dumps, CSV archives, etc. Each \
+                         folder is scanned independently — format is auto-detected per file.",
+                    )
+                    .small()
+                    .color(theme::TEXT_MUTED),
+                );
+                ui.add_space(4.0);
+                let mut to_remove: Option<usize> = None;
+                let mut to_rescan: Option<usize> = None;
+                for (idx, source) in state.bootstrap_form.external_sources.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{}.", idx + 1));
+                        ui.label(
+                            egui::RichText::new(source.display().to_string())
+                                .monospace()
+                                .small(),
+                        );
+                        if ui.small_button("⟳ Rescan").clicked() {
+                            to_rescan = Some(idx);
+                        }
+                        if ui.small_button("✕ Remove").clicked() {
+                            to_remove = Some(idx);
+                        }
+                    });
+                    // Per-source compact summary (auto-detected formats).
+                    if let Ok(cache) = external_source_cache().lock()
+                        && let Some(report) = cache.get(source)
+                    {
+                        let formats: Vec<String> = report
+                            .format_counts()
+                            .into_iter()
+                            .map(|(f, n)| format!("{}:{}", f.as_str(), n))
+                            .collect();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "    {} files · formats: {} · skipped: {}",
+                                report.entries.len(),
+                                if formats.is_empty() {
+                                    "(none detected)".to_string()
+                                } else {
+                                    formats.join(", ")
+                                },
+                                report.skipped.len(),
+                            ))
+                            .small()
+                            .color(theme::TEXT_MUTED),
+                        );
+                    }
+                }
+                if let Some(idx) = to_remove {
+                    let removed = state.bootstrap_form.external_sources.remove(idx);
+                    if let Ok(mut cache) = external_source_cache().lock() {
+                        cache.remove(&removed);
+                    }
+                }
+                if let Some(idx) = to_rescan
+                    && let Some(source) = state.bootstrap_form.external_sources.get(idx).cloned()
+                    && let Ok(report) = forex_data::DatasetDiscovery::scan(&source)
+                    && let Ok(mut cache) = external_source_cache().lock()
+                {
+                    cache.insert(source, report);
+                }
+                ui.add_space(2.0);
+                if ui.button("➕ Add source folder").clicked() {
+                    let start_dir = state
+                        .bootstrap_form
+                        .external_sources
+                        .last()
+                        .filter(|p| p.is_dir())
+                        .cloned()
+                        .or_else(|| {
+                            state
+                                .runtime
+                                .data_dir
+                                .parent()
+                                .map(std::path::Path::to_path_buf)
+                        })
+                        .unwrap_or_else(|| {
+                            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                        });
+                    if let Some(folder) = rfd::FileDialog::new()
+                        .set_title("Select additional source folder")
+                        .set_directory(&start_dir)
+                        .pick_folder()
+                    {
+                        // De-dupe: don't add the same path twice, and
+                        // don't add the primary data_dir as a source.
+                        if folder == state.runtime.data_dir
+                            || state.bootstrap_form.external_sources.contains(&folder)
+                        {
+                            tracing::info!(
+                                target: "forex_app::bootstrap::multi_source",
+                                path = %folder.display(),
+                                "operator picked an already-listed source; ignoring duplicate"
+                            );
+                        } else {
+                            // Eagerly scan so the preview shows when the
+                            // picker closes (same UX as the primary
+                            // data_dir Browse… button).
+                            if let Ok(report) = forex_data::DatasetDiscovery::scan(&folder)
+                                && let Ok(mut cache) = external_source_cache().lock()
+                            {
+                                cache.insert(folder.clone(), report);
+                            }
+                            state.bootstrap_form.external_sources.push(folder);
+                        }
+                    }
+                }
+            });
+
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label("Pairs");
                 ui.text_edit_singleline(&mut state.bootstrap_form.pairs_input);

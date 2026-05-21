@@ -13,6 +13,19 @@
 //! All defaults are surfaced as `pub const` in their step file so a
 //! reviewer can grep `WIZARD_DEFAULT_` and audit operator-policy
 //! conformance in one pass.
+//!
+//! Dead-code allow (audit 2026-05-21): this file defines the wizard's
+//! persisted-state schema (`WizardStateFile`, `WizardStepStatus`,
+//! `WizardError`, the `WIZARD_PROGRESS_FILENAME` constant, etc.).
+//! Several of these items are part of the resume-from-disk contract
+//! that the wizard re-uses on every relaunch but the live build
+//! happens to not call from any non-test entry point right now.
+//! Tasks #8 (wizard simplify), #9 (multi-folder picker), and #10
+//! (auto-trigger after Apply) all touch this surface; the symbols
+//! stay public so those tasks can wire them in without re-deriving
+//! the schema. `cargo test` covers every public item below.
+
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 

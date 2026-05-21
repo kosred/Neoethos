@@ -408,6 +408,10 @@ fn cancelled_snapshot_from(mut snapshot: JobSnapshot, message: impl Into<String>
 /// alongside the `forex-search` portfolio-fusion work.
 ///
 /// Audit gap #1 part 2 / roadmap §2 multi-symbol training entry point.
+#[allow(dead_code)] // mirrors `MultiSymbolDiscoveryRequest` —
+                    // scaffolding for the "All Majors" preset that
+                    // fans out N single-symbol jobs. Tests below
+                    // exercise validate/lower.
 #[derive(Debug, Clone)]
 pub struct MultiSymbolTrainingRequest {
     pub config_path: String,
@@ -416,6 +420,7 @@ pub struct MultiSymbolTrainingRequest {
     pub base_tf: String,
 }
 
+#[allow(dead_code)] // see struct allow above
 impl MultiSymbolTrainingRequest {
     pub fn validate(&self) -> Result<()> {
         if self.symbols.is_empty() {
@@ -461,6 +466,7 @@ impl MultiSymbolTrainingRequest {
 /// Start one training job per symbol. Returns a `Vec` of handles in
 /// symbol-order. Per-symbol startup errors return a `failed_snapshot`
 /// in the corresponding slot — the batch never aborts halfway.
+#[allow(dead_code)] // entry point for MultiSymbolTrainingRequest above
 pub fn start_multi_symbol_training_job(
     request: MultiSymbolTrainingRequest,
     tx: mpsc::Sender<ServiceEvent>,

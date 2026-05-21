@@ -69,7 +69,7 @@ fn render_one_step(
         CTraderStepStatus::Failed => (theme::DANGER, theme::DANGER),
         CTraderStepStatus::Skipped => (theme::TEXT_FAINT, theme::TEXT_FAINT),
     };
-    egui::Frame::none()
+    egui::Frame::new()
         .inner_margin(egui::Margin::symmetric(theme::SPACE_SM as i8, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {

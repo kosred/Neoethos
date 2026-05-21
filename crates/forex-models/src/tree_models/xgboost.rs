@@ -1,3 +1,12 @@
+// Tree-models XGBoost expert — Phase B5. Scaffolding allow because
+// the runtime-artifact validator (`XGBoostRuntimeArtifact::validate_runtime_artifact`)
+// and the file-name constant `XGBOOST_RUNTIME_FILE_NAME` are part of
+// the disk-layout contract that the ensemble loader pins on,
+// referenced via re-exports from `crate::tree_models::common` rather
+// than the methods directly. Tests below cover the on-disk round
+// trip end-to-end.
+#![allow(dead_code, unused_imports)]
+
 use super::common::{
     TreeLocalFallbackArtifact, XGBOOST_MODEL_FILE_NAME, build_tree_local_fallback_artifact,
     build_tree_runtime_predictions, calibrate_three_class_probabilities,

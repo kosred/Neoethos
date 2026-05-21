@@ -39,6 +39,12 @@ pub enum CTraderStepStatus {
     Skipped,
 }
 
+/// State-machine helpers — `label` is `dead_code` in the release
+/// build because the UI uses `glyph()` instead, but it's part of the
+/// documented contract for the `CTraderStepStatus` enum (used by the
+/// 14-step view's hover-tooltip path when wired). Tests below assert
+/// it returns the expected human-readable label.
+#[allow(dead_code)]
 impl CTraderStepStatus {
     pub fn label(self) -> &'static str {
         match self {
@@ -72,6 +78,14 @@ impl Default for CTraderStateMachine {
     }
 }
 
+/// The `mark_*` mutation API is not called from production (audit
+/// 2026-05-20: the state machine is DERIVED from session signals in
+/// `TradingSession::derive_ctrader_state_machine`, not mutated).
+/// They stay on the public surface because (a) tests below exercise
+/// the mutation contract and (b) when a future flow needs explicit
+/// progress reporting (e.g. wizard "connect now" walkthrough), the
+/// mutation surface is already designed and tested.
+#[allow(dead_code)]
 impl CTraderStateMachine {
     pub fn new() -> Self {
         let canonical = [
@@ -169,6 +183,9 @@ impl CTraderStateMachine {
     }
 }
 
+#[allow(dead_code)] // used only by the `mark_*` mutation methods,
+                    // which are themselves dead in the release build
+                    // (see the impl above).
 fn now_iso8601() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()

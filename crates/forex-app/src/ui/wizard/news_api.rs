@@ -10,6 +10,13 @@
 //!
 //! Optional `secrecy::SecretString` API key — stored in-memory until
 //! Step 10 Apply.
+//!
+//! Wizard Step 8 scaffolding allow: `WIZARD_DEFAULT_MAINTENANCE_*_HOUR_ET`
+//! consts and the `NewsApiKeyHolder` wrapper are part of the public
+//! contract but the wizard renderer uses inline literals + a raw
+//! `SecretString` field today. Task #8 (wizard simplify) consolidates
+//! these into the news_api step.
+#![allow(dead_code)]
 
 use eframe::egui;
 use secrecy::{ExposeSecret, SecretString};

@@ -94,6 +94,76 @@ pub fn render(
             }
         }
 
+        // Task #10 — Discovery → Training hand-off. Reads the
+        // `model_targets.json` written by `start_discovery_job` for
+        // the currently-selected (symbol, base_tf) and previews the
+        // discovered portfolio so the operator can see what they're
+        // about to train against. Clicking starts training with the
+        // pair the discovery job locked in (which may differ from
+        // the chrome's currently-selected pair if the operator has
+        // since navigated away).
+        if !running {
+            let targets_path = crate::app_services::discovery::model_targets_path_for(
+                &state.runtime.data_dir,
+                &state.selected_pair,
+                &state.chart_timeframe,
+            );
+            let targets_exists = targets_path.exists();
+            ui.add_enabled_ui(targets_exists, |ui| {
+                let label = if targets_exists {
+                    "📋 Load discovered targets"
+                } else {
+                    "📋 No discovered targets yet"
+                };
+                if ui
+                    .button(label)
+                    .on_hover_text(if targets_exists {
+                        "Read model_targets.json from the latest discovery run for this symbol/timeframe, and start a training job against the discovered portfolio."
+                    } else {
+                        "Run Discovery for this symbol/timeframe first — it writes model_targets.json on success."
+                    })
+                    .clicked()
+                {
+                    match load_model_targets(&targets_path) {
+                        Ok(file) => {
+                            // Sync chrome state to whatever Discovery
+                            // actually targeted (defensive against
+                            // operator nav since the discovery run).
+                            state.selected_pair = file.symbol.clone();
+                            state.chart_timeframe = file.base_tf.clone();
+                            let req = TrainingRequest {
+                                config_path: state.runtime.config_path.clone(),
+                                models_dir: PathBuf::from("models"),
+                                symbol: file.symbol,
+                                base_tf: file.base_tf,
+                            };
+                            tracing::info!(
+                                target: "forex_app::training::auto_trigger",
+                                portfolio_size = file.portfolio.len(),
+                                discovered_at = %file.discovered_at_utc,
+                                "training auto-triggered from model_targets.json"
+                            );
+                            match start_training_job(req, tx.clone()) {
+                                Ok(job_handle) => {
+                                    state.training_job = Some(job_handle.snapshot.clone());
+                                    *handle = Some(job_handle);
+                                }
+                                Err(err) => {
+                                    state.training_job = Some(failed_snapshot(err));
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            state.training_job = Some(failed_snapshot(anyhow::anyhow!(
+                                "model_targets.json at {} is malformed: {err}",
+                                targets_path.display()
+                            )));
+                        }
+                    }
+                }
+            });
+        }
+
         if running
             && ui.button("Stop Training").clicked()
             && let Some(handle) = handle.as_ref()
@@ -111,6 +181,24 @@ pub fn render(
             )));
         }
     });
+}
+
+/// Read `<data_root>/discovery_targets/<symbol>_<base_tf>_model_targets.json`
+/// and assert on the schema version. Task #10 hand-off from Discovery.
+fn load_model_targets(
+    path: &std::path::Path,
+) -> anyhow::Result<crate::app_services::discovery::ModelTargetsFile> {
+    let bytes = std::fs::read(path)?;
+    let file: crate::app_services::discovery::ModelTargetsFile =
+        serde_json::from_slice(&bytes)?;
+    if file.schema_version != crate::app_services::discovery::MODEL_TARGETS_SCHEMA_VERSION {
+        anyhow::bail!(
+            "model_targets.json schema_version mismatch: file={}, expected={}",
+            file.schema_version,
+            crate::app_services::discovery::MODEL_TARGETS_SCHEMA_VERSION
+        );
+    }
+    Ok(file)
 }
 
 fn render_training_dashboard(ui: &mut egui::Ui, snapshot: &JobSnapshot) {

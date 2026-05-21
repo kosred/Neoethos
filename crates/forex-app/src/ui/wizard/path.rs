@@ -10,6 +10,12 @@
 //!
 //! On entry the wizard also runs `migration::detect_portable_install`
 //! to surface the legacy `~/.forex-ai/` layout (spec §6).
+//!
+//! Wizard Step 2 scaffolding allow: the disk-free amber/red thresholds
+//! are part of the wizard's policy surface but not read from this Rust
+//! crate today (the Apply path checks free space without using the
+//! consts). Kept public for the `forex-cli` mirror and the spec.
+#![allow(dead_code)]
 
 use eframe::egui;
 use std::path::PathBuf;

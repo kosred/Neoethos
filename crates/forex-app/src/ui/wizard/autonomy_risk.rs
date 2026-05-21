@@ -15,6 +15,28 @@ use eframe::egui;
 use super::{RiskAcknowledgement, StepResult, TradingMode, WizardController};
 use crate::ui::theme;
 
+// Task #68 — in-memory quiz answer state. Lives in a process-global
+// `OnceLock<Mutex<QuizAnswers>>` so it survives egui's per-frame
+// re-render without being persisted to `wizard_state.json` (we
+// only persist the final SHA-256 hash + correct count via
+// `RiskAcknowledgement`, not the raw picks). Mirrors the same
+// pattern used by `ui/wizard/oauth.rs::runtime_mutex`.
+fn quiz_answers_mutex() -> &'static std::sync::Mutex<QuizAnswers> {
+    use std::sync::OnceLock;
+    static SLOT: OnceLock<std::sync::Mutex<QuizAnswers>> = OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(QuizAnswers::new()))
+}
+
+/// Read-only access to the live quiz state. Used by the renderer
+/// below; exposed at module scope so a future integration test
+/// can probe progress without having to re-render the panel.
+fn with_quiz_answers<R>(f: impl FnOnce(&mut QuizAnswers) -> R) -> R {
+    let mut guard = quiz_answers_mutex()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    f(&mut guard)
+}
+
 /// Default for the Autonomous Mode toggle. Competitive analysis §9.2
 /// — "off by default".
 pub const WIZARD_DEFAULT_AUTONOMOUS_MODE_ENABLED: bool = false;
@@ -29,6 +51,9 @@ pub const WIZARD_DEFAULT_EQUITY_STOP_CEILING_PCT: f32 = 95.0;
 /// Quiz version — bumped if the question set changes. Competitive
 /// analysis §11.8 reserves the right to operator-counsel-review the
 /// question content.
+// Task #68 (completed 2026-05-21): the 5-question risk quiz is now
+// rendered in `render()` below. Removed the dead-code allow attrs
+// that gated the scaffolding.
 pub const WIZARD_DEFAULT_QUIZ_VERSION: u32 = 1;
 
 /// Required correct count to proceed. Competitive analysis §9.2 —
@@ -239,19 +264,48 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
             .strong()
             .color(theme::DANGER),
     );
+
+    // Task #71 — surface the ruin-probability ceiling at the TOP of the
+    // panel in a visually distinct callout. Previously it was a single
+    // sentence buried in a 13-line paragraph and operators reported
+    // missing it entirely. The callout is the first non-title visual
+    // element so the eye can't slide past it.
+    egui::Frame::new()
+        .fill(theme::DANGER.linear_multiply(0.12))
+        .stroke(egui::Stroke::new(1.5, theme::DANGER))
+        .corner_radius(egui::CornerRadius::same(theme::RADIUS_SM))
+        .inner_margin(egui::Margin::same(theme::SPACE_SM as i8))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "⚠  UP TO {:.0}% PROBABILITY THE STARTING BANKROLL IS LOST",
+                    forex_core::MAX_ACCEPTABLE_INITIAL_RUIN_PROBABILITY * 100.0
+                ))
+                .strong()
+                .size(theme::FONT_BODY + 1.0)
+                .color(theme::DANGER),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Risky Mode trades 30–50% of bankroll per position from a \
+                     small starting bankroll ($20 default) toward a large \
+                     target ($50,000). Initial-stage ruin probability is up to \
+                     99% per directive §7.1. Acknowledging below means you \
+                     explicitly accept that the starting bankroll will most \
+                     likely be lost.",
+                )
+                .color(theme::TEXT_PRIMARY)
+                .size(theme::FONT_CAPTION),
+            );
+        });
+    ui.add_space(theme::SPACE_XS);
+
     ui.label(
         egui::RichText::new(
-            "Autonomous compounding from a small starting bankroll \
-             ($20 default) toward a large target ($50,000 default). \
-             The bot — not the operator — places every trade once armed; \
-             manual BUY/SELL is rejected at the gate. Per-trade risk is \
-             30–50 % of the current bankroll (default 40 %); the bot \
-             may scalp many times per day, targeting net profit after \
-             commission, spread and swap rather than a fixed daily pip \
-             count. Per-stage kill switches enforce daily / weekly DD \
-             caps. Initial-stage ruin probability is up to 99 % per \
-             operator directive §7.1 — the operator explicitly accepts \
-             that the starting bankroll will most likely be lost.",
+            "Mechanics: bot places every trade once armed; manual BUY/SELL is \
+             rejected at the gate. Scalps many times per day, targeting net \
+             profit after commission, spread, swap. Per-stage kill switches \
+             enforce daily / weekly DD caps.",
         )
         .color(theme::TEXT_MUTED)
         .size(theme::FONT_CAPTION),
@@ -312,11 +366,157 @@ pub fn render(ui: &mut egui::Ui, controller: &mut WizardController) -> StepResul
         );
     }
 
+    // Task #68 — 5-question risk acknowledgement quiz (spec §9.2).
+    // The wizard refuses to arm Risky Mode unless the operator has
+    // answered all 5 questions correctly. Question content lives in
+    // `WIZARD_DEFAULT_QUIZ_QUESTIONS`; answer state is held in a
+    // process-global mutex so partial picks survive re-renders.
+    ui.add_space(theme::SPACE_SM);
+    ui.separator();
+    ui.add_space(theme::SPACE_XS);
+    ui.label(
+        egui::RichText::new("Risk understanding quiz (5/5 required to arm Risky Mode)")
+            .strong()
+            .size(theme::FONT_BODY)
+            .color(theme::TEXT_PRIMARY),
+    );
+    ui.label(
+        egui::RichText::new(
+            "Pick the correct answer for each question. The wizard records a SHA-256 \
+             hash of your answers + a timestamp so the operator-consent step is \
+             auditable. The quiz is not pass/fail-and-done — every wizard rerun \
+             re-prompts.",
+        )
+        .color(theme::TEXT_MUTED)
+        .size(theme::FONT_CAPTION),
+    );
+    ui.add_space(theme::SPACE_XS);
+
+    // Render each of the 5 questions. Picks are tracked in the
+    // process-global QuizAnswers store; this closure mutates it
+    // in place. We compute correct_count + all_answered AFTER the
+    // closure to drive the Submit button state below.
+    let (correct_count, all_answered) = with_quiz_answers(|answers| {
+        // Defensive: if the quiz schema grew between launches, resize
+        // the picks vector so it lines up with the question slice.
+        if answers.picks.len() != WIZARD_DEFAULT_QUIZ_QUESTIONS.len() {
+            answers.picks = vec![None; WIZARD_DEFAULT_QUIZ_QUESTIONS.len()];
+        }
+        for (q_idx, question) in WIZARD_DEFAULT_QUIZ_QUESTIONS.iter().enumerate() {
+            ui.label(
+                egui::RichText::new(format!("Q{}. {}", q_idx + 1, question.prompt))
+                    .strong()
+                    .size(theme::FONT_CAPTION),
+            );
+            for (opt_idx, option) in question.options.iter().enumerate() {
+                let selected = answers.picks[q_idx] == Some(opt_idx);
+                // egui::RadioButton: clicking changes the pick;
+                // selecting the same option twice is a no-op.
+                if ui
+                    .radio(selected, *option)
+                    .on_hover_text(format!("Question {} — option {}", q_idx + 1, opt_idx + 1))
+                    .clicked()
+                {
+                    answers.picks[q_idx] = Some(opt_idx);
+                }
+            }
+            ui.add_space(2.0);
+        }
+        (answers.correct_count(), answers.all_answered())
+    });
+
+    let total = WIZARD_DEFAULT_QUIZ_QUESTIONS.len() as u8;
+    let progress_color = if correct_count == total {
+        theme::SUCCESS
+    } else if !all_answered {
+        theme::TEXT_MUTED
+    } else {
+        theme::WARNING
+    };
+    ui.label(
+        egui::RichText::new(format!(
+            "Progress: {}/{} correct{}",
+            correct_count,
+            total,
+            if all_answered { "" } else { " (some questions unanswered)" },
+        ))
+        .color(progress_color)
+        .size(theme::FONT_CAPTION),
+    );
+
+    let quiz_passed = correct_count == total;
+    let already_submitted = controller.config.risk_acknowledgement.is_some();
+    ui.horizontal(|ui| {
+        let submit_label = if already_submitted {
+            "Re-submit acknowledgement"
+        } else {
+            "Submit risk acknowledgement"
+        };
+        ui.add_enabled_ui(quiz_passed, |ui| {
+            if ui
+                .button(submit_label)
+                .on_hover_text(if quiz_passed {
+                    "Hashes your answers, records the timestamp, unlocks the arm toggle below."
+                } else {
+                    "All 5 questions must be answered correctly first."
+                })
+                .clicked()
+            {
+                // Compose the answer strings in the canonical order
+                // expected by `compute_quiz_answer_hash` (one entry
+                // per question, the chosen option text — NOT the
+                // option index — so a renumbering of options doesn't
+                // invalidate a freshly-passed quiz).
+                let picks: Vec<&str> = with_quiz_answers(|a| {
+                    a.picks
+                        .iter()
+                        .zip(WIZARD_DEFAULT_QUIZ_QUESTIONS.iter())
+                        .map(|(p, q)| p.and_then(|i| q.options.get(i).copied()).unwrap_or(""))
+                        .collect()
+                });
+                let now = chrono::Utc::now().to_rfc3339();
+                // `record_acknowledgement` builds the `RiskAcknowledgement`
+                // record (SHA-256 hash + timestamp + correct_count +
+                // quiz_version) from the live `QuizAnswers`.
+                let ack = with_quiz_answers(|a| record_acknowledgement(a, now.clone()));
+                let _ = picks; // kept for future extension (per-question audit log)
+                controller.config.risk_acknowledgement = Some(ack);
+                tracing::info!(
+                    target: "forex_app::wizard::risk_quiz",
+                    quiz_version = WIZARD_DEFAULT_QUIZ_VERSION,
+                    correct = correct_count,
+                    "risk acknowledgement submitted"
+                );
+            }
+        });
+        if already_submitted {
+            ui.label(
+                egui::RichText::new("✓ Recorded")
+                    .color(theme::SUCCESS)
+                    .size(theme::FONT_CAPTION),
+            );
+        }
+    });
+    if let Some(ack) = controller.config.risk_acknowledgement.as_ref() {
+        ui.label(
+            egui::RichText::new(format!(
+                "  ↳ Hash {}… · {} · quiz v{}",
+                &ack.answers_sha256[..ack.answers_sha256.len().min(12)],
+                ack.timestamp_utc,
+                ack.quiz_version,
+            ))
+            .color(theme::TEXT_FAINT)
+            .size(theme::FONT_CAPTION),
+        );
+    }
+    ui.add_space(theme::SPACE_SM);
+
     // Arm toggle — disabled until acknowledgement is recorded.
     let can_arm = controller
         .config
         .risky_mode_ruin_ceiling_acknowledged
-        .is_some();
+        .is_some()
+        && controller.config.risk_acknowledgement.is_some();
     ui.add_enabled_ui(can_arm, |ui| {
         ui.checkbox(
             &mut controller.config.risky_mode_armed,

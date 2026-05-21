@@ -415,6 +415,21 @@ impl ForexApp {
                         self.trading_session
                             .start_runtime_refresh_in_background(self.tx.clone());
                     }
+                    // Task #7 — drain any signals the live-inference
+                    // producer has emitted since the last heartbeat
+                    // and push them through the dispatcher gate chain.
+                    // Cheap when the producer is not running (returns
+                    // 0 immediately); when running, every emitted
+                    // AutoTradeSignal becomes a dispatch attempt.
+                    let dispatched =
+                        self.trading_session.drain_auto_trade_signals(&mut self.state);
+                    if dispatched > 0 {
+                        tracing::debug!(
+                            target: "forex_app::auto_trade",
+                            dispatched,
+                            "drained AutoTradeSignal batch on heartbeat tick"
+                        );
+                    }
                 }
                 ServiceEvent::CTraderConnectUpdated(runtime) => {
                     self.trading_session
@@ -502,6 +517,11 @@ impl Drop for ForexApp {
         if let Some(handle) = &self.training_handle {
             handle.cancel.request();
         }
+        // Task #7 — tear down the auto-trade producer if it was running
+        // so its inference thread observes the cancel flag and joins
+        // cleanly. Best-effort: the operator may have already toggled
+        // AUTO OFF, in which case this is a no-op.
+        let _ = self.trading_session.stop_auto_trade_producer();
         // Note — best-effort persist of the workspace
         // state (last active tab). Best-effort because Drop can't
         // surface errors; the helper logs on atomic-rename failure.
@@ -560,8 +580,8 @@ impl eframe::App for ForexApp {
                 )
             })
             .unwrap_or(false);
-        let discovery_dot = engine_dot_color(self.state.discovery_job.as_ref());
-        let training_dot = engine_dot_color(self.state.training_job.as_ref());
+        let _discovery_dot = engine_dot_color(self.state.discovery_job.as_ref());
+        let _training_dot = engine_dot_color(self.state.training_job.as_ref());
         let discovery_label = engine_short_label(self.state.discovery_job.as_ref());
         let training_label = engine_short_label(self.state.training_job.as_ref());
 
@@ -718,7 +738,60 @@ impl eframe::App for ForexApp {
                             .on_hover_text("Toggle automatic trade execution")
                             .clicked()
                         {
-                            self.state.auto_trade_enabled = !self.state.auto_trade_enabled;
+                            // Task #7 — AUTO ON/OFF is no longer cosmetic.
+                            // On flip-to-ON we attempt to spawn the live
+                            // inference producer end-to-end (ensemble load
+                            // from disk + bar-source against the cTrader
+                            // streaming backend + producer thread).
+                            // Failure does NOT flip the flag — the operator
+                            // sees the reason in the status strip and the
+                            // toggle stays OFF, which honestly reflects
+                            // that the AI is not actually running.
+                            if self.state.auto_trade_enabled {
+                                // Currently ON → tear down.
+                                let outcome = self.trading_session.stop_auto_trade_producer();
+                                self.state.auto_trade_enabled = false;
+                                self.state.status_msg = match outcome {
+                                    Some(o) => format!("AUTO OFF · producer exited: {o:?}"),
+                                    None => "AUTO OFF".to_string(),
+                                };
+                                tracing::info!(
+                                    target: "forex_app::auto_trade",
+                                    "AUTO toggled OFF by operator click"
+                                );
+                            } else {
+                                // Currently OFF → attempt to spawn.
+                                match self
+                                    .trading_session
+                                    .start_auto_trade_for_state(&self.state)
+                                {
+                                    Ok(summary) => {
+                                        self.state.auto_trade_enabled = true;
+                                        self.state.status_msg = format!(
+                                            "AUTO ON · {} experts loaded ({} missing, {} degraded)",
+                                            summary.loaded_names.len(),
+                                            summary.missing.len(),
+                                            summary.degraded_names.len(),
+                                        );
+                                        tracing::info!(
+                                            target: "forex_app::auto_trade",
+                                            loaded = summary.loaded_names.len(),
+                                            missing = summary.missing.len(),
+                                            degraded = summary.degraded_names.len(),
+                                            "AUTO toggled ON — live inference producer spawned"
+                                        );
+                                    }
+                                    Err(err) => {
+                                        // Honest failure — flag stays OFF.
+                                        self.state.status_msg = format!("AUTO ON failed: {err}");
+                                        tracing::warn!(
+                                            target: "forex_app::auto_trade",
+                                            error = %err,
+                                            "AUTO ON click failed — flag NOT set; prerequisite missing"
+                                        );
+                                    }
+                                }
+                            }
                         }
 
                         ui.add_space(ui::theme::SPACE_SM);
@@ -959,6 +1032,12 @@ impl eframe::App for ForexApp {
 
 /// Render one cell of the bottom action bar — status dot + name +
 /// substate label + a single Start/Stop (or Connect/Disconnect) button.
+///
+/// `#[allow(dead_code)]` 2026-05-21: the bottom-bar engine-control row
+/// is currently hidden behind the sidebar-tabs design, but the helper
+/// stays in the codebase because the planned compact-mode workspace
+/// reintroduces it.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn render_engine_control(
     ui: &mut egui::Ui,
@@ -1058,6 +1137,25 @@ fn format_utc_clock() -> String {
 
 fn compact_status_text(status: &str) -> String {
     const MAX_CHARS: usize = 30;
+    // DIAGNOSTIC (Task #80): log the full status_msg whenever it changes,
+    // because the top-bar banner truncates at 30 chars and obscures the
+    // actual failure cause. Dedupe on the full string so we log each
+    // distinct status_msg exactly once per process lifetime.
+    static SEEN_STATUSES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<String>>,
+    > = std::sync::OnceLock::new();
+    let set_lock = SEEN_STATUSES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    if let Ok(mut set) = set_lock.lock()
+        && set.insert(status.to_string())
+    {
+        tracing::info!(
+            target: "forex_app::status_msg",
+            chars = status.chars().count(),
+            full = %status,
+            "status_msg observed (first time this value rendered)"
+        );
+    }
     if status.chars().count() <= MAX_CHARS {
         return status.to_string();
     }

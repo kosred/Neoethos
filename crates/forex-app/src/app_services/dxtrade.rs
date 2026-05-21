@@ -63,6 +63,21 @@
 //! Each subphase ships as its own focused commit with full tests
 //! against a captured-fixture transport, mirroring the cTrader
 //! adapter's pattern.
+//!
+//! WARNING-SUPPRESSION RATIONALE (audit 2026-05-21): the
+//! `#![allow(dead_code)]` below is intentional and TIME-BOUND. The
+//! audit on 2026-05-20 found zero callers outside this file (only
+//! the embedded tests reach these symbols). The operator directive
+//! is explicit: DXtrade is planned to become a fully-wired second
+//! adapter. The allow is here so the legitimate scaffold — public
+//! traits, structs, backend factory, ~80 fully-tested helpers — does
+//! not generate noise warnings every build while the wiring effort
+//! is queued. **Remove this attribute the moment a UI surface or
+//! `TradingSession` dispatch path starts calling
+//! `DxTradeBackend::production()`** — at that point the compiler
+//! will tell us which leaves are still genuinely unreachable.
+
+#![allow(dead_code)]
 
 use std::sync::Arc;
 use std::time::Duration as StdDuration;

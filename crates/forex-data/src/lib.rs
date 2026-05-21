@@ -103,9 +103,65 @@ fn warned_once_for(symbol: &str, tf: &str) -> bool {
     !set.insert((symbol.to_string(), tf.to_string()))
 }
 
+/// Cache TTL for `discover_timeframes`. Task #79 — the function was being
+/// called once per render frame (60 Hz) from `market_chart_snapshot`, which
+/// translated into 60 `read_dir` syscalls/sec per active symbol panel. Two
+/// seconds is short enough that a new bootstrap shows up almost immediately
+/// in the timeframe dropdown but long enough to fully eliminate the per-
+/// frame syscall load (60 calls → ~0.5/sec).
+const DISCOVER_TIMEFRAMES_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[derive(Clone)]
+struct DiscoverTimeframesCacheEntry {
+    value: Vec<String>,
+    captured_at: std::time::Instant,
+}
+
+static DISCOVER_TIMEFRAMES_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<(PathBuf, String), DiscoverTimeframesCacheEntry>,
+    >,
+> = std::sync::OnceLock::new();
+
+fn discover_timeframes_cache_get(root: &Path, symbol: &str) -> Option<Vec<String>> {
+    let lock = DISCOVER_TIMEFRAMES_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let guard = lock.lock().ok()?;
+    let entry = guard.get(&(root.to_path_buf(), symbol.to_string()))?;
+    if entry.captured_at.elapsed() < DISCOVER_TIMEFRAMES_CACHE_TTL {
+        Some(entry.value.clone())
+    } else {
+        None
+    }
+}
+
+fn discover_timeframes_cache_put(root: &Path, symbol: &str, value: Vec<String>) {
+    let lock = DISCOVER_TIMEFRAMES_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(mut guard) = lock.lock() {
+        guard.insert(
+            (root.to_path_buf(), symbol.to_string()),
+            DiscoverTimeframesCacheEntry {
+                value,
+                captured_at: std::time::Instant::now(),
+            },
+        );
+    }
+}
+
 pub fn discover_timeframes(root: impl AsRef<Path>, symbol: &str) -> Result<Vec<String>> {
-    let path = PathBuf::from(root.as_ref()).join(format!("symbol={}", symbol));
+    let root_path = root.as_ref();
+    // Task #79 — 60 Hz filesystem read elimination. The chart panel's
+    // `market_chart_snapshot` calls us on every render frame; cache the
+    // result for `DISCOVER_TIMEFRAMES_CACHE_TTL` so we don't hammer the
+    // disk. The cache is keyed on (root, symbol) so different symbols /
+    // different data dirs don't clobber each other.
+    if let Some(cached) = discover_timeframes_cache_get(root_path, symbol) {
+        return Ok(cached);
+    }
+    let path = PathBuf::from(root_path).join(format!("symbol={}", symbol));
     if !path.exists() {
+        discover_timeframes_cache_put(root_path, symbol, Vec::new());
         return Ok(Vec::new());
     }
     let mut tfs = HashSet::new();
@@ -143,6 +199,7 @@ pub fn discover_timeframes(root: impl AsRef<Path>, symbol: &str) -> Result<Vec<S
     }
     let mut out: Vec<String> = tfs.into_iter().collect();
     out.sort_by_key(|tf| parse_timeframe_to_minutes(tf).unwrap_or(999999));
+    discover_timeframes_cache_put(root_path, symbol, out.clone());
     Ok(out)
 }
 

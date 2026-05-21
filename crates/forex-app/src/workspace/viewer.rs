@@ -139,6 +139,13 @@ pub fn render_workspace(
     viewer: &mut WorkspaceViewer<'_>,
 ) {
     let style = trading_dock_style(ui.style().as_ref());
+    // egui_dock 0.16 deprecation: `show_window_close_buttons` /
+    // `show_window_collapse_buttons` are scheduled to be renamed in
+    // egui_dock 0.17; the suggested replacements
+    // (`show_leaf_close_buttons` / `show_leaf_collapse_buttons`)
+    // don't exist in 0.16 yet. Keep the deprecated builder methods
+    // until Task #65 (workspace dep upgrade) lands.
+    #[allow(deprecated)]
     DockArea::new(workspace.dock_state_mut())
         .style(style)
         .show_add_buttons(false)
@@ -168,7 +175,12 @@ fn trading_dock_style(style: &egui::Style) -> Style {
     dock_style.tab_bar.height = 22.0;
     dock_style.tab_bar.corner_radius = egui::CornerRadius::ZERO;
     dock_style.tab_bar.hline_color = ui::theme::BORDER;
-    dock_style.tab_bar.show_scroll_bar_on_overflow = false;
+    // Task #76 — was `false`, so when the System group docked 6+ tabs
+    // into the bottom-right pane the labels got truncated to single
+    // glyphs and operators couldn't tell which tab they were on. Flip
+    // to `true` so overflowing tab strips become horizontally
+    // scrollable instead of squashed.
+    dock_style.tab_bar.show_scroll_bar_on_overflow = true;
 
     dock_style.tab.minimum_width = Some(60.0);
     dock_style.tab.tab_body.bg_fill = ui::theme::PANEL_BG;

@@ -80,6 +80,156 @@ impl TradingSession {
         self.adapter_readiness().can_attempt_connect
     }
 
+    /// Derive the 14-step cTrader connection state machine from the
+    /// session's observable state. Task #(state-machine-wire) — the
+    /// audit found that `CTraderStateMachine` was instantiated nowhere
+    /// and the BrokerSetup view always rendered 14 "pending" rows
+    /// regardless of what the connect path had already accomplished.
+    ///
+    /// Rather than thread `mark_in_flight`/`mark_ok`/`mark_failed`
+    /// calls through every layer (auth, account discovery, streaming,
+    /// chart fetch), we DERIVE each step's status from existing state
+    /// that the same layers already mutate. This keeps the wiring
+    /// surface tiny (one read-only method) and means the view stays
+    /// fresh on every render without any explicit "tell the state
+    /// machine I made progress" calls.
+    pub fn derive_ctrader_state_machine(
+        &self,
+    ) -> crate::app_services::ctrader_state_machine::CTraderStateMachine {
+        use crate::app_services::ctrader_auth::CTraderAuthState;
+        use crate::app_services::ctrader_state_machine::{
+            CTraderStateMachine, CTraderStepStatus,
+        };
+        let mut sm = CTraderStateMachine::new();
+        // Quick helper to set a step's status + message inline.
+        let mark = |sm: &mut CTraderStateMachine,
+                    index: u8,
+                    status: CTraderStepStatus,
+                    msg: Option<String>| {
+            if let Some(step) = sm.steps.iter_mut().find(|s| s.index == index) {
+                step.status = status;
+                step.message = msg;
+            }
+        };
+
+        let auth_state = self
+            .ctrader_auth
+            .as_ref()
+            .map(|a| a.snapshot().state)
+            .unwrap_or(CTraderAuthState::NotConfigured);
+
+        // 1. token present — auth snapshot says a token bundle is
+        //    persisted (RestoredFromStorage or beyond).
+        let token_present = matches!(
+            auth_state,
+            CTraderAuthState::RestoredFromStorage | CTraderAuthState::AccountsAvailable
+        );
+        if token_present {
+            mark(&mut sm, 1, CTraderStepStatus::Ok, Some("token bundle restored".into()));
+        }
+        // 2. token refreshed if needed — best-effort: mark ok when we
+        //    have a token; the refresh path is automatic inside the
+        //    chart/streaming fetchers.
+        if token_present {
+            mark(&mut sm, 2, CTraderStepStatus::Ok, None);
+        }
+        // 3. socket connected — `self.connected` reflects the connect
+        //    worker's success.
+        if self.connected {
+            mark(&mut sm, 3, CTraderStepStatus::Ok, Some("WebSocket established".into()));
+        }
+        // 4. ApplicationAuth sent + 5. ApplicationAuthRes received —
+        //    grouped under the same "connected" signal because the
+        //    streaming/connect path fails earlier if either fails.
+        if self.connected {
+            mark(&mut sm, 4, CTraderStepStatus::Ok, None);
+            mark(&mut sm, 5, CTraderStepStatus::Ok, None);
+        }
+        // 6. GetAccountListByAccessToken sent + 7. accounts received —
+        //    derived from the discovered-accounts list.
+        let account_count = self.broker_settings.ctrader.accounts.len();
+        if account_count > 0 {
+            mark(&mut sm, 6, CTraderStepStatus::Ok, None);
+            mark(
+                &mut sm,
+                7,
+                CTraderStepStatus::Ok,
+                Some(format!("{account_count} accounts received")),
+            );
+        }
+        // 8. selected account authenticated — at least one account in
+        //    `broker_settings.ctrader.accounts` is flagged for execution.
+        let selected_count = self
+            .broker_settings
+            .ctrader
+            .accounts
+            .iter()
+            .filter(|a| a.enabled_for_execution)
+            .count();
+        if selected_count > 0 {
+            mark(
+                &mut sm,
+                8,
+                CTraderStepStatus::Ok,
+                Some(format!("{selected_count} execution-enabled")),
+            );
+        }
+        // 9. symbols list loaded — chart cache implies symbol metadata
+        //    was resolved. 10. symbol metadata loaded — same source.
+        let chart_ready = self.market_chart_cache.is_some();
+        if chart_ready {
+            mark(&mut sm, 9, CTraderStepStatus::Ok, None);
+            mark(&mut sm, 10, CTraderStepStatus::Ok, None);
+        }
+        // 11. historical bars loaded — cache holds a snapshot.
+        if let Some(cache) = self.market_chart_cache.as_ref() {
+            mark(
+                &mut sm,
+                11,
+                CTraderStepStatus::Ok,
+                Some(format!("{} candles", cache.snapshot.candles.len())),
+            );
+        }
+        // 12. live spots subscribed + 13. live trendbars subscribed —
+        //    presence of `ctrader_live_spot_cache` means the streaming
+        //    backend returned at least one tick. Stale cache (>30s)
+        //    flags as InFlight to alert the operator.
+        if let Some(live) = self.ctrader_live_spot_cache.as_ref() {
+            let age = live.refreshed_at.elapsed();
+            if age < std::time::Duration::from_secs(30) {
+                mark(
+                    &mut sm,
+                    12,
+                    CTraderStepStatus::Ok,
+                    Some(format!("last tick {}s ago", age.as_secs())),
+                );
+                mark(&mut sm, 13, CTraderStepStatus::Ok, None);
+            } else {
+                mark(
+                    &mut sm,
+                    12,
+                    CTraderStepStatus::InFlight,
+                    Some(format!("stale tick — {}s old", age.as_secs())),
+                );
+            }
+        }
+        // 14. chart updated — the cache has a `refreshed_at` Instant;
+        //    fresh within the 1s live-update window means we are
+        //    actively rendering live ticks.
+        if let Some(cache) = self.market_chart_cache.as_ref() {
+            let age = cache.refreshed_at.elapsed();
+            if age < std::time::Duration::from_secs(5) {
+                mark(
+                    &mut sm,
+                    14,
+                    CTraderStepStatus::Ok,
+                    Some(format!("redrew {}ms ago", age.as_millis())),
+                );
+            }
+        }
+        sm
+    }
+
     pub fn ctrader_auth_snapshot(&self) -> Option<CTraderAuthSnapshot> {
         match self.configured_adapter {
             TradingAdapterKind::CTrader => {
@@ -897,14 +1047,52 @@ impl TradingSession {
             Err(_) => return false,
         };
         let handle = super::background::spawn_background_task("chart_fetch", tx.clone(), move || {
+            use crate::app_services::ctrader_streaming::{
+                CTraderLiveChartUpdateRequest, load_live_chart_update,
+            };
             use crate::app_services::trading::{
                 build_market_chart_snapshot_from_historical_bars, load_chart_history,
                 merge_live_spot_update_into_bars,
             };
             let snapshot = match load_chart_history(&request) {
                 Ok(history) => {
-                    let bars = merge_live_spot_update_into_bars(&history.bars, None);
-                    build_market_chart_snapshot_from_historical_bars(
+                    // Task #3 — pull a live spot tick on the same background
+                    // worker that just finished the history fetch, then merge
+                    // it into the last candle so the Chart panel actually
+                    // shows live bid/ask. The streaming module caches the
+                    // WSS session process-wide, so the first call opens the
+                    // socket + does the application/account auth + spot &
+                    // trendbar subscribe handshake; every subsequent call on
+                    // the same (env, account, symbol, timeframe) just reads
+                    // the next spot event off the cached socket. Failures
+                    // here are non-fatal: history-only is still useful.
+                    let live_request = CTraderLiveChartUpdateRequest {
+                        client_id: request.client_id.clone(),
+                        client_secret: request.client_secret.clone(),
+                        access_token: request.access_token.clone(),
+                        environment: request.environment,
+                        account_id: request.account_id.clone(),
+                        symbol_id: history.symbol.symbol_id,
+                        digits: history.symbol.digits,
+                        timeframe: request.timeframe.clone(),
+                        subscribe_to_spot_timestamp: false,
+                    };
+                    let live_update = match load_live_chart_update(&live_request) {
+                        Ok(update) => Some(update),
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "forex_app::chart_fetch",
+                                symbol = %request.symbol_name,
+                                timeframe = %request.timeframe,
+                                error = %err,
+                                "cTrader live spot update unavailable; chart will render history only"
+                            );
+                            None
+                        }
+                    };
+                    let bars =
+                        merge_live_spot_update_into_bars(&history.bars, live_update.as_ref());
+                    let mut snapshot = build_market_chart_snapshot_from_historical_bars(
                         &history.symbol.symbol_name,
                         &request.timeframe,
                         available_timeframes,
@@ -912,7 +1100,28 @@ impl TradingSession {
                         Vec::new(),
                         Vec::new(),
                     )
-                    .with_overlay_status(overlay_status)
+                    .with_overlay_status(overlay_status);
+                    // Surface the live bid/ask so the Markets panel + the
+                    // Chart headline can show real quotes instead of "--".
+                    // Mirrors the orphan `load_ctrader_market_chart_snapshot`
+                    // path in market_data.rs:258-272 that was wired up but
+                    // never reachable from any UI surface.
+                    if let Some(update) = live_update {
+                        snapshot.bid = update.bid;
+                        snapshot.ask = update.ask;
+                        let quote_line = match (update.bid, update.ask) {
+                            (Some(bid), Some(ask)) => {
+                                format!(" · bid {bid:.5} ask {ask:.5}")
+                            }
+                            (Some(bid), None) => format!(" · bid {bid:.5}"),
+                            (None, Some(ask)) => format!(" · ask {ask:.5}"),
+                            (None, None) => String::new(),
+                        };
+                        if !quote_line.is_empty() {
+                            snapshot.headline.push_str(&quote_line);
+                        }
+                    }
+                    snapshot
                 }
                 Err(err) => crate::app_services::trading::MarketChartSnapshot::empty_for(
                     &request.symbol_name,

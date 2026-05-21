@@ -13,6 +13,15 @@ pub trait SecretStoreBackend: Clone {
     fn delete_secret(&self, service: &str, user: &str) -> Result<()>;
 }
 
+/// Trait dispatch over the secure token store. Production code uses
+/// `load_token_bundle_with_legacy_fallback` because that's the path
+/// that migrates from the pre-v0.4.13 keyring entry name; the direct
+/// `load_token_bundle` is reachable via the inherent impl on
+/// `CTraderSecureStore` (used by tests that pin the no-migration
+/// contract). Both shapes stay on the trait surface so a future
+/// alternative backend (file-vault, OS keychain wrapper, etc.) can
+/// be plugged in without touching call sites.
+#[allow(dead_code)] // load_token_bundle trait method; see doc above
 pub trait CTraderTokenStore: Send + Sync {
     fn save_token_bundle(&self, bundle: &CTraderTokenBundle) -> Result<()>;
     fn load_token_bundle(&self) -> Result<Option<CTraderTokenBundle>>;

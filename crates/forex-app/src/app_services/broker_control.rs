@@ -41,6 +41,21 @@
 //! post-mortem audits where the distinction between "I panicked" vs.
 //! "the broker dropped me" determines whether retraining of the
 //! reconnect logic is needed.
+//!
+//! WARNING-SUPPRESSION RATIONALE (audit 2026-05-21): the
+//! `#![allow(dead_code)]` below is intentional and TIME-BOUND.
+//! Today's streaming path (Task #3, wired 2026-05-20) routes
+//! disconnect events through `ServiceEvent::ConnectOutcome(Err)`
+//! instead of this dedicated crossbeam bridge — that works because
+//! the streaming worker has a `ServiceEvent` sender in scope. But
+//! when the streaming work moves into a backend implementation that
+//! doesn't (e.g. the planned `forex-backend` crate extraction for
+//! the Flutter migration), this channel is the right shape because
+//! it's plain `Send + Sync + Clone` with no runtime dependency.
+//! **Remove the allow the moment any non-test path calls
+//! `install_broker_control_sender` / `send_broker_control_signal`.**
+
+#![allow(dead_code)]
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use std::sync::OnceLock;
