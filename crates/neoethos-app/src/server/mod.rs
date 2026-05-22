@@ -33,6 +33,7 @@ pub mod broker_control;
 pub mod chart;
 pub mod data_control;
 pub mod engines_control;
+pub mod gemma;
 pub mod hardware;
 pub mod intelligence;
 pub mod orders;
@@ -92,6 +93,9 @@ pub fn router(state: AppApiState) -> Router {
         .route("/orders", post(orders::place))
         .route("/orders/cancel", post(orders::cancel_order))
         .route("/positions/close", post(orders::close_position))
+        .route("/gemma/status", get(gemma::status))
+        .route("/gemma/chat", post(gemma::chat))
+        .route("/gemma/news", post(gemma::news))
         .route("/intelligence", get(intelligence::intelligence))
         .route("/chart", get(chart::chart))
         .layer(TraceLayer::new_for_http())

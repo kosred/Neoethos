@@ -273,6 +273,50 @@ class BackendClient {
     return response.data ?? const <String, dynamic>{};
   }
 
+  /// `/gemma/status` — local LLM availability check. Returns whether
+  /// the binary was built with --features gemma-backend AND whether
+  /// the GGUF is on disk.
+  Future<GemmaStatusSnapshot> fetchGemmaStatus() async {
+    final response = await _dio.get<Map<String, dynamic>>('/gemma/status');
+    if (response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/gemma/status returned empty body',
+      );
+    }
+    return GemmaStatusSnapshot.fromJson(response.data!);
+  }
+
+  /// POST `/gemma/chat` — local Gemma-4 inference. 503 if the runtime
+  /// or the model file is missing — the response body explains how to
+  /// fix it.
+  Future<GemmaChatResponse> gemmaChat({
+    required String prompt,
+    int? maxTokens,
+  }) async {
+    final body = <String, dynamic>{'prompt': prompt};
+    if (maxTokens != null) body['maxTokens'] = maxTokens;
+    final response = await _dio.post<Map<String, dynamic>>(
+      '/gemma/chat',
+      data: body,
+      // 5 minutes — first call loads the GGUF (5-30s), and a
+      // 600-token response on CPU can take a couple of minutes.
+      options: Options(receiveTimeout: const Duration(minutes: 5)),
+    );
+    return GemmaChatResponse.fromJson(response.data ?? const {});
+  }
+
+  /// POST `/gemma/news` — symbol-specific news summary via local LLM.
+  Future<GemmaChatResponse> gemmaNews({required String symbol}) async {
+    final response = await _dio.post<Map<String, dynamic>>(
+      '/gemma/news',
+      data: {'symbol': symbol},
+      options: Options(receiveTimeout: const Duration(minutes: 5)),
+    );
+    return GemmaChatResponse.fromJson(response.data ?? const {});
+  }
+
   /// POST `/positions/close` — close (or partially close) an open
   /// position. `volume` is in cTrader centi-lot units (use the
   /// Position.volumeUnits field straight through for a full close).
@@ -621,6 +665,59 @@ class BrokerSymbolsSnapshot {
           s.symbolName.length == 6 &&
           RegExp(r'^[A-Z]{6}$').hasMatch(s.symbolName))
       .toList(growable: false);
+}
+
+class GemmaStatusSnapshot {
+  final bool runtimeCompiledIn;
+  final bool modelFilePresent;
+  final String resolvedPath;
+  final String expectedFilename;
+  final String downloadUrl;
+  final int sizeBytes;
+  final int expectedSizeBytes;
+  final int nCtx;
+  final String message;
+  const GemmaStatusSnapshot({
+    required this.runtimeCompiledIn,
+    required this.modelFilePresent,
+    required this.resolvedPath,
+    required this.expectedFilename,
+    required this.downloadUrl,
+    required this.sizeBytes,
+    required this.expectedSizeBytes,
+    required this.nCtx,
+    required this.message,
+  });
+  factory GemmaStatusSnapshot.fromJson(Map<String, dynamic> j) =>
+      GemmaStatusSnapshot(
+        runtimeCompiledIn: (j['runtimeCompiledIn'] as bool?) ?? false,
+        modelFilePresent: (j['modelFilePresent'] as bool?) ?? false,
+        resolvedPath: (j['resolvedPath'] as String?) ?? '',
+        expectedFilename: (j['expectedFilename'] as String?) ?? '',
+        downloadUrl: (j['downloadUrl'] as String?) ?? '',
+        sizeBytes: (j['sizeBytes'] as num?)?.toInt() ?? 0,
+        expectedSizeBytes: (j['expectedSizeBytes'] as num?)?.toInt() ?? 0,
+        nCtx: (j['nCtx'] as num?)?.toInt() ?? 0,
+        message: (j['message'] as String?) ?? '',
+      );
+  bool get ready => runtimeCompiledIn && modelFilePresent;
+}
+
+class GemmaChatResponse {
+  final String modelId;
+  final String response;
+  final int elapsedMs;
+  const GemmaChatResponse({
+    required this.modelId,
+    required this.response,
+    required this.elapsedMs,
+  });
+  factory GemmaChatResponse.fromJson(Map<String, dynamic> j) =>
+      GemmaChatResponse(
+        modelId: (j['modelId'] as String?) ?? '',
+        response: (j['response'] as String?) ?? '',
+        elapsedMs: (j['elapsedMs'] as num?)?.toInt() ?? 0,
+      );
 }
 
 class ChartCandle {

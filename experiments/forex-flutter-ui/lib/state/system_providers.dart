@@ -80,6 +80,15 @@ final brokerSymbolsProvider =
   return client.fetchBrokerSymbols();
 });
 
+/// `/gemma/status` — local LLM availability. Cheap probe so the
+/// News + AI Helper screens know whether to render the chat UI or
+/// the "install model" instructions.
+final gemmaStatusProvider =
+    FutureProvider.autoDispose<GemmaStatusSnapshot>((ref) {
+  final client = ref.read(backendClientProvider);
+  return client.fetchGemmaStatus();
+});
+
 /// `/broker/timeframes` — canonical cTrader-supported timeframe list,
 /// sourced from neoethos_core::CANONICAL_TIMEFRAMES on the server.
 /// Tiny (11 strings) and immutable for the life of the binary, so we

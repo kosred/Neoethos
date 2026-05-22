@@ -24,6 +24,7 @@ import '../screens/trade_watch_screen.dart';
 import '../screens/discovery_screen.dart';
 import '../screens/training_screen.dart';
 import '../screens/intelligence_screen.dart';
+import '../screens/ai_helper_screen.dart';
 import '../screens/broker_setup_screen.dart';
 import '../screens/data_bootstrap_screen.dart';
 import '../screens/hardware_screen.dart';
@@ -136,6 +137,8 @@ class _DockArea extends StatelessWidget {
         return const TrainingScreen();
       case 'Intelligence':
         return const IntelligenceScreen();
+      case 'AiHelper':
+        return const AiHelperScreen();
       case 'BrokerSetup':
         return const BrokerSetupScreen();
       case 'DataBootstrap':

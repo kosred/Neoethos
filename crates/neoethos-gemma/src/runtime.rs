@@ -422,8 +422,22 @@ mod llama_impl {
         // A new context per request gives a clean KV-cache. In G2 we will
         // keep the context alive and call `llama_kv_cache_clear()` between
         // turns for lower per-request latency.
+        //
+        // n_ctx = 32K: Gemma 4 advertises 128K context, but the KV cache
+        // scales linearly with `n_ctx * n_layers * d_model * 2` and a
+        // 4B-param model at 128K eats well past 16 GB just for the KV
+        // cache — beyond what a 32 GB workstation can host alongside
+        // the model weights themselves. 32K is a safe middle ground
+        // for the public-testing build: covers a full news-feed
+        // article + a chat turn without OOMing on the operator's
+        // laptop. Override via `NEOETHOS_GEMMA_N_CTX` env var if you
+        // know your hardware can take more.
+        let n_ctx = std::env::var("NEOETHOS_GEMMA_N_CTX")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(32_768);
         let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(4096));
+            .with_n_ctx(NonZeroU32::new(n_ctx));
 
         let mut ctx = model
             .new_context(backend, ctx_params)
