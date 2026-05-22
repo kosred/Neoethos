@@ -1,37 +1,72 @@
-// TopBar — brand + status badges + ribbon items + auto pills.
-// Mirrors the .topbar block in mockups/ui_mockup.html.
+// TopBar — brand + connection badges + live ribbon items.
+//
+// Mirrors the .topbar block in mockups/ui_mockup.html, but every
+// numeric / status value now reads from `accountSnapshotProvider`
+// instead of hardcoded mockup figures.
+//
+// Render rules:
+//   - Brand:            always "NeoEthos" (post-rebrand).
+//   - LIVE / OFFLINE:   derives from `accountSnapshotProvider` state.
+//                         data        → green LIVE
+//                         BrokerNot…  → muted CONNECTING
+//                         other error → red OFFLINE
+//                         loading     → faint CONNECTING (first launch)
+//   - Ribbon (Balance/Equity/Free Margin): em-dash when no data,
+//     real numbers once the bridge has filled the cache, last-known
+//     numbers preserved during transient refresh errors so the
+//     operator doesn't lose situational awareness.
+//   - Auto pills:       static for now (Discovery / Training engine
+//                       state lives behind endpoints that ship in a
+//                       follow-up session).
 
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:intl/intl.dart';
 
+import '../api/backend_client.dart';
+import '../state/account_provider.dart';
 import '../theme/theme.dart';
 
-class TopBar extends StatelessWidget {
+class TopBar extends ConsumerWidget {
   const TopBar({super.key});
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final asyncSnapshot = ref.watch(accountSnapshotProvider);
+
+    // Connection-state badge. We collapse the four AsyncValue states
+    // into the three badge tints the design system supports.
+    final (badgeLabel, badgeKind) = switch (asyncSnapshot) {
+      AsyncData() => ('LIVE', _BadgeKind.live),
+      AsyncError(error: final e) when e is BrokerNotReadyException =>
+        ('CONNECTING', _BadgeKind.idle),
+      AsyncError() => ('OFFLINE', _BadgeKind.offline),
+      _ => ('CONNECTING', _BadgeKind.idle),
+    };
+
+    final snap = asyncSnapshot.valueOrNull;
+    final currencySymbol = snap?.currency == 'EUR' ? '€' : r'$';
+    final fmt = NumberFormat.currency(symbol: currencySymbol, decimalDigits: 2);
+    String ribbonValue(double? v) => v == null ? '—' : fmt.format(v);
+    final equityAccent = snap == null
+        ? _ValueAccent.plain
+        : snap.equity > snap.balance
+            ? _ValueAccent.success
+            : snap.equity < snap.balance
+                ? _ValueAccent.danger
+                : _ValueAccent.plain;
+
     return Container(
       height: ForexAiTokens.topbarHeight,
       padding: const EdgeInsets.symmetric(horizontal: ForexAiTokens.spLg),
       decoration: const BoxDecoration(
-        // The earlier scaffold set `color:` directly on the Container
-        // AND a `BoxDecoration` — Flutter 3.44+ trips an assert because
-        // `color` is shorthand for `BoxDecoration(color: …)` and the
-        // two can't coexist. Fold the panel background into the
-        // decoration so the bottom-border stays + the bg colour stays.
         color: ForexAiTokens.panelBg,
-        border: Border(
-          bottom: BorderSide(color: ForexAiTokens.border),
-        ),
+        border: Border(bottom: BorderSide(color: ForexAiTokens.border)),
       ),
-      // Three-zone Row: brand + badges on the left, ribbon items in
-      // the middle (horizontally scrollable so they don't push the
-      // right zone off-screen on narrow viewports), action pills +
-      // icons on the right.
       child: Row(
         children: [
           const Text(
-            'forex-ai',
+            'NeoEthos',
             style: TextStyle(
               fontSize: ForexAiTokens.fsSubtitle + 1,
               fontWeight: FontWeight.w700,
@@ -41,44 +76,55 @@ class TopBar extends StatelessWidget {
           const SizedBox(width: ForexAiTokens.spSm),
           const _Badge(label: 'PRO', kind: _BadgeKind.pro),
           const SizedBox(width: ForexAiTokens.spXs),
-          const _Badge(label: 'LIVE', kind: _BadgeKind.live),
+          _Badge(label: badgeLabel, kind: badgeKind),
           const _VSep(),
-          // Ribbon — placeholder values. Wired to provider in
-          // a follow-up commit; for now they read the same
-          // mockup figures. Wrapped in Expanded + horizontal
-          // SingleChildScrollView so the ribbon shrinks gracefully
-          // on narrow viewports without overflowing.
           Expanded(
             child: SingleChildScrollView(
               scrollDirection: Axis.horizontal,
               child: Row(
-                children: const [
-                  _RibbonItem(label: 'Balance', value: '\$10,000.00'),
+                children: [
+                  _RibbonItem(
+                    label: 'Balance',
+                    value: ribbonValue(snap?.balance),
+                  ),
                   _RibbonItem(
                     label: 'Equity',
-                    value: '\$10,243.55',
-                    valueAccent: _ValueAccent.success,
+                    value: ribbonValue(snap?.equity),
+                    valueAccent: equityAccent,
                   ),
-                  _RibbonItem(label: 'Free Margin', value: '\$9,762.40'),
+                  _RibbonItem(
+                    label: 'Free Margin',
+                    value: ribbonValue(snap?.freeMargin),
+                  ),
+                  _RibbonItem(
+                    label: 'Open',
+                    value: snap == null ? '—' : '${snap.positions.length}',
+                    valueAccent: snap != null && snap.positions.isNotEmpty
+                        ? _ValueAccent.accent
+                        : _ValueAccent.plain,
+                  ),
                 ],
               ),
             ),
           ),
-          // Right-side actions (fixed width, pinned to right).
-          const _AutoPill(label: 'Auto-Discover', on: true),
+          // Auto-Discover / Auto-Train pills stay static for now —
+          // engine-state endpoints land in a follow-up session.
+          const _AutoPill(label: 'Auto-Discover', on: false),
           const SizedBox(width: ForexAiTokens.spXs),
           const _AutoPill(label: 'Auto-Train', on: false),
           const SizedBox(width: ForexAiTokens.spSm),
           IconButton(
-            onPressed: () {},
-            tooltip: 'Notifications',
-            icon: const Icon(Icons.notifications_none,
-                color: ForexAiTokens.textMuted),
+            onPressed: () => ref
+                .read(accountSnapshotProvider.notifier)
+                .refreshNow(),
+            tooltip: 'Refresh account snapshot now',
+            icon: const Icon(Icons.refresh, color: ForexAiTokens.textMuted),
           ),
           IconButton(
             onPressed: () {},
-            tooltip: 'Command palette (⌘K)',
-            icon: const Icon(Icons.search, color: ForexAiTokens.textMuted),
+            tooltip: 'Notifications (TODO)',
+            icon: const Icon(Icons.notifications_none,
+                color: ForexAiTokens.textMuted),
           ),
         ],
       ),
@@ -98,7 +144,7 @@ class _Badge extends StatelessWidget {
     final (fg, bg, border) = switch (kind) {
       _BadgeKind.pro => (
           ForexAiTokens.accent,
-          const Color(0x29002962), // alpha-blended approx
+          const Color(0x29002962),
           ForexAiTokens.accent.withValues(alpha: 0.6),
         ),
       _BadgeKind.live => (
@@ -150,14 +196,12 @@ class _Badge extends StatelessWidget {
 class _VSep extends StatelessWidget {
   const _VSep();
   @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 1,
-      height: 28,
-      color: ForexAiTokens.border,
-      margin: const EdgeInsets.symmetric(horizontal: ForexAiTokens.spSm),
-    );
-  }
+  Widget build(BuildContext context) => Container(
+        width: 1,
+        height: 28,
+        color: ForexAiTokens.border,
+        margin: const EdgeInsets.symmetric(horizontal: ForexAiTokens.spSm),
+      );
 }
 
 enum _ValueAccent { plain, success, danger, accent }

@@ -163,13 +163,26 @@ async fn refresh_once() -> anyhow::Result<AccountSnapshotPayload> {
         balance,
         equity,
         free_margin,
-        used_margin,
-        // cTrader doesn't report the account currency in the trader
-        // snapshot — it's per-account static config we'd need a
-        // separate `/symbols-for-account` call to discover. For now,
-        // hard-code EUR (most FTMO challenges) and revisit once the
-        // symbol-metadata fetch lands.
-        currency: trader.account_type.clone().unwrap_or_else(|| "EUR".to_string()),
+        used_margin: if used_margin.is_sign_negative() && used_margin == 0.0 {
+            // serde renders f64 `-0.0` literally as `-0.0`; the Flutter
+            // dashboard surfaced that as a janky "-$0.00 used margin"
+            // pill. Normalize the sign for any sum-derived zero so the
+            // wire shape stays clean.
+            0.0
+        } else {
+            used_margin
+        },
+        // The ProtoOATraderRes payload only exposes the *integer*
+        // `depositAssetId` (e.g. 6 for EUR, 8 for USD) — resolving
+        // that to a 3-letter ISO code needs a follow-up
+        // ProtoOAAssetListReq call against the broker's asset
+        // registry. Until that endpoint ships, default to "EUR"
+        // (the Spotware sandbox + most FTMO challenges fall in that
+        // bucket). The previous code was passing the *account_type*
+        // enum label ("HEDGED", "NETTED") into the currency field,
+        // which surfaced as a wrong currency badge on the Flutter
+        // dashboard — fixed here.
+        currency: "EUR".to_string(),
         positions,
     })
 }

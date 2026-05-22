@@ -1,35 +1,49 @@
-// StatusBar — bottom strip (broker / engine / blackout / latency).
-// Mirrors the .statusbar block in mockups/ui_mockup.html.
+// StatusBar — bottom strip (broker / engine / blackout / version).
+//
+// Broker badge now reflects the live connection state from
+// `accountSnapshotProvider`. Engine + blackout stay as static
+// placeholders until their respective endpoints ship.
 
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../api/backend_client.dart';
+import '../state/account_provider.dart';
 import '../theme/theme.dart';
 
-class StatusBar extends StatelessWidget {
+class StatusBar extends ConsumerWidget {
   const StatusBar({super.key});
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final asyncSnapshot = ref.watch(accountSnapshotProvider);
+    final (brokerValue, brokerOk) = switch (asyncSnapshot) {
+      AsyncData() => ('cTrader · Live', true),
+      AsyncError(error: final e) when e is BrokerNotReadyException =>
+        ('cTrader · connecting', false),
+      AsyncError() => ('cTrader · offline', false),
+      _ => ('cTrader · connecting', false),
+    };
+
     return Container(
       height: ForexAiTokens.statusbarHeight,
       decoration: const BoxDecoration(
-        // Same fix as TopBar: Container.color + BoxDecoration is an
-        // assert in Flutter 3.44+. Fold the bg into the decoration.
         color: ForexAiTokens.panelBg,
         border: Border(top: BorderSide(color: ForexAiTokens.border)),
       ),
       padding: const EdgeInsets.symmetric(horizontal: ForexAiTokens.spMd),
       child: Row(
-        children: const [
-          _StatusItem(label: 'Broker', value: 'cTrader · Live', success: true),
-          _StatusSep(),
-          _StatusItem(label: 'Engine', value: 'Running', success: true),
-          _StatusSep(),
-          _StatusItem(label: 'News blackout', value: 'CLEAR', success: true),
-          _StatusSep(),
-          _StatusItem(label: 'Latency', value: '83 ms'),
-          Spacer(),
-          _StatusItem(label: 'v0.4.5'),
+        children: [
+          _StatusItem(label: 'Broker', value: brokerValue, success: brokerOk),
+          const _StatusSep(),
+          // Engine / blackout / latency stay static for now — their
+          // backing endpoints (/engines/status, /news/state) are
+          // scheduled in the next session.
+          const _StatusItem(label: 'Engine', value: 'Idle'),
+          const _StatusSep(),
+          const _StatusItem(label: 'News blackout', value: '—'),
+          const Spacer(),
+          const _StatusItem(label: 'v0.4.20'),
         ],
       ),
     );
@@ -73,12 +87,10 @@ class _StatusItem extends StatelessWidget {
 class _StatusSep extends StatelessWidget {
   const _StatusSep();
   @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 1,
-      height: 12,
-      color: ForexAiTokens.border,
-      margin: const EdgeInsets.symmetric(horizontal: ForexAiTokens.spMd),
-    );
-  }
+  Widget build(BuildContext context) => Container(
+        width: 1,
+        height: 12,
+        color: ForexAiTokens.border,
+        margin: const EdgeInsets.symmetric(horizontal: ForexAiTokens.spMd),
+      );
 }
