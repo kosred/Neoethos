@@ -86,6 +86,10 @@ pub fn router(state: AppApiState) -> Router {
         )
         .route("/broker/status", get(system_status::broker_status))
         .route("/broker/reauth", post(broker_control::reauth))
+        .route(
+            "/broker/credentials",
+            get(broker_control::credentials_get).post(broker_control::credentials_post),
+        )
         .route("/broker/symbols", get(data_control::symbols))
         .route("/broker/timeframes", get(data_control::timeframes))
         .route("/data/bootstrap", get(system_status::data_bootstrap))

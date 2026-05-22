@@ -1,25 +1,46 @@
+// Markets — open positions + broker symbol catalog.
+//
+// The symbol catalog is what /broker/symbols returns: the full
+// 800-ish list the broker offers, including stocks and crypto on
+// cTrader accounts. The "Forex only" toggle (on by default) filters
+// to 6-letter A-Z names so the operator isn't drowning in equities
+// they don't want to see.
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 
+import '../api/backend_client.dart';
 import '../state/account_provider.dart';
+import '../state/system_providers.dart';
 import '../theme/theme.dart';
 import '_placeholder.dart';
 
-/// Markets — Phase 1 wiring shows the operator's open positions from
-/// `/account/snapshot`. Live spot quotes per symbol (the second half
-/// of what this screen will eventually own) need the `/quotes` SSE
-/// endpoint, which is the next batch of Rust-side work.
-
-class MarketsScreen extends ConsumerWidget {
+class MarketsScreen extends ConsumerStatefulWidget {
   const MarketsScreen({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<MarketsScreen> createState() => _MarketsScreenState();
+}
+
+class _MarketsScreenState extends ConsumerState<MarketsScreen> {
+  bool _forexOnly = true;
+  String _search = '';
+  final _searchCtrl = TextEditingController();
+
+  @override
+  void dispose() {
+    _searchCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final snapshot = ref.watch(accountSnapshotProvider);
     final positions = snapshot.valueOrNull?.positions ?? const [];
     final usdFmt = NumberFormat.currency(symbol: r'$', decimalDigits: 2);
     final pipFmt = NumberFormat('+#,##0.0;-#,##0.0', 'en_US');
+    final brokerSymbols = ref.watch(brokerSymbolsProvider);
 
     return SingleChildScrollView(
       child: Column(
@@ -27,7 +48,7 @@ class MarketsScreen extends ConsumerWidget {
         children: [
           const ViewHeader(
             title: 'Markets',
-            subtitle: 'Open positions · symbol watchlist',
+            subtitle: 'Open positions · broker symbol catalog',
           ),
           SectionCard(
             title: 'Open Positions',
@@ -83,31 +104,141 @@ class MarketsScreen extends ConsumerWidget {
                     ],
                   ),
           ),
-          const SectionCard(
-            title: 'Symbol Watchlist',
-            child: _PendingNotice(
-              line:
-                  'Live tick stream lands when /quotes SSE endpoint ships. '
-                  'For now, prices are intentionally absent rather than '
-                  'fake — see the open-positions table above for the '
-                  'broker-confirmed state.',
-            ),
+          brokerSymbols.when(
+            data: (snap) => _symbolsCard(snap),
+            loading: () => const _Loading(),
+            error: (err, _) => _Error(error: err.toString()),
           ),
+        ],
+      ),
+    );
+  }
+
+  Widget _symbolsCard(BrokerSymbolsSnapshot snap) {
+    final all = snap.symbols.where((s) => s.enabled).toList();
+    final filtered = all.where((s) {
+      if (_forexOnly) {
+        // 6-letter uppercase ASCII == standard FX-pair shape.
+        if (s.symbolName.length != 6 ||
+            !RegExp(r'^[A-Z]{6}$').hasMatch(s.symbolName)) {
+          return false;
+        }
+      }
+      if (_search.isNotEmpty &&
+          !s.symbolName.toUpperCase().contains(_search.toUpperCase())) {
+        return false;
+      }
+      return true;
+    }).toList();
+
+    return SectionCard(
+      title:
+          'Broker Symbol Catalog · ${filtered.length} of ${all.length} enabled',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              FilterChip(
+                label: const Text('Forex only'),
+                selected: _forexOnly,
+                onSelected: (v) => setState(() => _forexOnly = v),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: TextField(
+                  controller: _searchCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'Search',
+                    isDense: true,
+                    border: OutlineInputBorder(),
+                    prefixIcon: Icon(Icons.search, size: 18),
+                  ),
+                  onChanged: (v) => setState(() => _search = v.trim()),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          if (filtered.isEmpty)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 8),
+              child: Text(
+                'No symbols match the current filter.',
+                style: TextStyle(
+                  color: ForexAiTokens.textMuted,
+                  fontSize: 12,
+                ),
+              ),
+            )
+          else
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                for (final s in filtered.take(120))
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 3,
+                    ),
+                    decoration: BoxDecoration(
+                      color: ForexAiTokens.surfaceBg,
+                      border: Border.all(color: ForexAiTokens.border),
+                      borderRadius:
+                          BorderRadius.circular(ForexAiTokens.rSm),
+                    ),
+                    child: Text(
+                      s.symbolName,
+                      style: const TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        color: ForexAiTokens.textPrimary,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          if (filtered.length > 120) ...[
+            const SizedBox(height: 6),
+            Text(
+              'Showing first 120 of ${filtered.length} matches. '
+              'Type in the search box to narrow further.',
+              style: const TextStyle(
+                fontSize: 10,
+                color: ForexAiTokens.textFaint,
+              ),
+            ),
+          ],
         ],
       ),
     );
   }
 }
 
-class _PendingNotice extends StatelessWidget {
-  final String line;
-  const _PendingNotice({required this.line});
+class _Loading extends StatelessWidget {
+  const _Loading();
+  @override
+  Widget build(BuildContext context) => const Padding(
+        padding: EdgeInsets.symmetric(vertical: 16),
+        child: Text(
+          'Loading broker symbol catalog…',
+          style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
+        ),
+      );
+}
+
+class _Error extends StatelessWidget {
+  final String error;
+  const _Error({required this.error});
   @override
   Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 4),
+        padding: const EdgeInsets.symmetric(vertical: 8),
         child: Text(
-          line,
-          style: const TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
+          'Broker symbol catalog unavailable: $error\n'
+          'Configure credentials in Settings, then Re-authenticate in '
+          'Broker Setup.',
+          style: const TextStyle(color: ForexAiTokens.sell, fontSize: 12),
         ),
       );
 }

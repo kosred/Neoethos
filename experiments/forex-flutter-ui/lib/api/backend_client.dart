@@ -273,6 +273,35 @@ class BackendClient {
     return response.data ?? const <String, dynamic>{};
   }
 
+  /// `/broker/credentials` — fetch current cTrader credential state.
+  /// `clientSecretMask` is the masked tail + length so the UI can show
+  /// "yes, a secret is saved" without us echoing the secret in full.
+  Future<Map<String, dynamic>> fetchBrokerCredentials() async {
+    final r = await _dio.get<Map<String, dynamic>>('/broker/credentials');
+    return r.data ?? const <String, dynamic>{};
+  }
+
+  /// POST `/broker/credentials` — persist new credentials.
+  Future<Map<String, dynamic>> saveBrokerCredentials({
+    required String clientId,
+    required String clientSecret,
+    String redirectUri = '',
+    String environment = 'Demo',
+    String accountId = '',
+  }) async {
+    final r = await _dio.post<Map<String, dynamic>>(
+      '/broker/credentials',
+      data: {
+        'clientId': clientId,
+        'clientSecret': clientSecret,
+        'redirectUri': redirectUri,
+        'environment': environment,
+        'accountId': accountId,
+      },
+    );
+    return r.data ?? const <String, dynamic>{};
+  }
+
   /// `/gemma/status` — local LLM availability check. Returns whether
   /// the binary was built with --features gemma-backend AND whether
   /// the GGUF is on disk.
