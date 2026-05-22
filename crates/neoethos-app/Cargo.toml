@@ -106,12 +106,10 @@ ndarray = "0.17.2"
 clap = { version = "4.6.0", features = ["derive"] }
 num_cpus = "1.17.0"
 # Native folder-picker for the "Browse..." button on the data-bootstrap
-# page (operator request 2026-05-14). Latest stable on crates.io as of
-# 2026-05-14: 0.17.2 — verified via crates.io API. Default features
-# pull GTK on Linux; if a packaged Windows build needs to drop those,
-# pin `default-features = false` once we know which file dialog
-# backend ships there.
-rfd = "0.17"
+# page. Resolved per-target — see the `cfg()` blocks at the bottom of
+# this file (each platform gets the minimum feature set it needs, so
+# a Linux build never pulls libgtk-3-dev and a Windows build never
+# pulls the GTK glue).
 # Wizard Step 9.5 — risk-quiz answer hash. Spec
 # `installer_wizard_ux_spec.md` §5 names SHA-256 explicitly for the
 # `answers_sha256` field, replacing the placeholder djb2 hasher
@@ -142,12 +140,22 @@ crossbeam-channel = "0.5.15"
 # loudly instead of silently dropping tokens.
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
+# Modern Win32 file dialog (uses the v6 common controls comctl32.dll
+# that ships with every Windows ≥ Vista — no extra runtime needed).
+rfd = { version = "0.17", default-features = false, features = ["common-controls-v6"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+# macOS uses the AppKit NSOpenPanel — no extra features needed.
+rfd = { version = "0.17", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3.6.3", default-features = false, features = ["linux-native-sync-persistent"] }
+# Drop GTK3 — talks to xdg-desktop-portal over D-Bus instead. Works on
+# GNOME / KDE / WSL2g without `libgtk-3-dev` installed; falls back
+# cleanly when the portal isn't available (the picker just doesn't
+# open — which is what the wizard already handles).
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 
 [build-dependencies]
 protoc-bin-vendored = "3.2.0"
@@ -164,6 +172,15 @@ formats = ["nsis"]
 # intentionally ships without native tree-model DLLs; those are gated behind
 # the `native-tree-models` feature so a clean Windows install is not blocked by
 # Visual C++ debug/runtime DLLs at process startup.
+#
+# VC++ Redistributable note: the Rust MSVC binaries depend on
+# VCRUNTIME140.dll (Visual C++ 2015-2022 redistributable). Every
+# Windows 10/11 install that has ever run Office/Chrome/Steam/etc.
+# already has it, but a *pristine* install does not. The NSIS template
+# below adds a pre-install check that downloads + silently installs
+# the Microsoft-signed VC_redist.x64.exe from microsoft.com if the
+# DLLs aren't already on PATH. See `installer_no_paid_certs_strategy.md`
+# §4 for the bootstrapper hash + signature verification details.
 resources = [
     "../../config.yaml",
     "../../LICENSE",
@@ -175,6 +192,15 @@ resources = [
     # writes to the canonical user-data dir.
     "../../scripts/fetch-gemma-model.ps1",
 ]
+# NSIS hook: emit the VC++ Redistributable bootstrapper into the
+# generated installer. cargo-packager's `nsis` backend accepts custom
+# hook templates — the snippet below is the smallest one that:
+#   1. Checks `HKLM\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64`
+#      for `Installed = 1`.
+#   2. If missing, downloads the Microsoft-signed VC_redist.x64.exe
+#      and runs it with `/install /quiet /norestart`.
+# Path is relative to this Cargo.toml.
+nsis.installer-hooks = "../../scripts/vc_redist_install.nsh"
 
 [[package.metadata.packager.binaries]]
 path = "neoethos-app"

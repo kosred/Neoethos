@@ -43,6 +43,38 @@ nalgebra    = "0.33.0"
 polars      = { version = "0.52.0", features = ["lazy", "dtype-datetime", "timezones"] }
 thiserror   = "2.0.16"
 
+# ── Release profile — public-testing distribution ────────────────────────────
+# Defaults give opt-level=3 but leave LTO off, codegen-units=16, debug
+# symbols inside the binary, and panic=unwind. For a public-testing
+# release the bin is ~111 MB with that default. The settings below
+# trade ~3-4× longer build time (≈ 10-15 m vs. ≈ 3-4 m) for:
+#   - `lto = "fat"`     — cross-crate inlining + dead-code stripping.
+#       Particularly important here because `neoethos-app` still links
+#       the old egui UI tree (task #89 will delete it) which is never
+#       exercised in `--server` mode; fat LTO lets the linker drop the
+#       unreached code paths.
+#   - `codegen-units = 1` — single LLVM module so LTO can see everything.
+#   - `strip = "symbols"` — drop DWARF + Windows debug symbols. Stack
+#       traces in panic messages are kept (panic infrastructure is
+#       separate); only symbol *names* go. ~30% size win on Windows.
+#   - `panic = "abort"`  — no `catch_unwind` machinery in the binary;
+#       any panic aborts the process. We never call `catch_unwind` and
+#       the tokio runtime is configured to fail fast on worker panics,
+#       so this is purely a code-size + perf win.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+# Build dependencies (build.rs scripts, proc-macros) should keep their
+# default profile — they run during the build, never ship. Override
+# back to dev defaults to avoid paying the LTO cost on every recompile
+# of e.g. `protoc-bin-vendored`.
+[profile.release.build-override]
+opt-level = 0
+codegen-units = 16
+
 [patch.crates-io]
 lightgbm3-sys = { path = "vendor/lightgbm3-sys" }
 # sklears-core patch removed 2026-05-21 (task #84) — the vendored copy
