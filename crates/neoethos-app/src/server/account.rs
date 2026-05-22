@@ -24,7 +24,9 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-use super::state::{AccountSnapshotPayload, AppApiState, PositionPayload};
+use super::state::{AccountSnapshotPayload, AppApiState};
+#[cfg(test)]
+use super::state::PositionPayload;
 
 /// Wire DTO. `serde(rename_all = "camelCase")` keeps the JSON keys
 /// matching the Dart field names without us having to maintain two

@@ -132,6 +132,11 @@ pub struct ChatBody {
     pub max_tokens: Option<u32>,
 }
 
+// Only constructed inside the `#[cfg(feature = "gemma-backend")]`
+// inference path. Without the feature, the chat/news handlers return
+// 503 before they ever reach the point of building a DTO — the
+// struct is unreachable code in that build, hence the gate.
+#[cfg(feature = "gemma-backend")]
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatResponseDto {
@@ -159,7 +164,10 @@ pub async fn chat(
     }
     #[cfg(not(feature = "gemma-backend"))]
     {
-        let _ = state;
+        // `state`, `body.prompt`, `max_tokens` are only consumed by
+        // the feature-gated path above; suppress the unused-warning
+        // here without touching the public API.
+        let _ = (state, body.prompt, max_tokens);
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
@@ -208,7 +216,7 @@ pub async fn news(
     }
     #[cfg(not(feature = "gemma-backend"))]
     {
-        let _ = state;
+        let _ = (state, prompt);
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({

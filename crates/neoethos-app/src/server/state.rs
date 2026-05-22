@@ -92,9 +92,12 @@ impl AppApiState {
         }
     }
 
-    /// Bootstrap with a canned snapshot so the Flutter dashboard has
-    /// something to render before live data arrives. Production paths
-    /// overwrite this via `set_account` once the broker session is up.
+    /// Bootstrap with a canned snapshot — used by the `#[cfg(test)]`
+    /// router fixtures in `account.rs` so axum handler tests can hit
+    /// `/account/snapshot` without spinning up a real bridge task.
+    /// Production paths leave the inner cache empty and let the bridge
+    /// fill it via `set_account` once the broker session is up.
+    #[cfg(test)]
     pub fn with_seed_account(self, snapshot: AccountSnapshotPayload) -> Self {
         {
             let inner = self.inner.clone();
