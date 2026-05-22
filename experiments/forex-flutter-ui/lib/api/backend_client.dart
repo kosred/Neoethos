@@ -267,6 +267,36 @@ class BackendClient {
     return response.data ?? const <String, dynamic>{};
   }
 
+  /// POST `/orders` — submit a Market order. SL/TP are in pips
+  /// (cTrader rejects absolute prices on market orders). The server
+  /// requires at least one of stopLossPips / takeProfitPips unless
+  /// `risky:true` is set.
+  Future<Map<String, dynamic>> placeMarketOrder({
+    required String symbol,
+    required String side, // "buy" / "sell"
+    required double volumeLots,
+    double? stopLossPips,
+    double? takeProfitPips,
+    String? comment,
+    bool risky = false,
+  }) async {
+    final body = <String, dynamic>{
+      'symbol': symbol,
+      'side': side,
+      'volumeLots': volumeLots,
+      if (stopLossPips != null) 'stopLossPips': stopLossPips,
+      if (takeProfitPips != null) 'takeProfitPips': takeProfitPips,
+      if (comment != null && comment.isNotEmpty) 'comment': comment,
+      if (risky) 'risky': true,
+    };
+    final response = await _dio.post<Map<String, dynamic>>(
+      '/orders',
+      data: body,
+      options: Options(receiveTimeout: const Duration(seconds: 30)),
+    );
+    return response.data ?? const <String, dynamic>{};
+  }
+
   /// `/broker/symbols` — full broker symbol catalog (not hardcoded).
   Future<BrokerSymbolsSnapshot> fetchBrokerSymbols() async {
     final response = await _dio.get<Map<String, dynamic>>(

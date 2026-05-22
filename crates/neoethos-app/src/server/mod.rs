@@ -35,6 +35,7 @@ pub mod data_control;
 pub mod engines_control;
 pub mod hardware;
 pub mod intelligence;
+pub mod orders;
 pub mod health;
 pub mod risk;
 pub mod settings;
@@ -87,6 +88,7 @@ pub fn router(state: AppApiState) -> Router {
         .route("/broker/symbols", get(data_control::symbols))
         .route("/data/bootstrap", get(system_status::data_bootstrap))
         .route("/data/fetch", post(data_control::fetch))
+        .route("/orders", post(orders::place))
         .route("/intelligence", get(intelligence::intelligence))
         .route("/chart", get(chart::chart))
         .layer(TraceLayer::new_for_http())

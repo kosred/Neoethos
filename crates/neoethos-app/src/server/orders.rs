@@ -1,0 +1,128 @@
+//! POST /orders — submit a Market order to the broker.
+//!
+//! Money-critical. Server-side defence in depth:
+//!   - volume_lots must be > 0 and finite (validated by helper)
+//!   - At least one of stopLoss / takeProfit must be present (otherwise
+//!     we refuse 400) — operator can override with `risky:true`, but
+//!     the Flutter UI deliberately makes that hard to flip.
+//!   - Broker enforces min_volume / max_volume / step_volume; we
+//!     surface its rejection verbatim.
+//!
+//! Returns the cTrader ExecutionOutcome verbatim so the UI can show
+//! order_id + fill price + side, or the broker's failure reason.
+
+use axum::Json;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+
+use crate::app_services::broker_api::{OrderSide, submit_market_order_blocking};
+
+use super::state::AppApiState;
+
+#[derive(Debug, serde::Deserialize)]
+pub struct NewOrderBody {
+    pub symbol: String,
+    pub side: OrderSide,
+    /// In lots (1.0 = standard lot, 0.01 = micro lot). Server converts
+    /// to broker volume units via the resolved symbol's lot_size.
+    #[serde(rename = "volumeLots")]
+    pub volume_lots: f64,
+    /// Pip distance from fill price; converted to cTrader's
+    /// relative_stop_loss (1e-5 units) by the helper. Absolute prices
+    /// are not accepted on Market orders.
+    #[serde(rename = "stopLossPips")]
+    pub stop_loss_pips: Option<f64>,
+    #[serde(rename = "takeProfitPips")]
+    pub take_profit_pips: Option<f64>,
+    pub comment: Option<String>,
+    /// Operator must opt in to send an order with no SL and no TP.
+    /// Without this, the server refuses 400 — protects against
+    /// fat-finger "what's the worst that can happen" trades.
+    #[serde(default)]
+    pub risky: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewOrderResponseDto {
+    pub status: String,
+    pub account_id: i64,
+    pub symbol_id: Option<i64>,
+    pub order_id: Option<i64>,
+    pub position_id: Option<i64>,
+    pub deal_id: Option<i64>,
+    pub trade_side: Option<String>,
+    pub order_type: Option<String>,
+    pub message: String,
+}
+
+pub async fn place(
+    State(_state): State<AppApiState>,
+    Json(body): Json<NewOrderBody>,
+) -> Response {
+    if body.stop_loss_pips.is_none() && body.take_profit_pips.is_none() && !body.risky {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "stopLossPips and takeProfitPips are both missing — \
+                          set at least one, or pass risky:true to override",
+            })),
+        )
+            .into_response();
+    }
+
+    let symbol = body.symbol.trim().to_uppercase();
+    if symbol.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "symbol must be non-empty"})),
+        )
+            .into_response();
+    }
+
+    let side = body.side;
+    let volume_lots = body.volume_lots;
+    let sl = body.stop_loss_pips;
+    let tp = body.take_profit_pips;
+    let comment = body.comment;
+
+    let result = tokio::task::spawn_blocking(move || {
+        submit_market_order_blocking(&symbol, side, volume_lots, sl, tp, comment)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(outcome)) => {
+            let dto = NewOrderResponseDto {
+                status: format!("{:?}", outcome.status),
+                account_id: outcome.account_id,
+                symbol_id: outcome.symbol_id,
+                order_id: outcome.order_id,
+                position_id: outcome.position_id,
+                deal_id: outcome.deal_id,
+                trade_side: outcome.trade_side.clone(),
+                order_type: outcome.order_type.clone(),
+                message: outcome.description.clone().unwrap_or_else(|| {
+                    format!(
+                        "order {:?}: orderId={:?} positionId={:?}",
+                        outcome.status, outcome.order_id, outcome.position_id
+                    )
+                }),
+            };
+            Json(dto).into_response()
+        }
+        Ok(Err(err)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+        Err(join_err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("order task panicked: {join_err}"),
+            })),
+        )
+            .into_response(),
+    }
+}

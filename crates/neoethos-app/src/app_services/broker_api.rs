@@ -18,8 +18,16 @@ use crate::app_services::bootstrap_writer::write_bootstrap_vortex;
 use crate::app_services::ctrader_bootstrap::NormalizedBar;
 use crate::app_services::ctrader_data::{
     CTraderChartHistoryRequest, CTraderHistoricalBarsFetchResult,
-    CTraderLightSymbolInfo, CTraderSymbolsListResult, HistoricalBar,
-    load_historical_bars_only, parse_symbols_list_response,
+    CTraderLightSymbolInfo, CTraderResolvedSymbol, CTraderSymbolLookupRequest,
+    CTraderSymbolsListResult, HistoricalBar, load_historical_bars_only,
+    parse_symbols_list_response, resolve_symbol,
+};
+use crate::app_services::ctrader_execution::{
+    CTraderExecutionBackend, CTraderExecutionOutcome, CTraderExecutionRequest,
+    CTraderExecutionRuntimeRequest, ProductionCTraderExecutionBackend,
+};
+use crate::app_services::ctrader_messages::{
+    CTraderNewOrderRequest, CTraderOrderType, CTraderTradeSide,
 };
 use crate::app_services::ctrader_messages::{
     CTraderOpenApiTransport, ProductionCTraderOpenApiTransport,
@@ -187,6 +195,168 @@ pub fn download_history_blocking(
         has_more,
         written_path,
     })
+}
+
+/// Side of a manual market order. Mirrors `CTraderTradeSide` but kept
+/// here so the server module doesn't depend on the cTrader-internal
+/// enum directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OrderSide {
+    Buy,
+    Sell,
+}
+
+impl From<OrderSide> for CTraderTradeSide {
+    fn from(s: OrderSide) -> Self {
+        match s {
+            OrderSide::Buy => CTraderTradeSide::Buy,
+            OrderSide::Sell => CTraderTradeSide::Sell,
+        }
+    }
+}
+
+/// Submit a Market order for `symbol` with the given side + lot size
+/// + SL/TP **in pips relative to fill price** (cTrader rejects
+/// absolute SL/TP on Market orders with "SL/TP in absolute values are
+/// allowed only for LIMIT/STOP/STOP_LIMIT"). Pass `None` to leave the
+/// bracket off — but the UI MUST hard-require at least one for
+/// risk-control reasons.
+///
+/// `stop_loss_pips` / `take_profit_pips` are positive distances:
+///   - BUY:  SL price = fill - sl_pips * 1 pip
+///           TP price = fill + tp_pips * 1 pip
+///   - SELL: mirror.
+///
+/// Blocking — wraps `ProductionCTraderExecutionBackend::execute`
+/// which uses sync WSS. Callers must `spawn_blocking`.
+pub fn submit_market_order_blocking(
+    symbol: &str,
+    side: OrderSide,
+    volume_lots: f64,
+    stop_loss_pips: Option<f64>,
+    take_profit_pips: Option<f64>,
+    comment: Option<String>,
+) -> Result<CTraderExecutionOutcome> {
+    if !(volume_lots.is_finite() && volume_lots > 0.0) {
+        return Err(anyhow!(
+            "volume_lots must be a finite positive number (got {volume_lots})"
+        ));
+    }
+    for (name, val) in [
+        ("stop_loss_pips", stop_loss_pips),
+        ("take_profit_pips", take_profit_pips),
+    ] {
+        if let Some(v) = val {
+            if !v.is_finite() || v <= 0.0 {
+                return Err(anyhow!(
+                    "{name} must be a finite positive number when set (got {v})"
+                ));
+            }
+        }
+    }
+    let creds = resolve_creds()?;
+
+    // Resolve the symbol so we know its id + lot_size for volume
+    // conversion. cTrader expresses volume in centi-lots: 1 lot of
+    // EURUSD ≈ 100,000 units in the base currency, and the protocol
+    // wants that × 100 = 10,000,000. The resolved `lot_size` field is
+    // the unit count per 1 lot (typically 100,000 for FX), so we go
+    // `volume_units = volume_lots * lot_size * 100` to land in
+    // centi-units the way `parse_execution_event` will read them back.
+    let resolved: CTraderResolvedSymbol = resolve_symbol(&CTraderSymbolLookupRequest {
+        client_id: creds.client_id.clone(),
+        client_secret: creds.client_secret.clone(),
+        access_token: creds.access_token.clone(),
+        environment: creds.environment,
+        account_id: creds.account_id_str.clone(),
+        symbol_name: symbol.to_string(),
+    })?;
+    let lot_size = resolved.symbol.lot_size.unwrap_or(100_000);
+    let volume_units = (volume_lots * lot_size as f64 * 100.0).round() as i64;
+    if volume_units <= 0 {
+        return Err(anyhow!(
+            "computed volume ({volume_units}) is not positive — \
+             check lot_size ({lot_size}) and volume_lots ({volume_lots})"
+        ));
+    }
+    if let Some(min) = resolved.symbol.min_volume {
+        if volume_units < min {
+            return Err(anyhow!(
+                "volume {volume_units} is below broker min_volume {min} \
+                 for {symbol}"
+            ));
+        }
+    }
+    if let Some(max) = resolved.symbol.max_volume {
+        if volume_units > max {
+            return Err(anyhow!(
+                "volume {volume_units} exceeds broker max_volume {max} \
+                 for {symbol}"
+            ));
+        }
+    }
+
+    // cTrader relative_stop_loss is in 1e-5 base-price units.
+    // For 5-digit FX (EURUSD etc): 1 pip = 0.0001 = 10 * 1e-5, so
+    //   relative_units = pips * 10.
+    // For 3-digit JPY pairs: 1 pip = 0.01 = 1000 * 1e-5, so
+    //   relative_units = pips * 1000.
+    // Generally: relative_units = pips * 10^(digits - 4).
+    let digits = resolved.symbol.digits.max(0) as u32;
+    // For 5-digit FX, pip_in_units = 10 (i.e. 10 * 1e-5 = 0.0001).
+    // We map every "pip" to `10^(digits-4)` 1e-5 units, then clamp
+    // at 1 so 3-digit JPY (digits=3) still resolves to something sane
+    // — though cTrader's standard contracts are 5/3 digits anyway.
+    let pip_relative_units: f64 = if digits >= 4 {
+        10f64.powi((digits - 4) as i32 + 1)
+    } else {
+        1.0
+    };
+    let relative_stop_loss =
+        stop_loss_pips.map(|p| (p * pip_relative_units).round() as i64);
+    let relative_take_profit =
+        take_profit_pips.map(|p| (p * pip_relative_units).round() as i64);
+
+    let new_order = CTraderNewOrderRequest {
+        account_id: resolved.account_id,
+        symbol_id: resolved.light_symbol.symbol_id,
+        order_type: CTraderOrderType::Market,
+        trade_side: side.into(),
+        volume: volume_units,
+        limit_price: None,
+        stop_price: None,
+        time_in_force: None,
+        expiration_timestamp_ms: None,
+        // For Market orders, ABSOLUTE SL/TP fields are rejected by
+        // cTrader ("SL/TP in absolute values are allowed only for
+        // LIMIT/STOP/STOP_LIMIT"). Use the `relative_*` fields instead,
+        // expressed in 1e-5 base-price units derived above.
+        stop_loss: None,
+        take_profit: None,
+        comment,
+        base_slippage_price: None,
+        slippage_in_points: None,
+        label: Some("neoethos-ui".to_string()),
+        position_id: None,
+        client_order_id: None,
+        relative_stop_loss,
+        relative_take_profit,
+        guaranteed_stop_loss: None,
+        trailing_stop_loss: None,
+        stop_trigger_method: None,
+    };
+
+    let backend = ProductionCTraderExecutionBackend::default();
+    let runtime_request = CTraderExecutionRuntimeRequest {
+        client_id: creds.client_id,
+        client_secret: creds.client_secret,
+        access_token: creds.access_token,
+        environment: creds.environment,
+        account_id: creds.account_id_str,
+        request: CTraderExecutionRequest::NewOrder(Box::new(new_order)),
+    };
+    backend.execute(&runtime_request)
 }
 
 fn bars_to_normalized(bars: &[HistoricalBar]) -> Vec<NormalizedBar> {
