@@ -19,6 +19,32 @@ use crate::app_services::broker_api::{
 
 use super::state::AppApiState;
 
+// ─── GET /broker/timeframes ───────────────────────────────────────────────
+
+/// Returns the canonical 11 timeframes that the cTrader Open API
+/// trendbar period mapper accepts — sourced from
+/// `neoethos_core::CANONICAL_TIMEFRAMES` so a workspace-wide change
+/// to that contract is picked up by the UI automatically. The Flutter
+/// chart + bootstrap screens read this instead of hardcoding chip
+/// lists locally.
+///
+/// Why this is **not** per-symbol: cTrader's ProtoOATrendbarPeriod is
+/// a global enum (M1..MN1) — every symbol the broker offers supports
+/// the same set. If we ever flip to a broker that varies timeframes
+/// per symbol, this endpoint grows a `?symbol=` query and the wire
+/// shape stays compatible.
+pub async fn timeframes(State(_state): State<AppApiState>) -> Response {
+    let list: Vec<String> = neoethos_core::CANONICAL_TIMEFRAMES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    Json(serde_json::json!({
+        "timeframes": list,
+        "count": list.len(),
+    }))
+    .into_response()
+}
+
 // ─── GET /broker/symbols ──────────────────────────────────────────────────
 
 #[derive(Debug, serde::Serialize)]

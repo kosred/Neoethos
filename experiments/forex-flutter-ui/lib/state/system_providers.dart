@@ -80,6 +80,16 @@ final brokerSymbolsProvider =
   return client.fetchBrokerSymbols();
 });
 
+/// `/broker/timeframes` — canonical cTrader-supported timeframe list,
+/// sourced from neoethos_core::CANONICAL_TIMEFRAMES on the server.
+/// Tiny (11 strings) and immutable for the life of the binary, so we
+/// can use a regular FutureProvider (not autoDispose); first read
+/// caches forever within the session.
+final brokerTimeframesProvider = FutureProvider<List<String>>((ref) {
+  final client = ref.read(backendClientProvider);
+  return client.fetchBrokerTimeframes();
+});
+
 /// Selected symbol + timeframe for the Chart screen. Bound to chips
 /// the operator clicks; survives screen navigation since these are
 /// NotifierProviders (not autoDispose).

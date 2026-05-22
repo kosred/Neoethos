@@ -297,6 +297,20 @@ class BackendClient {
     return response.data ?? const <String, dynamic>{};
   }
 
+  /// `/broker/timeframes` — canonical timeframe list from the
+  /// neoethos_core contract (= what cTrader Open API's trendbar
+  /// period mapper actually accepts: M1, M3, M5, M15, M30, H1, H4,
+  /// H12, D1, W1, MN1). Used by Chart + Data Bootstrap chips.
+  Future<List<String>> fetchBrokerTimeframes() async {
+    final response = await _dio.get<Map<String, dynamic>>(
+      '/broker/timeframes',
+    );
+    final raw = response.data?['timeframes'] as List?;
+    return (raw ?? const [])
+        .map((e) => e as String)
+        .toList(growable: false);
+  }
+
   /// `/broker/symbols` — full broker symbol catalog (not hardcoded).
   Future<BrokerSymbolsSnapshot> fetchBrokerSymbols() async {
     final response = await _dio.get<Map<String, dynamic>>(

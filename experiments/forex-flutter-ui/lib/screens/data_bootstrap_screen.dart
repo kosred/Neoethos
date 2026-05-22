@@ -10,17 +10,12 @@ import '../state/system_providers.dart';
 import '../theme/theme.dart';
 import '_placeholder.dart';
 
-const _timeframeChoices = <String>[
-  'M1',
-  'M5',
-  'M15',
-  'M30',
-  'H1',
-  'H4',
-  'D1',
-  'W1',
-  'MN1',
-];
+/// Fallback timeframe list shown ONLY while /broker/timeframes is
+/// in-flight. Real choices come from `brokerTimeframesProvider`
+/// (= `neoethos_core::CANONICAL_TIMEFRAMES`). Earlier revisions had a
+/// 9-entry hardcoded list here that was missing M3 + H12 — that
+/// drift is exactly why this is server-driven now.
+const _fallbackTimeframes = <String>['M1', 'H1', 'D1'];
 
 class DataBootstrapScreen extends ConsumerWidget {
   const DataBootstrapScreen({super.key});
@@ -254,17 +249,44 @@ class _BodyState extends ConsumerState<_Body> {
                     ),
                   ),
                   const SizedBox(width: 12),
-                  DropdownButton<String>(
-                    value: _timeframe,
-                    items: [
-                      for (final tf in _timeframeChoices)
-                        DropdownMenuItem(value: tf, child: Text(tf)),
-                    ],
-                    onChanged: _busy
-                        ? null
-                        : (v) {
-                            if (v != null) setState(() => _timeframe = v);
+                  Consumer(
+                    builder: (ctx, ref, _) {
+                      final tfs = ref
+                          .watch(brokerTimeframesProvider)
+                          .maybeWhen(
+                            data: (list) =>
+                                list.isEmpty ? _fallbackTimeframes : list,
+                            orElse: () => _fallbackTimeframes,
+                          );
+                      // If the live list doesn't include the saved
+                      // pick (e.g. canonical contract changed),
+                      // anchor on the first available value so
+                      // DropdownButton doesn't assert.
+                      final current = tfs.contains(_timeframe)
+                          ? _timeframe
+                          : tfs.first;
+                      if (current != _timeframe) {
+                        WidgetsBinding.instance.addPostFrameCallback(
+                          (_) {
+                            if (mounted) {
+                              setState(() => _timeframe = current);
+                            }
                           },
+                        );
+                      }
+                      return DropdownButton<String>(
+                        value: current,
+                        items: [
+                          for (final tf in tfs)
+                            DropdownMenuItem(value: tf, child: Text(tf)),
+                        ],
+                        onChanged: _busy
+                            ? null
+                            : (v) {
+                                if (v != null) setState(() => _timeframe = v);
+                              },
+                      );
+                    },
                   ),
                 ],
               ),
