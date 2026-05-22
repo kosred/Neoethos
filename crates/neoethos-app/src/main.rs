@@ -1,3 +1,15 @@
+// In Windows release builds, link as a GUI subsystem app so the
+// backend process spawned by the Flutter shell doesn't pop up a
+// black console window behind the UI. In debug builds we keep the
+// console so `cargo run -- --server` still shows tracing output
+// on stdout. The `cfg_attr` form is the only one that compiles
+// cleanly on non-Windows targets — Linux/macOS just ignore the
+// attribute entirely.
+#![cfg_attr(
+    all(windows, not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod app_services;
 mod app_state;
 mod server;
