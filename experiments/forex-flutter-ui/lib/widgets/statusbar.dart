@@ -1,14 +1,21 @@
 // StatusBar — bottom strip (broker / engine / blackout / version).
 //
-// Broker badge now reflects the live connection state from
-// `accountSnapshotProvider`. Engine + blackout stay as static
-// placeholders until their respective endpoints ship.
+// All four items now reflect live state — no hardcoded "Live" lying
+// about a Demo session, no "Idle" engine when a job is actually
+// running. Sources:
+//   - Broker: `/broker/status` (adapter + environment + connected flag)
+//   - Engine: `/engines/status` (whichever of Discovery/Training/AutoTrader
+//             is running takes the label; "Idle" only when all three are).
+//   - Blackout: still "—" because the news-blackout endpoint is part of
+//             the Gemma News work and the state we'd render here lives
+//             behind a follow-up.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
 import '../state/account_provider.dart';
+import '../state/system_providers.dart';
 import '../theme/theme.dart';
 
 class StatusBar extends ConsumerWidget {
@@ -16,14 +23,37 @@ class StatusBar extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final asyncSnapshot = ref.watch(accountSnapshotProvider);
-    final (brokerValue, brokerOk) = switch (asyncSnapshot) {
-      AsyncData() => ('cTrader · Live', true),
-      AsyncError(error: final e) when e is BrokerNotReadyException =>
-        ('cTrader · connecting', false),
-      AsyncError() => ('cTrader · offline', false),
-      _ => ('cTrader · connecting', false),
-    };
+    final asyncAccount = ref.watch(accountSnapshotProvider);
+    final brokerAsync = ref.watch(brokerStatusProvider);
+    final enginesAsync = ref.watch(enginesProvider);
+
+    // Broker label: prefer `/broker/status` (gives adapter + environment
+    // + connected). If that hasn't loaded yet, fall back to inferring
+    // from accountSnapshotProvider so the bar isn't empty on cold start.
+    final (brokerValue, brokerOk) = brokerAsync.maybeWhen(
+      data: (b) => (
+        '${b.adapter} · ${b.environment}${b.connected ? "" : " · offline"}',
+        b.connected,
+      ),
+      orElse: () => switch (asyncAccount) {
+        AsyncData() => ('cTrader · connecting', false),
+        AsyncError(error: final e) when e is BrokerNotReadyException =>
+          ('cTrader · connecting', false),
+        AsyncError() => ('cTrader · offline', false),
+        _ => ('cTrader · connecting', false),
+      },
+    );
+
+    final (engineValue, engineRunning) = enginesAsync.maybeWhen(
+      data: (e) {
+        bool running(String s) => s.toLowerCase() == 'running';
+        if (running(e.discovery)) return ('Discovery · running', true);
+        if (running(e.training)) return ('Training · running', true);
+        if (running(e.autoTrader)) return ('Auto-trader · running', true);
+        return ('Idle', false);
+      },
+      orElse: () => ('—', false),
+    );
 
     return Container(
       height: ForexAiTokens.statusbarHeight,
@@ -36,10 +66,11 @@ class StatusBar extends ConsumerWidget {
         children: [
           _StatusItem(label: 'Broker', value: brokerValue, success: brokerOk),
           const _StatusSep(),
-          // Engine / blackout / latency stay static for now — their
-          // backing endpoints (/engines/status, /news/state) are
-          // scheduled in the next session.
-          const _StatusItem(label: 'Engine', value: 'Idle'),
+          _StatusItem(
+            label: 'Engine',
+            value: engineValue,
+            success: engineRunning,
+          ),
           const _StatusSep(),
           const _StatusItem(label: 'News blackout', value: '—'),
           const Spacer(),
