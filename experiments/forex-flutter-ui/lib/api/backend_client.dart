@@ -267,6 +267,30 @@ class BackendClient {
     return response.data ?? const <String, dynamic>{};
   }
 
+  /// `/chart?symbol=&timeframe=&limit=` — OHLC candles for charting.
+  Future<ChartSnapshot> fetchChart({
+    String symbol = 'EURUSD',
+    String timeframe = 'M1',
+    int limit = 200,
+  }) async {
+    final response = await _dio.get<Map<String, dynamic>>(
+      '/chart',
+      queryParameters: {
+        'symbol': symbol,
+        'timeframe': timeframe,
+        'limit': limit,
+      },
+    );
+    if (response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/chart returned empty body',
+      );
+    }
+    return ChartSnapshot.fromJson(response.data!);
+  }
+
   /// `/intelligence` — model artifacts + discovery targets + walkforward.
   Future<IntelligenceSnapshot> fetchIntelligence() async {
     final response = await _dio.get<Map<String, dynamic>>('/intelligence');
@@ -427,6 +451,72 @@ class BrokerStatus {
         accountId: j['accountId'] as String,
         connected: j['connected'] as bool,
         clientIdPrefix: j['clientIdPrefix'] as String,
+      );
+}
+
+class ChartCandle {
+  final int? tsMs;
+  final double open;
+  final double high;
+  final double low;
+  final double close;
+  final double volume;
+  const ChartCandle({
+    required this.tsMs,
+    required this.open,
+    required this.high,
+    required this.low,
+    required this.close,
+    required this.volume,
+  });
+  factory ChartCandle.fromJson(Map<String, dynamic> j) => ChartCandle(
+        tsMs: j['tsMs'] as int?,
+        open: (j['open'] as num).toDouble(),
+        high: (j['high'] as num).toDouble(),
+        low: (j['low'] as num).toDouble(),
+        close: (j['close'] as num).toDouble(),
+        volume: (j['volume'] as num).toDouble(),
+      );
+}
+
+class ChartSnapshot {
+  final String symbol;
+  final String timeframe;
+  final List<String> availableTimeframes;
+  final int candleCount;
+  final List<ChartCandle> candles;
+  final double priceMin;
+  final double priceMax;
+  final double latestClose;
+  final double priceChangePct;
+  final String headline;
+  const ChartSnapshot({
+    required this.symbol,
+    required this.timeframe,
+    required this.availableTimeframes,
+    required this.candleCount,
+    required this.candles,
+    required this.priceMin,
+    required this.priceMax,
+    required this.latestClose,
+    required this.priceChangePct,
+    required this.headline,
+  });
+  factory ChartSnapshot.fromJson(Map<String, dynamic> j) => ChartSnapshot(
+        symbol: j['symbol'] as String,
+        timeframe: j['timeframe'] as String,
+        availableTimeframes: ((j['availableTimeframes'] as List?) ?? const [])
+            .map((s) => s as String)
+            .toList(growable: false),
+        candleCount: (j['candleCount'] as int?) ?? 0,
+        candles: ((j['candles'] as List?) ?? const [])
+            .map((e) => ChartCandle.fromJson(e as Map<String, dynamic>))
+            .toList(growable: false),
+        priceMin: (j['priceMin'] as num).toDouble(),
+        priceMax: (j['priceMax'] as num).toDouble(),
+        latestClose: (j['latestClose'] as num).toDouble(),
+        priceChangePct: (j['priceChangePct'] as num).toDouble(),
+        headline: (j['headline'] as String?) ?? '',
       );
 }
 

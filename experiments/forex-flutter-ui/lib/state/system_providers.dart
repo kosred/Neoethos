@@ -71,6 +71,22 @@ final intelligenceProvider =
   return client.fetchIntelligence();
 });
 
+/// Selected symbol + timeframe for the Chart screen. Bound to chips
+/// the operator clicks; survives screen navigation since these are
+/// NotifierProviders (not autoDispose).
+final chartSymbolProvider = StateProvider<String>((ref) => 'EURUSD');
+final chartTimeframeProvider = StateProvider<String>((ref) => 'M1');
+
+/// `/chart` snapshot. Family over (symbol, tf) so the user can flip
+/// chips and the cache holds.
+final chartProvider =
+    FutureProvider.autoDispose<ChartSnapshot>((ref) async {
+  final symbol = ref.watch(chartSymbolProvider);
+  final tf = ref.watch(chartTimeframeProvider);
+  final client = ref.read(backendClientProvider);
+  return client.fetchChart(symbol: symbol, timeframe: tf, limit: 200);
+});
+
 /// `/data/bootstrap` — local data-dir inventory.
 final dataBootstrapProvider =
     FutureProvider.autoDispose<DataBootstrapSnapshot>((ref) {

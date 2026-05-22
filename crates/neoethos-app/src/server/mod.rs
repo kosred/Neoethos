@@ -30,6 +30,7 @@
 pub mod account;
 pub mod bridge;
 pub mod broker_control;
+pub mod chart;
 pub mod engines_control;
 pub mod hardware;
 pub mod intelligence;
@@ -84,6 +85,7 @@ pub fn router(state: AppApiState) -> Router {
         .route("/broker/reauth", post(broker_control::reauth))
         .route("/data/bootstrap", get(system_status::data_bootstrap))
         .route("/intelligence", get(intelligence::intelligence))
+        .route("/chart", get(chart::chart))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
