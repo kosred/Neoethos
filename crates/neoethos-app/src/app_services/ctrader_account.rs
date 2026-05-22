@@ -142,10 +142,24 @@ struct TraderEnvelope {
     payload: TraderPayload,
 }
 
+/// Wire shape for `ProtoOATraderRes.payload` per the cTrader Open API.
+///
+/// The outer payload carries a nested `trader: { ... }` object that
+/// holds balance / leverage / login. Pre-`82b075` we tried to read
+/// those fields at the top level (matching no documented shape), which
+/// silently failed `parse_trader_response` with `failed to parse cTrader
+/// trader response` and propagated as `EQUITY $0.00` on the dashboard
+/// — the bug that finally surfaced when we got an end-to-end successful
+/// reply path from a sandbox account.
 #[derive(Debug, Deserialize)]
 struct TraderPayload {
     #[serde(rename = "ctidTraderAccountId")]
     ctid_trader_account_id: i64,
+    trader: TraderInfo,
+}
+
+#[derive(Debug, Deserialize)]
+struct TraderInfo {
     balance: i64,
     #[serde(rename = "moneyDigits")]
     money_digits: Option<u32>,
@@ -352,17 +366,17 @@ pub fn parse_trader_response(response_json: &str) -> Result<CTraderTraderSnapsho
         ));
     }
 
-    let money_digits = required_money_digits(envelope.payload.money_digits, "trader.money_digits");
+    let trader = envelope.payload.trader;
+    let money_digits = required_money_digits(trader.money_digits, "trader.money_digits");
     Ok(CTraderTraderSnapshot {
         account_id: envelope.payload.ctid_trader_account_id,
-        balance: scaled_money(envelope.payload.balance, money_digits),
-        leverage: envelope
-            .payload
+        balance: scaled_money(trader.balance, money_digits),
+        leverage: trader
             .leverage_in_cents
             .map(|value| value as f64 / 100.0),
-        trader_login: envelope.payload.trader_login,
-        account_type: envelope.payload.account_type.map(account_type_label),
-        broker_name: envelope.payload.broker_name,
+        trader_login: trader.trader_login,
+        account_type: trader.account_type.map(account_type_label),
+        broker_name: trader.broker_name,
         money_digits,
         unrealized_pnl: 0.0,
     })
