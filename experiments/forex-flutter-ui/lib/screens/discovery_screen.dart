@@ -1,9 +1,12 @@
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
 import '_placeholder.dart';
+import 'widgets/engine_controls.dart';
 
 class DiscoveryScreen extends ConsumerWidget {
   const DiscoveryScreen({super.key});
@@ -19,9 +22,30 @@ class DiscoveryScreen extends ConsumerWidget {
             subtitle: 'Genetic search → portfolio',
           ),
           async.when(
-            data: (e) => _Body(state: e.discovery),
+            data: (e) => EngineControls(
+              kind: 'Discovery',
+              running: e.discoveryRunning,
+              state: e.discovery,
+              summary: e.discoverySummary,
+              start: ({String? symbol, String? baseTf}) =>
+                  ref.read(backendClientProvider).startDiscovery(
+                        symbol: symbol,
+                        baseTf: baseTf,
+                      ),
+              stop: () => ref.read(backendClientProvider).stopDiscovery(),
+              onChanged: () => ref.invalidate(enginesProvider),
+              description:
+                  'Discovery runs a genetic algorithm over the configured '
+                  'symbol/timeframe to evolve a portfolio of candidate '
+                  'strategies. The Rust engine drives '
+                  'population/generations/novelty internally — defaults '
+                  'come from config.yaml. Once a run completes, the '
+                  'selected portfolio lands in models_targets.json and '
+                  'Training picks it up automatically.',
+            ),
             loading: () => const _Loading(),
-            error: (err, _) => _Error(error: err.toString()),
+            error: (err, _) =>
+                _Error(error: err is DioException ? _formatDio(err) : '$err'),
           ),
         ],
       ),
@@ -29,54 +53,10 @@ class DiscoveryScreen extends ConsumerWidget {
   }
 }
 
-class _Body extends StatelessWidget {
-  final String state;
-  const _Body({required this.state});
-  @override
-  Widget build(BuildContext context) {
-    final running = state.toLowerCase() == 'running';
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        SectionCard(
-          title: 'Current Job',
-          child: Row(
-            children: [
-              Container(
-                width: 10,
-                height: 10,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: running ? ForexAiTokens.buy : ForexAiTokens.textFaint,
-                ),
-              ),
-              const SizedBox(width: 8),
-              Text(
-                state,
-                style: TextStyle(
-                  fontSize: 14,
-                  fontWeight: FontWeight.w700,
-                  color: running ? ForexAiTokens.buy : ForexAiTokens.textPrimary,
-                ),
-              ),
-            ],
-          ),
-        ),
-        const SectionCard(
-          title: 'How discovery works',
-          child: Text(
-            'Discovery runs a genetic algorithm over the configured '
-            'symbol/timeframe to evolve a portfolio of candidate '
-            'strategies. The Rust engine drives population/generations/'
-            'novelty internally; this screen will gain start/stop '
-            'controls + a live progress sparkline once the POST '
-            '/engines/discovery/{start,stop} endpoints ship.',
-            style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
-          ),
-        ),
-      ],
-    );
-  }
+String _formatDio(DioException e) {
+  final body = e.response?.data;
+  if (body is Map && body['error'] is String) return body['error'] as String;
+  return e.message ?? e.toString();
 }
 
 class _Loading extends StatelessWidget {

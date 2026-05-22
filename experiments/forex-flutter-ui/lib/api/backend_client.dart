@@ -210,6 +210,46 @@ class BackendClient {
     return BrokerStatus.fromJson(response.data!);
   }
 
+  /// POST `/engines/discovery/{start,stop}`. Returns the response body
+  /// shape: `{started:true, kind:"discovery", symbol, base_tf}` for
+  /// start, `{running, kind}` for stop. Throws DioException on 4xx/5xx.
+  Future<Map<String, dynamic>> startDiscovery({
+    String? symbol,
+    String? baseTf,
+  }) async {
+    return _postEngine('/engines/discovery/start', symbol, baseTf);
+  }
+
+  Future<Map<String, dynamic>> stopDiscovery() async {
+    return _postEngine('/engines/discovery/stop', null, null);
+  }
+
+  Future<Map<String, dynamic>> startTraining({
+    String? symbol,
+    String? baseTf,
+  }) async {
+    return _postEngine('/engines/training/start', symbol, baseTf);
+  }
+
+  Future<Map<String, dynamic>> stopTraining() async {
+    return _postEngine('/engines/training/stop', null, null);
+  }
+
+  Future<Map<String, dynamic>> _postEngine(
+    String path,
+    String? symbol,
+    String? baseTf,
+  ) async {
+    final body = <String, dynamic>{};
+    if (symbol != null && symbol.trim().isNotEmpty) body['symbol'] = symbol;
+    if (baseTf != null && baseTf.trim().isNotEmpty) body['base_tf'] = baseTf;
+    final response = await _dio.post<Map<String, dynamic>>(
+      path,
+      data: body.isEmpty ? null : body,
+    );
+    return response.data ?? const <String, dynamic>{};
+  }
+
   /// `/data/bootstrap` — local data-dir inventory.
   Future<DataBootstrapSnapshot> fetchDataBootstrap() async {
     final response = await _dio.get<Map<String, dynamic>>('/data/bootstrap');
@@ -317,16 +357,25 @@ class EnginesSnapshot {
   final String discovery;
   final String training;
   final String autoTrader;
+  final String discoverySummary;
+  final String trainingSummary;
   const EnginesSnapshot({
     required this.discovery,
     required this.training,
     required this.autoTrader,
+    required this.discoverySummary,
+    required this.trainingSummary,
   });
   factory EnginesSnapshot.fromJson(Map<String, dynamic> j) => EnginesSnapshot(
         discovery: j['discovery'] as String,
         training: j['training'] as String,
         autoTrader: j['autoTrader'] as String,
+        discoverySummary: (j['discoverySummary'] as String?) ?? '',
+        trainingSummary: (j['trainingSummary'] as String?) ?? '',
       );
+
+  bool get discoveryRunning => discovery.toLowerCase() == 'running';
+  bool get trainingRunning => training.toLowerCase() == 'running';
 }
 
 class BrokerStatus {

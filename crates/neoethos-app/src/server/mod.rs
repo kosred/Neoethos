@@ -29,6 +29,7 @@
 
 pub mod account;
 pub mod bridge;
+pub mod engines_control;
 pub mod hardware;
 pub mod health;
 pub mod risk;
@@ -38,7 +39,7 @@ pub mod system_status;
 
 use anyhow::Context;
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{get, post};
 use std::net::SocketAddr;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -61,6 +62,22 @@ pub fn router(state: AppApiState) -> Router {
         .route("/risk", get(risk::risk))
         .route("/settings", get(settings::settings))
         .route("/engines/status", get(system_status::engines))
+        .route(
+            "/engines/discovery/start",
+            post(engines_control::discovery_start),
+        )
+        .route(
+            "/engines/discovery/stop",
+            post(engines_control::discovery_stop),
+        )
+        .route(
+            "/engines/training/start",
+            post(engines_control::training_start),
+        )
+        .route(
+            "/engines/training/stop",
+            post(engines_control::training_stop),
+        )
         .route("/broker/status", get(system_status::broker_status))
         .route("/data/bootstrap", get(system_status::data_bootstrap))
         .layer(TraceLayer::new_for_http())

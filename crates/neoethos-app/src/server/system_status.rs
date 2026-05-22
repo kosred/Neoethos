@@ -17,6 +17,7 @@ use axum::response::{IntoResponse, Response};
 use neoethos_core::Settings;
 
 use crate::app_services::broker_persistence::load_broker_settings;
+use crate::app_services::jobs::JobKind;
 
 use super::state::AppApiState;
 
@@ -28,20 +29,23 @@ pub struct EnginesDto {
     pub discovery: String,
     pub training: String,
     pub auto_trader: String,
+    /// Human-readable progress / status line for whichever engine is
+    /// currently active. Empty when all three are Idle.
+    pub discovery_summary: String,
+    pub training_summary: String,
 }
 
-/// Engine-state endpoint. Until we plumb the real `DiscoveryJobHandle`
-/// / `TrainingJobHandle` / `AutoTradeProducer` into the server (they
-/// currently live behind `TradingSession`), the bridge has no way to
-/// observe job lifecycle, so all three report `"Idle"`. The Flutter
-/// side renders these with the same green/yellow/red treatment the
-/// real values will use — when we wire the real state in, no UI
-/// changes needed.
-pub async fn engines(State(_state): State<AppApiState>) -> Json<EnginesDto> {
+/// Engine-state endpoint. Reads the latest `EngineRunState` written
+/// by the background ServiceEvent drainer that the `engines_control`
+/// start handlers spawn. Auto-Trader still reports `"Idle"` — it ships
+/// in a follow-up wiring along with the order-ticket endpoints.
+pub async fn engines(State(state): State<AppApiState>) -> Json<EnginesDto> {
     Json(EnginesDto {
-        discovery: "Idle".to_string(),
-        training: "Idle".to_string(),
+        discovery: state.engine_state(JobKind::Discovery).await.as_str().to_string(),
+        training: state.engine_state(JobKind::Training).await.as_str().to_string(),
         auto_trader: "Idle".to_string(),
+        discovery_summary: state.engine_summary(JobKind::Discovery).await,
+        training_summary: state.engine_summary(JobKind::Training).await,
     })
 }
 

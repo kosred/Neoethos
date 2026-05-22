@@ -16,6 +16,9 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::app_services::jobs::{CancellationFlag, JobKind};
+use crate::server::engines_control::EngineRunState;
+
 /// A minimal, render-ready account snapshot. Same shape as the
 /// `AccountSnapshot` Dart class in `backend_client.dart`. Kept here
 /// instead of in `account.rs` so other routes can read account state
@@ -53,6 +56,25 @@ pub struct AppApiState {
 #[derive(Default)]
 pub(crate) struct AppApiInner {
     pub account: Option<AccountSnapshotPayload>,
+    pub discovery: EngineSlot,
+    pub training: EngineSlot,
+}
+
+/// In-memory tracking of one engine's lifecycle. `state` is what
+/// `/engines/status` returns; `cancel` lets `/engines/{kind}/stop`
+/// signal the running job; `summary` is the latest one-line status
+/// from the job's progress reports.
+#[derive(Debug, Clone, Default)]
+pub struct EngineSlot {
+    pub state: EngineRunState,
+    pub cancel: Option<CancellationFlag>,
+    pub summary: String,
+}
+
+impl Default for EngineRunState {
+    fn default() -> Self {
+        EngineRunState::Idle
+    }
 }
 
 impl AppApiState {
@@ -93,6 +115,102 @@ impl AppApiState {
     #[allow(dead_code)] // wired up next session when the streaming worker lands
     pub async fn set_account(&self, snapshot: AccountSnapshotPayload) {
         self.inner.write().await.account = Some(snapshot);
+    }
+
+    // ─── Engine slot accessors ────────────────────────────────────────
+
+    /// Read the current run state for the given engine.
+    pub async fn engine_state(&self, kind: JobKind) -> EngineRunState {
+        let inner = self.inner.read().await;
+        match kind {
+            JobKind::Discovery => inner.discovery.state,
+            JobKind::Training => inner.training.state,
+            JobKind::Bootstrap => EngineRunState::Idle,
+        }
+    }
+
+    /// Read the latest one-line summary for the given engine.
+    pub async fn engine_summary(&self, kind: JobKind) -> String {
+        let inner = self.inner.read().await;
+        match kind {
+            JobKind::Discovery => inner.discovery.summary.clone(),
+            JobKind::Training => inner.training.summary.clone(),
+            JobKind::Bootstrap => String::new(),
+        }
+    }
+
+    /// Mark an engine as Running and remember its cancel flag so a
+    /// later `/stop` can signal it. Called by the discovery/training
+    /// `start` endpoints right after `start_*_job` returns.
+    pub async fn install_engine(&self, kind: JobKind, cancel: CancellationFlag) {
+        let mut inner = self.inner.write().await;
+        let slot = match kind {
+            JobKind::Discovery => &mut inner.discovery,
+            JobKind::Training => &mut inner.training,
+            JobKind::Bootstrap => return,
+        };
+        slot.state = EngineRunState::Running;
+        slot.cancel = Some(cancel);
+        slot.summary = "starting…".to_string();
+    }
+
+    /// Reflect the latest ServiceEvent-derived state into the slot.
+    /// Called from the engines_control state-drainer task.
+    pub async fn update_engine(
+        &self,
+        kind: JobKind,
+        state: EngineRunState,
+        summary: String,
+    ) {
+        let mut inner = self.inner.write().await;
+        let slot = match kind {
+            JobKind::Discovery => &mut inner.discovery,
+            JobKind::Training => &mut inner.training,
+            JobKind::Bootstrap => return,
+        };
+        slot.state = state;
+        if !summary.is_empty() {
+            slot.summary = summary;
+        }
+        // Once we hit a terminal state, drop the cancel flag — there's
+        // nothing left to cancel.
+        if !matches!(state, EngineRunState::Running) {
+            slot.cancel = None;
+        }
+    }
+
+    /// Defensive guard: if the ServiceEvent channel closes without a
+    /// terminal event (shouldn't happen in practice but worth
+    /// covering), flip Running → Idle so the UI doesn't get stuck.
+    pub async fn finalize_engine_if_running(&self, kind: JobKind) {
+        let mut inner = self.inner.write().await;
+        let slot = match kind {
+            JobKind::Discovery => &mut inner.discovery,
+            JobKind::Training => &mut inner.training,
+            JobKind::Bootstrap => return,
+        };
+        if matches!(slot.state, EngineRunState::Running) {
+            slot.state = EngineRunState::Idle;
+            slot.cancel = None;
+        }
+    }
+
+    /// Fire the cancel flag on the named engine if one is registered.
+    /// Returns `true` if a job was actually running; `false` is the
+    /// idempotent no-op case.
+    pub async fn cancel_engine(&self, kind: JobKind) -> bool {
+        let inner = self.inner.read().await;
+        let slot = match kind {
+            JobKind::Discovery => &inner.discovery,
+            JobKind::Training => &inner.training,
+            JobKind::Bootstrap => return false,
+        };
+        if let Some(cancel) = &slot.cancel {
+            cancel.request();
+            true
+        } else {
+            false
+        }
     }
 }
 
