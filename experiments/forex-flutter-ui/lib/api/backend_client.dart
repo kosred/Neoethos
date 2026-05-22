@@ -1,11 +1,16 @@
-// Backend API client — talks to forex-app (existing CLI/IPC) +
-// forex-gemma (G8 REST/SSE surface).
+// Backend API client — talks to the NeoEthos Rust HTTP server.
 //
-// Phase: skeleton with mocked responses. Real wiring lands when
-// the Rust side ships `forex-server` (a binary that hosts the
-// REST surface). Until then this client returns canned data
-// matching the wire shapes defined in
-// `crates/forex-gemma/src/api.rs`.
+// The Rust side runs as `neoethos-app --server` and listens on
+// `127.0.0.1:7423` (override via `NEOETHOS_SERVER_BIND` env var on the
+// server). This client is a thin dio wrapper — every business decision
+// lives on the Rust side (broker auth, polling cadence, prop-firm
+// guards), and Flutter just renders what the API returns.
+//
+// Wire shapes mirror the Rust DTOs in `crates/neoethos-app/src/server/
+// account.rs`. Keep them in lock-step: a missing `serde(rename_all =
+// "camelCase")` on the Rust side surfaces here as "null balance" /
+// "null positions" — extremely confusing because the HTTP call still
+// returns 200. If you change either side, change both.
 
 import 'package:dio/dio.dart';
 
@@ -14,16 +19,27 @@ class BackendConfig {
   const BackendConfig({this.baseUrl = 'http://127.0.0.1:7423'});
 }
 
-/// Stub data models — mirror the shapes from
-/// `crates/forex-gemma/src/api.rs` (ChatRequest, ChatEvent,
-/// SuggestionDecision, FeatureFlag) + forex-app trading state.
 class Position {
   final String symbol;
   final String side;
   final double volume;
   final double pnlPips;
   final double pnlUsd;
-  const Position(this.symbol, this.side, this.volume, this.pnlPips, this.pnlUsd);
+  const Position({
+    required this.symbol,
+    required this.side,
+    required this.volume,
+    required this.pnlPips,
+    required this.pnlUsd,
+  });
+
+  factory Position.fromJson(Map<String, dynamic> j) => Position(
+        symbol: j['symbol'] as String,
+        side: j['side'] as String,
+        volume: (j['volume'] as num).toDouble(),
+        pnlPips: (j['pnlPips'] as num).toDouble(),
+        pnlUsd: (j['pnlUsd'] as num).toDouble(),
+      );
 }
 
 class AccountSnapshot {
@@ -41,117 +57,88 @@ class AccountSnapshot {
     required this.currency,
     required this.positions,
   });
+
+  factory AccountSnapshot.fromJson(Map<String, dynamic> j) => AccountSnapshot(
+        balance: (j['balance'] as num).toDouble(),
+        equity: (j['equity'] as num).toDouble(),
+        freeMargin: (j['freeMargin'] as num).toDouble(),
+        usedMargin: (j['usedMargin'] as num).toDouble(),
+        currency: j['currency'] as String,
+        positions: ((j['positions'] as List?) ?? const [])
+            .map((p) => Position.fromJson(p as Map<String, dynamic>))
+            .toList(growable: false),
+      );
+}
+
+/// Sentinel that distinguishes a "real" backend error (network down,
+/// JSON malformed) from a "broker not ready yet" 503. The UI renders
+/// the second as a friendly "connecting…" placeholder, not a red banner.
+class BrokerNotReadyException implements Exception {
+  final String message;
+  const BrokerNotReadyException(this.message);
+  @override
+  String toString() => 'BrokerNotReadyException: $message';
 }
 
 class BackendClient {
   final Dio _dio;
   final BackendConfig config;
 
-  BackendClient({Dio? dio, this.config = const BackendConfig()})
-      : _dio = dio ??
-            Dio(BaseOptions(
-              baseUrl: const BackendConfig().baseUrl,
-              connectTimeout: const Duration(seconds: 5),
-              receiveTimeout: const Duration(seconds: 30),
-            ));
+  /// Factory so the dio `baseUrl` actually picks up a caller-supplied
+  /// [BackendConfig] (the older shorthand constructor hard-coded the
+  /// default baseUrl because Dart initializer-list scoping made it
+  /// awkward to reach the field). Pass `dio:` for tests that want to
+  /// inject a `MockAdapter`.
+  factory BackendClient({Dio? dio, BackendConfig? config}) {
+    final cfg = config ?? const BackendConfig();
+    final client = dio ?? _buildDefaultDio(cfg);
+    return BackendClient._(dio: client, config: cfg);
+  }
 
-  /// Fetch the current account snapshot. Returns canned data
-  /// until the Rust server is live.
+  BackendClient._({required Dio dio, required this.config}) : _dio = dio;
+
+  static Dio _buildDefaultDio(BackendConfig cfg) {
+    return Dio(BaseOptions(
+      baseUrl: cfg.baseUrl,
+      connectTimeout: const Duration(seconds: 3),
+      receiveTimeout: const Duration(seconds: 10),
+      // 503 is a legitimate "broker not ready yet" response, not a
+      // transport error — let it flow through to the catch block so
+      // we can translate it into BrokerNotReadyException.
+      validateStatus: (code) =>
+          code != null && ((code >= 200 && code < 300) || code == 503),
+    ));
+  }
+
+  /// Pull the current account snapshot from `/account/snapshot`.
+  ///
+  /// Returns the parsed [AccountSnapshot] on 200.
+  /// Throws [BrokerNotReadyException] on 503 (server is up but bridge
+  /// hasn't completed its first cTrader fetch yet).
+  /// Throws [DioException] on any other transport error.
   Future<AccountSnapshot> fetchAccountSnapshot() async {
-    // TODO(G8): GET /account/snapshot
-    return const AccountSnapshot(
-      balance: 10000.00,
-      equity: 10243.55,
-      freeMargin: 9762.40,
-      usedMargin: 250.00,
-      currency: 'EUR',
-      positions: [
-        Position('EURUSD', 'LONG', 0.10, 24.5, 23.65),
-        Position('XAUUSD', 'SHORT', 0.02, -3.2, -6.40),
-      ],
-    );
+    final response = await _dio.get<Map<String, dynamic>>('/account/snapshot');
+    if (response.statusCode == 503) {
+      final body = response.data ?? {};
+      final code = body['code']?.toString() ?? 'unknown';
+      final error = body['error']?.toString() ?? 'broker session not ready';
+      throw BrokerNotReadyException('$code: $error');
+    }
+    final data = response.data;
+    if (data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/account/snapshot returned 200 with empty body',
+      );
+    }
+    return AccountSnapshot.fromJson(data);
   }
 
-  /// Open a chat turn — returns a Stream of typed events. Once
-  /// the Rust SSE endpoint is live, this wraps the SSE response
-  /// in a Stream<ChatEventDto>.
-  Stream<ChatEventDto> openChat({
-    required String sessionId,
-    required String prompt,
-  }) async* {
-    // TODO(G8): POST /gemma/chat → SSE stream
-    yield ChatEventDto.refusedByGate(
-      reason: 'Backend not yet running',
-      cannedResponse:
-          'Ο rust backend δεν τρέχει ακόμα. Όταν το forex-server '
-          'εκκινήσει στο port ${config.baseUrl.split(":").last}, '
-          'οι αληθινές απαντήσεις του Gemma θα ροή εδώ.',
-    );
+  /// Liveness ping. Returns the server's compile-time version string
+  /// so the UI can flag bundle-version mismatch.
+  Future<String> fetchServerVersion() async {
+    final response = await _dio.get<Map<String, dynamic>>('/healthz');
+    return response.data?['version']?.toString() ?? 'unknown';
   }
-}
-
-/// Slim Dart twin of ChatEvent from
-/// `crates/forex-gemma/src/api.rs`.
-sealed class ChatEventDto {
-  const ChatEventDto();
-  factory ChatEventDto.refusedByGate({
-    required String reason,
-    required String cannedResponse,
-  }) = ChatEventRefused;
-  factory ChatEventDto.tokenDelta(String text) = ChatEventTokenDelta;
-  factory ChatEventDto.toolResult({
-    required String toolName,
-    required String outcome,
-  }) = ChatEventToolResult;
-  factory ChatEventDto.tradePendingApproval({
-    required String suggestionId,
-    required String symbol,
-    required String side,
-    required int volume,
-    required String reasoning,
-  }) = ChatEventTradePending;
-  factory ChatEventDto.turnFinished(int latencyMs) = ChatEventTurnFinished;
-}
-
-class ChatEventRefused extends ChatEventDto {
-  final String reason;
-  final String cannedResponse;
-  const ChatEventRefused({
-    required this.reason,
-    required this.cannedResponse,
-  });
-}
-
-class ChatEventTokenDelta extends ChatEventDto {
-  final String text;
-  const ChatEventTokenDelta(this.text);
-}
-
-class ChatEventToolResult extends ChatEventDto {
-  final String toolName;
-  final String outcome;
-  const ChatEventToolResult({
-    required this.toolName,
-    required this.outcome,
-  });
-}
-
-class ChatEventTradePending extends ChatEventDto {
-  final String suggestionId;
-  final String symbol;
-  final String side;
-  final int volume;
-  final String reasoning;
-  const ChatEventTradePending({
-    required this.suggestionId,
-    required this.symbol,
-    required this.side,
-    required this.volume,
-    required this.reasoning,
-  });
-}
-
-class ChatEventTurnFinished extends ChatEventDto {
-  final int latencyMs;
-  const ChatEventTurnFinished(this.latencyMs);
 }

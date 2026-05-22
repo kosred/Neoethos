@@ -1,11 +1,27 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:intl/intl.dart';
+
+import '../api/backend_client.dart';
+import '../state/account_provider.dart';
 import '../theme/theme.dart';
 import '_placeholder.dart';
 
-class DashboardScreen extends StatelessWidget {
+/// Dashboard — live numbers from the Rust HTTP server.
+///
+/// The screen is a thin `ConsumerWidget` over
+/// [accountSnapshotProvider]. Three render paths:
+///   - loading (no data ever): all four stat cards show `—`
+///   - data: real balance / equity / free margin / open positions
+///   - error: banner above the stats explaining what's wrong;
+///     last-known data still renders underneath so the operator
+///     keeps situational awareness across a transient network blip.
+class DashboardScreen extends ConsumerWidget {
   const DashboardScreen({super.key});
+
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final snapshot = ref.watch(accountSnapshotProvider);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -13,11 +29,11 @@ class DashboardScreen extends StatelessWidget {
           title: 'Operator Overview',
           subtitle: 'Equity · open positions · engine status',
         ),
-        // 4-column stat grid like the mockup
-        const _StatRow(),
-        const SectionCard(
+        if (snapshot.hasError) _ErrorBanner(error: snapshot.error!),
+        _StatRow(snapshot: snapshot),
+        SectionCard(
           title: 'Open Positions',
-          child: _PositionsTable(),
+          child: _PositionsTable(snapshot: snapshot),
         ),
         const SectionCard(
           title: 'Engine Health',
@@ -29,12 +45,49 @@ class DashboardScreen extends StatelessWidget {
 }
 
 class _StatRow extends StatelessWidget {
-  const _StatRow();
+  final AsyncValue<AccountSnapshot> snapshot;
+  const _StatRow({required this.snapshot});
+
   @override
   Widget build(BuildContext context) {
-    // `GridView.count` is not a `const` constructor in Flutter 3.44+
-    // (the underlying `SliverChildListDelegate.fixed` is non-const).
-    // Drop the `const` keyword — the children themselves stay const.
+    // Use `valueOrNull` so an error during a periodic refresh keeps
+    // the previous numbers on screen — we only fall back to em-dash
+    // placeholders if no data has ever loaded.
+    final data = snapshot.valueOrNull;
+    final isFirstLoad = snapshot.isLoading && data == null;
+
+    String fmt(double v) {
+      final f = NumberFormat.currency(
+        symbol: data?.currency == 'EUR' ? '€' : r'$',
+        decimalDigits: 2,
+      );
+      return f.format(v);
+    }
+
+    final balance = data == null
+        ? (isFirstLoad ? '…' : '—')
+        : fmt(data.balance);
+    final equity = data == null
+        ? (isFirstLoad ? '…' : '—')
+        : fmt(data.equity);
+    final freeMargin = data == null
+        ? (isFirstLoad ? '…' : '—')
+        : fmt(data.freeMargin);
+    final openCount = data == null
+        ? (isFirstLoad ? '…' : '—')
+        : '${data.positions.length}';
+
+    // Color equity green when up vs balance, red when down — gives the
+    // operator a one-glance read on session PnL without staring at the
+    // raw number.
+    final equityColor = data == null
+        ? null
+        : data.equity > data.balance
+            ? ForexAiTokens.buy
+            : data.equity < data.balance
+                ? ForexAiTokens.sell
+                : null;
+
     return GridView.count(
       crossAxisCount: 4,
       crossAxisSpacing: 8,
@@ -42,28 +95,36 @@ class _StatRow extends StatelessWidget {
       childAspectRatio: 3.2,
       shrinkWrap: true,
       physics: const NeverScrollableScrollPhysics(),
-      children: const [
-        StatCard(label: 'Balance', value: '\$10,000.00'),
-        StatCard(
-          label: 'Equity',
-          value: '\$10,243.55',
-          valueColor: ForexAiTokens.buy,
-        ),
-        StatCard(label: 'Free Margin', value: '\$9,762.40'),
-        StatCard(label: 'Open Positions', value: '2'),
+      children: [
+        StatCard(label: 'Balance', value: balance),
+        StatCard(label: 'Equity', value: equity, valueColor: equityColor),
+        StatCard(label: 'Free Margin', value: freeMargin),
+        StatCard(label: 'Open Positions', value: openCount),
       ],
     );
   }
 }
 
 class _PositionsTable extends StatelessWidget {
-  const _PositionsTable();
+  final AsyncValue<AccountSnapshot> snapshot;
+  const _PositionsTable({required this.snapshot});
+
   @override
   Widget build(BuildContext context) {
-    final positions = [
-      ('EURUSD', 'LONG', '0.10', '+24.5 pips', '+\$23.65'),
-      ('XAUUSD', 'SHORT', '0.02', '-3.2 pips', '-\$6.40'),
-    ];
+    final positions = snapshot.valueOrNull?.positions ?? const [];
+    if (positions.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 8),
+        child: Text(
+          'No open positions.',
+          style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
+        ),
+      );
+    }
+
+    final pipFmt = NumberFormat('+#,##0.0;-#,##0.0', 'en_US');
+    final usdFmt = NumberFormat.currency(symbol: r'$', decimalDigits: 2);
+
     return Table(
       defaultVerticalAlignment: TableCellVerticalAlignment.middle,
       columnWidths: const {
@@ -83,17 +144,65 @@ class _PositionsTable extends StatelessWidget {
         ]),
         for (final p in positions)
           TableRow(children: [
-            _Td(p.$1),
-            _Td(p.$2,
-                color: p.$2 == 'LONG' ? ForexAiTokens.buy : ForexAiTokens.sell),
-            _Td(p.$3),
-            _Td(p.$4),
-            _Td(p.$5,
-                color: p.$5.startsWith('+')
-                    ? ForexAiTokens.buy
-                    : ForexAiTokens.sell),
+            _Td(p.symbol),
+            _Td(
+              p.side,
+              color: p.side.toUpperCase() == 'LONG' || p.side.toUpperCase() == 'BUY'
+                  ? ForexAiTokens.buy
+                  : ForexAiTokens.sell,
+            ),
+            _Td(p.volume.toStringAsFixed(2)),
+            _Td('${pipFmt.format(p.pnlPips)} pips'),
+            _Td(
+              usdFmt.format(p.pnlUsd),
+              color: p.pnlUsd >= 0 ? ForexAiTokens.buy : ForexAiTokens.sell,
+            ),
           ]),
       ],
+    );
+  }
+}
+
+class _ErrorBanner extends StatelessWidget {
+  final Object error;
+  const _ErrorBanner({required this.error});
+
+  @override
+  Widget build(BuildContext context) {
+    final isBrokerNotReady = error is BrokerNotReadyException;
+    final message = isBrokerNotReady
+        ? 'Connecting to broker… the bridge is up but cTrader hasn\'t '
+            'replied yet. Live numbers will appear once the first '
+            'refresh completes (≤ 5s).'
+        : 'Backend unreachable: $error';
+    final colour = isBrokerNotReady
+        ? ForexAiTokens.textMuted
+        : ForexAiTokens.sell;
+
+    return Container(
+      margin: const EdgeInsets.only(top: 4, bottom: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: colour.withOpacity(0.08),
+        border: Border.all(color: colour.withOpacity(0.35)),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            isBrokerNotReady ? Icons.hourglass_empty : Icons.error_outline,
+            size: 16,
+            color: colour,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              message,
+              style: TextStyle(color: colour, fontSize: 12),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -102,14 +211,24 @@ class _EngineHealthRow extends StatelessWidget {
   const _EngineHealthRow();
   @override
   Widget build(BuildContext context) {
+    // Engine health stays static for Phase 1 — Discovery / Training /
+    // Auto-trade state will get their own server endpoints in
+    // the next session. Until then, these are intentional placeholders
+    // (not hidden) so the dashboard layout doesn't shift when they
+    // become live.
     return const Row(
       children: [
         Expanded(child: StatCard(label: 'Discovery', value: 'Idle')),
         SizedBox(width: 8),
         Expanded(child: StatCard(label: 'Training', value: 'Idle')),
         SizedBox(width: 8),
-        Expanded(child: StatCard(label: 'Autonomous Trader', value: 'Running',
-            valueColor: ForexAiTokens.buy)),
+        Expanded(
+          child: StatCard(
+            label: 'Autonomous Trader',
+            value: 'Idle',
+            valueColor: ForexAiTokens.textMuted,
+          ),
+        ),
       ],
     );
   }
