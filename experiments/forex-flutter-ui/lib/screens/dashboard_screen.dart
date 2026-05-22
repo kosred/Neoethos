@@ -4,6 +4,7 @@ import 'package:intl/intl.dart';
 
 import '../api/backend_client.dart';
 import '../state/account_provider.dart';
+import '../state/system_providers.dart';
 import '../theme/theme.dart';
 import '_placeholder.dart';
 
@@ -207,31 +208,71 @@ class _ErrorBanner extends StatelessWidget {
   }
 }
 
-class _EngineHealthRow extends StatelessWidget {
+class _EngineHealthRow extends ConsumerWidget {
   const _EngineHealthRow();
   @override
-  Widget build(BuildContext context) {
-    // Engine health stays static for Phase 1 — Discovery / Training /
-    // Auto-trade state will get their own server endpoints in
-    // the next session. Until then, these are intentional placeholders
-    // (not hidden) so the dashboard layout doesn't shift when they
-    // become live.
-    return const Row(
-      children: [
-        Expanded(child: StatCard(label: 'Discovery', value: 'Idle')),
-        SizedBox(width: 8),
-        Expanded(child: StatCard(label: 'Training', value: 'Idle')),
-        SizedBox(width: 8),
-        Expanded(
-          child: StatCard(
-            label: 'Autonomous Trader',
-            value: 'Idle',
-            valueColor: ForexAiTokens.textMuted,
+  Widget build(BuildContext context, WidgetRef ref) {
+    final async = ref.watch(enginesProvider);
+    return async.when(
+      data: (e) => Row(
+        children: [
+          Expanded(
+            child: StatCard(
+              label: 'Discovery',
+              value: e.discovery,
+              valueColor: _colorFor(e.discovery),
+            ),
           ),
-        ),
-      ],
+          const SizedBox(width: 8),
+          Expanded(
+            child: StatCard(
+              label: 'Training',
+              value: e.training,
+              valueColor: _colorFor(e.training),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: StatCard(
+              label: 'Autonomous Trader',
+              value: e.autoTrader,
+              valueColor: _colorFor(e.autoTrader),
+            ),
+          ),
+        ],
+      ),
+      loading: () => const _Skel(),
+      error: (_, __) => const _Skel(),
     );
   }
+
+  Color? _colorFor(String value) {
+    switch (value.toLowerCase()) {
+      case 'running':
+        return ForexAiTokens.buy;
+      case 'error':
+      case 'failed':
+        return ForexAiTokens.sell;
+      case 'idle':
+        return ForexAiTokens.textFaint;
+      default:
+        return ForexAiTokens.textMuted;
+    }
+  }
+}
+
+class _Skel extends StatelessWidget {
+  const _Skel();
+  @override
+  Widget build(BuildContext context) => const Row(
+        children: [
+          Expanded(child: StatCard(label: 'Discovery', value: '—')),
+          SizedBox(width: 8),
+          Expanded(child: StatCard(label: 'Training', value: '—')),
+          SizedBox(width: 8),
+          Expanded(child: StatCard(label: 'Autonomous Trader', value: '—')),
+        ],
+      );
 }
 
 class _Th extends StatelessWidget {

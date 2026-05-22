@@ -34,6 +34,7 @@ pub mod health;
 pub mod risk;
 pub mod settings;
 pub mod state;
+pub mod system_status;
 
 use anyhow::Context;
 use axum::Router;
@@ -59,6 +60,9 @@ pub fn router(state: AppApiState) -> Router {
         .route("/hardware", get(hardware::hardware))
         .route("/risk", get(risk::risk))
         .route("/settings", get(settings::settings))
+        .route("/engines/status", get(system_status::engines))
+        .route("/broker/status", get(system_status::broker_status))
+        .route("/data/bootstrap", get(system_status::data_bootstrap))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)

@@ -183,6 +183,45 @@ class BackendClient {
     }
     return SettingsSnapshot.fromJson(response.data!);
   }
+
+  /// `/engines/status` — Discovery / Training / Auto-Trader state.
+  Future<EnginesSnapshot> fetchEngines() async {
+    final response = await _dio.get<Map<String, dynamic>>('/engines/status');
+    if (response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/engines/status returned empty body',
+      );
+    }
+    return EnginesSnapshot.fromJson(response.data!);
+  }
+
+  /// `/broker/status` — current broker connection state.
+  Future<BrokerStatus> fetchBrokerStatus() async {
+    final response = await _dio.get<Map<String, dynamic>>('/broker/status');
+    if (response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/broker/status returned empty body',
+      );
+    }
+    return BrokerStatus.fromJson(response.data!);
+  }
+
+  /// `/data/bootstrap` — local data-dir inventory.
+  Future<DataBootstrapSnapshot> fetchDataBootstrap() async {
+    final response = await _dio.get<Map<String, dynamic>>('/data/bootstrap');
+    if (response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/data/bootstrap returned empty body',
+      );
+    }
+    return DataBootstrapSnapshot.fromJson(response.data!);
+  }
 }
 
 class HardwareSnapshot {
@@ -271,5 +310,67 @@ class SettingsSnapshot {
         newsCalendarEnabled: j['newsCalendarEnabled'] as bool,
         newsCalendarSource: j['newsCalendarSource'] as String,
         openaiModel: j['openaiModel'] as String,
+      );
+}
+
+class EnginesSnapshot {
+  final String discovery;
+  final String training;
+  final String autoTrader;
+  const EnginesSnapshot({
+    required this.discovery,
+    required this.training,
+    required this.autoTrader,
+  });
+  factory EnginesSnapshot.fromJson(Map<String, dynamic> j) => EnginesSnapshot(
+        discovery: j['discovery'] as String,
+        training: j['training'] as String,
+        autoTrader: j['autoTrader'] as String,
+      );
+}
+
+class BrokerStatus {
+  final String adapter;
+  final String environment;
+  final String accountId;
+  final bool connected;
+  final String clientIdPrefix;
+  const BrokerStatus({
+    required this.adapter,
+    required this.environment,
+    required this.accountId,
+    required this.connected,
+    required this.clientIdPrefix,
+  });
+  factory BrokerStatus.fromJson(Map<String, dynamic> j) => BrokerStatus(
+        adapter: j['adapter'] as String,
+        environment: j['environment'] as String,
+        accountId: j['accountId'] as String,
+        connected: j['connected'] as bool,
+        clientIdPrefix: j['clientIdPrefix'] as String,
+      );
+}
+
+class DataBootstrapSnapshot {
+  final String dataDir;
+  final bool dataDirExists;
+  final List<String> symbols;
+  final int fileCount;
+  final int? lastTouchedUnixMs;
+  const DataBootstrapSnapshot({
+    required this.dataDir,
+    required this.dataDirExists,
+    required this.symbols,
+    required this.fileCount,
+    required this.lastTouchedUnixMs,
+  });
+  factory DataBootstrapSnapshot.fromJson(Map<String, dynamic> j) => DataBootstrapSnapshot(
+        dataDir: j['dataDir'] as String,
+        dataDirExists: j['dataDirExists'] as bool,
+        symbols: ((j['symbols'] as List?) ?? const [])
+            .map((s) => s as String)
+            .toList(growable: false),
+        fileCount: j['fileCount'] as int,
+        lastTouchedUnixMs: j['lastTouchedUnixMs'] as int?,
       );
 }

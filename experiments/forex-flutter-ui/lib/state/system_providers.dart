@@ -28,3 +28,26 @@ final settingsProvider = FutureProvider.autoDispose<SettingsSnapshot>((ref) {
   final client = ref.read(backendClientProvider);
   return client.fetchSettings();
 });
+
+/// `/engines/status` — Discovery / Training / Auto-Trader.
+/// Polled with a fresh fetch every time the Dashboard is rebuilt
+/// (autoDispose dies on screen pop), which is good enough until the
+/// real job-state plumbing lands and we can promote to a periodic
+/// notifier.
+final enginesProvider = FutureProvider.autoDispose<EnginesSnapshot>((ref) {
+  final client = ref.read(backendClientProvider);
+  return client.fetchEngines();
+});
+
+/// `/broker/status` — current broker session state.
+final brokerStatusProvider = FutureProvider.autoDispose<BrokerStatus>((ref) {
+  final client = ref.read(backendClientProvider);
+  return client.fetchBrokerStatus();
+});
+
+/// `/data/bootstrap` — local data-dir inventory.
+final dataBootstrapProvider =
+    FutureProvider.autoDispose<DataBootstrapSnapshot>((ref) {
+  final client = ref.read(backendClientProvider);
+  return client.fetchDataBootstrap();
+});

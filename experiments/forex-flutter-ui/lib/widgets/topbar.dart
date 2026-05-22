@@ -25,6 +25,7 @@ import 'package:intl/intl.dart';
 
 import '../api/backend_client.dart';
 import '../state/account_provider.dart';
+import '../state/system_providers.dart';
 import '../theme/theme.dart';
 
 class TopBar extends ConsumerWidget {
@@ -33,6 +34,9 @@ class TopBar extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final asyncSnapshot = ref.watch(accountSnapshotProvider);
+    final engines = ref.watch(enginesProvider).valueOrNull;
+    final discoveryOn = (engines?.discovery.toLowerCase() ?? 'idle') == 'running';
+    final trainingOn = (engines?.training.toLowerCase() ?? 'idle') == 'running';
 
     // Connection-state badge. We collapse the four AsyncValue states
     // into the three badge tints the design system supports.
@@ -107,11 +111,13 @@ class TopBar extends ConsumerWidget {
               ),
             ),
           ),
-          // Auto-Discover / Auto-Train pills stay static for now —
-          // engine-state endpoints land in a follow-up session.
-          const _AutoPill(label: 'Auto-Discover', on: false),
+          // Auto-Discover / Auto-Train pills are now backed by
+          // `/engines/status`. Until the POST start/stop endpoints
+          // land they're read-only mirrors of whatever the bridge is
+          // doing, but they no longer lie about state.
+          _AutoPill(label: 'Auto-Discover', on: discoveryOn),
           const SizedBox(width: ForexAiTokens.spXs),
-          const _AutoPill(label: 'Auto-Train', on: false),
+          _AutoPill(label: 'Auto-Train', on: trainingOn),
           const SizedBox(width: ForexAiTokens.spSm),
           IconButton(
             onPressed: () => ref

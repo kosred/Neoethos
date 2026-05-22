@@ -6473,6 +6473,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sysinfo 0.37.2",
  "tokio",
  "tokio-tungstenite",
  "toml 0.8.23",

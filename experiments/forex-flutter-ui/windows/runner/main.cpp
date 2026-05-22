@@ -26,8 +26,15 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
 
   FlutterWindow window(project);
   Win32Window::Point origin(10, 10);
-  Win32Window::Size size(1280, 720);
-  if (!window.Create(L"forex_flutter_ui", origin, size)) {
+  // 1400×900 matches the mockup's intended dock density (4 stat cards
+  // across + 3-column engine-health row + sidebar). The previous
+  // 1280×720 was the Flutter default; on Windows DPI scaling that
+  // collapsed the dashboard ribbon and forced horizontal scrolling
+  // in the top bar.
+  Win32Window::Size size(1400, 900);
+  // Window title shown in the OS chrome (Alt-Tab, taskbar, title bar).
+  // Keep in lock-step with the brand string in `lib/widgets/topbar.dart`.
+  if (!window.Create(L"NeoEthos", origin, size)) {
     return EXIT_FAILURE;
   }
   window.SetQuitOnClose(true);
