@@ -6,18 +6,26 @@
 //   2. If it answers, we're piggybacking on an already-running server
 //      (developer running `neoethos-app --server` in a terminal) —
 //      don't spawn a duplicate. Return.
-//   3. If it doesn't answer, locate the `neoethos-app` binary next to
-//      the Flutter executable (production install) or fall back to
-//      `target/debug/neoethos-app[.exe]` walking up from CWD (dev
-//      mode). Spawn it detached with `--server`.
+//   3. If it doesn't answer, locate the `neoethos-app` binary by
+//      searching, in order:
+//        a) Side-by-side with the Flutter executable (production
+//           install — installer copies both .exe files into one dir).
+//        b) Ancestors of the Flutter executable, looking for
+//           `target/{debug,release}/` (dev workflow — running the
+//           freshly-built Flutter .exe from `build/...`).
+//        c) Ancestors of the OS current working directory (legacy /
+//           fallback path).
+//      Spawn the binary detached with `--server`.
 //   4. Wait (up to ~10s) for /healthz to come back. If it never does,
 //      we still let the UI render — the existing AsyncValue.error
 //      states will surface the failure on every screen, which beats
 //      blocking the splash forever.
 //
-// We deliberately keep this lightweight (no IPC, no port negotiation):
-// the backend always binds 7423, the UI always probes 7423, and the
-// child stays alive only as long as our process needs it.
+// Diagnostics: every spawn attempt + outcome is logged to
+//   <user-data>/neoethos/supervisor.log
+// because the Flutter Windows app is built as a GUI subsystem
+// process — stderr writes are invisible to the user. The log file
+// is the only way to see why the backend failed to come up.
 
 import 'dart:async';
 import 'dart:io';
@@ -33,29 +41,40 @@ class BackendSupervisor {
   static const _pollIntervalMs = 250;
 
   Process? _child;
+  late final File _logFile = _openLogFile();
 
   /// Spawn the backend if it isn't already responding. Returns once the
   /// backend is reachable, or after `_maxWaitMs` if it never came up
   /// (we still let the UI render so the user sees an actionable error
   /// instead of a hung splash).
   Future<void> ensureRunning() async {
+    _log('ensureRunning() start. Flutter exe: ${Platform.resolvedExecutable}');
+    _log('CWD: ${Directory.current.path}');
+
     if (await _probeHealth()) {
-      // Someone else owns the port (dev workflow). Don't double-spawn.
+      _log('Backend already responding on $_baseUrl — not spawning.');
       return;
     }
 
     final binary = _locateBackendBinary();
     if (binary == null) {
-      stderr.writeln('[BackendSupervisor] neoethos-app binary not found; '
-          'backend must be started manually.');
+      _log('FATAL: neoethos-app binary not found. Searched:\n'
+          '  1. Side-by-side with Flutter exe '
+          '(${File(Platform.resolvedExecutable).parent.path})\n'
+          '  2. Ancestors of Flutter exe → target/{debug,release}/\n'
+          '  3. Ancestors of CWD → target/{debug,release}/\n'
+          'Drop the neoethos-app.exe next to the Flutter exe and re-launch.');
       return;
     }
+    _log('Located backend binary: ${binary.path}');
 
     // neoethos-app loads `config.yaml` from its CWD by default, so we
     // pin the CWD to whichever dir contains it. In a production install
     // that's the binary's own dir; in dev that's the repo root. We
     // resolve it by walking up from the binary.
     final workDir = _locateConfigDir(binary) ?? binary.parent;
+    _log('Spawn CWD (config.yaml dir): ${workDir.path}');
+
     try {
       // `detached` (NOT `detachedWithStdio`) — the backend has very
       // chatty tracing output. If we keep stdio pipes open without
@@ -69,11 +88,9 @@ class BackendSupervisor {
         workingDirectory: workDir.path,
         mode: ProcessStartMode.detached,
       );
-      stderr.writeln('[BackendSupervisor] spawned ${binary.path} '
-          '(cwd=${workDir.path}, pid=${_child?.pid})');
+      _log('Spawned ${binary.path} (pid=${_child?.pid})');
     } on ProcessException catch (err) {
-      stderr.writeln('[BackendSupervisor] failed to spawn '
-          '${binary.path}: $err');
+      _log('FATAL: Process.start failed: $err');
       return;
     }
 
@@ -102,33 +119,50 @@ class BackendSupervisor {
       const Duration(milliseconds: _maxWaitMs),
     );
     while (DateTime.now().isBefore(deadline)) {
-      if (await _probeHealth()) return;
+      if (await _probeHealth()) {
+        _log('Backend reachable on /healthz.');
+        return;
+      }
       await Future<void>.delayed(
         const Duration(milliseconds: _pollIntervalMs),
       );
     }
-    stderr.writeln('[BackendSupervisor] backend did not respond within '
-        '${_maxWaitMs}ms — UI will render with error states.');
+    _log('Backend did not respond within ${_maxWaitMs}ms — UI will render '
+        'with error states. Check the backend\'s own daily-rotating log '
+        'under <user-data>/neoethos/logs/ for the real failure reason.');
   }
 
   /// Find the neoethos-app[.exe] binary.
   ///
-  /// Search order:
-  ///   1. Same directory as the Flutter executable (production install).
-  ///   2. `target/debug/` and `target/release/` walking up from the
-  ///      current working directory (developer running
-  ///      `flutter run` from inside the repo).
+  /// Search order: side-by-side with Flutter exe → ancestors of Flutter
+  /// exe → ancestors of CWD. The first hit wins.
   File? _locateBackendBinary() {
     final exeName = Platform.isWindows ? 'neoethos-app.exe' : 'neoethos-app';
 
     // 1. Production install — next to the Flutter executable.
     final flutterExeDir = File(Platform.resolvedExecutable).parent;
-    final coLocated = File('${flutterExeDir.path}${Platform.pathSeparator}$exeName');
+    final coLocated =
+        File('${flutterExeDir.path}${Platform.pathSeparator}$exeName');
     if (coLocated.existsSync()) return coLocated;
 
-    // 2. Dev mode — walk up from CWD looking for target/{debug,release}/.
-    Directory dir = Directory.current;
-    for (var i = 0; i < 8; i++) {
+    // 2. Ancestors of Flutter exe → target/{debug,release}/.
+    //    Covers `flutter build windows --debug` from inside the repo,
+    //    where the Flutter exe lives 6 levels under the repo root and
+    //    the backend lives at <root>/target/{debug,release}/.
+    final viaFlutter = _searchAncestors(flutterExeDir, exeName);
+    if (viaFlutter != null) return viaFlutter;
+
+    // 3. Ancestors of OS current working directory. Last-resort fallback
+    //    for unusual launch contexts (debugger, scheduled task, etc.).
+    final viaCwd = _searchAncestors(Directory.current, exeName);
+    if (viaCwd != null) return viaCwd;
+
+    return null;
+  }
+
+  File? _searchAncestors(Directory start, String exeName) {
+    Directory dir = start;
+    for (var i = 0; i < 10; i++) {
       for (final profile in const ['debug', 'release']) {
         final candidate = File(
           '${dir.path}${Platform.pathSeparator}target'
@@ -150,7 +184,7 @@ class BackendSupervisor {
   /// resolves to the real file.
   Directory? _locateConfigDir(File binary) {
     Directory dir = binary.parent;
-    for (var i = 0; i < 8; i++) {
+    for (var i = 0; i < 10; i++) {
       if (File('${dir.path}${Platform.pathSeparator}config.yaml')
           .existsSync()) {
         return dir;
@@ -160,5 +194,47 @@ class BackendSupervisor {
       dir = parent;
     }
     return null;
+  }
+
+  // ─── Diagnostic file logging ─────────────────────────────────────────
+
+  File _openLogFile() {
+    try {
+      final dir = _userDataDir();
+      if (!dir.existsSync()) dir.createSync(recursive: true);
+      final f = File('${dir.path}${Platform.pathSeparator}supervisor.log');
+      // Truncate on each app launch — keep the latest run only.
+      f.writeAsStringSync(
+        '=== BackendSupervisor log — '
+        '${DateTime.now().toIso8601String()} ===\n',
+      );
+      return f;
+    } catch (_) {
+      // Last resort: log to the OS temp dir.
+      return File(
+        '${Directory.systemTemp.path}${Platform.pathSeparator}'
+        'neoethos-supervisor.log',
+      );
+    }
+  }
+
+  Directory _userDataDir() {
+    if (Platform.isWindows) {
+      final root = Platform.environment['LOCALAPPDATA'] ??
+          Platform.environment['APPDATA'] ??
+          Directory.systemTemp.path;
+      return Directory('$root${Platform.pathSeparator}neoethos');
+    }
+    final home = Platform.environment['HOME'] ?? Directory.systemTemp.path;
+    return Directory('$home${Platform.pathSeparator}.neoethos');
+  }
+
+  void _log(String msg) {
+    final line = '[${DateTime.now().toIso8601String()}] $msg\n';
+    try {
+      _logFile.writeAsStringSync(line, mode: FileMode.append);
+    } catch (_) {/* swallow — never crash on logging */}
+    // Also write to stderr; harmless when the parent is GUI subsystem.
+    stderr.write(line);
   }
 }
