@@ -13,17 +13,12 @@ import '../state/system_providers.dart';
 import '../theme/theme.dart';
 import '_placeholder.dart';
 
-const _symbolChoices = <String>[
+/// Fallback symbol chips shown when /broker/symbols is unreachable
+/// (offline / not authed yet). Real symbols come from the broker.
+const _fallbackSymbolChoices = <String>[
   'EURUSD',
   'GBPUSD',
   'USDJPY',
-  'USDCHF',
-  'AUDUSD',
-  'NZDUSD',
-  'USDCAD',
-  'EURJPY',
-  'EURGBP',
-  'GBPJPY',
   'XAUUSD',
 ];
 
@@ -49,6 +44,19 @@ class ChartScreen extends ConsumerWidget {
     final symbol = ref.watch(chartSymbolProvider);
     final timeframe = ref.watch(chartTimeframeProvider);
     final async = ref.watch(chartProvider);
+    final brokerSymbols = ref.watch(brokerSymbolsProvider);
+
+    // Symbol list: prefer the broker catalog (filtered to forex-like
+    // pairs by default), fall back to a tiny hardcoded set so the
+    // chart still renders when the broker is offline.
+    final symbolChoices = brokerSymbols.maybeWhen(
+      data: (snap) {
+        final forex = snap.forexLikeEnabled;
+        if (forex.isEmpty) return _fallbackSymbolChoices;
+        return forex.map((s) => s.symbolName).toList(growable: false);
+      },
+      orElse: () => _fallbackSymbolChoices,
+    );
 
     return SingleChildScrollView(
       child: Column(
@@ -59,19 +67,37 @@ class ChartScreen extends ConsumerWidget {
             subtitle: 'Local OHLC · symbol / timeframe / 200 candles',
           ),
           SectionCard(
-            title: 'Symbol',
-            child: Wrap(
-              spacing: 6,
-              runSpacing: 6,
+            title: 'Symbol'
+                '${brokerSymbols.hasValue ? ' · ${symbolChoices.length} from broker' : ''}',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                for (final s in _symbolChoices)
-                  _Chip(
-                    label: s,
-                    selected: s == symbol,
-                    onTap: () => ref
-                        .read(chartSymbolProvider.notifier)
-                        .state = s,
+                if (brokerSymbols.hasError)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: Text(
+                      'Broker symbol catalog unavailable — showing fallback list. '
+                      'Re-authenticate in Broker Setup to populate.',
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: ForexAiTokens.warning,
+                      ),
+                    ),
                   ),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: [
+                    for (final s in symbolChoices)
+                      _Chip(
+                        label: s,
+                        selected: s == symbol,
+                        onTap: () => ref
+                            .read(chartSymbolProvider.notifier)
+                            .state = s,
+                      ),
+                  ],
+                ),
               ],
             ),
           ),

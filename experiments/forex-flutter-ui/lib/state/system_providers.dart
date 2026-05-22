@@ -71,6 +71,15 @@ final intelligenceProvider =
   return client.fetchIntelligence();
 });
 
+/// `/broker/symbols` — broker-offered catalog. Heavy call (830+ symbols
+/// on a typical cTrader account) so kept autoDispose; the UI caches it
+/// in a ConsumerStatefulWidget while needed.
+final brokerSymbolsProvider =
+    FutureProvider.autoDispose<BrokerSymbolsSnapshot>((ref) {
+  final client = ref.read(backendClientProvider);
+  return client.fetchBrokerSymbols();
+});
+
 /// Selected symbol + timeframe for the Chart screen. Bound to chips
 /// the operator clicks; survives screen navigation since these are
 /// NotifierProviders (not autoDispose).

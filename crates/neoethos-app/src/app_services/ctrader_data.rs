@@ -525,24 +525,49 @@ pub fn load_historical_bars_only_with_transport<T: CTraderOpenApiTransport>(
         },
     )?;
     let trendbar_period = trendbar_period_value(&request.timeframe)?;
-    let responses = transport.send_sequence(&[build_get_trendbars_request(
-        resolved.account_id,
-        resolved.light_symbol.symbol_id,
-        trendbar_period,
-        request.from_timestamp_ms,
-        request.to_timestamp_ms,
-        request.count,
-        "trendbars-1",
-    )])?;
+    // `ProductionCTraderOpenApiTransport::send_sequence` opens a fresh
+    // WSS connection per call and cTrader requires ProtoOAApplicationAuthReq
+    // + ProtoOAAccountAuthReq on every new socket — otherwise the next
+    // data-bearing request (trendbars here) comes back as ProtoOAErrorRes,
+    // which parse_trendbars_response then chokes on with the unhelpful
+    // "failed to parse cTrader trendbars response". Mirror the
+    // re-auth pattern already used by `resolve_symbol_with_transport` for
+    // the symbol-by-id call.
+    let auth_responses = transport.send_sequence(&[
+        build_application_auth_request(&request.client_id, &request.client_secret, "app-auth-1"),
+        build_account_auth_request(resolved.account_id, &request.access_token, "account-auth-1"),
+        build_get_trendbars_request(
+            resolved.account_id,
+            resolved.light_symbol.symbol_id,
+            trendbar_period,
+            request.from_timestamp_ms,
+            request.to_timestamp_ms,
+            request.count,
+            "trendbars-1",
+        ),
+    ])?;
 
-    if responses.len() != 1 {
+    if auth_responses.len() < 3 {
+        // Same partial-response error walking we do in resolve_symbol —
+        // send_sequence early-exits on ProtoOAErrorRes so the cTrader
+        // error code lives in the last envelope we got back.
+        for response in &auth_responses {
+            let envelope = parse_open_api_envelope(response)?;
+            if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+                return Err(anyhow!(
+                    "cTrader trendbars sequence failed (step {}): {}",
+                    auth_responses.len(),
+                    parse_ctrader_error_payload(&envelope.payload)?
+                ));
+            }
+        }
         return Err(anyhow!(
-            "expected 1 cTrader bars-only response, received {}",
-            responses.len()
+            "expected 3 cTrader auth/trendbars responses, received {}",
+            auth_responses.len()
         ));
     }
 
-    let trendbars = parse_trendbars_response(&responses[0], &resolved.symbol)?;
+    let trendbars = parse_trendbars_response(&auth_responses[2], &resolved.symbol)?;
     Ok(CTraderHistoricalBarsFetchResult {
         symbol: resolved.symbol.clone(),
         bars: trendbars.bars,

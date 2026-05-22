@@ -267,6 +267,44 @@ class BackendClient {
     return response.data ?? const <String, dynamic>{};
   }
 
+  /// `/broker/symbols` — full broker symbol catalog (not hardcoded).
+  Future<BrokerSymbolsSnapshot> fetchBrokerSymbols() async {
+    final response = await _dio.get<Map<String, dynamic>>(
+      '/broker/symbols',
+      options: Options(receiveTimeout: const Duration(seconds: 20)),
+    );
+    if (response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/broker/symbols returned empty body',
+      );
+    }
+    return BrokerSymbolsSnapshot.fromJson(response.data!);
+  }
+
+  /// POST `/data/fetch` — download historical bars for [fromMs, toMs]
+  /// and persist them under `data/symbol=<sym>/timeframe=<tf>/`.
+  Future<Map<String, dynamic>> fetchHistoricalData({
+    required String symbol,
+    required String timeframe,
+    required int fromMs,
+    int? toMs,
+  }) async {
+    final body = <String, dynamic>{
+      'symbol': symbol,
+      'timeframe': timeframe,
+      'fromMs': fromMs,
+    };
+    if (toMs != null) body['toMs'] = toMs;
+    final response = await _dio.post<Map<String, dynamic>>(
+      '/data/fetch',
+      data: body,
+      options: Options(receiveTimeout: const Duration(seconds: 60)),
+    );
+    return response.data ?? const <String, dynamic>{};
+  }
+
   /// `/chart?symbol=&timeframe=&limit=` — OHLC candles for charting.
   Future<ChartSnapshot> fetchChart({
     String symbol = 'EURUSD',
@@ -452,6 +490,62 @@ class BrokerStatus {
         connected: j['connected'] as bool,
         clientIdPrefix: j['clientIdPrefix'] as String,
       );
+}
+
+class BrokerSymbol {
+  final int symbolId;
+  final String symbolName;
+  final bool enabled;
+  final String? description;
+  const BrokerSymbol({
+    required this.symbolId,
+    required this.symbolName,
+    required this.enabled,
+    required this.description,
+  });
+  factory BrokerSymbol.fromJson(Map<String, dynamic> j) => BrokerSymbol(
+        symbolId: (j['symbolId'] as num).toInt(),
+        symbolName: (j['symbolName'] as String?) ?? '',
+        enabled: (j['enabled'] as bool?) ?? false,
+        description: j['description'] as String?,
+      );
+}
+
+class BrokerSymbolsSnapshot {
+  final int accountId;
+  final String environment;
+  final int symbolCount;
+  final List<BrokerSymbol> symbols;
+  final List<String> archivedSymbols;
+  const BrokerSymbolsSnapshot({
+    required this.accountId,
+    required this.environment,
+    required this.symbolCount,
+    required this.symbols,
+    required this.archivedSymbols,
+  });
+  factory BrokerSymbolsSnapshot.fromJson(Map<String, dynamic> j) =>
+      BrokerSymbolsSnapshot(
+        accountId: (j['accountId'] as num).toInt(),
+        environment: (j['environment'] as String?) ?? '',
+        symbolCount: (j['symbolCount'] as num?)?.toInt() ?? 0,
+        symbols: ((j['symbols'] as List?) ?? const [])
+            .map((e) => BrokerSymbol.fromJson(e as Map<String, dynamic>))
+            .toList(growable: false),
+        archivedSymbols: ((j['archivedSymbols'] as List?) ?? const [])
+            .map((s) => s as String)
+            .toList(growable: false),
+      );
+
+  /// Filter helper for the UI — return enabled-and-likely-forex symbols.
+  /// cTrader catalogs mix forex pairs with stocks/indices; the chart
+  /// screen wants just tradeable pairs by default.
+  List<BrokerSymbol> get forexLikeEnabled => symbols
+      .where((s) =>
+          s.enabled &&
+          s.symbolName.length == 6 &&
+          RegExp(r'^[A-Z]{6}$').hasMatch(s.symbolName))
+      .toList(growable: false);
 }
 
 class ChartCandle {
