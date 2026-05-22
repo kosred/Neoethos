@@ -90,6 +90,8 @@ pub fn router(state: AppApiState) -> Router {
         .route("/data/bootstrap", get(system_status::data_bootstrap))
         .route("/data/fetch", post(data_control::fetch))
         .route("/orders", post(orders::place))
+        .route("/orders/cancel", post(orders::cancel_order))
+        .route("/positions/close", post(orders::close_position))
         .route("/intelligence", get(intelligence::intelligence))
         .route("/chart", get(chart::chart))
         .layer(TraceLayer::new_for_http())

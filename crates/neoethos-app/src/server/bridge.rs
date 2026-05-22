@@ -188,7 +188,17 @@ async fn refresh_once() -> anyhow::Result<AccountSnapshotPayload> {
 }
 
 fn position_to_payload(p: &CTraderPositionSnapshot) -> PositionPayload {
+    // cTrader feeds `volume` as already-converted lots (f64). The
+    // close-position endpoint wants broker volume units (centi-lots).
+    // Convert via the standard FX lot_size: 1 lot = 100,000 units;
+    // 1 lot in centi-units = 100,000 * 100 = 10_000_000. Non-FX
+    // instruments may have other lot_sizes — once we plumb the
+    // symbol catalog through here we'll look up the real lot_size
+    // per symbol. For the MVP, EURUSD-shaped FX is the common case.
+    let volume_units = (p.volume * 100_000.0 * 100.0).round() as i64;
     PositionPayload {
+        position_id: p.position_id,
+        volume_units,
         // The cTrader feed gives us numeric symbol IDs, not names —
         // resolving id→ticker needs the symbol-list endpoint which
         // is its own session of work. For the dashboard MVP we stamp

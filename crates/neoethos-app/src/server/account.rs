@@ -43,11 +43,32 @@ pub struct AccountSnapshotDto {
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PositionDto {
+    /// cTrader position id — needed by the Close button to call
+    /// `POST /positions/close`.
+    pub position_id: i64,
+    /// Broker volume in centi-lot units (what the close endpoint
+    /// wants). The `volume` field below is the human-readable lot
+    /// count.
+    pub volume_units: i64,
     pub symbol: String,
     pub side: String,
     pub volume: f64,
     pub pnl_pips: f64,
     pub pnl_usd: f64,
+}
+
+impl From<crate::server::state::PositionPayload> for PositionDto {
+    fn from(p: crate::server::state::PositionPayload) -> Self {
+        PositionDto {
+            position_id: p.position_id,
+            volume_units: p.volume_units,
+            symbol: p.symbol,
+            side: p.side,
+            volume: p.volume,
+            pnl_pips: p.pnl_pips,
+            pnl_usd: p.pnl_usd,
+        }
+    }
 }
 
 impl From<AccountSnapshotPayload> for AccountSnapshotDto {
@@ -59,18 +80,6 @@ impl From<AccountSnapshotPayload> for AccountSnapshotDto {
             used_margin: p.used_margin,
             currency: p.currency,
             positions: p.positions.into_iter().map(Into::into).collect(),
-        }
-    }
-}
-
-impl From<PositionPayload> for PositionDto {
-    fn from(p: PositionPayload) -> Self {
-        Self {
-            symbol: p.symbol,
-            side: p.side,
-            volume: p.volume,
-            pnl_pips: p.pnl_pips,
-            pnl_usd: p.pnl_usd,
         }
     }
 }
@@ -104,6 +113,8 @@ mod tests {
             used_margin: 250.0,
             currency: "EUR".to_string(),
             positions: vec![PositionPayload {
+                position_id: 0,
+                volume_units: 0,
                 symbol: "EURUSD".to_string(),
                 side: "LONG".to_string(),
                 volume: 0.10,

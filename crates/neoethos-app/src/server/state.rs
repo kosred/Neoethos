@@ -35,6 +35,11 @@ pub struct AccountSnapshotPayload {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PositionPayload {
+    pub position_id: i64,
+    /// Broker volume in centi-lots (what `POST /positions/close`
+    /// wants). 0 if the source feed doesn't expose it — the Flutter
+    /// side falls back to a "volume in lots * 100000 * 100" estimate.
+    pub volume_units: i64,
     pub symbol: String,
     pub side: String,
     pub volume: f64,

@@ -16,7 +16,10 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-use crate::app_services::broker_api::{OrderSide, submit_market_order_blocking};
+use crate::app_services::broker_api::{
+    OrderSide, cancel_order_blocking, close_position_blocking,
+    submit_market_order_blocking,
+};
 
 use super::state::AppApiState;
 
@@ -92,6 +95,75 @@ pub async fn place(
     })
     .await;
 
+    outcome_to_response(result)
+}
+
+// ─── POST /positions/{id}/close ────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ClosePositionBody {
+    #[serde(rename = "positionId")]
+    pub position_id: i64,
+    /// Volume to close, in cTrader's centi-lot units. The Flutter UI
+    /// passes the position's full volume to close it entirely; partial
+    /// closes are also legal.
+    pub volume: i64,
+}
+
+pub async fn close_position(
+    State(_state): State<AppApiState>,
+    Json(body): Json<ClosePositionBody>,
+) -> Response {
+    if body.position_id <= 0 || body.volume <= 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "positionId and volume must both be positive",
+            })),
+        )
+            .into_response();
+    }
+    let position_id = body.position_id;
+    let volume = body.volume;
+    let result =
+        tokio::task::spawn_blocking(move || close_position_blocking(position_id, volume))
+            .await;
+    outcome_to_response(result)
+}
+
+// ─── POST /orders/{id}/cancel ──────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+pub struct CancelOrderBody {
+    #[serde(rename = "orderId")]
+    pub order_id: i64,
+}
+
+pub async fn cancel_order(
+    State(_state): State<AppApiState>,
+    Json(body): Json<CancelOrderBody>,
+) -> Response {
+    if body.order_id <= 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "orderId must be positive"})),
+        )
+            .into_response();
+    }
+    let order_id = body.order_id;
+    let result =
+        tokio::task::spawn_blocking(move || cancel_order_blocking(order_id)).await;
+    outcome_to_response(result)
+}
+
+/// Shared response shaper for place/close/cancel — they all come back
+/// as `CTraderExecutionOutcome`.
+fn outcome_to_response(
+    result: Result<
+        anyhow::Result<crate::app_services::ctrader_execution::CTraderExecutionOutcome>,
+        tokio::task::JoinError,
+    >,
+) -> Response {
     match result {
         Ok(Ok(outcome)) => {
             let dto = NewOrderResponseDto {
@@ -105,7 +177,7 @@ pub async fn place(
                 order_type: outcome.order_type.clone(),
                 message: outcome.description.clone().unwrap_or_else(|| {
                     format!(
-                        "order {:?}: orderId={:?} positionId={:?}",
+                        "{:?}: orderId={:?} positionId={:?}",
                         outcome.status, outcome.order_id, outcome.position_id
                     )
                 }),
@@ -120,7 +192,7 @@ pub async fn place(
         Err(join_err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
-                "error": format!("order task panicked: {join_err}"),
+                "error": format!("execution task panicked: {join_err}"),
             })),
         )
             .into_response(),

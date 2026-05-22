@@ -52,11 +52,31 @@ pub struct GpuDto {
 }
 
 pub async fn hardware(State(_state): State<AppApiState>) -> Json<HardwareDto> {
-    // Building a System inside the handler is fine — the underlying
-    // /proc / sysctl read is ~100µs on Windows and Linux. Avoids
-    // sharing the System across threads (it isn't `Send`-friendly
-    // across all platforms).
+    // CPU-load gotcha: `sysinfo` calculates per-CPU usage as the delta
+    // between two `refresh_cpu_usage()` calls. A single refresh returns
+    // 0.0 (no baseline) or 100.0 (uninitialised counter on Windows). We
+    // therefore refresh, sleep through `MINIMUM_CPU_UPDATE_INTERVAL`
+    // (~200ms), and refresh again. The sleep is in a blocking task
+    // (NOT directly in async) so the tokio reactor stays responsive
+    // — `std::thread::sleep` in an async handler would stall every
+    // other route for 200ms.
+    let dto = tokio::task::spawn_blocking(probe_hardware_blocking)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(
+                target: "neoethos_app::server::hardware",
+                error = %e,
+                "hardware probe task panicked"
+            );
+            empty_hardware_dto()
+        });
+    Json(dto)
+}
+
+fn probe_hardware_blocking() -> HardwareDto {
     let mut sys = System::new();
+    sys.refresh_cpu_usage();
+    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
     sys.refresh_cpu_usage();
     sys.refresh_memory();
 
@@ -77,7 +97,7 @@ pub async fn hardware(State(_state): State<AppApiState>) -> Json<HardwareDto> {
     let used_kb = sys.used_memory();
     let available_kb = sys.available_memory();
 
-    Json(HardwareDto {
+    HardwareDto {
         cpu: CpuDto {
             model,
             cores_logical,
@@ -97,5 +117,25 @@ pub async fn hardware(State(_state): State<AppApiState>) -> Json<HardwareDto> {
             name: "GPU probe pending".to_string(),
             available: false,
         },
-    })
+    }
+}
+
+fn empty_hardware_dto() -> HardwareDto {
+    HardwareDto {
+        cpu: CpuDto {
+            model: "unknown".to_string(),
+            cores_logical: 0,
+            cores_physical: 0,
+            load_avg: 0.0,
+        },
+        ram: RamDto {
+            total_mb: 0,
+            used_mb: 0,
+            available_mb: 0,
+        },
+        gpu: GpuDto {
+            name: "probe failed".to_string(),
+            available: false,
+        },
+    }
 }

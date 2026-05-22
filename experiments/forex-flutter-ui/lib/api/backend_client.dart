@@ -20,12 +20,16 @@ class BackendConfig {
 }
 
 class Position {
+  final int positionId;
+  final int volumeUnits;
   final String symbol;
   final String side;
   final double volume;
   final double pnlPips;
   final double pnlUsd;
   const Position({
+    required this.positionId,
+    required this.volumeUnits,
     required this.symbol,
     required this.side,
     required this.volume,
@@ -34,6 +38,8 @@ class Position {
   });
 
   factory Position.fromJson(Map<String, dynamic> j) => Position(
+        positionId: (j['positionId'] as num?)?.toInt() ?? 0,
+        volumeUnits: (j['volumeUnits'] as num?)?.toInt() ?? 0,
         symbol: j['symbol'] as String,
         side: j['side'] as String,
         volume: (j['volume'] as num).toDouble(),
@@ -263,6 +269,31 @@ class BackendClient {
     final response = await _dio.post<Map<String, dynamic>>(
       path,
       data: body.isEmpty ? null : body,
+    );
+    return response.data ?? const <String, dynamic>{};
+  }
+
+  /// POST `/positions/close` — close (or partially close) an open
+  /// position. `volume` is in cTrader centi-lot units (use the
+  /// Position.volumeUnits field straight through for a full close).
+  Future<Map<String, dynamic>> closePosition({
+    required int positionId,
+    required int volume,
+  }) async {
+    final response = await _dio.post<Map<String, dynamic>>(
+      '/positions/close',
+      data: {'positionId': positionId, 'volume': volume},
+      options: Options(receiveTimeout: const Duration(seconds: 30)),
+    );
+    return response.data ?? const <String, dynamic>{};
+  }
+
+  /// POST `/orders/cancel` — cancel a pending (unfilled) order.
+  Future<Map<String, dynamic>> cancelOrder({required int orderId}) async {
+    final response = await _dio.post<Map<String, dynamic>>(
+      '/orders/cancel',
+      data: {'orderId': orderId},
+      options: Options(receiveTimeout: const Duration(seconds: 30)),
     );
     return response.data ?? const <String, dynamic>{};
   }

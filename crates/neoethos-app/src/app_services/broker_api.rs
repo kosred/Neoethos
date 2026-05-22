@@ -27,6 +27,7 @@ use crate::app_services::ctrader_execution::{
     CTraderExecutionRuntimeRequest, ProductionCTraderExecutionBackend,
 };
 use crate::app_services::ctrader_messages::{
+    CTraderCancelOrderRequest, CTraderClosePositionRequest,
     CTraderNewOrderRequest, CTraderOrderType, CTraderTradeSide,
 };
 use crate::app_services::ctrader_messages::{
@@ -148,7 +149,12 @@ pub fn fetch_broker_symbols_blocking() -> Result<BrokerSymbolsBundle> {
 }
 
 /// Download historical bars for [from_ms, to_ms] and write the result
-/// into the local data dir under `data/symbol=<sym>/timeframe=<tf>/`.
+/// into the local data dir. Auto-chunked: cTrader caps each
+/// ProtoOAGetTrendbarsReq at ~5000 bars, so for wide windows we loop
+/// — sliding `to_ms` backwards by the timeframe's natural span until
+/// we cover the requested range. Accumulated bars are deduped and
+/// sorted by timestamp before the single vortex write.
+///
 /// Blocking; callers must wrap in `spawn_blocking`.
 pub fn download_history_blocking(
     symbol: &str,
@@ -164,37 +170,96 @@ pub fn download_history_blocking(
     }
 
     let creds = resolve_creds()?;
-    let request = CTraderChartHistoryRequest {
-        client_id: creds.client_id.clone(),
-        client_secret: creds.client_secret.clone(),
-        access_token: creds.access_token.clone(),
-        environment: creds.environment,
-        account_id: creds.account_id_str.clone(),
-        symbol_name: symbol.to_string(),
-        timeframe: timeframe.to_string(),
-        from_timestamp_ms: from_ms,
-        to_timestamp_ms: to_ms,
-        // None — cTrader caps at ~5000 bars per request; the upstream
-        // helper handles the cap. For very wide windows, the caller
-        // should issue multiple POSTs (the UI's date-range picker
-        // will encourage reasonable windows).
-        count: None,
-    };
+    let chunk_ms = timeframe_chunk_ms(timeframe);
 
-    let CTraderHistoricalBarsFetchResult { bars, has_more, .. } =
-        load_historical_bars_only(&request)?;
+    // Walk the window in `chunk_ms`-wide slices, latest first. Stops
+    // either when we cross from_ms or when a slice returns 0 bars
+    // (broker has nothing earlier — markets weren't trading, etc).
+    let mut all_bars: Vec<HistoricalBar> = Vec::new();
+    let mut cursor_to = to_ms;
+    let mut has_more_overall = false;
+    let max_chunks = 100; // hard cap so a misconfigured range can't loop forever
+    let mut chunk_count = 0;
+    while cursor_to > from_ms && chunk_count < max_chunks {
+        let cursor_from = (cursor_to - chunk_ms).max(from_ms);
+        let request = CTraderChartHistoryRequest {
+            client_id: creds.client_id.clone(),
+            client_secret: creds.client_secret.clone(),
+            access_token: creds.access_token.clone(),
+            environment: creds.environment,
+            account_id: creds.account_id_str.clone(),
+            symbol_name: symbol.to_string(),
+            timeframe: timeframe.to_string(),
+            from_timestamp_ms: cursor_from,
+            to_timestamp_ms: cursor_to,
+            count: None,
+        };
+        let CTraderHistoricalBarsFetchResult { bars, has_more, .. } =
+            load_historical_bars_only(&request)?;
+        if bars.is_empty() {
+            // No more data going further back in time — stop.
+            break;
+        }
+        if has_more {
+            // The broker still has more inside this chunk than fit
+            // in the response. Carry that flag through so the UI can
+            // hint the user to widen their range or split it further.
+            has_more_overall = true;
+        }
+        all_bars.extend(bars);
+        cursor_to = cursor_from;
+        chunk_count += 1;
+    }
 
-    let normalized = bars_to_normalized(&bars);
+    // Dedupe + sort. Multiple chunks can overlap by 1 bar at the
+    // boundary; dedupe on timestamp keeps the dataset clean.
+    all_bars.sort_by_key(|b| b.timestamp_ms);
+    all_bars.dedup_by_key(|b| b.timestamp_ms);
+
+    let normalized = bars_to_normalized(&all_bars);
     let written_path =
         write_bootstrap_vortex(data_root, symbol, timeframe, &normalized)?;
 
     Ok(HistoricalDownloadOutcome {
         symbol: symbol.to_string(),
         timeframe: timeframe.to_string(),
-        bar_count: bars.len(),
-        has_more,
+        bar_count: all_bars.len(),
+        has_more: has_more_overall,
         written_path,
     })
+}
+
+/// How wide a single ProtoOAGetTrendbarsReq slice should be for the
+/// given timeframe. cTrader caps each response at ~5000 bars; we
+/// stay below that with the values below so we never bump the cap.
+///
+///   M1  →  3 days   (4320 bars)
+///   M3  →  9 days   (4320 bars)
+///   M5  →  15 days  (4320 bars)
+///   M15 →  45 days  (4320 bars)
+///   M30 →  90 days
+///   H1  →  180 days (4320 bars)
+///   H4  →  720 days
+///   H12 →  6 years
+///   D1  →  12 years
+///   W1/MN1 → no chunking needed in practice (one shot covers
+///            available history)
+fn timeframe_chunk_ms(tf: &str) -> i64 {
+    let day_ms: i64 = 24 * 60 * 60 * 1000;
+    match tf.trim().to_ascii_uppercase().as_str() {
+        "M1" => 3 * day_ms,
+        "M3" => 9 * day_ms,
+        "M5" => 15 * day_ms,
+        "M15" => 45 * day_ms,
+        "M30" => 90 * day_ms,
+        "H1" => 180 * day_ms,
+        "H4" => 720 * day_ms,
+        "H12" => 6 * 365 * day_ms,
+        "D1" => 12 * 365 * day_ms,
+        // For W1 / MN1 the broker's full coverage is usually <500
+        // bars, so one big slice covers everything.
+        _ => 50 * 365 * day_ms,
+    }
 }
 
 /// Side of a manual market order. Mirrors `CTraderTradeSide` but kept
@@ -357,6 +422,54 @@ pub fn submit_market_order_blocking(
         request: CTraderExecutionRequest::NewOrder(Box::new(new_order)),
     };
     backend.execute(&runtime_request)
+}
+
+/// Close an open position (full close — pass the position's own
+/// volume). Used by the Trade Watch screen's per-row close button.
+pub fn close_position_blocking(
+    position_id: i64,
+    volume: i64,
+) -> Result<CTraderExecutionOutcome> {
+    let creds = resolve_creds()?;
+    let account_id: i64 = creds
+        .account_id_str
+        .parse()
+        .map_err(|_| anyhow!("account_id '{}' is not numeric", creds.account_id_str))?;
+    let runtime_request = CTraderExecutionRuntimeRequest {
+        client_id: creds.client_id,
+        client_secret: creds.client_secret,
+        access_token: creds.access_token,
+        environment: creds.environment,
+        account_id: creds.account_id_str,
+        request: CTraderExecutionRequest::ClosePosition(CTraderClosePositionRequest {
+            account_id,
+            position_id,
+            volume,
+        }),
+    };
+    ProductionCTraderExecutionBackend::default().execute(&runtime_request)
+}
+
+/// Cancel a pending order (not a filled position — use
+/// `close_position_blocking` for that).
+pub fn cancel_order_blocking(order_id: i64) -> Result<CTraderExecutionOutcome> {
+    let creds = resolve_creds()?;
+    let account_id: i64 = creds
+        .account_id_str
+        .parse()
+        .map_err(|_| anyhow!("account_id '{}' is not numeric", creds.account_id_str))?;
+    let runtime_request = CTraderExecutionRuntimeRequest {
+        client_id: creds.client_id,
+        client_secret: creds.client_secret,
+        access_token: creds.access_token,
+        environment: creds.environment,
+        account_id: creds.account_id_str,
+        request: CTraderExecutionRequest::CancelOrder(CTraderCancelOrderRequest {
+            account_id,
+            order_id,
+        }),
+    };
+    ProductionCTraderExecutionBackend::default().execute(&runtime_request)
 }
 
 fn bars_to_normalized(bars: &[HistoricalBar]) -> Vec<NormalizedBar> {
