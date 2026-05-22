@@ -29,7 +29,10 @@
 
 pub mod account;
 pub mod bridge;
+pub mod hardware;
 pub mod health;
+pub mod risk;
+pub mod settings;
 pub mod state;
 
 use anyhow::Context;
@@ -53,6 +56,9 @@ pub fn router(state: AppApiState) -> Router {
     Router::new()
         .route("/healthz", get(health::healthz))
         .route("/account/snapshot", get(account::snapshot))
+        .route("/hardware", get(hardware::hardware))
+        .route("/risk", get(risk::risk))
+        .route("/settings", get(settings::settings))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)

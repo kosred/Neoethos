@@ -141,4 +141,135 @@ class BackendClient {
     final response = await _dio.get<Map<String, dynamic>>('/healthz');
     return response.data?['version']?.toString() ?? 'unknown';
   }
+
+  /// `/hardware` — CPU/RAM/GPU snapshot. Refreshes on every call;
+  /// the Flutter side polls at a slower cadence (e.g. 5s) than the
+  /// account snapshot because hardware metrics don't move fast.
+  Future<HardwareSnapshot> fetchHardware() async {
+    final response = await _dio.get<Map<String, dynamic>>('/hardware');
+    final data = response.data;
+    if (data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/hardware returned 200 with empty body',
+      );
+    }
+    return HardwareSnapshot.fromJson(data);
+  }
+
+  /// `/risk` — currently-loaded prop-firm risk caps from config.yaml.
+  Future<RiskSnapshot> fetchRisk() async {
+    final response = await _dio.get<Map<String, dynamic>>('/risk');
+    if (response.statusCode != 200 || response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/risk failed: ${response.statusCode}',
+      );
+    }
+    return RiskSnapshot.fromJson(response.data!);
+  }
+
+  /// `/settings` — non-risk app-wide settings (data dir, news, LLM).
+  Future<SettingsSnapshot> fetchSettings() async {
+    final response = await _dio.get<Map<String, dynamic>>('/settings');
+    if (response.statusCode != 200 || response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/settings failed: ${response.statusCode}',
+      );
+    }
+    return SettingsSnapshot.fromJson(response.data!);
+  }
+}
+
+class HardwareSnapshot {
+  final String cpuModel;
+  final int cpuCoresLogical;
+  final int cpuCoresPhysical;
+  final double cpuLoadAvg;
+  final int ramTotalMb;
+  final int ramUsedMb;
+  final int ramAvailableMb;
+  final String gpuName;
+  final bool gpuAvailable;
+  const HardwareSnapshot({
+    required this.cpuModel,
+    required this.cpuCoresLogical,
+    required this.cpuCoresPhysical,
+    required this.cpuLoadAvg,
+    required this.ramTotalMb,
+    required this.ramUsedMb,
+    required this.ramAvailableMb,
+    required this.gpuName,
+    required this.gpuAvailable,
+  });
+
+  factory HardwareSnapshot.fromJson(Map<String, dynamic> j) {
+    final cpu = j['cpu'] as Map<String, dynamic>;
+    final ram = j['ram'] as Map<String, dynamic>;
+    final gpu = j['gpu'] as Map<String, dynamic>;
+    return HardwareSnapshot(
+      cpuModel: cpu['model'] as String,
+      cpuCoresLogical: cpu['coresLogical'] as int,
+      cpuCoresPhysical: cpu['coresPhysical'] as int,
+      cpuLoadAvg: (cpu['loadAvg'] as num).toDouble(),
+      ramTotalMb: ram['totalMb'] as int,
+      ramUsedMb: ram['usedMb'] as int,
+      ramAvailableMb: ram['availableMb'] as int,
+      gpuName: gpu['name'] as String,
+      gpuAvailable: gpu['available'] as bool,
+    );
+  }
+}
+
+class RiskSnapshot {
+  final double riskPerTrade;
+  final double minRiskPerTrade;
+  final double maxRiskPerTrade;
+  final double dailyDrawdownLimit;
+  final double totalDrawdownLimit;
+  final double maxLotSize;
+  final bool requireStopLoss;
+  const RiskSnapshot({
+    required this.riskPerTrade,
+    required this.minRiskPerTrade,
+    required this.maxRiskPerTrade,
+    required this.dailyDrawdownLimit,
+    required this.totalDrawdownLimit,
+    required this.maxLotSize,
+    required this.requireStopLoss,
+  });
+
+  factory RiskSnapshot.fromJson(Map<String, dynamic> j) => RiskSnapshot(
+        riskPerTrade: (j['riskPerTrade'] as num).toDouble(),
+        minRiskPerTrade: (j['minRiskPerTrade'] as num).toDouble(),
+        maxRiskPerTrade: (j['maxRiskPerTrade'] as num).toDouble(),
+        dailyDrawdownLimit: (j['dailyDrawdownLimit'] as num).toDouble(),
+        totalDrawdownLimit: (j['totalDrawdownLimit'] as num).toDouble(),
+        maxLotSize: (j['maxLotSize'] as num).toDouble(),
+        requireStopLoss: j['requireStopLoss'] as bool,
+      );
+}
+
+class SettingsSnapshot {
+  final String dataDir;
+  final bool newsCalendarEnabled;
+  final String newsCalendarSource;
+  final String openaiModel;
+  const SettingsSnapshot({
+    required this.dataDir,
+    required this.newsCalendarEnabled,
+    required this.newsCalendarSource,
+    required this.openaiModel,
+  });
+
+  factory SettingsSnapshot.fromJson(Map<String, dynamic> j) => SettingsSnapshot(
+        dataDir: j['dataDir'] as String,
+        newsCalendarEnabled: j['newsCalendarEnabled'] as bool,
+        newsCalendarSource: j['newsCalendarSource'] as String,
+        openaiModel: j['openaiModel'] as String,
+      );
 }

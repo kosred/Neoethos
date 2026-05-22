@@ -82,6 +82,10 @@ webpki-roots = { version = "0.26", optional = true }
 # `trace` (request/response logs piped through our existing tracing setup).
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
+# CPU / RAM probe for the `/hardware` HTTP endpoint. Same version
+# neoethos-core already pulls in transitively so the workspace
+# resolves to a single sysinfo build.
+sysinfo = "0.37.2"
 
 
 
