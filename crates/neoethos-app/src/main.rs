@@ -111,11 +111,23 @@ struct Args {
 
     /// Run as a headless HTTP API server on port 7423 (override with
     /// `NEOETHOS_SERVER_BIND=host:port`). The Flutter UI prototype at
-    /// `experiments/forex-flutter-ui/` consumes this surface. This
-    /// mode is the eventual replacement for the egui GUI loop — Phase
-    /// 1 of the Flutter migration (task #87).
+    /// `experiments/forex-flutter-ui/` consumes this surface.
+    ///
+    /// This is the **default behaviour** as of v0.4.20 — the binary
+    /// no longer pops up the legacy egui window on a bare invocation.
+    /// Passing `--server` explicitly is now equivalent to passing
+    /// nothing at all; the flag is preserved for back-compat with
+    /// older scripts and the Flutter `BackendSupervisor`.
     #[arg(long, default_value_t = false)]
     server: bool,
+
+    /// Launch the legacy egui desktop GUI instead of the headless
+    /// HTTP server. Kept as an escape hatch during the Flutter
+    /// migration (task #89 deletes the egui tree entirely). The
+    /// Flutter shell is the supported UI — only pass `--gui` if you
+    /// have a specific reason to look at the old window.
+    #[arg(long, default_value_t = false)]
+    gui: bool,
 
     /// Headless cTrader OAuth flow. Opens the system browser to the
     /// Spotware consent page, captures the redirect on the loopback
@@ -231,28 +243,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if args.server {
-        // Headless API server mode — the Flutter front-end's backend.
-        //
-        // No canned/seed data: the only state we hold is what the
-        // `bridge` task pulls live from cTrader. Until the first poll
-        // completes (~5 seconds) the `/account/snapshot` route returns
-        // 503, which the Flutter side renders as a "connecting…"
-        // placeholder. As soon as the cTrader account-runtime call
-        // succeeds the dashboard switches to real numbers.
-        info!("Starting NeoEthos in HTTP server mode (Flutter front-end backend)...");
-        let state = server::state::AppApiState::new();
-        server::bridge::spawn(state.clone());
-        server::serve(state).await?;
-        return Ok(());
-    }
-
+    // Headless training-loop mode — kept ahead of server-mode in the
+    // dispatch order because `--headless` is a stricter request (it
+    // implies "no HTTP either, just run jobs"). When neither --gui nor
+    // --headless are set we fall through to the server path below.
     if args.headless {
         info!("Starting NeoEthos in Headless Server Mode...");
         run_headless_loop(runtime).await;
-        Ok(())
-    } else {
-        info!("Starting NeoEthos in GUI Mode...");
+        return Ok(());
+    }
+
+    // Legacy egui GUI — explicit opt-in only. Task #89 deletes this
+    // tree entirely once the Flutter shell covers the last few
+    // operator-only paths; until then it stays behind --gui so the
+    // Flutter binary remains the supported entry point.
+    if args.gui {
+        info!("Starting NeoEthos in legacy egui GUI Mode (--gui)...");
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([1200.0, 800.0])
@@ -272,8 +278,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )))
             }),
         )?;
-        Ok(())
+        return Ok(());
     }
+
+    // Default: HTTP server mode — the Flutter front-end's backend.
+    //
+    // No canned/seed data: the only state we hold is what the
+    // `bridge` task pulls live from cTrader. Until the first poll
+    // completes (~5 seconds) the `/account/snapshot` route returns
+    // 503, which the Flutter side renders as a "connecting…"
+    // placeholder. As soon as the cTrader account-runtime call
+    // succeeds the dashboard switches to real numbers.
+    //
+    // Double-clicking the bare `neoethos-app.exe` lands here too —
+    // the binary stays silent (no window, since `windows_subsystem`
+    // is "windows" in release) and the Flutter shell's
+    // `BackendSupervisor` finds the listening port.
+    let _ = args.server; // keep the flag valid for back-compat
+    info!("Starting NeoEthos in HTTP server mode (Flutter front-end backend)...");
+    let state = server::state::AppApiState::new();
+    server::bridge::spawn(state.clone());
+    server::serve(state).await?;
+    Ok(())
 }
 
 async fn run_headless_loop(runtime: AppRuntimeConfig) {
