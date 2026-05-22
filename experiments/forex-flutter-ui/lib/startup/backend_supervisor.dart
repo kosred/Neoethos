@@ -134,26 +134,39 @@ class BackendSupervisor {
 
   /// Find the neoethos-app[.exe] binary.
   ///
-  /// Search order: side-by-side with Flutter exe → ancestors of Flutter
-  /// exe → ancestors of CWD. The first hit wins.
+  /// Search order:
+  ///   1. `<flutter-exe-dir>/bin/` — the production bundle layout where
+  ///      the backend is tucked into a `bin/` subfolder so the operator
+  ///      sees one executable (`NeoEthos.exe`) at the bundle's top
+  ///      level and the backend stays out of their way.
+  ///   2. Side-by-side with the Flutter exe — older bundle layout, kept
+  ///      working so existing installs don't break after the rename.
+  ///   3. Ancestors of Flutter exe → `target/{debug,release}/` — dev
+  ///      workflow where the Flutter exe is freshly-built inside the
+  ///      repo and the Rust target dir is several levels up.
+  ///   4. Ancestors of CWD → `target/{debug,release}/` — last-resort
+  ///      fallback for unusual launch contexts.
   File? _locateBackendBinary() {
     final exeName = Platform.isWindows ? 'neoethos-app.exe' : 'neoethos-app';
-
-    // 1. Production install — next to the Flutter executable.
     final flutterExeDir = File(Platform.resolvedExecutable).parent;
+
+    // 1. <flutter-exe-dir>/bin/neoethos-app[.exe] — new bundle layout.
+    final binSubdir = File(
+      '${flutterExeDir.path}${Platform.pathSeparator}bin'
+      '${Platform.pathSeparator}$exeName',
+    );
+    if (binSubdir.existsSync()) return binSubdir;
+
+    // 2. Side-by-side with the Flutter exe — legacy bundle layout.
     final coLocated =
         File('${flutterExeDir.path}${Platform.pathSeparator}$exeName');
     if (coLocated.existsSync()) return coLocated;
 
-    // 2. Ancestors of Flutter exe → target/{debug,release}/.
-    //    Covers `flutter build windows --debug` from inside the repo,
-    //    where the Flutter exe lives 6 levels under the repo root and
-    //    the backend lives at <root>/target/{debug,release}/.
+    // 3. Ancestors of Flutter exe → target/{debug,release}/.
     final viaFlutter = _searchAncestors(flutterExeDir, exeName);
     if (viaFlutter != null) return viaFlutter;
 
-    // 3. Ancestors of OS current working directory. Last-resort fallback
-    //    for unusual launch contexts (debugger, scheduled task, etc.).
+    // 4. Ancestors of OS current working directory.
     final viaCwd = _searchAncestors(Directory.current, exeName);
     if (viaCwd != null) return viaCwd;
 

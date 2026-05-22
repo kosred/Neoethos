@@ -2,9 +2,14 @@
 cmake_minimum_required(VERSION 3.14)
 project(forex_flutter_ui LANGUAGES CXX)
 
-# The name of the executable created for the application. Change this to change
-# the on-disk name of your application.
-set(BINARY_NAME "forex_flutter_ui")
+# The name of the executable created for the application. The user-facing
+# binary is `NeoEthos.exe` — that is what operators double-click. The
+# Dart-side project name in `pubspec.yaml` remains `forex_flutter_ui`
+# because changing that would force a workspace-wide rename of every
+# `package:forex_flutter_ui/...` import for purely cosmetic benefit;
+# the .exe rename is enough to satisfy "one application, one
+# double-click target".
+set(BINARY_NAME "NeoEthos")
 
 # Explicitly opt in to modern CMake behaviors to avoid warnings with recent
 # versions of CMake.

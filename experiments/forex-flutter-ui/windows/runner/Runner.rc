@@ -94,7 +94,7 @@ BEGIN
             VALUE "FileVersion", VERSION_AS_STRING "\0"
             VALUE "InternalName", "NeoEthos" "\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 NeoEthos. All rights reserved." "\0"
-            VALUE "OriginalFilename", "forex_flutter_ui.exe" "\0"
+            VALUE "OriginalFilename", "NeoEthos.exe" "\0"
             VALUE "ProductName", "NeoEthos" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
