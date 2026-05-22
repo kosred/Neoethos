@@ -59,21 +59,24 @@ class BackendSupervisor {
     final binary = _locateBackendBinary();
     if (binary == null) {
       _log('FATAL: neoethos-app binary not found. Searched:\n'
-          '  1. Side-by-side with Flutter exe '
-          '(${File(Platform.resolvedExecutable).parent.path})\n'
-          '  2. Ancestors of Flutter exe → target/{debug,release}/\n'
-          '  3. Ancestors of CWD → target/{debug,release}/\n'
-          'Drop the neoethos-app.exe next to the Flutter exe and re-launch.');
+          '  1. <flutter-exe-dir>/bin/ (production bundle)\n'
+          '  2. Side-by-side with Flutter exe (legacy bundle)\n'
+          '  3. Ancestors of Flutter exe → target/{debug,release}/\n'
+          '  4. Ancestors of CWD → target/{debug,release}/\n'
+          'Drop the neoethos-app.exe under <NeoEthos.exe-dir>/bin/ and re-launch.');
       return;
     }
     _log('Located backend binary: ${binary.path}');
 
-    // neoethos-app loads `config.yaml` from its CWD by default, so we
-    // pin the CWD to whichever dir contains it. In a production install
-    // that's the binary's own dir; in dev that's the repo root. We
-    // resolve it by walking up from the binary.
-    final workDir = _locateConfigDir(binary) ?? binary.parent;
-    _log('Spawn CWD (config.yaml dir): ${workDir.path}');
+    // Resolve a writable working directory for the backend. Bundle
+    // layout: the bundle root itself has a `data/` that conflicts
+    // with the Flutter engine's runtime asset folder; using it as
+    // CWD makes neoethos-app misidentify `flutter_assets/` etc. as
+    // symbol dirs. So in bundle mode we pin the CWD to a per-user
+    // data dir (e.g. `%LOCALAPPDATA%\neoethos\`) and seed it on
+    // first launch from the bundle's template config.
+    final workDir = _resolveSpawnCwd(binary);
+    _log('Spawn CWD: ${workDir.path}');
 
     try {
       // `detached` (NOT `detachedWithStdio`) — the backend has very
@@ -191,11 +194,41 @@ class BackendSupervisor {
     return null;
   }
 
-  /// Walk up from the binary's directory looking for the first
-  /// ancestor that contains `config.yaml`. That's the directory the
-  /// backend needs as its CWD so `Settings::from_yaml("config.yaml")`
-  /// resolves to the real file.
-  Directory? _locateConfigDir(File binary) {
+  /// Pick the backend's working directory.
+  ///
+  /// Two layouts to support:
+  ///
+  /// 1. **Production bundle** (`<bundle>/NeoEthos.exe` +
+  ///    `<bundle>/bin/neoethos-app.exe`). The bundle ships a
+  ///    `config.yaml` at its root, but the bundle also contains
+  ///    a Flutter runtime `data/` directory that conflicts with
+  ///    neoethos's `system.data_dir: data`. Solution: pin the CWD
+  ///    to a per-user data dir under `%LOCALAPPDATA%\neoethos\`
+  ///    (Linux/macOS equivalents below) and seed that dir on
+  ///    first launch from the bundle's template `config.yaml`.
+  ///    All relative paths in `config.yaml` now resolve under
+  ///    the user-data dir, which the user owns and the bundle
+  ///    can't accidentally collide with.
+  ///
+  /// 2. **Dev / cargo-built** (`target/{debug,release}/neoethos-app.exe`).
+  ///    Walk up from the binary looking for an existing
+  ///    `config.yaml` — that's the repo root, exactly what
+  ///    cargo run uses.
+  Directory _resolveSpawnCwd(File binary) {
+    // Bundle detection: the production layout puts the backend
+    // inside a `bin/` subdir of the Flutter exe dir. Anything
+    // else is the dev tree.
+    final flutterExeDir = File(Platform.resolvedExecutable).parent;
+    final inBin = binary.parent.path.toLowerCase() ==
+        '${flutterExeDir.path.toLowerCase()}${Platform.pathSeparator}bin';
+
+    if (inBin) {
+      final userDataDir = _userDataDir();
+      _seedUserDataDir(userDataDir, flutterExeDir);
+      return userDataDir;
+    }
+
+    // Dev path — walk up from the binary looking for config.yaml.
     Directory dir = binary.parent;
     for (var i = 0; i < 10; i++) {
       if (File('${dir.path}${Platform.pathSeparator}config.yaml')
@@ -206,7 +239,31 @@ class BackendSupervisor {
       if (parent.path == dir.path) break;
       dir = parent;
     }
-    return null;
+    return binary.parent;
+  }
+
+  /// First-launch seed: copy the bundle's `config.yaml` into
+  /// the user-data dir if it isn't there, and pre-create the
+  /// `data/`, `models/`, `logs/` subdirs the backend expects to
+  /// be writable. Subsequent launches are a no-op.
+  void _seedUserDataDir(Directory userDataDir, Directory bundleDir) {
+    if (!userDataDir.existsSync()) {
+      userDataDir.createSync(recursive: true);
+      _log('Created user-data dir: ${userDataDir.path}');
+    }
+    for (final sub in const ['data', 'models', 'logs', 'resources']) {
+      final d = Directory(
+          '${userDataDir.path}${Platform.pathSeparator}$sub');
+      if (!d.existsSync()) d.createSync(recursive: true);
+    }
+    final userConfig = File(
+        '${userDataDir.path}${Platform.pathSeparator}config.yaml');
+    final bundleConfig = File(
+        '${bundleDir.path}${Platform.pathSeparator}config.yaml');
+    if (!userConfig.existsSync() && bundleConfig.existsSync()) {
+      userConfig.writeAsStringSync(bundleConfig.readAsStringSync());
+      _log('Seeded ${userConfig.path} from bundle template.');
+    }
   }
 
   // ─── Diagnostic file logging ─────────────────────────────────────────
