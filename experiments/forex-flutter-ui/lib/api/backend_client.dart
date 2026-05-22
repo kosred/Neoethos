@@ -267,6 +267,19 @@ class BackendClient {
     return response.data ?? const <String, dynamic>{};
   }
 
+  /// `/intelligence` — model artifacts + discovery targets + walkforward.
+  Future<IntelligenceSnapshot> fetchIntelligence() async {
+    final response = await _dio.get<Map<String, dynamic>>('/intelligence');
+    if (response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/intelligence returned empty body',
+      );
+    }
+    return IntelligenceSnapshot.fromJson(response.data!);
+  }
+
   /// `/data/bootstrap` — local data-dir inventory.
   Future<DataBootstrapSnapshot> fetchDataBootstrap() async {
     final response = await _dio.get<Map<String, dynamic>>('/data/bootstrap');
@@ -414,6 +427,66 @@ class BrokerStatus {
         accountId: j['accountId'] as String,
         connected: j['connected'] as bool,
         clientIdPrefix: j['clientIdPrefix'] as String,
+      );
+}
+
+class DiscoveryTarget {
+  final String symbol;
+  final String baseTf;
+  final String strategyId;
+  final double? sharpe;
+  final double? winRate;
+  const DiscoveryTarget({
+    required this.symbol,
+    required this.baseTf,
+    required this.strategyId,
+    required this.sharpe,
+    required this.winRate,
+  });
+  factory DiscoveryTarget.fromJson(Map<String, dynamic> j) => DiscoveryTarget(
+        symbol: (j['symbol'] as String?) ?? '',
+        baseTf: (j['baseTf'] as String?) ?? '',
+        strategyId: (j['strategyId'] as String?) ?? '',
+        sharpe: (j['sharpe'] as num?)?.toDouble(),
+        winRate: (j['winRate'] as num?)?.toDouble(),
+      );
+}
+
+class IntelligenceSnapshot {
+  final String modelsDir;
+  final bool modelsDirExists;
+  final int artifactCount;
+  final List<String> artifacts;
+  final int? lastTouchedUnixMs;
+  final List<DiscoveryTarget> discoveryTargets;
+  final int? walkforwardSplits;
+  final double? walkforwardAvgAccuracy;
+  const IntelligenceSnapshot({
+    required this.modelsDir,
+    required this.modelsDirExists,
+    required this.artifactCount,
+    required this.artifacts,
+    required this.lastTouchedUnixMs,
+    required this.discoveryTargets,
+    required this.walkforwardSplits,
+    required this.walkforwardAvgAccuracy,
+  });
+  factory IntelligenceSnapshot.fromJson(Map<String, dynamic> j) =>
+      IntelligenceSnapshot(
+        modelsDir: (j['modelsDir'] as String?) ?? '',
+        modelsDirExists: (j['modelsDirExists'] as bool?) ?? false,
+        artifactCount: (j['artifactCount'] as int?) ?? 0,
+        artifacts: ((j['artifacts'] as List?) ?? const [])
+            .map((s) => s as String)
+            .toList(growable: false),
+        lastTouchedUnixMs: j['lastTouchedUnixMs'] as int?,
+        discoveryTargets: ((j['discoveryTargets'] as List?) ?? const [])
+            .map((e) =>
+                DiscoveryTarget.fromJson(e as Map<String, dynamic>))
+            .toList(growable: false),
+        walkforwardSplits: j['walkforwardSplits'] as int?,
+        walkforwardAvgAccuracy:
+            (j['walkforwardAvgAccuracy'] as num?)?.toDouble(),
       );
 }
 

@@ -64,6 +64,13 @@ final brokerStatusProvider = FutureProvider.autoDispose<BrokerStatus>((ref) {
   return client.fetchBrokerStatus();
 });
 
+/// `/intelligence` — model artifacts + discovery targets + walkforward.
+final intelligenceProvider =
+    FutureProvider.autoDispose<IntelligenceSnapshot>((ref) {
+  final client = ref.read(backendClientProvider);
+  return client.fetchIntelligence();
+});
+
 /// `/data/bootstrap` — local data-dir inventory.
 final dataBootstrapProvider =
     FutureProvider.autoDispose<DataBootstrapSnapshot>((ref) {
