@@ -198,70 +198,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // loopback callback, swaps the auth-code for a token bundle,
         // saves it to the keyring, exits. Run this once whenever
         // `--server` reports `RET_ACCOUNT_DISABLED`.
+        //
+        // The same logic is also exposed live via `POST /broker/reauth`
+        // when the server is running, so the Flutter "Re-authenticate"
+        // button doesn't need to spawn a child process.
         info!("Running cTrader OAuth flow (browser will open)...");
-        use app_services::ctrader_live_auth::{
-            CTraderLiveAuthBackend, CTraderLiveAuthRequest, CTraderLoopbackConfig,
-            ProductionCTraderLiveAuthBackend,
-        };
-        use app_services::secure_store::production_ctrader_token_store;
-
-        let settings = app_services::broker_persistence::load_broker_settings();
-        let ct = &settings.ctrader;
-        if ct.client_id.is_empty() || ct.client_secret.is_empty() {
-            error!(
-                "cTrader client_id / client_secret are empty — set them in \
-                 .local/neoethos/broker_credentials.toml (or via \
-                 NEOETHOS_EMBED_CTRADER_CLIENT_ID / _SECRET env vars at \
-                 build time) before re-authing"
-            );
-            std::process::exit(2);
-        }
-
-        // Primary callback port 43001 matches what's registered on the
-        // Spotware portal; fallbacks 43002 / 43003 cover the case where
-        // another process holds 43001. Keep this in lock-step with what
-        // `ctrader_live_auth.rs::CTRADER_DEFAULT_LOOPBACK_PORTS` uses.
-        let loopback = CTraderLoopbackConfig::new(43001, vec![43002, 43003], "/callback");
-
-        let request = CTraderLiveAuthRequest {
-            client_id: ct.client_id.clone(),
-            client_secret: ct.client_secret.clone(),
-            redirect_uri: ct.redirect_uri.clone(),
-            // `trading` (not `accounts`) is the scope ProtoOAAccountAuthReq
-            // requires. The earlier session's token had `accounts` scope
-            // only — account-list worked but account-auth failed with
-            // RET_ACCOUNT_DISABLED. Hard-code `trading` here so this
-            // never regresses.
-            scope: "trading".to_string(),
-            loopback,
-        };
-
-        // `backend.run()` performs synchronous filesystem + reqwest::blocking
-        // I/O internally (the token-exchange POST uses blocking HTTP). We're
-        // inside a `#[tokio::main]` runtime here, so calling it on the async
-        // task directly panics on drop with "Cannot drop a runtime in a
-        // context where blocking is not allowed" (tokio reactor refuses to
-        // host a nested blocking runtime). spawn_blocking moves the whole
-        // OAuth flow onto a dedicated worker thread where blocking I/O is
-        // first-class.
-        let result = tokio::task::spawn_blocking(move || {
-            let backend = ProductionCTraderLiveAuthBackend;
-            backend.run(request)
-        })
+        let outcome = tokio::task::spawn_blocking(
+            app_services::reauth::run_reauth_flow_blocking,
+        )
         .await
-        .map_err(|e| anyhow::anyhow!("OAuth blocking task panicked: {e}"))?
-        .map_err(|e| anyhow::anyhow!("OAuth flow failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("OAuth blocking task panicked: {e}"))??;
 
         info!(
-            callback_port = result.callback_port,
-            access_token_len = result.token_bundle.access_token.len(),
-            refresh_token_present = !result.token_bundle.refresh_token.is_empty(),
-            "OAuth flow complete; saving token bundle to keyring"
+            callback_port = outcome.callback_port,
+            access_token_len = outcome.access_token_len,
+            refresh_token_present = outcome.refresh_token_present,
+            "OAuth flow complete; token bundle saved to keyring"
         );
-        production_ctrader_token_store()
-            .save_token_bundle(&result.token_bundle)
-            .map_err(|e| anyhow::anyhow!("save_token_bundle failed: {e}"))?;
-
         info!("Token bundle saved. You can now run: neoethos-app --server");
         return Ok(());
     }

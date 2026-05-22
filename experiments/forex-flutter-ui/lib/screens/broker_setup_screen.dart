@@ -1,7 +1,9 @@
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
+import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
 import '_placeholder.dart';
@@ -30,11 +32,80 @@ class BrokerSetupScreen extends ConsumerWidget {
   }
 }
 
-class _Body extends StatelessWidget {
+class _Body extends ConsumerStatefulWidget {
   final BrokerStatus status;
   const _Body({required this.status});
   @override
+  ConsumerState<_Body> createState() => _BodyState();
+}
+
+class _BodyState extends ConsumerState<_Body> {
+  bool _reauthBusy = false;
+
+  Future<void> _onReauth() async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Re-authenticate with cTrader?'),
+        content: const Text(
+          'A browser window will open on the Spotware consent screen. '
+          'After you click "Continue", the new token is saved to the OS '
+          'keyring and the existing session picks it up on the next '
+          '5-second refresh — no restart needed.\n\n'
+          'Typical wall-clock time: 10–30 seconds.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Open browser'),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+    if (!mounted) return;
+
+    setState(() => _reauthBusy = true);
+    try {
+      final result = await ref.read(backendClientProvider).reauthBroker();
+      if (!mounted) return;
+      // Bump status + account so the new token is reflected.
+      ref.invalidate(brokerStatusProvider);
+      ref.invalidate(accountSnapshotProvider);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: ForexAiTokens.buy,
+          content: Text(
+            (result['message'] as String?) ?? 'OAuth refresh complete',
+          ),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    } on DioException catch (e) {
+      if (!mounted) return;
+      final body = e.response?.data;
+      final msg = (body is Map && body['error'] is String)
+          ? body['error'] as String
+          : e.message ?? e.toString();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: ForexAiTokens.sell,
+          content: Text('Re-auth failed: $msg'),
+          duration: const Duration(seconds: 6),
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _reauthBusy = false);
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final status = widget.status;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -75,18 +146,49 @@ class _Body extends StatelessWidget {
             ],
           ),
         ),
-        const SectionCard(
+        SectionCard(
           title: 'Re-authenticate',
-          child: Text(
-            'To refresh the OAuth token (e.g. after RET_ACCOUNT_DISABLED '
-            'or a 24h token expiry), close this app and run:\n\n'
-            '    neoethos-app --reauth\n\n'
-            'That opens the Spotware consent screen in your default '
-            'browser, captures the redirect on loopback, swaps the '
-            'auth code for a fresh trading-scope token, and writes it '
-            'to the OS keyring. The button equivalent ships when the '
-            'POST /broker/reauth control endpoint lands.',
-            style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Run the OAuth flow if the token expired or you see '
+                'RET_ACCOUNT_DISABLED in the logs. Opens the Spotware '
+                'consent screen in your default browser, captures the '
+                'redirect on loopback, swaps the auth code for a fresh '
+                'trading-scope token, and writes it to the OS keyring.',
+                style: TextStyle(
+                  color: ForexAiTokens.textMuted,
+                  fontSize: 12,
+                ),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  FilledButton.icon(
+                    onPressed: _reauthBusy ? null : _onReauth,
+                    icon: const Icon(Icons.refresh, size: 18),
+                    label: const Text('Re-authenticate'),
+                  ),
+                  if (_reauthBusy) ...[
+                    const SizedBox(width: 16),
+                    const SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                    const SizedBox(width: 8),
+                    const Text(
+                      'Waiting for browser approval…',
+                      style: TextStyle(
+                        color: ForexAiTokens.textMuted,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ],
           ),
         ),
       ],

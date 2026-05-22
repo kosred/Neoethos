@@ -44,6 +44,7 @@ pub mod embedded_credentials;
 pub mod jobs;
 pub mod live_journal;
 pub mod pnl;
+pub mod reauth;
 pub mod risky_mode_persistence;
 pub mod secure_store;
 pub mod trading;

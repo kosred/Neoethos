@@ -235,6 +235,23 @@ class BackendClient {
     return _postEngine('/engines/training/stop', null, null);
   }
 
+  /// POST `/broker/reauth` — runs the full cTrader OAuth flow on the
+  /// server side. Blocks until the operator approves in the browser
+  /// (10–30 s typical). Returns `{callbackPort, accessTokenLen,
+  /// refreshTokenPresent, message}` on success.
+  Future<Map<String, dynamic>> reauthBroker() async {
+    // 90 s receive timeout — gives the user time to click through the
+    // Spotware consent screen without the request timing out under them.
+    final response = await _dio.post<Map<String, dynamic>>(
+      '/broker/reauth',
+      options: Options(
+        receiveTimeout: const Duration(seconds: 90),
+        sendTimeout: const Duration(seconds: 10),
+      ),
+    );
+    return response.data ?? const <String, dynamic>{};
+  }
+
   Future<Map<String, dynamic>> _postEngine(
     String path,
     String? symbol,

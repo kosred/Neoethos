@@ -4,6 +4,12 @@
 // slow-moving, so a `FutureProvider.autoDispose` is enough. No need
 // for the `AsyncNotifier` + polling-timer machinery the
 // `accountSnapshotProvider` uses.
+//
+// `enginesProvider` is the exception: once the user clicks Start on
+// Discovery/Training, the status row needs to track progress in real
+// time, so it polls every 2 seconds while mounted.
+
+import 'dart:async';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -30,13 +36,26 @@ final settingsProvider = FutureProvider.autoDispose<SettingsSnapshot>((ref) {
 });
 
 /// `/engines/status` — Discovery / Training / Auto-Trader.
-/// Polled with a fresh fetch every time the Dashboard is rebuilt
-/// (autoDispose dies on screen pop), which is good enough until the
-/// real job-state plumbing lands and we can promote to a periodic
-/// notifier.
-final enginesProvider = FutureProvider.autoDispose<EnginesSnapshot>((ref) {
+///
+/// Polls every 2s so the status row + progress summary track the
+/// engine in real time after the user hits Start. We schedule the
+/// next refetch from inside `onDispose` so the timer dies with the
+/// provider (autoDispose still applies — leaving the screen halts
+/// polling). The first fetch happens synchronously below.
+final enginesProvider = FutureProvider.autoDispose<EnginesSnapshot>((ref) async {
   final client = ref.read(backendClientProvider);
-  return client.fetchEngines();
+  final snapshot = await client.fetchEngines();
+
+  // Schedule next tick. A one-shot Timer + invalidateSelf gives us
+  // "poll, await, repeat" — each invalidation re-runs this whole
+  // body, including scheduling the *next* timer. `onDispose` cancels
+  // the pending timer so navigating away halts polling cleanly.
+  final timer = Timer(const Duration(seconds: 2), () {
+    ref.invalidateSelf();
+  });
+  ref.onDispose(timer.cancel);
+
+  return snapshot;
 });
 
 /// `/broker/status` — current broker session state.
