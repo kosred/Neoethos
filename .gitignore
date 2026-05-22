@@ -107,3 +107,4 @@ crates/forex-flutter-ui/macos/
 # Zero-byte sed-pipeline staging artifacts produced during the split
 # extraction (see docs/qa/*-split-draft.md for context).
 **/_section_*.body
+dist/
