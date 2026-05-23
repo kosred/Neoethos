@@ -74,11 +74,17 @@ New-Item -ItemType Directory -Force -Path $dst | Out-Null
 Write-Host "Copying Flutter shell from $flutterDir"
 $srcUiExe = Join-Path $flutterDir 'NeoEthos.exe'
 if (-not (Test-Path $srcUiExe)) {
+    # Flutter's CMakeLists pins BINARY_NAME as lowercase "neoethos" today;
+    # earlier rev was "NeoEthos". Either is fine — we rename to NeoEthos.exe
+    # at the destination.
+    $srcUiExe = Join-Path $flutterDir 'neoethos.exe'
+}
+if (-not (Test-Path $srcUiExe)) {
     # Fallback to the pre-rename binary name.
     $srcUiExe = Join-Path $flutterDir 'forex_flutter_ui.exe'
 }
 if (-not (Test-Path $srcUiExe)) {
-    throw "Could not find NeoEthos.exe or forex_flutter_ui.exe in $flutterDir - re-run flutter build windows --$Profile."
+    throw "Could not find NeoEthos.exe / neoethos.exe / forex_flutter_ui.exe in $flutterDir - re-run flutter build windows --$Profile."
 }
 Copy-Item -Path $srcUiExe -Destination (Join-Path $dst 'NeoEthos.exe')
 Copy-Item -Path (Join-Path $flutterDir 'flutter_windows.dll') -Destination $dst
