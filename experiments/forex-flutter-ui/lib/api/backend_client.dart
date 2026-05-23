@@ -204,6 +204,46 @@ class BackendClient {
     return SettingsSnapshot.fromJson(response.data!);
   }
 
+  /// `POST /settings` — partial-update + persist to config.yaml.
+  ///
+  /// Only the non-null fields are sent; the backend merges them into
+  /// the existing on-disk config and rewrites the YAML, leaving the
+  /// 200+ unexposed fields untouched. Returns the post-merge snapshot
+  /// so the UI can refresh its local copy without a follow-up GET.
+  ///
+  /// Throws `DioException` (with the backend's structured `error` body
+  /// when validation fails — e.g. blank data_dir). Callers should
+  /// surface that via `describeError()` in `error_translation.dart`.
+  Future<SettingsSnapshot> saveSettings({
+    String? dataDir,
+    bool? newsCalendarEnabled,
+    String? newsCalendarSource,
+    String? openaiModel,
+  }) async {
+    final body = <String, dynamic>{};
+    if (dataDir != null) body['dataDir'] = dataDir;
+    if (newsCalendarEnabled != null) {
+      body['newsCalendarEnabled'] = newsCalendarEnabled;
+    }
+    if (newsCalendarSource != null) {
+      body['newsCalendarSource'] = newsCalendarSource;
+    }
+    if (openaiModel != null) body['openaiModel'] = openaiModel;
+
+    final response = await _dio.post<Map<String, dynamic>>(
+      '/settings',
+      data: body,
+    );
+    if (response.statusCode != 200 || response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: 'POST /settings failed: ${response.statusCode}',
+      );
+    }
+    return SettingsSnapshot.fromJson(response.data!);
+  }
+
   /// `/engines/status` — Discovery / Training / Auto-Trader state.
   Future<EnginesSnapshot> fetchEngines() async {
     final response = await _dio.get<Map<String, dynamic>>('/engines/status');

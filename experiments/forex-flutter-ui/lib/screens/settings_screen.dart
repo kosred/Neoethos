@@ -295,34 +295,241 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   }
 
   Widget _configCard(SettingsSnapshot s) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        SectionCard(
-          title: 'Data',
-          child: _Row('Data directory', s.dataDir),
-        ),
-        SectionCard(
-          title: 'News & Calendar',
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+    // Delegate to a stateful child so the text controllers
+    // (`_dataDirCtrl` etc.) survive parent rebuilds when the user
+    // toggles the cTrader credentials form above.
+    return _AppSettingsCard(snapshot: s);
+  }
+}
+
+/// Editable App-Settings form. POSTs to `/settings` which merges the
+/// 4 exposed fields into the on-disk `config.yaml` (leaving the
+/// ~200+ unexposed fields untouched) and rewrites the YAML in place.
+class _AppSettingsCard extends ConsumerStatefulWidget {
+  final SettingsSnapshot snapshot;
+  const _AppSettingsCard({required this.snapshot});
+
+  @override
+  ConsumerState<_AppSettingsCard> createState() => _AppSettingsCardState();
+}
+
+class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
+  late final TextEditingController _dataDirCtrl;
+  late final TextEditingController _newsSourceCtrl;
+  late final TextEditingController _openaiModelCtrl;
+  late bool _newsEnabled;
+  bool _busy = false;
+  String? _message;
+  bool _messageOk = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final s = widget.snapshot;
+    _dataDirCtrl = TextEditingController(text: s.dataDir);
+    _newsSourceCtrl = TextEditingController(text: s.newsCalendarSource);
+    _openaiModelCtrl = TextEditingController(text: s.openaiModel);
+    _newsEnabled = s.newsCalendarEnabled;
+  }
+
+  @override
+  void didUpdateWidget(covariant _AppSettingsCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Keep the text fields in sync if the snapshot changed (e.g. the
+    // user clicked Save and the provider re-emitted) — but never
+    // clobber what the user is actively typing into a focused field.
+    final s = widget.snapshot;
+    if (!_busy && _dataDirCtrl.text != s.dataDir) {
+      _dataDirCtrl.text = s.dataDir;
+    }
+    if (!_busy && _newsSourceCtrl.text != s.newsCalendarSource) {
+      _newsSourceCtrl.text = s.newsCalendarSource;
+    }
+    if (!_busy && _openaiModelCtrl.text != s.openaiModel) {
+      _openaiModelCtrl.text = s.openaiModel;
+    }
+  }
+
+  @override
+  void dispose() {
+    _dataDirCtrl.dispose();
+    _newsSourceCtrl.dispose();
+    _openaiModelCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    final dataDir = _dataDirCtrl.text.trim();
+    final newsSource = _newsSourceCtrl.text.trim();
+    // openai_model is allowed blank intentionally — see backend
+    // doc-comment in server/settings.rs::update_settings.
+    if (dataDir.isEmpty) {
+      _showSnack('Data directory cannot be blank', ok: false);
+      return;
+    }
+    if (newsSource.isEmpty) {
+      _showSnack('News calendar source cannot be blank', ok: false);
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      await ref.read(backendClientProvider).saveSettings(
+            dataDir: dataDir,
+            newsCalendarEnabled: _newsEnabled,
+            newsCalendarSource: newsSource,
+            openaiModel: _openaiModelCtrl.text.trim(),
+          );
+      if (!mounted) return;
+      setState(() {
+        _messageOk = true;
+        _message = 'Saved · config.yaml updated';
+      });
+      // Refresh the snapshot so the parent screen and any other
+      // consumers of settingsProvider see the new value.
+      ref.invalidate(settingsProvider);
+      _showSnack('Settings saved to config.yaml', ok: true);
+    } on DioException catch (e) {
+      if (!mounted) return;
+      final msg = describeError(e);
+      setState(() {
+        _messageOk = false;
+        _message = msg;
+      });
+      showTranslatedErrorSnackbar(context, e, prefix: 'Save failed');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _messageOk = false;
+        _message = e.toString();
+      });
+      _showSnack('Save failed: $e', ok: false);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  void _showSnack(String msg, {required bool ok}) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        backgroundColor: ok ? ForexAiTokens.buy : ForexAiTokens.sell,
+        content: Text(msg),
+        duration: const Duration(seconds: 4),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SectionCard(
+      title: 'App Settings',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'These fields write directly into config.yaml. Unchanged '
+            'lines (risk, models, the 200+ knobs the UI doesn\'t '
+            'show) are preserved on every save.',
+            style: TextStyle(fontSize: 11, color: ForexAiTokens.textMuted),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _dataDirCtrl,
+            enabled: !_busy,
+            decoration: const InputDecoration(
+              labelText: 'Data directory',
+              isDense: true,
+              border: OutlineInputBorder(),
+              helperText:
+                  'Where Vortex bars + discovery artifacts live. '
+                  'Relative paths resolve against the binary\'s CWD.',
+            ),
+          ),
+          const SizedBox(height: 10),
+          Row(
             children: [
-              _Row(
-                'Calendar enabled',
-                s.newsCalendarEnabled ? 'ON' : 'OFF',
-                accent: s.newsCalendarEnabled
-                    ? ForexAiTokens.buy
-                    : ForexAiTokens.textFaint,
+              Expanded(
+                child: TextField(
+                  controller: _newsSourceCtrl,
+                  enabled: !_busy,
+                  decoration: const InputDecoration(
+                    labelText: 'News calendar source',
+                    isDense: true,
+                    border: OutlineInputBorder(),
+                    helperText: 'e.g. "forexfactory", "investing", "test".',
+                  ),
+                ),
               ),
-              _Row('Calendar source', s.newsCalendarSource),
+              const SizedBox(width: 12),
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Row(
+                  children: [
+                    Switch(
+                      value: _newsEnabled,
+                      onChanged: _busy
+                          ? null
+                          : (v) => setState(() => _newsEnabled = v),
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      _newsEnabled ? 'Calendar ON' : 'Calendar OFF',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: _newsEnabled
+                            ? ForexAiTokens.buy
+                            : ForexAiTokens.textFaint,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             ],
           ),
-        ),
-        SectionCard(
-          title: 'LLM',
-          child: _Row('OpenAI model (legacy field)', s.openaiModel),
-        ),
-      ],
+          const SizedBox(height: 10),
+          TextField(
+            controller: _openaiModelCtrl,
+            enabled: !_busy,
+            decoration: const InputDecoration(
+              labelText: 'LLM model name (legacy "openai_model" field)',
+              isDense: true,
+              border: OutlineInputBorder(),
+              helperText:
+                  'Used by the news pipeline. Leave blank to disable LLM '
+                  'news ingestion. Gemma chat does not read this.',
+            ),
+          ),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              FilledButton.icon(
+                onPressed: _busy ? null : _save,
+                icon: _busy
+                    ? const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.save, size: 16),
+                label: Text(_busy ? 'Saving…' : 'Save settings'),
+              ),
+              if (_message != null) ...[
+                const SizedBox(width: 12),
+                Flexible(
+                  child: Text(
+                    _message!,
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: _messageOk
+                          ? ForexAiTokens.buy
+                          : ForexAiTokens.sell,
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ],
+      ),
     );
   }
 }
@@ -474,42 +681,6 @@ class _AccountPicker extends ConsumerWidget {
       ),
     );
   }
-}
-
-class _Row extends StatelessWidget {
-  final String label;
-  final String value;
-  final Color? accent;
-  const _Row(this.label, this.value, {this.accent});
-  @override
-  Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 2),
-        child: Row(
-          children: [
-            SizedBox(
-              width: 200,
-              child: Text(
-                label,
-                style: const TextStyle(
-                  fontSize: 12,
-                  color: ForexAiTokens.textMuted,
-                ),
-              ),
-            ),
-            Expanded(
-              child: Text(
-                value,
-                style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
-                  color: accent ?? ForexAiTokens.textPrimary,
-                ),
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-          ],
-        ),
-      );
 }
 
 class _Loading extends StatelessWidget {
