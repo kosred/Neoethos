@@ -139,6 +139,16 @@ impl AppApiState {
         self.inner.read().await.account.clone()
     }
 
+    /// Blocking-thread variant of [`account`] for callers that run
+    /// inside `tokio::task::spawn_blocking` and cannot `.await`
+    /// (e.g. the Gemma tool-loop dispatcher, which executes inside
+    /// the LLM inference blocking thread). Safe to call only from a
+    /// thread that does NOT hold a tokio reactor — calling this on
+    /// the reactor thread would deadlock the RwLock.
+    pub fn account_blocking(&self) -> Option<AccountSnapshotPayload> {
+        self.inner.blocking_read().account.clone()
+    }
+
     /// Overwrite the cached snapshot. Called from whatever background
     /// task pulls live data off the cTrader stream.
     #[allow(dead_code)] // wired up next session when the streaming worker lands

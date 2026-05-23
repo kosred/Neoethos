@@ -47,6 +47,7 @@ pub mod jobs;
 pub mod live_journal;
 pub mod pnl;
 pub mod reauth;
+pub mod gemma_tools;
 pub mod risky_mode_persistence;
 pub mod secure_store;
 pub mod trading;

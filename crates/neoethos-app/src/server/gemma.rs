@@ -225,6 +225,7 @@ pub async fn news(State(state): State<AppApiState>, Json(body): Json<NewsBody>) 
 
 #[cfg(feature = "gemma-backend")]
 async fn chat_impl(state: AppApiState, prompt: String, max_tokens: u32) -> Response {
+    use crate::app_services::gemma_tools::{ToolRegistry, register_default_tools, run_tool_loop};
     use neoethos_gemma::runtime::{GemmaRuntime, LlamaCppGemmaRuntime};
     use std::sync::Arc;
     use std::time::Instant;
@@ -287,14 +288,30 @@ async fn chat_impl(state: AppApiState, prompt: String, max_tokens: u32) -> Respo
     let started = Instant::now();
     let runtime_clone = runtime.clone();
     let prompt_clone = prompt.clone();
+    let state_clone = state.clone();
     let inference_result = tokio::task::spawn_blocking(move || {
+        // Build a fresh tool registry per request. Cheap (single-
+        // digit number of tools) and keeps the registry behaviour
+        // testable without global state.
+        let mut registry = ToolRegistry::new();
+        register_default_tools(&mut registry);
+
         // Lock the runtime so only one inference at a time hits the
-        // worker thread. We use blocking_lock here because this whole
-        // closure already runs on a blocking thread, never the
-        // reactor.
+        // worker thread. blocking_lock is safe here — we are inside
+        // spawn_blocking, never on the reactor.
         let rt = runtime_clone.blocking_lock();
-        rt.generate(&prompt_clone, max_tokens)
-            .map(|text| (rt.model_id().to_string(), text))
+        let model_id = rt.model_id().to_string();
+
+        // Drive the ReAct loop. The closure passes each turn's
+        // prompt to llama-cpp and returns the model's text. The
+        // loop handles parsing tool calls + appending tool results
+        // + bounded recursion (MAX_TOOL_STEPS).
+        let final_text = run_tool_loop(&state_clone, &registry, &prompt_clone, |conv| {
+            rt.generate(conv, max_tokens)
+                .map_err(|e| anyhow::anyhow!("llama-cpp inference failed: {e}"))
+        })?;
+
+        Ok::<(String, String), anyhow::Error>((model_id, final_text))
     })
     .await;
 
