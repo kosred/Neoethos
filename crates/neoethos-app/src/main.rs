@@ -178,6 +178,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // task is dropped along with everything else.
     }
 
+    // Spawn the live spot streamer (#137). Best-effort — if creds
+    // are missing or the broker rejects auth, the helper logs and
+    // returns false; the HTTP server still comes up. When the
+    // user re-auths and restarts the binary, the next attempt
+    // picks up the fresh token automatically.
+    let spawned = tokio::task::spawn_blocking(
+        app_services::live_spots_streamer::try_spawn_with_defaults_blocking,
+    )
+    .await
+    .unwrap_or(false);
+    if spawned {
+        info!("Live spot streamer spawned — /live/spots will populate as ticks arrive");
+    } else {
+        info!(
+            "Live spot streamer not spawned (creds/token missing or unreachable) — \
+             /live/spots will return an empty list"
+        );
+    }
+
     server::serve(state).await?;
     Ok(())
 }

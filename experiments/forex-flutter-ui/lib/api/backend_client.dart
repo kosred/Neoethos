@@ -700,6 +700,24 @@ class BackendClient {
     return DiagnosticReport.fromJson(r.data ?? const {});
   }
 
+  /// `/live/spots` — current bid/ask cache populated by the
+  /// long-running spot streamer (#137). Sub-2 s freshness for
+  /// the symbols in the streamer's subscription list (forex
+  /// majors today). UI components that need a live price
+  /// (chart current-candle close, trade-watch PnL) poll this
+  /// every 1 s.
+  Future<LiveSpotsSnapshot> fetchLiveSpots() async {
+    final response = await _dio.get<Map<String, dynamic>>('/live/spots');
+    if (response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/live/spots returned 200 with empty body',
+      );
+    }
+    return LiveSpotsSnapshot.fromJson(response.data!);
+  }
+
   /// `/actions/pending` — list of LLM-proposed trade-management
   /// actions waiting for the operator (or recently-finalised ones
   /// kept around for audit / UI history). The banner polls this
@@ -1439,6 +1457,75 @@ class DataBootstrapSnapshot {
         fileCount: j['fileCount'] as int,
         lastTouchedUnixMs: j['lastTouchedUnixMs'] as int?,
       );
+}
+
+/// Mirror of the `SpotTickDto` wire shape from `/live/spots`.
+/// Already in camelCase on the wire (Rust side uses
+/// `#[serde(rename = "...")]` per field), so the parsing is
+/// straightforward.
+class LiveSpotTick {
+  final int symbolId;
+  final String symbolName;
+  final double? bid;
+  final double? ask;
+  final double? midPrice;
+  final int receivedAtUnixMs;
+  final int? brokerTimestampMs;
+  /// Seconds since this tick was received server-side. The UI
+  /// uses this for a "stale tick" warning when freshness > 5 s.
+  final double freshnessSeconds;
+  const LiveSpotTick({
+    required this.symbolId,
+    required this.symbolName,
+    required this.bid,
+    required this.ask,
+    required this.midPrice,
+    required this.receivedAtUnixMs,
+    required this.brokerTimestampMs,
+    required this.freshnessSeconds,
+  });
+
+  factory LiveSpotTick.fromJson(Map<String, dynamic> j) => LiveSpotTick(
+        symbolId: (j['symbolId'] as num?)?.toInt() ?? 0,
+        symbolName: (j['symbolName'] as String?) ?? '',
+        bid: (j['bid'] as num?)?.toDouble(),
+        ask: (j['ask'] as num?)?.toDouble(),
+        midPrice: (j['midPrice'] as num?)?.toDouble(),
+        receivedAtUnixMs: (j['receivedAtUnixMs'] as num?)?.toInt() ?? 0,
+        brokerTimestampMs: (j['brokerTimestampMs'] as num?)?.toInt(),
+        freshnessSeconds: (j['freshnessSeconds'] as num?)?.toDouble() ?? 0.0,
+      );
+
+  bool get isStale => freshnessSeconds > 5.0;
+}
+
+class LiveSpotsSnapshot {
+  final List<LiveSpotTick> spots;
+  final int snapshotAtUnixMs;
+  final int symbolCount;
+  const LiveSpotsSnapshot({
+    required this.spots,
+    required this.snapshotAtUnixMs,
+    required this.symbolCount,
+  });
+
+  factory LiveSpotsSnapshot.fromJson(Map<String, dynamic> j) => LiveSpotsSnapshot(
+        spots: ((j['spots'] as List?) ?? const [])
+            .map((e) => LiveSpotTick.fromJson(e as Map<String, dynamic>))
+            .toList(growable: false),
+        snapshotAtUnixMs: (j['snapshotAtUnixMs'] as num?)?.toInt() ?? 0,
+        symbolCount: (j['symbolCount'] as num?)?.toInt() ?? 0,
+      );
+
+  /// O(n) lookup by symbol name. The snapshot is small (≤ 8 majors
+  /// in v1) so the linear scan is cheap; promoting to a map only
+  /// pays off if the subscription set grows beyond ~50.
+  LiveSpotTick? lookup(String symbol) {
+    for (final s in spots) {
+      if (s.symbolName.toUpperCase() == symbol.toUpperCase()) return s;
+    }
+    return null;
+  }
 }
 
 /// Mirror of `crate::app_services::pending_actions::PendingAction`.

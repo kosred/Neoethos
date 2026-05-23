@@ -15,6 +15,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 
 import '../api/backend_client.dart';
+import '../state/live_spots_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
 import '_placeholder.dart';
@@ -352,6 +353,18 @@ class _ChartBody extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final changePos = snapshot.priceChangePct >= 0;
+    // Live tick overlay (#137): if the streamer has a fresh tick
+    // for this symbol, prefer it over the historical-bar latestClose
+    // — the bar's close is up to 1 minute stale on an M1 chart,
+    // whereas the tick is sub-2 s old. Falls back to historical
+    // when no tick is available (e.g. the streamer didn't spawn,
+    // or this symbol isn't in the default-streamed-symbols list).
+    final liveSnap = ref.watch(liveSpotsProvider).valueOrNull;
+    final tick = liveSnap?.lookup(snapshot.symbol);
+    final livePrice = (tick != null && !tick.isStale)
+        ? (tick.midPrice ?? tick.bid)
+        : null;
+    final displayedPrice = livePrice ?? snapshot.latestClose;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -365,13 +378,26 @@ class _ChartBody extends ConsumerWidget {
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
                   Text(
-                    snapshot.latestClose.toStringAsFixed(5),
-                    style: const TextStyle(
+                    displayedPrice.toStringAsFixed(5),
+                    style: TextStyle(
                       fontSize: 24,
                       fontWeight: FontWeight.w800,
-                      color: ForexAiTokens.textPrimary,
+                      color: livePrice != null
+                          ? ForexAiTokens.buy
+                          : ForexAiTokens.textPrimary,
                     ),
                   ),
+                  if (livePrice != null) ...[
+                    const SizedBox(width: 6),
+                    const Tooltip(
+                      message: 'Live tick (sub-2 s)',
+                      child: Icon(
+                        Icons.bolt,
+                        size: 16,
+                        color: ForexAiTokens.buy,
+                      ),
+                    ),
+                  ],
                   const SizedBox(width: 12),
                   Text(
                     '${changePos ? '+' : ''}${snapshot.priceChangePct.toStringAsFixed(2)} %',

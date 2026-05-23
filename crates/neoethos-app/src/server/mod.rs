@@ -39,6 +39,7 @@ pub mod hardware;
 pub mod health;
 pub mod indicators;
 pub mod intelligence;
+pub mod live_spots;
 pub mod orders;
 pub mod pending_actions;
 pub mod risk;
@@ -112,6 +113,10 @@ pub fn router(state: AppApiState) -> Router {
         .route("/gemma/download/status", get(gemma_download::status))
         .route("/gemma/download/cancel", post(gemma_download::cancel))
         .route("/intelligence", get(intelligence::intelligence))
+        // Live tick stream (#137). Reads from the cache that the
+        // long-running spot streamer populates; sub-2s freshness
+        // for active majors.
+        .route("/live/spots", get(live_spots::list))
         .route("/chart", get(chart::chart))
         .route("/indicators", get(indicators::indicators))
         .route("/diagnostics/report", post(diagnostics::report))
