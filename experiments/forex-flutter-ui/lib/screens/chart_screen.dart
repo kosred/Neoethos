@@ -79,161 +79,275 @@ String _indicatorLabel(String id) {
   }
 }
 
+/// Slot descriptor — bundles the providers a chart panel reads so the
+/// same `_ChartPanel` widget can serve both panel A and panel B. Two
+/// instances live as `_slotA` / `_slotB` constants; the screen picks
+/// which to render based on `multiChartEnabledProvider`.
+class _ChartSlot {
+  final String label;
+  final StateProvider<String> symbol;
+  final StateProvider<String> timeframe;
+  final AutoDisposeFutureProvider<ChartSnapshot> chart;
+  final StateProvider<Set<String>> activeIndicators;
+  final AutoDisposeFutureProviderFamily<IndicatorSnapshot, String> indicator;
+  const _ChartSlot({
+    required this.label,
+    required this.symbol,
+    required this.timeframe,
+    required this.chart,
+    required this.activeIndicators,
+    required this.indicator,
+  });
+}
+
+final _slotA = _ChartSlot(
+  label: 'A',
+  symbol: chartSymbolProvider,
+  timeframe: chartTimeframeProvider,
+  chart: chartProvider,
+  activeIndicators: activeIndicatorsProvider,
+  indicator: indicatorProvider,
+);
+
+final _slotB = _ChartSlot(
+  label: 'B',
+  symbol: chartSymbolProviderB,
+  timeframe: chartTimeframeProviderB,
+  chart: chartProviderB,
+  activeIndicators: activeIndicatorsProviderB,
+  indicator: indicatorProviderB,
+);
+
 class ChartScreen extends ConsumerWidget {
   const ChartScreen({super.key});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final symbol = ref.watch(chartSymbolProvider);
-    final timeframe = ref.watch(chartTimeframeProvider);
-    final async = ref.watch(chartProvider);
-    final brokerSymbols = ref.watch(brokerSymbolsProvider);
-    final brokerTimeframes = ref.watch(brokerTimeframesProvider);
-
-    // Symbol list — broker catalog, filtered to forex-like pairs.
-    // Empty list when the broker hasn't responded yet or is offline;
-    // the screen surfaces an explicit "connect broker" message in
-    // that case rather than faking a chip list.
-    final symbolChoices = brokerSymbols.maybeWhen(
-      data: (snap) =>
-          snap.forexLikeEnabled.map((s) => s.symbolName).toList(growable: false),
-      orElse: () => const <String>[],
-    );
-
-    // Timeframe list — canonical-timeframes endpoint
-    // (`neoethos_core::CANONICAL_TIMEFRAMES` over the wire). Empty
-    // list when the endpoint hasn't returned yet; no Dart-side
-    // fallback because the contract lives on the server.
-    final timeframeChoices = brokerTimeframes.maybeWhen(
-      data: (list) => list,
-      orElse: () => const <String>[],
-    );
+    final multi = ref.watch(multiChartEnabledProvider);
 
     return SingleChildScrollView(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const ViewHeader(
-            title: 'Chart',
-            subtitle: 'Local OHLC · symbol / timeframe / 200 candles',
+          ViewHeader(
+            title: multi ? 'Charts (A + B)' : 'Chart',
+            subtitle: multi
+                ? 'Compare two symbols · max 2 panels (deliberate UX constraint)'
+                : 'Local OHLC · symbol / timeframe / 200 candles',
           ),
+          // Compare-mode toggle. Tapping it flips panel B on/off.
+          // Limit: TWO panels only. There is no UI affordance to add
+          // a third — multi-chart grids fragment attention and bury
+          // the trade thesis. The "vs 16" in the task title is the
+          // anti-goal we're avoiding.
           SectionCard(
-            title: 'Symbol'
-                '${brokerSymbols.hasValue ? ' · ${symbolChoices.length} from broker' : ''}',
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+            title: 'Layout',
+            child: Row(
               children: [
-                if (symbolChoices.isEmpty)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 6),
-                    child: Text(
-                      brokerSymbols.hasError
-                          ? 'Broker symbol catalog unavailable: '
-                              '${brokerSymbols.error}. Open Settings → '
-                              'save cTrader credentials → Broker Setup '
-                              '→ Re-authenticate. The chip list is '
-                              'populated from /broker/symbols, never '
-                              'hardcoded in the UI.'
-                          : 'Loading broker symbol catalog…',
-                      style: const TextStyle(
-                        fontSize: 11,
-                        color: ForexAiTokens.warning,
-                      ),
-                    ),
-                  )
-                else
-                  Wrap(
-                    spacing: 6,
-                    runSpacing: 6,
-                    children: [
-                      for (final s in symbolChoices)
-                        _Chip(
-                          label: s,
-                          selected: s == symbol,
-                          onTap: () => ref
-                              .read(chartSymbolProvider.notifier)
-                              .state = s,
-                        ),
-                    ],
-                  ),
-              ],
-            ),
-          ),
-          SectionCard(
-            title: 'Timeframe'
-                '${brokerTimeframes.hasValue ? ' · ${timeframeChoices.length} from canonical contract' : ''}',
-            child: timeframeChoices.isEmpty
-                ? Text(
-                    brokerTimeframes.hasError
-                        ? 'Timeframe list unavailable: '
-                            '${brokerTimeframes.error}'
-                        : 'Loading timeframes…',
+                Switch(
+                  value: multi,
+                  onChanged: (v) => ref
+                      .read(multiChartEnabledProvider.notifier)
+                      .state = v,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    multi
+                        ? 'Comparison mode ON — panel A + panel B side-by-side. '
+                            'Each panel has its own symbol, timeframe, and '
+                            'indicators.'
+                        : 'Single chart. Toggle ON to compare two symbols '
+                            'side-by-side (max 2 — no 4/8/16 grid by design).',
                     style: const TextStyle(
                       fontSize: 11,
-                      color: ForexAiTokens.warning,
+                      color: ForexAiTokens.textMuted,
                     ),
-                  )
-                : Wrap(
-                    spacing: 6,
-                    runSpacing: 6,
-                    children: [
-                      for (final t in timeframeChoices)
-                        _Chip(
-                          label: t,
-                          selected: t == timeframe,
-                          onTap: () => ref
-                              .read(chartTimeframeProvider.notifier)
-                              .state = t,
-                        ),
-                    ],
                   ),
-          ),
-          SectionCard(
-            title: 'Indicators · vector_ta',
-            child: Wrap(
-              spacing: 6,
-              runSpacing: 6,
-              children: [
-                for (final ind in _indicatorChips)
-                  Consumer(
-                    builder: (ctx, indRef, _) {
-                      final active = indRef
-                          .watch(activeIndicatorsProvider)
-                          .contains(ind);
-                      return _Chip(
-                        label: _indicatorLabel(ind),
-                        selected: active,
-                        onTap: () {
-                          final notifier = indRef
-                              .read(activeIndicatorsProvider.notifier);
-                          final next = {...notifier.state};
-                          if (next.contains(ind)) {
-                            next.remove(ind);
-                          } else {
-                            next.add(ind);
-                          }
-                          notifier.state = next;
-                        },
-                      );
-                    },
-                  ),
+                ),
               ],
             ),
           ),
-          async.when(
-            data: (c) => _ChartBody(snapshot: c),
-            loading: () => const _Loading(),
-            error: (err, _) => _Error(error: err.toString()),
-          ),
+          if (multi)
+            // Side-by-side when the window is wide enough; stack when
+            // it isn't (e.g. window pinned to half-screen). 720px is
+            // the empirical break where each panel becomes too narrow
+            // to read price tick labels.
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final wide = constraints.maxWidth >= 720;
+                if (wide) {
+                  return Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(child: _ChartPanel(slot: _slotA)),
+                      const SizedBox(width: 12),
+                      Expanded(child: _ChartPanel(slot: _slotB)),
+                    ],
+                  );
+                }
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _ChartPanel(slot: _slotA),
+                    const SizedBox(height: 12),
+                    _ChartPanel(slot: _slotB),
+                  ],
+                );
+              },
+            )
+          else
+            _ChartPanel(slot: _slotA),
         ],
       ),
     );
   }
 }
 
+/// One chart panel — symbol picker + timeframe picker + indicator
+/// chips + the candlestick canvas. Parameterised over a `_ChartSlot`
+/// so the same widget renders panel A or panel B.
+class _ChartPanel extends ConsumerWidget {
+  final _ChartSlot slot;
+  const _ChartPanel({required this.slot});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final symbol = ref.watch(slot.symbol);
+    final timeframe = ref.watch(slot.timeframe);
+    final async = ref.watch(slot.chart);
+    final brokerSymbols = ref.watch(brokerSymbolsProvider);
+    final brokerTimeframes = ref.watch(brokerTimeframesProvider);
+
+    final symbolChoices = brokerSymbols.maybeWhen(
+      data: (snap) => snap.forexLikeEnabled
+          .map((s) => s.symbolName)
+          .toList(growable: false),
+      orElse: () => const <String>[],
+    );
+    final timeframeChoices = brokerTimeframes.maybeWhen(
+      data: (list) => list,
+      orElse: () => const <String>[],
+    );
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SectionCard(
+          title: 'Panel ${slot.label} · Symbol'
+              '${brokerSymbols.hasValue ? ' · ${symbolChoices.length} from broker' : ''}',
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (symbolChoices.isEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: Text(
+                    brokerSymbols.hasError
+                        ? 'Broker symbol catalog unavailable: '
+                            '${brokerSymbols.error}. Open Settings → '
+                            'save cTrader credentials → Broker Setup '
+                            '→ Re-authenticate. The chip list is '
+                            'populated from /broker/symbols, never '
+                            'hardcoded in the UI.'
+                        : 'Loading broker symbol catalog…',
+                    style: const TextStyle(
+                      fontSize: 11,
+                      color: ForexAiTokens.warning,
+                    ),
+                  ),
+                )
+              else
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: [
+                    for (final s in symbolChoices)
+                      _Chip(
+                        label: s,
+                        selected: s == symbol,
+                        onTap: () =>
+                            ref.read(slot.symbol.notifier).state = s,
+                      ),
+                  ],
+                ),
+            ],
+          ),
+        ),
+        SectionCard(
+          title: 'Panel ${slot.label} · Timeframe'
+              '${brokerTimeframes.hasValue ? ' · ${timeframeChoices.length} canonical' : ''}',
+          child: timeframeChoices.isEmpty
+              ? Text(
+                  brokerTimeframes.hasError
+                      ? 'Timeframe list unavailable: '
+                          '${brokerTimeframes.error}'
+                      : 'Loading timeframes…',
+                  style: const TextStyle(
+                    fontSize: 11,
+                    color: ForexAiTokens.warning,
+                  ),
+                )
+              : Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: [
+                    for (final t in timeframeChoices)
+                      _Chip(
+                        label: t,
+                        selected: t == timeframe,
+                        onTap: () =>
+                            ref.read(slot.timeframe.notifier).state = t,
+                      ),
+                  ],
+                ),
+        ),
+        SectionCard(
+          title: 'Panel ${slot.label} · Indicators',
+          child: Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: [
+              for (final ind in _indicatorChips)
+                Consumer(
+                  builder: (ctx, indRef, _) {
+                    final active = indRef
+                        .watch(slot.activeIndicators)
+                        .contains(ind);
+                    return _Chip(
+                      label: _indicatorLabel(ind),
+                      selected: active,
+                      onTap: () {
+                        final notifier =
+                            indRef.read(slot.activeIndicators.notifier);
+                        final next = {...notifier.state};
+                        if (next.contains(ind)) {
+                          next.remove(ind);
+                        } else {
+                          next.add(ind);
+                        }
+                        notifier.state = next;
+                      },
+                    );
+                  },
+                ),
+            ],
+          ),
+        ),
+        async.when(
+          data: (c) => _ChartBody(snapshot: c, slot: slot),
+          loading: () => const _Loading(),
+          error: (err, _) => _Error(error: err.toString()),
+        ),
+      ],
+    );
+  }
+}
+
 class _ChartBody extends ConsumerWidget {
   final ChartSnapshot snapshot;
-  const _ChartBody({required this.snapshot});
+  final _ChartSlot slot;
+  const _ChartBody({required this.snapshot, required this.slot});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -242,7 +356,8 @@ class _ChartBody extends ConsumerWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         SectionCard(
-          title: '${snapshot.symbol} · ${snapshot.timeframe}',
+          title:
+              'Panel ${slot.label} · ${snapshot.symbol} · ${snapshot.timeframe}',
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -300,7 +415,7 @@ class _ChartBody extends ConsumerWidget {
                   ),
                 )
               else
-                _ChartCanvasWithOverlays(snapshot: snapshot),
+                _ChartCanvasWithOverlays(snapshot: snapshot, slot: slot),
             ],
           ),
         ),
@@ -316,16 +431,20 @@ class _ChartBody extends ConsumerWidget {
 /// sub-panel with an independent Y-axis (next iteration).
 class _ChartCanvasWithOverlays extends ConsumerWidget {
   final ChartSnapshot snapshot;
-  const _ChartCanvasWithOverlays({required this.snapshot});
+  final _ChartSlot slot;
+  const _ChartCanvasWithOverlays({
+    required this.snapshot,
+    required this.slot,
+  });
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final active = ref.watch(activeIndicatorsProvider);
+    final active = ref.watch(slot.activeIndicators);
     final overlayLines = <_PaintedLine>[];
     var colorIdx = 0;
     for (final ind in active) {
       if (!_priceBandOverlays.contains(ind)) continue;
-      final snap = ref.watch(indicatorProvider(ind));
+      final snap = ref.watch(slot.indicator(ind));
       snap.whenData((s) {
         for (final line in s.lines) {
           overlayLines.add(_PaintedLine(

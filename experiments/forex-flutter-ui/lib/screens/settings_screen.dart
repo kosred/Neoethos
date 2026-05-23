@@ -318,6 +318,9 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
   late final TextEditingController _newsSourceCtrl;
   late final TextEditingController _openaiModelCtrl;
   late bool _newsEnabled;
+  /// Snake_case id matching `crate::config::NewsTradingMode`.
+  /// Defaults to `block_on_news` (safe).
+  late String _newsTradingMode;
   bool _busy = false;
   String? _message;
   bool _messageOk = false;
@@ -330,6 +333,9 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
     _newsSourceCtrl = TextEditingController(text: s.newsCalendarSource);
     _openaiModelCtrl = TextEditingController(text: s.openaiModel);
     _newsEnabled = s.newsCalendarEnabled;
+    _newsTradingMode = s.newsTradingMode.isEmpty
+        ? 'block_on_news'
+        : s.newsTradingMode;
   }
 
   @override
@@ -378,6 +384,7 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
             newsCalendarEnabled: _newsEnabled,
             newsCalendarSource: newsSource,
             openaiModel: _openaiModelCtrl.text.trim(),
+            newsTradingMode: _newsTradingMode,
           );
       if (!mounted) return;
       setState(() {
@@ -485,7 +492,63 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
               ),
             ],
           ),
-          const SizedBox(height: 10),
+          const SizedBox(height: 14),
+          // News-trading mode picker (#117). Default is BlockOnNews —
+          // pause new orders inside the kill window. AllowAlways and
+          // WarnOnly are opt-in for operators with event-driven
+          // strategies (breakout-on-news, news-fade) who explicitly
+          // want to trade through high-impact events.
+          const Text(
+            'News-trading mode',
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+              color: ForexAiTokens.textPrimary,
+            ),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'How the gate treats high-impact news. The kill window is '
+            'set by `news_kill_window_min` in config.yaml (30 min '
+            'default). The default is to pause new orders; flip to '
+            'one of the others if your strategy is event-driven.',
+            style: TextStyle(fontSize: 11, color: ForexAiTokens.textMuted),
+          ),
+          const SizedBox(height: 8),
+          _NewsTradingModeRow(
+            id: 'block_on_news',
+            label: 'Pause during news (safe default)',
+            description:
+                'No new orders inside the kill window. Existing '
+                'positions keep their SL/TP.',
+            selected: _newsTradingMode == 'block_on_news',
+            busy: _busy,
+            onPick: () => setState(() => _newsTradingMode = 'block_on_news'),
+          ),
+          _NewsTradingModeRow(
+            id: 'allow_always',
+            label: 'Play through news (event-driven strategies)',
+            description:
+                'No automatic block. Use for breakout-on-news, '
+                'fade-the-spike, or any strategy whose edge IS the '
+                'news event. The UI still shows a banner while a '
+                'high-impact print is imminent.',
+            selected: _newsTradingMode == 'allow_always',
+            busy: _busy,
+            onPick: () => setState(() => _newsTradingMode = 'allow_always'),
+          ),
+          _NewsTradingModeRow(
+            id: 'warn_only',
+            label: 'Warn only — don\'t block',
+            description:
+                'Visual warning in the kill window but no order block. '
+                'For operators who want a heads-up without the gate '
+                'overriding their judgment.',
+            selected: _newsTradingMode == 'warn_only',
+            busy: _busy,
+            onPick: () => setState(() => _newsTradingMode = 'warn_only'),
+          ),
+          const SizedBox(height: 14),
           TextField(
             controller: _openaiModelCtrl,
             enabled: !_busy,
@@ -678,6 +741,89 @@ class _AccountPicker extends ConsumerWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// One radio-style row in the news-trading-mode picker.
+class _NewsTradingModeRow extends StatelessWidget {
+  final String id;
+  final String label;
+  final String description;
+  final bool selected;
+  final bool busy;
+  final VoidCallback onPick;
+  const _NewsTradingModeRow({
+    required this.id,
+    required this.label,
+    required this.description,
+    required this.selected,
+    required this.busy,
+    required this.onPick,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: busy ? null : onPick,
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 3),
+        padding: const EdgeInsets.all(8),
+        decoration: BoxDecoration(
+          color: selected
+              ? ForexAiTokens.accent.withValues(alpha: 0.12)
+              : ForexAiTokens.surfaceBg,
+          border: Border.all(
+            color: selected ? ForexAiTokens.accent : ForexAiTokens.border,
+          ),
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              width: 14,
+              height: 14,
+              margin: const EdgeInsets.only(right: 10, top: 2),
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                border: Border.all(
+                  color: selected
+                      ? ForexAiTokens.accent
+                      : ForexAiTokens.border,
+                  width: 2,
+                ),
+                color: selected ? ForexAiTokens.accent : Colors.transparent,
+              ),
+            ),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    label,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                      color: selected
+                          ? ForexAiTokens.accent
+                          : ForexAiTokens.textPrimary,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    description,
+                    style: const TextStyle(
+                      fontSize: 10,
+                      color: ForexAiTokens.textMuted,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

@@ -128,18 +128,50 @@ final brokerTimeframesProvider = FutureProvider<List<String>>((ref) {
   return client.fetchBrokerTimeframes();
 });
 
-/// Selected symbol + timeframe for the Chart screen. Bound to chips
-/// the operator clicks; survives screen navigation since these are
-/// NotifierProviders (not autoDispose).
+/// Selected symbol + timeframe for the Chart screen — primary slot
+/// (panel A). Bound to chips the operator clicks; survives screen
+/// navigation since these are StateProviders (not autoDispose).
 final chartSymbolProvider = StateProvider<String>((ref) => 'EURUSD');
 final chartTimeframeProvider = StateProvider<String>((ref) => 'M1');
 
-/// `/chart` snapshot. Family over (symbol, tf) so the user can flip
-/// chips and the cache holds.
+/// `/chart` snapshot for panel A. Refetches whenever the slot-A
+/// symbol or timeframe changes.
 final chartProvider =
     FutureProvider.autoDispose<ChartSnapshot>((ref) async {
   final symbol = ref.watch(chartSymbolProvider);
   final tf = ref.watch(chartTimeframeProvider);
+  final client = ref.read(backendClientProvider);
+  return client.fetchChart(symbol: symbol, timeframe: tf, limit: 200);
+});
+
+// ─── Chart panel B (comparison mode) ────────────────────────────────
+//
+// Task #116: NeoEthos supports a maximum of TWO charts side-by-side.
+// This is a deliberate UX constraint — multi-chart grids (MT5's 16
+// tile layout, cTrader's 4-pane "Multi-Chart") are exhausting to
+// monitor and bury the trade thesis. Two panels let you compare a
+// pair against its correlated index (EURUSD vs DXY, gold vs DXY,
+// majors vs their inverse, etc.) without spreading attention thin.
+//
+// Each panel has its own symbol, timeframe, and active-indicator
+// state. We deliberately do NOT auto-sync these — the whole point
+// of a second panel is comparison, not duplication.
+
+/// Whether panel B is visible. False on first launch (single-chart
+/// mode mirrors the pre-#116 default).
+final multiChartEnabledProvider = StateProvider<bool>((ref) => false);
+
+/// Panel-B symbol + timeframe. Default to GBPUSD so the very first
+/// time the user toggles comparison on they see two different pairs
+/// instead of EURUSD twice (no-op comparison would confuse).
+final chartSymbolProviderB = StateProvider<String>((ref) => 'GBPUSD');
+final chartTimeframeProviderB = StateProvider<String>((ref) => 'M1');
+
+/// `/chart` snapshot for panel B. Independent of panel A.
+final chartProviderB =
+    FutureProvider.autoDispose<ChartSnapshot>((ref) async {
+  final symbol = ref.watch(chartSymbolProviderB);
+  final tf = ref.watch(chartTimeframeProviderB);
   final client = ref.read(backendClientProvider);
   return client.fetchChart(symbol: symbol, timeframe: tf, limit: 200);
 });
@@ -159,16 +191,33 @@ final dataBootstrapProvider =
 // and the chart pan/zoom only re-fetches when symbol/timeframe
 // change — toggling an indicator is a single round-trip.
 
-/// Currently-enabled indicator ids (e.g. `{"sma", "ema"}`). The
-/// chart watches this and renders one overlay per id.
+/// Panel A currently-enabled indicator ids (e.g. `{"sma", "ema"}`).
 final activeIndicatorsProvider = StateProvider<Set<String>>((ref) => {});
 
-/// Per-indicator fetch. Family-keyed by indicator id; refetches
-/// whenever the symbol or timeframe changes.
+/// Panel B currently-enabled indicator ids. Independent of A — the
+/// whole point of panel B is to compare with different settings.
+final activeIndicatorsProviderB = StateProvider<Set<String>>((ref) => {});
+
+/// Per-indicator fetch for panel A. Family-keyed by indicator id;
+/// refetches whenever the slot-A symbol or timeframe changes.
 final indicatorProvider = FutureProvider.autoDispose
     .family<IndicatorSnapshot, String>((ref, indicatorName) {
   final symbol = ref.watch(chartSymbolProvider);
   final tf = ref.watch(chartTimeframeProvider);
+  final client = ref.read(backendClientProvider);
+  return client.fetchIndicator(
+    symbol: symbol,
+    timeframe: tf,
+    indicator: indicatorName,
+    limit: 200,
+  );
+});
+
+/// Per-indicator fetch for panel B. Same shape, different state.
+final indicatorProviderB = FutureProvider.autoDispose
+    .family<IndicatorSnapshot, String>((ref, indicatorName) {
+  final symbol = ref.watch(chartSymbolProviderB);
+  final tf = ref.watch(chartTimeframeProviderB);
   final client = ref.read(backendClientProvider);
   return client.fetchIndicator(
     symbol: symbol,

@@ -20,7 +20,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use neoethos_core::Settings;
+use neoethos_core::{NewsTradingMode, Settings};
 use std::path::PathBuf;
 
 use super::state::AppApiState;
@@ -38,6 +38,11 @@ pub struct SettingsDto {
     pub news_calendar_enabled: bool,
     pub news_calendar_source: String,
     pub openai_model: String,
+    /// `block_on_news` | `allow_always` | `warn_only`. Controls how
+    /// the gate behaves during the kill window around high-impact
+    /// news events. See [`NewsTradingMode`].
+    pub news_trading_mode: String,
+    pub news_trading_mode_display_name: String,
 }
 
 /// Partial-update payload for `POST /settings`. All fields optional —
@@ -51,6 +56,8 @@ pub struct SettingsUpdateDto {
     pub news_calendar_enabled: Option<bool>,
     pub news_calendar_source: Option<String>,
     pub openai_model: Option<String>,
+    /// Snake_case id of a [`NewsTradingMode`] variant.
+    pub news_trading_mode: Option<String>,
 }
 
 pub async fn settings(State(_state): State<AppApiState>) -> Response {
@@ -143,6 +150,25 @@ pub async fn update_settings(
         // Blank is allowed — operator-intentional "disable LLM news".
         settings.news.openai_model = raw.trim().to_string();
     }
+    if let Some(raw) = payload.news_trading_mode {
+        let parsed = NewsTradingMode::parse(&raw).ok_or(()).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "unknown news_trading_mode `{}`. Expected one of: \
+                         block_on_news, allow_always, warn_only.",
+                        raw
+                    ),
+                    "code": "invalid_news_trading_mode",
+                })),
+            )
+        });
+        match parsed {
+            Ok(mode) => settings.news.news_trading_mode = mode,
+            Err(resp) => return resp.into_response(),
+        }
+    }
 
     if let Err(err) = settings.save(CONFIG_PATH) {
         tracing::error!(
@@ -172,10 +198,13 @@ fn dto_from_settings(settings: &Settings) -> SettingsDto {
     // `NewsConfig` (verified in `crates/neoethos-core/src/config.rs`).
     // Keep the JSON keys flat so the Flutter side doesn't have to
     // mirror the Rust nesting.
+    let mode = settings.news.news_trading_mode;
     SettingsDto {
         data_dir: settings.system.data_dir.display().to_string(),
         news_calendar_enabled: settings.news.news_calendar_enabled,
         news_calendar_source: settings.news.news_calendar_source.clone(),
         openai_model: settings.news.openai_model.clone(),
+        news_trading_mode: mode.as_str().to_string(),
+        news_trading_mode_display_name: mode.display_name().to_string(),
     }
 }

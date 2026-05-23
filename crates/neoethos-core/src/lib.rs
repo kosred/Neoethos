@@ -18,7 +18,7 @@ pub use broker_config::{
     load_from_disk as load_broker_credentials_from_disk,
     save_to_disk as save_broker_credentials_to_disk,
 };
-pub use config::Settings;
+pub use config::{NewsTradingMode, Settings};
 pub use contracts::{
     ARTIFACT_SCHEMA_VERSION, ArtifactContractError, ArtifactContractKind, ArtifactEnvelope,
     ArtifactKind, ArtifactProvenance, BackendKind, CANONICAL_TIMEFRAMES, CandleTimestampPolicy,

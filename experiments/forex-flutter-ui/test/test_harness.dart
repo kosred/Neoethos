@@ -136,6 +136,8 @@ List<Override> testProviderOverrides() => [
           newsCalendarEnabled: true,
           newsCalendarSource: 'test',
           openaiModel: 'gemma-test',
+          newsTradingMode: 'block_on_news',
+          newsTradingModeDisplayName: 'Pause during news (safe default)',
         ),
       ),
       enginesProvider.overrideWith((ref) async => _engineSnapshot),

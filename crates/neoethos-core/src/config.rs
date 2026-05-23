@@ -766,10 +766,67 @@ impl Default for ModelsConfig {
     }
 }
 
+/// How the trading gate should treat high-impact news events.
+///
+/// Until #117 the only option was auto-pause; the runtime would block
+/// new orders inside the kill window. Operators with directional
+/// strategies (event-driven, breakout-on-news, news-fade) need the
+/// opposite — explicit opt-in to trade through events. This enum
+/// makes the choice an operator-driven setting instead of a baked
+/// policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NewsTradingMode {
+    /// Block new orders inside `news_kill_window_min` of any
+    /// high-impact event. Default — the safe choice.
+    #[default]
+    BlockOnNews,
+    /// Allow orders through the kill window. The UI shows a banner
+    /// while a high-impact event is imminent so the operator knows
+    /// what they're flying into.
+    AllowAlways,
+    /// Don't block, but surface a prominent warning in the UI when
+    /// inside the kill window. Suited to operators who want a head's-
+    /// up but don't want the gate to override their judgment.
+    WarnOnly,
+}
+
+impl NewsTradingMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BlockOnNews => "block_on_news",
+            Self::AllowAlways => "allow_always",
+            Self::WarnOnly => "warn_only",
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::BlockOnNews => "Pause during news (safe default)",
+            Self::AllowAlways => "Play through news (event-driven strategies)",
+            Self::WarnOnly => "Warn only — don't block",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "block_on_news" | "block" | "pause" => Some(Self::BlockOnNews),
+            "allow_always" | "allow" | "play" => Some(Self::AllowAlways),
+            "warn_only" | "warn" => Some(Self::WarnOnly),
+            _ => None,
+        }
+    }
+}
+
 /// News and LLM configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NewsConfig {
+    /// How the trading gate handles incoming high-impact news.
+    /// Operator-controlled; default `block_on_news` preserves the
+    /// pre-#117 safe behaviour. See [`NewsTradingMode`].
+    #[serde(default)]
+    pub news_trading_mode: NewsTradingMode,
     pub news_decay_minutes: usize,
     pub news_kill_window_min: usize,
     pub news_confidence_threshold: f64,
@@ -810,6 +867,7 @@ pub struct NewsConfig {
 impl Default for NewsConfig {
     fn default() -> Self {
         Self {
+            news_trading_mode: NewsTradingMode::default(),
             news_decay_minutes: 120,
             news_kill_window_min: 30,
             news_confidence_threshold: 0.65,

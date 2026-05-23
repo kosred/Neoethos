@@ -239,6 +239,7 @@ class BackendClient {
     bool? newsCalendarEnabled,
     String? newsCalendarSource,
     String? openaiModel,
+    String? newsTradingMode,
   }) async {
     final body = <String, dynamic>{};
     if (dataDir != null) body['dataDir'] = dataDir;
@@ -249,6 +250,7 @@ class BackendClient {
       body['newsCalendarSource'] = newsCalendarSource;
     }
     if (openaiModel != null) body['openaiModel'] = openaiModel;
+    if (newsTradingMode != null) body['newsTradingMode'] = newsTradingMode;
 
     final response = await _dio.post<Map<String, dynamic>>(
       '/settings',
@@ -815,11 +817,19 @@ class SettingsSnapshot {
   final bool newsCalendarEnabled;
   final String newsCalendarSource;
   final String openaiModel;
+  /// Snake_case news-trading mode id from
+  /// `crate::config::NewsTradingMode`. Empty when the backend
+  /// predates the field — the UI treats that as `block_on_news`
+  /// for safe back-compat.
+  final String newsTradingMode;
+  final String newsTradingModeDisplayName;
   const SettingsSnapshot({
     required this.dataDir,
     required this.newsCalendarEnabled,
     required this.newsCalendarSource,
     required this.openaiModel,
+    required this.newsTradingMode,
+    required this.newsTradingModeDisplayName,
   });
 
   factory SettingsSnapshot.fromJson(Map<String, dynamic> j) => SettingsSnapshot(
@@ -827,6 +837,9 @@ class SettingsSnapshot {
         newsCalendarEnabled: j['newsCalendarEnabled'] as bool,
         newsCalendarSource: j['newsCalendarSource'] as String,
         openaiModel: j['openaiModel'] as String,
+        newsTradingMode: (j['newsTradingMode'] as String?) ?? '',
+        newsTradingModeDisplayName:
+            (j['newsTradingModeDisplayName'] as String?) ?? '',
       );
 }
 
