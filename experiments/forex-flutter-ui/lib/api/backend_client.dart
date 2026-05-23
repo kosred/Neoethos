@@ -240,6 +240,12 @@ class BackendClient {
     String? newsCalendarSource,
     String? openaiModel,
     String? newsTradingMode,
+    // ── Gemma news watcher (#132) ──────────────────────────────
+    bool? gemmaNewsWatcherEnabled,
+    String? gemmaMorningScanTime,
+    int? gemmaSessionStartLeadMin,
+    int? gemmaAdaptivePollThresholdMin,
+    int? gemmaAdaptivePollIntervalSecs,
   }) async {
     final body = <String, dynamic>{};
     if (dataDir != null) body['dataDir'] = dataDir;
@@ -251,6 +257,21 @@ class BackendClient {
     }
     if (openaiModel != null) body['openaiModel'] = openaiModel;
     if (newsTradingMode != null) body['newsTradingMode'] = newsTradingMode;
+    if (gemmaNewsWatcherEnabled != null) {
+      body['gemmaNewsWatcherEnabled'] = gemmaNewsWatcherEnabled;
+    }
+    if (gemmaMorningScanTime != null) {
+      body['gemmaMorningScanTime'] = gemmaMorningScanTime;
+    }
+    if (gemmaSessionStartLeadMin != null) {
+      body['gemmaSessionStartLeadMin'] = gemmaSessionStartLeadMin;
+    }
+    if (gemmaAdaptivePollThresholdMin != null) {
+      body['gemmaAdaptivePollThresholdMin'] = gemmaAdaptivePollThresholdMin;
+    }
+    if (gemmaAdaptivePollIntervalSecs != null) {
+      body['gemmaAdaptivePollIntervalSecs'] = gemmaAdaptivePollIntervalSecs;
+    }
 
     final response = await _dio.post<Map<String, dynamic>>(
       '/settings',
@@ -823,6 +844,12 @@ class SettingsSnapshot {
   /// for safe back-compat.
   final String newsTradingMode;
   final String newsTradingModeDisplayName;
+  // ── Gemma news watcher (#132) ────────────────────────────────
+  final bool gemmaNewsWatcherEnabled;
+  final String gemmaMorningScanTime;
+  final int gemmaSessionStartLeadMin;
+  final int gemmaAdaptivePollThresholdMin;
+  final int gemmaAdaptivePollIntervalSecs;
   const SettingsSnapshot({
     required this.dataDir,
     required this.newsCalendarEnabled,
@@ -830,6 +857,11 @@ class SettingsSnapshot {
     required this.openaiModel,
     required this.newsTradingMode,
     required this.newsTradingModeDisplayName,
+    required this.gemmaNewsWatcherEnabled,
+    required this.gemmaMorningScanTime,
+    required this.gemmaSessionStartLeadMin,
+    required this.gemmaAdaptivePollThresholdMin,
+    required this.gemmaAdaptivePollIntervalSecs,
   });
 
   factory SettingsSnapshot.fromJson(Map<String, dynamic> j) => SettingsSnapshot(
@@ -840,6 +872,16 @@ class SettingsSnapshot {
         newsTradingMode: (j['newsTradingMode'] as String?) ?? '',
         newsTradingModeDisplayName:
             (j['newsTradingModeDisplayName'] as String?) ?? '',
+        gemmaNewsWatcherEnabled:
+            (j['gemmaNewsWatcherEnabled'] as bool?) ?? false,
+        gemmaMorningScanTime:
+            (j['gemmaMorningScanTime'] as String?) ?? '07:00',
+        gemmaSessionStartLeadMin:
+            (j['gemmaSessionStartLeadMin'] as num?)?.toInt() ?? 10,
+        gemmaAdaptivePollThresholdMin:
+            (j['gemmaAdaptivePollThresholdMin'] as num?)?.toInt() ?? 30,
+        gemmaAdaptivePollIntervalSecs:
+            (j['gemmaAdaptivePollIntervalSecs'] as num?)?.toInt() ?? 15,
       );
 }
 

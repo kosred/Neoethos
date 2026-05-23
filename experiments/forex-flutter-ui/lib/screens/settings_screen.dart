@@ -321,6 +321,12 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
   /// Snake_case id matching `crate::config::NewsTradingMode`.
   /// Defaults to `block_on_news` (safe).
   late String _newsTradingMode;
+  // ── Gemma news-watcher knobs (#132) ────────────────────────────
+  late bool _gemmaWatcherEnabled;
+  late final TextEditingController _gemmaMorningScanCtrl;
+  late int _gemmaSessionLeadMin;
+  late int _gemmaAdaptiveThresholdMin;
+  late int _gemmaAdaptiveIntervalSecs;
   bool _busy = false;
   String? _message;
   bool _messageOk = false;
@@ -336,6 +342,12 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
     _newsTradingMode = s.newsTradingMode.isEmpty
         ? 'block_on_news'
         : s.newsTradingMode;
+    _gemmaWatcherEnabled = s.gemmaNewsWatcherEnabled;
+    _gemmaMorningScanCtrl =
+        TextEditingController(text: s.gemmaMorningScanTime);
+    _gemmaSessionLeadMin = s.gemmaSessionStartLeadMin;
+    _gemmaAdaptiveThresholdMin = s.gemmaAdaptivePollThresholdMin;
+    _gemmaAdaptiveIntervalSecs = s.gemmaAdaptivePollIntervalSecs;
   }
 
   @override
@@ -361,6 +373,7 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
     _dataDirCtrl.dispose();
     _newsSourceCtrl.dispose();
     _openaiModelCtrl.dispose();
+    _gemmaMorningScanCtrl.dispose();
     super.dispose();
   }
 
@@ -385,6 +398,11 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
             newsCalendarSource: newsSource,
             openaiModel: _openaiModelCtrl.text.trim(),
             newsTradingMode: _newsTradingMode,
+            gemmaNewsWatcherEnabled: _gemmaWatcherEnabled,
+            gemmaMorningScanTime: _gemmaMorningScanCtrl.text.trim(),
+            gemmaSessionStartLeadMin: _gemmaSessionLeadMin,
+            gemmaAdaptivePollThresholdMin: _gemmaAdaptiveThresholdMin,
+            gemmaAdaptivePollIntervalSecs: _gemmaAdaptiveIntervalSecs,
           );
       if (!mounted) return;
       setState(() {
@@ -559,6 +577,120 @@ class _AppSettingsCardState extends ConsumerState<_AppSettingsCard> {
               helperText:
                   'Used by the news pipeline. Leave blank to disable LLM '
                   'news ingestion. Gemma chat does not read this.',
+            ),
+          ),
+          const SizedBox(height: 18),
+          // ── Gemma news watcher (#132) ─────────────────────────
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: ForexAiTokens.surfaceBg,
+              border: Border.all(color: ForexAiTokens.border),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Gemma news watcher',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                    color: ForexAiTokens.textPrimary,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  'OFF by default. When ON, a background task wakes the '
+                  'local LLM at scheduled times to read the economic '
+                  'calendar + recent news, then persists a digest to its '
+                  'memory layer. Three modes run independently: morning '
+                  'scan, pre-session scan, and adaptive poll when a '
+                  'high-impact event is imminent.',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: ForexAiTokens.textMuted,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Switch(
+                      value: _gemmaWatcherEnabled,
+                      onChanged: _busy
+                          ? null
+                          : (v) => setState(() => _gemmaWatcherEnabled = v),
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      _gemmaWatcherEnabled
+                          ? 'Watcher ON — schedules below are active'
+                          : 'Watcher OFF — schedules ignored',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: _gemmaWatcherEnabled
+                            ? ForexAiTokens.buy
+                            : ForexAiTokens.textFaint,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: _gemmaMorningScanCtrl,
+                  enabled: !_busy && _gemmaWatcherEnabled,
+                  decoration: const InputDecoration(
+                    labelText: 'Morning scan time (HH:MM local)',
+                    isDense: true,
+                    border: OutlineInputBorder(),
+                    helperText:
+                        '07:00 default. Leave blank to disable just the '
+                        'morning scan while keeping the watcher on.',
+                  ),
+                ),
+                const SizedBox(height: 8),
+                _IntSliderRow(
+                  label: 'Session-start lead time',
+                  value: _gemmaSessionLeadMin,
+                  min: 0,
+                  max: 60,
+                  suffix: 'min',
+                  enabled: !_busy && _gemmaWatcherEnabled,
+                  onChanged: (v) =>
+                      setState(() => _gemmaSessionLeadMin = v),
+                  helper:
+                      'How many minutes BEFORE each Tokyo/London/NY '
+                      'open to fire the scan. 0 = disabled.',
+                ),
+                const SizedBox(height: 8),
+                _IntSliderRow(
+                  label: 'Adaptive-poll event threshold',
+                  value: _gemmaAdaptiveThresholdMin,
+                  min: 5,
+                  max: 120,
+                  suffix: 'min',
+                  enabled: !_busy && _gemmaWatcherEnabled,
+                  onChanged: (v) =>
+                      setState(() => _gemmaAdaptiveThresholdMin = v),
+                  helper:
+                      'Switch to adaptive poll when a high-impact '
+                      'event is within this many minutes of now.',
+                ),
+                const SizedBox(height: 8),
+                _IntSliderRow(
+                  label: 'Adaptive-poll cadence',
+                  value: _gemmaAdaptiveIntervalSecs,
+                  min: 5,
+                  max: 120,
+                  suffix: 's',
+                  enabled: !_busy && _gemmaWatcherEnabled,
+                  onChanged: (v) =>
+                      setState(() => _gemmaAdaptiveIntervalSecs = v),
+                  helper:
+                      'How often to re-check while inside the event '
+                      'window. Hard floor 5 s regardless of slider.',
+                ),
+              ],
             ),
           ),
           const SizedBox(height: 14),
@@ -852,4 +984,79 @@ class _Error extends StatelessWidget {
           style: const TextStyle(color: ForexAiTokens.sell, fontSize: 12),
         ),
       );
+}
+
+/// Slider + numeric readout + helper text for the Gemma watcher
+/// integer knobs. Kept local because nothing else in the app needs
+/// quite this shape (most numeric Settings fields use TextField).
+class _IntSliderRow extends StatelessWidget {
+  final String label;
+  final int value;
+  final int min;
+  final int max;
+  final String suffix;
+  final bool enabled;
+  final ValueChanged<int> onChanged;
+  final String helper;
+  const _IntSliderRow({
+    required this.label,
+    required this.value,
+    required this.min,
+    required this.max,
+    required this.suffix,
+    required this.enabled,
+    required this.onChanged,
+    required this.helper,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final divisions = (max - min).clamp(1, 240);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                label,
+                style: TextStyle(
+                  fontSize: 11,
+                  color: enabled
+                      ? ForexAiTokens.textPrimary
+                      : ForexAiTokens.textFaint,
+                ),
+              ),
+            ),
+            Text(
+              '$value $suffix',
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+                color: enabled
+                    ? ForexAiTokens.textPrimary
+                    : ForexAiTokens.textFaint,
+              ),
+            ),
+          ],
+        ),
+        Slider(
+          value: value.toDouble().clamp(min.toDouble(), max.toDouble()),
+          min: min.toDouble(),
+          max: max.toDouble(),
+          divisions: divisions,
+          onChanged: enabled ? (v) => onChanged(v.round()) : null,
+        ),
+        Text(
+          helper,
+          style: TextStyle(
+            fontSize: 10,
+            color: enabled
+                ? ForexAiTokens.textMuted
+                : ForexAiTokens.textFaint,
+          ),
+        ),
+      ],
+    );
+  }
 }
