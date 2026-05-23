@@ -12,7 +12,18 @@ repository = "https://github.com/kosred/neoethos"
 readme = "../../README.md"
 
 [features]
-default = []
+# #170: Public installers (release-installers.yml + the Lite NSIS
+# bundle) used to build with NO --features flag, which silently
+# shipped a stripped binary — AI Helper + News Watcher returned
+# 503, headless-browser news scraping was off, tree models gone.
+# The Lite installer even fetched the 5 GB Gemma GGUF for a binary
+# that couldn't load it. Promoting `gemma-backend` + `headless-browser`
+# to default means a fresh user gets the killer features out of
+# the box; CI / dev iteration that wants a minimal build can still
+# pass `--no-default-features`. Tree-models stays opt-in because
+# the lightgbm / xgboost / catboost FFI doubles disk size + has
+# native-toolchain build-time requirements.
+default = ["gemma-backend", "headless-browser"]
 gpu = ["neoethos-search/gpu", "neoethos-models/neuro-evolution-gpu", "neoethos-models/statistical-gpu"]
 # headless-browser: opt-in dependency on `headless_chrome` for the
 # `news_sources::headless_browser` module. Cloudflare-protected and
