@@ -72,6 +72,19 @@ struct Args {
     /// `RET_ACCOUNT_DISABLED` or "Authentication failed".
     #[arg(long, default_value_t = false)]
     reauth: bool,
+
+    /// Suppress the orphan-launch help dialog. Set by the Flutter shell's
+    /// BackendSupervisor when it spawns the backend.
+    ///
+    /// Previously we used the `NEOETHOS_LAUNCHED_BY_FLUTTER=1` env var,
+    /// but `Process.start(mode: ProcessStartMode.detached)` on Windows
+    /// (Dart 3.x) does NOT propagate the `environment` map to the child
+    /// process even with `includeParentEnvironment: true` — verified
+    /// live: the spawned backend showed the orphan dialog and blocked
+    /// the HTTP server from binding port 7423. CLI flags survive the
+    /// detached spawn cleanly. See task #179.
+    #[arg(long, default_value_t = false)]
+    launched_by_flutter: bool,
 }
 
 #[tokio::main]
@@ -79,17 +92,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     setup_logging(true)?;
 
-    // #101 follow-up: the help dialog must fire BEFORE the config-load
-    // step below, otherwise an orphaned double-click whose CWD lacks
-    // `config.yaml` exits silently with `windows_subsystem = "windows"`
-    // and the user never sees the explanation. Previously the call
-    // sat at line 145 — past `Settings::from_yaml` — so the original
-    // fix only covered the case where the config WAS found but the
-    // user was still surprised. Moving it up here means a config-
-    // missing path also pops the dialog first. The dialog is a
-    // no-op on non-Windows, in debug builds, and when the Flutter
-    // shell set NEOETHOS_LAUNCHED_BY_FLUTTER=1.
-    show_double_click_help_dialog_if_orphaned("http://127.0.0.1:7423");
+    // #101 follow-up + #179: the help dialog must fire BEFORE the
+    // config-load step below, otherwise an orphaned double-click whose
+    // CWD lacks `config.yaml` exits silently with `windows_subsystem =
+    // "windows"`. We pass the CLI flag (set by the Flutter shell's
+    // BackendSupervisor) so the dialog is suppressed in the
+    // supervised-spawn path. The previous env-var signal didn't
+    // survive `Process.start(mode: detached)` on Windows — verified
+    // live with PID 21224 showing "NeoEthos backend" dialog while the
+    // HTTP server was stuck behind the modal. Skip in debug builds /
+    // non-Windows (the helper already handles those internally).
+    if !args.launched_by_flutter {
+        show_double_click_help_dialog_if_orphaned("http://127.0.0.1:7423");
+    }
 
     neoethos_search::install_search_runtime_overrides_from_env();
     let settings = Settings::from_yaml(&args.config)?;

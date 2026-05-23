@@ -87,14 +87,14 @@ class BackendSupervisor {
       // tracing-appender, so dropping the pipes loses nothing.
       _child = await Process.start(
         binary.path,
-        const ['--server'],
+        // #179: tag the spawn via CLI flag, NOT env var. Verified
+        // live that `Process.start(mode: detached)` on Windows does
+        // NOT propagate the `environment` map to the child — the
+        // backend then thought it was orphaned, showed a Win32
+        // MessageBox, and blocked port 7423 forever. CLI flags
+        // survive the detached spawn cleanly.
+        const ['--server', '--launched-by-flutter'],
         workingDirectory: workDir.path,
-        // Tag this spawn so the Rust binary knows it was launched by
-        // the Flutter shell (and skips the "you double-clicked me by
-        // accident" help dialog from #101). Inherit the parent env
-        // so user overrides like NEOETHOS_BROKER_CREDENTIALS_PATH
-        // still flow through.
-        environment: const {'NEOETHOS_LAUNCHED_BY_FLUTTER': '1'},
         includeParentEnvironment: true,
         mode: ProcessStartMode.detached,
       );
