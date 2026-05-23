@@ -88,44 +88,63 @@ pub async fn credentials_post(
     // Trim everything before validation so a stray trailing newline
     // from a paste doesn't fail an empty-check.
     let client_id = body.client_id.trim().to_string();
-    let client_secret = body.client_secret.trim().to_string();
+    let client_secret_in = body.client_secret.trim().to_string();
     let redirect_uri = body.redirect_uri.trim().to_string();
     let environment_raw = body.environment.trim();
     let account_id = body.account_id.trim().to_string();
 
-    if client_id.is_empty() || client_secret.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "clientId and clientSecret are required",
-            })),
-        )
-            .into_response();
-    }
-
+    // Empty-secret semantics: the Settings UI prompts "leave blank to
+    // keep existing" — so an empty secret in the payload is NOT a
+    // validation failure when the on-disk secret is already populated.
+    // We merge: anything empty in the payload inherits the current
+    // saved value. Only when BOTH input and saved are empty do we
+    // 400. Same merge logic for client_id (UI may pre-fill it but the
+    // operator could clear the field to swap apps; we still need the
+    // *new* value, but if they leave it blank we keep the old one).
     let environment = match environment_raw.to_ascii_lowercase().as_str() {
         "live" => CTraderBrokerEnvironment::Live,
         _ => CTraderBrokerEnvironment::Demo, // default = safer
     };
 
-    // Default redirect URI matches the loopback OAuth flow the rest of
-    // the codebase expects (port 43001). Operators rarely need to
-    // change this, but the field exists for white-label setups.
-    let redirect_uri = if redirect_uri.is_empty() {
-        "http://127.0.0.1:43001/callback".to_string()
-    } else {
-        redirect_uri
-    };
-
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        // Preserve any existing DxTrade config on disk — we're only
-        // updating the cTrader section here.
+        // Preserve any existing DxTrade config + load the current
+        // cTrader secret so we can keep it when the form left the
+        // field blank.
         let mut current = load_broker_settings();
+        let saved_client_id = current.ctrader.client_id.clone();
+        let saved_client_secret = current.ctrader.client_secret.clone();
+
+        let merged_client_id = if client_id.is_empty() {
+            saved_client_id
+        } else {
+            client_id
+        };
+        let merged_client_secret = if client_secret_in.is_empty() {
+            saved_client_secret
+        } else {
+            client_secret_in
+        };
+
+        if merged_client_id.is_empty() || merged_client_secret.is_empty() {
+            anyhow::bail!(
+                "clientId and clientSecret are required (no saved value to fall back on)"
+            );
+        }
+
+        // Default redirect URI matches the loopback OAuth flow the rest
+        // of the codebase expects (port 43001). Operators rarely need
+        // to change this, but the field exists for white-label setups.
+        let merged_redirect_uri = if redirect_uri.is_empty() {
+            "http://127.0.0.1:43001/callback".to_string()
+        } else {
+            redirect_uri
+        };
+
         current.schema_version = BROKER_CREDENTIALS_SCHEMA_VERSION;
         current.ctrader = CTraderBrokerSettings {
-            client_id,
-            client_secret,
-            redirect_uri,
+            client_id: merged_client_id,
+            client_secret: merged_client_secret,
+            redirect_uri: merged_redirect_uri,
             authorization_code_input: String::new(),
             environment,
             accounts: if account_id.is_empty() {

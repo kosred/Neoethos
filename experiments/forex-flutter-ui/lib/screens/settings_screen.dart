@@ -70,11 +70,27 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     final clientSecret = _clientSecretCtrl.text.trim();
     final accountId = _accountIdCtrl.text.trim();
 
-    if (clientId.isEmpty || clientSecret.isEmpty) {
+    // Empty-secret semantics:
+    //   * Empty Client ID is OK if the server already has one saved
+    //     (UI shows it pre-filled; user might clear and leave blank
+    //     to keep the existing).
+    //   * Empty Client Secret is OK ONLY when a secret is already
+    //     saved server-side (`_secretConfigured == true`) — the form
+    //     literally says "Leave blank to keep". This is the common
+    //     case when the user only wants to change account-id or
+    //     environment.
+    //   * If neither side has anything we still need both — the
+    //     backend will catch that and return 400 with a clear
+    //     message, but we pre-check here for snappier UX.
+    final clientIdMissing = clientId.isEmpty && _clientIdCtrl.text.isEmpty;
+    final clientSecretMissing = clientSecret.isEmpty && !_secretConfigured;
+    if (clientIdMissing || clientSecretMissing) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           backgroundColor: ForexAiTokens.sell,
-          content: Text('Client ID and Client Secret are required'),
+          content: Text(
+            'Client ID and Client Secret are required (no saved value to fall back on)',
+          ),
         ),
       );
       return;
