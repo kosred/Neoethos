@@ -38,6 +38,12 @@ use super::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+// TradingSession::market_chart_snapshot and apply_chart_data_update are the
+// legacy egui chart-pull entry points. The production HTTP /chart endpoint
+// (server/chart.rs) reads bars directly from the vortex store and does not
+// route through TradingSession. Kept as the integration surface that the
+// trading_tests.rs chart-flow tests exercise.
+#[allow(dead_code)]
 impl TradingSession {
     pub fn market_chart_snapshot(
         &mut self,

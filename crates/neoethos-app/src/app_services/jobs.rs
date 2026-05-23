@@ -7,6 +7,11 @@ use std::sync::{
 pub enum JobKind {
     Discovery,
     Training,
+    // Constructed by start_ctrader_bootstrap_batch (snapshots.rs:469, session.rs:278); matched
+    // exhaustively in server/state.rs to forward bootstrap status into the engine-state map.
+    // Trigger path is the test harness today (production /data/bootstrap is a filesystem scan),
+    // but the variant ships with the JobSnapshot wire format and the state.rs match arms.
+    #[allow(dead_code)]
     Bootstrap,
 }
 

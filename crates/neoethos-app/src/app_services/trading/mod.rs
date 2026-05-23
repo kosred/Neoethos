@@ -13,8 +13,7 @@ pub(super) use crate::app_services::ctrader_account::{
     ProductionCTraderAccountRuntimeBackend,
 };
 pub(super) use crate::app_services::ctrader_auth::{
-    CTraderAccountSummary, CTraderAuthSession, CTraderAuthSnapshot, CTraderTokenBundle,
-    CTraderTokenExchangeRequest,
+    CTraderAuthSession, CTraderAuthSnapshot, CTraderTokenBundle,
 };
 pub(super) use crate::app_services::ctrader_data::{
     CTraderChartHistoryRequest, CTraderSymbolLookupRequest, HistoricalBar, load_chart_history,
@@ -28,9 +27,9 @@ pub(super) use crate::app_services::ctrader_history::{
     CTraderPositionOrderHistoryBackend, ProductionCTraderPositionOrderHistoryBackend,
 };
 pub(super) use crate::app_services::ctrader_live_auth::{
-    CTRADER_DEFAULT_SCOPE, CTraderAccountDiscoveryBackend, CTraderAccountDiscoveryRequest,
-    CTraderEnvironment, CTraderLiveAuthBackend, CTraderLiveAuthRequest, CTraderLiveAuthResult,
-    CTraderTokenRefreshRequest, ProductionCTraderLiveAuthBackend, build_default_loopback_config,
+    CTraderAccountDiscoveryBackend, CTraderAccountDiscoveryRequest, CTraderEnvironment,
+    CTraderLiveAuthBackend, CTraderLiveAuthResult, CTraderTokenRefreshRequest,
+    ProductionCTraderLiveAuthBackend,
 };
 pub(super) use crate::app_services::ctrader_messages::{
     CTRADER_TOKEN_EXPIRED_SENTINEL, CTraderCancelOrderRequest, CTraderClosePositionRequest,
@@ -158,6 +157,10 @@ impl TradingAdapterKind {
     /// `ClosePosition` via the cTrader Open API); DXtrade's draft
     /// backend does not yet implement them. Flip the DXtrade arm to
     /// `true` once `dxtrade.rs::cancel_order`/`close_position` ship.
+    // Capability flags used by the Flutter UI's order/position screens
+    // (planned wiring — broker_control HTTP endpoints will read these
+    // before allowing Cancel/Close buttons to enable).
+    #[allow(dead_code)]
     pub fn supports_order_cancellation(self) -> bool {
         match self {
             Self::CTrader => true,
@@ -170,6 +173,7 @@ impl TradingAdapterKind {
     /// capabilities CAN diverge per broker (e.g. an adapter that
     /// supports cancelling resting orders but only flattens positions
     /// via a counter-trade rather than a dedicated Close call).
+    #[allow(dead_code)]
     pub fn supports_position_close(self) -> bool {
         match self {
             Self::CTrader => true,
@@ -319,6 +323,10 @@ impl EnsembleLoadSummary {
 /// This is the v0.4.5 finish on the §7.1 autonomous-only invariant:
 /// the operator's wizard acknowledgement isn't merely a config flag
 /// — it actively blocks manual BUY/SELL while Risky Mode is armed.
+// OrderSource::Manual is constructed by execute_buy_order / execute_sell_order
+// (still maintained as test-only entry points for the order pipeline); the AI /
+// AiApproved variants are constructed by auto_trade_producer in production.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderSource {
     /// UI button click (`execute_buy_order` / `execute_sell_order`)
@@ -549,6 +557,12 @@ pub struct RiskyModeState {
     pub ruin_probability_estimate: f64,
 }
 
+// TradingSession is the legacy egui session struct. Many of its fields are
+// initialised but never read in production because the HTTP server has its own
+// pipelines. Kept whole as the test fixture for trading_tests.rs (391 tests
+// rely on this). When the test surface is migrated to direct ctrader_* helper
+// calls, this struct can be slimmed down.
+#[allow(dead_code)]
 pub struct TradingSession {
     configured_adapter: TradingAdapterKind,
     broker_settings: BrokerSettingsState,

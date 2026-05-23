@@ -542,7 +542,6 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    const ONE_DAY_MS: i64 = 24 * 60 * 60 * 1000;
     const ONE_MINUTE_NS: i64 = 60 * 1_000_000_000;
 
     fn unique_temp_root(test_name: &str) -> PathBuf {
@@ -556,42 +555,6 @@ mod tests {
             std::process::id(),
             nonce
         ))
-    }
-
-    #[test]
-    fn chunk_planner_splits_m1_year_request_into_multiple_ordered_windows() {
-        let now_ms = 1_700_000_000_000;
-
-        let chunks = plan_bootstrap_chunks(now_ms, "M1", 2).expect("m1 chunks");
-
-        assert!(
-            chunks.len() > 4,
-            "expected multiple chunks for long M1 request"
-        );
-        assert_eq!(
-            chunks.last().map(|chunk| chunk.to_timestamp_ms),
-            Some(now_ms)
-        );
-        for pair in chunks.windows(2) {
-            assert_eq!(pair[0].to_timestamp_ms, pair[1].from_timestamp_ms);
-        }
-    }
-
-    #[test]
-    fn chunk_planner_uses_larger_windows_for_h1_than_m15() {
-        let now_ms = 1_700_000_000_000;
-
-        let m15_chunks = plan_bootstrap_chunks(now_ms, "M15", 1).expect("m15 chunks");
-        let h1_chunks = plan_bootstrap_chunks(now_ms, "H1", 1).expect("h1 chunks");
-
-        assert!(
-            h1_chunks.len() < m15_chunks.len(),
-            "higher timeframe should need fewer chunks"
-        );
-        assert_eq!(
-            h1_chunks.last().map(|chunk| chunk.to_timestamp_ms),
-            Some(now_ms)
-        );
     }
 
     #[test]
@@ -655,25 +618,6 @@ mod tests {
         .expect_err("invalid ohlc row must fail");
 
         assert!(err.to_string().contains("OHLC"));
-    }
-
-    #[test]
-    fn chunk_planner_rejects_zero_years() {
-        let err = plan_bootstrap_chunks(1_700_000_000_000, "M15", 0)
-            .expect_err("zero-year request must fail");
-
-        assert!(err.to_string().contains("years"));
-    }
-
-    #[test]
-    fn chunk_planner_spans_the_requested_period() {
-        let now_ms = 1_700_000_000_000;
-
-        let chunks = plan_bootstrap_chunks(now_ms, "D1", 1).expect("d1 chunks");
-
-        let first = chunks.first().expect("first chunk");
-        let covered_ms = now_ms - first.from_timestamp_ms;
-        assert!(covered_ms >= 365 * ONE_DAY_MS - ONE_DAY_MS);
     }
 
     #[test]

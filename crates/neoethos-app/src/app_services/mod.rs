@@ -47,6 +47,13 @@ pub mod jobs;
 pub mod live_journal;
 pub mod pnl;
 pub mod reauth;
+// Only compiled when the gemma-backend feature is on — the entire
+// module is consumed by the feature-gated `chat_impl` in
+// `server/gemma.rs`. Without the feature the LLM endpoints return
+// 503 before any tool dispatch happens, so the registry, parser,
+// and tools themselves are unreachable. Gating the module avoids
+// 30+ false-positive dead-code warnings in the default build.
+#[cfg(feature = "gemma-backend")]
 pub mod gemma_tools;
 pub mod risky_mode_persistence;
 pub mod secure_store;
@@ -59,13 +66,24 @@ use crate::app_services::jobs::JobSnapshot;
 pub enum ServiceEvent {
     DiscoveryUpdated(JobSnapshot),
     TrainingUpdated(JobSnapshot),
-    LlmNewsUpdated(String),
-    Heartbeat,
+    // Sent by trading::session::start_connect (allow-listed legacy TradingSession
+    // method) and inspected only via Debug logging on the event bus.
+    #[allow(dead_code)]
     CTraderConnectUpdated(crate::app_services::ctrader_account::CTraderAccountRuntimeSnapshot),
+    // Sent by trading::session at 3 sites for the bootstrap progress stream;
+    // the inner snapshot is currently only surfaced via Debug logging on the
+    // event bus. Field read is provided for the future bootstrap-progress UI.
+    #[allow(dead_code)]
     BootstrapUpdated(JobSnapshot),
+    // Sent by trading::session at start_connect failure paths; inspected only
+    // via Debug logging until the Flutter UI subscribes for live status text.
+    #[allow(dead_code)]
     ConnectOutcome(Result<String, String>),
     /// Background chart-data fetch completed. The UI should refresh the
     /// chart panel without blocking the render thread on WebSocket I/O.
+    // Constructed in trading::session::1150; inner snapshot consumed via
+    // Debug logging on the event bus until the chart panel reads it directly.
+    #[allow(dead_code)]
     ChartDataUpdated(Box<crate::app_services::trading::MarketChartSnapshot>),
     /// A background OS thread spawned via
     /// `app_services::trading::background::spawn_background_task` panicked.
@@ -73,6 +91,9 @@ pub enum ServiceEvent {
     /// but the operator MUST see it — previously a panic in (e.g.) the chart
     /// fetcher left the UI showing "Running…" forever because the join
     /// handle was simply discarded.
+    // Fields are read by trading::background tests (panic_with_string_payload_is_surfaced,
+    // panic_with_static_str_payload_is_surfaced); production reads via Debug logging.
+    #[allow(dead_code)]
     BackgroundTaskPanic {
         task: String,
         message: String,

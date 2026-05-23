@@ -145,6 +145,9 @@ impl AppApiState {
     /// the LLM inference blocking thread). Safe to call only from a
     /// thread that does NOT hold a tokio reactor — calling this on
     /// the reactor thread would deadlock the RwLock.
+    // Compiled in only with the gemma-backend feature; without it the
+    // tool-loop dispatcher (server/gemma.rs) does not exist.
+    #[allow(dead_code)]
     pub fn account_blocking(&self) -> Option<AccountSnapshotPayload> {
         self.inner.blocking_read().account.clone()
     }

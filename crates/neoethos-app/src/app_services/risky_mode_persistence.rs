@@ -185,6 +185,9 @@ fn candidate_paths() -> Result<Vec<PathBuf>> {
 /// Idempotent: a re-save with the same field values rewrites the
 /// file in place. Concurrent saves rely on the OS's atomic write —
 /// this is the same guarantee broker_persistence offers.
+// Used by the saved_state_roundtrip test in this file. Production write
+// path lives elsewhere — wired up when the Flutter risky-mode UI lands.
+#[allow(dead_code)]
 pub fn save_risky_mode_state(state: &RiskyModeStateFile) -> Result<()> {
     let path = state_file_path().context("resolve risky mode state path")?;
 
@@ -260,6 +263,8 @@ pub fn load_risky_mode_state() -> Result<Option<RiskyModeStateFile>> {
     Ok(Some(state))
 }
 
+// Used by save_risky_mode_state to stamp last_updated_utc_ms.
+#[allow(dead_code)]
 fn current_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

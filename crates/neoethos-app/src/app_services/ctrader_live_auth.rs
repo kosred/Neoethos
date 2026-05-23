@@ -19,7 +19,6 @@ use crate::app_services::ctrader_messages::{
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 
-pub const CTRADER_DEFAULT_SCOPE: &str = "trading";
 pub const CTRADER_TOKEN_ENDPOINT_BASE: &str = "https://openapi.ctrader.com";
 const CTRADER_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const CTRADER_CALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -163,17 +162,6 @@ impl CTraderLoopbackConfig {
             callback_path: callback_path.into(),
             bind_host: "127.0.0.1".to_string(),
         }
-    }
-
-    pub fn with_bind_host(
-        primary_port: u16,
-        fallback_ports: Vec<u16>,
-        callback_path: impl Into<String>,
-        bind_host: impl Into<String>,
-    ) -> Self {
-        let mut config = Self::new(primary_port, fallback_ports, callback_path);
-        config.bind_host = bind_host.into();
-        config
     }
 
     pub fn callback_path(&self) -> &str {
@@ -573,24 +561,6 @@ impl CTraderLiveAuthBackend for ProductionCTraderLiveAuthBackend {
 
 #[cfg(test)]
 impl StubCTraderLiveAuthBackend {
-    pub fn success(result: CTraderLiveAuthResult) -> Self {
-        Self {
-            outcome: Arc::new(Mutex::new(Some(Ok(result)))),
-            refresh_outcome: Arc::new(Mutex::new(Some(Err(
-                "stub cTrader refresh backend was not configured".to_string(),
-            )))),
-        }
-    }
-
-    pub fn failure(message: impl Into<String>) -> Self {
-        Self {
-            outcome: Arc::new(Mutex::new(Some(Err(message.into())))),
-            refresh_outcome: Arc::new(Mutex::new(Some(Err(
-                "stub cTrader refresh backend was not configured".to_string(),
-            )))),
-        }
-    }
-
     pub fn with_refresh_success(result: CTraderTokenBundle) -> Self {
         Self {
             outcome: Arc::new(Mutex::new(Some(Err(
@@ -624,13 +594,6 @@ impl StubCTraderAccountDiscoveryBackend {
     pub fn success(result: CTraderAccountDiscoveryResult) -> Self {
         Self {
             outcome: Arc::new(Mutex::new(Some(Ok(result)))),
-            last_request: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    pub fn failure(message: impl Into<String>) -> Self {
-        Self {
-            outcome: Arc::new(Mutex::new(Some(Err(message.into())))),
             last_request: Arc::new(Mutex::new(None)),
         }
     }
@@ -670,7 +633,14 @@ impl CTraderAccountDiscoveryBackend for StubCTraderAccountDiscoveryBackend {
 #[cfg(test)]
 impl Default for StubCTraderLiveAuthBackend {
     fn default() -> Self {
-        Self::failure("stub cTrader live auth backend was not configured")
+        Self {
+            outcome: Arc::new(Mutex::new(Some(Err(
+                "stub cTrader live auth backend was not configured".to_string(),
+            )))),
+            refresh_outcome: Arc::new(Mutex::new(Some(Err(
+                "stub cTrader refresh backend was not configured".to_string(),
+            )))),
+        }
     }
 }
 
@@ -705,25 +675,6 @@ impl CTraderLiveAuthBackend for StubCTraderLiveAuthBackend {
             Err(message) => Err(anyhow!(message)),
         }
     }
-}
-
-pub fn build_default_loopback_config(redirect_uri: &str) -> Result<CTraderLoopbackConfig> {
-    let parts = parse_redirect_uri_parts(redirect_uri)?;
-    if !is_loopback_redirect_host(&parts.bind_host) {
-        return Err(anyhow!(
-            "cTrader loopback redirect URI host must be localhost, 127.0.0.1, or [::1]"
-        ));
-    }
-    Ok(CTraderLoopbackConfig::with_bind_host(
-        parts.port,
-        vec![parts.port.saturating_add(1), parts.port.saturating_add(2)],
-        callback_path_from_suffix(&parts.suffix),
-        parts.bind_host,
-    ))
-}
-
-fn is_loopback_redirect_host(host: &str) -> bool {
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 #[allow(dead_code)] // back-compat shim — see comment below
@@ -1363,10 +1314,6 @@ fn parse_redirect_authority(authority: &str) -> Result<(String, String, u16)> {
         .parse::<u16>()
         .context("redirect URI port is invalid")?;
     Ok((host.to_string(), host.to_string(), port))
-}
-
-fn callback_path_from_suffix(suffix: &str) -> String {
-    format!("/{}", suffix.trim_start_matches('/'))
 }
 
 fn percent_encode(value: &str) -> String {

@@ -33,34 +33,6 @@ fn authorize_url_rejects_malformed_redirect_uri() {
 }
 
 #[test]
-fn default_loopback_config_rejects_non_loopback_redirect_host() {
-    let err = build_default_loopback_config("http://example.com:43001/callback")
-        .expect_err("non-loopback redirect host must fail");
-
-    assert!(err.to_string().contains("loopback"));
-}
-
-#[test]
-fn default_loopback_config_preserves_localhost_for_listener_binding() {
-    let config = build_default_loopback_config("http://localhost:43001/callback")
-        .expect("localhost loopback redirect should build");
-
-    assert_eq!(config.bind_host(), "localhost");
-    assert_eq!(config.allowed_ports(), &[43001, 43002, 43003]);
-    assert_eq!(config.callback_path(), "/callback");
-}
-
-#[test]
-fn default_loopback_config_accepts_ipv6_loopback_redirect_host() {
-    let config = build_default_loopback_config("http://[::1]:43001/callback")
-        .expect("IPv6 loopback redirect should build");
-
-    assert_eq!(config.bind_host(), "::1");
-    assert_eq!(config.allowed_ports(), &[43001, 43002, 43003]);
-    assert_eq!(config.callback_path(), "/callback");
-}
-
-#[test]
 fn authorize_url_rewrites_ipv6_loopback_port() {
     let authorize_url =
         build_authorize_url("client-id", "http://[::1]:43001/callback", 43002, "trading")

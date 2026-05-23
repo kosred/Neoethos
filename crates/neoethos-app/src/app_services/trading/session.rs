@@ -38,22 +38,27 @@
 
 use super::{
     AdapterReadinessSnapshot, AppState, BrokerSessionState, BrokerSettingsReadiness,
-    BrokerSettingsState, CTRADER_DEFAULT_SCOPE, CTRADER_TOKEN_REFRESH_WINDOW_SECS,
+    BrokerSettingsState, CTRADER_TOKEN_REFRESH_WINDOW_SECS,
     CTraderAccountDiscoveryRequest,
-    CTraderAccountRuntimeRequest, CTraderAccountRuntimeSnapshot, CTraderAccountSummary,
+    CTraderAccountRuntimeRequest, CTraderAccountRuntimeSnapshot,
     CTraderAuthSession, CTraderAuthSnapshot, CTraderBootstrapContext, CTraderBrokerEnvironment,
-    CTraderEnvironment, CTraderLiveAuthRequest, CTraderTokenBundle, CTraderTokenExchangeRequest,
+    CTraderEnvironment, CTraderTokenBundle,
     CTraderTokenRefreshRequest, DataSource, JobKind, JobSnapshot, JobState, ServiceEvent, TaskKind,
-    TradingAdapter, TradingAdapterKind, TradingSession, build_default_loopback_config,
+    TradingAdapter, TradingAdapterKind, TradingSession,
     current_unix_seconds, format_ctrader_connect_error, format_ctrader_terminal_info,
     record_app_event, run_ctrader_bootstrap_batch_with_context,
     sync_ctrader_discovered_accounts_into_targets, sync_discovered_accounts_with_targets,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, TryRecvError};
 use std::time::Instant;
 
+// Legacy egui-era TradingSession entry points. The production HTTP server
+// (server/bridge.rs + server/broker_control.rs) re-builds the auth/connection
+// state via direct calls to ctrader_live_auth / ctrader_account_runtime helpers
+// and does not call through TradingSession. These methods stay as the
+// integration surface that trading_tests.rs exercises.
+#[allow(dead_code)]
 impl TradingSession {
     pub fn is_connected(&self) -> bool {
         self.connected
@@ -321,190 +326,6 @@ impl TradingSession {
         self.bootstrap_handle = Some(handle);
 
         Ok(())
-    }
-
-    pub fn start_ctrader_auth(&mut self) -> anyhow::Result<CTraderAuthSnapshot> {
-        let client_id = self.broker_settings.ctrader.client_id.trim().to_string();
-        let redirect_uri = self.broker_settings.ctrader.redirect_uri.trim().to_string();
-        if client_id.is_empty() || redirect_uri.is_empty() {
-            return Err(anyhow::anyhow!(
-                "cTrader auth requires client_id and redirect_uri"
-            ));
-        }
-        let mut session = CTraderAuthSession::new(client_id, redirect_uri);
-        session.start_authorization("trading");
-        let snapshot = session.snapshot();
-        self.ctrader_auth = Some(session);
-        Ok(snapshot)
-    }
-
-    pub fn receive_ctrader_authorization_code(
-        &mut self,
-        code: impl Into<String>,
-    ) -> CTraderAuthSnapshot {
-        let session = self.ctrader_auth.get_or_insert_with(|| {
-            CTraderAuthSession::new(
-                self.broker_settings.ctrader.client_id.clone(),
-                self.broker_settings.ctrader.redirect_uri.clone(),
-            )
-        });
-        session.receive_authorization_code(code);
-        session.snapshot()
-    }
-
-    pub fn build_ctrader_token_exchange_request(
-        &mut self,
-    ) -> anyhow::Result<CTraderTokenExchangeRequest> {
-        let client_secret = self
-            .broker_settings
-            .ctrader
-            .client_secret
-            .trim()
-            .to_string();
-        if client_secret.is_empty() {
-            if let Some(session) = self.ctrader_auth.as_mut() {
-                session.mark_failed("cTrader token exchange requires client_secret");
-            }
-            return Err(anyhow::anyhow!(
-                "cTrader token exchange requires client_secret"
-            ));
-        }
-        let session = self
-            .ctrader_auth
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("cTrader auth has not started"))?;
-        let request = session.build_token_exchange_request(client_secret);
-        if !self.broker_settings.ctrader.accounts.is_empty() {
-            session.set_accounts(
-                self.broker_settings
-                    .ctrader
-                    .accounts
-                    .iter()
-                    .map(|account| CTraderAccountSummary {
-                        account_id: account.account_id.clone(),
-                        broker_title: account.label.clone(),
-                        enabled_for_execution: account.enabled_for_execution,
-                    })
-                    .collect(),
-            );
-        }
-        Ok(request)
-    }
-
-    pub fn start_ctrader_live_auth(
-        &mut self,
-        _tx: tokio::sync::mpsc::Sender<crate::app_services::ServiceEvent>,
-    ) -> anyhow::Result<CTraderAuthSnapshot> {
-        self.reap_finished_background_tasks();
-        if self.ctrader_live_auth_rx.is_some() {
-            return Err(anyhow::anyhow!("cTrader live auth is already in progress"));
-        }
-        let client_id = self.broker_settings.ctrader.client_id.trim().to_string();
-        let client_secret = self
-            .broker_settings
-            .ctrader
-            .client_secret
-            .trim()
-            .to_string();
-        let redirect_uri = self.broker_settings.ctrader.redirect_uri.trim().to_string();
-        if client_id.is_empty() || client_secret.is_empty() || redirect_uri.is_empty() {
-            return Err(anyhow::anyhow!(
-                "cTrader live auth requires client_id, client_secret, and redirect_uri"
-            ));
-        }
-        let loopback = build_default_loopback_config(&redirect_uri)?;
-        let callback_port = *loopback
-            .allowed_ports()
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("cTrader live auth has no callback ports configured"))?;
-        let mut session = CTraderAuthSession::new(client_id.clone(), redirect_uri.clone());
-        session.start_authorization(CTRADER_DEFAULT_SCOPE);
-        session.mark_listening_for_callback(callback_port);
-        let snapshot = session.snapshot();
-        self.ctrader_auth = Some(session);
-
-        let request = CTraderLiveAuthRequest {
-            client_id,
-            client_secret,
-            redirect_uri,
-            scope: CTRADER_DEFAULT_SCOPE.to_string(),
-            loopback,
-        };
-        let backend = Arc::clone(&self.ctrader_live_auth_backend);
-        let (local_tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let result = backend.run(request).map_err(|err| err.to_string());
-            let _ = local_tx.send(result.clone());
-            if let Ok(_auth_result) = result {
-                // Background update via ServiceEvent if needed
-                // For now just prevent the unused variable warning
-            }
-        });
-        self.ctrader_live_auth_rx = Some(rx);
-        Ok(snapshot)
-    }
-
-    pub fn poll_ctrader_live_auth(&mut self) -> Option<CTraderAuthSnapshot> {
-        let receiver = self.ctrader_live_auth_rx.as_ref()?;
-        let outcome = match receiver.try_recv() {
-            Ok(outcome) => outcome,
-            Err(TryRecvError::Empty) => return None,
-            Err(TryRecvError::Disconnected) => {
-                if let Some(session) = self.ctrader_auth.as_mut() {
-                    session.mark_failed(
-                        "cTrader live auth worker disconnected before returning a result",
-                    );
-                    let snapshot = session.snapshot();
-                    self.ctrader_live_auth_rx = None;
-                    return Some(snapshot);
-                }
-                self.ctrader_live_auth_rx = None;
-                return None;
-            }
-        };
-        self.ctrader_live_auth_rx = None;
-
-        match outcome {
-            Ok(result) => {
-                {
-                    let session = self.ctrader_auth.get_or_insert_with(|| {
-                        CTraderAuthSession::new(
-                            self.broker_settings.ctrader.client_id.clone(),
-                            self.broker_settings.ctrader.redirect_uri.clone(),
-                        )
-                    });
-                    session.mark_listening_for_callback(result.callback_port);
-                    session.receive_authorization_code(result.authorization_code);
-                    if let Err(err) = self
-                        .ctrader_token_store
-                        .save_token_bundle(&result.token_bundle)
-                    {
-                        session.mark_failed(format!("failed to save cTrader token bundle: {err}"));
-                        return Some(session.snapshot());
-                    }
-                    session.restore_from_storage(result.token_bundle);
-                }
-                match self.discover_ctrader_accounts() {
-                    Ok(Some(snapshot)) => Some(snapshot),
-                    Ok(None) => self.ctrader_auth.as_ref().map(|session| session.snapshot()),
-                    Err(err) => {
-                        let session = self.ctrader_auth.as_mut()?;
-                        session.mark_failed(format!("cTrader account discovery failed: {err}"));
-                        Some(session.snapshot())
-                    }
-                }
-            }
-            Err(message) => {
-                let session = self.ctrader_auth.get_or_insert_with(|| {
-                    CTraderAuthSession::new(
-                        self.broker_settings.ctrader.client_id.clone(),
-                        self.broker_settings.ctrader.redirect_uri.clone(),
-                    )
-                });
-                session.mark_failed(message);
-                Some(session.snapshot())
-            }
-        }
     }
 
     pub fn restore_ctrader_session(&mut self) -> anyhow::Result<Option<CTraderAuthSnapshot>> {

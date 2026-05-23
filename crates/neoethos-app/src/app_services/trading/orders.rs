@@ -69,12 +69,17 @@ impl TradingSession {
     /// For Limit / Stop the `target_price` field of the order ticket is
     /// surfaced as `limit_price` / `stop_price` respectively in the cTrader
     /// `ProtoOANewOrderReq`.
+    // Legacy egui Buy/Sell button entry points; the production HTTP order
+    // endpoint will call execute_ctrader_order directly with OrderSource::Ai
+    // when wired. Kept for the order-pipeline tests in trading_tests.rs.
+    #[allow(dead_code)]
     pub fn execute_buy_order(&mut self, state: &mut AppState) {
         self.execute_ctrader_order(state, CTraderTradeSide::Buy, super::OrderSource::Manual);
     }
 
     /// Submit a SELL order for the currently-selected symbol. See
     /// [`Self::execute_buy_order`] for the order-type dispatch contract.
+    #[allow(dead_code)]
     pub fn execute_sell_order(&mut self, state: &mut AppState) {
         self.execute_ctrader_order(state, CTraderTradeSide::Sell, super::OrderSource::Manual);
     }

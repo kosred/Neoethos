@@ -27,14 +27,6 @@
 
 use crate::app_services::broker_config::BrokerSettingsState;
 use anyhow::Result;
-use std::path::PathBuf;
-
-/// Re-export the shared path resolver so existing call sites
-/// (`crate::app_services::broker_persistence::credentials_file_path`)
-/// keep working after the move into `neoethos-core`.
-pub fn credentials_file_path() -> Result<PathBuf> {
-    neoethos_core::broker_config::credentials_file_path()
-}
 
 /// Loads broker settings, applying the four-level resolution chain.
 ///
@@ -138,6 +130,7 @@ mod tests {
     use crate::app_services::broker_config::{
         BrokerAccountTarget, CTraderBrokerEnvironment, CTraderBrokerSettings, DxTradeBrokerSettings,
     };
+    use std::path::PathBuf;
     use std::sync::Mutex;
     use std::{env, fs};
 

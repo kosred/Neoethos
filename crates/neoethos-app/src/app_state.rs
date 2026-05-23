@@ -32,12 +32,19 @@ impl AppRuntimeConfig {
     }
 }
 
+// Discriminator passed into AppState by trading_tests.rs::sample_state — both
+// variants are constructed in the test fixtures (CTrader vs Local mode setup).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataSource {
     CTrader,
     Local,
 }
 
+// AppState is the legacy egui state struct retained as the wide test fixture
+// for trading_tests.rs (391 tests). The production HTTP server has its own
+// server::state::AppApiState and does not read these fields.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub runtime: AppRuntimeConfig,
@@ -63,6 +70,7 @@ pub struct AppState {
     pub account_equity: f64,
 }
 
+#[allow(dead_code)] // AppState constructed only by trading_tests.rs::sample_state
 impl AppState {
     pub fn new(
         runtime: AppRuntimeConfig,
@@ -145,6 +153,7 @@ impl Default for DiscoveryFormState {
     }
 }
 
+#[allow(dead_code)] // DiscoveryFormState constructed by AppState::new (tests only)
 impl DiscoveryFormState {
     pub fn from_settings(settings: &Settings) -> Self {
         let discovery = neoethos_search::DiscoveryConfig::from_settings(settings);
@@ -182,6 +191,7 @@ pub struct BootstrapFormState {
     pub external_sources: Vec<std::path::PathBuf>,
 }
 
+#[allow(dead_code)] // BootstrapFormState constructed by AppState::new (tests only)
 impl BootstrapFormState {
     pub fn default_for_symbol(symbol: &str) -> Self {
         Self {
@@ -193,6 +203,11 @@ impl BootstrapFormState {
     }
 }
 
+// OrderType variants Limit and Stop are referenced by trading_tests.rs and by
+// the planned /order/place HTTP DTO (see ctrader_messages::CTraderOrderType).
+// Wire shape is stable — do not delete without migrating the order-placement
+// HTTP endpoint at the same time.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderType {
     Market,
@@ -239,6 +254,10 @@ impl Default for OrderTicketState {
     }
 }
 
+// Populated by Default::default() inside AppState::new; the fields are read
+// only by the legacy egui Hardware panel (now removed). Keep until a server
+// HTTP endpoint surfaces hardware info, then either delete or wire through.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct HardwareState {
     pub cpu_cores: i32,
