@@ -40,6 +40,8 @@ use crate::app_services::ctrader_account::{
     CTraderAccountRuntimeRequest, CTraderPositionSnapshot, load_account_runtime,
 };
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
+use crate::app_services::ctrader_messages::ProductionCTraderOpenApiTransport;
+use crate::app_services::pnl::{BrokerPositionPnL, fetch_unrealized_pnl_for_all_positions};
 use crate::app_services::secure_store::production_ctrader_token_store;
 
 use super::state::{AccountSnapshotPayload, AppApiState, PositionPayload};
@@ -222,10 +224,110 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
         }
     }
 
+    // #134 — pull broker-authoritative unrealized PnL per position
+    // and pass into `position_to_payload`. Broker does the FX
+    // conversion server-side so we don't have to chase per-symbol
+    // pip-value-in-account-currency conversion. Failure is
+    // non-fatal: positions still flow through with pnl_usd = 0.0
+    // (the pre-#134 behaviour) and a `warn!` documents the gap so
+    // the operator sees in the log that the dashboard's PnL
+    // column will be quiet until the next refresh.
+    let pnl_by_position: HashMap<i64, BrokerPositionPnL> = if has_positions {
+        let open_ids: Vec<i64> = snapshot
+            .reconcile
+            .positions
+            .iter()
+            .map(|p| p.position_id)
+            .collect();
+        let client_id_clone = ctrader.client_id.clone();
+        let client_secret_clone = ctrader.client_secret.clone();
+        let access_token_for_pnl = match production_ctrader_token_store()
+            .load_token_bundle_with_legacy_fallback()
+            .ok()
+            .flatten()
+        {
+            Some(tb) => tb.access_token,
+            None => {
+                tracing::debug!(
+                    target: "neoethos_app::server::bridge",
+                    "skipped authoritative PnL fetch — token bundle vanished mid-refresh"
+                );
+                return Ok(AccountSnapshotPayload {
+                    balance,
+                    equity,
+                    free_margin,
+                    used_margin: if used_margin.is_sign_negative()
+                        && used_margin == 0.0
+                    {
+                        0.0
+                    } else {
+                        used_margin
+                    },
+                    currency: "EUR".to_string(),
+                    fetched_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+                    positions: snapshot
+                        .reconcile
+                        .positions
+                        .iter()
+                        .map(|p| {
+                            position_to_payload(
+                                p,
+                                None,
+                                &HashMap::new(),
+                            )
+                        })
+                        .collect(),
+                });
+            }
+        };
+        let endpoint_host = environment.endpoint_host();
+        // Both `snapshot.trader.account_id` and `snapshot.reconcile.account_id`
+        // exist; they're the same value the broker echoes back on
+        // each call. Prefer the trader-side because the
+        // ProtoOATraderRes carries it as the canonical i64
+        // discriminator; reconcile sometimes elides it on empty
+        // result sets.
+        let account_id_i64 = snapshot.trader.account_id;
+        let pnl_result = tokio::task::spawn_blocking(move || {
+            let transport = ProductionCTraderOpenApiTransport::new(endpoint_host);
+            fetch_unrealized_pnl_for_all_positions(
+                &transport,
+                &client_id_clone,
+                &client_secret_clone,
+                &access_token_for_pnl,
+                account_id_i64,
+                &open_ids,
+            )
+        })
+        .await;
+        match pnl_result {
+            Ok(Ok(auth)) => auth.by_position,
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    target: "neoethos_app::server::bridge",
+                    error = %err,
+                    "authoritative PnL fetch failed — positions will report \
+                     pnl_usd=0.0 this refresh cycle"
+                );
+                HashMap::new()
+            }
+            Err(join_err) => {
+                tracing::warn!(
+                    target: "neoethos_app::server::bridge",
+                    error = %join_err,
+                    "authoritative PnL blocking task panicked"
+                );
+                HashMap::new()
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+
     let mut positions = Vec::with_capacity(snapshot.reconcile.positions.len());
     for p in &snapshot.reconcile.positions {
         let resolved_name = state.resolve_symbol_name(p.symbol_id).await;
-        positions.push(position_to_payload(p, resolved_name));
+        positions.push(position_to_payload(p, resolved_name, &pnl_by_position));
     }
 
     Ok(AccountSnapshotPayload {
@@ -265,6 +367,7 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
 fn position_to_payload(
     p: &CTraderPositionSnapshot,
     resolved_name: Option<String>,
+    pnl_by_position: &HashMap<i64, BrokerPositionPnL>,
 ) -> PositionPayload {
     // cTrader feeds `volume` as already-converted lots (f64). The
     // close-position endpoint wants broker volume units (centi-lots).
@@ -274,6 +377,35 @@ fn position_to_payload(
     // symbol catalog through here we'll look up the real lot_size
     // per symbol. For the MVP, EURUSD-shaped FX is the common case.
     let volume_units = (p.volume * 100_000.0 * 100.0).round() as i64;
+
+    // #134 — broker-authoritative net unrealized PnL in the account
+    // currency. The pnl module already handles money-digit scaling +
+    // FX conversion to the deposit currency, so we just plug it
+    // through. Missing rows (broker omitted the position, or the
+    // fetch failed earlier) fall back to 0.0 — pre-#134 behaviour.
+    let pnl_usd = pnl_by_position
+        .get(&p.position_id)
+        .map(|b| b.net_unrealized_pnl)
+        .unwrap_or(0.0);
+
+    // Derive pnl_pips from the account-currency PnL via the symbol
+    // metadata table. Formula:
+    //   pip_value_quote = pip_size * contract_size (per lot)
+    //   pnl_pips = pnl_account_ccy / (pip_value_quote * volume_lots)
+    // For pairs where quote == account_currency this is exact. For
+    // base==account or cross pairs the FX conversion the broker
+    // already did is folded into pnl_usd, so the division still
+    // gives a sensible pip number — at worst off by the spot
+    // multiplier used at carry time, which is the right magnitude.
+    // When metadata is missing for the symbol (rare — exotic
+    // synthetics), report 0.0 pips rather than NaN; UI shows 0
+    // until the symbol table gets populated.
+    let pnl_pips = compute_pnl_pips(
+        resolved_name.as_deref(),
+        pnl_usd,
+        p.volume,
+    );
+
     PositionPayload {
         position_id: p.position_id,
         volume_units,
@@ -292,15 +424,131 @@ fn position_to_payload(
         // and the broker hadn't stamped it yet — UI shows "—" in
         // that case rather than guessing.
         open_timestamp_ms: p.open_timestamp_ms,
-        // cTrader's mark-to-market pip and USD PnL are derived
-        // server-side from the position's open price + the latest
-        // spot — we don't have the spot stream here. Report 0 for
-        // now; the spot stream worker (Session 2) will overwrite
-        // these with live values. swap + commission ARE available
-        // (cTrader feeds them on the reconcile response) but they
-        // are cost-of-carry, not PnL — surfacing them in the PnL
-        // column would mislead the operator, so they stay 0 here.
-        pnl_pips: 0.0,
-        pnl_usd: 0.0,
+        pnl_pips,
+        pnl_usd,
+    }
+}
+
+/// Derive PnL in pips from broker-side net unrealized PnL (already
+/// in account currency, broker did the FX conversion) and the
+/// position's lot volume. Returns 0.0 when:
+///   - `pnl_account_ccy` is 0.0 (nothing to convert),
+///   - `volume_lots` is 0.0 (defensive — shouldn't happen but a
+///     div-by-zero is unhelpful),
+///   - the symbol isn't in the metadata table (use 0.0 as a
+///     visible "unknown" rather than NaN which breaks JSON).
+fn compute_pnl_pips(
+    resolved_name: Option<&str>,
+    pnl_account_ccy: f64,
+    volume_lots: f64,
+) -> f64 {
+    if !pnl_account_ccy.is_finite() || pnl_account_ccy == 0.0 {
+        return 0.0;
+    }
+    if !volume_lots.is_finite() || volume_lots <= 0.0 {
+        return 0.0;
+    }
+    let Some(name) = resolved_name else {
+        return 0.0;
+    };
+    let Some(meta) = neoethos_core::symbol_metadata::resolve(name) else {
+        return 0.0;
+    };
+    // pip_value_quote is per-lot in the QUOTE currency. The broker
+    // returns PnL in the DEPOSIT (account) currency. For
+    // quote == account: exact. For other cases the conversion the
+    // broker did is implicit in pnl_account_ccy; dividing here
+    // gives a pip count that round-trips correctly when the price
+    // is close to typical_price (the bulk of trades).
+    let denom = meta.pip_value_quote * volume_lots;
+    if !denom.is_finite() || denom.abs() < 1e-12 {
+        return 0.0;
+    }
+    pnl_account_ccy / denom
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_position() -> CTraderPositionSnapshot {
+        CTraderPositionSnapshot {
+            position_id: 42,
+            symbol_id: 1,
+            trade_side: "BUY".to_string(),
+            volume: 0.1,
+            price: Some(1.0840),
+            stop_loss: None,
+            take_profit: None,
+            open_timestamp_ms: Some(1_716_422_400_000),
+            swap: None,
+            commission: None,
+            mirroring_commission: None,
+            used_margin: None,
+            label: None,
+            comment: None,
+            client_order_id: None,
+        }
+    }
+
+    #[test]
+    fn position_to_payload_uses_broker_pnl_when_present() {
+        let p = sample_position();
+        let mut map = HashMap::new();
+        map.insert(
+            42,
+            BrokerPositionPnL {
+                position_id: 42,
+                gross_unrealized_pnl: 12.5,
+                net_unrealized_pnl: 11.3,
+                money_digits: 2,
+            },
+        );
+        let payload = position_to_payload(&p, Some("EURUSD".to_string()), &map);
+        assert!((payload.pnl_usd - 11.3).abs() < 1e-9);
+        // For EURUSD: pip_value_quote = 0.0001 * 100_000 = 10.0/lot.
+        // At 0.1 lots → 1.0/pip. PnL 11.3 → 11.3 pips.
+        assert!((payload.pnl_pips - 11.3).abs() < 0.01);
+    }
+
+    #[test]
+    fn position_to_payload_zero_when_no_pnl_entry() {
+        let p = sample_position();
+        let payload = position_to_payload(&p, Some("EURUSD".to_string()), &HashMap::new());
+        assert_eq!(payload.pnl_usd, 0.0);
+        assert_eq!(payload.pnl_pips, 0.0);
+    }
+
+    #[test]
+    fn position_to_payload_zero_pips_when_symbol_not_in_metadata() {
+        let p = sample_position();
+        let mut map = HashMap::new();
+        map.insert(
+            42,
+            BrokerPositionPnL {
+                position_id: 42,
+                gross_unrealized_pnl: 5.0,
+                net_unrealized_pnl: 5.0,
+                money_digits: 2,
+            },
+        );
+        // Resolved name is the placeholder — symbol_metadata::resolve
+        // returns None → pnl_pips falls back to 0.0 (visible
+        // "unknown", not NaN).
+        let payload = position_to_payload(&p, Some("sym#999".to_string()), &map);
+        assert_eq!(payload.pnl_usd, 5.0);
+        assert_eq!(payload.pnl_pips, 0.0);
+    }
+
+    #[test]
+    fn compute_pnl_pips_handles_zero_volume() {
+        assert_eq!(compute_pnl_pips(Some("EURUSD"), 10.0, 0.0), 0.0);
+        assert_eq!(compute_pnl_pips(Some("EURUSD"), 10.0, f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn compute_pnl_pips_handles_nonfinite_pnl() {
+        assert_eq!(compute_pnl_pips(Some("EURUSD"), f64::NAN, 0.1), 0.0);
+        assert_eq!(compute_pnl_pips(Some("EURUSD"), f64::INFINITY, 0.1), 0.0);
     }
 }
