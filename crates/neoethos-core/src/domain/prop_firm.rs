@@ -1,12 +1,99 @@
-//! Prop firm hard constraints and local challenge/risk defaults.
+//! Prop firm hard constraints + named-preset registry.
 //!
-//! Source of truth: FTMO Trader Challenge rules (https://ftmo.com/en/trading-objectives/).
-//! Other prop firms (MyForexFunds, The5%ers, FundedNext) use similar
-//! limits ±0.5% — if we need per-firm customization later, this struct
-//! becomes a runtime config but the defaults stay.
+//! NeoEthos is not locked to a single firm. The runtime reads its rule
+//! set from a named preset (`PropFirmPreset`) — FTMO, MyForexFunds,
+//! FundedNext, The5%ers, or `None` (own-money / personal account, no
+//! external caps). FTMO is *one* preset, not "the" rule set. Operators
+//! pick the preset that matches their account via `config.yaml`'s
+//! `risk.preset` field, the `NEOETHOS_PROP_FIRM_PRESET` env var, or
+//! the Flutter Risk Settings screen.
+//!
+//! Numbers in built-in presets are approximate as of writing
+//! (2026-05). Prop firms revise their rule sheets routinely —
+//! operators are responsible for verifying the active values against
+//! their current contract. The runtime never enforces a number it
+//! didn't read from the active preset; users can override any field
+//! by editing `config.yaml`'s `risk:` block (preset values are seeds,
+//! not locks).
+//!
+//! Source for FTMO numbers: https://ftmo.com/en/trading-objectives/.
+//! Other firms cross-checked from each firm's published rule pages.
 //! External prop-firm numbers belong in [`PropFirmConstraints`]. Local
-//! neoethos policy defaults live beside it so search, validation, and live
-//! risk code do not carry duplicate literals.
+//! neoethos policy defaults live beside it so search, validation, and
+//! live risk code do not carry duplicate literals.
+
+use serde::{Deserialize, Serialize};
+
+/// Named prop-firm preset. Drives the default values in `RiskConfig`,
+/// `PropFirmRules`, and the discovery-side challenge gate. The runtime
+/// itself is firm-agnostic — it just reads numeric thresholds from
+/// whichever preset is active.
+///
+/// `None` is the own-money / personal-account preset: no external
+/// drawdown caps, no profit target, no minimum trading days. Use it
+/// when the operator's account is theirs and not a funded challenge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PropFirmPreset {
+    #[default]
+    Ftmo,
+    MyForexFunds,
+    FundedNext,
+    The5ers,
+    /// Own-money / personal account. No external caps; the runtime
+    /// still respects per-trade risk-management settings the operator
+    /// dialled in, but the prop-firm gate is effectively bypassed.
+    None,
+}
+
+impl PropFirmPreset {
+    /// Human-readable preset label for UI / CLI output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ftmo => "ftmo",
+            Self::MyForexFunds => "myforexfunds",
+            Self::FundedNext => "fundednext",
+            Self::The5ers => "the5ers",
+            Self::None => "none",
+        }
+    }
+
+    /// Display name (Title Case) suitable for UI dropdowns / labels.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Ftmo => "FTMO",
+            Self::MyForexFunds => "MyForexFunds",
+            Self::FundedNext => "FundedNext",
+            Self::The5ers => "The5%ers",
+            Self::None => "None (own account)",
+        }
+    }
+
+    /// Parse `--prop-firm-preset` / `NEOETHOS_PROP_FIRM_PRESET` / the
+    /// `risk.preset` YAML field. Case-insensitive. Returns `None` for
+    /// unknown values so callers can decide to default vs. reject.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "ftmo" => Some(Self::Ftmo),
+            "myforexfunds" | "mff" => Some(Self::MyForexFunds),
+            "fundednext" | "funded_next" => Some(Self::FundedNext),
+            "the5ers" | "the_5ers" | "5ers" => Some(Self::The5ers),
+            "none" | "personal" | "own" | "ownmoney" | "own_money" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    /// All known presets — used by the Flutter dropdown + CLI listing.
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Ftmo,
+            Self::MyForexFunds,
+            Self::FundedNext,
+            Self::The5ers,
+            Self::None,
+        ]
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PropFirmConstraints {
@@ -38,6 +125,63 @@ impl PropFirmConstraints {
         min_monthly_net_profit_pct: 0.04, // operator directive
         min_trading_days: 10,
     };
+
+    /// MyForexFunds Rapid / Evaluation defaults (approximate).
+    /// MFF historically used 5% daily DD, 12% overall, 8% Phase 1
+    /// profit target, 5 minimum trading days.
+    pub const MYFOREXFUNDS_STANDARD: Self = Self {
+        max_daily_loss_pct: 0.05,
+        max_overall_drawdown_pct: 0.12,
+        challenge_profit_target_pct: 0.08,
+        min_monthly_net_profit_pct: 0.04,
+        min_trading_days: 5,
+    };
+
+    /// FundedNext Stellar Lite defaults (approximate).
+    pub const FUNDEDNEXT_STANDARD: Self = Self {
+        max_daily_loss_pct: 0.05,
+        max_overall_drawdown_pct: 0.10,
+        challenge_profit_target_pct: 0.08,
+        min_monthly_net_profit_pct: 0.04,
+        min_trading_days: 5,
+    };
+
+    /// The5%ers Bootcamp / Hyper-Growth defaults (approximate).
+    /// The5%ers historically uses tighter daily DD (4%) and a 6%
+    /// total drawdown ceiling.
+    pub const THE5ERS_STANDARD: Self = Self {
+        max_daily_loss_pct: 0.04,
+        max_overall_drawdown_pct: 0.06,
+        challenge_profit_target_pct: 0.06,
+        min_monthly_net_profit_pct: 0.02,
+        min_trading_days: 3,
+    };
+
+    /// Permissive "own-money / personal-account" preset. No external
+    /// challenge target. The 10% / 20% drawdown caps are *recommended
+    /// ceilings* the system surfaces in the UI as warnings — not
+    /// challenge-failure conditions. Operators trading their own
+    /// capital still benefit from a kill switch.
+    pub const NONE_OWN_MONEY: Self = Self {
+        max_daily_loss_pct: 0.10,
+        max_overall_drawdown_pct: 0.20,
+        challenge_profit_target_pct: 0.0,
+        min_monthly_net_profit_pct: 0.0,
+        min_trading_days: 0,
+    };
+
+    /// Look up the constraint set for a preset. Always returns
+    /// something — `None` (personal account) is a valid preset, not
+    /// an absence of rules.
+    pub fn for_preset(preset: PropFirmPreset) -> Self {
+        match preset {
+            PropFirmPreset::Ftmo => Self::FTMO_STANDARD,
+            PropFirmPreset::MyForexFunds => Self::MYFOREXFUNDS_STANDARD,
+            PropFirmPreset::FundedNext => Self::FUNDEDNEXT_STANDARD,
+            PropFirmPreset::The5ers => Self::THE5ERS_STANDARD,
+            PropFirmPreset::None => Self::NONE_OWN_MONEY,
+        }
+    }
 }
 
 /// Local operating defaults for challenge-cycle planning.
@@ -66,6 +210,32 @@ impl PropFirmChallengeDefaults {
         target_trading_days: 22,
         max_trading_days: 60,
     };
+
+    /// "Own money / personal" — no challenge cycle. Use the FTMO
+    /// values as a sane pacing default since the search code still
+    /// needs a denominator. The runtime ignores these when the
+    /// preset is `None`.
+    pub const NONE_OWN_MONEY: Self = Self::FTMO_STANDARD;
+
+    /// All non-FTMO funded challenges in our preset list compress
+    /// the cycle window vs. FTMO's 60-day max. 30 days is a tight
+    /// default that matches FundedNext / MFF Evaluation cadence.
+    pub const COMPACT_30_DAY: Self = Self {
+        daily_target_trading_days: 15,
+        relaxed_min_trading_days: 3,
+        target_trading_days: 18,
+        max_trading_days: 30,
+    };
+
+    pub fn for_preset(preset: PropFirmPreset) -> Self {
+        match preset {
+            PropFirmPreset::Ftmo => Self::FTMO_STANDARD,
+            PropFirmPreset::MyForexFunds
+            | PropFirmPreset::FundedNext
+            | PropFirmPreset::The5ers => Self::COMPACT_30_DAY,
+            PropFirmPreset::None => Self::NONE_OWN_MONEY,
+        }
+    }
 }
 
 /// Local runtime defaults layered under the hard prop-firm constraints.
@@ -111,6 +281,38 @@ impl PropFirmRuntimeDefaults {
         defensive_mode_risk_multiplier: 0.50,
         caution_mode_risk_multiplier: 0.75,
     };
+
+    /// The5%ers compresses the tolerated daily DD from FTMO's 5%
+    /// down to 4%, so the runtime stop-trading threshold needs to
+    /// move with it (kept at 75% of the firm's ceiling).
+    pub const THE5ERS_TIGHTER_DAILY_DD: Self = Self {
+        daily_dd_warning_pct: 0.028,
+        daily_dd_stop_trading_pct: 0.032,
+        daily_profit_lock_pct: 0.02,
+        ..Self::FTMO_STANDARD
+    };
+
+    /// Personal account — looser guard-rails than the funded
+    /// presets, but still finite. Doubles the daily DD tolerance
+    /// vs. FTMO so the operator's own bad day doesn't trip the
+    /// kill switch unless something is genuinely wrong.
+    pub const NONE_OWN_MONEY: Self = Self {
+        daily_dd_warning_pct: 0.07,
+        daily_dd_stop_trading_pct: 0.08,
+        daily_profit_lock_pct: 0.05,
+        max_trades_per_day: 30,
+        ..Self::FTMO_STANDARD
+    };
+
+    pub fn for_preset(preset: PropFirmPreset) -> Self {
+        match preset {
+            PropFirmPreset::Ftmo | PropFirmPreset::MyForexFunds | PropFirmPreset::FundedNext => {
+                Self::FTMO_STANDARD
+            }
+            PropFirmPreset::The5ers => Self::THE5ERS_TIGHTER_DAILY_DD,
+            PropFirmPreset::None => Self::NONE_OWN_MONEY,
+        }
+    }
 }
 
 /// Phase-specific strategy defaults for FTMO-style challenge operation.
@@ -151,14 +353,144 @@ impl PropFirmPhaseRiskDefaults {
         max_trades_per_day: 4,
         daily_profit_lock_pct: 0.0,
     };
+
+    /// Phase-1 numbers for any non-FTMO preset that doesn't have
+    /// its own table. The5%ers tightens by ~25 % because the daily
+    /// DD ceiling is lower; the rest stay close to FTMO.
+    pub const THE5ERS_PHASE_1: Self = Self {
+        risk_per_trade: 0.0020,
+        max_risk_per_trade: 0.0035,
+        min_confidence_threshold: 0.70,
+        max_trades_per_day: 2,
+        daily_profit_lock_pct: 0.010,
+    };
+
+    /// "Own money" — wider risk-per-trade band, lower confidence
+    /// threshold (the operator wears the loss, not a prop firm).
+    pub const NONE_OWN_MONEY: Self = Self {
+        risk_per_trade: 0.0050,
+        max_risk_per_trade: 0.0100,
+        min_confidence_threshold: 0.55,
+        max_trades_per_day: 10,
+        daily_profit_lock_pct: 0.0,
+    };
+
+    /// Phase 1 / 2 / Funded selector. Most firms run a Phase 1 →
+    /// Phase 2 → Funded ladder; The5%ers has a single Bootcamp
+    /// phase that we slot in as Phase 1.
+    pub fn for_preset(preset: PropFirmPreset, challenge_phase: &str) -> Self {
+        let phase_norm = challenge_phase.trim().to_ascii_lowercase();
+        match preset {
+            PropFirmPreset::Ftmo | PropFirmPreset::MyForexFunds | PropFirmPreset::FundedNext => {
+                match phase_norm.as_str() {
+                    "phase_1" | "phase1" | "p1" => Self::FTMO_PHASE_1,
+                    "phase_2" | "phase2" | "p2" => Self::FTMO_PHASE_2,
+                    "funded" => Self::FTMO_FUNDED,
+                    _ => Self::FTMO_PHASE_1,
+                }
+            }
+            PropFirmPreset::The5ers => Self::THE5ERS_PHASE_1,
+            PropFirmPreset::None => Self::NONE_OWN_MONEY,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         PropFirmChallengeDefaults, PropFirmConstraints, PropFirmPhaseRiskDefaults,
-        PropFirmRuntimeDefaults,
+        PropFirmPreset, PropFirmRuntimeDefaults,
     };
+
+    #[test]
+    fn preset_parse_is_case_insensitive_and_aliased() {
+        assert_eq!(PropFirmPreset::parse("ftmo"), Some(PropFirmPreset::Ftmo));
+        assert_eq!(PropFirmPreset::parse("FTMO"), Some(PropFirmPreset::Ftmo));
+        assert_eq!(
+            PropFirmPreset::parse("mff"),
+            Some(PropFirmPreset::MyForexFunds)
+        );
+        assert_eq!(
+            PropFirmPreset::parse("MyForexFunds"),
+            Some(PropFirmPreset::MyForexFunds)
+        );
+        assert_eq!(
+            PropFirmPreset::parse("funded_next"),
+            Some(PropFirmPreset::FundedNext)
+        );
+        assert_eq!(PropFirmPreset::parse("5ers"), Some(PropFirmPreset::The5ers));
+        assert_eq!(PropFirmPreset::parse("none"), Some(PropFirmPreset::None));
+        assert_eq!(
+            PropFirmPreset::parse("personal"),
+            Some(PropFirmPreset::None)
+        );
+        assert_eq!(PropFirmPreset::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn preset_default_is_ftmo_for_backwards_compatibility() {
+        // The CURRENT default has been FTMO since the project began;
+        // bumping this would silently change every existing operator's
+        // active rule set on a routine upgrade. Anyone who wants a
+        // different preset sets it explicitly in `config.yaml` or via
+        // the env var.
+        assert_eq!(PropFirmPreset::default(), PropFirmPreset::Ftmo);
+    }
+
+    #[test]
+    fn for_preset_returns_distinct_constraints() {
+        let ftmo = PropFirmConstraints::for_preset(PropFirmPreset::Ftmo);
+        let the5ers = PropFirmConstraints::for_preset(PropFirmPreset::The5ers);
+        let none = PropFirmConstraints::for_preset(PropFirmPreset::None);
+        assert!(the5ers.max_overall_drawdown_pct < ftmo.max_overall_drawdown_pct);
+        assert!(none.max_daily_loss_pct > ftmo.max_daily_loss_pct);
+        assert_eq!(none.challenge_profit_target_pct, 0.0);
+        assert_eq!(none.min_trading_days, 0);
+    }
+
+    #[test]
+    fn the5ers_runtime_caps_stay_under_the5ers_constraints() {
+        let constraints = PropFirmConstraints::for_preset(PropFirmPreset::The5ers);
+        let runtime = PropFirmRuntimeDefaults::for_preset(PropFirmPreset::The5ers);
+        assert!(runtime.daily_dd_stop_trading_pct <= constraints.max_daily_loss_pct as f64);
+        assert!(runtime.daily_dd_warning_pct < runtime.daily_dd_stop_trading_pct);
+    }
+
+    #[test]
+    fn for_preset_phase_picks_funded_when_requested() {
+        let funded = PropFirmPhaseRiskDefaults::for_preset(PropFirmPreset::Ftmo, "funded");
+        assert_eq!(funded.daily_profit_lock_pct, 0.0);
+
+        let phase_2 = PropFirmPhaseRiskDefaults::for_preset(PropFirmPreset::Ftmo, "phase_2");
+        let phase_1 = PropFirmPhaseRiskDefaults::for_preset(PropFirmPreset::Ftmo, "phase_1");
+        assert!(phase_2.risk_per_trade <= phase_1.risk_per_trade);
+
+        // Unknown phase string falls back to phase 1 (safer default).
+        let fallback = PropFirmPhaseRiskDefaults::for_preset(PropFirmPreset::Ftmo, "garbage");
+        assert_eq!(fallback.risk_per_trade, phase_1.risk_per_trade);
+    }
+
+    #[test]
+    fn challenge_defaults_compact_window_is_shorter_than_ftmo() {
+        let ftmo = PropFirmChallengeDefaults::for_preset(PropFirmPreset::Ftmo);
+        let mff = PropFirmChallengeDefaults::for_preset(PropFirmPreset::MyForexFunds);
+        assert!(mff.max_trading_days < ftmo.max_trading_days);
+    }
+
+    #[test]
+    fn all_presets_lookup_resolves_every_variant() {
+        // Smoke test — every variant of the enum returns a real
+        // constraint set so the lookup table can never silently miss
+        // a preset.
+        for &preset in PropFirmPreset::all() {
+            let c = PropFirmConstraints::for_preset(preset);
+            assert!(c.max_daily_loss_pct >= 0.0);
+            let r = PropFirmRuntimeDefaults::for_preset(preset);
+            assert!(r.max_trades_per_day > 0);
+            let _ = PropFirmChallengeDefaults::for_preset(preset);
+            let _ = PropFirmPhaseRiskDefaults::for_preset(preset, "phase_1");
+        }
+    }
 
     #[test]
     fn ftmo_runtime_defaults_stay_inside_hard_constraints() {

@@ -191,6 +191,26 @@ class BackendClient {
     return RiskSnapshot.fromJson(response.data!);
   }
 
+  /// `POST /risk/preset` — switch the active prop-firm preset.
+  ///
+  /// Pass the snake_case preset id (`ftmo`, `myforexfunds`,
+  /// `fundednext`, `the5ers`, `none`). Returns the post-switch
+  /// RiskSnapshot so the UI can refresh without a follow-up GET.
+  Future<RiskSnapshot> savePropFirmPreset(String presetId) async {
+    final response = await _dio.post<Map<String, dynamic>>(
+      '/risk/preset',
+      data: {'preset': presetId},
+    );
+    if (response.statusCode != 200 || response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: 'POST /risk/preset failed: ${response.statusCode}',
+      );
+    }
+    return RiskSnapshot.fromJson(response.data!);
+  }
+
   /// `/settings` — non-risk app-wide settings (data dir, news, LLM).
   Future<SettingsSnapshot> fetchSettings() async {
     final response = await _dio.get<Map<String, dynamic>>('/settings');
@@ -719,6 +739,14 @@ class RiskSnapshot {
   final double totalDrawdownLimit;
   final double maxLotSize;
   final bool requireStopLoss;
+  /// Active prop-firm preset (snake_case id, e.g. `ftmo`, `none`).
+  /// Empty string when the backend pre-dates the preset registry —
+  /// the UI treats that as "ftmo" for back-compat display.
+  final String preset;
+  final String presetDisplayName;
+  final List<PropFirmPresetSummary> availablePresets;
+  /// Whether the prop-firm gate is armed (false when preset == none).
+  final bool propFirmRulesEnabled;
   const RiskSnapshot({
     required this.riskPerTrade,
     required this.minRiskPerTrade,
@@ -727,6 +755,10 @@ class RiskSnapshot {
     required this.totalDrawdownLimit,
     required this.maxLotSize,
     required this.requireStopLoss,
+    required this.preset,
+    required this.presetDisplayName,
+    required this.availablePresets,
+    required this.propFirmRulesEnabled,
   });
 
   factory RiskSnapshot.fromJson(Map<String, dynamic> j) => RiskSnapshot(
@@ -737,6 +769,44 @@ class RiskSnapshot {
         totalDrawdownLimit: (j['totalDrawdownLimit'] as num).toDouble(),
         maxLotSize: (j['maxLotSize'] as num).toDouble(),
         requireStopLoss: j['requireStopLoss'] as bool,
+        preset: (j['preset'] as String?) ?? '',
+        presetDisplayName: (j['presetDisplayName'] as String?) ?? '',
+        availablePresets: ((j['availablePresets'] as List?) ?? const [])
+            .map((e) =>
+                PropFirmPresetSummary.fromJson(e as Map<String, dynamic>))
+            .toList(growable: false),
+        propFirmRulesEnabled: (j['propFirmRulesEnabled'] as bool?) ?? true,
+      );
+}
+
+/// One row in the available-presets list returned by `/risk`. The UI
+/// dropdown renders these so users can see each firm's hard ceilings
+/// inline before they commit to switching.
+class PropFirmPresetSummary {
+  final String id;
+  final String displayName;
+  final double maxDailyLossPct;
+  final double maxOverallDrawdownPct;
+  final double challengeProfitTargetPct;
+  final int minTradingDays;
+  const PropFirmPresetSummary({
+    required this.id,
+    required this.displayName,
+    required this.maxDailyLossPct,
+    required this.maxOverallDrawdownPct,
+    required this.challengeProfitTargetPct,
+    required this.minTradingDays,
+  });
+
+  factory PropFirmPresetSummary.fromJson(Map<String, dynamic> j) =>
+      PropFirmPresetSummary(
+        id: j['id'] as String,
+        displayName: j['displayName'] as String,
+        maxDailyLossPct: (j['maxDailyLossPct'] as num).toDouble(),
+        maxOverallDrawdownPct: (j['maxOverallDrawdownPct'] as num).toDouble(),
+        challengeProfitTargetPct:
+            (j['challengeProfitTargetPct'] as num).toDouble(),
+        minTradingDays: (j['minTradingDays'] as num).toInt(),
       );
 }
 

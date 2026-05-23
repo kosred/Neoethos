@@ -124,6 +124,10 @@ List<Override> testProviderOverrides() => [
           totalDrawdownLimit: 10.0,
           maxLotSize: 1.0,
           requireStopLoss: true,
+          preset: 'ftmo',
+          presetDisplayName: 'FTMO',
+          availablePresets: [],
+          propFirmRulesEnabled: true,
         ),
       ),
       settingsProvider.overrideWith(

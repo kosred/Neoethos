@@ -2,7 +2,7 @@
 // Project configuration loader.
 
 use crate::contracts::CANONICAL_TIMEFRAMES;
-use crate::domain::prop_firm::PropFirmConstraints;
+use crate::domain::prop_firm::{PropFirmConstraints, PropFirmPreset, PropFirmRuntimeDefaults};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -143,6 +143,14 @@ impl Default for SystemConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RiskConfig {
+    /// Named prop-firm preset that seeds every other field in this
+    /// struct. The runtime is firm-agnostic; this field just selects
+    /// which lookup table populates the numeric thresholds at default
+    /// construction. Operators can override any field below — preset
+    /// values are seeds, not locks. Setting `preset: none` disables
+    /// the external-challenge gate without touching the other fields.
+    #[serde(default)]
+    pub preset: PropFirmPreset,
     pub initial_balance: f64,
     pub monthly_profit_target_pct: f64,
     pub min_risk_per_trade: f64,
@@ -258,45 +266,61 @@ impl Default for RiskConfig {
             ewma_lambda_by_timeframe.insert(tf.to_string(), lambda);
         }
 
-        let ftmo = PropFirmConstraints::FTMO_STANDARD;
+        // Honour the `NEOETHOS_PROP_FIRM_PRESET` env override at
+        // default-construction time. `config.yaml`'s `risk.preset` key
+        // overrides this when loaded (serde fills it post-construction);
+        // the env var is the next layer up so headless deployments can
+        // pin the preset without editing YAML.
+        let preset = std::env::var("NEOETHOS_PROP_FIRM_PRESET")
+            .ok()
+            .and_then(|raw| PropFirmPreset::parse(&raw))
+            .unwrap_or_default();
+        let constraints = PropFirmConstraints::for_preset(preset);
+        let runtime = PropFirmRuntimeDefaults::for_preset(preset);
         Self {
-            // FIXME(hardcoded): config-extract — account starting balance is broker-specific.
+            preset,
+            // Account starting balance is broker-specific. Operators
+            // override this via `config.yaml`'s `risk.initial_balance`.
             initial_balance: 10_000.0,
-            // Operator-mandated 4% monthly profit floor (directive 2026-05-14).
-            monthly_profit_target_pct: ftmo.min_monthly_net_profit_pct as f64,
-            // FIXME(hardcoded): config-extract — strategy risk-per-trade tunables.
+            // Monthly profit floor (operator directive 2026-05-14)
+            // tracks the active preset's published target.
+            monthly_profit_target_pct: constraints.min_monthly_net_profit_pct as f64,
             min_risk_per_trade: 0.0,
-            // FIXME(hardcoded): config-extract — strategy risk-per-trade tunables.
             max_risk_per_trade: 0.030,
-            // FIXME(hardcoded): config-extract — strategy risk-per-trade tunables.
             risk_per_trade: 0.030,
-            // FIXME(hardcoded): config-extract — internal early stop below FTMO 5% prop-firm limit.
-            // Production code that needs the actual FTMO DD limit must read
-            // `PropFirmConstraints::FTMO_STANDARD.max_daily_loss_pct`.
-            daily_drawdown_limit: 0.04,
-            // FIXME(hardcoded): config-extract — internal trailing total cap below FTMO 10% prop-firm limit.
-            // Production code that needs the actual FTMO DD limit must read
-            // `PropFirmConstraints::FTMO_STANDARD.max_overall_drawdown_pct`.
-            total_drawdown_limit: 0.07,
-            // FIXME(hardcoded): config-extract — strategy risk-reward floor.
+            // Internal early stop sits 20% below the firm's published
+            // daily-loss ceiling so a guard-rail trips before a real
+            // breach. Operators override in YAML if their firm gives
+            // tighter / looser tolerance.
+            daily_drawdown_limit: runtime.daily_dd_stop_trading_pct,
+            // Internal trailing total cap at 70% of the firm's
+            // overall-drawdown ceiling for the same buffer reason.
+            total_drawdown_limit: (constraints.max_overall_drawdown_pct as f64) * 0.7,
             min_risk_reward: 2.0,
             spread_guard_multiplier: 2.5,
             slippage_guard_multiplier: 2.0,
-            max_lot_size: 10.0,
+            max_lot_size: runtime.max_lot_size,
             require_stop_loss: true,
             challenge_mode: false,
             challenge_phase: "phase_1".to_string(),
-            prop_firm_rules: true,
-            max_daily_risk_pct: 0.04,
+            // Disable the prop-firm gate entirely when the operator
+            // selected `preset: none` — they're trading their own
+            // money; we still respect per-trade risk limits but skip
+            // the challenge accounting.
+            prop_firm_rules: preset != PropFirmPreset::None,
+            max_daily_risk_pct: runtime.daily_dd_stop_trading_pct,
             base_risk_per_trade: 0.03,
-            daily_risk_budget: 0.040,
+            daily_risk_budget: runtime.daily_dd_stop_trading_pct,
             consistency_tracking: true,
             min_confidence_threshold: 0.55,
             kill_zones_enabled: true,
             enhanced_features: true,
             uncertainty_quantification: true,
-            max_trades_per_day: 8,
-            daily_profit_stop_pct: 0.0,
+            // Cap is preset-driven. FTMO defaults to 15; The5%ers is
+            // tighter; "own money" raises it. Operators can override
+            // via YAML when their style demands a different cap.
+            max_trades_per_day: runtime.max_trades_per_day,
+            daily_profit_stop_pct: runtime.daily_profit_lock_pct,
             recovery_mode_enabled: true,
             feature_drift_threshold: 0.30,
             high_quality_confidence: 0.65,
@@ -314,7 +338,7 @@ impl Default for RiskConfig {
             backtest_spread_pips: 1.5,
             cost_penalty_r: 0.0,
             gate_trade_prob: 0.55,
-            daily_hard_stop_pct: 0.04,
+            daily_hard_stop_pct: runtime.daily_dd_stop_trading_pct,
             conformal_enabled: true,
             conformal_alpha: 0.10,
             conformal_abstain_min_set_size: 3,

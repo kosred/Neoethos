@@ -318,11 +318,21 @@ mod tests {
         assert!(log_name.ends_with(".log"));
         assert_eq!(state.hardware.cpu_cores, num_cpus::get() as i32);
         assert!(state.hardware.gpu_enabled);
-        assert_eq!(state.risk.daily_drawdown_limit, 0.04);
-        assert_eq!(state.risk.total_drawdown_limit, 0.07);
+        // FTMO preset defaults — approx-equal because the values are
+        // now computed from `PropFirmConstraints` f32 constants (the
+        // multiply-cast introduces sub-ULP drift, e.g. 0.10 * 0.7 in
+        // f64 ≠ literal 0.07).
+        assert!((state.risk.daily_drawdown_limit - 0.04).abs() < 1e-6);
+        assert!((state.risk.total_drawdown_limit - 0.07).abs() < 1e-6);
         assert_eq!(state.risk.max_lot_size, 10.0);
         assert_eq!(state.risk.risk_per_trade, 0.03);
         assert!(state.risk.require_stop_loss);
+        // FTMO is the back-compat default preset (so existing
+        // operators get the same numbers they had before #112).
+        assert_eq!(
+            state.risk.preset,
+            neoethos_core::domain::prop_firm::PropFirmPreset::Ftmo
+        );
     }
 
     #[test]

@@ -68,6 +68,7 @@ pub fn router(state: AppApiState) -> Router {
         .route("/account/snapshot", get(account::snapshot))
         .route("/hardware", get(hardware::hardware))
         .route("/risk", get(risk::risk))
+        .route("/risk/preset", post(risk::update_preset))
         .route(
             "/settings",
             get(settings::settings).post(settings::update_settings),
