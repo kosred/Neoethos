@@ -265,13 +265,51 @@ where
 
 /// Build the system prompt the model sees. Combines the
 /// task-agnostic preamble with the dynamic tool list.
+///
+/// #126 — topic-scope enforcement. The preamble explicitly scopes
+/// the model to economics + trading + the operator's platform.
+/// Off-topic questions (poems, recipes, general chitchat) get a
+/// polite decline that points the user back at what we DO answer.
+/// The model also gets a directive about its role relative to the
+/// trained models: it explains, it doesn't override.
 pub fn build_system_prompt(registry: &ToolRegistry) -> String {
     let tools_block = registry.render_for_prompt();
     format!(
         "You are NeoEthos, a local AI assistant embedded in a forex trading platform. \
          You help the operator understand their account, risk settings, market data, \
-         and strategy performance. Stay concise, factual, and never invent numbers — \
-         use the tools below to fetch real data.\n\n\
+         their trained ML strategies, and the economic context.\n\n\
+         \
+         ## Scope (strict)\n\
+         You ONLY discuss topics related to: forex / commodities / index trading, \
+         economics, the operator's NeoEthos account and positions, the platform's \
+         trained ML models, risk management, and news that affects markets. If the \
+         user asks about anything else (weather, recipes, code in other domains, \
+         personal advice, general chitchat), politely decline with one sentence \
+         like: \"I'm scoped to trading and markets — happy to help with anything \
+         in that area.\" Do not attempt the off-topic task even partially.\n\n\
+         \
+         ## Your role relative to the trained models\n\
+         The platform runs its own ML strategies that open and close positions. \
+         You are NOT above those models — you are the EXPLAINER. When the user \
+         asks about a trade, your job is to read the signal metadata (use the \
+         tools below) and translate what the models saw into plain language. \
+         You may flag concerns (\"this trade is bigger than your usual size\") \
+         but you do not override the strategy's decisions. Trade-management \
+         actions, when added later, require explicit user confirmation.\n\n\
+         \
+         ## Truthfulness\n\
+         Stay concise, factual, and never invent numbers. Always use the tools \
+         below to fetch real data. If you don't know something and no tool can \
+         answer it, say so directly — do not guess.\n\n\
+         \
+         ## Memory\n\
+         You have persistent memory via `save_memory_note` / `load_memory_note`. \
+         At the start of a conversation it's often useful to `list_memory_keys` \
+         to see what you already know about the operator before answering. \
+         Save user preferences (\"trade only EURUSD\", \"prefer 50-pip stops\") \
+         with category `user_pref`, news digests with `event_digest`, trade \
+         narratives with `trade_explanation`.\n\n\
+         \
          {tools_block}"
     )
 }
@@ -771,6 +809,204 @@ impl Tool for GetRecentLogLinesTool {
     }
 }
 
+// ─── Persistent-memory tools (#125) ───────────────────────────────
+//
+// Four thin wrappers around `crate::app_services::gemma_memory`.
+// The model uses these to remember user preferences, digested news
+// events, and trade explanations across sessions. Without them
+// every chat turn forgets everything before it.
+
+use crate::app_services::gemma_memory::{self, NoteCategory};
+
+pub struct SaveMemoryNoteTool;
+
+impl Tool for SaveMemoryNoteTool {
+    fn name(&self) -> &'static str {
+        "save_memory_note"
+    }
+
+    fn description(&self) -> &'static str {
+        "Stores a note in persistent memory so you can read it back in a future \
+         chat turn or session. Arguments: `key` (unique identifier — re-saving \
+         the same key overwrites), `content` (the note body), `category` (one \
+         of: user_pref, event_digest, trade_explanation, scratch). Use \
+         `user_pref` for things the user told you to remember forever, \
+         `event_digest` for news/calendar summaries, `trade_explanation` for \
+         per-trade narratives, `scratch` for anything else (FIFO-evicted at \
+         200 entries)."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "key":      {"type": "string"},
+                "content":  {"type": "string"},
+                "category": {"type": "string", "enum": ["user_pref", "event_digest", "trade_explanation", "scratch"]}
+            },
+            "required": ["key", "content", "category"]
+        })
+    }
+
+    fn execute(&self, _state: &AppApiState, args: Value) -> Result<Value> {
+        let key = args.get("key").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing `key`"))?.to_string();
+        let content = args.get("content").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing `content`"))?.to_string();
+        let cat_raw = args.get("category").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing `category`"))?;
+        let category = NoteCategory::parse(cat_raw).ok_or_else(|| {
+            anyhow!(
+                "unknown category `{cat_raw}`. Valid: user_pref, event_digest, \
+                 trade_explanation, scratch"
+            )
+        })?;
+        gemma_memory::global()?.save(&key, &content, category)?;
+        Ok(json!({"ok": true, "key": key, "category": category.as_str()}))
+    }
+}
+
+pub struct LoadMemoryNoteTool;
+
+impl Tool for LoadMemoryNoteTool {
+    fn name(&self) -> &'static str {
+        "load_memory_note"
+    }
+
+    fn description(&self) -> &'static str {
+        "Reads a single note from persistent memory by key. Returns the note \
+         content + category + timestamps, or `{found: false}` if absent. Use \
+         to check whether you already digested an event ('did I see today's \
+         NFP?') or to recall a user preference. Argument: `key`."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"]
+        })
+    }
+
+    fn execute(&self, _state: &AppApiState, args: Value) -> Result<Value> {
+        let key = args.get("key").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing `key`"))?;
+        match gemma_memory::global()?.load(key)? {
+            Some(note) => Ok(json!({
+                "found": true,
+                "key": note.key,
+                "content": note.content,
+                "category": note.category,
+                "created_at_unix_ms": note.created_at_unix_ms,
+                "updated_at_unix_ms": note.updated_at_unix_ms,
+            })),
+            None => Ok(json!({"found": false, "key": key})),
+        }
+    }
+}
+
+pub struct ListMemoryKeysTool;
+
+impl Tool for ListMemoryKeysTool {
+    fn name(&self) -> &'static str {
+        "list_memory_keys"
+    }
+
+    fn description(&self) -> &'static str {
+        "Lists notes in persistent memory, most-recently-updated first. \
+         Optional filters: `prefix` (e.g. \"trade:\" to find all trade \
+         explanations), `category` (one of user_pref/event_digest/\
+         trade_explanation/scratch), `limit` (default 20, max 100). Use to \
+         scan what you already know before deciding whether to ask the user \
+         or fetch fresh data."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "prefix":   {"type": "string"},
+                "category": {"type": "string"},
+                "limit":    {"type": "integer", "minimum": 1, "maximum": 100}
+            }
+        })
+    }
+
+    fn execute(&self, _state: &AppApiState, args: Value) -> Result<Value> {
+        let prefix = args.get("prefix").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let category = args
+            .get("category")
+            .and_then(|v| v.as_str())
+            .and_then(NoteCategory::parse);
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20)
+            .clamp(1, 100) as usize;
+        let notes = gemma_memory::global()?.list(prefix.as_deref(), category, limit)?;
+        // Compact result — content elided to keep the model's
+        // context window happy when the list is long. Caller must
+        // load_memory_note(key) to get the actual content.
+        let summaries: Vec<Value> = notes
+            .iter()
+            .map(|n| {
+                json!({
+                    "key": n.key,
+                    "category": n.category,
+                    "updated_at_unix_ms": n.updated_at_unix_ms,
+                    "content_preview": preview(&n.content, 120),
+                })
+            })
+            .collect();
+        Ok(json!({
+            "count": summaries.len(),
+            "notes": summaries,
+        }))
+    }
+}
+
+pub struct ForgetMemoryNoteTool;
+
+impl Tool for ForgetMemoryNoteTool {
+    fn name(&self) -> &'static str {
+        "forget_memory_note"
+    }
+
+    fn description(&self) -> &'static str {
+        "Permanently removes a note from persistent memory. Idempotent: \
+         forgetting a key that doesn't exist is fine, returns `{removed: \
+         false}`. Use ONLY when the user explicitly asks you to forget \
+         something, OR when a note is clearly stale (e.g. an event_digest \
+         for last year's NFP that someone forgot to TTL out)."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"]
+        })
+    }
+
+    fn execute(&self, _state: &AppApiState, args: Value) -> Result<Value> {
+        let key = args.get("key").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing `key`"))?;
+        let removed = gemma_memory::global()?.forget(key)?;
+        Ok(json!({"removed": removed, "key": key}))
+    }
+}
+
+/// Truncate a string for the list-tool preview field. Cuts at the
+/// nearest char boundary so we don't slice a multi-byte UTF-8
+/// scalar in half.
+fn preview(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(max_chars).collect();
+    format!("{truncated}…")
+}
+
 pub fn register_default_tools(registry: &mut ToolRegistry) {
     registry.register(Box::new(GetAccountSnapshotTool));
     registry.register(Box::new(GetOpenPositionsTool));
@@ -779,6 +1015,10 @@ pub fn register_default_tools(registry: &mut ToolRegistry) {
     registry.register(Box::new(GetNewsTradingModeTool));
     registry.register(Box::new(FetchUrlTool));
     registry.register(Box::new(GetRecentLogLinesTool));
+    registry.register(Box::new(SaveMemoryNoteTool));
+    registry.register(Box::new(LoadMemoryNoteTool));
+    registry.register(Box::new(ListMemoryKeysTool));
+    registry.register(Box::new(ForgetMemoryNoteTool));
 }
 
 #[cfg(test)]
@@ -799,6 +1039,10 @@ mod tests {
             "get_news_trading_mode",
             "fetch_url",
             "get_recent_log_lines",
+            "save_memory_note",
+            "load_memory_note",
+            "list_memory_keys",
+            "forget_memory_note",
         ] {
             assert!(
                 rendered.contains(name),
@@ -850,6 +1094,31 @@ mod tests {
     fn ssrf_guard_rejects_malformed_url() {
         assert!(ssrf_guard("not a url").is_err());
         assert!(ssrf_guard("").is_err());
+    }
+
+    #[test]
+    fn system_prompt_carries_scope_and_role_directives() {
+        let mut reg = ToolRegistry::new();
+        register_default_tools(&mut reg);
+        let prompt = build_system_prompt(&reg);
+        // Scope: must explicitly call out the off-topic decline.
+        assert!(
+            prompt.contains("Scope") && prompt.contains("politely decline"),
+            "system prompt must contain the scope-enforcement block"
+        );
+        // Role: must explicitly position Gemma as the explainer, not
+        // the override layer. This is the directive from #112 + the
+        // user's #124 follow-up.
+        assert!(
+            prompt.contains("EXPLAINER") || prompt.contains("explainer"),
+            "system prompt must scope Gemma's role to explanation, not override"
+        );
+        // Memory hint: the model should know it has persistent
+        // memory and that `list_memory_keys` is a good first call.
+        assert!(
+            prompt.contains("list_memory_keys"),
+            "system prompt should mention the memory-list tool by name"
+        );
     }
 
     #[test]

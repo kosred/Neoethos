@@ -54,6 +54,8 @@ pub mod reauth;
 // and tools themselves are unreachable. Gating the module avoids
 // 30+ false-positive dead-code warnings in the default build.
 #[cfg(feature = "gemma-backend")]
+pub mod gemma_memory;
+#[cfg(feature = "gemma-backend")]
 pub mod gemma_tools;
 pub mod risky_mode_persistence;
 pub mod secure_store;
