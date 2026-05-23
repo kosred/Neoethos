@@ -529,6 +529,46 @@ class BackendClient {
     return ChartSnapshot.fromJson(response.data!);
   }
 
+  /// `/indicators?symbol=…&timeframe=…&indicator=…&period=…&limit=…`
+  /// — compute a single indicator overlay for the chart. Backed by
+  /// vector_ta. Returns a list of named lines; single-output
+  /// indicators have 1 line, multi-output (Bollinger / MACD /
+  /// Stochastic) decompose to 3-ish lines.
+  Future<IndicatorSnapshot> fetchIndicator({
+    required String symbol,
+    required String timeframe,
+    required String indicator,
+    double? period,
+    double? stdDev,
+    double? fast,
+    double? slow,
+    double? signal,
+    double? kPeriod,
+    double? kSlow,
+    double? dPeriod,
+    int limit = 200,
+  }) async {
+    final query = <String, dynamic>{
+      'symbol': symbol,
+      'timeframe': timeframe,
+      'indicator': indicator,
+      'limit': limit,
+    };
+    if (period != null) query['period'] = period;
+    if (stdDev != null) query['std_dev'] = stdDev;
+    if (fast != null) query['fast'] = fast;
+    if (slow != null) query['slow'] = slow;
+    if (signal != null) query['signal'] = signal;
+    if (kPeriod != null) query['k_period'] = kPeriod;
+    if (kSlow != null) query['k_slow'] = kSlow;
+    if (dPeriod != null) query['d_period'] = dPeriod;
+    final r = await _dio.get<Map<String, dynamic>>(
+      '/indicators',
+      queryParameters: query,
+    );
+    return IndicatorSnapshot.fromJson(r.data ?? const {});
+  }
+
   /// `/intelligence` — model artifacts + discovery targets + walkforward.
   Future<IntelligenceSnapshot> fetchIntelligence() async {
     final response = await _dio.get<Map<String, dynamic>>('/intelligence');
@@ -968,6 +1008,46 @@ class ChartSnapshot {
         latestClose: (j['latestClose'] as num).toDouble(),
         priceChangePct: (j['priceChangePct'] as num).toDouble(),
         headline: (j['headline'] as String?) ?? '',
+      );
+}
+
+/// One series produced by `/indicators`. Multi-output indicators
+/// (Bollinger Bands → lower/middle/upper) come back as multiple
+/// of these in the same snapshot.
+class IndicatorLine {
+  final String name;
+  final List<double> values;
+  const IndicatorLine({required this.name, required this.values});
+  factory IndicatorLine.fromJson(Map<String, dynamic> j) => IndicatorLine(
+        name: (j['name'] as String?) ?? '',
+        values: ((j['values'] as List?) ?? const [])
+            .map((e) => (e as num).toDouble())
+            .toList(growable: false),
+      );
+}
+
+class IndicatorSnapshot {
+  final String symbol;
+  final String timeframe;
+  final String indicator;
+  final int candleCount;
+  final List<IndicatorLine> lines;
+  const IndicatorSnapshot({
+    required this.symbol,
+    required this.timeframe,
+    required this.indicator,
+    required this.candleCount,
+    required this.lines,
+  });
+  factory IndicatorSnapshot.fromJson(Map<String, dynamic> j) =>
+      IndicatorSnapshot(
+        symbol: (j['symbol'] as String?) ?? '',
+        timeframe: (j['timeframe'] as String?) ?? '',
+        indicator: (j['indicator'] as String?) ?? '',
+        candleCount: (j['candleCount'] as num?)?.toInt() ?? 0,
+        lines: ((j['lines'] as List?) ?? const [])
+            .map((e) => IndicatorLine.fromJson(e as Map<String, dynamic>))
+            .toList(growable: false),
       );
 }
 

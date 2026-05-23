@@ -1,6 +1,7 @@
 // Chart screen — symbol + timeframe chips, candlestick canvas painted
-// from `/chart` OHLC data. Read-only (the local data dir is the
-// source); switching chips refetches via Riverpod.
+// from `/chart` OHLC data, plus optional indicator overlays from
+// `/indicators` (server-side vector_ta). Read-only (the local data
+// dir is the source); switching chips refetches via Riverpod.
 //
 // Symbol + timeframe lists come EXCLUSIVELY from the broker. No
 // hardcoded fallbacks — when the broker isn't reachable, the screen
@@ -17,6 +18,66 @@ import '../api/backend_client.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
 import '_placeholder.dart';
+
+/// Top-10 indicators surfaced as toggle chips above the chart.
+/// Mirrors the server's ALLOWED_INDICATORS list. Order = display order.
+const _indicatorChips = <String>[
+  'sma',
+  'ema',
+  'rsi',
+  'macd',
+  'bollinger_bands',
+  'atr',
+  'stoch',
+  'adx',
+  'vwap',
+];
+
+/// Which indicators render directly on the price chart (share the
+/// candle's Y-axis range). The others would need a separate sub-panel
+/// with its own Y-axis — that lands in a follow-up; for now toggling
+/// them on shows the chip as active but doesn't draw anything.
+const _priceBandOverlays = <String>{
+  'sma',
+  'ema',
+  'bollinger_bands',
+  'vwap',
+};
+
+/// One color per indicator-line index — round-robin through this when
+/// painting multi-line overlays (e.g. Bollinger Bands has 3 lines).
+const _overlayPalette = <Color>[
+  Color(0xFF60A5FA), // blue
+  Color(0xFFFBBF24), // amber
+  Color(0xFF34D399), // emerald
+  Color(0xFFF472B6), // pink
+  Color(0xFFA78BFA), // violet
+];
+
+String _indicatorLabel(String id) {
+  switch (id) {
+    case 'sma':
+      return 'SMA';
+    case 'ema':
+      return 'EMA';
+    case 'rsi':
+      return 'RSI';
+    case 'macd':
+      return 'MACD';
+    case 'bollinger_bands':
+      return 'BBands';
+    case 'atr':
+      return 'ATR';
+    case 'stoch':
+      return 'Stoch';
+    case 'adx':
+      return 'ADX';
+    case 'vwap':
+      return 'VWAP';
+    default:
+      return id.toUpperCase();
+  }
+}
 
 class ChartScreen extends ConsumerWidget {
   const ChartScreen({super.key});
@@ -127,6 +188,38 @@ class ChartScreen extends ConsumerWidget {
                     ],
                   ),
           ),
+          SectionCard(
+            title: 'Indicators · vector_ta',
+            child: Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                for (final ind in _indicatorChips)
+                  Consumer(
+                    builder: (ctx, indRef, _) {
+                      final active = indRef
+                          .watch(activeIndicatorsProvider)
+                          .contains(ind);
+                      return _Chip(
+                        label: _indicatorLabel(ind),
+                        selected: active,
+                        onTap: () {
+                          final notifier = indRef
+                              .read(activeIndicatorsProvider.notifier);
+                          final next = {...notifier.state};
+                          if (next.contains(ind)) {
+                            next.remove(ind);
+                          } else {
+                            next.add(ind);
+                          }
+                          notifier.state = next;
+                        },
+                      );
+                    },
+                  ),
+              ],
+            ),
+          ),
           async.when(
             data: (c) => _ChartBody(snapshot: c),
             loading: () => const _Loading(),
@@ -138,12 +231,12 @@ class ChartScreen extends ConsumerWidget {
   }
 }
 
-class _ChartBody extends StatelessWidget {
+class _ChartBody extends ConsumerWidget {
   final ChartSnapshot snapshot;
   const _ChartBody({required this.snapshot});
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final changePos = snapshot.priceChangePct >= 0;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -207,13 +300,7 @@ class _ChartBody extends StatelessWidget {
                   ),
                 )
               else
-                SizedBox(
-                  height: 320,
-                  child: CustomPaint(
-                    painter: _CandlestickPainter(snapshot: snapshot),
-                    size: Size.infinite,
-                  ),
-                ),
+                _ChartCanvasWithOverlays(snapshot: snapshot),
             ],
           ),
         ),
@@ -222,9 +309,105 @@ class _ChartBody extends StatelessWidget {
   }
 }
 
+/// Glue widget — watches the active-indicator set, fetches each
+/// price-band overlay, and hands a flattened list of lines to the
+/// candlestick painter. Oscillators (RSI/MACD/Stoch/ADX/ATR) still
+/// toggle in the chip row but don't draw here — they need their own
+/// sub-panel with an independent Y-axis (next iteration).
+class _ChartCanvasWithOverlays extends ConsumerWidget {
+  final ChartSnapshot snapshot;
+  const _ChartCanvasWithOverlays({required this.snapshot});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final active = ref.watch(activeIndicatorsProvider);
+    final overlayLines = <_PaintedLine>[];
+    var colorIdx = 0;
+    for (final ind in active) {
+      if (!_priceBandOverlays.contains(ind)) continue;
+      final snap = ref.watch(indicatorProvider(ind));
+      snap.whenData((s) {
+        for (final line in s.lines) {
+          overlayLines.add(_PaintedLine(
+            label: '${_indicatorLabel(ind)}${s.lines.length > 1 ? " · ${line.name.split("_").last}" : ""}',
+            values: line.values,
+            color: _overlayPalette[colorIdx % _overlayPalette.length],
+          ));
+          colorIdx++;
+        }
+      });
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          height: 320,
+          child: CustomPaint(
+            painter: _CandlestickPainter(
+              snapshot: snapshot,
+              overlays: overlayLines,
+            ),
+            size: Size.infinite,
+          ),
+        ),
+        if (overlayLines.isNotEmpty) ...[
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 10,
+            runSpacing: 4,
+            children: [
+              for (final line in overlayLines)
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(width: 10, height: 2, color: line.color),
+                    const SizedBox(width: 4),
+                    Text(
+                      line.label,
+                      style: const TextStyle(
+                        fontSize: 10,
+                        color: ForexAiTokens.textMuted,
+                      ),
+                    ),
+                  ],
+                ),
+            ],
+          ),
+        ],
+        // Oscillators that the user toggled on but we can't render
+        // on the price canvas yet — surface a hint so they know it
+        // worked but is parked.
+        if (active.any((i) => !_priceBandOverlays.contains(i))) ...[
+          const SizedBox(height: 4),
+          Text(
+            'Oscillators (${active.where((i) => !_priceBandOverlays.contains(i)).map(_indicatorLabel).join(", ")}) — sub-panel coming soon.',
+            style: const TextStyle(
+              fontSize: 10,
+              color: ForexAiTokens.textFaint,
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+/// Cheap value-type for the painter: one line on the canvas.
+class _PaintedLine {
+  final String label;
+  final List<double> values;
+  final Color color;
+  const _PaintedLine({
+    required this.label,
+    required this.values,
+    required this.color,
+  });
+}
+
 class _CandlestickPainter extends CustomPainter {
   final ChartSnapshot snapshot;
-  _CandlestickPainter({required this.snapshot});
+  final List<_PaintedLine> overlays;
+  _CandlestickPainter({required this.snapshot, this.overlays = const []});
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -310,6 +493,35 @@ class _CandlestickPainter extends CustomPainter {
       );
     }
 
+    // Indicator overlays: one polyline per series. Skips leading
+    // NaN warm-up bars (most indicators emit NaN until they have
+    // enough history) so the line begins where the indicator
+    // actually has a value. Indicator series are right-aligned with
+    // the candle slice: index 0 of the overlay maps to index 0 of
+    // the visible candles (server already trimmed to limit).
+    for (final overlay in overlays) {
+      final overlayPaint = Paint()
+        ..color = overlay.color
+        ..strokeWidth = 1.5
+        ..style = PaintingStyle.stroke;
+      Offset? prev;
+      final maxLen =
+          overlay.values.length < candles.length ? overlay.values.length : candles.length;
+      for (var i = 0; i < maxLen; i++) {
+        final v = overlay.values[i];
+        if (v.isNaN || v.isInfinite) {
+          prev = null;
+          continue;
+        }
+        final cx = padLeft + slot * (i + 0.5);
+        final cy = yOf(v);
+        if (prev != null) {
+          canvas.drawLine(prev, Offset(cx, cy), overlayPaint);
+        }
+        prev = Offset(cx, cy);
+      }
+    }
+
     // X-axis: first + middle + last timestamp label.
     final tsFmt = DateFormat('MM-dd HH:mm');
     String tsLabel(int idx) {
@@ -350,7 +562,21 @@ class _CandlestickPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _CandlestickPainter old) =>
-      old.snapshot != snapshot;
+      old.snapshot != snapshot ||
+      old.overlays.length != overlays.length ||
+      // Compare colors/lengths as a cheap proxy — full value-by-value
+      // comparison would dominate paint time for long histories.
+      !_overlaysShallowEqual(old.overlays, overlays);
+
+  static bool _overlaysShallowEqual(List<_PaintedLine> a, List<_PaintedLine> b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i].color != b[i].color || a[i].values.length != b[i].values.length) {
+        return false;
+      }
+    }
+    return true;
+  }
 }
 
 class _Chip extends StatelessWidget {

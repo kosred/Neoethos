@@ -150,3 +150,30 @@ final dataBootstrapProvider =
   final client = ref.read(backendClientProvider);
   return client.fetchDataBootstrap();
 });
+
+// ─── Chart indicator overlays ────────────────────────────────────────────
+//
+// The Chart screen lets the user toggle on/off a small set of
+// technical indicators that overlay the candlestick canvas.
+// Server-side compute (vector_ta) so the math stays in one place
+// and the chart pan/zoom only re-fetches when symbol/timeframe
+// change — toggling an indicator is a single round-trip.
+
+/// Currently-enabled indicator ids (e.g. `{"sma", "ema"}`). The
+/// chart watches this and renders one overlay per id.
+final activeIndicatorsProvider = StateProvider<Set<String>>((ref) => {});
+
+/// Per-indicator fetch. Family-keyed by indicator id; refetches
+/// whenever the symbol or timeframe changes.
+final indicatorProvider = FutureProvider.autoDispose
+    .family<IndicatorSnapshot, String>((ref, indicatorName) {
+  final symbol = ref.watch(chartSymbolProvider);
+  final tf = ref.watch(chartTimeframeProvider);
+  final client = ref.read(backendClientProvider);
+  return client.fetchIndicator(
+    symbol: symbol,
+    timeframe: tf,
+    indicator: indicatorName,
+    limit: 200,
+  );
+});
