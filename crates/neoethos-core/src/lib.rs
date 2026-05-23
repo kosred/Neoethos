@@ -1,3 +1,4 @@
+pub mod broker_config;
 pub mod config;
 pub mod contracts;
 pub mod domain;
@@ -10,6 +11,13 @@ pub mod symbol_metadata;
 pub mod system;
 pub mod utils;
 
+pub use broker_config::{
+    BROKER_CREDENTIALS_SCHEMA_VERSION, BrokerAccountTarget, BrokerSettingsState,
+    CTRADER_CREATE_DEMO_ACCOUNT_URL, CTRADER_CREATE_LIVE_ACCOUNT_URL, CTraderBrokerEnvironment,
+    CTraderBrokerSettings, DxTradeBrokerSettings, credentials_file_path,
+    load_from_disk as load_broker_credentials_from_disk,
+    save_to_disk as save_broker_credentials_to_disk,
+};
 pub use config::Settings;
 pub use contracts::{
     ARTIFACT_SCHEMA_VERSION, ArtifactContractError, ArtifactContractKind, ArtifactEnvelope,

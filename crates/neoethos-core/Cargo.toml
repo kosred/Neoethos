@@ -34,6 +34,10 @@ reqwest = { version = "0.13.3", default-features = false, features = ["rustls", 
 # users to `secrecy` for string-shaped secrets because `Zeroizing<String>`
 # leaves un-zeroed reallocated buffers on the heap.
 secrecy = "0.10"
+# TOML serializer for the broker credentials file. Owns the
+# canonical on-disk shape so both neoethos-app and neoethos-cli can
+# read + write `broker_credentials.toml` without a workspace cycle.
+toml = "0.8.20"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.1", features = [

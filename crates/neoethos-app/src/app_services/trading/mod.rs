@@ -5,7 +5,8 @@
 // external (`neoethos-app`) surface is unchanged.
 pub(super) use crate::app_services::ServiceEvent;
 pub(super) use crate::app_services::broker_config::{
-    AdapterReadinessSnapshot, BrokerSessionState, BrokerSettingsState, CTraderBrokerEnvironment,
+    AdapterReadinessSnapshot, BrokerSessionState, BrokerSettingsReadiness, BrokerSettingsState,
+    CTraderBrokerEnvironment,
 };
 pub(super) use crate::app_services::ctrader_account::{
     CTraderAccountRuntimeBackend, CTraderAccountRuntimeRequest, CTraderAccountRuntimeSnapshot,

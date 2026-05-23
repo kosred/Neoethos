@@ -1,9 +1,9 @@
-//! Persistence layer for [`BrokerSettingsState`].
+//! App-side persistence wrapper for [`BrokerSettingsState`].
 //!
-//! Loads and saves broker connection credentials (cTrader Open API client ID,
-//! client secret, redirect URI, etc.) to a TOML file outside the repository,
-//! so the application can pre-populate the Settings → Brokers UI on startup
-//! instead of requiring the user to retype credentials every launch.
+//! The raw I/O lives in `neoethos-core::broker_config` so the CLI can
+//! reuse it. This module layers the `neoethos-app`-specific
+//! embedded-credentials fallback (compile-time constants baked in by
+//! `build.rs`) on top of the load path.
 //!
 //! # Lookup order (highest priority first)
 //!
@@ -14,6 +14,8 @@
 //! 3. `<cwd>/.local/neoethos/broker_credentials.toml` — dev machine fallback.
 //! 4. Compile-time embedded constants from [`crate::app_services::embedded_credentials`]
 //!    — baked into the binary by `build.rs` for zero-config distribution.
+//!    THIS LAYER LIVES ONLY IN `neoethos-app` — the CLI's `credentials set`
+//!    path skips it on purpose (the operator is writing fresh values).
 //!
 //! # Security
 //!
@@ -24,75 +26,14 @@
 //! - `DxTradeBrokerSettings::password` — re-entered each session
 
 use crate::app_services::broker_config::BrokerSettingsState;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::PathBuf;
-use std::{env, fs};
 
-const APP_CONFIG_SUBDIR: &str = "neoethos";
-const CREDENTIALS_FILENAME: &str = "broker_credentials.toml";
-const ENV_OVERRIDE_VAR: &str = "NEOETHOS_BROKER_CREDENTIALS_PATH";
-
-/// Resolves the path to the broker credentials TOML file.
-///
-/// Order of resolution:
-/// 1. `$NEOETHOS_BROKER_CREDENTIALS_PATH` if non-empty
-/// 2. `<dirs::config_dir>/neoethos/broker_credentials.toml`
-/// 3. `<cwd>/.local/neoethos/broker_credentials.toml`
-///
-/// Returns the first candidate that EXISTS. If none exists, returns the
-/// preferred candidate (env override → config_dir → local) so the caller can
-/// create it.
+/// Re-export the shared path resolver so existing call sites
+/// (`crate::app_services::broker_persistence::credentials_file_path`)
+/// keep working after the move into `neoethos-core`.
 pub fn credentials_file_path() -> Result<PathBuf> {
-    // Env override is AUTHORITATIVE: when set, it bypasses both the
-    // existing-file lookup AND the fallback chain so tests can target
-    // an isolated temp path WITHOUT silently falling through to the
-    // operator's real `~/AppData/Roaming/neoethos/broker_credentials.toml`.
-    // (That fall-through was a real bug — tests were writing to the
-    // user's live credentials file when their temp path did not yet
-    // exist.)
-    if let Ok(custom) = env::var(ENV_OVERRIDE_VAR) {
-        if !custom.trim().is_empty() {
-            return Ok(PathBuf::from(custom));
-        }
-    }
-
-    let candidates = candidate_paths()?;
-
-    for candidate in &candidates {
-        if candidate.is_file() {
-            return Ok(candidate.clone());
-        }
-    }
-
-    candidates
-        .into_iter()
-        .next()
-        .context("no candidate path could be resolved for broker credentials")
-}
-
-fn candidate_paths() -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::with_capacity(2);
-
-    if let Some(config_dir) = dirs::config_dir() {
-        paths.push(
-            config_dir
-                .join(APP_CONFIG_SUBDIR)
-                .join(CREDENTIALS_FILENAME),
-        );
-    }
-
-    if let Ok(cwd) = env::current_dir() {
-        paths.push(
-            cwd.join(".local")
-                .join(APP_CONFIG_SUBDIR)
-                .join(CREDENTIALS_FILENAME),
-        );
-    }
-
-    if paths.is_empty() {
-        anyhow::bail!("unable to determine broker credentials file path on this platform");
-    }
-    Ok(paths)
+    neoethos_core::broker_config::credentials_file_path()
 }
 
 /// Loads broker settings, applying the four-level resolution chain.
@@ -105,9 +46,11 @@ pub fn load_broker_settings() -> BrokerSettingsState {
     settings
 }
 
-/// Filesystem portion of the load (levels 1–3).
+/// Filesystem portion of the load (levels 1–3). Delegates the bytes-
+/// and-TOML work to `neoethos-core` and logs at the app layer for
+/// observability parity with the prior implementation.
 fn load_from_filesystem() -> BrokerSettingsState {
-    let path = match credentials_file_path() {
+    let path = match neoethos_core::broker_config::credentials_file_path() {
         Ok(p) => p,
         Err(err) => {
             tracing::warn!(error = %err, "broker credentials path resolution failed");
@@ -115,54 +58,27 @@ fn load_from_filesystem() -> BrokerSettingsState {
         }
     };
 
-    if !path.is_file() {
-        tracing::debug!(
-            path = %path.display(),
-            "no broker credentials file found; will use embedded defaults"
-        );
-        return BrokerSettingsState::default();
-    }
-
-    match fs::read_to_string(&path) {
-        Ok(contents) => match toml::from_str::<BrokerSettingsState>(&contents) {
-            Ok(s) => {
-                // Schema version sanity check. Per Phase D4 the
-                // contract carries `schema_version: SchemaVersion`;
-                // pre-versioning files default to v1 via
-                // `#[serde(default = "default_v1")]`. We only fail
-                // loud when the file is from a NEWER build than
-                // this binary — the operator must update the app.
-                if let Err(err) =
-                    neoethos_core::check_schema_version_readable(&s, "broker_credentials.toml")
-                {
-                    tracing::error!(
-                        path = %path.display(),
-                        error = %err,
-                        "broker_credentials.toml schema version mismatch; falling back to defaults"
-                    );
-                    return BrokerSettingsState::default();
-                }
-                tracing::info!(
-                    path = %path.display(),
-                    schema_version = %s.schema_version,
-                    "loaded broker credentials from disk"
-                );
-                s
-            }
-            Err(err) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "failed to parse broker credentials TOML; will try embedded defaults"
-                );
-                BrokerSettingsState::default()
-            }
-        },
+    match neoethos_core::broker_config::load_from_disk(&path) {
+        Ok(Some(s)) => {
+            tracing::info!(
+                path = %path.display(),
+                schema_version = %s.schema_version,
+                "loaded broker credentials from disk"
+            );
+            s
+        }
+        Ok(None) => {
+            tracing::debug!(
+                path = %path.display(),
+                "no broker credentials file found; will use embedded defaults"
+            );
+            BrokerSettingsState::default()
+        }
         Err(err) => {
             tracing::warn!(
                 path = %path.display(),
                 error = %err,
-                "failed to read broker credentials file; will try embedded defaults"
+                "failed to load broker credentials TOML; will try embedded defaults"
             );
             BrokerSettingsState::default()
         }
@@ -206,32 +122,12 @@ fn apply_embedded_fallback(settings: &mut BrokerSettingsState) {
 ///
 /// Creates the parent directory if missing. Writes TOML in the standard
 /// formatting. Transient fields (`authorization_code_input`, DxTrade
-/// `password`) are excluded by their serde annotations.
+/// `password`) are excluded by their serde annotations. The shared
+/// writer in `neoethos-core` always stamps the current schema version
+/// regardless of what the in-memory value carries.
 pub fn save_broker_settings(settings: &BrokerSettingsState) -> Result<()> {
-    let path = credentials_file_path()?;
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create directory for broker credentials at {}",
-                parent.display()
-            )
-        })?;
-    }
-
-    // Always stamp the CURRENT schema version on save, regardless
-    // of what the in-memory value carries. This protects against
-    // a code path that constructed the struct manually and forgot
-    // to set schema_version — every saved file is correctly
-    // tagged with the version this build writes.
-    let mut to_write = settings.clone();
-    to_write.schema_version = crate::app_services::broker_config::BROKER_CREDENTIALS_SCHEMA_VERSION;
-    let serialized = toml::to_string_pretty(&to_write)
-        .context("failed to serialize broker credentials to TOML")?;
-
-    fs::write(&path, serialized)
-        .with_context(|| format!("failed to write broker credentials to {}", path.display()))?;
-
+    let path = neoethos_core::broker_config::credentials_file_path()?;
+    neoethos_core::broker_config::save_to_disk(&path, settings)?;
     tracing::info!(path = %path.display(), "saved broker credentials to disk");
     Ok(())
 }
@@ -243,6 +139,13 @@ mod tests {
         BrokerAccountTarget, CTraderBrokerEnvironment, CTraderBrokerSettings, DxTradeBrokerSettings,
     };
     use std::sync::Mutex;
+    use std::{env, fs};
+
+    /// The path-override env var lives in `neoethos-core::broker_config`
+    /// now. The test name is repeated here so the tests can poke at it
+    /// directly via `env::set_var` without exposing it as a public
+    /// const just for the tests.
+    const ENV_OVERRIDE_VAR: &str = "NEOETHOS_BROKER_CREDENTIALS_PATH";
 
     /// `env::set_var`/`env::var` are process-global. Serialize the env-mutating
     /// tests so they don't race.

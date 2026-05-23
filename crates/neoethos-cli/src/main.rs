@@ -77,6 +77,7 @@ fn main() -> Result<()> {
         "stop-target" => cmd_stop_target(&args[2..]),
         "wizard" => cmd_wizard(&args[2..]),
         "setup" => cmd_setup(&args[2..]),
+        "credentials" => cmd_credentials(&args[2..]),
         _ => {
             print_help();
             Ok(())
@@ -1376,6 +1377,192 @@ fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|arg| arg == name)
 }
 
+/// `credentials` subcommand — write `broker_credentials.toml` headlessly.
+///
+/// This is the CLI parity for the Flutter Settings → cTrader credentials
+/// form. Same file, same schema, same path-resolution rules — the
+/// shared writer lives in `neoethos_core::broker_config` so the two
+/// frontends can never drift.
+///
+/// Subcommands:
+///   credentials show
+///     Read the current `broker_credentials.toml` and print a redacted
+///     summary (client_secret is shown as `••••<last4>` only). Useful
+///     for verifying which set the binary is picking up via the
+///     `NEOETHOS_BROKER_CREDENTIALS_PATH` env override.
+///
+///   credentials set --client-id <id> [--client-secret <secret>]
+///                   [--redirect-uri <uri>] [--environment Demo|Live]
+///                   [--account-id <cTID>]
+///     Merge-update the on-disk file. Unspecified fields keep their
+///     current value (merge semantics match `POST /broker/credentials`).
+///     If --client-secret is provided but blank, the existing secret
+///     is preserved (same rule as the UI's "Leave blank to keep" form).
+fn cmd_credentials(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        anyhow::bail!(
+            "credentials requires a subcommand: `show` or `set`. \
+             Run `neoethos-cli credentials show` to read the current \
+             on-disk values."
+        );
+    }
+    match args[0].as_str() {
+        "show" => cmd_credentials_show(),
+        "set" => cmd_credentials_set(&args[1..]),
+        other => anyhow::bail!(
+            "unknown credentials subcommand `{other}`. Expected `show` or `set`."
+        ),
+    }
+}
+
+fn cmd_credentials_show() -> Result<()> {
+    let path = neoethos_core::broker_config::credentials_file_path()?;
+    let loaded = neoethos_core::broker_config::load_from_disk(&path)?;
+    println!("Path: {}", path.display());
+    match loaded {
+        None => {
+            println!("(no file at that path — defaults will be used)");
+        }
+        Some(state) => {
+            println!("Schema version: {}", state.schema_version);
+            println!("\n[ctrader]");
+            println!("  client_id    : {}", maybe_blank(&state.ctrader.client_id));
+            println!(
+                "  client_secret: {}",
+                redact_secret(&state.ctrader.client_secret)
+            );
+            println!(
+                "  redirect_uri : {}",
+                maybe_blank(&state.ctrader.redirect_uri)
+            );
+            println!("  environment  : {}", state.ctrader.environment.as_str());
+            println!("  accounts     : {} entries", state.ctrader.accounts.len());
+            for (i, a) in state.ctrader.accounts.iter().enumerate() {
+                println!(
+                    "    [{i}] id={} label={} enabled={}",
+                    a.account_id, a.label, a.enabled_for_execution
+                );
+            }
+            println!("\n[dxtrade]");
+            println!(
+                "  platform_url : {}",
+                maybe_blank(&state.dxtrade.platform_url)
+            );
+            println!("  username     : {}", maybe_blank(&state.dxtrade.username));
+            println!("  domain       : {}", maybe_blank(&state.dxtrade.domain));
+            println!("  password     : (never persisted)");
+            println!("  accounts     : {} entries", state.dxtrade.accounts.len());
+        }
+    }
+    Ok(())
+}
+
+fn cmd_credentials_set(args: &[String]) -> Result<()> {
+    let mut client_id: Option<String> = None;
+    let mut client_secret: Option<String> = None;
+    let mut redirect_uri: Option<String> = None;
+    let mut environment: Option<String> = None;
+    let mut account_id: Option<String> = None;
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--client-id" => client_id = iter.next().cloned(),
+            "--client-secret" => client_secret = iter.next().cloned(),
+            "--redirect-uri" => redirect_uri = iter.next().cloned(),
+            "--environment" => environment = iter.next().cloned(),
+            "--account-id" => account_id = iter.next().cloned(),
+            other => anyhow::bail!(
+                "unknown flag `{other}` for `credentials set`. \
+                 Supported flags: --client-id, --client-secret, \
+                 --redirect-uri, --environment, --account-id."
+            ),
+        }
+    }
+
+    let path = neoethos_core::broker_config::credentials_file_path()?;
+    let mut state = neoethos_core::broker_config::load_from_disk(&path)?
+        .unwrap_or_default();
+
+    if let Some(v) = client_id {
+        state.ctrader.client_id = v.trim().to_string();
+    }
+    // Empty-secret semantics match the UI: blank means "keep current".
+    if let Some(v) = client_secret {
+        if !v.is_empty() {
+            state.ctrader.client_secret = v;
+        }
+    }
+    if let Some(v) = redirect_uri {
+        state.ctrader.redirect_uri = v.trim().to_string();
+    }
+    if let Some(v) = environment {
+        let parsed = neoethos_core::broker_config::CTraderBrokerEnvironment::parse(&v)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid --environment value `{v}`. Expected `Demo` or `Live`."
+                )
+            })?;
+        state.ctrader.environment = parsed;
+    }
+    if let Some(v) = account_id {
+        let trimmed = v.trim().to_string();
+        if !trimmed.is_empty() {
+            // Replace the entire account list with the single target —
+            // matches the UI's behaviour (the dropdown sends one
+            // accountId, the server overwrites the targets vec).
+            state.ctrader.accounts = vec![
+                neoethos_core::broker_config::BrokerAccountTarget {
+                    account_id: trimmed,
+                    label: String::new(),
+                    enabled_for_execution: true,
+                },
+            ];
+        }
+    }
+
+    if state.ctrader.client_id.trim().is_empty() {
+        anyhow::bail!(
+            "client_id is required (it is currently blank on disk and no \
+             --client-id was supplied). Provide --client-id at least once \
+             before saving."
+        );
+    }
+    if state.ctrader.client_secret.is_empty() {
+        anyhow::bail!(
+            "client_secret is required (it is currently blank on disk and \
+             no --client-secret was supplied). Provide --client-secret at \
+             least once before saving."
+        );
+    }
+    if state.ctrader.redirect_uri.trim().is_empty() {
+        // Match the server's default — `http://127.0.0.1:43001/callback`
+        // is the loopback port the OAuth flow listens on.
+        state.ctrader.redirect_uri = "http://127.0.0.1:43001/callback".to_string();
+    }
+
+    neoethos_core::broker_config::save_to_disk(&path, &state)?;
+    println!(
+        "Wrote {} ({} ctrader.accounts)",
+        path.display(),
+        state.ctrader.accounts.len()
+    );
+    println!("Next step: open the GUI and run Broker Setup → Re-authenticate to fetch an OAuth token.");
+    Ok(())
+}
+
+fn redact_secret(s: &str) -> String {
+    if s.is_empty() {
+        return "(blank)".to_string();
+    }
+    let last4: String = s.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("••••{last4} (len={})", s.len())
+}
+
+fn maybe_blank(s: &str) -> &str {
+    if s.is_empty() { "(blank)" } else { s }
+}
+
 fn print_help() {
     println!("neoethos-cli");
     println!("  symbols --root data");
@@ -1396,6 +1583,11 @@ fn print_help() {
     println!("  wizard                       Launch the interactive first-run wizard (TUI).");
     println!("  setup [show|paths|ctrader|news]  Headless credentials helper (Task #61).");
     println!("                               Prints canonical paths + ready-to-paste templates.");
+    println!("  credentials show             Show on-disk broker_credentials.toml (redacted).");
+    println!("  credentials set --client-id X --client-secret Y [--redirect-uri Z]");
+    println!("                  [--environment Demo|Live] [--account-id N]");
+    println!("                               Merge-update broker_credentials.toml. Same writer");
+    println!("                               as the GUI Settings screen — never drifts.");
     println!();
     println!("  --data-path <folder>   Browse a folder and auto-discover dataset layout");
     println!("                         (subfolders for symbol/timeframe, Hive-style or flat).");
