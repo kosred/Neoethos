@@ -5,6 +5,7 @@ import 'package:intl/intl.dart';
 
 import '../api/backend_client.dart';
 import '../state/account_provider.dart';
+import '../state/live_spots_provider.dart';
 import '../theme/theme.dart';
 import '_placeholder.dart';
 
@@ -137,7 +138,7 @@ class _TradeWatchScreenState extends ConsumerState<TradeWatchScreen> {
   }
 }
 
-class _PositionRow extends StatelessWidget {
+class _PositionRow extends ConsumerWidget {
   final Position position;
   final NumberFormat money;
   final bool busy;
@@ -150,12 +151,20 @@ class _PositionRow extends StatelessWidget {
   });
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final p = position;
     final sideColor = p.side.toUpperCase() == 'LONG' ||
             p.side.toUpperCase() == 'BUY'
         ? ForexAiTokens.buy
         : ForexAiTokens.sell;
+    // #142: detect whether this position's PnL pips number is being
+    // driven by the live-spot stream (sub-2 s) or the broker's 5 s
+    // poll. The bridge silently overrides pnl_pips on the wire; the
+    // UI surfaces a ⚡ icon so the operator knows which positions
+    // have a live overlay and which don't (e.g. exotic pairs not
+    // in DEFAULT_STREAMED_SYMBOLS).
+    final liveSnap = ref.watch(liveSpotsProvider).valueOrNull;
+    final hasFreshTick = liveSnap?.lookup(p.symbol)?.isStale == false;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Row(
@@ -192,11 +201,51 @@ class _PositionRow extends StatelessWidget {
             ),
           ),
           const Spacer(),
-          Text(
-            money.format(p.pnlUsd),
-            style: TextStyle(
-              fontWeight: FontWeight.w700,
-              color: p.pnlUsd >= 0 ? ForexAiTokens.buy : ForexAiTokens.sell,
+          // Pips column with live indicator when fresh tick is
+          // driving the calculation. Two-line text so the row
+          // height stays consistent with the broker-only case.
+          SizedBox(
+            width: 90,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    if (hasFreshTick) ...[
+                      const Tooltip(
+                        message: 'Live tick (sub-2 s)',
+                        child: Icon(
+                          Icons.bolt,
+                          size: 12,
+                          color: ForexAiTokens.buy,
+                        ),
+                      ),
+                      const SizedBox(width: 2),
+                    ],
+                    Text(
+                      '${p.pnlPips >= 0 ? '+' : ''}${p.pnlPips.toStringAsFixed(1)} p',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 12,
+                        color: p.pnlPips >= 0
+                            ? ForexAiTokens.buy
+                            : ForexAiTokens.sell,
+                      ),
+                    ),
+                  ],
+                ),
+                Text(
+                  money.format(p.pnlUsd),
+                  style: TextStyle(
+                    fontWeight: FontWeight.w700,
+                    fontSize: 11,
+                    color: p.pnlUsd >= 0
+                        ? ForexAiTokens.buy
+                        : ForexAiTokens.sell,
+                  ),
+                ),
+              ],
             ),
           ),
           const SizedBox(width: 12),
