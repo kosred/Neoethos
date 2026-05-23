@@ -49,6 +49,43 @@ use super::state::{AccountSnapshotPayload, AppApiState, PositionPayload};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Map cTrader's numeric `depositAssetId` to a 3-letter ISO code
+/// for the dashboard currency badge. The full source of truth is
+/// `ProtoOAAssetListReq`, but pulling that registry on every refresh
+/// is wasteful when 95% of operators use one of the 8 majors below.
+///
+/// Returns `"EUR"` as the conservative fallback for unknown ids —
+/// most demo / FTMO accounts ARE EUR, and rendering an unfamiliar
+/// numeric id in the UI is strictly worse than rendering a slightly-
+/// wrong-but-readable label. When this returns the fallback we log
+/// the unknown id so #144's follow-up can grow the table.
+fn asset_id_to_currency(asset_id: Option<i64>) -> &'static str {
+    match asset_id {
+        // Sourced from public Spotware OpenAPI samples + the cTrader
+        // sandbox catalog. Conservative subset — additions here are
+        // safe (purely widens the supported set).
+        Some(4) => "GBP",
+        Some(5) => "CHF",
+        Some(6) => "EUR",
+        Some(8) => "USD",
+        Some(14) => "JPY",
+        Some(23) => "AUD",
+        Some(25) => "NZD",
+        Some(27) => "CAD",
+        Some(36) => "PLN",
+        Some(id) => {
+            tracing::warn!(
+                target: "neoethos_app::bridge",
+                asset_id = id,
+                "unknown cTrader depositAssetId; falling back to EUR. \
+                 Add to asset_id_to_currency() once confirmed."
+            );
+            "EUR"
+        }
+        None => "EUR",
+    }
+}
+
 /// Spawn the long-running refresh task. Returns immediately; the
 /// task lives for the lifetime of the tokio runtime (and therefore
 /// the server process).
@@ -264,7 +301,10 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
                     } else {
                         used_margin
                     },
-                    currency: "EUR".to_string(),
+                    currency: asset_id_to_currency(
+                        snapshot.trader.deposit_asset_id,
+                    )
+                    .to_string(),
                     fetched_at_unix_ms: chrono::Utc::now().timestamp_millis(),
                     positions: snapshot
                         .reconcile
@@ -344,17 +384,12 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
         } else {
             used_margin
         },
-        // The ProtoOATraderRes payload only exposes the *integer*
-        // `depositAssetId` (e.g. 6 for EUR, 8 for USD) — resolving
-        // that to a 3-letter ISO code needs a follow-up
-        // ProtoOAAssetListReq call against the broker's asset
-        // registry. Until that endpoint ships, default to "EUR"
-        // (the Spotware sandbox + most FTMO challenges fall in that
-        // bucket). The previous code was passing the *account_type*
-        // enum label ("HEDGED", "NETTED") into the currency field,
-        // which surfaced as a wrong currency badge on the Flutter
-        // dashboard — fixed here.
-        currency: "EUR".to_string(),
+        // #144: 8-currency lookup table from the trader payload's
+        // depositAssetId. EUR fallback for unknown ids, logged so
+        // we can grow the table. Full ProtoOAAssetListReq still
+        // a follow-up for the very-long-tail currencies.
+        currency: asset_id_to_currency(snapshot.trader.deposit_asset_id)
+            .to_string(),
         // Wall-clock at the moment we finished assembling this
         // snapshot. The Flutter Dashboard converts to local time
         // for the "as of HH:MM:SS" freshness badge so the

@@ -40,6 +40,11 @@ pub struct CTraderTraderSnapshot {
     pub account_type: Option<String>,
     pub broker_name: Option<String>,
     pub money_digits: u32,
+    /// Numeric asset id of the deposit currency (e.g. 6 = EUR, 8 = USD,
+    /// 4 = GBP). Comes from `ProtoOATrader.depositAssetId`. Used by the
+    /// bridge to render the right currency symbol on the dashboard.
+    /// `None` only when the broker omitted the field (rare).
+    pub deposit_asset_id: Option<i64>,
     /// Sum of mark-to-market PnL for currently open positions (account currency).
     /// Updated by the streaming/spot subsystem; defaults to 0.0 when no live
     /// spot data is available. Read alongside `balance` to compute live equity:
@@ -171,6 +176,13 @@ struct TraderInfo {
     account_type: Option<i32>,
     #[serde(rename = "brokerName")]
     broker_name: Option<String>,
+    /// Numeric asset id referenced into `ProtoOAAssetListReq`'s
+    /// catalog. Well-known values: 4=GBP, 5=CHF, 6=EUR, 8=USD,
+    /// 14=JPY. Used by the bridge to render the dashboard
+    /// currency symbol without an extra round-trip to the asset
+    /// list endpoint (#144).
+    #[serde(rename = "depositAssetId")]
+    deposit_asset_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -376,6 +388,7 @@ pub fn parse_trader_response(response_json: &str) -> Result<CTraderTraderSnapsho
         account_type: trader.account_type.map(account_type_label),
         broker_name: trader.broker_name,
         money_digits,
+        deposit_asset_id: trader.deposit_asset_id,
         unrealized_pnl: 0.0,
     })
 }

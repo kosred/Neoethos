@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 
 import '../api/backend_client.dart';
+import '../api/currency_format.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
@@ -65,7 +66,7 @@ class _StatRow extends StatelessWidget {
 
     String fmt(double v) {
       final f = NumberFormat.currency(
-        symbol: data?.currency == 'EUR' ? '€' : r'$',
+        symbol: currencyGlyph(data?.currency ?? 'EUR'),
         decimalDigits: 2,
       );
       return f.format(v);

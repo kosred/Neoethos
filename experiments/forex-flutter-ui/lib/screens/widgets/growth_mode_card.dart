@@ -18,6 +18,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../api/currency_format.dart';
 import '../../state/account_provider.dart';
 import '../../theme/theme.dart';
 import '../_placeholder.dart';
@@ -88,7 +89,7 @@ class GrowthModeCard extends ConsumerWidget {
     final starting = ref.watch(growthStartingBalanceProvider);
     final target = ref.watch(growthTargetBalanceProvider);
     final profile = ref.watch(growthRiskProfileProvider);
-    final currency = snapshot?.currency == 'EUR' ? '€' : (snapshot?.currency ?? r'$');
+    final currency = currencyGlyph(snapshot?.currency ?? 'EUR');
 
     final currentEquity = snapshot?.equity ?? starting;
     final multiplier = starting > 0 ? currentEquity / starting : 0.0;

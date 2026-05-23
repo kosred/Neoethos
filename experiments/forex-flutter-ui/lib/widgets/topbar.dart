@@ -24,6 +24,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 
 import '../api/backend_client.dart';
+import '../api/currency_format.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
@@ -50,7 +51,7 @@ class TopBar extends ConsumerWidget {
     };
 
     final snap = asyncSnapshot.valueOrNull;
-    final currencySymbol = snap?.currency == 'EUR' ? '€' : r'$';
+    final currencySymbol = currencyGlyph(snap?.currency ?? 'EUR');
     final fmt = NumberFormat.currency(symbol: currencySymbol, decimalDigits: 2);
     String ribbonValue(double? v) => v == null ? '—' : fmt.format(v);
     final equityAccent = snap == null

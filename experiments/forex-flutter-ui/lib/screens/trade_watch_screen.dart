@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 
 import '../api/backend_client.dart';
+import '../api/currency_format.dart';
 import '../state/account_provider.dart';
 import '../state/live_spots_provider.dart';
 import '../theme/theme.dart';
@@ -95,7 +96,7 @@ class _TradeWatchScreenState extends ConsumerState<TradeWatchScreen> {
     final positions = snapshot.valueOrNull?.positions ?? const <Position>[];
     final currency = snapshot.valueOrNull?.currency ?? 'EUR';
     final money = NumberFormat.currency(
-      symbol: currency == 'EUR' ? '€' : r'$',
+      symbol: currencyGlyph(currency),
       decimalDigits: 2,
     );
 

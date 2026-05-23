@@ -16,8 +16,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use crate::app_services::broker_config::{
-    BROKER_CREDENTIALS_SCHEMA_VERSION, BrokerAccountTarget, BrokerSettingsState,
-    CTraderBrokerEnvironment, CTraderBrokerSettings, DxTradeBrokerSettings,
+    BROKER_CREDENTIALS_SCHEMA_VERSION, BrokerAccountTarget, CTraderBrokerEnvironment,
+    CTraderBrokerSettings,
 };
 use crate::app_services::broker_persistence::{load_broker_settings, save_broker_settings};
 use crate::app_services::reauth::run_reauth_flow_blocking;
@@ -181,15 +181,6 @@ pub async fn credentials_post(
         )
             .into_response(),
     }
-}
-
-#[allow(dead_code)] // used by tests that pin the wire shape
-fn _unused() -> DxTradeBrokerSettings {
-    DxTradeBrokerSettings::default()
-}
-#[allow(dead_code)]
-fn _unused2() -> BrokerSettingsState {
-    BrokerSettingsState::default()
 }
 
 pub async fn reauth(State(_state): State<AppApiState>) -> Response {
