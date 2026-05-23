@@ -27,6 +27,7 @@ import '../api/backend_client.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
+import 'report_issue.dart';
 
 class TopBar extends ConsumerWidget {
   const TopBar({super.key});
@@ -125,6 +126,18 @@ class TopBar extends ConsumerWidget {
                 .refreshNow(),
             tooltip: 'Refresh account snapshot now',
             icon: const Icon(Icons.refresh, color: ForexAiTokens.textMuted),
+          ),
+          // Report Issue — single, always-visible entry point. End
+          // users can't rebuild the app, so this is the canonical way
+          // to bundle today's logs + redacted config and email them
+          // to NeoEthos support. Wired here so the button is reachable
+          // from any screen, even when a panel further down is the one
+          // that broke.
+          IconButton(
+            onPressed: () => showReportIssueDialog(context),
+            tooltip: 'Report an issue — bundles logs + emails support',
+            icon: const Icon(Icons.bug_report_outlined,
+                color: ForexAiTokens.textMuted),
           ),
           IconButton(
             onPressed: () {},

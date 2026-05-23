@@ -17,6 +17,7 @@ class TestAccountSnapshotNotifier extends AccountSnapshotNotifier {
         freeMargin: 9000,
         usedMargin: 1000,
         currency: 'USD',
+        fetchedAtUnixMs: 1716422400000,
         positions: [
           Position(
             positionId: 1,
@@ -24,6 +25,7 @@ class TestAccountSnapshotNotifier extends AccountSnapshotNotifier {
             symbol: 'EURUSD',
             side: 'LONG',
             volume: 0.1,
+            openTimestampMs: 1716422400000,
             pnlPips: 12.5,
             pnlUsd: 11.3,
           ),

@@ -58,6 +58,12 @@ futures = "0.3.31"
 protobuf = "4.31.1-release"
 rand = { workspace = true }
 base64 = "0.22"
+# zip 7.x ships with no transitive bloat (default features are deflate + bzip2;
+# we keep both for compatibility with email clients) and is already in the
+# transitive tree, so cargo's dedup keeps the build small. Used by the
+# /diagnostics/bundle route to package log + config + sysinfo into a single
+# .zip that end users attach to support emails.
+zip = "7.2"
 # audit-fix F8: SecretString is the safe wrapper for string-shaped
 # secrets — see neoethos-core/Cargo.toml for the rationale.
 secrecy = "0.10"

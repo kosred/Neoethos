@@ -194,11 +194,20 @@ pub fn translate_code(code: &str) -> TranslatedError {
             // time. The frontend banner shows the friendly intro +
             // the raw code in small text so the user can copy-paste
             // it into a support request.
-            "Unexpected broker error. If this keeps happening, copy the code \
-             below and share it when asking for help.",
+            //
+            // Severity is `critical` here — unknown codes are exactly
+            // the ones support most needs the diagnostic bundle for,
+            // and the Flutter snackbar wiring automatically renders a
+            // "Report" button on critical severity that opens the
+            // logs-to-email dialog. End users can't read these codes
+            // and we can't fix them blind, so we funnel every one of
+            // them into the email flow.
+            "Unexpected broker error. Click Report to send us a \
+             diagnostic bundle so we can look at exactly what \
+             happened.",
             None,
             None,
-            "error",
+            "critical",
         ),
     };
 
@@ -265,7 +274,10 @@ mod tests {
     fn unknown_code_falls_through_with_severity() {
         let t = translate_code("ZZZ_NEVER_SEEN_THIS");
         assert_eq!(t.code, "ZZZ_NEVER_SEEN_THIS");
-        assert_eq!(t.severity, "error");
+        // Critical — Flutter renders a Report button on critical
+        // severity that opens the email-logs flow. End users can't
+        // act on unknown broker codes, so we route them all to us.
+        assert_eq!(t.severity, "critical");
         assert!(t.action_label.is_none());
     }
 

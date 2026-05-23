@@ -15,6 +15,7 @@ import '../api/error_translation.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
+import '../widgets/report_issue.dart';
 import '_placeholder.dart';
 
 class _Message {
@@ -114,16 +115,17 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
 
   Widget _installUi(GemmaStatusSnapshot s) {
     // Two distinct branches:
-    //  * Runtime NOT compiled in: user needs to rebuild the backend
-    //    with the gemma-backend feature flag. We can't help with that
-    //    from inside the running app — just show the cargo line.
+    //  * Runtime NOT compiled in: this is a packaging defect —
+    //    end users CAN'T fix it by themselves (they don't have a
+    //    cargo toolchain). Surface the Report Issue flow instead of
+    //    a useless cargo command line they can't act on.
     //  * Runtime compiled in, model missing: we CAN help. Show the
     //    download button + progress, calling /gemma/download under
     //    the hood. This is the first-launch fallback when the NSIS
     //    install-time fetch was skipped or interrupted.
     if (!s.runtimeCompiledIn) {
       return SectionCard(
-        title: 'Gemma 4 runtime not compiled in',
+        title: 'Gemma 4 runtime not compiled in this build',
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -135,15 +137,40 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
               ),
             ),
             const SizedBox(height: 12),
-            const _Kv(
-              k: 'Rebuild',
-              v: 'cargo build -p neoethos-app --release --features gemma-backend',
+            const Text(
+              'This installer was built without the local LLM '
+              'feature compiled in — so AI Helper + News can\'t '
+              'run on this machine. This is a build-side issue, '
+              'not something you can fix locally. Please send us '
+              'a diagnostic bundle and we\'ll ship a corrected '
+              'installer.',
+              style: TextStyle(
+                fontSize: 12,
+                color: ForexAiTokens.textPrimary,
+              ),
             ),
-            const SizedBox(height: 8),
-            OutlinedButton.icon(
-              onPressed: () => ref.invalidate(gemmaStatusProvider),
-              icon: const Icon(Icons.refresh, size: 16),
-              label: const Text('Re-check status'),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                FilledButton.icon(
+                  onPressed: () => showReportIssueDialog(
+                    context,
+                    prefillDescription:
+                        'AI Helper screen reports the Gemma 4 runtime '
+                        'is not compiled into this installer. Backend '
+                        'message: ${s.message}',
+                    category: 'Gemma runtime missing',
+                  ),
+                  icon: const Icon(Icons.bug_report, size: 16),
+                  label: const Text('Report issue'),
+                ),
+                const SizedBox(width: 8),
+                OutlinedButton.icon(
+                  onPressed: () => ref.invalidate(gemmaStatusProvider),
+                  icon: const Icon(Icons.refresh, size: 16),
+                  label: const Text('Re-check status'),
+                ),
+              ],
             ),
           ],
         ),

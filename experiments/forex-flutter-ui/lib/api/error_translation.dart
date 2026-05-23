@@ -16,6 +16,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 
 import '../theme/theme.dart';
+import '../widgets/report_issue.dart';
 
 /// Mirror of `crate::app_services::ctrader_errors::TranslatedError`.
 class TranslatedError {
@@ -110,6 +111,13 @@ String describeError(Object error) {
 /// at the moment, so a generic navigation helper here would be
 /// brittle). Callers that care can read [extractTranslation] and
 /// handle `actionTarget` themselves.
+///
+/// Special case: when the translated severity is `critical` AND no
+/// caller-supplied `onAction` is provided, the snackbar's action
+/// button switches to a "Report" button that opens the
+/// diagnostic-bundle / email-support dialog. End users can't fix
+/// catastrophic backend failures themselves, so we ALWAYS give them
+/// a one-tap path to get logs into our inbox.
 void showTranslatedErrorSnackbar(
   BuildContext context,
   Object error, {
@@ -128,6 +136,19 @@ void showTranslatedErrorSnackbar(
       label: translation.actionLabel!,
       textColor: Colors.white,
       onPressed: onAction,
+    );
+  } else if (translation?.severity == 'critical') {
+    // Fallback for catastrophic errors with no caller-handled CTA.
+    // Pre-fill the description with the prefix + body so support
+    // sees the exact wording the user hit.
+    action = SnackBarAction(
+      label: 'Report',
+      textColor: Colors.white,
+      onPressed: () => showReportIssueDialog(
+        context,
+        prefillDescription: '$prefix: $body',
+        category: translation?.code ?? 'critical',
+      ),
     );
   }
 

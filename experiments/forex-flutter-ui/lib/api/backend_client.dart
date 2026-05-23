@@ -596,6 +596,27 @@ class BackendClient {
     return IntelligenceSnapshot.fromJson(response.data!);
   }
 
+  /// POST `/diagnostics/report` — bundle the day's logs + redacted
+  /// config + system info into a .zip on the user's Desktop and
+  /// return the pre-rendered email subject + body so the Flutter
+  /// side can open the user's default mail client via mailto:.
+  /// End users can't rebuild the app; this is the support channel
+  /// that replaces every "rebuild with cargo build" hint in the UI.
+  Future<DiagnosticReport> requestDiagnosticReport({
+    String userDescription = '',
+    String category = '',
+  }) async {
+    final r = await _dio.post<Map<String, dynamic>>(
+      '/diagnostics/report',
+      data: {
+        'userDescription': userDescription,
+        'category': category,
+      },
+      options: Options(receiveTimeout: const Duration(seconds: 30)),
+    );
+    return DiagnosticReport.fromJson(r.data ?? const {});
+  }
+
   /// `/data/bootstrap` — local data-dir inventory.
   Future<DataBootstrapSnapshot> fetchDataBootstrap() async {
     final response = await _dio.get<Map<String, dynamic>>('/data/bootstrap');
@@ -1123,6 +1144,42 @@ class IntelligenceSnapshot {
         walkforwardAvgAccuracy:
             (j['walkforwardAvgAccuracy'] as num?)?.toDouble(),
       );
+}
+
+/// What `/diagnostics/report` returns: where the zip landed on
+/// disk, what it contains, and a pre-rendered mailto: payload the
+/// UI can pass to `Uri(scheme: 'mailto', ...).launch()`.
+class DiagnosticReport {
+  final String zipPath;
+  final int totalBytes;
+  final List<String> filesIncluded;
+  final String emailSubject;
+  final String emailBody;
+  final String emailRecipient;
+  const DiagnosticReport({
+    required this.zipPath,
+    required this.totalBytes,
+    required this.filesIncluded,
+    required this.emailSubject,
+    required this.emailBody,
+    required this.emailRecipient,
+  });
+  factory DiagnosticReport.fromJson(Map<String, dynamic> j) => DiagnosticReport(
+        zipPath: (j['zipPath'] as String?) ?? '',
+        totalBytes: (j['totalBytes'] as num?)?.toInt() ?? 0,
+        filesIncluded: ((j['filesIncluded'] as List?) ?? const [])
+            .map((e) => e as String)
+            .toList(growable: false),
+        emailSubject: (j['emailSubject'] as String?) ?? '',
+        emailBody: (j['emailBody'] as String?) ?? '',
+        emailRecipient: (j['emailRecipient'] as String?) ?? '',
+      );
+
+  String get sizeLabel {
+    if (totalBytes < 1024) return '$totalBytes B';
+    if (totalBytes < 1024 * 1024) return '${(totalBytes / 1024).toStringAsFixed(1)} KB';
+    return '${(totalBytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
 }
 
 class DataBootstrapSnapshot {

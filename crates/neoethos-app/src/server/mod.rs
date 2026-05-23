@@ -31,6 +31,7 @@ pub mod bridge;
 pub mod broker_control;
 pub mod chart;
 pub mod data_control;
+pub mod diagnostics;
 pub mod engines_control;
 pub mod gemma;
 pub mod gemma_download;
@@ -108,6 +109,7 @@ pub fn router(state: AppApiState) -> Router {
         .route("/intelligence", get(intelligence::intelligence))
         .route("/chart", get(chart::chart))
         .route("/indicators", get(indicators::indicators))
+        .route("/diagnostics/report", post(diagnostics::report))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
