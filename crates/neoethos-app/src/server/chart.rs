@@ -115,7 +115,15 @@ pub async fn chart(State(_state): State<AppApiState>, Query(q): Query<ChartQuery
     }
 }
 
-fn load_chart(symbol: String, timeframe: String, limit: usize) -> anyhow::Result<ChartDto> {
+/// Load OHLC candles for a symbol/timeframe from the local data dir.
+///
+/// Exposed `pub` so the Gemma tool-calling path
+/// (`app_services::gemma_tools::GetChartDataTool`) can reuse the
+/// same loader the HTTP route uses — same Settings::from_yaml lookup,
+/// same Vortex/Parquet auto-detect, same headline strings. Keeping
+/// one loader means the tool's answers can't drift from what the
+/// Chart screen shows.
+pub fn load_chart(symbol: String, timeframe: String, limit: usize) -> anyhow::Result<ChartDto> {
     let settings = Settings::from_yaml("config.yaml")
         .map_err(|e| anyhow::anyhow!("config.yaml not loadable: {e}"))?;
     let dataset = load_symbol_dataset(&settings.system.data_dir, &symbol)

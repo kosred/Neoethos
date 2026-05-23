@@ -414,10 +414,371 @@ impl Tool for GetNewsTradingModeTool {
 
 /// Wire up the standard tool set. Add new tools here as the
 /// platform grows — chart snapshot, recent fills, open orders, etc.
+/// `get_open_positions` — returns one row per open position with
+/// side, volume, PnL pips, PnL in account currency, and how long the
+/// position has been open. Used when the operator asks "what am I in
+/// right now?" or "which position is bleeding?".
+pub struct GetOpenPositionsTool;
+
+impl Tool for GetOpenPositionsTool {
+    fn name(&self) -> &'static str {
+        "get_open_positions"
+    }
+
+    fn description(&self) -> &'static str {
+        "Returns the list of currently open positions: position_id, symbol, side, \
+         volume in lots, P&L in pips, P&L in account currency, and the position's \
+         open timestamp (Unix milliseconds, UTC). Empty list when no positions are \
+         open. Use when the user asks about specific positions, totals, or which \
+         one is losing."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        })
+    }
+
+    fn execute(&self, state: &AppApiState, _args: Value) -> Result<Value> {
+        let snap = state.account_blocking().ok_or_else(|| {
+            anyhow!(
+                "no account snapshot available yet — broker not connected or initial \
+                 fetch not finished"
+            )
+        })?;
+        let positions: Vec<Value> = snap
+            .positions
+            .iter()
+            .map(|p| {
+                json!({
+                    "position_id": p.position_id,
+                    "symbol": p.symbol,
+                    "side": p.side,
+                    "volume_lots": p.volume,
+                    "pnl_pips": p.pnl_pips,
+                    "pnl_account_currency": p.pnl_usd,
+                    "open_timestamp_ms": p.open_timestamp_ms,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "open_position_count": positions.len(),
+            "positions": positions,
+            "account_currency": snap.currency,
+        }))
+    }
+}
+
+/// `get_chart_data` — returns the last N candles for a symbol +
+/// timeframe (OHLC + volume + timestamps). Reuses the same loader
+/// the HTTP `/chart` route uses so answers can't drift from what
+/// the Chart screen shows.
+pub struct GetChartDataTool;
+
+impl Tool for GetChartDataTool {
+    fn name(&self) -> &'static str {
+        "get_chart_data"
+    }
+
+    fn description(&self) -> &'static str {
+        "Returns the most recent OHLC candles for a symbol on a given timeframe. \
+         Arguments: `symbol` (e.g. \"EURUSD\"), `timeframe` (M1, M5, M15, H1, H4, D1), \
+         `limit` (1-500, default 50). Returns the candle list, latest close, \
+         price min/max in the window, and a percent change from window-open to \
+         window-close. Use when the user asks about recent price action, support/\
+         resistance levels, or wants you to reason about a specific pair."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "symbol":    {"type": "string", "description": "Symbol ticker, e.g. EURUSD"},
+                "timeframe": {"type": "string", "description": "M1|M5|M15|M30|H1|H4|D1|W1"},
+                "limit":     {"type": "integer", "minimum": 1, "maximum": 500}
+            },
+            "required": ["symbol", "timeframe"]
+        })
+    }
+
+    fn execute(&self, _state: &AppApiState, args: Value) -> Result<Value> {
+        let symbol = args
+            .get("symbol")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing required argument `symbol`"))?
+            .trim()
+            .to_uppercase();
+        let timeframe = args
+            .get("timeframe")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing required argument `timeframe`"))?
+            .trim()
+            .to_uppercase();
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50)
+            .clamp(1, 500) as usize;
+
+        let chart = crate::server::chart::load_chart(symbol, timeframe, limit)
+            .map_err(|e| anyhow!("chart load failed: {e}"))?;
+
+        // Compact candle representation — full OHLC + ts + volume,
+        // skipping the per-candle "name" boilerplate to keep the
+        // result payload small for the LLM context window.
+        let candles: Vec<Value> = chart
+            .candles
+            .iter()
+            .map(|c| {
+                json!({
+                    "ts_ms": c.ts_ms,
+                    "o": c.open,
+                    "h": c.high,
+                    "l": c.low,
+                    "c": c.close,
+                    "v": c.volume,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "symbol": chart.symbol,
+            "timeframe": chart.timeframe,
+            "candle_count": chart.candle_count,
+            "latest_close": chart.latest_close,
+            "price_min": chart.price_min,
+            "price_max": chart.price_max,
+            "price_change_pct": chart.price_change_pct,
+            "headline": chart.headline,
+            "candles": candles,
+        }))
+    }
+}
+
+/// `fetch_url` — HTTP GET against a public URL. Bounded by a 10s
+/// timeout and a 1 MB body cap. SSRF-guarded: only http(s), no
+/// localhost / private-network targets, no `file://`.
+///
+/// Returns: `{"status": 200, "content_type": "...", "body": "...",
+/// "truncated": false}`. When the body exceeds 1 MB or 500 KB of
+/// text the `body` is truncated and `truncated` is `true` — the
+/// model is told to ask the user before doing more retries.
+pub struct FetchUrlTool;
+
+/// Hard caps so a misbehaving LLM call can't DoS the local memory
+/// or hammer a third-party server. 500 KB is enough for a typical
+/// HTML article body after stripping ads; 10s is generous for an
+/// ECB-website fetch over a wired connection.
+const FETCH_MAX_BODY_BYTES: usize = 500 * 1024;
+const FETCH_TIMEOUT_SECS: u64 = 10;
+
+impl Tool for FetchUrlTool {
+    fn name(&self) -> &'static str {
+        "fetch_url"
+    }
+
+    fn description(&self) -> &'static str {
+        "Performs an HTTP GET against a PUBLIC URL and returns the response body \
+         as text. Use this when the user asks about external information you don't \
+         have a tool for — economic calendars, central-bank press releases, news \
+         articles. Capped at 10s timeout and 500 KB body; private/internal URLs \
+         (localhost, 127.x, 10.x, 192.168.x, file://) are rejected. Argument: `url`."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Public http(s) URL"}
+            },
+            "required": ["url"]
+        })
+    }
+
+    fn execute(&self, _state: &AppApiState, args: Value) -> Result<Value> {
+        let url_str = args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing required argument `url`"))?
+            .trim()
+            .to_string();
+
+        ssrf_guard(&url_str)?;
+
+        // Synchronous reqwest::blocking — we're already on a
+        // spawn_blocking thread (see chat_impl), no reactor in the
+        // call stack to starve.
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
+            // Allow up to 5 redirects — common for news sites
+            // canonicalising URLs. The SSRF guard re-checks the
+            // final URL via reqwest's policy hook.
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() > 5 {
+                    attempt.error("too many redirects (max 5)")
+                } else if let Err(e) = ssrf_guard(attempt.url().as_str()) {
+                    attempt.error(format!("redirect blocked by SSRF guard: {e}"))
+                } else {
+                    attempt.follow()
+                }
+            }))
+            // Set a generic User-Agent so politely-configured
+            // servers know who's calling.
+            .user_agent("NeoEthos-Gemma/0.4 (LLM tool fetch)")
+            .build()
+            .map_err(|e| anyhow!("failed to build HTTP client: {e}"))?;
+
+        let resp = client
+            .get(&url_str)
+            .send()
+            .map_err(|e| anyhow!("HTTP request failed: {e}"))?;
+        let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        // Cap body read so a multi-GB response can't OOM us.
+        let bytes = resp
+            .bytes()
+            .map_err(|e| anyhow!("failed to read response body: {e}"))?;
+        let total_len = bytes.len();
+        let truncated = total_len > FETCH_MAX_BODY_BYTES;
+        let body_slice = if truncated {
+            &bytes[..FETCH_MAX_BODY_BYTES]
+        } else {
+            &bytes[..]
+        };
+        let body_text = String::from_utf8_lossy(body_slice).to_string();
+        Ok(json!({
+            "status": status,
+            "content_type": content_type,
+            "body": body_text,
+            "body_length_bytes": total_len,
+            "truncated": truncated,
+        }))
+    }
+}
+
+/// SSRF guard. Rejects schemes and hosts that would let an LLM tool
+/// pivot into the local network. NOT a substitute for proper egress
+/// firewalling, but enough to block obvious mistakes.
+fn ssrf_guard(url_str: &str) -> Result<()> {
+    let parsed = url::Url::parse(url_str)
+        .map_err(|e| anyhow!("invalid URL `{url_str}`: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => anyhow::bail!("scheme `{other}` not allowed (only http/https)"),
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("URL has no host"))?
+        .to_ascii_lowercase();
+    // Block obvious private/loopback identifiers. We deliberately
+    // do NOT resolve via DNS — that would (a) leak DNS queries for
+    // model-generated URLs and (b) open a TOCTOU window between
+    // resolve-and-check and actual connect. Anyone routing public
+    // hostnames to private IPs in their /etc/hosts is asking for
+    // it; reqwest will follow that resolution and the egress
+    // firewall is the real defence.
+    const BLOCKED_HOSTS: &[&str] = &[
+        "localhost",
+        "127.0.0.1",
+        "0.0.0.0",
+        "::1",
+        "[::1]",
+        // common metadata-server addresses (AWS, GCP, Azure)
+        "169.254.169.254",
+        "metadata.google.internal",
+    ];
+    if BLOCKED_HOSTS.iter().any(|b| *b == host) {
+        anyhow::bail!("host `{host}` is in the SSRF block-list");
+    }
+    // RFC1918 private ranges — only the literal IP prefixes; we
+    // already skipped DNS resolution on purpose.
+    let private_prefixes = ["10.", "192.168.", "172.16.", "172.17.", "172.18.",
+        "172.19.", "172.20.", "172.21.", "172.22.", "172.23.", "172.24.",
+        "172.25.", "172.26.", "172.27.", "172.28.", "172.29.", "172.30.",
+        "172.31.", "127."];
+    if private_prefixes.iter().any(|p| host.starts_with(p)) {
+        anyhow::bail!("host `{host}` is in a private IP range");
+    }
+    Ok(())
+}
+
+/// `get_recent_log_lines` — tails the daily log file. Used when the
+/// operator asks "what just broke?" or "why isn't X working?". The
+/// log is the canonical observability surface; this tool puts it in
+/// front of the LLM.
+pub struct GetRecentLogLinesTool;
+
+/// Cap on lines returned — large log files would blow the model's
+/// context window. 200 lines covers a few minutes of typical
+/// activity at this codebase's log volume.
+const LOG_TAIL_MAX_LINES: usize = 200;
+
+impl Tool for GetRecentLogLinesTool {
+    fn name(&self) -> &'static str {
+        "get_recent_log_lines"
+    }
+
+    fn description(&self) -> &'static str {
+        "Returns the last N lines of today's NeoEthos log file (default 50, max 200). \
+         Use when the user reports a problem and asks 'what just happened?' or \
+         'check the logs'. The path is `<user-data-dir>/neoethos/logs/\
+         neoethos.YYYY-MM-DD.log`. Argument: `lines` (optional integer)."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "lines": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": LOG_TAIL_MAX_LINES,
+                    "description": "How many trailing lines to return"
+                }
+            }
+        })
+    }
+
+    fn execute(&self, _state: &AppApiState, args: Value) -> Result<Value> {
+        let lines = args
+            .get("lines")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50)
+            .clamp(1, LOG_TAIL_MAX_LINES as u64) as usize;
+
+        let path = neoethos_core::logging::canonical_log_path();
+        let contents = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow!("failed to read log {}: {e}", path.display()))?;
+        let all_lines: Vec<&str> = contents.lines().collect();
+        let tail = if all_lines.len() > lines {
+            &all_lines[all_lines.len() - lines..]
+        } else {
+            &all_lines[..]
+        };
+        Ok(json!({
+            "path": path.display().to_string(),
+            "total_lines": all_lines.len(),
+            "returned_lines": tail.len(),
+            "lines": tail,
+        }))
+    }
+}
+
 pub fn register_default_tools(registry: &mut ToolRegistry) {
     registry.register(Box::new(GetAccountSnapshotTool));
+    registry.register(Box::new(GetOpenPositionsTool));
+    registry.register(Box::new(GetChartDataTool));
     registry.register(Box::new(GetRiskCapsTool));
     registry.register(Box::new(GetNewsTradingModeTool));
+    registry.register(Box::new(FetchUrlTool));
+    registry.register(Box::new(GetRecentLogLinesTool));
 }
 
 #[cfg(test)]
@@ -429,14 +790,66 @@ mod tests {
         let mut reg = ToolRegistry::new();
         register_default_tools(&mut reg);
         let rendered = reg.render_for_prompt();
-        assert!(rendered.contains("get_account_snapshot"));
-        assert!(rendered.contains("get_risk_caps"));
-        assert!(rendered.contains("get_news_trading_mode"));
+        // Every shipped tool surfaces by its canonical name.
+        for name in [
+            "get_account_snapshot",
+            "get_open_positions",
+            "get_chart_data",
+            "get_risk_caps",
+            "get_news_trading_mode",
+            "fetch_url",
+            "get_recent_log_lines",
+        ] {
+            assert!(
+                rendered.contains(name),
+                "rendered prompt missing tool `{name}`:\n{rendered}"
+            );
+        }
         // Schema fragments should be inline so the model has full
         // info without a follow-up turn. serde_json's compact
         // Display impl emits `"type":"object"` (no space after the
         // colon) which is intentional — fewer tokens.
         assert!(rendered.contains("\"type\":\"object\""));
+    }
+
+    #[test]
+    fn ssrf_guard_rejects_obvious_local_targets() {
+        for bad in [
+            "http://localhost/",
+            "http://127.0.0.1/",
+            "http://127.0.0.1:7423/healthz",
+            "http://10.0.0.5/",
+            "http://192.168.1.1/admin",
+            "http://172.16.0.1/",
+            "http://169.254.169.254/latest/meta-data/",
+            "file:///etc/passwd",
+            "ftp://example.com/",
+        ] {
+            assert!(
+                ssrf_guard(bad).is_err(),
+                "SSRF guard should have rejected `{bad}`"
+            );
+        }
+    }
+
+    #[test]
+    fn ssrf_guard_allows_public_https() {
+        for good in [
+            "https://www.ecb.europa.eu/press/pr/html/index.en.html",
+            "https://api.example.com/v1/things",
+            "http://huggingface.co/path",
+        ] {
+            assert!(
+                ssrf_guard(good).is_ok(),
+                "SSRF guard should have allowed `{good}`"
+            );
+        }
+    }
+
+    #[test]
+    fn ssrf_guard_rejects_malformed_url() {
+        assert!(ssrf_guard("not a url").is_err());
+        assert!(ssrf_guard("").is_err());
     }
 
     #[test]

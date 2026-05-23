@@ -241,8 +241,10 @@ async fn chat_impl(state: AppApiState, prompt: String, max_tokens: u32) -> Respo
         r.clone()
     } else {
         // Resolve + load on first call. spawn_blocking because the
-        // mmap + LlamaBackend init takes seconds.
-        let _state = state;
+        // mmap + LlamaBackend init takes seconds. We do NOT consume
+        // `state` here anymore — the Phase B tool loop below needs
+        // a clone of it to dispatch tools that read live account /
+        // chart / log data.
         let probe = neoethos_gemma::runtime::RealFsProbe;
         let resolved = match neoethos_gemma::runtime::resolve_bundled_model_path(&probe) {
             Ok(r) => r,

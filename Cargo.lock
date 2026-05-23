@@ -5753,6 +5753,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tungstenite 0.28.0",
+ "url",
  "webpki-roots 0.26.11",
  "zip 7.2.0",
 ]
