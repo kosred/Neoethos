@@ -827,6 +827,36 @@ pub struct NewsConfig {
     /// pre-#117 safe behaviour. See [`NewsTradingMode`].
     #[serde(default)]
     pub news_trading_mode: NewsTradingMode,
+    // ── Gemma news-watcher scheduler (#128) ─────────────────────
+    /// Master switch for the autonomous Gemma news watcher.
+    /// Default OFF — operator must explicitly opt in from Settings.
+    /// When true, the scheduler runs the three modes below.
+    #[serde(default)]
+    pub gemma_news_watcher_enabled: bool,
+    /// Local-time HH:MM string. The morning scan fires the first
+    /// time the local wall clock crosses this minute each day.
+    /// Default 07:00 — early enough to digest overnight Asia +
+    /// pre-market headlines, before London open. Empty string =
+    /// disable just the morning-scan mode.
+    #[serde(default = "default_gemma_morning_scan_time")]
+    pub gemma_morning_scan_time: String,
+    /// Minutes BEFORE each major session open (London, NY, Tokyo)
+    /// to fire the session-start scan. Default 10 — enough lead
+    /// for the operator to read Gemma's summary before the bell.
+    /// 0 = disable session-start mode.
+    #[serde(default = "default_gemma_session_start_lead_min")]
+    pub gemma_session_start_lead_min: u32,
+    /// When the calendar shows a high-impact event within this many
+    /// minutes, switch to adaptive-poll mode. Default 30 — captures
+    /// FOMC / NFP / CPI announcements without spamming the LLM on
+    /// quiet days.
+    #[serde(default = "default_gemma_adaptive_poll_threshold_min")]
+    pub gemma_adaptive_poll_threshold_min: u32,
+    /// Adaptive-poll cadence in seconds while inside the event
+    /// threshold window. Default 15 — every 10-20s per operator
+    /// directive 2026-05-23.
+    #[serde(default = "default_gemma_adaptive_poll_interval_secs")]
+    pub gemma_adaptive_poll_interval_secs: u64,
     pub news_decay_minutes: usize,
     pub news_kill_window_min: usize,
     pub news_confidence_threshold: f64,
@@ -864,10 +894,28 @@ pub struct NewsConfig {
     pub auto_rescore_only_missing: bool,
 }
 
+fn default_gemma_morning_scan_time() -> String {
+    "07:00".to_string()
+}
+fn default_gemma_session_start_lead_min() -> u32 {
+    10
+}
+fn default_gemma_adaptive_poll_threshold_min() -> u32 {
+    30
+}
+fn default_gemma_adaptive_poll_interval_secs() -> u64 {
+    15
+}
+
 impl Default for NewsConfig {
     fn default() -> Self {
         Self {
             news_trading_mode: NewsTradingMode::default(),
+            gemma_news_watcher_enabled: false,
+            gemma_morning_scan_time: default_gemma_morning_scan_time(),
+            gemma_session_start_lead_min: default_gemma_session_start_lead_min(),
+            gemma_adaptive_poll_threshold_min: default_gemma_adaptive_poll_threshold_min(),
+            gemma_adaptive_poll_interval_secs: default_gemma_adaptive_poll_interval_secs(),
             news_decay_minutes: 120,
             news_kill_window_min: 30,
             news_confidence_threshold: 0.65,

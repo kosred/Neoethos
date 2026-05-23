@@ -56,6 +56,8 @@ pub mod reauth;
 #[cfg(feature = "gemma-backend")]
 pub mod gemma_memory;
 #[cfg(feature = "gemma-backend")]
+pub mod gemma_news_watcher;
+#[cfg(feature = "gemma-backend")]
 pub mod gemma_tools;
 pub mod risky_mode_persistence;
 pub mod secure_store;

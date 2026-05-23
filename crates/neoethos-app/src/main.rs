@@ -146,6 +146,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = server::state::AppApiState::new();
     server::bridge::spawn(state.clone());
+
+    // Spawn the Gemma news watcher (#128). The task is a no-op
+    // when `news.gemma_news_watcher_enabled = false` — the loop
+    // exits immediately. Behind the gemma-backend feature so the
+    // default build doesn't pull in the watcher code path.
+    #[cfg(feature = "gemma-backend")]
+    {
+        let watcher_config =
+            app_services::gemma_news_watcher::WatcherConfig::from_news_config(&settings.news);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _watcher_handle = app_services::gemma_news_watcher::spawn(
+            state.clone(),
+            watcher_config,
+            cancel,
+        );
+        // We deliberately drop the handle — the watcher should live
+        // for the entire process lifetime. The serve() call below
+        // never returns in the happy path; on a signal-shutdown the
+        // task is dropped along with everything else.
+    }
+
     server::serve(state).await?;
     Ok(())
 }

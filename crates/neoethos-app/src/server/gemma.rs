@@ -223,8 +223,33 @@ pub async fn news(State(state): State<AppApiState>, Json(body): Json<NewsBody>) 
 
 // ─── inference path (only compiled with feature flag) ─────────────────────
 
+/// Outcome of one full `run_chat_with_tools` round-trip — what the
+/// HTTP handler turns into a `ChatResponseDto` and what the
+/// background news-watcher (#128) consumes directly.
 #[cfg(feature = "gemma-backend")]
-async fn chat_impl(state: AppApiState, prompt: String, max_tokens: u32) -> Response {
+#[derive(Debug, Clone)]
+pub struct ChatOutcome {
+    pub model_id: String,
+    pub response: String,
+    pub elapsed_ms: u64,
+}
+
+/// Inference + ReAct tool-loop entry point. Extracted from
+/// `chat_impl` so the news-watcher task (#128) can drive the same
+/// pipeline without going through HTTP. The HTTP handler is now a
+/// thin wrapper around this.
+///
+/// Errors surface as `Err` rather than `Response` so callers
+/// (HTTP / scheduler / future API) can map them however they want.
+/// Specifically: 503 when the GGUF isn't on disk, 500 on inference
+/// failure or task panic. The function loads the model on first
+/// call (5-30s mmap) and reuses the loaded handle thereafter.
+#[cfg(feature = "gemma-backend")]
+pub async fn run_chat_with_tools(
+    state: AppApiState,
+    prompt: String,
+    max_tokens: u32,
+) -> anyhow::Result<ChatOutcome> {
     use crate::app_services::gemma_tools::{ToolRegistry, register_default_tools, run_tool_loop};
     use neoethos_gemma::runtime::{GemmaRuntime, LlamaCppGemmaRuntime};
     use std::sync::Arc;
@@ -240,103 +265,80 @@ async fn chat_impl(state: AppApiState, prompt: String, max_tokens: u32) -> Respo
     let runtime = if let Some(r) = RUNTIME.get() {
         r.clone()
     } else {
-        // Resolve + load on first call. spawn_blocking because the
-        // mmap + LlamaBackend init takes seconds. We do NOT consume
-        // `state` here anymore — the Phase B tool loop below needs
-        // a clone of it to dispatch tools that read live account /
-        // chart / log data.
         let probe = neoethos_gemma::runtime::RealFsProbe;
-        let resolved = match neoethos_gemma::runtime::resolve_bundled_model_path(&probe) {
-            Ok(r) => r,
-            Err(err) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({
-                        "error": format!("Gemma model file not found: {err}"),
-                    })),
-                )
-                    .into_response();
-            }
-        };
+        let resolved = neoethos_gemma::runtime::resolve_bundled_model_path(&probe)
+            .map_err(|e| anyhow::anyhow!("Gemma model file not found: {e}"))?;
         let path = resolved.path;
-        let loaded = tokio::task::spawn_blocking(move || LlamaCppGemmaRuntime::load(path)).await;
-        match loaded {
-            Ok(Ok(rt)) => {
-                let arc = Arc::new(Mutex::new(rt));
-                let _ = RUNTIME.set(arc.clone());
-                arc
-            }
-            Ok(Err(err)) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": format!("LlamaCppGemmaRuntime::load failed: {err}"),
-                    })),
-                )
-                    .into_response();
-            }
-            Err(join_err) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": format!("Gemma load task panicked: {join_err}"),
-                    })),
-                )
-                    .into_response();
-            }
-        }
+        let loaded = tokio::task::spawn_blocking(move || LlamaCppGemmaRuntime::load(path))
+            .await
+            .map_err(|e| anyhow::anyhow!("Gemma load task panicked: {e}"))?
+            .map_err(|e| anyhow::anyhow!("LlamaCppGemmaRuntime::load failed: {e}"))?;
+        let arc = Arc::new(Mutex::new(loaded));
+        let _ = RUNTIME.set(arc.clone());
+        arc
     };
 
     let started = Instant::now();
     let runtime_clone = runtime.clone();
     let prompt_clone = prompt.clone();
     let state_clone = state.clone();
-    let inference_result = tokio::task::spawn_blocking(move || {
-        // Build a fresh tool registry per request. Cheap (single-
-        // digit number of tools) and keeps the registry behaviour
-        // testable without global state.
+    let join = tokio::task::spawn_blocking(move || {
         let mut registry = ToolRegistry::new();
         register_default_tools(&mut registry);
-
-        // Lock the runtime so only one inference at a time hits the
-        // worker thread. blocking_lock is safe here — we are inside
-        // spawn_blocking, never on the reactor.
         let rt = runtime_clone.blocking_lock();
         let model_id = rt.model_id().to_string();
-
-        // Drive the ReAct loop. The closure passes each turn's
-        // prompt to llama-cpp and returns the model's text. The
-        // loop handles parsing tool calls + appending tool results
-        // + bounded recursion (MAX_TOOL_STEPS).
         let final_text = run_tool_loop(&state_clone, &registry, &prompt_clone, |conv| {
             rt.generate(conv, max_tokens)
                 .map_err(|e| anyhow::anyhow!("llama-cpp inference failed: {e}"))
         })?;
-
         Ok::<(String, String), anyhow::Error>((model_id, final_text))
     })
-    .await;
+    .await
+    .map_err(|e| anyhow::anyhow!("Gemma inference task panicked: {e}"))?;
+    let (model_id, text) = join?;
+    Ok(ChatOutcome {
+        model_id,
+        response: text,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    })
+}
 
-    match inference_result {
-        Ok(Ok((model_id, text))) => Json(ChatResponseDto {
-            model_id,
-            response: text,
-            elapsed_ms: started.elapsed().as_millis() as u64,
+/// HTTP handler — thin wrapper around `run_chat_with_tools` that
+/// maps the structured Result into an axum Response. Kept as a
+/// separate function so unit tests can hit the underlying pipeline
+/// without spinning up axum.
+#[cfg(feature = "gemma-backend")]
+async fn chat_impl(state: AppApiState, prompt: String, max_tokens: u32) -> Response {
+    use neoethos_gemma::runtime::LlamaCppGemmaRuntime;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    // Same static — referenced here only so the `cfg` doesn't trip
+    // an unused-import lint from the line below; the actual cache
+    // sits inside `run_chat_with_tools`.
+    use std::sync::OnceLock;
+    static _RUNTIME_TYPE_ANCHOR: OnceLock<Arc<Mutex<LlamaCppGemmaRuntime>>> = OnceLock::new();
+    let _ = &_RUNTIME_TYPE_ANCHOR;
+
+    match run_chat_with_tools(state, prompt, max_tokens).await {
+        Ok(outcome) => Json(ChatResponseDto {
+            model_id: outcome.model_id,
+            response: outcome.response,
+            elapsed_ms: outcome.elapsed_ms,
         })
         .into_response(),
-        Ok(Err(err)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("Gemma inference failed: {err}"),
-            })),
-        )
-            .into_response(),
-        Err(join_err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("Gemma inference task panicked: {join_err}"),
-            })),
-        )
-            .into_response(),
+        Err(err) => {
+            let message = err.to_string();
+            let status = if message.contains("model file not found") {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (
+                status,
+                Json(serde_json::json!({"error": message})),
+            )
+                .into_response()
+        }
     }
 }
+
