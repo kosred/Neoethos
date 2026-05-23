@@ -118,9 +118,14 @@ pub fn get_tick(symbol_id: i64) -> Option<SpotTick> {
     cache().read().ok().and_then(|g| g.get(&symbol_id).cloned())
 }
 
-/// Drop everything. Used by tests + by the streamer when the
-/// session is invalidated (e.g. token expired) so stale ticks
-/// don't survive a re-auth.
+/// Drop everything. Used by tests + intended for the streamer
+/// when the session is invalidated (e.g. token expired) so stale
+/// ticks don't survive a re-auth. The streamer doesn't call this
+/// today (it just reconnects and overwrites on next tick), so
+/// the function shows up as dead code in non-test builds —
+/// allow-listed rather than removed because the streamer-on-
+/// reauth use case is on the near-term roadmap.
+#[allow(dead_code)]
 pub fn clear() {
     if let Ok(mut g) = cache().write() {
         g.clear();

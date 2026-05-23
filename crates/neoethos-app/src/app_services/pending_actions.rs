@@ -64,6 +64,11 @@ pub enum ActionKind {
 }
 
 impl ActionKind {
+    /// Human-readable one-liner used by the Gemma `list_pending_actions`
+    /// tool — feature-gated, so this method is dead code in the
+    /// default build. The cfg_attr keeps the warning quiet without
+    /// hiding it behind a blanket `#[allow]`.
+    #[cfg_attr(not(feature = "gemma-backend"), allow(dead_code))]
     pub fn summary(&self) -> String {
         match self {
             Self::ClosePosition {
@@ -133,6 +138,9 @@ fn current_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Used only by `propose()` which is itself feature-gated to the
+/// Gemma tool path — no other code path mints action IDs today.
+#[cfg_attr(not(feature = "gemma-backend"), allow(dead_code))]
 fn next_id() -> String {
     // Cheap unique id — Unix-ms + a small counter so two proposals
     // in the same millisecond don't collide. We don't need UUID's
@@ -156,6 +164,11 @@ fn queue() -> &'static Mutex<VecDeque<PendingAction>> {
 /// exceeded, the OLDEST `Pending` action is evicted (operator's
 /// most recent thought takes priority over a stale unanswered
 /// prompt from 10 minutes ago).
+/// Called by the `propose_close_position` Gemma tool — feature-gated,
+/// so unused in the default build. The endpoint stack
+/// (`server/pending_actions::list/confirm/reject`) still works
+/// without the LLM; it just always sees an empty queue.
+#[cfg_attr(not(feature = "gemma-backend"), allow(dead_code))]
 pub fn propose(kind: ActionKind, reason: String) -> Result<String> {
     let mut q = queue().lock().map_err(|_| anyhow!("queue mutex poisoned"))?;
     sweep_expired(&mut q);
