@@ -1,0 +1,66 @@
+NeoEthos bundles a Gemma 4 fine-tune for its local AI Helper feature.
+This file documents the upstream license and attribution that travel
+with the model weights.
+
+────────────────────────────────────────────────────────────────────────
+Model:   Gemma 4 E4B Uncensored (HauhauCS Aggressive variant)
+File:    Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf
+Source:  https://huggingface.co/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive
+Base:    Google Gemma 4 (gemma-3-4b-it lineage)
+License: Gemma Terms of Use (Google) + Gemma Prohibited Use Policy
+────────────────────────────────────────────────────────────────────────
+
+GEMMA TERMS OF USE — KEY POINTS (full text at the URL below)
+
+  https://ai.google.dev/gemma/terms
+
+  1. You may use, reproduce, modify, and distribute the Gemma model
+     weights (and derivatives) subject to:
+       a. compliance with the Gemma Prohibited Use Policy
+          (https://ai.google.dev/gemma/prohibited_use_policy), and
+       b. carrying through this notice + the Gemma Terms of Use to any
+          downstream redistribution.
+
+  2. Modifications must be flagged as such. The HauhauCS "abliterated"
+     fine-tune referenced above is a third-party modification; NeoEthos
+     is a further-downstream bundler and does NOT modify the GGUF.
+
+  3. Output of the model is yours. The license covers weight redistribution,
+     not the generated text.
+
+  4. NO WARRANTY. Google and the upstream model maintainers ship the
+     weights "AS IS". NeoEthos likewise ships the bundled file without
+     warranty.
+
+  5. Trademark. "Gemma" is a Google trademark; NeoEthos does not claim it.
+
+PROHIBITED USE (https://ai.google.dev/gemma/prohibited_use_policy)
+
+  You may NOT use this model to generate content that:
+    - facilitates illegal activity, violence, child exploitation, or
+      mass harm;
+    - deceives or manipulates people in ways that cause material harm;
+    - infringes on intellectual property, privacy, or civil rights;
+    - violates platform-specific safety policies of the deployment.
+
+  The "abliterated" variant lowers the model's built-in refusal layer.
+  This makes the operator MORE — not less — responsible for what
+  prompts are sent and what outputs are surfaced. NeoEthos exposes
+  the model to the operator via the AI Helper screen on the explicit
+  understanding that the operator accepts these constraints.
+
+ATTRIBUTION
+
+  When you redistribute NeoEthos with the bundled GGUF, please keep:
+    - this LICENSE-gemma file alongside the .gguf;
+    - the credit line "Powered by Google Gemma; HauhauCS abliterated
+      fine-tune" anywhere the AI Helper feature is described.
+
+UPSTREAM LINKS
+
+  Google Gemma:       https://ai.google.dev/gemma
+  Gemma Terms:        https://ai.google.dev/gemma/terms
+  Prohibited Use:     https://ai.google.dev/gemma/prohibited_use_policy
+  Fine-tune source:   https://huggingface.co/HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive
+
+NeoEthos compliance contact: konstantinoskokkinos1982@gmail.com

@@ -92,24 +92,68 @@ Copy-Item -Path (Join-Path $repoRoot 'assets') -Destination $dst -Recurse
 Copy-Item -Path (Join-Path $repoRoot 'LICENSE') -Destination $dst
 Copy-Item -Path (Join-Path $repoRoot 'README.md') -Destination $dst -ErrorAction SilentlyContinue
 
-# 6. Carve out a place for the Gemma GGUF. The AI Helper screen tells
-#    the user to drop the model file here; pre-creating the dir makes
-#    the install hint actionable.
-New-Item -ItemType Directory -Force -Path (Join-Path $dst 'resources\models') | Out-Null
+# 6. Bundle the Gemma GGUF if it's already on disk under the repo's
+#    `resources/models/`. The user explicitly asked that the model
+#    ship inside the bundle so the operator never has to download it
+#    by hand ("κακος το εχουμε αφησει στο χρηστη"). If the GGUF is
+#    missing we still create the empty slot and warn loudly — the
+#    bundle is still usable for chart/exec/discovery, but AI Helper +
+#    News will show "rebuild with --features gemma-backend OR run
+#    scripts/fetch-gemma-model.ps1" until the file lands.
+$bundleModelDir = Join-Path $dst 'resources\models'
+New-Item -ItemType Directory -Force -Path $bundleModelDir | Out-Null
+
+$repoModelDir = Join-Path $repoRoot 'resources\models'
+$ggufFiles = if (Test-Path $repoModelDir) {
+    Get-ChildItem -Path $repoModelDir -Filter '*.gguf' -File -ErrorAction SilentlyContinue
+} else { @() }
+
+if ($ggufFiles.Count -gt 0) {
+    foreach ($gguf in $ggufFiles) {
+        $sizeGB = [math]::Round($gguf.Length / 1GB, 2)
+        Write-Host ("Copying GGUF: {0} ({1} GB)" -f $gguf.Name, $sizeGB) -ForegroundColor Green
+        Copy-Item -Path $gguf.FullName -Destination $bundleModelDir
+    }
+    # License compliance: Gemma is Google's license and requires
+    # the license file + attribution to travel with the weights.
+    $gemmaLicenseSrc = Join-Path $repoRoot 'LICENSE-gemma'
+    if (Test-Path $gemmaLicenseSrc) {
+        Copy-Item -Path $gemmaLicenseSrc -Destination $bundleModelDir
+    } else {
+        # No license file yet — emit a placeholder so the bundle is
+        # never shipped without notice. Compliance scaffolding lives
+        # in the repo as `LICENSE-gemma`; document the missing-file
+        # case here loudly.
+        Write-Warning "LICENSE-gemma not found at $gemmaLicenseSrc — bundle ships without Gemma license attribution. Fix before publishing."
+    }
+} else {
+    Write-Warning ("No .gguf found in {0}. AI Helper + News will be disabled in this bundle. To include them, run scripts/fetch-gemma-model.ps1 and re-bundle." -f $repoModelDir)
+}
 
 # 7. Quick verification.
 $bundleExe = Join-Path $dst 'NeoEthos.exe'
 $bundleBackend = Join-Path $dst 'bin\neoethos-app.exe'
 $bundleConfig = Join-Path $dst 'config.yaml'
+$bundleGguf = Get-ChildItem -Path $bundleModelDir -Filter '*.gguf' -ErrorAction SilentlyContinue | Select-Object -First 1
 
 Write-Host ""
 Write-Host "Bundle contents:"
 Get-ChildItem $dst | Format-Table Name, @{Name='Size'; Expression={if ($_.PSIsContainer) { 'dir' } else { $_.Length }}} -AutoSize
+
+# Total bundle size — relevant because the GGUF makes it jump from ~250 MB
+# to ~5.5 GB; the user should see this stat before publishing.
+$totalBytes = (Get-ChildItem $dst -Recurse -File | Measure-Object -Property Length -Sum).Sum
+$totalGB = [math]::Round($totalBytes / 1GB, 2)
 
 Write-Host ""
 Write-Host "Sanity check:"
 Write-Host ("  NeoEthos.exe exists       : " + (Test-Path $bundleExe))
 Write-Host ("  bin/neoethos-app.exe      : " + (Test-Path $bundleBackend))
 Write-Host ("  config.yaml exists        : " + (Test-Path $bundleConfig))
+Write-Host ("  Gemma GGUF bundled        : " + ($null -ne $bundleGguf))
+if ($bundleGguf) {
+    Write-Host ("    → {0} ({1} GB)" -f $bundleGguf.Name, [math]::Round($bundleGguf.Length / 1GB, 2))
+}
+Write-Host ("  Total bundle size         : {0} GB" -f $totalGB)
 Write-Host ""
 Write-Host "Done. Double-click $bundleExe to launch."

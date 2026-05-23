@@ -113,8 +113,15 @@ pub const BUNDLED_MODEL_DOWNLOAD_URL: &str = "https://huggingface.co/HauhauCS/Ge
 
 /// Approximate on-disk size of the bundled quant, in bytes.
 /// Updated when the operator rebases the bundled quant. Used by
-/// the disk-safety pre-check in the installer-prep script.
-pub const BUNDLED_MODEL_APPROX_BYTES: u64 = 5_000_000_000;
+/// the disk-safety pre-check in the installer-prep script and by
+/// the AI Helper panel banner that warns the user before they
+/// kick a multi-GB download.
+///
+/// Current value matches the HauhauCS Q4_K_M (~5.34 GB on disk per
+/// the HuggingFace upload metadata). The number is a soft anchor —
+/// the file may shift by a few hundred MB between HF re-uploads; UI
+/// copy says "approximately" so small drift is fine.
+pub const BUNDLED_MODEL_APPROX_BYTES: u64 = 5_340_000_000;
 
 /// Result of a successful path-resolve.
 #[derive(Debug, Clone, PartialEq, Eq)]
