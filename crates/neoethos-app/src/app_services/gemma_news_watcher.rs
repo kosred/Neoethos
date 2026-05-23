@@ -172,6 +172,27 @@ async fn run_loop(state: AppApiState, config: WatcherConfig, cancel: Arc<AtomicB
         "gemma news watcher loop starting"
     );
 
+    // Probe the headless-browser path at boot so the operator gets
+    // a clear log line about whether the JS-rendered sources will
+    // work on this machine. The probe itself doesn't launch Chrome
+    // — it just checks the install paths.
+    #[cfg(feature = "headless-browser")]
+    {
+        if crate::app_services::news_sources::headless_browser::is_available() {
+            tracing::info!(
+                target: "neoethos_app::gemma_news_watcher",
+                "headless browser detected — JS-rendered news sources are available"
+            );
+        } else {
+            tracing::warn!(
+                target: "neoethos_app::gemma_news_watcher",
+                "no Chrome/Edge/Chromium found — headless-browser sources will fall back \
+                 to direct HTTP which is often blocked by Cloudflare. Install Chrome \
+                 from https://www.google.com/chrome/ to unlock the JS-rendered sources."
+            );
+        }
+    }
+
     // Last-fire timestamps prevent double-firing the same mode
     // within a single window. We compare on (local_date,
     // mode_kind) for morning-scan + session-start, and use a

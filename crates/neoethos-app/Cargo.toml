@@ -14,6 +14,19 @@ readme = "../../README.md"
 [features]
 default = []
 gpu = ["neoethos-search/gpu", "neoethos-models/neuro-evolution-gpu", "neoethos-models/statistical-gpu"]
+# headless-browser: opt-in dependency on `headless_chrome` for the
+# `news_sources::headless_browser` module. Cloudflare-protected and
+# JS-rendered news sites (FXStreet, DailyFX, Investing.com) defeat
+# simple reqwest GETs; enabling this feature lets the news aggregator
+# fall back to driving a real Chrome / Edge instance. Adds ~20 transitive
+# deps (DevTools-Protocol websocket client + browser process management),
+# all of them already in the workspace's transitive tree via reqwest's
+# tls + tokio's net machinery — so the on-disk install size grows by
+# ~3 MB rather than the ~30 MB chromiumoxide costs. Requires Chrome or
+# Edge to be installed on the operator's machine at runtime; the source
+# auto-detects via the standard Windows / macOS / Linux paths and falls
+# back to "no data" when neither is present.
+headless-browser = ["dep:headless_chrome"]
 native-tree-models = ["neoethos-models/tree-models"]
 # Enable the native Protobuf-over-TCP transport (port 5035) for the cTrader
 # Open API. Wire-format only; the higher-level Rust API surface is unchanged.
@@ -67,6 +80,13 @@ rusqlite = { version = "0.38.0", features = ["bundled", "chrono"] }
 # enough structural irregularity that serde-XML round-trips don't
 # pay off.
 quick-xml = "0.36"
+# headless_chrome — controls a Chrome / Chromium / Edge instance over
+# the DevTools Protocol. Pulled in only when the `headless-browser`
+# feature is on (see [features] above). Sync API (the crate runs its
+# own internal tokio); we call it from `spawn_blocking` blocks. Chosen
+# over chromiumoxide because the dep graph is smaller and the sync API
+# is easier to integrate with our existing blocking-thread tool path.
+headless_chrome = { version = "1.0", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 toml = "0.8.20"

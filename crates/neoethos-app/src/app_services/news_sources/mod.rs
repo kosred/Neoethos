@@ -36,6 +36,8 @@
 
 pub mod cache;
 pub mod forex_factory;
+#[cfg(feature = "headless-browser")]
+pub mod headless_browser;
 pub mod rss_feed;
 
 use anyhow::Result;

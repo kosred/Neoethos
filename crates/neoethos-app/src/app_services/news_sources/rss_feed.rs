@@ -37,23 +37,45 @@ pub struct RssFeedSource {
     id: &'static str,
     display_name: &'static str,
     url: String,
+    /// When true, fetch the feed through the headless-browser
+    /// module (#130) instead of reqwest. Required for Cloudflare-
+    /// protected or JS-rendered feeds (FXStreet, DailyFX,
+    /// Investing.com all do this). The flag is operator-controlled
+    /// via the `NEOETHOS_<SOURCE>_USE_HEADLESS=1` env var so a
+    /// machine without Chrome installed can stay on the reqwest
+    /// path. Compiled out without the `headless-browser` feature
+    /// — the flag has no effect when the dep is absent.
+    use_headless_browser: bool,
 }
 
 impl RssFeedSource {
     /// Build a generic RSS reader. The `url_override_env` is read
     /// once at construction — operators tweaking the feed URL
     /// without rebuilding can set the env var and restart.
+    /// `headless_env` is the name of the env var that toggles
+    /// headless-browser fetching for this source (`NEOETHOS_FXSTREET_USE_HEADLESS`
+    /// etc.). Truthy values: `1`, `true`, `yes`, `on` (case-insensitive).
     pub fn new(
         id: &'static str,
         display_name: &'static str,
         default_url: &'static str,
         url_override_env: &str,
+        headless_env: &str,
     ) -> Self {
         let url = std::env::var(url_override_env).unwrap_or_else(|_| default_url.to_string());
+        let use_headless_browser = std::env::var(headless_env)
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
         Self {
             id,
             display_name,
             url,
+            use_headless_browser,
         }
     }
 
@@ -63,6 +85,7 @@ impl RssFeedSource {
             "FXStreet news RSS",
             "https://www.fxstreet.com/rss/news",
             "NEOETHOS_FXSTREET_RSS_URL",
+            "NEOETHOS_FXSTREET_USE_HEADLESS",
         )
     }
 
@@ -72,6 +95,7 @@ impl RssFeedSource {
             "DailyFX market-news RSS",
             "https://www.dailyfx.com/feeds/market-news",
             "NEOETHOS_DAILYFX_RSS_URL",
+            "NEOETHOS_DAILYFX_USE_HEADLESS",
         )
     }
 
@@ -81,7 +105,26 @@ impl RssFeedSource {
             "Investing.com news RSS",
             "https://www.investing.com/rss/news.rss",
             "NEOETHOS_INVESTING_RSS_URL",
+            "NEOETHOS_INVESTING_USE_HEADLESS",
         )
+    }
+
+    /// Choose between reqwest and the headless-browser fetcher.
+    /// Returns the body text on success. Caller is responsible for
+    /// parsing the XML — both paths return the same canonical
+    /// shape, so the parser doesn't care which one fetched.
+    fn fetch_body(&self) -> anyhow::Result<String> {
+        #[cfg(feature = "headless-browser")]
+        if self.use_headless_browser {
+            return super::headless_browser::fetch_via_browser(&self.url);
+        }
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
+            .user_agent(USER_AGENT)
+            .build()
+            .context("failed to build HTTP client for RSS feed")?;
+        let body = client.get(&self.url).send()?.text()?;
+        Ok(body)
     }
 }
 
@@ -98,17 +141,13 @@ impl NewsSource for RssFeedSource {
         if let Some(cached) = cache::get_headlines(self.id()) {
             return Ok(cached);
         }
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
-            .user_agent(USER_AGENT)
-            .build()
-            .context("failed to build HTTP client for RSS feed")?;
-        let body = match client.get(&self.url).send().and_then(|r| r.text()) {
+        let body = match self.fetch_body() {
             Ok(b) => b,
             Err(err) => {
                 tracing::warn!(
                     target: "neoethos_app::news_sources::rss",
                     url = %self.url,
+                    use_headless = self.use_headless_browser,
                     error = %err,
                     "failed to fetch RSS feed; serving stale cache if any"
                 );
