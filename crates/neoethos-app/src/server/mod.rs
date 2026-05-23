@@ -40,6 +40,7 @@ pub mod health;
 pub mod indicators;
 pub mod intelligence;
 pub mod orders;
+pub mod pending_actions;
 pub mod risk;
 pub mod settings;
 pub mod state;
@@ -114,6 +115,13 @@ pub fn router(state: AppApiState) -> Router {
         .route("/chart", get(chart::chart))
         .route("/indicators", get(indicators::indicators))
         .route("/diagnostics/report", post(diagnostics::report))
+        // ── Trade-management confirmation flow (#136) ──────────
+        .route("/actions/pending", get(pending_actions::list))
+        .route(
+            "/actions/{id}/confirm",
+            post(pending_actions::confirm),
+        )
+        .route("/actions/{id}/reject", post(pending_actions::reject))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)

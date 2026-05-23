@@ -67,6 +67,7 @@ pub mod gemma_tools;
 // keeps the default build free of unused-module warnings.
 #[cfg(feature = "gemma-backend")]
 pub mod news_sources;
+pub mod pending_actions;
 pub mod risky_mode_persistence;
 pub mod secure_store;
 pub mod signal_journal;

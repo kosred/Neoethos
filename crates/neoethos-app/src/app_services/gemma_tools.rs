@@ -293,9 +293,17 @@ pub fn build_system_prompt(registry: &ToolRegistry) -> String {
          You are NOT above those models — you are the EXPLAINER. When the user \
          asks about a trade, your job is to read the signal metadata (use the \
          tools below) and translate what the models saw into plain language. \
-         You may flag concerns (\"this trade is bigger than your usual size\") \
-         but you do not override the strategy's decisions. Trade-management \
-         actions, when added later, require explicit user confirmation.\n\n\
+         You may flag concerns (\"this trade is bigger than your usual size\").\n\n\
+         \
+         ## Trade-management actions (strictly proposal-only)\n\
+         You can suggest closing a position via `propose_close_position`. \
+         IMPORTANT: this does NOT execute the close — it adds a Confirm / \
+         Reject prompt to the operator's UI. The operator's click is what \
+         actually closes the position; there is no way for you to bypass that. \
+         Use the proposal tool sparingly and only with a strong reason \
+         (down N pips, high-impact event imminent, risk cap about to trip). \
+         Never propose placing new orders, modifying stops, or cancelling \
+         pending orders — those actions are not yet on the whitelist.\n\n\
          \
          ## Truthfulness\n\
          Stay concise, factual, and never invent numbers. Always use the tools \
@@ -1332,6 +1340,143 @@ impl Tool for GetRecentMarketHeadlinesTool {
     }
 }
 
+// ─── Trade-management proposal tool (#136) ───────────────────────
+//
+// The LLM CANNOT execute trades autonomously. Its only path to
+// changing position state is to PROPOSE an action via this tool,
+// which adds a row to the pending-actions queue. The Flutter UI
+// pops a Confirm / Reject prompt; the user's explicit click is
+// what actually fires the broker call.
+//
+// Today the only whitelisted action kind is ClosePosition. Adding
+// further kinds (cancel pending, modify SL, place new order) is a
+// deliberate code change here AND in `pending_actions::ActionKind`
+// — there is no generic "execute arbitrary command" backdoor.
+
+pub struct ProposeClosePositionTool;
+
+impl Tool for ProposeClosePositionTool {
+    fn name(&self) -> &'static str {
+        "propose_close_position"
+    }
+
+    fn description(&self) -> &'static str {
+        "Propose closing an open position. This DOES NOT execute the close — \
+         it adds a Confirm / Reject prompt to the operator's UI. The operator's \
+         click is what actually closes the position; you cannot bypass the prompt. \
+         Use ONLY when you've reasoned through `get_open_positions` + \
+         `get_chart_data` and have a concrete recommendation. Arguments: \
+         `position_id` (the integer position_id from get_open_positions), \
+         `symbol_hint` (optional, e.g. \"EURUSD\" — surfaced in the UI \
+         prompt), `reason` (REQUIRED plain-English explanation the operator \
+         sees: \"down 25 pips, ECB conference in 8 min, recommend closing\")."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "position_id": {"type": "integer", "description": "position_id from get_open_positions"},
+                "symbol_hint": {"type": "string"},
+                "reason":      {"type": "string", "minLength": 10}
+            },
+            "required": ["position_id", "reason"]
+        })
+    }
+
+    fn execute(&self, _state: &AppApiState, args: Value) -> Result<Value> {
+        let position_id = args
+            .get("position_id")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| anyhow!("missing required argument `position_id` (integer)"))?;
+        if position_id <= 0 {
+            return Err(anyhow!("position_id must be a positive integer"));
+        }
+        let reason = args
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing required argument `reason`"))?
+            .trim()
+            .to_string();
+        if reason.len() < 10 {
+            return Err(anyhow!(
+                "reason must be at least 10 chars — the operator needs context to \
+                 decide whether to confirm. Got: `{reason}`"
+            ));
+        }
+        let symbol_hint = args
+            .get("symbol_hint")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let id = crate::app_services::pending_actions::propose(
+            crate::app_services::pending_actions::ActionKind::ClosePosition {
+                position_id,
+                // 0 = "close entire position". The UI will pass the
+                // real broker volume_units when the operator clicks
+                // Confirm. We can't look it up here because the
+                // LLM tool runs synchronously and AppApiState's
+                // position cache is async-locked.
+                volume_units: 0,
+                symbol_hint,
+            },
+            reason.clone(),
+        )?;
+        Ok(json!({
+            "ok": true,
+            "action_id": id,
+            "status": "pending",
+            "ttl_seconds": crate::app_services::pending_actions::PENDING_ACTION_TTL_SECS,
+            "note": "Proposal added to operator queue. The user will see a \
+                     Confirm / Reject prompt; their click is what actually \
+                     closes the position. If they don't respond within the \
+                     TTL the action auto-expires.",
+        }))
+    }
+}
+
+pub struct ListPendingActionsTool;
+
+impl Tool for ListPendingActionsTool {
+    fn name(&self) -> &'static str {
+        "list_pending_actions"
+    }
+
+    fn description(&self) -> &'static str {
+        "Returns recent trade-action proposals + their current status (pending / \
+         confirmed / rejected / executed / expired / failed). Use to check \
+         whether a propose_close_position you fired earlier has been actioned \
+         by the operator, or to see history before proposing again. No arguments."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({"type": "object", "properties": {}})
+    }
+
+    fn execute(&self, _state: &AppApiState, _args: Value) -> Result<Value> {
+        let actions = crate::app_services::pending_actions::list_all();
+        let rows: Vec<Value> = actions
+            .iter()
+            .map(|a| {
+                json!({
+                    "id": a.id,
+                    "summary": a.kind.summary(),
+                    "reason": preview(&a.reason, 240),
+                    "status": serde_json::to_value(a.status).unwrap_or(Value::Null),
+                    "proposed_at_unix_ms": a.proposed_at_unix_ms,
+                    "expires_at_unix_ms": a.expires_at_unix_ms,
+                    "result_note": preview(&a.result_note, 240),
+                })
+            })
+            .collect();
+        Ok(json!({
+            "count": rows.len(),
+            "actions": rows,
+        }))
+    }
+}
+
 pub fn register_default_tools(registry: &mut ToolRegistry) {
     registry.register(Box::new(GetAccountSnapshotTool));
     registry.register(Box::new(GetOpenPositionsTool));
@@ -1347,6 +1492,8 @@ pub fn register_default_tools(registry: &mut ToolRegistry) {
     registry.register(Box::new(ExplainRecentTradesTool));
     registry.register(Box::new(GetUpcomingCalendarEventsTool));
     registry.register(Box::new(GetRecentMarketHeadlinesTool));
+    registry.register(Box::new(ProposeClosePositionTool));
+    registry.register(Box::new(ListPendingActionsTool));
 }
 
 #[cfg(test)]
@@ -1374,6 +1521,8 @@ mod tests {
             "explain_recent_trades",
             "get_upcoming_calendar_events",
             "get_recent_market_headlines",
+            "propose_close_position",
+            "list_pending_actions",
         ] {
             assert!(
                 rendered.contains(name),
