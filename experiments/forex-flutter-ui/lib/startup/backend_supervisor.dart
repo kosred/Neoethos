@@ -47,13 +47,30 @@ class BackendSupervisor {
   /// backend is reachable, or after `_maxWaitMs` if it never came up
   /// (we still let the UI render so the user sees an actionable error
   /// instead of a hung splash).
-  Future<void> ensureRunning() async {
+  /// Returns `true` when the caller should continue running the
+  /// Flutter UI. Returns `false` when another NeoEthos instance is
+  /// already alive and the caller should `exit(0)` immediately to
+  /// avoid two competing UI windows (#176).
+  Future<bool> ensureRunning() async {
     _log('ensureRunning() start. Flutter exe: ${Platform.resolvedExecutable}');
     _log('CWD: ${Directory.current.path}');
 
     if (await _probeHealth()) {
-      _log('Backend already responding on $_baseUrl — not spawning.');
-      return;
+      // #176: an already-running backend almost certainly means an
+      // already-running Flutter shell owns the UI. Verified live
+      // today — the user ended up with TWO NeoEthos windows + a
+      // stale dev-bundle backend confusing every click. Refusing
+      // the second launch is the cleanest UX: the existing window
+      // stays in focus and the new shell never opens a competing
+      // viewport.
+      //
+      // We could add a "bring existing to foreground" IPC here
+      // (Win32 SetForegroundWindow on the existing Flutter HWND)
+      // but that's polish — exiting clean already solves the
+      // confusion. Logs say why.
+      _log('Backend already responding on $_baseUrl — '
+          'another NeoEthos instance is running. This shell will exit.');
+      return false;
     }
 
     final binary = _locateBackendBinary();
@@ -64,7 +81,7 @@ class BackendSupervisor {
           '  3. Ancestors of Flutter exe → target/{debug,release}/\n'
           '  4. Ancestors of CWD → target/{debug,release}/\n'
           'Drop the neoethos-app.exe under <neoethos.exe-dir>/bin/ and re-launch.');
-      return;
+      return true; // continue showing the UI; "Backend unreachable" will explain
     }
     _log('Located backend binary: ${binary.path}');
 
@@ -101,10 +118,11 @@ class BackendSupervisor {
       _log('Spawned ${binary.path} (pid=${_child?.pid})');
     } on ProcessException catch (err) {
       _log('FATAL: Process.start failed: $err');
-      return;
+      return true; // continue showing the UI; error states will surface
     }
 
     await _waitForHealth();
+    return true;
   }
 
   Future<bool> _probeHealth() async {

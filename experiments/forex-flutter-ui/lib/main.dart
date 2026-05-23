@@ -13,6 +13,8 @@
 //      one .exe, both halves come up.
 //   3. Run the Flutter UI.
 
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -22,11 +24,17 @@ import 'widgets/app_shell.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  // Fire-and-forget: spawn the backend if it isn't already up. The
-  // supervisor is non-blocking — UI renders immediately and the
-  // existing AsyncValue.error states cover the (very short) window
-  // where the server hasn't bound the port yet.
-  await BackendSupervisor.instance.ensureRunning();
+  // #176: spawn the backend if it isn't already up. The supervisor
+  // returns FALSE when another NeoEthos instance is already alive
+  // (an existing healthy /healthz response). We exit immediately in
+  // that case to avoid two competing UI windows — the existing
+  // window stays in focus, the duplicate shell vanishes.
+  final shouldContinue = await BackendSupervisor.instance.ensureRunning();
+  if (!shouldContinue) {
+    // The existing instance owns the UI; exiting with code 0 keeps
+    // the OS from logging a crash and stops the duplicate cold.
+    exit(0);
+  }
   runApp(const ProviderScope(child: NeoethosApp()));
 }
 
