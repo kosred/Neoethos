@@ -182,15 +182,25 @@ resources = [
     # writes to the canonical user-data dir.
     "../../scripts/fetch-gemma-model.ps1",
 ]
-# NSIS hook: emit the VC++ Redistributable bootstrapper into the
-# generated installer. cargo-packager's `nsis` backend accepts custom
-# hook templates — the snippet below is the smallest one that:
-#   1. Checks `HKLM\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64`
-#      for `Installed = 1`.
-#   2. If missing, downloads the Microsoft-signed VC_redist.x64.exe
-#      and runs it with `/install /quiet /norestart`.
-# Path is relative to this Cargo.toml.
-nsis.installer-hooks = "../../scripts/vc_redist_install.nsh"
+# NSIS hooks (cargo-packager `NSIS_HOOK_PREINSTALL` / `NSIS_HOOK_POSTINSTALL`):
+#
+#   PRE-install:   vc_redist_install.nsh — downloads VC++ 2015-2022
+#                  redistributable from microsoft.com if HKLM\Microsoft\
+#                  VC\Runtimes\x64\Installed != 1, so the freshly-extracted
+#                  NeoEthos.exe doesn't fail to load on pristine Windows.
+#
+#   POST-install:  gemma_model_install.nsh — fetches the ~5 GiB Gemma 4
+#                  abliterated GGUF from HuggingFace into
+#                  $INSTDIR\resources\models\ so AI Helper + News work on
+#                  first launch. Failure is non-fatal — the Flutter shell
+#                  has a first-launch downloader fallback in AI Helper.
+#                  This is what makes the Lite installer (~250 MB) fit
+#                  under GitHub Releases' 2 GB per-asset cap while still
+#                  delivering an "AI works out of the box" end-user UX.
+#
+# Both .nsh files are wrapped by `installer_hooks.nsh` which defines the
+# cargo-packager-recognised hook macros. Path is relative to this Cargo.toml.
+nsis.installer-hooks = "../../scripts/installer_hooks.nsh"
 
 [[package.metadata.packager.binaries]]
 path = "neoethos-app"

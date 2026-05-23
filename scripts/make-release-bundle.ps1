@@ -26,7 +26,16 @@
 [CmdletBinding()]
 param(
     [string]$Profile = 'release',     # 'release' or 'debug'
-    [string]$Destination = 'dist\NeoEthos'
+    [string]$Destination = 'dist\NeoEthos',
+    # When -Lite is set, the bundle ships WITHOUT the Gemma GGUF —
+    # the NSIS installer downloads it at install time via
+    # `scripts/gemma_model_install.nsh`. Total bundle drops from
+    # ~5.5 GB back to ~250 MB so the installer .exe stays under
+    # GitHub Releases' 2 GB per-asset cap. Default behaviour (no
+    # -Lite) is the "Full" offline-testing bundle that includes
+    # the GGUF inline — handy for local AI Helper verification
+    # without internet access during install.
+    [switch]$Lite
 )
 
 $ErrorActionPreference = 'Stop'
@@ -103,31 +112,41 @@ Copy-Item -Path (Join-Path $repoRoot 'README.md') -Destination $dst -ErrorAction
 $bundleModelDir = Join-Path $dst 'resources\models'
 New-Item -ItemType Directory -Force -Path $bundleModelDir | Out-Null
 
-$repoModelDir = Join-Path $repoRoot 'resources\models'
-$ggufFiles = if (Test-Path $repoModelDir) {
-    Get-ChildItem -Path $repoModelDir -Filter '*.gguf' -File -ErrorAction SilentlyContinue
-} else { @() }
-
-if ($ggufFiles.Count -gt 0) {
-    foreach ($gguf in $ggufFiles) {
-        $sizeGB = [math]::Round($gguf.Length / 1GB, 2)
-        Write-Host ("Copying GGUF: {0} ({1} GB)" -f $gguf.Name, $sizeGB) -ForegroundColor Green
-        Copy-Item -Path $gguf.FullName -Destination $bundleModelDir
-    }
-    # License compliance: Gemma is Google's license and requires
-    # the license file + attribution to travel with the weights.
+if ($Lite) {
+    Write-Host "Lite mode: skipping GGUF copy. NSIS installer will fetch it during install." -ForegroundColor Cyan
+    # We still copy the LICENSE-gemma so end users see the upstream
+    # attribution even before the download lands.
     $gemmaLicenseSrc = Join-Path $repoRoot 'LICENSE-gemma'
     if (Test-Path $gemmaLicenseSrc) {
         Copy-Item -Path $gemmaLicenseSrc -Destination $bundleModelDir
-    } else {
-        # No license file yet — emit a placeholder so the bundle is
-        # never shipped without notice. Compliance scaffolding lives
-        # in the repo as `LICENSE-gemma`; document the missing-file
-        # case here loudly.
-        Write-Warning "LICENSE-gemma not found at $gemmaLicenseSrc — bundle ships without Gemma license attribution. Fix before publishing."
     }
 } else {
-    Write-Warning ("No .gguf found in {0}. AI Helper + News will be disabled in this bundle. To include them, run scripts/fetch-gemma-model.ps1 and re-bundle." -f $repoModelDir)
+    $repoModelDir = Join-Path $repoRoot 'resources\models'
+    $ggufFiles = if (Test-Path $repoModelDir) {
+        Get-ChildItem -Path $repoModelDir -Filter '*.gguf' -File -ErrorAction SilentlyContinue
+    } else { @() }
+
+    if ($ggufFiles.Count -gt 0) {
+        foreach ($gguf in $ggufFiles) {
+            $sizeGB = [math]::Round($gguf.Length / 1GB, 2)
+            Write-Host ("Copying GGUF: {0} ({1} GB)" -f $gguf.Name, $sizeGB) -ForegroundColor Green
+            Copy-Item -Path $gguf.FullName -Destination $bundleModelDir
+        }
+        # License compliance: Gemma is Google's license and requires
+        # the license file + attribution to travel with the weights.
+        $gemmaLicenseSrc = Join-Path $repoRoot 'LICENSE-gemma'
+        if (Test-Path $gemmaLicenseSrc) {
+            Copy-Item -Path $gemmaLicenseSrc -Destination $bundleModelDir
+        } else {
+            # No license file yet — emit a placeholder so the bundle is
+            # never shipped without notice. Compliance scaffolding lives
+            # in the repo as `LICENSE-gemma`; document the missing-file
+            # case here loudly.
+            Write-Warning "LICENSE-gemma not found at $gemmaLicenseSrc — bundle ships without Gemma license attribution. Fix before publishing."
+        }
+    } else {
+        Write-Warning ("No .gguf found in {0}. AI Helper + News will be disabled in this bundle. To include them, run scripts/fetch-gemma-model.ps1 and re-bundle (or use -Lite to defer to NSIS install-time fetch)." -f $repoModelDir)
+    }
 }
 
 # 7. Quick verification.
