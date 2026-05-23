@@ -65,10 +65,20 @@ SetCompressor /SOLID lzma
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 
-; Finish page — offer to launch NeoEthos.exe (NOT neoethos-app.exe).
-; Without this the user has to hunt for the Start Menu entry.
-!define MUI_FINISHPAGE_RUN "$INSTDIR\NeoEthos.exe"
-!define MUI_FINISHPAGE_RUN_TEXT "Launch NeoEthos now"
+; Finish page — show a tip pointing at the Start Menu shortcut
+; INSTEAD of the auto-launch checkbox. Auto-launch from the
+; installer inherits the installer's admin token, which makes
+; NeoEthos run at High integrity → Windows UIPI then blocks
+; input from any normal-integrity process (drag-drop from File
+; Explorer, automation tools, etc.) and files written by the app
+; land owned by admin, unreadable to the standard user. The user
+; launches from Start Menu / Desktop shortcut → app runs at the
+; user's normal token. Task #177.
+!define MUI_FINISHPAGE_TEXT \
+    "Setup is complete.$\r$\n$\r$\nLaunch NeoEthos from the Start \
+Menu (or the Desktop shortcut).$\r$\n$\r$\nDo NOT relaunch this \
+installer to start the app — that would run NeoEthos with \
+administrator privileges and break some Windows features."
 !insertmacro MUI_PAGE_FINISH
 
 !insertmacro MUI_UNPAGE_CONFIRM
