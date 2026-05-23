@@ -700,6 +700,76 @@ class BackendClient {
     return DiagnosticReport.fromJson(r.data ?? const {});
   }
 
+  /// `/actions/pending` — list of LLM-proposed trade-management
+  /// actions waiting for the operator (or recently-finalised ones
+  /// kept around for audit / UI history). The banner polls this
+  /// every 2 s while mounted; #136 backend caps the queue at 16
+  /// entries and prunes >24 h old, so the response is small.
+  Future<List<PendingAction>> fetchPendingActions() async {
+    final response = await _dio.get<Map<String, dynamic>>('/actions/pending');
+    final raw = response.data?['actions'] as List?;
+    return (raw ?? const [])
+        .map((e) => PendingAction.fromJson(e as Map<String, dynamic>))
+        .toList(growable: false);
+  }
+
+  /// `POST /actions/{id}/confirm` — user clicked Confirm. Flips
+  /// Pending→Confirmed server-side and dispatches the underlying
+  /// broker call. The response carries `{ok:true, broker_outcome:
+  /// {...}}` on a clean fill, or a 4xx/5xx with `{error, code}`
+  /// when the broker rejects.
+  ///
+  /// [volumeUnitsOverride] lets the operator pick a partial-close
+  /// volume even when the LLM proposed "close entire". Pass null
+  /// to honour the LLM's proposal. The backend rejects volume == 0
+  /// with `code:missing_volume`, so for "close entire" cases the
+  /// UI must look up the position's actual volume and pass that.
+  Future<Map<String, dynamic>> confirmPendingAction(
+    String id, {
+    int? volumeUnitsOverride,
+  }) async {
+    final body = <String, dynamic>{};
+    if (volumeUnitsOverride != null) {
+      body['volumeUnitsOverride'] = volumeUnitsOverride;
+    }
+    final response = await _dio.post<Map<String, dynamic>>(
+      '/actions/$id/confirm',
+      data: body.isEmpty ? null : body,
+      // Confirm can take a few seconds (broker round-trip), give it
+      // headroom over the default 10 s receive timeout.
+      options: Options(
+        receiveTimeout: const Duration(seconds: 30),
+        // 4xx / 409 / 502 are all "real" responses from the backend
+        // (expired, broker rejected, etc.) — let them flow back to
+        // the caller so the UI can show the structured `code`.
+        validateStatus: (code) => code != null && code < 600,
+      ),
+    );
+    return response.data ?? const <String, dynamic>{};
+  }
+
+  /// `POST /actions/{id}/reject` — user clicked Reject. Flips
+  /// Pending→Rejected server-side; no broker side effects. The
+  /// optional [reason] is journalled to the audit JSONL so the LLM
+  /// can later read "operator said X" and adjust.
+  Future<Map<String, dynamic>> rejectPendingAction(
+    String id, {
+    String? reason,
+  }) async {
+    final body = <String, dynamic>{};
+    if (reason != null && reason.trim().isNotEmpty) {
+      body['reason'] = reason.trim();
+    }
+    final response = await _dio.post<Map<String, dynamic>>(
+      '/actions/$id/reject',
+      data: body.isEmpty ? null : body,
+      options: Options(
+        validateStatus: (code) => code != null && code < 600,
+      ),
+    );
+    return response.data ?? const <String, dynamic>{};
+  }
+
   /// `/data/bootstrap` — local data-dir inventory.
   Future<DataBootstrapSnapshot> fetchDataBootstrap() async {
     final response = await _dio.get<Map<String, dynamic>>('/data/bootstrap');
@@ -1369,4 +1439,99 @@ class DataBootstrapSnapshot {
         fileCount: j['fileCount'] as int,
         lastTouchedUnixMs: j['lastTouchedUnixMs'] as int?,
       );
+}
+
+/// Mirror of `crate::app_services::pending_actions::PendingAction`.
+///
+/// The Rust struct uses serde defaults (no `rename_all = "camelCase"`),
+/// so wire fields stay snake_case: `proposed_at_unix_ms`,
+/// `expires_at_unix_ms`, `result_note`, `status`. The `kind` field is
+/// a tagged enum — serde emits a nested `{"kind": "close_position",
+/// "position_id": ..., ...}` object, so we keep the discriminant in
+/// `kindTag` and surface the close-position fields as nullable here
+/// (today only one variant exists; new ones go behind explicit code
+/// changes per #136's whitelist guarantee).
+class PendingAction {
+  final String id;
+  final String kindTag;
+  final int? positionId;
+  final int? volumeUnits;
+  final String? symbolHint;
+  final String reason;
+  final int proposedAtUnixMs;
+  final int expiresAtUnixMs;
+  /// Snake-case state: `pending`, `confirmed`, `rejected`, `expired`,
+  /// `executed`, `failed`. The widget switches on these directly.
+  final String status;
+  final String resultNote;
+
+  const PendingAction({
+    required this.id,
+    required this.kindTag,
+    required this.positionId,
+    required this.volumeUnits,
+    required this.symbolHint,
+    required this.reason,
+    required this.proposedAtUnixMs,
+    required this.expiresAtUnixMs,
+    required this.status,
+    required this.resultNote,
+  });
+
+  factory PendingAction.fromJson(Map<String, dynamic> j) {
+    final kindRaw = j['kind'];
+    String tag = '';
+    int? posId;
+    int? volUnits;
+    String? symHint;
+    if (kindRaw is Map<String, dynamic>) {
+      tag = (kindRaw['kind'] as String?) ?? '';
+      posId = (kindRaw['position_id'] as num?)?.toInt();
+      volUnits = (kindRaw['volume_units'] as num?)?.toInt();
+      symHint = kindRaw['symbol_hint'] as String?;
+    }
+    return PendingAction(
+      id: (j['id'] as String?) ?? '',
+      kindTag: tag,
+      positionId: posId,
+      volumeUnits: volUnits,
+      symbolHint: symHint,
+      reason: (j['reason'] as String?) ?? '',
+      proposedAtUnixMs: (j['proposed_at_unix_ms'] as num?)?.toInt() ?? 0,
+      expiresAtUnixMs: (j['expires_at_unix_ms'] as num?)?.toInt() ?? 0,
+      status: (j['status'] as String?) ?? 'pending',
+      resultNote: (j['result_note'] as String?) ?? '',
+    );
+  }
+
+  bool get isPending => status == 'pending';
+  bool get isTerminal =>
+      status == 'executed' ||
+      status == 'failed' ||
+      status == 'rejected' ||
+      status == 'expired';
+
+  /// Human summary mirroring the Rust `ActionKind::summary()`. Kept
+  /// in Dart so we don't have to wait for a server round-trip after
+  /// the user clicks Confirm — the banner re-renders instantly.
+  String get summary {
+    if (kindTag == 'close_position') {
+      final vol = (volumeUnits ?? 0) == 0
+          ? 'entire'
+          : '${volumeUnits!} units';
+      final sym = (symbolHint == null || symbolHint!.isEmpty)
+          ? '?'
+          : symbolHint!;
+      return 'Close $vol of position #${positionId ?? 0} ($sym)';
+    }
+    return kindTag.isEmpty ? 'Unknown action' : 'Action: $kindTag';
+  }
+
+  /// Seconds remaining until `expires_at_unix_ms`. Negative when
+  /// already past expiry (sweep_expired hasn't run yet on the
+  /// server). Used by the banner's countdown badge.
+  int secondsUntilExpiry({DateTime? now}) {
+    final nowMs = (now ?? DateTime.now().toUtc()).millisecondsSinceEpoch;
+    return ((expiresAtUnixMs - nowMs) / 1000).round();
+  }
 }

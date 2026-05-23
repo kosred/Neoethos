@@ -12,6 +12,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../state/nav.dart';
 import '../theme/theme.dart';
+import 'pending_actions_banner.dart';
 import 'sidebar.dart';
 import 'topbar.dart';
 import 'statusbar.dart';
@@ -74,6 +75,10 @@ class _DockArea extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        // Banner for LLM-proposed actions awaiting Confirm/Reject
+        // (#136 Phase B). Renders as SizedBox.shrink when the
+        // queue is empty, so non-LLM users see no UI difference.
+        const PendingActionsBanner(),
         // Breadcrumb
         Padding(
           padding: const EdgeInsets.only(bottom: 2),
