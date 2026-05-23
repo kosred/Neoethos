@@ -50,8 +50,9 @@ pub struct FlowBlueprint {
 pub type FlowFn = for<'a> fn(
     &'a mut TradingSession,
     &'a mut SuiteState,
-)
-    -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<FlowResult>> + Send + 'a>>;
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<FlowResult>> + Send + 'a>,
+>;
 
 impl FlowBlueprint {
     pub fn first_missing_dependency(&self, state: &SuiteState) -> Option<&'static str> {
@@ -74,21 +75,13 @@ pub fn all_flow_blueprints() -> Vec<FlowBlueprint> {
             &["account_id"],
             symbols_resolve_case,
         ),
-        bp(
-            "symbols.by_id",
-            &["account_id", "symbol_id"],
-            symbols_by_id,
-        ),
+        bp("symbols.by_id", &["account_id", "symbol_id"], symbols_by_id),
         bp(
             "history.bars_paged",
             &["account_id", "symbol_id"],
             history_bars_paged,
         ),
-        bp(
-            "history.ticks",
-            &["account_id", "symbol_id"],
-            history_ticks,
-        ),
+        bp("history.ticks", &["account_id", "symbol_id"], history_ticks),
         bp(
             "streaming.spot.sub",
             &["account_id", "symbol_id"],
@@ -154,7 +147,11 @@ pub fn all_flow_blueprints() -> Vec<FlowBlueprint> {
             &["last_pending_order_id"],
             orders_cancel_limit,
         ),
-        bp("errors.invalid_symbol", &["account_id"], errors_invalid_symbol),
+        bp(
+            "errors.invalid_symbol",
+            &["account_id"],
+            errors_invalid_symbol,
+        ),
     ]
 }
 
@@ -183,10 +180,12 @@ macro_rules! flow_skip_stub {
         fn $name<'a>(
             _: &'a mut TradingSession,
             _: &'a mut SuiteState,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<FlowResult>> + Send + 'a>>
-        {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<FlowResult>> + Send + 'a>> {
             Box::pin(async move {
-                Ok(FlowResult::skip(stringify_flow_name(stringify!($name)), $reason))
+                Ok(FlowResult::skip(
+                    stringify_flow_name(stringify!($name)),
+                    $reason,
+                ))
             })
         }
     };
@@ -291,12 +290,7 @@ fn auth_refresh<'a>(
                 } else {
                     FailureKind::AuthMissingOrRefused
                 };
-                Ok(FlowResult::fail(
-                    "auth.refresh",
-                    start.elapsed(),
-                    msg,
-                    kind,
-                ))
+                Ok(FlowResult::fail("auth.refresh", start.elapsed(), msg, kind))
             }
         }
     })
@@ -360,7 +354,12 @@ fn accounts_discover<'a>(
                 } else {
                     FailureKind::Other
                 };
-                Ok(FlowResult::fail("accounts.discover", start.elapsed(), msg, kind))
+                Ok(FlowResult::fail(
+                    "accounts.discover",
+                    start.elapsed(),
+                    msg,
+                    kind,
+                ))
             }
         }
     })
@@ -480,7 +479,10 @@ mod tests {
 
     #[test]
     fn stringify_flow_name_dots() {
-        assert_eq!(stringify_flow_name("auth_oauth_resume"), "auth.oauth.resume");
+        assert_eq!(
+            stringify_flow_name("auth_oauth_resume"),
+            "auth.oauth.resume"
+        );
         // Note: real flow names use single dots (auth.oauth_resume not
         // auth.oauth.resume). The blueprint registration uses literal
         // strings so the `stringify_flow_name` helper is only a

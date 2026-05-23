@@ -70,9 +70,7 @@ pub async fn status(State(_state): State<AppApiState>) -> Json<GemmaStatusDto> {
 
     let (path_str, size_bytes, present) = match &resolved {
         Ok(r) => {
-            let size = std::fs::metadata(&r.path)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let size = std::fs::metadata(&r.path).map(|m| m.len()).unwrap_or(0);
             (r.path.display().to_string(), size, true)
         }
         Err(_) => (String::new(), 0, false),
@@ -145,10 +143,7 @@ pub struct ChatResponseDto {
     pub elapsed_ms: u64,
 }
 
-pub async fn chat(
-    State(state): State<AppApiState>,
-    Json(body): Json<ChatBody>,
-) -> Response {
+pub async fn chat(State(state): State<AppApiState>, Json(body): Json<ChatBody>) -> Response {
     if body.prompt.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -187,10 +182,7 @@ pub struct NewsBody {
     pub symbol: String,
 }
 
-pub async fn news(
-    State(state): State<AppApiState>,
-    Json(body): Json<NewsBody>,
-) -> Response {
+pub async fn news(State(state): State<AppApiState>, Json(body): Json<NewsBody>) -> Response {
     let symbol = body.symbol.trim().to_uppercase();
     if symbol.is_empty() {
         return (
@@ -251,24 +243,20 @@ async fn chat_impl(state: AppApiState, prompt: String, max_tokens: u32) -> Respo
         // mmap + LlamaBackend init takes seconds.
         let _state = state;
         let probe = neoethos_gemma::runtime::RealFsProbe;
-        let resolved =
-            match neoethos_gemma::runtime::resolve_bundled_model_path(&probe) {
-                Ok(r) => r,
-                Err(err) => {
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(serde_json::json!({
-                            "error": format!("Gemma model file not found: {err}"),
-                        })),
-                    )
-                        .into_response();
-                }
-            };
+        let resolved = match neoethos_gemma::runtime::resolve_bundled_model_path(&probe) {
+            Ok(r) => r,
+            Err(err) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": format!("Gemma model file not found: {err}"),
+                    })),
+                )
+                    .into_response();
+            }
+        };
         let path = resolved.path;
-        let loaded = tokio::task::spawn_blocking(move || {
-            LlamaCppGemmaRuntime::load(path)
-        })
-        .await;
+        let loaded = tokio::task::spawn_blocking(move || LlamaCppGemmaRuntime::load(path)).await;
         match loaded {
             Ok(Ok(rt)) => {
                 let arc = Arc::new(Mutex::new(rt));

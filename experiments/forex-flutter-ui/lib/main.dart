@@ -1,4 +1,4 @@
-// NeoEthos Flutter front-end entry point.
+// neoethos Flutter front-end entry point.
 //
 // Multi-platform desktop (Windows/macOS/Linux) + mobile target.
 // Pure thin client over the Rust backend — no business logic
@@ -27,16 +27,16 @@ Future<void> main() async {
   // existing AsyncValue.error states cover the (very short) window
   // where the server hasn't bound the port yet.
   await BackendSupervisor.instance.ensureRunning();
-  runApp(const ProviderScope(child: NeoEthosApp()));
+  runApp(const ProviderScope(child: NeoethosApp()));
 }
 
-class NeoEthosApp extends StatelessWidget {
-  const NeoEthosApp({super.key});
+class NeoethosApp extends StatelessWidget {
+  const NeoethosApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'NeoEthos',
+      title: 'neoethos',
       debugShowCheckedModeBanner: false,
       theme: buildForexAiTheme(),
       home: const AppShell(),

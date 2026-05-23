@@ -8,23 +8,23 @@
 # when AppImage / cargo-deb tooling is unavailable.
 #
 # Outputs:
-#   dist/forex-ai-<version>-<os>-<arch>-portable.tar.gz
+#   dist/neoethos-<version>-<os>-<arch>-portable.tar.gz
 #
 # Layout inside the tarball:
-#   forex-ai-<version>/forex-app           (release binary)
-#   forex-ai-<version>/README.md           (top-level project README)
-#   forex-ai-<version>/LICENSE             (Apache-2.0)
-#   forex-ai-<version>/config.yaml         (default config, copy-on-edit)
+#   neoethos-<version>/neoethos-app        (release binary)
+#   neoethos-<version>/README.md           (top-level project README)
+#   neoethos-<version>/LICENSE             (license file)
+#   neoethos-<version>/config.yaml         (default config, copy-on-edit)
 #
 # Required tools: cargo, tar (BSD or GNU). On macOS also `lipo` if you
 # want a universal binary — not done here; this script ships the host
 # architecture only.
 #
 # Environment:
-#   FOREX_AI_VERSION  (optional)  — version override; defaults to the
+#   NEOETHOS_VERSION  (optional)  - version override; defaults to the
 #                                   `version =` line in
-#                                   crates/forex-app/Cargo.toml.
-#   FOREX_AI_OUTDIR   (optional)  — output directory; default `dist/`.
+#                                   crates/neoethos-app/Cargo.toml.
+#   NEOETHOS_OUTDIR   (optional)  - output directory; default `dist/`.
 
 set -euo pipefail
 
@@ -33,8 +33,8 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 cd "${REPO_ROOT}"
 
 # ── version detection (same mechanism as appimage/build.sh) ────────────
-if [[ -z "${FOREX_AI_VERSION:-}" ]]; then
-    FOREX_AI_VERSION="$(grep -m1 '^version = ' crates/forex-app/Cargo.toml \
+if [[ -z "${NEOETHOS_VERSION:-}" ]]; then
+    NEOETHOS_VERSION="$(grep -m1 '^version = ' crates/neoethos-app/Cargo.toml \
         | sed -E 's/version = "([^"]+)"/\1/')"
 fi
 
@@ -51,27 +51,27 @@ case "${ARCH_TAG}" in
     x86_64|amd64)  ARCH_TAG="x86_64" ;;
 esac
 
-OUTDIR="${FOREX_AI_OUTDIR:-${REPO_ROOT}/dist}"
-STEM="forex-ai-${FOREX_AI_VERSION}-${OS_TAG}-${ARCH_TAG}-portable"
+OUTDIR="${NEOETHOS_OUTDIR:-${REPO_ROOT}/dist}"
+STEM="neoethos-${NEOETHOS_VERSION}-${OS_TAG}-${ARCH_TAG}-portable"
 TARBALL="${OUTDIR}/${STEM}.tar.gz"
 
-echo "[portable] version=${FOREX_AI_VERSION} os=${OS_TAG} arch=${ARCH_TAG}"
+echo "[portable] version=${NEOETHOS_VERSION} os=${OS_TAG} arch=${ARCH_TAG}"
 echo "[portable] output → ${TARBALL}"
 
 # ── Step 1: release build ──────────────────────────────────────────────
-echo "[portable] step 1/3 — cargo build --release -p forex-app"
-cargo build --release -p forex-app
+echo "[portable] step 1/3 — cargo build --release -p neoethos-app"
+cargo build --release -p neoethos-app
 
 # ── Step 2: stage the bundle in a clean dir ────────────────────────────
-STAGING="$(mktemp -d -t forex-ai-portable-XXXXXX)"
+STAGING="$(mktemp -d -t neoethos-portable-XXXXXX)"
 trap 'rm -rf "${STAGING}"' EXIT
 
-INNER="${STAGING}/forex-ai-${FOREX_AI_VERSION}"
+INNER="${STAGING}/neoethos-${NEOETHOS_VERSION}"
 mkdir -p "${INNER}"
 
 # Binary name differs on Windows.
-BIN_NAME="forex-app"
-[[ "${OS_TAG}" == "windows" ]] && BIN_NAME="forex-app.exe"
+BIN_NAME="neoethos-app"
+[[ "${OS_TAG}" == "windows" ]] && BIN_NAME="neoethos-app.exe"
 
 cp "target/release/${BIN_NAME}" "${INNER}/"
 cp README.md "${INNER}/" 2>/dev/null || echo "[portable] (no README.md to bundle — ok)"
@@ -81,7 +81,7 @@ cp config.yaml "${INNER}/" 2>/dev/null || echo "[portable] (no config.yaml to bu
 # ── Step 3: package ────────────────────────────────────────────────────
 mkdir -p "${OUTDIR}"
 echo "[portable] step 3/3 — tar czf ${TARBALL}"
-tar czf "${TARBALL}" -C "${STAGING}" "forex-ai-${FOREX_AI_VERSION}"
+tar czf "${TARBALL}" -C "${STAGING}" "neoethos-${NEOETHOS_VERSION}"
 
 echo "[portable] ✓ done"
 echo "[portable]   ${TARBALL}"

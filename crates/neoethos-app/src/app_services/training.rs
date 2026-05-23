@@ -408,10 +408,11 @@ fn cancelled_snapshot_from(mut snapshot: JobSnapshot, message: impl Into<String>
 /// alongside the `neoethos-search` portfolio-fusion work.
 ///
 /// Audit gap #1 part 2 / roadmap §2 multi-symbol training entry point.
-#[allow(dead_code)] // mirrors `MultiSymbolDiscoveryRequest` —
-                    // scaffolding for the "All Majors" preset that
-                    // fans out N single-symbol jobs. Tests below
-                    // exercise validate/lower.
+#[allow(dead_code)]
+// mirrors `MultiSymbolDiscoveryRequest` —
+// scaffolding for the "All Majors" preset that
+// fans out N single-symbol jobs. Tests below
+// exercise validate/lower.
 #[derive(Debug, Clone)]
 pub struct MultiSymbolTrainingRequest {
     pub config_path: String,

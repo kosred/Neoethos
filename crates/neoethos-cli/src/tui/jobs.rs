@@ -137,7 +137,8 @@ impl JobManager {
         // Resolve the current binary so the spawned process is the same
         // build as the running TUI (otherwise pressing the button would
         // run an older `~/bin/neoethos-cli.exe` and confuse everyone).
-        let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("neoethos-cli"));
+        let exe =
+            std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("neoethos-cli"));
 
         let (tx, rx) = channel::<LogLine>();
 

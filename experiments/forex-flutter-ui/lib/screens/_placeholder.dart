@@ -137,7 +137,7 @@ class PendingStub extends StatelessWidget {
               'Αυτό το panel θα συνδεθεί στο Rust backend μέσω REST/SSE '
               'στην επόμενη φάση. Το shell (topbar, sidebar, statusbar, '
               'theme) λειτουργεί ήδη — εδώ θα έρθει το πραγματικό '
-              'wiring με data από το forex-app + forex-gemma.',
+              'wiring με data από το neoethos backend + Gemma.',
               style: TextStyle(color: ForexAiTokens.textMuted),
             ),
           ),

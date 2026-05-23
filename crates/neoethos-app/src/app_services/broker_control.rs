@@ -1,13 +1,11 @@
-//! Broker-control bridge — async signal channel between the cTrader
-//! streaming worker (which has no `&mut TradingSession` handle) and the
-//! main UI loop in `main.rs::ForexApp::process_messages` (the only place
-//! that can call `TradingSession::trip_hardware_kill_global`).
+//! Broker-control bridge - async signal channel between the cTrader
+//! streaming worker (which has no `&mut TradingSession` handle) and a
+//! broker-control consumer that can call `TradingSession::trip_hardware_kill_global`.
 //!
 //! ## Why a separate channel from `ServiceEvent`
 //!
-//! `ServiceEvent` is a `tokio::sync::mpsc` channel owned by `ForexApp`
-//! and only readable from `process_messages`. The streaming worker
-//! runs inside a synchronous blocking call
+//! `ServiceEvent` is a `tokio::sync::mpsc` channel used by app tasks.
+//! The streaming worker runs inside a synchronous blocking call
 //! (`load_live_chart_update_with_transport` → `read_next_spot_event`)
 //! from a non-async background thread spun off by the
 //! `CTraderLiveStreamingBackend` impl, and we cannot route a
@@ -21,7 +19,7 @@
 //!
 //! - [`BrokerControlSignal::HardwareKill`] is emitted when the broker
 //!   sends `ProtoOAAccountDisconnectEvent` — the streaming worker has
-//!   already best-effort-closed the socket; the main loop must then
+//!   already best-effort-closed the socket; the broker-control consumer must then
 //!   trip the T-Hardware kill switch (research §5.6 in
 //!   `risky_mode_compounding_research.md`) and write the
 //!   `HARDWARE_KILL_<unix-secs>.flag` sentinel.
@@ -69,9 +67,8 @@ use std::sync::OnceLock;
 const BROKER_CONTROL_CHANNEL_CAPACITY: usize = 16;
 
 /// Control signal pushed from a broker-facing worker thread (the
-/// cTrader streaming worker today) into the main UI loop. The main
-/// loop reads with [`try_recv_broker_control`] once per frame and acts
-/// via `TradingSession::trip_hardware_kill_global`.
+/// cTrader streaming worker today) into a broker-control receiver.
+/// The receiver acts via `TradingSession::trip_hardware_kill_global`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrokerControlSignal {
     /// The broker dropped our session server-side. The streaming
@@ -97,11 +94,10 @@ pub enum BrokerControlSignal {
 static BROKER_CONTROL_SENDER: OnceLock<Sender<BrokerControlSignal>> = OnceLock::new();
 
 /// Install the process-global sender. Returns the matching receiver
-/// the caller (the main UI loop) must keep and poll. Idempotent only
+/// the caller must keep and poll. Idempotent only
 /// in the sense that subsequent calls return `None` for the receiver
 /// because the global sender is already installed — `OnceLock::set`
-/// fails silently after the first install. In production this is
-/// called exactly once from `ForexApp::new`; the `cfg(test)` path uses
+/// fails silently after the first install. The `cfg(test)` path uses
 /// [`make_broker_control_channel_for_test`] which bypasses the global.
 pub fn install_broker_control_sender() -> Option<Receiver<BrokerControlSignal>> {
     let (tx, rx) = bounded::<BrokerControlSignal>(BROKER_CONTROL_CHANNEL_CAPACITY);
@@ -140,13 +136,13 @@ pub fn send_broker_control_signal(signal: BrokerControlSignal) -> bool {
     }
 }
 
-/// Non-blocking poll used by the main UI loop once per frame. Returns
+/// Non-blocking poll used by a broker-control consumer. Returns
 /// the next pending signal, or `None` when the queue is empty / the
 /// channel was dropped. We deliberately drain only ONE signal per call
-/// so a flood of disconnect events cannot starve egui repaints — the
+/// so a flood of disconnect events cannot starve the consumer. The
 /// caller loops over `try_recv` until empty if it wants drain
-/// semantics, but a single tick of the main loop processes one at a
-/// time which is fine because the only action is "flip the halt
+/// semantics, but processing one at a time is fine because the only
+/// action is "flip the halt
 /// flag", which is idempotent.
 pub fn try_recv_broker_control(
     receiver: &Receiver<BrokerControlSignal>,

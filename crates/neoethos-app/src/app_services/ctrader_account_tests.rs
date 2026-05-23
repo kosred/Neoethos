@@ -16,12 +16,14 @@ fn trader_response_parses_balance_and_account_metadata() {
         "payloadType": 2122,
         "payload": {
             "ctidTraderAccountId": 712345,
-            "balance": 123456789,
-            "moneyDigits": 2,
-            "leverageInCents": 5000,
-            "traderLogin": 998877,
-            "accountType": 1,
-            "brokerName": "Spotware Demo Broker"
+            "trader": {
+                "balance": 123456789,
+                "moneyDigits": 2,
+                "leverageInCents": 5000,
+                "traderLogin": 998877,
+                "accountType": 1,
+                "brokerName": "Spotware Demo Broker"
+            }
         }
     });
 
@@ -234,12 +236,14 @@ fn trader_response_parses_balance_money_digits_four() {
         "payloadType": 2122,
         "payload": {
             "ctidTraderAccountId": 712345,
-            "balance": 123_456_789i64,   // raw integer wire value
-            "moneyDigits": 4,
-            "leverageInCents": 5000,
-            "traderLogin": 998877,
-            "accountType": 1,
-            "brokerName": "High-Precision Demo"
+            "trader": {
+                "balance": 123_456_789i64,
+                "moneyDigits": 4,
+                "leverageInCents": 5000,
+                "traderLogin": 998877,
+                "accountType": 1,
+                "brokerName": "High-Precision Demo"
+            }
         }
     });
 
@@ -385,7 +389,7 @@ fn account_runtime_loader_authenticates_then_loads_trader_reconcile_and_deals() 
     let transport = StubTransport::with_responses(vec![
         Ok(r#"{"clientMsgId":"app-auth-1","payloadType":2101,"payload":{}}"#.to_string()),
         Ok(r#"{"clientMsgId":"account-auth-1","payloadType":2103,"payload":{"ctidTraderAccountId":712345}}"#.to_string()),
-        Ok(r#"{"clientMsgId":"trader-1","payloadType":2122,"payload":{"ctidTraderAccountId":712345,"balance":100000,"moneyDigits":2,"leverageInCents":5000,"brokerName":"Demo Broker"}}"#.to_string()),
+        Ok(r#"{"clientMsgId":"trader-1","payloadType":2122,"payload":{"ctidTraderAccountId":712345,"trader":{"balance":100000,"moneyDigits":2,"leverageInCents":5000,"brokerName":"Demo Broker"}}}"#.to_string()),
         Ok(r#"{"clientMsgId":"reconcile-1","payloadType":2125,"payload":{"ctidTraderAccountId":712345,"position":[{"positionId":9001,"tradeData":{"symbolId":14,"volume":2500,"tradeSide":1,"openTimestamp":1710000000000},"positionStatus":1,"price":1.10123}],"order":[]}}"#.to_string()),
         Ok(r#"{"clientMsgId":"deals-1","payloadType":2134,"payload":{"ctidTraderAccountId":712345,"deal":[{"dealId":3001,"orderId":8001,"positionId":9001,"volume":1500,"filledVolume":1500,"symbolId":14,"createTimestamp":1710000200000,"executionTimestamp":1710000201000,"executionPrice":1.099,"tradeSide":1,"dealStatus":2,"commission":-40,"moneyDigits":2,"closePositionDetail":{"entryPrice":1.098,"grossProfit":1250,"swap":0,"commission":-40,"balance":1001250,"moneyDigits":2}}],"hasMore":false}}"#.to_string()),
     ]);

@@ -3,9 +3,9 @@ use crate::eval::{
     BacktestMetrics, BacktestSettings, fast_evaluate_strategy_core, simulate_trades_core,
 };
 use anyhow::{Result, bail};
+use itertools::Itertools;
 use neoethos_core::contracts::{TemporalFeatureContract, TemporalScopeHashes};
 use neoethos_core::domain::prop_firm::{PropFirmChallengeDefaults, PropFirmConstraints};
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;

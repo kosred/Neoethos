@@ -1,7 +1,7 @@
 name: forex_flutter_ui
 description: >
-  Flutter desktop/mobile front-end for the forex-ai trading bot.
-  Talks to the Rust backend (forex-app + forex-gemma) over REST + SSE.
+  Flutter desktop/mobile front-end for neoethos.
+  Talks to the Rust backend (neoethos-app + neoethos-gemma) over REST.
   Mirrors the layout / design tokens of mockups/ui_mockup.html.
 publish_to: 'none'
 version: 0.4.18+1
@@ -35,7 +35,7 @@ dependencies:
   # Date / time formatting + duration helpers.
   intl: ^0.19.0
 
-  # Logging — flow into the same forex-app log stream eventually.
+  # Logging - flows into the backend log stream eventually.
   logger: ^2.4.0
 
   cupertino_icons: ^1.0.8

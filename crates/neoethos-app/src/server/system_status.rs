@@ -41,8 +41,16 @@ pub struct EnginesDto {
 /// in a follow-up wiring along with the order-ticket endpoints.
 pub async fn engines(State(state): State<AppApiState>) -> Json<EnginesDto> {
     Json(EnginesDto {
-        discovery: state.engine_state(JobKind::Discovery).await.as_str().to_string(),
-        training: state.engine_state(JobKind::Training).await.as_str().to_string(),
+        discovery: state
+            .engine_state(JobKind::Discovery)
+            .await
+            .as_str()
+            .to_string(),
+        training: state
+            .engine_state(JobKind::Training)
+            .await
+            .as_str()
+            .to_string(),
         auto_trader: "Idle".to_string(),
         discovery_summary: state.engine_summary(JobKind::Discovery).await,
         training_summary: state.engine_summary(JobKind::Training).await,

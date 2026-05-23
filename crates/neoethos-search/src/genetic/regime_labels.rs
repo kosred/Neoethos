@@ -2,8 +2,8 @@ use super::evolution_math::gene_signature_hash;
 use super::search_engine::evaluate_genes;
 use super::strategy_gene::{EvaluationConfig, Gene};
 use anyhow::{Result, bail};
-use neoethos_data::{FeatureFrame, Ohlcv};
 use ndarray::s;
+use neoethos_data::{FeatureFrame, Ohlcv};
 use serde::{Deserialize, Serialize};
 
 const MILLIS_PER_DAY: i64 = 86_400_000;

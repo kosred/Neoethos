@@ -1,0 +1,15 @@
+[Desktop Entry]
+# XDG Desktop Entry - appimagetool reads this for launcher metadata.
+Type=Application
+Version=1.5
+Name=neoethos
+GenericName=Quantitative Trading Workspace
+Comment=Disciplined multi-model ML engine for FX strategy research and risk-aware execution
+Exec=neoethos-app %U
+# Icon name without extension. Must match neoethos-app.png in this AppDir.
+Icon=neoethos-app
+Terminal=false
+Categories=Finance;Office;
+Keywords=fx;forex;trading;quant;ctrader;neoethos;
+StartupNotify=true
+StartupWMClass=neoethos-app

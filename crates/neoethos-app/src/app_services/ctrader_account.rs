@@ -371,9 +371,7 @@ pub fn parse_trader_response(response_json: &str) -> Result<CTraderTraderSnapsho
     Ok(CTraderTraderSnapshot {
         account_id: envelope.payload.ctid_trader_account_id,
         balance: scaled_money(trader.balance, money_digits),
-        leverage: trader
-            .leverage_in_cents
-            .map(|value| value as f64 / 100.0),
+        leverage: trader.leverage_in_cents.map(|value| value as f64 / 100.0),
         trader_login: trader.trader_login,
         account_type: trader.account_type.map(account_type_label),
         broker_name: trader.broker_name,

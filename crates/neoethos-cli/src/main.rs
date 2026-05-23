@@ -201,8 +201,12 @@ fn cmd_prepare(args: &[String]) -> Result<()> {
     let higher_refs: Vec<&str> = higher_list.iter().map(|s| s.as_str()).collect();
     let dataset = neoethos_data::load_symbol_dataset(&root, &symbol)?;
     let cache = neoethos_data::FeatureCache::new("cache/features", 60, true);
-    let features =
-        neoethos_data::prepare_multitimeframe_features(&dataset, &base, &higher_refs, Some(&cache))?;
+    let features = neoethos_data::prepare_multitimeframe_features(
+        &dataset,
+        &base,
+        &higher_refs,
+        Some(&cache),
+    )?;
     println!(
         "Prepared {} base={} rows={} cols={}",
         symbol,
@@ -257,8 +261,10 @@ fn cmd_train(args: &[String]) -> Result<()> {
         let base =
             parse_flag(args, "--base").unwrap_or_else(|| settings.system.base_timeframe.clone());
         let models_dir = parse_flag(args, "--models-dir").unwrap_or_else(|| "models".to_string());
-        let orchestrator =
-            neoethos_models::TrainingOrchestrator::new(settings, std::path::PathBuf::from(models_dir));
+        let orchestrator = neoethos_models::TrainingOrchestrator::new(
+            settings,
+            std::path::PathBuf::from(models_dir),
+        );
 
         orchestrator.train_symbol(&symbol, &base)?;
 
@@ -323,13 +329,20 @@ fn cmd_search(args: &[String]) -> Result<()> {
     let higher_refs: Vec<&str> = higher_list.iter().map(|s| s.as_str()).collect();
 
     let dataset = neoethos_data::load_symbol_dataset(&root, &symbol)?;
-    let dataset =
-        neoethos_data::ensure_timeframes_with_resample(&dataset, &base, neoethos_data::MANDATORY_TFS)?;
+    let dataset = neoethos_data::ensure_timeframes_with_resample(
+        &dataset,
+        &base,
+        neoethos_data::MANDATORY_TFS,
+    )?;
     let features = neoethos_data::prepare_multitimeframe_features(
         &dataset,
         &base,
         &higher_refs,
-        Some(&neoethos_data::FeatureCache::new("cache/features", 60, true)),
+        Some(&neoethos_data::FeatureCache::new(
+            "cache/features",
+            60,
+            true,
+        )),
     )?;
     let base_ohlcv = dataset
         .frames
@@ -421,7 +434,11 @@ fn cmd_discover(args: &[String]) -> Result<()> {
             &dataset,
             &base,
             &higher_refs,
-            Some(&neoethos_data::FeatureCache::new("cache/features", 60, true)),
+            Some(&neoethos_data::FeatureCache::new(
+                "cache/features",
+                60,
+                true,
+            )),
         )?;
         let base_ohlcv = dataset
             .frames
@@ -1043,15 +1060,9 @@ fn setup_help() {
     println!("    ctrader    Emit a broker_credentials.toml template for the cTrader broker");
     println!("    news       Emit a TOML snippet for the news API key");
     println!();
-    println!(
-        "    The CLI does NOT write binary state — paste the template into the canonical"
-    );
-    println!(
-        "    path printed by `setup paths`. Drive the egui wizard once on a desktop if you"
-    );
-    println!(
-        "    prefer a graphical flow, then `scp` the resulting `broker_credentials.toml`."
-    );
+    println!("    The CLI does NOT write binary state — paste the template into the canonical");
+    println!("    path printed by `setup paths`. Drive the egui wizard once on a desktop if you");
+    println!("    prefer a graphical flow, then `scp` the resulting `broker_credentials.toml`.");
 }
 
 /// Canonical user-config directory — matches the resolution in
@@ -1137,9 +1148,7 @@ fn setup_ctrader_template() -> Result<()> {
     println!("schema_version = 1");
     println!();
     println!("[ctrader]");
-    println!(
-        "environment = \"Demo\"  # or \"Live\" — match the cTrader account's tier"
-    );
+    println!("environment = \"Demo\"  # or \"Live\" — match the cTrader account's tier");
     println!("client_id = \"<your cTrader app client_id>\"");
     println!("client_secret = \"<your cTrader app client_secret>\"");
     println!("redirect_uri = \"http://127.0.0.1:43001/callback\"");

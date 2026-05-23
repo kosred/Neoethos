@@ -31,8 +31,10 @@
 //! tries again — no point spamming the cTrader API with calls that
 //! will all 401.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::app_services::broker_api::fetch_broker_symbols_blocking;
 use crate::app_services::broker_persistence::load_broker_settings;
 use crate::app_services::ctrader_account::{
     CTraderAccountRuntimeRequest, CTraderPositionSnapshot, load_account_runtime,
@@ -58,24 +60,48 @@ async fn run(state: AppApiState) {
     // Run an immediate first refresh so the dashboard isn't blank for
     // the first 5 seconds after server start.
     ticker.tick().await;
+    // Consecutive-failure counter. After 3 failed refreshes (= 15s of
+    // continuous error), wipe the cached snapshot so /account/snapshot
+    // returns 503 instead of last-known-good numbers. Without this the
+    // dashboard would silently lie for hours — the v0.4.20 user-visible
+    // symptom was "balance shows €1000 forever even though token is
+    // CH_ACCESS_TOKEN_INVALID since 30 minutes ago". One transient blip
+    // (1-2 missed ticks) does NOT clear the cache; only sustained failure.
+    const STALE_THRESHOLD: usize = 3;
+    let mut failures: usize = 0;
     loop {
-        match refresh_once().await {
+        match refresh_once(&state).await {
             Ok(payload) => {
                 state.set_account(payload).await;
+                failures = 0;
                 tracing::debug!(
                     target: "neoethos_app::server::bridge",
                     "/account/snapshot refreshed from cTrader"
                 );
             }
             Err(err) => {
+                failures = failures.saturating_add(1);
                 tracing::warn!(
                     target: "neoethos_app::server::bridge",
                     error = %err,
+                    consecutive_failures = failures,
                     "cTrader account refresh failed — Flutter dashboard \
                      will keep showing the previous snapshot until the \
                      next interval. Common causes: OAuth token expired, \
                      broker session not yet established, or no network."
                 );
+                if failures >= STALE_THRESHOLD && state.account().await.is_some() {
+                    tracing::warn!(
+                        target: "neoethos_app::server::bridge",
+                        consecutive_failures = failures,
+                        "clearing cached account snapshot — dashboard \
+                         will now show 'broker not ready' instead of \
+                         stale balance/equity numbers. Re-authenticate \
+                         (Broker Setup → Re-authenticate) or correct \
+                         the account_id (Settings) to restore the feed."
+                    );
+                    state.clear_account().await;
+                }
             }
         }
         ticker.tick().await;
@@ -83,9 +109,12 @@ async fn run(state: AppApiState) {
 }
 
 /// Pull saved creds + access token, hit cTrader, return a render-ready
-/// snapshot. Pure-async, no shared state — the caller is responsible
-/// for writing the result into [`AppApiState`].
-async fn refresh_once() -> anyhow::Result<AccountSnapshotPayload> {
+/// snapshot. Reads through `state.symbol_catalog` so positions are
+/// labelled with real tickers (`EURUSD`) instead of the legacy
+/// `sym#<id>` placeholder. If the catalog is empty (Markets tab never
+/// opened), this triggers a one-time lazy fetch so the dashboard
+/// shows correct names from the very first refresh.
+async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayload> {
     // Step 1: resolve credentials. `load_broker_settings` and the
     // secure store are both sync filesystem / keyring ops; we run
     // them on a blocking task so the tokio reactor stays free.
@@ -100,7 +129,9 @@ async fn refresh_once() -> anyhow::Result<AccountSnapshotPayload> {
     .map_err(|e| anyhow::anyhow!("blocking creds task panicked: {e}"))??;
 
     let access_token = token_bundle
-        .ok_or_else(|| anyhow::anyhow!("no saved cTrader OAuth token bundle — operator must sign in"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("no saved cTrader OAuth token bundle — operator must sign in")
+        })?
         .access_token;
 
     let ctrader = &settings.ctrader;
@@ -117,8 +148,12 @@ async fn refresh_once() -> anyhow::Result<AccountSnapshotPayload> {
         // The on-disk enum mirrors the live-auth one but they're
         // independent types so we can't blanket-cast. Explicit
         // match keeps a compile error if either gains a variant.
-        crate::app_services::broker_config::CTraderBrokerEnvironment::Demo => CTraderEnvironment::Demo,
-        crate::app_services::broker_config::CTraderBrokerEnvironment::Live => CTraderEnvironment::Live,
+        crate::app_services::broker_config::CTraderBrokerEnvironment::Demo => {
+            CTraderEnvironment::Demo
+        }
+        crate::app_services::broker_config::CTraderBrokerEnvironment::Live => {
+            CTraderEnvironment::Live
+        }
     };
 
     let request = CTraderAccountRuntimeRequest {
@@ -152,12 +187,46 @@ async fn refresh_once() -> anyhow::Result<AccountSnapshotPayload> {
         .sum();
     let free_margin = (equity - used_margin).max(0.0);
 
-    let positions = snapshot
-        .reconcile
-        .positions
-        .iter()
-        .map(position_to_payload)
-        .collect();
+    // Resolve symbol_id → ticker name from the cached catalog. If the
+    // catalog is empty *and* we actually have positions to label, do a
+    // one-time blocking fetch so the dashboard doesn't show `sym#1`
+    // until the operator visits the Markets tab. Empty positions →
+    // skip the fetch (no point paying for the catalog if we don't
+    // need names).
+    let has_positions = !snapshot.reconcile.positions.is_empty();
+    if has_positions && state.symbol_catalog_is_empty().await {
+        match tokio::task::spawn_blocking(fetch_broker_symbols_blocking).await {
+            Ok(Ok(bundle)) => {
+                let catalog: HashMap<i64, String> = bundle
+                    .symbols
+                    .into_iter()
+                    .map(|s| (s.symbol_id, s.symbol_name))
+                    .collect();
+                state.set_symbol_catalog(catalog).await;
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    target: "neoethos_app::server::bridge",
+                    error = %err,
+                    "lazy symbol-catalog fetch failed — positions will \
+                     fall back to `sym#<id>` placeholders this cycle"
+                );
+            }
+            Err(join_err) => {
+                tracing::warn!(
+                    target: "neoethos_app::server::bridge",
+                    error = %join_err,
+                    "symbol-catalog blocking task panicked"
+                );
+            }
+        }
+    }
+
+    let mut positions = Vec::with_capacity(snapshot.reconcile.positions.len());
+    for p in &snapshot.reconcile.positions {
+        let resolved_name = state.resolve_symbol_name(p.symbol_id).await;
+        positions.push(position_to_payload(p, resolved_name));
+    }
 
     Ok(AccountSnapshotPayload {
         balance,
@@ -187,7 +256,10 @@ async fn refresh_once() -> anyhow::Result<AccountSnapshotPayload> {
     })
 }
 
-fn position_to_payload(p: &CTraderPositionSnapshot) -> PositionPayload {
+fn position_to_payload(
+    p: &CTraderPositionSnapshot,
+    resolved_name: Option<String>,
+) -> PositionPayload {
     // cTrader feeds `volume` as already-converted lots (f64). The
     // close-position endpoint wants broker volume units (centi-lots).
     // Convert via the standard FX lot_size: 1 lot = 100,000 units;
@@ -199,21 +271,22 @@ fn position_to_payload(p: &CTraderPositionSnapshot) -> PositionPayload {
     PositionPayload {
         position_id: p.position_id,
         volume_units,
-        // The cTrader feed gives us numeric symbol IDs, not names —
-        // resolving id→ticker needs the symbol-list endpoint which
-        // is its own session of work. For the dashboard MVP we stamp
-        // the id with a `sym#` prefix so the operator at least sees
-        // *which* symbol; a follow-up will pipe the resolved ticker
-        // (we already cache the map in app_services::ctrader_symbols
-        // for the egui side — that wiring just needs to be exposed).
-        symbol: format!("sym#{}", p.symbol_id),
+        // Resolved from the cached cTrader symbol catalog. Falls back
+        // to the legacy `sym#<id>` placeholder only when neither
+        // `/broker/symbols` nor the bridge's lazy refresh has populated
+        // the cache — e.g. when the broker is briefly unreachable for
+        // the catalog call but the account-runtime call succeeded.
+        symbol: resolved_name.unwrap_or_else(|| format!("sym#{}", p.symbol_id)),
         side: p.trade_side.clone(),
         volume: p.volume,
         // cTrader's mark-to-market pip and USD PnL are derived
         // server-side from the position's open price + the latest
         // spot — we don't have the spot stream here. Report 0 for
         // now; the spot stream worker (Session 2) will overwrite
-        // these with live values.
+        // these with live values. swap + commission ARE available
+        // (cTrader feeds them on the reconcile response) but they
+        // are cost-of-carry, not PnL — surfacing them in the PnL
+        // column would mislead the operator, so they stay 0 here.
         pnl_pips: 0.0,
         pnl_usd: 0.0,
     }

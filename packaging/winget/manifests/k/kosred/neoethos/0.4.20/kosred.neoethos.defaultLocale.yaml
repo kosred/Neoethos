@@ -1,0 +1,26 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+PackageIdentifier: kosred.neoethos
+PackageVersion: 0.4.20
+PackageLocale: en-US
+Publisher: kosred
+PublisherUrl: https://github.com/kosred
+PublisherSupportUrl: https://github.com/kosred/neoethos/issues
+PackageName: neoethos
+PackageUrl: https://github.com/kosred/neoethos
+License: LicenseRef-Proprietary
+LicenseUrl: https://github.com/kosred/neoethos/blob/main/LICENSE
+Copyright: Copyright 2024-2026 neoethos contributors
+ShortDescription: Quantitative trading workspace for the cTrader Open API.
+Description: |
+  neoethos is a quantitative trading workspace targeting the cTrader Open API.
+  It includes data ingestion, ML-driven strategy search, paper / live trading
+  orchestration, and a risk-aware execution gate.
+Moniker: neoethos
+Tags:
+  - forex
+  - trading
+  - quant
+  - ctrader
+  - rust
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

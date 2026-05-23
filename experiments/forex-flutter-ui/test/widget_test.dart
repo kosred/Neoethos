@@ -2,24 +2,23 @@
 //
 // Replaces the default `flutter create` counter-app test that referenced
 // `MyApp` (which never existed in this scaffold) with a real boot test
-// against `NeoEthosApp` + `ProviderScope`. The actual UI-tree assertions
+// against `NeoethosApp` + `ProviderScope`. The actual UI-tree assertions
 // live in `shell_smoke_test.dart`; this one just guarantees the entry
 // point pumps a frame without panicking.
 
 import 'package:flutter/material.dart';
-import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:forex_flutter_ui/main.dart';
+import 'test_harness.dart';
 
 void main() {
-  testWidgets('NeoEthosApp boots without panicking', (WidgetTester tester) async {
+  testWidgets('NeoethosApp boots without panicking',
+      (WidgetTester tester) async {
     // The shell is designed for desktop viewport; pump the default
     // surface up before pumping the widget tree to keep the TopBar
     // Row from overflowing the 800x600 test default.
-    await tester.binding.setSurfaceSize(const Size(1440, 900));
-    addTearDown(() => tester.binding.setSurfaceSize(null));
-    await tester.pumpWidget(const ProviderScope(child: NeoEthosApp()));
+    await useDesktopSurface(tester);
+    await tester.pumpWidget(appHarness());
     expect(find.byType(MaterialApp), findsOneWidget);
   });
 }

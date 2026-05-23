@@ -2,8 +2,6 @@
 // directive): this module is the cTrader Open API history fetcher.
 // Its proto result parsers and `fetch_*` entry points are the
 // API surface that:
-//   - the (now-deferred) egui D2 wizard apply writer would have
-//     consumed, AND
 //   - the upcoming Flutter API layer (gRPC/REST endpoints
 //     exposing position/order history to mobile + desktop
 //     clients) WILL consume.
@@ -45,7 +43,8 @@ use crate::app_services::ctrader_account::{
     parse_order_list_by_position_id_response, parse_symbol_category_list_response,
 };
 use crate::app_services::ctrader_data::{
-    CTraderResolvedSymbol, CTraderSymbolLookupRequest, HistoricalBar, HistoricalBarsResult, HistoricalTicksResult, parse_tick_data_response, parse_trendbars_response,
+    CTraderResolvedSymbol, CTraderSymbolLookupRequest, HistoricalBar, HistoricalBarsResult,
+    HistoricalTicksResult, parse_tick_data_response, parse_trendbars_response,
     resolve_symbol_with_transport,
 };
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;

@@ -24,9 +24,9 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-use super::state::{AccountSnapshotPayload, AppApiState};
 #[cfg(test)]
 use super::state::PositionPayload;
+use super::state::{AccountSnapshotPayload, AppApiState};
 
 /// Wire DTO. `serde(rename_all = "camelCase")` keeps the JSON keys
 /// matching the Dart field names without us having to maintain two
@@ -144,7 +144,10 @@ mod tests {
             .expect("body collects");
         let text = std::str::from_utf8(&body).expect("utf-8 body");
         // CamelCase keys — important for Flutter side to deserialize.
-        assert!(text.contains("\"freeMargin\""), "expected camelCase, got: {text}");
+        assert!(
+            text.contains("\"freeMargin\""),
+            "expected camelCase, got: {text}"
+        );
         assert!(text.contains("\"usedMargin\""));
         assert!(text.contains("\"pnlPips\""));
         assert!(text.contains("\"pnlUsd\""));

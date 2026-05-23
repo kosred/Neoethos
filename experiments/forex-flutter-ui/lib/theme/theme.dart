@@ -1,5 +1,5 @@
 // Design tokens mirrored from mockups/ui_mockup.html
-// (which itself mirrors crates/forex-app/src/ui/theme.rs).
+// (kept locally in Flutter after the legacy Rust UI removal).
 //
 // Single source of truth for color / typography / spacing /
 // dimensions so every widget reads from `ForexAiTheme.of(context)`

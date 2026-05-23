@@ -118,9 +118,7 @@ struct DiscoverTimeframesCacheEntry {
 }
 
 static DISCOVER_TIMEFRAMES_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<
-        std::collections::HashMap<(PathBuf, String), DiscoverTimeframesCacheEntry>,
-    >,
+    std::sync::Mutex<std::collections::HashMap<(PathBuf, String), DiscoverTimeframesCacheEntry>>,
 > = std::sync::OnceLock::new();
 
 fn discover_timeframes_cache_get(root: &Path, symbol: &str) -> Option<Vec<String>> {

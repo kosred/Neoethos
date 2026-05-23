@@ -30,8 +30,8 @@ pub struct RiskDto {
 }
 
 pub async fn risk(State(_state): State<AppApiState>) -> Response {
-    // config.yaml lives at the workspace root by default. The same
-    // file the egui side reads — single source of truth.
+    // config.yaml lives at the workspace root by default and remains
+    // the single source of truth for backend risk settings.
     let settings = match Settings::from_yaml("config.yaml") {
         Ok(s) => s,
         Err(err) => {

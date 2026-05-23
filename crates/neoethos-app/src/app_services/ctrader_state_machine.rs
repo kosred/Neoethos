@@ -184,8 +184,8 @@ impl CTraderStateMachine {
 }
 
 #[allow(dead_code)] // used only by the `mark_*` mutation methods,
-                    // which are themselves dead in the release build
-                    // (see the impl above).
+// which are themselves dead in the release build
+// (see the impl above).
 fn now_iso8601() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()

@@ -1,6 +1,5 @@
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 
@@ -8,14 +7,18 @@ import '../api/backend_client.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
+import '../widgets/symbol_picker.dart';
 import '_placeholder.dart';
 
-/// Fallback timeframe list shown ONLY while /broker/timeframes is
-/// in-flight. Real choices come from `brokerTimeframesProvider`
-/// (= `neoethos_core::CANONICAL_TIMEFRAMES`). Earlier revisions had a
-/// 9-entry hardcoded list here that was missing M3 + H12 — that
-/// drift is exactly why this is server-driven now.
-const _fallbackTimeframes = <String>['M1', 'H1', 'D1'];
+// Data Bootstrap screen — local OHLCV inventory + per-symbol
+// historical-download form.
+//
+// Timeframe dropdown is sourced EXCLUSIVELY from
+// `brokerTimeframesProvider` (= `neoethos_core::CANONICAL_TIMEFRAMES`
+// over the wire). No hardcoded fallback list — earlier revisions had
+// one that drifted out of sync (missed M3 + H12 when the contract
+// gained them) and that's exactly the bug we don't want to ship
+// again. The dropdown stays disabled until the server replies.
 
 class DataBootstrapScreen extends ConsumerWidget {
   const DataBootstrapScreen({super.key});
@@ -50,7 +53,8 @@ class _Body extends ConsumerStatefulWidget {
 }
 
 class _BodyState extends ConsumerState<_Body> {
-  final _symbolCtrl = TextEditingController(text: 'EURUSD');
+  // Symbol + timeframe both come from broker-backed pickers.
+  String _symbol = 'EURUSD';
   String _timeframe = 'H1';
   // Default: last 12 months — operator can shrink or extend (years if
   // the broker supports it).
@@ -59,12 +63,6 @@ class _BodyState extends ConsumerState<_Body> {
   DateTime _toDate = DateTime.now().toUtc();
   bool _busy = false;
   String? _lastResult;
-
-  @override
-  void dispose() {
-    _symbolCtrl.dispose();
-    super.dispose();
-  }
 
   Future<void> _pickDate({required bool isFrom}) async {
     final initial = isFrom ? _fromDate : _toDate;
@@ -85,7 +83,7 @@ class _BodyState extends ConsumerState<_Body> {
   }
 
   Future<void> _onDownload() async {
-    final symbol = _symbolCtrl.text.trim().toUpperCase();
+    final symbol = _symbol.trim().toUpperCase();
     if (symbol.isEmpty) return;
     if (_toDate.isBefore(_fromDate)) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -229,64 +227,24 @@ class _BodyState extends ConsumerState<_Body> {
               ),
               const SizedBox(height: 10),
               Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  SizedBox(
-                    width: 140,
-                    child: TextField(
-                      controller: _symbolCtrl,
+                  Expanded(
+                    flex: 3,
+                    child: SymbolPicker(
+                      value: _symbol,
                       enabled: !_busy,
-                      textCapitalization: TextCapitalization.characters,
-                      inputFormatters: [
-                        FilteringTextInputFormatter.allow(
-                          RegExp(r'[A-Za-z0-9.]'),
-                        ),
-                      ],
-                      decoration: const InputDecoration(
-                        labelText: 'Symbol',
-                        isDense: true,
-                        border: OutlineInputBorder(),
-                      ),
+                      onChanged: (v) => setState(() => _symbol = v),
                     ),
                   ),
                   const SizedBox(width: 12),
-                  Consumer(
-                    builder: (ctx, ref, _) {
-                      final tfs = ref
-                          .watch(brokerTimeframesProvider)
-                          .maybeWhen(
-                            data: (list) =>
-                                list.isEmpty ? _fallbackTimeframes : list,
-                            orElse: () => _fallbackTimeframes,
-                          );
-                      // If the live list doesn't include the saved
-                      // pick (e.g. canonical contract changed),
-                      // anchor on the first available value so
-                      // DropdownButton doesn't assert.
-                      final current = tfs.contains(_timeframe)
-                          ? _timeframe
-                          : tfs.first;
-                      if (current != _timeframe) {
-                        WidgetsBinding.instance.addPostFrameCallback(
-                          (_) {
-                            if (mounted) {
-                              setState(() => _timeframe = current);
-                            }
-                          },
-                        );
-                      }
-                      return DropdownButton<String>(
-                        value: current,
-                        items: [
-                          for (final tf in tfs)
-                            DropdownMenuItem(value: tf, child: Text(tf)),
-                        ],
-                        onChanged: _busy
-                            ? null
-                            : (v) {
-                                if (v != null) setState(() => _timeframe = v);
-                              },
-                      );
-                    },
+                  Expanded(
+                    flex: 2,
+                    child: TimeframePicker(
+                      value: _timeframe,
+                      enabled: !_busy,
+                      onChanged: (v) => setState(() => _timeframe = v),
+                    ),
                   ),
                 ],
               ),

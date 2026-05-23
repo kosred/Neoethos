@@ -1132,10 +1132,8 @@ mod tests {
 
     #[test]
     fn bars_only_backend_loads_symbol_metadata_then_trendbars_without_ticks() {
-        // After symbol resolution the v0.5.1.1 fix re-auths before fetching
-        // symbol-by-id and trendbars (fresh WSS connection per call), so the
-        // full sequence is 7 messages: initial auth (2) + symbols-list (1) +
-        // re-auth (2) + symbol-by-id (1) + trendbars (1).
+        // Every production send_sequence opens a fresh WSS connection, so
+        // symbol list, symbol detail, and trendbars each re-auth.
         let transport = StubTransport::with_responses(vec![
             Ok(r#"{"clientMsgId":"app-auth-1","payloadType":2101,"payload":{}}"#.to_string()),
             Ok(r#"{"clientMsgId":"account-auth-1","payloadType":2103,"payload":{"ctidTraderAccountId":712345}}"#.to_string()),
@@ -1144,6 +1142,9 @@ mod tests {
             Ok(r#"{"clientMsgId":"app-auth-2","payloadType":2101,"payload":{}}"#.to_string()),
             Ok(r#"{"clientMsgId":"account-auth-2","payloadType":2103,"payload":{"ctidTraderAccountId":712345}}"#.to_string()),
             Ok(r#"{"clientMsgId":"symbol-by-id-1","payloadType":2117,"payload":{"symbol":[{"symbolId":14,"digits":5,"pipPosition":4,"tradingMode":"ENABLED"}]}}"#.to_string()),
+            // Re-auth on the third WSS connection (before trendbars):
+            Ok(r#"{"clientMsgId":"app-auth-3","payloadType":2101,"payload":{}}"#.to_string()),
+            Ok(r#"{"clientMsgId":"account-auth-3","payloadType":2103,"payload":{"ctidTraderAccountId":712345}}"#.to_string()),
             Ok(r#"{"clientMsgId":"trendbars-1","payloadType":2138,"payload":{"period":"M15","symbolId":14,"trendbar":[{"volume":9,"low":109950,"deltaOpen":50,"deltaClose":125,"deltaHigh":225,"utcTimestampInMinutes":28500000}],"hasMore":false}}"#.to_string()),
         ]);
 
@@ -1168,6 +1169,6 @@ mod tests {
         assert_eq!(result.bars.len(), 1);
         assert_eq!(result.bars[0].close, 1.10075);
         assert!(!result.has_more);
-        assert_eq!(transport.sent_len(), 7);
+        assert_eq!(transport.sent_len(), 9);
     }
 }

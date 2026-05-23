@@ -86,7 +86,7 @@ class _Body extends StatelessWidget {
           child: Text(
             'Read-only in this build. Live edits land when the '
             'POST /risk endpoint ships. Until then, edit config.yaml '
-            'and restart neoethos-app --server.',
+            'and restart the backend server.',
             style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
           ),
         ),

@@ -5,7 +5,7 @@
 // instead of hardcoded mockup figures.
 //
 // Render rules:
-//   - Brand:            always "NeoEthos" (post-rebrand).
+//   - Brand:            always "neoethos".
 //   - LIVE / OFFLINE:   derives from `accountSnapshotProvider` state.
 //                         data        → green LIVE
 //                         BrokerNot…  → muted CONNECTING
@@ -70,7 +70,7 @@ class TopBar extends ConsumerWidget {
       child: Row(
         children: [
           const Text(
-            'NeoEthos',
+            'neoethos',
             style: TextStyle(
               fontSize: ForexAiTokens.fsSubtitle + 1,
               fontWeight: FontWeight.w700,

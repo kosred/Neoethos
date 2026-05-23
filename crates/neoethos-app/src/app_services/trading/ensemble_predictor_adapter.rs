@@ -117,7 +117,7 @@ impl EnsembleModelPredictor {
     /// rendering the operator-facing "X/Y experts active" banner
     /// without re-querying the registry.
     #[allow(dead_code)] // chrome banner widget not yet wired —
-                        // status_msg string carries the count today
+    // status_msg string carries the count today
     pub fn ensemble(&self) -> &dyn EnsemblePredictor {
         self.ensemble.as_ref()
     }

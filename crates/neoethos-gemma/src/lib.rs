@@ -49,9 +49,9 @@ pub use gate::{
     LanguageHint, StubEmbeddingGate, TopicCheck, TopicGate, TopicGateStack, refusal_text,
 };
 pub use readonly_tools::{register_all_g3, registry_with_g3_tools};
-pub use runtime::{GemmaRuntime, StubGemmaRuntime};
 #[cfg(feature = "mistralrs-runtime")]
 pub use runtime::LlamaCppGemmaRuntime;
+pub use runtime::{GemmaRuntime, StubGemmaRuntime};
 pub use suggestions::{
     InMemorySuggestionQueue, PendingSuggestion, SUGGESTION_REASONING_MAX_CHARS, SuggestionQueue,
     SuggestionResolution, SuggestionSide, compute_expiry,

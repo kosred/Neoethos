@@ -116,9 +116,9 @@ pub enum GateDecision {
     RiskyModeKillSwitch,
     /// Prop-firm risk gate rejected the implied order.
     #[allow(dead_code)] // emitted by the dispatch gate when wired
-                       // to the producer's reject-with-reason path;
-                       // dispatch currently passes through the gate
-                       // chain directly to `execute_ctrader_order`.
+    // to the producer's reject-with-reason path;
+    // dispatch currently passes through the gate
+    // chain directly to `execute_ctrader_order`.
     PropFirmGate { reason: String },
 }
 
@@ -127,9 +127,9 @@ impl AutoTradeSignal {
     /// dispatch candidate. Useful for the inference loop's logging
     /// before it hits the session-level gates.
     #[allow(dead_code)] // logging helper for the inference loop —
-                       // not currently called from production but
-                       // the gate-chain tests below assert its
-                       // semantics so the contract is locked.
+    // not currently called from production but
+    // the gate-chain tests below assert its
+    // semantics so the contract is locked.
     pub fn is_actionable(&self) -> bool {
         !matches!(self.side, AutoTradeSide::Flat) && self.confidence >= AUTO_TRADE_MIN_CONFIDENCE
     }

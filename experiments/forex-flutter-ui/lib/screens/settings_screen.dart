@@ -205,10 +205,21 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             ),
           ),
           const SizedBox(height: 10),
+          // Account picker — auto-populated from /broker/accounts so
+          // the user never has to type a numeric cTID by hand. Falls
+          // back to the free-text TextField when the catalog isn't
+          // available yet (haven't OAuthed, or credentials still
+          // blank, or network down).
           Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Expanded(
-                child: TextField(
+              Expanded(child: _AccountPicker(
+                currentAccountId: _accountIdCtrl.text,
+                enabled: !_busy,
+                onPicked: (id) => setState(() {
+                  _accountIdCtrl.text = id;
+                }),
+                fallback: TextField(
                   controller: _accountIdCtrl,
                   enabled: !_busy,
                   keyboardType: TextInputType.number,
@@ -216,22 +227,27 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                     labelText: 'Account ID (cTID)',
                     isDense: true,
                     border: OutlineInputBorder(),
-                    hintText: 'numeric, e.g. 46774385',
+                    hintText: 'numeric, e.g. 5789955',
+                    helperText:
+                        'Will switch to a live dropdown once cTrader OAuth completes.',
                   ),
                 ),
-              ),
+              )),
               const SizedBox(width: 12),
-              DropdownButton<String>(
-                value: _environment,
-                items: const [
-                  DropdownMenuItem(value: 'Demo', child: Text('Demo')),
-                  DropdownMenuItem(value: 'Live', child: Text('Live')),
-                ],
-                onChanged: _busy
-                    ? null
-                    : (v) {
-                        if (v != null) setState(() => _environment = v);
-                      },
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: DropdownButton<String>(
+                  value: _environment,
+                  items: const [
+                    DropdownMenuItem(value: 'Demo', child: Text('Demo')),
+                    DropdownMenuItem(value: 'Live', child: Text('Live')),
+                  ],
+                  onChanged: _busy
+                      ? null
+                      : (v) {
+                          if (v != null) setState(() => _environment = v);
+                        },
+                ),
               ),
             ],
           ),
@@ -299,6 +315,155 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           child: _Row('OpenAI model (legacy field)', s.openaiModel),
         ),
       ],
+    );
+  }
+}
+
+/// Account picker — Dropdown sourced from `/broker/accounts`. Falls
+/// back to the parent's `fallback` TextField when:
+///   * The OAuth token isn't saved yet (Re-authenticate must run first)
+///   * /broker/accounts returns an error
+///   * The list comes back empty (token granted zero accounts)
+///
+/// This is the visible cure for the `CH_ACCESS_TOKEN_INVALID` loop —
+/// users now pick a *real* cTID from the granted set instead of
+/// guessing at a stale value left over in broker_credentials.toml.
+class _AccountPicker extends ConsumerWidget {
+  final String currentAccountId;
+  final bool enabled;
+  final ValueChanged<String> onPicked;
+  final Widget fallback;
+  const _AccountPicker({
+    required this.currentAccountId,
+    required this.enabled,
+    required this.onPicked,
+    required this.fallback,
+  });
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final async = ref.watch(brokerAccountsProvider);
+    return async.when(
+      data: (snap) {
+        if (snap.accounts.isEmpty) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              fallback,
+              const SizedBox(height: 4),
+              const Text(
+                'Token granted access to 0 accounts. Open Broker Setup '
+                '→ Re-authenticate and tick at least one account on '
+                'the Spotware consent screen.',
+                style: TextStyle(
+                  fontSize: 10,
+                  color: ForexAiTokens.warning,
+                ),
+              ),
+            ],
+          );
+        }
+        // If the saved account_id isn't in the granted set, fall back
+        // to first available — that's typically what the user meant
+        // anyway, and the consent screen has already accepted it.
+        final ids = snap.accounts.map((a) => a.accountId).toList();
+        final selected = ids.contains(currentAccountId)
+            ? currentAccountId
+            : ids.first;
+        if (selected != currentAccountId) {
+          // Post-frame nudge so we don't setState during build.
+          WidgetsBinding.instance
+              .addPostFrameCallback((_) => onPicked(selected));
+        }
+        return InputDecorator(
+          decoration: InputDecoration(
+            labelText:
+                'Account · ${snap.accountCount} from /broker/accounts (live)',
+            isDense: true,
+            border: const OutlineInputBorder(),
+            helperText:
+                'Picked from the cTrader OAuth grant — no more typing cTIDs by hand.',
+          ),
+          child: DropdownButtonHideUnderline(
+            child: DropdownButton<String>(
+              isExpanded: true,
+              value: selected,
+              items: [
+                for (final a in snap.accounts)
+                  DropdownMenuItem(
+                    value: a.accountId,
+                    child: Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 1,
+                          ),
+                          decoration: BoxDecoration(
+                            color: (a.isLive == true)
+                                ? ForexAiTokens.sell.withValues(alpha: 0.25)
+                                : ForexAiTokens.buy.withValues(alpha: 0.2),
+                            borderRadius: BorderRadius.circular(3),
+                          ),
+                          child: Text(
+                            (a.isLive == true) ? 'LIVE' : 'DEMO',
+                            style: const TextStyle(
+                              fontSize: 9,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            a.dropdownLabel,
+                            style: const TextStyle(fontSize: 12),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+              ],
+              onChanged: enabled
+                  ? (v) {
+                      if (v != null) onPicked(v);
+                    }
+                  : null,
+            ),
+          ),
+        );
+      },
+      loading: () => Stack(
+        children: [
+          fallback,
+          const Positioned(
+            right: 8,
+            top: 16,
+            child: SizedBox(
+              width: 14,
+              height: 14,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+          ),
+        ],
+      ),
+      error: (err, _) => Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          fallback,
+          const SizedBox(height: 4),
+          Text(
+            'Account picker unavailable: $err\n'
+            'Save credentials, then Broker Setup → Re-authenticate '
+            'before the dropdown can populate.',
+            style: const TextStyle(
+              fontSize: 10,
+              color: ForexAiTokens.warning,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

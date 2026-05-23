@@ -63,7 +63,7 @@ class BackendSupervisor {
           '  2. Side-by-side with Flutter exe (legacy bundle)\n'
           '  3. Ancestors of Flutter exe → target/{debug,release}/\n'
           '  4. Ancestors of CWD → target/{debug,release}/\n'
-          'Drop the neoethos-app.exe under <NeoEthos.exe-dir>/bin/ and re-launch.');
+          'Drop the neoethos-app.exe under <neoethos.exe-dir>/bin/ and re-launch.');
       return;
     }
     _log('Located backend binary: ${binary.path}');
@@ -140,7 +140,7 @@ class BackendSupervisor {
   /// Search order:
   ///   1. `<flutter-exe-dir>/bin/` — the production bundle layout where
   ///      the backend is tucked into a `bin/` subfolder so the operator
-  ///      sees one executable (`NeoEthos.exe`) at the bundle's top
+  ///      sees one executable (`neoethos.exe`) at the bundle's top
   ///      level and the backend stays out of their way.
   ///   2. Side-by-side with the Flutter exe — older bundle layout, kept
   ///      working so existing installs don't break after the rename.
@@ -198,7 +198,7 @@ class BackendSupervisor {
   ///
   /// Two layouts to support:
   ///
-  /// 1. **Production bundle** (`<bundle>/NeoEthos.exe` +
+  /// 1. **Production bundle** (`<bundle>/neoethos.exe` +
   ///    `<bundle>/bin/neoethos-app.exe`). The bundle ships a
   ///    `config.yaml` at its root, but the bundle also contains
   ///    a Flutter runtime `data/` directory that conflicts with

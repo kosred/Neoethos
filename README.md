@@ -1,4 +1,4 @@
-# NeoEthos
+# neoethos
 
 **A disciplined multi-model ML engine for FX strategy research and risk-aware execution.**
 
@@ -7,7 +7,7 @@
 ## 🏗️ Architecture
 The project has been fully migrated from a hybrid Python/Rust structure to a **Pure Rust** architecture to eliminate GIL bottlenecks and ensure absolute safety.
 
-- **`neoethos-app`**: The main entry point. Supports both a **Native GUI** (Windows/Linux Desktop) and a **Headless Mode** (Linux VPS/Server).
+- **`neoethos-app`**: Rust backend entry point for HTTP server, headless jobs, reauth, and API-test workflows.
 - **`neoethos-core`**: Core logic including Risk Management, Portfolio Optimization, and Configuration.
 - **`neoethos-data`**: High-speed OHLCV data engine with zero lookahead bias.
 - **`neoethos-models`**: Native Rust machine learning models (XGBoost, Neural Networks via Burn, etc.).
@@ -29,12 +29,12 @@ required at runtime — the project is 100% pure Rust on the hot path.
 cargo build --release -p neoethos-app
 ```
 
-### Running the App
-- **GUI Mode (Desktop):**
+### Running the Backend
+- **HTTP server mode:**
   ```bash
-  ./target/release/neoethos-app
+  ./target/release/neoethos-app --server
   ```
-- **Headless Mode (Linux Server):**
+- **Headless job mode (Linux Server):**
   ```bash
   ./target/release/neoethos-app --headless --config config.yaml
   ```

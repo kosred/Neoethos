@@ -46,8 +46,8 @@ pub struct GpuDto {
     /// but the dependency edge isn't wired yet — out of scope for the
     /// HTTP-server work).
     pub name: String,
-    /// Whether at least one GPU is detected. Mirrors the boolean the
-    /// existing `Hardware` egui panel renders.
+    /// Whether at least one GPU is detected. Rendered by the Flutter
+    /// hardware screen.
     pub available: bool,
 }
 

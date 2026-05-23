@@ -34,7 +34,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   Win32Window::Size size(1400, 900);
   // Window title shown in the OS chrome (Alt-Tab, taskbar, title bar).
   // Keep in lock-step with the brand string in `lib/widgets/topbar.dart`.
-  if (!window.Create(L"NeoEthos", origin, size)) {
+  if (!window.Create(L"neoethos", origin, size)) {
     return EXIT_FAILURE;
   }
   window.SetQuitOnClose(true);

@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
 use cubecl::cuda::{CudaDevice, CudaRuntime};
 use cubecl::prelude::*;
-use neoethos_core::TrainingPrecision;
 use half::bf16;
 use ndarray::ArrayView2;
+use neoethos_core::TrainingPrecision;
 
 use crate::eval::{BacktestSettings, SmcRow};
 

@@ -1,7 +1,9 @@
 use crate::artifact_io::write_json_atomic;
 use crate::scheduler_assignment::accelerator_backend_from_assignment;
 use anyhow::{Result, bail};
-use neoethos_core::{AcceleratorBackend, ResolvedWorkloadAssignment, TrainingPrecision, WorkloadKind};
+use neoethos_core::{
+    AcceleratorBackend, ResolvedWorkloadAssignment, TrainingPrecision, WorkloadKind,
+};
 use neoethos_data::{
     FeatureCache, FeatureFrame, FeatureProfile, Ohlcv, SymbolDataset, compute_hpc_feature_frame,
 };

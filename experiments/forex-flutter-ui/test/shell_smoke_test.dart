@@ -3,35 +3,18 @@
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:forex_flutter_ui/state/nav.dart';
 import 'package:forex_flutter_ui/theme/theme.dart';
-import 'package:forex_flutter_ui/widgets/app_shell.dart';
 
-Widget _harness() => ProviderScope(
-      child: MaterialApp(
-        theme: buildForexAiTheme(),
-        home: const AppShell(),
-      ),
-    );
-
-/// The shell is designed for a 1440x900+ desktop viewport. The
-/// default flutter_test surface (800x600) is too narrow for the
-/// TopBar ribbon + the sidebar's icon-and-label rows, so layout
-/// overflows trip as exceptions. Pump the surface up to the size
-/// the design assumes before every desktop-shell test.
-Future<void> _withDesktopSize(WidgetTester tester) async {
-  await tester.binding.setSurfaceSize(const Size(1440, 900));
-  addTearDown(() => tester.binding.setSurfaceSize(null));
-}
+import 'test_harness.dart';
 
 void main() {
   testWidgets('shell renders all four grid areas', (tester) async {
-    await _withDesktopSize(tester);
-    await tester.pumpWidget(_harness());
+    await useDesktopSurface(tester);
+    await tester.pumpWidget(shellHarness());
     // TopBar brand
-    expect(find.text('forex-ai'), findsOneWidget);
+    expect(find.text('neoethos'), findsOneWidget);
     // Sidebar section headers (letter-spaced uppercase)
     expect(find.textContaining('T R A D I N G'), findsOneWidget);
     expect(find.textContaining('A I   E N G I N E'), findsOneWidget);
@@ -40,9 +23,9 @@ void main() {
     expect(find.text('Operator Overview'), findsOneWidget);
   });
 
-  testWidgets('sidebar lists all 14 panels', (tester) async {
-    await _withDesktopSize(tester);
-    await tester.pumpWidget(_harness());
+  testWidgets('sidebar lists all 15 panels', (tester) async {
+    await useDesktopSurface(tester);
+    await tester.pumpWidget(shellHarness());
     for (final tab in kNavTabs) {
       expect(
         find.text(tab.title),
@@ -52,25 +35,23 @@ void main() {
     }
   });
 
-  testWidgets('clicking a sidebar item swaps the dock view',
-      (tester) async {
-    await _withDesktopSize(tester);
-    await tester.pumpWidget(_harness());
+  testWidgets('clicking a sidebar item swaps the dock view', (tester) async {
+    await useDesktopSurface(tester);
+    await tester.pumpWidget(shellHarness());
     // Click "Broker Setup" in the sidebar.
     await tester.tap(find.text('Broker Setup').first);
     await tester.pumpAndSettle();
     // The dock should show the BrokerSetupScreen placeholder.
     expect(find.text('Broker Setup'), findsWidgets);
     expect(
-      find.textContaining('cTrader / DXtrade credentials'),
+      find.textContaining('cTrader / DXtrade'),
       findsOneWidget,
     );
   });
 
-  testWidgets('all 14 screens load without throwing',
-      (tester) async {
-    await _withDesktopSize(tester);
-    await tester.pumpWidget(_harness());
+  testWidgets('all 15 screens load without throwing', (tester) async {
+    await useDesktopSurface(tester);
+    await tester.pumpWidget(shellHarness());
     for (final tab in kNavTabs) {
       await tester.tap(find.text(tab.title).first);
       await tester.pumpAndSettle();
@@ -78,15 +59,14 @@ void main() {
     // No exception escapes pumpAndSettle.
   });
 
-  test('nav tab catalog has 14 entries grouped 6/3/5', () {
-    final trading =
-        kNavTabs.where((t) => t.group == NavGroup.trading).length;
+  test('nav tab catalog has 15 entries grouped 6/4/5', () {
+    final trading = kNavTabs.where((t) => t.group == NavGroup.trading).length;
     final ai = kNavTabs.where((t) => t.group == NavGroup.aiEngine).length;
     final system = kNavTabs.where((t) => t.group == NavGroup.system).length;
     expect(trading, 6);
-    expect(ai, 3);
+    expect(ai, 4);
     expect(system, 5);
-    expect(kNavTabs.length, 14);
+    expect(kNavTabs.length, 15);
   });
 
   test('design tokens pin TradingView dark scheme', () {

@@ -38,14 +38,12 @@ use anyhow::Result;
 /// Note — message updated to reflect actual options.
 /// There is no `neoethos-cli init` subcommand yet (planned), so we point
 /// users at the documented headless-config path instead.
-pub const WIZARD_TUI_NO_TTY_MESSAGE: &str =
-    "neoethos-cli wizard requires a TTY. For headless setup, hand-edit \
+pub const WIZARD_TUI_NO_TTY_MESSAGE: &str = "neoethos-cli wizard requires a TTY. For headless setup, hand-edit \
      ~/.local/share/neoethos/broker_credentials.toml (Linux/macOS) or \
      %APPDATA%\\neoethos\\broker_credentials.toml (Windows) — see \
      docs/audits/research/installer_wizard_ux_spec.md §6 for the schema. \
      If you have a desktop session, run the GUI wizard via `neoethos-app`.";
-pub const WIZARD_TUI_NOT_PORTED_MESSAGE: &str =
-    "neoethos-cli wizard: TUI rendering not yet ported (tracked under V0.5 \
+pub const WIZARD_TUI_NOT_PORTED_MESSAGE: &str = "neoethos-cli wizard: TUI rendering not yet ported (tracked under V0.5 \
      follow-up). The desktop GUI wizard is fully functional — run \
      `neoethos-app` to open it. For scripted/headless onboarding, \
      hand-edit the broker_credentials.toml under your platform's \

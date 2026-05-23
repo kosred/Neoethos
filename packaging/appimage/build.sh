@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # packaging/appimage/build.sh
 #
-# Build forex-app as a portable AppImage. Zero paid certificates required —
+# Build neoethos-app as a portable AppImage. Zero paid certificates required —
 # AppImages are GPG-signed via `appimagetool -s` per the no-paid-certs
 # strategy spec §3 (Linux AppImage path).
 #
@@ -11,9 +11,9 @@
 #   - Strategy doc: docs/audits/research/installer_no_paid_certs_strategy.md §3
 #
 # Outputs:
-#   forex-app-<version>-x86_64.AppImage         (the AppImage bundle)
-#   forex-app-<version>-x86_64.AppImage.asc     (detached GPG sig, when GPG_KEY_ID set)
-#   forex-app-<version>-x86_64.AppImage.zsync   (delta-update manifest, optional)
+#   neoethos-app-<version>-x86_64.AppImage         (the AppImage bundle)
+#   neoethos-app-<version>-x86_64.AppImage.asc     (detached GPG sig, when GPG_KEY_ID set)
+#   neoethos-app-<version>-x86_64.AppImage.zsync   (delta-update manifest, optional)
 #
 # Required tools (PATH):
 #   - cargo (Rust toolchain)
@@ -26,8 +26,9 @@
 #                                       secrets.GPG_PRIVATE_KEY after import.
 #   APPIMAGETOOL_SIGN_PASSPHRASE (optional) — passphrase for the GPG key, per
 #                                              appimagetool docs.
-#   FOREX_AI_VERSION      (optional) — version string; defaults to the
-#                                       `version =` line in crates/forex-app/Cargo.toml.
+#   NEOETHOS_VERSION      (optional) — version string; defaults to the
+#                                       `version =` line in crates/neoethos-app/Cargo.toml.
+#   FOREX_AI_VERSION      (optional) — legacy alias for NEOETHOS_VERSION.
 
 set -euo pipefail
 
@@ -35,40 +36,37 @@ set -euo pipefail
 # from anywhere.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
-APPDIR="${SCRIPT_DIR}/forex-app.AppDir"
+APPDIR="${SCRIPT_DIR}/neoethos-app.AppDir"
 
 cd "${REPO_ROOT}"
 
 # ── Version detection ────────────────────────────────────────────────────────
-if [[ -z "${FOREX_AI_VERSION:-}" ]]; then
-    FOREX_AI_VERSION="$(grep -m1 '^version = ' crates/forex-app/Cargo.toml \
-        | sed -E 's/version = "([^"]+)"/\1/')"
+if [[ -z "${NEOETHOS_VERSION:-}" ]]; then
+    NEOETHOS_VERSION="${FOREX_AI_VERSION:-}"
 fi
-echo "[appimage] version = ${FOREX_AI_VERSION}"
+if [[ -z "${NEOETHOS_VERSION:-}" ]]; then
+    NEOETHOS_VERSION="$(grep -m1 '^version = ' crates/neoethos-app/Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"
+fi
+echo "[appimage] version = ${NEOETHOS_VERSION}"
 
-# ── Step 1: cargo build --release -p forex-app ───────────────────────────────
-echo "[appimage] step 1/4 — cargo build --release -p forex-app"
-cargo build --release -p forex-app
+# ── Step 1: cargo build --release -p neoethos-app ────────────────────────────
+echo "[appimage] step 1/4 — cargo build --release -p neoethos-app"
+cargo build --release -p neoethos-app
 
 # ── Step 2: stage the binary inside the AppDir ───────────────────────────────
 echo "[appimage] step 2/4 — staging binary into AppDir"
-install -Dm755 \
-    "${REPO_ROOT}/target/release/forex-app" \
-    "${APPDIR}/usr/bin/forex-app"
+install -Dm755 "${REPO_ROOT}/target/release/neoethos-app" "${APPDIR}/usr/bin/neoethos-app"
 
 # Stage runtime assets per installer_infrastructure_spec.md §8.
-install -Dm644 \
-    "${REPO_ROOT}/assets/symbol_metadata/defaults.json" \
-    "${APPDIR}/usr/share/forex-ai/symbol_metadata/defaults.json"
+install -Dm644 "${REPO_ROOT}/assets/symbol_metadata/defaults.json" "${APPDIR}/usr/share/neoethos/symbol_metadata/defaults.json"
 
 # Top-level icon expected by appimagetool. Use the real icon if it exists,
 # otherwise fail-loudly so the operator can't ship a no-icon AppImage by
 # accident.
-if [[ -f "${APPDIR}/forex-app.png" ]]; then
-    echo "[appimage] using existing forex-app.png"
+if [[ -f "${APPDIR}/neoethos-app.png" ]]; then
+    echo "[appimage] using existing neoethos-app.png"
 else
-    echo "[appimage] ERROR: ${APPDIR}/forex-app.png missing — see forex-app.png.TODO" >&2
-    echo "[appimage] (TODO(real-icon): replace placeholder with a 256x256 PNG)" >&2
+    echo "[appimage] ERROR: ${APPDIR}/neoethos-app.png missing" >&2
     exit 1
 fi
 
@@ -81,13 +79,12 @@ if [[ ! -x "${APPIMAGETOOL}" ]]; then
     echo "[appimage] step 3a/4 — fetching appimagetool"
     # Continuous-release URL per appimagetool README; pinned mirror would be
     # an enhancement, but the project deliberately ships only this URL.
-    curl -fL -o "${APPIMAGETOOL}" \
-        "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+    curl -fL -o "${APPIMAGETOOL}" "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
     chmod +x "${APPIMAGETOOL}"
 fi
 
 # ── Step 4: build the AppImage (with optional GPG signing) ───────────────────
-OUT_NAME="forex-app-${FOREX_AI_VERSION}-x86_64.AppImage"
+OUT_NAME="neoethos-app-${NEOETHOS_VERSION}-x86_64.AppImage"
 OUT_PATH="${REPO_ROOT}/${OUT_NAME}"
 
 echo "[appimage] step 4/4 — running appimagetool"

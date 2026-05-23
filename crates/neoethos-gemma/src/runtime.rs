@@ -436,8 +436,7 @@ mod llama_impl {
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(32_768);
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(n_ctx));
+        let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(n_ctx));
 
         let mut ctx = model
             .new_context(backend, ctx_params)
@@ -461,7 +460,8 @@ mod llama_impl {
                 .add(token, i as i32, &[0], is_last)
                 .context("batch.add (prompt) failed")?;
         }
-        ctx.decode(&mut batch).context("initial prompt decode failed")?;
+        ctx.decode(&mut batch)
+            .context("initial prompt decode failed")?;
 
         // Sampler chain: temperature → top-k → nucleus → random dist.
         // Greedy (`LlamaSampler::greedy()`) is a valid alternative for

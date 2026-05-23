@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# AppRun - AppImage entry point for neoethos-app.
+#
+# AppImage runtime mounts the .AppDir at $APPDIR and executes this script.
+# We forward to the bundled neoethos-app binary under usr/bin/.
+
+set -euo pipefail
+
+# $APPDIR is set by the AppImage runtime to the FUSE mount point of the .AppDir.
+# Fall back to the directory of this script if invoked directly.
+APPDIR="${APPDIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
+
+# Ensure bundled libraries, if any are added later, are picked up by the
+# dynamic linker without requiring system installs.
+export LD_LIBRARY_PATH="${APPDIR}/usr/lib:${LD_LIBRARY_PATH:-}"
+
+# Point the binary at the packaged data root. The legacy variable stays for
+# compatibility with older runtime probes during the rename window.
+export NEOETHOS_BUNDLED_DATA="${APPDIR}/usr/share/neoethos"
+export FOREX_AI_BUNDLED_DATA="${APPDIR}/usr/share/neoethos"
+
+exec "${APPDIR}/usr/bin/neoethos-app" "$@"

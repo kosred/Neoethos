@@ -120,7 +120,7 @@ impl TradingSession {
                 // Return whatever the cache holds right now (may be stale /
                 // empty). When the background thread finishes it sends
                 // ServiceEvent::ChartDataUpdated, which updates the cache and
-                // triggers an egui repaint.
+                // lets the caller refresh its snapshot.
                 if let Some(cache) = &self.market_chart_cache {
                     return cache.snapshot.clone();
                 }
@@ -335,7 +335,9 @@ impl TradingSession {
             return None;
         }
         match (cache.update.bid, cache.update.ask) {
-            (Some(bid), Some(ask)) if bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0 => {
+            (Some(bid), Some(ask))
+                if bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0 =>
+            {
                 Some((bid + ask) / 2.0)
             }
             // Fall back to the side we have if only one is present. A

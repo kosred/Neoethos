@@ -10,9 +10,9 @@
 
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../../theme/theme.dart';
+import '../../widgets/symbol_picker.dart';
 import '../_placeholder.dart';
 
 typedef EngineStart = Future<Map<String, dynamic>> Function({
@@ -67,34 +67,27 @@ class EngineControls extends StatefulWidget {
 }
 
 class _EngineControlsState extends State<EngineControls> {
-  final TextEditingController _symbolCtrl =
-      TextEditingController(text: 'EURUSD');
-  final TextEditingController _tfCtrl = TextEditingController(text: 'M1');
+  // Symbol + timeframe now flow through the broker-backed pickers
+  // instead of free-text TextFields. Defaults stay as before so the
+  // dashboard "Start" affordance still has a sane initial pick.
+  String _symbol = 'EURUSD';
+  String _timeframe = 'M1';
 
   bool _busy = false;
-
-  @override
-  void dispose() {
-    _symbolCtrl.dispose();
-    _tfCtrl.dispose();
-    super.dispose();
-  }
 
   Future<void> _onStart() async {
     setState(() => _busy = true);
     try {
       await widget.start(
-        symbol: _symbolCtrl.text.trim(),
-        baseTf: _tfCtrl.text.trim(),
+        symbol: _symbol,
+        baseTf: _timeframe,
       );
       widget.onChanged();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              '${widget.kind} started for '
-              '${_symbolCtrl.text.trim().toUpperCase()} '
-              '${_tfCtrl.text.trim().toUpperCase()}',
+              '${widget.kind} started for $_symbol $_timeframe',
             ),
             duration: const Duration(seconds: 2),
           ),
@@ -203,45 +196,35 @@ class _EngineControlsState extends State<EngineControls> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  SizedBox(
-                    width: 140,
-                    child: TextField(
-                      controller: _symbolCtrl,
+                  // Symbol: type-ahead from /broker/symbols. Forex-only
+                  // filter on by default since Discovery + Training are
+                  // wired for FX-shaped pairs (the strategy heuristics
+                  // and tick value math assume forex semantics).
+                  Expanded(
+                    flex: 3,
+                    child: SymbolPicker(
+                      value: _symbol,
                       enabled: !widget.running && !_busy,
-                      decoration: const InputDecoration(
-                        labelText: 'Symbol',
-                        isDense: true,
-                        border: OutlineInputBorder(),
-                      ),
-                      inputFormatters: [
-                        FilteringTextInputFormatter.allow(
-                          RegExp(r'[A-Za-z0-9]'),
-                        ),
-                      ],
-                      textCapitalization: TextCapitalization.characters,
+                      onChanged: (v) => setState(() => _symbol = v),
                     ),
                   ),
                   const SizedBox(width: 12),
-                  SizedBox(
-                    width: 100,
-                    child: TextField(
-                      controller: _tfCtrl,
+                  // Timeframe: dropdown over /broker/timeframes.
+                  Expanded(
+                    flex: 2,
+                    child: TimeframePicker(
+                      value: _timeframe,
                       enabled: !widget.running && !_busy,
-                      decoration: const InputDecoration(
-                        labelText: 'Timeframe',
-                        isDense: true,
-                        border: OutlineInputBorder(),
-                      ),
-                      inputFormatters: [
-                        FilteringTextInputFormatter.allow(
-                          RegExp(r'[A-Za-z0-9]'),
-                        ),
-                      ],
-                      textCapitalization: TextCapitalization.characters,
+                      onChanged: (v) => setState(() => _timeframe = v),
                     ),
                   ),
-                  const SizedBox(width: 16),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
                   FilledButton.icon(
                     onPressed:
                         (widget.running || _busy) ? null : _onStart,

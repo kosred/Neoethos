@@ -97,9 +97,7 @@ impl TradingSession {
         &self,
     ) -> crate::app_services::ctrader_state_machine::CTraderStateMachine {
         use crate::app_services::ctrader_auth::CTraderAuthState;
-        use crate::app_services::ctrader_state_machine::{
-            CTraderStateMachine, CTraderStepStatus,
-        };
+        use crate::app_services::ctrader_state_machine::{CTraderStateMachine, CTraderStepStatus};
         let mut sm = CTraderStateMachine::new();
         // Quick helper to set a step's status + message inline.
         let mark = |sm: &mut CTraderStateMachine,
@@ -125,7 +123,12 @@ impl TradingSession {
             CTraderAuthState::RestoredFromStorage | CTraderAuthState::AccountsAvailable
         );
         if token_present {
-            mark(&mut sm, 1, CTraderStepStatus::Ok, Some("token bundle restored".into()));
+            mark(
+                &mut sm,
+                1,
+                CTraderStepStatus::Ok,
+                Some("token bundle restored".into()),
+            );
         }
         // 2. token refreshed if needed — best-effort: mark ok when we
         //    have a token; the refresh path is automatic inside the
@@ -136,7 +139,12 @@ impl TradingSession {
         // 3. socket connected — `self.connected` reflects the connect
         //    worker's success.
         if self.connected {
-            mark(&mut sm, 3, CTraderStepStatus::Ok, Some("WebSocket established".into()));
+            mark(
+                &mut sm,
+                3,
+                CTraderStepStatus::Ok,
+                Some("WebSocket established".into()),
+            );
         }
         // 4. ApplicationAuth sent + 5. ApplicationAuthRes received —
         //    grouped under the same "connected" signal because the
@@ -279,35 +287,36 @@ impl TradingSession {
         let tx_clone = tx.clone();
         let _ = tx.blocking_send(ServiceEvent::BootstrapUpdated(snapshot.clone()));
 
-        let handle = super::background::spawn_background_task("bootstrap", tx_clone.clone(), move || {
-            let mut running_snapshot = snapshot;
-            running_snapshot.state = JobState::Running;
-            running_snapshot.progress.stage = "bootstrap_running".to_string();
-            running_snapshot.progress.message =
-                "Fetching and normalizing historical data".to_string();
-            let _ =
-                tx_clone.blocking_send(ServiceEvent::BootstrapUpdated(running_snapshot.clone()));
+        let handle =
+            super::background::spawn_background_task("bootstrap", tx_clone.clone(), move || {
+                let mut running_snapshot = snapshot;
+                running_snapshot.state = JobState::Running;
+                running_snapshot.progress.stage = "bootstrap_running".to_string();
+                running_snapshot.progress.message =
+                    "Fetching and normalizing historical data".to_string();
+                let _ = tx_clone
+                    .blocking_send(ServiceEvent::BootstrapUpdated(running_snapshot.clone()));
 
-            let final_snapshot = match run_ctrader_bootstrap_batch_with_context(
-                &context,
-                &data_root,
-                &symbols,
-                &timeframes,
-                years,
-            ) {
-                Ok(snapshot) => snapshot,
-                Err(err) => {
-                    let mut failed = running_snapshot;
-                    failed.state = JobState::Failed;
-                    failed.progress.stage = "bootstrap_failed".to_string();
-                    failed.progress.message = err.to_string();
-                    failed.report.summary = format!("Bootstrap failed: {err}");
-                    failed.report.errors.push(err.to_string());
-                    failed
-                }
-            };
-            let _ = tx_clone.blocking_send(ServiceEvent::BootstrapUpdated(final_snapshot));
-        });
+                let final_snapshot = match run_ctrader_bootstrap_batch_with_context(
+                    &context,
+                    &data_root,
+                    &symbols,
+                    &timeframes,
+                    years,
+                ) {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        let mut failed = running_snapshot;
+                        failed.state = JobState::Failed;
+                        failed.progress.stage = "bootstrap_failed".to_string();
+                        failed.progress.message = err.to_string();
+                        failed.report.summary = format!("Bootstrap failed: {err}");
+                        failed.report.errors.push(err.to_string());
+                        failed
+                    }
+                };
+                let _ = tx_clone.blocking_send(ServiceEvent::BootstrapUpdated(final_snapshot));
+            });
         self.bootstrap_handle = Some(handle);
 
         Ok(())
@@ -509,8 +518,7 @@ impl TradingSession {
         // values (environment, accounts, credentials) are not
         // overwritten by whatever is on disk.
         if self.broker_settings.ctrader.client_id.trim().is_empty() {
-            self.broker_settings =
-                crate::app_services::broker_persistence::load_broker_settings();
+            self.broker_settings = crate::app_services::broker_persistence::load_broker_settings();
         }
         let client_id = self.broker_settings.ctrader.client_id.trim().to_string();
         let redirect_uri = self.broker_settings.ctrader.redirect_uri.trim().to_string();
@@ -620,10 +628,8 @@ impl TradingSession {
                 let request = self.build_ctrader_account_runtime_request()?;
                 let backend = Arc::clone(&self.ctrader_account_runtime_backend);
                 let in_flight = Arc::clone(&self.connect_in_flight);
-                let handle = super::background::spawn_background_task(
-                    "connect",
-                    tx.clone(),
-                    move || {
+                let handle =
+                    super::background::spawn_background_task("connect", tx.clone(), move || {
                         // RAII guard — flips the flag back to false when the
                         // worker exits, whether by success, network error,
                         // or panic. The `background` helper wraps us in
@@ -638,17 +644,16 @@ impl TradingSession {
                         let _reset = ResetGuard(in_flight);
                         match backend.load_account_runtime(&request) {
                             Ok(runtime) => {
-                                let _ = tx
-                                    .blocking_send(ServiceEvent::CTraderConnectUpdated(runtime));
+                                let _ =
+                                    tx.blocking_send(ServiceEvent::CTraderConnectUpdated(runtime));
                             }
                             Err(err) => {
                                 let _ = tx.blocking_send(ServiceEvent::ConnectOutcome(Err(
-                                    err.to_string(),
+                                    err.to_string()
                                 )));
                             }
                         }
-                    },
-                );
+                    });
                 self.connect_handle = Some(handle);
             }
             _ => {
@@ -1046,102 +1051,106 @@ impl TradingSession {
             Ok(r) => r,
             Err(_) => return false,
         };
-        let handle = super::background::spawn_background_task("chart_fetch", tx.clone(), move || {
-            use crate::app_services::ctrader_streaming::{
-                CTraderLiveChartUpdateRequest, load_live_chart_update,
-            };
-            use crate::app_services::trading::{
-                build_market_chart_snapshot_from_historical_bars, load_chart_history,
-                merge_live_spot_update_into_bars,
-            };
-            let snapshot = match load_chart_history(&request) {
-                Ok(history) => {
-                    // Task #3 — pull a live spot tick on the same background
-                    // worker that just finished the history fetch, then merge
-                    // it into the last candle so the Chart panel actually
-                    // shows live bid/ask. The streaming module caches the
-                    // WSS session process-wide, so the first call opens the
-                    // socket + does the application/account auth + spot &
-                    // trendbar subscribe handshake; every subsequent call on
-                    // the same (env, account, symbol, timeframe) just reads
-                    // the next spot event off the cached socket. Failures
-                    // here are non-fatal: history-only is still useful.
-                    let live_request = CTraderLiveChartUpdateRequest {
-                        client_id: request.client_id.clone(),
-                        client_secret: request.client_secret.clone(),
-                        access_token: request.access_token.clone(),
-                        environment: request.environment,
-                        account_id: request.account_id.clone(),
-                        symbol_id: history.symbol.symbol_id,
-                        digits: history.symbol.digits,
-                        timeframe: request.timeframe.clone(),
-                        subscribe_to_spot_timestamp: false,
-                    };
-                    let live_update = match load_live_chart_update(&live_request) {
-                        Ok(update) => Some(update),
-                        Err(err) => {
-                            tracing::warn!(
-                                target: "neoethos_app::chart_fetch",
-                                symbol = %request.symbol_name,
-                                timeframe = %request.timeframe,
-                                error = %err,
-                                "cTrader live spot update unavailable; chart will render history only"
-                            );
-                            None
+        let handle = super::background::spawn_background_task(
+            "chart_fetch",
+            tx.clone(),
+            move || {
+                use crate::app_services::ctrader_streaming::{
+                    CTraderLiveChartUpdateRequest, load_live_chart_update,
+                };
+                use crate::app_services::trading::{
+                    build_market_chart_snapshot_from_historical_bars, load_chart_history,
+                    merge_live_spot_update_into_bars,
+                };
+                let snapshot = match load_chart_history(&request) {
+                    Ok(history) => {
+                        // Task #3 — pull a live spot tick on the same background
+                        // worker that just finished the history fetch, then merge
+                        // it into the last candle so the Chart panel actually
+                        // shows live bid/ask. The streaming module caches the
+                        // WSS session process-wide, so the first call opens the
+                        // socket + does the application/account auth + spot &
+                        // trendbar subscribe handshake; every subsequent call on
+                        // the same (env, account, symbol, timeframe) just reads
+                        // the next spot event off the cached socket. Failures
+                        // here are non-fatal: history-only is still useful.
+                        let live_request = CTraderLiveChartUpdateRequest {
+                            client_id: request.client_id.clone(),
+                            client_secret: request.client_secret.clone(),
+                            access_token: request.access_token.clone(),
+                            environment: request.environment,
+                            account_id: request.account_id.clone(),
+                            symbol_id: history.symbol.symbol_id,
+                            digits: history.symbol.digits,
+                            timeframe: request.timeframe.clone(),
+                            subscribe_to_spot_timestamp: false,
+                        };
+                        let live_update = match load_live_chart_update(&live_request) {
+                            Ok(update) => Some(update),
+                            Err(err) => {
+                                tracing::warn!(
+                                    target: "neoethos_app::chart_fetch",
+                                    symbol = %request.symbol_name,
+                                    timeframe = %request.timeframe,
+                                    error = %err,
+                                    "cTrader live spot update unavailable; chart will render history only"
+                                );
+                                None
+                            }
+                        };
+                        let bars =
+                            merge_live_spot_update_into_bars(&history.bars, live_update.as_ref());
+                        let mut snapshot = build_market_chart_snapshot_from_historical_bars(
+                            &history.symbol.symbol_name,
+                            &request.timeframe,
+                            available_timeframes,
+                            &bars,
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                        .with_overlay_status(overlay_status);
+                        // Surface the live bid/ask so the Markets panel + the
+                        // Chart headline can show real quotes instead of "--".
+                        // Mirrors the orphan `load_ctrader_market_chart_snapshot`
+                        // path in market_data.rs:258-272 that was wired up but
+                        // never reachable from any UI surface.
+                        if let Some(update) = live_update {
+                            snapshot.bid = update.bid;
+                            snapshot.ask = update.ask;
+                            let quote_line = match (update.bid, update.ask) {
+                                (Some(bid), Some(ask)) => {
+                                    format!(" · bid {bid:.5} ask {ask:.5}")
+                                }
+                                (Some(bid), None) => format!(" · bid {bid:.5}"),
+                                (None, Some(ask)) => format!(" · ask {ask:.5}"),
+                                (None, None) => String::new(),
+                            };
+                            if !quote_line.is_empty() {
+                                snapshot.headline.push_str(&quote_line);
+                            }
                         }
-                    };
-                    let bars =
-                        merge_live_spot_update_into_bars(&history.bars, live_update.as_ref());
-                    let mut snapshot = build_market_chart_snapshot_from_historical_bars(
-                        &history.symbol.symbol_name,
+                        snapshot
+                    }
+                    Err(err) => crate::app_services::trading::MarketChartSnapshot::empty_for(
+                        &request.symbol_name,
                         &request.timeframe,
                         available_timeframes,
-                        &bars,
-                        Vec::new(),
-                        Vec::new(),
-                    )
-                    .with_overlay_status(overlay_status);
-                    // Surface the live bid/ask so the Markets panel + the
-                    // Chart headline can show real quotes instead of "--".
-                    // Mirrors the orphan `load_ctrader_market_chart_snapshot`
-                    // path in market_data.rs:258-272 that was wired up but
-                    // never reachable from any UI surface.
-                    if let Some(update) = live_update {
-                        snapshot.bid = update.bid;
-                        snapshot.ask = update.ask;
-                        let quote_line = match (update.bid, update.ask) {
-                            (Some(bid), Some(ask)) => {
-                                format!(" · bid {bid:.5} ask {ask:.5}")
-                            }
-                            (Some(bid), None) => format!(" · bid {bid:.5}"),
-                            (None, Some(ask)) => format!(" · ask {ask:.5}"),
-                            (None, None) => String::new(),
-                        };
-                        if !quote_line.is_empty() {
-                            snapshot.headline.push_str(&quote_line);
-                        }
-                    }
-                    snapshot
-                }
-                Err(err) => crate::app_services::trading::MarketChartSnapshot::empty_for(
-                    &request.symbol_name,
-                    &request.timeframe,
-                    available_timeframes,
-                    format!(
-                        "cTrader chart unavailable for {} {}",
-                        request.symbol_name, request.timeframe
+                        format!(
+                            "cTrader chart unavailable for {} {}",
+                            request.symbol_name, request.timeframe
+                        ),
+                        overlay_status,
+                        vec![format!(
+                            "Failed to load cTrader {} chart for {}: {}",
+                            request.timeframe, request.symbol_name, err
+                        )],
                     ),
-                    overlay_status,
-                    vec![format!(
-                        "Failed to load cTrader {} chart for {}: {}",
-                        request.timeframe, request.symbol_name, err
-                    )],
-                ),
-            };
-            let _ = tx.blocking_send(crate::app_services::ServiceEvent::ChartDataUpdated(
-                Box::new(snapshot),
-            ));
-        });
+                };
+                let _ = tx.blocking_send(crate::app_services::ServiceEvent::ChartDataUpdated(
+                    Box::new(snapshot),
+                ));
+            },
+        );
         self.chart_fetch_handle = Some(handle);
         true
     }
@@ -1194,9 +1203,7 @@ impl TradingSession {
     /// `ensure_fresh_ctrader_token_bundle` which only refreshes near
     /// expiry — the harness always refreshes so the network call is
     /// the test.
-    pub fn refresh_ctrader_token_bundle_for_test(
-        &mut self,
-    ) -> anyhow::Result<CTraderTokenBundle> {
+    pub fn refresh_ctrader_token_bundle_for_test(&mut self) -> anyhow::Result<CTraderTokenBundle> {
         self.force_refresh_ctrader_token_bundle()
     }
 

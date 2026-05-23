@@ -5,20 +5,19 @@
 // external (`neoethos-app`) surface is unchanged.
 pub(super) use crate::app_services::ServiceEvent;
 pub(super) use crate::app_services::broker_config::{
-    AdapterReadinessSnapshot, BrokerSessionState, BrokerSettingsState,
-    CTraderBrokerEnvironment,
+    AdapterReadinessSnapshot, BrokerSessionState, BrokerSettingsState, CTraderBrokerEnvironment,
 };
 pub(super) use crate::app_services::ctrader_account::{
     CTraderAccountRuntimeBackend, CTraderAccountRuntimeRequest, CTraderAccountRuntimeSnapshot,
     ProductionCTraderAccountRuntimeBackend,
 };
 pub(super) use crate::app_services::ctrader_auth::{
-    CTraderAccountSummary, CTraderAuthSession, CTraderAuthSnapshot,
-    CTraderTokenBundle, CTraderTokenExchangeRequest,
+    CTraderAccountSummary, CTraderAuthSession, CTraderAuthSnapshot, CTraderTokenBundle,
+    CTraderTokenExchangeRequest,
 };
 pub(super) use crate::app_services::ctrader_data::{
-    CTraderChartHistoryRequest, CTraderSymbolLookupRequest, HistoricalBar,
-    load_chart_history, resolve_symbol,
+    CTraderChartHistoryRequest, CTraderSymbolLookupRequest, HistoricalBar, load_chart_history,
+    resolve_symbol,
 };
 pub(super) use crate::app_services::ctrader_execution::{
     CTraderExecutionBackend, CTraderExecutionOutcome, CTraderExecutionRequest,
@@ -33,17 +32,14 @@ pub(super) use crate::app_services::ctrader_live_auth::{
     CTraderTokenRefreshRequest, ProductionCTraderLiveAuthBackend, build_default_loopback_config,
 };
 pub(super) use crate::app_services::ctrader_messages::{
-    CTRADER_TOKEN_EXPIRED_SENTINEL, CTraderCancelOrderRequest,
-    CTraderClosePositionRequest, CTraderNewOrderRequest,
-    CTraderOrderType, CTraderTimeInForce, CTraderTradeSide,
+    CTRADER_TOKEN_EXPIRED_SENTINEL, CTraderCancelOrderRequest, CTraderClosePositionRequest,
+    CTraderNewOrderRequest, CTraderOrderType, CTraderTimeInForce, CTraderTradeSide,
 };
 pub(super) use crate::app_services::ctrader_streaming::{
     CTraderLiveChartUpdate, CTraderLiveChartUpdateRequest, CTraderLiveStreamingBackend,
     ProductionCTraderLiveStreamingBackend, merge_live_spot_update_into_bars,
 };
-pub(super) use crate::app_services::jobs::{
-    JobKind, JobSnapshot, JobState,
-};
+pub(super) use crate::app_services::jobs::{JobKind, JobSnapshot, JobState};
 pub(super) use neoethos_core::{KillSwitchTier, RiskyModeConfig, RiskyModeManager};
 // Batch 14 authoritative PnL path. Re-exported into `trading::*` so
 // `orders.rs` can reach the helpers via `super::*` without a long
@@ -96,10 +92,10 @@ use client_order::{
     CTRADER_TOKEN_REFRESH_WINDOW_SECS, current_unix_seconds, next_client_order_seq,
 };
 use diagnostics::{
-    extract_client_order_id_from_request,
-    find_existing_client_order_id, format_ctrader_connect_error, format_ctrader_terminal_info,
-    format_execution_journal_line, format_execution_outcome_status, non_empty_option,
-    record_app_event, synthesize_idempotent_retry_outcome,
+    extract_client_order_id_from_request, find_existing_client_order_id,
+    format_ctrader_connect_error, format_ctrader_terminal_info, format_execution_journal_line,
+    format_execution_outcome_status, non_empty_option, record_app_event,
+    synthesize_idempotent_retry_outcome,
 };
 use risk_gate::{
     ctrader_protocol_volume_from_units, prop_firm_pre_trade_check,
@@ -263,7 +259,7 @@ pub enum BotDecisionSide {
 }
 
 #[allow(dead_code)] // `Manual` variant scaffolded for the operator-
-                    // origin path; only `Ai` is currently emitted.
+// origin path; only `Ai` is currently emitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BotDecisionSource {
     /// Operator clicked BUY/SELL in the UI.
@@ -295,10 +291,10 @@ pub struct EnsembleLoadSummary {
 }
 
 #[allow(dead_code)] // chrome banner helpers ("X/Y experts active")
-                    // — wired into the AUTO ON status_msg as a
-                    // string today; will be replaced with these
-                    // accessors when the banner gains its own
-                    // dedicated widget.
+// — wired into the AUTO ON status_msg as a
+// string today; will be replaced with these
+// accessors when the banner gains its own
+// dedicated widget.
 impl EnsembleLoadSummary {
     /// Count of experts actively participating in inference.
     pub fn loaded_count(&self) -> usize {
@@ -347,9 +343,9 @@ pub enum OrderSource {
 }
 
 #[allow(dead_code)] // `is_ai_originated` is used by the Risky Mode
-                    // manual-rejection gate, which fires only when
-                    // Risky Mode is armed (off by default). Kept
-                    // public for the gate tests in trading_tests.rs.
+// manual-rejection gate, which fires only when
+// Risky Mode is armed (off by default). Kept
+// public for the gate tests in trading_tests.rs.
 impl OrderSource {
     /// `true` when the source is AI-originated (autonomous OR
     /// user-approved Gemma suggestion). Risky Mode treats both
@@ -425,9 +421,8 @@ pub struct ExecutionSurfaceSnapshot {
     pub ticket: ExecutionTicketSnapshot,
 }
 
-/// Trading-environment classifier used by the persistent status pill
-/// in the main chrome (`ui::chrome::status_pill`) and consulted by the
-/// HALT button to label its audit-log lines.
+/// Trading-environment classifier used by operator status surfaces and
+/// consulted by the HALT flow to label its audit-log lines.
 ///
 /// Maps verbatim to the four autonomy stages defined in
 /// `docs/audits/research/wizard_onboarding_competitive_analysis.md`
@@ -465,8 +460,8 @@ pub enum TradingEnvironment {
 }
 
 #[allow(dead_code)] // `is_live_money` is consumed by the audit-log
-                    // severity classifier, which is wired but only
-                    // fires on environments that don't exist yet.
+// severity classifier, which is wired but only
+// fires on environments that don't exist yet.
 impl TradingEnvironment {
     /// Operator-facing label rendered inside the status pill.
     pub fn pill_label(self) -> &'static str {
@@ -593,13 +588,12 @@ pub struct TradingSession {
     bootstrap_handle: Option<std::thread::JoinHandle<()>>,
     /// Background handle for the cTrader chart-data fetch. A live
     /// connection opens a fresh WSS socket per call, so this is run
-    /// off the render thread to avoid blocking egui.
+    /// off the request path to avoid blocking callers.
     chart_fetch_handle: Option<std::thread::JoinHandle<()>>,
     /// Completed chart snapshot waiting to be promoted into the regular
-    /// `market_chart_cache`. Set by `apply_chart_data_update` (called
-    /// from `process_messages` when `ServiceEvent::ChartDataUpdated`
-    /// arrives); consumed by the next render-thread call to
-    /// `market_chart_snapshot`.
+    /// `market_chart_cache`. Set by `apply_chart_data_update` when
+    /// `ServiceEvent::ChartDataUpdated` arrives; consumed by the next
+    /// `market_chart_snapshot` call.
     pending_ctrader_chart: Option<MarketChartSnapshot>,
     /// Trading environment for the session — used by the status pill
     /// and HALT button. Defaults to Demo; the wizard / autonomy
@@ -1531,17 +1525,14 @@ impl TradingSession {
             .trim()
             .to_string();
         if client_id.is_empty() || client_secret.is_empty() {
-            anyhow::bail!(
-                "AUTO ON requires configured cTrader client_id and client_secret"
-            );
+            anyhow::bail!("AUTO ON requires configured cTrader client_id and client_secret");
         }
         let access_token = self
-            .ensure_fresh_ctrader_token_bundle(
-                "AUTO ON requires a stored cTrader token bundle",
-            )?
+            .ensure_fresh_ctrader_token_bundle("AUTO ON requires a stored cTrader token bundle")?
             .access_token;
-        let account_id =
-            self.selected_ctrader_execution_account_id().ok_or_else(|| {
+        let account_id = self
+            .selected_ctrader_execution_account_id()
+            .ok_or_else(|| {
                 anyhow::anyhow!(
                     "AUTO ON requires a discovered cTrader account to bind execution to"
                 )
@@ -1969,11 +1960,11 @@ impl Default for TradingSession {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskKind {
     #[allow(dead_code)] // re-entrancy guard taxonomy: `Connect` is
-                       // checked by `background_task_running` but the
-                       // current connect path uses an explicit
-                       // AtomicBool (`connect_in_flight`) instead.
-                       // Kept on the enum because the taxonomy is
-                       // exposed to the trace target.
+    // checked by `background_task_running` but the
+    // current connect path uses an explicit
+    // AtomicBool (`connect_in_flight`) instead.
+    // Kept on the enum because the taxonomy is
+    // exposed to the trace target.
     Connect,
     Bootstrap,
 }

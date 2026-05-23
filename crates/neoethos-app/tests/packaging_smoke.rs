@@ -15,6 +15,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::Command;
 
 /// Walk back from `CARGO_MANIFEST_DIR` (the neoethos-app crate root) to the
@@ -118,7 +119,12 @@ fn winget_manifests_have_required_keys() {
     // call it cross-platform from a unit test. The structural check
     // below catches the common typos: missing top-level keys, wrong
     // PackageIdentifier, ManifestVersion drift.
-    let winget_dir = packaging_dir().join("winget");
+    let winget_dir = packaging_dir()
+        .join("winget")
+        .join("manifests")
+        .join("k")
+        .join("kosred")
+        .join("neoethos");
     let files = collect_files(&winget_dir, |p| {
         p.extension().is_some_and(|e| e == "yaml" || e == "yml")
     });

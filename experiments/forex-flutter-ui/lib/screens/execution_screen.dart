@@ -13,12 +13,12 @@
 
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
+import '../widgets/symbol_picker.dart';
 import '_placeholder.dart';
 
 class ExecutionScreen extends ConsumerStatefulWidget {
@@ -29,7 +29,10 @@ class ExecutionScreen extends ConsumerStatefulWidget {
 }
 
 class _ExecutionScreenState extends ConsumerState<ExecutionScreen> {
-  final _symbolCtrl = TextEditingController(text: 'EURUSD');
+  // Symbol picked via SymbolPicker (broker catalog type-ahead). The
+  // volume/SL/TP/comment fields stay as free-form text inputs — those
+  // are numeric, not picklist-shaped.
+  String _symbol = 'EURUSD';
   final _volumeCtrl = TextEditingController(text: '0.01');
   final _slCtrl = TextEditingController(text: '50');
   final _tpCtrl = TextEditingController(text: '100');
@@ -39,7 +42,6 @@ class _ExecutionScreenState extends ConsumerState<ExecutionScreen> {
 
   @override
   void dispose() {
-    _symbolCtrl.dispose();
     _volumeCtrl.dispose();
     _slCtrl.dispose();
     _tpCtrl.dispose();
@@ -48,7 +50,7 @@ class _ExecutionScreenState extends ConsumerState<ExecutionScreen> {
   }
 
   Future<void> _submit(String side) async {
-    final symbol = _symbolCtrl.text.trim().toUpperCase();
+    final symbol = _symbol.trim().toUpperCase();
     final volume = double.tryParse(_volumeCtrl.text.trim());
     final sl = double.tryParse(_slCtrl.text.trim());
     final tp = double.tryParse(_tpCtrl.text.trim());
@@ -247,24 +249,18 @@ class _ExecutionScreenState extends ConsumerState<ExecutionScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                // Symbol picker (broker-catalog typeahead) gets a row
+                // to itself because it carries a "Forex only" toggle
+                // underneath. Volume sits next to it.
                 Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Expanded(
                       flex: 2,
-                      child: TextField(
-                        controller: _symbolCtrl,
+                      child: SymbolPicker(
+                        value: _symbol,
                         enabled: !_busy,
-                        textCapitalization: TextCapitalization.characters,
-                        inputFormatters: [
-                          FilteringTextInputFormatter.allow(
-                            RegExp(r'[A-Za-z0-9.]'),
-                          ),
-                        ],
-                        decoration: const InputDecoration(
-                          labelText: 'Symbol',
-                          isDense: true,
-                          border: OutlineInputBorder(),
-                        ),
+                        onChanged: (v) => setState(() => _symbol = v),
                       ),
                     ),
                     const SizedBox(width: 8),

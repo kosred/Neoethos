@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail};
 use cubecl::cuda::{CudaDevice, CudaRuntime};
 use cubecl::prelude::*;
-use neoethos_core::TrainingPrecision;
 use half::bf16;
+use neoethos_core::TrainingPrecision;
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
 

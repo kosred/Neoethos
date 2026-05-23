@@ -12,31 +12,29 @@
 use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 
+use crate::app_services::bootstrap_writer::write_bootstrap_vortex;
 use crate::app_services::broker_config::CTraderBrokerEnvironment;
 use crate::app_services::broker_persistence::load_broker_settings;
-use crate::app_services::bootstrap_writer::write_bootstrap_vortex;
 use crate::app_services::ctrader_bootstrap::NormalizedBar;
 use crate::app_services::ctrader_data::{
-    CTraderChartHistoryRequest, CTraderHistoricalBarsFetchResult,
-    CTraderLightSymbolInfo, CTraderResolvedSymbol, CTraderSymbolLookupRequest,
-    CTraderSymbolsListResult, HistoricalBar, load_historical_bars_only,
-    parse_symbols_list_response, resolve_symbol,
+    CTraderChartHistoryRequest, CTraderHistoricalBarsFetchResult, CTraderLightSymbolInfo,
+    CTraderResolvedSymbol, CTraderSymbolLookupRequest, CTraderSymbolsListResult, HistoricalBar,
+    load_historical_bars_only, parse_symbols_list_response, resolve_symbol,
 };
 use crate::app_services::ctrader_execution::{
     CTraderExecutionBackend, CTraderExecutionOutcome, CTraderExecutionRequest,
     CTraderExecutionRuntimeRequest, ProductionCTraderExecutionBackend,
 };
 use crate::app_services::ctrader_messages::{
-    CTraderCancelOrderRequest, CTraderClosePositionRequest,
-    CTraderNewOrderRequest, CTraderOrderType, CTraderTradeSide,
+    CTraderCancelOrderRequest, CTraderClosePositionRequest, CTraderNewOrderRequest,
+    CTraderOrderType, CTraderTradeSide,
 };
 use crate::app_services::ctrader_messages::{
-    CTraderOpenApiTransport, ProductionCTraderOpenApiTransport,
-    build_account_auth_request, build_application_auth_request,
-    build_symbols_list_request,
+    CTraderOpenApiTransport, ProductionCTraderOpenApiTransport, build_account_auth_request,
+    build_application_auth_request, build_symbols_list_request,
 };
-use crate::app_services::trading::CTraderEnvironment;
 use crate::app_services::secure_store::production_ctrader_token_store;
+use crate::app_services::trading::CTraderEnvironment;
 
 /// What `/broker/symbols` ultimately returns over the wire — kept here
 /// so the server module just shovels it to JSON.
@@ -46,6 +44,29 @@ pub struct BrokerSymbolsBundle {
     pub environment: &'static str,
     pub symbols: Vec<CTraderLightSymbolInfo>,
     pub archived_symbols: Vec<String>,
+}
+
+/// What `/broker/accounts` returns. Sourced from
+/// `ProtoOAGetAccountListByAccessTokenReq` (payload 2149/2150) — the
+/// authoritative list of accounts the user granted access to during
+/// OAuth. Used by the Settings screen's account picker so the user
+/// doesn't have to type a numeric cTID by hand (and end up with a
+/// stale ID that returns CH_ACCESS_TOKEN_INVALID).
+#[derive(Debug, Clone)]
+pub struct BrokerAccountsBundle {
+    pub environment: &'static str,
+    pub permission_scope: String,
+    pub accounts: Vec<BrokerAccountInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BrokerAccountInfo {
+    pub account_id: String,
+    pub broker_title: String,
+    pub account_name: String,
+    pub trader_login: Option<i64>,
+    pub is_live: Option<bool>,
+    pub enabled_for_execution: bool,
 }
 
 /// Bundled outcome of a historical fetch.
@@ -107,6 +128,82 @@ fn resolve_creds() -> Result<ResolvedCreds> {
         account_id_str: account.account_id.clone(),
         environment: env,
         env_label,
+    })
+}
+
+/// Hit `ProtoOAGetAccountListByAccessTokenReq` (payload 2149/2150) and
+/// return every account the user granted access to during OAuth.
+///
+/// Differs from `resolve_creds` in one key way: it does NOT require an
+/// account_id to already be configured. That's the whole point — we
+/// call this BEFORE the user has picked an account, so the Settings
+/// dropdown can show them what's available without making them type a
+/// numeric cTID by hand. client_id/secret + access_token are enough.
+///
+/// Blocking; callers must wrap in `spawn_blocking`.
+pub fn fetch_broker_accounts_blocking() -> Result<BrokerAccountsBundle> {
+    use crate::app_services::ctrader_live_auth::{
+        CTraderAccountDiscoveryBackend, CTraderAccountDiscoveryRequest,
+        ProductionCTraderLiveAuthBackend,
+    };
+
+    let settings = load_broker_settings();
+    let ct = &settings.ctrader;
+    if ct.client_id.is_empty() || ct.client_secret.is_empty() {
+        return Err(anyhow!(
+            "cTrader client_id / client_secret are empty in \
+             broker_credentials.toml. Save them in Settings first."
+        ));
+    }
+
+    let bundle = production_ctrader_token_store()
+        .load_token_bundle_with_legacy_fallback()
+        .map_err(|e| anyhow!("token bundle load failed: {e}"))?
+        .ok_or_else(|| {
+            anyhow!(
+                "no cTrader token bundle saved yet — open Broker Setup \
+                 and click Re-authenticate first"
+            )
+        })?;
+
+    let (env, env_label) = match ct.environment {
+        CTraderBrokerEnvironment::Demo => (CTraderEnvironment::Demo, "Demo"),
+        CTraderBrokerEnvironment::Live => (CTraderEnvironment::Live, "Live"),
+    };
+
+    let request = CTraderAccountDiscoveryRequest {
+        client_id: ct.client_id.clone(),
+        client_secret: ct.client_secret.clone(),
+        access_token: bundle.access_token,
+        environment: env,
+    };
+
+    // `ProductionCTraderLiveAuthBackend` is a unit struct — no ::new
+    // or ::default() needed; instantiate directly. The discovery call
+    // does its own ProtoOAApplicationAuth handshake internally, so we
+    // don't need to wire the transport here.
+    let backend = ProductionCTraderLiveAuthBackend;
+    let result = backend
+        .discover_accounts(&request)
+        .map_err(|e| anyhow!("cTrader account-list call failed: {e}"))?;
+
+    let accounts: Vec<BrokerAccountInfo> = result
+        .accounts
+        .into_iter()
+        .map(|a| BrokerAccountInfo {
+            account_id: a.account_id,
+            broker_title: a.broker_title,
+            account_name: a.account_name,
+            trader_login: a.trader_login,
+            is_live: a.is_live,
+            enabled_for_execution: a.enabled_for_execution,
+        })
+        .collect();
+
+    Ok(BrokerAccountsBundle {
+        environment: env_label,
+        permission_scope: result.permission_scope,
+        accounts,
     })
 }
 
@@ -217,8 +314,7 @@ pub fn download_history_blocking(
     all_bars.dedup_by_key(|b| b.timestamp_ms);
 
     let normalized = bars_to_normalized(&all_bars);
-    let written_path =
-        write_bootstrap_vortex(data_root, symbol, timeframe, &normalized)?;
+    let written_path = write_bootstrap_vortex(data_root, symbol, timeframe, &normalized)?;
 
     Ok(HistoricalDownloadOutcome {
         symbol: symbol.to_string(),
@@ -378,10 +474,8 @@ pub fn submit_market_order_blocking(
     } else {
         1.0
     };
-    let relative_stop_loss =
-        stop_loss_pips.map(|p| (p * pip_relative_units).round() as i64);
-    let relative_take_profit =
-        take_profit_pips.map(|p| (p * pip_relative_units).round() as i64);
+    let relative_stop_loss = stop_loss_pips.map(|p| (p * pip_relative_units).round() as i64);
+    let relative_take_profit = take_profit_pips.map(|p| (p * pip_relative_units).round() as i64);
 
     let new_order = CTraderNewOrderRequest {
         account_id: resolved.account_id,
@@ -426,10 +520,7 @@ pub fn submit_market_order_blocking(
 
 /// Close an open position (full close — pass the position's own
 /// volume). Used by the Trade Watch screen's per-row close button.
-pub fn close_position_blocking(
-    position_id: i64,
-    volume: i64,
-) -> Result<CTraderExecutionOutcome> {
+pub fn close_position_blocking(position_id: i64, volume: i64) -> Result<CTraderExecutionOutcome> {
     let creds = resolve_creds()?;
     let account_id: i64 = creds
         .account_id_str

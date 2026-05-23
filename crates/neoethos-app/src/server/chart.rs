@@ -53,10 +53,7 @@ pub struct CandleDto {
     pub volume: f64,
 }
 
-pub async fn chart(
-    State(_state): State<AppApiState>,
-    Query(q): Query<ChartQuery>,
-) -> Response {
+pub async fn chart(State(_state): State<AppApiState>, Query(q): Query<ChartQuery>) -> Response {
     let symbol = q
         .symbol
         .unwrap_or_else(|| "EURUSD".to_string())
@@ -70,14 +67,41 @@ pub async fn chart(
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT).max(1);
 
     let result = tokio::task::spawn_blocking(move || {
-        load_chart(symbol, timeframe, limit)
+        load_chart(symbol.clone(), timeframe.clone(), limit).or_else(|err| {
+            // Returning 404 made Flutter render a generic
+            // "Backend unreachable" banner that hid the *real*
+            // remedy ("run Data Bootstrap for this symbol /
+            // timeframe"). 200 with an empty candle list plus a
+            // human-readable headline lets the Chart screen draw
+            // its empty-state UI and the operator knows what to
+            // do next.
+            Ok::<ChartDto, anyhow::Error>(ChartDto {
+                symbol: symbol.clone(),
+                timeframe: timeframe.clone(),
+                available_timeframes: Vec::new(),
+                candle_count: 0,
+                candles: Vec::new(),
+                price_min: 0.0,
+                price_max: 0.0,
+                latest_close: 0.0,
+                price_change_pct: 0.0,
+                headline: format!(
+                    "No data on disk for {symbol} {timeframe}. \
+                         Go to Data Bootstrap and download a window \
+                         from the broker, then come back. ({err})"
+                ),
+            })
+        })
     })
     .await;
 
     match result {
         Ok(Ok(dto)) => Json(dto).into_response(),
+        // load_chart's or_else above always returns Ok, so this arm
+        // is only reachable if a future change re-introduces a fatal
+        // error path; surface it as 500 so the UI banner makes sense.
         Ok(Err(err)) => (
-            StatusCode::NOT_FOUND,
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": err.to_string()})),
         )
             .into_response(),
@@ -91,30 +115,22 @@ pub async fn chart(
     }
 }
 
-fn load_chart(
-    symbol: String,
-    timeframe: String,
-    limit: usize,
-) -> anyhow::Result<ChartDto> {
+fn load_chart(symbol: String, timeframe: String, limit: usize) -> anyhow::Result<ChartDto> {
     let settings = Settings::from_yaml("config.yaml")
         .map_err(|e| anyhow::anyhow!("config.yaml not loadable: {e}"))?;
     let dataset = load_symbol_dataset(&settings.system.data_dir, &symbol)
         .map_err(|e| anyhow::anyhow!("dataset load failed for {symbol}: {e}"))?;
 
-    let mut available_timeframes: Vec<String> =
-        dataset.frames.keys().cloned().collect();
+    let mut available_timeframes: Vec<String> = dataset.frames.keys().cloned().collect();
     available_timeframes.sort();
 
-    let ohlcv = dataset
-        .frames
-        .get(&timeframe)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "timeframe '{timeframe}' not in dataset for {symbol} \
+    let ohlcv = dataset.frames.get(&timeframe).ok_or_else(|| {
+        anyhow::anyhow!(
+            "timeframe '{timeframe}' not in dataset for {symbol} \
                  (available: {})",
-                available_timeframes.join(", ")
-            )
-        })?;
+            available_timeframes.join(", ")
+        )
+    })?;
 
     let total = ohlcv.len();
     let start = total.saturating_sub(limit);
@@ -135,11 +151,9 @@ fn load_chart(
     let (price_min, price_max) = if candles.is_empty() {
         (0.0, 0.0)
     } else {
-        candles
-            .iter()
-            .fold((f64::MAX, f64::MIN), |(mn, mx), c| {
-                (mn.min(c.low), mx.max(c.high))
-            })
+        candles.iter().fold((f64::MAX, f64::MIN), |(mn, mx), c| {
+            (mn.min(c.low), mx.max(c.high))
+        })
     };
     let latest_close = candles.last().map(|c| c.close).unwrap_or(0.0);
     let first_open = candles.first().map(|c| c.open).unwrap_or(0.0);

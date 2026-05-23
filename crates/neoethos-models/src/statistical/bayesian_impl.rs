@@ -940,7 +940,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock should be monotonic")
             .as_nanos();
-        let artifact_dir = std::env::temp_dir().join(format!("neoethos-models-bayes-embed-{unique}"));
+        let artifact_dir =
+            std::env::temp_dir().join(format!("neoethos-models-bayes-embed-{unique}"));
         std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
 
         model.save(&artifact_dir)?;
@@ -967,7 +968,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock should be monotonic")
             .as_nanos();
-        let artifact_dir = std::env::temp_dir().join(format!("neoethos-models-bayes-drift-{unique}"));
+        let artifact_dir =
+            std::env::temp_dir().join(format!("neoethos-models-bayes-drift-{unique}"));
         std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
 
         model.save(&artifact_dir)?;

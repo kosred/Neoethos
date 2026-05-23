@@ -763,10 +763,8 @@ impl TradingSession {
         // garbage price to the broker is safer than letting the broker
         // reject it after the WSS round-trip.
         let target_price = state.order_ticket.target_price;
-        if matches!(
-            order_type,
-            CTraderOrderType::Limit | CTraderOrderType::Stop
-        ) && (!target_price.is_finite() || target_price <= 0.0)
+        if matches!(order_type, CTraderOrderType::Limit | CTraderOrderType::Stop)
+            && (!target_price.is_finite() || target_price <= 0.0)
         {
             anyhow::bail!(
                 "Order ticket target_price is not a positive finite price ({target_price}); \

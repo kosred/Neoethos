@@ -1,4 +1,4 @@
-// Backend API client — talks to the NeoEthos Rust HTTP server.
+// Backend API client - talks to the neoethos Rust HTTP server.
 //
 // The Rust side runs as `neoethos-app --server` and listens on
 // `127.0.0.1:7423` (override via `NEOETHOS_SERVER_BIND` env var on the
@@ -431,6 +431,27 @@ class BackendClient {
     return BrokerSymbolsSnapshot.fromJson(response.data!);
   }
 
+  /// `/broker/accounts` — list every cTID the OAuth token grants
+  /// access to. Drives the Settings-screen Account dropdown so the
+  /// operator picks from real options instead of typing a numeric
+  /// cTID by hand (and accidentally pinning a stale ID, which is
+  /// what produced the `CH_ACCESS_TOKEN_INVALID` loop on the
+  /// pre-fix builds).
+  Future<BrokerAccountsSnapshot> fetchBrokerAccounts() async {
+    final response = await _dio.get<Map<String, dynamic>>(
+      '/broker/accounts',
+      options: Options(receiveTimeout: const Duration(seconds: 25)),
+    );
+    if (response.data == null) {
+      throw DioException(
+        requestOptions: response.requestOptions,
+        response: response,
+        message: '/broker/accounts returned empty body',
+      );
+    }
+    return BrokerAccountsSnapshot.fromJson(response.data!);
+  }
+
   /// POST `/data/fetch` — download historical bars for [fromMs, toMs]
   /// and persist them under `data/symbol=<sym>/timeframe=<tf>/`.
   Future<Map<String, dynamic>> fetchHistoricalData({
@@ -694,6 +715,65 @@ class BrokerSymbolsSnapshot {
           s.symbolName.length == 6 &&
           RegExp(r'^[A-Z]{6}$').hasMatch(s.symbolName))
       .toList(growable: false);
+}
+
+/// One row in the `/broker/accounts` list — the user's view of a
+/// single cTID granted during OAuth.
+class BrokerAccount {
+  /// Numeric cTID, kept as a string because cTrader IDs can exceed
+  /// i32 range and we don't want JS-style number truncation.
+  final String accountId;
+  final String brokerTitle;
+  final String accountName;
+  final int? traderLogin;
+  final bool? isLive;
+  final bool enabledForExecution;
+  const BrokerAccount({
+    required this.accountId,
+    required this.brokerTitle,
+    required this.accountName,
+    required this.traderLogin,
+    required this.isLive,
+    required this.enabledForExecution,
+  });
+  factory BrokerAccount.fromJson(Map<String, dynamic> j) => BrokerAccount(
+        accountId: (j['accountId'] as String?) ?? '',
+        brokerTitle: (j['brokerTitle'] as String?) ?? '',
+        accountName: (j['accountName'] as String?) ?? '',
+        traderLogin: (j['traderLogin'] as num?)?.toInt(),
+        isLive: j['isLive'] as bool?,
+        enabledForExecution: (j['enabledForExecution'] as bool?) ?? false,
+      );
+
+  /// One-line label for dropdown rows. Picks the most-useful bits so
+  /// the operator can tell two demos apart at a glance.
+  String get dropdownLabel {
+    final liveTag = isLive == null ? '?' : (isLive! ? 'Live' : 'Demo');
+    final broker = brokerTitle.isEmpty ? 'Spotware' : brokerTitle;
+    return '$broker · $liveTag · $accountId';
+  }
+}
+
+class BrokerAccountsSnapshot {
+  final String environment;
+  final String permissionScope;
+  final int accountCount;
+  final List<BrokerAccount> accounts;
+  const BrokerAccountsSnapshot({
+    required this.environment,
+    required this.permissionScope,
+    required this.accountCount,
+    required this.accounts,
+  });
+  factory BrokerAccountsSnapshot.fromJson(Map<String, dynamic> j) =>
+      BrokerAccountsSnapshot(
+        environment: (j['environment'] as String?) ?? '',
+        permissionScope: (j['permissionScope'] as String?) ?? '',
+        accountCount: (j['accountCount'] as num?)?.toInt() ?? 0,
+        accounts: ((j['accounts'] as List?) ?? const [])
+            .map((e) => BrokerAccount.fromJson(e as Map<String, dynamic>))
+            .toList(growable: false),
+      );
 }
 
 class GemmaStatusSnapshot {

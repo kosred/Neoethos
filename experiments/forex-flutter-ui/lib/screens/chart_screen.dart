@@ -1,6 +1,11 @@
 // Chart screen — symbol + timeframe chips, candlestick canvas painted
 // from `/chart` OHLC data. Read-only (the local data dir is the
 // source); switching chips refetches via Riverpod.
+//
+// Symbol + timeframe lists come EXCLUSIVELY from the broker. No
+// hardcoded fallbacks — when the broker isn't reachable, the screen
+// shows an explicit "connect broker first" message instead of
+// faking choices the broker may or may not actually offer.
 
 import 'dart:ui' as ui;
 
@@ -13,23 +18,6 @@ import '../state/system_providers.dart';
 import '../theme/theme.dart';
 import '_placeholder.dart';
 
-/// Fallback symbol chips shown when /broker/symbols is unreachable
-/// (offline / not authed yet). Real symbols come from the broker.
-const _fallbackSymbolChoices = <String>[
-  'EURUSD',
-  'GBPUSD',
-  'USDJPY',
-  'XAUUSD',
-];
-
-/// Fallback timeframe chips shown ONLY while /broker/timeframes is
-/// loading or unreachable. The real list comes from
-/// `brokerTimeframesProvider` which reads
-/// `neoethos_core::CANONICAL_TIMEFRAMES` over the wire — single source
-/// of truth so a workspace-wide contract change propagates to the UI
-/// automatically.
-const _fallbackTimeframes = <String>['M1', 'H1', 'D1'];
-
 class ChartScreen extends ConsumerWidget {
   const ChartScreen({super.key});
 
@@ -41,24 +29,23 @@ class ChartScreen extends ConsumerWidget {
     final brokerSymbols = ref.watch(brokerSymbolsProvider);
     final brokerTimeframes = ref.watch(brokerTimeframesProvider);
 
-    // Symbol list: prefer the broker catalog (filtered to forex-like
-    // pairs by default), fall back to a tiny hardcoded set so the
-    // chart still renders when the broker is offline.
+    // Symbol list — broker catalog, filtered to forex-like pairs.
+    // Empty list when the broker hasn't responded yet or is offline;
+    // the screen surfaces an explicit "connect broker" message in
+    // that case rather than faking a chip list.
     final symbolChoices = brokerSymbols.maybeWhen(
-      data: (snap) {
-        final forex = snap.forexLikeEnabled;
-        if (forex.isEmpty) return _fallbackSymbolChoices;
-        return forex.map((s) => s.symbolName).toList(growable: false);
-      },
-      orElse: () => _fallbackSymbolChoices,
+      data: (snap) =>
+          snap.forexLikeEnabled.map((s) => s.symbolName).toList(growable: false),
+      orElse: () => const <String>[],
     );
 
-    // Timeframe list: from the canonical-timeframes endpoint. We
-    // never hardcode this in Dart — the source of truth is
-    // `neoethos_core::CANONICAL_TIMEFRAMES`.
+    // Timeframe list — canonical-timeframes endpoint
+    // (`neoethos_core::CANONICAL_TIMEFRAMES` over the wire). Empty
+    // list when the endpoint hasn't returned yet; no Dart-side
+    // fallback because the contract lives on the server.
     final timeframeChoices = brokerTimeframes.maybeWhen(
-      data: (list) => list.isEmpty ? _fallbackTimeframes : list,
-      orElse: () => _fallbackTimeframes,
+      data: (list) => list,
+      orElse: () => const <String>[],
     );
 
     return SingleChildScrollView(
@@ -75,52 +62,70 @@ class ChartScreen extends ConsumerWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                if (brokerSymbols.hasError)
-                  const Padding(
-                    padding: EdgeInsets.only(bottom: 6),
+                if (symbolChoices.isEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
                     child: Text(
-                      'Broker symbol catalog unavailable — showing fallback list. '
-                      'Re-authenticate in Broker Setup to populate.',
-                      style: TextStyle(
+                      brokerSymbols.hasError
+                          ? 'Broker symbol catalog unavailable: '
+                              '${brokerSymbols.error}. Open Settings → '
+                              'save cTrader credentials → Broker Setup '
+                              '→ Re-authenticate. The chip list is '
+                              'populated from /broker/symbols, never '
+                              'hardcoded in the UI.'
+                          : 'Loading broker symbol catalog…',
+                      style: const TextStyle(
                         fontSize: 11,
                         color: ForexAiTokens.warning,
                       ),
                     ),
+                  )
+                else
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: [
+                      for (final s in symbolChoices)
+                        _Chip(
+                          label: s,
+                          selected: s == symbol,
+                          onTap: () => ref
+                              .read(chartSymbolProvider.notifier)
+                              .state = s,
+                        ),
+                    ],
                   ),
-                Wrap(
-                  spacing: 6,
-                  runSpacing: 6,
-                  children: [
-                    for (final s in symbolChoices)
-                      _Chip(
-                        label: s,
-                        selected: s == symbol,
-                        onTap: () => ref
-                            .read(chartSymbolProvider.notifier)
-                            .state = s,
-                      ),
-                  ],
-                ),
               ],
             ),
           ),
           SectionCard(
             title: 'Timeframe'
                 '${brokerTimeframes.hasValue ? ' · ${timeframeChoices.length} from canonical contract' : ''}',
-            child: Wrap(
-              spacing: 6,
-              runSpacing: 6,
-              children: [
-                for (final t in timeframeChoices)
-                  _Chip(
-                    label: t,
-                    selected: t == timeframe,
-                    onTap: () => ref
-                        .read(chartTimeframeProvider.notifier)
-                        .state = t,
+            child: timeframeChoices.isEmpty
+                ? Text(
+                    brokerTimeframes.hasError
+                        ? 'Timeframe list unavailable: '
+                            '${brokerTimeframes.error}'
+                        : 'Loading timeframes…',
+                    style: const TextStyle(
+                      fontSize: 11,
+                      color: ForexAiTokens.warning,
+                    ),
+                  )
+                : Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: [
+                      for (final t in timeframeChoices)
+                        _Chip(
+                          label: t,
+                          selected: t == timeframe,
+                          onTap: () => ref
+                              .read(chartTimeframeProvider.notifier)
+                              .state = t,
+                        ),
+                    ],
                   ),
-              ],
-            ),
           ),
           async.when(
             data: (c) => _ChartBody(snapshot: c),

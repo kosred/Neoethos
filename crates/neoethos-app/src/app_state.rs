@@ -54,15 +54,6 @@ pub struct AppState {
     pub canonical_log_path: PathBuf,
     pub hardware: HardwareState,
     pub risk: neoethos_core::config::RiskConfig,
-    pub dashboard_panel: crate::ui::dashboard::DashboardPanel,
-    pub ai_insights_panel: crate::ui::ai_insights::AiInsightsPanel,
-    /// v0.4.8 — chat scrollback + input for the AI Helper panel. Lives
-    /// in `AppState` so the conversation survives tab switches and is
-    /// re-rendered on every frame without losing the operator's
-    /// in-progress prompt. The chat is in-memory only by design — no
-    /// persistence to disk until the audit log (G7 / disk-backed
-    /// JsonlAuditLog) is wired in.
-    pub ai_helper_panel: crate::ui::ai_helper::AiHelperState,
     pub llm_news_filter: neoethos_core::domain::news_filter::NewsFilter,
     pub discovery_form: DiscoveryFormState,
     pub auto_trade_enabled: bool,
@@ -116,9 +107,6 @@ impl AppState {
             order_ticket: OrderTicketState::default(),
             hardware: HardwareState::default(),
             risk: settings.risk.clone(),
-            dashboard_panel: crate::ui::dashboard::DashboardPanel::new(),
-            ai_insights_panel: crate::ui::ai_insights::AiInsightsPanel::new(),
-            ai_helper_panel: crate::ui::ai_helper::AiHelperState::new(),
             llm_news_filter,
             discovery_form: DiscoveryFormState::from_settings(settings),
             auto_trade_enabled: false,
@@ -321,10 +309,13 @@ mod tests {
         assert_eq!(state.order_ticket.label, "manual");
         assert!(state.order_ticket.selected_position_id.is_none());
         assert!(state.order_ticket.selected_order_id.is_none());
-        assert_eq!(
-            state.canonical_log_path,
-            PathBuf::from("logs").join("neoethos.log")
-        );
+        let log_name = state
+            .canonical_log_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("canonical log path has a UTF-8 file name");
+        assert!(log_name.starts_with("neoethos."));
+        assert!(log_name.ends_with(".log"));
         assert_eq!(state.hardware.cpu_cores, num_cpus::get() as i32);
         assert!(state.hardware.gpu_enabled);
         assert_eq!(state.risk.daily_drawdown_limit, 0.04);

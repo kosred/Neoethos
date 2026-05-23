@@ -274,9 +274,9 @@ mod ctrader_integration_tests {
     // ─── Historical bars fetch ──────────────────────────────────────────────
 
     #[test]
-    fn bars_only_flow_sends_5_messages_and_returns_bar() {
-        // v0.5.1.1: resolve_symbol uses two send_sequence calls (re-auth on
-        // each), so the full sequence is now 7 messages not 5.
+    fn bars_only_flow_sends_9_messages_and_returns_bar() {
+        // Each production send_sequence call opens a fresh WSS connection,
+        // so symbol list, symbol detail, and trendbars each authenticate.
         let transport = SequenceTransport::with(vec![
             Ok(app_auth_ok()),
             Ok(account_auth_ok(712345)),
@@ -284,6 +284,8 @@ mod ctrader_integration_tests {
             Ok(app_auth_ok()),
             Ok(account_auth_ok(712345)),
             Ok(symbol_by_id_ok(14, 5)),
+            Ok(app_auth_ok()),
+            Ok(account_auth_ok(712345)),
             Ok(trendbars_ok(14, "M15")),
         ]);
 
@@ -304,7 +306,7 @@ mod ctrader_integration_tests {
         )
         .expect("bars-only fetch should succeed");
 
-        assert_eq!(transport.sent_count(), 7);
+        assert_eq!(transport.sent_count(), 9);
         assert_eq!(result.bars.len(), 1);
         assert!(!result.has_more);
         assert!((result.bars[0].low - 1.10000).abs() < 1e-9);

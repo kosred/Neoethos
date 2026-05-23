@@ -167,7 +167,13 @@ fn format_section_block(section: SubsystemSection, record: &SectionedRunRecord) 
     let _ = writeln!(s, "{rule}");
 
     // Header line: ▶ [SECTION] STATUS operation  •  symbol/timeframe  •  run_id
-    let _ = write!(s, "▶ [{}] {} {}", section.as_str(), record.status, record.operation);
+    let _ = write!(
+        s,
+        "▶ [{}] {} {}",
+        section.as_str(),
+        record.status,
+        record.operation
+    );
     if let (Some(sym), Some(tf)) = (record.symbol.as_deref(), record.timeframe.as_deref()) {
         let _ = write!(s, "  •  {sym} {tf}");
     } else if let Some(sym) = record.symbol.as_deref() {
@@ -321,8 +327,12 @@ fn cleanup_old_logs(dir: &Path, retain_days: u64) -> std::io::Result<()> {
         if !prefix_matches || !ext_matches {
             continue;
         }
-        let Ok(metadata) = entry.metadata() else { continue };
-        let Ok(modified) = metadata.modified() else { continue };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
         if let Ok(age) = now.duration_since(modified) {
             if age > max_age {
                 let _ = fs::remove_file(&path);
@@ -502,8 +512,14 @@ mod tests {
 
         // Visual dividers wrap the block (two horizontal rules, one prefix line).
         assert!(block.contains("══"), "expected box-drawing divider");
-        assert!(block.contains("▶ [TRAINING] SUCCESS train"), "expected greppable header");
-        assert!(block.contains("EURUSD M1"), "expected symbol/timeframe in header");
+        assert!(
+            block.contains("▶ [TRAINING] SUCCESS train"),
+            "expected greppable header"
+        );
+        assert!(
+            block.contains("EURUSD M1"),
+            "expected symbol/timeframe in header"
+        );
         assert!(block.contains("run_id=training-42"));
         assert!(block.contains("parent_run_id: discovery-7"));
         assert!(block.contains("message: training completed"));
@@ -540,8 +556,10 @@ mod tests {
         let stale = dir.join("neoethos.2020-01-01.log");
         fs::write(&stale, b"old\n").expect("write stale file");
         let thirty_days_ago = SystemTime::now() - Duration::from_secs(30 * 86_400);
-        let stale_handle =
-            File::options().write(true).open(&stale).expect("open stale for mtime");
+        let stale_handle = File::options()
+            .write(true)
+            .open(&stale)
+            .expect("open stale for mtime");
         stale_handle
             .set_modified(thirty_days_ago)
             .expect("backdate stale mtime");
@@ -564,7 +582,10 @@ mod tests {
         cleanup_old_logs(&dir, 7).expect("cleanup ran");
 
         assert!(!stale.exists(), "stale neoethos log was not deleted");
-        assert!(recent.exists(), "recent neoethos log was incorrectly deleted");
+        assert!(
+            recent.exists(),
+            "recent neoethos log was incorrectly deleted"
+        );
         assert!(unrelated.exists(), "unrelated file was incorrectly deleted");
         assert!(
             prefix_only.exists(),

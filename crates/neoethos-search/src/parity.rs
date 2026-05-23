@@ -112,8 +112,8 @@ mod tests {
     use crate::genetic::{
         EvaluationConfig, Gene, evaluate_genes, month_day_indices, signals_for_gene,
     };
-    use neoethos_data::{FeatureFrame, Ohlcv};
     use ndarray::arr2;
+    use neoethos_data::{FeatureFrame, Ohlcv};
 
     // TODO(real-data): synthetic feature/OHLCV fixture. Replace with a
     // cTrader historical sample (e.g. EURUSD M1 12 bars from a fixed

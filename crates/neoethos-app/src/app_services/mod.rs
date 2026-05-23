@@ -39,11 +39,11 @@ pub mod discovery;
 // wiring-pending state, not an abandonment. When TradingSession
 // starts dispatching DxTrade through the runtime adapter trait, the
 // allow below comes off.
+pub mod broker_api;
 pub mod dxtrade;
 pub mod embedded_credentials;
 pub mod jobs;
 pub mod live_journal;
-pub mod broker_api;
 pub mod pnl;
 pub mod reauth;
 pub mod risky_mode_persistence;

@@ -127,7 +127,9 @@ mod tests {
         let handle = spawn_background_task("test_panic_string", tx, || {
             panic!("synthetic test panic: {}", 42);
         });
-        handle.join().expect("join panicked thread (panic was caught)");
+        handle
+            .join()
+            .expect("join panicked thread (panic was caught)");
         // The wrapper must have emitted a BackgroundTaskPanic with our
         // task name and the formatted panic message.
         std::thread::sleep(Duration::from_millis(50));

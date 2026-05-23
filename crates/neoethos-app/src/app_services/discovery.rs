@@ -22,13 +22,13 @@ use neoethos_data::{
 #[cfg(test)]
 use neoethos_search::DiscoveryValidationGates;
 use neoethos_search::{
-    DiscoveryConfig, DiscoveryProgress, DiscoveryResult,
-    PropFirmRiskRules, compute_discovery_forward_test_artifacts,
-    compute_discovery_prop_firm_artifacts, ensure_non_empty_portfolio,
-    run_discovery_cycle_with_progress, save_canonical_backtest_artifacts,
-    save_discovery_profile_json, save_forward_test_validation_artifacts, save_portfolio_json,
-    save_promotion_summary_json, save_prop_firm_validation_artifacts, save_quality_report_json,
-    save_trade_log_json, save_walkforward_validation_artifacts,
+    DiscoveryConfig, DiscoveryProgress, DiscoveryResult, PropFirmRiskRules,
+    compute_discovery_forward_test_artifacts, compute_discovery_prop_firm_artifacts,
+    ensure_non_empty_portfolio, run_discovery_cycle_with_progress,
+    save_canonical_backtest_artifacts, save_discovery_profile_json,
+    save_forward_test_validation_artifacts, save_portfolio_json, save_promotion_summary_json,
+    save_prop_firm_validation_artifacts, save_quality_report_json, save_trade_log_json,
+    save_walkforward_validation_artifacts,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -588,10 +588,11 @@ fn cancelled_snapshot_from(mut snapshot: JobSnapshot, message: impl Into<String>
 ///
 /// Audit gap #1: closes the multi-symbol DiscoveryRequest entry point
 /// requirement.
-#[allow(dead_code)] // scaffolding for "All Majors" / "EUR pairs" preset
-                    // buttons — wiring tracked in the operator notes;
-                    // tests below exercise validate/lower paths so
-                    // contract regressions still get caught.
+#[allow(dead_code)]
+// scaffolding for "All Majors" / "EUR pairs" preset
+// buttons — wiring tracked in the operator notes;
+// tests below exercise validate/lower paths so
+// contract regressions still get caught.
 #[derive(Debug, Clone)]
 pub struct MultiSymbolDiscoveryRequest {
     /// Shared data root for every symbol in the batch.
@@ -659,7 +660,7 @@ impl MultiSymbolDiscoveryRequest {
 /// fails for any individual symbol the corresponding slot returns
 /// the failed snapshot from `failed_snapshot`; the rest still run.
 #[allow(dead_code)] // entry point for the preset-button wiring; see
-                    // MultiSymbolDiscoveryRequest above
+// MultiSymbolDiscoveryRequest above
 pub fn start_multi_symbol_discovery_job(
     request: MultiSymbolDiscoveryRequest,
     tx: mpsc::Sender<ServiceEvent>,

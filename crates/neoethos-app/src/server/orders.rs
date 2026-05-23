@@ -17,8 +17,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use crate::app_services::broker_api::{
-    OrderSide, cancel_order_blocking, close_position_blocking,
-    submit_market_order_blocking,
+    OrderSide, cancel_order_blocking, close_position_blocking, submit_market_order_blocking,
 };
 
 use super::state::AppApiState;
@@ -60,10 +59,7 @@ pub struct NewOrderResponseDto {
     pub message: String,
 }
 
-pub async fn place(
-    State(_state): State<AppApiState>,
-    Json(body): Json<NewOrderBody>,
-) -> Response {
+pub async fn place(State(_state): State<AppApiState>, Json(body): Json<NewOrderBody>) -> Response {
     if body.stop_loss_pips.is_none() && body.take_profit_pips.is_none() && !body.risky {
         return (
             StatusCode::BAD_REQUEST,
@@ -126,8 +122,7 @@ pub async fn close_position(
     let position_id = body.position_id;
     let volume = body.volume;
     let result =
-        tokio::task::spawn_blocking(move || close_position_blocking(position_id, volume))
-            .await;
+        tokio::task::spawn_blocking(move || close_position_blocking(position_id, volume)).await;
     outcome_to_response(result)
 }
 
@@ -151,8 +146,7 @@ pub async fn cancel_order(
             .into_response();
     }
     let order_id = body.order_id;
-    let result =
-        tokio::task::spawn_blocking(move || cancel_order_blocking(order_id)).await;
+    let result = tokio::task::spawn_blocking(move || cancel_order_blocking(order_id)).await;
     outcome_to_response(result)
 }
 

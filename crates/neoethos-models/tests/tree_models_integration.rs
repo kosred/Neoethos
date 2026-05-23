@@ -161,8 +161,8 @@ mod lightgbm_tests {
 
     #[test]
     fn test_output_reordering() {
-        use neoethos_models::tree_models::reorder_to_neutral_buy_sell;
         use ndarray::Array2;
+        use neoethos_models::tree_models::reorder_to_neutral_buy_sell;
 
         // Binary classification (2 classes — Buy / Sell, no Neutral).
         // The production contract for the 2-column case is: there is no

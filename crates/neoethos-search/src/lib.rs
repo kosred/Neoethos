@@ -22,11 +22,11 @@ pub mod discovery_gpu {
     };
     use crate::scheduler_assignment::accelerator_backend_from_assignment;
     use anyhow::{Result, bail};
+    use ndarray::Array2;
     use neoethos_core::{
         AcceleratorBackend, ResolvedWorkloadAssignment, TrainingPrecision, WorkloadKind,
     };
     use neoethos_data::{FeatureCache, FeatureFrame, Ohlcv, SymbolDataset, compute_hpc_features};
-    use ndarray::Array2;
     use rand::{Rng, SeedableRng, rngs::StdRng};
     use rayon::prelude::*;
     use serde::Serialize;
@@ -954,7 +954,6 @@ pub use eval::{
     install_backtest_runtime_overrides, install_backtest_runtime_overrides_from_env,
     simulate_trades_core,
 };
-pub use neoethos_core::contracts::DeterminismPolicy;
 pub use gauntlet::{GauntletConfig, StrategyGauntlet};
 pub use genetic::{
     ArchiveScoringOverrides, CostProfileRuntimeOverrides, EvaluationConfig, EvolutionSearchPolicy,
@@ -972,6 +971,7 @@ pub use genetic::{
     install_strategy_evaluation_runtime_overrides_from_env, month_day_indices, random_search,
     signals_for_gene,
 };
+pub use neoethos_core::contracts::DeterminismPolicy;
 pub use orchestration::{BatchDiscoverySummary, DiscoveryOrchestrator};
 pub use portfolio::{AllocationResult, PortfolioOptimizer, SymbolMetrics};
 pub use quality::{

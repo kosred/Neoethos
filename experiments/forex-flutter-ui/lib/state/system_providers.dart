@@ -80,6 +80,16 @@ final brokerSymbolsProvider =
   return client.fetchBrokerSymbols();
 });
 
+/// `/broker/accounts` — the cTIDs the OAuth token grants access to.
+/// Drives the Settings → Account dropdown. autoDispose because it's
+/// only consumed by the Settings screen which the operator visits
+/// rarely; refetched whenever the user reopens the screen.
+final brokerAccountsProvider =
+    FutureProvider.autoDispose<BrokerAccountsSnapshot>((ref) {
+  final client = ref.read(backendClientProvider);
+  return client.fetchBrokerAccounts();
+});
+
 /// `/gemma/status` — local LLM availability. Cheap probe so the
 /// News + AI Helper screens know whether to render the chat UI or
 /// the "install model" instructions.

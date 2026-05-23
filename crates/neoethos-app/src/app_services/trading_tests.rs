@@ -216,8 +216,7 @@ fn market_chart_snapshot_reports_ctrader_requirements_instead_of_fake_fallback()
     // "no data" state for the current pair/timeframe.
     assert!(snapshot.warnings.is_empty());
     assert!(
-        snapshot.headline.contains("No cTrader data for")
-            || snapshot.headline.contains("EURUSD"),
+        snapshot.headline.contains("No cTrader data for") || snapshot.headline.contains("EURUSD"),
         "unexpected headline: {}",
         snapshot.headline
     );
@@ -268,7 +267,7 @@ fn execution_surface_snapshot_surfaces_adapter_specific_unwired_feed_reason() {
 #[test]
 fn selecting_adapter_updates_configured_runtime_and_status_message() {
     let mut state = sample_state(DataSource::CTrader, "Offline");
-    let mut session = TradingSession::new();
+    let mut session = TradingSession::with_configured_adapter_for_test(TradingAdapterKind::CTrader);
 
     session.select_adapter(&mut state, TradingAdapterKind::CTrader);
     let snapshot = session.snapshot(&state);
@@ -1540,8 +1539,9 @@ fn prop_firm_gate_blocks_order_without_stop_loss() {
     let mut order = sample_prop_firm_order();
     order.stop_loss = None;
     let risk = RiskConfig::default();
-    let err = prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None)
-        .unwrap_err();
+    let err =
+        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None)
+            .unwrap_err();
     assert!(err.to_string().contains("missing stop_loss"));
 }
 
@@ -1577,13 +1577,15 @@ fn prop_firm_gate_respects_jpy_pip_precision() {
     };
     // Should pass under 2-digit precision (50 pips).
     assert!(
-        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 2, "USDJPY", None).is_ok()
+        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 2, "USDJPY", None)
+            .is_ok()
     );
     // 4-digit precision would amplify pip_distance by 100×; with the same
     // lot size and pip value that's $50,000 of risk on a $10,000 account,
     // still > 100% so it must reject.
     assert!(
-        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "USDJPY", None).is_err()
+        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "USDJPY", None)
+            .is_err()
     );
 }
 
@@ -1593,8 +1595,8 @@ fn prop_firm_gate_blocks_when_total_drawdown_breached() {
     let order = sample_prop_firm_order();
     let risk = RiskConfig::default();
     // Set day_start_equity equal to account_equity so daily DD is 0%, forcing it to hit total DD rule
-    let err =
-        prop_firm_pre_trade_check(&risk, &order, 8900.0, 10000.0, 8900.0, 4, "EURUSD", None).unwrap_err();
+    let err = prop_firm_pre_trade_check(&risk, &order, 8900.0, 10000.0, 8900.0, 4, "EURUSD", None)
+        .unwrap_err();
     assert!(err.to_string().contains("Total drawdown limit reached"));
     assert!(err.to_string().contains("current 11.00% >= max 7.00%"));
 }
@@ -1609,7 +1611,8 @@ fn prop_firm_gate_passes_valid_order_within_limits() {
     order.limit_price = Some(1.10000);
     let risk = RiskConfig::default();
     assert!(
-        prop_firm_pre_trade_check(&risk, &order, 10100.0, 10000.0, 10000.0, 4, "EURUSD", None).is_ok()
+        prop_firm_pre_trade_check(&risk, &order, 10100.0, 10000.0, 10000.0, 4, "EURUSD", None)
+            .is_ok()
     );
 }
 
@@ -1626,10 +1629,9 @@ fn prop_firm_gate_rejects_market_with_sl_but_no_entry_estimate() {
     let risk = RiskConfig::default();
     // Pass None for the market-price fallback — simulates the cold-start
     // case where no live spot quote is available for the symbol yet.
-    let err = prop_firm_pre_trade_check(
-        &risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None,
-    )
-    .unwrap_err();
+    let err =
+        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None)
+            .unwrap_err();
     assert!(
         err.to_string().contains("no entry-price estimate")
             || err
@@ -1677,7 +1679,8 @@ fn prop_firm_gate_respects_disabled_stop_loss_requirement() {
         ..RiskConfig::default()
     };
     assert!(
-        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None).is_ok()
+        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None)
+            .is_ok()
     );
 }
 
@@ -1689,8 +1692,8 @@ fn prop_firm_gate_rejects_unknown_symbol_without_synthetic_fallback() {
     // Empty symbol must be rejected — the old code silently used
     // `infer_market_cost_profile("", "", …)` and the EURUSD default,
     // producing a synthetic pip value. That is not allowed any more.
-    let err =
-        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "", None).unwrap_err();
+    let err = prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "", None)
+        .unwrap_err();
     assert!(
         err.to_string().contains("symbol name was not supplied")
             || err.to_string().contains("Daily drawdown")
@@ -1716,8 +1719,9 @@ fn prop_firm_gate_rejects_when_account_currency_unset() {
     }
     let order = sample_prop_firm_order();
     let risk = RiskConfig::default();
-    let err = prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None)
-        .unwrap_err();
+    let err =
+        prop_firm_pre_trade_check(&risk, &order, 10000.0, 10000.0, 10000.0, 4, "EURUSD", None)
+            .unwrap_err();
     assert!(
         err.to_string().contains("FOREX_BOT_PROP_ACCOUNT_CURRENCY")
             || err.to_string().contains("symbol metadata"),
@@ -1923,7 +1927,6 @@ fn manual_sell_blocked_when_autonomous_only_contract_armed() {
 fn start_auto_trade_with_ensemble_refuses_when_no_artifacts_on_disk() {
     use crate::app_services::trading::auto_trade_producer::LiveBarSource;
     use anyhow::Result;
-    use std::path::Path;
     use std::sync::Arc;
 
     /// Source that never returns a bar.

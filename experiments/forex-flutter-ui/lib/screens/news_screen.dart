@@ -8,13 +8,13 @@
 
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
+import '../widgets/symbol_picker.dart';
 import '_placeholder.dart';
 
 class NewsScreen extends ConsumerStatefulWidget {
@@ -25,20 +25,17 @@ class NewsScreen extends ConsumerStatefulWidget {
 }
 
 class _NewsScreenState extends ConsumerState<NewsScreen> {
-  final _symbolCtrl = TextEditingController(text: 'EURUSD');
+  // Symbol comes from SymbolPicker (broker catalog typeahead) so the
+  // operator can summarise news for any of the ~830 instruments the
+  // broker offers, not just the four we used to hardcode in a chip.
+  String _symbol = 'EURUSD';
   String? _result;
   int _elapsedMs = 0;
   String _lastSymbol = '';
   bool _busy = false;
 
-  @override
-  void dispose() {
-    _symbolCtrl.dispose();
-    super.dispose();
-  }
-
   Future<void> _fetch() async {
-    final symbol = _symbolCtrl.text.trim().toUpperCase();
+    final symbol = _symbol.trim().toUpperCase();
     if (symbol.isEmpty || _busy) return;
     setState(() {
       _busy = true;
@@ -130,36 +127,31 @@ class _NewsScreenState extends ConsumerState<NewsScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  SizedBox(
-                    width: 160,
-                    child: TextField(
-                      controller: _symbolCtrl,
+                  Expanded(
+                    flex: 3,
+                    child: SymbolPicker(
+                      value: _symbol,
                       enabled: !_busy,
-                      textCapitalization: TextCapitalization.characters,
-                      inputFormatters: [
-                        FilteringTextInputFormatter.allow(
-                          RegExp(r'[A-Za-z0-9.]'),
-                        ),
-                      ],
-                      decoration: const InputDecoration(
-                        labelText: 'Symbol',
-                        isDense: true,
-                        border: OutlineInputBorder(),
-                      ),
+                      onChanged: (v) => setState(() => _symbol = v),
                     ),
                   ),
                   const SizedBox(width: 12),
-                  FilledButton.icon(
-                    onPressed: _busy ? null : _fetch,
-                    icon: _busy
-                        ? const SizedBox(
-                            width: 14,
-                            height: 14,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Icon(Icons.auto_awesome, size: 16),
-                    label: Text(_busy ? 'Summarising…' : 'Summarise'),
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: FilledButton.icon(
+                      onPressed: _busy ? null : _fetch,
+                      icon: _busy
+                          ? const SizedBox(
+                              width: 14,
+                              height: 14,
+                              child:
+                                  CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.auto_awesome, size: 16),
+                      label: Text(_busy ? 'Summarising…' : 'Summarise'),
+                    ),
                   ),
                 ],
               ),

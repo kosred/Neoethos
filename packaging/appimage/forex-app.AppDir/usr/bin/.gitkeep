@@ -1,2 +1,0 @@
-# build.sh populates this directory with target/release/forex-app at build time.
-# This marker keeps the directory tracked by git while it is otherwise empty.

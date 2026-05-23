@@ -98,11 +98,7 @@ pub async fn discovery_start(
         data_root,
         symbol: symbol.clone(),
         base_tf: base_tf.clone(),
-        higher_tfs: vec![
-            "M5".to_string(),
-            "M15".to_string(),
-            "H1".to_string(),
-        ],
+        higher_tfs: vec!["M5".to_string(), "M15".to_string(), "H1".to_string()],
         config: neoethos_search::DiscoveryConfig::default(),
         prop_firm_rules: neoethos_search::PropFirmRiskRules::default(),
     };
@@ -122,7 +118,18 @@ pub async fn discovery_start(
     state
         .install_engine(JobKind::Discovery, handle.cancel.clone())
         .await;
-    spawn_state_drainer(state.clone(), JobKind::Discovery, rx);
+    // The fourth arg arms the auto-chain: when this discovery run
+    // hits a terminal "Succeeded" state, the drainer fires
+    // `start_training_job` with the same (symbol, base_tf) — that's
+    // the "natural sequence" the user explicitly asked for
+    // (discovery → training → trading). Skipped if the user is
+    // already running training manually when discovery finishes.
+    spawn_state_drainer(
+        state.clone(),
+        JobKind::Discovery,
+        rx,
+        Some((symbol.clone(), base_tf.clone())),
+    );
 
     Json(StartResponse {
         started: true,
@@ -191,7 +198,11 @@ pub async fn training_start(
     state
         .install_engine(JobKind::Training, handle.cancel.clone())
         .await;
-    spawn_state_drainer(state.clone(), JobKind::Training, rx);
+    // Training has no further auto-chain step yet (the auto-trader
+    // wiring lands in a follow-up), so the drainer gets None for the
+    // chain arg — a Succeeded training run leaves the operator on
+    // the dashboard, not in autonomous mode.
+    spawn_state_drainer(state.clone(), JobKind::Training, rx, None);
 
     Json(StartResponse {
         started: true,
@@ -212,9 +223,8 @@ pub async fn training_stop(State(state): State<AppApiState>) -> Json<StopRespons
 
 // ─── shared helpers ───────────────────────────────────────────────────────
 
-/// Where the engines pull their input data from. Mirrors the wiring
-/// the egui main loop used: load `config.yaml` from CWD, take
-/// `system.data_dir` from it.
+/// Where the engines pull their input data from. Mirrors backend startup
+/// wiring: load `config.yaml` from CWD, then take `system.data_dir` from it.
 async fn resolve_data_root() -> Result<PathBuf> {
     tokio::task::spawn_blocking(|| {
         let settings = Settings::from_yaml("config.yaml")
@@ -229,12 +239,31 @@ async fn resolve_data_root() -> Result<PathBuf> {
 /// emitted by the job and reflects the latest `JobState` into the
 /// `AppApiState` engine slot. The task exits when the channel closes
 /// (job's send end dropped after terminal event).
+///
+/// `auto_chain_args` is `Some((symbol, base_tf))` for Discovery only —
+/// when discovery terminates with `Succeeded`, the drainer fires
+/// `start_training_job` against the same pair. That's the
+/// "natural sequence" the operator expects:
+///
+///     Discovery (GA-evolves a portfolio)
+///        ↓ writes model_targets.json
+///     Training (33-model ensemble fits per model_targets.json)
+///        ↓ writes models/*.{pkl,joblib,pt}
+///     (Auto-Trader — lands in a follow-up)
+///
+/// Auto-chain is suppressed if the user already started Training
+/// manually before Discovery finishes (Training is single-job:
+/// `state.engine_state(Training)` would be Running). Failed,
+/// Cancelled, or Degraded discoveries also skip the chain — we only
+/// promote a clean Success.
 fn spawn_state_drainer(
     state: AppApiState,
     kind: JobKind,
     mut rx: mpsc::Receiver<ServiceEvent>,
+    auto_chain_args: Option<(String, String)>,
 ) {
     tokio::spawn(async move {
+        let mut terminal_state: Option<JobState> = None;
         while let Some(event) = rx.recv().await {
             let snapshot = match (&event, kind) {
                 (ServiceEvent::DiscoveryUpdated(s), JobKind::Discovery) => Some(s),
@@ -242,6 +271,7 @@ fn spawn_state_drainer(
                 _ => None,
             };
             let Some(snap) = snapshot else { continue };
+            terminal_state = Some(snap.state);
             state
                 .update_engine(
                     kind,
@@ -254,7 +284,81 @@ fn spawn_state_drainer(
         // "Running" state if the producer side dropped without a
         // terminal event (shouldn't happen, defensive guard).
         state.finalize_engine_if_running(kind).await;
+
+        // Auto-chain Discovery → Training when:
+        //   1. We're the discovery drainer (Some auto_chain_args).
+        //   2. Discovery succeeded (Degraded counts as success in
+        //      EngineRunState but Training needs the strictly-clean
+        //      `model_targets.json` from a Succeeded run).
+        //   3. Training isn't already running (idempotency — the user
+        //      might have hit Train manually while Discovery was
+        //      still grinding).
+        if let Some((symbol, base_tf)) = auto_chain_args {
+            if matches!(terminal_state, Some(JobState::Succeeded)) {
+                let already_training = matches!(
+                    state.engine_state(JobKind::Training).await,
+                    EngineRunState::Running
+                );
+                if already_training {
+                    tracing::info!(
+                        target: "neoethos_app::server::engines_control",
+                        "Discovery succeeded but Training is already \
+                         running — skipping auto-chain to avoid 409"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "neoethos_app::server::engines_control",
+                        symbol = %symbol,
+                        base_tf = %base_tf,
+                        "Discovery succeeded — auto-chaining Training \
+                         on the same (symbol, base_tf) per natural \
+                         pipeline sequence"
+                    );
+                    spawn_auto_chained_training(state, symbol, base_tf);
+                }
+            } else {
+                tracing::info!(
+                    target: "neoethos_app::server::engines_control",
+                    ?terminal_state,
+                    "Discovery did NOT succeed cleanly — skipping \
+                     auto-chain. Operator can re-trigger Discovery \
+                     or start Training manually."
+                );
+            }
+        }
     });
+}
+
+/// Helper: kick off a Training job from inside the Discovery drainer
+/// (not an HTTP path), wiring up its own drainer with no further
+/// auto-chain. Pulled out so the recursive shape stays readable.
+fn spawn_auto_chained_training(state: AppApiState, symbol: String, base_tf: String) {
+    let request = TrainingRequest {
+        config_path: "config.yaml".to_string(),
+        models_dir: PathBuf::from("models"),
+        symbol,
+        base_tf,
+    };
+    let (tx, rx) = mpsc::channel::<ServiceEvent>(1000);
+    match start_training_job(request, tx) {
+        Ok(handle) => {
+            let state_for_install = state.clone();
+            tokio::spawn(async move {
+                state_for_install
+                    .install_engine(JobKind::Training, handle.cancel.clone())
+                    .await;
+            });
+            spawn_state_drainer(state, JobKind::Training, rx, None);
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "neoethos_app::server::engines_control",
+                error = %err,
+                "auto-chained Training failed to start — operator \
+                 must launch it manually from the Training screen"
+            );
+        }
+    }
 }
 
 // ─── EngineRunState (wire-friendly subset of JobState) ────────────────────

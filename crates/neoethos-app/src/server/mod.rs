@@ -1,9 +1,8 @@
 //! HTTP API surface that the Flutter front-end talks to.
 //!
-//! Phase 1 of the egui → Flutter migration (task #87). The goal of this
-//! module is **not** to replicate every egui panel — it is to expose the
-//! same TradingSession state and broker actions over a stable JSON +
-//! Server-Sent-Events surface so a thin Flutter client can render the UI.
+//! Backend HTTP surface for the Flutter migration. The goal of this module
+//! is to expose TradingSession state and broker actions over stable JSON so
+//! a thin Flutter client can render the UI.
 //!
 //! ## Layering
 //!
@@ -35,9 +34,9 @@ pub mod data_control;
 pub mod engines_control;
 pub mod gemma;
 pub mod hardware;
+pub mod health;
 pub mod intelligence;
 pub mod orders;
-pub mod health;
 pub mod risk;
 pub mod settings;
 pub mod state;
@@ -92,6 +91,7 @@ pub fn router(state: AppApiState) -> Router {
         )
         .route("/broker/symbols", get(data_control::symbols))
         .route("/broker/timeframes", get(data_control::timeframes))
+        .route("/broker/accounts", get(data_control::accounts))
         .route("/data/bootstrap", get(system_status::data_bootstrap))
         .route("/data/fetch", post(data_control::fetch))
         .route("/orders", post(orders::place))
@@ -119,7 +119,9 @@ fn default_bind_addr() -> SocketAddr {
             "NEOETHOS_SERVER_BIND set but unparseable; falling back to 127.0.0.1:7423"
         );
     }
-    "127.0.0.1:7423".parse().expect("hard-coded default must parse")
+    "127.0.0.1:7423"
+        .parse()
+        .expect("hard-coded default must parse")
 }
 
 /// Bind the HTTP listener and serve until the process is killed. The

@@ -39,7 +39,13 @@ class TrainingScreen extends ConsumerWidget {
                   'evolutionary, reinforcement-learning, statistical, '
                   'anomaly-detection families) over the symbol/timeframe '
                   'you chose. Per-epoch loss + accuracy stream into the '
-                  'sectioned log under the TRAINING section.',
+                  'sectioned log under the TRAINING section.\n\n'
+                  'Auto-start: if you launch Discovery first and it '
+                  'finishes cleanly (Succeeded), Training kicks off '
+                  'automatically against the same (symbol, timeframe) — '
+                  'the natural pipeline sequence. Manual Start here is '
+                  'still available for re-training without re-running '
+                  'Discovery.',
             ),
             loading: () => const _Loading(),
             error: (err, _) =>

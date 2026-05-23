@@ -486,7 +486,9 @@ mod tests {
             },
             cpu_budget: neoethos_core::CpuBudget::new(8),
             gpu_budget: None,
-            precision_policy: neoethos_core::PrecisionPolicy::from_precision(TrainingPrecision::Fp32),
+            precision_policy: neoethos_core::PrecisionPolicy::from_precision(
+                TrainingPrecision::Fp32,
+            ),
             batch_size: 512,
             runtime_degraded_reason: None,
             notes: Vec::new(),
@@ -510,7 +512,9 @@ mod tests {
             },
             cpu_budget: neoethos_core::CpuBudget::new(8),
             gpu_budget: None,
-            precision_policy: neoethos_core::PrecisionPolicy::from_precision(TrainingPrecision::Fp32),
+            precision_policy: neoethos_core::PrecisionPolicy::from_precision(
+                TrainingPrecision::Fp32,
+            ),
             batch_size: 512,
             runtime_degraded_reason: None,
             notes: Vec::new(),

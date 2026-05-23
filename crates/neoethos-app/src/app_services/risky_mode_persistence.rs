@@ -238,7 +238,8 @@ pub fn load_risky_mode_state() -> Result<Option<RiskyModeStateFile>> {
     let state: RiskyModeStateFile = serde_json::from_str(&contents)
         .with_context(|| format!("parse risky mode state at {}", path.display()))?;
 
-    if let Err(err) = neoethos_core::check_schema_version_readable(&state, "risky_mode_state.json") {
+    if let Err(err) = neoethos_core::check_schema_version_readable(&state, "risky_mode_state.json")
+    {
         tracing::error!(
             target: "neoethos_app::risky_mode_persistence",
             path = %path.display(),

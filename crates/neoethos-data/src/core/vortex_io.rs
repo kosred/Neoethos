@@ -52,8 +52,9 @@ pub fn read_vortex_array(path: impl AsRef<Path>) -> Result<ArrayRef> {
     // bootstrap pipeline can re-fetch from cTrader instead of refusing
     // to start.
     let path_owned = path.to_path_buf();
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read_vortex_array_inner(path)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_vortex_array_inner(path)
+    }));
     match result {
         Ok(Ok(arr)) => Ok(arr),
         Ok(Err(err)) => Err(err),

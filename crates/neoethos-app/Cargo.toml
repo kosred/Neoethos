@@ -6,7 +6,7 @@ edition.workspace = true
 # cargo-deb (which prefers `license` over `license-file` when generating
 # `debian/control`) and cargo-generate-rpm. Standard Rust ecosystem choice.
 license = "LicenseRef-Proprietary"
-description = "NeoEthos desktop GUI — a disciplined multi-model ML engine for FX strategy research and risk-aware execution."
+description = "neoethos backend server for FX strategy research and risk-aware execution."
 homepage = "https://github.com/kosred/neoethos"
 repository = "https://github.com/kosred/neoethos"
 readme = "../../README.md"
@@ -25,16 +25,13 @@ native-tree-models = ["neoethos-models/tree-models"]
 # Runtime opt-in is via `FOREX_BOT_CTRADER_TRANSPORT=protobuf` plus this
 # feature being enabled at build time.
 ctrader-protobuf-streaming = ["dep:webpki-roots"]
-# G1 LLM backend — wire the real llama.cpp runtime into the AI Helper panel.
+# G1 LLM backend - wire the real llama.cpp runtime into server-side intelligence.
 # Requires cmake + a C/C++ compiler and a ~5 GB GGUF on disk.
 # Download the GGUF via: `powershell -File scripts/fetch-gemma-model.ps1`
 # The feature is OFF by default so the app builds cleanly without them.
 gemma-backend = ["neoethos-gemma/mistralrs-runtime"]
 
 [dependencies]
-eframe = "0.31.0" # UI framework (egui)
-egui = "0.31.0"
-egui_dock = "0.16.0"
 tokio = { version = "1.49.0", features = ["full", "rt-multi-thread"] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
@@ -96,11 +93,9 @@ neoethos-core = { path = "../neoethos-core" }
 neoethos-data = { path = "../neoethos-data" }
 neoethos-search = { path = "../neoethos-search" }
 neoethos-models = { path = "../neoethos-models", default-features = false, features = ["pure-rust-ml"] }
-# v0.4.8: on-device LLM helper (Gemma) — wired into the egui AI Helper
-# panel + the workspace `ToolRegistry` for chat-driven read-only tool
-# invocation. The stub runtime is always available so the desktop
-# binary builds without a GGUF file on disk; `mistralrs-runtime`
-# feature lights up the real inference path when G1 lands.
+# v0.4.8: on-device LLM helper (Gemma). The stub runtime is always
+# available so the backend binary builds without a GGUF file on disk;
+# `mistralrs-runtime` feature lights up the real inference path.
 neoethos-gemma = { path = "../neoethos-gemma" }
 ndarray = "0.17.2"
 clap = { version = "4.6.0", features = ["derive"] }
@@ -110,27 +105,22 @@ num_cpus = "1.17.0"
 # this file (each platform gets the minimum feature set it needs, so
 # a Linux build never pulls libgtk-3-dev and a Windows build never
 # pulls the GTK glue).
-# Wizard Step 9.5 — risk-quiz answer hash. Spec
-# `installer_wizard_ux_spec.md` §5 names SHA-256 explicitly for the
-# `answers_sha256` field, replacing the placeholder djb2 hasher
-# (collision-prone, see competitive analysis §11.8). RustCrypto
-# `sha2` 0.10.x is the canonical pure-Rust impl; `hex` 0.4.x is the
-# minimal lowercase-hex encoder. Both already in the workspace
-# lockfile via transitive deps — pinning here gives a direct edge
-# so the wizard does not depend on a transitive accident.
+# Risk-state signatures use SHA-256. RustCrypto `sha2` is the canonical
+# pure-Rust implementation; `hex` is the minimal lowercase-hex encoder.
 sha2 = "0.10"
 hex = "0.4"
 # Bounded multi-producer/multi-consumer channel used to bridge the
-# cTrader streaming worker thread (which holds neither a `&mut
-# TradingSession` nor the egui ctx) and the main UI loop, which is the
-# only place we can call `TradingSession::trip_hardware_kill_global`.
+# cTrader streaming worker thread and server-side broker-control sinks.
 # Crossbeam (vs. `std::sync::mpsc`) gives us a `Sender` that is
 # `Send + Sync + Clone` without a `Mutex` wrapper, which is what the
 # `OnceLock`-backed global broker-control sink in `broker_control.rs`
-# needs so the streaming worker can write without contending with the
-# main loop's reader. Version 0.5.15 matches the transitive resolution
-# already present in `Cargo.lock` — no version drift.
+# needs so the streaming worker can write without contending on a mutex.
+# Version 0.5.15 matches the transitive resolution already present in
+# `Cargo.lock` - no version drift.
 crossbeam-channel = "0.5.15"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 # keyring per-platform backend — see comment next to the original `keyring = ...`
 # pin removal above. Each feature is the minimum needed to bind to the OS
@@ -154,7 +144,7 @@ keyring = { version = "3.6.3", default-features = false, features = ["linux-nati
 # Drop GTK3 — talks to xdg-desktop-portal over D-Bus instead. Works on
 # GNOME / KDE / WSL2g without `libgtk-3-dev` installed; falls back
 # cleanly when the portal isn't available (the picker just doesn't
-# open — which is what the wizard already handles).
+# open.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 
 [build-dependencies]
@@ -163,10 +153,10 @@ cc = "1.2.14"
 
 
 [package.metadata.packager]
-product_name = "NeoEthos"
+product_name = "neoethos"
 identifier = "com.neoethos.app"
 authors = ["Konstantinos Red"]
-description = "NeoEthos — a disciplined multi-model ML engine for FX strategy research and risk-aware execution."
+description = "neoethos - a disciplined multi-model ML engine for FX strategy research and risk-aware execution."
 formats = ["nsis"]
 # Paths are resolved relative to this Cargo.toml. The default GUI build
 # intentionally ships without native tree-model DLLs; those are gated behind
@@ -186,7 +176,7 @@ resources = [
     "../../LICENSE",
     "../../README.md",
     # v0.4.10: ship the Gemma GGUF fetcher next to the .exe so the
-    # AI Helper panel's "Run fetch-gemma-model.ps1" button can spawn
+    # The Flutter shell can spawn
     # it without the operator having to clone the repo. The script
     # itself does the HuggingFace download + disk-safety check +
     # writes to the canonical user-data dir.
@@ -230,8 +220,7 @@ assets = [
     ["../../LICENSE", "usr/share/doc/neoethos/", "644"],
     ["../../README.md", "usr/share/doc/neoethos/", "644"],
 ]
-# Opt-in autostart only via the in-app wizard — never enable the unit on
-# install. (Wizard §9: user controls autonomous-watchdog autostart.)
+# Opt-in autostart only. Never enable the unit on install.
 systemd-units = { enable = false }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -248,4 +237,3 @@ assets = [
     { source = "LICENSE", dest = "/usr/share/doc/neoethos/LICENSE", mode = "0644" },
     { source = "README.md", dest = "/usr/share/doc/neoethos/README.md", mode = "0644" },
 ]
-

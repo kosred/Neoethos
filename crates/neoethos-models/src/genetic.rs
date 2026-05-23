@@ -10,6 +10,7 @@ use crate::runtime::capabilities::{
 use crate::runtime::prediction::RuntimePrediction;
 use anyhow::{Context, Result, bail};
 use chrono::{Duration, TimeZone, Utc};
+use ndarray::Array2;
 use neoethos_core::storage::json::{
     JsonBackupWriteConfig, read_json as read_json_artifact,
     write_json_with_backup as write_json_artifact_with_backup,
@@ -21,7 +22,6 @@ use neoethos_search::genetic::{
     signals_for_gene, unique_candidate_or_retry,
 };
 use neoethos_search::{DiscoveryConfig, FilteringConfig, run_discovery_cycle};
-use ndarray::Array2;
 use polars::prelude::*;
 use rand::Rng;
 use serde::{Deserialize, Serialize};

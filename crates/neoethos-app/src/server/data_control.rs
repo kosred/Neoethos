@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use neoethos_core::Settings;
 
 use crate::app_services::broker_api::{
-    download_history_blocking, fetch_broker_symbols_blocking,
+    download_history_blocking, fetch_broker_accounts_blocking, fetch_broker_symbols_blocking,
 };
 
 use super::state::AppApiState;
@@ -66,9 +66,22 @@ pub struct BrokerSymbolDto {
     pub description: Option<String>,
 }
 
-pub async fn symbols(State(_state): State<AppApiState>) -> Response {
+pub async fn symbols(State(state): State<AppApiState>) -> Response {
     match tokio::task::spawn_blocking(fetch_broker_symbols_blocking).await {
         Ok(Ok(bundle)) => {
+            // Mirror the (id → name) lookup into AppApiState so the
+            // bridge can label positions with real tickers (e.g.
+            // `EURUSD`) instead of the previous `sym#1` placeholder.
+            // Every successful Markets-tab fetch refreshes this cache —
+            // no staleness even after a broker maintenance window
+            // that re-issues IDs.
+            let catalog: std::collections::HashMap<i64, String> = bundle
+                .symbols
+                .iter()
+                .map(|s| (s.symbol_id, s.symbol_name.clone()))
+                .collect();
+            state.set_symbol_catalog(catalog).await;
+
             let dto = BrokerSymbolsDto {
                 account_id: bundle.account_id,
                 environment: bundle.environment.to_string(),
@@ -102,6 +115,78 @@ pub async fn symbols(State(_state): State<AppApiState>) -> Response {
     }
 }
 
+// ─── GET /broker/accounts ─────────────────────────────────────────────────
+
+/// Wire shape for the Settings-screen account picker.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrokerAccountsDto {
+    pub environment: String,
+    pub permission_scope: String,
+    pub account_count: usize,
+    pub accounts: Vec<BrokerAccountDto>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrokerAccountDto {
+    /// Numeric cTID as a string — cTrader's account_id can exceed
+    /// i32 range so we serialize as text to keep the wire safe.
+    pub account_id: String,
+    pub broker_title: String,
+    pub account_name: String,
+    pub trader_login: Option<i64>,
+    pub is_live: Option<bool>,
+    /// Whether this account had the "execution" scope checked during
+    /// OAuth. The trader-scope flow we use grants execution by
+    /// default, but if a user pinned a more restrictive scope here we
+    /// surface it so the UI can grey out trade buttons accordingly.
+    pub enabled_for_execution: bool,
+}
+
+/// Pulls the full list of accounts the user granted access to during
+/// OAuth (`ProtoOAGetAccountListByAccessTokenReq` → payload 2150). The
+/// Settings dropdown reads this so the operator picks from a real
+/// list instead of typing a numeric cTID by hand — which was the
+/// root cause of the `CH_ACCESS_TOKEN_INVALID` loop in v0.4.20 where
+/// the on-disk config still held a deleted sandbox account_id.
+pub async fn accounts(State(_state): State<AppApiState>) -> Response {
+    match tokio::task::spawn_blocking(fetch_broker_accounts_blocking).await {
+        Ok(Ok(bundle)) => {
+            let dto = BrokerAccountsDto {
+                environment: bundle.environment.to_string(),
+                permission_scope: bundle.permission_scope,
+                account_count: bundle.accounts.len(),
+                accounts: bundle
+                    .accounts
+                    .into_iter()
+                    .map(|a| BrokerAccountDto {
+                        account_id: a.account_id,
+                        broker_title: a.broker_title,
+                        account_name: a.account_name,
+                        trader_login: a.trader_login,
+                        is_live: a.is_live,
+                        enabled_for_execution: a.enabled_for_execution,
+                    })
+                    .collect(),
+            };
+            Json(dto).into_response()
+        }
+        Ok(Err(err)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+        Err(join_err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("accounts task panicked: {join_err}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
 // ─── POST /data/fetch ─────────────────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
@@ -126,10 +211,7 @@ pub struct FetchOutcomeDto {
     pub written_path: String,
 }
 
-pub async fn fetch(
-    State(_state): State<AppApiState>,
-    Json(body): Json<FetchBody>,
-) -> Response {
+pub async fn fetch(State(_state): State<AppApiState>, Json(body): Json<FetchBody>) -> Response {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let to_ms = body.to_ms.unwrap_or(now_ms);
 

@@ -8,16 +8,18 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow};
 
 use super::flows;
-use super::report::{ApiTestReport, FailureKind, FlowResult, FlowStatus, HostSummary, ReportTotals};
+use super::report::{
+    ApiTestReport, FailureKind, FlowResult, FlowStatus, HostSummary, ReportTotals,
+};
 use crate::app_services::trading::TradingSession;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiTestEnvironment {
     Demo,
     #[allow(dead_code)] // CLI flag accepts only `--api-test` (= Demo)
-                       // today; `Live` exists for the planned
-                       // `--api-test-live` opt-in that the operator
-                       // must spell out explicitly per safety policy.
+    // today; `Live` exists for the planned
+    // `--api-test-live` opt-in that the operator
+    // must spell out explicitly per safety policy.
     Live,
 }
 

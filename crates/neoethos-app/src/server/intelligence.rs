@@ -69,8 +69,8 @@ pub async fn intelligence(State(_state): State<AppApiState>) -> Response {
 }
 
 fn scan_intelligence() -> anyhow::Result<IntelligenceDto> {
-    // The egui side reads models/ from a hardcoded "models" path. We
-    // mirror that so the Flutter screen surfaces the same artifacts.
+    // The backend currently scans the hardcoded "models" path so the
+    // Flutter screen surfaces the same artifacts every run.
     // If Settings ever grows a `models_dir` we'll switch over here.
     let _settings = Settings::from_yaml("config.yaml").ok();
     let models_dir = std::path::PathBuf::from("models");

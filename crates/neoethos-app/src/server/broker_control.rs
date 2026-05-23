@@ -57,7 +57,8 @@ pub async fn credentials_get(State(_state): State<AppApiState>) -> Response {
             let secret_mask = if ct.client_secret.is_empty() {
                 String::new()
             } else {
-                format!("****{} (length {})",
+                format!(
+                    "****{} (length {})",
                     &ct.client_secret[ct.client_secret.len().saturating_sub(4)..],
                     ct.client_secret.len(),
                 )
@@ -164,9 +165,13 @@ pub async fn credentials_post(
 }
 
 #[allow(dead_code)] // used by tests that pin the wire shape
-fn _unused() -> DxTradeBrokerSettings { DxTradeBrokerSettings::default() }
+fn _unused() -> DxTradeBrokerSettings {
+    DxTradeBrokerSettings::default()
+}
 #[allow(dead_code)]
-fn _unused2() -> BrokerSettingsState { BrokerSettingsState::default() }
+fn _unused2() -> BrokerSettingsState {
+    BrokerSettingsState::default()
+}
 
 pub async fn reauth(State(_state): State<AppApiState>) -> Response {
     // run_reauth_flow_blocking() does sync filesystem + reqwest::blocking
@@ -207,4 +212,3 @@ pub async fn reauth(State(_state): State<AppApiState>) -> Response {
         }
     }
 }
-
