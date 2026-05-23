@@ -41,6 +41,7 @@ use crate::app_services::ctrader_account::{
 };
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::ProductionCTraderOpenApiTransport;
+use crate::app_services::live_spots::get_tick;
 use crate::app_services::pnl::{BrokerPositionPnL, fetch_unrealized_pnl_for_all_positions};
 use crate::app_services::secure_store::production_ctrader_token_store;
 
@@ -400,11 +401,50 @@ fn position_to_payload(
     // When metadata is missing for the symbol (rare — exotic
     // synthetics), report 0.0 pips rather than NaN; UI shows 0
     // until the symbol table gets populated.
-    let pnl_pips = compute_pnl_pips(
+    let mut pnl_pips = compute_pnl_pips(
         resolved_name.as_deref(),
         pnl_usd,
         p.volume,
     );
+
+    // #142: if the live_spots streamer has a fresh tick for this
+    // position's symbol AND we have an entry price, recompute
+    // pnl_pips directly from the live mid-price. The broker-derived
+    // pnl_pips above is up to 5 s stale (one bridge refresh
+    // interval); the live tick is < 2 s old. We OVERRIDE pnl_pips
+    // only — pnl_usd is left as the broker-authoritative number
+    // since recomputing it in account currency requires per-symbol
+    // FX conversion data we don't track yet. So the UI sees pips
+    // update at sub-2 s cadence while the dollar number refreshes
+    // on the 5 s bridge tick. Good enough for the live-overlay
+    // case; full live USD PnL is a follow-up.
+    if let Some(entry_price) = p.price {
+        if let Some(tick) = get_tick(p.symbol_id) {
+            // Use the tick's freshness as the gate — > 5 s old and
+            // we'd just be replacing one stale number with another.
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let freshness_ms = now_ms - tick.received_at_unix_ms;
+            if freshness_ms <= 5_000 {
+                if let Some(mid) = tick.mid_price() {
+                    let price_diff = if p.trade_side.eq_ignore_ascii_case("Buy") {
+                        mid - entry_price
+                    } else {
+                        entry_price - mid
+                    };
+                    let pip_size = if resolved_name
+                        .as_deref()
+                        .map(|n| n.to_ascii_uppercase().ends_with("JPY"))
+                        .unwrap_or(false)
+                    {
+                        0.01
+                    } else {
+                        0.0001
+                    };
+                    pnl_pips = price_diff / pip_size;
+                }
+            }
+        }
+    }
 
     PositionPayload {
         position_id: p.position_id,
