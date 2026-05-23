@@ -386,6 +386,21 @@ impl LiveInferenceProducer {
                 self.config.signal_label_prefix, outcome.side, confidence
             ),
             timestamp_ms: newest_ts,
+            // #127: stamp the signal with provenance so
+            // explain_recent_trades can narrate why each trade fired.
+            // We use the producer's `signal_label_prefix` as the
+            // strategy_id (it identifies which strategy/source the
+            // operator wired up — e.g. "ema_cross_v3") and a stable
+            // ensemble label derived from the symbol the producer is
+            // bound to. The feature_snapshot stays empty for now; a
+            // richer PredictionOutput that exposes the last feature
+            // row is a follow-up — capturing it here would require
+            // threading the DataFrame back from ModelPredictor::predict
+            // which we don't want to do in the same pass that wires
+            // the explain tool.
+            strategy_id: Some(self.config.signal_label_prefix.clone()),
+            model_id: Some(format!("ensemble:{}", self.config.symbol)),
+            feature_snapshot: std::collections::HashMap::new(),
         })
     }
 }

@@ -73,6 +73,25 @@ pub struct AutoTradeSignal {
     /// for the chart overlay's timestamp→candle mapping (see
     /// `bot_decisions_to_overlays`).
     pub timestamp_ms: i64,
+    /// Stable identifier of the discovery-time strategy that fired
+    /// this signal — e.g. `"ema_cross_v3"` or the content-hash
+    /// `strategy_id` from `cache/discovery/*.json`. `None` for
+    /// signals produced by paths that don't track a strategy (e.g.
+    /// manual UI clicks routed through this struct). Surfaced to the
+    /// Gemma `explain_recent_trades` tool (#127).
+    pub strategy_id: Option<String>,
+    /// Stable identifier of the trained model ensemble that produced
+    /// the prediction — e.g. `"lgb_eurusd_m1_2026-05-22"` or a
+    /// content-hash of the loaded `EnsembleLoadSummary.loaded_names`.
+    /// `None` for non-ML paths.
+    pub model_id: Option<String>,
+    /// Snapshot of the most-recent feature values the model saw at
+    /// inference time. Keyed by feature name (`"rsi_14"`, `"adx_14"`,
+    /// `"macd_hist"`). Used by Gemma to narrate "why" the trade
+    /// opened — without it the LLM can only say "the model said
+    /// BUY" with no detail. Producer fills this from the last row
+    /// of the feature DataFrame before predict().
+    pub feature_snapshot: std::collections::HashMap<String, f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +106,54 @@ pub enum AutoTradeSide {
 /// stage-0 minimum; the Risky Mode gate tightens this further per
 /// stage when active.
 pub const AUTO_TRADE_MIN_CONFIDENCE: f64 = 0.6;
+
+/// Write one signal-journal record covering the dispatch decision.
+/// Free function (not a method) so the gate chain stays a single
+/// expression-bodied dispatcher. `decision` is the GateDecision the
+/// chain returned; we encode it as a short tag string for the
+/// Gemma `explain_recent_trades` tool to summarise on. Failures
+/// here are non-fatal — the trade has already happened (or been
+/// rejected) by the time we journal.
+fn journal_signal_decision(signal: &AutoTradeSignal, decision: &GateDecision) {
+    use crate::app_services::signal_journal::{SignalRecord, record};
+    let dispatched = matches!(decision, GateDecision::Dispatched);
+    let note = match decision {
+        GateDecision::Dispatched => "Dispatched to broker".to_string(),
+        GateDecision::AutoTradeOff => "Rejected: auto-trade disabled".to_string(),
+        GateDecision::SymbolMismatch { active, signal: s } => {
+            format!("Rejected: symbol mismatch (active={active}, signal={s})")
+        }
+        GateDecision::FlatSide => "Skipped: flat side".to_string(),
+        GateDecision::BelowConfidence { confidence, minimum } => format!(
+            "Rejected: confidence {confidence:.3} < threshold {minimum:.3}"
+        ),
+        GateDecision::NewsBlackout => "Rejected: news blackout (B1)".to_string(),
+        GateDecision::Halted => "Rejected: manual HALT in force".to_string(),
+        GateDecision::RiskyModeKillSwitch => {
+            "Rejected: Risky Mode kill switch tripped".to_string()
+        }
+        GateDecision::PropFirmGate { reason } => {
+            format!("Rejected by prop-firm gate: {reason}")
+        }
+    };
+    let side_str = match signal.side {
+        AutoTradeSide::Buy => "BUY",
+        AutoTradeSide::Sell => "SELL",
+        AutoTradeSide::Flat => "FLAT",
+    };
+    record(SignalRecord {
+        timestamp_ms: signal.timestamp_ms,
+        symbol: signal.symbol.clone(),
+        side: side_str.to_string(),
+        confidence: signal.confidence,
+        label: signal.label.clone(),
+        strategy_id: signal.strategy_id.clone(),
+        model_id: signal.model_id.clone(),
+        feature_snapshot: signal.feature_snapshot.clone(),
+        dispatched,
+        dispatch_note: note,
+    });
+}
 
 /// Outcome of pushing an auto-trade signal through the gate chain.
 /// Every variant is observable from outside so the inference loop's
@@ -175,6 +242,21 @@ impl TradingSession {
         &mut self,
         state: &mut AppState,
         signal: AutoTradeSignal,
+    ) -> GateDecision {
+        // #127: emit ONE journal record per signal regardless of
+        // gate outcome so explain_recent_trades can surface even
+        // the rejections ("EURUSD BUY at 14:32 was blocked by news
+        // blackout"). The journal is a thin, lossy observability
+        // surface — we don't fail the gate chain if record fails.
+        let decision = self.evaluate_and_dispatch(state, &signal);
+        journal_signal_decision(&signal, &decision);
+        decision
+    }
+
+    fn evaluate_and_dispatch(
+        &mut self,
+        state: &mut AppState,
+        signal: &AutoTradeSignal,
     ) -> GateDecision {
         // Gate 1 — operator flag.
         if !state.auto_trade_enabled {
@@ -289,6 +371,9 @@ mod tests {
             confidence,
             label: format!("AI {:?} · {:.2}", side, confidence),
             timestamp_ms: 1_700_000_000_000,
+            strategy_id: None,
+            model_id: None,
+            feature_snapshot: std::collections::HashMap::new(),
         }
     }
 

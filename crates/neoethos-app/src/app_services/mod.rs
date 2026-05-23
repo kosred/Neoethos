@@ -59,6 +59,7 @@ pub mod gemma_memory;
 pub mod gemma_tools;
 pub mod risky_mode_persistence;
 pub mod secure_store;
+pub mod signal_journal;
 pub mod trading;
 pub mod training;
 

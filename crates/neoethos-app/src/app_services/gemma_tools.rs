@@ -1007,6 +1007,105 @@ fn preview(s: &str, max_chars: usize) -> String {
     format!("{truncated}…")
 }
 
+// ─── Trade-explanation tool (#127) ───────────────────────────────
+//
+// Reads from the in-memory `signal_journal` (every auto-trade
+// signal the dispatcher saw — dispatched or rejected) plus the live
+// `account.positions` cache, and returns the joined view so the
+// Gemma layer can narrate "why" each trade opened. The model is
+// expected to correlate signals with positions by (symbol, side,
+// timestamp_ms close-to) — we hand it both streams; we don't try
+// to build an exact join server-side because the broker doesn't
+// echo the originating signal id back on the fill.
+
+pub struct ExplainRecentTradesTool;
+
+impl Tool for ExplainRecentTradesTool {
+    fn name(&self) -> &'static str {
+        "explain_recent_trades"
+    }
+
+    fn description(&self) -> &'static str {
+        "Returns the recent dispatch history of the auto-trade pipeline AND the \
+         current open positions, so you can narrate WHY each trade opened. Each \
+         signal carries strategy_id, model_id, confidence, dispatch outcome (was \
+         it filled or blocked by a gate?), and a feature_snapshot of indicator \
+         values at signal time. Correlate signals with positions by symbol + \
+         side + nearby timestamp. Use when the user asks 'why did you open \
+         EURUSD long?', 'what did the model see?', or 'why is this trade in \
+         the book?'. Arguments: `limit` (default 20, max 100)."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100}
+            }
+        })
+    }
+
+    fn execute(&self, state: &AppApiState, args: Value) -> Result<Value> {
+        use crate::app_services::signal_journal::recent;
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20)
+            .clamp(1, 100) as usize;
+        let signals = recent(limit);
+        // Live positions — None when broker hasn't filled the cache
+        // yet (no session). We don't fail the tool in that case;
+        // the model can still narrate from the signal stream alone.
+        let positions = state.account_blocking().map(|snap| {
+            snap.positions
+                .iter()
+                .map(|p| {
+                    json!({
+                        "position_id": p.position_id,
+                        "symbol": p.symbol,
+                        "side": p.side,
+                        "volume_lots": p.volume,
+                        "pnl_pips": p.pnl_pips,
+                        "pnl_account_currency": p.pnl_usd,
+                        "open_timestamp_ms": p.open_timestamp_ms,
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        let signals_json: Vec<Value> = signals
+            .iter()
+            .map(|s| {
+                let features: Vec<Value> = s
+                    .feature_snapshot
+                    .iter()
+                    .map(|(k, v)| json!({"name": k, "value": v}))
+                    .collect();
+                json!({
+                    "timestamp_ms": s.timestamp_ms,
+                    "symbol": s.symbol,
+                    "side": s.side,
+                    "confidence": s.confidence,
+                    "label": s.label,
+                    "strategy_id": s.strategy_id,
+                    "model_id": s.model_id,
+                    "feature_snapshot": features,
+                    "dispatched": s.dispatched,
+                    "dispatch_note": s.dispatch_note,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "signal_count": signals_json.len(),
+            "signals": signals_json,
+            "open_positions": positions,
+            "hint": "Correlate signals with open positions by (symbol, side, \
+                     timestamp_ms close-to). Rejected signals — dispatched=false \
+                     — explain WHY a trade did NOT open, which is often what the \
+                     user is asking when a position they expected isn't there.",
+        }))
+    }
+}
+
 pub fn register_default_tools(registry: &mut ToolRegistry) {
     registry.register(Box::new(GetAccountSnapshotTool));
     registry.register(Box::new(GetOpenPositionsTool));
@@ -1019,6 +1118,7 @@ pub fn register_default_tools(registry: &mut ToolRegistry) {
     registry.register(Box::new(LoadMemoryNoteTool));
     registry.register(Box::new(ListMemoryKeysTool));
     registry.register(Box::new(ForgetMemoryNoteTool));
+    registry.register(Box::new(ExplainRecentTradesTool));
 }
 
 #[cfg(test)]
@@ -1043,6 +1143,7 @@ mod tests {
             "load_memory_note",
             "list_memory_keys",
             "forget_memory_note",
+            "explain_recent_trades",
         ] {
             assert!(
                 rendered.contains(name),
