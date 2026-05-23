@@ -14,9 +14,14 @@ use crate::app_services::trading::TradingAdapterKind;
 
 pub use neoethos_core::broker_config::{
     BROKER_CREDENTIALS_SCHEMA_VERSION, BrokerAccountTarget, BrokerSettingsState,
-    CTRADER_CREATE_DEMO_ACCOUNT_URL, CTRADER_CREATE_LIVE_ACCOUNT_URL, CTraderBrokerEnvironment,
-    CTraderBrokerSettings, DxTradeBrokerSettings,
+    CTraderBrokerEnvironment, CTraderBrokerSettings, DxTradeBrokerSettings,
 };
+// `CTRADER_CREATE_DEMO_ACCOUNT_URL` / `CTRADER_CREATE_LIVE_ACCOUNT_URL`
+// constants live in `neoethos-core::broker_config` and were
+// previously re-exported here for the legacy egui "create demo
+// account" buttons (removed in #89). When the Flutter shell wants
+// to surface those links it can import them directly from
+// neoethos-core — no need for a pass-through re-export.
 
 /// Runtime-only flavour of "what state is the broker session in".
 /// Not persisted to disk — recomputed from credentials + live

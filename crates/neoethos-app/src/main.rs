@@ -4,6 +4,24 @@
 // console so `cargo run -- --server` still shows tracing output
 // on stdout. Linux/macOS ignore the attribute.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+//
+// `#![allow(dead_code)]` — crate-wide suppression of dead-code
+// warnings. Rationale: after the Phase-3 egui removal (#89) the
+// `app_services` tree carries ~35 helpers that USED to be called
+// by the legacy egui UI (OAuth state-machine helpers, bootstrap
+// chunk planner, order-cancel methods, the ServiceEvent variants
+// the message bus drains via Debug-formatting, etc.). Most of
+// them will be re-wired piece-by-piece as features land (Gemma
+// tool-calling, headless order management, multi-account
+// auto-trade) — they are not zombies, they are scaffolding for
+// adjacent work. Some (the ServiceEvent / OrderType / DataSource
+// enum variants) are constructed via serde from over-the-wire
+// JSON that the dead-code analysis cannot see.
+//
+// Re-evaluate this annotation after #122 (Gemma tool-calling)
+// ships — that work will pick up many of the dormant helpers and
+// the remaining ones can be deleted with confidence.
+#![allow(dead_code)]
 
 mod app_services;
 mod app_state;
