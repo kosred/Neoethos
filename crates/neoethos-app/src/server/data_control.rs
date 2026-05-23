@@ -16,8 +16,21 @@ use neoethos_core::Settings;
 use crate::app_services::broker_api::{
     download_history_blocking, fetch_broker_accounts_blocking, fetch_broker_symbols_blocking,
 };
+use crate::app_services::ctrader_errors::translate_anyhow;
 
 use super::state::AppApiState;
+
+/// Build a 502 BAD_GATEWAY response that includes the cTrader error
+/// translation (when one can be extracted) so the Flutter side can
+/// render a friendly banner + action button instead of the raw
+/// "errorCode=CH_ACCESS_TOKEN_INVALID" gibberish.
+fn broker_gateway_error(err: anyhow::Error) -> Response {
+    let mut body = serde_json::json!({"error": err.to_string()});
+    if let Some(t) = translate_anyhow(&err) {
+        body["translation"] = serde_json::to_value(&t).unwrap_or(serde_json::Value::Null);
+    }
+    (StatusCode::BAD_GATEWAY, Json(body)).into_response()
+}
 
 // ─── GET /broker/timeframes ───────────────────────────────────────────────
 
@@ -100,11 +113,7 @@ pub async fn symbols(State(state): State<AppApiState>) -> Response {
             };
             Json(dto).into_response()
         }
-        Ok(Err(err)) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": err.to_string()})),
-        )
-            .into_response(),
+        Ok(Err(err)) => broker_gateway_error(err),
         Err(join_err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -172,11 +181,7 @@ pub async fn accounts(State(_state): State<AppApiState>) -> Response {
             };
             Json(dto).into_response()
         }
-        Ok(Err(err)) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": err.to_string()})),
-        )
-            .into_response(),
+        Ok(Err(err)) => broker_gateway_error(err),
         Err(join_err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -250,11 +255,7 @@ pub async fn fetch(State(_state): State<AppApiState>, Json(body): Json<FetchBody
             written_path: outcome.written_path.display().to_string(),
         })
         .into_response(),
-        Ok(Err(err)) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": err.to_string()})),
-        )
-            .into_response(),
+        Ok(Err(err)) => broker_gateway_error(err),
         Err(join_err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({

@@ -11,6 +11,7 @@
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 
+import '../../api/error_translation.dart';
 import '../../theme/theme.dart';
 import '../../widgets/symbol_picker.dart';
 import '../_placeholder.dart';
@@ -128,17 +129,7 @@ class _EngineControlsState extends State<EngineControls> {
 
   void _showError(DioException e) {
     if (!mounted) return;
-    final body = e.response?.data;
-    final msg = (body is Map && body['error'] is String)
-        ? body['error'] as String
-        : e.message ?? e.toString();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        backgroundColor: ForexAiTokens.sell,
-        content: Text('${widget.kind}: $msg'),
-        duration: const Duration(seconds: 4),
-      ),
-    );
+    showTranslatedErrorSnackbar(context, e, prefix: widget.kind);
   }
 
   @override

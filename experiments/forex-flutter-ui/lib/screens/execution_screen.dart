@@ -15,6 +15,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../api/error_translation.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
@@ -152,19 +153,14 @@ class _ExecutionScreenState extends ConsumerState<ExecutionScreen> {
         ),
       );
     } on DioException catch (e) {
-      final body = e.response?.data;
-      final msg = (body is Map && body['error'] is String)
-          ? body['error'] as String
-          : e.message ?? e.toString();
+      // Use the structured translation when available (e.g.
+      // MARKET_CLOSED → "Markets are closed right now …") so the
+      // operator sees a human-readable reason, not the raw
+      // `code=Some("MARKET_CLOSED")` payload.
+      final msg = describeError(e);
       setState(() => _lastResult = 'Failed: $msg');
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          backgroundColor: ForexAiTokens.sell,
-          content: Text('Order failed: $msg'),
-          duration: const Duration(seconds: 8),
-        ),
-      );
+      showTranslatedErrorSnackbar(context, e, prefix: 'Order failed');
     } finally {
       if (mounted) setState(() => _busy = false);
     }

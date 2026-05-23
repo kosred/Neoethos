@@ -16,6 +16,7 @@ pub mod ctrader_account;
 pub mod ctrader_auth;
 pub mod ctrader_bootstrap;
 pub mod ctrader_data;
+pub mod ctrader_errors;
 pub mod ctrader_execution;
 pub mod ctrader_history;
 #[cfg(test)]

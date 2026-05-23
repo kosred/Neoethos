@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 
 import '../api/backend_client.dart';
+import '../api/error_translation.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
@@ -124,19 +125,10 @@ class _BodyState extends ConsumerState<_Body> {
         ),
       );
     } on DioException catch (e) {
-      final body = e.response?.data;
-      final msg = (body is Map && body['error'] is String)
-          ? body['error'] as String
-          : e.message ?? e.toString();
+      final msg = describeError(e);
       setState(() => _lastResult = 'Failed: $msg');
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          backgroundColor: ForexAiTokens.sell,
-          content: Text('Download failed: $msg'),
-          duration: const Duration(seconds: 5),
-        ),
-      );
+      showTranslatedErrorSnackbar(context, e, prefix: 'Download failed');
     } finally {
       if (mounted) setState(() => _busy = false);
     }

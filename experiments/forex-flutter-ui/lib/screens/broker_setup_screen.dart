@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
+import '../api/error_translation.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
@@ -87,17 +88,7 @@ class _BodyState extends ConsumerState<_Body> {
       );
     } on DioException catch (e) {
       if (!mounted) return;
-      final body = e.response?.data;
-      final msg = (body is Map && body['error'] is String)
-          ? body['error'] as String
-          : e.message ?? e.toString();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          backgroundColor: ForexAiTokens.sell,
-          content: Text('Re-auth failed: $msg'),
-          duration: const Duration(seconds: 6),
-        ),
-      );
+      showTranslatedErrorSnackbar(context, e, prefix: 'Re-auth failed');
     } finally {
       if (mounted) setState(() => _reauthBusy = false);
     }

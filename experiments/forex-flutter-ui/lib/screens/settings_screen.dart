@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
+import '../api/error_translation.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
@@ -123,22 +124,13 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         ),
       );
     } on DioException catch (e) {
-      final body = e.response?.data;
-      final msg = (body is Map && body['error'] is String)
-          ? body['error'] as String
-          : e.message ?? e.toString();
+      final msg = describeError(e);
       if (!mounted) return;
       setState(() {
         _resultOk = false;
         _resultMessage = msg;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          backgroundColor: ForexAiTokens.sell,
-          content: Text('Save failed: $msg'),
-          duration: const Duration(seconds: 6),
-        ),
-      );
+      showTranslatedErrorSnackbar(context, e, prefix: 'Save failed');
     } finally {
       if (mounted) setState(() => _busy = false);
     }

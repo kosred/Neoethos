@@ -11,6 +11,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../api/backend_client.dart';
+import '../api/error_translation.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
@@ -67,10 +68,7 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
         ));
       });
     } on DioException catch (e) {
-      final body = e.response?.data;
-      final msg = (body is Map && body['error'] is String)
-          ? body['error'] as String
-          : e.message ?? e.toString();
+      final msg = describeError(e);
       if (!mounted) return;
       setState(() {
         _messages.add(_Message(fromUser: false, text: 'Error: $msg'));

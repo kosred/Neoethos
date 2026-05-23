@@ -19,6 +19,7 @@ use axum::response::{IntoResponse, Response};
 use crate::app_services::broker_api::{
     OrderSide, cancel_order_blocking, close_position_blocking, submit_market_order_blocking,
 };
+use crate::app_services::ctrader_errors::translate_anyhow;
 
 use super::state::AppApiState;
 
@@ -178,11 +179,20 @@ fn outcome_to_response(
             };
             Json(dto).into_response()
         }
-        Ok(Err(err)) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": err.to_string()})),
-        )
-            .into_response(),
+        Ok(Err(err)) => {
+            // Decorate the BAD_GATEWAY with a cTrader-error translation
+            // when one can be extracted. The Flutter side renders the
+            // structured `translation` payload as a colored banner with
+            // an optional Re-authenticate / Open Settings CTA, instead
+            // of the raw "errorCode=CH_ACCESS_TOKEN_INVALID" string the
+            // operator would otherwise see.
+            let mut body = serde_json::json!({"error": err.to_string()});
+            if let Some(t) = translate_anyhow(&err) {
+                body["translation"] =
+                    serde_json::to_value(&t).unwrap_or(serde_json::Value::Null);
+            }
+            (StatusCode::BAD_GATEWAY, Json(body)).into_response()
+        }
         Err(join_err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
