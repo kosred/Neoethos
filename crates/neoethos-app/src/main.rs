@@ -78,6 +78,19 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     setup_logging(true)?;
+
+    // #101 follow-up: the help dialog must fire BEFORE the config-load
+    // step below, otherwise an orphaned double-click whose CWD lacks
+    // `config.yaml` exits silently with `windows_subsystem = "windows"`
+    // and the user never sees the explanation. Previously the call
+    // sat at line 145 — past `Settings::from_yaml` — so the original
+    // fix only covered the case where the config WAS found but the
+    // user was still surprised. Moving it up here means a config-
+    // missing path also pops the dialog first. The dialog is a
+    // no-op on non-Windows, in debug builds, and when the Flutter
+    // shell set NEOETHOS_LAUNCHED_BY_FLUTTER=1.
+    show_double_click_help_dialog_if_orphaned("http://127.0.0.1:7423");
+
     neoethos_search::install_search_runtime_overrides_from_env();
     let settings = Settings::from_yaml(&args.config)?;
     let runtime = AppRuntimeConfig::from_settings(
@@ -135,14 +148,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let _ = args.server; // keep the flag valid for back-compat.
     info!("Starting neoethos in HTTP server mode (Flutter front-end backend)...");
-
-    // Pop the help dialog BEFORE we await on serve(). The function is
-    // a no-op on non-Windows, in debug builds, and when the Flutter
-    // shell set NEOETHOS_LAUNCHED_BY_FLUTTER=1. In the orphaned-
-    // double-click path it blocks the main thread until the user
-    // clicks OK — which is fine; the dialog is the entire UI surface
-    // for that user right now.
-    show_double_click_help_dialog_if_orphaned("http://127.0.0.1:7423");
 
     let state = server::state::AppApiState::new();
     server::bridge::spawn(state.clone());
