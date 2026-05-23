@@ -198,7 +198,14 @@ pub fn credentials_file_path() -> Result<PathBuf> {
         .context("no candidate path could be resolved for broker credentials")
 }
 
-fn candidate_paths() -> Result<Vec<PathBuf>> {
+/// Every candidate path that `credentials_file_path` would try, in
+/// priority order (canonical first). Exposed (vs the previous
+/// private helper) so the neoethos-app layer can detect when more
+/// than one of these is populated and migrate the stale copies —
+/// otherwise the user re-auth'd from a different CWD and now has
+/// two files with different `account_id`s drifting against each
+/// other (#141).
+pub fn candidate_credentials_paths() -> Result<Vec<PathBuf>> {
     let mut paths = Vec::with_capacity(2);
 
     if let Some(config_dir) = dirs::config_dir() {
@@ -221,6 +228,13 @@ fn candidate_paths() -> Result<Vec<PathBuf>> {
         anyhow::bail!("unable to determine broker credentials file path on this platform");
     }
     Ok(paths)
+}
+
+/// Backwards-compat wrapper kept so other callers in the workspace
+/// that already use `candidate_paths()` keep working without a
+/// rename sweep. New code should call `candidate_credentials_paths`.
+fn candidate_paths() -> Result<Vec<PathBuf>> {
+    candidate_credentials_paths()
 }
 
 /// Read the TOML at `path` and parse it. Returns the parsed state on
