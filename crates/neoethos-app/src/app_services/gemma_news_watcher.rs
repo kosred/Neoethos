@@ -60,6 +60,24 @@ use std::time::Duration;
 #[cfg(feature = "gemma-backend")]
 const SCHEDULED_CHAT_MAX_TOKENS: u32 = 1200;
 
+/// Global broadcast channel for hot-reloading WatcherConfig (#133).
+/// `POST /settings` calls `notify_config_changed()` after persisting
+/// `config.yaml`; the watcher loop's `select!` picks up the new
+/// snapshot on the next tick (or immediately, if it was sleeping).
+///
+/// We use a `tokio::sync::watch` channel because:
+///   - The watcher only cares about the LATEST config — older
+///     pending changes are obsolete by definition.
+///   - The receiver can `borrow()` the current value without
+///     consuming it, so the loop's normal sleep-tick branch can
+///     just read it whenever it wakes.
+///   - Sender + receiver are cheap to clone via Arc.
+#[cfg(feature = "gemma-backend")]
+static CONFIG_CHANNEL: std::sync::OnceLock<(
+    tokio::sync::watch::Sender<WatcherConfig>,
+    tokio::sync::watch::Receiver<WatcherConfig>,
+)> = std::sync::OnceLock::new();
+
 /// Floor on the adaptive-poll interval — a misconfigured 1s would
 /// hammer the GPU. 5 s is the hard floor regardless of what
 /// `gemma_adaptive_poll_interval_secs` says.
@@ -150,27 +168,60 @@ pub fn spawn(
     config: WatcherConfig,
     cancel: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
+    // Seed the broadcast channel with the boot-time config. Calling
+    // this is idempotent — only the first call sets the channel; the
+    // POST /settings handler later calls `notify_config_changed` to
+    // push new snapshots.
+    let _ = CONFIG_CHANNEL.set(tokio::sync::watch::channel(config.clone()));
     tokio::spawn(async move {
         run_loop(state, config, cancel).await;
     })
 }
 
+/// Push a fresh WatcherConfig to the running loop. Called by
+/// `POST /settings` after persisting `config.yaml` so a UI toggle
+/// of `gemma_news_watcher_enabled` takes effect immediately
+/// instead of requiring a backend restart (#133).
+///
+/// No-op when the channel hasn't been initialised yet (i.e. the
+/// watcher hasn't been spawned, e.g. on an early startup error
+/// path). No-op when there are no receivers — the watch::Sender's
+/// `send_replace` swallows that case.
 #[cfg(feature = "gemma-backend")]
-async fn run_loop(state: AppApiState, config: WatcherConfig, cancel: Arc<AtomicBool>) {
-    if !config.enabled {
+pub fn notify_config_changed(new_config: WatcherConfig) {
+    if let Some((tx, _rx)) = CONFIG_CHANNEL.get() {
+        // `send_replace` returns the previous value; we discard
+        // it (the watcher reads the current via Receiver::borrow).
+        tx.send_replace(new_config);
         tracing::info!(
             target: "neoethos_app::gemma_news_watcher",
-            "watcher disabled by config — loop exiting"
+            "watcher config hot-reloaded via POST /settings"
         );
-        return;
     }
+}
+
+#[cfg(feature = "gemma-backend")]
+async fn run_loop(state: AppApiState, initial_config: WatcherConfig, cancel: Arc<AtomicBool>) {
+    // Mutable local copy so hot-reload (#133) can swap in new
+    // values mid-loop. The initial value matches what `spawn`
+    // seeded into CONFIG_CHANNEL.
+    let mut config = initial_config;
+    let mut config_rx = CONFIG_CHANNEL
+        .get()
+        .map(|(_, rx)| rx.clone());
     tracing::info!(
         target: "neoethos_app::gemma_news_watcher",
+        enabled = config.enabled,
         morning_scan = ?config.morning_scan_time,
         session_start_lead_min = config.session_start_lead_min,
         adaptive_threshold_min = config.adaptive_poll_threshold_min,
         "gemma news watcher loop starting"
     );
+
+    // No early-exit on `!config.enabled` — the loop stays alive so
+    // a hot-reload flipping the switch ON later (via #132 + #133)
+    // takes effect without a backend restart. Disabled state just
+    // skips the mode-firing work each tick.
 
     // Probe the headless-browser path at boot so the operator gets
     // a clear log line about whether the JS-rendered sources will
@@ -202,6 +253,31 @@ async fn run_loop(state: AppApiState, config: WatcherConfig, cancel: Arc<AtomicB
     let mut last_adaptive_fire: Option<std::time::Instant> = None;
 
     while !cancel.load(Ordering::Relaxed) {
+        // Skip the per-tick mode evaluation entirely while the
+        // watcher is in "disabled" state. The select! at the
+        // bottom still waits for either a sleep or a hot-reload
+        // signal, so flipping the switch ON via #132 + #133 wakes
+        // us straight into the work below.
+        if !config.enabled {
+            let tick = Duration::from_secs(WATCHER_TICK_SECS);
+            if let Some(rx) = config_rx.as_mut() {
+                tokio::select! {
+                    _ = tokio::time::sleep(tick) => {}
+                    _ = rx.changed() => {
+                        config = rx.borrow().clone();
+                        tracing::info!(
+                            target: "neoethos_app::gemma_news_watcher",
+                            enabled = config.enabled,
+                            "hot-reload while disabled — re-checking config"
+                        );
+                    }
+                }
+            } else {
+                tokio::time::sleep(tick).await;
+            }
+            continue;
+        }
+
         let now_local = Local::now();
         let now_naive = now_local.naive_local();
         let today = now_naive.date();
@@ -298,10 +374,49 @@ async fn run_loop(state: AppApiState, config: WatcherConfig, cancel: Arc<AtomicB
             }
         }
 
-        // Sleep until the next tick. Long enough not to thrash;
-        // short enough that the morning-scan HH:MM lands within
-        // at most WATCHER_TICK_SECS of accuracy.
-        tokio::time::sleep(Duration::from_secs(WATCHER_TICK_SECS)).await;
+        // Sleep until the next tick OR until the config channel
+        // fires a change. Hot-reload (#133): when POST /settings
+        // pushes a new WatcherConfig, the receiver's `changed()`
+        // resolves immediately and we re-read the snapshot.
+        // Cancel-flag check happens at the top of the loop, so a
+        // mid-sleep cancel is at most WATCHER_TICK_SECS away.
+        let tick = Duration::from_secs(WATCHER_TICK_SECS);
+        if let Some(rx) = config_rx.as_mut() {
+            tokio::select! {
+                _ = tokio::time::sleep(tick) => {}
+                _ = rx.changed() => {
+                    config = rx.borrow().clone();
+                    tracing::info!(
+                        target: "neoethos_app::gemma_news_watcher",
+                        enabled = config.enabled,
+                        morning_scan = ?config.morning_scan_time,
+                        "applied hot-reloaded config"
+                    );
+                    if !config.enabled {
+                        // Operator turned the watcher off via UI —
+                        // log + keep looping; the next iteration's
+                        // top-of-loop "disabled? sleep" branch
+                        // takes care of doing nothing useful.
+                        tracing::info!(
+                            target: "neoethos_app::gemma_news_watcher",
+                            "watcher disabled via hot-reload; entering quiet mode"
+                        );
+                    }
+                }
+            }
+        } else {
+            // No channel (defensive — should never happen in a
+            // properly spawned watcher) → fall back to simple
+            // sleep so the loop still ticks.
+            tokio::time::sleep(tick).await;
+        }
+        // If we're now disabled (either at boot or via reload),
+        // skip the rest of the loop body so we don't fire any
+        // mode. Cheaper than restructuring around an early
+        // continue at the top of every iteration.
+        if !config.enabled {
+            continue;
+        }
     }
     tracing::info!(
         target: "neoethos_app::gemma_news_watcher",
@@ -493,5 +608,38 @@ mod tests {
                 m
             );
         }
+    }
+
+    /// Verify the hot-reload channel actually broadcasts when
+    /// `notify_config_changed` is called. We use the channel
+    /// directly (not through `spawn`) to avoid needing a
+    /// AppApiState fixture.
+    #[tokio::test]
+    async fn notify_config_changed_broadcasts_to_receiver() {
+        // Seed the channel — `set` is idempotent (subsequent calls
+        // in this test fixture return Err and we ignore it).
+        let mut nc = neoethos_core::config::NewsConfig::default();
+        nc.gemma_news_watcher_enabled = false;
+        let initial = WatcherConfig::from_news_config(&nc);
+        let _ = CONFIG_CHANNEL.set(tokio::sync::watch::channel(initial));
+
+        let mut rx = CONFIG_CHANNEL
+            .get()
+            .expect("channel set")
+            .1
+            .clone();
+
+        // Push a config with enabled = true.
+        let mut nc_on = neoethos_core::config::NewsConfig::default();
+        nc_on.gemma_news_watcher_enabled = true;
+        nc_on.gemma_session_start_lead_min = 25;
+        let new_cfg = WatcherConfig::from_news_config(&nc_on);
+        notify_config_changed(new_cfg);
+
+        // Receiver should see the change.
+        rx.changed().await.expect("receiver should observe change");
+        let observed = rx.borrow().clone();
+        assert!(observed.enabled);
+        assert_eq!(observed.session_start_lead_min, 25);
     }
 }

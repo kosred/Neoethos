@@ -271,6 +271,19 @@ pub async fn update_settings(
         target: "neoethos_app::server::settings",
         "config.yaml updated via POST /settings"
     );
+
+    // #133 — push the fresh WatcherConfig to the running news
+    // watcher so a UI toggle of `gemma_news_watcher_enabled`
+    // takes effect immediately. The watcher's `select!` picks up
+    // the change on the next tick (or immediately if it was
+    // sleeping). Feature-gated — when `gemma-backend` is off
+    // the watcher doesn't exist and the call is a no-op stub.
+    #[cfg(feature = "gemma-backend")]
+    {
+        let new_watcher_cfg = crate::app_services::gemma_news_watcher::WatcherConfig::from_news_config(&settings.news);
+        crate::app_services::gemma_news_watcher::notify_config_changed(new_watcher_cfg);
+    }
+
     Json(dto_from_settings(&settings)).into_response()
 }
 
