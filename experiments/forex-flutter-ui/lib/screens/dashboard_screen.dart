@@ -7,6 +7,7 @@ import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
 import '_placeholder.dart';
+import 'widgets/growth_mode_card.dart';
 
 /// Dashboard — live numbers from the Rust HTTP server.
 ///
@@ -32,6 +33,11 @@ class DashboardScreen extends ConsumerWidget {
         ),
         if (snapshot.hasError) _ErrorBanner(error: snapshot.error!),
         _StatRow(snapshot: snapshot),
+        // Growth Mode card — surfaces the "from €100 to thousands"
+        // pitch that's the moat versus generic broker UIs. Lives
+        // right above Open Positions so it's the first non-stat
+        // panel the operator sees.
+        const GrowthModeCard(),
         SectionCard(
           title: 'Open Positions',
           child: _PositionsTable(snapshot: snapshot),
