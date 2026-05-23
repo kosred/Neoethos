@@ -5736,6 +5736,7 @@ dependencies = [
  "polars",
  "protobuf",
  "protoc-bin-vendored",
+ "quick-xml 0.36.2",
  "rand 0.9.4",
  "reqwest 0.13.3",
  "rfd",
@@ -6227,7 +6228,7 @@ dependencies = [
  "itertools 0.14.0",
  "parking_lot",
  "percent-encoding",
- "quick-xml",
+ "quick-xml 0.38.4",
  "rand 0.9.4",
  "reqwest 0.12.28",
  "ring",
@@ -7601,6 +7602,15 @@ name = "pulp-wasm-simd-flag"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40e24eee682d89fb193496edf918a7f407d30175b2e785fe057e4392dfd182e0"
+
+[[package]]
+name = "quick-xml"
+version = "0.36.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7649a7b4df05aed9ea7ec6f628c67c9953a43869b8bc50929569b2999d443fe"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "quick-xml"

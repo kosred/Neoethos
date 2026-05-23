@@ -59,6 +59,14 @@ url = "2.5"
 # the dynamic link table stays small. `bundled` avoids a system
 # libsqlite dep on Windows/macOS.
 rusqlite = { version = "0.38.0", features = ["bundled", "chrono"] }
+# quick-xml is the canonical streaming XML / RSS / Atom parser in
+# the Rust ecosystem. Used by `app_services::news_sources` to parse
+# ForexFactory's free weekly XML calendar plus the RSS feeds we
+# scrape for market headlines. `serialize` feature isn't needed —
+# we walk the event stream by hand because both FF and RSS have
+# enough structural irregularity that serde-XML round-trips don't
+# pay off.
+quick-xml = "0.36"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 toml = "0.8.20"

@@ -59,6 +59,14 @@ pub mod gemma_memory;
 pub mod gemma_news_watcher;
 #[cfg(feature = "gemma-backend")]
 pub mod gemma_tools;
+// news_sources is feature-gated alongside the gemma stack today.
+// When a non-LLM consumer lands (planned dashboard newsfeed widget,
+// headless CLI `--scan-news` mode), open this up by dropping the
+// `cfg` and the only adjustment needed is removing dead-code
+// allows that the gating currently obviates. Until then, gating
+// keeps the default build free of unused-module warnings.
+#[cfg(feature = "gemma-backend")]
+pub mod news_sources;
 pub mod risky_mode_persistence;
 pub mod secure_store;
 pub mod signal_journal;

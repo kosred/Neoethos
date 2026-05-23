@@ -251,13 +251,14 @@ async fn run_loop(state: AppApiState, config: WatcherConfig, cancel: Arc<AtomicB
 
         // ── ADAPTIVE_POLL ────────────────────────────────────
         //
-        // Wire-up of "is there a high-impact event imminent?" is a
-        // follow-up — that needs a live news-calendar source. For
-        // now this branch is a stub that logs a "not yet armed"
-        // line at info level so the loop's behaviour is auditable.
-        // When the calendar lands, flip the `false` to the real
-        // predicate.
-        let calendar_event_within_threshold = false;
+        // Predicate: "is there a high-impact event scheduled
+        // within `adaptive_poll_threshold_min` minutes?". We
+        // consult the ForexFactory aggregator (#129). The fetch
+        // is cached for 5 minutes so this loop tick doesn't
+        // re-issue the HTTP request — at WATCHER_TICK_SECS = 30
+        // we'd otherwise hammer FF twice a minute.
+        let calendar_event_within_threshold =
+            high_impact_event_imminent(config.adaptive_poll_threshold_min);
         if calendar_event_within_threshold {
             let interval = Duration::from_secs(config.adaptive_poll_interval_secs);
             let should_fire = match last_adaptive_fire {
@@ -328,6 +329,44 @@ async fn fire_mode(state: &AppApiState, mode: WatcherMode) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Predicate consulted by the ADAPTIVE_POLL branch — does the
+/// upstream calendar (#129) show any High-impact event within
+/// `threshold_min` minutes of now? Cached at the source level so
+/// calling this every WATCHER_TICK_SECS doesn't hammer FF.
+///
+/// Failures (network down, parse error, all sources disabled) are
+/// treated as "no imminent event" so the watcher degrades to its
+/// quiet baseline instead of firing the LLM on a stale guess. Each
+/// source's display name is logged on a successful hit so the
+/// audit trail tells the operator which feed flagged the event.
+fn high_impact_event_imminent(threshold_min: u32) -> bool {
+    use crate::app_services::news_sources::{NewsImpact, default_sources};
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let until_ms = now_ms + (threshold_min as i64) * 60_000;
+    let sources = default_sources();
+    for src in sources {
+        let Ok(events) = src.fetch_calendar_events() else {
+            continue;
+        };
+        if let Some(hit) = events.iter().find(|e| {
+            e.scheduled_at_unix_ms >= now_ms
+                && e.scheduled_at_unix_ms <= until_ms
+                && e.impact == NewsImpact::High
+        }) {
+            tracing::info!(
+                target: "neoethos_app::gemma_news_watcher",
+                source = src.display_name(),
+                event_title = %hit.title,
+                event_currency = %hit.currency,
+                event_ms = hit.scheduled_at_unix_ms,
+                "adaptive-poll predicate matched"
+            );
+            return true;
+        }
+    }
+    false
 }
 
 /// Mode-specific prompt templates. The model already has the

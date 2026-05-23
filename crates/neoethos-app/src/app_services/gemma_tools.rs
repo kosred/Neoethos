@@ -1106,6 +1106,232 @@ impl Tool for ExplainRecentTradesTool {
     }
 }
 
+// ─── News-aggregator tools (#129) ────────────────────────────────
+//
+// Sit on top of `app_services::news_sources` so the LLM gets
+// structured calendar events + headlines without having to
+// remember source URLs. Both tools are read-only and consult the
+// 5-min in-process cache so consecutive calls don't re-fetch.
+
+use crate::app_services::news_sources;
+
+pub struct GetUpcomingCalendarEventsTool;
+
+impl Tool for GetUpcomingCalendarEventsTool {
+    fn name(&self) -> &'static str {
+        "get_upcoming_calendar_events"
+    }
+
+    fn description(&self) -> &'static str {
+        "Returns scheduled economic-calendar events from the configured news \
+         sources (ForexFactory by default). Filters by currency list and a \
+         lookahead window so the LLM can answer 'is anything coming up for \
+         EURUSD in the next 30 min?'. Arguments: `currencies` (array of \
+         3-letter codes, e.g. [\"USD\", \"EUR\"] — empty array returns all), \
+         `lookahead_minutes` (default 60, max 1440), `min_impact` (\"low\" / \
+         \"medium\" / \"high\" — default \"medium\")."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "currencies":       {"type": "array", "items": {"type": "string"}},
+                "lookahead_minutes":{"type": "integer", "minimum": 1, "maximum": 1440},
+                "min_impact":       {"type": "string", "enum": ["low", "medium", "high"]}
+            }
+        })
+    }
+
+    fn execute(&self, state: &AppApiState, args: Value) -> Result<Value> {
+        let mut currencies: Vec<String> = args
+            .get("currencies")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.trim().to_uppercase()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // If the caller didn't supply a currency list, default to
+        // the union of currencies derived from the operator's open
+        // positions. This makes the tool "do the right thing" when
+        // the LLM asks for upcoming events without filters — it
+        // gets only the events that matter to the trade book.
+        if currencies.is_empty()
+            && let Some(snap) = state.account_blocking()
+        {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for p in &snap.positions {
+                for c in news_sources::currencies_for_symbol(&p.symbol) {
+                    if seen.insert(c.to_string()) {
+                        currencies.push(c.to_string());
+                    }
+                }
+            }
+        }
+        let lookahead_min = args
+            .get("lookahead_minutes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(60)
+            .clamp(1, 1440) as i64;
+        let min_impact = args
+            .get("min_impact")
+            .and_then(|v| v.as_str())
+            .map(news_sources::NewsImpact::parse)
+            .unwrap_or(news_sources::NewsImpact::Medium);
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let until_ms = now_ms + lookahead_min * 60_000;
+
+        let sources = news_sources::default_sources();
+        let mut all: Vec<news_sources::CalendarEvent> = Vec::new();
+        for src in sources {
+            match src.fetch_calendar_events() {
+                Ok(events) => all.extend(events),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "neoethos_app::gemma_tools::calendar",
+                        source = src.id(),
+                        error = %err,
+                        "calendar fetch failed"
+                    );
+                }
+            }
+        }
+        // Dedupe by (currency, scheduled_at, title) — same event
+        // could appear in multiple sources (FF + secondary calendar
+        // mirrors etc.).
+        let mut seen: std::collections::HashSet<(String, i64, String)> =
+            std::collections::HashSet::new();
+        all.retain(|e| seen.insert((e.currency.clone(), e.scheduled_at_unix_ms, e.title.clone())));
+        // Filter by time window + impact + currency.
+        let filtered: Vec<&news_sources::CalendarEvent> = all
+            .iter()
+            .filter(|e| e.scheduled_at_unix_ms >= now_ms && e.scheduled_at_unix_ms <= until_ms)
+            .filter(|e| e.impact.weight() >= min_impact.weight())
+            .filter(|e| currencies.is_empty() || currencies.contains(&e.currency))
+            .collect();
+        let mut sorted: Vec<&news_sources::CalendarEvent> = filtered;
+        sorted.sort_by_key(|e| e.scheduled_at_unix_ms);
+
+        let events_json: Vec<Value> = sorted
+            .iter()
+            .map(|e| {
+                json!({
+                    "currency": e.currency,
+                    "title": e.title,
+                    "scheduled_at_unix_ms": e.scheduled_at_unix_ms,
+                    "impact": e.impact.as_str(),
+                    "forecast": e.forecast,
+                    "previous": e.previous,
+                    "actual": e.actual,
+                    "source": e.source,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "now_unix_ms": now_ms,
+            "lookahead_minutes": lookahead_min,
+            "min_impact": min_impact.as_str(),
+            "event_count": events_json.len(),
+            "events": events_json,
+        }))
+    }
+}
+
+pub struct GetRecentMarketHeadlinesTool;
+
+impl Tool for GetRecentMarketHeadlinesTool {
+    fn name(&self) -> &'static str {
+        "get_recent_market_headlines"
+    }
+
+    fn description(&self) -> &'static str {
+        "Returns recent market-news headlines from the configured RSS sources \
+         (FXStreet, DailyFX, Investing.com by default). Use to scan the dominant \
+         narrative without picking which site to fetch. Arguments: `query` \
+         (optional case-insensitive substring filter, e.g. \"EUR\"), `limit` \
+         (default 25, max 100). Headlines are deduplicated by URL across \
+         sources and sorted newest-first."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100}
+            }
+        })
+    }
+
+    fn execute(&self, _state: &AppApiState, args: Value) -> Result<Value> {
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_lowercase());
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(25)
+            .clamp(1, 100) as usize;
+
+        let sources = news_sources::default_sources();
+        let mut all: Vec<news_sources::Headline> = Vec::new();
+        for src in sources {
+            match src.fetch_headlines() {
+                Ok(items) => all.extend(items),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "neoethos_app::gemma_tools::headlines",
+                        source = src.id(),
+                        error = %err,
+                        "headline fetch failed"
+                    );
+                }
+            }
+        }
+        // Dedupe by link (RSS items occasionally appear in multiple
+        // feeds with the same canonical URL).
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        all.retain(|h| {
+            if h.link.is_empty() {
+                // No link to dedupe on; keep all such items.
+                true
+            } else {
+                seen.insert(h.link.clone())
+            }
+        });
+        // Apply query filter.
+        if let Some(q) = query.as_deref() {
+            all.retain(|h| {
+                h.title.to_lowercase().contains(q) || h.summary.to_lowercase().contains(q)
+            });
+        }
+        // Sort newest first + truncate to limit.
+        all.sort_by(|a, b| b.published_at_unix_ms.cmp(&a.published_at_unix_ms));
+        all.truncate(limit);
+
+        let items_json: Vec<Value> = all
+            .iter()
+            .map(|h| {
+                json!({
+                    "title": h.title,
+                    "link": h.link,
+                    "summary": preview(&h.summary, 240),
+                    "published_at_unix_ms": h.published_at_unix_ms,
+                    "source": h.source,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "headline_count": items_json.len(),
+            "headlines": items_json,
+        }))
+    }
+}
+
 pub fn register_default_tools(registry: &mut ToolRegistry) {
     registry.register(Box::new(GetAccountSnapshotTool));
     registry.register(Box::new(GetOpenPositionsTool));
@@ -1119,6 +1345,8 @@ pub fn register_default_tools(registry: &mut ToolRegistry) {
     registry.register(Box::new(ListMemoryKeysTool));
     registry.register(Box::new(ForgetMemoryNoteTool));
     registry.register(Box::new(ExplainRecentTradesTool));
+    registry.register(Box::new(GetUpcomingCalendarEventsTool));
+    registry.register(Box::new(GetRecentMarketHeadlinesTool));
 }
 
 #[cfg(test)]
@@ -1144,6 +1372,8 @@ mod tests {
             "list_memory_keys",
             "forget_memory_note",
             "explain_recent_trades",
+            "get_upcoming_calendar_events",
+            "get_recent_market_headlines",
         ] {
             assert!(
                 rendered.contains(name),
