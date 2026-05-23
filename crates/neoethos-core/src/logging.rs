@@ -56,6 +56,23 @@ const LOG_FILE_PREFIX: &str = "neoethos";
 ///
 /// Override the log directory with the `LOG_DIR` environment variable.
 pub fn setup_logging(verbose: bool) -> anyhow::Result<()> {
+    // Switch the console to UTF-8 BEFORE any tracing macro fires.
+    // No-op on Linux/macOS (they default to UTF-8 already); on
+    // Windows this flips the active code page from CP-1252/437 to
+    // CP_UTF8 so Greek characters, the box-drawing ▶ in
+    // `format_section_block`, the ULP-tick em-dashes in error
+    // copy, etc. don't render as `?` or mojibake. Failure is
+    // non-fatal — the operator just loses Unicode in the console
+    // (the file layer is unaffected; that path writes UTF-8 bytes
+    // verbatim regardless of console code page).
+    if let Err(err) = configure_console_for_utf8() {
+        // Use eprintln rather than tracing — tracing isn't up yet.
+        eprintln!(
+            "[neoethos] non-fatal: could not configure console for UTF-8 ({err}); \
+             non-ASCII characters may render as `?` in this terminal"
+        );
+    }
+
     initialize_console_and_file_tracing(verbose)?;
     write_subsystem_record(
         SubsystemSection::System,
@@ -75,9 +92,136 @@ pub fn setup_logging(verbose: bool) -> anyhow::Result<()> {
 
 /// Setup minimal logging (console only, no files)
 pub fn setup_minimal_logging(verbose: bool) -> anyhow::Result<()> {
+    if let Err(err) = configure_console_for_utf8() {
+        eprintln!(
+            "[neoethos] non-fatal: could not configure console for UTF-8 ({err})"
+        );
+    }
     initialize_console_tracing(verbose)?;
 
     tracing::info!("Minimal logging initialized");
+    Ok(())
+}
+
+/// Show a one-shot info dialog on Windows when the binary was
+/// double-clicked directly (no Flutter shell parent).
+///
+/// Context (task #101): when an end-user double-clicks
+/// `neoethos-app.exe` from a file manager, the binary is built with
+/// `windows_subsystem = "windows"` so NO console window appears.
+/// The HTTP server starts, binds 127.0.0.1:7423, but there is no
+/// visible feedback — the user assumes it crashed silently. This
+/// helper detects "I was launched directly, not by Flutter" via the
+/// `NEOETHOS_LAUNCHED_BY_FLUTTER` env var that the Flutter shell
+/// sets when it spawns the backend, and pops a Win32 MessageBox
+/// telling the user where to find the actual NeoEthos UI.
+///
+/// Failure modes:
+/// - Non-Windows: no-op (CLI/terminal users see logs directly).
+/// - Env var present: silent (Flutter shell spawn).
+/// - Debug builds: silent (developers run from terminal; popups annoy).
+/// - MessageBoxW fails: silent (no console fallback either; the only
+///   user impact is the missing dialog).
+///
+/// Returns immediately — the dialog is shown synchronously but the
+/// HTTP server hasn't started yet, so this brief block is fine.
+pub fn show_double_click_help_dialog_if_orphaned(server_url: &str) {
+    // Skip in debug — devs run from terminal and don't need the popup.
+    if cfg!(debug_assertions) {
+        return;
+    }
+    // Skip when the Flutter shell launched us.
+    if std::env::var("NEOETHOS_LAUNCHED_BY_FLUTTER")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MessageBoxW,
+        };
+        use windows::core::PCWSTR;
+
+        // Build the body — keep it short, give the user a clear next
+        // step. The server_url ends up in `body` so power users can
+        // confirm the port matches their expectation.
+        let body = format!(
+            "NeoEthos backend is running on {server_url}.\n\n\
+             This is the BACKEND server — it has no window of its own.\n\n\
+             To use NeoEthos:\n\
+             1. Close this dialog (the backend keeps running).\n\
+             2. Launch the NeoEthos shortcut from the Start menu \
+                or Desktop. The UI will connect to this backend \
+                automatically.\n\n\
+             If you don't have a NeoEthos shortcut, reinstall NeoEthos \
+             — the installer creates one. You can stop this backend \
+             by closing it from Task Manager (neoethos-app.exe)."
+        );
+        let title = "NeoEthos backend";
+        let title_w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        let body_w: Vec<u16> = body.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: Pointers come from `Vec<u16>`s that outlive the call;
+        // MessageBoxW takes wide-string pointers and an HWND (null is
+        // valid = no owner window). Returns the user's choice; we
+        // discard it since the dialog has a single OK button.
+        unsafe {
+            MessageBoxW(
+                None,
+                PCWSTR(body_w.as_ptr()),
+                PCWSTR(title_w.as_ptr()),
+                MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = server_url;
+}
+
+/// Switch the active console to UTF-8 on Windows, no-op elsewhere.
+///
+/// Why: Windows consoles default to a legacy code page (1252 on
+/// Western installs, 437 on US-English fresh installs, 1253 on Greek
+/// locales, etc.) which mangles any UTF-8 bytes we write — Greek
+/// labels in error messages, the ▶ box-drawing chars in
+/// `format_section_block`, the em-dash separators in CLI help text.
+/// `SetConsoleOutputCP(CP_UTF8)` flips just the active console
+/// without touching system locale.
+///
+/// The fix is the same trick Python's `PYTHONUTF8=1`, Node's
+/// `chcp 65001`, and Rust's `colored` crate use under the hood. We
+/// do it once, at logging-init time, before any non-ASCII char hits
+/// stdout.
+///
+/// Failure is non-fatal: if the call fails (running headless without
+/// a real console, or under a different OS, or with stdin/stdout
+/// already redirected), we leave the console alone. The file log
+/// layer is unaffected — that writes UTF-8 bytes regardless of
+/// console code page.
+pub fn configure_console_for_utf8() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        // SAFETY: `SetConsoleOutputCP` is a thread-safe Win32 call
+        // that touches only the calling process's console. No
+        // invariants to uphold. Returns BOOL via windows-rs's
+        // `Result<()>` wrapper; an Err here means the call failed.
+        use windows::Win32::System::Console::SetConsoleOutputCP;
+        const CP_UTF8: u32 = 65001;
+        unsafe {
+            SetConsoleOutputCP(CP_UTF8).map_err(|e| {
+                anyhow::anyhow!(
+                    "SetConsoleOutputCP(CP_UTF8) failed: {e} \
+                     (no attached console, or insufficient permissions)"
+                )
+            })?;
+        }
+    }
+    // Non-Windows: every modern terminal we'd run under (xterm,
+    // gnome-terminal, kitty, alacritty, iTerm, macOS Terminal) is
+    // UTF-8 by default. Nothing to do.
+    #[cfg(not(windows))]
+    let _ = ();
     Ok(())
 }
 

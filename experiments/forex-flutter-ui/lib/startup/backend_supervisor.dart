@@ -89,6 +89,13 @@ class BackendSupervisor {
         binary.path,
         const ['--server'],
         workingDirectory: workDir.path,
+        // Tag this spawn so the Rust binary knows it was launched by
+        // the Flutter shell (and skips the "you double-clicked me by
+        // accident" help dialog from #101). Inherit the parent env
+        // so user overrides like NEOETHOS_BROKER_CREDENTIALS_PATH
+        // still flow through.
+        environment: const {'NEOETHOS_LAUNCHED_BY_FLUTTER': '1'},
+        includeParentEnvironment: true,
         mode: ProcessStartMode.detached,
       );
       _log('Spawned ${binary.path} (pid=${_child?.pid})');

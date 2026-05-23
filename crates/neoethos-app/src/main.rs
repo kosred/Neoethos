@@ -12,7 +12,9 @@ mod server;
 use app_state::AppRuntimeConfig;
 use clap::Parser;
 use neoethos_core::Settings;
-use neoethos_core::logging::{setup_logging, write_subsystem_record};
+use neoethos_core::logging::{
+    setup_logging, show_double_click_help_dialog_if_orphaned, write_subsystem_record,
+};
 use neoethos_core::sectioned_log::{SectionedRunRecord, SubsystemSection};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -133,6 +135,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let _ = args.server; // keep the flag valid for back-compat.
     info!("Starting neoethos in HTTP server mode (Flutter front-end backend)...");
+
+    // Pop the help dialog BEFORE we await on serve(). The function is
+    // a no-op on non-Windows, in debug builds, and when the Flutter
+    // shell set NEOETHOS_LAUNCHED_BY_FLUTTER=1. In the orphaned-
+    // double-click path it blocks the main thread until the user
+    // clicks OK — which is fine; the dialog is the entire UI surface
+    // for that user right now.
+    show_double_click_help_dialog_if_orphaned("http://127.0.0.1:7423");
+
     let state = server::state::AppApiState::new();
     server::bridge::spawn(state.clone());
     server::serve(state).await?;
