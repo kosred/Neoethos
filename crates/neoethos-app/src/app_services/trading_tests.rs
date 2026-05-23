@@ -340,6 +340,7 @@ fn connect_uses_ctrader_account_runtime_probe_when_session_is_restored() {
                     account_type: Some("NETTED".to_string()),
                     broker_name: Some("Demo Broker".to_string()),
                     money_digits: 2,
+                    deposit_asset_id: Some(6),
                     unrealized_pnl: 0.0,
                 },
                 reconcile: crate::app_services::ctrader_account::CTraderReconcileSnapshot {
@@ -425,6 +426,7 @@ fn execution_surface_snapshot_uses_ctrader_reconcile_runtime_when_connected() {
                     account_type: Some("NETTED".to_string()),
                     broker_name: Some("Demo Broker".to_string()),
                     money_digits: 2,
+                    deposit_asset_id: Some(6),
                     unrealized_pnl: 0.0,
                 },
                 reconcile: crate::app_services::ctrader_account::CTraderReconcileSnapshot {
@@ -549,6 +551,7 @@ fn cancel_selected_order_records_ctrader_journal_and_updates_status() {
                     account_type: Some("NETTED".to_string()),
                     broker_name: Some("Demo Broker".to_string()),
                     money_digits: 2,
+                    deposit_asset_id: Some(6),
                     unrealized_pnl: 0.0,
                 },
                 reconcile: crate::app_services::ctrader_account::CTraderReconcileSnapshot {
@@ -669,6 +672,7 @@ fn close_selected_position_surfaces_ctrader_execution_failure() {
                     account_type: Some("NETTED".to_string()),
                     broker_name: Some("Demo Broker".to_string()),
                     money_digits: 2,
+                    deposit_asset_id: Some(6),
                     unrealized_pnl: 0.0,
                 },
                 reconcile: crate::app_services::ctrader_account::CTraderReconcileSnapshot {
@@ -1103,6 +1107,7 @@ fn refresh_runtime_skips_ctrader_probe_within_refresh_window() {
                 account_type: Some("NETTED".to_string()),
                 broker_name: Some("Demo Broker".to_string()),
                 money_digits: 2,
+                deposit_asset_id: Some(6),
                 unrealized_pnl: 0.0,
             },
             reconcile: crate::app_services::ctrader_account::CTraderReconcileSnapshot {
@@ -1125,6 +1130,7 @@ fn refresh_runtime_skips_ctrader_probe_within_refresh_window() {
                 account_type: Some("NETTED".to_string()),
                 broker_name: Some("Demo Broker".to_string()),
                 money_digits: 2,
+                deposit_asset_id: Some(6),
                 unrealized_pnl: 0.0,
             },
             reconcile: crate::app_services::ctrader_account::CTraderReconcileSnapshot {

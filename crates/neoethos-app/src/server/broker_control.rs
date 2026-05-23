@@ -16,8 +16,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use crate::app_services::broker_config::{
-    BROKER_CREDENTIALS_SCHEMA_VERSION, BrokerAccountTarget, CTraderBrokerEnvironment,
-    CTraderBrokerSettings,
+    BROKER_CREDENTIALS_SCHEMA_VERSION, BrokerAccountTarget, CTRADER_OAUTH_REDIRECT_URI,
+    CTraderBrokerEnvironment, CTraderBrokerSettings,
 };
 use crate::app_services::broker_persistence::{load_broker_settings, save_broker_settings};
 use crate::app_services::reauth::run_reauth_flow_blocking;
@@ -135,7 +135,7 @@ pub async fn credentials_post(
         // of the codebase expects (port 43001). Operators rarely need
         // to change this, but the field exists for white-label setups.
         let merged_redirect_uri = if redirect_uri.is_empty() {
-            "http://127.0.0.1:43001/callback".to_string()
+            CTRADER_OAUTH_REDIRECT_URI.to_string()
         } else {
             redirect_uri
         };

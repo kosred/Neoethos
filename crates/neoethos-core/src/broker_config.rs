@@ -53,6 +53,17 @@ pub const CTRADER_CREATE_DEMO_ACCOUNT_URL: &str = "https://app.ctrader.com/accou
 /// Spotware's canonical cTrader live-account sign-up page.
 pub const CTRADER_CREATE_LIVE_ACCOUNT_URL: &str = "https://app.ctrader.com/accounts/create-live";
 
+/// OAuth redirect URI the loopback listener binds to during the
+/// cTrader consent flow. Hardcoded in 5+ sites before #150 —
+/// promoted here so a future port change doesn't drift between
+/// the listener, the CLI default, and the embedded fallback
+/// state. Format: scheme + host + port + path. Spotware echoes
+/// this string back in the consent URL, so any change here MUST
+/// be mirrored in the cTrader application portal's registered
+/// redirect-uri list — otherwise the post-consent redirect
+/// fails with `unauthorized_client`.
+pub const CTRADER_OAUTH_REDIRECT_URI: &str = "http://127.0.0.1:43001/callback";
+
 const APP_CONFIG_SUBDIR: &str = "neoethos";
 const CREDENTIALS_FILENAME: &str = "broker_credentials.toml";
 const ENV_OVERRIDE_VAR: &str = "NEOETHOS_BROKER_CREDENTIALS_PATH";

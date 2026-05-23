@@ -14,7 +14,8 @@ use crate::app_services::trading::TradingAdapterKind;
 
 pub use neoethos_core::broker_config::{
     BROKER_CREDENTIALS_SCHEMA_VERSION, BrokerAccountTarget, BrokerSettingsState,
-    CTraderBrokerEnvironment, CTraderBrokerSettings, DxTradeBrokerSettings,
+    CTRADER_OAUTH_REDIRECT_URI, CTraderBrokerEnvironment, CTraderBrokerSettings,
+    DxTradeBrokerSettings,
 };
 // `CTRADER_CREATE_DEMO_ACCOUNT_URL` / `CTRADER_CREATE_LIVE_ACCOUNT_URL`
 // constants live in `neoethos-core::broker_config` and were

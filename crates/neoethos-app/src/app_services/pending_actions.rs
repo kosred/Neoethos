@@ -131,11 +131,10 @@ impl PendingAction {
 }
 
 fn current_unix_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    // Thin wrapper around the workspace-wide helper (#152) so existing
+    // call sites in this module stay readable. The trait-level work
+    // (mockable clock) will swap the underlying impl, not these.
+    neoethos_core::utils::now_unix_ms()
 }
 
 /// Used only by `propose()` which is itself feature-gated to the

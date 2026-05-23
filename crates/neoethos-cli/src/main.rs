@@ -1536,9 +1536,11 @@ fn cmd_credentials_set(args: &[String]) -> Result<()> {
         );
     }
     if state.ctrader.redirect_uri.trim().is_empty() {
-        // Match the server's default — `http://127.0.0.1:43001/callback`
-        // is the loopback port the OAuth flow listens on.
-        state.ctrader.redirect_uri = "http://127.0.0.1:43001/callback".to_string();
+        // Sourced from neoethos-core so the listener, the CLI
+        // default, and the embedded fallback can't drift apart
+        // (#150).
+        state.ctrader.redirect_uri =
+            neoethos_core::broker_config::CTRADER_OAUTH_REDIRECT_URI.to_string();
     }
 
     neoethos_core::broker_config::save_to_disk(&path, &state)?;

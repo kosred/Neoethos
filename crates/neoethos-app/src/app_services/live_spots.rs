@@ -23,10 +23,10 @@
 //! contention is dominated by the writes; no need for a more
 //! sophisticated structure (DashMap, sharded locks) yet.
 
+use neoethos_core::utils::now_unix_ms;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One row in the cache. Mirrors enough of
 /// `CTraderLiveChartUpdate` for the UI's needs without dragging
@@ -83,10 +83,7 @@ pub fn update_tick(
     ask: Option<f64>,
     broker_timestamp_ms: Option<i64>,
 ) {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
+    let now_ms = now_unix_ms();
     let tick = SpotTick {
         symbol_id,
         symbol_name: symbol_name.into(),
