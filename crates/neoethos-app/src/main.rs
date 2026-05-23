@@ -147,6 +147,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = server::state::AppApiState::new();
     server::bridge::spawn(state.clone());
 
+    // Hydrate the in-memory signal journal (#127, #131) from disk
+    // so explain_recent_trades can narrate signals that fired in
+    // earlier sessions. Logs the row count at info; first-launch
+    // is a clean zero.
+    let restored = app_services::signal_journal::restore_from_disk();
+    info!(
+        target: "neoethos_app::main",
+        restored,
+        "signal journal hydrated"
+    );
+
     // Spawn the Gemma news watcher (#128). The task is a no-op
     // when `news.gemma_news_watcher_enabled = false` — the loop
     // exits immediately. Behind the gemma-backend feature so the
