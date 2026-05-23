@@ -33,6 +33,7 @@ pub mod chart;
 pub mod data_control;
 pub mod engines_control;
 pub mod gemma;
+pub mod gemma_download;
 pub mod hardware;
 pub mod health;
 pub mod intelligence;
@@ -100,6 +101,9 @@ pub fn router(state: AppApiState) -> Router {
         .route("/gemma/status", get(gemma::status))
         .route("/gemma/chat", post(gemma::chat))
         .route("/gemma/news", post(gemma::news))
+        .route("/gemma/download", post(gemma_download::start))
+        .route("/gemma/download/status", get(gemma_download::status))
+        .route("/gemma/download/cancel", post(gemma_download::cancel))
         .route("/intelligence", get(intelligence::intelligence))
         .route("/chart", get(chart::chart))
         .layer(TraceLayer::new_for_http())

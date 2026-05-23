@@ -317,6 +317,37 @@ class BackendClient {
     return GemmaStatusSnapshot.fromJson(response.data!);
   }
 
+  /// POST `/gemma/download` — start the background fetch of the
+  /// bundled GGUF from HuggingFace into the user-data-dir. Used by
+  /// the AI Helper screen's first-launch downloader as a fallback
+  /// for when the NSIS install-time download was skipped or failed.
+  /// 409 if a download is already in flight.
+  Future<Map<String, dynamic>> startGemmaDownload() async {
+    final r = await _dio.post<Map<String, dynamic>>(
+      '/gemma/download',
+      options: Options(
+        // 409 (Conflict) is "already running" — let the UI treat it
+        // as a no-op success and just poll status.
+        validateStatus: (code) =>
+            code != null && ((code >= 200 && code < 300) || code == 409),
+      ),
+    );
+    return r.data ?? const <String, dynamic>{};
+  }
+
+  /// GET `/gemma/download/status` — polled by the AI Helper screen
+  /// while the download is in flight so the progress bar can update.
+  Future<GemmaDownloadStatus> fetchGemmaDownloadStatus() async {
+    final r = await _dio.get<Map<String, dynamic>>('/gemma/download/status');
+    return GemmaDownloadStatus.fromJson(r.data ?? const {});
+  }
+
+  /// POST `/gemma/download/cancel` — abort the in-flight download.
+  Future<Map<String, dynamic>> cancelGemmaDownload() async {
+    final r = await _dio.post<Map<String, dynamic>>('/gemma/download/cancel');
+    return r.data ?? const <String, dynamic>{};
+  }
+
   /// POST `/gemma/chat` — local Gemma-4 inference. 503 if the runtime
   /// or the model file is missing — the response body explains how to
   /// fix it.
@@ -810,6 +841,51 @@ class GemmaStatusSnapshot {
         message: (j['message'] as String?) ?? '',
       );
   bool get ready => runtimeCompiledIn && modelFilePresent;
+}
+
+/// Wire shape for the /gemma/download/status poll. Five state values:
+///   - `idle`         — nothing has been started this session
+///   - `downloading`  — bytes are flowing; UI shows progress bar
+///   - `completed`    — file is on disk, AI Helper will flip to chat
+///   - `failed`       — network/server error; UI surfaces `error`
+///   - `cancelled`    — user clicked Cancel mid-flight
+class GemmaDownloadStatus {
+  final String state;
+  final int bytesDone;
+  final int bytesTotal;
+  final int elapsedSeconds;
+  final String? writtenPath;
+  final String? error;
+  const GemmaDownloadStatus({
+    required this.state,
+    required this.bytesDone,
+    required this.bytesTotal,
+    required this.elapsedSeconds,
+    required this.writtenPath,
+    required this.error,
+  });
+  factory GemmaDownloadStatus.fromJson(Map<String, dynamic> j) =>
+      GemmaDownloadStatus(
+        state: (j['state'] as String?) ?? 'idle',
+        bytesDone: (j['bytesDone'] as num?)?.toInt() ?? 0,
+        bytesTotal: (j['bytesTotal'] as num?)?.toInt() ?? 0,
+        elapsedSeconds: (j['elapsedSeconds'] as num?)?.toInt() ?? 0,
+        writtenPath: j['writtenPath'] as String?,
+        error: j['error'] as String?,
+      );
+
+  bool get isDownloading => state == 'downloading';
+  bool get isCompleted => state == 'completed';
+  bool get isFailed => state == 'failed';
+  bool get isCancelled => state == 'cancelled';
+
+  /// 0.0–1.0 normalised fraction for the progress bar. Returns null
+  /// when total isn't known yet (server hasn't replied with content-
+  /// length) so the UI can render an indeterminate spinner.
+  double? get fraction {
+    if (bytesTotal <= 0) return null;
+    return (bytesDone / bytesTotal).clamp(0.0, 1.0);
+  }
 }
 
 class GemmaChatResponse {

@@ -99,6 +99,25 @@ final gemmaStatusProvider =
   return client.fetchGemmaStatus();
 });
 
+/// `/gemma/download/status` — drives the AI Helper screen's
+/// progress bar while the GGUF is being fetched. Self-invalidates
+/// every second while state == "downloading" so the bar advances
+/// in real time; goes quiet once the download terminates
+/// (completed / failed / cancelled / idle) so we don't keep
+/// hammering the endpoint pointlessly.
+final gemmaDownloadStatusProvider =
+    FutureProvider.autoDispose<GemmaDownloadStatus>((ref) async {
+  final client = ref.read(backendClientProvider);
+  final snapshot = await client.fetchGemmaDownloadStatus();
+  if (snapshot.isDownloading) {
+    final timer = Timer(const Duration(seconds: 1), () {
+      ref.invalidateSelf();
+    });
+    ref.onDispose(timer.cancel);
+  }
+  return snapshot;
+});
+
 /// `/broker/timeframes` — canonical cTrader-supported timeframe list,
 /// sourced from neoethos_core::CANONICAL_TIMEFRAMES on the server.
 /// Tiny (11 strings) and immutable for the life of the binary, so we

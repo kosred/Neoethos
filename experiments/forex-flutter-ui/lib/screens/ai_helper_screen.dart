@@ -115,49 +115,44 @@ class _AiHelperScreenState extends ConsumerState<AiHelperScreen> {
   }
 
   Widget _installUi(GemmaStatusSnapshot s) {
-    return SectionCard(
-      title: 'Gemma 4 not ready',
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            s.message,
-            style: const TextStyle(
-              fontSize: 12,
-              color: ForexAiTokens.warning,
+    // Two distinct branches:
+    //  * Runtime NOT compiled in: user needs to rebuild the backend
+    //    with the gemma-backend feature flag. We can't help with that
+    //    from inside the running app — just show the cargo line.
+    //  * Runtime compiled in, model missing: we CAN help. Show the
+    //    download button + progress, calling /gemma/download under
+    //    the hood. This is the first-launch fallback when the NSIS
+    //    install-time fetch was skipped or interrupted.
+    if (!s.runtimeCompiledIn) {
+      return SectionCard(
+        title: 'Gemma 4 runtime not compiled in',
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              s.message,
+              style: const TextStyle(
+                fontSize: 12,
+                color: ForexAiTokens.warning,
+              ),
             ),
-          ),
-          const SizedBox(height: 12),
-          if (!s.runtimeCompiledIn)
+            const SizedBox(height: 12),
             const _Kv(
               k: 'Rebuild',
               v: 'cargo build -p neoethos-app --release --features gemma-backend',
             ),
-          if (s.runtimeCompiledIn && !s.modelFilePresent) ...[
-            const _Kv(k: 'Download URL', v: ''),
-            SelectableText(
-              s.downloadUrl,
-              style: const TextStyle(
-                fontSize: 11,
-                color: ForexAiTokens.accent,
-              ),
-            ),
-            const SizedBox(height: 6),
-            _Kv(k: 'Save as', v: 'resources/models/${s.expectedFilename}'),
-            _Kv(
-              k: 'Expected size',
-              v: '≈${(s.expectedSizeBytes / 1024 / 1024 / 1024).toStringAsFixed(1)} GB',
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: () => ref.invalidate(gemmaStatusProvider),
+              icon: const Icon(Icons.refresh, size: 16),
+              label: const Text('Re-check status'),
             ),
           ],
-          const SizedBox(height: 8),
-          OutlinedButton.icon(
-            onPressed: () => ref.invalidate(gemmaStatusProvider),
-            icon: const Icon(Icons.refresh, size: 16),
-            label: const Text('Re-check status'),
-          ),
-        ],
-      ),
-    );
+        ),
+      );
+    }
+    // Runtime is compiled in — show the live downloader.
+    return _GemmaDownloader(status: s);
   }
 
   Widget _chatUi(GemmaStatusSnapshot s) {
@@ -334,6 +329,254 @@ class _MessageBubble extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+/// First-launch downloader card. Shown by AI Helper when the Gemma
+/// runtime is compiled in but the GGUF file is missing — typically
+/// the case after a Lite-SKU install where the NSIS install-time
+/// fetch was skipped or interrupted. Hits the new POST /gemma/download
+/// endpoint and renders live progress via gemmaDownloadStatusProvider.
+class _GemmaDownloader extends ConsumerStatefulWidget {
+  final GemmaStatusSnapshot status;
+  const _GemmaDownloader({required this.status});
+
+  @override
+  ConsumerState<_GemmaDownloader> createState() => _GemmaDownloaderState();
+}
+
+class _GemmaDownloaderState extends ConsumerState<_GemmaDownloader> {
+  bool _starting = false;
+
+  Future<void> _start() async {
+    setState(() => _starting = true);
+    try {
+      await ref.read(backendClientProvider).startGemmaDownload();
+      // Force an immediate status refresh so the UI flips from
+      // "Start Download" to the progress bar without waiting for
+      // the next poll tick.
+      ref.invalidate(gemmaDownloadStatusProvider);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: ForexAiTokens.sell,
+          content: Text('Download start failed: $e'),
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _starting = false);
+    }
+  }
+
+  Future<void> _cancel() async {
+    try {
+      await ref.read(backendClientProvider).cancelGemmaDownload();
+      ref.invalidate(gemmaDownloadStatusProvider);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: ForexAiTokens.sell,
+          content: Text('Cancel failed: $e'),
+        ),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = widget.status;
+    final dlAsync = ref.watch(gemmaDownloadStatusProvider);
+    final approxGiB = (s.expectedSizeBytes / (1024 * 1024 * 1024)).toStringAsFixed(1);
+
+    return SectionCard(
+      title: 'Gemma 4 model not on disk',
+      child: dlAsync.when(
+        data: (dl) {
+          if (dl.isDownloading) return _progressView(dl);
+          if (dl.isCompleted) return _completedView(dl);
+          if (dl.isFailed) return _failedView(dl, approxGiB);
+          if (dl.isCancelled) return _cancelledView(approxGiB);
+          // idle — show the start button
+          return _startView(approxGiB, s);
+        },
+        loading: () => const Padding(
+          padding: EdgeInsets.symmetric(vertical: 16),
+          child: Text(
+            'Checking download status…',
+            style: TextStyle(fontSize: 12, color: ForexAiTokens.textMuted),
+          ),
+        ),
+        error: (err, _) => _startView(approxGiB, s),
+      ),
+    );
+  }
+
+  Widget _startView(String approxGiB, GemmaStatusSnapshot s) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'The AI Helper + News features need the local Gemma 4 model. '
+          'Click below to fetch it (~$approxGiB GiB) from HuggingFace. '
+          'The download runs in the background; you can keep using the '
+          'rest of NeoEthos while it finishes.',
+          style: const TextStyle(
+            fontSize: 12,
+            color: ForexAiTokens.textPrimary,
+          ),
+        ),
+        const SizedBox(height: 8),
+        _Kv(k: 'File', v: s.expectedFilename),
+        _Kv(k: 'Size', v: '≈ $approxGiB GiB'),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            FilledButton.icon(
+              onPressed: _starting ? null : _start,
+              icon: _starting
+                  ? const SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.cloud_download, size: 16),
+              label: Text(_starting ? 'Starting…' : 'Download Gemma 4'),
+            ),
+            const SizedBox(width: 8),
+            OutlinedButton.icon(
+              onPressed: () => ref.invalidate(gemmaStatusProvider),
+              icon: const Icon(Icons.refresh, size: 16),
+              label: const Text('Re-check status'),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _progressView(GemmaDownloadStatus dl) {
+    final mb = (dl.bytesDone / (1024 * 1024)).toStringAsFixed(1);
+    final totalMb = dl.bytesTotal > 0
+        ? (dl.bytesTotal / (1024 * 1024)).toStringAsFixed(1)
+        : '?';
+    final percent = dl.fraction == null
+        ? '—'
+        : '${(dl.fraction! * 100).toStringAsFixed(1)} %';
+    final mins = (dl.elapsedSeconds ~/ 60).toString().padLeft(2, '0');
+    final secs = (dl.elapsedSeconds % 60).toString().padLeft(2, '0');
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'Downloading the Gemma 4 GGUF from HuggingFace.',
+          style: const TextStyle(fontSize: 12, color: ForexAiTokens.textPrimary),
+        ),
+        const SizedBox(height: 10),
+        LinearProgressIndicator(
+          value: dl.fraction,
+          minHeight: 6,
+          backgroundColor: ForexAiTokens.border,
+        ),
+        const SizedBox(height: 8),
+        Text(
+          '$mb / $totalMb MB · $percent · elapsed $mins:$secs',
+          style: const TextStyle(fontSize: 11, color: ForexAiTokens.textMuted),
+        ),
+        const SizedBox(height: 12),
+        OutlinedButton.icon(
+          onPressed: _cancel,
+          icon: const Icon(Icons.cancel_outlined, size: 16),
+          label: const Text('Cancel download'),
+        ),
+      ],
+    );
+  }
+
+  Widget _completedView(GemmaDownloadStatus dl) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            const Icon(Icons.check_circle, size: 18, color: ForexAiTokens.buy),
+            const SizedBox(width: 6),
+            const Text(
+              'Download complete',
+              style: TextStyle(
+                fontWeight: FontWeight.w700,
+                color: ForexAiTokens.buy,
+              ),
+            ),
+          ],
+        ),
+        if (dl.writtenPath != null) ...[
+          const SizedBox(height: 6),
+          SelectableText(
+            dl.writtenPath!,
+            style: const TextStyle(fontSize: 10, color: ForexAiTokens.textMuted),
+          ),
+        ],
+        const SizedBox(height: 10),
+        FilledButton.icon(
+          onPressed: () {
+            ref.invalidate(gemmaStatusProvider);
+            ref.invalidate(gemmaDownloadStatusProvider);
+          },
+          icon: const Icon(Icons.refresh, size: 16),
+          label: const Text('Reload AI Helper'),
+        ),
+      ],
+    );
+  }
+
+  Widget _failedView(GemmaDownloadStatus dl, String approxGiB) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'Download failed: ${dl.error ?? "unknown error"}',
+          style: const TextStyle(color: ForexAiTokens.sell, fontSize: 12),
+        ),
+        const SizedBox(height: 10),
+        Row(
+          children: [
+            FilledButton.icon(
+              onPressed: _starting ? null : _start,
+              icon: const Icon(Icons.refresh, size: 16),
+              label: const Text('Retry'),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              '($approxGiB GiB)',
+              style: const TextStyle(
+                fontSize: 11,
+                color: ForexAiTokens.textMuted,
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _cancelledView(String approxGiB) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'Download cancelled. The partial file has been cleaned up.',
+          style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
+        ),
+        const SizedBox(height: 10),
+        FilledButton.icon(
+          onPressed: _starting ? null : _start,
+          icon: const Icon(Icons.cloud_download, size: 16),
+          label: Text('Restart download ($approxGiB GiB)'),
+        ),
+      ],
     );
   }
 }
