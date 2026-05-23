@@ -93,6 +93,42 @@ New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 Write-Host "Copying neoethos-app.exe from $rustExe into bin/"
 Copy-Item -Path $rustExe -Destination $binDir
 
+# 4a. Operator-confusion guard. The `bin/` folder ships a clear
+#     "do not run" marker AND has the Hidden + System attributes set
+#     so File Explorer hides it by default. Real-world report: even
+#     the project owner double-clicked the backend exe by accident
+#     and saw the binary "die silently" because cwd lacks config.yaml.
+#     The Win32 help dialog in `show_double_click_help_dialog_if_orphaned`
+#     catches the curious user who still drills in; this attribute +
+#     README catches the casual user before they even see the file.
+$donotRunPath = Join-Path $binDir 'DO-NOT-RUN.txt'
+@'
+⚠️  DO NOT RUN ANY .EXE IN THIS FOLDER  ⚠️
+
+This folder contains the NeoEthos BACKEND SERVER.
+It is meant to be auto-started by the NeoEthos app, NOT clicked directly.
+
+WHAT TO DO:
+→ Go back one folder up to "NeoEthos\"
+→ Double-click "NeoEthos.exe" (250 KB, the small one with the icon)
+→ The app will auto-start everything in this folder for you
+
+If you double-click "neoethos-app.exe" directly:
+- No window appears (the backend has no UI of its own)
+- The backend tries to start but has no config in this dir
+- You see "nothing happens" — but the process either errored out
+  silently or is running invisibly on port 7423
+
+This folder is normally HIDDEN from File Explorer.
+You're only seeing it because "Show hidden files" is enabled.
+'@ | Set-Content -Path $donotRunPath -Encoding UTF8
+
+# Set Hidden + System attribute so default File Explorer settings
+# don't show this folder at all. The operator only sees NeoEthos.exe
+# + config.yaml + assets/ at the bundle root.
+(Get-Item $binDir -Force).Attributes = 'Hidden, System, Directory'
+Write-Host "Marked bin/ as Hidden+System; dropped DO-NOT-RUN.txt marker."
+
 # 5. Copy config.yaml + branding. config.yaml is what the backend
 #    loads as `Settings::from_yaml("config.yaml")` from its CWD;
 #    BackendSupervisor pins the CWD to the dir that contains it.
