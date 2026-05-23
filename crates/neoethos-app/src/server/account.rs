@@ -39,6 +39,15 @@ pub struct AccountSnapshotDto {
     pub free_margin: f64,
     pub used_margin: f64,
     pub currency: String,
+    /// Server-side wall-clock (Unix milliseconds, UTC) for when
+    /// this snapshot was assembled. The Flutter Dashboard renders
+    /// "as of HH:MM:SS" in the user's local timezone next to the
+    /// balance number so the operator can tell at a glance whether
+    /// the displayed equity is fresh or carried over from a stale
+    /// poll. Optional only because the DTO predates this field — a
+    /// missing value renders as "—" and triggers the staleness
+    /// banner.
+    pub fetched_at_unix_ms: Option<i64>,
     pub positions: Vec<PositionDto>,
 }
 
@@ -55,6 +64,11 @@ pub struct PositionDto {
     pub symbol: String,
     pub side: String,
     pub volume: f64,
+    /// Unix-ms timestamp of the position open fill (UTC). Flutter
+    /// converts to local time for the "since HH:MM" badge in the
+    /// position row. None when cTrader didn't include a stamp in
+    /// the reconcile payload (rare race window).
+    pub open_timestamp_ms: Option<i64>,
     pub pnl_pips: f64,
     pub pnl_usd: f64,
 }
@@ -67,6 +81,7 @@ impl From<crate::server::state::PositionPayload> for PositionDto {
             symbol: p.symbol,
             side: p.side,
             volume: p.volume,
+            open_timestamp_ms: p.open_timestamp_ms,
             pnl_pips: p.pnl_pips,
             pnl_usd: p.pnl_usd,
         }
@@ -81,6 +96,7 @@ impl From<AccountSnapshotPayload> for AccountSnapshotDto {
             free_margin: p.free_margin,
             used_margin: p.used_margin,
             currency: p.currency,
+            fetched_at_unix_ms: Some(p.fetched_at_unix_ms),
             positions: p.positions.into_iter().map(Into::into).collect(),
         }
     }
@@ -114,12 +130,14 @@ mod tests {
             free_margin: 9_750.0,
             used_margin: 250.0,
             currency: "EUR".to_string(),
+            fetched_at_unix_ms: 0,
             positions: vec![PositionPayload {
                 position_id: 0,
                 volume_units: 0,
                 symbol: "EURUSD".to_string(),
                 side: "LONG".to_string(),
                 volume: 0.10,
+                open_timestamp_ms: None,
                 pnl_pips: 12.5,
                 pnl_usd: 11.30,
             }],

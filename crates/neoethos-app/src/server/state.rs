@@ -25,16 +25,24 @@ use crate::server::engines_control::EngineRunState;
 /// instead of in `account.rs` so other routes can read account state
 /// without a circular dep.
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AccountSnapshotPayload {
     pub balance: f64,
     pub equity: f64,
     pub free_margin: f64,
     pub used_margin: f64,
     pub currency: String,
+    /// Server-side wall-clock when this snapshot was assembled
+    /// (Unix milliseconds, UTC). Flutter converts to local time
+    /// for the "as of HH:MM:SS" badge on the Dashboard so the
+    /// operator always knows whether the displayed numbers are
+    /// fresh or stale.
+    pub fetched_at_unix_ms: i64,
     pub positions: Vec<PositionPayload>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PositionPayload {
     pub position_id: i64,
     /// Broker volume in centi-lots (what `POST /positions/close`
@@ -44,6 +52,11 @@ pub struct PositionPayload {
     pub symbol: String,
     pub side: String,
     pub volume: f64,
+    /// Position open time as Unix milliseconds (UTC). Flutter
+    /// converts to local time for the "Open since HH:MM" badge in
+    /// the position row. `None` when cTrader didn't include it
+    /// (unusual but possible mid-fill).
+    pub open_timestamp_ms: Option<i64>,
     pub pnl_pips: f64,
     pub pnl_usd: f64,
 }

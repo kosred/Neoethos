@@ -25,6 +25,11 @@ class Position {
   final String symbol;
   final String side;
   final double volume;
+  /// Position open time as Unix milliseconds (UTC). Convert with
+  /// `DateTime.fromMillisecondsSinceEpoch(openTimestampMs!)` for
+  /// the local-time "since HH:MM" badge in the position row.
+  /// Null when the broker didn't stamp the fill (rare race).
+  final int? openTimestampMs;
   final double pnlPips;
   final double pnlUsd;
   const Position({
@@ -33,6 +38,7 @@ class Position {
     required this.symbol,
     required this.side,
     required this.volume,
+    required this.openTimestampMs,
     required this.pnlPips,
     required this.pnlUsd,
   });
@@ -43,6 +49,7 @@ class Position {
         symbol: j['symbol'] as String,
         side: j['side'] as String,
         volume: (j['volume'] as num).toDouble(),
+        openTimestampMs: (j['openTimestampMs'] as num?)?.toInt(),
         pnlPips: (j['pnlPips'] as num).toDouble(),
         pnlUsd: (j['pnlUsd'] as num).toDouble(),
       );
@@ -54,6 +61,11 @@ class AccountSnapshot {
   final double freeMargin;
   final double usedMargin;
   final String currency;
+  /// Unix-ms (UTC) when the snapshot was assembled server-side.
+  /// Use `DateTime.fromMillisecondsSinceEpoch(fetchedAtUnixMs!)`
+  /// for the local-time freshness badge on the Dashboard. Null
+  /// only on older servers that predate the field.
+  final int? fetchedAtUnixMs;
   final List<Position> positions;
   const AccountSnapshot({
     required this.balance,
@@ -61,6 +73,7 @@ class AccountSnapshot {
     required this.freeMargin,
     required this.usedMargin,
     required this.currency,
+    required this.fetchedAtUnixMs,
     required this.positions,
   });
 
@@ -70,6 +83,7 @@ class AccountSnapshot {
         freeMargin: (j['freeMargin'] as num).toDouble(),
         usedMargin: (j['usedMargin'] as num).toDouble(),
         currency: j['currency'] as String,
+        fetchedAtUnixMs: (j['fetchedAtUnixMs'] as num?)?.toInt(),
         positions: ((j['positions'] as List?) ?? const [])
             .map((p) => Position.fromJson(p as Map<String, dynamic>))
             .toList(growable: false),

@@ -89,18 +89,44 @@ class _StatRow extends StatelessWidget {
                 ? ForexAiTokens.sell
                 : null;
 
-    return GridView.count(
-      crossAxisCount: 4,
-      crossAxisSpacing: 8,
-      mainAxisSpacing: 8,
-      childAspectRatio: 3.2,
-      shrinkWrap: true,
-      physics: const NeverScrollableScrollPhysics(),
+    // Freshness badge — local time of the last successful refresh.
+    // Mirrors what the server stamped into the snapshot; we localise
+    // here so each user sees their wall-clock, not UTC. Hidden until
+    // the first snapshot lands.
+    final asOf = data?.fetchedAtUnixMs == null
+        ? null
+        : DateTime.fromMillisecondsSinceEpoch(data!.fetchedAtUnixMs!).toLocal();
+    final asOfLabel = asOf == null
+        ? null
+        : 'As of ${DateFormat('HH:mm:ss').format(asOf)} local';
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        StatCard(label: 'Balance', value: balance),
-        StatCard(label: 'Equity', value: equity, valueColor: equityColor),
-        StatCard(label: 'Free Margin', value: freeMargin),
-        StatCard(label: 'Open Positions', value: openCount),
+        GridView.count(
+          crossAxisCount: 4,
+          crossAxisSpacing: 8,
+          mainAxisSpacing: 8,
+          childAspectRatio: 3.2,
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          children: [
+            StatCard(label: 'Balance', value: balance),
+            StatCard(label: 'Equity', value: equity, valueColor: equityColor),
+            StatCard(label: 'Free Margin', value: freeMargin),
+            StatCard(label: 'Open Positions', value: openCount),
+          ],
+        ),
+        if (asOfLabel != null) ...[
+          const SizedBox(height: 4),
+          Text(
+            asOfLabel,
+            style: const TextStyle(
+              fontSize: 10,
+              color: ForexAiTokens.textFaint,
+            ),
+          ),
+        ],
       ],
     );
   }
@@ -126,6 +152,15 @@ class _PositionsTable extends StatelessWidget {
     final pipFmt = NumberFormat('+#,##0.0;-#,##0.0', 'en_US');
     final usdFmt = NumberFormat.currency(symbol: r'$', decimalDigits: 2);
 
+    // "Since" formatter — converts UTC openTimestampMs into local
+    // wall-clock. Falls back to "—" when the broker didn't stamp the
+    // fill yet (rare race). Short HH:mm format saves table real estate.
+    final sinceFmt = DateFormat('HH:mm');
+    String sinceLabel(int? ms) {
+      if (ms == null) return '—';
+      return sinceFmt.format(DateTime.fromMillisecondsSinceEpoch(ms).toLocal());
+    }
+
     return Table(
       defaultVerticalAlignment: TableCellVerticalAlignment.middle,
       columnWidths: const {
@@ -134,12 +169,14 @@ class _PositionsTable extends StatelessWidget {
         2: FlexColumnWidth(2),
         3: FlexColumnWidth(2),
         4: FlexColumnWidth(2),
+        5: FlexColumnWidth(2),
       },
       children: [
         const TableRow(children: [
           _Th('Symbol'),
           _Th('Side'),
           _Th('Volume'),
+          _Th('Since'),
           _Th('Pips'),
           _Th('PnL'),
         ]),
@@ -153,6 +190,7 @@ class _PositionsTable extends StatelessWidget {
                   : ForexAiTokens.sell,
             ),
             _Td(p.volume.toStringAsFixed(2)),
+            _Td(sinceLabel(p.openTimestampMs)),
             _Td('${pipFmt.format(p.pnlPips)} pips'),
             _Td(
               usdFmt.format(p.pnlUsd),

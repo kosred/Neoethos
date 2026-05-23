@@ -252,6 +252,12 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
         // which surfaced as a wrong currency badge on the Flutter
         // dashboard — fixed here.
         currency: "EUR".to_string(),
+        // Wall-clock at the moment we finished assembling this
+        // snapshot. The Flutter Dashboard converts to local time
+        // for the "as of HH:MM:SS" freshness badge so the
+        // operator can tell at a glance whether the numbers are
+        // live or carried over from a stale cycle.
+        fetched_at_unix_ms: chrono::Utc::now().timestamp_millis(),
         positions,
     })
 }
@@ -279,6 +285,13 @@ fn position_to_payload(
         symbol: resolved_name.unwrap_or_else(|| format!("sym#{}", p.symbol_id)),
         side: p.trade_side.clone(),
         volume: p.volume,
+        // Server-side timestamp from the cTrader fill event. Flutter
+        // converts to local time for the "Open since HH:MM" badge in
+        // the position row. None on the rare cTrader payload where
+        // the fill happened literally microseconds before we polled
+        // and the broker hadn't stamped it yet — UI shows "—" in
+        // that case rather than guessing.
+        open_timestamp_ms: p.open_timestamp_ms,
         // cTrader's mark-to-market pip and USD PnL are derived
         // server-side from the position's open price + the latest
         // spot — we don't have the spot stream here. Report 0 for
