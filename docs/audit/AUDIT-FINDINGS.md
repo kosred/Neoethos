@@ -1020,10 +1020,50 @@ This is the **canonical SL/TP-faithful GPU evaluator** the doc-comment in `disco
 
 ---
 
+## hpc_gpu_discovery.rs — `crates/neoethos-search/src/hpc_gpu_discovery.rs` (894 lines, **COMPLETE**)
+
+Implements an **Island Model GA** that wraps `discovery_gpu.rs`'s evaluator for 8×A6000 setups with NVLink migration. The Island wrapper is legitimate (multi-GPU coordination is genuinely different work), but the GA loop + utilities are COPY-PASTED from `discovery_gpu.rs` rather than imported.
+
+### F-085 (CRITICAL) — Third copy of the same GA loop + same synthetic-data violations
+- **Location**: `hpc_gpu_discovery.rs:351-457` (GA evolve), `591-717` (chunk evaluator), `720-876` (helpers)
+- **What**: this file duplicates from `discovery_gpu.rs`:
+  - **Lines 351-457** `Island::evolve_generation` ≈ `discovery_gpu.rs:506-554` (mutate/crossover/immigrant logic)
+  - **Lines 591-717** `evaluate_chunk_hpc` ≈ `discovery_gpu.rs:717-845` (`evaluate_population_gpu`) — same kernel logic, same magic constants
+  - **Lines 659** hardcoded `0.0002` cost — SAME synthetic-data violation as F-074
+  - **Lines 693** hardcoded `1440` M1-bars/day — SAME timeframe-bias as F-073
+  - **Lines 699-701** `sortino * 10.0 + consistency * 5.0` — SAME scoring formula as F-075 (the FIFTH/SIXTH copy)
+  - **Lines 720-876** `build_data_cube_hpc`, `build_ohlc_cube_hpc`, `build_segments_hpc`, `shift_down_hpc`, `causal_zscore_hpc`, `mean_vector`, `std_vector` — literal copy-paste with `_hpc` suffix
+- **Why it matters**:
+  1. THIRD copy of the GA loop (after discovery_gpu.rs file + lib.rs inline twin). Now ~2800+ LOC of cfg-conditional GA twin code.
+  2. Same synthetic 0.0002 cost — operator directive 2026-05-24 ban applies here too.
+  3. Same M1-bars-per-day bias on H1/H4/D1 data.
+  4. Maintainers must apply every fix in 3 places.
+- **Fix**: tracked under F-070 unification. Extract:
+  - `discovery_gpu/ga_loop.rs` — single shared GA loop with `BackendFn` trait for the evaluator
+  - `discovery_gpu/island.rs` — only the NVLink-migration + per-GPU coordination layer (legit unique work, ~150 LOC)
+  - `discovery_gpu/gpu.rs` — calls into cubecl_eval (F-080) for the real backtest, killing the 0.0002 synthetic cost
+- **Severity**: CRITICAL (compounds F-070, third copy of same bugs)
+
+### F-086 (NOTE) — Island Model NVLink migration IS legitimate unique work
+- **Location**: `hpc_gpu_discovery.rs:504-545` (`perform_nvlink_migration`), `466-502` (`evaluate_islands_parallel`)
+- **What**: this is the only thing that justifies this file's existence:
+  - Spawns per-island `thread::scope` workers (one per GPU)
+  - Sets NUMA/CPU affinity per GPU (`get_gpu_cpu_affinity`)
+  - Detects NVLink-paired GPUs (`is_nvlink_pair`) and exchanges top elites between paired islands every `migration_interval` generations
+- **Severity**: NONE — keep this code. Just extract the GA loop it wraps so this file is small + focused.
+
+### F-087 (LOW) — Hardcoded 1000-elite cap on final result
+- **Location**: `hpc_gpu_discovery.rs:188-191`
+- **What**: `let final_elites: Vec<Vec<f32>> = scored.iter().take(1000)...` — top-1000 cap regardless of population. Magic number.
+- **Fix**: replace with `config.candidate_count` (from a shared `DiscoveryConfig`) or a named constant.
+- **Severity**: LOW
+
+---
+
 ---
 
 # Sessions (updated)
-- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041; **quality.rs COMPLETE (786/786)** F-042..F-047; **regime_labels.rs COMPLETE (523/523)** F-048..F-052; **portfolio.rs COMPLETE (345/345)** F-053..F-056; **evolution_math.rs COMPLETE (946/946)** F-057..F-063; **stop_target.rs COMPLETE (958/958)** F-064..F-067; **runtime_overrides.rs COMPLETE (795/795)** F-068..F-069; **discovery_gpu.rs COMPLETE (1028/1028)** F-070..F-076; **lib.rs COMPLETE (1017/1017)** F-077..F-079; **cubecl_eval.rs COMPLETE (1078/1078)** F-080..F-084. Total findings: 84. **GPU PATH CLARIFIED**: F-080 — cubecl_eval is the SL/TP-faithful canonical GPU path. discovery_gpu.rs (F-070/F-071) is the WRONG GPU path while a CORRECT one already exists → fix is delete discovery_gpu, route everything through cubecl_eval.
+- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041; **quality.rs COMPLETE (786/786)** F-042..F-047; **regime_labels.rs COMPLETE (523/523)** F-048..F-052; **portfolio.rs COMPLETE (345/345)** F-053..F-056; **evolution_math.rs COMPLETE (946/946)** F-057..F-063; **stop_target.rs COMPLETE (958/958)** F-064..F-067; **runtime_overrides.rs COMPLETE (795/795)** F-068..F-069; **discovery_gpu.rs COMPLETE (1028/1028)** F-070..F-076; **lib.rs COMPLETE (1017/1017)** F-077..F-079; **cubecl_eval.rs COMPLETE (1078/1078)** F-080..F-084; **hpc_gpu_discovery.rs COMPLETE (894/894)** F-085..F-087. Total findings: 87. **DUPLICATION ESCALATION**: now confirmed at ~2800 LOC of cfg-conditional GA twin code across 3 files (discovery_gpu.rs file + lib.rs inline + hpc_gpu_discovery.rs island wrapper). All three share the same 0.0002 synthetic cost violation and the same M1-bars/day bias.
 
 ## Audit progress
 | Crate | File | Lines | Status |
@@ -1045,6 +1085,7 @@ This is the **canonical SL/TP-faithful GPU evaluator** the doc-comment in `disco
 | neoethos-search | discovery_gpu.rs | 1028 | COMPLETE (delete candidate) |
 | neoethos-search | lib.rs | 1017 | COMPLETE (incl. 886-line F-077 inline twin) |
 | neoethos-search | cubecl_eval.rs | 1078 | COMPLETE (canonical GPU) |
+| neoethos-search | hpc_gpu_discovery.rs | 894 | COMPLETE (third GA copy) |
 | neoethos-search | genetic/diversity.rs | 219 | pending |
 | neoethos-search | genetic/mod.rs | 45 | pending |
 | neoethos-search | lib.rs | 1017 | pending |
@@ -1068,4 +1109,4 @@ This is the **canonical SL/TP-faithful GPU evaluator** the doc-comment in `disco
 | neoethos-data | core/*.rs | ? | pending |
 | ... | further crates | ... | pending |
 
-**neoethos-search progress: 18 of 31 files COMPLETE (≈ 16300 of 20810 lines = 78%)**
+**neoethos-search progress: 19 of 31 files COMPLETE (≈ 17194 of 20810 lines = 83%)**
