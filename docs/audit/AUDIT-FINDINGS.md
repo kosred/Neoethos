@@ -101,10 +101,47 @@
 # Sessions
 - **2026-05-24 session 1**: scaffolded ledger; audited eval.rs COMPLETE (1211/1211 lines); surfaced F-001, F-002, F-003, F-004, F-005, F-006. Critical findings: F-002 + F-003 are the root cause of bug #214 (cost-model with empty symbol). Fixes deferred to "batch implementation" phase per user directive: build only once at end.
 
+## discovery.rs — `crates/neoethos-search/src/discovery.rs` (2900 lines, **PARTIAL** lines 1-500)
+
+### F-007 (HIGH) — `evaluation_account_currency: "USD"` hardcoded in `from_settings`
+- **Location**: `discovery.rs:275`
+- **What**: `from_settings` builds the `DiscoveryConfig` from `Settings`, but the account currency is a literal `"USD".to_string()` — does NOT read from settings.
+- **Why it matters**: cost-model lookup uses this. A user with a GBP demo account (we have one!) gets USD-based pip conversion. Already manifested as bug #181 ("currency shows £ but settings say USD"). The "fix" for #181 was UI-side; the engine still hardcodes USD.
+- **Fix**: read `settings.system.account_currency` (need to add to `SystemConfig` first if not present). NO synthetic fallback — bail if missing.
+- **Severity**: HIGH
+
+### F-008 (MEDIUM) — `corr_threshold: 0.85` hardcoded in `from_settings`
+- **Location**: `discovery.rs:294`
+- **What**: hardcoded 0.85 even though `DiscoveryConfig::default()` has the same value at line 215 — `from_settings` should pull from `settings.models.*` like the other fields do, OR document why it deliberately ignores settings.
+- **Severity**: MEDIUM (matches default so behavior identical — but the silent ignoring of settings is the smell)
+
+### F-009 (LOW) — `max_regime_loss_pct: 3.0` hardcoded in `from_settings`
+- **Location**: `discovery.rs:307`
+- **What**: same pattern as F-008. Hardcoded 3.0 instead of reading from settings.
+- **Severity**: LOW
+
+### F-010 (MEDIUM) — `portfolio_size: 2000` default seems unrealistic
+- **Location**: `discovery.rs:211` (`Default`); from_settings reads from config so this is just the Default-path
+- **What**: a portfolio of 2000 discovered strategies cannot be traded — real prop-firm operators run 5-20 simultaneously, broker margins limit far below 2000. Likely set to "use all candidates" sentinel without explicit comment.
+- **Fix**: either lower the default to e.g. 20, or document why 2000 is "the candidate pool size, not the deployed-strategy count".
+- **Severity**: MEDIUM (UX/semantics confusion, not correctness)
+
+### F-011 (MEDIUM) — `with_env_runtime_overrides` silently switches ~10 fields when mode=PropFirm
+- **Location**: `discovery.rs:325-357`
+- **What**: when `FOREX_BOT_DISCOVERY_MODE` resolves to `PropFirm`, the method overrides: `filtering.max_dd`, `filtering.min_profit`, `filtering.min_trades`, `filtering.min_sharpe`, `filtering.min_win_rate`, `filtering.min_profit_factor`, `filtering.anomaly_guard`, `cpcv_min_phi`, `min_trades_per_day`, and installs `prop_firm_gate`. Heavy silent behavior change driven by one env var, no startup log line announcing the mode.
+- **Why it matters**: identical inputs → wildly different discovery outputs depending on env. Reproducibility hazard. Operator could forget the env was set last week.
+- **Fix**: log a single `tracing::info!` at discovery start naming the resolved mode + which fields were overridden.
+- **Severity**: MEDIUM
+
+---
+
+# Sessions (updated)
+- **2026-05-24 session 1**: scaffolded ledger; audited **eval.rs COMPLETE (1211/1211)**; surfaced F-001 to F-006. Begun **discovery.rs (500/2900)**; surfaced F-007 to F-011.
+
 ## Next session targets
-- `crates/neoethos-search/src/discovery.rs` (2900 lines) — the orchestrator
-- `crates/neoethos-search/src/validation.rs` (1855 lines) — CPCV / forward-test
+- `crates/neoethos-search/src/discovery.rs` lines 500-2900 (remaining ~2400 lines, probably 1-2 sessions)
+- `crates/neoethos-search/src/validation.rs` (1855 lines)
 - `crates/neoethos-search/src/genetic/search_engine.rs`
-- `crates/neoethos-search/src/genetic/strategy_gene.rs` (contains the `for_symbol` template to mirror)
+- `crates/neoethos-search/src/genetic/strategy_gene.rs`
 - … then continue priority list
 
