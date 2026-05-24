@@ -475,10 +475,73 @@ This module computes/derives 11 SMC indicator arrays from either OHLCV alone (`d
 
 ---
 
+## quality.rs — `crates/neoethos-search/src/quality.rs` (786 lines, **COMPLETE**)
+
+This module computes per-strategy quality metrics (Sharpe, Sortino, Calmar, etc.) plus a composite `quality_score` and a binary `has_edge` flag used downstream by `StrategyRanker` to pick survivors.
+
+### F-042 (HIGH) — `score_strategy` is a heavily-tuned magic-number scoring function with no config knob
+- **Location**: `quality.rs:570-611`
+- **What**: the function combines 8 sub-scores into a `quality_score` ∈ [0, 100]. Each sub-score has its own opaque magic constants:
+  ```rust
+  let sortino_score = 30.0 * (1.0 - (-metrics.sortino_ratio.max(0.0) * 0.6).exp());
+  let pf_score      = 20.0 * (1.0 - (-(metrics.profit_factor.max(0.0) - 1.0).max(0.0) * 1.5).exp());
+  let wr_score      = 15.0 * ((metrics.win_rate - 0.45) / 0.25).clamp(0.0, 1.0);
+  let calmar_score  = 20.0 * (1.0 - (-metrics.calmar_ratio.max(0.0) * 0.8).exp());
+  let dd_score      = 15.0 * (1.0 - (metrics.max_drawdown_pct / 0.15).clamp(0.0, 1.0)).max(0.0);
+  let pval_score    = 10.0 * (1.0 - pval).powi(3);
+  let mwr_score     = 10.0 * metrics.monthly_win_rate.clamp(0.0, 1.0);
+  let mr_score      = if avg_monthly >= min_monthly { 10.0 * ratio.min(1.0) } else { 0.0 };
+  ```
+  Constants: 30, 0.6, 20, 1.5, 15, 0.45, 0.25, 20, 0.8, 15, 0.15, 10 (cubic), 10, 10, min_monthly_return_pct. Pre-saturation weights sum to 30+20+15+20+15+10+10+10 = 130 capped to 100 — so the cap is binding only on great strategies, and "weight" semantics are inconsistent.
+- **Why it matters**: this scoring decides which strategies survive the quality screen. A strategy with Sortino=2.0 + PF=1.4 + WR=0.55 + DD=0.10 might score 65 ("ACCEPTABLE"); change Sortino curve constant from 0.6 to 0.4 and the same strategy scores 60 ("POOR"). The operator has zero visibility into these tunables.
+- **Fix**:
+  1. Move sub-score weights + saturation constants into a new `QualityScoreConfig` struct (or into `QualityRuntimeOverrides`).
+  2. Defaults preserve current behaviour.
+  3. Document the saturation math (`1 - exp(-k*x)` saturates ~1 at `x = 5/k`, so `k=0.6` means Sortino saturates around 8.3).
+- **Severity**: HIGH (silent strategy ranking determined by unaudited constants)
+
+### F-043 (MEDIUM) — MC ruin threshold + iteration count baked into source
+- **Location**: `quality.rs:284-287, 336`
+- **What**:
+  - Line 284: `mc_iterations = 1000` — magic; can't be tuned without recompile
+  - Line 287: `ruin_threshold = initial_balance * 0.50` — magic 50% loss-of-capital = "ruin"
+  - Line 336: `p95_idx = (mc_iterations as f64 * 0.95)` — magic 95th percentile worst-DD reporting
+- **Why it matters**:
+  - 50% ruin is harsher than typical (most propfirms call 10% drawdown a fail) but more generous than some risk frameworks (1% ruin probability). The semantics of `mc_risk_of_ruin_pct` therefore depend on this magic threshold.
+  - 1000 MC iterations is the speed/accuracy tradeoff. Operators can't ask for 10000 to get tighter confidence intervals.
+- **Fix**: extract to `QualityRuntimeOverrides` (mc_iterations, ruin_threshold_pct, p_worst_dd_percentile).
+- **Severity**: MEDIUM
+
+### F-044 (LOW) — Recommendation tier thresholds (80/70/60) undocumented
+- **Location**: `quality.rs:636-645`
+- **What**: `EXCELLENT >= 80`, `GOOD >= 70`, `ACCEPTABLE >= 60`, `POOR < 60`. Magic boundaries.
+- **Fix**: name them as constants OR put on `QualityScoreConfig`. Document that 80 = "deploy live", 70 = "trade demo first", 60 = "needs tuning".
+- **Severity**: LOW
+
+### F-045 (LOW) — Quarter-Kelly magic multiplier
+- **Location**: `quality.rs:546`
+- **What**: `kelly = kelly.clamp(0.0, 1.0); kelly * 0.25` — Kelly fraction multiplied by 0.25 (quarter-Kelly). Industry-standard for "conservative Kelly" but no doc comment explaining the choice.
+- **Fix**: add doc-comment `// Quarter-Kelly for conservative position sizing (Thorp 1962)` and consider exposing the fraction.
+- **Severity**: LOW
+
+### F-046 (LOW) — `profit_factor` hard-capped at 100
+- **Location**: `quality.rs:218-221`
+- **What**: `if profit_factor > 100.0 { profit_factor = 100.0; }` — caps the ratio gross_profit / gross_loss. Reasonable to cap (prevents one zero-loss winning trade from inflating to infinity) but the value 100 is magic.
+- **Fix**: promote to constant `PROFIT_FACTOR_CAP = 100.0` with doc.
+- **Severity**: LOW
+
+### F-047 (NOTE) — Sortino threshold correctly differentiated from Sharpe (counter-example to F-014)
+- **Location**: `quality.rs:144-145`
+- **What**: `min_sharpe: 1.2, min_sortino: 1.2` — wait, these are the SAME default. F-014 noted discovery.rs's `quality_analyzer_for_config` reuses min_sharpe for min_sortino — but the DEFAULT struct here also has them equal. So the F-014 bug ALSO affects the standalone `StrategyQualityAnalyzer::default()` — Sortino floor of 1.2 is too weak relative to Sharpe 1.2 in good strategies.
+- **Update F-014**: the bug is wider than discovery.rs; it's also in this default. Same fix applies (raise min_sortino default, OR document why they should be equal).
+- **Severity**: REFERENCE — promotes F-014's scope.
+
+---
+
 ---
 
 # Sessions (updated)
-- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041. Total findings: 41. Verified `EvaluationConfig::for_symbol` shape for F-003 template. **F-002 EURUSD-leak confirmed at 4 production sites** (discovery.rs:710, gauntlet.rs:60, search_engine.rs:355 + 450).
+- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041; **quality.rs COMPLETE (786/786)** F-042..F-047. Total findings: 47. **F-002 EURUSD-leak confirmed at 4 production sites**. F-014 scope promoted via F-047 (Sortino floor also weak in `StrategyQualityAnalyzer::default()`).
 
 ## Audit progress
 | Crate | File | Lines | Status |
@@ -491,12 +554,12 @@ This module computes/derives 11 SMC indicator arrays from either OHLCV alone (`d
 | neoethos-search | genetic/strategy_gene.rs | 649 | COMPLETE (F-003 template) |
 | neoethos-search | genetic/search_engine.rs | 1060 | COMPLETE |
 | neoethos-search | genetic/smc_indicators.rs | 659 | COMPLETE |
-| neoethos-search | genetic/evolution_math.rs | 946 | pending |
+| neoethos-search | quality.rs | 786 | COMPLETE |
+| neoethos-search | genetic/evolution_math.rs | 946 | next |
 | neoethos-search | genetic/runtime_overrides.rs | 795 | pending |
 | neoethos-search | genetic/regime_labels.rs | 523 | pending |
 | neoethos-search | genetic/diversity.rs | 219 | pending |
 | neoethos-search | genetic/mod.rs | 45 | pending |
-| neoethos-search | quality.rs | 786 | pending |
 | neoethos-search | portfolio.rs | 345 | pending |
 | neoethos-search | lib.rs | 1017 | pending |
 | neoethos-search | stop_target.rs | 958 | pending |
@@ -519,4 +582,4 @@ This module computes/derives 11 SMC indicator arrays from either OHLCV alone (`d
 | neoethos-data | core/*.rs | ? | pending |
 | ... | further crates | ... | pending |
 
-**neoethos-search progress: 9 of 31 files COMPLETE (≈ 8820 of 20810 lines = 42%)**
+**neoethos-search progress: 10 of 31 files COMPLETE (≈ 9610 of 20810 lines = 46%)**
