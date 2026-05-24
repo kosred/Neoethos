@@ -1284,3 +1284,167 @@ These files are smaller or specialist; I list real findings per file and mark th
 | ... | further crates | ... | pending |
 
 **neoethos-search progress: 30 of 31 files COMPLETE (~19572 of 20810 lines = 94%). Only `discovery_tests.rs` (1238 LOC, test-only) skipped. Production code 100% audited.**
+
+**neoethos-core audit: IN PROGRESS** — findings F-097..F-116 added (16 new findings, batch 1).
+
+---
+
+# neoethos-core findings (work in progress 2026-05-24)
+
+## domain/events.rs (102 lines, **COMPLETE**)
+
+### F-097 (LOW) — `SignalResult` carries 14+ lines of Python→Rust porting musings
+- **Location**: `domain/events.rs:14-28`
+- **What**: comments like "Looking at usage:", "If it's a history,", "For backtesting, we might..." — leftover from porting that should be either deleted or replaced with crisp doc-comments.
+- **Severity**: LOW
+
+### F-098 (LOW) — `PreparedDatasetLite` appears half-implemented
+- **Location**: `domain/events.rs:53-58`
+- **What**: only `feature_names: Vec<String>`. Comment says "Actual data might be too heavy for a simple event struct unless we use shared pointers or paths. Keeping it minimal for now." No consumers — possibly dead.
+- **Severity**: LOW
+
+### F-099 (MEDIUM) — `TradeEvent.side`, `RiskEvent.severity`/`.category` are untyped Strings
+- **Location**: `domain/events.rs:63, 80-82`
+- **What**: `side: String` ("buy"/"sell"), `severity: String`, `category: String`. Should be enums so typos are compile errors.
+- **Severity**: MEDIUM
+
+### F-100 (LOW) — 16-char UUID truncation in `RiskEvent::new` (64-bit collision space)
+- **Location**: `domain/events.rs:94`
+- **What**: `Uuid::new_v4().simple().to_string()[..16]` — keeps only half the UUID. 64-bit ID space is acceptable for short-lived events but birthday-collision-prone at scale.
+- **Severity**: LOW
+
+---
+
+## utils/window_control.rs (140 lines, **COMPLETE — ORPHAN DELETE CANDIDATE**)
+
+### F-101 (CRITICAL) — `window_control.rs` is ORPHAN: 140 LOC of Win32 GUI automation, 0 external callers
+- **Location**: `utils/window_control.rs` (full file)
+- **Verification**: grep for `ensure_autotrading_enabled|ensure_autotrading_window_shortcut|focus_broker_terminal|send_ctrl_e|window_control::` across `crates/` and `docs/` returns **only self-references**. Not even re-exported from `utils/mod.rs` (which exports `clock`, `hashing`, `numeric`, `series`, `stats` but not `window_control`).
+- **What**: uses Win32 `EnumWindows`+`SendInput` to find a window with "cTrader" in the title and send Ctrl+E to toggle AutoTrading. Fragile (title might change in updates, multiple cTrader windows possible, UWP/web cTrader doesn't appear in EnumWindows), insecure (sends keystrokes into whatever's focused if our window grab fails), and OS-locked (non-Windows returns `true` silently → operator believes AutoTrading is on when nothing happened).
+- **Even the file admits the right path is the broker API**: line 32 — *"Cannot verify AutoTrading from neoethos-core without broker terminal state; use the broker adapter before live execution."*
+- **Fix**: **DELETE the entire file**. Drop `windows = { features = ["Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }` from Cargo.toml (the remaining two — `Win32_Foundation`, `Win32_System_Console` — stay because `logging.rs` uses Console codepage setup).
+- **Severity**: CRITICAL (orphan code that bypasses the broker API for a safety-critical operation)
+
+---
+
+## Cargo.toml (50 lines, **COMPLETE**)
+
+### F-102 (CRITICAL) — `tokio = "1.49.0", features = ["full"]` is UNUSED in foundation crate
+- **Location**: `crates/neoethos-core/Cargo.toml:21`
+- **Verification**: `grep -rn 'tokio\b' crates/neoethos-core/src/` returns **one hit**: `logging.rs:495` — `.add_directive("tokio=info".parse().expect("valid directive"))`. That's just a string in a tracing filter. **No `use tokio` / `tokio::` anywhere**. The runtime, macros, fs, net, time, sync, signal modules from `features = ["full"]` are completely uncalled.
+- **Why it matters**: `tokio = "full"` pulls in 200+ transitive deps (mio, socket2, parking_lot, signal-hook-registry, …) and ~2-3 MB compile time for a string used in one tracing directive. Foundation crate should be lean.
+- **Fix**: drop `tokio` entirely from `neoethos-core/Cargo.toml`. App crates (`neoethos-app`, `neoethos-cli`) keep their own `tokio` deps with whatever feature set they actually use.
+- **Severity**: CRITICAL (massive transitive-dep waste + violates "foundation crate is foundation" principle)
+
+### F-103 (HIGH) — `reqwest` pulled in for ONE blocking HTTP call in `domain/news_filter.rs`
+- **Location**: `crates/neoethos-core/Cargo.toml:31` + `domain/news_filter.rs:112`
+- **What**: `reqwest = { version = "0.13.3", default-features = false, features = ["rustls", "json", "blocking", "query", "form"] }` — 5 features. Only `reqwest::blocking::Client` is used (1 callsite). `query` and `form` features may be unused entirely.
+- **Architectural smell**: `domain/news_filter.rs` lives in `neoethos-core` but is an integration-level concern (LLM API caller). Foundation crates shouldn't talk to OpenAI/Perplexity.
+- **Fix**: move `news_filter` to an app-level crate (e.g. `neoethos-app::news`). Drop `reqwest` from `neoethos-core/Cargo.toml`. Verify `query` and `form` features are actually used — likely droppable.
+- **Severity**: HIGH (foundation-crate boundary violation)
+
+### F-104 (MEDIUM) — `windows` crate features over-broad after `window_control.rs` deletion (F-101)
+- **Location**: `crates/neoethos-core/Cargo.toml:42-48`
+- **What**: 4 features enabled. After F-101 deletion: `Win32_UI_WindowsAndMessaging` and `Win32_UI_Input_KeyboardAndMouse` become unused. `Win32_Foundation` + `Win32_System_Console` stay (used by `logging.rs` for ANSI/UTF-8 console codepage).
+- **Fix**: bundled into the F-101 delete commit.
+- **Severity**: MEDIUM
+
+---
+
+## domain/news_filter.rs (256 lines, **COMPLETE**)
+
+### F-105 (HIGH) — `is_blackout_active` ignores all its arguments — window-based check is DEAD code
+- **Location**: `domain/news_filter.rs:156-161`
+- **What**: signature `is_blackout_active(_currency_pair, _current_timestamp_ms)` — both args prefixed with `_` because the implementation only checks `self.current_status == "BLACKOUT"`. The struct fields `blackout_minutes_before`/`blackout_minutes_after` (lines 28-29) and `recent_events` (line 31) are **never consulted** in the active check.
+- **Why it matters**: the API LOOKS like it does a per-symbol, per-timestamp blackout window check (which is what a real news filter should do — "is EURUSD in blackout RIGHT NOW because NFP was scheduled at HH:MM ± window"). Actually it's a global on/off flag.
+- **Fix**: implement the window check using `recent_events` and the time deltas, OR delete the unused fields and rename the function to `is_global_blackout()` to match what it does.
+- **Severity**: HIGH (dead infrastructure giving false impression of safety check)
+
+### F-106 (CRITICAL) — `poll_llm_news_sentiment` FAILS OPEN on every error path — inverted safety gate
+- **Location**: `domain/news_filter.rs:86-154` — specifically lines 91, 100, 104, 153
+- **What**: every error path returns `Ok("SAFE")`:
+  - filter disabled → `Ok("SAFE")` (line 91)
+  - api_key empty → `Ok("SAFE")` (line 100)
+  - api_key None → `Ok("SAFE")` (line 104)
+  - 200 OK but unparseable response → `Ok("SAFE")` (line 153, fallthrough)
+  Only the non-200 HTTP path returns Err (lines 147-151).
+- **Why it matters**: this is a SAFETY-CRITICAL pre-trade gate. "SAFE" means "trade allowed". If the LLM API is down, auth is wrong, or response is malformed, the system trades through major news events as if nothing's happening. The correct fail mode is **BLACKOUT** (don't trade) so transient API failures don't open the door to NFP/CPI trading.
+- **Fix**: change every non-explicit-SAFE path to `Ok("BLACKOUT")` or `Err(...)`. Document the policy as "fail-closed on news blackout".
+- **Severity**: CRITICAL (silent fail-open in safety gate; trades through NFP if LLM API blips)
+
+### F-107 (MEDIUM) — Hardcoded LLM endpoints + model names baked in
+- **Location**: `domain/news_filter.rs:115-118`
+- **What**: `gpt-4o-mini` and `sonar-pro` model names + their endpoint URLs are literals. OpenAI rotates `gpt-4o-mini` aliases periodically; if it gets renamed, news filter silently 404s and returns SAFE (per F-106).
+- **Fix**: move to `Settings::news_filter::llm_endpoint` + `llm_model`. Task #59 already addresses gpt-5-nano config externalisation — same pattern here.
+- **Severity**: MEDIUM
+
+### F-108 (LOW) — `reqwest::blocking::Client::new()` per call
+- **Location**: `domain/news_filter.rs:112`
+- **What**: creates a fresh TLS-backed client on every news check (TLS handshake, cert chain validation, connection pool init). Should be a `OnceCell<Client>`.
+- **Fix**: lazy-init shared `Client` in `NewsFilter::new`.
+- **Severity**: LOW
+
+### F-109 (LOW) — `llm_provider`, `current_status`, etc. as untyped `String`
+- **Location**: `domain/news_filter.rs:27, 30`
+- **What**: `llm_provider: String` ("openai"/"perplexity"), `current_status: String` ("SAFE"/"BLACKOUT"/"UNKNOWN"/""). Should be enums. The case-insensitive `eq_ignore_ascii_case("BLACKOUT")` check at line 69 papers over the typing weakness.
+- **Severity**: LOW
+
+---
+
+## domain/meta_controller.rs (179 lines, **COMPLETE**)
+
+### F-110 (HIGH) — `MetaController` has 15+ magic constants determining risk allocation
+- **Location**: `domain/meta_controller.rs:50-67, 75, 80-83, 88-96, 99-107, 109, 125, 127, 135`
+- **What**: defaults + inline magic numbers controlling risk multipliers:
+  - **Defaults** (lines 50-67): k_steepness=200.0, base_confidence=0.55, max_daily_dd=0.045, safety_buffer=0.025, base_risk=0.015
+  - **Exponent clamp** (line 75): [-20.0, 20.0]
+  - **Vol regime multipliers** (lines 80-83): low=1.1, normal=1.0, high=0.7
+  - **Market regime scale** (lines 88-96): Volatile=0.5, Quiet=1.2, Bear/Bull=1.0 (no-op, see F-112)
+  - **Perf multipliers** (lines 99-107): win_rate<0.4→0.8, consec_losses>=2→0.8, >=4→0.5
+  - **Consistency capper** (line 109): daily_profit>=3.5%→risk×0.01 (stop trading after hitting 3.5% daily)
+  - **Confidence adjustment** (line 125): (1-survival)×0.2 with line 127 cap at 0.85
+  - **Hard stop trigger** (line 135): dd >= max_daily_dd - 0.002 (i.e. 4.3% triggers stop when max is 4.5%)
+- **Why it matters**: this is the central risk-modulation engine — it directly controls how much capital goes into each trade. Every constant is opaque, baked in, and changes the system's behavior dramatically. The "Consistency Capper" (line 109) silently kills trading after 3.5% daily profit; an operator who doesn't know this exists will see the bot stop trading and not understand why.
+- **Fix**: extract `MetaControllerConfig` struct with all 15+ knobs as named fields. Document each: the calibration that produced it, the operator-tunable range, and the downstream effect.
+- **Severity**: HIGH
+
+### F-111 (MEDIUM) — Market-regime detection uses fragile substring matching
+- **Location**: `domain/meta_controller.rs:88, 90, 94`
+- **What**: `state.market_regime.contains("Volatile")`, `.contains("Quiet")`, `.contains("Bear") || .contains("Bull")`. Any string containing the substring matches — "Volatile-Bear-Storm-Mode" would trigger BOTH Volatile (regime_scale=0.5) AND Bear branches.
+- **Fix**: enum `MarketRegime { Volatile, Quiet, Trending(Direction), Neutral, ... }`.
+- **Severity**: MEDIUM
+
+### F-112 (LOW) — Dead branch: `if Bear || Bull { regime_scale *= 1.0 }`
+- **Location**: `domain/meta_controller.rs:94-96`
+- **What**: `regime_scale *= 1.0` is a no-op. Either the branch is dead placeholder for future logic, or someone deleted the multiplier value but left the scaffolding.
+- **Fix**: delete or actually implement.
+- **Severity**: LOW
+
+### F-113 (MEDIUM) — Three `SystemTime::now()...unwrap()` calls inside risk hot path
+- **Location**: `domain/meta_controller.rs:111-114, 130-133, 138-141`
+- **What**: panics if system clock is before 1970. The codebase already has `utils::clock::now_unix_ms()` exactly for this (extracted in task #152). Three sites here didn't migrate.
+- **Fix**: replace all three with `crate::utils::clock::now_unix_ms()`.
+- **Severity**: MEDIUM
+
+---
+
+## domain/order_execution.rs (186 lines, **COMPLETE**)
+
+### F-114 (CRITICAL) — `OrderExecutorConfig::default()` ships with `symbol = "EURUSD"` and `commission_per_lot = 7.0`
+- **Location**: `domain/order_execution.rs:18-34`
+- **What**: same EURUSD-default + $7-commission pattern as F-002 + F-029. Any caller that constructs `OrderExecutorConfig::default()` and then sets only `partial_take_profit_enabled` / `entry_patience_bars` ends up trading **EURUSD with $7 commission** regardless of the actual symbol.
+- **Fix**: same as F-002/F-003 — `OrderExecutorConfig::for_symbol(symbol, broker_metadata)` is the constructor. `Default::default()` becomes `#[cfg(test)]`-only.
+- **Severity**: CRITICAL (synthetic-data pattern repeated)
+
+### F-115 (LOW) — `round_2` / `round_2_down` assume 0.01-lot increments
+- **Location**: `domain/order_execution.rs:116-122`
+- **What**: `(val * 100.0).round() / 100.0` quantizes to 2 decimal places — i.e. 0.01-lot steps. Some brokers allow 0.001 (micro lots) or only 1.0 (standard lots only).
+- **Fix**: take `lot_step` from broker metadata; `quantize_to_step(val, step)` helper. Compiles into `symbol_metadata::SymbolMetadata` (the F-029 extension I proposed for typical_spread + commission_per_lot).
+- **Severity**: LOW
+
+### F-116 (LOW) — Minimum-volume threshold 0.01 hardcoded
+- **Location**: `domain/order_execution.rs:99`
+- **What**: `if *vol < 0.01 { continue; }` — drops partial-TP legs below 0.01 lots. Same broker-metadata story as F-115.
+- **Severity**: LOW
+
+---
