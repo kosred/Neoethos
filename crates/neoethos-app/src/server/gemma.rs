@@ -95,13 +95,18 @@ pub async fn status(State(_state): State<AppApiState>) -> Json<GemmaStatusDto> {
             neoethos_gemma::runtime::BUNDLED_MODEL_DOWNLOAD_URL,
             neoethos_gemma::runtime::BUNDLED_MODEL_FILENAME,
         )
-    } else if size_bytes < neoethos_gemma::runtime::BUNDLED_MODEL_APPROX_BYTES / 2 {
+    } else if size_bytes < neoethos_gemma::BUNDLED_MODEL_MIN_BYTES {
+        // #196: stricter threshold (99% of expected) — the previous
+        // 50% threshold accepted obviously-corrupted files. GGUF tail
+        // bytes hold critical tensor data; losing the last 50 MB
+        // still corrupts the model even if the first 5.3 GB are fine.
         format!(
             "GGUF file at {} is only {} bytes — looks like a partial \
-             download. Expected ≥{} bytes.",
+             download. Expected ≥{} bytes. Delete the file and click \
+             Download again.",
             path_str,
             size_bytes,
-            neoethos_gemma::runtime::BUNDLED_MODEL_APPROX_BYTES / 2,
+            neoethos_gemma::BUNDLED_MODEL_MIN_BYTES,
         )
     } else {
         String::new()
@@ -109,7 +114,11 @@ pub async fn status(State(_state): State<AppApiState>) -> Json<GemmaStatusDto> {
 
     Json(GemmaStatusDto {
         runtime_compiled_in,
-        model_file_present: present && !message.contains("partial"),
+        // Treat "Ready" as: file exists AND not truncated. Anything
+        // less and we surface the message so the UI shows "Download
+        // Gemma" instead of a fake-Ready badge that leads to a chat
+        // crash (#197).
+        model_file_present: present && message.is_empty(),
         resolved_path: path_str,
         expected_filename: neoethos_gemma::runtime::BUNDLED_MODEL_FILENAME.to_string(),
         download_url: neoethos_gemma::runtime::BUNDLED_MODEL_DOWNLOAD_URL.to_string(),
@@ -269,6 +278,27 @@ pub async fn run_chat_with_tools(
         let resolved = neoethos_gemma::runtime::resolve_bundled_model_path(&probe)
             .map_err(|e| anyhow::anyhow!("Gemma model file not found: {e}"))?;
         let path = resolved.path;
+        // #197: verify file integrity BEFORE handing the path to
+        // llama-cpp. A truncated GGUF (interrupted download) triggers
+        // C-side abort() inside llama-cpp's mmap path, which kills
+        // the entire backend process — tokio's panic catcher can't
+        // recover from a libc abort. Pre-validating the file size
+        // and magic bytes here keeps the process alive and lets us
+        // return a clean 503 with an actionable message.
+        if let Err(reason) = neoethos_gemma::verify_gguf_file(
+            &path,
+            neoethos_gemma::BUNDLED_MODEL_MIN_BYTES,
+        ) {
+            tracing::warn!(
+                target: "neoethos_app::server::gemma",
+                path = %path.display(),
+                error = %reason,
+                "GGUF file failed integrity check — refusing to load"
+            );
+            return Err(anyhow::anyhow!(
+                "Gemma model file is corrupted or incomplete: {reason}"
+            ));
+        }
         let loaded = tokio::task::spawn_blocking(move || LlamaCppGemmaRuntime::load(path))
             .await
             .map_err(|e| anyhow::anyhow!("Gemma load task panicked: {e}"))?

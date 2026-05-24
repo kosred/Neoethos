@@ -123,6 +123,72 @@ pub const BUNDLED_MODEL_DOWNLOAD_URL: &str = "https://huggingface.co/HauhauCS/Ge
 /// copy says "approximately" so small drift is fine.
 pub const BUNDLED_MODEL_APPROX_BYTES: u64 = 5_340_000_000;
 
+/// Minimum size that's "credibly close to" the bundled model.
+/// Allows ±1% drift since HuggingFace re-uploads sometimes shift the
+/// file by a few MB. A download that lands ≥ 99% of the expected size
+/// is treated as complete; anything less is rejected as truncated and
+/// the caller is told to re-download. Set to 99% rather than e.g. 95%
+/// because GGUF tail bytes hold critical tensor data — losing the
+/// last 50 MB still corrupts the model, even if the first 5.3 GB are
+/// fine. See task #196.
+pub const BUNDLED_MODEL_MIN_BYTES: u64 = 5_286_600_000; // 0.99 × BUNDLED_MODEL_APPROX_BYTES
+
+/// First four bytes of any GGUF file. Quick sanity check before
+/// letting llama-cpp mmap a multi-GB file we're not sure is valid.
+pub const GGUF_MAGIC: [u8; 4] = [b'G', b'G', b'U', b'F'];
+
+/// Verify a GGUF file is structurally plausible before loading it.
+///
+/// Catches the "download was interrupted" case where the file is on
+/// disk but truncated. Without this check, llama-cpp tries to mmap
+/// the partial file, reads tensor offsets past EOF, and the C-side
+/// code either UB-faults or calls `abort()` — both bring down the
+/// whole backend process (task #197 — verified live with the
+/// HauhauCS GGUF that landed 4.5 MB short of expected size).
+///
+/// Returns an error string describing what's wrong so the HTTP layer
+/// can surface "model corrupted, click Re-download" rather than a
+/// generic 500. Pass the size threshold via `min_bytes` so tests can
+/// inject smaller fixtures.
+pub fn verify_gguf_file(path: &Path, min_bytes: u64) -> Result<(), String> {
+    use std::fs::File;
+    use std::io::Read;
+
+    let metadata = std::fs::metadata(path).map_err(|err| {
+        format!("cannot stat GGUF at {}: {err}", path.display())
+    })?;
+    let actual = metadata.len();
+    if actual < min_bytes {
+        return Err(format!(
+            "GGUF at {} is truncated: have {} bytes, need at least {} \
+             bytes (~{:.2} GB). The download was likely interrupted — \
+             delete the file and click Download again.",
+            path.display(),
+            actual,
+            min_bytes,
+            min_bytes as f64 / 1_000_000_000.0,
+        ));
+    }
+    // Magic-byte sniff — guards against the case where the file is
+    // big enough but isn't a GGUF (e.g. an HTML 404 page or a
+    // different model format saved with the wrong extension).
+    let mut header = [0_u8; 4];
+    File::open(path)
+        .and_then(|mut f| f.read_exact(&mut header))
+        .map_err(|err| {
+            format!("cannot read GGUF header at {}: {err}", path.display())
+        })?;
+    if header != GGUF_MAGIC {
+        return Err(format!(
+            "file at {} doesn't start with 'GGUF' magic bytes \
+             (got {:?}). This isn't a GGUF — re-download.",
+            path.display(),
+            header,
+        ));
+    }
+    Ok(())
+}
+
 /// Result of a successful path-resolve.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedModelPath {

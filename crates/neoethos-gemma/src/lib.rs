@@ -70,7 +70,7 @@ pub use tools::{BotTool, ToolCategory, ToolContext, ToolRegistry};
 
 pub use crate::runtime::{
     BUNDLED_MODEL_APPROX_BYTES, BUNDLED_MODEL_DOWNLOAD_URL, BUNDLED_MODEL_FILENAME,
-    MODEL_PATH_ENV_VAR,
+    BUNDLED_MODEL_MIN_BYTES, GGUF_MAGIC, MODEL_PATH_ENV_VAR, verify_gguf_file,
 };
 
 /// Build the production G2 topic-gate stack:
