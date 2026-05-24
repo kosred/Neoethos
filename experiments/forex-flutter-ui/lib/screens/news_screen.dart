@@ -1,7 +1,7 @@
-// News — local Gemma-4-powered symbol news summary.
+// News — ChatGPT-subscription-powered symbol news summary.
 //
-// Replaces the previous PendingStub. Pick a symbol, tap "Summarise"
-// and the server runs the prompt through the local Gemma runtime.
+// Pick a symbol, tap "Summarise" and the server proxies the prompt
+// through the operator's ChatGPT subscription via /codex/chat.
 // Read-only — no live news feed (yet); the LLM works from its
 // training data, which is good for "what drives EURUSD" types of
 // questions and explicit about uncertainty for very recent events.
@@ -43,13 +43,21 @@ class _NewsScreenState extends ConsumerState<NewsScreen> {
       _result = null;
       _lastSymbol = symbol;
     });
+    final sw = Stopwatch()..start();
     try {
-      final r =
-          await ref.read(backendClientProvider).gemmaNews(symbol: symbol);
+      final r = await ref.read(backendClientProvider).codexChat(
+            prompt:
+                'Summarise the current market drivers for the symbol $symbol. '
+                'Mention macro themes, recent central-bank moves if you know '
+                'them, and typical correlations to other instruments. Flag '
+                'any uncertainty about events past your training cutoff.',
+            maxTokens: 512,
+          );
       if (!mounted) return;
+      sw.stop();
       setState(() {
         _result = r.response.trim();
-        _elapsedMs = r.elapsedMs;
+        _elapsedMs = sw.elapsedMilliseconds;
       });
     } on DioException catch (e) {
       final msg = describeError(e);
@@ -62,17 +70,17 @@ class _NewsScreenState extends ConsumerState<NewsScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final status = ref.watch(gemmaStatusProvider);
+    final status = ref.watch(codexStatusProvider);
     return SingleChildScrollView(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const ViewHeader(
             title: 'News',
-            subtitle: 'Per-symbol summary via local Gemma-4',
+            subtitle: 'Per-symbol summary via ChatGPT subscription',
           ),
           status.when(
-            data: (s) => s.ready ? _readyUi(s) : _installHint(s),
+            data: (s) => s.authenticated ? _readyUi(s) : _connectHint(s),
             loading: () => const _Loading(),
             error: (err, _) => _Error(error: err.toString()),
           ),
@@ -81,32 +89,34 @@ class _NewsScreenState extends ConsumerState<NewsScreen> {
     );
   }
 
-  Widget _installHint(GemmaStatusSnapshot s) {
+  Widget _connectHint(CodexStatusSnapshot s) {
     return SectionCard(
-      title: 'Local LLM not ready',
+      title: 'ChatGPT subscription not linked',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            s.message,
-            style: const TextStyle(
-              fontSize: 12,
-              color: ForexAiTokens.warning,
-            ),
-          ),
-          const SizedBox(height: 8),
           const Text(
-            'News uses the same local inference path as AI Helper. '
-            'Open AI Helper → follow the install instructions, then come '
-            'back here.',
+            'News summaries use the same ChatGPT subscription path as '
+            'AI Helper. Open AI Helper → click Connect ChatGPT, then '
+            'come back here.',
             style: TextStyle(
-              fontSize: 11,
-              color: ForexAiTokens.textMuted,
+              fontSize: 12,
+              color: ForexAiTokens.textPrimary,
             ),
           ),
+          if (s.lastError != null && s.lastError!.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Previous attempt: ${s.lastError}',
+              style: const TextStyle(
+                fontSize: 11,
+                color: ForexAiTokens.warning,
+              ),
+            ),
+          ],
           const SizedBox(height: 8),
           OutlinedButton.icon(
-            onPressed: () => ref.invalidate(gemmaStatusProvider),
+            onPressed: () => ref.invalidate(codexStatusProvider),
             icon: const Icon(Icons.refresh, size: 16),
             label: const Text('Re-check status'),
           ),
@@ -115,7 +125,7 @@ class _NewsScreenState extends ConsumerState<NewsScreen> {
     );
   }
 
-  Widget _readyUi(GemmaStatusSnapshot s) {
+  Widget _readyUi(CodexStatusSnapshot s) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -155,7 +165,9 @@ class _NewsScreenState extends ConsumerState<NewsScreen> {
               ),
               const SizedBox(height: 6),
               Text(
-                'Model: ${s.expectedFilename} · n_ctx ${s.nCtx}',
+                s.email != null && s.email!.isNotEmpty
+                    ? 'Signed in as ${s.email}'
+                    : 'ChatGPT subscription linked',
                 style: const TextStyle(
                   fontSize: 11,
                   color: ForexAiTokens.textMuted,
@@ -194,11 +206,10 @@ class _NewsScreenState extends ConsumerState<NewsScreen> {
           const SectionCard(
             title: 'Tip',
             child: Text(
-              'Local Gemma works from its training cutoff — great for '
-              '"what typically drives EURUSD" or "explain rate-hike '
-              'transmission to GBP", less reliable for events from the '
-              'last 24 hours. A live news-feed integration is the next '
-              'iteration.',
+              'ChatGPT responses are great for "what typically drives '
+              'EURUSD" or "explain rate-hike transmission to GBP", '
+              'less reliable for events from the last 24 hours. A live '
+              'news-feed integration is the next iteration.',
               style: TextStyle(
                 color: ForexAiTokens.textMuted,
                 fontSize: 12,
@@ -216,7 +227,7 @@ class _Loading extends StatelessWidget {
   Widget build(BuildContext context) => const Padding(
         padding: EdgeInsets.symmetric(vertical: 16),
         child: Text(
-          'Checking local LLM status…',
+          'Checking ChatGPT subscription…',
           style: TextStyle(color: ForexAiTokens.textMuted, fontSize: 12),
         ),
       );

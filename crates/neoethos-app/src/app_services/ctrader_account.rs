@@ -31,6 +31,16 @@ pub struct CTraderAccountRuntimeRequest {
     pub return_protection_orders: bool,
 }
 
+/// Wire-format version of the cTrader trader snapshot. Bumped whenever
+/// the field set changes in a way an older consumer (or persisted cache,
+/// if one is later added) cannot read. The struct itself is not currently
+/// persisted to disk, but the bridge passes it across an async boundary
+/// and the dashboard pins the shape; pinning the version here makes the
+/// contract explicit and future-proofs any "save last-known account
+/// snapshot to disk on shutdown" follow-up.
+#[allow(dead_code)] // referenced once a persistence layer lands (#163).
+pub const CTRADER_TRADER_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CTraderTraderSnapshot {
     pub account_id: i64,

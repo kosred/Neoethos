@@ -259,8 +259,8 @@ pub fn load_from_disk(path: &Path) -> Result<Option<BrokerSettingsState>> {
     if !path.is_file() {
         return Ok(None);
     }
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let parsed: BrokerSettingsState = toml::from_str(&contents)
         .with_context(|| format!("failed to parse TOML at {}", path.display()))?;
     crate::schema_version::check_schema_version_readable(&parsed, "broker_credentials.toml")

@@ -68,6 +68,9 @@ jobs:
       - name: Run workspace tests without default features
         run: cargo test --workspace --no-default-features
 
+      - name: Run neoethos-codex tests
+        run: cargo test -p neoethos-codex
+
       - name: Cargo check workspace with default features
         if: ${{ inputs.run_default_features == 'true' }}
         run: cargo check --workspace --all-targets

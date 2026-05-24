@@ -1,14 +1,8 @@
 use neoethos_models::tree_models::{CatBoostExpert, LightGBMExpert, XGBoostExpert};
 
-#[test]
-#[cfg(not(feature = "python-onnx-export"))]
-fn default_build_keeps_tree_stack_python_free() {
-    let python_export_enabled = std::hint::black_box(cfg!(feature = "python-onnx-export"));
-    assert!(
-        !python_export_enabled,
-        "default tree-model build should stay Python-free unless explicitly enabled"
-    );
-}
+// #173: prior test depended on a `python-onnx-export` feature that has
+// not existed in this workspace since the Rust port. Removing the
+// test entirely is correct — there's nothing left to gate against.
 
 #[test]
 fn tree_experts_construct_without_python_runtime_requirements() {

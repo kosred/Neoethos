@@ -34,12 +34,36 @@ use super::state::AppApiState;
 /// Shared request body for `start` endpoints — picks the symbol +
 /// timeframe to operate on. Empty fields fall back to "EURUSD" / "M1"
 /// so the dashboard "Start" button can fire without any params.
+///
+/// `higher_tfs` is the MTF context discovery considers alongside
+/// `base_tf`. When omitted, falls back to [`DEFAULT_HIGHER_TFS`]. The
+/// dashboard exposes this as a comma-separated text field; the
+/// canonical wire form is a JSON array of canonical timeframe labels
+/// (`["M5", "M15", "H1"]`).
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
 pub struct StartJobBody {
     pub symbol: Option<String>,
     pub base_tf: Option<String>,
+    pub higher_tfs: Option<Vec<String>>,
+    /// #194: optional GA hyperparameter overrides. When `None` the
+    /// engine uses the defaults baked into
+    /// `neoethos_search::DiscoveryConfig::default()`; sending any field
+    /// here replaces only that knob. The UI's "Advanced" expander
+    /// builds this struct from the operator's sliders.
+    pub population: Option<usize>,
+    pub generations: Option<usize>,
+    pub max_indicators: Option<usize>,
+    pub target_candidates: Option<usize>,
+    pub portfolio_size: Option<usize>,
 }
+
+/// Default MTF context for discovery when the caller does not supply
+/// one. Mirrors the dashboard preset that ships in `DiscoveryFormState`
+/// in `app_state.rs` so the server-driven start and the UI-driven
+/// start operate on the same context unless the caller explicitly
+/// overrides.
+pub const DEFAULT_HIGHER_TFS: &[&str] = &["M5", "M15", "H1"];
 
 #[derive(Debug, serde::Serialize)]
 pub struct StartResponse {
@@ -72,6 +96,19 @@ pub async fn discovery_start(
         .unwrap_or_else(|| "M1".to_string())
         .trim()
         .to_uppercase();
+    let higher_tfs: Vec<String> = body
+        .higher_tfs
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            DEFAULT_HIGHER_TFS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        })
+        .into_iter()
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     if state.engine_state(JobKind::Discovery).await == EngineRunState::Running {
         return (
@@ -94,12 +131,51 @@ pub async fn discovery_start(
         }
     };
 
+    // #153: pre-flight gate. A bare-install user clicks "Start Discovery"
+    // before running Data Bootstrap; discovery then runs for ~2 seconds
+    // before bailing with a deep "no matching files" panic that the
+    // dashboard surfaces as a useless "crash". Catch the empty / missing
+    // data root here and explain what to do instead.
+    if let Err(err) = preflight_discovery_data_root(&data_root, &symbol, &base_tf).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": err.to_string(),
+                "code": "discovery_no_data",
+                "data_root": data_root.display().to_string(),
+                "hint": "Run Data Bootstrap or import a CSV/Parquet \
+                         file for this symbol + base timeframe first.",
+            })),
+        )
+            .into_response();
+    }
+
+    // #194: stitch operator overrides into the default DiscoveryConfig.
+    // Anything the body omits stays at the engine default (which itself
+    // pulls from config.yaml).
+    let mut config = neoethos_search::DiscoveryConfig::default();
+    if let Some(p) = body.population.filter(|&p| p > 0) {
+        config.population = p;
+    }
+    if let Some(g) = body.generations.filter(|&g| g > 0) {
+        config.generations = g;
+    }
+    if let Some(m) = body.max_indicators.filter(|&m| m > 0) {
+        config.max_indicators = m;
+    }
+    if let Some(t) = body.target_candidates.filter(|&t| t > 0) {
+        config.candidate_count = t;
+    }
+    if let Some(s) = body.portfolio_size.filter(|&s| s > 0) {
+        config.portfolio_size = s;
+    }
+
     let request = DiscoveryRequest {
         data_root,
         symbol: symbol.clone(),
         base_tf: base_tf.clone(),
-        higher_tfs: vec!["M5".to_string(), "M15".to_string(), "H1".to_string()],
-        config: neoethos_search::DiscoveryConfig::default(),
+        higher_tfs: higher_tfs.clone(),
+        config,
         prop_firm_rules: neoethos_search::PropFirmRiskRules::default(),
     };
 
@@ -233,6 +309,92 @@ async fn resolve_data_root() -> Result<PathBuf> {
     })
     .await
     .map_err(|e| anyhow::anyhow!("blocking task panicked: {e}"))?
+}
+
+/// #153 pre-flight: refuse to start discovery if the data root is
+/// missing, unreadable, or contains zero files for the requested
+/// `symbol`+`base_tf`. The deep-stack failure that motivated this
+/// gate was a `panic!("no matching files")` two layers below
+/// `start_discovery_job` after ~2s — fast enough to look like a
+/// crash, slow enough that the user thought the engine "broke".
+///
+/// #203 refactor: the original v1 only scanned the TOP LEVEL of the
+/// data directory for filenames containing both the symbol and the
+/// timeframe strings. That gave a false negative for the actual
+/// hive-style layout the rest of the codebase uses
+/// (`data/symbol=EURUSD/timeframe=H1/data.vortex`) — the only
+/// top-level entry is `symbol=EURUSD` which doesn't contain "H1".
+/// Now we delegate to the data layer's `discover_timeframes` which
+/// already understands the hive layout and is cached per #79.
+async fn preflight_discovery_data_root(
+    data_root: &std::path::Path,
+    symbol: &str,
+    base_tf: &str,
+) -> Result<()> {
+    if !data_root.exists() {
+        anyhow::bail!(
+            "data directory does not exist: {} (configured via \
+             config.yaml `system.data_dir`)",
+            data_root.display()
+        );
+    }
+    if !data_root.is_dir() {
+        anyhow::bail!("data directory is not a directory: {}", data_root.display());
+    }
+
+    // Empty-directory branch: distinguish "user hasn't run Data
+    // Bootstrap at all" from "user ran it for a different symbol".
+    let mut entries = tokio::fs::read_dir(data_root)
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot read data directory {}: {e}", data_root.display()))?;
+    let mut total = 0usize;
+    while let Some(_entry) = entries.next_entry().await? {
+        total += 1;
+    }
+    if total == 0 {
+        anyhow::bail!(
+            "data directory is empty: {} — run Data Bootstrap or import \
+             a CSV/Parquet file first",
+            data_root.display()
+        );
+    }
+
+    let symbol_up = symbol.to_uppercase();
+    let base_tf_up = base_tf.to_uppercase();
+    let data_root_owned = data_root.to_path_buf();
+    let symbol_for_blocking = symbol_up.clone();
+    // `discover_timeframes` walks `symbol=*/timeframe=*/` and does
+    // some std::fs work; run it on the blocking pool so the async
+    // runtime stays responsive even when the data dir is on a slow
+    // network drive.
+    let discovered: Vec<String> = tokio::task::spawn_blocking(move || {
+        neoethos_data::discover_timeframes(&data_root_owned, &symbol_for_blocking)
+            .unwrap_or_default()
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("timeframe-discovery task panicked: {e}"))?;
+
+    if discovered.is_empty() {
+        anyhow::bail!(
+            "no data on disk for {} in {} — import OHLCV for this \
+             symbol first (data dir has {} top-level entries but \
+             none under symbol={})",
+            symbol_up,
+            data_root.display(),
+            total,
+            symbol_up,
+        );
+    }
+    if !discovered.iter().any(|tf| tf.eq_ignore_ascii_case(&base_tf_up)) {
+        anyhow::bail!(
+            "{} is on disk but timeframe {} is missing — available: {} ({})",
+            symbol_up,
+            base_tf_up,
+            discovered.join(", "),
+            data_root.display(),
+        );
+    }
+    Ok(())
 }
 
 /// Spawn a background task that drains the ServiceEvent rx channel

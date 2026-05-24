@@ -80,10 +80,7 @@ pub struct ReportResponse {
 /// here when we eventually rotate to a shared inbox.
 pub const REPORT_EMAIL: &str = "konstantinoskokkinos1982@gmail.com";
 
-pub async fn report(
-    State(_state): State<AppApiState>,
-    Json(req): Json<ReportRequest>,
-) -> Response {
+pub async fn report(State(_state): State<AppApiState>, Json(req): Json<ReportRequest>) -> Response {
     match tokio::task::spawn_blocking(move || build_bundle(&req)).await {
         Ok(Ok(resp)) => Json(resp).into_response(),
         Ok(Err(err)) => (

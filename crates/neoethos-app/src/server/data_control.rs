@@ -265,3 +265,115 @@ pub async fn fetch(State(_state): State<AppApiState>, Json(body): Json<FetchBody
             .into_response(),
     }
 }
+
+// ─── POST /data/import ────────────────────────────────────────────────────
+
+/// Request body for `POST /data/import` (#192).
+///
+/// `source_path` is the absolute path to the file the user wants to
+/// ingest. `symbol`/`timeframe` decide where the converted Vortex file
+/// lands on disk (`data/symbol=<sym>/timeframe=<tf>/data.vortex`). The
+/// source format is auto-detected from the file extension by the data
+/// layer's `DataFormat::from_extension`, so we don't ask the user to
+/// pick "CSV vs Parquet" — they just give us a file.
+#[derive(Debug, serde::Deserialize)]
+pub struct ImportBody {
+    #[serde(rename = "sourcePath")]
+    pub source_path: String,
+    pub symbol: String,
+    pub timeframe: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportOutcomeDto {
+    pub symbol: String,
+    pub timeframe: String,
+    pub source_format: String,
+    pub written_path: String,
+}
+
+/// `POST /data/import` — convert a user-provided CSV/Parquet/Arrow/
+/// JSON/JSONL/TSV file into the canonical Vortex layout under
+/// `data_dir/symbol=<S>/timeframe=<T>/data.vortex`.
+///
+/// This is the "I have my own data, don't make me re-download from
+/// the broker" workflow. The data layer's `convert_to_vortex` does
+/// the actual schema validation + write; we just route requests at
+/// it and return a tidy DTO.
+pub async fn import_file(
+    State(_state): State<AppApiState>,
+    Json(body): Json<ImportBody>,
+) -> Response {
+    let symbol = body.symbol.trim().to_uppercase();
+    let timeframe = body.timeframe.trim().to_uppercase();
+    let source_path = body.source_path.trim().to_string();
+
+    if symbol.is_empty() || timeframe.is_empty() || source_path.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "sourcePath, symbol, and timeframe must all be non-empty",
+            })),
+        )
+            .into_response();
+    }
+
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<ImportOutcomeDto> {
+        let settings = Settings::from_yaml("config.yaml")
+            .map_err(|e| anyhow::anyhow!("config.yaml not loadable: {e}"))?;
+        let source = std::path::Path::new(&source_path);
+        if !source.exists() {
+            anyhow::bail!("source file not found: {}", source.display());
+        }
+        // Auto-detect format from extension (CSV/TSV/Parquet/JSON/
+        // JSONL/Arrow/IPC/Feather). Anything else returns an `Err`.
+        let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let format =
+            neoethos_data::core::discover::DataFormat::from_extension(ext).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unsupported extension on {} — \
+                     supported: csv, tsv, parquet, json, jsonl, arrow, ipc, feather",
+                    source.display()
+                )
+            })?;
+        let destination = neoethos_data::symbol_timeframe_vortex_path(
+            &settings.system.data_dir,
+            &symbol,
+            &timeframe,
+        );
+        let hint = neoethos_data::core::to_vortex::IngestionSchema {
+            optional: vec!["volume".to_string()],
+            timeframe_hint: Some(timeframe.clone()),
+        };
+        let written = neoethos_data::core::to_vortex::convert_to_vortex(
+            source,
+            format,
+            &destination,
+            Some(&hint),
+        )?;
+        Ok(ImportOutcomeDto {
+            symbol: symbol.clone(),
+            timeframe: timeframe.clone(),
+            source_format: format!("{format:?}"),
+            written_path: written.display().to_string(),
+        })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(dto)) => Json(dto).into_response(),
+        Ok(Err(err)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+        Err(join_err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("import task panicked: {join_err}"),
+            })),
+        )
+            .into_response(),
+    }
+}

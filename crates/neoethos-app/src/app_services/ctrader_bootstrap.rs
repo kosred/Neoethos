@@ -139,10 +139,25 @@ pub fn inspect_local_bar_coverage(
     // quantities. Multiply back to nanoseconds so the rest of the function is
     // unit-consistent with the NormalizedBar timestamps written by the writer.
     let raw_ms = ohlcv.timestamp.context("local dataset has no timestamps")?;
+    // #157: checked_mul instead of saturating_mul. The original code
+    // silently clamped any ms > 9_223_372_036_854 (year 2262) to
+    // i64::MAX, which collapsed the entire coverage window into one
+    // saturated bucket — silent corruption. Real timestamps from the
+    // broker are nowhere near 2262, so a future-dated value here is
+    // almost certainly upstream corruption that deserves a loud
+    // error rather than a mis-bucketed integral overflow.
     let mut timestamps: Vec<i64> = raw_ms
         .into_iter()
-        .map(|ms| ms.saturating_mul(1_000_000))
-        .collect();
+        .map(|ms| {
+            ms.checked_mul(1_000_000).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "timestamp {} ms × 1_000_000 overflows i64 nanoseconds — \
+                     refusing to silently saturate; check upstream data source",
+                    ms
+                )
+            })
+        })
+        .collect::<Result<Vec<i64>>>()?;
     timestamps.sort_unstable();
     timestamps.dedup();
 

@@ -1409,9 +1409,9 @@ fn cmd_credentials(args: &[String]) -> Result<()> {
     match args[0].as_str() {
         "show" => cmd_credentials_show(),
         "set" => cmd_credentials_set(&args[1..]),
-        other => anyhow::bail!(
-            "unknown credentials subcommand `{other}`. Expected `show` or `set`."
-        ),
+        other => {
+            anyhow::bail!("unknown credentials subcommand `{other}`. Expected `show` or `set`.")
+        }
     }
 }
 
@@ -1481,8 +1481,7 @@ fn cmd_credentials_set(args: &[String]) -> Result<()> {
     }
 
     let path = neoethos_core::broker_config::credentials_file_path()?;
-    let mut state = neoethos_core::broker_config::load_from_disk(&path)?
-        .unwrap_or_default();
+    let mut state = neoethos_core::broker_config::load_from_disk(&path)?.unwrap_or_default();
 
     if let Some(v) = client_id {
         state.ctrader.client_id = v.trim().to_string();
@@ -1497,11 +1496,9 @@ fn cmd_credentials_set(args: &[String]) -> Result<()> {
         state.ctrader.redirect_uri = v.trim().to_string();
     }
     if let Some(v) = environment {
-        let parsed = neoethos_core::broker_config::CTraderBrokerEnvironment::parse(&v)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "invalid --environment value `{v}`. Expected `Demo` or `Live`."
-                )
+        let parsed =
+            neoethos_core::broker_config::CTraderBrokerEnvironment::parse(&v).ok_or_else(|| {
+                anyhow::anyhow!("invalid --environment value `{v}`. Expected `Demo` or `Live`.")
             })?;
         state.ctrader.environment = parsed;
     }
@@ -1511,13 +1508,11 @@ fn cmd_credentials_set(args: &[String]) -> Result<()> {
             // Replace the entire account list with the single target —
             // matches the UI's behaviour (the dropdown sends one
             // accountId, the server overwrites the targets vec).
-            state.ctrader.accounts = vec![
-                neoethos_core::broker_config::BrokerAccountTarget {
-                    account_id: trimmed,
-                    label: String::new(),
-                    enabled_for_execution: true,
-                },
-            ];
+            state.ctrader.accounts = vec![neoethos_core::broker_config::BrokerAccountTarget {
+                account_id: trimmed,
+                label: String::new(),
+                enabled_for_execution: true,
+            }];
         }
     }
 
@@ -1549,7 +1544,9 @@ fn cmd_credentials_set(args: &[String]) -> Result<()> {
         path.display(),
         state.ctrader.accounts.len()
     );
-    println!("Next step: open the GUI and run Broker Setup → Re-authenticate to fetch an OAuth token.");
+    println!(
+        "Next step: open the GUI and run Broker Setup → Re-authenticate to fetch an OAuth token."
+    );
     Ok(())
 }
 
@@ -1557,7 +1554,14 @@ fn redact_secret(s: &str) -> String {
     if s.is_empty() {
         return "(blank)".to_string();
     }
-    let last4: String = s.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    let last4: String = s
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("••••{last4} (len={})", s.len())
 }
 

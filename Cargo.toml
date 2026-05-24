@@ -7,8 +7,7 @@ members = [
   "crates/neoethos-models",
   "crates/neoethos-core",
   "crates/neoethos-app",
-  "crates/neoethos-news",
-  "crates/neoethos-gemma",
+  "crates/neoethos-codex",
 ]
 default-members = [
   "crates/neoethos-search",
@@ -17,8 +16,7 @@ default-members = [
   "crates/neoethos-models",
   "crates/neoethos-core",
   "crates/neoethos-app",
-  "crates/neoethos-news",
-  "crates/neoethos-gemma",
+  "crates/neoethos-codex",
 ]
 
 [workspace.package]

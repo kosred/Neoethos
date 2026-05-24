@@ -240,12 +240,6 @@ class BackendClient {
     String? newsCalendarSource,
     String? openaiModel,
     String? newsTradingMode,
-    // ── Gemma news watcher (#132) ──────────────────────────────
-    bool? gemmaNewsWatcherEnabled,
-    String? gemmaMorningScanTime,
-    int? gemmaSessionStartLeadMin,
-    int? gemmaAdaptivePollThresholdMin,
-    int? gemmaAdaptivePollIntervalSecs,
   }) async {
     final body = <String, dynamic>{};
     if (dataDir != null) body['dataDir'] = dataDir;
@@ -257,21 +251,6 @@ class BackendClient {
     }
     if (openaiModel != null) body['openaiModel'] = openaiModel;
     if (newsTradingMode != null) body['newsTradingMode'] = newsTradingMode;
-    if (gemmaNewsWatcherEnabled != null) {
-      body['gemmaNewsWatcherEnabled'] = gemmaNewsWatcherEnabled;
-    }
-    if (gemmaMorningScanTime != null) {
-      body['gemmaMorningScanTime'] = gemmaMorningScanTime;
-    }
-    if (gemmaSessionStartLeadMin != null) {
-      body['gemmaSessionStartLeadMin'] = gemmaSessionStartLeadMin;
-    }
-    if (gemmaAdaptivePollThresholdMin != null) {
-      body['gemmaAdaptivePollThresholdMin'] = gemmaAdaptivePollThresholdMin;
-    }
-    if (gemmaAdaptivePollIntervalSecs != null) {
-      body['gemmaAdaptivePollIntervalSecs'] = gemmaAdaptivePollIntervalSecs;
-    }
 
     final response = await _dio.post<Map<String, dynamic>>(
       '/settings',
@@ -316,11 +295,33 @@ class BackendClient {
   /// POST `/engines/discovery/{start,stop}`. Returns the response body
   /// shape: `{started:true, kind:"discovery", symbol, base_tf}` for
   /// start, `{running, kind}` for stop. Throws DioException on 4xx/5xx.
+  ///
+  /// #194: optional GA hyperparameter overrides. When `null`, the
+  /// engine uses defaults from `config.yaml`. Passing any non-null
+  /// value here lets the operator tune that knob from the Advanced
+  /// expander without editing YAML.
   Future<Map<String, dynamic>> startDiscovery({
     String? symbol,
     String? baseTf,
+    int? population,
+    int? generations,
+    int? maxIndicators,
+    int? targetCandidates,
+    int? portfolioSize,
   }) async {
-    return _postEngine('/engines/discovery/start', symbol, baseTf);
+    final body = <String, dynamic>{};
+    if (symbol != null && symbol.trim().isNotEmpty) body['symbol'] = symbol;
+    if (baseTf != null && baseTf.trim().isNotEmpty) body['base_tf'] = baseTf;
+    if (population != null) body['population'] = population;
+    if (generations != null) body['generations'] = generations;
+    if (maxIndicators != null) body['max_indicators'] = maxIndicators;
+    if (targetCandidates != null) body['target_candidates'] = targetCandidates;
+    if (portfolioSize != null) body['portfolio_size'] = portfolioSize;
+    final response = await _dio.post<Map<String, dynamic>>(
+      '/engines/discovery/start',
+      data: body.isEmpty ? null : body,
+    );
+    return response.data ?? const <String, dynamic>{};
   }
 
   Future<Map<String, dynamic>> stopDiscovery() async {
@@ -399,79 +400,40 @@ class BackendClient {
     return r.data ?? const <String, dynamic>{};
   }
 
-  /// `/gemma/status` — local LLM availability check. Returns whether
-  /// the binary was built with --features gemma-backend AND whether
-  /// the GGUF is on disk.
-  Future<GemmaStatusSnapshot> fetchGemmaStatus() async {
-    final response = await _dio.get<Map<String, dynamic>>('/gemma/status');
-    if (response.data == null) {
-      throw DioException(
-        requestOptions: response.requestOptions,
-        response: response,
-        message: '/gemma/status returned empty body',
-      );
-    }
-    return GemmaStatusSnapshot.fromJson(response.data!);
+  /// `GET /auth/codex/status` — does the operator have a ChatGPT
+  /// subscription linked? Returns null fields when not logged in.
+  Future<CodexStatusSnapshot> fetchCodexStatus() async {
+    final r = await _dio.get<Map<String, dynamic>>('/auth/codex/status');
+    return CodexStatusSnapshot.fromJson(r.data ?? const {});
   }
 
-  /// POST `/gemma/download` — start the background fetch of the
-  /// bundled GGUF from HuggingFace into the user-data-dir. Used by
-  /// the AI Helper screen's first-launch downloader as a fallback
-  /// for when the NSIS install-time download was skipped or failed.
-  /// 409 if a download is already in flight.
-  Future<Map<String, dynamic>> startGemmaDownload() async {
-    final r = await _dio.post<Map<String, dynamic>>(
-      '/gemma/download',
-      options: Options(
-        // 409 (Conflict) is "already running" — let the UI treat it
-        // as a no-op success and just poll status.
-        validateStatus: (code) =>
-            code != null && ((code >= 200 && code < 300) || code == 409),
-      ),
-    );
-    return r.data ?? const <String, dynamic>{};
+  /// `POST /auth/codex/start` — kicks off the PKCE OAuth flow.
+  /// Returns the authorize URL the front-end opens in the browser.
+  Future<CodexStartResponse> startCodexLogin() async {
+    final r = await _dio.post<Map<String, dynamic>>('/auth/codex/start');
+    return CodexStartResponse.fromJson(r.data ?? const {});
   }
 
-  /// GET `/gemma/download/status` — polled by the AI Helper screen
-  /// while the download is in flight so the progress bar can update.
-  Future<GemmaDownloadStatus> fetchGemmaDownloadStatus() async {
-    final r = await _dio.get<Map<String, dynamic>>('/gemma/download/status');
-    return GemmaDownloadStatus.fromJson(r.data ?? const {});
+  /// `POST /auth/codex/logout` — wipes `~/.codex/auth.json`.
+  Future<void> logoutCodex() async {
+    await _dio.post<void>('/auth/codex/logout');
   }
 
-  /// POST `/gemma/download/cancel` — abort the in-flight download.
-  Future<Map<String, dynamic>> cancelGemmaDownload() async {
-    final r = await _dio.post<Map<String, dynamic>>('/gemma/download/cancel');
-    return r.data ?? const <String, dynamic>{};
-  }
-
-  /// POST `/gemma/chat` — local Gemma-4 inference. 503 if the runtime
-  /// or the model file is missing — the response body explains how to
-  /// fix it.
-  Future<GemmaChatResponse> gemmaChat({
+  /// `POST /codex/chat` — proxy a chat completion through the
+  /// operator's ChatGPT subscription. 401 = re-auth needed.
+  Future<CodexChatResponse> codexChat({
     required String prompt,
+    String? model,
     int? maxTokens,
   }) async {
     final body = <String, dynamic>{'prompt': prompt};
+    if (model != null) body['model'] = model;
     if (maxTokens != null) body['maxTokens'] = maxTokens;
-    final response = await _dio.post<Map<String, dynamic>>(
-      '/gemma/chat',
+    final r = await _dio.post<Map<String, dynamic>>(
+      '/codex/chat',
       data: body,
-      // 5 minutes — first call loads the GGUF (5-30s), and a
-      // 600-token response on CPU can take a couple of minutes.
-      options: Options(receiveTimeout: const Duration(minutes: 5)),
     );
-    return GemmaChatResponse.fromJson(response.data ?? const {});
-  }
-
-  /// POST `/gemma/news` — symbol-specific news summary via local LLM.
-  Future<GemmaChatResponse> gemmaNews({required String symbol}) async {
-    final response = await _dio.post<Map<String, dynamic>>(
-      '/gemma/news',
-      data: {'symbol': symbol},
-      options: Options(receiveTimeout: const Duration(minutes: 5)),
-    );
-    return GemmaChatResponse.fromJson(response.data ?? const {});
+    return CodexChatResponse.fromJson(r.data ?? const {});
   }
 
   /// POST `/positions/close` — close (or partially close) an open
@@ -578,6 +540,38 @@ class BackendClient {
       );
     }
     return BrokerAccountsSnapshot.fromJson(response.data!);
+  }
+
+  /// GET `/settings/raw` (#193) — full `config.yaml` contents as a
+  /// single string, plus the absolute on-disk path. Lets the Settings
+  /// screen surface the 200+ knobs the typed `/settings` DTO can't.
+  Future<Map<String, dynamic>> fetchRawConfigYaml() async {
+    final response = await _dio.get<Map<String, dynamic>>('/settings/raw');
+    return response.data ?? const <String, dynamic>{};
+  }
+
+  /// POST `/data/import` (#192) — convert a local CSV/Parquet/Arrow/
+  /// JSON/JSONL/TSV file into the canonical Vortex layout under
+  /// `data/symbol=<sym>/timeframe=<tf>/`. The source format is auto-
+  /// detected from the file extension server-side.
+  ///
+  /// Returns the path the converted Vortex file landed at (so the UI
+  /// can show "Imported to: <path>") plus the detected format string.
+  Future<Map<String, dynamic>> importLocalFile({
+    required String sourcePath,
+    required String symbol,
+    required String timeframe,
+  }) async {
+    final response = await _dio.post<Map<String, dynamic>>(
+      '/data/import',
+      data: {
+        'sourcePath': sourcePath,
+        'symbol': symbol,
+        'timeframe': timeframe,
+      },
+      options: Options(receiveTimeout: const Duration(seconds: 120)),
+    );
+    return response.data ?? const <String, dynamic>{};
   }
 
   /// POST `/data/fetch` — download historical bars for [fromMs, toMs]
@@ -932,12 +926,6 @@ class SettingsSnapshot {
   /// for safe back-compat.
   final String newsTradingMode;
   final String newsTradingModeDisplayName;
-  // ── Gemma news watcher (#132) ────────────────────────────────
-  final bool gemmaNewsWatcherEnabled;
-  final String gemmaMorningScanTime;
-  final int gemmaSessionStartLeadMin;
-  final int gemmaAdaptivePollThresholdMin;
-  final int gemmaAdaptivePollIntervalSecs;
   const SettingsSnapshot({
     required this.dataDir,
     required this.newsCalendarEnabled,
@@ -945,11 +933,6 @@ class SettingsSnapshot {
     required this.openaiModel,
     required this.newsTradingMode,
     required this.newsTradingModeDisplayName,
-    required this.gemmaNewsWatcherEnabled,
-    required this.gemmaMorningScanTime,
-    required this.gemmaSessionStartLeadMin,
-    required this.gemmaAdaptivePollThresholdMin,
-    required this.gemmaAdaptivePollIntervalSecs,
   });
 
   factory SettingsSnapshot.fromJson(Map<String, dynamic> j) => SettingsSnapshot(
@@ -960,16 +943,6 @@ class SettingsSnapshot {
         newsTradingMode: (j['newsTradingMode'] as String?) ?? '',
         newsTradingModeDisplayName:
             (j['newsTradingModeDisplayName'] as String?) ?? '',
-        gemmaNewsWatcherEnabled:
-            (j['gemmaNewsWatcherEnabled'] as bool?) ?? false,
-        gemmaMorningScanTime:
-            (j['gemmaMorningScanTime'] as String?) ?? '07:00',
-        gemmaSessionStartLeadMin:
-            (j['gemmaSessionStartLeadMin'] as num?)?.toInt() ?? 10,
-        gemmaAdaptivePollThresholdMin:
-            (j['gemmaAdaptivePollThresholdMin'] as num?)?.toInt() ?? 30,
-        gemmaAdaptivePollIntervalSecs:
-            (j['gemmaAdaptivePollIntervalSecs'] as num?)?.toInt() ?? 15,
       );
 }
 
@@ -1074,6 +1047,30 @@ class BrokerSymbolsSnapshot {
           s.symbolName.length == 6 &&
           RegExp(r'^[A-Z]{6}$').hasMatch(s.symbolName))
       .toList(growable: false);
+
+  /// #184: enabled metals — XAU/XAG/XPT/XPD heads, 6-letter codes.
+  /// Surfaces gold, silver, platinum, palladium for the category
+  /// chips that want a non-forex slice.
+  List<BrokerSymbol> get metalsEnabled => symbols.where((s) {
+        if (!s.enabled || s.symbolName.length != 6) return false;
+        const heads = ['XAU', 'XAG', 'XPT', 'XPD'];
+        return heads.contains(s.symbolName.substring(0, 3).toUpperCase());
+      }).toList(growable: false);
+
+  /// #184: enabled-and-not-(forex|metals) — the residual that is most
+  /// likely indices, equities, or other CFDs on a retail broker catalog.
+  /// Defined by exclusion so we don't have to enumerate every ticker.
+  List<BrokerSymbol> get equitiesAndIndicesEnabled {
+        final forexNames =
+            forexLikeEnabled.map((x) => x.symbolName).toSet();
+        final metalNames = metalsEnabled.map((x) => x.symbolName).toSet();
+        return symbols.where((s) {
+          if (!s.enabled) return false;
+          if (forexNames.contains(s.symbolName)) return false;
+          if (metalNames.contains(s.symbolName)) return false;
+          return true;
+        }).toList(growable: false);
+  }
 }
 
 /// One row in the `/broker/accounts` list — the user's view of a
@@ -1135,101 +1132,66 @@ class BrokerAccountsSnapshot {
       );
 }
 
-class GemmaStatusSnapshot {
-  final bool runtimeCompiledIn;
-  final bool modelFilePresent;
-  final String resolvedPath;
-  final String expectedFilename;
-  final String downloadUrl;
-  final int sizeBytes;
-  final int expectedSizeBytes;
-  final int nCtx;
-  final String message;
-  const GemmaStatusSnapshot({
-    required this.runtimeCompiledIn,
-    required this.modelFilePresent,
-    required this.resolvedPath,
-    required this.expectedFilename,
-    required this.downloadUrl,
-    required this.sizeBytes,
-    required this.expectedSizeBytes,
-    required this.nCtx,
-    required this.message,
+class CodexStatusSnapshot {
+  final bool authenticated;
+  final String? email;
+  final bool loginInProgress;
+  final String? lastError;
+  final String authPath;
+
+  CodexStatusSnapshot({
+    required this.authenticated,
+    required this.email,
+    required this.loginInProgress,
+    required this.lastError,
+    required this.authPath,
   });
-  factory GemmaStatusSnapshot.fromJson(Map<String, dynamic> j) =>
-      GemmaStatusSnapshot(
-        runtimeCompiledIn: (j['runtimeCompiledIn'] as bool?) ?? false,
-        modelFilePresent: (j['modelFilePresent'] as bool?) ?? false,
-        resolvedPath: (j['resolvedPath'] as String?) ?? '',
-        expectedFilename: (j['expectedFilename'] as String?) ?? '',
-        downloadUrl: (j['downloadUrl'] as String?) ?? '',
-        sizeBytes: (j['sizeBytes'] as num?)?.toInt() ?? 0,
-        expectedSizeBytes: (j['expectedSizeBytes'] as num?)?.toInt() ?? 0,
-        nCtx: (j['nCtx'] as num?)?.toInt() ?? 0,
-        message: (j['message'] as String?) ?? '',
+
+  factory CodexStatusSnapshot.fromJson(Map<String, dynamic> json) =>
+      CodexStatusSnapshot(
+        authenticated: json['authenticated'] as bool? ?? false,
+        email: json['email'] as String?,
+        loginInProgress: json['loginInProgress'] as bool? ?? false,
+        lastError: json['lastError'] as String?,
+        authPath: json['authPath'] as String? ?? '',
       );
-  bool get ready => runtimeCompiledIn && modelFilePresent;
 }
 
-/// Wire shape for the /gemma/download/status poll. Five state values:
-///   - `idle`         — nothing has been started this session
-///   - `downloading`  — bytes are flowing; UI shows progress bar
-///   - `completed`    — file is on disk, AI Helper will flip to chat
-///   - `failed`       — network/server error; UI surfaces `error`
-///   - `cancelled`    — user clicked Cancel mid-flight
-class GemmaDownloadStatus {
-  final String state;
-  final int bytesDone;
-  final int bytesTotal;
-  final int elapsedSeconds;
-  final String? writtenPath;
-  final String? error;
-  const GemmaDownloadStatus({
-    required this.state,
-    required this.bytesDone,
-    required this.bytesTotal,
-    required this.elapsedSeconds,
-    required this.writtenPath,
-    required this.error,
-  });
-  factory GemmaDownloadStatus.fromJson(Map<String, dynamic> j) =>
-      GemmaDownloadStatus(
-        state: (j['state'] as String?) ?? 'idle',
-        bytesDone: (j['bytesDone'] as num?)?.toInt() ?? 0,
-        bytesTotal: (j['bytesTotal'] as num?)?.toInt() ?? 0,
-        elapsedSeconds: (j['elapsedSeconds'] as num?)?.toInt() ?? 0,
-        writtenPath: j['writtenPath'] as String?,
-        error: j['error'] as String?,
+class CodexStartResponse {
+  final String authorizeUrl;
+  final int callbackPort;
+
+  CodexStartResponse({required this.authorizeUrl, required this.callbackPort});
+
+  factory CodexStartResponse.fromJson(Map<String, dynamic> json) =>
+      CodexStartResponse(
+        authorizeUrl: json['authorizeUrl'] as String? ?? '',
+        callbackPort: (json['callbackPort'] as num?)?.toInt() ?? 1455,
       );
-
-  bool get isDownloading => state == 'downloading';
-  bool get isCompleted => state == 'completed';
-  bool get isFailed => state == 'failed';
-  bool get isCancelled => state == 'cancelled';
-
-  /// 0.0–1.0 normalised fraction for the progress bar. Returns null
-  /// when total isn't known yet (server hasn't replied with content-
-  /// length) so the UI can render an indeterminate spinner.
-  double? get fraction {
-    if (bytesTotal <= 0) return null;
-    return (bytesDone / bytesTotal).clamp(0.0, 1.0);
-  }
 }
 
-class GemmaChatResponse {
-  final String modelId;
+class CodexChatResponse {
+  final String model;
   final String response;
-  final int elapsedMs;
-  const GemmaChatResponse({
-    required this.modelId,
+  final int promptTokens;
+  final int completionTokens;
+  final int totalTokens;
+
+  CodexChatResponse({
+    required this.model,
     required this.response,
-    required this.elapsedMs,
+    required this.promptTokens,
+    required this.completionTokens,
+    required this.totalTokens,
   });
-  factory GemmaChatResponse.fromJson(Map<String, dynamic> j) =>
-      GemmaChatResponse(
-        modelId: (j['modelId'] as String?) ?? '',
-        response: (j['response'] as String?) ?? '',
-        elapsedMs: (j['elapsedMs'] as num?)?.toInt() ?? 0,
+
+  factory CodexChatResponse.fromJson(Map<String, dynamic> json) =>
+      CodexChatResponse(
+        model: json['model'] as String? ?? '',
+        response: json['response'] as String? ?? '',
+        promptTokens: (json['promptTokens'] as num?)?.toInt() ?? 0,
+        completionTokens: (json['completionTokens'] as num?)?.toInt() ?? 0,
+        totalTokens: (json['totalTokens'] as num?)?.toInt() ?? 0,
       );
 }
 

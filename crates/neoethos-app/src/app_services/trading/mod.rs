@@ -339,15 +339,13 @@ pub enum OrderSource {
     /// (per-trade, per-day, per-stage, per-month, manual-halt,
     /// hardware-halt, pre-send sanity) and the prop-firm gate.
     Ai,
-    /// Gemma-suggested trade that the user explicitly **Approved**
-    /// via the conversational helper (Phase G6b — see
-    /// `neoethos_gemma::PendingSuggestion`). Distinct from
-    /// [`Self::Ai`] so the audit log can slice "Gemma-initiated
-    /// trades" cleanly from autonomous-ensemble trades. Passes
-    /// the same gates as `Ai` — every Risky Mode tier + the
-    /// prop-firm gate still applies. NEVER set without an
-    /// explicit user-click Approve through the chat UI.
-    #[allow(dead_code)] // Gemma Approve-flow not yet wired (Task #40)
+    /// AI-suggested trade that the user explicitly **Approved**
+    /// via a conversational helper. Distinct from [`Self::Ai`] so
+    /// the audit log can slice "user-approved suggestions" cleanly
+    /// from autonomous-ensemble trades. Passes the same gates as
+    /// `Ai` — every Risky Mode tier + the prop-firm gate still
+    /// applies. NEVER set without an explicit user-click Approve.
+    #[allow(dead_code)]
     AiSuggested,
 }
 
@@ -357,8 +355,8 @@ pub enum OrderSource {
 // public for the gate tests in trading_tests.rs.
 impl OrderSource {
     /// `true` when the source is AI-originated (autonomous OR
-    /// user-approved Gemma suggestion). Risky Mode treats both
-    /// the same way for the manual-rejection gate.
+    /// user-approved suggestion). Risky Mode treats both the
+    /// same way for the manual-rejection gate.
     pub fn is_ai_originated(self) -> bool {
         matches!(self, Self::Ai | Self::AiSuggested)
     }

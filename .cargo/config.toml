@@ -8,3 +8,20 @@ BINDGEN_EXTRA_CLANG_ARGS = "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
 # with unresolved __imp_fsetpos / __imp_fseeki64 / __imp_ungetc / etc.
 # The runtime UCRT DLLs (api-ms-win-crt-*.dll) ship with VS C++
 # Redistributable; if missing, copy them alongside neoethos-cli.exe.
+
+# OpenMP duplicate-symbol workaround (MSVC toolchain 14.51.36231+).
+#
+# Two OpenMP libraries land in the final link of `neoethos-app`:
+#   - `VCOMP.lib` (MSVC's OpenMP runtime), auto-linked because
+#     `llama-cpp-sys-2`'s ggml-cpu.c.obj calls `_vcomp_*` MSVC-specific
+#     primitives — we cannot exclude VCOMP without breaking llama-cpp.
+#   - `lightgbm3-sys/c_api.cpp.obj`, which has `omp_get_thread_num`
+#     etc. compiled-in (statically linked OpenMP).
+#
+# Both define `omp_get_thread_num` → LNK2005 (multiply defined symbol).
+# Pure exclusion of either breaks the other. `/FORCE:MULTIPLE` tells
+# the linker to keep the first definition and downgrade the duplicate
+# to a warning (LNK4006); both copies implement the same standard
+# OpenMP ABI so picking either is correct.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/FORCE:MULTIPLE", "-C", "link-arg=/IGNORE:4006"]

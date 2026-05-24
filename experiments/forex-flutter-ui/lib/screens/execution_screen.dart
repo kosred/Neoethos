@@ -382,8 +382,12 @@ class _ExecutionScreenState extends ConsumerState<ExecutionScreen> {
           ),
           if (brokerSymbols.hasValue)
             SectionCard(
+              // #187: previously showed only `symbolCount` (total, including
+              // disabled) which mismatched the Markets screen's "of N enabled".
+              // Show both numbers so the user has a consistent denominator.
               title:
-                  'Catalog · ${brokerSymbols.value!.symbolCount} symbols from broker',
+                  'Catalog · ${brokerSymbols.value!.symbols.where((s) => s.enabled).length} enabled · '
+                  '${brokerSymbols.value!.symbolCount} total from broker',
               child: const Text(
                 'Type any symbol the broker offers (forex pairs, '
                 'metals, indices, equities). The server resolves the '

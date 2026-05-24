@@ -6,11 +6,9 @@
 //! `String` for keyboard editability — page code converts to int / Vec
 //! at launch time.
 //!
-//! There is also a special "browse" action that, when invoked on the
-//! data-root field, scans the current value's directory and offers the
-//! list of `symbol=*/` children as picker rows.
-
-use std::path::PathBuf;
+//! The Symbols page enumerates `symbol=*/` directories itself; this
+//! module no longer needs to scan disk (the earlier `discover_symbols_in_root`
+//! helper was removed in #200 because nothing called it).
 
 #[derive(Debug, Clone)]
 pub struct Field {
@@ -138,10 +136,6 @@ impl FormState {
         }
     }
 
-    pub fn get(&self, idx: usize) -> Option<&Field> {
-        self.fields.get(idx)
-    }
-
     pub fn value_for(&self, label: &str) -> Option<&str> {
         self.fields
             .iter()
@@ -207,23 +201,7 @@ pub fn make_train_form(default_root: &str) -> FormState {
     ])
 }
 
-// ─── Symbol-from-data-root helper (used by Symbol field's browse) ──────
-
-/// Scan a data root and return the list of `symbol=*` directory names
-/// (with the prefix stripped). Empty if path missing or unreadable.
-pub fn discover_symbols_in_root(data_root: &str) -> Vec<String> {
-    let p = PathBuf::from(data_root);
-    let mut out = Vec::new();
-    let Ok(read) = std::fs::read_dir(&p) else {
-        return out;
-    };
-    for entry in read.flatten() {
-        let name = entry.file_name();
-        let s = name.to_string_lossy();
-        if let Some(rest) = s.strip_prefix("symbol=") {
-            out.push(rest.to_string());
-        }
-    }
-    out.sort();
-    out
-}
+// `discover_symbols_in_root` was a half-wired helper for a Symbol-field
+// browse that never landed — the Symbols page already enumerates
+// `symbol=*` directories itself via `collect_inventory`. Deleted to
+// avoid two parallel scanners drifting (#200).

@@ -39,7 +39,7 @@ const List<NavTab> kNavTabs = [
   NavTab('Intelligence', NavGroup.aiEngine, '✺', 'Intelligence',
       'AI model insights & explainability'),
   NavTab('AiHelper', NavGroup.aiEngine, '🤖', 'AI Helper',
-      'Local Gemma-4 chat assistant'),
+      'ChatGPT-subscription chat assistant'),
 
   // System
   NavTab('BrokerSetup', NavGroup.system, '🔌', 'Broker Setup',

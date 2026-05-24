@@ -35,22 +35,65 @@ impl TimestampUnit {
     }
 }
 
+fn classify_magnitude(value: i64) -> TimestampUnit {
+    let abs = value.unsigned_abs();
+    if abs >= 10_000_000_000_000_000 {
+        TimestampUnit::Nanoseconds
+    } else if abs >= 10_000_000_000_000 {
+        TimestampUnit::Microseconds
+    } else if abs >= 10_000_000_000 {
+        TimestampUnit::Milliseconds
+    } else {
+        TimestampUnit::Seconds
+    }
+}
+
 /// Infer a likely timestamp unit from absolute Unix timestamp magnitude.
 ///
-/// This is only a migration helper. New code should prefer typed config or
-/// dataset metadata instead of guessing.
+/// #156: this is only a migration helper. New code should prefer typed
+/// config or dataset metadata instead of guessing. To make the guess robust
+/// against single-row upstream corruption (e.g. one stray row with
+/// `timestamp = 1`), we sample up to the first 16 non-zero values and use
+/// the **most common** magnitude bucket. If we see a heterogeneous sample
+/// (no bucket gets ≥75% of the votes) we conservatively return `None` so
+/// the caller bails rather than silently mis-folding the dataset.
 pub fn infer_timestamp_unit(values: &[i64]) -> Option<TimestampUnit> {
-    let sample = values.iter().copied().find(|value| *value != 0)?;
-    let abs = sample.unsigned_abs();
-    if abs >= 10_000_000_000_000_000 {
-        Some(TimestampUnit::Nanoseconds)
-    } else if abs >= 10_000_000_000_000 {
-        Some(TimestampUnit::Microseconds)
-    } else if abs >= 10_000_000_000 {
-        Some(TimestampUnit::Milliseconds)
-    } else {
-        Some(TimestampUnit::Seconds)
+    let sample: Vec<TimestampUnit> = values
+        .iter()
+        .copied()
+        .filter(|value| *value != 0)
+        .take(16)
+        .map(classify_magnitude)
+        .collect();
+    if sample.is_empty() {
+        return None;
     }
+    let mut votes = [0usize; 4];
+    for &u in &sample {
+        let idx = match u {
+            TimestampUnit::Seconds => 0,
+            TimestampUnit::Milliseconds => 1,
+            TimestampUnit::Microseconds => 2,
+            TimestampUnit::Nanoseconds => 3,
+        };
+        votes[idx] += 1;
+    }
+    let (best_idx, &best_count) = votes.iter().enumerate().max_by_key(|(_, count)| *count)?;
+    // ≥75% threshold catches both "all 16 agree" (normal case) and the
+    // realistic mixed-bag of 1 corrupted row among 16 good ones (15/16
+    // = 93.75%, well over the threshold). 13/16 = 81.25% still passes;
+    // 12/16 = 75% exactly passes. A 50/50 split fails — that points at
+    // a real schema problem the caller should surface.
+    if (best_count as f64) / (sample.len() as f64) < 0.75 {
+        return None;
+    }
+    Some(match best_idx {
+        0 => TimestampUnit::Seconds,
+        1 => TimestampUnit::Milliseconds,
+        2 => TimestampUnit::Microseconds,
+        3 => TimestampUnit::Nanoseconds,
+        _ => unreachable!("votes array has exactly 4 buckets"),
+    })
 }
 
 pub fn timestamp_to_millis(value: i64, unit: TimestampUnit) -> Result<i64> {
@@ -163,5 +206,31 @@ mod tests {
     fn rejects_non_monotonic_timestamps() {
         assert!(validate_monotonic_timestamps(&[1, 2, 2, 3]).is_ok());
         assert!(validate_monotonic_timestamps(&[1, 3, 2]).is_err());
+    }
+
+    #[test]
+    fn infer_timestamp_unit_tolerates_single_corrupt_row() {
+        // 1 corrupted row + 15 legitimate millis rows → still infers ms.
+        let mut values = vec![1_i64]; // corrupt: classifies as Seconds.
+        for i in 0..15 {
+            values.push(1_700_000_000_000 + i);
+        }
+        assert_eq!(
+            infer_timestamp_unit(&values),
+            Some(TimestampUnit::Milliseconds)
+        );
+    }
+
+    #[test]
+    fn infer_timestamp_unit_refuses_heterogeneous_sample() {
+        // 8 seconds + 8 millis → no bucket reaches 75%, refuses to guess.
+        let mut values = vec![];
+        for i in 0..8 {
+            values.push(1_700_000_000 + i);
+        }
+        for i in 0..8 {
+            values.push(1_700_000_000_000 + i);
+        }
+        assert_eq!(infer_timestamp_unit(&values), None);
     }
 }

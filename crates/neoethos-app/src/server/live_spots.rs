@@ -114,6 +114,9 @@ pub async fn list(State(_state): State<AppApiState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
 
     #[test]
     fn dto_computes_mid_and_freshness() {
@@ -133,5 +136,42 @@ mod tests {
         assert!((dto.mid_price.unwrap() - 1.0851).abs() < 1e-6);
         // Δt is 500_000 ms = 500 s
         assert!((dto.freshness_seconds - 500.0).abs() < 1e-3);
+    }
+
+    /// #147: smoke-test the route end-to-end. Even with no ticks
+    /// flowing (the realistic state before the streamer first
+    /// connects), the route must return HTTP 200 with the wire
+    /// shape Flutter expects — empty `spots` array, zero
+    /// `symbolCount`. A 5xx here means the UI's first poll on a
+    /// cold backend would surface "live ticks unavailable" instead
+    /// of "waiting for ticks…".
+    #[tokio::test]
+    async fn list_returns_200_with_camel_case_shape_on_empty_cache() {
+        let app = super::super::router(AppApiState::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/live/spots")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body collects");
+        let text = std::str::from_utf8(&body).expect("utf-8 body");
+        // CamelCase keys — must match the Flutter LiveSpot parser.
+        assert!(
+            text.contains("\"snapshotAtUnixMs\""),
+            "expected camelCase, got: {text}"
+        );
+        assert!(text.contains("\"symbolCount\""));
+        // No streamer has been started in the test, so spots are empty.
+        assert!(
+            text.contains("\"spots\":[]"),
+            "expected empty spots array on cold backend, got: {text}"
+        );
     }
 }

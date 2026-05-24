@@ -11,7 +11,7 @@
 #     neoethos-app.exe          ← Rust backend (hidden from operator;
 #                                 auto-spawned by the UI exe)
 #   assets/branding/*.png       ← icons / splash
-#   resources/models/           ← optional: Gemma GGUF lives here
+#   (no model files — AI Helper runs against a ChatGPT subscription)
 #
 # Operator workflow: copy the whole `dist/NeoEthos/` folder anywhere,
 # double-click `forex_flutter_ui.exe`. The Flutter `BackendSupervisor`
@@ -26,16 +26,7 @@
 [CmdletBinding()]
 param(
     [string]$Profile = 'release',     # 'release' or 'debug'
-    [string]$Destination = 'dist\NeoEthos',
-    # When -Lite is set, the bundle ships WITHOUT the Gemma GGUF —
-    # the NSIS installer downloads it at install time via
-    # `scripts/gemma_model_install.nsh`. Total bundle drops from
-    # ~5.5 GB back to ~250 MB so the installer .exe stays under
-    # GitHub Releases' 2 GB per-asset cap. Default behaviour (no
-    # -Lite) is the "Full" offline-testing bundle that includes
-    # the GGUF inline — handy for local AI Helper verification
-    # without internet access during install.
-    [switch]$Lite
+    [string]$Destination = 'dist\NeoEthos'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -143,78 +134,27 @@ Copy-Item -Path (Join-Path $repoRoot 'assets') -Destination $dst -Recurse
 Copy-Item -Path (Join-Path $repoRoot 'LICENSE') -Destination $dst
 Copy-Item -Path (Join-Path $repoRoot 'README.md') -Destination $dst -ErrorAction SilentlyContinue
 
-# 6. Bundle the Gemma GGUF if it's already on disk under the repo's
-#    `resources/models/`. The user explicitly asked that the model
-#    ship inside the bundle so the operator never has to download it
-#    by hand ("κακος το εχουμε αφησει στο χρηστη"). If the GGUF is
-#    missing we still create the empty slot and warn loudly — the
-#    bundle is still usable for chart/exec/discovery, but AI Helper +
-#    News will show "rebuild with --features gemma-backend OR run
-#    scripts/fetch-gemma-model.ps1" until the file lands.
-$bundleModelDir = Join-Path $dst 'resources\models'
-New-Item -ItemType Directory -Force -Path $bundleModelDir | Out-Null
-
-if ($Lite) {
-    Write-Host "Lite mode: skipping GGUF copy. NSIS installer will fetch it during install." -ForegroundColor Cyan
-    # We still copy the LICENSE-gemma so end users see the upstream
-    # attribution even before the download lands.
-    $gemmaLicenseSrc = Join-Path $repoRoot 'LICENSE-gemma'
-    if (Test-Path $gemmaLicenseSrc) {
-        Copy-Item -Path $gemmaLicenseSrc -Destination $bundleModelDir
-    }
-} else {
-    $repoModelDir = Join-Path $repoRoot 'resources\models'
-    $ggufFiles = if (Test-Path $repoModelDir) {
-        Get-ChildItem -Path $repoModelDir -Filter '*.gguf' -File -ErrorAction SilentlyContinue
-    } else { @() }
-
-    if ($ggufFiles.Count -gt 0) {
-        foreach ($gguf in $ggufFiles) {
-            $sizeGB = [math]::Round($gguf.Length / 1GB, 2)
-            Write-Host ("Copying GGUF: {0} ({1} GB)" -f $gguf.Name, $sizeGB) -ForegroundColor Green
-            Copy-Item -Path $gguf.FullName -Destination $bundleModelDir
-        }
-        # License compliance: Gemma is Google's license and requires
-        # the license file + attribution to travel with the weights.
-        $gemmaLicenseSrc = Join-Path $repoRoot 'LICENSE-gemma'
-        if (Test-Path $gemmaLicenseSrc) {
-            Copy-Item -Path $gemmaLicenseSrc -Destination $bundleModelDir
-        } else {
-            # No license file yet — emit a placeholder so the bundle is
-            # never shipped without notice. Compliance scaffolding lives
-            # in the repo as `LICENSE-gemma`; document the missing-file
-            # case here loudly.
-            Write-Warning "LICENSE-gemma not found at $gemmaLicenseSrc — bundle ships without Gemma license attribution. Fix before publishing."
-        }
-    } else {
-        Write-Warning ("No .gguf found in {0}. AI Helper + News will be disabled in this bundle. To include them, run scripts/fetch-gemma-model.ps1 and re-bundle (or use -Lite to defer to NSIS install-time fetch)." -f $repoModelDir)
-    }
-}
+# 6. (Gemma GGUF bundling removed — AI Helper now uses a ChatGPT
+#    subscription via neoethos-codex OAuth, no local model file is
+#    needed. The bundle stays ~250 MB regardless.)
 
 # 7. Quick verification.
 $bundleExe = Join-Path $dst 'NeoEthos.exe'
 $bundleBackend = Join-Path $dst 'bin\neoethos-app.exe'
 $bundleConfig = Join-Path $dst 'config.yaml'
-$bundleGguf = Get-ChildItem -Path $bundleModelDir -Filter '*.gguf' -ErrorAction SilentlyContinue | Select-Object -First 1
 
 Write-Host ""
 Write-Host "Bundle contents:"
 Get-ChildItem $dst | Format-Table Name, @{Name='Size'; Expression={if ($_.PSIsContainer) { 'dir' } else { $_.Length }}} -AutoSize
 
-# Total bundle size — relevant because the GGUF makes it jump from ~250 MB
-# to ~5.5 GB; the user should see this stat before publishing.
 $totalBytes = (Get-ChildItem $dst -Recurse -File | Measure-Object -Property Length -Sum).Sum
-$totalGB = [math]::Round($totalBytes / 1GB, 2)
+$totalMB = [math]::Round($totalBytes / 1MB, 2)
 
 Write-Host ""
 Write-Host "Sanity check:"
 Write-Host ("  NeoEthos.exe exists       : " + (Test-Path $bundleExe))
 Write-Host ("  bin/neoethos-app.exe      : " + (Test-Path $bundleBackend))
 Write-Host ("  config.yaml exists        : " + (Test-Path $bundleConfig))
-Write-Host ("  Gemma GGUF bundled        : " + ($null -ne $bundleGguf))
-if ($bundleGguf) {
-    Write-Host ("    → {0} ({1} GB)" -f $bundleGguf.Name, [math]::Round($bundleGguf.Length / 1GB, 2))
-}
-Write-Host ("  Total bundle size         : {0} GB" -f $totalGB)
+Write-Host ("  Total bundle size         : {0} MB" -f $totalMB)
 Write-Host ""
 Write-Host "Done. Double-click $bundleExe to launch."

@@ -1,6 +1,6 @@
 //! Pending-action queue for LLM-proposed trade-management actions (#136).
 //!
-//! When the Gemma layer wants to take an action that affects real money
+//! When an AI helper wants to take an action that affects real money
 //! (close a position, cancel a pending order, …) it CANNOT execute the
 //! action directly. Instead it calls the `propose_*` tool which adds a
 //! `PendingAction` to this queue. The Flutter UI surfaces the proposal
@@ -24,8 +24,7 @@
 //!
 //! Currently the only allowed action kind is `ClosePosition`. NO order
 //! placement, NO modify-SL, NO cancel-pending. Each new action kind
-//! requires a deliberate code change here AND a matching tool
-//! definition in `gemma_tools::propose_*` — there is no generic
+//! requires a deliberate code change here — there is no generic
 //! "execute arbitrary command" backdoor.
 
 use anyhow::{Context, Result, anyhow};
@@ -64,11 +63,10 @@ pub enum ActionKind {
 }
 
 impl ActionKind {
-    /// Human-readable one-liner used by the Gemma `list_pending_actions`
-    /// tool — feature-gated, so this method is dead code in the
-    /// default build. The cfg_attr keeps the warning quiet without
-    /// hiding it behind a blanket `#[allow]`.
-    #[cfg_attr(not(feature = "gemma-backend"), allow(dead_code))]
+    /// Human-readable one-liner consumed by future AI-helper tools
+    /// that want to list pending actions. Unused today; kept so the
+    /// rendering surface is in place when the tool is wired in.
+    #[allow(dead_code)]
     pub fn summary(&self) -> String {
         match self {
             Self::ClosePosition {
@@ -105,12 +103,26 @@ pub enum ActionStatus {
     Failed,
 }
 
+/// Schema version baked into every persisted `PendingAction`. Bumped
+/// whenever the on-disk shape changes in a non-additive way. The
+/// loader (`journal_to_disk` partner) refuses to deserialize rows
+/// stamped with a newer version than this binary knows about — old
+/// audit entries with a missing field default via serde, while newer
+/// entries from a future build are skipped with a warn rather than
+/// silently mis-deserialized.
+pub const PENDING_ACTION_SCHEMA_VERSION: u32 = 1;
+
 /// One row on the queue.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingAction {
     /// Stable UUID-style identifier the UI references when the user
     /// clicks Confirm / Reject.
     pub id: String,
+    /// Schema version of THIS row. Defaults to 1 for rows written
+    /// before #163 added the field (serde fills in the default on
+    /// load); new rows are stamped with [`PENDING_ACTION_SCHEMA_VERSION`].
+    #[serde(default = "default_schema_version_one")]
+    pub schema_version: u32,
     pub kind: ActionKind,
     /// Plain-language explanation from the LLM. Surfaced verbatim in
     /// the UI so the user knows why the model wants to act.
@@ -122,6 +134,10 @@ pub struct PendingAction {
     /// clicks Confirm / Reject and the action runs to completion.
     /// Empty while `status == Pending`.
     pub result_note: String,
+}
+
+fn default_schema_version_one() -> u32 {
+    1
 }
 
 impl PendingAction {
@@ -137,9 +153,9 @@ fn current_unix_ms() -> i64 {
     neoethos_core::utils::now_unix_ms()
 }
 
-/// Used only by `propose()` which is itself feature-gated to the
-/// Gemma tool path — no other code path mints action IDs today.
-#[cfg_attr(not(feature = "gemma-backend"), allow(dead_code))]
+/// Used only by `propose()`. Unused today; the endpoint stack still
+/// works without a proposer — it just always sees an empty queue.
+#[allow(dead_code)]
 fn next_id() -> String {
     // Cheap unique id — Unix-ms + a small counter so two proposals
     // in the same millisecond don't collide. We don't need UUID's
@@ -163,15 +179,22 @@ fn queue() -> &'static Mutex<VecDeque<PendingAction>> {
 /// exceeded, the OLDEST `Pending` action is evicted (operator's
 /// most recent thought takes priority over a stale unanswered
 /// prompt from 10 minutes ago).
-/// Called by the `propose_close_position` Gemma tool — feature-gated,
-/// so unused in the default build. The endpoint stack
-/// (`server/pending_actions::list/confirm/reject`) still works
-/// without the LLM; it just always sees an empty queue.
-#[cfg_attr(not(feature = "gemma-backend"), allow(dead_code))]
+/// Add a new proposed action. Unused today (no proposer is wired)
+/// but kept on the public surface so the endpoint stack
+/// (`server/pending_actions::list/confirm/reject`) and the queue
+/// machinery stay symmetric — when an AI helper does start
+/// proposing, only this function needs to be invoked.
+#[allow(dead_code)]
 pub fn propose(kind: ActionKind, reason: String) -> Result<String> {
-    let mut q = queue().lock().map_err(|_| anyhow!("queue mutex poisoned"))?;
+    let mut q = queue()
+        .lock()
+        .map_err(|_| anyhow!("queue mutex poisoned"))?;
     sweep_expired(&mut q);
-    if q.iter().filter(|a| a.status == ActionStatus::Pending).count() >= MAX_PENDING_ACTIONS {
+    if q.iter()
+        .filter(|a| a.status == ActionStatus::Pending)
+        .count()
+        >= MAX_PENDING_ACTIONS
+    {
         // Evict the oldest Pending entry. Confirmed / Executed
         // entries we keep around for audit + UI history.
         if let Some(idx) = q.iter().position(|a| a.status == ActionStatus::Pending) {
@@ -185,6 +208,7 @@ pub fn propose(kind: ActionKind, reason: String) -> Result<String> {
     let now = current_unix_ms();
     let action = PendingAction {
         id: next_id(),
+        schema_version: PENDING_ACTION_SCHEMA_VERSION,
         kind,
         reason: reason.trim().to_string(),
         proposed_at_unix_ms: now,
@@ -221,7 +245,9 @@ pub fn list_all() -> Vec<PendingAction> {
 /// can dispatch to the broker. Errors if the id doesn't exist, has
 /// already been confirmed/rejected, or has expired.
 pub fn mark_confirmed(id: &str) -> Result<PendingAction> {
-    let mut q = queue().lock().map_err(|_| anyhow!("queue mutex poisoned"))?;
+    let mut q = queue()
+        .lock()
+        .map_err(|_| anyhow!("queue mutex poisoned"))?;
     let now = current_unix_ms();
     let entry = q
         .iter_mut()
@@ -235,9 +261,8 @@ pub fn mark_confirmed(id: &str) -> Result<PendingAction> {
     }
     if entry.is_expired(now) {
         entry.status = ActionStatus::Expired;
-        entry.result_note = format!(
-            "Auto-expired after {PENDING_ACTION_TTL_SECS} s (user click arrived too late)"
-        );
+        entry.result_note =
+            format!("Auto-expired after {PENDING_ACTION_TTL_SECS} s (user click arrived too late)");
         let snapshot = entry.clone();
         journal_to_disk(&snapshot);
         anyhow::bail!("action `{id}` has expired");
@@ -252,7 +277,9 @@ pub fn mark_confirmed(id: &str) -> Result<PendingAction> {
 /// `mark_confirmed` minus the actionable side-effect — rejected
 /// actions just sit in the queue for audit.
 pub fn mark_rejected(id: &str, reason: Option<&str>) -> Result<PendingAction> {
-    let mut q = queue().lock().map_err(|_| anyhow!("queue mutex poisoned"))?;
+    let mut q = queue()
+        .lock()
+        .map_err(|_| anyhow!("queue mutex poisoned"))?;
     let now = current_unix_ms();
     let entry = q
         .iter_mut()
@@ -348,7 +375,10 @@ fn write_audit_line(action: &PendingAction) -> Result<()> {
     let path = default_journal_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create directory for pending-actions audit at {}", parent.display())
+            format!(
+                "failed to create directory for pending-actions audit at {}",
+                parent.display()
+            )
         })?;
     }
     let mut f = OpenOptions::new()

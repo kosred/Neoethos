@@ -9,8 +9,18 @@
 use ratatui::style::{Color, Modifier, Style};
 
 // ─── Surfaces ──────────────────────────────────────────────────────
+//
+// The four-shade surface ladder (APP_BG → PANEL_BG → SURFACE_BG →
+// SURFACE_ALT) is anchored to the TradingView dark palette and
+// documented in `docs/audits/ui_design_research_2026-05-12.md`.
+// SURFACE_BG sits between PANEL_BG and SURFACE_ALT for elements
+// that need a third elevation layer (e.g. nested cards inside a
+// panel). It's a public design token even when no current call
+// site references it — deleting it would leave a gap in the ladder
+// that future surfaces couldn't honor.
 pub const APP_BG: Color = Color::Rgb(0x0E, 0x11, 0x16);
 pub const PANEL_BG: Color = Color::Rgb(0x16, 0x1B, 0x22);
+#[allow(dead_code)] // design token; intentional gap in the surface ladder.
 pub const SURFACE_BG: Color = Color::Rgb(0x1C, 0x22, 0x30);
 pub const SURFACE_ALT: Color = Color::Rgb(0x22, 0x29, 0x3A);
 

@@ -93,9 +93,7 @@ pub fn setup_logging(verbose: bool) -> anyhow::Result<()> {
 /// Setup minimal logging (console only, no files)
 pub fn setup_minimal_logging(verbose: bool) -> anyhow::Result<()> {
     if let Err(err) = configure_console_for_utf8() {
-        eprintln!(
-            "[neoethos] non-fatal: could not configure console for UTF-8 ({err})"
-        );
+        eprintln!("[neoethos] non-fatal: could not configure console for UTF-8 ({err})");
     }
     initialize_console_tracing(verbose)?;
 

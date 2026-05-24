@@ -12,32 +12,37 @@ repository = "https://github.com/kosred/neoethos"
 readme = "../../README.md"
 
 [features]
-# #170: Public installers (release-installers.yml + the Lite NSIS
-# bundle) used to build with NO --features flag, which silently
-# shipped a stripped binary — AI Helper + News Watcher returned
-# 503, headless-browser news scraping was off, tree models gone.
-# The Lite installer even fetched the 5 GB Gemma GGUF for a binary
-# that couldn't load it. Promoting `gemma-backend` + `headless-browser`
-# to default means a fresh user gets the killer features out of
-# the box; CI / dev iteration that wants a minimal build can still
-# pass `--no-default-features`. Tree-models stays opt-in because
-# the lightgbm / xgboost / catboost FFI doubles disk size + has
-# native-toolchain build-time requirements.
-default = ["gemma-backend", "headless-browser"]
-gpu = ["neoethos-search/gpu", "neoethos-models/neuro-evolution-gpu", "neoethos-models/statistical-gpu"]
-# headless-browser: opt-in dependency on `headless_chrome` for the
-# `news_sources::headless_browser` module. Cloudflare-protected and
-# JS-rendered news sites (FXStreet, DailyFX, Investing.com) defeat
-# simple reqwest GETs; enabling this feature lets the news aggregator
-# fall back to driving a real Chrome / Edge instance. Adds ~20 transitive
-# deps (DevTools-Protocol websocket client + browser process management),
-# all of them already in the workspace's transitive tree via reqwest's
-# tls + tokio's net machinery — so the on-disk install size grows by
-# ~3 MB rather than the ~30 MB chromiumoxide costs. Requires Chrome or
-# Edge to be installed on the operator's machine at runtime; the source
-# auto-detects via the standard Windows / macOS / Linux paths and falls
-# back to "no data" when neither is present.
-headless-browser = ["dep:headless_chrome"]
+# Gemma was the previous local-LLM path. Removed in the cleanup
+# that replaced it with the ChatGPT-subscription Codex OAuth flow
+# (neoethos-codex) — the AI Helper now lives entirely behind HTTP,
+# so there is no native LLM dependency to feature-gate.
+default = []
+
+# #205 GPU backends — pick ONE per build.
+#
+# Pulls cubecl/burn/lightgbm/candle/ort into the appropriate GPU
+# code path. Picking the wrong vendor for the host makes the LINK
+# step fail — that's better than silently shipping a binary that
+# crashes at startup because libcuda.dll is absent.
+gpu = ["gpu-nvidia"]
+gpu-nvidia = [
+    "neoethos-models/gpu-cuda",
+    "neoethos-search/gpu-cuda",
+]
+gpu-vulkan = [
+    "neoethos-models/gpu-vulkan",
+    "neoethos-search/gpu-vulkan",
+]
+gpu-rocm = [
+    "neoethos-models/gpu-rocm",
+    "neoethos-search/gpu-rocm",
+]
+# `gpu-apple` previously light up llama-cpp(metal) for the Gemma
+# path. With Gemma gone, the AI Helper runs entirely against the
+# ChatGPT subscription API (HTTP), so there is no Metal-accelerated
+# work on Apple Silicon to wire in. Kept as an alias for parity in
+# build matrices; behaves as gpu-vulkan via MoltenVK.
+gpu-apple = ["gpu-vulkan"]
 native-tree-models = ["neoethos-models/tree-models"]
 # Enable the native Protobuf-over-TCP transport (port 5035) for the cTrader
 # Open API. Wire-format only; the higher-level Rust API surface is unchanged.
@@ -49,11 +54,6 @@ native-tree-models = ["neoethos-models/tree-models"]
 # Runtime opt-in is via `FOREX_BOT_CTRADER_TRANSPORT=protobuf` plus this
 # feature being enabled at build time.
 ctrader-protobuf-streaming = ["dep:webpki-roots"]
-# G1 LLM backend - wire the real llama.cpp runtime into server-side intelligence.
-# Requires cmake + a C/C++ compiler and a ~5 GB GGUF on disk.
-# Download the GGUF via: `powershell -File scripts/fetch-gemma-model.ps1`
-# The feature is OFF by default so the app builds cleanly without them.
-gemma-backend = ["neoethos-gemma/mistralrs-runtime"]
 
 [dependencies]
 tokio = { version = "1.49.0", features = ["full", "rt-multi-thread"] }
@@ -61,6 +61,11 @@ tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 anyhow = "1.0.100"
 chrono = "0.4"
+# chrono-tz 0.10 — IANA zoneinfo tables for "America/New_York" / "US/Eastern"
+# so the ForexFactory parser can fold ET → UTC across DST without hand-rolling
+# "spring forward / fall back" logic. See `news_sources/forex_factory.rs`
+# `ff_date_time_to_unix_ms` for the call site.
+chrono-tz = "0.10"
 # keyring 3.6.3 — backend is OPT-IN per platform feature flag. Without these
 # features the crate falls back to an in-memory MockCredential that does not
 # persist anything (verified 2026-05-20 via --api-test on Windows: tokens
@@ -72,32 +77,12 @@ open = "5.3.2"
 # reqwest >= 0.13.3 logs only the host, not the full URL — protects client_secret from leaking to debug/trace logs.
 # In 0.13, `form`/`query` are opt-in features (per the 0.13.0 CHANGELOG).
 reqwest = { version = "0.13.3", default-features = false, features = ["blocking", "json", "rustls", "query", "form"] }
-# `url` is the canonical parser shared with reqwest; we use it directly
-# in `gemma_tools::ssrf_guard` to inspect scheme + host before letting
-# the FetchUrlTool issue a request. Pinning the version here so the
-# SSRF guard never diverges from reqwest's internal URL parser.
+# `url` is the canonical parser shared with reqwest. Kept as a direct
+# dep so any future code that inspects URL components (SSRF guards,
+# allow-list checks for redirect handlers) uses the same parser
+# reqwest does — avoids divergence between request validation and
+# actual request issuance.
 url = "2.5"
-# rusqlite backs the Gemma memory layer (#125) — persistent notes
-# the model writes and reads between sessions. Same version as
-# neoethos-core so the bundled SQLite source compiles once and
-# the dynamic link table stays small. `bundled` avoids a system
-# libsqlite dep on Windows/macOS.
-rusqlite = { version = "0.38.0", features = ["bundled", "chrono"] }
-# quick-xml is the canonical streaming XML / RSS / Atom parser in
-# the Rust ecosystem. Used by `app_services::news_sources` to parse
-# ForexFactory's free weekly XML calendar plus the RSS feeds we
-# scrape for market headlines. `serialize` feature isn't needed —
-# we walk the event stream by hand because both FF and RSS have
-# enough structural irregularity that serde-XML round-trips don't
-# pay off.
-quick-xml = "0.36"
-# headless_chrome — controls a Chrome / Chromium / Edge instance over
-# the DevTools Protocol. Pulled in only when the `headless-browser`
-# feature is on (see [features] above). Sync API (the crate runs its
-# own internal tokio); we call it from `spawn_blocking` blocks. Chosen
-# over chromiumoxide because the dep graph is smaller and the sync API
-# is easier to integrate with our existing blocking-thread tool path.
-headless_chrome = { version = "1.0", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 toml = "0.8.20"
@@ -149,10 +134,11 @@ neoethos-core = { path = "../neoethos-core" }
 neoethos-data = { path = "../neoethos-data" }
 neoethos-search = { path = "../neoethos-search" }
 neoethos-models = { path = "../neoethos-models", default-features = false, features = ["pure-rust-ml"] }
-# v0.4.8: on-device LLM helper (Gemma). The stub runtime is always
-# available so the backend binary builds without a GGUF file on disk;
-# `mistralrs-runtime` feature lights up the real inference path.
-neoethos-gemma = { path = "../neoethos-gemma" }
+# #204: ChatGPT subscription via the Codex CLI's PKCE OAuth flow.
+# Replaces the previous local-Gemma runtime. No native deps (pure
+# HTTP + crypto); the AI Helper proxies chat requests through the
+# operator's ChatGPT Plus/Pro subscription.
+neoethos-codex = { path = "../neoethos-codex" }
 ndarray = "0.17.2"
 clap = { version = "4.6.0", features = ["derive"] }
 num_cpus = "1.17.0"
@@ -231,30 +217,11 @@ resources = [
     "../../config.yaml",
     "../../LICENSE",
     "../../README.md",
-    # v0.4.10: ship the Gemma GGUF fetcher next to the .exe so the
-    # The Flutter shell can spawn
-    # it without the operator having to clone the repo. The script
-    # itself does the HuggingFace download + disk-safety check +
-    # writes to the canonical user-data dir.
-    "../../scripts/fetch-gemma-model.ps1",
 ]
-# NSIS hooks (cargo-packager `NSIS_HOOK_PREINSTALL` / `NSIS_HOOK_POSTINSTALL`):
-#
-#   PRE-install:   vc_redist_install.nsh — downloads VC++ 2015-2022
-#                  redistributable from microsoft.com if HKLM\Microsoft\
-#                  VC\Runtimes\x64\Installed != 1, so the freshly-extracted
-#                  NeoEthos.exe doesn't fail to load on pristine Windows.
-#
-#   POST-install:  gemma_model_install.nsh — fetches the ~5 GiB Gemma 4
-#                  abliterated GGUF from HuggingFace into
-#                  $INSTDIR\resources\models\ so AI Helper + News work on
-#                  first launch. Failure is non-fatal — the Flutter shell
-#                  has a first-launch downloader fallback in AI Helper.
-#                  This is what makes the Lite installer (~250 MB) fit
-#                  under GitHub Releases' 2 GB per-asset cap while still
-#                  delivering an "AI works out of the box" end-user UX.
-#
-# Both .nsh files are wrapped by `installer_hooks.nsh` which defines the
+# NSIS hook: vc_redist_install.nsh downloads VC++ 2015-2022 redistributable
+# from microsoft.com if HKLM\Microsoft\VC\Runtimes\x64\Installed != 1 so
+# the freshly-extracted NeoEthos.exe doesn't fail to load on pristine
+# Windows. Wrapped by installer_hooks.nsh which defines the
 # cargo-packager-recognised hook macros. Path is relative to this Cargo.toml.
 nsis.installer-hooks = "../../scripts/installer_hooks.nsh"
 

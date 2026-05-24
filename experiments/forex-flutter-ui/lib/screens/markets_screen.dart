@@ -16,6 +16,31 @@ import '../state/system_providers.dart';
 import '../theme/theme.dart';
 import '_placeholder.dart';
 
+/// #185: ISO 4217 currency codes for the majors + commonly-traded
+/// crosses available on cTrader retail. The previous "6-letter uppercase
+/// ASCII" filter matched precious-metal codes (XAU/XAG/XPT/XPD) and oil
+/// CFD codes alongside actual currency pairs, so the toggle looked
+/// broken — operators saw XAUUSD listed under "Forex only" and (rightly)
+/// asked why. Strict forex = BOTH halves are recognised ISO currencies.
+const _isoCurrencyCodes = <String>{
+  // G10 + most commonly cross-traded on retail brokers.
+  'USD', 'EUR', 'GBP', 'JPY', 'CHF', 'AUD', 'NZD', 'CAD',
+  // Scandinavian / European
+  'SEK', 'NOK', 'DKK', 'PLN', 'CZK', 'HUF', 'RON',
+  // Asia
+  'SGD', 'HKD', 'CNH', 'CNY', 'KRW', 'INR', 'THB',
+  // EMs commonly available
+  'MXN', 'ZAR', 'TRY', 'BRL', 'RUB', 'ILS', 'ARS',
+};
+
+bool _isStrictForexPair(String name) {
+  if (name.length != 6) return false;
+  final base = name.substring(0, 3).toUpperCase();
+  final quote = name.substring(3, 6).toUpperCase();
+  return _isoCurrencyCodes.contains(base) &&
+      _isoCurrencyCodes.contains(quote);
+}
+
 class MarketsScreen extends ConsumerStatefulWidget {
   const MarketsScreen({super.key});
 
@@ -117,12 +142,8 @@ class _MarketsScreenState extends ConsumerState<MarketsScreen> {
   Widget _symbolsCard(BrokerSymbolsSnapshot snap) {
     final all = snap.symbols.where((s) => s.enabled).toList();
     final filtered = all.where((s) {
-      if (_forexOnly) {
-        // 6-letter uppercase ASCII == standard FX-pair shape.
-        if (s.symbolName.length != 6 ||
-            !RegExp(r'^[A-Z]{6}$').hasMatch(s.symbolName)) {
-          return false;
-        }
+      if (_forexOnly && !_isStrictForexPair(s.symbolName)) {
+        return false;
       }
       if (_search.isNotEmpty &&
           !s.symbolName.toUpperCase().contains(_search.toUpperCase())) {
@@ -131,9 +152,16 @@ class _MarketsScreenState extends ConsumerState<MarketsScreen> {
       return true;
     }).toList();
 
+    // #187: unify the denominators across Markets / Order Ticket /
+    // SymbolPicker. There are TWO real numbers — total catalog
+    // (`symbolCount`, includes disabled) and currently-tradable
+    // (`enabled.length`). Show both so the operator can see at a glance
+    // why "Forex only · 104" differs from "all enabled · 443" differs
+    // from "catalog · 830".
     return SectionCard(
       title:
-          'Broker Symbol Catalog · ${filtered.length} of ${all.length} enabled',
+          'Broker Symbol Catalog · ${filtered.length} shown · '
+          '${all.length} enabled · ${snap.symbolCount} total',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [

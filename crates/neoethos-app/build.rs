@@ -2,6 +2,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 fn main() {
+    assert_at_most_one_gpu_feature();
+    assert_gpu_toolkit_available();
     emit_embedded_credentials();
     force_link_libtorch_cuda();
 
@@ -237,6 +239,123 @@ fn extract_toml_string_value(after_key: &str) -> String {
         }
     }
     String::new()
+}
+
+/// #205: GPU backends are mutually exclusive — picking two vendors at
+/// once will compile cleanly today but at link time you get
+/// duplicate-symbol or "no backend selected" depending on which
+/// llama-cpp-2 build path wins the race. We fail fast at build.rs
+/// instead with a clear message naming the offending features.
+///
+/// Acceptable single picks (env vars Cargo sets when a feature is on):
+///   CARGO_FEATURE_GPU_NVIDIA
+///   CARGO_FEATURE_GPU_VULKAN
+///   CARGO_FEATURE_GPU_ROCM
+///   CARGO_FEATURE_GPU_APPLE
+///   CARGO_FEATURE_GPU         (legacy alias, equals gpu-nvidia)
+/// The legacy `gpu` alias resolves to `gpu-nvidia` per Cargo.toml so
+/// when both are set simultaneously (someone wrote `--features
+/// gpu,gpu-nvidia` belt-and-braces) we treat that as the SAME vendor,
+/// not a conflict.
+fn assert_at_most_one_gpu_feature() {
+    let nvidia = std::env::var("CARGO_FEATURE_GPU_NVIDIA").is_ok()
+        || std::env::var("CARGO_FEATURE_GPU").is_ok();
+    let vulkan = std::env::var("CARGO_FEATURE_GPU_VULKAN").is_ok();
+    let rocm = std::env::var("CARGO_FEATURE_GPU_ROCM").is_ok();
+    let apple = std::env::var("CARGO_FEATURE_GPU_APPLE").is_ok();
+    let selected: Vec<&str> = [
+        ("gpu-nvidia", nvidia),
+        ("gpu-vulkan", vulkan),
+        ("gpu-rocm", rocm),
+        ("gpu-apple", apple),
+    ]
+    .iter()
+    .filter_map(|(n, on)| if *on { Some(*n) } else { None })
+    .collect();
+    if selected.len() > 1 {
+        panic!(
+            "neoethos-app: multiple GPU backends selected ({}). Pick exactly ONE — \
+             llama-cpp-2 builds with a single ggml backend and a dual build wastes \
+             link time + binary size. See crates/neoethos-app/Cargo.toml feature \
+             block for descriptions of each option.",
+            selected.join(", ")
+        );
+    }
+    // Re-run the check when any GPU feature flips.
+    for var in &[
+        "CARGO_FEATURE_GPU_NVIDIA",
+        "CARGO_FEATURE_GPU_VULKAN",
+        "CARGO_FEATURE_GPU_ROCM",
+        "CARGO_FEATURE_GPU_APPLE",
+        "CARGO_FEATURE_GPU",
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
+}
+
+/// #205: pre-check that the selected GPU backend has its toolkit
+/// installed on this build machine. Without this, the build fails
+/// deep inside `llama-cpp-sys-2/build.rs` with a panic that doesn't
+/// name the right SDK to install or where to download it from. The
+/// upstream message is correct but easy to miss in 200 lines of
+/// CMake spew; we surface it earlier with a clickable URL.
+///
+/// Detection mirrors the env-var contracts the upstream build
+/// scripts check:
+///   - CUDA  → CUDA_PATH (set by the official installer on Windows)
+///             or libcuda.so present (POSIX heuristic via /usr/local/cuda)
+///   - Vulkan → VULKAN_SDK (set by the LunarG installer)
+///   - ROCm  → HIP_PATH / ROCM_PATH
+///   - Metal → no SDK probe (always present on macOS, never on others)
+fn assert_gpu_toolkit_available() {
+    let nvidia = std::env::var("CARGO_FEATURE_GPU_NVIDIA").is_ok()
+        || std::env::var("CARGO_FEATURE_GPU").is_ok();
+    let vulkan = std::env::var("CARGO_FEATURE_GPU_VULKAN").is_ok();
+    let rocm = std::env::var("CARGO_FEATURE_GPU_ROCM").is_ok();
+    let apple = std::env::var("CARGO_FEATURE_GPU_APPLE").is_ok();
+
+    if nvidia && std::env::var("CUDA_PATH").is_err()
+        && !std::path::Path::new("/usr/local/cuda").exists()
+    {
+        panic!(
+            "neoethos-app: gpu-nvidia selected but the CUDA toolkit is not on \
+             this machine. Install from https://developer.nvidia.com/cuda-downloads \
+             then re-run cargo build. (Probed CUDA_PATH env var and /usr/local/cuda.)"
+        );
+    }
+    if vulkan && std::env::var("VULKAN_SDK").is_err() {
+        panic!(
+            "neoethos-app: gpu-vulkan selected but the Vulkan SDK is not on this \
+             machine. Install from https://vulkan.lunarg.com/sdk/home then re-run \
+             cargo build. (Probed VULKAN_SDK env var.)\n\
+             \n\
+             Note: the Vulkan SDK is only required at BUILD time. At RUNTIME the \
+             Vulkan ICD ships with every modern GPU driver, so the finished .exe \
+             runs on machines without the SDK installed."
+        );
+    }
+    if rocm
+        && std::env::var("HIP_PATH").is_err()
+        && std::env::var("ROCM_PATH").is_err()
+    {
+        panic!(
+            "neoethos-app: gpu-rocm selected but the ROCm toolkit is not on this \
+             machine. Install from https://rocm.docs.amd.com/projects/install-on-linux/ \
+             then re-run cargo build. (Probed HIP_PATH and ROCM_PATH env vars.)\n\
+             Note: ROCm on Windows is experimental — Linux is the supported path."
+        );
+    }
+    if apple && !cfg!(target_os = "macos") {
+        panic!(
+            "neoethos-app: gpu-apple selected on a non-macOS host. The Metal \
+             backend only links + runs on macOS. Pick gpu-vulkan instead for \
+             cross-platform GPU support."
+        );
+    }
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-env-changed=VULKAN_SDK");
+    println!("cargo:rerun-if-env-changed=HIP_PATH");
+    println!("cargo:rerun-if-env-changed=ROCM_PATH");
 }
 
 /// When the `gpu` feature is enabled, force the linker to keep

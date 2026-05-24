@@ -15,9 +15,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::app_services::jobs::{CancellationFlag, JobKind};
+use crate::server::codex::CodexFlowState;
 use crate::server::engines_control::EngineRunState;
 
 /// A minimal, render-ready account snapshot. Same shape as the
@@ -70,6 +71,17 @@ pub struct PositionPayload {
 #[derive(Clone)]
 pub struct AppApiState {
     inner: Arc<RwLock<AppApiInner>>,
+    /// In-flight OAuth state for the Codex (ChatGPT) fallback. Kept
+    /// as a separate `Mutex<Option<...>>` rather than inside the main
+    /// RwLock because:
+    ///   1. It's write-heavy on the slow path (callback completion
+    ///      updates it) and the main state is read-heavy — splitting
+    ///      avoids reader-starvation pathologies.
+    ///   2. Only the `/auth/codex/*` routes touch it, so isolating
+    ///      the lock surface keeps cross-handler coupling minimal.
+    ///   3. The data is small (`Option<CodexFlowState>` is ≤ 200 B);
+    ///      cloning the `Arc<Mutex<...>>` per request is free.
+    pub codex: Arc<Mutex<Option<CodexFlowState>>>,
 }
 
 #[derive(Default)]
@@ -114,6 +126,7 @@ impl AppApiState {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(AppApiInner::default())),
+            codex: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -140,13 +153,10 @@ impl AppApiState {
     }
 
     /// Blocking-thread variant of [`account`] for callers that run
-    /// inside `tokio::task::spawn_blocking` and cannot `.await`
-    /// (e.g. the Gemma tool-loop dispatcher, which executes inside
-    /// the LLM inference blocking thread). Safe to call only from a
-    /// thread that does NOT hold a tokio reactor — calling this on
-    /// the reactor thread would deadlock the RwLock.
-    // Compiled in only with the gemma-backend feature; without it the
-    // tool-loop dispatcher (server/gemma.rs) does not exist.
+    /// inside `tokio::task::spawn_blocking` and cannot `.await`.
+    /// Safe to call only from a thread that does NOT hold a tokio
+    /// reactor — calling this on the reactor thread would deadlock
+    /// the RwLock.
     #[allow(dead_code)]
     pub fn account_blocking(&self) -> Option<AccountSnapshotPayload> {
         self.inner.blocking_read().account.clone()

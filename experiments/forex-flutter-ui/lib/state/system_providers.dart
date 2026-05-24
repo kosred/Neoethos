@@ -90,32 +90,13 @@ final brokerAccountsProvider =
   return client.fetchBrokerAccounts();
 });
 
-/// `/gemma/status` — local LLM availability. Cheap probe so the
-/// News + AI Helper screens know whether to render the chat UI or
-/// the "install model" instructions.
-final gemmaStatusProvider =
-    FutureProvider.autoDispose<GemmaStatusSnapshot>((ref) {
+/// `/auth/codex/status` — ChatGPT subscription link state. Cheap
+/// probe so the News + AI Helper screens know whether to render the
+/// chat UI or the "Connect ChatGPT" CTA.
+final codexStatusProvider =
+    FutureProvider.autoDispose<CodexStatusSnapshot>((ref) {
   final client = ref.read(backendClientProvider);
-  return client.fetchGemmaStatus();
-});
-
-/// `/gemma/download/status` — drives the AI Helper screen's
-/// progress bar while the GGUF is being fetched. Self-invalidates
-/// every second while state == "downloading" so the bar advances
-/// in real time; goes quiet once the download terminates
-/// (completed / failed / cancelled / idle) so we don't keep
-/// hammering the endpoint pointlessly.
-final gemmaDownloadStatusProvider =
-    FutureProvider.autoDispose<GemmaDownloadStatus>((ref) async {
-  final client = ref.read(backendClientProvider);
-  final snapshot = await client.fetchGemmaDownloadStatus();
-  if (snapshot.isDownloading) {
-    final timer = Timer(const Duration(seconds: 1), () {
-      ref.invalidateSelf();
-    });
-    ref.onDispose(timer.cancel);
-  }
-  return snapshot;
+  return client.fetchCodexStatus();
 });
 
 /// `/broker/timeframes` — canonical cTrader-supported timeframe list,

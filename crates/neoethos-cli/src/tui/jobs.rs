@@ -53,8 +53,25 @@ impl Job {
                     }
                     self.log.push_back(s);
                 }
-                LogLine::ExitOk => self.status = JobStatus::Completed,
-                LogLine::ExitFail(_) => self.status = JobStatus::Failed,
+                LogLine::ExitOk => {
+                    self.status = JobStatus::Completed;
+                    if self.log.len() == RING_BUFFER_LINES {
+                        self.log.pop_front();
+                    }
+                    self.log.push_back("[exited cleanly]".to_string());
+                }
+                LogLine::ExitFail(code) => {
+                    self.status = JobStatus::Failed;
+                    // Surface the actual exit code (#200) — previously
+                    // discarded with `_`, leaving the operator with a red
+                    // "Failed" badge and no clue whether it was a Rust
+                    // panic, a signal, or a clean non-zero return.
+                    if self.log.len() == RING_BUFFER_LINES {
+                        self.log.pop_front();
+                    }
+                    self.log
+                        .push_back(format!("[exit code: {}] ({})", code, self.command_summary));
+                }
             }
         }
     }
@@ -91,8 +108,14 @@ impl JobManager {
         }
     }
 
-    pub fn jobs(&self) -> &[Job] {
-        &self.jobs
+    /// Count currently-running jobs across all kinds. Used by the
+    /// Dashboard "Active jobs" KPI which previously hardcoded 0
+    /// (#200) because the JobManager API didn't expose it.
+    pub fn running_count(&self) -> usize {
+        self.jobs
+            .iter()
+            .filter(|j| j.status == JobStatus::Running)
+            .count()
     }
 
     /// Return the most recent job whose label starts with `prefix`, if

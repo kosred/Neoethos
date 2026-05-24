@@ -48,9 +48,8 @@ use tungstenite::{Message, WebSocket, connect};
 
 use crate::app_services::ctrader_messages::{
     CTRADER_OA_ACCOUNT_DISCONNECT_EVENT_PAYLOAD_TYPE, CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE,
-    CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE, build_account_auth_request,
-    build_application_auth_request, build_subscribe_spots_request, parse_ctrader_error_payload,
-    parse_open_api_envelope,
+    CTRADER_OA_SPOT_EVENT_PAYLOAD_TYPE, build_account_auth_request, build_application_auth_request,
+    build_subscribe_spots_request, parse_ctrader_error_payload, parse_open_api_envelope,
 };
 use crate::app_services::live_spots;
 
@@ -328,8 +327,9 @@ fn run_blocking(config: LiveSpotsStreamerConfig) -> Result<()> {
             .context("failed to read frame from cTrader spot stream")?;
         let payload_text = match frame {
             Message::Text(t) => t.to_string(),
-            Message::Binary(b) => String::from_utf8(b.to_vec())
-                .context("non-utf8 binary frame on spot stream")?,
+            Message::Binary(b) => {
+                String::from_utf8(b.to_vec()).context("non-utf8 binary frame on spot stream")?
+            }
             Message::Ping(p) => {
                 socket
                     .send(Message::Pong(p))
@@ -463,8 +463,14 @@ fn parse_spot_event_loose(
     let symbol_meta = known_symbols
         .iter()
         .find(|s| s.symbol_id == env.payload.symbol_id)?;
-    let bid = env.payload.bid.map(|v| scale_price(v as i64, symbol_meta.digits));
-    let ask = env.payload.ask.map(|v| scale_price(v as i64, symbol_meta.digits));
+    let bid = env
+        .payload
+        .bid
+        .map(|v| scale_price(v as i64, symbol_meta.digits));
+    let ask = env
+        .payload
+        .ask
+        .map(|v| scale_price(v as i64, symbol_meta.digits));
     Some((symbol_meta.symbol_id, bid, ask, env.payload.timestamp))
 }
 

@@ -14,10 +14,15 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:intl/intl.dart';
 
+import 'package:dio/dio.dart';
+
 import '../api/backend_client.dart';
+import '../api/error_translation.dart';
+import '../state/account_provider.dart';
 import '../state/live_spots_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
+import '../widgets/symbol_picker.dart';
 import '_placeholder.dart';
 
 /// Top-10 indicators surfaced as toggle chips above the chart.
@@ -122,11 +127,56 @@ final _slotB = _ChartSlot(
 class ChartScreen extends ConsumerWidget {
   const ChartScreen({super.key});
 
+  /// #198: open a TradingView-Copilot-style modal sheet seeded with
+  /// the active chart's symbol + timeframe so the user can ask the
+  /// AI a contextual question without leaving the screen. The full
+  /// AI Helper screen still exists (for long-form chat); this is the
+  /// "quick question" entry point that lives next to what the user
+  /// is looking at.
+  void _openContextualAi(
+    BuildContext context,
+    WidgetRef ref,
+    String symbol,
+    String timeframe,
+  ) {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => DraggableScrollableSheet(
+        initialChildSize: 0.6,
+        minChildSize: 0.3,
+        maxChildSize: 0.95,
+        expand: false,
+        builder: (sheetCtx, scrollCtrl) => _ContextualAiSheet(
+          symbol: symbol,
+          timeframe: timeframe,
+          scrollController: scrollCtrl,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final multi = ref.watch(multiChartEnabledProvider);
+    final activeSymbol = ref.watch(_slotA.symbol);
+    final activeTimeframe = ref.watch(_slotA.timeframe);
 
-    return SingleChildScrollView(
+    return Scaffold(
+      backgroundColor: Colors.transparent,
+      floatingActionButton: FloatingActionButton.extended(
+        // #198: TradingView Copilot is a corner button on the chart
+        // page that pops a context-aware chat. We do the same.
+        onPressed: () => _openContextualAi(
+          context,
+          ref,
+          activeSymbol,
+          activeTimeframe,
+        ),
+        icon: const Icon(Icons.psychology_alt_outlined),
+        label: const Text('Ask AI'),
+      ),
+      body: SingleChildScrollView(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -201,6 +251,160 @@ class ChartScreen extends ConsumerWidget {
             _ChartPanel(slot: _slotA),
         ],
       ),
+      ),
+    );
+  }
+}
+
+/// #198: contextual AI bottom sheet — wraps a Codex chat with a
+/// fixed system prefix that names the active symbol/timeframe so the
+/// model can answer questions like "what's driving EURUSD today?"
+/// without the user having to type the symbol every time.
+class _ContextualAiSheet extends ConsumerStatefulWidget {
+  final String symbol;
+  final String timeframe;
+  final ScrollController scrollController;
+  const _ContextualAiSheet({
+    required this.symbol,
+    required this.timeframe,
+    required this.scrollController,
+  });
+
+  @override
+  ConsumerState<_ContextualAiSheet> createState() =>
+      _ContextualAiSheetState();
+}
+
+class _ContextualAiSheetState extends ConsumerState<_ContextualAiSheet> {
+  final _input = TextEditingController();
+  final List<({bool user, String text})> _msgs = [];
+  bool _busy = false;
+
+  @override
+  void dispose() {
+    _input.dispose();
+    super.dispose();
+  }
+
+  Future<void> _send() async {
+    final q = _input.text.trim();
+    if (q.isEmpty || _busy) return;
+    // Inject the chart context as a soft prefix the model can use
+    // without echoing back. Keep terse.
+    final prompt =
+        'Active chart: ${widget.symbol} ${widget.timeframe}. User asks: $q';
+    setState(() {
+      _msgs.add((user: true, text: q));
+      _busy = true;
+      _input.clear();
+    });
+    try {
+      final r = await ref.read(backendClientProvider).codexChat(
+            prompt: prompt,
+            maxTokens: 512,
+          );
+      if (!mounted) return;
+      setState(() => _msgs.add((user: false, text: r.response.trim())));
+    } on DioException catch (e) {
+      if (!mounted) return;
+      setState(() => _msgs.add((user: false, text: 'Error: ${describeError(e)}')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: const BoxDecoration(
+        color: ForexAiTokens.panelBg,
+        borderRadius: BorderRadius.vertical(
+          top: Radius.circular(16),
+        ),
+      ),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.psychology_alt_outlined,
+                  color: ForexAiTokens.textPrimary),
+              const SizedBox(width: 8),
+              Text(
+                'Ask AI · ${widget.symbol} ${widget.timeframe}',
+                style: const TextStyle(
+                  fontWeight: FontWeight.w700,
+                  fontSize: 14,
+                ),
+              ),
+              const Spacer(),
+              IconButton(
+                onPressed: () => Navigator.of(context).pop(),
+                icon: const Icon(Icons.close),
+              ),
+            ],
+          ),
+          const Divider(),
+          Expanded(
+            child: ListView.builder(
+              controller: widget.scrollController,
+              itemCount: _msgs.length,
+              itemBuilder: (ctx, i) {
+                final m = _msgs[i];
+                return Container(
+                  alignment:
+                      m.user ? Alignment.centerRight : Alignment.centerLeft,
+                  margin: const EdgeInsets.symmetric(vertical: 4),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 6,
+                    ),
+                    decoration: BoxDecoration(
+                      color: m.user
+                          ? ForexAiTokens.buy.withValues(alpha: 0.15)
+                          : ForexAiTokens.surfaceBg,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      m.text,
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _input,
+                  enabled: !_busy,
+                  decoration: const InputDecoration(
+                    hintText: 'Ask about this chart…',
+                    isDense: true,
+                    border: OutlineInputBorder(),
+                  ),
+                  onSubmitted: (_) => _send(),
+                ),
+              ),
+              const SizedBox(width: 8),
+              FilledButton.icon(
+                onPressed: _busy ? null : _send,
+                icon: _busy
+                    ? const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.send, size: 16),
+                label: const Text('Send'),
+              ),
+            ],
+          ),
+        ],
+      ),
     );
   }
 }
@@ -217,15 +421,8 @@ class _ChartPanel extends ConsumerWidget {
     final symbol = ref.watch(slot.symbol);
     final timeframe = ref.watch(slot.timeframe);
     final async = ref.watch(slot.chart);
-    final brokerSymbols = ref.watch(brokerSymbolsProvider);
     final brokerTimeframes = ref.watch(brokerTimeframesProvider);
 
-    final symbolChoices = brokerSymbols.maybeWhen(
-      data: (snap) => snap.forexLikeEnabled
-          .map((s) => s.symbolName)
-          .toList(growable: false),
-      orElse: () => const <String>[],
-    );
     final timeframeChoices = brokerTimeframes.maybeWhen(
       data: (list) => list,
       orElse: () => const <String>[],
@@ -235,44 +432,19 @@ class _ChartPanel extends ConsumerWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         SectionCard(
-          title: 'Panel ${slot.label} · Symbol'
-              '${brokerSymbols.hasValue ? ' · ${symbolChoices.length} from broker' : ''}',
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              if (symbolChoices.isEmpty)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 6),
-                  child: Text(
-                    brokerSymbols.hasError
-                        ? 'Broker symbol catalog unavailable: '
-                            '${brokerSymbols.error}. Open Settings → '
-                            'save cTrader credentials → Broker Setup '
-                            '→ Re-authenticate. The chip list is '
-                            'populated from /broker/symbols, never '
-                            'hardcoded in the UI.'
-                        : 'Loading broker symbol catalog…',
-                    style: const TextStyle(
-                      fontSize: 11,
-                      color: ForexAiTokens.warning,
-                    ),
-                  ),
-                )
-              else
-                Wrap(
-                  spacing: 6,
-                  runSpacing: 6,
-                  children: [
-                    for (final s in symbolChoices)
-                      _Chip(
-                        label: s,
-                        selected: s == symbol,
-                        onTap: () =>
-                            ref.read(slot.symbol.notifier).state = s,
-                      ),
-                  ],
-                ),
-            ],
+          // #183: previously rendered as a wall of FilterChips (104+
+          // entries) which scrolled the screen down and made the user
+          // hunt visually for "EURUSD" among "XAUUSD, GBPJPY, …". The
+          // SymbolPicker widget is type-ahead — operator types "eu" and
+          // gets EURUSD / EURJPY / EURGBP / EURCAD as suggestions. The
+          // catalog count is appended to the label so users still know
+          // how many symbols the broker exposed.
+          title: 'Panel ${slot.label} · Symbol',
+          child: SymbolPicker(
+            value: symbol,
+            label: 'Symbol',
+            onChanged: (s) =>
+                ref.read(slot.symbol.notifier).state = s,
           ),
         ),
         SectionCard(
@@ -365,6 +537,14 @@ class _ChartBody extends ConsumerWidget {
         ? (tick.midPrice ?? tick.bid)
         : null;
     final displayedPrice = livePrice ?? snapshot.latestClose;
+    // #182: when the backend returns an empty-data placeholder we get
+    // `latestClose == 0.0` and `priceChangePct == 0.0`. Rendering that
+    // as "0.00000  +0.00%" looks like a real instrument at zero —
+    // operators reasonably ask "is EURUSD really priced at 0.00000?".
+    // Treat the no-data case explicitly and show an em-dash so it's
+    // unambiguous that no candles are loaded for this pair yet.
+    final hasData = snapshot.candleCount > 0
+        && (displayedPrice > 0.0 || livePrice != null);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -378,7 +558,7 @@ class _ChartBody extends ConsumerWidget {
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
                   Text(
-                    displayedPrice.toStringAsFixed(5),
+                    hasData ? displayedPrice.toStringAsFixed(5) : '—',
                     style: TextStyle(
                       fontSize: 24,
                       fontWeight: FontWeight.w800,
@@ -400,19 +580,25 @@ class _ChartBody extends ConsumerWidget {
                   ],
                   const SizedBox(width: 12),
                   Text(
-                    '${changePos ? '+' : ''}${snapshot.priceChangePct.toStringAsFixed(2)} %',
+                    hasData
+                        ? '${changePos ? '+' : ''}${snapshot.priceChangePct.toStringAsFixed(2)} %'
+                        : '—',
                     style: TextStyle(
                       fontSize: 14,
                       fontWeight: FontWeight.w700,
-                      color: changePos
-                          ? ForexAiTokens.buy
-                          : ForexAiTokens.sell,
+                      color: hasData
+                          ? (changePos
+                              ? ForexAiTokens.buy
+                              : ForexAiTokens.sell)
+                          : ForexAiTokens.textMuted,
                     ),
                   ),
                   const Spacer(),
                   Text(
-                    'range ${snapshot.priceMin.toStringAsFixed(5)} – '
-                    '${snapshot.priceMax.toStringAsFixed(5)}',
+                    hasData
+                        ? 'range ${snapshot.priceMin.toStringAsFixed(5)} – '
+                            '${snapshot.priceMax.toStringAsFixed(5)}'
+                        : 'no data — run Data Bootstrap',
                     style: const TextStyle(
                       fontSize: 11,
                       color: ForexAiTokens.textMuted,
@@ -430,15 +616,10 @@ class _ChartBody extends ConsumerWidget {
               ),
               const SizedBox(height: 12),
               if (snapshot.candles.isEmpty)
-                const Padding(
-                  padding: EdgeInsets.symmetric(vertical: 24),
-                  child: Text(
-                    'No candles in window.',
-                    style: TextStyle(
-                      color: ForexAiTokens.textMuted,
-                      fontSize: 12,
-                    ),
-                  ),
+                _AutoFetchPrompt(
+                  symbol: snapshot.symbol,
+                  timeframe: snapshot.timeframe,
+                  slot: slot,
                 )
               else
                 _ChartCanvasWithOverlays(snapshot: snapshot, slot: slot),
@@ -446,6 +627,100 @@ class _ChartBody extends ConsumerWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+/// #190: "no candles loaded" prompt with a one-click broker fetch.
+/// Replaces the silent placeholder text. The button asks the backend
+/// for the last 30 days of bars on the active symbol/timeframe — the
+/// same call Data Bootstrap makes, but pre-filled with what the chart
+/// is already trying to show. After the fetch completes the chart
+/// provider invalidates and re-loads.
+class _AutoFetchPrompt extends ConsumerStatefulWidget {
+  final String symbol;
+  final String timeframe;
+  final _ChartSlot slot;
+  const _AutoFetchPrompt({
+    required this.symbol,
+    required this.timeframe,
+    required this.slot,
+  });
+
+  @override
+  ConsumerState<_AutoFetchPrompt> createState() => _AutoFetchPromptState();
+}
+
+class _AutoFetchPromptState extends ConsumerState<_AutoFetchPrompt> {
+  bool _busy = false;
+  String? _error;
+
+  Future<void> _fetch() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final api = ref.read(backendClientProvider);
+      final now = DateTime.now().toUtc().millisecondsSinceEpoch;
+      // 30 days is enough to render the default 200-candle window on
+      // every supported timeframe (M1..D1) without rate-limiting the
+      // broker — they pace bar fetches at roughly 1 per second.
+      final from = now - const Duration(days: 30).inMilliseconds;
+      await api.fetchHistoricalData(
+        symbol: widget.symbol,
+        timeframe: widget.timeframe,
+        fromMs: from,
+        toMs: now,
+      );
+      // Re-pull the chart now that bars exist on disk.
+      ref.invalidate(widget.slot.chart);
+    } catch (err) {
+      if (mounted) setState(() => _error = err.toString());
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 24),
+      child: Column(
+        children: [
+          Text(
+            'No candles on disk for ${widget.symbol} ${widget.timeframe}.',
+            style: const TextStyle(
+              color: ForexAiTokens.textMuted,
+              fontSize: 12,
+            ),
+          ),
+          const SizedBox(height: 8),
+          ElevatedButton.icon(
+            onPressed: _busy ? null : _fetch,
+            icon: _busy
+                ? const SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.cloud_download_outlined),
+            label: Text(_busy
+                ? 'Fetching last 30 days from broker…'
+                : 'Fetch last 30 days from broker'),
+          ),
+          if (_error != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              _error!,
+              style: const TextStyle(
+                color: ForexAiTokens.sell,
+                fontSize: 11,
+              ),
+            ),
+          ],
+        ],
+      ),
     );
   }
 }

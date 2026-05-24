@@ -23,7 +23,7 @@ param(
     [string]$VmId         = $env:HYPERSTACK_VM_ID,
     [string]$VmUser       = ${env:HYPERSTACK_VM_USER}    ?? 'ubuntu',
     [string]$VmIp         = $env:HYPERSTACK_VM_IP,
-    [string]$Branch       = 'feature/neoethos-gemma-g0',
+    [string]$Branch       = 'master',
     [string]$MergeInto    = 'master',
     [switch]$SkipGitPush,
     [switch]$SkipVpsBuild,
@@ -84,22 +84,7 @@ if (-not $SkipGitPush) {
         if ($dirty) {
             Info "Staging changes..."
             git add -A
-            $msg = @"
-Phase G + D3.1 follow-ups + Flutter scaffold · 2026-05-18
-
-Round 1: neoethos-gemma crate (G0 scaffold + G2 topic gate w/ embedding
-gate + 40+40 anchor corpus + G3 read-only tools + G1 prep w/
-bundled-model path resolver + G6a expert wiring). 144 tests pass.
-
-Round 2: G7 JSONL audit log writer, OrderSource::AiSuggested variant,
-DxTrade Domain UI row. 151 tests pass.
-
-Round 3: forex-flutter-ui scaffold from mockups/ui_mockup.html
-(14 panels, TradingView dark theme, Riverpod, Dio, mocked backend
-client, 6 widget smoke tests). egui untouched pending Step B parity.
-
-Disk safety: 102 GB free throughout. Headless invariant preserved.
-"@
+            $msg = "Automated release commit from release-on-vps.ps1 · $DateStamp"
             git commit -m $msg
             OK "Committed on $currentBranch"
         } else {

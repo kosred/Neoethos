@@ -157,7 +157,13 @@ pub async fn indicators(
     let timeframe_clone = timeframe.clone();
     let indicator_clone = indicator.clone();
     let result = tokio::task::spawn_blocking(move || {
-        load_and_compute(symbol_clone, timeframe_clone, indicator_clone, params, limit)
+        load_and_compute(
+            symbol_clone,
+            timeframe_clone,
+            indicator_clone,
+            params,
+            limit,
+        )
     })
     .await;
 

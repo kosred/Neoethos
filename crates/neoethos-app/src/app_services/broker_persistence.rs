@@ -59,11 +59,7 @@ pub fn load_broker_settings() -> BrokerSettingsState {
 /// so subsequent reads see the cleaned-up disk state.
 fn heal_credentials_drift() -> Result<()> {
     let candidates = neoethos_core::broker_config::candidate_credentials_paths()?;
-    let existing: Vec<_> = candidates
-        .iter()
-        .filter(|p| p.is_file())
-        .cloned()
-        .collect();
+    let existing: Vec<_> = candidates.iter().filter(|p| p.is_file()).cloned().collect();
     if existing.len() < 2 {
         return Ok(()); // nothing to heal
     }
@@ -478,7 +474,8 @@ mod tests {
         let local_dir = dir.join(".local").join("neoethos");
         fs::create_dir_all(&local_dir).expect("local dir");
         let local_file = local_dir.join("broker_credentials.toml");
-        fs::write(&local_file, "[ctrader]\nclient_id = \"OLDER\"\n[dxtrade]\n").expect("local file");
+        fs::write(&local_file, "[ctrader]\nclient_id = \"OLDER\"\n[dxtrade]\n")
+            .expect("local file");
 
         // dirs::config_dir() can't be redirected from a test, so
         // instead of testing the actual prod paths we test the
@@ -486,15 +483,21 @@ mod tests {
         // it backs up all but the newest. We invoke the function
         // body inline against a temp-rooted candidate list.
         let canonical_file = dir.join("canonical_creds.toml");
-        fs::write(&canonical_file, "[ctrader]\nclient_id = \"NEWER\"\n[dxtrade]\n")
-            .expect("canonical");
+        fs::write(
+            &canonical_file,
+            "[ctrader]\nclient_id = \"NEWER\"\n[dxtrade]\n",
+        )
+        .expect("canonical");
         // Force canonical's mtime to be NEWER than local's.
         // SystemTime::now() vs local_file's stamp is enough on
         // most filesystems, but be explicit by sleeping a beat
         // and rewriting the canonical.
         std::thread::sleep(Duration::from_millis(20));
-        fs::write(&canonical_file, "[ctrader]\nclient_id = \"NEWER\"\n[dxtrade]\n")
-            .expect("canonical retouched");
+        fs::write(
+            &canonical_file,
+            "[ctrader]\nclient_id = \"NEWER\"\n[dxtrade]\n",
+        )
+        .expect("canonical retouched");
 
         // Inline the heal logic against our two paths so we don't
         // have to redirect `candidate_credentials_paths`. This

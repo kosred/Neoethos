@@ -147,12 +147,7 @@ pub fn translate_code(code: &str) -> TranslatedError {
             None,
             "info",
         ),
-        "POSITION_NOT_FOUND" => (
-            "That position has already been closed.",
-            None,
-            None,
-            "info",
-        ),
+        "POSITION_NOT_FOUND" => ("That position has already been closed.", None, None, "info"),
 
         // ── Risk / prop-firm gate ──────────────────────────────────
         "RISK_EXCEEDED" | "RET_LIMITS_EXCEEDED" => (
@@ -241,10 +236,16 @@ pub(crate) fn extract_error_code(s: &str) -> Option<String> {
     if let Some(rest) = s.find("errorCode=").map(|i| &s[i + "errorCode=".len()..]) {
         return Some(rest_to_token(rest));
     }
-    if let Some(rest) = s.find("\"errorCode\":\"").map(|i| &s[i + "\"errorCode\":\"".len()..]) {
+    if let Some(rest) = s
+        .find("\"errorCode\":\"")
+        .map(|i| &s[i + "\"errorCode\":\"".len()..])
+    {
         return Some(rest.split('"').next().unwrap_or("").to_string());
     }
-    if let Some(rest) = s.find("code=Some(\"").map(|i| &s[i + "code=Some(\"".len()..]) {
+    if let Some(rest) = s
+        .find("code=Some(\"")
+        .map(|i| &s[i + "code=Some(\"".len()..])
+    {
         return Some(rest.split('"').next().unwrap_or("").to_string());
     }
     None

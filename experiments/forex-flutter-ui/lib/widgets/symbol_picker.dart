@@ -72,8 +72,16 @@ class SymbolPicker extends ConsumerStatefulWidget {
   ConsumerState<SymbolPicker> createState() => _SymbolPickerState();
 }
 
+/// #184: symbol category filters surfaced as chips above the
+/// Autocomplete. Defaults to `forex` (the same behavior the picker
+/// shipped with originally — operators want pairs 95% of the time)
+/// but lets the user flip to metals, equities/indices, or "all"
+/// without leaving the picker.
+enum _SymbolCategory { forex, metals, equities, all }
+
 class _SymbolPickerState extends ConsumerState<SymbolPicker> {
-  late bool _forexOnly = widget.forexOnlyDefault;
+  late _SymbolCategory _category =
+      widget.forexOnlyDefault ? _SymbolCategory.forex : _SymbolCategory.all;
 
   @override
   Widget build(BuildContext context) {
@@ -87,15 +95,25 @@ class _SymbolPickerState extends ConsumerState<SymbolPicker> {
   }
 
   Widget _buildPicker(BrokerSymbolsSnapshot snap) {
-    // Filter exactly the same way the Markets screen does so the
-    // operator sees a consistent universe across the app.
-    final source = (_forexOnly ? snap.forexLikeEnabled : snap.symbols)
-        .where((s) => s.enabled)
-        .toList(growable: false);
+    // #184: filter universe by selected category. `all` is intentionally
+    // unfiltered (other than `enabled`) so the user can fall back to the
+    // raw broker list if our heuristics misclassify something.
+    final source = switch (_category) {
+      _SymbolCategory.forex => snap.forexLikeEnabled,
+      _SymbolCategory.metals => snap.metalsEnabled,
+      _SymbolCategory.equities => snap.equitiesAndIndicesEnabled,
+      _SymbolCategory.all => snap.symbols.where((s) => s.enabled).toList(),
+    };
 
     final names = source.map((s) => s.symbolName).toList(growable: false);
+    final categoryLabel = switch (_category) {
+      _SymbolCategory.forex => 'forex',
+      _SymbolCategory.metals => 'metals',
+      _SymbolCategory.equities => 'equities/indices',
+      _SymbolCategory.all => 'all',
+    };
     final activeLabel =
-        '${widget.label} · ${names.length} ${_forexOnly ? "forex" : "all"} from broker';
+        '${widget.label} · ${names.length} $categoryLabel from broker';
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -217,26 +235,38 @@ class _SymbolPickerState extends ConsumerState<SymbolPicker> {
           },
         ),
         const SizedBox(height: 4),
+        // #184: category chips. Selecting one narrows the autocomplete
+        // pool to that asset class; "all" gives the unfiltered broker
+        // catalog. The picker remembers the choice for the lifetime of
+        // the widget instance (state is local on purpose — different
+        // screens may want different defaults).
         Row(
           children: [
-            SizedBox(
-              height: 18,
-              width: 18,
-              child: Checkbox(
-                value: _forexOnly,
-                onChanged: widget.enabled
-                    ? (v) => setState(() => _forexOnly = v ?? true)
-                    : null,
+            for (final entry in [
+              (_SymbolCategory.forex, 'Forex (${snap.forexLikeEnabled.length})'),
+              (_SymbolCategory.metals, 'Metals (${snap.metalsEnabled.length})'),
+              (
+                _SymbolCategory.equities,
+                'Equities/Indices (${snap.equitiesAndIndicesEnabled.length})'
               ),
-            ),
-            const SizedBox(width: 4),
-            Text(
-              'Forex pairs only (${_forexOnly ? "${snap.forexLikeEnabled.length}" : "${snap.symbols.length}"} of ${snap.symbolCount})',
-              style: const TextStyle(
-                fontSize: 11,
-                color: ForexAiTokens.textMuted,
+              (_SymbolCategory.all, 'All (${snap.symbols.where((s) => s.enabled).length})'),
+            ])
+              Padding(
+                padding: const EdgeInsets.only(right: 6),
+                child: FilterChip(
+                  label: Text(
+                    entry.$2,
+                    style: const TextStyle(fontSize: 11),
+                  ),
+                  selected: _category == entry.$1,
+                  visualDensity: VisualDensity.compact,
+                  materialTapTargetSize:
+                      MaterialTapTargetSize.shrinkWrap,
+                  onSelected: widget.enabled
+                      ? (_) => setState(() => _category = entry.$1)
+                      : null,
+                ),
               ),
-            ),
           ],
         ),
       ],

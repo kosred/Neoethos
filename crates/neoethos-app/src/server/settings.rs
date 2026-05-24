@@ -43,12 +43,6 @@ pub struct SettingsDto {
     /// news events. See [`NewsTradingMode`].
     pub news_trading_mode: String,
     pub news_trading_mode_display_name: String,
-    // ── Gemma news watcher (#128 / #132) ───────────────────────
-    pub gemma_news_watcher_enabled: bool,
-    pub gemma_morning_scan_time: String,
-    pub gemma_session_start_lead_min: u32,
-    pub gemma_adaptive_poll_threshold_min: u32,
-    pub gemma_adaptive_poll_interval_secs: u64,
 }
 
 /// Partial-update payload for `POST /settings`. All fields optional —
@@ -64,12 +58,6 @@ pub struct SettingsUpdateDto {
     pub openai_model: Option<String>,
     /// Snake_case id of a [`NewsTradingMode`] variant.
     pub news_trading_mode: Option<String>,
-    // ── Gemma news watcher (#132) ──────────────────────────────
-    pub gemma_news_watcher_enabled: Option<bool>,
-    pub gemma_morning_scan_time: Option<String>,
-    pub gemma_session_start_lead_min: Option<u32>,
-    pub gemma_adaptive_poll_threshold_min: Option<u32>,
-    pub gemma_adaptive_poll_interval_secs: Option<u64>,
 }
 
 pub async fn settings(State(_state): State<AppApiState>) -> Response {
@@ -93,6 +81,30 @@ pub async fn settings(State(_state): State<AppApiState>) -> Response {
     };
 
     Json(dto_from_settings(&settings)).into_response()
+}
+
+/// `GET /settings/raw` — return the raw `config.yaml` contents so the
+/// Flutter Settings screen can surface the full 200+ knob configuration
+/// the typed `/settings` DTO can't enumerate (#193). The response is
+/// `{"yaml": "<file contents>", "path": "<absolute path>"}`.
+pub async fn settings_raw_yaml(State(_state): State<AppApiState>) -> Response {
+    let path = std::path::PathBuf::from(CONFIG_PATH);
+    let absolute = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    match std::fs::read_to_string(&path) {
+        Ok(yaml) => Json(serde_json::json!({
+            "yaml": yaml,
+            "path": absolute.display().to_string(),
+        }))
+        .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("failed to read {}: {err}", path.display()),
+                "code": "config_read_failed",
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// POST /settings — merge-update + persist to config.yaml.
@@ -181,76 +193,6 @@ pub async fn update_settings(
             Err(resp) => return resp.into_response(),
         }
     }
-    // ── #132 Gemma news watcher fields ──────────────────────────
-    if let Some(b) = payload.gemma_news_watcher_enabled {
-        settings.news.gemma_news_watcher_enabled = b;
-    }
-    if let Some(raw) = payload.gemma_morning_scan_time {
-        // Empty string is meaningful — disables the morning_scan
-        // mode while leaving the watcher enabled. Validation just
-        // ensures HH:MM parses if non-blank.
-        let trimmed = raw.trim().to_string();
-        if !trimmed.is_empty()
-            && chrono::NaiveTime::parse_from_str(&trimmed, "%H:%M").is_err()
-            && chrono::NaiveTime::parse_from_str(&trimmed, "%H:%M:%S").is_err()
-        {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "gemma_morning_scan_time `{}` is not a valid HH:MM time",
-                        trimmed
-                    ),
-                    "code": "invalid_morning_scan_time",
-                })),
-            )
-                .into_response();
-        }
-        settings.news.gemma_morning_scan_time = trimmed;
-    }
-    if let Some(n) = payload.gemma_session_start_lead_min {
-        // 0-120 min range — anything beyond is operator error.
-        if n > 120 {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "gemma_session_start_lead_min must be 0..=120",
-                    "code": "invalid_session_lead_min",
-                })),
-            )
-                .into_response();
-        }
-        settings.news.gemma_session_start_lead_min = n;
-    }
-    if let Some(n) = payload.gemma_adaptive_poll_threshold_min {
-        if n == 0 || n > 240 {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "gemma_adaptive_poll_threshold_min must be 1..=240",
-                    "code": "invalid_adaptive_threshold",
-                })),
-            )
-                .into_response();
-        }
-        settings.news.gemma_adaptive_poll_threshold_min = n;
-    }
-    if let Some(n) = payload.gemma_adaptive_poll_interval_secs {
-        // Hard floor of 5 s is enforced in WatcherConfig::from_news_config
-        // — accept anything reasonable here.
-        if n == 0 || n > 600 {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "gemma_adaptive_poll_interval_secs must be 1..=600",
-                    "code": "invalid_adaptive_interval",
-                })),
-            )
-                .into_response();
-        }
-        settings.news.gemma_adaptive_poll_interval_secs = n;
-    }
-
     if let Err(err) = settings.save(CONFIG_PATH) {
         tracing::error!(
             target: "neoethos_app::server::settings",
@@ -272,18 +214,6 @@ pub async fn update_settings(
         "config.yaml updated via POST /settings"
     );
 
-    // #133 — push the fresh WatcherConfig to the running news
-    // watcher so a UI toggle of `gemma_news_watcher_enabled`
-    // takes effect immediately. The watcher's `select!` picks up
-    // the change on the next tick (or immediately if it was
-    // sleeping). Feature-gated — when `gemma-backend` is off
-    // the watcher doesn't exist and the call is a no-op stub.
-    #[cfg(feature = "gemma-backend")]
-    {
-        let new_watcher_cfg = crate::app_services::gemma_news_watcher::WatcherConfig::from_news_config(&settings.news);
-        crate::app_services::gemma_news_watcher::notify_config_changed(new_watcher_cfg);
-    }
-
     Json(dto_from_settings(&settings)).into_response()
 }
 
@@ -300,10 +230,5 @@ fn dto_from_settings(settings: &Settings) -> SettingsDto {
         openai_model: settings.news.openai_model.clone(),
         news_trading_mode: mode.as_str().to_string(),
         news_trading_mode_display_name: mode.display_name().to_string(),
-        gemma_news_watcher_enabled: settings.news.gemma_news_watcher_enabled,
-        gemma_morning_scan_time: settings.news.gemma_morning_scan_time.clone(),
-        gemma_session_start_lead_min: settings.news.gemma_session_start_lead_min,
-        gemma_adaptive_poll_threshold_min: settings.news.gemma_adaptive_poll_threshold_min,
-        gemma_adaptive_poll_interval_secs: settings.news.gemma_adaptive_poll_interval_secs,
     }
 }

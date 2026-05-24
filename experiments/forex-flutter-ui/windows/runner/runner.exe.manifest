@@ -1,5 +1,21 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <!--
+    #199 — explicitly declare asInvoker so Windows never auto-elevates
+    NeoEthos.exe. Without this block the OS heuristic-detects setup-like
+    EXEs (anything containing "install", "update", "patch", "setup")
+    and silently prompts for UAC. An elevated process then rejects
+    input from the non-elevated Flutter window via UIPI and becomes
+    unkillable from Task Manager → which is exactly the "all buttons
+    fail" + "Access is denied" symptom from the live audit.
+  -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
       <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>

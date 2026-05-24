@@ -5,7 +5,7 @@
 // instead of hardcoded mockup figures.
 //
 // Render rules:
-//   - Brand:            always "neoethos".
+//   - Brand:            always "NeoEthos".
 //   - LIVE / OFFLINE:   derives from `accountSnapshotProvider` state.
 //                         data        → green LIVE
 //                         BrokerNot…  → muted CONNECTING
@@ -28,6 +28,7 @@ import '../api/currency_format.dart';
 import '../state/account_provider.dart';
 import '../state/system_providers.dart';
 import '../theme/theme.dart';
+import 'backend_diagnostics_dialog.dart';
 import 'report_issue.dart';
 
 class TopBar extends ConsumerWidget {
@@ -72,7 +73,7 @@ class TopBar extends ConsumerWidget {
       child: Row(
         children: [
           const Text(
-            'neoethos',
+            'NeoEthos',
             style: TextStyle(
               fontSize: ForexAiTokens.fsSubtitle + 1,
               fontWeight: FontWeight.w700,
@@ -138,6 +139,15 @@ class TopBar extends ConsumerWidget {
             onPressed: () => showReportIssueDialog(context),
             tooltip: 'Report an issue — bundles logs + emails support',
             icon: const Icon(Icons.bug_report_outlined,
+                color: ForexAiTokens.textMuted),
+          ),
+          // Backend diagnostics — supervisor.log tail + Restart button.
+          // Always visible (not gated on degraded state) so the
+          // operator can audit a healthy backend too.
+          IconButton(
+            onPressed: () => showBackendDiagnosticsDialog(context),
+            tooltip: 'Backend diagnostics — view supervisor log + restart',
+            icon: const Icon(Icons.monitor_heart_outlined,
                 color: ForexAiTokens.textMuted),
           ),
           IconButton(

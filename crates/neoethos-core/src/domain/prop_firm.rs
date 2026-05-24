@@ -230,9 +230,9 @@ impl PropFirmChallengeDefaults {
     pub fn for_preset(preset: PropFirmPreset) -> Self {
         match preset {
             PropFirmPreset::Ftmo => Self::FTMO_STANDARD,
-            PropFirmPreset::MyForexFunds
-            | PropFirmPreset::FundedNext
-            | PropFirmPreset::The5ers => Self::COMPACT_30_DAY,
+            PropFirmPreset::MyForexFunds | PropFirmPreset::FundedNext | PropFirmPreset::The5ers => {
+                Self::COMPACT_30_DAY
+            }
             PropFirmPreset::None => Self::NONE_OWN_MONEY,
         }
     }
@@ -398,8 +398,8 @@ impl PropFirmPhaseRiskDefaults {
 #[cfg(test)]
 mod tests {
     use super::{
-        PropFirmChallengeDefaults, PropFirmConstraints, PropFirmPhaseRiskDefaults,
-        PropFirmPreset, PropFirmRuntimeDefaults,
+        PropFirmChallengeDefaults, PropFirmConstraints, PropFirmPhaseRiskDefaults, PropFirmPreset,
+        PropFirmRuntimeDefaults,
     };
 
     #[test]

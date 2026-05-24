@@ -258,11 +258,7 @@ pub fn compute_single_indicator(
                 } else if v.len() > n {
                     v.into_iter().take(n).collect()
                 } else {
-                    anyhow::bail!(
-                        "indicator returned {} values, expected ≥{}",
-                        v.len(),
-                        n
-                    );
+                    anyhow::bail!("indicator returned {} values, expected ≥{}", v.len(), n);
                 };
                 lines.push(IndicatorLine {
                     name: indicator_id.to_string(),

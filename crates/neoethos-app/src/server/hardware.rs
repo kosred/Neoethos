@@ -40,15 +40,18 @@ pub struct RamDto {
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GpuDto {
-    /// Best-effort name. cTrader desktop reports this for diagnostics;
-    /// we ship a placeholder until a real GPU probe lands (the existing
-    /// `forex-models::hardware` module knows how to do CUDA discovery
-    /// but the dependency edge isn't wired yet — out of scope for the
-    /// HTTP-server work).
+    /// Best-effort name. The wgpu/Vulkan-backed enumerator that lists
+    /// every adapter on the system is tracked separately (#189); until
+    /// then we infer iGPU presence from the CPU model string (#188).
     pub name: String,
     /// Whether at least one GPU is detected. Rendered by the Flutter
     /// hardware screen.
     pub available: bool,
+    /// One of `"none"`, `"integrated"`, `"discrete"`, `"unknown"`. The
+    /// hardware screen uses this to surface a more honest label than
+    /// the binary `available`. Defaults to `"unknown"` whenever the
+    /// inference is ambiguous — never lies.
+    pub kind: String,
 }
 
 pub async fn hardware(State(_state): State<AppApiState>) -> Json<HardwareDto> {
@@ -97,6 +100,7 @@ fn probe_hardware_blocking() -> HardwareDto {
     let used_kb = sys.used_memory();
     let available_kb = sys.available_memory();
 
+    let gpu = infer_gpu_from_cpu_model(&model);
     HardwareDto {
         cpu: CpuDto {
             model,
@@ -110,13 +114,55 @@ fn probe_hardware_blocking() -> HardwareDto {
             used_mb: used_kb / (1024 * 1024),
             available_mb: available_kb / (1024 * 1024),
         },
-        gpu: GpuDto {
-            // Placeholder until a real probe lands. The Flutter side
-            // shows this as a hint that GPU detection isn't wired yet,
-            // not as a real model claim.
-            name: "GPU probe pending".to_string(),
+        gpu,
+    }
+}
+
+/// #188: best-effort iGPU inference from the CPU model string. Until
+/// the real wgpu/Vulkan probe lands (#189), this catches the common
+/// case where a Ryzen-U / Intel-Core part has an integrated GPU that
+/// `sysinfo` doesn't surface and the old `available: false` placeholder
+/// flat-out lied about. Returns `kind = "unknown"` for anything we
+/// can't classify with high confidence so the UI never makes up a
+/// claim about the user's hardware.
+fn infer_gpu_from_cpu_model(cpu_model: &str) -> GpuDto {
+    let model_lower = cpu_model.to_lowercase();
+
+    // Ryzen mobile parts (U / H / HS / HX / G suffix) carry Radeon
+    // integrated graphics. Desktop "F" parts (Intel) have iGPU
+    // DISABLED; everything else in the Intel Core line has one.
+    let is_amd_apu = model_lower.contains("ryzen")
+        && (model_lower.ends_with('u')
+            || model_lower.contains(" u ")
+            || model_lower.contains(" h ")
+            || model_lower.contains("hs")
+            || model_lower.contains("hx")
+            || model_lower.contains(" g ")
+            || model_lower.ends_with('g'));
+    let is_intel_core_with_igpu = model_lower.contains("intel")
+        && (model_lower.contains("core") || model_lower.contains("xeon"))
+        && !model_lower.contains("-f ")
+        && !model_lower.ends_with('f')
+        && !model_lower.contains("xeon w");
+
+    if is_amd_apu {
+        GpuDto {
+            name: format!("Integrated Radeon (inferred from {cpu_model})"),
+            available: true,
+            kind: "integrated".to_string(),
+        }
+    } else if is_intel_core_with_igpu {
+        GpuDto {
+            name: format!("Integrated Intel Graphics (inferred from {cpu_model})"),
+            available: true,
+            kind: "integrated".to_string(),
+        }
+    } else {
+        GpuDto {
+            name: "GPU probe pending (no integrated GPU inferred)".to_string(),
             available: false,
-        },
+            kind: "unknown".to_string(),
+        }
     }
 }
 
@@ -136,6 +182,7 @@ fn empty_hardware_dto() -> HardwareDto {
         gpu: GpuDto {
             name: "probe failed".to_string(),
             available: false,
+            kind: "unknown".to_string(),
         },
     }
 }

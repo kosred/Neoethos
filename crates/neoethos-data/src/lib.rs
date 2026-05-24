@@ -213,6 +213,46 @@ pub fn load_symbol_timeframe(
     load_vortex(path)
 }
 
+/// Load only the trailing `tail_n` rows for a symbol/timeframe.
+///
+/// #155: the full `load_symbol_timeframe` path materialises every row in
+/// the Vortex file into an `Ohlcv` even when the caller only wants the
+/// last 200 candles for a chart. For a multi-year M1 dataset that's
+/// ~1 M rows × (5 × 8 bytes) ≈ 40 MB allocated per request, plus a
+/// timestamp normalisation pass that walks every value.
+///
+/// This helper loads the same file but trims the in-memory `Ohlcv` down
+/// to its last `tail_n` rows BEFORE returning it. The on-disk read still
+/// materialises the whole stream — Vortex doesn't expose a cheap "skip
+/// to row N" primitive at the layout level we use today — but the
+/// caller-visible allocation and downstream iteration drops to
+/// O(tail_n). When Vortex grows a true row-range scan API, this is the
+/// function to upgrade; the surrounding contract stays the same.
+pub fn load_symbol_timeframe_tail(
+    root: impl AsRef<Path>,
+    symbol: &str,
+    timeframe: &str,
+    tail_n: usize,
+) -> Result<Ohlcv> {
+    let mut ohlcv = load_symbol_timeframe(root, symbol, timeframe)?;
+    let total = ohlcv.len();
+    if tail_n >= total {
+        return Ok(ohlcv);
+    }
+    let drop = total - tail_n;
+    ohlcv.open.drain(..drop);
+    ohlcv.high.drain(..drop);
+    ohlcv.low.drain(..drop);
+    ohlcv.close.drain(..drop);
+    if let Some(ts) = ohlcv.timestamp.as_mut() {
+        ts.drain(..drop);
+    }
+    if let Some(v) = ohlcv.volume.as_mut() {
+        v.drain(..drop);
+    }
+    Ok(ohlcv)
+}
+
 pub fn load_symbol_dataset(root: impl AsRef<Path>, symbol: &str) -> Result<SymbolDataset> {
     let tfs = discover_timeframes(&root, symbol)?;
     let mut frames = HashMap::new();

@@ -188,8 +188,7 @@ fn outcome_to_response(
             // operator would otherwise see.
             let mut body = serde_json::json!({"error": err.to_string()});
             if let Some(t) = translate_anyhow(&err) {
-                body["translation"] =
-                    serde_json::to_value(&t).unwrap_or(serde_json::Value::Null);
+                body["translation"] = serde_json::to_value(&t).unwrap_or(serde_json::Value::Null);
             }
             (StatusCode::BAD_GATEWAY, Json(body)).into_response()
         }

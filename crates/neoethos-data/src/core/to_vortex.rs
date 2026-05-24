@@ -146,7 +146,7 @@ pub fn convert_to_vortex(
     // Validation suite — every gate bails rather than silently filling.
     validate_required_columns(&ohlcv, schema_hint)?;
     validate_f32_precision(&ohlcv)?;
-    validate_timestamp_monotonic_utc(&ohlcv)?;
+    validate_timestamp_strictly_monotonic(&ohlcv)?;
     validate_implied_timeframe(&ohlcv, schema_hint, source)?;
 
     if let Some(parent) = destination.parent() {
@@ -374,7 +374,12 @@ fn validate_f32_precision(ohlcv: &Ohlcv) -> Result<()> {
     Ok(())
 }
 
-fn validate_timestamp_monotonic_utc(ohlcv: &Ohlcv) -> Result<()> {
+// Verifies strict monotonicity of the timestamp column. The "utc" suffix
+// was removed from the prior name because nothing here actually proves a
+// timezone — we only assert that ts[0] is positive (a weak proxy for "an
+// epoch value, not a sentinel like 0 or -1") and that each subsequent
+// timestamp is strictly greater than the last.
+fn validate_timestamp_strictly_monotonic(ohlcv: &Ohlcv) -> Result<()> {
     let ts = ohlcv
         .timestamp
         .as_ref()
@@ -386,7 +391,7 @@ fn validate_timestamp_monotonic_utc(ohlcv: &Ohlcv) -> Result<()> {
     if prev <= 0 {
         bail!(
             "validate: timestamp[0] = {prev} is non-positive — \
-              not a valid UTC epoch value"
+              not a valid epoch value"
         );
     }
     for (i, &t) in ts.iter().enumerate().skip(1) {
@@ -625,7 +630,7 @@ mod tests {
             close: vec![1.0, 1.0, 1.0],
             volume: None,
         };
-        let err = validate_timestamp_monotonic_utc(&ohlcv).unwrap_err();
+        let err = validate_timestamp_strictly_monotonic(&ohlcv).unwrap_err();
         assert!(err.to_string().contains("duplicate"), "unexpected: {err}");
     }
 
@@ -697,6 +702,42 @@ mod tests {
         assert_eq!(written, tmp);
 
         let reloaded = crate::load_vortex(&tmp).expect("reload converted Vortex");
+
+        // #158: shallow `len > 0` check used to be the only assertion here.
+        // That doesn't actually prove the roundtrip preserves values, only
+        // that the writer didn't produce an empty file. Tighten:
+        //   - row count matches between CSV → Ohlcv → Vortex → reload,
+        //   - OHLC columns survive byte-identical,
+        //   - timestamps are strictly monotonic in ms (the on-disk
+        //     normalised unit) and span > 1 minute (real fixture is M5).
+        // Volume is optional in the schema so we don't gate on it here.
+        let csv_parsed = universal_importer::parse_csv_public(&fixture, false)
+            .expect("re-parse source CSV for length comparison");
         assert!(reloaded.open.len() > 0, "real fixture has at least one row");
+        assert_eq!(
+            reloaded.open.len(),
+            csv_parsed.open.len(),
+            "Vortex row count must match source CSV"
+        );
+        assert_eq!(reloaded.open, csv_parsed.open, "open column drift");
+        assert_eq!(reloaded.high, csv_parsed.high, "high column drift");
+        assert_eq!(reloaded.low, csv_parsed.low, "low column drift");
+        assert_eq!(reloaded.close, csv_parsed.close, "close column drift");
+
+        let ts = reloaded.timestamp.as_ref().expect("Vortex has timestamps");
+        assert!(ts.len() >= 2, "M5 real fixture needs ≥ 2 rows");
+        for w in ts.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "Vortex timestamps must be strictly monotonic: {} → {}",
+                w[0],
+                w[1]
+            );
+        }
+        let span_ms = ts.last().unwrap() - ts.first().unwrap();
+        assert!(
+            span_ms >= 60_000,
+            "M5 fixture should span at least 1 minute, got {span_ms} ms"
+        );
     }
 }

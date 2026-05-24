@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  #199 — Force asInvoker so Windows never auto-elevates this binary.
+  Without this manifest the OS heuristic-detects "neoethos-app.exe"
+  may scan its name + import table looking for setup-like patterns
+  and silently prompt for UAC. An elevated background process then
+  rejects input from the (non-elevated) Flutter front-end via UIPI
+  and becomes unkillable from the user-mode Task Manager — exactly
+  the "Access is denied" + "all buttons fail" failure mode from the
+  live audit.
+
+  Building Rust binaries on Windows with MSVC: the linker picks up a
+  sibling `<bin>.exe.manifest` automatically when present alongside
+  the crate's Cargo.toml. For full embedding (so the file works on
+  MinGW + when the bin is moved) you'd use the `embed-resource` crate;
+  the bare manifest covers our shipping target (cargo + msvc + x86_64
+  Windows) which is the only Windows config we publish.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 + 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+</assembly>

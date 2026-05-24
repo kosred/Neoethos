@@ -49,6 +49,16 @@ use super::state::{AccountSnapshotPayload, AppApiState, PositionPayload};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Number of consecutive refresh failures before the cached account
+/// snapshot is wiped (= `STALE_THRESHOLD * REFRESH_INTERVAL` of
+/// continuous broker silence — 15s with the current 3 × 5s tuning).
+/// Lower → faster "broker not ready" surface but more flapping on a
+/// flaky network; higher → dashboard lies for longer when the token
+/// has actually expired. The v0.4.20 symptom that motivated the cache
+/// invalidation is documented in `run()` below.
+#[allow(dead_code)] // referenced inside the cTrader-gated run() loop.
+const STALE_THRESHOLD: usize = 3;
+
 /// Map cTrader's numeric `depositAssetId` to a 3-letter ISO code
 /// for the dashboard currency badge. The full source of truth is
 /// `ProtoOAAssetListReq`, but pulling that registry on every refresh
@@ -107,7 +117,7 @@ async fn run(state: AppApiState) {
     // symptom was "balance shows €1000 forever even though token is
     // CH_ACCESS_TOKEN_INVALID since 30 minutes ago". One transient blip
     // (1-2 missed ticks) does NOT clear the cache; only sustained failure.
-    const STALE_THRESHOLD: usize = 3;
+    // The threshold itself lives at module scope (#148) as STALE_THRESHOLD.
     let mut failures: usize = 0;
     loop {
         match refresh_once(&state).await {
@@ -286,37 +296,35 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
         {
             Some(tb) => tb.access_token,
             None => {
-                tracing::debug!(
+                // #149 follow-up: this branch early-returns with pnl_usd=0.0
+                // for every open position. That used to be a `debug!` which
+                // meant the user saw quiet zeroes in the dashboard with no
+                // signal anywhere unless RUST_LOG=debug. Promoted to `warn!`
+                // and called out the user-visible effect so an operator can
+                // tell from the log whether the column is actually $0.00 or
+                // just the keyring lookup blanked mid-refresh.
+                tracing::warn!(
                     target: "neoethos_app::server::bridge",
-                    "skipped authoritative PnL fetch — token bundle vanished mid-refresh"
+                    "skipped authoritative PnL fetch — token bundle vanished \
+                     mid-refresh; dashboard will show pnl_usd=0.0 for all \
+                     positions until the next bridge tick recovers it"
                 );
                 return Ok(AccountSnapshotPayload {
                     balance,
                     equity,
                     free_margin,
-                    used_margin: if used_margin.is_sign_negative()
-                        && used_margin == 0.0
-                    {
+                    used_margin: if used_margin.is_sign_negative() && used_margin == 0.0 {
                         0.0
                     } else {
                         used_margin
                     },
-                    currency: asset_id_to_currency(
-                        snapshot.trader.deposit_asset_id,
-                    )
-                    .to_string(),
+                    currency: asset_id_to_currency(snapshot.trader.deposit_asset_id).to_string(),
                     fetched_at_unix_ms: chrono::Utc::now().timestamp_millis(),
                     positions: snapshot
                         .reconcile
                         .positions
                         .iter()
-                        .map(|p| {
-                            position_to_payload(
-                                p,
-                                None,
-                                &HashMap::new(),
-                            )
-                        })
+                        .map(|p| position_to_payload(p, None, &HashMap::new()))
                         .collect(),
                 });
             }
@@ -388,8 +396,7 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
         // depositAssetId. EUR fallback for unknown ids, logged so
         // we can grow the table. Full ProtoOAAssetListReq still
         // a follow-up for the very-long-tail currencies.
-        currency: asset_id_to_currency(snapshot.trader.deposit_asset_id)
-            .to_string(),
+        currency: asset_id_to_currency(snapshot.trader.deposit_asset_id).to_string(),
         // Wall-clock at the moment we finished assembling this
         // snapshot. The Flutter Dashboard converts to local time
         // for the "as of HH:MM:SS" freshness badge so the
@@ -436,11 +443,7 @@ fn position_to_payload(
     // When metadata is missing for the symbol (rare — exotic
     // synthetics), report 0.0 pips rather than NaN; UI shows 0
     // until the symbol table gets populated.
-    let mut pnl_pips = compute_pnl_pips(
-        resolved_name.as_deref(),
-        pnl_usd,
-        p.volume,
-    );
+    let mut pnl_pips = compute_pnl_pips(resolved_name.as_deref(), pnl_usd, p.volume);
 
     // #142: if the live_spots streamer has a fresh tick for this
     // position's symbol AND we have an entry price, recompute
@@ -512,11 +515,7 @@ fn position_to_payload(
 ///     div-by-zero is unhelpful),
 ///   - the symbol isn't in the metadata table (use 0.0 as a
 ///     visible "unknown" rather than NaN which breaks JSON).
-fn compute_pnl_pips(
-    resolved_name: Option<&str>,
-    pnl_account_ccy: f64,
-    volume_lots: f64,
-) -> f64 {
+fn compute_pnl_pips(resolved_name: Option<&str>, pnl_account_ccy: f64, volume_lots: f64) -> f64 {
     if !pnl_account_ccy.is_finite() || pnl_account_ccy == 0.0 {
         return 0.0;
     }

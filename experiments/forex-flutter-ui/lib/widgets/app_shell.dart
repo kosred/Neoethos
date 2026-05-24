@@ -10,8 +10,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../startup/backend_watchdog.dart';
 import '../state/nav.dart';
 import '../theme/theme.dart';
+import 'backend_health_banner.dart';
 import 'pending_actions_banner.dart';
 import 'sidebar.dart';
 import 'topbar.dart';
@@ -38,11 +40,24 @@ class AppShell extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final activeId = ref.watch(activeTabProvider);
+    // Eagerly materialise the watchdog provider so it starts polling
+    // on the first frame, even if the BackendHealthBanner below
+    // collapses to SizedBox.shrink (healthy path). Without this read
+    // the Notifier wouldn't `build()` until the banner first decided
+    // to render — which would never happen on a healthy machine and
+    // we'd never poll at all.
+    ref.watch(backendHealthProvider);
     return Scaffold(
       backgroundColor: ForexAiTokens.appBg,
       body: Column(
         children: [
           const TopBar(),
+          // Backend connectivity banner sits BELOW the TopBar so the
+          // brand + LIVE/OFFLINE badges remain anchored, and ABOVE
+          // the sidebar+dock split so it spans the full window width
+          // (the user can't miss it). Zero height in the healthy
+          // steady state — no layout penalty.
+          const BackendHealthBanner(),
           Expanded(
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.stretch,

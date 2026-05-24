@@ -10,7 +10,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use neoethos_core::Settings;
-use neoethos_data::load_symbol_dataset;
+use neoethos_data::{discover_timeframes, load_symbol_timeframe_tail};
 
 use super::state::AppApiState;
 
@@ -116,36 +116,38 @@ pub async fn chart(State(_state): State<AppApiState>, Query(q): Query<ChartQuery
 }
 
 /// Load OHLC candles for a symbol/timeframe from the local data dir.
-///
-/// Exposed `pub` so the Gemma tool-calling path
-/// (`app_services::gemma_tools::GetChartDataTool`) can reuse the
-/// same loader the HTTP route uses — same Settings::from_yaml lookup,
-/// same Vortex/Parquet auto-detect, same headline strings. Keeping
-/// one loader means the tool's answers can't drift from what the
-/// Chart screen shows.
 pub fn load_chart(symbol: String, timeframe: String, limit: usize) -> anyhow::Result<ChartDto> {
     let settings = Settings::from_yaml("config.yaml")
         .map_err(|e| anyhow::anyhow!("config.yaml not loadable: {e}"))?;
-    let dataset = load_symbol_dataset(&settings.system.data_dir, &symbol)
-        .map_err(|e| anyhow::anyhow!("dataset load failed for {symbol}: {e}"))?;
 
-    let mut available_timeframes: Vec<String> = dataset.frames.keys().cloned().collect();
+    // #154: previously called `load_symbol_dataset` which eagerly loaded
+    // ALL discovered timeframes for the symbol (commonly 19+ Vortex
+    // files at ~30 MB each — half a gigabyte of disk reads to render a
+    // single timeframe). Now we ask `discover_timeframes` for the
+    // dropdown list (cheap directory listing, cached per #79) and load
+    // only the requested timeframe's Vortex file.
+    let mut available_timeframes = discover_timeframes(&settings.system.data_dir, &symbol)
+        .map_err(|e| anyhow::anyhow!("timeframe discovery failed for {symbol}: {e}"))?;
     available_timeframes.sort();
-
-    let ohlcv = dataset.frames.get(&timeframe).ok_or_else(|| {
-        anyhow::anyhow!(
+    if !available_timeframes.contains(&timeframe) {
+        anyhow::bail!(
             "timeframe '{timeframe}' not in dataset for {symbol} \
-                 (available: {})",
+             (available: {})",
             available_timeframes.join(", ")
-        )
-    })?;
+        );
+    }
+
+    // #155: ask the data layer for just the trailing `limit` rows so
+    // we don't allocate a million-row Ohlcv only to slice the last 200.
+    let ohlcv =
+        load_symbol_timeframe_tail(&settings.system.data_dir, &symbol, &timeframe, limit)
+            .map_err(|e| anyhow::anyhow!("dataset load failed for {symbol} {timeframe}: {e}"))?;
 
     let total = ohlcv.len();
-    let start = total.saturating_sub(limit);
     let timestamps = ohlcv.timestamp.as_deref();
     let volumes = ohlcv.volume.as_deref();
 
-    let candles: Vec<CandleDto> = (start..total)
+    let candles: Vec<CandleDto> = (0..total)
         .map(|idx| CandleDto {
             ts_ms: timestamps.and_then(|ts| ts.get(idx)).copied(),
             open: ohlcv.open[idx],

@@ -32,13 +32,7 @@ param(
     # 'release' (default) or 'debug'. Debug builds a slower, less-compressed
     # bundle that's still useful for end-to-end smoke testing the installer
     # wizard itself.
-    [string]$Profile = 'release',
-
-    # When set, runs the bundle in Lite mode (no Gemma GGUF bundled in;
-    # the installer's POST hook downloads it from HuggingFace at install
-    # time). Keeps the Setup.exe under GitHub Releases' 2 GB asset cap.
-    # See cargo-packager metadata + scripts/gemma_model_install.nsh.
-    [switch]$Lite
+    [string]$Profile = 'release'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,7 +41,6 @@ $repoRoot = (Get-Item $PSScriptRoot).Parent.FullName
 Write-Host "NeoEthos installer build" -ForegroundColor Cyan
 Write-Host "  repo root : $repoRoot"
 Write-Host "  profile   : $Profile"
-Write-Host "  lite      : $Lite"
 Write-Host ""
 
 # ── 1. NSIS check ────────────────────────────────────────────────────────────
@@ -73,9 +66,7 @@ if (-not (Test-Path $bundleScript)) {
 
 Write-Host ""
 Write-Host "==> Running make-release-bundle.ps1..." -ForegroundColor Cyan
-$bundleParams = @{ Profile = $Profile }
-if ($Lite) { $bundleParams['Lite'] = $true }
-& $bundleScript @bundleParams
+& $bundleScript -Profile $Profile
 if ($LASTEXITCODE -ne 0) { throw "make-release-bundle.ps1 failed with exit code $LASTEXITCODE" }
 
 # ── 3. Compile the NSIS installer ────────────────────────────────────────────

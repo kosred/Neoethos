@@ -39,7 +39,7 @@ pub fn draw(area: Rect, buf: &mut Buffer, shared: &AppShared) {
         .value_style(theme::accent_style())
         .render(kpi_cols[0], buf);
 
-    let active = active_job_count();
+    let active = shared.jobs.running_count();
     Kpi::new("Active jobs", active.to_string())
         .sub(if active == 0 { "Idle" } else { "Running" })
         .value_style(if active == 0 {
@@ -173,14 +173,6 @@ fn dataset_summary(shared: &AppShared) -> (usize, usize) {
         }
     }
     (symbols, max_tfs)
-}
-
-fn active_job_count() -> usize {
-    // No live job-state IPC yet. Count any cli.exe sibling
-    // processes via tasklist-like info is not portable; for now
-    // we just return 0. Refresh button on the page can later
-    // probe a `~/.neoethos/jobs.json` index.
-    0
 }
 
 fn portfolio_count(shared: &AppShared) -> usize {

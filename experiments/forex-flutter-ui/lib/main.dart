@@ -11,7 +11,11 @@
 //      on 127.0.0.1:7423. If it isn't, spawn it as a child process.
 //      This gives the operator the double-click experience: launch
 //      one .exe, both halves come up.
-//   3. Run the Flutter UI.
+//   3. Run the Flutter UI. AppShell materialises the
+//      `backendHealthProvider` on first build, which starts the
+//      watchdog timer that polls `/healthz` every 3 s and auto-
+//      respawns the backend after 3 consecutive failures (see
+//      `startup/backend_watchdog.dart` for details).
 
 import 'dart:io';
 

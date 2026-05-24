@@ -43,6 +43,97 @@ class BackendSupervisor {
   Process? _child;
   late final File _logFile = _openLogFile();
 
+  /// Absolute path to the supervisor log file. The Diagnostics dialog
+  /// tails this so the operator can see why a respawn happened without
+  /// having to dig through `%LOCALAPPDATA%` manually.
+  String get logFilePath => _logFile.path;
+
+  /// PID of the most recent spawn, or null if we never spawned (the
+  /// initial `ensureRunning()` found an already-running backend) or
+  /// the spawn failed. Surfaced so the "Restart backend" button can
+  /// hard-kill the existing process before respawning.
+  int? get childPid => _child?.pid;
+
+  /// Cheap public probe — the watchdog hits this every 3 s. Same dio
+  /// instance every call so we're not paying connection-setup cost on
+  /// the polling path. Returns false on ANY error (timeout, refused,
+  /// 5xx) so the watchdog treats "anything other than a clean 200" as
+  /// a failure tick.
+  ///
+  /// 2 s timeout per request to match the watchdog's task contract —
+  /// healthy responses come back in <50 ms; anything past 2 s is
+  /// effectively dead.
+  Future<bool> probeHealth({
+    Duration timeout = const Duration(seconds: 2),
+  }) async {
+    final dio = Dio(BaseOptions(
+      baseUrl: _baseUrl,
+      connectTimeout: timeout,
+      receiveTimeout: timeout,
+      sendTimeout: timeout,
+    ));
+    try {
+      final r = await dio.get<dynamic>('/healthz');
+      return r.statusCode == 200;
+    } catch (_) {
+      return false;
+    } finally {
+      dio.close(force: true);
+    }
+  }
+
+  /// Force a respawn: kill the tracked child (best-effort — on
+  /// Windows `Process.killPid` with SIGKILL is mapped to
+  /// TerminateProcess) and rerun `ensureRunning()`. The watchdog
+  /// calls this after 3 consecutive `/healthz` failures; the
+  /// Diagnostics dialog calls it from the "Restart backend" button.
+  ///
+  /// Returns the boolean from `ensureRunning()` — `false` only when
+  /// the probe found ANOTHER live instance during the relaunch
+  /// (extremely unlikely mid-session but kept for symmetry).
+  Future<bool> restartBackend() async {
+    final pid = _child?.pid;
+    _log('restartBackend() requested. tracked child pid=${pid ?? "none"}');
+    if (pid != null) {
+      try {
+        // Best-effort kill. `detached` mode means we don't own the
+        // pipes, so killPid is the only handle we have. On Windows
+        // SIGKILL → TerminateProcess; on Unix → SIGKILL. The child
+        // is GUI-subsystem-less so no orphaned window to clean up.
+        final killed = Process.killPid(pid, ProcessSignal.sigkill);
+        _log('killPid($pid, SIGKILL) = $killed');
+      } catch (e) {
+        _log('killPid($pid) threw: $e — proceeding with respawn anyway.');
+      }
+      _child = null;
+    } else {
+      _log('No tracked child PID — respawning without a kill.');
+    }
+    // Brief settle so the OS releases the port; ensureRunning's
+    // probeHealth would otherwise race the dying socket.
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+    return ensureRunning();
+  }
+
+  /// Tail the supervisor log for the Diagnostics dialog.
+  ///
+  /// Reads the whole file (it's truncated on each app launch so
+  /// "whole file" is bounded by one session — typically <30 KB
+  /// even after a few respawns) and returns the last [maxLines]
+  /// lines. Returns an empty string if the file doesn't exist yet
+  /// (extreme cold start).
+  String tailLog({int maxLines = 200}) {
+    try {
+      if (!_logFile.existsSync()) return '';
+      final content = _logFile.readAsStringSync();
+      final lines = content.split('\n');
+      if (lines.length <= maxLines) return content;
+      return lines.sublist(lines.length - maxLines).join('\n');
+    } catch (e) {
+      return '<log read failed: $e>';
+    }
+  }
+
   /// Spawn the backend if it isn't already responding. Returns once the
   /// backend is reachable, or after `_maxWaitMs` if it never came up
   /// (we still let the UI render so the user sees an actionable error
@@ -125,22 +216,8 @@ class BackendSupervisor {
     return true;
   }
 
-  Future<bool> _probeHealth() async {
-    final dio = Dio(BaseOptions(
-      baseUrl: _baseUrl,
-      connectTimeout: const Duration(milliseconds: 500),
-      receiveTimeout: const Duration(milliseconds: 500),
-      sendTimeout: const Duration(milliseconds: 500),
-    ));
-    try {
-      final r = await dio.get<dynamic>('/healthz');
-      return r.statusCode == 200;
-    } catch (_) {
-      return false;
-    } finally {
-      dio.close(force: true);
-    }
-  }
+  Future<bool> _probeHealth() =>
+      probeHealth(timeout: const Duration(milliseconds: 500));
 
   Future<void> _waitForHealth() async {
     final deadline = DateTime.now().add(

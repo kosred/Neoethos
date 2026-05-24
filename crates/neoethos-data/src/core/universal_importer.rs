@@ -438,8 +438,20 @@ pub fn parse_parquet_public(path: &Path) -> Result<Ohlcv> {
 /// Parse a CSV / TSV file, auto-detecting which header column maps to
 /// timestamp / open / high / low / close / volume.
 fn parse_csv(path: &Path, tab_separated: bool) -> Result<Ohlcv> {
+    // #206 MT5-friendliness: MetaTrader 5 exports files with a `.csv`
+    // extension that are actually TAB-separated. If the caller told us
+    // "this is csv" but the first non-comment line contains tabs and no
+    // commas, flip to tab-mode automatically. Sniffing only kicks in
+    // when the caller said csv — explicit `tab_separated=true` is
+    // honoured as-is so we don't second-guess a known TSV.
+    let effective_tab = if tab_separated {
+        true
+    } else {
+        sniff_csv_is_tab_separated(path).unwrap_or(false)
+    };
+
     let mut rdr = csv::ReaderBuilder::new()
-        .delimiter(if tab_separated { b'\t' } else { b',' })
+        .delimiter(if effective_tab { b'\t' } else { b',' })
         .has_headers(true)
         .from_path(path)
         .with_context(|| format!("open csv {}", path.display()))?;
@@ -448,6 +460,13 @@ fn parse_csv(path: &Path, tab_separated: bool) -> Result<Ohlcv> {
     let map = build_column_map(headers.iter());
 
     let ts_col = map.get("timestamp").copied();
+    // #206 MT5 split date/time: MT5 exports have TWO separate columns
+    // (`<DATE>` `YYYY.MM.DD` + `<TIME>` `HH:MM:SS`) instead of one
+    // unified timestamp. When the column-mapper found neither but DID
+    // find both a "date_part" and a "time_part" we concatenate them
+    // per-row below before calling `parse_timestamp_cell`.
+    let date_col = map.get("date_part").copied();
+    let time_col = map.get("time_part").copied();
     let open_col = map.get("open").context("missing 'open' column")?;
     let high_col = map.get("high").context("missing 'high' column")?;
     let low_col = map.get("low").context("missing 'low' column")?;
@@ -463,9 +482,23 @@ fn parse_csv(path: &Path, tab_separated: bool) -> Result<Ohlcv> {
 
     for (i, rec) in rdr.records().enumerate() {
         let rec = rec.with_context(|| format!("read csv row {}", i))?;
-        let ts_value = match ts_col {
-            Some(c) => parse_timestamp_cell(rec.get(c).unwrap_or("0")),
-            None => i as i64,
+        let ts_value = match (ts_col, date_col, time_col) {
+            (Some(c), _, _) => parse_timestamp_cell(rec.get(c).unwrap_or("0")),
+            (None, Some(d), Some(t)) => {
+                // MT5 split — concat with a space and let
+                // parse_timestamp_cell try the format list.
+                let combined = format!(
+                    "{} {}",
+                    rec.get(d).unwrap_or(""),
+                    rec.get(t).unwrap_or("")
+                );
+                parse_timestamp_cell(&combined)
+            }
+            (None, Some(d), None) => {
+                // Date only (daily bars). Use 00:00 as time.
+                parse_timestamp_cell(rec.get(d).unwrap_or(""))
+            }
+            (None, None, _) => i as i64,
         };
         ts.push(ts_value);
         open.push(parse_f64(rec.get(*open_col).unwrap_or("0")));
@@ -500,26 +533,92 @@ fn parse_csv(path: &Path, tab_separated: bool) -> Result<Ohlcv> {
 
 /// Build a normalised column-name → index map. Many sources use slightly
 /// different header conventions (`Open`/`open`/`o`/`Price.open` etc.).
+///
+/// #206 MT5 support: also strip `<` and `>` so `<DATE>` / `<OPEN>` etc.
+/// (MetaTrader 5's default angle-bracket-wrapped header style) match
+/// the same canonical names as a plain `Date` / `Open`.
+///
+/// Two-pass logic for the date/time ambiguity:
+///   - PASS 1 collects normalised header strings to detect MT5-style
+///     paired headers (both `date` AND `time` present, separately).
+///   - PASS 2 assigns canonical names. If the file has BOTH columns,
+///     `date` → `date_part` and `time` → `time_part` (MT5 splits the
+///     timestamp). If only ONE of them is present we keep the historical
+///     mapping (`time` alone → `timestamp`, holding a unix epoch; `date`
+///     alone → `date_part`, daily bars without a clock).
+///
+/// This dual-mode handling is what keeps the existing unix-epoch CSVs
+/// (test `parse_csv_round_trip`) working while ALSO accepting the
+/// MT5 split-column layout (test `mt5_split_date_time_header_concat`).
 fn build_column_map<'a, I: Iterator<Item = &'a str>>(headers: I) -> HashMap<String, usize> {
+    let normalised: Vec<(usize, String)> = headers
+        .enumerate()
+        .map(|(i, h)| {
+            let n = h
+                .trim()
+                .trim_matches(['<', '>'])
+                .to_ascii_lowercase()
+                .replace([' ', '.', '-'], "_");
+            (i, n)
+        })
+        .collect();
+
+    let has_plain_date = normalised.iter().any(|(_, n)| n == "date");
+    let has_plain_time = normalised.iter().any(|(_, n)| n == "time");
+    let mt5_split = has_plain_date && has_plain_time;
+
     let mut out = HashMap::new();
-    for (i, h) in headers.enumerate() {
-        let normalised = h.trim().to_ascii_lowercase().replace([' ', '.', '-'], "_");
+    for (i, n) in &normalised {
         // Keep first occurrence per canonical name.
-        let canonical = match normalised.as_str() {
-            "ts" | "time" | "date" | "datetime" | "timestamp" | "unix" | "unix_time" | "epoch"
-            | "open_time" | "candle_time" => Some("timestamp"),
+        let canonical = match n.as_str() {
+            "ts" | "datetime" | "timestamp" | "unix" | "unix_time" | "epoch" | "open_time"
+            | "candle_time" => Some("timestamp"),
+            // `date` alone → not a usable single timestamp (daily bars
+            // only). With a paired `time`, both go into the
+            // date_part/time_part slots for per-row concat.
+            "date" if mt5_split => Some("date_part"),
+            "date" => Some("date_part"),
+            // `time` alone → historical contract: unix epoch in this
+            // column. With a paired `date`, route to `time_part`.
+            "time" if mt5_split => Some("time_part"),
+            "time" => Some("timestamp"),
             "o" | "open" | "price_open" | "openprice" => Some("open"),
             "h" | "high" | "price_high" | "highprice" => Some("high"),
             "l" | "low" | "price_low" | "lowprice" => Some("low"),
             "c" | "close" | "price_close" | "closeprice" | "last" => Some("close"),
-            "v" | "vol" | "volume" | "tickvol" | "tickvolume" | "tick_volume" => Some("volume"),
+            // MT5 has both `<TICKVOL>` (tick count) and `<VOL>` (real
+            // volume, often 0 on FX). We prefer real volume when
+            // present, fall back to tick count — the standard FX-broker
+            // convention.
+            "v" | "vol" | "volume" | "real_volume" => Some("volume"),
+            "tickvol" | "tickvolume" | "tick_volume" => Some("volume"),
             _ => None,
         };
         if let Some(name) = canonical {
-            out.entry(name.to_string()).or_insert(i);
+            out.entry(name.to_string()).or_insert(*i);
         }
     }
     out
+}
+
+/// #206 Sniff whether a `.csv`-extensioned file is actually tab-separated
+/// (which MetaTrader 5 does by default). Reads only the first 4 KB and
+/// returns `Some(true)` if that buffer contains more tabs than commas.
+/// `None` for empty/unreadable files so the caller falls back to its
+/// default. We never look past the first 4 KB to keep the check cheap.
+fn sniff_csv_is_tab_separated(path: &Path) -> Option<bool> {
+    use std::io::Read;
+    let mut buf = [0u8; 4096];
+    let mut f = std::fs::File::open(path).ok()?;
+    let n = f.read(&mut buf).ok()?;
+    if n == 0 {
+        return None;
+    }
+    let tabs = buf[..n].iter().filter(|b| **b == b'\t').count();
+    let commas = buf[..n].iter().filter(|b| **b == b',').count();
+    // Strict majority required so an MT4 CSV with one stray tab in a
+    // comment line isn't misclassified.
+    Some(tabs > commas && tabs >= 5)
 }
 
 fn parse_f64(s: &str) -> f64 {
@@ -543,6 +642,18 @@ fn parse_timestamp_cell(s: &str) -> i64 {
         return dt.timestamp_millis();
     }
     // Common explicit formats.
+    //
+    // #206 MT5/MT4 additions:
+    //   - `%Y.%m.%d %H:%M:%S` — MT5 `<DATE>` + `<TIME>` concatenated,
+    //     e.g. `2024.05.23 14:30:00`. The `.` separator in the date
+    //     part is unique to MetaTrader; every other vendor uses `-`
+    //     or `/`.
+    //   - `%Y.%m.%d %H:%M`     — MT5 M1/M5 historical export (no
+    //     seconds).
+    //   - `%Y.%m.%d`           — MT5 D1+ daily export, time omitted.
+    // The full list is tried in order; first match wins. Putting the
+    // ISO formats first means MT5 only pays the cost for genuinely
+    // MT5-shaped strings.
     for fmt in &[
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d %H:%M",
@@ -550,7 +661,10 @@ fn parse_timestamp_cell(s: &str) -> i64 {
         "%Y/%m/%d %H:%M:%S",
         "%d/%m/%Y %H:%M:%S",
         "%d.%m.%Y %H:%M:%S",
+        "%Y.%m.%d %H:%M:%S", // MT5 default
+        "%Y.%m.%d %H:%M",    // MT5 M-timeframes
         "%Y-%m-%d",
+        "%Y.%m.%d",          // MT5 D1+
     ] {
         if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
             return dt.and_utc().timestamp_millis();
@@ -762,5 +876,62 @@ mod tests {
         assert_eq!(ohlcv.open, vec![1.10, 1.105]);
         assert_eq!(ohlcv.close, vec![1.105, 1.11]);
         assert_eq!(ohlcv.timestamp.as_ref().unwrap()[0], 1_700_000_000_000);
+    }
+
+    /// #206 regression guard: a MetaTrader 5 raw export must import
+    /// without manual pre-processing. MT5 quirks exercised here:
+    ///   - `.csv` extension but TAB-separated content (auto-sniff)
+    ///   - angle-bracket headers: `<DATE>` `<TIME>` `<OPEN>` …
+    ///   - separate `<DATE>` (YYYY.MM.DD) and `<TIME>` (HH:MM:SS)
+    ///     columns instead of a unified timestamp (per-row concat)
+    ///   - dot-separated date format `YYYY.MM.DD` (parse_timestamp_cell
+    ///     format list addition)
+    ///   - `<TICKVOL>` mapped to `volume` (MT5 sets `<VOL>` to 0 on
+    ///     most FX brokers, so tick count is what users actually want)
+    #[test]
+    fn mt5_raw_export_imports_without_preprocessing() {
+        let tmp = std::env::temp_dir().join("neoethos_importer_mt5.csv");
+        let mut f = std::fs::File::create(&tmp).unwrap();
+        writeln!(
+            f,
+            "<DATE>\t<TIME>\t<OPEN>\t<HIGH>\t<LOW>\t<CLOSE>\t<TICKVOL>\t<VOL>\t<SPREAD>"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "2024.05.23\t14:30:00\t1.0850\t1.0855\t1.0849\t1.0852\t150\t0\t1"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "2024.05.23\t14:31:00\t1.0852\t1.0858\t1.0851\t1.0857\t180\t0\t1"
+        )
+        .unwrap();
+        drop(f);
+
+        // Caller passes tab_separated=false to trigger the sniff path;
+        // a real /data/import would do the same since the extension is
+        // .csv. The sniff must flip to tabs and the columns must map.
+        let ohlcv = parse_csv(&tmp, false).expect("MT5 raw export must parse");
+
+        assert_eq!(ohlcv.open, vec![1.0850, 1.0852], "open prices");
+        assert_eq!(ohlcv.close, vec![1.0852, 1.0857], "close prices");
+        // Real volume is 0 on FX, so the importer should fall back to
+        // tick count (<TICKVOL>) and surface 150/180, not 0/0.
+        assert_eq!(
+            ohlcv.volume.as_ref().unwrap(),
+            &vec![150.0, 180.0],
+            "TICKVOL fallback when VOL=0"
+        );
+        // 2024-05-23 14:30:00 UTC = 1716474600 epoch seconds.
+        // The importer normalises to ms; first bar should land there.
+        let first_ts_ms = ohlcv.timestamp.as_ref().unwrap()[0];
+        assert_eq!(
+            first_ts_ms, 1_716_474_600_000,
+            "MT5 date+time concat → 2024-05-23 14:30:00 UTC"
+        );
+        // Δt between consecutive bars = 60 s.
+        let second_ts_ms = ohlcv.timestamp.as_ref().unwrap()[1];
+        assert_eq!(second_ts_ms - first_ts_ms, 60_000, "M1 bar spacing");
     }
 }

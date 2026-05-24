@@ -65,6 +65,14 @@ class _BodyState extends ConsumerState<_Body> {
   bool _busy = false;
   String? _lastResult;
 
+  // #192: local-file import state. Separate from the download state
+  // so the user can have a download in-flight while typing an import
+  // path (or vice versa). Path is a free-text field today; a real
+  // file-picker drop-zone is a follow-up (needs `file_picker` dep).
+  final _importPathCtrl = TextEditingController();
+  bool _importBusy = false;
+  String? _importResult;
+
   Future<void> _pickDate({required bool isFrom}) async {
     final initial = isFrom ? _fromDate : _toDate;
     final picked = await showDatePicker(
@@ -81,6 +89,44 @@ class _BodyState extends ConsumerState<_Body> {
         _toDate = DateTime.utc(picked.year, picked.month, picked.day);
       }
     });
+  }
+
+  Future<void> _onImport() async {
+    final path = _importPathCtrl.text.trim();
+    if (path.isEmpty) return;
+    final symbol = _symbol.trim().toUpperCase();
+    if (symbol.isEmpty) return;
+    setState(() {
+      _importBusy = true;
+      _importResult = null;
+    });
+    try {
+      final r = await ref.read(backendClientProvider).importLocalFile(
+            sourcePath: path,
+            symbol: symbol,
+            timeframe: _timeframe,
+          );
+      final written = (r['writtenPath'] as String?) ?? '';
+      final fmt = (r['sourceFormat'] as String?) ?? '?';
+      setState(
+          () => _importResult = 'Imported $fmt → $written');
+      ref.invalidate(dataBootstrapProvider);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: ForexAiTokens.buy,
+          content: Text('Imported $symbol $_timeframe from $fmt'),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    } on DioException catch (e) {
+      final msg = describeError(e);
+      setState(() => _importResult = 'Failed: $msg');
+      if (!mounted) return;
+      showTranslatedErrorSnackbar(context, e, prefix: 'Import failed');
+    } finally {
+      if (mounted) setState(() => _importBusy = false);
+    }
   }
 
   Future<void> _onDownload() async {
@@ -291,8 +337,76 @@ class _BodyState extends ConsumerState<_Body> {
             ],
           ),
         ),
+        SectionCard(
+          // #192: import the user's own data files into Vortex layout.
+          // The backend auto-detects format from the extension (csv, tsv,
+          // parquet, json, jsonl, arrow, ipc, feather). This unblocks the
+          // "I have years of MT4/MT5 history exported as CSV, don't make
+          // me re-download" workflow.
+          title: 'Import a local OHLCV file',
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Paste the full path to a CSV, TSV, Parquet, JSON, JSONL '
+                'or Arrow/IPC file. The Symbol + Timeframe selected above '
+                'decide where the converted Vortex file lands on disk.',
+                style: TextStyle(
+                  color: ForexAiTokens.textMuted,
+                  fontSize: 12,
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _importPathCtrl,
+                enabled: !_importBusy,
+                decoration: const InputDecoration(
+                  labelText: 'Source path',
+                  hintText:
+                      r'C:\Users\you\Downloads\EURUSD_H1_2023.csv',
+                  isDense: true,
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  FilledButton.icon(
+                    onPressed: _importBusy ? null : _onImport,
+                    icon: const Icon(Icons.file_upload, size: 18),
+                    label: const Text('Import file'),
+                  ),
+                  if (_importBusy) ...[
+                    const SizedBox(width: 12),
+                    const SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  ],
+                ],
+              ),
+              if (_importResult != null) ...[
+                const SizedBox(height: 10),
+                Text(
+                  _importResult!,
+                  style: const TextStyle(
+                    fontSize: 11,
+                    color: ForexAiTokens.textMuted,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
       ],
     );
+  }
+
+  @override
+  void dispose() {
+    _importPathCtrl.dispose();
+    super.dispose();
   }
 }
 

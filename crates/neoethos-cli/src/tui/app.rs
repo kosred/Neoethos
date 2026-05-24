@@ -211,6 +211,15 @@ impl App {
             KeyCode::Char('7') => self.current = Page::AutoLoop,
             KeyCode::Char('8') => self.current = Page::Config,
             KeyCode::Char('9') => self.current = Page::Logs,
+            // Refresh: re-stamp last_refresh so the next render's
+            // dataset summary is recomputed from disk and the status
+            // bar shows "Refreshed Xs ago". The help text on every
+            // page already promises this key works.
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.shared.last_refresh = Instant::now();
+                self.shared.status =
+                    "Refreshed dataset inventory.".to_string();
+            }
             other => {
                 // Page-local: Up/Down focus, Enter to edit/launch, etc.
                 let _ = self.current.handle_key(other, &mut self.shared);
@@ -432,10 +441,20 @@ fn render_status_bar(area: Rect, buf: &mut ratatui::buffer::Buffer, app: &App) {
 
     Paragraph::new(Line::from(hints)).render(cols[0], buf);
 
-    let right = Paragraph::new(Line::from(vec![Span::styled(
-        app.shared.status.clone(),
-        theme::muted_style(),
-    )]))
+    // Right column: status text on top, "refreshed Xs ago" below so the
+    // operator can see how stale the dashboard's dataset summary is
+    // without scrolling. Updates when the user presses R.
+    let refreshed = app.shared.last_refresh.elapsed().as_secs();
+    let right = Paragraph::new(vec![
+        Line::from(vec![Span::styled(
+            app.shared.status.clone(),
+            theme::muted_style(),
+        )]),
+        Line::from(vec![Span::styled(
+            format!("refreshed {}s ago", refreshed),
+            theme::caption_style(),
+        )]),
+    ])
     .alignment(ratatui::layout::Alignment::Right);
     right.render(cols[1], buf);
 }

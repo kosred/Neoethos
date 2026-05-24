@@ -1,7 +1,7 @@
 name: forex_flutter_ui
 description: >
   Flutter desktop/mobile front-end for neoethos.
-  Talks to the Rust backend (neoethos-app + neoethos-gemma) over REST.
+  Talks to the Rust backend (neoethos-app + neoethos-codex) over REST.
   Mirrors the layout / design tokens of mockups/ui_mockup.html.
 publish_to: 'none'
 version: 0.4.18+1
@@ -19,10 +19,12 @@ dependencies:
   # providers fit the "thin client over a Rust backend" model.
   flutter_riverpod: ^2.5.1
 
-  # REST + SSE
+  # REST
   dio: ^5.5.0          # HTTP client
-  http: ^1.2.1         # fallback simple HTTP for SSE bootstrap
-  sse_channel: ^0.2.2  # Server-Sent Events parser for /gemma/chat
+  http: ^1.2.1         # fallback simple HTTP
+
+  # Browser launcher for Codex OAuth (PKCE authorize URL).
+  url_launcher: ^6.3.0
 
   # Routing — go_router for declarative side-bar driven nav.
   go_router: ^14.2.0
