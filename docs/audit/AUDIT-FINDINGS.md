@@ -10,6 +10,22 @@
 
 **Build policy**: do NOT compile per-finding. Single workspace build at the END.
 
+## TL;DR (top findings to fix first when batch phase starts)
+
+| # | Severity | Theme |
+|---|----------|-------|
+| F-002 + F-003 | CRITICAL | `BacktestSettings::default()` uses synthetic EURUSD profile; `for_symbol(...)` referenced in doc but does not exist. **4 production callers leak the EURUSD bias** (discovery.rs:710, gauntlet.rs:60, search_engine.rs:355 + 450). |
+| F-032 | CRITICAL | `signals_for_gene` doc claims SMC gating; implementation does NOT gate. Only caller is `gauntlet.rs` — gauntlet checks min_trades/win_rate/PF against UN-gated signals. |
+| F-057 + F-042 + F-049 | CRITICAL | **Three independent scoring functions** all named "score" — `evolution_math::score_from_metrics` drives the GA, `quality::score_strategy` drives the quality screen, `regime_labels::window_quality_score` drives regime profiling. Disagree silently. |
+| F-013 + F-048 + F-064 | HIGH | **Three independent regime systems** — feature-bucket (with dead-zones), time-window, ADX/Hurst/EMA. No coordination. |
+| F-020 | HIGH | Walkforward min-window thresholds (80 bars, 40 train + 40 test) are timeframe-agnostic. `break` at small window kills all subsequent splits silently. |
+| F-053 | HIGH | Two `.expect()` panics in `portfolio.rs:181-187` on missing per-symbol metrics — crash risk. |
+| F-038 | HIGH | SMC derivation lookbacks (12, 20, 20 bars) timeframe-agnostic. |
+| F-028 | HIGH | `Gene::is_anomalous` 4 overlapping anomaly classifications, all magic numbers, no config knob; a real 4%/mo strategy compounded 11y could trip the $10M bar. |
+| F-014 + F-047 | MEDIUM | Sortino floor defaults equal Sharpe floor in BOTH `discovery::quality_analyzer_for_config` AND `quality::StrategyQualityAnalyzer::default` — gate is much weaker than it should be. |
+
+**Root cause picture**: F-002 + F-003 explain why bug #214 ("cost-model called with empty symbol") was surface-fixed only. The cost-profile leak hits 4 production sites because nobody implemented the `for_symbol` method the comment says they should. **F-003 is the single change that unblocks fixing F-002/F-012/F-025/F-033/F-050 in one go.**
+
 ## Scope
 
 | Crate | Files | Lines | Audit status |
@@ -709,10 +725,52 @@ This is the GA core: parent/survivor selection policies, crossover, mutate, gene
 
 ---
 
+## stop_target.rs — `crates/neoethos-search/src/stop_target.rs` (958 lines, **COMPLETE**)
+
+This module is the **third regime-classifier**, also implementing volatility estimators (Yang-Zhang, Garman-Klass, Rogers-Satchell, Parkinson, EWMA), Expected Shortfall, Hurst exponent, ADX, ATR, and composite SL/TP inference. The math is textbook-correct (verified YZ `k` constant, GK `c1`, ADX directional movement).
+
+### F-064 (HIGH) — THIRD regime-classification system: ADX/Hurst/EMA-based
+- **Location**: `stop_target.rs:585-639` (`infer_regime`)
+- **What**: this is the third independent "is this regime trending/ranging?" implementation:
+  1. `discovery.rs::validate_regime_robustness` (F-013): feature-column-based with dead-zones
+  2. `regime_labels.rs::label_strategies_by_regime_windows` (F-048): rolling-time-window-based
+  3. `stop_target.rs::infer_regime` (THIS): ADX(25/20) + Hurst(0.55/0.45) + EMA-spread/ATR (0.6/0.3) cascade
+- **Why it matters**: same architectural issue as F-048 but worse — now THREE systems. Each one looks reasonable in isolation. A position sized by stop_target.rs's "trend" classification gets evaluated for regime robustness by discovery.rs's bucket system. Disagreement is silent.
+- **Note**: this file's regime classifier is the MOST RIGOROUS (uses well-known indicators) and should probably be the canonical one. The other two should defer to it.
+- **Fix**: pick `stop_target.rs::infer_regime` as the canonical regime API. Migrate F-013 and F-048 to call into it.
+- **Severity**: HIGH
+
+### F-065 (MEDIUM) — `StopTargetSettings::default()` has 25+ magic constants
+- **Location**: `stop_target.rs:66-104`
+- **What**: 25 individual numeric defaults (vol_window=50, ewma_lambda=0.94, tail_alpha=0.975, regime_adx_trend=25.0, hurst_trend=0.55, rr_trend=2.5, structure_lookback_bars=120, ema_fast/slow=20/50, atr_period=14, ...).
+- **Note**: many of these are INDUSTRY-STANDARD defaults (atr_period=14, ewma_lambda=0.94 RiskMetrics, ema 20/50). Others are bespoke (structure_lookback_bars=120). The mix is hard to audit — the operator can't tell which numbers are "well-known" vs "calibrated last Thursday".
+- **Fix**: doc-comment each field with source (`// atr_period=14 — Wilder 1978 standard`, `// structure_lookback_bars=120 — empirically tuned for 1h+ TFs`). Then expose via SettingsConfig.
+- **Severity**: MEDIUM (audit-readability)
+
+### F-066 (LOW) — Composite SL/TP blend weights magic per regime
+- **Location**: `stop_target.rs:920-935`
+- **What**: when both structure-based and base SL exist, blended with regime-dependent weights:
+  - trend: `w_struct=0.70`, w_atr=0.30
+  - range: `w_struct=0.35`, w_atr=0.65
+  - else:  `w_struct=0.55`, w_atr=0.45
+- **Fix**: extract to `RegimeBlendWeights` on settings.
+- **Severity**: LOW
+
+### F-067 (NOTE) — Volatility estimator implementations look mathematically correct
+- **Location**: `stop_target.rs:150-280` (Parkinson, GK, RS, YZ, EWMA)
+- **What**: verified:
+  - Parkinson: `(log(h)-log(l))² / (4·ln2)` — correct formula.
+  - GK constant: `c1 = 2·ln2 - 1 ≈ 0.386` — correct.
+  - Yang-Zhang `k = 0.34/(1.34 + (n+1)/(n-1))` — correct.
+  - EWMA with `λ=0.94` (RiskMetrics default) — correct.
+- **Severity**: NONE — reference for "good math".
+
+---
+
 ---
 
 # Sessions (updated)
-- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041; **quality.rs COMPLETE (786/786)** F-042..F-047; **regime_labels.rs COMPLETE (523/523)** F-048..F-052; **portfolio.rs COMPLETE (345/345)** F-053..F-056; **evolution_math.rs COMPLETE (946/946)** F-057..F-063. Total findings: 63. **Architectural smell promoted**: THREE parallel scoring functions (F-042 quality.rs + F-049 regime_labels.rs + F-057 evolution_math.rs — the GA actually optimizes F-057). Two parallel "regime" systems (F-048). Latent panic (F-053).
+- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041; **quality.rs COMPLETE (786/786)** F-042..F-047; **regime_labels.rs COMPLETE (523/523)** F-048..F-052; **portfolio.rs COMPLETE (345/345)** F-053..F-056; **evolution_math.rs COMPLETE (946/946)** F-057..F-063; **stop_target.rs COMPLETE (958/958)** F-064..F-067. Total findings: 67. **Architectural smell promoted**: THREE parallel scoring functions (F-042 quality.rs + F-049 regime_labels.rs + F-057 evolution_math.rs — the GA actually optimizes F-057). **THREE parallel regime systems** (F-013 feature-bucket + F-048 time-window + F-064 ADX/Hurst/EMA). Latent panic (F-053).
 
 ## Audit progress
 | Crate | File | Lines | Status |
@@ -729,8 +787,8 @@ This is the GA core: parent/survivor selection policies, crossover, mutate, gene
 | neoethos-search | genetic/regime_labels.rs | 523 | COMPLETE |
 | neoethos-search | portfolio.rs | 345 | COMPLETE |
 | neoethos-search | genetic/evolution_math.rs | 946 | COMPLETE |
-| neoethos-search | stop_target.rs | 958 | next |
-| neoethos-search | genetic/runtime_overrides.rs | 795 | pending |
+| neoethos-search | stop_target.rs | 958 | COMPLETE |
+| neoethos-search | genetic/runtime_overrides.rs | 795 | next |
 | neoethos-search | genetic/diversity.rs | 219 | pending |
 | neoethos-search | genetic/mod.rs | 45 | pending |
 | neoethos-search | lib.rs | 1017 | pending |
@@ -754,4 +812,4 @@ This is the GA core: parent/survivor selection policies, crossover, mutate, gene
 | neoethos-data | core/*.rs | ? | pending |
 | ... | further crates | ... | pending |
 
-**neoethos-search progress: 13 of 31 files COMPLETE (≈ 11424 of 20810 lines = 55%)**
+**neoethos-search progress: 14 of 31 files COMPLETE (≈ 12382 of 20810 lines = 59%)**
