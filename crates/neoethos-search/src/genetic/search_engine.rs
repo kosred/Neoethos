@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 /// `Deterministic { seed }` produces reproducible runs, while
 /// `BestEffort` and `NonDeterministicAllowed` both fall back to a fresh
 /// OS-derived seed (the latter is the legacy "no seed configured"
-/// behavior). Matching the parity work in `discovery_gpu` / `lib.rs`.
+/// behavior). The GPU path in `cubecl_eval` consumes the same seed so
+/// CPU/GPU runs produce identical genomes for identical inputs.
 fn build_search_rng() -> StdRng {
     use neoethos_core::contracts::DeterminismPolicy;
     let seed = match current_genetic_search_runtime_overrides().determinism_policy() {

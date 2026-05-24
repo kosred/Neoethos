@@ -11,7 +11,6 @@ ndarray = { version = "0.17.2", features = ["rayon"] }
 half = { version = "2.5", optional = true, default-features = false, features = ["alloc", "num-traits"] }
 itertools = "0.14.0"
 rand = "0.9.2"
-rand_distr = { version = "0.5.1", optional = true }
 rayon = "1.11.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -21,19 +20,17 @@ neoethos-data = { path = "../neoethos-data" }
 neoethos-core = { path = "../neoethos-core" }
 duckdb = { version = "1.1.1", optional = true, features = ["bundled"] }
 tch = { version = "0.22.0", optional = true }
-libc = { version = "0.2", optional = true }
 
 [features]
 default = []
-# `gpu`: pulls in the GPU dep chain (libtorch via tch, CUDA via cubecl)
-# but uses the CPU-fallback discovery path. The cubecl/tch kernel
-# modules in this crate target older API versions and need migration
-# before they compile against the pinned cubecl 0.9 / tch 0.22 versions
-# (see docs/audits/gpu_migration_2026-05-11.md).
-gpu = ["dep:rand_distr", "dep:tch", "dep:cubecl", "dep:half", "dep:libc"]
-# `gpu-experimental`: opt-in for migrators working on the kernel
-# modules. Will not compile until the migration lands. Implies `gpu`.
-gpu-experimental = ["gpu"]
+# `gpu`: pulls in the GPU dep chain — cubecl 0.9 for the SL/TP-faithful
+# eval/backtest kernel (`cubecl_eval.rs`) and tch 0.22 for CUDA device
+# enumeration. After audit 2026-05-24 the legacy `discovery_gpu` +
+# `hpc_gpu_discovery` + `hpc` modules were removed (~3132 LOC of orphan
+# code targeting Hyperstack-N3 specifically); generic multi-GPU support
+# now lives inside `cubecl_eval.rs` itself and scales 1→N devices via
+# `tch::Cuda::device_count()`.
+gpu = ["dep:tch", "dep:cubecl", "dep:half"]
 # #205: vendor-aware aliases so the top-level binary can pick a path
 # without knowing the internals. Today cubecl/tch is CUDA-only, so
 # `gpu-cuda` is the only one that actually wires anything; `gpu-vulkan`

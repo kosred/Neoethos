@@ -15,6 +15,7 @@
 | # | Severity | Theme |
 |---|----------|-------|
 | F-002 + F-003 | CRITICAL | `BacktestSettings::default()` uses synthetic EURUSD profile; `for_symbol(...)` referenced in doc but does not exist. **4 production callers leak the EURUSD bias** (discovery.rs:710, gauntlet.rs:60, search_engine.rs:355 + 450). |
+| **F-070 + F-077** | **CRITICAL** | DUAL `discovery_gpu` module: `discovery_gpu.rs` (1028 LOC) + `lib.rs` inline twin (886 LOC) = 1914 LOC cfg-conditional dup. `cubecl_eval` is the canonical SL/TP-faithful GPU path; `discovery_gpu` used a returns-based fitness with hardcoded 0.0002 cost (synthetic data violation). **[APPLIED 2026-05-24]** — both deleted along with the orphan `cubecl_ga.rs` (324 LOC, only callers were the deleted GPU modules). |
 | F-032 | CRITICAL | `signals_for_gene` doc claims SMC gating; implementation does NOT gate. Only caller is `gauntlet.rs` — gauntlet checks min_trades/win_rate/PF against UN-gated signals. |
 | F-057 + F-042 + F-049 | CRITICAL | **Three independent scoring functions** all named "score" — `evolution_math::score_from_metrics` drives the GA, `quality::score_strategy` drives the quality screen, `regime_labels::window_quality_score` drives regime profiling. Disagree silently. |
 | F-013 + F-048 + F-064 | HIGH | **Three independent regime systems** — feature-bucket (with dead-zones), time-window, ADX/Hurst/EMA. No coordination. |
@@ -26,7 +27,7 @@
 | **F-070** | **CRITICAL** | **DUAL `discovery_gpu` module**: `discovery_gpu.rs` (1028 lines, gpu feature) + `lib.rs::discovery_gpu` (inline ~610 lines, no-gpu feature). Same structs + functions, different backend. Single biggest dedup target in the crate. |
 | **F-071** | **CRITICAL** | GPU discovery uses returns-based fitness with hardcoded `0.0002` cost — synthetic data violation. The doc-comment ADMITS "not equivalent to the CPU GA". Algorithm-level divergence: GPU flag picks DIFFERENT strategies. |
 | F-073 | HIGH | `discovery_gpu.rs:822` hardcodes `1440` M1-bars/day denominator — silently wrong fitness on H1/H4/D1 data. |
-| **F-092 + F-094** | **CRITICAL** | `hpc.rs` (324 LOC) + `hpc_gpu_discovery.rs` (894 LOC) = **1218 LOC ORPHAN feature-gated dead code**. Verified 0 external callers across the entire workspace. Both gated to Hyperstack-N3-specific topology (8 A6000s, 252 cores, 464GB RAM). Decision: **DELETE both**. Replace with ~50-line generic multi-GPU helper (`available_cuda_devices()`, `optimal_chunk_size_for_device(id)`) that scales from 1 to N GPUs without hardware-specific assumptions. |
+| **F-092 + F-094** | **CRITICAL** | `hpc.rs` (324 LOC) + `hpc_gpu_discovery.rs` (894 LOC) = **1218 LOC ORPHAN feature-gated dead code**. Verified 0 external callers across the entire workspace. Both gated to Hyperstack-N3-specific topology (8 A6000s, 252 cores, 464GB RAM). Decision: **DELETE both**. Replace with ~50-line generic multi-GPU helper (`available_cuda_devices()`, `optimal_chunk_size_for_device(id)`) that scales from 1 to N GPUs without hardware-specific assumptions. **[APPLIED 2026-05-24]** — files deleted. |
 | **F-096** | **CRITICAL** | No pre-flight historical-data sufficiency check — discovery/training/validation run on any non-empty data set, even 6 months of bars. Operator directive: **always >= 10 years per symbol or `bail!`**. Pre-flight order: (a) user-imported via Data Bootstrap → use; (b) else auto-fetch ≥10y from cTrader + cache; (c) else `bail!` naming the symbol + actual coverage. The synthetic-data ban is incomplete without this — insufficient real data is just as bad as synthetic. |
 
 **Root cause picture**: F-002 + F-003 explain why bug #214 ("cost-model called with empty symbol") was surface-fixed only. The cost-profile leak hits 4 production sites because nobody implemented the `for_symbol` method the comment says they should. **F-003 is the single change that unblocks fixing F-002/F-012/F-025/F-033/F-050 in one go.**
@@ -108,6 +109,24 @@ The single biggest risk is the **scoring function unification (F-057)**. The GA'
 - Keep the existing formula intact for v1. The new `scoring/ga_fitness.rs` is byte-for-byte identical at first.
 - Then add a `scoring_version: u32` field to `DiscoveryRunProfile`. Old artifacts have `scoring_version=1`.
 - When we eventually update the formula (e.g. unifying with quality_score's better calibration), bump to v2 and document the formula change in the changelog.
+
+## Applied fixes — running log (per operator directive: write code without intermediate builds; final `cargo build --release` at end of full audit)
+
+### 2026-05-24 batch 1 — orphan-delete pass (F-070 + F-077 + F-092 + F-094 + F-085 callers)
+**Net delta**: -3456 LOC of feature-gated orphan code. NO behavior change for any non-Hyperstack-N3 deployment (which is 100% of current users).
+
+Deleted files (4):
+- `crates/neoethos-search/src/discovery_gpu.rs` (1028 LOC — F-070 file twin, returns-based fitness with 0.0002 synthetic cost, NOT equivalent to canonical GA per its own doc-comment)
+- `crates/neoethos-search/src/hpc.rs` (324 LOC — F-092 Hyperstack-N3 topology descriptor, 0 external callers)
+- `crates/neoethos-search/src/hpc_gpu_discovery.rs` (894 LOC — F-094 Island Model wrapper, bails on every non-N3 machine)
+- `crates/neoethos-search/src/cubecl_ga.rs` (324 LOC — orphan after the 3 above were removed; only callers were those files)
+
+Modified files (3):
+- `crates/neoethos-search/src/lib.rs` — was 1017 LOC, now ~125 LOC. Removed: inline `pub mod discovery_gpu { ... }` no-gpu twin (lines 14-900, 886 LOC, F-077), `pub mod discovery_gpu`/`pub mod hpc`/`pub mod hpc_gpu_discovery` declarations, all `pub use` re-exports of deleted symbols. Module-root now actually IS a module-root (declarations + re-exports + the one `install_search_runtime_overrides_from_env` helper).
+- `crates/neoethos-search/Cargo.toml` — dropped optional `rand_distr` and `libc` deps (only used by deleted files). `gpu` feature is now `["dep:tch", "dep:cubecl", "dep:half"]` instead of `["dep:rand_distr", "dep:tch", "dep:cubecl", "dep:half", "dep:libc"]`. Dropped `gpu-experimental` feature (its purpose — opt-in for migrators — is moot now). Documented the audit decision in the `gpu` feature comment.
+- `crates/neoethos-search/src/genetic/search_engine.rs:25` — stale doc-comment that referenced "the parity work in `discovery_gpu` / `lib.rs`" updated to point at `cubecl_eval`.
+
+Per operator directive: **no `cargo check` / `cargo build` run** between this batch and the next one. Final `cargo build --release` happens once all audits + fixes across all 6 remaining crates have landed. Every warning that build emits — even "noise" the compiler thinks is harmless — is an error and gets fixed before release.
 
 ## Scope
 
