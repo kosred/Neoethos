@@ -599,10 +599,47 @@ This module is a SECOND, INDEPENDENT regime-labeling system using rolling 90-day
 
 ---
 
+## portfolio.rs — `crates/neoethos-search/src/portfolio.rs` (345 lines, **COMPLETE**)
+
+This module builds final symbol-level capital allocation from per-symbol metrics (Sharpe, returns, win-rate, avg-win/loss). It does NOT call evaluate_genes, so F-002 doesn't hit here — but it operates on metrics computed upstream of F-002, so the inputs may already be contaminated.
+
+### F-053 (HIGH) — Two `.expect()` panics on missing per-symbol metrics
+- **Location**: `portfolio.rs:181-183, 185-187`
+- **What**: lines 181 and 185 use `.expect("...always resolve...")` to look up win_rate and metrics for a name. Lines 147-155 (above) noted a similar previous panic on sharpe lookup and replaced it with `tracing::warn!` + fallback to 0.0. But these two later sites still panic. If `metrics_map` doesn't carry the name (e.g. typo in upstream wiring), the optimizer panics.
+- **Why it matters**: panic in portfolio optimization can crash the whole discovery cycle. The pattern was already identified as bad above; these two siblings were missed in the fix.
+- **Fix**: replace both `.expect(...)` with the same `unwrap_or_else` pattern + `tracing::warn!` that the sharpe lookup uses. Or, better: filter `names` to only include names with full metric coverage BEFORE this loop, so the panic path is unreachable.
+- **Severity**: HIGH (latent panic crash)
+
+### F-054 (LOW) — `PortfolioOptimizer::default()` has 3 unaudited magic numbers
+- **Location**: `portfolio.rs:30-37`
+- **What**: defaults baked in:
+  - `lookback_days: 30` — returns to consider for allocation math
+  - `max_weight: 0.35` — single-symbol cap (35% of book)
+  - `kelly_fraction: 0.25` — quarter-Kelly multiplier
+- **Note**: the 0.25 here PAIRS with the `kelly * 0.25` in `quality.rs:546` (F-045). Two places implement quarter-Kelly. Either intentional belt-and-braces OR an accidental double-application — verify.
+- **Fix**: extract to config struct + cross-check that quarter-Kelly isn't applied twice (here at allocation level + in quality.rs's quality-score computation).
+- **Severity**: LOW (but cross-check needed)
+
+### F-055 (LOW) — `min_corr_samples` magic 6/30 clamp
+- **Location**: `portfolio.rs:70-74`
+- **What**: `min_corr_samples = if lookback_days == 0 { 30 } else { lookback_days.clamp(6, 30) }`. Magic floor 6 + ceiling 30.
+- **Fix**: name them as constants with doc explaining "6 = minimum samples for stable Pearson r, 30 = enough for monthly correlation stability".
+- **Severity**: LOW
+
+### F-056 (LOW) — Kelly clamp `[0.0, 0.5]` + diversification cap magic factors
+- **Location**: `portfolio.rs:156-160, 192`
+- **What**:
+  - line 159: `1.0 + (-avg_corr[i]).min(1.0) * 0.5` — negative-correlation reward capped at 1.5× via magic 0.5 multiplier + 1.0 clamp on corr magnitude
+  - line 192: `kelly_raw.clamp(0.0, 0.5)` — Kelly hard-capped at 50% per position (before the quarter-Kelly multiplier)
+- **Fix**: name + doc. These ARE conservative-by-design choices that probably should stay; just need to be explicit.
+- **Severity**: LOW
+
+---
+
 ---
 
 # Sessions (updated)
-- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041; **quality.rs COMPLETE (786/786)** F-042..F-047; **regime_labels.rs COMPLETE (523/523)** F-048..F-052. Total findings: 52. **Architectural smell**: two parallel "regime" systems (F-048), two parallel scoring functions (F-049 + F-042).
+- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041; **quality.rs COMPLETE (786/786)** F-042..F-047; **regime_labels.rs COMPLETE (523/523)** F-048..F-052; **portfolio.rs COMPLETE (345/345)** F-053..F-056. Total findings: 56. **Architectural smell**: two parallel "regime" systems (F-048), two parallel scoring functions (F-049 + F-042). **Latent panic**: F-053 two `.expect()` sites in portfolio.rs.
 
 ## Audit progress
 | Crate | File | Lines | Status |
@@ -617,11 +654,11 @@ This module is a SECOND, INDEPENDENT regime-labeling system using rolling 90-day
 | neoethos-search | genetic/smc_indicators.rs | 659 | COMPLETE |
 | neoethos-search | quality.rs | 786 | COMPLETE |
 | neoethos-search | genetic/regime_labels.rs | 523 | COMPLETE |
+| neoethos-search | portfolio.rs | 345 | COMPLETE |
 | neoethos-search | genetic/evolution_math.rs | 946 | next |
 | neoethos-search | genetic/runtime_overrides.rs | 795 | pending |
 | neoethos-search | genetic/diversity.rs | 219 | pending |
 | neoethos-search | genetic/mod.rs | 45 | pending |
-| neoethos-search | portfolio.rs | 345 | pending |
 | neoethos-search | lib.rs | 1017 | pending |
 | neoethos-search | stop_target.rs | 958 | pending |
 | neoethos-search | cubecl_eval.rs | 1078 | pending |
@@ -643,4 +680,4 @@ This module is a SECOND, INDEPENDENT regime-labeling system using rolling 90-day
 | neoethos-data | core/*.rs | ? | pending |
 | ... | further crates | ... | pending |
 
-**neoethos-search progress: 11 of 31 files COMPLETE (≈ 10133 of 20810 lines = 49%)**
+**neoethos-search progress: 12 of 31 files COMPLETE (≈ 10478 of 20810 lines = 50%)**
