@@ -538,10 +538,71 @@ This module computes per-strategy quality metrics (Sharpe, Sortino, Calmar, etc.
 
 ---
 
+## genetic/regime_labels.rs — `crates/neoethos-search/src/genetic/regime_labels.rs` (523 lines, **COMPLETE**)
+
+This module is a SECOND, INDEPENDENT regime-labeling system using rolling 90-day windows. F-013 noted that `validate_regime_robustness` in discovery.rs uses feature columns (`regime_trend_strength`, `regime_vol_state`) with dead-zones. This module uses TIME windows. Two parallel systems for the same conceptual job.
+
+### F-048 (HIGH) — Two parallel "regime" systems coexist with no coordination
+- **Location**: `regime_labels.rs` (full file) AND `discovery.rs:1564-1627` (`validate_regime_robustness`)
+- **What**:
+  1. `discovery.rs::validate_regime_robustness` (F-013) buckets PnL by features (`regime_trend_strength`, `regime_vol_state` columns), with documented dead-zones.
+  2. `regime_labels.rs::label_strategies_by_regime_windows` slices time into 90-day windows, evaluates each gene per window, scores each window, then composes `deployment_candidate` / `specialist_candidate` / `training_candidate` flags.
+  Both are called "regime" — but they classify regimes differently (feature-based vs time-based). Neither references the other. An operator reading the codebase can't tell which one is the actual "regime gate".
+- **Why it matters**: there's no single source of truth for "did this strategy survive a regime check?". A strategy could be marked `regime_robust=false` (by F-013 path) AND `deployment_candidate=true` (by this module) at the same time. Downstream code that consumes "is the strategy regime-robust?" sees inconsistent answers.
+- **Fix**:
+  1. Pick ONE regime system as the canonical one.
+  2. Either delete the other or rename it (e.g. `time_window_robustness` vs `feature_regime_robustness`) so operators can tell them apart.
+  3. Document which one feeds `deployment_candidate` in the persisted profile.
+- **Severity**: HIGH (architectural confusion)
+
+### F-049 (HIGH) — `window_quality_score` is a SECOND scoring function with 14+ magic constants
+- **Location**: `regime_labels.rs:266-292`
+- **What**: yet another scoring formula, completely independent from `quality.rs::score_strategy` (F-042):
+  ```rust
+  let trade_confidence = (trades.sqrt() / 8.0).min(1.0);
+  let net_component = (net / 2_500.0).clamp(-3.0, 3.0) * 0.20;
+  let sharpe_component = sharpe.clamp(-2.0, 4.0) * 0.25 * trade_confidence;
+  let pf_component = ((profit_factor - 1.0) * 0.80).clamp(-1.5, 2.5) * 0.20;
+  let consistency_component = consistency * 0.15;
+  let win_component = ((win_rate - 0.45) * 2.0).clamp(0.0, 1.0) * 0.10;
+  let expectancy_component = (expectancy / 50.0).clamp(-1.0, 1.0) * 0.10;
+  let drawdown_penalty = (max_drawdown * 8.0).min(3.0);
+  ```
+  Magic constants: 8.0, 2500.0, ±3.0, 0.20, ±2.0, 4.0, 0.25, 0.80, ±1.5/2.5, 0.20, 0.15, 0.45, 2.0, 0.10, 50.0, ±1.0, 0.10, 8.0, 3.0.
+- **Why it matters**: same problem as F-042 — opaque scoring drives `tradable` flag, which drives `tradable_windows`, which drives `specialist_candidate` and `deployment_candidate`. The operator can't reproduce or tune the formula.
+- **Fix**: extract to `WindowQualityScoreConfig` struct alongside the F-042 fix. OR (better) unify the two scoring functions into ONE if they're computing the same conceptual "is this strategy good?" measure.
+- **Severity**: HIGH (same-conceptual-job has two unreconciled implementations)
+
+### F-050 (CRITICAL) — `label_strategies_by_regime_windows` runs `evaluate_genes` which hits F-002/F-033
+- **Location**: `regime_labels.rs:198`
+- **What**: `let metrics = evaluate_genes(&wf, &wo, genes, eval_config)?;` — calls into `search_engine.rs::evaluate_genes` which (F-033) builds `BacktestSettings` with `..Default::default()` for fields not in the EvaluationConfig override list. So per-window regime evaluation also uses the synthetic EURUSD profile.
+- **Why it matters**: not a NEW finding, but adds to the F-033 caller surface. The regime profile's `tradable_windows` and `specialist_candidate` flags are computed against EURUSD-shaped costs.
+- **Fix**: tracked under F-003 / F-033. When `BacktestSettings::for_symbol` lands, no change needed here — the fix is upstream in evaluate_genes.
+- **Severity**: CRITICAL (compounds F-002, but fix is upstream)
+
+### F-051 (MEDIUM) — `RegimeLabelPolicy::default()` has 11 unaudited magic numbers
+- **Location**: `regime_labels.rs:81-97`
+- **What**: defaults for window_days (90), step_days (30), min_bars_per_window (500), min_trades_per_window (8.0), min_profit_factor (1.05), max_drawdown (0.20), min_quality_score (0.05), min_specialist_windows (2), min_specialist_score (0.30), min_always_on_hit_rate (0.55).
+- **Why it matters**: same as other magic-number findings — operators can't tune without recompile.
+- **Note**: `RegimeLabelPolicy` doesn't have a `from_env` constructor (deleted in Phase 22 per comment lines 99-106). The struct fields ARE settable directly, but I don't see a UI/CLI surface that exposes them. So in practice these are unreachable defaults.
+- **Fix**: add to the proposed `genetic::runtime_overrides::RegimeLabelRuntimeOverrides` (TBD) and surface in CLI/Settings.
+- **Severity**: MEDIUM
+
+### F-052 (LOW) — More magic factors in specialist/deployment scoring
+- **Location**: `regime_labels.rs:333-346`
+- **What**: more magic numbers in the composite scoring:
+  - line 335: `(1.0 - fragility_score * 0.35).max(0.25)` — magic 0.35 and 0.25
+  - line 340-343: always_on_score weights `0.35/0.35/0.20/0.10`
+  - line 344-346: `hit_rate >= min` AND `tradable_rate >= min * 0.75` AND `fragility <= 0.35`
+- **Fix**: same — extract to config or constants with doc.
+- **Severity**: LOW
+
+---
+
 ---
 
 # Sessions (updated)
-- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041; **quality.rs COMPLETE (786/786)** F-042..F-047. Total findings: 47. **F-002 EURUSD-leak confirmed at 4 production sites**. F-014 scope promoted via F-047 (Sortino floor also weak in `StrategyQualityAnalyzer::default()`).
+- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041; **quality.rs COMPLETE (786/786)** F-042..F-047; **regime_labels.rs COMPLETE (523/523)** F-048..F-052. Total findings: 52. **Architectural smell**: two parallel "regime" systems (F-048), two parallel scoring functions (F-049 + F-042).
 
 ## Audit progress
 | Crate | File | Lines | Status |
@@ -555,9 +616,9 @@ This module computes per-strategy quality metrics (Sharpe, Sortino, Calmar, etc.
 | neoethos-search | genetic/search_engine.rs | 1060 | COMPLETE |
 | neoethos-search | genetic/smc_indicators.rs | 659 | COMPLETE |
 | neoethos-search | quality.rs | 786 | COMPLETE |
+| neoethos-search | genetic/regime_labels.rs | 523 | COMPLETE |
 | neoethos-search | genetic/evolution_math.rs | 946 | next |
 | neoethos-search | genetic/runtime_overrides.rs | 795 | pending |
-| neoethos-search | genetic/regime_labels.rs | 523 | pending |
 | neoethos-search | genetic/diversity.rs | 219 | pending |
 | neoethos-search | genetic/mod.rs | 45 | pending |
 | neoethos-search | portfolio.rs | 345 | pending |
@@ -582,4 +643,4 @@ This module computes per-strategy quality metrics (Sharpe, Sortino, Calmar, etc.
 | neoethos-data | core/*.rs | ? | pending |
 | ... | further crates | ... | pending |
 
-**neoethos-search progress: 10 of 31 files COMPLETE (≈ 9610 of 20810 lines = 46%)**
+**neoethos-search progress: 11 of 31 files COMPLETE (≈ 10133 of 20810 lines = 49%)**
