@@ -54,6 +54,7 @@ pub mod risky_mode_persistence;
 pub mod secure_store;
 pub mod trading;
 pub mod training;
+pub mod validation;
 
 use crate::app_services::jobs::JobSnapshot;
 

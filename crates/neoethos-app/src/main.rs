@@ -73,6 +73,29 @@ struct Args {
     #[arg(long, default_value_t = false)]
     reauth: bool,
 
+    /// Multi-timeframe Discovery sweep on a single symbol; writes
+    /// per-TF outcomes to `validation-runs/<ts>/sweep.csv` and exits.
+    ///
+    /// Mutually exclusive with `--auto-discovery` / `--auto-training`.
+    /// Honors `--validation-tfs` (default `M5,M15,M30,H1,H4,D1`) and
+    /// `--validation-tf-timeout-secs` (default 1800). Driven by
+    /// `config.yaml` via `DiscoveryConfig::from_settings` so the
+    /// operator's population/generation counts apply.
+    #[arg(long, default_value_t = false)]
+    validation_mode: bool,
+
+    /// Comma-separated timeframes to sweep when `--validation-mode` is set.
+    /// M1 is intentionally omitted from the default — it's noise-dominated
+    /// and pure cost for the GA search.
+    #[arg(long, default_value = "M5,M15,M30,H1,H4,D1")]
+    validation_tfs: String,
+
+    /// Per-TF hard timeout in seconds for `--validation-mode`. A TF that
+    /// blows the cap is recorded as `Timeout` in the CSV and the sweep
+    /// continues with the next TF.
+    #[arg(long, default_value_t = 1800)]
+    validation_tf_timeout_secs: u64,
+
     /// Suppress the orphan-launch help dialog. Set by the Flutter shell's
     /// BackendSupervisor when it spawns the backend.
     ///
@@ -139,6 +162,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         app_services::api_test::run_api_test_suite(cfg).await?;
         return Ok(());
+    }
+
+    if args.validation_mode {
+        // Mutually exclusive with the existing headless auto-* paths.
+        // We could let clap enforce this via `conflicts_with`, but
+        // returning a typed error here gives the operator a clearer
+        // message and keeps the CLI parser config readable.
+        if args.auto_discovery || args.auto_training {
+            error!(
+                "--validation-mode is mutually exclusive with --auto-discovery / --auto-training; \
+                 drop the auto-* flag(s) and re-run"
+            );
+            return Err(anyhow::anyhow!(
+                "--validation-mode conflicts with --auto-discovery / --auto-training"
+            )
+            .into());
+        }
+        info!(
+            target: "neoethos_app::validation",
+            tfs = %args.validation_tfs,
+            tf_timeout_secs = args.validation_tf_timeout_secs,
+            "Starting neoethos-app in VALIDATION-MODE (multi-TF Discovery sweep)..."
+        );
+        let exit_code = app_services::validation::run_validation_sweep(
+            &runtime,
+            &settings,
+            &args.validation_tfs,
+            args.validation_tf_timeout_secs,
+        )
+        .await?;
+        std::process::exit(exit_code);
     }
 
     if args.reauth {

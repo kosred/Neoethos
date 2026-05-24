@@ -471,6 +471,15 @@ pub fn completed_snapshot(mut snapshot: JobSnapshot, result: &DiscoveryResult) -
             format!("{:.2}", best.sharpe_ratio),
         ));
         highlights.push(("best_win_rate".to_string(), format!("{:.2}", best.win_rate)));
+        // Surface the best gene's max-drawdown (as percent of equity)
+        // so `--validation-mode` can record an OOS risk metric per TF
+        // without re-reading the on-disk portfolio JSON. Additive
+        // highlight — no existing reader keys off the highlights list
+        // length, and the UI ignores unknown keys.
+        highlights.push((
+            "best_max_dd".to_string(),
+            format!("{:.4}", best.max_drawdown),
+        ));
     }
     let entries = result
         .portfolio
