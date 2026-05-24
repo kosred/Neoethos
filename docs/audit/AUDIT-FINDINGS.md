@@ -361,10 +361,70 @@ Internally calls `infer_market_cost_profile(...)` and overrides the 6 cost-profi
 
 ---
 
+## genetic/search_engine.rs — `crates/neoethos-search/src/genetic/search_engine.rs` (1060 lines, **COMPLETE**)
+
+### F-032 (CRITICAL) — `signals_for_gene` doc-comment lies about SMC gating
+- **Location**: `search_engine.rs:111-203`
+- **What**: the function's doc-comment claims "Apply the SMC-flag gate using the same scoring as `synthesize_signals_cpu`" (line 127-131), and item 6 of the search-optimization notes warns the post-search filter used to produce a "signal series that did NOT match what was actually evaluated and archived during search". BUT — the actual implementation at lines 171-202 is identical for both `any_flag=true` and `any_flag=false` cases (both run the bare threshold logic and return). The "Need OHLCV-derived SMC indicator series" comment at line 186 admits this: "Without OHLCV we fall back to the un-gated path so single-arg callers (no Ohlcv handy) keep working; gated callers should use `signals_for_gene_full`."
+- **Why it matters**: callers reading the public API doc believe they get gated signals. They get UN-GATED signals. The function's job per its doc and per item 6 is to "Apply the SMC-flag gate" but it does NOT. A caller that built a Gene with `use_ob=true` then called `signals_for_gene(features, &gene)` will get more signals than the evaluator would have generated for the same gene. The post-search min_trades gate then over-counts trades.
+- **The only caller in production code is `gauntlet.rs:85`** — so the gauntlet's min_trades / win_rate / pf comparisons are computed against un-gated signals. The gauntlet may pass strategies whose gated trade count is below `min_trades`.
+- **Fix**: either
+  1. Fix the implementation to actually gate (using `signals_for_gene_full` internally with default SMC arrays built from a `FeatureFrame`-only fallback), OR
+  2. Rewrite the doc to plainly say "this is the un-gated path; use `signals_for_gene_full` when you need gating; the gauntlet must migrate to `signals_for_gene_full`".
+- **Severity**: CRITICAL (silently wrong gauntlet results)
+
+### F-033 (CRITICAL) — Third + fourth F-002 caller sites in `evaluate_genes` and `evaluate_genes_cached`
+- **Location**: `search_engine.rs:355-365` (cached), `450-460` (non-cached)
+- **What**: both functions build `BacktestSettings` with `..Default::default()` (the synthetic EURUSD profile from F-002). Identical pattern to F-012 in discovery.rs and F-025 in gauntlet.rs. With these two more sites confirmed, the EURUSD profile leak now hits **4 production sites**:
+  1. discovery.rs:710 (validation/forward/prop-firm artifact generation)
+  2. gauntlet.rs:60 (gauntlet gate)
+  3. search_engine.rs:355 (evaluate_genes_cached — main GA evaluation loop)
+  4. search_engine.rs:450 (evaluate_genes — the unbuffered evaluation path)
+- **Why it matters**: the GA itself (#3 + #4) selects strategies based on EURUSD-shaped fitness. Strategy selection is built on the wrong cost model. Any "good" candidate the GA finds is good relative to EURUSD economics, not the target symbol.
+- **Fix**: when F-003 lands, change all four sites to `..BacktestSettings::for_symbol(...)`. Since the EvaluationConfig already carries the symbol+account_currency (via `config.symbol`, `config.account_currency`), this becomes a 1-line change per site.
+- **Severity**: CRITICAL (compounds F-002)
+
+### F-034 (MEDIUM) — `resolve_stop_target_arrays` hardcoded EURUSD-style pip fallback
+- **Location**: `search_engine.rs:486-524`
+- **What**:
+  - Line 491-494: `pip_size = if config.pip_value.is_finite() && > 0 { config.pip_value } else { 0.0001 }` — the fallback `0.0001` is EURUSD-style. For JPY pairs (`0.01`), metals (`0.01`), crypto (`1.0`) this is wrong.
+  - Line 505-507: `let (default_sl, default_tp) = default.map(...).unwrap_or((20.0, 40.0))` — same 20/40 magic as F-030 (Gene::normalize), but used here only when `infer_stop_target_pips` returns None.
+- **Why it matters**: invalid genes that fall through to fallback get EURUSD-shaped stops. For YEN pairs this means a 20-pip SL is 0.20 yen = ~$0.20 — far too tight.
+- **Fix**: read pip_size from `infer_market_cost_profile(config.symbol, ...).pip_value`. Promote 20.0 / 40.0 to named constants `DEFAULT_SL_PIPS_EURUSD` / `DEFAULT_TP_PIPS_EURUSD` and bail when symbol is unknown.
+- **Severity**: MEDIUM
+
+### F-035 (MEDIUM) — `best_return_count` formula is opaque magic
+- **Location**: `search_engine.rs:868-870`, `903-904`
+- **What**: `let best_return_count = population.clamp(2, (population / 2).clamp(100, 500)).min(scored.len());` — what does this even do?
+  - population=50 → pop/2=25 → clamp(100,500)=100 → 50.clamp(2,100)=50 (return all 50)
+  - population=200 → pop/2=100 → clamp(100,500)=100 → 200.clamp(2,100)=100 (return 100)
+  - population=1500 → pop/2=750 → clamp(100,500)=500 → 1500.clamp(2,500)=500 (return 500)
+  - population=10000 → pop/2=5000 → clamp(100,500)=500 → 10000.clamp(2,500)=500 (return 500)
+- **Why it matters**: behavior changes nonlinearly across population sizes and operators have no obvious knob to control "how many candidates does the GA return for downstream filtering". The hard 500 cap on large populations silently drops the tail of the population.
+- **Fix**: replace with a named config field like `return_top_k_fraction` (default 0.5) with explicit min/max bounds and a doc-comment.
+- **Severity**: MEDIUM
+
+### F-036 (MEDIUM) — SMC gate stagnation-decrement has no lower bound before clamp
+- **Location**: `search_engine.rs:732-734`
+- **What**: `gate_now -= gate_stagnation_step * (stagnant_gens as f32);` — multiplied by `stagnant_gens` which can grow unboundedly across generations. The subsequent `.clamp(gate_lo, gate_hi)` saves it, but the intermediate value can be NEGATIVE / very-large-negative. Fine numerically, but the clamp at `gate_lo` is the only thing protecting. If `gate_lo > gate_hi` (because `min().min(max())` etc. was passed garbage), clamp behaves weirdly.
+- **Fix**: tighten to `gate_now = (gate_now - gate_stagnation_step * stagnant_gens as f32).max(gate_lo).min(gate_hi);` and add a debug_assert that `gate_lo <= gate_hi`.
+- **Severity**: MEDIUM (low blast radius in practice, but the gate's calibration shouldn't depend on a clamp)
+
+### F-037 (LOW) — Magic factors in stagnation-recovery branches
+- **Location**: `search_engine.rs:944-948`, `969-973`
+- **What**:
+  - Line 945: `(search_policy.survivor_fraction * 0.75).clamp(0.0, 0.5)` — magic 0.75 multiplier + magic 0.5 upper bound when stagnant.
+  - Line 970: `search_policy.immigrant_fraction.max(0.5)` — magic 0.5 lower bound for immigrants when stagnant.
+  - Line 1016: `while b_idx == a_idx && retries < 4` — magic 4 retries to find a distinct second parent.
+- **Fix**: extract as named constants in module scope (`STAGNATION_SURVIVOR_MULTIPLIER = 0.75`, etc.) with doc explaining the choice. OR (preferred) add fields to `EvolutionSearchPolicy` so they're tunable per run.
+- **Severity**: LOW
+
+---
+
 ---
 
 # Sessions (updated)
-- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031. Total findings: 31. Verified `EvaluationConfig::for_symbol` shape for F-003 template.
+- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037. Total findings: 37. Verified `EvaluationConfig::for_symbol` shape for F-003 template. **F-002 EURUSD-leak now confirmed at 4 production sites** (discovery.rs:710, gauntlet.rs:60, search_engine.rs:355 + 450).
 
 ## Audit progress
 | Crate | File | Lines | Status |
@@ -375,7 +435,7 @@ Internally calls `infer_market_cost_profile(...)` and overrides the 6 cost-profi
 | neoethos-search | gauntlet.rs | 154 | COMPLETE |
 | neoethos-search | parity.rs | 315 | COMPLETE |
 | neoethos-search | genetic/strategy_gene.rs | 649 | COMPLETE (F-003 template) |
-| neoethos-search | genetic/search_engine.rs | 1060 | next |
+| neoethos-search | genetic/search_engine.rs | 1060 | COMPLETE |
 | neoethos-search | genetic/smc_indicators.rs | 659 | pending |
 | neoethos-search | genetic/evolution_math.rs | 946 | pending |
 | neoethos-search | genetic/runtime_overrides.rs | 795 | pending |
@@ -405,4 +465,4 @@ Internally calls `infer_market_cost_profile(...)` and overrides the 6 cost-profi
 | neoethos-data | core/*.rs | ? | pending |
 | ... | further crates | ... | pending |
 
-**neoethos-search progress: 7 of 31 files COMPLETE (≈ 7100 of 20810 lines = 34%)**
+**neoethos-search progress: 8 of 31 files COMPLETE (≈ 8160 of 20810 lines = 39%)**
