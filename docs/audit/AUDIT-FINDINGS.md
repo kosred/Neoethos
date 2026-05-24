@@ -636,10 +636,83 @@ This module builds final symbol-level capital allocation from per-symbol metrics
 
 ---
 
+## genetic/evolution_math.rs — `crates/neoethos-search/src/genetic/evolution_math.rs` (946 lines, **COMPLETE**)
+
+This is the GA core: parent/survivor selection policies, crossover, mutate, gene_signature_hash, seen-signature memory, and `score_from_metrics` (the FITNESS function that drives the GA).
+
+### F-057 (CRITICAL) — `score_from_metrics` is a THIRD independent scoring function — and it's the one the GA actually optimizes
+- **Location**: `evolution_math.rs:836-871`
+- **What**: this `score_from_metrics` is the third scoring formula in the search pipeline:
+  ```rust
+  let trades_confidence = (trades.sqrt() / 10.0).min(1.0);
+  let sharpe_component = sharpe * trades_confidence * 0.40;
+  let consistency_component = consistency.clamp(0.0, 1.0) * 0.25;
+  let dd_penalty = (max_dd * 15.0).min(5.0);
+  let pf_component = if pf >= 1.0 { ((pf - 1.0) * 0.5).min(1.5) * 0.20 }
+                     else { -(1.0 / pf.max(0.1)) * 0.30 };
+  let wr_component = ((win_rate - 0.45) * 2.0).clamp(0.0, 0.5) * 0.10;
+  // sum - dd_penalty
+  ```
+  This formula assigns `gene.fitness` (line 875). Selection then uses fitness for parent/survivor decisions. So the GA's entire convergence behaviour is governed by THIS formula — NOT by `quality.rs::score_strategy` (F-042) and NOT by `regime_labels.rs::window_quality_score` (F-049).
+- **Why it matters**:
+  1. **Three scoring functions, all unaudited, all incompatible**. A strategy with quality_score=85 (F-042: "EXCELLENT") could have fitness=-1.5 here. An operator who tunes one function sees no effect on selection.
+  2. The constants are even MORE opaque here: 10, 0.40, 0.25, 15, 5, 0.5/1.5, 0.20, 0.30, 0.45, 2.0, 0.5, 0.10. Even with a doc, the system is essentially "trust the numbers".
+  3. The pf component for PF < 1.0 is `-(1.0 / pf.max(0.1)) * 0.30`. For PF=0.5, that's -0.6. For PF=0.1 (terrible), that's -3.0. The penalty is asymmetric and goes to "moderate" not "catastrophic". Possibly too lenient on losers.
+- **Fix**: this is the most important scoring function in the pipeline.
+  1. Document each component's intent on a per-line basis.
+  2. Move constants to a `GeneFitnessConfig` struct.
+  3. Provide a debug-print so operator can see, for each top-N gene, the component breakdown (sharpe_component=X, consistency=Y, dd_penalty=Z, pf=W).
+  4. Cross-check that this formula and `quality.rs::score_strategy` produce consistent ORDERING (not necessarily same scale) on a held-out fixture. If a gene that scores low here scores high there, one of the two is wrong.
+- **Severity**: CRITICAL (the GA optimises an unaudited formula)
+
+### F-058 (MEDIUM) — `FOREX_BOT_NORMALIZE_FEATURES` env switches threshold levels silently
+- **Location**: `evolution_math.rs:530-547`
+- **What**: when the env is set, the GA uses thresholds `[0.30, 0.45, 0.60, 0.80, 1.00, 1.20]` (6 levels). Otherwise it uses `[0.15, 0.25, 0.35, 0.45, 0.55]` (5 levels). Same FOREX_BOT_*-hidden-bypass pattern as F-005, F-011, F-058.
+- **The comment explains why** (lines 525-540): the threshold range needs to match the feature magnitudes. Without re-calibration, empty-portfolio bug on EURJPY/XAUUSD. Good awareness in the comment, but no startup log of which mode is active.
+- **Why it matters**: changes the GA's threshold search space invisibly. A discovery run done last week with `=1` and this week without will produce different distributions of `long_threshold` / `short_threshold` even with identical seeds.
+- **Fix**: log at startup `tracing::info!` listing which FOREX_BOT_* env vars are set, including this one. Also: think about whether feature normalization should be ON by default (the comment suggests it's needed for non-EURUSD symbols).
+- **Severity**: MEDIUM (silent threshold-range change)
+
+### F-059 (LOW) — `new_random_gene` SL/TP initialization magic
+- **Location**: `evolution_math.rs:578-585`
+- **What**: 20% chance the initial SL/TP is exactly `(15.0, 30.0)` (a "default" injected via `rng.random_bool(0.2)`). 80% chance: SL random in [5, 50], rr random in [1.5, 3.0], TP = sl*rr clamped to [10, 100]. Magic numbers everywhere.
+- **Fix**: extract these to constants OR make the SL/TP search ranges configurable via the GA config struct.
+- **Severity**: LOW
+
+### F-060 (LOW) — Adaptive mutation rate stagnation thresholds 10/5 are magic
+- **Location**: `evolution_math.rs:775-783`
+- **What**: 
+  - `stagnant > 10` → 3 mutations, intensity 1.5
+  - `stagnant > 5` → 2 mutations, intensity 1.2
+  - `stagnant == 0` → 1 mutation, intensity 0.5 (exploitation)
+  - else → 1 mutation, intensity 1.0
+- **Fix**: extract to `AdaptiveMutationConfig` with thresholds + intensities per tier.
+- **Severity**: LOW
+
+### F-061 (LOW) — `mutate` has many embedded magic probabilities
+- **Location**: `evolution_math.rs:789, 791, 819, 826`
+- **What**: `0.5`, `0.3*intensity`, `0.3`, `0.25*intensity` — magic probabilities for "use exploitation path", "replace indicator", "randomize SMC", "enforce SMC". Each is a tunable knob baked in.
+- **Fix**: move to config.
+- **Severity**: LOW
+
+### F-062 (NOTE) — Crossover/mutate look correct + deterministic-RNG plumbing is good
+- **Location**: `evolution_math.rs:661-761`
+- **What**: half-half index/weight crossover, half-half uniform crossover for booleans, deterministic random_bool(0.5) chooses TP/SL from a or b. The `rng` is threaded from the caller's seeded RNG (comment lines 662-664 explicitly warns against using `rand::rng()` here). Determinism guarantee holds.
+- **Severity**: NONE — verification.
+
+### F-063 (LOW) — `new_random_gene` line 604 hardcodes `mtf_confirmation: true` then immediately calls randomize_smc_flags
+- **Location**: `evolution_math.rs:604, 617`
+- **What**: line 604 sets `mtf_confirmation: true` in the struct literal, then line 617 calls `randomize_smc_flags(&mut gene, smc_cfg, rng)` which overwrites it with `rng.random_bool(cfg.p_mtf)` (p_mtf=0.85 default).
+- **Why it matters**: dead initialization. The `true` at line 604 is irrelevant — overwritten 13 lines later. Minor confusion but no bug.
+- **Fix**: set `mtf_confirmation: false` (matching the other SMC flags) to make it clear randomize_smc_flags is the source of truth.
+- **Severity**: LOW (cleanup only)
+
+---
+
 ---
 
 # Sessions (updated)
-- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041; **quality.rs COMPLETE (786/786)** F-042..F-047; **regime_labels.rs COMPLETE (523/523)** F-048..F-052; **portfolio.rs COMPLETE (345/345)** F-053..F-056. Total findings: 56. **Architectural smell**: two parallel "regime" systems (F-048), two parallel scoring functions (F-049 + F-042). **Latent panic**: F-053 two `.expect()` sites in portfolio.rs.
+- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041; **quality.rs COMPLETE (786/786)** F-042..F-047; **regime_labels.rs COMPLETE (523/523)** F-048..F-052; **portfolio.rs COMPLETE (345/345)** F-053..F-056; **evolution_math.rs COMPLETE (946/946)** F-057..F-063. Total findings: 63. **Architectural smell promoted**: THREE parallel scoring functions (F-042 quality.rs + F-049 regime_labels.rs + F-057 evolution_math.rs — the GA actually optimizes F-057). Two parallel "regime" systems (F-048). Latent panic (F-053).
 
 ## Audit progress
 | Crate | File | Lines | Status |
@@ -655,7 +728,8 @@ This module builds final symbol-level capital allocation from per-symbol metrics
 | neoethos-search | quality.rs | 786 | COMPLETE |
 | neoethos-search | genetic/regime_labels.rs | 523 | COMPLETE |
 | neoethos-search | portfolio.rs | 345 | COMPLETE |
-| neoethos-search | genetic/evolution_math.rs | 946 | next |
+| neoethos-search | genetic/evolution_math.rs | 946 | COMPLETE |
+| neoethos-search | stop_target.rs | 958 | next |
 | neoethos-search | genetic/runtime_overrides.rs | 795 | pending |
 | neoethos-search | genetic/diversity.rs | 219 | pending |
 | neoethos-search | genetic/mod.rs | 45 | pending |
@@ -680,4 +754,4 @@ This module builds final symbol-level capital allocation from per-symbol metrics
 | neoethos-data | core/*.rs | ? | pending |
 | ... | further crates | ... | pending |
 
-**neoethos-search progress: 12 of 31 files COMPLETE (≈ 10478 of 20810 lines = 50%)**
+**neoethos-search progress: 13 of 31 files COMPLETE (≈ 11424 of 20810 lines = 55%)**
