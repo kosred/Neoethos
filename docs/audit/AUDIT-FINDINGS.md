@@ -101,7 +101,7 @@
 # Sessions
 - **2026-05-24 session 1**: scaffolded ledger; audited eval.rs COMPLETE (1211/1211 lines); surfaced F-001, F-002, F-003, F-004, F-005, F-006. Critical findings: F-002 + F-003 are the root cause of bug #214 (cost-model with empty symbol). Fixes deferred to "batch implementation" phase per user directive: build only once at end.
 
-## discovery.rs — `crates/neoethos-search/src/discovery.rs` (2900 lines, **PARTIAL** lines 1-500)
+## discovery.rs — `crates/neoethos-search/src/discovery.rs` (2900 lines, **COMPLETE**)
 
 ### F-007 (HIGH) — `evaluation_account_currency: "USD"` hardcoded in `from_settings`
 - **Location**: `discovery.rs:275`
@@ -133,15 +133,102 @@
 - **Fix**: log a single `tracing::info!` at discovery start naming the resolved mode + which fields were overridden.
 - **Severity**: MEDIUM
 
+### F-012 (CRITICAL) — `discovery_backtest_settings` inherits EURUSD-synthetic fields via struct-update `..BacktestSettings::default()`
+- **Location**: `discovery.rs:684-712` (lines 690 + 710 specifically)
+- **What**: this helper builds the per-gene `BacktestSettings` by overriding ~10 named fields (sl_pips, tp_pips, max_hold_bars, trailing*, pip_value, spread_pips, commission_per_trade, pip_value_per_lot, kill_zones_enabled) and ends with `..crate::eval::BacktestSettings::default()`. The default constructor (F-002) builds with synthetic EURUSD cost-profile, so any field NOT in the override list (e.g. `min_hold_bars`, `slippage_pips`, `enable_intrabar`, `commission_min_per_trade`, account-currency-dependent micro-adjustments) leaks the synthetic profile into every backtest the discovery pipeline runs.
+- **Why it matters**: this is the production-side EVIDENCE of F-002/F-003. The five public entry points (`build_discovery_validation_artifacts`, `compute_discovery_forward_test_artifacts`, `compute_discovery_prop_firm_artifacts`, `evaluate_cpcv_gate`, the MC perturbation loop) all reach `discovery_backtest_settings`, which all reach `BacktestSettings::default()`. So every persisted artifact (canonical_backtest, walkforward, forward_test, prop_firm) has the same hidden EURUSD bias.
+- **Fix**: once F-003 ships `BacktestSettings::for_symbol(...)`, change line 710 from `..BacktestSettings::default()` to `..BacktestSettings::for_symbol(&config.evaluation_symbol, &config.evaluation_account_currency, price_hint, None, None)`. Then the named overrides act as deltas on top of a CORRECT base profile.
+- **Severity**: CRITICAL — silently contaminates every discovery artifact.
+
+### F-013 (HIGH) — `validate_regime_robustness` has dead-zones where trades count for nothing
+- **Location**: `discovery.rs:1564-1627`, specifically lines 1607-1617
+- **What**: the function buckets per-trade PnL by regime:
+  - `trend_str > 0.25` → trend bucket
+  - `trend_str < 0.15` → range bucket
+  - `0.15 ≤ trend_str ≤ 0.25` → NO bucket (silently dropped)
+  - `vol_state > 0.5` → high-vol bucket
+  - `vol_state < -0.5` → low-vol bucket
+  - `-0.5 ≤ vol_state ≤ 0.5` → NO bucket
+- **Why it matters**: trades in the dead-zones are not counted toward any regime PnL, so the gate's `if trend_pnl < limit || range_pnl < limit ...` check sees an artificially small set. A strategy that always trades in 0.15-0.25 trend regime would pass the gate trivially with all four buckets at zero. The gate ALSO silently returns `true` (passing) when `regime_trend_strength` or `regime_vol_state` features are absent from `features.names` (line 1576-1578).
+- **Fix**:
+  1. Decide whether dead-zone trades go into "trend" or "range" (likely range since 0.15-0.25 is weak-trend). Make the boundaries adjacent: e.g. `trend_str >= 0.20 → trend, else range`.
+  2. Same for vol: `vol_state >= 0.0 → high, else low` (or document the dead-zone choice explicitly).
+  3. When regime features are missing, return `false` (fail the gate) OR log a tracing::warn — silently passing is a "gate that does nothing" failure mode.
+- **Severity**: HIGH (gate that silently does nothing)
+
+### F-014 (MEDIUM) — `quality_analyzer_for_config` uses `min_sharpe` as `min_sortino`
+- **Location**: `discovery.rs:670-682` (lines 672-673)
+- **What**: `min_sortino: config.filtering.min_sharpe.max(0.0)` — both ratios get the same threshold even though Sortino is typically 1.5-2× Sharpe for the same strategy (downside-only denominator). A min_sharpe=1.0 floor effectively becomes min_sortino=1.0, which is much weaker than the natural Sortino bar for a real signal.
+- **Why it matters**: gate is weaker than the user thinks. Strategies with poor downside risk-adjusted returns (low Sortino) pass because we're checking against a number meant for Sharpe.
+- **Fix**: add `min_sortino: f64` field to `FilteringConfig` with sensible default (e.g. 1.5× the Sharpe floor) and read from settings. Or, document why min_sharpe doubles as min_sortino (which I don't think there's a reason).
+- **Severity**: MEDIUM
+
+### F-015 (HIGH) — Magic numbers everywhere in MC + sensitivity + income-score pipeline
+- **Locations**: `discovery.rs` lines 1834-1845, 1990, 1996-2005, 2033, 2040-2041
+- **What**: the post-search quality screen and ranking use a cluster of hardcoded magic numbers that materially affect which strategies survive:
+  - `pf_capped = gene.profit_factor.min(3.0) / 3.0` (line 1834) — PF cap = 3.0
+  - `safety = 1.0 - gene.max_drawdown / 0.07` (line 1835) — DD safety floor = 7%
+  - `consistency_score > 0.8 → 2x bonus` (line 1843) — bonus threshold + magnitude
+  - `mc_runs = 100usize` (line 1990) — Monte Carlo run count
+  - `+/- 15%` threshold perturbation (lines 1996-1997)
+  - `+/- 20%` weight perturbation (line 1999)
+  - `+/- 25%` SL/TP perturbation (lines 2001-2005)
+  - `if profitable_runs < 70` (line 2033) — 70% MC pass-rate threshold
+  - `spread_pips = 2.0; commission_per_trade = 7.0` (lines 2040-2041) — sensitivity test hardcoded to EURUSD-grade costs
+- **Why it matters**:
+  1. The 70/100 MC threshold is a HARD gate, not just a ranking. Changing it from 70 to 60 likely changes the surviving portfolio size dramatically — and the operator has no way to do that without recompiling.
+  2. The sensitivity test (2pip + $7) is EURUSD-biased. For JPY pairs (where 2pip ≠ same proportion of price as on EURUSD) and exotics (5-15 pip realistic spread) this test is too lenient. Cross-pair fairness is broken.
+  3. The income-score magic numbers (PF cap, DD floor, bonus threshold) jointly determine candidate ranking. They should be in the audit log so we can A/B them.
+- **Fix**:
+  1. Add a `QualityScreenConfig` (or extend `FilteringConfig`) with all magic numbers as named fields.
+  2. `compute_sensitivity_settings(symbol, base_settings)` → derive sensitivity spread/comm from the SAME `for_symbol` cost-profile, scaled by some "worst-case multiplier" (e.g. spread × 1.5, comm × 1.5).
+  3. Document why 70/100 is the floor (or pick a different floor based on backtested edge significance).
+- **Severity**: HIGH (sensitivity test on JPY/exotic is essentially broken — F-016 below specifies the symbol-bias half)
+
+### F-016 (HIGH) — Sensitivity test hardcoded to EURUSD-grade costs
+- **Location**: `discovery.rs:2037-2053` (specifically lines 2040-2041)
+- **What**: `sensitive_settings.spread_pips = 2.0; sensitive_settings.commission_per_trade = 7.0;` — these are reasonable worst-case for EURUSD, but completely wrong for:
+  - EURJPY (1 pip = 0.01, so 2pip = 200 yen × pip_value_per_lot — and the real broker spread is usually 1.0-1.5pip, not 2.0)
+  - GBPUSD (real spread 1.5pip typical, 2.0 is reasonable worst-case — OK)
+  - XAUUSD (gold, spread varies wildly, 2pip = $0.02 which is far below real)
+  - GBPNZD (exotic, 5-10pip real spread → 2pip is OPTIMISTIC, not pessimistic)
+- **Why it matters**: a strategy that survives the EURUSD-grade sensitivity test on a GBPNZD signal is not actually robust to GBPNZD costs. F-016 + F-012 together mean the entire cost model in discovery is silently EURUSD-shaped.
+- **Fix**: replace literals with `sensitive_settings = BacktestSettings::for_symbol(symbol, ..., spread_override=Some(base_spread * 1.5), commission_override=Some(base_comm * 1.5));` once F-003 lands.
+- **Severity**: HIGH (compounds F-012)
+
+### F-017 (MEDIUM) — Train ratio mismatch: eval.rs uses 0.80, discovery.rs uses 0.70
+- **Locations**: `eval.rs:953` (`wfv_bound = n_rows * 0.8`) vs `discovery.rs:830, 1077` (both `train_ratio: 0.70`)
+- **What**: the GA fitness evaluation (eval.rs `evaluate_population_core`) uses 80/20 train/OOS split. The post-search validation (discovery.rs `build_discovery_validation_artifacts` → `embargoed_walkforward_backtest`) uses 70/30. The discovery temporal-contract hash claims 0.70.
+- **Why it matters**: two different walk-forward setups, no explicit doc on why. If both are intended, the choice should be documented. If one is wrong, we have a bug. The hash claims 70/30 but the GA fitness is built on 80/20 — so the persisted contract describes a different split than the GA actually used to select the candidate.
+- **Fix**: pick ONE canonical ratio for in-sample fitness vs OOS validation OR document the two-stage design explicitly (e.g. "GA uses 80/20 to maximise the search horizon, post-search validation uses 70/30 to reserve more OOS for the gate"). Promote to a named constant in `discovery::TRAIN_RATIO_VALIDATION` and `eval::TRAIN_RATIO_GA_FITNESS`.
+- **Severity**: MEDIUM
+
+### F-018 (MEDIUM) — `evaluate_cpcv_gate` returns "passed" without running CPCV when disabled
+- **Location**: `discovery.rs:948-950`
+- **What**: `if !config.enable_cpcv { return Ok((true, 0, 1.0)); }` — when CPCV is disabled, the gate returns `(passed=true, fold_count=0, profitable_ratio=1.0)`. Then upstream `validation_gates.cpcv_passed = true` is recorded in the persisted profile and ALSO satisfies `is_portfolio_export_ready` (via `walkforward_passed && cpcv_passed`).
+- **Why it matters**: the persisted profile says `cpcv_passed=true` for a run where CPCV NEVER RAN. An operator reading the profile reasonably assumes CPCV validated the portfolio. The `profitable_fold_ratio=1.0` is even more misleading — claims 100% folds profitable when zero folds were run.
+- **Fix**: when CPCV is disabled, return `cpcv_passed=true` but also set `cpcv_fold_count=None` (change the type to Option<usize>) OR `cpcv_profitable_fold_ratio=None`. Persist the disabled state distinctly from "ran and passed". The `is_portfolio_export_ready` check then needs to allow `cpcv_disabled || cpcv_passed`.
+- **Severity**: MEDIUM (profile lies about what was validated)
+
+### F-019 (LOW) — Hardcoded `min_trading_days: 0, max_trades_per_day: 0` in walkforward call
+- **Location**: `discovery.rs:1083-1084`
+- **What**: `embargoed_walkforward_backtest` is called with these two limits zeroed (= disabled). But `config.min_trades_per_day` exists at line 220 and is used elsewhere (e.g. `min_trades_required` line 1879). So the gate is disabled in the validation walkforward but enabled in the candidate filter — inconsistent.
+- **Fix**: either thread `config.min_trades_per_day` into the walkforward call OR document why we disable it there.
+- **Severity**: LOW
+
 ---
 
 # Sessions (updated)
-- **2026-05-24 session 1**: scaffolded ledger; audited **eval.rs COMPLETE (1211/1211)**; surfaced F-001 to F-006. Begun **discovery.rs (500/2900)**; surfaced F-007 to F-011.
+- **2026-05-24 session 1**: scaffolded ledger; audited **eval.rs COMPLETE (1211/1211)** — F-001 to F-006. Audited **discovery.rs COMPLETE (2900/2900)** — F-007 to F-019. Total findings so far: 19.
 
 ## Next session targets
-- `crates/neoethos-search/src/discovery.rs` lines 500-2900 (remaining ~2400 lines, probably 1-2 sessions)
 - `crates/neoethos-search/src/validation.rs` (1855 lines)
 - `crates/neoethos-search/src/genetic/search_engine.rs`
-- `crates/neoethos-search/src/genetic/strategy_gene.rs`
-- … then continue priority list
-
+- `crates/neoethos-search/src/genetic/strategy_gene.rs` (template for F-003 fix; verify `for_symbol` shape)
+- `crates/neoethos-search/src/genetic/mod.rs`, `genetic/smc_indicators.rs`
+- `crates/neoethos-search/src/quality.rs`
+- `crates/neoethos-search/src/portfolio.rs`
+- `crates/neoethos-search/src/gauntlet.rs` (F-002 caller site)
+- `crates/neoethos-search/src/parity.rs` (F-002 caller site)
+- `crates/neoethos-data/src/core/hpc_ta.rs`, `timestamps.rs` and feature pipeline
+- engine continues … then app_services, models, CLI/TUI
