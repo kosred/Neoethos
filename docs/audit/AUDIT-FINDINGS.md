@@ -23,6 +23,9 @@
 | F-038 | HIGH | SMC derivation lookbacks (12, 20, 20 bars) timeframe-agnostic. |
 | F-028 | HIGH | `Gene::is_anomalous` 4 overlapping anomaly classifications, all magic numbers, no config knob; a real 4%/mo strategy compounded 11y could trip the $10M bar. |
 | F-014 + F-047 | MEDIUM | Sortino floor defaults equal Sharpe floor in BOTH `discovery::quality_analyzer_for_config` AND `quality::StrategyQualityAnalyzer::default` — gate is much weaker than it should be. |
+| **F-070** | **CRITICAL** | **DUAL `discovery_gpu` module**: `discovery_gpu.rs` (1028 lines, gpu feature) + `lib.rs::discovery_gpu` (inline ~610 lines, no-gpu feature). Same structs + functions, different backend. Single biggest dedup target in the crate. |
+| **F-071** | **CRITICAL** | GPU discovery uses returns-based fitness with hardcoded `0.0002` cost — synthetic data violation. The doc-comment ADMITS "not equivalent to the CPU GA". Algorithm-level divergence: GPU flag picks DIFFERENT strategies. |
+| F-073 | HIGH | `discovery_gpu.rs:822` hardcodes `1440` M1-bars/day denominator — silently wrong fitness on H1/H4/D1 data. |
 
 **Root cause picture**: F-002 + F-003 explain why bug #214 ("cost-model called with empty symbol") was surface-fixed only. The cost-profile leak hits 4 production sites because nobody implemented the `for_symbol` method the comment says they should. **F-003 is the single change that unblocks fixing F-002/F-012/F-025/F-033/F-050 in one go.**
 
@@ -863,10 +866,84 @@ This is the **typed-boundary template** for all `FOREX_BOT_*` env vars. Well-des
 
 ---
 
+## discovery_gpu.rs — `crates/neoethos-search/src/discovery_gpu.rs` (1028 lines, **COMPLETE**)
+
+This file is the `#[cfg(feature = "gpu")]` arm of a cfg-conditional duplicated module. The other arm is **inline in `lib.rs`** (lines 14-624, ~610 lines). The two implementations share names but differ in dependencies (tch+CUDA vs ndarray+rayon) — a classic two-impls-same-struct duplication.
+
+### F-070 (CRITICAL) — DUAL `discovery_gpu` module: file (1028 lines, gpu feature) + inline (~610 lines, no-gpu feature) in `lib.rs`
+- **Location**: `lib.rs:6-15` (cfg switch) + `discovery_gpu.rs` (full file) + `lib.rs:14-624` (inline cfg-disabled twin)
+- **What**: lib.rs declares:
+  ```rust
+  #[cfg(feature = "gpu")]
+  pub mod discovery_gpu;            // → discovery_gpu.rs (1028 lines, tch+CUDA)
+  #[cfg(not(feature = "gpu"))]
+  pub mod discovery_gpu { ... }     // → inline in lib.rs (~610 lines, ndarray+rayon)
+  ```
+  Both expose the SAME structs (`GpuDiscoveryConfig`, `GpuDiscoveryResult`), the SAME functions (`run_gpu_discovery`, `build_feature_cube`, `save_gpu_genomes`). The cfg switches between them at compile time.
+- **Why it matters**:
+  1. **THIS IS THE PRIMARY DEDUPLICATION TARGET** the operator flagged. Two ~600-1000 line implementations of "the same thing" differing only by which math backend they use.
+  2. Any bug fix has to be applied to BOTH copies. A drift between them is silent (each build gets one based on the feature flag).
+  3. The CPU-fallback variant (inline in lib.rs) is much harder to audit because lib.rs is supposed to be a thin module-root, not a 1000-line implementation.
+- **Fix**:
+  1. Extract the SHARED struct definitions (`GpuDiscoveryConfig`, `GpuDiscoveryResult`, helpers) into `discovery_gpu/types.rs` or `discovery_gpu/config.rs` — backend-agnostic.
+  2. Move CPU fallback into `discovery_gpu/cpu.rs` (with the GpuDiscovery name renamed — "DiscoveryEnsemble"? "MultiTimeframeDiscovery"?).
+  3. Move GPU path into `discovery_gpu/gpu.rs`.
+  4. lib.rs goes back to declaring `pub mod discovery_gpu` (no inline `mod { ... }` block).
+  5. Both paths share the SAME `evaluate_population_*` shape so the only difference is "where the matmul happens".
+- **Severity**: CRITICAL (single biggest dedup target in this crate)
+
+### F-071 (CRITICAL) — GPU discovery uses a fundamentally different fitness model than the canonical GA — and it's documented
+- **Location**: `discovery_gpu.rs:338-345` (the doc comment ADMITS this) + `791` (hardcoded 0.0002 cost)
+- **What**: the GPU path's doc-comment is explicit:
+  > "this entry point uses a *returns-based* fitness (cumulative `action * (close_next - open_next)/open_next` minus a flat 0.0002 cost) and does NOT model SL/TP, spread, or commission. It is not equivalent to the CPU GA driven by [`crate::evolve_search`]."
+  This is FOURTH parallel fitness model alongside F-042+F-049+F-057 (the three CPU scoring functions). Plus line 828 has yet another scoring formula: `let mut window_fit = sortino * 10.0 + consistency * 5.0 - freq_penalty - dd_penalty;` — FIFTH.
+- **Why it matters**:
+  1. **Pure synthetic data**: the `0.0002` cost is not a real broker spread on anything. Per directive 2026-05-24 ("απαγορεύονται παντού συνθετικά δεδομένα") this MUST die.
+  2. **Algorithm-level divergence**: an operator who flips `gpu` feature on doesn't just get faster eval — they get a DIFFERENT algorithm that picks DIFFERENT strategies. The doc says so. So GPU-discovered portfolios are NOT comparable to CPU-discovered ones.
+  3. **Where the real GPU path lives**: the comment redirects to `evolve_search` + `gpu` feature which uses `cubecl_eval.rs` / `cubecl_ga.rs`. So `discovery_gpu.rs::run_gpu_discovery` is essentially a different product.
+- **Fix options**:
+  - **Option A (preferred)**: DELETE `discovery_gpu.rs` + the inline twin in lib.rs. The cubecl path is the canonical GPU. `run_gpu_discovery` is orphan-ish (callers in lib.rs tests + hpc_gpu_discovery.rs). Verify no production caller, then delete.
+  - **Option B**: Rewrite `discovery_gpu.rs::evaluate_population_gpu` to use `BacktestSettings::for_symbol(...)` (F-003 once landed) and the same SL/TP-faithful step function from `eval/step.rs` (F-004 fix). Then the GPU and CPU paths produce comparable results.
+- **Severity**: CRITICAL (synthetic 0.0002 cost + fitness model divergence)
+
+### F-072 (MEDIUM) — `GpuDiscoveryConfig::default()` has 24 magic numbers, M1-biased
+- **Location**: `discovery_gpu.rs:57-89`
+- **What**: defaults: population=24000, generations=200, elite=0.05, survivor=0.10, immigrant=0.20, temperature=0.75, tournament=4, sigma=0.5, crossover=0.35, threshold_scale=0.10, margin=0.02, clip=0.30, **window_bars=1440*22*6 (M1 6-month)**, segments=4, min_trades_per_day=1.0, trade_penalty=25.0, dd_limit=0.04, dd_penalty=200.0, robust_weight=0.2, pos_window_fraction=0.5, pos_penalty=15.0, chunk_size=2048.
+- **Why it matters**: `window_bars = 1440 * 22 * 6 = 190,080` only makes sense for M1 data. For H1 data (24 bars/day) that's 360 years of bars — meaningless. For D1 (1 bar/day) it's 760 years. Hard-coded M1 assumption.
+- **Fix**: convert window_bars to a duration (`window_days: 132`) and compute bars from timeframe at runtime. Put all other magic numbers behind `GpuDiscoveryRuntimeOverrides` per F-068 template.
+- **Severity**: MEDIUM
+
+### F-073 (HIGH) — Hardcoded 1440 M1-bars/day assumption in trade-penalty math
+- **Location**: `discovery_gpu.rs:822`
+- **What**: `let expected = (len as f64 / 1440.0) * config.min_trades_per_day;` — assumes 1440 bars per trading day (= M1). For non-M1 data the "expected trade count" denominator is wrong.
+- **Why it matters**: silently wrong fitness on H1/H4/D1 data. The `freq_penalty` will be too aggressive (expecting too many trades).
+- **Fix**: derive bars-per-day from timeframe label like `discovery.rs::min_trades_required` does (line 2349-2360, which IS timeframe-aware via timestamp inspection).
+- **Severity**: HIGH (silently wrong fitness on non-M1 TFs)
+
+### F-074 (HIGH) — Hardcoded 0.0002 cost is the synthetic-data violation
+- **Location**: `discovery_gpu.rs:791`
+- **What**: `actions_slice * rets.unsqueeze(0) - actions_slice.abs() * 0.0002` — the `0.0002` is the per-trade cost. Not a real spread, not a real commission, just a magic number.
+- **Per directive 2026-05-24**: synthetic data ban applies. This 0.0002 must come from the real cost profile or the function must bail.
+- **Fix**: same as F-002/F-003 — use `BacktestSettings::for_symbol(...)` to get real spread + commission, then convert to per-bar cost.
+- **Severity**: HIGH
+
+### F-075 (LOW) — Yet another scoring formula at line 828
+- **Location**: `discovery_gpu.rs:828-830`
+- **What**: `window_fit = sortino * 10.0 + consistency * 5.0 - freq_penalty - dd_penalty;` + `window_fit += profit_pct.clamp_max(0.10) * 100.0;`. Magic: 10.0, 5.0, 0.10, 100.0. This is the FIFTH scoring formula in the crate (F-042 quality, F-049 window, F-057 GA, plus this one and the one inside cubecl_eval).
+- **Fix**: tracked under the F-042+F-049+F-057 unification in the doctrine — all fitness formulas migrate to `scoring/`.
+- **Severity**: LOW (but feeds into the bigger unification)
+
+### F-076 (NOTE) — `resolve_execution_mode` good defensive pattern
+- **Location**: `discovery_gpu.rs:154-230`
+- **What**: explicit handling of CUDA-requested-but-unavailable case with structured `tracing::error!` log and optional `FOREX_BOT_REQUIRE_GPU=1` opt-in to panic instead of silently falling back. Good operator-facing diagnostic.
+- **Severity**: NONE — reference example.
+
+---
+
 ---
 
 # Sessions (updated)
-- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041; **quality.rs COMPLETE (786/786)** F-042..F-047; **regime_labels.rs COMPLETE (523/523)** F-048..F-052; **portfolio.rs COMPLETE (345/345)** F-053..F-056; **evolution_math.rs COMPLETE (946/946)** F-057..F-063; **stop_target.rs COMPLETE (958/958)** F-064..F-067; **runtime_overrides.rs COMPLETE (795/795)** F-068..F-069. Total findings: 69. **Architectural smell**: THREE parallel scoring functions (F-042+F-049+F-057), THREE parallel regime systems (F-013+F-048+F-064). Latent panic (F-053). **GOOD NEWS**: F-068 verifies `CostProfileRuntimeOverrides` already provides the typed boundary F-003 needs.
+- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041; **quality.rs COMPLETE (786/786)** F-042..F-047; **regime_labels.rs COMPLETE (523/523)** F-048..F-052; **portfolio.rs COMPLETE (345/345)** F-053..F-056; **evolution_math.rs COMPLETE (946/946)** F-057..F-063; **stop_target.rs COMPLETE (958/958)** F-064..F-067; **runtime_overrides.rs COMPLETE (795/795)** F-068..F-069; **discovery_gpu.rs COMPLETE (1028/1028)** F-070..F-076. Total findings: 76. **BIG DUPLICATION DISCOVERED**: F-070 — discovery_gpu.rs (1028 lines, gpu) + lib.rs inline twin (~610 lines, no-gpu) are dual implementations of the SAME module. F-071 — GPU fitness model is fundamentally different (returns-based, no SL/TP, hardcoded 0.0002 cost — synthetic data violation).
 
 ## Audit progress
 | Crate | File | Lines | Status |
@@ -885,6 +962,8 @@ This is the **typed-boundary template** for all `FOREX_BOT_*` env vars. Well-des
 | neoethos-search | genetic/evolution_math.rs | 946 | COMPLETE |
 | neoethos-search | stop_target.rs | 958 | COMPLETE |
 | neoethos-search | genetic/runtime_overrides.rs | 795 | COMPLETE (template) |
+| neoethos-search | discovery_gpu.rs | 1028 | COMPLETE (delete candidate) |
+| neoethos-search | lib.rs (inline discovery_gpu) | ~610 | partial (F-070 — twin of above) |
 | neoethos-search | genetic/diversity.rs | 219 | pending |
 | neoethos-search | genetic/mod.rs | 45 | pending |
 | neoethos-search | lib.rs | 1017 | pending |
@@ -908,4 +987,4 @@ This is the **typed-boundary template** for all `FOREX_BOT_*` env vars. Well-des
 | neoethos-data | core/*.rs | ? | pending |
 | ... | further crates | ... | pending |
 
-**neoethos-search progress: 15 of 31 files COMPLETE (≈ 13177 of 20810 lines = 63%)**
+**neoethos-search progress: 16 of 31 files COMPLETE (≈ 14205 of 20810 lines = 68%)**
