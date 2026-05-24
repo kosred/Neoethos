@@ -767,10 +767,40 @@ This module is the **third regime-classifier**, also implementing volatility est
 
 ---
 
+## genetic/runtime_overrides.rs — `crates/neoethos-search/src/genetic/runtime_overrides.rs` (795 lines, **COMPLETE**)
+
+This is the **typed-boundary template** for all `FOREX_BOT_*` env vars. Well-designed, well-tested, well-documented. Audit doctrine: every other magic-number finding should migrate to a struct like the ones in this file.
+
+### F-068 (REFERENCE) — `runtime_overrides.rs` is the canonical template for config-extraction
+- **What**: this file already provides typed `from_env` → `OnceLock` → `current_*` accessor pattern with explicit clamping (`resolved_curve`, `resolved_temperature`, `effective_tournament_size`, `effective_archive_cap`, `effective_stagnation_patience`). Defaults documented in struct + tests.
+- **Why it matters as reference**: when batch fixes start, F-014/F-018/F-019/F-028/F-031/F-041/F-042/F-049/F-051/F-052/F-054/F-055/F-056/F-057/F-059/F-060/F-061/F-063/F-065/F-066 (~20 findings about magic constants in defaults) should all use this exact pattern:
+  ```
+  #[derive(...)] struct XxxRuntimeOverrides { field1, field2, ... }
+  impl Default for XxxRuntimeOverrides { ... documented defaults ... }
+  fn populate_from_env(&mut self) { /* one-shot env read */ }
+  static XXX_RUNTIME_OVERRIDES: OnceLock<XxxRuntimeOverrides>;
+  pub fn install_xxx_runtime_overrides(...) -> Result<(), _>;
+  pub fn current_xxx_runtime_overrides() -> XxxRuntimeOverrides;
+  ```
+- **The most important migration**: `CostProfileRuntimeOverrides` (lines 326-360) already has `symbol`, `account_currency`, `pip_value`, `quote_to_account_rate`, `pip_value_per_lot`, `spread_pips`, `commission_per_trade`. F-003 (`BacktestSettings::for_symbol`) can READ from this without adding new fields. The whole F-002/F-003 fix surface is already prepared by this file.
+- **Severity**: NONE — reference example.
+
+### F-069 (LOW) — A few magic constants in derivation helpers
+- **Location**: `runtime_overrides.rs:284, 292-294`
+- **What**:
+  - Line 284: `(population / 12).max(3)` — magic divisor 12 + magic floor 3 for default tournament size.
+  - Line 292: `(population * generations.max(1)).min(50_000)` — magic cap at 50K for derived archive size.
+  - Line 294: `.max(population).min(200_000)` — magic hard ceiling at 200K.
+- **Why it matters**: the file IS the audit-aligned boundary, so these are the audit-aligned constants. But they're still magic numbers in the source.
+- **Fix**: name as `DEFAULT_TOURNAMENT_DIVISOR = 12`, `DEFAULT_TOURNAMENT_FLOOR = 3`, `ARCHIVE_DERIVED_CAP = 50_000`, `ARCHIVE_HARD_CEILING = 200_000` with doc comments.
+- **Severity**: LOW
+
+---
+
 ---
 
 # Sessions (updated)
-- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041; **quality.rs COMPLETE (786/786)** F-042..F-047; **regime_labels.rs COMPLETE (523/523)** F-048..F-052; **portfolio.rs COMPLETE (345/345)** F-053..F-056; **evolution_math.rs COMPLETE (946/946)** F-057..F-063; **stop_target.rs COMPLETE (958/958)** F-064..F-067. Total findings: 67. **Architectural smell promoted**: THREE parallel scoring functions (F-042 quality.rs + F-049 regime_labels.rs + F-057 evolution_math.rs — the GA actually optimizes F-057). **THREE parallel regime systems** (F-013 feature-bucket + F-048 time-window + F-064 ADX/Hurst/EMA). Latent panic (F-053).
+- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041; **quality.rs COMPLETE (786/786)** F-042..F-047; **regime_labels.rs COMPLETE (523/523)** F-048..F-052; **portfolio.rs COMPLETE (345/345)** F-053..F-056; **evolution_math.rs COMPLETE (946/946)** F-057..F-063; **stop_target.rs COMPLETE (958/958)** F-064..F-067; **runtime_overrides.rs COMPLETE (795/795)** F-068..F-069. Total findings: 69. **Architectural smell**: THREE parallel scoring functions (F-042+F-049+F-057), THREE parallel regime systems (F-013+F-048+F-064). Latent panic (F-053). **GOOD NEWS**: F-068 verifies `CostProfileRuntimeOverrides` already provides the typed boundary F-003 needs.
 
 ## Audit progress
 | Crate | File | Lines | Status |
@@ -788,7 +818,7 @@ This module is the **third regime-classifier**, also implementing volatility est
 | neoethos-search | portfolio.rs | 345 | COMPLETE |
 | neoethos-search | genetic/evolution_math.rs | 946 | COMPLETE |
 | neoethos-search | stop_target.rs | 958 | COMPLETE |
-| neoethos-search | genetic/runtime_overrides.rs | 795 | next |
+| neoethos-search | genetic/runtime_overrides.rs | 795 | COMPLETE (template) |
 | neoethos-search | genetic/diversity.rs | 219 | pending |
 | neoethos-search | genetic/mod.rs | 45 | pending |
 | neoethos-search | lib.rs | 1017 | pending |
@@ -812,4 +842,4 @@ This module is the **third regime-classifier**, also implementing volatility est
 | neoethos-data | core/*.rs | ? | pending |
 | ... | further crates | ... | pending |
 
-**neoethos-search progress: 14 of 31 files COMPLETE (≈ 12382 of 20810 lines = 59%)**
+**neoethos-search progress: 15 of 31 files COMPLETE (≈ 13177 of 20810 lines = 63%)**
