@@ -218,17 +218,67 @@
 
 ---
 
-# Sessions (updated)
-- **2026-05-24 session 1**: scaffolded ledger; audited **eval.rs COMPLETE (1211/1211)** — F-001 to F-006. Audited **discovery.rs COMPLETE (2900/2900)** — F-007 to F-019. Total findings so far: 19.
+## validation.rs — `crates/neoethos-search/src/validation.rs` (1855 lines, **COMPLETE**)
 
-## Next session targets
-- `crates/neoethos-search/src/validation.rs` (1855 lines)
-- `crates/neoethos-search/src/genetic/search_engine.rs`
-- `crates/neoethos-search/src/genetic/strategy_gene.rs` (template for F-003 fix; verify `for_symbol` shape)
-- `crates/neoethos-search/src/genetic/mod.rs`, `genetic/smc_indicators.rs`
-- `crates/neoethos-search/src/quality.rs`
-- `crates/neoethos-search/src/portfolio.rs`
-- `crates/neoethos-search/src/gauntlet.rs` (F-002 caller site)
-- `crates/neoethos-search/src/parity.rs` (F-002 caller site)
-- `crates/neoethos-data/src/core/hpc_ta.rs`, `timestamps.rs` and feature pipeline
-- engine continues … then app_services, models, CLI/TUI
+Module breakdown: production code lines 1-1277, tests 1280-1855. Most of the production code is artifact-schema/scope/IO boilerplate (Canonical / Walkforward / ForwardTest / LiveExecutionSimulation / PropFirmRisk × { Scope, ArtifactFile, validate, atomic-write, read }). Real logic lives in `compute_prop_firm_risk_summary` (742-836), `walkforward_risk_diagnostics` (884-1008), `embargoed_walkforward_backtest` (1010-1173), and `CombinatorialPurgedCV::split` (1192-1276).
+
+### F-020 (HIGH) — `embargoed_walkforward_backtest` hardcoded min-window thresholds are timeframe-agnostic
+- **Location**: `validation.rs:1054, 1061`
+- **What**: each candidate split must satisfy:
+  - `end - start >= 80` (line 1054, else `break` ends the whole loop)
+  - `(train_end - start) >= 40 && (end - test_start) >= 40` (line 1061, else `continue` skips THIS split)
+- **Why it matters**: 80 bars is meaningless without a timeframe — on M1 that's 80 minutes (≈1.3h), on D1 it's 80 days (≈4 months). With H4 data and `n_rows = 1500` + `n_splits = 5`, `window = 300`, train = 210, test = 70 — passes. But with the same H4 data and `n_splits = 20`, `window = 75 < 80` → entire loop breaks at first iteration → `split_results` empty → walkforward gate fails for "no splits", not "no edge". The break-not-continue at line 1054 makes ALL subsequent splits dead too. Combined with the **F-017 train_ratio mismatch** this means the validation harness can silently produce zero splits without explanation.
+- **Fix**:
+  1. Replace `break` with `continue` at line 1054 so a single small window doesn't kill the rest.
+  2. Convert the thresholds to be expressed as "min N bars OR equivalent time-span (e.g. >= 2 calendar weeks of data)" — let the caller supply both bounds, default the time-bound from `config.timeframe_label`.
+  3. Emit a tracing::warn when a split is skipped so operator sees "skipped split 3/5: train_size 35 < 40 minimum".
+- **Severity**: HIGH (silent gate failure mode on small-window timeframes)
+
+### F-021 (MEDIUM) — Walkforward silently degrades timestamps → days when length mismatches
+- **Location**: `validation.rs:921-926` (inside `walkforward_risk_diagnostics`) and `1071-1075` (inside `embargoed_walkforward_backtest`)
+- **What**: both helpers contain `let ts = if timestamps.len() == close.len() { timestamps } else { days };` — when the timestamps array length doesn't match, simulation falls back to using the `days` array as timestamps. `simulate_trades_core` uses timestamps for: gap detection (lookahead at session boundaries), kill-zone rules, intraday session classification. Day-level "timestamps" make all of these coarse-grained or wrong.
+- **Why it matters**: a caller bug (passing wrong-length array) becomes a silent quality degradation instead of a hard failure. The walkforward summary will look valid but the simulation underneath is not.
+- **Fix**: change the fallback to a hard `bail!("timestamps length must match close length OR be empty")` — empty is the documented "no timestamps available" path (line 845-846 of `WalkforwardBacktestInput` says "ms or ns" but doesn't mention empty as a valid input — clean this up too).
+- **Severity**: MEDIUM (caller-bug-masking)
+
+### F-022 (MEDIUM) — `normalized_pct_threshold` boundary ambiguity at value=1.0
+- **Location**: `validation.rs:874-882`
+- **What**: the helper accepts pct in two forms: fraction (e.g. `0.05` = 5%) or percentage-points (e.g. `5.0` = 5%). It picks based on `value > 1.0`. The boundary value `1.0` is treated as a fraction (= 100%), NOT as "1 percent". A config writer who sets `max_daily_loss_pct: 1.0` expecting "1% max daily loss" gets `100% max daily loss` (i.e. the gate is disabled).
+- **Why it matters**: silent severe misconfiguration. The 1% daily-loss gate is plausible for some prop firms; writing it as `1.0` is the natural form and the auto-detect gets it backwards.
+- **Fix**: kill the auto-detect. Pick ONE convention (recommend "always pct-points: 5.0 means 5%") and document it on every caller. Validate that callers use the correct form — or rename the field to `max_daily_loss_fraction` to make the unit explicit.
+- **Severity**: MEDIUM (config footgun)
+
+### F-023 (LOW) — `max_profit_consistency_ratio` carries FIXME(hardcoded) marker untouched
+- **Location**: `validation.rs:607`
+- **What**: `PropFirmRiskRules::default()` sets `max_profit_consistency_ratio: 0.50` with an explicit `// FIXME(hardcoded): config-extract — internal consistency-ratio cap.` comment. Per directive 2026-05-14 the rest of the prop-firm defaults come from `PropFirmConstraints::FTMO_STANDARD`, but this one is still inline.
+- **Fix**: add `consistency_ratio_cap` to `PropFirmConstraints` (or `PropFirmChallengeDefaults`) and read it from there.
+- **Severity**: LOW
+
+### F-024 (LOW) — Hardcoded `100_000.0` initial-balance fallback in two places
+- **Location**: `validation.rs:745-749` (`compute_prop_firm_risk_summary`), `903-907` (`walkforward_risk_diagnostics`)
+- **What**: when caller passes a non-finite or non-positive `initial_balance`, both helpers default to `$100,000`. That's the standard FTMO challenge size but the magic number lives in two places and is undocumented.
+- **Fix**: either error out instead of defaulting (force callers to be explicit) or promote to a named constant `DEFAULT_PROP_FIRM_BALANCE` exported from `neoethos_core::domain::prop_firm::PropFirmConstants`.
+- **Severity**: LOW
+
+---
+
+# Sessions (updated)
+- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024. Total findings so far: 24.
+
+## Audit progress
+| Crate | File | Lines | Status |
+|---|---|---|---|
+| neoethos-search | eval.rs | 1211 | COMPLETE |
+| neoethos-search | discovery.rs | 2900 | COMPLETE |
+| neoethos-search | validation.rs | 1855 | COMPLETE |
+| neoethos-search | genetic/search_engine.rs | ? | next |
+| neoethos-search | genetic/strategy_gene.rs | ? | F-003 template; verify |
+| neoethos-search | genetic/mod.rs, smc_indicators.rs | ? | pending |
+| neoethos-search | quality.rs | ? | pending |
+| neoethos-search | portfolio.rs | ? | pending |
+| neoethos-search | gauntlet.rs | ? | F-002 caller |
+| neoethos-search | parity.rs | ? | F-002 caller |
+| neoethos-data | core/hpc_ta.rs | ? | partial #212 |
+| neoethos-data | core/timestamps.rs | ? | pending |
+| neoethos-data | core/*.rs | ? | pending |
+| ... | further crates | ... | pending |
