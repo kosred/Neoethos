@@ -940,10 +940,49 @@ This file is the `#[cfg(feature = "gpu")]` arm of a cfg-conditional duplicated m
 
 ---
 
+## lib.rs — `crates/neoethos-search/src/lib.rs` (1017 lines, **COMPLETE**)
+
+The crate root. Should be thin (module declarations + re-exports). Instead, lines 14-900 contain an inline 886-line implementation that is the F-070 twin of `discovery_gpu.rs`.
+
+### F-077 (CRITICAL) — `lib.rs` IS 1017 lines because it embeds a complete 886-line `discovery_gpu` twin inline
+- **Location**: `lib.rs:14-900` (inline `pub mod discovery_gpu { ... }`)
+- **What**: a crate root file (the place where new readers go to understand the public API) is 87% filled with a CPU-fallback implementation of GPU discovery. The actual module-root concerns (declarations + re-exports) occupy lines 1-12 + 902-1017 = ~120 lines. The other 886 lines are an entire alternative impl of `GpuDiscoveryConfig`, `GpuDiscoveryResult`, `run_gpu_discovery`, `save_gpu_genomes`, plus their tests.
+- **Why it matters**:
+  1. lib.rs is supposed to be a thin module-root showing the public API surface. Right now it's a 1000-line wall of code that obscures the API.
+  2. The 886-line CPU-twin reproduces virtually all GA logic (selection, survivors, immigrants, crossover) of the GPU twin in `discovery_gpu.rs`. Lines 730-806 here are essentially copy-paste of lines 442-555 in discovery_gpu.rs.
+  3. The CPU-twin imports `BacktestSettings` and `infer_market_cost_profile` (lines 17-19) — meaning it ACTUALLY has a path to F-002 fixes that the GPU twin doesn't (the GPU twin uses the hardcoded 0.0002 cost). So the two impls have DIFFERENT cost-model coverage on top of having different backends. Drift risk × 2.
+- **Total duplication**: 1028 (discovery_gpu.rs) + 886 (lib.rs inline) = **1914 lines of cfg-conditional twin code** that should be ONE module structured around backend trait + shared GA loop.
+- **Fix**: tracked under F-070. The inline `pub mod discovery_gpu { ... }` in lib.rs:14-900 gets extracted to `src/discovery_gpu/cpu.rs` and the file `discovery_gpu.rs` becomes `discovery_gpu/gpu.rs`. Module root becomes:
+  ```rust
+  pub mod discovery_gpu {
+      mod config;       // shared struct definitions
+      #[cfg(feature = "gpu")] mod gpu;
+      #[cfg(not(feature = "gpu"))] mod cpu;
+      mod ga_loop;      // shared selection/crossover/immigrant logic
+      pub use config::*; pub use ga_loop::*;
+      #[cfg(feature = "gpu")] pub use gpu::*;
+      #[cfg(not(feature = "gpu"))] pub use cpu::*;
+  }
+  ```
+  After this lib.rs drops to ~150 lines (module decls + re-exports only).
+- **Severity**: CRITICAL (matches the operator dedup directive head-on)
+
+### F-078 (NOTE) — `install_search_runtime_overrides_from_env()` is the canonical bootstrap
+- **Location**: `lib.rs:988-995`
+- **What**: a single convenience entry point that installs ALL the typed runtime overrides at startup. Production binaries (`neoethos-cli`, `neoethos-app`) call this once and `neoethos-search` then never reads `std::env` again.
+- **Severity**: NONE — reference pattern. When new `*RuntimeOverrides` structs land (per F-068 template), they should be added to this bootstrap.
+
+### F-079 (LOW) — Re-export surface is clean but huge
+- **Location**: `lib.rs:934-1017`
+- **What**: `pub use` re-exports span 80+ symbols. The block looks fine, but a re-export surface this size suggests the crate's public API is wide enough that a `prelude` module would help (e.g. `neoethos_search::prelude::*` for the 10 most common imports).
+- **Severity**: LOW (ergonomics, not correctness)
+
+---
+
 ---
 
 # Sessions (updated)
-- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041; **quality.rs COMPLETE (786/786)** F-042..F-047; **regime_labels.rs COMPLETE (523/523)** F-048..F-052; **portfolio.rs COMPLETE (345/345)** F-053..F-056; **evolution_math.rs COMPLETE (946/946)** F-057..F-063; **stop_target.rs COMPLETE (958/958)** F-064..F-067; **runtime_overrides.rs COMPLETE (795/795)** F-068..F-069; **discovery_gpu.rs COMPLETE (1028/1028)** F-070..F-076. Total findings: 76. **BIG DUPLICATION DISCOVERED**: F-070 — discovery_gpu.rs (1028 lines, gpu) + lib.rs inline twin (~610 lines, no-gpu) are dual implementations of the SAME module. F-071 — GPU fitness model is fundamentally different (returns-based, no SL/TP, hardcoded 0.0002 cost — synthetic data violation).
+- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041; **quality.rs COMPLETE (786/786)** F-042..F-047; **regime_labels.rs COMPLETE (523/523)** F-048..F-052; **portfolio.rs COMPLETE (345/345)** F-053..F-056; **evolution_math.rs COMPLETE (946/946)** F-057..F-063; **stop_target.rs COMPLETE (958/958)** F-064..F-067; **runtime_overrides.rs COMPLETE (795/795)** F-068..F-069; **discovery_gpu.rs COMPLETE (1028/1028)** F-070..F-076; **lib.rs COMPLETE (1017/1017)** F-077..F-079. Total findings: 79. **TOTAL DUPLICATION CONFIRMED**: F-077 — lib.rs:14-900 contains the inline 886-line twin. Combined with discovery_gpu.rs (1028) = **1914 lines of cfg-conditional twin code** to dedup.
 
 ## Audit progress
 | Crate | File | Lines | Status |
@@ -963,7 +1002,7 @@ This file is the `#[cfg(feature = "gpu")]` arm of a cfg-conditional duplicated m
 | neoethos-search | stop_target.rs | 958 | COMPLETE |
 | neoethos-search | genetic/runtime_overrides.rs | 795 | COMPLETE (template) |
 | neoethos-search | discovery_gpu.rs | 1028 | COMPLETE (delete candidate) |
-| neoethos-search | lib.rs (inline discovery_gpu) | ~610 | partial (F-070 — twin of above) |
+| neoethos-search | lib.rs | 1017 | COMPLETE (incl. 886-line F-077 inline twin) |
 | neoethos-search | genetic/diversity.rs | 219 | pending |
 | neoethos-search | genetic/mod.rs | 45 | pending |
 | neoethos-search | lib.rs | 1017 | pending |
@@ -987,4 +1026,4 @@ This file is the `#[cfg(feature = "gpu")]` arm of a cfg-conditional duplicated m
 | neoethos-data | core/*.rs | ? | pending |
 | ... | further crates | ... | pending |
 
-**neoethos-search progress: 16 of 31 files COMPLETE (≈ 14205 of 20810 lines = 68%)**
+**neoethos-search progress: 17 of 31 files COMPLETE (≈ 15222 of 20810 lines = 73%)**
