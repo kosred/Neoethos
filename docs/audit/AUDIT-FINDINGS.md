@@ -979,10 +979,51 @@ The crate root. Should be thin (module declarations + re-exports). Instead, line
 
 ---
 
+## cubecl_eval.rs — `crates/neoethos-search/src/cubecl_eval.rs` (1078 lines, **COMPLETE**)
+
+This is the **canonical SL/TP-faithful GPU evaluator** the doc-comment in `discovery_gpu.rs:344` redirects users to. Implements the CPU `fast_evaluate_strategy_core` semantics inside a cubecl CUDA kernel: half-spread at entry, real commission, pip_value_per_lot, gap-stop, kill-zones, monthly-PnL aggregation. Math is textbook-correct.
+
+### F-080 (REFERENCE) — cubecl_eval is the SL/TP-faithful canonical GPU path; discovery_gpu.rs should defer to it
+- **Location**: `cubecl_eval.rs:111-465` (`backtest_population_kernel`) + `946-1076` (`try_evaluate_population_cuda` host-side wrapper)
+- **What**: this kernel uses **real** BacktestSettings (line 914-929 passes spread_pips, commission_per_trade, pip_value_per_lot, trailing_*, etc. to the kernel). Half-spread at entry (line 411): `entry_px.store(close_pips[i] + (s as f32) * spread_pips * 0.5);`. Real causal entry (line 404-405): `// Causal entry: read PRIOR-bar signal, fill at CURRENT-bar close.`
+- **Why it matters**:
+  1. This is the GPU path that should be used. The F-071 problem (discovery_gpu.rs's 0.0002 synthetic cost) doesn't exist here.
+  2. Strengthens the case for F-070 fix: DELETE discovery_gpu.rs entirely and use cubecl_eval directly. The `evaluate_population_core` in eval.rs ALREADY routes through this when `gpu` feature is enabled (verified via callers).
+- **Severity**: NONE — reference. But it reframes F-070/F-071: discovery_gpu.rs isn't just dup, it's the WRONG GPU path while a CORRECT one (this file) exists.
+
+### F-081 (MEDIUM) — Profit-factor cap diverges between GPU and CPU paths
+- **Location**: `cubecl_eval.rs:437, 439` (cap = 10.0) vs `quality.rs:218-221` (cap = 100.0, F-046)
+- **What**: GPU kernel caps PF at 10.0 (`pf_cell.store((final_gp / final_gl).min(10.0))`). CPU quality.rs caps at 100.0. Same concept, two limits.
+- **Why it matters**: a strategy with PF = 50 gets reported as PF=10 by GPU and PF=50 by CPU. Cross-path comparisons (e.g. parity tests) will see drift.
+- **Fix**: define `PROFIT_FACTOR_CAP` constant in `eval/metrics.rs` and use it from both paths.
+- **Severity**: MEDIUM
+
+### F-082 (LOW) — Magic `3.4641` for monthly→annual Sharpe
+- **Location**: `cubecl_eval.rs:1048`
+- **What**: `sharpe = (avg_m / std_m) * 3.4641` — 3.4641 ≈ √12 (months per year). Standard annualization for monthly returns. Correct math but the constant is uncommented.
+- **Fix**: name as `const SQRT_MONTHS_PER_YEAR: f64 = 3.4641016151377544;` or compute inline as `(12.0_f64).sqrt()`.
+- **Severity**: LOW
+
+### F-083 (MEDIUM) — Two different metric-array widths in the same crate (7 vs 11)
+- **Location**: `cubecl_eval.rs:11` (`BACKTEST_CORE_METRIC_WIDTH = 7`) vs `eval.rs` 11-element layout (F-001)
+- **What**: GPU kernel emits 7 raw metrics (net_profit, peak, max_dd, win_rate, pf, expectancy, max_daily_dd). Host-side wrapper at line 1060-1072 EXPANDS to 11-wide by inserting computed sharpe + consistency. So the "11-element metric array" actually has TWO different layouts:
+  - GPU path: 7-raw + sharpe + 0.0 (slot 7) + trade_count + consistency + 1 more raw
+  - CPU path: 11 fields packed differently with phantom slot at index 7
+- **Why it matters**: F-001 noted the phantom slot 7. Looking at GPU result composition (line 1068), it ALSO uses `0.0` at slot 7. So the phantom slot is BAKED INTO the protocol between GPU and CPU paths. F-001's "shrink to [f64; 10]" fix has to coordinate with this file.
+- **Fix**: tracked under F-001 — convert to named-field struct, update both paths atomically.
+- **Severity**: MEDIUM (cross-path coordination requirement)
+
+### F-084 (NOTE) — Defensive env-var handling for CUDA device + precision
+- **Location**: `cubecl_eval.rs:549-571` (`cuda_device_id`), `489-499` (`requested_eval_precision`)
+- **What**: explicit `tracing::warn!` when `FOREX_BOT_SEARCH_EVAL_CUDA_DEVICE` is set to a non-parseable value ("auto", "all", typo). Previously silently fell back to device 0; now shouts. Good operator-facing diagnostic, matches the F-076 pattern.
+- **Severity**: NONE — reference example.
+
+---
+
 ---
 
 # Sessions (updated)
-- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041; **quality.rs COMPLETE (786/786)** F-042..F-047; **regime_labels.rs COMPLETE (523/523)** F-048..F-052; **portfolio.rs COMPLETE (345/345)** F-053..F-056; **evolution_math.rs COMPLETE (946/946)** F-057..F-063; **stop_target.rs COMPLETE (958/958)** F-064..F-067; **runtime_overrides.rs COMPLETE (795/795)** F-068..F-069; **discovery_gpu.rs COMPLETE (1028/1028)** F-070..F-076; **lib.rs COMPLETE (1017/1017)** F-077..F-079. Total findings: 79. **TOTAL DUPLICATION CONFIRMED**: F-077 — lib.rs:14-900 contains the inline 886-line twin. Combined with discovery_gpu.rs (1028) = **1914 lines of cfg-conditional twin code** to dedup.
+- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041; **quality.rs COMPLETE (786/786)** F-042..F-047; **regime_labels.rs COMPLETE (523/523)** F-048..F-052; **portfolio.rs COMPLETE (345/345)** F-053..F-056; **evolution_math.rs COMPLETE (946/946)** F-057..F-063; **stop_target.rs COMPLETE (958/958)** F-064..F-067; **runtime_overrides.rs COMPLETE (795/795)** F-068..F-069; **discovery_gpu.rs COMPLETE (1028/1028)** F-070..F-076; **lib.rs COMPLETE (1017/1017)** F-077..F-079; **cubecl_eval.rs COMPLETE (1078/1078)** F-080..F-084. Total findings: 84. **GPU PATH CLARIFIED**: F-080 — cubecl_eval is the SL/TP-faithful canonical GPU path. discovery_gpu.rs (F-070/F-071) is the WRONG GPU path while a CORRECT one already exists → fix is delete discovery_gpu, route everything through cubecl_eval.
 
 ## Audit progress
 | Crate | File | Lines | Status |
@@ -1003,6 +1044,7 @@ The crate root. Should be thin (module declarations + re-exports). Instead, line
 | neoethos-search | genetic/runtime_overrides.rs | 795 | COMPLETE (template) |
 | neoethos-search | discovery_gpu.rs | 1028 | COMPLETE (delete candidate) |
 | neoethos-search | lib.rs | 1017 | COMPLETE (incl. 886-line F-077 inline twin) |
+| neoethos-search | cubecl_eval.rs | 1078 | COMPLETE (canonical GPU) |
 | neoethos-search | genetic/diversity.rs | 219 | pending |
 | neoethos-search | genetic/mod.rs | 45 | pending |
 | neoethos-search | lib.rs | 1017 | pending |
@@ -1026,4 +1068,4 @@ The crate root. Should be thin (module declarations + re-exports). Instead, line
 | neoethos-data | core/*.rs | ? | pending |
 | ... | further crates | ... | pending |
 
-**neoethos-search progress: 17 of 31 files COMPLETE (≈ 15222 of 20810 lines = 73%)**
+**neoethos-search progress: 18 of 31 files COMPLETE (≈ 16300 of 20810 lines = 78%)**
