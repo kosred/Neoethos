@@ -26,6 +26,72 @@
 
 **Root cause picture**: F-002 + F-003 explain why bug #214 ("cost-model called with empty symbol") was surface-fixed only. The cost-profile leak hits 4 production sites because nobody implemented the `for_symbol` method the comment says they should. **F-003 is the single change that unblocks fixing F-002/F-012/F-025/F-033/F-050 in one go.**
 
+## Strategic doctrine (operator directive 2026-05-24)
+
+Three principles the user has set for the eventual batch-fix phase:
+
+### 1. NO synthetic data anywhere
+
+Every "synthetic fallback" identified in the audit must die. The ban applies in priority order:
+1. **Cost profile** — F-002/F-003/F-029: no EURUSD "default" symbol, no flat $7 commission default, no asset-class default spreads. If broker metadata is missing, **`bail!`**, do not fall back. The `FOREX_BOT_ALLOW_SYNTHETIC_SPREADS=1` opt-in proposed in F-029 is also rejected — there is no opt-in for synthetic data.
+2. **Stop/target inference** — F-030/F-034/F-059: kill the `(20.0, 40.0)` SL/TP fallbacks, the `pip_size = 0.0001` fallback, the `(15.0, 30.0)` initial gene SL/TP. Genes whose stop/target cannot be inferred from real volatility/structure get discarded, not patched.
+3. **Initial balance** — F-024: no `100_000.0` default. The caller passes a real account size or the function errors.
+4. **Test fixtures** — parity.rs and eval.rs tests use hand-crafted price sequences. Migrate to **cached real broker samples** (e.g. one M5 EURUSD bar window pulled from cTrader + frozen as a fixture file). The "TODO(real-data)" comments at parity.rs:118-121 explicitly say this.
+5. **Threshold-quantization env switch** — F-058 `FOREX_BOT_NORMALIZE_FEATURES`: pick ONE convention based on what the real feature pipeline emits and commit to it. No env-driven duality.
+
+### 2. Deduplicate parallel implementations
+
+The audit found three families of "same conceptual job, multiple unreconciled impls":
+
+| Concept | Locations | Resolution |
+|---|---|---|
+| **Strategy scoring** | F-042 (`quality::score_strategy`) + F-049 (`regime_labels::window_quality_score`) + F-057 (`evolution_math::score_from_metrics`) | New `scoring/mod.rs` with shared "ingredient" functions (sharpe_component, dd_penalty, pf_component). Three top-level functions (`ga_fitness`, `quality_score`, `window_score`) share the ingredients but expose their weighting explicitly. Operator can read all three formulas in one file and see what differs. |
+| **Regime classification** | F-013 (feature-bucket with dead-zones, in `discovery.rs`) + F-048 (time-window, in `regime_labels.rs`) + F-064 (ADX/Hurst/EMA, in `stop_target.rs`) | F-064 is the most rigorous → promote to canonical `regime/classifier.rs`. F-013 and F-048 migrate to call into it (F-013 gets its dead-zones eliminated by switching to F-064's clean cascade). |
+| **Backtest core** | F-004: `fast_evaluate_strategy_core` and `simulate_trades_core` in `eval.rs` are two near-identical loops | Extract shared `eval/step.rs` `step_one_bar(...)` function. Both variants call it; their only difference is whether they accumulate `Trade` records. |
+| **F-002 EURUSD-leak pattern** | 4 call sites (discovery.rs:710, gauntlet.rs:60, search_engine.rs:355 + 450) all share `..BacktestSettings::default()` | Once F-003 lands, all 4 sites change in one PR. Then ban `BacktestSettings::default()` from production (compile gate: `#[cfg(test)]` only). |
+
+### 3. Shared file modules (the new layout)
+
+After audit completion, the search crate gets restructured around shared modules — **not bigger, more focused**:
+
+```
+crates/neoethos-search/src/
+├── eval/
+│   ├── mod.rs              # public API (was eval.rs)
+│   ├── step.rs             # NEW: shared per-bar simulation step (F-004 fix)
+│   ├── settings.rs         # NEW: BacktestSettings + for_symbol (F-003 fix)
+│   └── metrics.rs          # NEW: BacktestMetrics + named-field round-trip (F-001 fix)
+├── scoring/
+│   ├── mod.rs              # NEW: ingredient functions
+│   ├── ga_fitness.rs       # NEW: was evolution_math::score_from_metrics (F-057)
+│   ├── quality.rs          # was quality.rs::score_strategy (F-042)
+│   └── window.rs           # was regime_labels::window_quality_score (F-049)
+├── regime/
+│   ├── mod.rs              # NEW: canonical regime API
+│   ├── classifier.rs       # NEW: was stop_target::infer_regime (F-064 promoted)
+│   ├── feature_view.rs     # was discovery::validate_regime_robustness (F-013 migrated)
+│   └── time_window.rs      # was regime_labels (F-048 migrated)
+└── ... (rest unchanged)
+```
+
+This is **structural**, not behavioural. We're not rewriting the engine — we're putting the right pieces in the right files so the duplication becomes visible to the next reader.
+
+### 4. Safety doctrine ("πάνω από όλα να μην σπάσουμε")
+
+Migration order that does NOT break the running system:
+
+1. **Audit FIRST, completely**. Finish reading all 269 files. Don't touch any code until the ledger is complete and every "synthetic" / "duplicate" call site is catalogued.
+2. **Plan, then skeleton**. For each shared module: write the skeleton (struct + signature + doc) as a new file. NO IMPLEMENTATION YET. Get the type system to compile against the new layout while the OLD functions are still the implementation. This is just renaming + re-exporting in the first pass.
+3. **Migrate one call site per commit**. Adapter shims: when migrating callers from `BacktestSettings::default()` to `for_symbol(...)`, keep `default()` as `#[deprecated]` re-export of `for_symbol("EURUSD", "USD", ...)` for ONE release cycle so persisted artifacts continue to deserialize. Then delete.
+4. **Schema-version bump persisted artifacts** when scoring functions unify. Old discovery profiles with `score_strategy_v1` results keep working; new runs produce `score_strategy_v2`.
+5. **Tests stay green at every commit**. Run `cargo test -p neoethos-search` after each migration step. No "I'll fix the tests at the end" — that's how things stay broken.
+6. **Build only ONCE per session** (per the existing build policy). Use `cargo check` (no codegen) during refactor; `cargo build --release` once at the end.
+
+The single biggest risk is the **scoring function unification (F-057)**. The GA's fitness landscape changes if we touch `score_from_metrics`. Mitigations:
+- Keep the existing formula intact for v1. The new `scoring/ga_fitness.rs` is byte-for-byte identical at first.
+- Then add a `scoring_version: u32` field to `DiscoveryRunProfile`. Old artifacts have `scoring_version=1`.
+- When we eventually update the formula (e.g. unifying with quality_score's better calibration), bump to v2 and document the formula change in the changelog.
+
 ## Scope
 
 | Crate | Files | Lines | Audit status |
