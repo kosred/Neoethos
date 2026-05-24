@@ -421,10 +421,64 @@ Internally calls `infer_market_cost_profile(...)` and overrides the 6 cost-profi
 
 ---
 
+## genetic/smc_indicators.rs — `crates/neoethos-search/src/genetic/smc_indicators.rs` (659 lines, **COMPLETE**)
+
+This module computes/derives 11 SMC indicator arrays from either OHLCV alone (`derive_smc_arrays`, lines 335-510) or feature-frame columns when present (`build_smc_arrays`, lines 512-659). Both paths produce the same 11-tuple consumed by the evaluator.
+
+### F-038 (HIGH) — SMC derivation lookback windows are timeframe-agnostic
+- **Location**: `smc_indicators.rs:365-367` (declaration), used throughout 369-495
+- **What**: three hardcoded lookback windows are baked in:
+  - `lookback = 12` — used for trend (close[i] vs close[i-12]) and BoS (close vs 12-bar high/low)
+  - `eq_lookback = 20` — equal-highs/lows tolerance over 20 bars
+  - `displacement_lookback = 20` — body vs average body over 20 bars
+- **Why it matters**: on M1 data 12 bars = 12 minutes, on H4 = 48 hours, on D1 = 12 days. The "trend" and "BoS" definitions become wildly different things across timeframes. A "12-bar trend" on M1 is intraday noise; on D1 it's a multi-week move. A strategy whose SMC signals depend on these gives different trade counts on the same symbol at different TFs purely because of the lookback semantics, not because of the strategy logic.
+- **Fix**:
+  1. Express lookbacks as time-units (minutes/hours) instead of bars, then convert to bar-count at runtime using `timeframe_label` minutes/bar.
+  2. Or expose as `SmcDerivationConfig { trend_lookback_bars, eq_lookback_bars, displacement_lookback_bars }` so per-TF tuning is possible.
+- **Severity**: HIGH (SMC signal semantics drift across timeframes)
+
+### F-039 (MEDIUM) — `derive_smc_arrays` heuristics diverge from textbook SMC, silent fallback when feature columns absent
+- **Location**: `smc_indicators.rs:335-510` — `derive_smc_arrays`
+- **What**: when the feature frame doesn't carry pre-computed SMC columns (`smc_ob`, `smc_fvg`, etc.), the engine falls back to these simplified heuristics:
+  - "Order Block" (393-406): bull/bear ENGULFING pattern. Textbook OB requires a structure break (BoS) first — this implementation doesn't.
+  - "Fair Value Gap" (416-422): bar-pair gap between bar[i-2] and bar[i] — closer to textbook but ignores sweep/context.
+  - "Liquidity sweep" (424-436): 3-bar low/high penetrate-and-close-back — textbook requires session/swing context.
+  - "Inducement" (408-413): just a high-wick or low-wick > 2× body — textbook needs broader structural context.
+- **Why it matters**: a user who doesn't ship SMC columns through the feature pipeline gets "SMC" signals that are simplified caricatures. The system is named "SMC-based" but degrades silently to toy patterns. No warning, no log, no documentation that this fallback is active.
+- **Fix**:
+  1. At `build_smc_arrays` entry, log `tracing::warn!` listing WHICH SMC columns were missing → derived. Operator can then see "5 of 11 SMC columns derived heuristically".
+  2. Add a strict mode env (`FOREX_BOT_REQUIRE_REAL_SMC_COLUMNS=1`) that BAILS when any SMC column is missing — for production users who need real SMC, not toy heuristics.
+- **Severity**: MEDIUM (silent fallback to simplified logic)
+
+### F-040 (MEDIUM) — `apply_dir_fill_zeros` pattern conflates separate signals
+- **Location**: `smc_indicators.rs:624-629`
+- **What**:
+  ```
+  apply_dir_fill_zeros(&mut ob, cols.bos);     // ob inherits bos's non-zero values
+  apply_dir_fill_zeros(&mut ob, cols.choch);   // ob inherits choch's non-zero values too
+  apply_dir_fill_zeros(&mut trend, cols.bos);
+  apply_dir_fill_zeros(&mut trend, cols.choch);
+  apply_dir_fill_zeros(&mut trend, cols.displacement);
+  ```
+- **Why it matters**: if BoS column has data but OB column doesn't, OB's zeros get filled with BoS's values. The gene's `use_ob` flag then activates against what is really BoS data. The signal carries the wrong semantic label. Likewise trend ends up being a mix of trend/bos/choch/displacement. The gating logic in the evaluator can't distinguish "the user said OB" from "we filled OB with BoS".
+- **Fix**: drop the fill-zeros pattern — let signals stay zero when their column is missing. If a gene has `use_ob=true` and no OB data, the gate evaluates against zero (which fails the gate naturally) — better than silently substituting another signal.
+- **Severity**: MEDIUM (semantic label drift in gated signals)
+
+### F-041 (LOW) — Magic threshold constants in heuristic SMC derivation
+- **Location**: `smc_indicators.rs:411, 463, 485`
+- **What**:
+  - Line 411: `(upper / body) > 2.0 || (lower / body) > 2.0` — magic 2.0 wick-to-body ratio for inducement
+  - Line 463: `tol = (avg_range * 0.1).max(1e-9)` — magic 10% of avg range as equal-highs/lows tolerance
+  - Line 485: `body >= (1.8 * avg_body)` — magic 1.8× threshold for displacement
+- **Fix**: promote to named constants with doc OR put on the `SmcDerivationConfig` proposed in F-038.
+- **Severity**: LOW
+
+---
+
 ---
 
 # Sessions (updated)
-- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037. Total findings: 37. Verified `EvaluationConfig::for_symbol` shape for F-003 template. **F-002 EURUSD-leak now confirmed at 4 production sites** (discovery.rs:710, gauntlet.rs:60, search_engine.rs:355 + 450).
+- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031; **search_engine.rs COMPLETE (1060/1060)** F-032..F-037; **smc_indicators.rs COMPLETE (659/659)** F-038..F-041. Total findings: 41. Verified `EvaluationConfig::for_symbol` shape for F-003 template. **F-002 EURUSD-leak confirmed at 4 production sites** (discovery.rs:710, gauntlet.rs:60, search_engine.rs:355 + 450).
 
 ## Audit progress
 | Crate | File | Lines | Status |
@@ -436,7 +490,7 @@ Internally calls `infer_market_cost_profile(...)` and overrides the 6 cost-profi
 | neoethos-search | parity.rs | 315 | COMPLETE |
 | neoethos-search | genetic/strategy_gene.rs | 649 | COMPLETE (F-003 template) |
 | neoethos-search | genetic/search_engine.rs | 1060 | COMPLETE |
-| neoethos-search | genetic/smc_indicators.rs | 659 | pending |
+| neoethos-search | genetic/smc_indicators.rs | 659 | COMPLETE |
 | neoethos-search | genetic/evolution_math.rs | 946 | pending |
 | neoethos-search | genetic/runtime_overrides.rs | 795 | pending |
 | neoethos-search | genetic/regime_labels.rs | 523 | pending |
@@ -465,4 +519,4 @@ Internally calls `infer_market_cost_profile(...)` and overrides the 6 cost-profi
 | neoethos-data | core/*.rs | ? | pending |
 | ... | further crates | ... | pending |
 
-**neoethos-search progress: 8 of 31 files COMPLETE (≈ 8160 of 20810 lines = 39%)**
+**neoethos-search progress: 9 of 31 files COMPLETE (≈ 8820 of 20810 lines = 42%)**
