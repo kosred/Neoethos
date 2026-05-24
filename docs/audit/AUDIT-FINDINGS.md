@@ -26,7 +26,8 @@
 | **F-070** | **CRITICAL** | **DUAL `discovery_gpu` module**: `discovery_gpu.rs` (1028 lines, gpu feature) + `lib.rs::discovery_gpu` (inline ~610 lines, no-gpu feature). Same structs + functions, different backend. Single biggest dedup target in the crate. |
 | **F-071** | **CRITICAL** | GPU discovery uses returns-based fitness with hardcoded `0.0002` cost — synthetic data violation. The doc-comment ADMITS "not equivalent to the CPU GA". Algorithm-level divergence: GPU flag picks DIFFERENT strategies. |
 | F-073 | HIGH | `discovery_gpu.rs:822` hardcodes `1440` M1-bars/day denominator — silently wrong fitness on H1/H4/D1 data. |
-| **F-092 + F-094** | **CRITICAL** | `hpc.rs` (324 LOC) + `hpc_gpu_discovery.rs` (894 LOC) = **1218 LOC ORPHAN feature-gated dead code**. Verified 0 external callers across the entire workspace. Both gated to Hyperstack-N3-specific topology (8 A6000s, 252 cores, 464GB RAM). Decision: **DELETE both**. Replace with ~50-line generic multi-GPU helper if/when measurements justify. |
+| **F-092 + F-094** | **CRITICAL** | `hpc.rs` (324 LOC) + `hpc_gpu_discovery.rs` (894 LOC) = **1218 LOC ORPHAN feature-gated dead code**. Verified 0 external callers across the entire workspace. Both gated to Hyperstack-N3-specific topology (8 A6000s, 252 cores, 464GB RAM). Decision: **DELETE both**. Replace with ~50-line generic multi-GPU helper (`available_cuda_devices()`, `optimal_chunk_size_for_device(id)`) that scales from 1 to N GPUs without hardware-specific assumptions. |
+| **F-096** | **CRITICAL** | No pre-flight historical-data sufficiency check — discovery/training/validation run on any non-empty data set, even 6 months of bars. Operator directive: **always >= 10 years per symbol or `bail!`**. Pre-flight order: (a) user-imported via Data Bootstrap → use; (b) else auto-fetch ≥10y from cTrader + cache; (c) else `bail!` naming the symbol + actual coverage. The synthetic-data ban is incomplete without this — insufficient real data is just as bad as synthetic. |
 
 **Root cause picture**: F-002 + F-003 explain why bug #214 ("cost-model called with empty symbol") was surface-fixed only. The cost-profile leak hits 4 production sites because nobody implemented the `for_symbol` method the comment says they should. **F-003 is the single change that unblocks fixing F-002/F-012/F-025/F-033/F-050 in one go.**
 
@@ -34,14 +35,25 @@
 
 Three principles the user has set for the eventual batch-fix phase:
 
-### 1. NO synthetic data anywhere
+### 1. NO synthetic data anywhere — REAL DATA POLICY (operator directive 2026-05-24)
 
-Every "synthetic fallback" identified in the audit must die. The ban applies in priority order:
-1. **Cost profile** — F-002/F-003/F-029: no EURUSD "default" symbol, no flat $7 commission default, no asset-class default spreads. If broker metadata is missing, **`bail!`**, do not fall back. The `FOREX_BOT_ALLOW_SYNTHETIC_SPREADS=1` opt-in proposed in F-029 is also rejected — there is no opt-in for synthetic data.
-2. **Stop/target inference** — F-030/F-034/F-059: kill the `(20.0, 40.0)` SL/TP fallbacks, the `pip_size = 0.0001` fallback, the `(15.0, 30.0)` initial gene SL/TP. Genes whose stop/target cannot be inferred from real volatility/structure get discarded, not patched.
-3. **Initial balance** — F-024: no `100_000.0` default. The caller passes a real account size or the function errors.
-4. **Test fixtures** — parity.rs and eval.rs tests use hand-crafted price sequences. Migrate to **cached real broker samples** (e.g. one M5 EURUSD bar window pulled from cTrader + frozen as a fixture file). The "TODO(real-data)" comments at parity.rs:118-121 explicitly say this.
-5. **Threshold-quantization env switch** — F-058 `FOREX_BOT_NORMALIZE_FEATURES`: pick ONE convention based on what the real feature pipeline emits and commit to it. No env-driven duality.
+Every "synthetic fallback" identified in the audit must die. **Replacement policy** for cases where current code falls back to synthetic:
+
+**Triple-source policy** for every "data needed but missing" situation:
+1. **User-provided real data** — first preference. Already supported via Data Bootstrap import (MT5/MT4 CSV, Parquet — task #192 completed). Discovery / training MUST use user-imported data when present.
+2. **Auto-fetch ≥10 years per symbol** — if user hasn't provided data for the symbol being requested, auto-fetch from the live cTrader history API a MINIMUM of 10 years of bars before the run starts. Cache persistently so subsequent runs don't re-fetch.
+3. **`bail!` with specific cause** — ONLY when neither (1) nor (2) is possible (e.g. cTrader doesn't have 10y for an exotic / recent-IPO symbol). Error message names exactly what's missing so the user can decide (use less data, pick a different symbol, or import their own history).
+
+There is **NO fourth option**. No EURUSD-fallback, no synthetic-spread-by-asset-class, no $100k-default-balance, no 0.0002-flat-cost. The previous `FOREX_BOT_ALLOW_SYNTHETIC_*=1` env opt-ins are rejected — there is no opt-in for synthetic data.
+
+The ban applies in priority order across the audit findings:
+
+1. **Cost profile** — F-002/F-003/F-029/F-074: kill the EURUSD default, the per-asset-class default spreads (metal 2.5 / crypto 8 / fx 1.5), the flat $7 commission, the GPU's 0.0002 magic. Replace with `BacktestSettings::for_symbol(...)` populated from real cTrader symbol metadata. When metadata is missing, attempt auto-fetch; if cTrader doesn't ship typical_spread_pips for that symbol, `bail!` with the symbol name in the error.
+2. **Stop/target inference** — F-030/F-034/F-059: kill the (20.0, 40.0) SL/TP fallbacks, the pip_size = 0.0001 fallback, the (15.0, 30.0) initial gene SL/TP. Stops come from real volatility/structure (stop_target.rs already does this — just need to error on insufficient bars instead of falling back).
+3. **Initial balance** — F-024: no $100k default. Caller passes the real account balance from cTrader or errors.
+4. **Historical data sufficiency** — **F-096 (new finding below)**: every discovery/training/validation entry point gets a pre-flight that bails when < 10y of bars are available for the chosen symbol+timeframe. Today's pipelines silently run on whatever data is on disk (could be 6 months) and produce overfit garbage.
+5. **Test fixtures** — parity.rs and eval.rs tests use hand-crafted price sequences. Migrate to **cached real broker samples** (one M5 EURUSD window pulled from cTrader + frozen as a fixture file). The `TODO(real-data)` comment at parity.rs:118-121 says exactly this.
+6. **Threshold-quantization env switch** — F-058 `FOREX_BOT_NORMALIZE_FEATURES`: pick ONE convention based on what the real feature pipeline emits and commit to it. No env-driven duality.
 
 ### 2. Deduplicate parallel implementations
 
@@ -1150,6 +1162,26 @@ These files are smaller or specialist; I list real findings per file and mark th
 - **What**: tests at lines 295-322 toggle the static `HPC_MODE_ACTIVE: AtomicBool` to test gpu_cpu_affinity / is_nvlink_pair. With `force_hpc_mode(true)` followed by `force_hpc_mode(false)`, but if any test panics in the middle, the atomic stays set and bleeds into the next test in the same process.
 - **Fix**: redundant once F-092 deletes the file. If kept for any reason, wrap each test in a guard struct that resets on Drop.
 - **Severity**: LOW (test isolation, deleted by F-092 anyway)
+
+### F-096 (CRITICAL) — No pre-flight check for historical data sufficiency (operator directive 2026-05-24)
+- **Location**: every discovery/training/validation entry point in the crate. Specifically:
+  - `discovery.rs::run_discovery_cycle` (line 1350)
+  - `discovery.rs::run_discovery_cycle_with_progress` (line 1358)
+  - `orchestration.rs::DiscoveryOrchestrator::run_batch` (line 67)
+  - `regime_labels.rs::label_strategies_by_regime_windows` (line 161)
+  - All `validation.rs::compute_*` summaries
+- **What is missing**: there is no check that ensures the loaded OHLCV history covers a meaningful timespan before discovery runs. The only existing precondition is "non-empty" (e.g. `discovery.rs:638` bails on `available_rows == 0`). A symbol with 6 months of M1 data passes the check, runs the GA, and produces strategies that look great in-sample because there's no real cross-market-condition coverage.
+- **Why it matters** (per operator directive): *"αντί για συνθετικά δεδομένα καλό είναι να δουλεύουμε τα δεδομένα που δίνει ο χρήστης ή να κατεβάζουμε τουλάχιστον δέκα χρόνια ανά ζευγάρι."* The synthetic-data ban is incomplete without this — banning EURUSD-fallback doesn't help if the real symbol has only 8 months of bars. The strategies will still be garbage.
+- **Fix**:
+  1. Add `crate::eval::historical_coverage_check(timestamps, settings) -> Result<HistoricalCoverage>` that computes `years_covered = (last_ts - first_ts) / 31_557_600_000`.
+  2. Discovery/training entry points get a config field `min_years_history: f64` (default **10.0**, matching the directive).
+  3. Pipeline pre-flight order:
+     - (a) Check user-imported data (already loaded by Data Bootstrap) — if `years_covered >= min_years_history`, proceed.
+     - (b) Else: attempt `cTrader::fetch_history(symbol, start = now - 10y, end = now)` via the existing broker adapter. Cache to disk under the canonical OHLCV store.
+     - (c) Else: `bail!("symbol {} has only {:.1}y of history available; need >= {:.1}y. \
+            Either import a longer history via Data Bootstrap or pick a different symbol.", symbol, years_covered, min_years_history)`.
+  4. The 10y default is operator-configurable per symbol (some users may want 20y for slow-moving pairs like XAUUSD, some may accept 5y for newer crypto). But the default must NEVER be `0` ("any data is fine") — that's how today's pipelines silently run on insufficient history.
+- **Severity**: CRITICAL — without this, the synthetic-data ban is half a fix.
 
 ### F-093 (NOTE) — `checkpoint.rs` is clean, well-versioned
 - **Location**: `checkpoint.rs`
