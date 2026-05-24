@@ -26,6 +26,7 @@
 | **F-070** | **CRITICAL** | **DUAL `discovery_gpu` module**: `discovery_gpu.rs` (1028 lines, gpu feature) + `lib.rs::discovery_gpu` (inline ~610 lines, no-gpu feature). Same structs + functions, different backend. Single biggest dedup target in the crate. |
 | **F-071** | **CRITICAL** | GPU discovery uses returns-based fitness with hardcoded `0.0002` cost — synthetic data violation. The doc-comment ADMITS "not equivalent to the CPU GA". Algorithm-level divergence: GPU flag picks DIFFERENT strategies. |
 | F-073 | HIGH | `discovery_gpu.rs:822` hardcodes `1440` M1-bars/day denominator — silently wrong fitness on H1/H4/D1 data. |
+| **F-092 + F-094** | **CRITICAL** | `hpc.rs` (324 LOC) + `hpc_gpu_discovery.rs` (894 LOC) = **1218 LOC ORPHAN feature-gated dead code**. Verified 0 external callers across the entire workspace. Both gated to Hyperstack-N3-specific topology (8 A6000s, 252 cores, 464GB RAM). Decision: **DELETE both**. Replace with ~50-line generic multi-GPU helper if/when measurements justify. |
 
 **Root cause picture**: F-002 + F-003 explain why bug #214 ("cost-model called with empty symbol") was surface-fixed only. The cost-profile leak hits 4 production sites because nobody implemented the `for_symbol` method the comment says they should. **F-003 is the single change that unblocks fixing F-002/F-012/F-025/F-033/F-050 in one go.**
 
@@ -44,14 +45,15 @@ Every "synthetic fallback" identified in the audit must die. The ban applies in 
 
 ### 2. Deduplicate parallel implementations
 
-The audit found three families of "same conceptual job, multiple unreconciled impls":
+The audit found four families of "same conceptual job, multiple unreconciled impls":
 
 | Concept | Locations | Resolution |
 |---|---|---|
-| **Strategy scoring** | F-042 (`quality::score_strategy`) + F-049 (`regime_labels::window_quality_score`) + F-057 (`evolution_math::score_from_metrics`) | New `scoring/mod.rs` with shared "ingredient" functions (sharpe_component, dd_penalty, pf_component). Three top-level functions (`ga_fitness`, `quality_score`, `window_score`) share the ingredients but expose their weighting explicitly. Operator can read all three formulas in one file and see what differs. |
-| **Regime classification** | F-013 (feature-bucket with dead-zones, in `discovery.rs`) + F-048 (time-window, in `regime_labels.rs`) + F-064 (ADX/Hurst/EMA, in `stop_target.rs`) | F-064 is the most rigorous → promote to canonical `regime/classifier.rs`. F-013 and F-048 migrate to call into it (F-013 gets its dead-zones eliminated by switching to F-064's clean cascade). |
-| **Backtest core** | F-004: `fast_evaluate_strategy_core` and `simulate_trades_core` in `eval.rs` are two near-identical loops | Extract shared `eval/step.rs` `step_one_bar(...)` function. Both variants call it; their only difference is whether they accumulate `Trade` records. |
-| **F-002 EURUSD-leak pattern** | 4 call sites (discovery.rs:710, gauntlet.rs:60, search_engine.rs:355 + 450) all share `..BacktestSettings::default()` | Once F-003 lands, all 4 sites change in one PR. Then ban `BacktestSettings::default()` from production (compile gate: `#[cfg(test)]` only). |
+| **Strategy scoring** | F-042 + F-049 + F-057 + F-075 + F-085 + **F-089** (SIX scoring formulas) | New `scoring/mod.rs` with shared "ingredient" functions (sharpe_component, dd_penalty, pf_component). Top-level named functions (`ga_fitness`, `quality_score`, `window_score`, `archive_score`) share the ingredients but expose their weighting explicitly. Operator can read all formulas in one file. |
+| **Regime classification** | F-013 (feature-bucket with dead-zones) + F-048 (time-window) + F-064 (ADX/Hurst/EMA) | F-064 is the most rigorous → promote to canonical `regime/classifier.rs`. F-013 and F-048 migrate to call into it (F-013 gets dead-zones eliminated by switching to F-064's clean cascade). |
+| **Backtest core** | F-004: `fast_evaluate_strategy_core` and `simulate_trades_core` in `eval.rs` are two near-identical loops | Extract shared `eval/step.rs` `step_one_bar(...)`. Both variants call it; difference is only whether they accumulate `Trade` records. |
+| **F-002 EURUSD-leak pattern** | 4 call sites all share `..BacktestSettings::default()` | F-003 lands `for_symbol`, all 4 sites change in one PR. Then ban `BacktestSettings::default()` from production (compile gate: `#[cfg(test)]` only). |
+| **Orphan GPU code paths** | F-070 + F-077 (1914 LOC dual discovery_gpu) + **F-092 + F-094 (1218 LOC orphan hpc + island)** | **DELETE all four**. Total ~3132 LOC of feature-gated dead code goes. Generic multi-GPU support (~50 LOC) gets added to `cubecl_eval.rs::detect_available_gpus` if/when measurements show benefit. The `cubecl_eval.rs` SL/TP-faithful kernel (F-080) is the canonical GPU path; everything else is debt. |
 
 ### 3. Shared file modules (the new layout)
 
@@ -1113,11 +1115,41 @@ These files are smaller or specialist; I list real findings per file and mark th
 - **Fix**: change to `.context("serialize indices for db insert")?` so the failure propagates. Or persist as DuckDB arrays directly (no JSON-string column).
 - **Severity**: LOW (silent corruption on already-unlikely failure)
 
-### F-092 (NOTE) — `hpc.rs` is hardware-specific (Hyperstack N3) but legitimately so
-- **Location**: `hpc.rs` (full file)
-- **What**: hardcoded constants (8 GPUs, 252 cores, 504 logical threads, 464GB RAM, NVLink pairs (0,1),(2,3),(4,5),(6,7), 500K population in HPC mode, 8192 chunk size). These describe a SPECIFIC hardware profile and are appropriate to be hardcoded as a hardware-detection layer.
-- **Why it's not a finding**: this is a topology descriptor for a specific cloud instance type (Hyperstack N3). Hardcoded numbers here are correct — they ARE the hardware.
-- **Severity**: NONE — design is appropriate.
+### F-092 (CRITICAL — RECLASSIFIED 2026-05-24, operator review) — `hpc.rs` is ORPHAN dead code
+- **Location**: `hpc.rs` (full 324 lines)
+- **What I missed in the original audit**: hardcoded constants describe Hyperstack N3 hardware (8 A6000s, 252 cores, 464GB RAM). My first read marked this as "appropriate hardware descriptor". **Operator review caught the real problem**: this descriptor is ONLY useful if the user actually deploys on Hyperstack N3, AND nobody outside hpc_gpu_discovery.rs calls these helpers.
+- **Verification grep across the entire workspace** (`crates/`, `docs/`, all .rs/.toml/.md/.dart files):
+  - `detect_hyperstack_n3` → 1 hit (self-definition) + 1 lib.rs re-export = **0 external callers**
+  - `is_hpc_mode` / `force_hpc_mode` / `get_gpu_cpu_affinity` / `is_nvlink_pair` / `set_thread_affinity` / `get_optimal_chunk_size` / `get_optimal_population` / `print_hpc_config` / `get_validation_cpu_cores` → **only `hpc_gpu_discovery.rs` uses them**
+- **Why it matters**:
+  1. The user's machine (and any non-Hyperstack-N3 deployment) gets `is_hpc_mode() = false`, at which point every `hpc.rs` helper returns `Vec::new()` / 2048-default-chunk / 24K-default-population. The code is a no-op on every machine that isn't this one specific cloud instance.
+  2. `#[cfg(feature = "gpu")]` gated, so in default builds it doesn't even compile. The user never sees it.
+  3. ~324 lines of source for a single-cloud-instance topology descriptor that no other code path needs.
+- **Fix**: **DELETE `hpc.rs`**. If a future feature genuinely needs multi-GPU coordination, the right surface is a small generic helper in `cubecl_eval.rs`:
+  ```rust
+  fn detect_available_gpus() -> Vec<usize> { (0..tch::Cuda::device_count() as usize).collect() }
+  fn optimal_chunk_size_for_vram_gb(vram_gb: f64) -> usize { ... }
+  ```
+  ~50 lines that works generically (1 GPU on user's workstation, N GPUs on any cloud). No Hyperstack-specific topology table.
+- **Severity reclassified**: was NOTE, **now CRITICAL** (per operator review — orphan code is debt, not infrastructure).
+
+### F-094 (CRITICAL) — `hpc_gpu_discovery.rs` is ORPHAN dead code too (companion to F-092)
+- **Location**: `hpc_gpu_discovery.rs` (full 894 lines)
+- **What**: this file's whole purpose is `run_island_model_discovery` on top of `hpc.rs`'s topology detection. With F-092 confirming `hpc.rs` is unused outside this file, this file in turn is unused outside its own `lib.rs` re-export.
+- **Verification grep**: `run_island_model_discovery` and `IslandConfig` have **0 external callers** in the entire workspace.
+- **Hard gate** at `hpc_gpu_discovery.rs:61`: `if !is_hpc_mode() { bail!("Island model requires HPC mode. Use standard GPU discovery instead.") }`. So even if a future caller appears, the function bails on every machine that isn't Hyperstack N3.
+- **The Island Model algorithm itself**: a legitimate GA technique (multiple populations exchanging migrants). But:
+  - On a 1-GPU machine (user's case), Island Model degenerates to "1 island = standard GA" → identical to `search_engine.rs::evolve_search`.
+  - On a 2-4 GPU machine, the migration logic doesn't fire because the `is_nvlink_pair` check only matches Hyperstack-N3 pairs (0,1),(2,3),(4,5),(6,7).
+  - Generic multi-GPU parallelization (split population across N devices, no migration) is much simpler and works on every multi-GPU box. That's what cubecl_eval already does via `chunk_size` partitioning.
+- **Fix**: **DELETE `hpc_gpu_discovery.rs`**. Replace any future generic multi-GPU need with chunked-parallel evaluation across `Vec<Device>` inside `cubecl_eval.rs`. The Island Model algorithm itself can be revisited as a generic library helper later if measurements ever show it beats single-population GA on the user's actual hardware.
+- **Severity**: CRITICAL (orphan code, F-085 dups + F-074 0.0002 cost violation + 894 LOC noise)
+
+### F-095 (LOW) — `force_hpc_mode(true)` in test scope is a static-atomic side-channel
+- **Location**: `hpc.rs:101-107, 296-322`
+- **What**: tests at lines 295-322 toggle the static `HPC_MODE_ACTIVE: AtomicBool` to test gpu_cpu_affinity / is_nvlink_pair. With `force_hpc_mode(true)` followed by `force_hpc_mode(false)`, but if any test panics in the middle, the atomic stays set and bleeds into the next test in the same process.
+- **Fix**: redundant once F-092 deletes the file. If kept for any reason, wrap each test in a guard struct that resets on Drop.
+- **Severity**: LOW (test isolation, deleted by F-092 anyway)
 
 ### F-093 (NOTE) — `checkpoint.rs` is clean, well-versioned
 - **Location**: `checkpoint.rs`
