@@ -262,8 +262,109 @@ Module breakdown: production code lines 1-1277, tests 1280-1855. Most of the pro
 
 ---
 
+## gauntlet.rs — `crates/neoethos-search/src/gauntlet.rs` (154 lines, **COMPLETE**)
+
+### F-025 (CRITICAL) — `GauntletConfig::default()` is the second confirmed F-002 caller site
+- **Location**: `gauntlet.rs:60`
+- **What**: `backtest: BacktestSettings::default()` — same struct-update pattern as F-012 in discovery.rs. `StrategyGauntlet::run()` then only overrides `settings.sl_pips` and `settings.tp_pips` from the gene (lines 91-93). All cost-profile fields (`pip_value`, `spread_pips`, `commission_per_trade`, `pip_value_per_lot`) leak the synthetic EURUSD profile.
+- **Why it matters**: every strategy that passes through the gauntlet is evaluated under synthetic EURUSD costs regardless of which symbol it's intended for. Combined with F-012 this means the gauntlet endorses strategies that survive EURUSD economics but might fail on the real symbol.
+- **Fix**: same as F-003 — when `BacktestSettings::for_symbol` lands, change line 60 to `backtest: BacktestSettings::for_symbol(...)`. Also: the `StrategyGauntlet::run()` signature takes no symbol; thread the symbol through `Gene` (or pass it as an argument) so the gauntlet can build the correct profile.
+- **Severity**: CRITICAL (compounds F-002/F-012)
+
+### F-026 (LOW) — Internal vs prop-firm DD/daily caps documented with `debug_assert` cross-check
+- **Location**: `gauntlet.rs:42-53`
+- **What**: NOT a bug — this is the GOOD pattern. `DEFAULT_MAX_DRAWDOWN_PCT = 0.07` is intentionally below `FTMO_STANDARD.max_overall_drawdown_pct = 0.10`. The `debug_assert!` catches the inversion at startup.
+- **Note**: file this as a reference example for how to handle internal-tunable thresholds across audit-extracted finding fixes.
+- **Severity**: NONE — pattern reference.
+
+---
+
+## parity.rs — `crates/neoethos-search/src/parity.rs` (315 lines, **COMPLETE**)
+
+### F-027 (LOW) — Test-only F-002 caller + 11-shape coupling
+- **Location**: `parity.rs:217` (test helper) + line 45-46 + 63-64 (signature)
+- **What**:
+  1. `..BacktestSettings::default()` in test helper `backtest_settings()` — minor; just means parity tests use EURUSD-synthetic context. Not a runtime risk but the tests don't catch F-002 because they all use the same synthetic.
+  2. Hardcoded `[f64; 11]` shape in `compare_metric_matrices` signature and tests — directly coupled to F-001. If F-001 shrinks the metric array to `[f64; 10]`, this file needs simultaneous update.
+- **Fix**: when F-001 lands, update parity.rs to track the new shape. Also: add at least one parity test that uses `BacktestSettings::for_symbol("EURJPY", "USD", ...)` so JPY-pair parity is covered.
+- **Severity**: LOW (test-only)
+
+---
+
+## strategy_gene.rs — `crates/neoethos-search/src/genetic/strategy_gene.rs` (649 lines, **COMPLETE**)
+
+This is the file that holds `EvaluationConfig::for_symbol` (line 582-605) — the **template** F-003 should mirror in `BacktestSettings::for_symbol`. Verified the shape:
+```rust
+pub fn for_symbol(
+    symbol: &str,
+    account_currency: &str,
+    price_hint: Option<f64>,
+    spread_pips_override: Option<f64>,
+    commission_override: Option<f64>,
+) -> Self
+```
+Internally calls `infer_market_cost_profile(...)` and overrides the 6 cost-profile fields from the resolved profile. Same signature shape should land in `BacktestSettings::for_symbol`.
+
+### F-028 (HIGH) — `Gene::is_anomalous()` has 4 overlapping anomaly classifications with all magic numbers
+- **Location**: `strategy_gene.rs:356-391`
+- **What**: four independent thresholds reject strategies as "too good to be true":
+  - `suspicious_combo`: trades ≥ 120 AND dd ≤ 0.25% AND win_rate ≥ 92% AND PF ≥ 12 AND profit ≥ $10M
+  - `suspicious_ppt`: trades ≥ 40 AND dd ≤ 1% AND profit-per-trade ≥ $100k
+  - `suspicious_ultra`: trades ≥ 50 AND dd ≤ 0.1% AND profit ≥ $7.5M AND ppt ≥ $50k
+  - `suspicious_low_dd`: trades ≥ 80 AND dd ≤ 0.1% AND profit ≥ $2.5M
+- **Why it matters**:
+  1. A real prop-firm-grade strategy that hits 4-10%/mo (the documented target per the comment) compounded on a $10k base over 10y gives ~$11M target equity. That's RIGHT NEXT to the `min_profit = 10_000_000` bar. A genuine 4%/mo strategy over 11 years would cross $10M and could trip `suspicious_combo` if its other metrics are also strong. The comment claims "raised 50× so genuine target-hitting strategies are not discarded" but the calibration math is opaque.
+  2. The four classifications OVERLAP heavily — a strategy that trips one likely trips two — but the code treats them as OR'd independent gates. The thresholds were tuned in lockstep, not independently.
+  3. No way to tune any of these from config — all baked into source. Operators have NO knob to relax this for genuinely-good runs.
+- **Fix**:
+  1. Promote to `AnomalyGuardConfig` struct on `FilteringConfig` with all 4 classification thresholds.
+  2. Default to today's values (preserve behaviour).
+  3. Log at `tracing::warn!` when a strategy is anomaly-flagged so operator sees which classification + which threshold tripped.
+- **Severity**: HIGH (silent good-strategy rejection risk on the 10y compounded backtest)
+
+### F-029 (MEDIUM) — `infer_market_cost_profile` asset-class default spreads + flat $7 commission
+- **Location**: `strategy_gene.rs:331-343`
+- **What**: when no spread/commission is provided from runtime overrides OR explicit override, the function falls back to:
+  - metal: 2.5 pips
+  - crypto: 8.0 pips
+  - fx: 1.5 pips
+  - other: 1.0 pip
+  - commission: $7.00 per trade (universal)
+- **Why it matters**: these defaults are EURUSD-grade fx, XAUUSD-grade metal, BTCUSD-grade crypto. They are wrong for:
+  - EURGBP (typical 1.5 OK but cross-pair adds non-trivial slippage not modelled)
+  - GBPNZD (typical 5-10pip real spread)
+  - USDMXN (typical 200+pip "raw" or 2-4pip with normalization)
+  - XAGUSD (typical 4-7pip spread, NOT 2.5)
+  - ETHUSD (typical 5-15pip on most brokers)
+- **The existing TODO(real-data)** at lines 323-330 acknowledges this explicitly — "Once `symbol_metadata::SymbolMetadata` is extended with broker-supplied `typical_spread_pips` and `commission_per_lot` fields (sourced from the cTrader account / commission plan), remove these magic defaults and bail when the metadata is missing."
+- **Fix**:
+  1. Extend `neoethos_core::symbol_metadata::SymbolMetadata` with `typical_spread_pips: Option<f64>` and `commission_per_lot: Option<f64>`.
+  2. Source these from cTrader symbol records (look in `ctrader_data` / `ctrader_messages` for `ProtoOASymbolCategory` parsing) when the user connects.
+  3. When metadata is missing, BAIL (fail-loudly) instead of silently using EURUSD-grade defaults. Add a `FOREX_BOT_ALLOW_SYNTHETIC_SPREADS=1` env override for backtests on symbols without real metadata.
+- **Severity**: MEDIUM (multi-symbol cost accuracy)
+
+### F-030 (LOW) — `Gene::normalize()` hardcoded fallbacks for invalid genes
+- **Location**: `strategy_gene.rs:483, 491-505`
+- **What**: when a gene has NaN/invalid fields, normalize() fills in:
+  - long_threshold = 0.25, short_threshold = -0.25 (line 491, 494)
+  - tp_pips = 40, sl_pips = 20 (lines 502, 505)
+  - weights clamped to [-5.0, 5.0] (line 483)
+- **Why it matters**: these magic numbers determine the behaviour of a "salvaged" gene. They probably came from "what looks reasonable" but are not derived from any cost-profile or per-symbol consideration. A salvaged gene meant for XAUUSD with `sl_pips = 20` will have a much tighter SL (in price terms) than the operator might expect.
+- **Fix**: extract to `GeneNormalizationDefaults` config (or use `FilteringConfig` slots). Or, alternatively: don't salvage genes with NaN fields — discard them entirely so the GA pool stays clean.
+- **Severity**: LOW
+
+### F-031 (LOW) — `FilteringConfig::default()` has 8+ undocumented magic numbers
+- **Location**: `strategy_gene.rs:76-100`
+- **What**: defaults for max_dd, min_profit, min_trades, min_sharpe, min_win_rate, min_profit_factor, trade_log_max are all hardcoded with no derivation. Some are reasonable (min_profit_factor: 1.05 ≈ "make $1.05 for every $1 lost") but others (min_sharpe: 0.3?) are oddly weak for a prop-firm-grade gate.
+- **Fix**: add doc-comment per field stating provenance OR sourcing from a published threshold (e.g. "Sharpe ≥ 0.3 per Cliff's quant-edge threshold").
+- **Severity**: LOW
+
+---
+
+---
+
 # Sessions (updated)
-- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024. Total findings so far: 24.
+- **2026-05-24 session 1**: scaffolded ledger; **eval.rs COMPLETE (1211/1211)** F-001..F-006; **discovery.rs COMPLETE (2900/2900)** F-007..F-019; **validation.rs COMPLETE (1855/1855)** F-020..F-024; **gauntlet.rs COMPLETE (154/154)** F-025..F-026; **parity.rs COMPLETE (315/315)** F-027; **strategy_gene.rs COMPLETE (649/649)** F-028..F-031. Total findings: 31. Verified `EvaluationConfig::for_symbol` shape for F-003 template.
 
 ## Audit progress
 | Crate | File | Lines | Status |
@@ -271,14 +372,37 @@ Module breakdown: production code lines 1-1277, tests 1280-1855. Most of the pro
 | neoethos-search | eval.rs | 1211 | COMPLETE |
 | neoethos-search | discovery.rs | 2900 | COMPLETE |
 | neoethos-search | validation.rs | 1855 | COMPLETE |
-| neoethos-search | genetic/search_engine.rs | ? | next |
-| neoethos-search | genetic/strategy_gene.rs | ? | F-003 template; verify |
-| neoethos-search | genetic/mod.rs, smc_indicators.rs | ? | pending |
-| neoethos-search | quality.rs | ? | pending |
-| neoethos-search | portfolio.rs | ? | pending |
-| neoethos-search | gauntlet.rs | ? | F-002 caller |
-| neoethos-search | parity.rs | ? | F-002 caller |
+| neoethos-search | gauntlet.rs | 154 | COMPLETE |
+| neoethos-search | parity.rs | 315 | COMPLETE |
+| neoethos-search | genetic/strategy_gene.rs | 649 | COMPLETE (F-003 template) |
+| neoethos-search | genetic/search_engine.rs | 1060 | next |
+| neoethos-search | genetic/smc_indicators.rs | 659 | pending |
+| neoethos-search | genetic/evolution_math.rs | 946 | pending |
+| neoethos-search | genetic/runtime_overrides.rs | 795 | pending |
+| neoethos-search | genetic/regime_labels.rs | 523 | pending |
+| neoethos-search | genetic/diversity.rs | 219 | pending |
+| neoethos-search | genetic/mod.rs | 45 | pending |
+| neoethos-search | quality.rs | 786 | pending |
+| neoethos-search | portfolio.rs | 345 | pending |
+| neoethos-search | lib.rs | 1017 | pending |
+| neoethos-search | stop_target.rs | 958 | pending |
+| neoethos-search | cubecl_eval.rs | 1078 | pending |
+| neoethos-search | discovery_gpu.rs | 1028 | pending |
+| neoethos-search | hpc_gpu_discovery.rs | 894 | pending |
+| neoethos-search | hpc.rs | 324 | pending |
+| neoethos-search | checkpoint.rs | 494 | pending |
+| neoethos-search | cubecl_ga.rs | 324 | pending |
+| neoethos-search | challenge.rs | 160 | pending |
+| neoethos-search | orchestration.rs | 222 | pending |
+| neoethos-search | funnel_profile.rs | 236 | pending |
+| neoethos-search | strategy_db.rs | 238 | pending |
+| neoethos-search | export_state.rs | 115 | pending |
+| neoethos-search | scheduler_assignment.rs | 18 | pending |
+| neoethos-search | artifact_io.rs | 4 | pending |
+| neoethos-search | discovery_tests.rs | 1238 | pending (test) |
 | neoethos-data | core/hpc_ta.rs | ? | partial #212 |
 | neoethos-data | core/timestamps.rs | ? | pending |
 | neoethos-data | core/*.rs | ? | pending |
 | ... | further crates | ... | pending |
+
+**neoethos-search progress: 7 of 31 files COMPLETE (≈ 7100 of 20810 lines = 34%)**
