@@ -1384,23 +1384,6 @@ fn calibrated_interval_spread(
     quantile_half_width.max(validation_floor * coverage_scale)
 }
 
-#[allow(dead_code)]
-fn fallback_forecast_from_forecasts(
-    snapshot: &SwarmForecastSnapshot,
-    candidates: &[(String, Vec<f32>)],
-    horizon: usize,
-) -> SwarmForecastResult {
-    let weights = build_candidate_weight_map_from_consensus(snapshot, candidates);
-    fallback_forecast_with_strategy(
-        snapshot,
-        candidates,
-        &weights,
-        &[],
-        SwarmEnsembleStrategy::WeightedAverage,
-        horizon,
-    )
-}
-
 fn fallback_forecast_with_strategy(
     snapshot: &SwarmForecastSnapshot,
     candidates: &[(String, Vec<f32>)],
@@ -2008,44 +1991,6 @@ fn write_swarm_artifact_atomically(
     )
 }
 
-#[allow(dead_code)]
-fn build_candidate_weight_map_from_consensus(
-    snapshot: &SwarmForecastSnapshot,
-    candidates: &[(String, Vec<f32>)],
-) -> HashMap<String, f32> {
-    if candidates.is_empty() {
-        return HashMap::new();
-    }
-
-    let reference = aggregate_average(
-        &candidates
-            .iter()
-            .map(|(_, forecast)| forecast.clone())
-            .collect::<Vec<_>>(),
-        candidates
-            .first()
-            .map(|(_, forecast)| forecast.len())
-            .expect("non-empty candidate ensemble must provide a forecast horizon"),
-        snapshot.last_value,
-    );
-    let mut reports = candidates
-        .iter()
-        .map(|(name, forecast)| {
-            candidate_report(
-                name,
-                "local_ensemble",
-                forecast,
-                "consensus",
-                &reference,
-                1.0,
-                Some(snapshot),
-            )
-        })
-        .collect::<Vec<_>>();
-    apply_candidate_weights(&mut reports);
-    build_candidate_weight_map(&reports)
-}
-
 fn aggregate_weighted(
     candidates: &[(String, Vec<f32>)],
     weights: &HashMap<String, f32>,
@@ -2390,7 +2335,6 @@ fn normalize_prediction_intervals(lower: Vec<f32>, upper: Vec<f32>) -> (Vec<f32>
     (lower, upper)
 }
 
-#[allow(dead_code)]
 fn candidate_forecasts_local(
     values: &[f32],
     snapshot: &SwarmForecastSnapshot,
@@ -2564,11 +2508,6 @@ fn prune_local_candidates(
     }
 
     kept
-}
-
-#[allow(dead_code)]
-fn build_local_snapshot(values: &[f32], timestamps: &[f64]) -> Result<SwarmForecastSnapshot> {
-    build_local_snapshot_with_min(values, timestamps, 32)
 }
 
 fn snapshot_rebuild_min_observations(observations: usize) -> usize {
