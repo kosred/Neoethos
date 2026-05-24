@@ -1448,3 +1448,164 @@ These files are smaller or specialist; I list real findings per file and mark th
 - **Severity**: LOW
 
 ---
+
+## domain/portfolio.rs (230 lines, **COMPLETE**)
+
+### F-117 (HIGH) — TWO `PortfolioManager`/`PortfolioOptimizer` implementations in workspace
+- **Location**: `neoethos-core/src/domain/portfolio.rs` (`PortfolioManager`) + `neoethos-search/src/portfolio.rs` (`PortfolioOptimizer`, see F-053..F-056)
+- **What**: both compute Pearson correlation between strategy returns, both do inverse-volatility weighting, both apply a correlation-based diversification penalty. APIs are different (PortfolioManager uses `Array2<f64>` returns matrix, PortfolioOptimizer uses `HashMap<String, SymbolMetrics>`). Neither uses the other.
+- **Why it matters**: same dedup pattern as F-070 (dual discovery_gpu) — two implementations of the "weight strategies by edge / vol / correlation" logic. A bug fixed in one won't propagate to the other.
+- **Fix**: unify into `neoethos-core::portfolio` (foundation layer). `neoethos-search` consumes it via the standard API.
+- **Severity**: HIGH
+
+### F-118 (LOW) — `PortfolioManager::default()` magic constants
+- **Location**: `domain/portfolio.rs:12-20`
+- **What**: `max_exposure: 1.0` (100% of capital), `correlation_threshold: 0.7`. Reasonable but unaudited.
+- **Fix**: doc-comment provenance + expose as constructor args (already exposed via `::new`, but Default uses these).
+- **Severity**: LOW
+
+### F-119 (NOTE) — `get_weight` returning `Option<f64>` is the GOOD pattern
+- **Location**: `domain/portfolio.rs:163-173`
+- **What**: F-CORE2-003 review note says the previous `-> f64` signature hid "strategy not in portfolio" behind "strategy has zero weight". Now `Option<f64>`. Reference example.
+- **Severity**: NONE — reference for future fix pattern.
+
+---
+
+## domain/consistency.rs (245 lines, **COMPLETE**)
+
+### F-120 (HIGH) — TWO `TradeEvent` types in `neoethos-core::domain` with completely different shapes
+- **Location**: `domain/events.rs:60-74` AND `domain/consistency.rs:20-27`
+- **What**:
+  - `domain::events::TradeEvent`: symbol, side, volume, open_price, open_time, close_price, close_time, pnl, commission, swap, comment, magic — broker-trade record
+  - `domain::consistency::TradeEvent`: entry_time (String!), pnl, risk_pct, size, hold_minutes, win — internal-stats record
+- **Why it matters**: same name, completely different semantics. Any caller doing `use neoethos_core::domain::TradeEvent` gets ambiguous import. Conversion between them is silent dropping/inventing of fields.
+- **Fix**: rename one (e.g. `BrokerTradeEvent` for events.rs, `TradeOutcome` for consistency.rs) OR unify into one rich struct used by both.
+- **Severity**: HIGH (type-name collision in same crate)
+
+### F-121 (MEDIUM) — `ConsistencyTracker::get_metrics` is the SEVENTH scoring function
+- **Location**: `domain/consistency.rs:190-198`
+- **What**: weighted 8-component score (daily_profit 0.25 + daily_trade 0.20 + daily_risk 0.15 + weekly_profit 0.10 + weekly_dd 0.10 + trade_size 0.10 + hold_time 0.05 + win_rate 0.05) × 100. Joins F-042 (`quality::score_strategy`), F-049 (`window_quality_score`), F-057 (`score_from_metrics`), F-075 (GPU window_fit), F-085 (HPC island window_fit), F-089 (`archive_quality_score`) for **7 total scoring functions**, each with its own magic weights.
+- **Severity**: MEDIUM (adds to F-042/F-049/F-057 unification scope)
+
+### F-122 (LOW) — `TradeEvent.entry_time: String` (ISO format)
+- **Location**: `domain/consistency.rs:21`
+- **What**: should be `DateTime<Utc>` not stringly-typed. The `parse_from_rfc3339` fallback chain at line 55-67 + the "dropped trade with invalid entry_time" warn at line 60 papers over the weak typing.
+- **Severity**: LOW
+
+### F-123 (LOW) — Magic windows, weights, thresholds in ConsistencyTracker
+- **Location**: `domain/consistency.rs:47, 149, 178, 200-211`
+- **What**:
+  - `max_hist = 500` (line 47)
+  - `pnls.chunks(5)` = "weekly = 5 trading days" (line 149) — assumes Mon-Fri trading
+  - `n = min(30)` recent-trades window (line 178)
+  - Grade thresholds: A+ 90, A 80, B 70, C 60, D 50, F<50 (lines 200-211)
+- **Fix**: extract to `ConsistencyTrackerConfig`.
+- **Severity**: LOW
+
+### F-124 (LOW) — `variance` / `std_dev` local helpers duplicate `utils::stats::stddev_sample`
+- **Location**: `domain/consistency.rs:229-245`
+- **What**: Phase 64 was supposed to consolidate stats helpers into `utils::stats`. These two local helpers got missed.
+- **Fix**: use `crate::utils::stats::stddev_sample` instead.
+- **Severity**: LOW
+
+---
+
+## storage/json.rs (279 lines, **COMPLETE — clean**)
+
+No findings. Solid atomic-write pattern (temp file + fsync + rename), proper directory fsync as belt-and-braces, backup/rollback semantics on `write_json_with_backup`, FNV64-prefixed stable hash, good error context. Tests included.
+
+---
+
+## symbol_metadata.rs (511 lines, **COMPLETE — REFERENCE EXAMPLE**)
+
+### F-125 (REFERENCE) — `symbol_metadata.rs` is the canonical pattern for "no-synthetic-data" registries
+- **Location**: `crates/neoethos-core/src/symbol_metadata.rs` (full file)
+- **What**: this file shows EXACTLY the pattern the F-029 fix needs. Highlights:
+  - **Disk-backed table** loaded via `OnceLock` at first access.
+  - **`resolve(symbol) -> Option<SymbolMetadata>`** returns None on miss (no synthetic fallback). Production callers MUST treat None as a hard error.
+  - **`baked_in_default` is `#[cfg(test)]`-only** — explicitly documented as test-fixture, never production.
+  - **`pip_value_in_account` returns NaN** for cross pairs without conversion rates (fail-loud rather than silently wrong).
+  - **Schema versioning** via `SchemaVersion::new(1)` + `ensure_schema_version_readable`.
+  - **Operator override** via `FOREX_BOT_SYMBOL_METADATA` env.
+  - **Packaged asset fallback** for fresh checkouts — but that's a SNAPSHOT of broker data, not synthetic.
+- **The pattern other findings should adopt**:
+  - F-002/F-003 (`BacktestSettings`): use this exact disk-backed shape.
+  - F-029 (asset-class default spreads): extend `SymbolMetadata` with `typical_spread_pips` + `commission_per_lot` fields.
+  - F-114 (`OrderExecutorConfig::default`): consume `resolve(symbol)` rather than baking `symbol="EURUSD"`.
+- **Severity**: NONE — reference example.
+
+### F-126 (HIGH) — `SymbolMetadata` is missing `typical_spread_pips` + `commission_per_lot` fields (F-029 fix dependency)
+- **Location**: `crates/neoethos-core/src/symbol_metadata.rs:37-67`
+- **What**: the struct has pip_size, contract_size, pip_value_quote, digits, min_lot, max_lot, lot_step, typical_price — but no spread or commission. Without these, `strategy_gene.rs::infer_market_cost_profile` falls back to its asset-class default table (F-029: metal=2.5 / crypto=8.0 / fx=1.5 / comm=$7) which is EURUSD-biased.
+- **Fix**: extend struct with:
+  ```rust
+  /// Typical bid-ask spread in pips when the symbol is freshly quoted
+  /// (e.g. EURUSD ≈ 0.6, GBPNZD ≈ 5.0, BTCUSD ≈ 20.0). Sourced from
+  /// the broker spread table (cTrader ProtoOASymbol). None when the
+  /// broker hasn't reported it yet.
+  pub typical_spread_pips: Option<f64>,
+  /// Round-trip commission per standard lot in account currency
+  /// (e.g. $7 on EURUSD raw-spread, $4 on some Asian sessions).
+  /// Sourced from the broker's commission plan. None when unknown.
+  pub commission_per_lot: Option<f64>,
+  ```
+  And bump `SYMBOL_METADATA_SCHEMA_VERSION` to 2. The cTrader connector populates these from `ProtoOASymbolCategory` + the commission plan.
+- **Severity**: HIGH (this is the concrete F-029 fix surface; without these fields the synthetic-data ban can't be lifted on spreads/commissions)
+
+---
+
+## domain/prop_firm.rs (529 lines, **COMPLETE — REFERENCE EXAMPLE**)
+
+### F-127 (REFERENCE) — `prop_firm.rs` is the canonical pattern for preset-driven constants
+- **Location**: `crates/neoethos-core/src/domain/prop_firm.rs` (full file)
+- **What**: multi-preset (`Ftmo`, `MyForexFunds`, `FundedNext`, `The5ers`, `None`) with four structs (`PropFirmConstraints`, `PropFirmChallengeDefaults`, `PropFirmRuntimeDefaults`, `PropFirmPhaseRiskDefaults`) each providing `for_preset()`. Operator can switch firm via `risk.preset` config field. `None` (own-money) is a legitimate preset, not absence-of-rules. Comprehensive tests check ordering invariants (e.g. `runtime.daily_dd_stop_trading_pct <= constraints.max_daily_loss_pct`).
+- **What to fix per F-023 + F-024**:
+  - F-023 (`max_profit_consistency_ratio = 0.50` hardcoded in `validation.rs`): add `pub max_profit_consistency_ratio: f32` to `PropFirmConstraints`, with the `0.50` going into `FTMO_STANDARD` and per-firm overrides for the others.
+  - F-024 (`100_000.0` initial balance fallback): add `pub default_account_size: f64` to `PropFirmConstraints` (FTMO is `100_000.0`, MFF varies, etc.). Or — better — REQUIRE callers to pass the real balance from cTrader (no fallback).
+- **Severity**: NONE — reference + maps F-023/F-024 to concrete extensions.
+
+### F-128 (NOTE) — Multiple presets are tested for invariant ordering (good pattern)
+- **Location**: `prop_firm.rs:495-528` tests
+- **What**: every preset has its `runtime.daily_dd_stop_trading_pct < constraints.max_daily_loss_pct` cross-checked, every phase has its `risk_per_trade` ordering verified. This is the kind of "compiles-and-tests-stay-green" guarantee the broader audit's risk-config changes should adopt.
+- **Severity**: NONE — reference.
+
+---
+
+## config.rs (1322 lines, **PARTIAL** — top 200 lines read)
+
+### F-129 (CRITICAL) — `SystemConfig::default()` ships `symbol = "EURUSD"` and `symbols = vec!["EURUSD"]`
+- **Location**: `config.rs:79-80`
+- **What**: same EURUSD-as-default pattern as F-002 / F-114. `SystemConfig::default()` is what every `config::from_env_or_default()` path falls back to when the user hasn't bound a real symbol.
+- **Severity**: CRITICAL (synthetic-data pattern repeated in the foundational config struct)
+
+### F-130 (NOTE — POSITIVE) — `history_years: 10` is already the F-096 default
+- **Location**: `config.rs:102`
+- **What**: `history_years: 10` matches the operator directive "auto-fetch ≥10 years per symbol". So the config field exists; the missing piece is the **pre-flight check** that ENFORCES it (F-096).
+- **Severity**: NONE — wiring confirmation.
+
+### F-131 (MEDIUM) — Magic trading-session window strings in default
+- **Location**: `config.rs:103-105`
+- **What**: `trading_session_start: "00:05", trading_session_end: "23:55", session_timezone: "UTC"`. The 5-min head/tail buffer is undocumented. UTC default conflicts with EET broker timezones (most cTrader prop firms run EET).
+- **Severity**: MEDIUM (magic windows + tz mismatch)
+
+### F-132 (PENDING — needs full file scan) — `config.rs` is 1322 lines with many Default impls
+- **Location**: `config.rs` (full file)
+- **What**: only first 200 lines read so far. `RiskConfig` alone has 40+ fields (lines 145-200 visible). The file likely contains dozens of magic numbers in Default impls. Full audit pending in next pass.
+- **Severity**: PENDING
+
+---
+
+# Status (mid-audit checkpoint 2026-05-24)
+
+**neoethos-core progress**: ~12 of 39 production files complete (~3000/14300 LOC = 21%). 36 findings catalogued (F-097..F-132) in this crate so far.
+
+**Critical findings emerging from neoethos-core**:
+- F-101: window_control.rs orphan delete candidate
+- F-102: tokio dep unused
+- F-106: NewsFilter fails OPEN
+- F-114: OrderExecutorConfig::default EURUSD
+- F-129: SystemConfig::default EURUSD
+
+**Reference examples (good patterns)**: F-125 symbol_metadata, F-127 prop_firm, F-119 portfolio.get_weight Option return.
+
+**Remaining files in neoethos-core**: ~27 files / ~11000 LOC. Auditor continues per directive.
