@@ -481,6 +481,27 @@ pub fn completed_snapshot(mut snapshot: JobSnapshot, result: &DiscoveryResult) -
             format!("{:.4}", best.max_drawdown),
         ));
     }
+    // #211: surface the BEST Sharpe across the forward-test (OOS) tail
+    // artifacts so `--validation-mode` can record both in-sample and
+    // out-of-sample top-Sharpe per TF. `best_sharpe` above is in-sample
+    // (stage-1) and is by construction what the GA optimized against —
+    // it always looks inflated. The forward-test artifact is the
+    // strictly-held-out 20% tail that the discovery cycle never trained
+    // on, so its Sharpe is an unbiased OOS estimate.
+    //
+    // Empty `forward_test_validation_artifacts` (e.g. when the tail
+    // window was too short or `compute_discovery_forward_test_artifacts`
+    // failed) → no highlight emitted. The validation reader treats the
+    // absence as `None` and falls back to in-sample reporting.
+    if let Some(best_oos) = result
+        .forward_test_validation_artifacts
+        .iter()
+        .map(|artifact| artifact.summary.metrics.sharpe)
+        .filter(|v| v.is_finite())
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    {
+        highlights.push(("best_oos_sharpe".to_string(), format!("{:.4}", best_oos)));
+    }
     let entries = result
         .portfolio
         .iter()

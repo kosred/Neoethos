@@ -51,7 +51,13 @@ struct TfOutcome {
     duration_secs: f64,
     candidate_count: u64,
     portfolio_count: u64,
-    top_sharpe: Option<f64>,
+    /// In-sample (stage-1) top Sharpe — the metric the GA optimized
+    /// against. Inflated relative to OOS because the GA fit it directly.
+    top_sharpe_is: Option<f64>,
+    /// Out-of-sample top Sharpe — computed on the forward-test tail the
+    /// GA never saw. The IS/OOS gap is itself diagnostic (#211); a small
+    /// gap is a strong edge signal, a 3× gap means overfit.
+    top_sharpe_oos: Option<f64>,
     top_max_dd_pct: Option<f64>,
     error_message: String,
 }
@@ -61,8 +67,12 @@ impl TfOutcome {
         // No CSV crate dependency — the columns are simple scalars and
         // the only field that needs escaping is `error_message`. We
         // double-quote it and escape internal quotes per RFC 4180.
-        let sharpe = self
-            .top_sharpe
+        let sharpe_is = self
+            .top_sharpe_is
+            .map(|v| format!("{:.6}", v))
+            .unwrap_or_default();
+        let sharpe_oos = self
+            .top_sharpe_oos
             .map(|v| format!("{:.6}", v))
             .unwrap_or_default();
         let dd = self
@@ -71,13 +81,14 @@ impl TfOutcome {
             .unwrap_or_default();
         let err_escaped = self.error_message.replace('"', "\"\"");
         format!(
-            "{},{},{:.3},{},{},{},{},\"{}\"\n",
+            "{},{},{:.3},{},{},{},{},{},\"{}\"\n",
             self.tf,
             self.status,
             self.duration_secs,
             self.candidate_count,
             self.portfolio_count,
-            sharpe,
+            sharpe_is,
+            sharpe_oos,
             dd,
             err_escaped
         )
@@ -86,17 +97,27 @@ impl TfOutcome {
 
 /// CSV header — kept in sync with `TfOutcome::to_csv_row`. Stable
 /// columns so downstream notebook analysis can rely on the order.
+///
+/// Column change vs prior schema: `top_sharpe` is now split into
+/// `top_sharpe_is` (in-sample, stage-1) and `top_sharpe_oos`
+/// (forward-test on the strictly held-out tail). A big IS-OOS gap is
+/// itself diagnostic — see #211.
 const CSV_HEADER: &str =
-    "tf,status,duration_secs,candidate_count,portfolio_count,top_sharpe,top_max_dd_pct,error_message\n";
+    "tf,status,duration_secs,candidate_count,portfolio_count,top_sharpe_is,top_sharpe_oos,top_max_dd_pct,error_message\n";
 
 /// Run a multi-TF Discovery sweep on the first locally-discoverable
 /// symbol (falls back to AUDUSD if none). Returns the exit code the
 /// caller should propagate: 0 if at least one TF succeeded, 1 otherwise.
+///
+/// `min_generations` is the GA generation floor applied per TF —
+/// `DiscoveryConfig.generations` is bumped up to this value when the
+/// operator's `config.yaml` set it lower. `0` honors `config.yaml` as-is.
 pub async fn run_validation_sweep(
     runtime: &AppRuntimeConfig,
     settings: &Settings,
     tfs_csv: &str,
     tf_timeout_secs: u64,
+    min_generations: usize,
 ) -> Result<i32> {
     let symbol = resolve_symbol(runtime);
     let tfs = parse_tfs(tfs_csv);
@@ -114,6 +135,7 @@ pub async fn run_validation_sweep(
         data_dir = %runtime.data_dir.display(),
         tfs = ?tfs,
         tf_timeout_secs,
+        min_generations,
         csv = %csv_path.display(),
         "validation-mode sweep starting"
     );
@@ -134,6 +156,7 @@ pub async fn run_validation_sweep(
             &symbol,
             tf,
             Duration::from_secs(tf_timeout_secs),
+            min_generations,
         )
         .await;
         info!(
@@ -252,11 +275,37 @@ async fn run_one_tf(
     symbol: &str,
     base_tf: &str,
     tf_timeout: Duration,
+    min_generations: usize,
 ) -> TfOutcome {
     let started = Instant::now();
     // Honor the operator's config.yaml — defaults in code are smaller
     // than what we need for a meaningful validation signal.
-    let config = DiscoveryConfig::from_settings(settings);
+    let mut config = DiscoveryConfig::from_settings(settings);
+    // #214: bind the *actual* sweep symbol into the discovery config so
+    // the cost-model lookup sees a real cTrader symbol instead of the
+    // empty-string fallback (which floods logs with synthetic-EURUSD
+    // warnings and makes MaxDD numbers untrustworthy). The settings
+    // `system.symbol` may differ from the sweep symbol — `discover_symbols`
+    // chose the latter from on-disk Parquet, and that's the symbol whose
+    // data the GA actually backtests. Account currency defaults to USD
+    // because `SystemConfig` does not yet carry an account-currency field
+    // (#214 follow-up tracked separately).
+    config.evaluation_symbol = symbol.to_string();
+    config.evaluation_account_currency = "USD".to_string();
+    // #215: floor the GA generation count so short-data TFs (D1/H4) can't
+    // smoke-test through the sweep with a 0.2s run that produces a tiny
+    // archive. The floor is applied per-TF — `min_generations = 0` skips
+    // the override entirely.
+    if min_generations > 0 && config.generations < min_generations {
+        info!(
+            target: "neoethos_app::validation",
+            tf = %base_tf,
+            configured_generations = config.generations,
+            floor = min_generations,
+            "applying --validation-min-generations floor"
+        );
+        config.generations = min_generations;
+    }
     let higher_tfs = higher_tfs_for(base_tf);
     let request = DiscoveryRequest {
         data_root: runtime.data_dir.clone(),
@@ -281,7 +330,8 @@ async fn run_one_tf(
                 duration_secs: started.elapsed().as_secs_f64(),
                 candidate_count: 0,
                 portfolio_count: 0,
-                top_sharpe: None,
+                top_sharpe_is: None,
+                top_sharpe_oos: None,
                 top_max_dd_pct: None,
                 error_message: err.to_string(),
             };
@@ -342,7 +392,8 @@ async fn run_one_tf(
             duration_secs,
             candidate_count: 0,
             portfolio_count: 0,
-            top_sharpe: None,
+            top_sharpe_is: None,
+            top_sharpe_oos: None,
             top_max_dd_pct: None,
             error_message: format!("hit per-TF timeout {}s", tf_timeout.as_secs()),
         };
@@ -374,8 +425,32 @@ fn snapshot_to_outcome(
     let candidate_count = counter_value(snapshot, "candidates").unwrap_or(0);
     let portfolio_count = counter_value(snapshot, "portfolio").unwrap_or(0);
 
-    let top_sharpe = highlight_f64(snapshot, "best_sharpe");
+    let top_sharpe_is = highlight_f64(snapshot, "best_sharpe");
+    let top_sharpe_oos = highlight_f64(snapshot, "best_oos_sharpe");
     let top_max_dd_pct = highlight_f64(snapshot, "best_max_dd");
+
+    // #213 diagnostic: when the funnel produced a non-zero candidate
+    // pool but no portfolio, surface the funnel counters so an operator
+    // can tell whether genes were rejected on `min_trades`, `passes_filter`,
+    // or `nonzero_signal`. The data is already in `snapshot.report.counters`
+    // — we just log it at sweep-end so the validation harness produces a
+    // single line of attribution per TF instead of forcing the operator
+    // to read the full discovery log.
+    if candidate_count > 0 && portfolio_count == 0 {
+        let post_passes_filter = counter_value(snapshot, "filtered_candidates").unwrap_or(0);
+        let post_min_trades = counter_value(snapshot, "quality_screened").unwrap_or(0);
+        let min_trades_required = counter_value(snapshot, "min_trades_required").unwrap_or(0);
+        warn!(
+            target: "neoethos_app::validation",
+            tf = %base_tf,
+            candidate_count,
+            post_passes_filter,
+            post_min_trades,
+            min_trades_required,
+            "validation-mode: TF produced candidates but zero portfolio — \
+             funnel rejected every candidate (see counters)"
+        );
+    }
 
     let error_message = if matches!(snapshot.state, JobState::Failed | JobState::Cancelled) {
         // The summary string carries the most operator-friendly
@@ -396,7 +471,8 @@ fn snapshot_to_outcome(
         duration_secs,
         candidate_count,
         portfolio_count,
-        top_sharpe,
+        top_sharpe_is,
+        top_sharpe_oos,
         top_max_dd_pct,
         error_message,
     }
@@ -441,37 +517,50 @@ fn build_summary(symbol: &str, outcomes: &[TfOutcome], total_elapsed: Duration) 
     buf.push_str("\nper-TF runtime:\n");
     for outcome in outcomes {
         buf.push_str(&format!(
-            "  {:<5} status={:<12} duration={:>8.2}s candidates={:>5} portfolio={:>5} top_sharpe={}\n",
+            "  {:<5} status={:<12} duration={:>8.2}s candidates={:>5} portfolio={:>5} \
+             top_sharpe_is={} top_sharpe_oos={}\n",
             outcome.tf,
             outcome.status,
             outcome.duration_secs,
             outcome.candidate_count,
             outcome.portfolio_count,
             outcome
-                .top_sharpe
+                .top_sharpe_is
+                .map(|v| format!("{:.4}", v))
+                .unwrap_or_else(|| "-".to_string()),
+            outcome
+                .top_sharpe_oos
                 .map(|v| format!("{:.4}", v))
                 .unwrap_or_else(|| "-".to_string()),
         ));
     }
 
-    // BEST TF by top_sharpe — only consider successful runs so a
-    // Timeout/Failed row with a zero sharpe can't masquerade as best.
+    // BEST TF by OOS sharpe (preferred when present) falling back to IS
+    // — only consider successful runs so a Timeout/Failed row with a
+    // zero sharpe can't masquerade as best. OOS is what an operator
+    // actually cares about: the GA always inflates IS, so picking on IS
+    // would crown the most overfit TF.
     let best = outcomes
         .iter()
         .filter(|o| {
-            (o.status == "Succeeded" || o.status == "Degraded") && o.top_sharpe.is_some()
+            (o.status == "Succeeded" || o.status == "Degraded")
+                && (o.top_sharpe_oos.is_some() || o.top_sharpe_is.is_some())
         })
         .max_by(|a, b| {
-            a.top_sharpe
-                .unwrap_or(f64::MIN)
-                .partial_cmp(&b.top_sharpe.unwrap_or(f64::MIN))
+            let a_key = a.top_sharpe_oos.or(a.top_sharpe_is).unwrap_or(f64::MIN);
+            let b_key = b.top_sharpe_oos.or(b.top_sharpe_is).unwrap_or(f64::MIN);
+            a_key
+                .partial_cmp(&b_key)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
     match best {
         Some(o) => buf.push_str(&format!(
-            "\nbest_tf: {} (top_sharpe={:.4})\n",
+            "\nbest_tf: {} (top_sharpe_is={:.4} top_sharpe_oos={})\n",
             o.tf,
-            o.top_sharpe.unwrap_or(0.0)
+            o.top_sharpe_is.unwrap_or(0.0),
+            o.top_sharpe_oos
+                .map(|v| format!("{:.4}", v))
+                .unwrap_or_else(|| "-".to_string()),
         )),
         None => buf.push_str("\nbest_tf: <none — every TF failed or had no portfolio>\n"),
     }
@@ -553,7 +642,8 @@ mod tests {
             duration_secs: 1.5,
             candidate_count: 0,
             portfolio_count: 0,
-            top_sharpe: None,
+            top_sharpe_is: None,
+            top_sharpe_oos: None,
             top_max_dd_pct: None,
             error_message: "load failed: missing \"frame\"".to_string(),
         };
@@ -570,17 +660,58 @@ mod tests {
             duration_secs: 12.345,
             candidate_count: 42,
             portfolio_count: 7,
-            top_sharpe: Some(1.8261),
+            top_sharpe_is: Some(1.8261),
+            top_sharpe_oos: Some(0.9123),
             top_max_dd_pct: Some(0.0921),
             error_message: String::new(),
         };
         let row = outcome.to_csv_row();
-        // tf,status,duration_secs(12.345),candidate(42),portfolio(7),sharpe(1.826100),dd(0.092100),""
-        assert!(row.starts_with("H4,Succeeded,12.345,42,7,1.826100,0.092100,\"\""));
+        // tf,status,duration_secs(12.345),candidate(42),portfolio(7),
+        // sharpe_is(1.826100),sharpe_oos(0.912300),dd(0.092100),""
+        assert!(row.starts_with(
+            "H4,Succeeded,12.345,42,7,1.826100,0.912300,0.092100,\"\""
+        ));
+    }
+
+    // #211: header carries both IS and OOS sharpe columns. Downstream
+    // notebook analysis relies on the column order being stable — this
+    // test traps drift between header and row.
+    #[test]
+    fn csv_header_includes_both_is_and_oos_sharpe_columns() {
+        assert!(CSV_HEADER.contains("top_sharpe_is"));
+        assert!(CSV_HEADER.contains("top_sharpe_oos"));
+        // Column order: IS comes before OOS (matches `to_csv_row`).
+        let is_pos = CSV_HEADER.find("top_sharpe_is").unwrap();
+        let oos_pos = CSV_HEADER.find("top_sharpe_oos").unwrap();
+        assert!(is_pos < oos_pos);
+        assert!(CSV_HEADER.ends_with('\n'));
     }
 
     #[test]
-    fn build_summary_picks_highest_sharpe_amongst_successful_tfs() {
+    fn csv_row_field_count_matches_header_field_count() {
+        // Trap regressions where someone adds a CSV column to the row
+        // but forgets the header (or vice versa). Compare comma counts
+        // — the error_message field can contain embedded quotes but no
+        // commas thanks to the RFC 4180 double-quoting.
+        let outcome = TfOutcome {
+            tf: "M5".to_string(),
+            status: "Succeeded".to_string(),
+            duration_secs: 1.0,
+            candidate_count: 1,
+            portfolio_count: 1,
+            top_sharpe_is: Some(1.0),
+            top_sharpe_oos: Some(0.5),
+            top_max_dd_pct: Some(0.01),
+            error_message: String::new(),
+        };
+        let row = outcome.to_csv_row();
+        let header_commas = CSV_HEADER.matches(',').count();
+        let row_commas = row.matches(',').count();
+        assert_eq!(header_commas, row_commas);
+    }
+
+    #[test]
+    fn build_summary_picks_highest_oos_sharpe_amongst_successful_tfs() {
         let outcomes = vec![
             TfOutcome {
                 tf: "M5".to_string(),
@@ -588,7 +719,10 @@ mod tests {
                 duration_secs: 1.0,
                 candidate_count: 1,
                 portfolio_count: 1,
-                top_sharpe: Some(0.5),
+                top_sharpe_is: Some(5.0),
+                // IS is highest here but OOS is low — overfit. The
+                // summary should NOT crown this one.
+                top_sharpe_oos: Some(0.5),
                 top_max_dd_pct: Some(0.01),
                 error_message: String::new(),
             },
@@ -598,7 +732,8 @@ mod tests {
                 duration_secs: 2.0,
                 candidate_count: 2,
                 portfolio_count: 2,
-                top_sharpe: Some(2.1),
+                top_sharpe_is: Some(2.1),
+                top_sharpe_oos: Some(2.0),
                 top_max_dd_pct: Some(0.04),
                 error_message: String::new(),
             },
@@ -610,7 +745,8 @@ mod tests {
                 portfolio_count: 0,
                 // Even with a huge sharpe a Failed row must never be
                 // crowned best — only Succeeded/Degraded count.
-                top_sharpe: Some(9.9),
+                top_sharpe_is: Some(9.9),
+                top_sharpe_oos: Some(9.9),
                 top_max_dd_pct: None,
                 error_message: "boom".to_string(),
             },
@@ -622,6 +758,39 @@ mod tests {
     }
 
     #[test]
+    fn build_summary_falls_back_to_is_sharpe_when_oos_missing() {
+        // Older runs (or TFs that didn't produce a forward-test
+        // artifact) may emit `best_sharpe` but not `best_oos_sharpe`.
+        // The picker must fall back to IS in that case.
+        let outcomes = vec![
+            TfOutcome {
+                tf: "M5".to_string(),
+                status: "Succeeded".to_string(),
+                duration_secs: 1.0,
+                candidate_count: 1,
+                portfolio_count: 1,
+                top_sharpe_is: Some(0.5),
+                top_sharpe_oos: None,
+                top_max_dd_pct: Some(0.01),
+                error_message: String::new(),
+            },
+            TfOutcome {
+                tf: "H4".to_string(),
+                status: "Succeeded".to_string(),
+                duration_secs: 2.0,
+                candidate_count: 2,
+                portfolio_count: 2,
+                top_sharpe_is: Some(2.1),
+                top_sharpe_oos: None,
+                top_max_dd_pct: Some(0.04),
+                error_message: String::new(),
+            },
+        ];
+        let summary = build_summary("AUDUSD", &outcomes, Duration::from_secs(3));
+        assert!(summary.contains("best_tf: H4"));
+    }
+
+    #[test]
     fn build_summary_reports_no_best_when_every_tf_failed() {
         let outcomes = vec![TfOutcome {
             tf: "M5".to_string(),
@@ -629,7 +798,8 @@ mod tests {
             duration_secs: 1.0,
             candidate_count: 0,
             portfolio_count: 0,
-            top_sharpe: None,
+            top_sharpe_is: None,
+            top_sharpe_oos: None,
             top_max_dd_pct: None,
             error_message: "boom".to_string(),
         }];

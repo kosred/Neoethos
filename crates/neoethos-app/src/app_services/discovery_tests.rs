@@ -124,6 +124,151 @@ fn success_snapshot_carries_candidate_and_portfolio_counters() {
     );
 }
 
+// #211: the `completed_snapshot` highlight emits `best_oos_sharpe`
+// taken from `forward_test_validation_artifacts`, distinct from
+// `best_sharpe` (which is in-sample stage-1). Both columns end up in
+// the validation CSV so a big IS-OOS gap can be spotted at-a-glance.
+#[test]
+fn success_snapshot_emits_best_oos_sharpe_from_forward_test_artifacts() {
+    use neoethos_core::contracts::TemporalFeatureContract;
+    use neoethos_search::{
+        BacktestMetrics, ForwardTestSummary, ForwardTestValidationArtifactFile,
+        ForwardTestValidationScope,
+    };
+
+    let best = Gene {
+        strategy_id: "alpha-1".to_string(),
+        fitness: 1450.0,
+        // In-sample stage-1 Sharpe — the GA optimized for this.
+        sharpe_ratio: 5.50,
+        win_rate: 0.64,
+        ..Gene::default()
+    };
+
+    let lo_oos_metrics = BacktestMetrics {
+        net_profit: 0.0,
+        sharpe: 1.20,
+        peak_equity: 0.0,
+        max_drawdown: 0.0,
+        win_rate: 0.0,
+        profit_factor: 0.0,
+        expectancy: 0.0,
+        trade_count: 0,
+        consistency: 0.0,
+        max_daily_drawdown: 0.0,
+    };
+    let hi_oos_metrics = BacktestMetrics {
+        sharpe: 1.55,
+        ..lo_oos_metrics
+    };
+
+    let temporal_contract = TemporalFeatureContract::strict_live(
+        "UTC",
+        "alignment-policy-v1",
+        "label-policy-v1",
+        "walk-forward-policy-v1",
+        "live-readiness-policy-v1",
+    )
+    .expect("strict temporal contract should be valid for OOS sharpe test");
+    let scope = ForwardTestValidationScope::new("ds", "ec", "st", &temporal_contract);
+
+    let forward_artifacts = vec![
+        ForwardTestValidationArtifactFile::new(
+            scope.clone(),
+            ForwardTestSummary {
+                bars: 100,
+                metrics: lo_oos_metrics,
+                span_days: 1.0,
+            },
+        ),
+        ForwardTestValidationArtifactFile::new(
+            scope,
+            ForwardTestSummary {
+                bars: 100,
+                metrics: hi_oos_metrics,
+                span_days: 1.0,
+            },
+        ),
+    ];
+
+    let result = DiscoveryResult {
+        portfolio: vec![best.clone()],
+        candidates: vec![best],
+        quality_metrics: Vec::new(),
+        logged_trades: Vec::new(),
+        effective_feature_names: Vec::new(),
+        validation_gates: DiscoveryValidationGates::pending(),
+        canonical_backtest_artifacts: Vec::new(),
+        walkforward_validation_artifacts: Vec::new(),
+        forward_test_validation_artifacts: forward_artifacts,
+        prop_firm_validation_artifacts: Vec::new(),
+    };
+
+    let snapshot = completed_snapshot(JobSnapshot::new(JobKind::Discovery), &result);
+
+    // In-sample Sharpe still emitted (unchanged from prior contract).
+    assert!(
+        snapshot
+            .report
+            .highlights
+            .iter()
+            .any(|(name, value)| { name == "best_sharpe" && value == "5.50" }),
+        "best_sharpe (in-sample) must still be present"
+    );
+    // New OOS highlight picks the MAX Sharpe across the forward-test
+    // tail artifacts — 1.55 wins over 1.20.
+    assert!(
+        snapshot
+            .report
+            .highlights
+            .iter()
+            .any(|(name, value)| { name == "best_oos_sharpe" && value == "1.5500" }),
+        "best_oos_sharpe must be the max forward-test sharpe (1.55)"
+    );
+}
+
+#[test]
+fn success_snapshot_omits_best_oos_sharpe_when_forward_test_artifacts_empty() {
+    // Backward compatibility: when no forward-test artifacts are
+    // produced (tail too short, or `compute_discovery_forward_test_artifacts`
+    // failed) the highlight is simply absent. The validation harness
+    // treats absence as `None` and falls back to in-sample reporting.
+    let best = Gene {
+        strategy_id: "alpha-1".to_string(),
+        sharpe_ratio: 1.82,
+        ..Gene::default()
+    };
+    let result = DiscoveryResult {
+        portfolio: vec![best.clone()],
+        candidates: vec![best],
+        quality_metrics: Vec::new(),
+        logged_trades: Vec::new(),
+        effective_feature_names: Vec::new(),
+        validation_gates: DiscoveryValidationGates::pending(),
+        canonical_backtest_artifacts: Vec::new(),
+        walkforward_validation_artifacts: Vec::new(),
+        forward_test_validation_artifacts: Vec::new(),
+        prop_firm_validation_artifacts: Vec::new(),
+    };
+    let snapshot = completed_snapshot(JobSnapshot::new(JobKind::Discovery), &result);
+    assert!(
+        !snapshot
+            .report
+            .highlights
+            .iter()
+            .any(|(name, _)| name == "best_oos_sharpe"),
+        "best_oos_sharpe must be absent when no forward-test artifacts exist"
+    );
+    // best_sharpe (in-sample) is still emitted.
+    assert!(
+        snapshot
+            .report
+            .highlights
+            .iter()
+            .any(|(name, _)| name == "best_sharpe")
+    );
+}
+
 #[tokio::test]
 async fn start_discovery_job_emits_initial_snapshot_with_requested_targets() {
     let mut request = sample_request();

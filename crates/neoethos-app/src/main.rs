@@ -96,6 +96,16 @@ struct Args {
     #[arg(long, default_value_t = 1800)]
     validation_tf_timeout_secs: u64,
 
+    /// Floor on the GA generation count for each `--validation-mode` TF.
+    /// Overrides `DiscoveryConfig.generations` from `config.yaml` when the
+    /// configured value is lower. This exists because operator configs
+    /// often set 20 generations as a "fast smoke test" value — but a
+    /// validation sweep needs every TF to actually exercise the search,
+    /// otherwise short-data TFs (D1/H4) finish in <1s with a tiny archive
+    /// (#215). Set to 0 to honor whatever `config.yaml` says.
+    #[arg(long, default_value_t = 20)]
+    validation_min_generations: usize,
+
     /// Suppress the orphan-launch help dialog. Set by the Flutter shell's
     /// BackendSupervisor when it spawns the backend.
     ///
@@ -190,6 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &settings,
             &args.validation_tfs,
             args.validation_tf_timeout_secs,
+            args.validation_min_generations,
         )
         .await?;
         std::process::exit(exit_code);

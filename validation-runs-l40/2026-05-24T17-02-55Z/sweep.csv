@@ -1,0 +1,7 @@
+tf,status,duration_secs,candidate_count,portfolio_count,top_sharpe,top_max_dd_pct,error_message
+M5,Succeeded,320.896,1196,4,5.980000,0.007400,""
+M15,Failed,101.196,0,0,,,"Discovery produced an empty portfolio for AUDUSD M15 (candidates=4)"
+M30,Succeeded,18.088,1370,4,4.530000,0.015500,""
+H1,Succeeded,6.362,1427,4,5.030000,0.012000,""
+H4,Succeeded,0.965,759,1,4.130000,0.016200,""
+D1,Succeeded,0.189,289,2,2.410000,0.020000,""
